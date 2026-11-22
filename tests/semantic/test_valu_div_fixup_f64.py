@@ -24,7 +24,9 @@ RDNA2 Vector Arithmetic Logic Unit (VALU) Architecture:
 Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
 """
 
+import abc
 from dataclasses import dataclass
+import enum
 import math
 import struct
 import unittest
@@ -310,6 +312,284 @@ class VALURegisterFile:
         lo, hi = split_dwords(val64)
         self.set_vgpr(idx, lo)
         self.set_vgpr(idx + 1, hi)
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class OperandKind(enum.Enum):
+    VGPR_PAIR = enum.auto()
+    SGPR_PAIR = enum.auto()
+    LITERAL_64 = enum.auto()
+    INLINE_IMM = enum.auto()
+
+
+@dataclass
+class ASTOperand:
+    kind: OperandKind
+    reg_idx: int = 0
+    imm_val: int = 0
+    neg: bool = False
+    abs_val: bool = False
+
+    def format_asm(self) -> str:
+        if self.kind == OperandKind.VGPR_PAIR:
+            s = f"v[{self.reg_idx}:{self.reg_idx + 1}]"
+        elif self.kind == OperandKind.SGPR_PAIR:
+            s = f"s[{self.reg_idx}:{self.reg_idx + 1}]"
+        elif self.kind == OperandKind.LITERAL_64:
+            s = f"0x{self.imm_val:016x}"
+        elif self.kind == OperandKind.INLINE_IMM:
+            s = f"{self.imm_val}"
+        else:
+            s = "unknown"
+        if self.abs_val:
+            s = f"|{s}|"
+        if self.neg:
+            s = f"-{s}"
+        return s
+
+
+@dataclass
+class ASTInstruction:
+    opcode: str
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+    src2: ASTOperand
+    clamp: bool = False
+    omod: float = 1.0
+
+    def validate(self) -> None:
+        if self.opcode != "v_div_fixup_f64":
+            raise ValueError(f"Invalid opcode for v_div_fixup_f64 AST: {self.opcode}")
+        if self.dst.kind != OperandKind.VGPR_PAIR:
+            raise ValueError(f"Destination must be a VGPR pair, got {self.dst.kind}")
+        if not (0 <= self.dst.reg_idx <= 254):
+            raise ValueError(f"Destination VGPR pair index out of range: {self.dst.reg_idx}")
+        if self.dst.neg or self.dst.abs_val:
+            raise ValueError("Destination operand cannot have neg or abs modifiers")
+
+        for idx, (src_name, src_op) in enumerate([("src0", self.src0), ("src1", self.src1), ("src2", self.src2)]):
+            if src_op.kind == OperandKind.VGPR_PAIR:
+                if not (0 <= src_op.reg_idx <= 254):
+                    raise ValueError(f"{src_name} VGPR pair index out of range: {src_op.reg_idx}")
+            elif src_op.kind == OperandKind.SGPR_PAIR:
+                if not (0 <= src_op.reg_idx <= 104):
+                    raise ValueError(f"{src_name} SGPR pair index out of range: {src_op.reg_idx}")
+            elif src_op.kind in (OperandKind.LITERAL_64, OperandKind.INLINE_IMM):
+                pass
+            else:
+                raise ValueError(f"Unsupported operand kind for {src_name}: {src_op.kind}")
+
+        if self.omod not in (1.0, 2.0, 4.0, 0.5):
+            raise ValueError(f"Invalid omod value: {self.omod}")
+
+    def format_asm(self) -> str:
+        tokens = [
+            f"{self.opcode} {self.dst.format_asm()}, {self.src0.format_asm()}, "
+            f"{self.src1.format_asm()}, {self.src2.format_asm()}"
+        ]
+        if self.clamp:
+            tokens.append("clamp")
+        if self.omod == 2.0:
+            tokens.append("mul:2")
+        elif self.omod == 4.0:
+            tokens.append("mul:4")
+        elif self.omod == 0.5:
+            tokens.append("div:2")
+        return " ".join(tokens)
+
+
+class F64Expression(abc.ABC):
+    """Abstract base class for typed 64-bit floating-point expressions."""
+
+    @abc.abstractmethod
+    def evaluate(self, env: dict[str, int]) -> int:
+        pass
+
+
+@dataclass
+class F64Constant(F64Expression):
+    bits: int
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        return self.bits & MASK64
+
+
+@dataclass
+class F64Variable(F64Expression):
+    name: str
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        if self.name not in env:
+            raise KeyError(f"Variable {self.name} not found in environment")
+        return env[self.name] & MASK64
+
+
+@dataclass
+class F64UnaryOp(F64Expression):
+    op: str  # "abs", "neg", "neg_abs"
+    operand: F64Expression
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        val = self.operand.evaluate(env)
+        if self.op == "abs":
+            return apply_src_mods_f64(val, abs_val=True)
+        elif self.op == "neg":
+            return apply_src_mods_f64(val, neg=True)
+        elif self.op == "neg_abs":
+            return apply_src_mods_f64(val, neg=True, abs_val=True)
+        raise ValueError(f"Unknown unary operator: {self.op}")
+
+
+@dataclass
+class F64DivFixup(F64Expression):
+    s0: F64Expression
+    s1: F64Expression
+    s2: F64Expression
+    clamp: bool = False
+    omod: float = 1.0
+
+    def evaluate(self, env: dict[str, int]) -> int:
+        v0 = self.s0.evaluate(env)
+        v1 = self.s1.evaluate(env)
+        v2 = self.s2.evaluate(env)
+        return ref_div_fixup_f64(v0, v1, v2, clamp=self.clamp, omod=self.omod)
+
+
+def instruction_to_expression(inst: ASTInstruction) -> F64DivFixup:
+    """Translate an ASTInstruction into a typed symbolic expression tree."""
+    inst.validate()
+
+    def build_operand_expr(op: ASTOperand, prefix: str) -> F64Expression:
+        if op.kind in (OperandKind.VGPR_PAIR, OperandKind.SGPR_PAIR):
+            expr: F64Expression = F64Variable(f"{prefix}_{op.reg_idx}")
+        elif op.kind in (OperandKind.LITERAL_64, OperandKind.INLINE_IMM):
+            expr = F64Constant(op.imm_val)
+        else:
+            raise ValueError(f"Unsupported operand kind: {op.kind}")
+
+        if op.abs_val and op.neg:
+            expr = F64UnaryOp("neg_abs", expr)
+        elif op.abs_val:
+            expr = F64UnaryOp("abs", expr)
+        elif op.neg:
+            expr = F64UnaryOp("neg", expr)
+        return expr
+
+    s0_expr = build_operand_expr(inst.src0, "src0")
+    s1_expr = build_operand_expr(inst.src1, "src1")
+    s2_expr = build_operand_expr(inst.src2, "src2")
+    return F64DivFixup(s0=s0_expr, s1=s1_expr, s2=s2_expr, clamp=inst.clamp, omod=inst.omod)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_creation_and_formatting(self) -> None:
+        dst = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=2)
+        src1 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=4)
+        src2 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=6)
+
+        inst = ASTInstruction(opcode="v_div_fixup_f64", dst=dst, src0=src0, src1=src1, src2=src2)
+        inst.validate()
+        self.assertEqual(inst.format_asm(), "v_div_fixup_f64 v[0:1], v[2:3], v[4:5], v[6:7]")
+
+        # With modifiers and clamp
+        src1_mod = ASTOperand(kind=OperandKind.SGPR_PAIR, reg_idx=8, neg=True, abs_val=True)
+        inst_clamp = ASTInstruction(
+            opcode="v_div_fixup_f64",
+            dst=dst,
+            src0=src0,
+            src1=src1_mod,
+            src2=src2,
+            clamp=True,
+            omod=2.0,
+        )
+        inst_clamp.validate()
+        self.assertEqual(inst_clamp.format_asm(), "v_div_fixup_f64 v[0:1], v[2:3], -|s[8:9]|, v[6:7] clamp mul:2")
+
+    def test_typed_expression_evaluation(self) -> None:
+        c0 = F64Constant(f64_to_u64(5.0))
+        c1 = F64Constant(f64_to_u64(2.0))
+        c2 = F64Constant(f64_to_u64(10.0))
+
+        expr = F64DivFixup(s0=c0, s1=c1, s2=c2)
+        res = expr.evaluate({})
+        self.assertEqual(u64_to_f64(res), 5.0)
+
+        # Unary modifier on s1: negate denominator -> negative quotient
+        neg_c1 = F64UnaryOp("neg", c1)
+        expr_neg = F64DivFixup(s0=c0, s1=neg_c1, s2=c2)
+        res_neg = expr_neg.evaluate({})
+        self.assertEqual(u64_to_f64(res_neg), -5.0)
+
+    def test_instruction_to_expression(self) -> None:
+        dst = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=0)
+        src0 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=2)
+        src1 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=4, abs_val=True)
+        src2 = ASTOperand(kind=OperandKind.VGPR_PAIR, reg_idx=6, neg=True)
+
+        inst = ASTInstruction(opcode="v_div_fixup_f64", dst=dst, src0=src0, src1=src1, src2=src2)
+        expr = instruction_to_expression(inst)
+
+        env = {
+            "src0_2": f64_to_u64(3.0),
+            "src1_4": f64_to_u64(-4.0),
+            "src2_6": f64_to_u64(12.0),
+        }
+        res = expr.evaluate(env)
+        # s1 = |-4.0| = 4.0; s2 = -12.0; s0 = 3.0 -> -12 / 4 = -3.0
+        self.assertEqual(u64_to_f64(res), -3.0)
+
+    def test_ast_validation_errors(self) -> None:
+        # Invalid opcode
+        bad_op = ASTInstruction(
+            opcode="v_div_scale_f64",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, 0),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, 2),
+            src1=ASTOperand(OperandKind.VGPR_PAIR, 4),
+            src2=ASTOperand(OperandKind.VGPR_PAIR, 6),
+        )
+        with self.assertRaises(ValueError):
+            bad_op.validate()
+
+        # Destination cannot be SGPR
+        bad_dst = ASTInstruction(
+            opcode="v_div_fixup_f64",
+            dst=ASTOperand(OperandKind.SGPR_PAIR, 0),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, 2),
+            src1=ASTOperand(OperandKind.VGPR_PAIR, 4),
+            src2=ASTOperand(OperandKind.VGPR_PAIR, 6),
+        )
+        with self.assertRaises(ValueError):
+            bad_dst.validate()
+
+        # Destination out of bounds
+        oob_dst = ASTInstruction(
+            opcode="v_div_fixup_f64",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, 256),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, 2),
+            src1=ASTOperand(OperandKind.VGPR_PAIR, 4),
+            src2=ASTOperand(OperandKind.VGPR_PAIR, 6),
+        )
+        with self.assertRaises(ValueError):
+            oob_dst.validate()
+
+        # Invalid omod
+        bad_omod = ASTInstruction(
+            opcode="v_div_fixup_f64",
+            dst=ASTOperand(OperandKind.VGPR_PAIR, 0),
+            src0=ASTOperand(OperandKind.VGPR_PAIR, 2),
+            src1=ASTOperand(OperandKind.VGPR_PAIR, 4),
+            src2=ASTOperand(OperandKind.VGPR_PAIR, 6),
+            omod=3.0,
+        )
+        with self.assertRaises(ValueError):
+            bad_omod.validate()
 
 
 class TestVDivFixupF64ReferenceOracle(unittest.TestCase):
