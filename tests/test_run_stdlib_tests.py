@@ -211,28 +211,43 @@ class RunStdlibTestsTest(unittest.TestCase):
         self.assertEqual(self.runner._decode_bytes(b"caf\xe9\r\n", encoding="cp1252"), "caf\u00e9\n")
 
     def test_timeout_kills_helper_process_tree_and_does_not_wait_for_inherited_pipe(self):
-        # Covers both helper modes: inheriting stdout/stderr (which would otherwise block communicate()
-        # until the helper exits) and redirecting to DEVNULL (which would otherwise leave an orphan
-        # helper running after the parent is killed).
+        # Covers three helper controls:
+        # 1. inherited: parent waits on a helper that inherits stdout/stderr;
+        # 2. devnull: parent waits on a helper redirected to DEVNULL;
+        # 3. early_exit_inherited: parent starts a helper with inherited stdout/stderr via Popen
+        #    and exits immediately before the timeout fires.
         helper_code = (
             "import os, sys, time; "
             "open(sys.argv[1], 'w', encoding='utf-8', newline='\\n').write('started'); "
             "time.sleep(3.5); "
             "open(sys.argv[2], 'w', encoding='utf-8', newline='\\n').write('late')"
         )
-        for mode in ("inherited", "devnull"):
+        for mode in ("inherited", "devnull", "early_exit_inherited"):
             with self.subTest(mode=mode):
-                redirect = ", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL" if mode == "devnull" else ""
                 with tempfile.TemporaryDirectory() as tmp:
                     started = os.path.join(tmp, "started.txt")
                     late = os.path.join(tmp, "late.txt")
+                    if mode == "early_exit_inherited":
+                        spawn = (
+                            f"    subprocess.Popen([sys.executable, '-I', '-c', {helper_code!r}, "
+                            f"{started!r}, {late!r}])\n"
+                        )
+                    else:
+                        redirect = (
+                            ", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL"
+                            if mode == "devnull"
+                            else ""
+                        )
+                        spawn = (
+                            f"    subprocess.run([sys.executable, '-I', '-c', {helper_code!r}, "
+                            f"{started!r}, {late!r}]{redirect})\n"
+                        )
                     write_file(
                         tmp,
                         "tests/test_spawns_helper.py",
                         "import subprocess, sys\n"
                         'if __name__ == "__main__":\n'
-                        f"    subprocess.run([sys.executable, '-I', '-c', {helper_code!r}, "
-                        f"{started!r}, {late!r}]{redirect})\n",
+                        + spawn,
                     )
                     t0 = time.monotonic()
                     res = self.runner.run_one(tmp, "tests/test_spawns_helper.py", timeout=1.5)

@@ -116,19 +116,121 @@ def _decode_bytes(data, encoding=None):
     return text.replace("\r\n", "\n")
 
 
-def _terminate_process_tree(proc):
+class _Win32Job:
+    """Windows Job Object retaining ownership of a child and its descendants past parent exit."""
+
+    def __init__(self):
+        self._handle = None
+        self._kernel32 = None
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _BasicLimitInfo(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class _IoCounters(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_uint64),
+                    ("WriteOperationCount", ctypes.c_uint64),
+                    ("OtherOperationCount", ctypes.c_uint64),
+                    ("ReadTransferCount", ctypes.c_uint64),
+                    ("WriteTransferCount", ctypes.c_uint64),
+                    ("OtherTransferCount", ctypes.c_uint64),
+                ]
+
+            class _ExtendedLimitInfo(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", _BasicLimitInfo),
+                    ("IoInfo", _IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            kernel32.TerminateJobObject.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return
+            info = _ExtendedLimitInfo()
+            # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000), JobObjectExtendedLimitInformation (9).
+            info.BasicLimitInformation.LimitFlags = 0x2000
+            if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                kernel32.CloseHandle(job)
+                return
+            self._kernel32 = kernel32
+            self._handle = job
+        except (ImportError, OSError, AttributeError):
+            self._handle = None
+            self._kernel32 = None
+
+    def assign(self, proc):
+        if not self._handle:
+            return False
+        proc_handle = getattr(proc, "_handle", None)
+        if not proc_handle:
+            return False
+        if self._kernel32.AssignProcessToJobObject(self._handle, int(proc_handle)):
+            return True
+        self.close()
+        return False
+
+    def terminate(self):
+        if self._handle:
+            return bool(self._kernel32.TerminateJobObject(self._handle, 1))
+        return False
+
+    def close(self):
+        if self._handle:
+            handle, self._handle = self._handle, None
+            self._kernel32.CloseHandle(handle)
+
+
+def _terminate_process_tree(proc, job=None):
     """Terminate ``proc`` and any descendants so helpers cannot outlive a timeout or hold pipes open."""
     if os.name == "nt":
-        # Kill the tree while the parent PID is still alive so `taskkill /T` can walk its children.
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+        if job is not None and job.terminate():
             pass
+        else:
+            # Fallback when Job Object assignment is unavailable: kill tree while parent PID is alive.
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
     else:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -155,10 +257,13 @@ def run_one(root, rel, python_exe=None, timeout=DEFAULT_TIMEOUT):
     else:
         popen_kwargs["start_new_session"] = True
 
+    job = _Win32Job() if os.name == "nt" else None
     t0 = time.monotonic()
     try:
         proc = subprocess.Popen([exe, "-I", script_arg], **popen_kwargs)
     except OSError as exc:
+        if job is not None:
+            job.close()
         elapsed = time.monotonic() - t0
         return TestResult(
             path=rel,
@@ -166,6 +271,9 @@ def run_one(root, rel, python_exe=None, timeout=DEFAULT_TIMEOUT):
             elapsed=elapsed,
             output=f"[run_stdlib_tests] failed to start {rel}: {exc}\n",
         )
+
+    if job is not None:
+        job.assign(proc)
 
     try:
         stdout_bytes, _ = proc.communicate(timeout=effective_timeout)
@@ -177,7 +285,7 @@ def run_one(root, rel, python_exe=None, timeout=DEFAULT_TIMEOUT):
             output=_decode_bytes(stdout_bytes),
         )
     except subprocess.TimeoutExpired:
-        _terminate_process_tree(proc)
+        _terminate_process_tree(proc, job)
         partial_bytes = b""
         try:
             partial_bytes, _ = proc.communicate(timeout=5)
@@ -204,7 +312,7 @@ def run_one(root, rel, python_exe=None, timeout=DEFAULT_TIMEOUT):
             timed_out=True,
         )
     except BaseException:
-        _terminate_process_tree(proc)
+        _terminate_process_tree(proc, job)
         if proc.stdout is not None:
             try:
                 proc.stdout.close()
@@ -215,6 +323,9 @@ def run_one(root, rel, python_exe=None, timeout=DEFAULT_TIMEOUT):
         except subprocess.TimeoutExpired:
             pass
         raise
+    finally:
+        if job is not None:
+            job.close()
 
 
 def run_suite(
