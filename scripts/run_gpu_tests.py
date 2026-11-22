@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -255,18 +256,67 @@ def verdict_line(rc: int, msg: str) -> str:
     return failure(rc, msg, 1) if rc else msg.splitlines()[-1] if msg else ""
 
 
-def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
-            cwd: str | None = None) -> tuple[int, str]:
+def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, split: bool = False, *,
+            cwd: str | None = None) -> tuple:
+    """(exit, text) for a launch, or (exit, stdout, stderr) with `split` so a failure report can say which stream
+    carried what (TEST-388)."""
     # A hung GPU test program fails its test instead of stalling the suite (check.py, LEONIDA_GPU_TEST_TIMEOUT).
     # gpu=False (the translator over the whole suite) runs without a limit.
     limit = gpu_test_timeout() if gpu else None
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit, cwd=cwd)
     except subprocess.TimeoutExpired:
-        return 1, timed_out(cmd[0], limit)
+        msg = timed_out(cmd[0], limit)
+        return (1, "", msg) if split else (1, msg)
     except OSError as e:   # e.g. Smart App Control blocked a fresh build: fail this test, keep running the others
-        return 1, start_failure(cmd[0], e)
-    return p.returncode, (p.stdout + "\n" + p.stderr).strip()
+        msg = start_failure(cmd[0], e)
+        return (1, "", msg) if split else (1, msg)
+    return (p.returncode, p.stdout, p.stderr) if split else (p.returncode, (p.stdout + "\n" + p.stderr).strip())
+
+
+def split_output(result: tuple) -> tuple[int, str, str]:
+    """(exit, stdout, stderr) from a run_cmd call, also when a test patched run_cmd with the old two-tuple."""
+    rc, *rest = result
+    return (rc, *rest, "") if len(rest) == 1 else (rc, rest[0], rest[1])
+
+
+def _tail(text: str, lines: int = 4, width: int = 400) -> str:
+    kept = [ln for ln in (text or "").splitlines() if ln.strip()][-lines:]
+    joined = " | ".join(kept)
+    return joined[-width:] if joined else "(nothing)"
+
+
+def exit_status(rc: int) -> str:
+    """A return code as a reader needs it: a signal by name, a Windows exception status in hex, else the code."""
+    if rc < 0:
+        try:
+            return f"killed by {signal.Signals(-rc).name}"
+        except ValueError:
+            return f"killed by signal {-rc}"
+    if rc > 255:
+        return f"exit status {rc:#x}"
+    return f"exit status {rc}"
+
+
+def failure_detail(rc: int, msg: str = "", out: str | None = None, err: str | None = None,
+                   missing_words: bool = False) -> str:
+    """A failure line that separates a failed launch, unparseable output and a wrong result instead of pasting the
+    combined output, which for vk_compute_test can be its stderr device line alone (TEST-388)."""
+    what = []
+    if rc != 0:
+        what.append(exit_status(rc))
+    if missing_words:
+        what.append("no result words in the output" if rc == 0 else "and no result words in the output")
+    if not what:
+        what.append("failed")
+    streams = []
+    if err and err.strip():
+        streams.append("stderr: " + _tail(err))
+    combined_only = out is None          # a caller that only kept the joined text: label it "output"
+    shown = msg if combined_only else out
+    if shown and shown.strip():
+        streams.append(("output: " if combined_only else "stdout: ") + _tail(shown))
+    return "; ".join(what + streams)
 
 
 def bary_fallback() -> bool:
@@ -350,11 +400,12 @@ WAVE32_PIN_DUMPS = ("cs_barrier_loop",)
 
 
 def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: bool, emulated: bool,
-                  hexwords: bool = False) -> tuple[bool | None, str]:
+                  hexwords: bool = False, out: str | None = None, err: str | None = None) -> tuple[bool | None, str]:
     """Judge one vk_compute_test "dump" run: (True, words), (False, why), or (None, why) when the device can't run it.
     wave64: it was run with --require-wave64, so exit 77 is a skip and the 64-wide confirmation must be printed.
     partial: a group smaller than a wave, run at subgroup size 64 without full subgroups; skipped when the device
-    reports no subgroup size of 64. emulated: translated with --wave64-emulate, runs on any subgroup size."""
+    reports no subgroup size of 64. emulated: translated with --wave64-emulate, runs on any subgroup size.
+    `msg` is the combined output used for parsing; `out`/`err` are the separate streams for the failure detail."""
     if rc == 77:   # the program refused the module and said why ("unsupported: <why>"): a skip with that reason, in every mode
         why = next((ln for ln in msg.splitlines() if ln.startswith("unsupported:")), None)
         if why:
@@ -365,8 +416,10 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     if rc == 0 and wave64 and "compute subgroup size: 64" not in msg.splitlines():
         return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
     words = dump_words(msg)
-    if rc != 0 or words is None:
-        return False, msg
+    if rc != 0:
+        return False, failure_detail(rc, msg, out, err)
+    if words is None:
+        return False, failure_detail(0, msg, out, err, missing_words=True)
     vals = words[:len(want)]
     return words_match(vals, want), " ".join((hex if hexwords else str)(x) for x in vals)
 
@@ -962,11 +1015,13 @@ def run_suite(a, work: str) -> int:
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
             # cs_global_mem_ext.asm: global/buffer atomics, 8/16-bit global stores and d16 loads in the same heap.
-            rc, msg = run_cmd([vk_compute, spv, "40", "dump"], env=cs_env)
+            rc, out, err = split_output(run_cmd([vk_compute, spv, "40", "dump"], env=cs_env, split=True))
+            msg = (out + "\n" + err).strip()
             want = {"cs_global_neg_offset": [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4, 0x9E, 0xFFFF8BAD,
                                              0x57023FFC, 0xEEEEEEEE],
                     "cs_global_mem_ext": [0x5, 0xC, 0x977, 0xFFF00000, 0xEDCB5678, 0xEF332211, 0x887766BE, 0xFF801234]}[name]
-            ok, detail = judge_cs_dump(rc, msg, want, wave64=False, partial=False, emulated=False, hexwords=True)
+            ok, detail = judge_cs_dump(rc, msg, want, wave64=False, partial=False, emulated=False, hexwords=True,
+                                       out=out, err=err)
             results.append((name, ok, detail))
         elif name == "cs_heap_init":
             # vk_compute_test copies VKC_HEAP_INIT's file into the heap; the shader copies its words at 0x100 to 0.
@@ -994,11 +1049,16 @@ def run_suite(a, work: str) -> int:
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
             wrong = []
             for bits, unsigned, signed in CVT_F32_SAT_CASES:
-                rc, msg = run_cmd([vk_compute, spv, "1", "dump"],
-                                  env=dict(cs_env or os.environ, VKC_SGPRS=f"{bits:#010x}"))
+                rc, out, err = split_output(run_cmd([vk_compute, spv, "1", "dump"],
+                                                    env=dict(cs_env or os.environ, VKC_SGPRS=f"{bits:#010x}"),
+                                                    split=True))
+                msg = (out + "\n" + err).strip()
                 words = dump_words(msg)
                 if rc != 0 or not words or words[:2] != [unsigned, signed]:
-                    got = " ".join(hex(x) for x in words[:2]) if words else msg.splitlines()[-1] if msg else "no output"
+                    if rc != 0 or not words:
+                        got = failure_detail(rc, msg, out, err, missing_words=not words)
+                    else:
+                        got = " ".join(hex(x) for x in words[:2])
                     wrong.append(f"{bits:#010x} gave {got}, want {unsigned:#x} {signed:#x}")
             n = len(CVT_F32_SAT_CASES)
             results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
@@ -1144,7 +1204,9 @@ def run_suite(a, work: str) -> int:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
                 cs_env = dict(os.environ, **WAVE32_LANE_ENV)
-            rc, msg = run_cmd([vk_compute, spv, "1", "dump"] + (["--require-wave64"] if wave64 else []), env=cs_env)
+            rc, out, err = split_output(run_cmd([vk_compute, spv, "1", "dump"] +
+                                               (["--require-wave64"] if wave64 else []), env=cs_env, split=True))
+            msg = (out + "\n" + err).strip()
             skip = None
             if name in WAVE32_LANE_DUMPS:
                 if rc == UNSUPPORTED:
@@ -1163,7 +1225,7 @@ def run_suite(a, work: str) -> int:
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
                                            hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16",
                                                              "cs_w32_lds_subdword", "cs_w32_lds_wide",
-                                                             "cs_lds_b64_cmpst", "cs_signed_zero_nan"))
+                                                             "cs_lds_b64_cmpst", "cs_signed_zero_nan"), out=out, err=err)
                 if ok and None in want:
                     unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
                     detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"

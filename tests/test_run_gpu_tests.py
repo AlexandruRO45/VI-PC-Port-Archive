@@ -643,6 +643,86 @@ class FmaFusedSuite(unittest.TestCase):
         rc, out = self.run_fma(77, "unsupported: no VK_KHR_shader_fma", fma_env="khr")
         self.assertEqual(rc, 0, out)
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
+class FailureDetail(unittest.TestCase):
+    """TEST-388: a failure says whether the launch failed, nothing was parsed or the words were wrong, and keeps
+    stdout and stderr apart. vk_compute_test prints its device line to stderr, so the joined text on its own can read
+    as a bare "device: ..."."""
+
+    def test_a_failed_launch_reports_the_exit_and_the_streams(self):
+        ok, detail = rgt.judge_cs_dump(1, DEVICE_64 + CONFIRMED + dump(WANT), WANT, wave64=True, partial=False,
+                                       emulated=False, out=dump(WANT), err="Vulkan pipeline failed\n")
+        self.assertIs(ok, False)
+        self.assertIn("exit status 1", detail)
+        self.assertIn("stderr: Vulkan pipeline failed", detail)
+        self.assertIn("stdout: out[0..7] =", detail)
+
+    def test_exit_status_names_signals_and_windows_statuses(self):
+        self.assertEqual(rgt.exit_status(0), "exit status 0")
+        self.assertEqual(rgt.exit_status(-11), "killed by SIGSEGV")
+        self.assertEqual(rgt.exit_status(0xC0000005), "exit status 0xc0000005")
+
+    def test_no_result_words_says_so(self):
+        ok, detail = judge(0, DEVICE_64 + CONFIRMED, out="", err=DEVICE_64)
+        self.assertIs(ok, False)
+        self.assertIn("no result words in the output", detail)
+        self.assertIn("stderr: device: X", detail)          # the device line is stderr, as vk_compute_test prints it
+        self.assertNotIn("stdout:", detail)                 # and stdout really was empty
+
+    def test_a_wrong_word_is_not_reported_as_a_launch_problem(self):
+        ok, detail = judge(0, CONFIRMED + dump([1, 2]))
+        self.assertIs(ok, False)
+        self.assertNotIn("exit", detail)
+        self.assertNotIn("no result words", detail)
+        self.assertEqual(detail, "1 2")
+
+    def test_the_joined_text_alone_still_works(self):
+        # Callers that only kept run_cmd's joined text get it labelled as output, not as stdout.
+        ok, detail = judge(1, "device: X\nVulkan pipeline failed\n")
+        self.assertIs(ok, False)
+        self.assertIn("exit status 1", detail)
+        self.assertIn("output: device: X | Vulkan pipeline failed", detail)
+
+
+class CvtSatFailureDetail(unittest.TestCase):
+    """The cs_cvt_f32_sat report through the suite: the 16-case loop must not print a device line as the reason."""
+    NAME = "cs_cvt_f32_sat"
+
+    def run_suite(self, reply):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=self.NAME, build=tmp, llvm_mc="unused")
+
+            def run(cmd, env=None, gpu=True, split=False):
+                if Path(cmd[0]).stem == "vk_compute_test":
+                    return reply
+                (Path(tmp) / "spirv" / f"{self.NAME}.spv").touch()   # rdna2spirv.py "translating" the shader
+                return (0, "", "") if split else (0, "")
+
+            out = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=run),
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(out)):
+                rc = rgt.run_suite(args, tmp)
+            return rc, out.getvalue()
+
+    def test_a_failed_launch_names_the_exit(self):
+        rc, out = self.run_suite((1, "device: X\n", "Vulkan pipeline failed\n"))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("exit status 1", out)
+        self.assertIn("stderr: Vulkan pipeline failed", out)
+        self.assertIn("16/16 inputs wrong", out)
+
+    def test_no_words_names_the_missing_result(self):
+        rc, out = self.run_suite((0, "", "device: X (subgroup 32..32)\n"))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no result words in the output", out)
+        self.assertIn("stderr: device: X (subgroup 32..32)", out)
+
+    def test_wrong_words_still_report_the_values(self):
+        rc, out = self.run_suite((0, dump([0, 0]), DEVICE_32))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("gave 0x0 0x0, want", out)
+        self.assertNotIn("no result words", out)
 
 
 if __name__ == "__main__":
