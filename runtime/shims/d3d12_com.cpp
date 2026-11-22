@@ -1389,11 +1389,17 @@ private:
         submit.pCommandBuffers = &stamp_.commands;
         LARGE_INTEGER before{}, after{};
         {
-            std::lock_guard submit_lock(context_.submit_mutex());
+            // Queue host-sync is per physical handle; the global submit lock must NEVER be held across GPU idle.
+            // A different queue may be responsible for the fence that releases this queue's pending Wait().
+            std::lock_guard queue_lock(context_.queue_host_mutex(vk_queue_));
             if (vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS) return E_FAIL;
             QueryPerformanceCounter(&before);
-            if (vk.vkQueueSubmit(vk_queue_, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS ||
-                vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS)
+            VkResult submitted;
+            {
+                std::lock_guard submit_lock(context_.submit_mutex());
+                submitted = vk.vkQueueSubmit(vk_queue_, 1, &submit, VK_NULL_HANDLE);
+            }
+            if (submitted != VK_SUCCESS || vk.vkQueueWaitIdle(vk_queue_) != VK_SUCCESS)
                 return E_FAIL;
             QueryPerformanceCounter(&after);
         }

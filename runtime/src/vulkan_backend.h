@@ -1248,6 +1248,15 @@ public:
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
     std::mutex& submit_mutex() { return submit_mutex_; }
+    // The device-global submit lock protects retirement tickets and cross-queue submission ordering. A blocking
+    // vkQueueWaitIdle cannot hold it: another VkQueue may need to submit the signal that makes this one idle.
+    // Acquire this lock first, then submit_mutex_ only for the brief Vulkan enqueue/ticket critical section.
+    std::mutex& queue_host_mutex(VkQueue queue) {
+        std::lock_guard lock(queue_host_mutexes_mutex_);
+        auto& entry = queue_host_mutexes_[queue];
+        if (!entry) entry = std::make_unique<std::mutex>();
+        return *entry;
+    }
 
     void mark_device_lost() noexcept {
         device_lost_.store(true, std::memory_order_release);
@@ -1334,6 +1343,8 @@ private:
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
     alignas(64) std::mutex submit_mutex_;
+    std::mutex queue_host_mutexes_mutex_;
+    std::map<VkQueue, std::unique_ptr<std::mutex>> queue_host_mutexes_;
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
@@ -1475,11 +1486,14 @@ public:
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
         if (queue_) {
-            std::lock_guard lock(context_.submit_mutex());
+            std::lock_guard queue_lock(context_.queue_host_mutex(queue_));
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
             const VkResult idle_result = vk.vkQueueWaitIdle(queue_);
             if (idle_result == VK_SUCCESS) {
-                if (progress_) context_.retire_queue_idle_locked(progress_);
+                if (progress_) {
+                    std::lock_guard submit_lock(context_.submit_mutex());
+                    context_.retire_queue_idle_locked(progress_);
+                }
             } else {
                 context_.mark_device_lost();
             }
@@ -1635,7 +1649,7 @@ public:
     }
 
     bool idle() {
-        std::lock_guard lock(context_.submit_mutex());
+        std::lock_guard lock(context_.queue_host_mutex(queue_));
         return context_.vk.vkQueueWaitIdle(queue_) == VK_SUCCESS;
     }
 
@@ -1980,6 +1994,7 @@ private:
         if (kind == DebugMarker::Kind::end && !open_labels_) return;
         VkDebugUtilsLabelEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
         info.pLabelName = label ? label : "";
+        std::lock_guard queue_lock(context_.queue_host_mutex(queue_));
         std::lock_guard lock(context_.submit_mutex());
         if (kind == DebugMarker::Kind::set) {
             f.queue_insert(queue_, &info);
@@ -2176,6 +2191,7 @@ private:
         info.pSignalSemaphores = &progress_;
         pending_bindings_.push_back(std::move(pending));
         {
+            std::lock_guard queue_lock(context_.queue_host_mutex(queue_));
             std::lock_guard lock(context_.submit_mutex());
             const auto result = vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE);
             if (result != VK_SUCCESS) {
@@ -2275,6 +2291,7 @@ private:
         const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkResult res = VK_SUCCESS;
         {
+            std::lock_guard queue_lock(context_.queue_host_mutex(queue_));
             std::lock_guard lock(context_.submit_mutex());
             VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
             std::uint64_t signal_values[2]{ticket, 0};

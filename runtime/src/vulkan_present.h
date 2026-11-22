@@ -164,7 +164,7 @@ public:
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         {
-            std::lock_guard lock(context_.submit_mutex());
+            std::lock_guard lock(context_.queue_host_mutex(queue_));
             vk.vkQueueWaitIdle(queue_);
         }
         release(swapchain_);
@@ -443,6 +443,7 @@ public:
 #endif
         VkResult submitted, result = VK_SUCCESS;
         {
+            std::lock_guard queue_lock(context_.queue_host_mutex(queue_));
             std::lock_guard lock(context_.submit_mutex());
             submitted = vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
             if (submitted != VK_SUCCESS) rollback();
@@ -503,6 +504,7 @@ private:
         submit_info.pWaitDstStageMask = &wait_stage;
         VkResult submitted;
         {
+            std::lock_guard queue_lock(context_.queue_host_mutex(queue_));
             std::lock_guard lock(context_.submit_mutex());
             submitted = context_.vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
         }
@@ -604,7 +606,7 @@ private:
             composer_->extent().height == extent_.height)
             return true;
         {
-            std::lock_guard lock(context_.submit_mutex());
+            std::lock_guard lock(context_.queue_host_mutex(queue_));
             context_.vk.vkQueueWaitIdle(queue_);  // the old target may still be in use
         }
         bool changed = false;
@@ -851,7 +853,7 @@ private:
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
         {
-            std::lock_guard lock(context_.submit_mutex());
+            std::lock_guard lock(context_.queue_host_mutex(queue_));
             vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
         }
         stale_ = true;  // until this succeeds

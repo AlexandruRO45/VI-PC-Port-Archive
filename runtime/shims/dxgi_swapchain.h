@@ -108,9 +108,9 @@ class VulkanSwapchain {
 public:
     VulkanSwapchain(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                     PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkQueue queue, std::uint32_t queue_family,
-                    std::mutex& submit_mutex)
+                    std::mutex& submit_mutex, std::mutex& queue_host_mutex)
         : instance_(instance), physical_(physical), device_(device), queue_(queue), queue_family_(queue_family),
-          submit_mutex_(submit_mutex) {
+          submit_mutex_(submit_mutex), queue_host_mutex_(queue_host_mutex) {
         loaded_ = fn_.load(gipa, instance, gdpa, device);
         if (loaded_) {
             VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -199,6 +199,7 @@ public:
         pi.swapchainCount = 1;
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &image_index;
+        std::lock_guard queue_lock(queue_host_mutex_);
         std::lock_guard lock(submit_mutex_);
         const VkResult r = fn_.queue_present(queue_, &pi);
         return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
@@ -233,6 +234,7 @@ public:
 private:
     bool transition_image_layout(VkImage img, VkImageLayout old_layout, VkImageLayout new_layout) {
         if (!blit_cmd_ || !blit_fence_ || !img) return false;
+        std::lock_guard queue_lock(queue_host_mutex_);
         std::lock_guard lock(submit_mutex_);
         if (fn_.reset_fences(device_, 1, &blit_fence_) != VK_SUCCESS ||
             fn_.reset_cmd_buf(blit_cmd_, 0) != VK_SUCCESS)
@@ -340,6 +342,7 @@ private:
         // Transition newly created offscreen backbuffers to GENERAL so presenting an untouched buffer
         // never violates blit_to_swapchain's GENERAL -> TRANSFER_SRC_OPTIMAL transition.
         if (blit_cmd_ && blit_fence_ && !offscreen_images_.empty()) {
+            std::lock_guard queue_lock(queue_host_mutex_);
             std::lock_guard lock(submit_mutex_);
             if (fn_.reset_fences(device_, 1, &blit_fence_) != VK_SUCCESS ||
                 fn_.reset_cmd_buf(blit_cmd_, 0) != VK_SUCCESS) {
@@ -384,6 +387,7 @@ private:
 
     bool blit_to_swapchain(std::uint32_t image_index) {
         if (!blit_cmd_ || !blit_fence_ || image_index >= offscreen_images_.size()) return false;
+        std::lock_guard queue_lock(queue_host_mutex_);
         std::lock_guard lock(submit_mutex_);
         if (fn_.reset_fences(device_, 1, &blit_fence_) != VK_SUCCESS) return false;
         if (fn_.reset_cmd_buf(blit_cmd_, 0) != VK_SUCCESS) return false;
@@ -551,6 +555,7 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     std::uint32_t queue_family_ = 0;
     std::mutex& submit_mutex_;
+    std::mutex& queue_host_mutex_;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFence acquire_fence_ = VK_NULL_HANDLE;
