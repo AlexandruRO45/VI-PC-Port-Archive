@@ -866,5 +866,69 @@ class TestDsDecSrc2F64ConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertFalse(flags_aligned.unaligned_addr)
 
 
+# ==============================================================================
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+POS_ZERO_F64 = 0x0000_0000_0000_0000
+NEG_ZERO_F64 = 0x8000_0000_0000_0000
+POS_INF_F64 = 0x7FF0_0000_0000_0000
+NEG_INF_F64 = 0xFFF0_0000_0000_0000
+QNAN_F64 = 0x7FF8_0000_0000_0000
+SNAN_F64 = 0x7FF0_0000_0000_0001
+MIN_NORMAL_F64 = 0x0010_0000_0000_0000
+MIN_SUBNORMAL_F64 = 0x0000_0000_0000_0001
+MAX_SUBNORMAL_F64 = 0x000F_FFFF_FFFF_FFFF
+MAX_NORMAL_F64 = 0x7FEF_FFFF_FFFF_FFFF
+
+
+class TestDsDecSrc2F64IEEE754EdgeCases(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_decrement_wraps_at_zero(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        vaddr = 0x100
+        idx_a = 0x100 >> 3
+        idx_b = (0x100 + 8) >> 3
+
+        # Subnormal float < 1.0 decrements into negative float, which triggers wrap to threshold
+        lds.write_qword(idx_a, MIN_SUBNORMAL_F64)
+        lds.write_qword(idx_b, f64_to_bits(10.0))
+
+        new_val = lds.atomic_dec_src2_f64(vaddr, offset0=0, offset1=1)
+        # MIN_SUBNORMAL_F64 - 1.0 is ~ -1.0 < 0 -> next wrap condition triggers
+        f_res = bits_to_f64(new_val)
+        self.assertTrue(math.isclose(f_res, -1.0, rel_tol=1e-9))
+
+    def test_positive_and_negative_zero_asymmetry(self) -> None:
+        b10 = f64_to_bits(10.0)
+        self.assertEqual(ref_ds_dec_src2_f64(POS_ZERO_F64, b10), b10)
+        self.assertEqual(ref_ds_dec_src2_f64(NEG_ZERO_F64, b10), b10)
+
+    def test_infinities_bit_patterns(self) -> None:
+        b10 = f64_to_bits(10.0)
+        # +Inf > 10.0 resets to 10.0
+        self.assertEqual(ref_ds_dec_src2_f64(POS_INF_F64, b10), b10)
+        # -Inf <= 0.0 resets to 10.0
+        self.assertEqual(ref_ds_dec_src2_f64(NEG_INF_F64, b10), b10)
+
+    def test_quiet_and_signaling_nan_resets(self) -> None:
+        b10 = f64_to_bits(10.0)
+        self.assertEqual(ref_ds_dec_src2_f64(QNAN_F64, b10), b10)
+        self.assertEqual(ref_ds_dec_src2_f64(SNAN_F64, b10), b10)
+
+    def test_counter_cyclic_trajectory(self) -> None:
+        limit_val = 5.0
+        b_limit = f64_to_bits(limit_val)
+        curr = b_limit
+        for expected in [4.0, 3.0, 2.0, 1.0, 0.0]:
+            curr = ref_ds_dec_src2_f64(curr, b_limit)
+            self.assertEqual(bits_to_f64(curr), expected)
+
+        # At 0.0, wraps to 5.0
+        curr = ref_ds_dec_src2_f64(curr, b_limit)
+        self.assertEqual(bits_to_f64(curr), 5.0)
+
+
 if __name__ == "__main__":
     unittest.main()
