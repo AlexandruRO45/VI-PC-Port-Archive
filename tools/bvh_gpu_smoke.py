@@ -17,7 +17,8 @@ installed) reports no error, and a second run writes the same heap bytes.
 --checked also runs the programs whose effect reads straight off their code with inputs chosen for them, and compares
 every byte they write (CHECKED below). Five take a count and write that many 16- or 8-byte entries from thread index 0
 up; 32 threads per group, so one group with a count of 20 also shows that entries past the count are left alone.
-PrefixSum64 scans 64 words in place into their exclusive prefix sum and stores the total.
+PrefixSum64..PrefixSum4096 each scan their size's worth of words in place into the exclusive prefix sum and store
+the total.
 
 The three rehydration programs (Box16Rehydration, Box32Rehydration, LeafRehydration) belong to TEST-376, which checks
 them against tools/bvh_rehydrate.py; --include-rehydration runs them too.
@@ -58,9 +59,23 @@ def changed_words(initial, after):
     return sum(1 for x, y in zip(a, b) if x != y)
 
 
-def run_program(vkc, spv, init, dump, heap_words, validation, timeout):
-    """One dispatch of one workgroup. Returns (status, last line of output): ok, 'exit N', validation, timeout."""
+def wave_sizes(spirv_dir):
+    """{program: 32 or 64} from rdna2spirv.py's index.json (its wave64 flag), as check.py runs compute tests."""
+    path = Path(spirv_dir) / "index.json"
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows = data.items() if isinstance(data, dict) else ((e.get("name"), e) for e in data)
+    return {name: 64 if entry.get("wave64") else 32 for name, entry in rows if name and isinstance(entry, dict)}
+
+
+def run_program(vkc, spv, init, dump, heap_words, validation, timeout, subgroup=None):
+    """One dispatch of one workgroup, at the program's wave size (VKC_SUBGROUP_SIZE): a wave64 program left to the
+    device's default may run 32 wide and combine its lane halves wrong. Returns (status, last line of output): ok,
+    'exit N', validation, timeout, or 'no wave64' when the device can't run 64-wide compute subgroups."""
     env = dict(os.environ, VKC_OUT_WORDS=str(heap_words), VKC_HEAP_INIT=str(init), VKC_DUMP=str(dump))
+    if subgroup:
+        env["VKC_SUBGROUP_SIZE"] = str(subgroup)
     if validation:
         env["VK_INSTANCE_LAYERS"] = "VK_LAYER_KHRONOS_validation"
     try:
@@ -70,6 +85,8 @@ def run_program(vkc, spv, init, dump, heap_words, validation, timeout):
         return "timeout", ""
     out = (p.stdout or "") + (p.stderr or "")
     last = (out.strip().splitlines() or [""])[-1][:160]
+    if subgroup and "not available" in out and "subgroup size" in out:
+        return "no wave64" if subgroup == 64 else f"no wave{subgroup}", last
     if p.returncode != 0:
         return f"exit {p.returncode}", last
     if "Validation Error" in out:
@@ -80,6 +97,7 @@ def run_program(vkc, spv, init, dump, heap_words, validation, timeout):
 def smoke(spirv_dir, vkc, *, table_qword, heap_bytes, validation, timeout, include_rehydration, runner=run_program):
     """Run every program in spirv_dir twice. Returns [{name, status, words_changed, detail}] in name order."""
     image = heap_image(table_qword, heap_bytes)
+    waves = wave_sizes(spirv_dir)
     results = []
     with tempfile.TemporaryDirectory(prefix="bvh_gpu_smoke_") as tmp:
         tmp = Path(tmp)
@@ -90,10 +108,11 @@ def smoke(spirv_dir, vkc, *, table_qword, heap_bytes, validation, timeout, inclu
             if name in REHYDRATION and not include_rehydration:
                 continue
             first, second = tmp / (name + ".1.bin"), tmp / (name + ".2.bin")
-            status, detail = runner(vkc, spv, init, first, heap_bytes // 4, validation, timeout)
+            wave = waves.get(name)
+            status, detail = runner(vkc, spv, init, first, heap_bytes // 4, validation, timeout, wave)
             changed = None
             if status == "ok":
-                again, detail2 = runner(vkc, spv, init, second, heap_bytes // 4, validation, timeout)
+                again, detail2 = runner(vkc, spv, init, second, heap_bytes // 4, validation, timeout, wave)
                 a = first.read_bytes() if first.is_file() else b""
                 b = second.read_bytes() if second.is_file() else b""
                 if again != "ok":
@@ -103,7 +122,8 @@ def smoke(spirv_dir, vkc, *, table_qword, heap_bytes, validation, timeout, inclu
                 else:
                     status = "pass"
                 changed = changed_words(image, a) if a else None
-            results.append({"name": name, "status": status, "words_changed": changed, "detail": detail})
+            results.append({"name": name, "wave": wave, "status": status, "words_changed": changed,
+                            "detail": detail})
     return results
 
 
@@ -141,27 +161,38 @@ def _expect_entries(heap, base, stride, count, entry):
     return problems
 
 
-# PrefixSum64's input: 64 words large enough that the sums wrap past 2^32.
-PREFIX_INPUT = [(0x01000193 * (i + 1) ^ (i << 20)) & 0xFFFFFFFF for i in range(64)]
+# PrefixSumN's input: N words large enough that the sums wrap past 2^32. The data sits at PREFIX_DATA, far enough
+# from the block sums at SUMS for N = 4096 (16 KiB).
+PREFIX_DATA = 0x10000
 
 
-def _prefix_setup(heap):
-    struct.pack_into("<64I", heap, DST, *PREFIX_INPUT)
+def prefix_input(n):
+    return [(0x01000193 * (i + 1) ^ (i << 20)) & 0xFFFFFFFF for i in range(n)]
 
 
-def _prefix_expect(heap):
-    """The exclusive prefix sum of the 64 words, in place, and their total (mod 2^32) as group 0's block sum."""
-    problems, run = [], 0
-    for i, x in enumerate(PREFIX_INPUT):
-        got = _u32(heap, DST + 4 * i)
-        if got != run:
-            problems.append(f"element {i}: {got:#x} != {run:#x}")
-        run = (run + x) & 0xFFFFFFFF
-    if _u32(heap, SUMS) != run:
-        problems.append(f"block sum: {_u32(heap, SUMS):#x} != {run:#x}")
-    if bytes(heap[DST + 256:DST + 512]) != bytes([FILL]) * 256:
-        problems.append("bytes past the 64 elements changed")
-    return problems
+def _prefix_case(n):
+    """PrefixSumN: one group scans n words in place at table+0x0 into their exclusive prefix sum; with bit 0 of +0x10
+    set, it stores the group's total at table+0x8 + 4 * group."""
+    values = prefix_input(n)
+
+    def setup(heap):
+        struct.pack_into(f"<{n}I", heap, PREFIX_DATA, *values)
+
+    def expect(heap):
+        problems, run = [], 0
+        for i, x in enumerate(values):
+            got = _u32(heap, PREFIX_DATA + 4 * i)
+            if got != run:
+                problems.append(f"element {i}: {got:#x} != {run:#x}")
+            run = (run + x) & 0xFFFFFFFF
+        if _u32(heap, SUMS) != run:
+            problems.append(f"block sum: {_u32(heap, SUMS):#x} != {run:#x}")
+        end = PREFIX_DATA + 4 * n
+        if bytes(heap[end:end + 256]) != bytes([FILL]) * 256:
+            problems.append(f"bytes past the {n} elements changed")
+        return problems
+
+    return [(0x0, 8, PREFIX_DATA), (0x8, 8, SUMS), (0x10, 4, 1)], expect, setup
 
 
 def _source_pattern(i):
@@ -185,9 +216,7 @@ CHECKED = {
     # the value at +0x18, four times per 16-byte entry, at table+0x8 (count at +0x14)
     "ResetCounterValues": ([(0x8, 8, DST), (0x14, 4, COUNT), (0x18, 4, 0xC0FFEE11)],
                            lambda h: _expect_entries(h, DST, 16, COUNT, lambda i: struct.pack("<4I", *[0xC0FFEE11] * 4))),
-    # one group scans 64 words (32 lanes, two words each) in place at table+0x0 into their exclusive prefix sum; with
-    # bit 0 of +0x10 set, lane 31 stores the group's total at table+0x8 + 4 * group
-    "PrefixSum64": ([(0x0, 8, DST), (0x8, 8, SUMS), (0x10, 4, 1)], _prefix_expect, _prefix_setup),
+    **{f"PrefixSum{n}": _prefix_case(n) for n in (64, 128, 256, 512, 1024, 2048, 4096)},
 }
 
 
@@ -201,6 +230,7 @@ def checked_heap(fields, heap_bytes):
 
 def run_checked(spirv_dir, vkc, *, heap_bytes, validation, timeout, runner=run_program):
     """Each CHECKED program with its inputs; [{name, status, detail}] with status pass, mismatch or a run failure."""
+    waves = wave_sizes(spirv_dir)
     results = []
     with tempfile.TemporaryDirectory(prefix="bvh_gpu_checked_") as tmp:
         tmp = Path(tmp)
@@ -214,7 +244,7 @@ def run_checked(spirv_dir, vkc, *, heap_bytes, validation, timeout, runner=run_p
             for prepare in setup:
                 prepare(heap)
             init.write_bytes(bytes(heap))
-            status, detail = runner(vkc, spv, init, dump, heap_bytes // 4, validation, timeout)
+            status, detail = runner(vkc, spv, init, dump, heap_bytes // 4, validation, timeout, waves.get(name))
             if status == "ok":
                 problems = expect(dump.read_bytes()) if dump.is_file() else ["no heap dump"]
                 status, detail = ("pass", "") if not problems else ("mismatch", "; ".join(problems[:3]))

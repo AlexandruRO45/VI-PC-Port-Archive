@@ -17,7 +17,7 @@ def fake_runner(behaviour):
     behaviour: name -> ("ok", writes) | ("exit 1",) | ("validation",) | ("timeout",) | ("flaky", writes)."""
     calls = {}
 
-    def run(vkc, spv, init, dump, heap_words, validation, timeout):
+    def run(vkc, spv, init, dump, heap_words, validation, timeout, subgroup=None):
         name = Path(spv).stem
         calls[name] = calls.get(name, 0) + 1
         kind = behaviour.get(name, ("ok", {}))
@@ -131,8 +131,9 @@ class Checked(unittest.TestCase):
             elif name == "ResetCounterValues":
                 for i in range(n):
                     struct.pack_into("<4I", heap, fields[8] + 16 * i, *[fields[0x18]] * 4)
-            elif name == "PrefixSum64":
-                values = struct.unpack_from("<64I", heap, fields[0])
+            elif name.startswith("PrefixSum"):
+                size = int(name[len("PrefixSum"):])
+                values = struct.unpack_from(f"<{size}I", heap, fields[0])
                 run = 0
                 for i, x in enumerate(values):
                     struct.pack_into("<I", heap, fields[0] + 4 * i, run)
@@ -140,11 +141,11 @@ class Checked(unittest.TestCase):
                 struct.pack_into("<I", heap, fields[8], run)
 
         def runner_for(corrupt):
-            def run(vkc, spv, init, dump, heap_words, validation, timeout):
+            def run(vkc, spv, init, dump, heap_words, validation, timeout, subgroup=None):
                 heap = bytearray(Path(init).read_bytes())
                 ideal(spv, heap)
-                if corrupt:
-                    heap[smoke.DST + 4] ^= 1
+                if corrupt:   # one wrong byte in the case's output (prefix sums scan in place at PREFIX_DATA)
+                    heap[(smoke.PREFIX_DATA if Path(spv).stem.startswith("PrefixSum") else smoke.DST) + 4] ^= 1
                 Path(dump).write_bytes(bytes(heap))
                 return "ok", ""
             return run
@@ -152,9 +153,9 @@ class Checked(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             for name in smoke.CHECKED:
                 (Path(d) / (name + ".spv")).write_bytes(b"\x03\x02\x23\x07")
-            good = smoke.run_checked(d, "vkc", heap_bytes=1 << 16, validation=False, timeout=5, runner=runner_for(False))
+            good = smoke.run_checked(d, "vkc", heap_bytes=1 << 18, validation=False, timeout=5, runner=runner_for(False))
             self.assertEqual({r["name"]: r["status"] for r in good}, {n: "pass" for n in smoke.CHECKED})
-            bad = smoke.run_checked(d, "vkc", heap_bytes=1 << 16, validation=False, timeout=5, runner=runner_for(True))
+            bad = smoke.run_checked(d, "vkc", heap_bytes=1 << 18, validation=False, timeout=5, runner=runner_for(True))
             self.assertEqual({r["status"] for r in bad}, {"mismatch"})
 
     def test_missing_program(self):

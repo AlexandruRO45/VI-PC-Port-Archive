@@ -179,14 +179,18 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
   Radeon RX 9070, Windows 11, `--max-shared-memory 32768`, package 1.0.2.1). With these inputs only seven change any
   heap word (`InitHeaders`, `InitPartitionedHeaders`, `LoadInstances`, `LoadProceduralGeometry`, `LoadTriangles`,
   `PT_BeginPass`, `PT_WriteInstances`); the others leave early. So this alone shows that the translated programs
-  run cleanly, not that their output is right. **Six are checked byte for byte** (`--checked`), the ones whose effect
-  reads straight off their code. `RadixReset`, `ResetKDOP`, `ResetToIndexBuffer`, `CopyCounters` and
+  run cleanly, not that their output is right. **Twelve are checked byte for byte** (`--checked`), the ones whose
+  effect reads straight off their code. `RadixReset`, `ResetKDOP`, `ResetToIndexBuffer`, `CopyCounters` and
   `ResetCounterValues` get their root-table fields (an output address, a count of 20, a value or a source), and the
-  tool compares all 20 entries they write and the bytes after them, which must stay untouched. `PrefixSum64` scans 64
-  words in place into their exclusive prefix sum through five `ds_swizzle_b32` broadcast steps and stores the group's
-  total; the input wraps past 2^32. All six match exactly. Negative controls: with the translator made to skip
-  `v_add_nc_u32`, `ResetToIndexBuffer` fails (entries hold `base+4i` and zeros); with it skipping `ds_swizzle_b32`,
-  `PrefixSum64` fails from element 2 on. So the check sees a wrong translation. Two things found on the way:
+  tool compares all 20 entries they write and the bytes after them, which must stay untouched. `PrefixSum64` to
+  `PrefixSum4096` each scan their size's worth of words in place into the exclusive prefix sum and store the group's
+  total; the input wraps past 2^32. 64 and 128 are wave32 programs, 256 to 4096 wave64 (512 threads with LDS and a
+  barrier for the three largest), and the tool runs each at the wave size `index.json` records (`VKC_SUBGROUP_SIZE`).
+  On `main` the wave64 ones fail at element 128 or 256: their upper half adds the lower half's total through a VOP3
+  lane mask printed as `s6` for `s[6:7]`, which the translator read as `s6` alone. #3910 fixes that, and with it all
+  twelve match exactly (7 of 12 without). Negative controls: with the translator made to skip `v_add_nc_u32`,
+  `ResetToIndexBuffer` fails (entries hold `base+4i` and zeros); with it skipping `ds_swizzle_b32`, `PrefixSum64` fails
+  from element 2 on. So the check sees a wrong translation. Two things found on the way:
   * the wave64 bitonic sorts (`BitonicPreSort64CS`, `BitonicInnerSort64CS`) declare 32,780 bytes of workgroup memory
     with the translator's default cap, 12 over the 32 KiB AMD's Windows driver allows
     (`VUID-RuntimeSpirv-Workgroup-06530`). Their highest LDS offset is 8192, and `--max-shared-memory 32768` shrinks
@@ -203,7 +207,7 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
 ## 6. Tool and tests
 
 `tools/bvh_gpu_smoke.py --game-dir <package> [--max-shared-memory N] [--checked] [--json report.json]` reproduces the
-GPU run above: the extraction and translation of §4, then two dispatches per program, and with `--checked` the six
+GPU run above: the extraction and translation of §4, then two dispatches per program, and with `--checked` the twelve
 byte-exact cases. Its report holds module names, statuses
 and counts only. `tests/test_bvh_gpu_smoke.py` checks the heap image, the word count and the judging of runs with a
 fake `vk_compute_test`, and the checked cases' inputs and judging (a fake that does what each case describes passes,
