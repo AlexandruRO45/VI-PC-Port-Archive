@@ -695,5 +695,167 @@ class TestValuCvtNormI16F16ScalarInterpreter(unittest.TestCase):
         self.assertEqual(res_hi & MASK16, 32767)
 
 
+# ---------------------------------------------------------------------------
+# SIMD multi-lane divergence and 32/64-bit EXEC masking
+# ---------------------------------------------------------------------------
+
+class SIMDVALUInterpreter:
+    """SIMD multi-lane execution model supporting Wave32 and Wave64 with EXEC masking."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size}. Must be 32 or 64.")
+        self.wave_size = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.num_vgprs = 256
+        self.num_sgprs = 106
+        self.vgprs: list[list[int]] = [[0] * wave_size for _ in range(self.num_vgprs)]
+        self.sgprs: list[int] = [0] * self.num_sgprs
+
+    def get_vgpr_u32(self, reg: int, lane: int) -> int:
+        return self.vgprs[reg & 0xFF][lane] & MASK32
+
+    def set_vgpr_u32(self, reg: int, lane: int, val: int) -> None:
+        self.vgprs[reg & 0xFF][lane] = val & MASK32
+
+    def get_vgpr_half(self, reg: int, lane: int, is_hi: bool) -> int:
+        dword = self.get_vgpr_u32(reg, lane)
+        return (dword >> 16) & MASK16 if is_hi else dword & MASK16
+
+    def set_vgpr_half(self, reg: int, lane: int, is_hi: bool, half_val: int) -> int:
+        """Write halfword into VGPR for specified lane, preserving the untouched 16-bit half."""
+        current = self.get_vgpr_u32(reg, lane)
+        h = half_val & MASK16
+        if is_hi:
+            new_dword = (current & 0x0000FFFF) | (h << 16)
+        else:
+            new_dword = (current & 0xFFFF0000) | h
+        self.set_vgpr_u32(reg, lane, new_dword)
+        return new_dword
+
+    def get_sgpr_u32(self, idx: int) -> int:
+        return self.sgprs[idx % self.num_sgprs] & MASK32
+
+    def set_sgpr_u32(self, idx: int, val: int) -> None:
+        self.sgprs[idx % self.num_sgprs] = val & MASK32
+
+    def get_sgpr_half(self, idx: int, is_hi: bool) -> int:
+        dword = self.get_sgpr_u32(idx)
+        return (dword >> 16) & MASK16 if is_hi else dword & MASK16
+
+    def resolve_src0_half(self, src: Union[RegOperand, ImmediateOperand], lane: int, src_hi: bool) -> int:
+        if isinstance(src, ImmediateOperand):
+            val = src.value & MASK16
+            abs_mod = src.abs_mod
+            neg_mod = src.neg_mod
+        elif isinstance(src, RegOperand):
+            abs_mod = src.abs_mod
+            neg_mod = src.neg_mod
+            if src.reg_type == RegType.VGPR:
+                val = self.get_vgpr_half(src.index, lane, src_hi)
+            else:
+                val = self.get_sgpr_half(src.index, src_hi)
+        else:
+            raise TypeError(f"Unknown source operand type: {type(src)}")
+        return apply_f16_modifiers(val, abs_mod, neg_mod)
+
+    def execute(self, ast: InstructionAST) -> list[int]:
+        ast.validate()
+        if ast.opcode == "v_cvt_norm_i16_f16":
+            dst_hi = bool(ast.op_sel[0]) or ast.dst.is_hi
+            src0_hi = bool(ast.op_sel[1]) or (isinstance(ast.src0, RegOperand) and ast.src0.is_hi)
+            results = []
+            for lane in range(self.wave_size):
+                lane_active = bool(self.exec_mask & (1 << lane))
+                if lane_active:
+                    src0_val = self.resolve_src0_half(ast.src0, lane, src0_hi)
+                    res_half = oracle_v_cvt_norm_i16_f16(src0_val)
+                    new_dword = self.set_vgpr_half(ast.dst.index, lane, dst_hi, res_half)
+                    results.append(new_dword)
+                else:
+                    results.append(self.get_vgpr_u32(ast.dst.index, lane))
+            return results
+        raise NotImplementedError(f"Opcode '{ast.opcode}' not implemented in SIMD interpreter")
+
+    def execute_asm(self, asm_line: str) -> list[int]:
+        ast = parse_vop_cvt_norm_i16_f16(asm_line)
+        return self.execute(ast)
+
+
+class TestValuCvtNormI16F16SIMD(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and EXEC masking."""
+
+    def test_wave32_uniform_execution(self) -> None:
+        simd = SIMDVALUInterpreter(wave_size=32)
+        for lane in range(32):
+            simd.set_vgpr_u32(1, lane, ONE_F16)
+        res = simd.execute_asm("v_cvt_norm_i16_f16 v0, v1")
+        self.assertEqual(len(res), 32)
+        for lane in range(32):
+            self.assertEqual(res[lane] & MASK16, 32767)
+            self.assertEqual(simd.get_vgpr_half(0, lane, False), 32767)
+
+    def test_wave64_uniform_execution(self) -> None:
+        simd = SIMDVALUInterpreter(wave_size=64)
+        for lane in range(64):
+            simd.set_vgpr_u32(1, lane, NEG_ONE_F16)
+        res = simd.execute_asm("v_cvt_norm_i16_f16 v0, v1")
+        self.assertEqual(len(res), 64)
+        for lane in range(64):
+            self.assertEqual(res[lane] & MASK16, 0x8001)
+            self.assertEqual(simd.get_vgpr_half(0, lane, False), 0x8001)
+
+    def test_exec_mask_selective_divergence(self) -> None:
+        simd = SIMDVALUInterpreter(wave_size=64)
+        simd.exec_mask = 0x55555555_55555555  # Even lanes active, odd lanes inactive
+        for lane in range(64):
+            simd.set_vgpr_u32(0, lane, 0xDEADBEEF)
+            simd.set_vgpr_u32(1, lane, ONE_F16)
+
+        res = simd.execute_asm("v_cvt_norm_i16_f16 v0.l, v1")
+        for lane in range(64):
+            if lane % 2 == 0:
+                # Active: low half is 32767, high half preserved 0xDEAD
+                self.assertEqual(res[lane] & MASK16, 32767)
+                self.assertEqual(res[lane] >> 16, 0xDEAD)
+                self.assertEqual(simd.get_vgpr_u32(0, lane), (0xDEAD << 16) | 32767)
+            else:
+                # Inactive: untouched
+                self.assertEqual(res[lane], 0xDEADBEEF)
+                self.assertEqual(simd.get_vgpr_u32(0, lane), 0xDEADBEEF)
+
+    def test_lane_divergent_values(self) -> None:
+        simd = SIMDVALUInterpreter(wave_size=32)
+        test_inputs = [
+            (POS_ZERO_F16, 0),
+            (HALF_F16, 16384),
+            (ONE_F16, 32767),
+            (NEG_ONE_F16, 0x8001),
+            (QNAN_F16, 0),
+            (TWO_F16, 32767),
+            (NEG_TWO_F16, 0x8001),
+            (POS_INF_F16, 32767),
+        ]
+        for lane in range(32):
+            inp, _ = test_inputs[lane % len(test_inputs)]
+            simd.set_vgpr_u32(1, lane, inp)
+
+        res = simd.execute_asm("v_cvt_norm_i16_f16 v0, v1")
+        for lane in range(32):
+            _, expected = test_inputs[lane % len(test_inputs)]
+            self.assertEqual(res[lane] & MASK16, expected)
+
+    def test_zero_exec_mask_no_modification(self) -> None:
+        simd = SIMDVALUInterpreter(wave_size=32)
+        simd.exec_mask = 0
+        for lane in range(32):
+            simd.set_vgpr_u32(0, lane, 0x12345678)
+            simd.set_vgpr_u32(1, lane, ONE_F16)
+        res = simd.execute_asm("v_cvt_norm_i16_f16 v0, v1")
+        for lane in range(32):
+            self.assertEqual(res[lane], 0x12345678)
+            self.assertEqual(simd.get_vgpr_u32(0, lane), 0x12345678)
+
+
 if __name__ == "__main__":
     unittest.main()
