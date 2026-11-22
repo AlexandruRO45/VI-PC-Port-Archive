@@ -271,6 +271,30 @@ class TestCensus(unittest.TestCase):
                 self.assertEqual(len(lines), 1, r.stderr)
                 self.assertTrue(lines[0].startswith(f"error: {state}: "), lines[0])
 
+    def test_json_must_not_overwrite_a_scanned_container(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        target = os.path.join(self.tmp.name, "sig.dxbc")
+        with open(target, "rb") as fh:
+            original = fh.read()
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", target],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("overwrite an input", r.stderr)
+        with open(target, "rb") as fh:
+            self.assertEqual(fh.read(), original)
+
+    def test_json_must_not_overwrite_a_scanned_sidecar(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        target = os.path.join(self.tmp.name, "fspx", "sig.json")
+        with open(target, encoding="utf-8") as fh:
+            original = fh.read()
+        r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", target],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("overwrite an input", r.stderr)
+        with open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), original)
+
 
 if __name__ == "__main__":
     unittest.main()

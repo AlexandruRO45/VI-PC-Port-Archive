@@ -223,13 +223,25 @@ def _read_summary(rows):
     }
 
 
+def dxbc_paths(root):
+    """The <root>/*.dxbc containers census() scans, in census order (the discovery criterion the guard shares)."""
+    return sorted(glob.glob(os.path.join(glob.escape(root), "*.dxbc")))
+
+
+def scanned_inputs(root):
+    """Every file census() reads: each container above and its fspx/<name>.json sidecar (the sidecar is optional)."""
+    for path in dxbc_paths(root):
+        yield path
+        yield os.path.join(root, "fspx", os.path.basename(path)[:-5] + ".json")
+
+
 def census(root, disasm=None):
     """Rows for every container in `root`, joined with the program's measured USER_SGPR count.
 
     With `disasm`, the `--disasm` folder of tools/fspx_unpack.py, each row also carries the program's reads.
     """
     rows, errors = [], []
-    for path in sorted(glob.glob(os.path.join(glob.escape(root), "*.dxbc"))):
+    for path in dxbc_paths(root):
         name = os.path.basename(path)[:-5]
         with open(path, "rb") as fh:
             chunks = parts(fh.read())
@@ -289,6 +301,26 @@ def summarize(rows):
     }
 
 
+def json_output_problem(root, out):
+    """Why `--json` `out` must not be written, checked before any census work: it is the input folder or one of
+    the .dxbc containers / fspx sidecars census() reads, so the report would replace the user's data ("" when it
+    may be written). samefile catches a hard link, a symlink or a case-only spelling the name test would miss."""
+    try:
+        if os.path.samefile(root, out):
+            return "--json must not be the input folder"
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        pass
+    if os.path.exists(out):          # a not-yet-written output cannot already be one of the inputs census reads
+        for path in scanned_inputs(root):
+            if os.path.isfile(path):
+                try:
+                    if os.path.samefile(out, path):
+                        return f"--json would overwrite an input census scans: {path}"
+                except OSError:
+                    pass
+    return ""
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("root", help="tools/fspx_unpack.py --out folder")
@@ -296,11 +328,9 @@ def main(argv=None):
     ap.add_argument("--disasm", help="a tools/fspx_unpack.py --disasm folder; adds each program's reads")
     a = ap.parse_args(argv)
     if a.json:
-        try:
-            if os.path.samefile(a.root, a.json):
-                ap.error("--json must not be the input folder")
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            pass
+        problem = json_output_problem(a.root, a.json)
+        if problem:
+            ap.error(problem)
     if not os.path.isdir(a.root):
         ap.error(f"not a folder: {a.root}")
     if a.disasm and not os.path.isdir(a.disasm):
