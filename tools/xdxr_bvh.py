@@ -728,6 +728,86 @@ def validate(data, expect_bottom=None):
     return errs
 
 
+# ---- source vertex formats (D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC.VertexFormat) ----
+# name: (component encoding, position components read, bytes per component). The two-component formats read z = 0,
+# and the A of the four-component ones is not read.
+VERTEX_FORMATS = {
+    "R32G32B32_FLOAT": ("float", 3, 4),
+    "R32G32_FLOAT": ("float", 2, 4),
+    "R16G16B16A16_FLOAT": ("half", 3, 2),
+    "R16G16_FLOAT": ("half", 2, 2),
+    "R16G16B16A16_SNORM": ("snorm", 3, 2),
+    "R16G16_SNORM": ("snorm", 2, 2),
+}
+
+
+def snorm16(bits):
+    """A 16-bit SNORM component as D3D12 converts it: max(c / 32767, -1), so -32768 and -32767 are both -1.0, rounded
+    to float32 (the double quotient rounds the same way: c / 32767 repeats with period 15 bits, so it is never a
+    float32 rounding midpoint, nor within a double rounding of one)."""
+    c = bits - 0x10000 if bits & 0x8000 else bits
+    return max(f32(c / 32767.0), -1.0)
+
+
+def decode_vertex(fmt, data, offset):
+    """The position of one vertex at byte ``offset`` of a vertex buffer, as [x, y, z]."""
+    kind, n, size = VERTEX_FORMATS[fmt]
+    out = []
+    for c in range(n):
+        at = offset + size * c
+        if kind == "float":
+            out.append(struct.unpack_from("<f", data, at)[0])
+        elif kind == "half":
+            out.append(struct.unpack_from("<e", data, at)[0])
+        else:
+            out.append(snorm16(struct.unpack_from("<H", data, at)[0]))
+    return out + [0.0] * (3 - n)
+
+
+def source_triangles(src):
+    """The triangles of one geometry as a case's "sources" entry describes it: ``format``, ``stride``, the vertex
+    buffer's bytes in hex (``vertices``) and ``indices`` (absent or null: three vertices per triangle). No transform."""
+    data = bytes.fromhex(src["vertices"])
+    stride = src["stride"]
+    idx = src.get("indices")
+    if idx is None:
+        idx = list(range(len(data) // stride // 3 * 3))
+    return [[decode_vertex(src["format"], data, stride * idx[3 * t + k]) for k in range(3)]
+            for t in range(len(idx) // 3)]
+
+
+def check_sources(data, desc):
+    """Each leaf's vertices, bit for bit (any NaN matches any NaN), against the triangles decoded here from the case's
+    "sources" (vertex buffers in a stated format): the builder's vertex decode checked against this one."""
+    decoded = {s["geometry"]: source_triangles(s) for s in desc.get("sources", [])}
+    if not decoded:
+        return []
+    errs = []
+    count, elements = struct.unpack_from("<I", data, 12)[0], struct.unpack_from("<I", data, 52)[0]
+    seen = 0
+    for k in range(count):
+        off = elements + LEAF_SIZE * k
+        geometry = struct.unpack_from("<I", data, off + 48)[0] >> 8
+        primitive = struct.unpack_from("<I", data, off + 52)[0]
+        if geometry not in decoded:
+            continue
+        if primitive >= len(decoded[geometry]):
+            errs.append(f"leaf {k}: primitive {primitive} of geometry {geometry} is not in its source")
+            continue
+        got = struct.unpack_from("<9f", data, off)
+        want = [c for v in decoded[geometry][primitive] for c in v]
+        same = all((math.isnan(g) and math.isnan(w)) or struct.pack("<f", g) == struct.pack("<f", w)
+                   for g, w in zip(got, want))
+        if not same:
+            errs.append(f"leaf {k} (geometry {geometry}, primitive {primitive}): vertices {list(got)}, "
+                        f"the source decodes to {want}")
+        seen += 1
+    total = sum(len(t) for t in decoded.values())
+    if seen != total:
+        errs.append(f"leaves hold {seen} of the {total} source triangles")
+    return errs
+
+
 # ---- checking a GPU build (runtime/test/vk_xdxr_build_test.cpp) ----
 def _case_names(directory):
     """Find cases using a literal directory and the usual JSON filename pattern."""
@@ -750,7 +830,8 @@ def _load_case(directory, name):
 
 
 def check_build(directory, rays=300, seed=1):
-    """Validate every <case>.bin of a GPU build and trace rays against brute force. Returns a list of problems."""
+    """Validate every <case>.bin of a GPU build (and, for a BLAS case with "sources", its leaf vertices against
+    check_sources) and trace rays against brute force. Returns a list of problems."""
     names = _case_names(directory)
     if not names:
         return [f"no cases in {directory}"]
@@ -766,6 +847,8 @@ def check_build(directory, rays=300, seed=1):
             if other != n:
                 mem.place(odesc["address"], odata)
         errs = validate(data, expect_bottom=desc["kind"] == "blas")
+        if desc["kind"] == "blas" and not errs:
+            errs = check_sources(data, desc)
         problems += [f"{n}: {e}" for e in errs]
         if desc["kind"] == "blas":
             tris = desc["triangles"]

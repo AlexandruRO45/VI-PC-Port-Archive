@@ -90,6 +90,9 @@ struct ResourceBinding {
     bool sampled = false;              // has SAMPLED usage (no DENY_SHADER_RESOURCE): the present compose pass reads it
     bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
     bool sparse_buffer = false;
+    // A buffer's bytes as the CPU sees them (an upload or readback mapping, or its range of the host-visible arena);
+    // null when it has none. Read only while a list is prepared, for inputs the replay must see before the GPU runs.
+    const std::uint8_t* host = nullptr;
 };
 
 struct VulkanAccess {
@@ -768,6 +771,17 @@ struct ShaderUserData {
 };
 static_assert(sizeof(ShaderUserData) == 144);
 
+enum class ReplayResult;
+
+// The instance descs of an XDXR top-level build from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS, resolved while the list
+// is prepared: copies that gather the descs the pointers name into `dst` (the build's scratch, at
+// XdxrLayout::gather_off), in instance order, so the builder reads them as an ARRAY. Each source is 64 bytes of one
+// known buffer; consecutive descs that are consecutive in memory share a copy.
+struct XdxrGather {
+    VkBuffer dst = VK_NULL_HANDLE;
+    std::vector<std::pair<VkBuffer, VkBufferCopy>> copies;  // sorted by source buffer
+};
+
 struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
@@ -848,9 +862,10 @@ struct ReplayFunctions {
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
     // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
-    // cannot read while the list is prepared, `xdxr_record` records the build.
-    std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
-    std::function<void(VkCommandBuffer, const BuildAccelerationStructure&)> xdxr_record;
+    // cannot read while the list is prepared (and resolves ARRAY_OF_POINTERS instances into `XdxrGather`),
+    // `xdxr_record` records the build.
+    std::function<ReplayResult(const BuildAccelerationStructure&, XdxrGather&)> xdxr_check;
+    std::function<void(VkCommandBuffer, const BuildAccelerationStructure&, const XdxrGather&)> xdxr_record;
     // CopyRaytracingAccelerationStructure (CLONE, COMPACT) of XDXR structures: `bytes` is the room the destination
     // resource has; and one postbuild value (COMPACTED_SIZE, CURRENT_SIZE) of the structure at `src` to `dest`.
     std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dst_va, std::uint64_t bytes)> xdxr_copy;
@@ -963,6 +978,7 @@ struct Prepared {
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
+    XdxrGather xdxr_gather;           // BuildAccelerationStructure: ARRAY_OF_POINTERS instances
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
 
@@ -2761,7 +2777,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             if (vk.xdxr_check) {
-                if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
+                if (const auto r = vk.xdxr_check(*build, p.xdxr_gather); r != ReplayResult::success) return r;
             } else {
                 if (!vk.build_acceleration_structures || !vk.resolve_acceleration_structure)
                     return ReplayResult::unsupported;
@@ -3597,7 +3613,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
-            vk.xdxr_record(command_buffer, *xdxr_build);
+            vk.xdxr_record(command_buffer, *xdxr_build, p.xdxr_gather);
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
         } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command);

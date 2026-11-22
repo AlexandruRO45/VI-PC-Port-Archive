@@ -6,10 +6,17 @@
 // and written again as d3d12_blas_update; then its postbuild COMPACTED_SIZE and a TLAS rebuild's CURRENT_SIZE are
 // checked against the prebuild sizes, and the BLAS is compacted (CopyRaytracingAccelerationStructure COMPACT) into a
 // buffer of exactly that size, written as d3d12_blas_compacted as <case>.bin + <case>.json at their console GPU virtual addresses.
+// Then the input forms: the TLAS from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS (descs out of order and in two buffers)
+// must equal the ARRAY build byte for byte, with the same prebuild sizes, and a null pointer, one past its buffer's
+// end and one into no resource refuse the list; a scene in all six triangle vertex formats must equal its
+// R32G32B32_FLOAT build (d3d12_fmt_*, with the source vertices for the checker to decode), and 16-bit vertex strides
+// below the element size, odd strides and odd addresses are refused.
 // `python -I tools/xdxr_bvh.py check-build <out dir>` validates them and traces rays against brute force (ctest:
 // d3d12_xdxr_rt + d3d12_xdxr_rt_check). Exit 77 without a Vulkan device, or with LEONIDA_RT_AS=khr. No game files.
 #include "../shims/d3d12_com.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -403,9 +410,483 @@ int main(int argc, char** argv) {
               "{\"kind\": \"blas\", \"address\": " + std::to_string(compacted->GetGPUVirtualAddress()) +
                   ", \"triangles\": " + triangles_json(moved) + "}\n"))
         return fail("compacted BLAS readback");
+    // ---- the cases below record each refusal and comparison and go on, so one run shows every result ----
+    int failures = 0;
+    auto expect = [&](bool ok, const std::string& what) {
+        if (!ok) {
+            std::fprintf(stderr, "FAIL: %s\n", what.c_str());
+            ++failures;
+        }
+        return ok;
+    };
+    UINT64 fence_value = 4;
+    // Closes, executes and waits; returns what ExecuteCommandLists did (a refused list submits nothing).
+    auto execute = [&]() {
+        if (FAILED(list->Close())) return leonida::ReplayResult::unsupported;
+        queue->ExecuteCommandLists(1, lists);
+        const leonida::ReplayResult result = rt::d3d12::last_execute_result(queue.p);
+        ++fence_value;
+        HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        const bool waited = e && SUCCEEDED(queue->Signal(fence.p, fence_value)) &&
+                            SUCCEEDED(fence->SetEventOnCompletion(fence_value, e)) &&
+                            WaitForSingleObject(e, 10000) == WAIT_OBJECT_0;
+        if (e) CloseHandle(e);
+        return waited ? result : leonida::ReplayResult::unsupported;
+    };
+    auto reset = [&]() { return SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)); };
+    auto read_back = [&](ID3D12Resource* rb, UINT64 size) {
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+        void* p = nullptr;
+        if (SUCCEEDED(rb->Map(0, nullptr, &p))) {
+            std::memcpy(bytes.data(), p, bytes.size());
+            rb->Unmap(0, nullptr);
+        }
+        return bytes;
+    };
+    auto fill = [&](ID3D12Resource* rb, UINT64 size, int value) {
+        void* p = nullptr;
+        if (FAILED(rb->Map(0, nullptr, &p))) return false;
+        std::memset(p, value, std::size_t(size));
+        rb->Unmap(0, nullptr);
+        return true;
+    };
+    // The bytes a structure uses, from its header (totalSizeIn64BNodes does not count the header).
+    auto used_bytes = [](const std::vector<std::uint8_t>& bytes) {
+        std::uint32_t units = 0;
+        if (bytes.size() >= 8) std::memcpy(&units, bytes.data() + 4, 4);
+        const std::size_t used = (std::size_t(units) + 1) * 64;
+        return used <= bytes.size() ? std::vector<std::uint8_t>(bytes.begin(), bytes.begin() + used)
+                                    : std::vector<std::uint8_t>{};
+    };
+
+    // ---- TLAS from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS ----
+    // The three instances above, through an array of GPU addresses: descs 0 and 2 lie swapped in a second upload
+    // buffer, and desc 1 in a default-heap buffer (an arena range) that a copy earlier in the same list fills. The
+    // ARRAY build of the same descs, recorded in the same list, must give the same bytes. Every pointer array is
+    // padded with zeros to 64 bytes per instance, so a builder that read the pointers as descs reads only bytes
+    // that exist (and finds no BLAS address in them).
+    {
+        Ref<ID3D12Resource> pointer_upload, desc_buffer, tlas_p, tlas_a_rb, tlas_p_rb;
+        const UINT64 pointer_upload_size = 1024;
+        if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_UPLOAD, pointer_upload_size, D3D12_RESOURCE_STATE_GENERIC_READ,
+                               D3D12_RESOURCE_FLAG_NONE, pointer_upload.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, 64, D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_FLAG_NONE, desc_buffer.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, tlas_info.ResultDataMaxSizeInBytes, as_state, uav,
+                               tlas_p.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, tlas_info.ResultDataMaxSizeInBytes,
+                               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, tlas_a_rb.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, tlas_info.ResultDataMaxSizeInBytes,
+                               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, tlas_p_rb.put())))
+            return fail("pointer-layout buffers", hr);
+        const UINT64 pointer_va = pointer_upload->GetGPUVirtualAddress();
+        // 0: desc 2, 64: desc 0, 128: the pointer array, 320: desc 1 (copied to desc_buffer), 384: an array with a
+        // null pointer, 576: one whose last pointer runs past the end of its buffer, 768: one into no resource.
+        const UINT64 good = 128, with_null = 384, past_end = 576, nowhere = 768;
+        const D3D12_GPU_VIRTUAL_ADDRESS pointers[3] = {pointer_va + 64, desc_buffer->GetGPUVirtualAddress(),
+                                                       pointer_va + 0};
+        const D3D12_GPU_VIRTUAL_ADDRESS null_pointers[3] = {pointer_va + 64, 0, pointer_va + 0};
+        const D3D12_GPU_VIRTUAL_ADDRESS cut_pointers[3] = {pointer_va + 64, desc_buffer->GetGPUVirtualAddress(),
+                                                           pointer_va + pointer_upload_size - 32};
+        // 0x40 is in the arena's reserved zero page, which no resource holds: harmless even if it were read
+        const D3D12_GPU_VIRTUAL_ADDRESS lost_pointers[3] = {pointer_va + 64, 0x40, pointer_va + 0};
+        {
+            char* p = nullptr;
+            if (FAILED(pointer_upload->Map(0, nullptr, reinterpret_cast<void**>(&p)))) return fail("Map pointer upload");
+            std::memcpy(p + 0, &instances[2], 64);
+            std::memcpy(p + 64, &instances[0], 64);
+            std::memcpy(p + good, pointers, sizeof pointers);
+            std::memcpy(p + 320, &instances[1], 64);
+            std::memcpy(p + with_null, null_pointers, sizeof null_pointers);
+            std::memcpy(p + past_end, cut_pointers, sizeof cut_pointers);
+            std::memcpy(p + nowhere, lost_pointers, sizeof lost_pointers);
+            pointer_upload->Unmap(0, nullptr);
+        }
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS pointer_inputs = tlas_inputs;
+        pointer_inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
+        pointer_inputs.InstanceDescs = pointer_va + good;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pointer_info{};
+        device->GetRaytracingAccelerationStructurePrebuildInfo(&pointer_inputs, &pointer_info);
+        expect(pointer_info.ResultDataMaxSizeInBytes == tlas_info.ResultDataMaxSizeInBytes &&
+                   pointer_info.ScratchDataSizeInBytes == tlas_info.ScratchDataSizeInBytes &&
+                   pointer_info.UpdateScratchDataSizeInBytes == tlas_info.UpdateScratchDataSizeInBytes,
+               "TLAS prebuild sizes differ between ARRAY and ARRAY_OF_POINTERS");
+
+        if (!reset()) return fail("Reset for the pointer TLAS");
+        list->CopyBufferRegion(desc_buffer.p, 0, pointer_upload.p, 320, 64);
+        D3D12_RESOURCE_BARRIER to_read{};
+        to_read.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_read.Transition.pResource = desc_buffer.p;
+        to_read.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        to_read.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        to_read.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        list->ResourceBarrier(1, &to_read);
+        build = {};
+        build.Inputs = tlas_inputs;                                    // ARRAY: the descs in instance order
+        build.DestAccelerationStructureData = tlas->GetGPUVirtualAddress();
+        build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+        list->ResourceBarrier(1, &barrier);
+        build.Inputs = pointer_inputs;
+        build.DestAccelerationStructureData = tlas_p->GetGPUVirtualAddress();
+        list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+        list->ResourceBarrier(1, &barrier);
+        list->CopyBufferRegion(tlas_a_rb.p, 0, tlas.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+        list->CopyBufferRegion(tlas_p_rb.p, 0, tlas_p.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+        const leonida::ReplayResult built = execute();
+        if (expect(built == leonida::ReplayResult::success,
+                   std::string("pointer TLAS list: ") + std::to_string(int(built)))) {
+            const auto array_bytes = used_bytes(read_back(tlas_a_rb.p, tlas_info.ResultDataMaxSizeInBytes));
+            const auto pointer_bytes = used_bytes(read_back(tlas_p_rb.p, tlas_info.ResultDataMaxSizeInBytes));
+            expect(!array_bytes.empty() && array_bytes == pointer_bytes,
+                   "the ARRAY_OF_POINTERS TLAS differs from the ARRAY TLAS of the same instances");
+        }
+
+        // A null pointer, a pointer whose 64 bytes run past its buffer, and one into no resource: the list is
+        // refused before anything runs, so the readback after the build keeps the bytes the CPU wrote.
+        const struct { UINT64 at; const char* what; } refused[] = {
+            {with_null, "a null instance pointer"}, {past_end, "an instance pointer past its buffer's end"},
+            {nowhere, "an instance pointer into no resource"}};
+        for (const auto& r : refused) {
+            if (!fill(tlas_p_rb.p, tlas_info.ResultDataMaxSizeInBytes, 0xa5) || !reset())
+                return fail("Reset for a refused pointer TLAS");
+            build.Inputs = pointer_inputs;
+            build.Inputs.InstanceDescs = pointer_va + r.at;
+            build.DestAccelerationStructureData = tlas_p->GetGPUVirtualAddress();
+            list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+            list->ResourceBarrier(1, &barrier);
+            list->CopyBufferRegion(tlas_p_rb.p, 0, tlas_p.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+            const leonida::ReplayResult result = execute();
+            expect(result == leonida::ReplayResult::unresolved_resource,
+                   std::string(r.what) + ": ExecuteCommandLists gave " + std::to_string(int(result)) +
+                       ", not unresolved_resource");
+            const auto after = read_back(tlas_p_rb.p, tlas_info.ResultDataMaxSizeInBytes);
+            expect(std::all_of(after.begin(), after.end(), [](std::uint8_t b) { return b == 0xa5; }),
+                   std::string(r.what) + ": the list ran");
+        }
+        std::printf("pointer TLAS: ARRAY_OF_POINTERS compared with ARRAY, three bad pointer arrays\n");
+    }
+
+    // ---- vertex formats ----
+    // One scene in every vertex format D3D12 allows for triangles, with coordinates in {-1, 0, 1}: exact in float,
+    // half and SNORM16 (+-32767; -32768 also reads as -1.0), so every format must give the R32G32B32_FLOAT build's
+    // bytes. "plane" is a 2x2 grid of squares at z = 0 with R16 indices, built in all six formats (the two-component
+    // ones read z = 0); "cube" is the surface of the cube [-1, 1]^3 with R32 indices, built in the three formats with
+    // z. Some 16-bit buffers start 2 bytes past a 4-byte boundary with a stride of 2 mod 4, so the components fall in
+    // both halves of the words; the A component and the bytes between vertices hold junk the build must ignore.
+    {
+        using V3 = std::array<float, 3>;
+        std::vector<V3> plane_v, cube_v;
+        std::vector<std::uint32_t> plane_i, cube_i;
+        for (int j = 0; j < 3; ++j)
+            for (int i = 0; i < 3; ++i) plane_v.push_back({float(i - 1), float(j - 1), 0.0f});
+        for (std::uint32_t j = 0; j < 2; ++j)
+            for (std::uint32_t i = 0; i < 2; ++i) {
+                const std::uint32_t a = 3 * j + i;
+                const std::uint32_t q[6] = {a, a + 1, a + 4, a, a + 4, a + 3};
+                plane_i.insert(plane_i.end(), q, q + 6);
+            }
+        for (int z = -1; z <= 1; ++z)
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x) cube_v.push_back({float(x), float(y), float(z)});
+        auto lattice = [](int x, int y, int z) { return std::uint32_t((x + 1) + 3 * (y + 1) + 9 * (z + 1)); };
+        for (int axis = 0; axis < 3; ++axis)
+            for (int side = -1; side <= 1; side += 2)
+                for (int cv = -1; cv <= 0; ++cv)
+                    for (int cu = -1; cu <= 0; ++cu) {
+                        auto corner = [&](int du, int dv) {
+                            int c[3];
+                            c[axis] = side;
+                            c[(axis + 1) % 3] = cu + du;
+                            c[(axis + 2) % 3] = cv + dv;
+                            return lattice(c[0], c[1], c[2]);
+                        };
+                        const std::uint32_t q[6] = {corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 0), corner(1, 1), corner(0, 1)};
+                        cube_i.insert(cube_i.end(), q, q + 6);
+                    }
+
+        struct Format { DXGI_FORMAT format; const char* name; UINT element; UINT components; bool half, snorm; };
+        const Format r32x3{DXGI_FORMAT_R32G32B32_FLOAT, "R32G32B32_FLOAT", 12, 3, false, false};
+        const Format r32x2{DXGI_FORMAT_R32G32_FLOAT, "R32G32_FLOAT", 8, 2, false, false};
+        const Format f16x4{DXGI_FORMAT_R16G16B16A16_FLOAT, "R16G16B16A16_FLOAT", 8, 4, true, false};
+        const Format f16x2{DXGI_FORMAT_R16G16_FLOAT, "R16G16_FLOAT", 4, 2, true, false};
+        const Format s16x4{DXGI_FORMAT_R16G16B16A16_SNORM, "R16G16B16A16_SNORM", 8, 4, false, true};
+        const Format s16x2{DXGI_FORMAT_R16G16_SNORM, "R16G16_SNORM", 4, 2, false, true};
+        // minus_one: how SNORM writes -1.0 (0: -32767, 1: -32768, 2: alternating by vertex, -32768 at even ones)
+        auto encode = [](const std::vector<V3>& verts, const Format& f, UINT stride, int minus_one) {
+            std::vector<std::uint8_t> out(verts.size() * stride, 0xcd);
+            for (std::size_t v = 0; v < verts.size(); ++v) {
+                std::uint8_t* at = out.data() + v * stride;
+                for (UINT c = 0; c < f.components; ++c) {
+                    const float x = c < 3 ? verts[v][c] : 0.0f;
+                    if (!f.half && !f.snorm) {
+                        std::memcpy(at + 4 * c, &x, 4);
+                    } else if (f.half) {
+                        const std::uint16_t h = c == 3 ? 0x7e00 : x > 0 ? 0x3c00 : x < 0 ? 0xbc00 : 0x0000;  // A: NaN
+                        std::memcpy(at + 2 * c, &h, 2);
+                    } else {
+                        const bool low = minus_one == 1 || (minus_one == 2 && v % 2 == 0);
+                        const std::int16_t s = c == 3 ? std::int16_t(-12345)
+                                                      : x > 0 ? 32767 : x < 0 ? (low ? -32768 : -32767) : 0;
+                        std::memcpy(at + 2 * c, &s, 2);
+                    }
+                }
+            }
+            return out;
+        };
+        std::string hex_digits = "0123456789abcdef";
+        auto hex = [&](const std::vector<std::uint8_t>& bytes) {
+            std::string s;
+            for (std::uint8_t b : bytes) {
+                s += hex_digits[b >> 4];
+                s += hex_digits[b & 15];
+            }
+            return s;
+        };
+
+        // the BLAS sizes of the larger scene; prebuild does not depend on the format
+        auto inputs_for = [](D3D12_RAYTRACING_GEOMETRY_DESC* g) {
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in{};
+            in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+            in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+            in.NumDescs = 1;
+            in.pGeometryDescs = g;
+            return in;
+        };
+        D3D12_RAYTRACING_GEOMETRY_DESC sizing{};
+        sizing.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        sizing.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        sizing.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+        sizing.Triangles.IndexCount = UINT(cube_i.size());
+        sizing.Triangles.VertexCount = UINT(cube_v.size());
+        auto sizing_inputs = inputs_for(&sizing);
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO fmt_info{};
+        device->GetRaytracingAccelerationStructurePrebuildInfo(&sizing_inputs, &fmt_info);
+        Ref<ID3D12Resource> fmt_upload, fmt_blas, fmt_rb;
+        const UINT64 fmt_upload_size = 64 * 1024;
+        if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_UPLOAD, fmt_upload_size, D3D12_RESOURCE_STATE_GENERIC_READ,
+                               D3D12_RESOURCE_FLAG_NONE, fmt_upload.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, fmt_info.ResultDataMaxSizeInBytes, as_state, uav,
+                               fmt_blas.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, fmt_info.ResultDataMaxSizeInBytes,
+                               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, fmt_rb.put())))
+            return fail("vertex-format buffers", hr);
+        if (fmt_info.ScratchDataSizeInBytes > scratch_size) return fail("vertex-format scratch");
+        char* fmt_mapped = nullptr;
+        if (FAILED(fmt_upload->Map(0, nullptr, reinterpret_cast<void**>(&fmt_mapped)))) return fail("Map format upload");
+        UINT64 fmt_at = 0;
+        // `skew` bytes past a 4-byte boundary
+        auto put = [&](const void* data, UINT64 bytes, UINT64 skew) {
+            fmt_at = (fmt_at + 15) / 16 * 16 + skew;
+            std::memcpy(fmt_mapped + fmt_at, data, std::size_t(bytes));
+            const UINT64 va = fmt_upload->GetGPUVirtualAddress() + fmt_at;
+            fmt_at += bytes;
+            return va;
+        };
+        std::vector<std::uint16_t> plane_i16(plane_i.begin(), plane_i.end());
+        const UINT64 plane_index_va = put(plane_i16.data(), plane_i16.size() * 2, 0);
+        const UINT64 cube_index_va = put(cube_i.data(), cube_i.size() * 4, 0);
+
+        // One build in its own list; the structure's bytes, or nothing when the list was refused.
+        auto build_one = [&](const D3D12_RAYTRACING_GEOMETRY_DESC& g, leonida::ReplayResult& result) {
+            D3D12_RAYTRACING_GEOMETRY_DESC geometry = g;
+            auto in = inputs_for(&geometry);
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+            device->GetRaytracingAccelerationStructurePrebuildInfo(&in, &info);
+            std::vector<std::uint8_t> bytes;
+            if (!fill(fmt_rb.p, fmt_info.ResultDataMaxSizeInBytes, 0) || !reset()) return bytes;
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC b{};
+            b.Inputs = in;
+            b.DestAccelerationStructureData = fmt_blas->GetGPUVirtualAddress();
+            b.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+            list->BuildRaytracingAccelerationStructure(&b, 0, nullptr);
+            list->ResourceBarrier(1, &barrier);
+            list->CopyBufferRegion(fmt_rb.p, 0, fmt_blas.p, 0, fmt_info.ResultDataMaxSizeInBytes);
+            result = execute();
+            if (result == leonida::ReplayResult::success)
+                bytes = used_bytes(read_back(fmt_rb.p, fmt_info.ResultDataMaxSizeInBytes));
+            return bytes;
+        };
+        struct Case { const Format* format; UINT stride; UINT64 skew; int minus_one; };
+        struct Scene {
+            const char* name;
+            const std::vector<V3>* verts;
+            const std::vector<std::uint32_t>* indices;
+            bool u16;
+            UINT64 index_va;
+            std::vector<Case> cases;    // the first is the R32G32B32_FLOAT reference
+        };
+        const Scene scenes[] = {
+            {"plane", &plane_v, &plane_i, true, plane_index_va,
+             {{&r32x3, 12, 0, 0}, {&r32x2, 8, 0, 0}, {&f16x4, 10, 2, 0}, {&f16x2, 6, 2, 0}, {&s16x4, 8, 0, 1},
+              {&s16x2, 6, 2, 2}}},
+            {"cube", &cube_v, &cube_i, false, cube_index_va,
+             {{&r32x3, 12, 0, 0}, {&f16x4, 8, 0, 0}, {&s16x4, 12, 2, 2}}},
+        };
+        for (const Scene& scene : scenes) {
+            std::vector<std::uint8_t> reference;
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO reference_info{};
+            for (const Case& fc : scene.cases) {
+                const auto vertex_bytes = encode(*scene.verts, *fc.format, fc.stride, fc.minus_one);
+                D3D12_RAYTRACING_GEOMETRY_DESC g{};
+                g.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+                g.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+                g.Triangles.VertexFormat = fc.format->format;
+                g.Triangles.VertexCount = UINT(scene.verts->size());
+                g.Triangles.VertexBuffer = {put(vertex_bytes.data(), vertex_bytes.size(), fc.skew), fc.stride};
+                g.Triangles.IndexFormat = scene.u16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+                g.Triangles.IndexCount = UINT(scene.indices->size());
+                g.Triangles.IndexBuffer = scene.index_va;
+                auto in = inputs_for(&g);
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO case_info{};
+                device->GetRaytracingAccelerationStructurePrebuildInfo(&in, &case_info);
+                const std::string what = std::string(scene.name) + " in " + fc.format->name;
+                if (&fc == &scene.cases[0]) reference_info = case_info;
+                expect(case_info.ResultDataMaxSizeInBytes == reference_info.ResultDataMaxSizeInBytes &&
+                           case_info.ScratchDataSizeInBytes == reference_info.ScratchDataSizeInBytes,
+                       what + ": prebuild sizes differ from R32G32B32_FLOAT");
+                leonida::ReplayResult result = leonida::ReplayResult::unsupported;
+                const auto bytes = build_one(g, result);
+                if (!expect(result == leonida::ReplayResult::success && !bytes.empty(),
+                            what + ": the build was refused (" + std::to_string(int(result)) + ")"))
+                    continue;
+                if (&fc == &scene.cases[0]) reference = bytes;
+                expect(bytes == reference, what + ": the records differ from the R32G32B32_FLOAT build");
+                // the case, with the source vertices for tools/xdxr_bvh.py to decode itself
+                std::string case_tris = "[";
+                for (std::size_t t = 0; t < scene.indices->size() / 3; ++t) {
+                    case_tris += t ? ",\n  [" : "\n  [";
+                    for (int k = 0; k < 3; ++k) {
+                        const V3& p = (*scene.verts)[(*scene.indices)[3 * t + k]];
+                        case_tris += (k ? ", [" : "[") + num(p[0]) + ", " + num(p[1]) + ", " + num(p[2]) + "]";
+                    }
+                    case_tris += ", 0, " + std::to_string(t) + "]";
+                }
+                case_tris += "]";
+                std::string idx = "[";
+                for (std::size_t i = 0; i < scene.indices->size(); ++i)
+                    idx += (i ? ", " : "") + std::to_string((*scene.indices)[i]);
+                idx += "]";
+                const std::string name = std::string("d3d12_fmt_") + scene.name + "_" + fc.format->name;
+                const std::string json = "{\"kind\": \"blas\", \"address\": " +
+                                         std::to_string(fmt_blas->GetGPUVirtualAddress()) + ", \"triangles\": " + case_tris +
+                                         ", \"sources\": [{\"geometry\": 0, \"format\": \"" + fc.format->name +
+                                         "\", \"stride\": " + std::to_string(fc.stride) + ", \"vertices\": \"" +
+                                         hex(vertex_bytes) + "\", \"indices\": " + idx + "}]}\n";
+                expect(write_file(dir + "/" + name + ".bin", bytes.data(), bytes.size()) &&
+                           write_file(dir + "/" + name + ".json", json.data(), json.size()),
+                       name + ": write");
+            }
+        }
+
+        // Values that are not exact in every format: 40 triangles of random halves (denormals among them) and of
+        // random SNORM16 values (-32768, -32767 and 32767 among them), each against the R32G32B32_FLOAT build of the
+        // floats they stand for: the half's value, and SNORM's float(c / 32767.0) clamped to -1 (correctly rounded;
+        // see tools/xdxr_bvh.py snorm16). Unindexed, stride 8, the A component random.
+        {
+            std::mt19937 vrng(5);
+            const UINT soup_vertices = 40 * 3;
+            std::vector<std::uint16_t> halves(4 * soup_vertices), snorms(4 * soup_vertices);
+            for (std::size_t i = 0; i < halves.size(); ++i) {
+                const std::uint32_t r = vrng();
+                halves[i] = std::uint16_t((r & 0x8000u) | (((r >> 16) % 17u) << 10) | (r & 0x3ffu));   // |x| < 4
+                snorms[i] = std::uint16_t(vrng());
+            }
+            snorms[0] = 0x8000;
+            snorms[1] = 0x8001;
+            snorms[2] = 0x7fff;
+            auto half_value = [](std::uint16_t h) {
+                const std::uint32_t sign = std::uint32_t(h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+                float f = 0;
+                if (e) {
+                    const std::uint32_t bits = sign | ((e + 112u) << 23) | (m << 13);
+                    std::memcpy(&f, &bits, 4);
+                    return f;
+                }
+                f = std::ldexp(float(m), -24);
+                return sign ? -f : f;
+            };
+            auto snorm_value = [](std::uint16_t s) {
+                return std::max(float(double(std::int16_t(s)) / 32767.0), -1.0f);
+            };
+            const struct { const Format* format; const std::vector<std::uint16_t>* bits; } soups[] = {
+                {&f16x4, &halves}, {&s16x4, &snorms}};
+            for (const auto& random_soup : soups) {
+                std::vector<float> floats;
+                std::vector<std::uint8_t> raw(random_soup.bits->size() * 2);
+                std::memcpy(raw.data(), random_soup.bits->data(), raw.size());
+                for (UINT v = 0; v < soup_vertices; ++v)
+                    for (UINT k = 0; k < 3; ++k) {
+                        const std::uint16_t b = (*random_soup.bits)[4 * v + k];
+                        floats.push_back(random_soup.format->half ? half_value(b) : snorm_value(b));
+                    }
+                D3D12_RAYTRACING_GEOMETRY_DESC g{};
+                g.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+                g.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+                g.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+                g.Triangles.VertexCount = soup_vertices;
+                g.Triangles.VertexBuffer = {put(floats.data(), floats.size() * 4, 0), 12};
+                const std::string what = std::string("random ") + random_soup.format->name;
+                leonida::ReplayResult result = leonida::ReplayResult::unsupported;
+                const auto reference = build_one(g, result);
+                if (!expect(result == leonida::ReplayResult::success && !reference.empty(),
+                            what + ": the R32G32B32_FLOAT build was refused"))
+                    continue;
+                g.Triangles.VertexFormat = random_soup.format->format;
+                g.Triangles.VertexBuffer = {put(raw.data(), raw.size(), 0), 8};
+                const auto bytes = build_one(g, result);
+                if (!expect(result == leonida::ReplayResult::success && !bytes.empty(),
+                            what + ": the build was refused (" + std::to_string(int(result)) + ")"))
+                    continue;
+                expect(bytes == reference, what + ": the records differ from the R32G32B32_FLOAT build");
+                std::string random_tris = "[";
+                for (UINT t = 0; t < soup_vertices / 3; ++t) {
+                    random_tris += t ? ",\n  [" : "\n  [";
+                    for (UINT k = 0; k < 3; ++k) {
+                        const float* p = &floats[3 * (3 * t + k)];
+                        random_tris += (k ? ", [" : "[") + num(p[0]) + ", " + num(p[1]) + ", " + num(p[2]) + "]";
+                    }
+                    random_tris += ", 0, " + std::to_string(t) + "]";
+                }
+                random_tris += "]";
+                const std::string name = std::string("d3d12_fmt_random_") + random_soup.format->name;
+                const std::string json = "{\"kind\": \"blas\", \"address\": " +
+                                         std::to_string(fmt_blas->GetGPUVirtualAddress()) + ", \"triangles\": " +
+                                         random_tris + ", \"sources\": [{\"geometry\": 0, \"format\": \"" +
+                                         random_soup.format->name + "\", \"stride\": 8, \"vertices\": \"" + hex(raw) +
+                                         "\", \"indices\": null}]}\n";
+                expect(write_file(dir + "/" + name + ".bin", bytes.data(), bytes.size()) &&
+                           write_file(dir + "/" + name + ".json", json.data(), json.size()),
+                       name + ": write");
+            }
+        }
+
+        // Bad strides and addresses for the 16-bit formats: below the element size, odd, or an odd address.
+        const struct { const Format* format; UINT stride; UINT64 skew; const char* what; } bad[] = {
+            {&f16x4, 6, 0, "R16G16B16A16_FLOAT with stride 6"}, {&f16x2, 2, 0, "R16G16_FLOAT with stride 2"},
+            {&s16x2, 5, 0, "R16G16_SNORM with stride 5"}, {&s16x4, 8, 1, "R16G16B16A16_SNORM at an odd address"}};
+        for (const auto& b : bad) {
+            const auto vertex_bytes = encode(plane_v, *b.format, b.stride < b.format->element ? b.format->element : b.stride, 0);
+            D3D12_RAYTRACING_GEOMETRY_DESC g{};
+            g.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+            g.Triangles.VertexFormat = b.format->format;
+            g.Triangles.VertexCount = UINT(plane_v.size());
+            g.Triangles.VertexBuffer = {put(vertex_bytes.data(), vertex_bytes.size(), b.skew), b.stride};
+            g.Triangles.IndexFormat = DXGI_FORMAT_R16_UINT;
+            g.Triangles.IndexCount = UINT(plane_i.size());
+            g.Triangles.IndexBuffer = plane_index_va;
+            leonida::ReplayResult result = leonida::ReplayResult::success;
+            build_one(g, result);
+            expect(result == leonida::ReplayResult::unsupported,
+                   std::string(b.what) + ": gave " + std::to_string(int(result)) + ", not unsupported");
+        }
+        fmt_upload->Unmap(0, nullptr);
+        std::printf("vertex formats: plane in 6 formats, cube in 3, 4 refused strides or addresses\n");
+    }
+
     std::printf("d3d12_xdxr_rt: BLAS %llu bytes (prebuild %llu), TLAS (prebuild %llu), written to %s\n",
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),
                 static_cast<unsigned long long>(tlas_info.ResultDataMaxSizeInBytes), dir.c_str());
-    return 0;
+    return failures ? 1 : 0;
 }

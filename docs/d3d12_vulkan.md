@@ -2769,8 +2769,15 @@ Vulkan AS would be invisible to them. Two paths:
    buffers then keep their console VAs, the addresses the records name each other by. `LEONIDA_RT_AS=khr` keeps
    #743's `VkAccelerationStructureKHR` builds (for `RayQueryKHR`), which the game's shaders can't read. Updates refit
    the source structure instead of rebuilding it, `CopyRaytracingAccelerationStructure` clones and compacts, and the
-   postbuild compacted and current sizes are written ([bvh.md](bvh.md) §7a). Serialization and the Xbox
-   batched/streaming builds are not implemented. The
+   postbuild compacted and current sizes are written ([bvh.md](bvh.md) §7a). Triangles take every vertex format D3D12
+   allows (`R32G32B32_FLOAT`, `R32G32_FLOAT`, `R16G16B16A16_FLOAT`, `R16G16_FLOAT`, `R16G16B16A16_SNORM`,
+   `R16G16_SNORM`); a 16-bit format with an odd address or stride, or a stride below its element size, is refused at
+   `ExecuteCommandLists`. A top-level build from `D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS` reads the pointer array
+   through its buffer's host mapping when the list is submitted. Each pointer must name 64 bytes of one known buffer,
+   or the list is refused (`unresolved_resource`) before anything runs. The descs are then copied into the build's
+   scratch on the GPU and built as an `ARRAY`; the scratch size counts that room for both layouts. So the pointers are
+   their values at submission, and an array the GPU writes in the same submission is not supported. Procedural (AABB)
+   geometry is refused. Serialization and the Xbox batched/streaming builds are not implemented. The
    reported `RaytracingTier` is unchanged (`NOT_SUPPORTED`). Checked by `runtime/test/d3d12_xdxr_rt_test.cpp` through
    the D3D12 API.
 

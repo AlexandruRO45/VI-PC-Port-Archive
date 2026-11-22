@@ -513,9 +513,16 @@ no BLAS and one with a singular transform. An instance record holds its BLAS add
 so BLAS addresses must be below 2^40, as console GPU addresses are. Where device addresses are wider (llvmpipe's are
 host pointers), the builder takes a bias that is added to the addresses read from instance descs.
 
+Vertices come in the six formats D3D12 allows for triangles. The 16-bit ones are read as halves of aligned words.
+Half is converted from its bits (exact, denormals included), and SNORM16 is `max(c / 32767, -1)` rounded to nearest
+even by an integer long division, since a float division in SPIR-V need not be correctly rounded. The two-component
+formats read z = 0, and the A component is not read.
+
 The Vulkan layer uses it for `BuildRaytracingAccelerationStructure` unless `LEONIDA_RT_AS=khr`
 (`docs/d3d12_vulkan.md` §4.8); `d3d12_xdxr_rt_test <dir>` builds a BLAS and a TLAS through the D3D12 API and writes
-them the same way.
+them the same way. It also builds a TLAS from an array of instance pointers, which must equal the `ARRAY` build byte
+for byte, and scenes in every vertex format that must equal their `R32G32B32_FLOAT` builds. Those cases carry their
+source vertex buffers (`"sources"`), and `check-build` decodes them itself and compares every leaf's vertex bits.
 
 `vk_xdxr_build_test <dir>` builds nine synthetic cases on the GPU and writes each structure with a description of its
 scene. `xdxr_bvh.py check-build <dir>` validates them and traces rays against brute force. `ctest` runs both as

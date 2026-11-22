@@ -74,8 +74,10 @@ layout(push_constant) uniform Push {
     uint count;           // threads of this dispatch
     uint first;           // triangles: first element; level: first node of this level; radix: the pass (0..7)
     uint arg0;            // triangles: vertex stride; level: entries in the level below
-    uint arg1;            // triangles: 0 = R32G32B32_FLOAT, 1 = R32G32_FLOAT; level: first node of the level below,
-                          //   or INVALID when the level below is the elements
+    uint arg1;            // triangles: the vertex format (xdxr_build.h XdxrVertexFormat): 0 = R32G32B32_FLOAT,
+                          //   1 = R32G32_FLOAT, 2 = R16G16B16A16_FLOAT, 3 = R16G16_FLOAT, 4 = R16G16B16A16_SNORM,
+                          //   5 = R16G16_SNORM; level: first node of the level below, or INVALID when the level below
+                          //   is the elements
     uint arg2;            // triangles: index type (0 none, 1 u16, 2 u32); level: 1 = refit the existing node
     uint geometry;        // triangles: geometry index << 8 | D3D12_RAYTRACING_GEOMETRY_FLAGS
     uint elements;        // element count N
@@ -154,8 +156,49 @@ uint node_ptr(uint n) { return ((pc.nodes_off + n * 128u) >> 6) << 3 | BOX32; }
 uint ptr_unit(uint p) { return p >> 3; }
 
 // ---- MODE_TRIANGLES ----
+// A 16-bit component: the half of its aligned word (D3D12 has 16-bit vertex addresses and strides 2-byte aligned).
+uint load16(uvec2 base, uint byte_offset) {
+    uvec2 a = add(base, byte_offset);
+    uint word = Words(uvec2(a.x & ~3u, a.y)).w[0];
+    return (a.x & 2u) != 0u ? word >> 16 : word & 0xffffu;
+}
+// FLOAT16 to float, exactly (every half is a float), built from the bits so no rounding or denormal mode applies.
+float half_bits_to_float(uint h) {
+    uint sign = (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    if (e == 0x1fu) return uintBitsToFloat(sign | 0x7f800000u | (m << 13));       // inf, NaN
+    if (e != 0u) return uintBitsToFloat(sign | ((e + 112u) << 23) | (m << 13));   // normal: rebias 15 -> 127
+    float f = float(m) * uintBitsToFloat(0x33800000u);                            // denormal or 0: m * 2^-24, exact
+    return sign != 0u ? -f : f;
+}
+// SNORM16 to float as D3D12 converts it: max(c / 32767, -1), rounded to nearest even. A float division is not
+// correctly rounded on every device (SPIR-V allows 2.5 ULP), so the quotient is a long division: 25 bits from the
+// leading one, then the rounding from the guard bit and the remainder.
+float snorm16_bits_to_float(uint s) {
+    int c = int(s << 16) >> 16;
+    if (c <= -32767) return -1.0;
+    if (c == 0) return 0.0;
+    uint r = uint(abs(c)), q = 0u;
+    int e = 0;
+    while (r < 32767u) { r <<= 1; e -= 1; }      // r / 32767 in [1, 2): the quotient is that times 2^e
+    for (uint k = 0u; k < 25u; ++k) {
+        q <<= 1;
+        if (r >= 32767u) { q |= 1u; r -= 32767u; }
+        r <<= 1;
+    }
+    uint m = q >> 1;                              // 24 bits, the leading one included
+    if ((q & 1u) != 0u && (r != 0u || (m & 1u) != 0u)) m += 1u;
+    float f = ldexp(float(m), e - 23);            // m < 2^24 + 1 and 2^e >= 2^-15: exact
+    return c < 0 ? -f : f;
+}
+float component16(uint bits, bool snorm) { return snorm ? snorm16_bits_to_float(bits) : half_bits_to_float(bits); }
+
 vec3 vertex(uint v) {
     uvec2 a = add(pc.src0, v * pc.arg0);
+    if (pc.arg1 >= 2u) {                          // 16-bit components; two-component formats have z = 0, A is not read
+        bool snorm = pc.arg1 >= 4u, xyz = (pc.arg1 & 1u) == 0u;
+        return vec3(component16(load16(a, 0u), snorm), component16(load16(a, 2u), snorm),
+                    xyz ? component16(load16(a, 4u), snorm) : 0.0);
+    }
     float x = uintBitsToFloat(load(a, 0u)), y = uintBitsToFloat(load(a, 4u));
     float z = pc.arg1 == 1u ? 0.0 : uintBitsToFloat(load(a, 8u));
     return vec3(x, y, z);

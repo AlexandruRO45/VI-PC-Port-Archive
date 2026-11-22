@@ -877,12 +877,16 @@ public:
         if (xdxr && loaded_) {
             xdxr_ = std::make_unique<XdxrBuilder>(get, device);
             if (xdxr_->loaded()) {
-                replay_.xdxr_check = [](const BuildAccelerationStructure& b) {
+                replay_.xdxr_check = [this](const BuildAccelerationStructure& b, XdxrGather& gather) {
                     XdxrLayout layout;
-                    return xdxr_inputs(b, nullptr, 0) && layout.compute(xdxr_elements(b), b.is_tlas) && b.dst_va &&
-                           b.scratch_va && (!b.is_tlas || !b.instance_count || b.instances_va);
+                    if (!xdxr_inputs(b, nullptr, 0) || !layout.compute(xdxr_elements(b), b.is_tlas) || !b.dst_va ||
+                        !b.scratch_va || (b.is_tlas && b.instance_count && !b.instances_va))
+                        return ReplayResult::unsupported;
+                    if (b.is_tlas && b.instance_pointers && b.instance_count) return xdxr_gather(b, layout, gather);
+                    return ReplayResult::success;
                 };
-                replay_.xdxr_record = [this](VkCommandBuffer cb, const BuildAccelerationStructure& b) {
+                replay_.xdxr_record = [this](VkCommandBuffer cb, const BuildAccelerationStructure& b,
+                                             const XdxrGather& gather) {
                     // Every address is a console VA in the GPU address arena: the device address is heap_base + VA,
                     // and the BLAS addresses in instance descs get the same bias.
                     const std::uint64_t base = replay_.heap_base;
@@ -892,8 +896,12 @@ public:
                     // allows for an in-place update); a full build otherwise.
                     const std::uint64_t from = b.update ? base + (b.src_va ? b.src_va : b.dst_va) : 0;
                     if (b.is_tlas) {
-                        xdxr_->record_tlas(cb, layout, b.instances_va ? base + b.instances_va : 0, base + b.dst_va,
-                                           base + b.scratch_va, base, from);
+                        std::uint64_t instances = b.instances_va ? base + b.instances_va : 0;
+                        if (b.instance_pointers && b.instance_count) {
+                            record_xdxr_gather(cb, gather);
+                            instances = base + b.scratch_va + layout.gather_off;
+                        }
+                        xdxr_->record_tlas(cb, layout, instances, base + b.dst_va, base + b.scratch_va, base, from);
                     } else {
                         std::vector<XdxrTriangles> geometries;
                         xdxr_inputs(b, &geometries, base);
@@ -1117,12 +1125,30 @@ public:
         for (const auto& t : b.triangles) n += (t.index_type ? t.index_count : t.vertex_count) / 3;
         return n > 0xffffffffu ? 0xffffffffu : std::uint32_t(n);
     }
-    // The geometries as the builder reads them, with `base` added to their VAs; false for an input it cannot read
-    // (a vertex format other than R32G32B32_FLOAT or R32G32_FLOAT, an index type other than none/R16/R32).
+    // The builder's vertex format for a geometry's VkFormat, and its element and component sizes in bytes; false for a
+    // format D3D12 does not allow for triangles.
+    static bool xdxr_vertex_format(std::uint32_t format, XdxrVertexFormat& out, std::uint32_t& element,
+                                   std::uint32_t& component) {
+        switch (format) {
+        case VK_FORMAT_R32G32B32_SFLOAT: out = XdxrVertexFormat::r32g32b32_float; element = 12; component = 4; return true;
+        case VK_FORMAT_R32G32_SFLOAT: out = XdxrVertexFormat::r32g32_float; element = 8; component = 4; return true;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: out = XdxrVertexFormat::r16g16b16a16_float; element = 8; component = 2; return true;
+        case VK_FORMAT_R16G16_SFLOAT: out = XdxrVertexFormat::r16g16_float; element = 4; component = 2; return true;
+        case VK_FORMAT_R16G16B16A16_SNORM: out = XdxrVertexFormat::r16g16b16a16_snorm; element = 8; component = 2; return true;
+        case VK_FORMAT_R16G16_SNORM: out = XdxrVertexFormat::r16g16_snorm; element = 4; component = 2; return true;
+        default: return false;
+        }
+    }
+    // The geometries as the builder reads them, with `base` added to their VAs; false for an input it cannot read (a
+    // vertex format D3D12 does not allow for triangles, an index type other than none/R16/R32, or a 16-bit format
+    // whose address or stride is odd or whose stride is below its element size; the R32 formats are not checked).
     static bool xdxr_inputs(const BuildAccelerationStructure& b, std::vector<XdxrTriangles>* out, std::uint64_t base) {
         if (b.is_tlas) return true;
         for (const auto& t : b.triangles) {
-            if (t.vertex_format != VK_FORMAT_R32G32B32_SFLOAT && t.vertex_format != VK_FORMAT_R32G32_SFLOAT) return false;
+            XdxrVertexFormat format = XdxrVertexFormat::r32g32b32_float;
+            std::uint32_t element = 0, component = 0;
+            if (!xdxr_vertex_format(t.vertex_format, format, element, component)) return false;
+            if (component == 2 && (t.vertex_va % 2 || t.vertex_stride % 2 || t.vertex_stride < element)) return false;
             if (t.index_type > 2) return false;
             const std::uint32_t count = (t.index_type ? t.index_count : t.vertex_count) / 3;
             if (count && !t.vertex_va) return false;
@@ -1131,7 +1157,7 @@ public:
             XdxrTriangles g;
             g.vertices = t.vertex_va ? base + t.vertex_va : 0;
             g.vertex_stride = t.vertex_stride;
-            g.xy_only = t.vertex_format == VK_FORMAT_R32G32_SFLOAT;
+            g.format = format;
             g.indices = t.index_type && t.index_va ? base + t.index_va : 0;
             g.index_type = t.index_type;
             g.triangle_count = count;
@@ -1140,6 +1166,77 @@ public:
             out->push_back(g);
         }
         return true;
+    }
+
+    // The buffer resource that holds all of [va, va + size), or null. Called with resource_mutex_ held.
+    const ResourceBinding* xdxr_buffer_holding(std::uint64_t va, std::uint64_t size) const {
+        for (const auto& [id, r] : resources_) {
+            if (!r.image && r.buffer && r.va && va >= r.va && va - r.va < r.size && size <= r.size - (va - r.va))
+                return &r;
+        }
+        return nullptr;
+    }
+
+    // A top-level build from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS, while the list is prepared (resource_mutex_
+    // held). The pointer array is read now, through its buffer's host mapping, and each pointer must name 64 bytes
+    // of one known buffer: a null pointer, one into no resource, or one whose desc runs past its buffer's end refuses
+    // the list (unresolved_resource) before the GPU reads anything. The descs themselves are copied on the GPU when the
+    // build runs, so a desc written earlier in the same list is seen; the pointers are the values at submission
+    // (a pointer array the GPU writes in the same or an unfinished submission is not seen).
+    ReplayResult xdxr_gather(const BuildAccelerationStructure& b, const XdxrLayout& layout, XdxrGather& out) const {
+        out = XdxrGather{};
+        const std::uint64_t n = b.instance_count;
+        const ResourceBinding* array = xdxr_buffer_holding(b.instances_va, 8 * n);
+        if (!array || !array->host) return ReplayResult::unresolved_resource;
+        const std::uint8_t* pointers = array->host + (b.instances_va - array->va);
+        const ResourceBinding* scratch = xdxr_buffer_holding(b.scratch_va + layout.gather_off, 64 * n);
+        if (!scratch) return ReplayResult::unresolved_resource;
+        out.dst = scratch->buffer;
+        const VkDeviceSize dst = scratch->buffer_offset + (b.scratch_va + layout.gather_off - scratch->va);
+        const ResourceBinding* source = nullptr;
+        for (std::uint64_t i = 0; i < n; ++i) {
+            std::uint64_t va = 0;
+            std::memcpy(&va, pointers + 8 * i, sizeof va);
+            if (!va) return ReplayResult::unresolved_resource;
+            if (!source || va < source->va || va - source->va >= source->size || source->size - (va - source->va) < 64)
+                source = xdxr_buffer_holding(va, 64);   // pointers usually stay in one buffer
+            if (!source) return ReplayResult::unresolved_resource;
+            const VkDeviceSize src = source->buffer_offset + (va - source->va);
+            // a copy's source must not overlap its destination (Vulkan; D3D12 keeps inputs out of the scratch too)
+            if (source->buffer == out.dst && src < dst + 64 * n && dst < src + 64) return ReplayResult::invalid_copy;
+            auto& copies = out.copies;
+            if (!copies.empty() && copies.back().first == source->buffer &&
+                copies.back().second.srcOffset + copies.back().second.size == src &&
+                copies.back().second.dstOffset + copies.back().second.size == dst + 64 * i)
+                copies.back().second.size += 64;
+            else
+                copies.push_back({source->buffer, VkBufferCopy{src, dst + 64 * i, 64}});
+        }
+        std::stable_sort(out.copies.begin(), out.copies.end(),
+                         [](const auto& x, const auto& y) { return std::less<VkBuffer>()(x.first, y.first); });
+        return ReplayResult::success;
+    }
+
+    // The gather an ARRAY_OF_POINTERS build was prepared with: earlier writes to the descs (any stage, as the
+    // application's barrier may name a shader stage, not a copy) and earlier use of the scratch are done first, and
+    // the build's compute pass reads the gathered descs after. One vkCmdCopyBuffer per source buffer.
+    void record_xdxr_gather(VkCommandBuffer cb, const XdxrGather& gather) const {
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
+                               VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+        vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before,
+                                0, nullptr, 0, nullptr);
+        std::vector<VkBufferCopy> regions;
+        for (std::size_t i = 0; i < gather.copies.size();) {
+            const VkBuffer source = gather.copies[i].first;
+            regions.clear();
+            for (; i < gather.copies.size() && gather.copies[i].first == source; ++i)
+                regions.push_back(gather.copies[i].second);
+            vk.vkCmdCopyBuffer(cb, source, gather.dst, std::uint32_t(regions.size()), regions.data());
+        }
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT};
+        vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &after,
+                                0, nullptr, 0, nullptr);
     }
 
     void register_acceleration_structure(std::uint64_t va, VkAccelerationStructureKHR as) {
