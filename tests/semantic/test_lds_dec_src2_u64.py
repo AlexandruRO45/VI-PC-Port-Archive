@@ -546,5 +546,244 @@ class TestDsDecSrc2U64ScalarInterpreter(unittest.TestCase):
             self.assertEqual(self.rf.read_vgpr(i), 0x1000 + i)
 
 
+# ==============================================================================
+# Phase 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDLDS64WavefrontInterpreter:
+    """Multi-lane SIMD wavefront interpreter for ds_dec_src2_u64 with EXEC masking."""
+
+    def __init__(self, wave_size: int = 64, lds: LDSModel64 | None = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self._exec_mask = (1 << wave_size) - 1
+        self.lds = lds if lds is not None else LDSModel64()
+        self.vgprs = [[0] * DEFAULT_NUM_VGPRS for _ in range(wave_size)]
+
+    @property
+    def exec_mask(self) -> int:
+        return self._exec_mask
+
+    def set_exec_mask(self, mask: int) -> None:
+        limit = (1 << self.wave_size) - 1
+        self._exec_mask = mask & limit
+
+    @property
+    def exec_lo(self) -> int:
+        return self._exec_mask & MASK32
+
+    def set_exec_lo(self, val: int) -> None:
+        self._exec_mask = (self._exec_mask & ~MASK32) | (val & MASK32)
+
+    @property
+    def exec_hi(self) -> int:
+        return (self._exec_mask >> 32) & MASK32
+
+    def set_exec_hi(self, val: int) -> None:
+        if self.wave_size == 32:
+            raise ValueError("Cannot set exec_hi on Wave32")
+        self._exec_mask = (self._exec_mask & MASK32) | ((val & MASK32) << 32)
+
+    def read_lane_vgpr(self, lane: int, idx: int) -> int:
+        return self.vgprs[lane][idx]
+
+    def write_lane_vgpr(self, lane: int, idx: int, val: int) -> None:
+        self.vgprs[lane][idx] = val & MASK32
+
+    def step(self, inst: DsSrc2Instruction) -> list[int | None]:
+        results: list[int | None] = []
+        for lane in range(self.wave_size):
+            if (self._exec_mask >> lane) & 1:
+                vaddr = self.read_lane_vgpr(lane, inst.vaddr.index)
+                new_val_a = self.lds.atomic_dec_src2_u64(
+                    vaddr=vaddr,
+                    offset0=inst.offset0,
+                    offset1=inst.offset1,
+                )
+                results.append(new_val_a)
+            else:
+                results.append(None)
+        return results
+
+
+class TestDsDecSrc2U64SIMDMultiLane(unittest.TestCase):
+    """Phase 4: Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave64_full_exec_independent_lanes(self) -> None:
+        lds = LDSModel64(capacity_qwords=2048)
+        simd = SIMDLDS64WavefrontInterpreter(wave_size=64, lds=lds)
+
+        for lane in range(64):
+            addr = lane * 16  # Each lane has 2 qwords: A at +0, B at +8
+            idx_a = (addr + 0) >> 3
+            idx_b = (addr + 8) >> 3
+            lds.write_qword(idx_a, 20 + lane)
+            lds.write_qword(idx_b, 100)
+            simd.write_lane_vgpr(lane, 0, addr)
+
+        inst = DsSrc2Instruction(
+            opcode=DsSrc2Opcode.DS_DEC_SRC2_U64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(inst)
+        self.assertEqual(len(results), 64)
+        for lane in range(64):
+            addr = lane * 16
+            idx_a = (addr + 0) >> 3
+            idx_b = (addr + 8) >> 3
+            expected = (20 + lane) - 1
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(lds.read_qword(idx_a), expected)
+            self.assertEqual(lds.read_qword(idx_b), 100)
+
+    def test_wave32_full_exec(self) -> None:
+        lds = LDSModel64(capacity_qwords=1024)
+        simd = SIMDLDS64WavefrontInterpreter(wave_size=32, lds=lds)
+
+        for lane in range(32):
+            addr = lane * 16
+            idx_a = (addr + 0) >> 3
+            idx_b = (addr + 8) >> 3
+            lds.write_qword(idx_a, 5)
+            lds.write_qword(idx_b, 10)
+            simd.write_lane_vgpr(lane, 0, addr)
+
+        inst = DsSrc2Instruction(
+            opcode=DsSrc2Opcode.DS_DEC_SRC2_U64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(inst)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            self.assertEqual(results[lane], 4)
+
+    def test_exec_mask_disabled_lanes_unmodified(self) -> None:
+        lds = LDSModel64(capacity_qwords=1024)
+        simd = SIMDLDS64WavefrontInterpreter(wave_size=64, lds=lds)
+        simd.set_exec_mask(0x5555_5555_5555_5555)  # Even lanes active
+
+        for lane in range(64):
+            addr = lane * 16
+            idx_a = (addr + 0) >> 3
+            idx_b = (addr + 8) >> 3
+            lds.write_qword(idx_a, 50)
+            lds.write_qword(idx_b, 100)
+            simd.write_lane_vgpr(lane, 0, addr)
+
+        inst = DsSrc2Instruction(
+            opcode=DsSrc2Opcode.DS_DEC_SRC2_U64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(inst)
+        for lane in range(64):
+            addr = lane * 16
+            idx_a = (addr + 0) >> 3
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], 49)
+                self.assertEqual(lds.read_qword(idx_a), 49)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(lds.read_qword(idx_a), 50)
+
+    def test_exec_lo_hi_partial_wavefront_masking(self) -> None:
+        lds = LDSModel64(capacity_qwords=1024)
+        simd = SIMDLDS64WavefrontInterpreter(wave_size=64, lds=lds)
+        simd.set_exec_lo(0x1)        # Lane 0 only
+        simd.set_exec_hi(0x80000000) # Lane 63 only
+
+        for lane in (0, 63):
+            addr = lane * 16
+            idx_a = (addr + 0) >> 3
+            idx_b = (addr + 8) >> 3
+            lds.write_qword(idx_a, 10)
+            lds.write_qword(idx_b, 20)
+            simd.write_lane_vgpr(lane, 0, addr)
+
+        inst = DsSrc2Instruction(
+            opcode=DsSrc2Opcode.DS_DEC_SRC2_U64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(inst)
+        self.assertEqual(results[0], 9)
+        self.assertEqual(results[63], 9)
+        for lane in range(1, 63):
+            self.assertIsNone(results[lane])
+
+    def test_multi_lane_serialization_same_target_a(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        simd = SIMDLDS64WavefrontInterpreter(wave_size=32, lds=lds)
+        simd.set_exec_mask(0xF)  # First 4 lanes active
+
+        # All 4 lanes target same location A and threshold B
+        common_addr = 0x80
+        idx_a = (common_addr + 0) >> 3
+        idx_b = (common_addr + 8) >> 3
+        lds.write_qword(idx_a, 10)
+        lds.write_qword(idx_b, 20)
+
+        for lane in range(4):
+            simd.write_lane_vgpr(lane, 0, common_addr)
+
+        inst = DsSrc2Instruction(
+            opcode=DsSrc2Opcode.DS_DEC_SRC2_U64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(inst)
+        # Sequential decrement across lanes: 10 -> 9 -> 8 -> 7 -> 6
+        self.assertEqual(results[0], 9)
+        self.assertEqual(results[1], 8)
+        self.assertEqual(results[2], 7)
+        self.assertEqual(results[3], 6)
+        self.assertEqual(lds.read_qword(idx_a), 6)
+
+    def test_multi_lane_serialization_wrapping_at_zero(self) -> None:
+        lds = LDSModel64(capacity_qwords=512)
+        simd = SIMDLDS64WavefrontInterpreter(wave_size=32, lds=lds)
+        simd.set_exec_mask(0xF)  # 4 lanes active
+
+        common_addr = 0x80
+        idx_a = (common_addr + 0) >> 3
+        idx_b = (common_addr + 8) >> 3
+        lds.write_qword(idx_a, 1)  # Starts at 1
+        lds.write_qword(idx_b, 5)  # Wrap threshold 5
+
+        for lane in range(4):
+            simd.write_lane_vgpr(lane, 0, common_addr)
+
+        inst = DsSrc2Instruction(
+            opcode=DsSrc2Opcode.DS_DEC_SRC2_U64,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset0=0,
+            offset1=1,
+        )
+
+        results = simd.step(inst)
+        # Lane 0: 1 -> 0
+        self.assertEqual(results[0], 0)
+        # Lane 1: 0 -> wraps to threshold 5
+        self.assertEqual(results[1], 5)
+        # Lane 2: 5 -> 4
+        self.assertEqual(results[2], 4)
+        # Lane 3: 4 -> 3
+        self.assertEqual(results[3], 3)
+        self.assertEqual(lds.read_qword(idx_a), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
