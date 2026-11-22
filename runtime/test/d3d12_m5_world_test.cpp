@@ -7,8 +7,10 @@
 //     records written by the CPU into an upload buffer, and by the GPU (CopyBufferRegion into default-heap buffers
 //     placed at non-zero heap offsets, then a COPY_DEST -> INDIRECT_ARGUMENT barrier), argument offsets inside those
 //     buffers, a count buffer (the draw count is the smaller of it and MaxCommandCount; a count of 0 draws nothing).
-//     Each record draws one cell of an 8x8 grid (vs_m5.asm places a quad from the vertex index, so StartVertexLocation
-//     or StartIndexLocation pick the cell; the colour says which cell and which variant).
+//     Each record draws cells of an 8x8 grid (vs_m5.asm places a quad from the vertex index and the instance id:
+//     the index values pick the cell of an indexed record, InstanceCount the cells of a non-indexed one; the colour
+//     says which cell and which variant). The ids are zero-based, so StartVertexLocation and StartInstanceLocation
+//     are not visible to the shaders.
 // (b) Multi-threaded recording. Four std::threads each create their own allocator and list and record 40 draws of
 //     random rectangles (root constants) at once; the four lists run in one ExecuteCommandLists between a clear list and
 //     a readback list. The rectangles overlap across the lists, so the list order shows in the pixels. Eight rounds of
@@ -375,18 +377,18 @@ int main() {
             // drawIndirectFirstInstance, which the device enables where it has it).
             const auto first_instance = [&](unsigned r) { return d.draw_indirect_first_instance ? r + 1 : 0u; };
             Image want(64, 64);
-            // P1: CPU-written records in an upload buffer, argument offset 64, stride 16: strips of 4 vertices.
-            // Record r draws cell r, variant 1 for r = 5 and 12, with no instances at all for r % 4 == 3, and twice
-            // (InstanceCount 2) for r = 8.
+            // P1: CPU-written records in an upload buffer, argument offset 64, stride 16: strips of 4 vertices, each
+            // record InstanceCount instances, which are cells 0..InstanceCount-1 (all variant 0). Most records are
+            // empty or small and the last one is the largest, so cells 0..12 are all painted only if the records
+            // after the first were drawn too, and an empty record draws nothing.
             EXPECT(SUCCEEDED(args_cpu->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
             std::memset(mapped, 0xA5, 4096);  // bytes outside the records are never read
+            static constexpr unsigned instances[16] = {2, 0, 0, 5, 0, 1, 0, 8, 0, 0, 3, 0, 0, 0, 6, 13};
             for (unsigned r = 0; r < 16; ++r) {
-                const unsigned w = (r == 5 || r == 12) ? 1 : 0;
-                const D3D12_DRAW_ARGUMENTS record{4, (r % 4 == 3) ? 0u : (r == 8 ? 2u : 1u), 8 * r + 4 * w,
-                                                  first_instance(r)};
+                const D3D12_DRAW_ARGUMENTS record{4, instances[r], 0, 0};
                 std::memcpy(mapped + 64 + r * sizeof(record), &record, sizeof(record));
-                if (record.InstanceCount) { paint_cell(want, r, w); ++cells_drawn; }
             }
+            for (unsigned k = 0; k < 13; ++k) { paint_cell(want, k, 0); ++cells_drawn; }
             // P2..P5 records and the count words, built in one upload buffer and copied into placed default buffers.
             //   args2 (placed at 64 KiB): 20 indexed records of stride 32 at 96 for cells 16..35 (variant r % 2, none
             //   at r = 6), then 4 records at 736 for cells 44..47 (never drawn: count 0), then 6 at 864 for cells
