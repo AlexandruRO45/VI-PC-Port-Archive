@@ -929,7 +929,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst",
-                      "cs_mask_vgpr_exec"):
+                      "cs_mask_vgpr_exec", "cs_w32_sopk"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -943,6 +943,7 @@ def run_suite(a, work: str) -> int:
                 "cs_w32_permute": [218, 29, 8, 211, 0, 15, 99, 15],
                 # integer ops with CPU-only checks until now (cs_w32_int_ext.asm)
                 "cs_w32_int_ext": [1, 27, 1, 0x33332222, 0xC0000000, 0x4000, 18, 0x20304050],
+                "cs_w32_sopk": [0xFFFF8000, 0, 0xFFFFFFEB, 0, 0x00018000, 1, 0x80000000, 1],
                 # 64-bit scalar data ops and v_mad_u64_u32 (cs_w32_salu64.asm)
                 # more ops with CPU-only checks until now (cs_w32_misc_ext.asm)
                 # ops merged on 2026-11-22 with CPU-only checks (cs_w32_new_ops.asm)
@@ -1028,6 +1029,7 @@ def run_suite(a, work: str) -> int:
             wave64 = name not in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
+                                  "cs_w32_sopk",
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos",
                                   "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
