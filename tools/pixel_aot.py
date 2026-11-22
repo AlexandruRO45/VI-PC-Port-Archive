@@ -1356,12 +1356,14 @@ SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", 
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
-          second_texture_offset=None, integer_export=False):
+          second_texture_offset=None, integer_export=False, texcoord_components=2):
     """Track descriptor provenance, interpolation and packed or uncompressed exports."""
     if texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105:
         raise ValueError("Invalid scalar inputs")
     if sampler is not None and (len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
         raise ValueError("Invalid sampler descriptor words")
+    if texcoord_components not in (2, 4):
+        raise ValueError("Expected two or four TEXCOORD components")
     scalar = {f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}
     vector = {"v0": "bary_i", "v1": "bary_j"}
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
@@ -2311,7 +2313,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
                 raise ValueError("Unsupported export")
             args = [f"export16({v})" for pair in pairs for v in pair]
-            inputs = "float4 uv : TEXCOORD0" if attribute_input else "float2 uv : TEXCOORD0"
+            components = 4 if attribute_input else texcoord_components
+            inputs = f"float{components} uv : TEXCOORD0"
             if not bindings and not interpolated:
                 inputs = ""
             lines[entry_line] = f"float{len(args)} main({inputs}) : SV_Target0 {{"
@@ -2326,7 +2329,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in values)):
                 raise ValueError("Unsupported export")
             args = [f"asuint({v})" for v in values] if integer_export else values
-            input_type = "float4" if attribute_input else "float2"
+            input_type = f"float{4 if attribute_input else texcoord_components}"
             lines[entry_line] = f"{result_type} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
             lines.append(f"    return {result_type}({', '.join(args)});")
             exported = True

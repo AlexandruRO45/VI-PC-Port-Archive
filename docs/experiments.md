@@ -1432,6 +1432,25 @@ python3 -B tests/mesh_attribute_check.py binary llvm-mc-15 llvm-objcopy-15 libLL
 ctest --preset dev --no-tests=error -R "^mesh_attribute_draw_" -V
 ```
 
+The textured mesh fixture passes indexed UVs through PARAM0 and samples a
+source-built 2×2 RGBA8 texture with a translated `image_sample_lz` pixel shader.
+The mesh buffer and pixel texture both use `t0`, with stage-specific root
+signature visibility. The sample consumes only `xy` but declares a four-component
+`TEXCOORD0` to match the mesh output. Point sampling, clamp addressing and the
+single mip level make the reference selection deterministic.
+
+The 32×32 readback compares a baseline, an independent texture change and a
+horizontal UV reflection. Each stale baseline reference gives exactly 276
+mismatches while the geometry trace still matches. The images are CPU
+references checked byte for byte against each GPU readback.
+
+![Baseline texture, changed texture, and reflected UVs](mesh-textured-reference.png)
+
+```sh
+python3 -B tests/mesh_textured_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_textured_draw_" -V
+```
+
 A separate draw binds two immutable constant buffers through a shader-visible
 D3D12 table. The translated mesh reads depth from b0 and a horizontal offset
 from b1. The translated pixel stage reads a packed color from b0. Both draws
