@@ -89,14 +89,22 @@ def pixel_profiles(code, llvm, emit):
     return profiles, f"pixel lowering / first general profile: {first_general}"
 
 
-def compute_profiles(code, width, llvm, emit):
+def compute_profiles(code, group_size, llvm, emit):
     lines = pixel_aot.disassemble(code, llvm)
-    choices = [(4, None), (5, None)] if width == 1 else [(5, 6), (4, 5)]
-    strides = [None] if width == 1 else [4, 8, 12, 16]
+    single = group_size == (1, 1, 1)
+    choices = [(4, None), (5, None)] if single else [(5, 6), (4, 5)]
+    strides = [None] if single else [4, 8, 12, 16]
     for (table, group), offset, stride in itertools.product(choices, (0, 32, 64), strides):
+        # Group IDs occupy consecutive system SGPRs in X, Y, Z order; Y and Z are bound
+        # here only for group dimensions larger than one.
+        extra = {}
+        if group is not None:
+            following = iter(range(group + 1, group + 3))
+            extra = {key: next(following) for key, size in (("group_reg_y", group_size[1]),
+                                                             ("group_reg_z", group_size[2])) if size > 1}
         try:
-            source = compute_store_aot.lower(lines, width, table_reg=table, descriptor_offset=offset,
-                                             group_reg=group, stride=stride)
+            source = compute_store_aot.lower(lines, group_size, table_reg=table, descriptor_offset=offset,
+                                             group_reg=group, stride=stride, **extra)
             emit("store", source)
             return ["store"]
         except ValueError:
@@ -107,12 +115,12 @@ def compute_profiles(code, width, llvm, emit):
 def classify(blob, sections, stage, llvm, emit):
     if stage not in (0, 5, 13):
         return [], "no stage profile"
-    width = compute_store_aot.group_width(sections.get(b"PSV0", b"")) if stage == 5 else None
+    group_size = compute_store_aot.group_size(sections.get(b"PSV0", b"")) if stage == 5 else None
     code = pixel_aot.container_code(sections[b"DXIL"], stage=stage, llvm=llvm)
     if stage == 0:
         return pixel_profiles(code, llvm, emit)
     if stage == 5:
-        return compute_profiles(code, width, llvm, emit), "store lowering"
+        return compute_profiles(code, group_size, llvm, emit), "store lowering"
 
     profiles = []
     if len(code) == 832:

@@ -50,6 +50,7 @@ for t in \
   tests/pso_readiness_check.py \
   tests/docs_links_check.py \
   tests/bidi_controls_check.py \
+  tests/hardware_reports_check.py \
   tests/gpu_report_format_check.py; do
   ./out/pe-env/bin/python -B "$t"
 done
@@ -74,6 +75,13 @@ LLVM_LIB="$LLVM_PREFIX/lib/libLLVM-15.dylib" \
 ## Quick start on Linux
 
 The [CI workflow](../.github/workflows/windows.yml) runs the platform-independent Python suite on Ubuntu 24.04 with Python 3.12 (`python-linux`) and the `gfx1013` machine-code checks on Ubuntu 22.04 with LLVM 15 (`pixel-binary`).
+
+On Debian/Ubuntu, install `python3-venv` first. Without it, `python3 -m venv` fails with `ensurepip is not available`:
+
+```bash
+sudo apt-get update -q
+sudo apt-get install -y python3-venv
+```
 
 From the repository root, create `out/pe-env` (Python 3.11 or newer; CI uses 3.12), install dependencies, and run the platform-independent checks below:
 
@@ -101,6 +109,7 @@ for t in \
   tests/xmem_attribute_scan_check.py \
   tests/docs_links_check.py \
   tests/bidi_controls_check.py \
+  tests/hardware_reports_check.py \
   tests/gpu_report_format_check.py; do
   ./out/pe-env/bin/python -B "$t"
 done

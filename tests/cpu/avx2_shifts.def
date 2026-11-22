@@ -3,9 +3,43 @@ EXPORTS
     bcast_w256
     bcast_d256
     bcast_q256
+    bcast_b256_reg
+    bcast_w256_reg
+    bcast_d256_reg
+    bcast_q256_reg
+    bcast_d256_alias
+    bcast_b128
+    bcast_w128
+    bcast_d128
+    bcast_q128
+    bcast_b128_reg
+    bcast_w128_reg
     bcast_d128_reg
+    bcast_q128_reg
+    bcast_b128_alias
     sllvd256
     srlvd256
     sravd256
     sllvq256
     srlvq256
+    sllvd256_mem
+    srlvd256_mem
+    sravd256_mem
+    sllvq256_mem
+    srlvq256_mem
+    sllvd128
+    srlvd128
+    sravd128
+    sllvq128
+    srlvq128
+    sllvd128_mem
+    srlvd128_mem
+    sravd128_mem
+    sllvq128_mem
+    srlvq128_mem
+    sllvd256_alias_src2
+    srlvd256_alias_src1
+    sravd256_alias_all
+    sllvd256_alias_all
+    sllvd128_alias_src2
+    sllvq256_alias_src2

@@ -12,6 +12,8 @@ Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D1
 void check_compute(ID3D12Device* device, bool tables);
 void check_sampler_views(ID3D12Device* device, const char* shader_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
+void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, const char* ordinary_register,
+                                 const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr);
 void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);

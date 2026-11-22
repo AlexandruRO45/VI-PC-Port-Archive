@@ -35,7 +35,7 @@ def emit(folder, assembler, validator, cross, pixel=False):
         subprocess.run([assembler, "--target-env", "vulkan1.2", source, "-o", module], check=True)
         subprocess.run([validator, "--target-env", "vulkan1.2", module], check=True)
     hlsl = folder / "shader.hlsl"
-    subprocess.run([cross, module, "--hlsl", "--shader-model", "66", "--output", hlsl], check=True)
+    subprocess.run([cross, module, "--hlsl", "--shader-model", "60", "--output", hlsl], check=True)
     text = hlsl.read_text()
     for token in ("SamplerState ", "SamplerComparisonState ", (".Sample(" if pixel else ".SampleLevel("), ".SampleCmpLevelZero("):
         if token not in text:
@@ -47,9 +47,9 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         pixel = emit(Path(tmp), *sys.argv[1:4], pixel=True)
         if len(sys.argv) > 4:
-            subprocess.run([sys.argv[4], "-T", "ps_6_6", "-E", "main", "-Fo", pixel.with_suffix(".dxil"), pixel], check=True)
+            subprocess.run([sys.argv[4], "-T", "ps_6_0", "-E", "main", "-Fo", pixel.with_suffix(".dxil"), pixel], check=True)
         hlsl = emit(Path(tmp), *sys.argv[1:4])
         if len(sys.argv) > 4:
             dxil = hlsl.with_suffix(".dxil")
-            subprocess.run([sys.argv[4], "-T", "cs_6_6", "-E", "main", "-Fo", dxil, hlsl], check=True)
+            subprocess.run([sys.argv[4], "-T", "cs_6_0", "-E", "main", "-Fo", dxil, hlsl], check=True)
             sys.exit(subprocess.run([sys.argv[5], sys.argv[6], "--spirv-sampler-views", dxil]).returncode)

@@ -140,6 +140,8 @@ def source():
         {
             "s_buffer_load_dword s15, s[24:27], null": "s_buffer_load_dword s15, s[24:27], 0x4"
         },
+        {"v_mov_b32_e32 v9, 0x200400": "v_mov_b32_e32 v9, 0x200600"},
+        {"exp pos0, v1, v2, v3, v4 done": "exp pos0, v1, v2, v3, v4"},
     ):
         try:
             lower([(pc, change.get(op, op)) for pc, op in decoded], [0x1003], (3, 1))
@@ -255,12 +257,22 @@ if __name__ == "__main__":
         if sys.argv[1] == "binary":
             binary(Path(directory), *sys.argv[2:])
             sys.exit(0)
+        clipped = triangle_inputs()
+        struct.pack_into("<f", clipped, 4, -0.625)  # Plus 0.375 gives Z = -0.25.
+        clipped_positions = [(x, y, -0.25, w) for x, y, _, w in TRIANGLE]
+        # The triangle runs right then up in render-target coordinates, so it
+        # is back-facing with the harness's clockwise front-face convention.
+        winding_pixel = (
+            "float4 main(bool front : SV_IsFrontFace) : SV_Target "
+            "{ return float4(0, front ? 0 : 1, 0, 1); }"
+        )
         sys.exit(
             draw(
                 *sys.argv[1:],
                 Path(directory),
                 source(),
-                [(triangle_inputs(), TRIANGLE, True)],
+                [(triangle_inputs(), TRIANGLE, True), (clipped, clipped_positions, False)],
+                pixel_source=winding_pixel,
             )
             or draw(*sys.argv[1:], Path(directory), *offset_draw())
         )

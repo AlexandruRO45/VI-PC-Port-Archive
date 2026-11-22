@@ -11,7 +11,7 @@ from depth_mask_aot import lower
 
 VS = """
 float4 main(uint id : SV_VertexID) : SV_Position {
-    return float4(float2((id << 1) & 2, id & 2) * float2(2,-2) + float2(-1,1), 0.375, 1);
+    return float4(float2((id << 1) & 2, id & 2) * float2(2,-2) + float2(-1,1), 0.75, 1);
 }
 """
 
@@ -81,6 +81,45 @@ def source(extended=False):
         except ValueError:
             continue
         raise AssertionError("Unverified mask or pending load accepted")
+    # These edits keep the decoded instruction addresses and widths intact.
+    for case, edits in (
+        ("partial wait", (("s_waitcnt lgkmcnt(0)", "s_waitcnt lgkmcnt(1)"),)),
+        (
+            "restore mask operand",
+            (("s_and_b64 exec, s[24:25], s[22:23]", "s_and_b64 exec, s[24:25], s[24:25]"),),
+        ),
+        (
+            "restore mask alias",
+            (("s_and_b64 exec, s[24:25], s[22:23]", "s_and_b64 exec, s[22:23], s[22:23]"),),
+        ),
+        (
+            "constant buffer end",
+            ((
+                f"s_buffer_load_dword s30, s[12:15], {0x18 if extended else 0x4:#x}",
+                "s_buffer_load_dword s30, s[12:15], 0x800",
+            ),),
+        ),
+        (
+            "descriptor register alignment",
+            (
+                ("s_load_dwordx4 s[16:19], s[10:11], 0x10", "s_load_dwordx4 s[18:21], s[10:11], 0x10"),
+                ("s_buffer_load_dword s31, s[16:19], null", "s_buffer_load_dword s31, s[18:21], null"),
+            ),
+        ),
+        (
+            "null export valid mask",
+            (("exp null, off, off, off, off done vm", "exp null, off, off, off, off done"),),
+        ),
+    ):
+        changed = decoded.copy()
+        for original, replacement in edits:
+            index = lines.index(original)
+            changed[index] = (offsets[index], replacement)
+        try:
+            lower(changed, tables)
+        except ValueError:
+            continue
+        raise AssertionError(f"Invalid depth program accepted: {case}")
     return lower(decoded, tables)
 
 
@@ -100,7 +139,7 @@ def draw(dxc, renderer, adapter, tmp, shader, word_offset, noise, *, thresholds=
     def picture(seed, threshold):
         return b"".join(
             struct.pack(
-                "<f", 0.375 if noise(x + 0.5, y + 0.5, seed) <= threshold else 0.9375
+                "<f", 0.75 if noise(x + 0.5, y + 0.5, seed) <= threshold else 0.9375
             )
             for y in range(32)
             for x in range(32)
@@ -218,6 +257,6 @@ if __name__ == "__main__":
                 source(extended=True),
                 0x18,
                 lambda x, y, seed: ((y + seed + 12) % 32) / 32,
-                thresholds=(62 / 64, 63 / 64),
+                thresholds=(62 / 64, 63 / 64, 0.0),
             )
         )

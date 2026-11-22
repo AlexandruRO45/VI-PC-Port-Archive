@@ -519,6 +519,13 @@ OperationResult run_spirv_sampler_views(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_spirv_compare_sampler(const OperationContext& ctx)
+{
+    check_spirv_compare_sampler(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                ctx.argc == 7 ? ctx.argv[6] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_spirv_address_window(const OperationContext& ctx)
 {
     check_spirv_window(ctx.device, ctx.argv[3]);
@@ -819,6 +826,10 @@ constexpr CapabilityGate kGateSm66SamplerViews{
     D3D_SHADER_MODEL_6_6, false, false, 0,
     "skip: sampler fixture requires SM 6.6",
     CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm66CompareSampler{
+    D3D_SHADER_MODEL_6_6, false, false, 0,
+    "skip: comparison-sampler fixture requires SM 6.6",
+    CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_6, true, false, 0,
     "skip: address window fixture requires SM 6.6 and 64-bit shader integer operations",
@@ -835,6 +846,7 @@ const OperationSpec kOperations[] = {
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm66SamplerViews, run_spirv_sampler_views},
+    {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm66CompareSampler, run_spirv_compare_sampler},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--ffx-device-init", 3, 3, nullptr, kNoGate, run_ffx_device_init},
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},

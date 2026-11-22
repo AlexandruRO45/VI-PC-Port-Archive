@@ -133,9 +133,65 @@ still agrees across runners; an unknown draw case must exit 21 with no frame.
 The non-mirrored shader object is unchanged, so the existing triangle draws are
 unaffected.
 
+For the two-frame case, the guest calls the same draw import twice, with
+arguments 6 and 7. The provider keeps one device, direct queue, graphics
+pipeline, render target and readback resource. It waits for the first fence
+before resetting the command allocator and rebinding the pixel shader's root
+constants. All three runners must publish the green triangle followed by a
+red triangle. The check compares all 16,384 RGBA bytes per frame with an
+independent raster reference and requires completed fence values 1 and 2.
+The stale-input control changes the second import argument to 8 and must
+return two green frames and exit 20. Argument 9 fails before the second
+submission. That control must publish just the first frame, report just fence
+1 and exit 24. The mapped host must regain control in all three cases.
+
+`cpu_shim_texture_reuse` extends the same EXE with three fenced draws. One
+compute dispatch fills a 2×2 `R32_UINT` texture with packed RGBA8 colors.
+The second dispatch changes only texel (1, 0), from green to magenta. The
+other three texels serve as guards. Both draws load from the same texture
+SRV. The second dispatch transitions that resource from pixel-shader-resource
+to UAV, then back before rasterization. The third draw leaves the texture in
+pixel-shader-resource state and uses a second pipeline to swap red and blue.
+
+Each runner checks the full 64×64 readback after fence values 1, 2 and 3.
+Pixels (12, 12), (30, 12), (12, 30) and (30, 30) observe the four texels.
+The stale control skips the partial dispatch. Comparing it against the
+updated reference must report the first mismatch at stage 2, pixel (24, 8),
+with expected magenta and actual green. The control also checks the full
+unchanged second frame and the channel-swapped third frame.
+
 ```powershell
 cmake --build --preset dev --target cpu_shim_startup cpu_shim_startup_lifted pe_map
-ctest --preset dev --no-tests=error -R '^cpu_shim_draw_warp$' -V
+ctest --preset dev --no-tests=error -R '^cpu_shim_(draw|texture_reuse)_(warp|hardware)$' -V
+```
+
+The same draw contract also runs the translated compute, mesh and pixel chain
+from the [compute-to-mesh texture fixture](#single-group-mesh-entry-specialization).
+The draw cases `chain0`, `chain1` and `chain-stale` send the frame to
+[`shim_chain_gpu.cpp`](../tests/cpu/shim_chain_gpu.cpp). On one direct queue it
+dispatches translated gfx1013 producers that write two packed RGBA8 rows to a
+raw UAV, copies them into a 2x2 texture, and draws with the translated indexed
+mesh and `image_sample_lz` pixel stages into a 32x32 target. The EXE, the AOT
+import table and the `draw_request`/`draw_frame` signatures are unchanged. The
+provider publishes all 4,096 RGBA bytes and the 80-byte mesh export trace, and
+the guest exits 42 only when both match the case reference.
+[The check](../tests/cpu/shim_chain_check.py) builds the shaders and references
+from the generators that `compute_mesh_texture_check.py` uses. It requires the
+native EXE, `pe_map` and the AOT build to agree on the shim bindings, the exit
+status and all 4,176 published bytes, and compares them with the Python
+reference.
+
+| Case | Producers dispatched | Bound texture | Exit | Published bytes |
+|---|---|---|---|---|
+| `chain0` | palette A | A | 42 | match A's reference |
+| `chain1` | A, then B | B | 42 | match B's reference |
+| `chain-stale` | A, then B | A | 20 | equal to A's frame; against B's reference, 276 covered pixels differ, while all 748 clear pixels and the trace match |
+
+Mesh shader tier 1 is required. Without it the test exits 77, reported as a
+skip. `XBOX2WINDOWS_ADAPTER` selects the hardware adapter by part of its name.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_shim_chain_(warp|hardware)$' -V
 ```
 
 ## Source-built EXE entry to a DLL import
@@ -263,6 +319,47 @@ The profile tables in this document divide by the 26,503 accepted archive record
 The 21,522 cache entries sit on the other side of the archive. The last named record ends 170,812 B before the cache begins, and the two disk ranges do not overlap. 21,044 was the earlier extractor result. It was revised because that scan assumed a fixed 40-byte `S_CODE_END` tail and a terminating `S_ENDPGM`, and 478 of the entries fell outside that scan's assumptions: 419 carry the standard 8-byte gate and a normal `S_ENDPGM` yet 407 of them end with a 20-byte tail and 12 carry no `S_CODE_END` fill at all, 58 begin directly with the program body without the gate, and one has no terminator. A further 4,485 programs are not aligned to any old record at all: each starts in the gap between two old records and its tail runs on into the next old record, so the record that follows it is bounded wrongly at both ends. Boundaries now come from the index, which gives 21,522 programs. 26,091 is the number of `S_ENDPGM` instructions in the code area and is not a count of records.
 
 The 218 re-detections are suffix aliases. Each one starts inside the name of the previous record, at a byte whose value equals its distance to the name's terminating NUL, and shares that record's terminator, header and payload. The count does not change either way, because de-duplication keeps the earlier start whenever the end offset and the digest match.
+
+### Reporting shader census populations
+
+`tools/shader_census.py` reports accepted record occurrences, distinct header
+digests and full-container SHA-256 counts without running LLVM or changing
+`shader_profile_audit.py` output. It reuses the same `scene_records` acceptance
+and scan order as the profile audit. With an already decoded cache from the
+same build, it also reports index entries, distinct `(code_offset,
+allocation_size)` spans and alias counts. The supported cache profile starts
+with bytes `50 53 00 09`; the four u32 counts at byte 80 describe 0x70-byte,
+0x18-byte, 8-byte and index-entry tables following a 128-byte header. Each index entry is
+a little-endian offset and size pair, relative to a caller-established code-area
+base. The tool does not guess that base or decompress cache streams.
+
+```powershell
+python -B tools/shader_census.py local.archive
+python -B tools/shader_census.py local.archive --cache-blob out/decoded.cache --code-base 0x2100000
+ctest --preset dev --no-tests=error -R 'shader_metadata|dxcontainer_part_offsets' -V
+```
+
+The base in the example is illustrative: replace it with the independently
+established offset for that cache. Missing cache input reports `null`, not zero.
+The parser checks table extents, a limit of 1,048,576 index entries, nonzero
+in-range allocations, 16-byte relative offset alignment and distinct-span
+overlaps. Exact aliases remain separate index entries. It does not validate the
+programs inside allocations or prove that two supplied inputs share a build.
+
+Run `python -B tests/shader_census_check.py` without local archives or a GPU.
+Its source-built framing fixture has four accepted records, two deliberately
+colliding header digests, three complete-container hashes and five cache index
+entries. It is not executable DXIL. Rejection controls cover malformed cache
+tables, allocation bounds and overlaps, invalid archive framing and CLI input.
+Separate controls verify alias accounting, missing-cache output and that the
+unchanged profile audit still counts all four occurrences while classifying
+only the three full-container hashes.
+
+Observed with Python 3.14.4 on Linux: all seven census test methods and all
+seven DXContainer controls passed. On Windows 11 build 26300.9974, MSVC
+19.44.35230 and Python 3.12.8, the CTest filter above passed 4/4 tests, including
+the existing native metadata probe, with no skips. No archive totals were
+remeasured for this change.
 
 ### Fixed-profile archive rescan
 
@@ -432,6 +529,14 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_chained_ranges$' -V
 ```
 
 The source-owned fixture has a primary interval, two levels of chaining and a neighboring export, built in `JE`, `JNE`, self-`XOR` zeroing, general 32-bit immediate (`edx`/`r8d`), and 32-bit immediate stack-frame (`sub`/`add rsp, 136`) variants. Both null inputs return 7 (or 0 in the `XOR`-zeroing variant), and two non-null inputs return 21. A Windows probe compares native returns with the generated result, physical RBX/RSI, and guards. A patched copy verifies version-2 chained header resolution. Negative controls cover broken and cyclic parent links, unsupported chained header versions and combined flags, an unsupported conditional branch after `TEST`, a non-self `XOR`, clobbering an unsaved callee-saved register with a 32-bit immediate, a stack frame exceeding 4096 bytes, jumps into a neighbor or instruction interior, and an indirect call.
+
+The translator reads each `MOV` memory operand once, in guest order, into a local declared at that point, through a `volatile` load: the original faults on an inaccessible operand even when the value is overwritten before use, and with an ordinary load an optimized MSVC build drops such a read. A load whose value nothing uses is written as the declaration followed by `static_cast<void>(...)`. Reads of the modelled stack slots are not emitted, and the table and allocator words that a bound callback or destroy call compares keep their ordinary read, since the comparison uses the value.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_aot_chained_dead_reads$' -V
+```
+
+The [dead-read fixture](../tests/cpu/chained_dead_read.asm) exports `read_dead` (a load overwritten by `MOV RAX, RDX`), `disp_dead` (a load at RCX + 8 into a register nothing reads), `pair_dead` (two loads, neither used), `read_skip` (a load skipped when y is zero) and the control `read_live`, which returns the value read. Each export is translated on its own and built by the project's build and again by a separate `cl /O2` command. `cpu_aot_chained_dead_reads` calls the original and both translations inside `__try` on a fresh page followed by an inaccessible page, and compares the structured exception code and the result. A readable operand returns the reference. A null operand, and an operand whose last read crosses one byte into the inaccessible page, raise an access violation in the original and in both translations; reads that end exactly at the page boundary return. On the path that skips the read, the same inaccessible addresses return normally. A source control checks that each memory operand is read once through the `volatile` load. An unoptimized build performs an ordinary load as well, so the `/O2` builds are the ones that show the difference.
 
 For the local FidelityFX loader, run `cpu_chained_aot.py <loader.dll> ffxDestroyContext out/local_context.cpp --partial` using the Python dev environment. Compile the generated C++ as a Windows x64 DLL. Its `try_lifted(first, second, output)` returns 1 and writes the guest result for a completed path. Status 0 leaves the output untouched at an unsupported indirect call. Pointer arguments must reference readable fixture storage on paths that dereference them. The local inspection recovered four owned intervals. Running the generated code produced 6 for a null first argument and for a pointer to a null context. A valid non-null control stopped at the first indirect call with its output sentinel intact. The original package DLL was inspected as a file. Native differential results above are from the repository fixture. [Callback follow-up](https://github.com/R0Y00/Xbox2Windows/issues/29)
 
@@ -805,7 +910,7 @@ The shared lowering also handles all six unsigned/equality `cmovcc` (`cmove`, `c
 
 The shared lowering also handles 32-bit and 64-bit ADX forms (`adcx`, `adox`) and `seto`, tracking `OF` independently from `CF` so interleaved `adcx`/`adox` chains preserve each other's carry flag. `cpu_aot_adx` probes CPUID leaf 7 EBX bit 19 (`ADX`) before invoking the native fixture and exits 77 (capability skip) on unsupported hosts; on ADX-capable hosts it builds all five exports from MASM source (`tests/cpu/adx.asm`), translates them, and compares sums and `(CF << 1) | OF` against the native DLL and a reference model. Run `cmake --build --preset dev --target cpu_adx_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_adx$' -V`.
 
-The shared lowering also handles 128-bit and 256-bit AVX2 integer broadcasts (`vpbroadcastb`, `vpbroadcastw`, `vpbroadcastd`, `vpbroadcastq`) and variable per-lane shifts (`vpsllvd`, `vpsrlvd`, `vpsravd`, `vpsllvq`, `vpsrlvq`), zeroing upper 128 bits on 128-bit VEX destinations and clamping out-of-range shift counts to match hardware. `cpu_aot_avx2_shifts` probes CPUID (`OSXSAVE`, `XCR0` YMM state, and leaf 7 EBX bit 5 `AVX2`) before invoking the native fixture and exits 77 (capability skip) on unsupported hosts; on AVX2-capable hosts it builds all 10 exports from MASM source (`tests/cpu/avx2_shifts.asm`), translates them, and compares outputs against the native DLL and a reference model. Run `cmake --build --preset dev --target cpu_avx2_shifts_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx2_shifts$' -V`.
+The shared lowering also handles 128-bit and 256-bit AVX2 integer broadcasts (`vpbroadcastb`, `vpbroadcastw`, `vpbroadcastd`, `vpbroadcastq`) and variable per-lane shifts (`vpsllvd`, `vpsrlvd`, `vpsravd`, `vpsllvq`, `vpsrlvq`), zeroing upper 128 bits on 128-bit VEX destinations and clamping out-of-range shift counts to match hardware. `cpu_aot_avx2_shifts` probes CPUID (`OSXSAVE`, `XCR0` YMM state, and leaf 7 EBX bit 5 `AVX2`) before invoking the native fixture and exits 77 (capability skip) on unsupported hosts; on AVX2-capable hosts it builds all 44 exports from MASM source (`tests/cpu/avx2_shifts.asm`), translates them, and compares outputs against the native DLL and a reference model across 128-bit and 256-bit register/memory operands, register-aliasing forms (`dst == src1`, `dst == src2`, `dst == src1 == src2`), and boundary shift counts while checking deterministic rejections for untracked registers, EVEX encodings, segment prefixes, and EIP-relative operands. Run `cmake --build --preset dev --target cpu_avx2_shifts_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx2_shifts$' -V`.
 
 The shared lowering also handles AVX2 128-bit lane operations, dword blends, and cross-lane permutes (`vbroadcasti128`, `vextracti128`, `vinserti128`, `vpblendd`, `vperm2i128`, `vpermd`, `vpermps`, `vpermq`, `vpermpd`). `cpu_aot_avx2_permutes` probes CPUID (`OSXSAVE`, `XCR0` YMM state, and leaf 7 EBX bit 5 `AVX2`) before invoking the native fixture and exits 77 (capability skip) on unsupported hosts; on AVX2-capable hosts it builds all 17 exports from MASM source (`tests/cpu/avx2_permutes.asm`), translates them, and compares outputs against the native DLL and a reference model. The `vpblendd` memory tests check that native and translated code both fault before writing output when either only masked-off lanes cross into an inaccessible page or all lanes are masked off and the whole operand is inaccessible. Run `cmake --build --preset dev --target cpu_avx2_permutes_lifted` and `ctest --preset dev --no-tests=error -R '^cpu_aot_avx2_permutes$' -V`.
 
@@ -1297,12 +1402,12 @@ ctest --test-dir out/native --no-tests=error -R '^cpu_aot_switch_strings$' -V
 ```
 
 Windows 11 build 26300.9974, MSVC/ML64 19.44.35230 and Python 3.12.8:
-35 exports, 13,656 native/AOT/reference comparisons and 63 access-violation
+38 exports, 24,243 native/AOT/reference comparisons and 93 access-violation
 comparisons passed, including the `/O2` translation. Compiled incorrect
 implementations must fail the comparison: a bulk `memmove` on destructive overlap
 and a truncated repeat count, plus ignored backwards direction.
 The comparison includes inaccessible addresses with a zero count, and a read that
-copies three bytes before faulting at a protected page; no later trace store executes. It also compares native and translated memory effects when a word, dword or qword straddles the protected page.
+copies three bytes before faulting at a protected page; no later trace store executes. The same fault must occur with a repeat count of 2^32 + 1, so the full 64-bit RCX is used. Non-overlapping copies run from an even and an odd source address, and an overlapping copy runs with the destination 8 bytes past the source. `rep stos` also runs with a nonzero fill whose low byte is zero, with RCX = 2^32 (zero ECX) at a protected destination, with a two-byte `rep stosb` from the last writable byte (the first byte is stored before the fault), with a word that straddles a protected page (nothing is stored), and with a one-byte store just below a 4 GiB boundary, so RDI must carry into its upper half. It also compares native and translated memory effects when a word, dword or qword straddles the protected page.
 No title startup result is claimed.
 
 The Windows ABI boundary follows [Microsoft's direction-flag convention](https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions).
@@ -1637,6 +1742,73 @@ compares all 320 output words each time. The stale reference fails on exactly
 eight stored words. The binding is limited to unsigned 32-bit words and fixed
 byte offsets.
 
+### Two- and three-dimensional thread groups
+
+The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits
+(x and y up to 1024, z up to 64, x·y·z up to 1024). The translator emits it
+unchanged, so an 8×8 group stays 8×8. On gfx10, compute waves receive local X,
+Y and Z in separate registers `v0`, `v1` and `v2`. LLVM 15 packs the three IDs
+into `v0` only for targets with `FeaturePackedTID` (gfx90a, gfx940 and gfx11), and
+`FeatureISAVersion10_1_3` does not have it. `v1` and `v2` are bound only when
+that group dimension is larger than one. `--group-reg-y` and `--group-reg-z`
+name the group-ID SGPRs in the same way as `--group-reg`. LLVM allocates them
+as consecutive system SGPRs in X, Y, Z order, each only when the program reads
+it. For an original program this is still a caller assumption.
+
+A dispatch index is `v_lshl_add_u32` of a group ID and the local ID of the
+same axis, shifted by log2 of a power-of-two group dimension. An indexed store
+takes one of two forms:
+
+- one `idxen` axis, when every other group dimension is one;
+- a row axis through `idxen` and a column axis through `offen`, with a
+  `v_lshlrev_b32` byte offset. The store must fit in one element, and one
+  group's row must fit in the stride.
+
+All stores in a program use one layout, so no two invocations of a group write
+the same bytes. A dispatch-thread index can also be stored as data. The
+translator does not model out-of-range behavior for structured buffers: the
+caller's stride and dispatch must keep every row in range. Addresses that need
+other ALU forms, for example a `v_mad_u32_u24` row pitch, are still rejected.
+
+```sh
+python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-reg 8 --descriptor-offset 0 --group-reg 10 --group-reg-y 11 --stride 72 --output out/tile.hlsl
+```
+
+The Windows fixture covers four group shapes, each with a full 320-word
+readback:
+
+| Group | Dispatches |
+|---|---|
+| 8×8×1 | 1×1×1 and 1×2×1 |
+| 4×1×8 | 1×1×1 and 1×1×2 |
+| 4×4×1 | 1×1×1 and 3×2×1 |
+| 256×1×1 | 1×1×1 |
+
+The expected words come from an independent per-invocation model. For each
+shape, the following must fail on the adapter:
+
+- a flipped guard word;
+- the first group count against the larger reference;
+- recompiled HLSL with swapped axes;
+- recompiled HLSL that ignores Z (4×1×8 only);
+- recompiled HLSL with half the group X size.
+
+The CPU controls reject:
+
+- swapped local or group axes;
+- a non-power-of-two size whose shift still matches;
+- `v1` in a group whose Y is one;
+- duplicate or missing group registers;
+- an element or row overflow;
+- an index and a byte offset taken from the same axis;
+- two stores with transposed layouts.
+
+`tools/shader_profile_audit.py` passes the PSV0 size and tries the next one or
+two SGPRs after the group-X candidate for group Y and Z. A CPU control in
+`compute_store_check.py` checks that a 4×1×8 kernel reading group Z from the
+SGPR after group X is accepted, and one reading it two SGPRs later is not. Its
+record counts have not been remeasured after this change.
+
 A local scan of 2,689 compute records accepted 12 records (10 distinct instruction streams). Ten use one-thread groups and fixed addresses. Two use 32- and 64-thread groups and indexed addresses. Tested table bindings used s4 or s5 with descriptor offsets of 0, 32 or 64. The indexed bindings used strides of 4, 8, 12 or 16 bytes, selecting the first compatible profile. On RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818), each record compiled to desktop DXIL and dispatched. Each adapter completed 14 full-buffer comparisons with zero mismatches, including two different group counts for both indexed records.
 ## AVX2 leaf recompilation
 
@@ -1911,6 +2083,17 @@ expected mismatches, each followed by a passing draw. The three 16-bit
 draw each. These three suites
 go from 108 device creations to 23, and DXC compiles one shader fewer, because
 the signed/unsigned control now reuses the group's compiled shader.
+
+The remaining multi-case `--check-pixel-case` loops across `draw-core`,
+`draw-predicate-rounding`, `draw-blend-scalar`, `draw-e64`, `draw-integer-nc`,
+`draw-bfm`, `three-way` and the full-RGBA `buffer-color` pass now group cases
+per compiled shader through `run_pixel_batch()`, preserving every reference case
+and expected mismatch control (`--check-pixel`, `--check-pixel-quad-lod`,
+`--dual-pixel` and `--check-pixel-case-rg` keep their single-draw paths).
+Across all eight modes, total renderer launches per backend drop from 494 to
+263 (`draw-core`: 127 to 65; `draw-predicate-rounding`: 147 to 74;
+`draw-blend-scalar`: 126 to 61; `draw-e64`: 57 to 50; `draw-integer-nc`: 12 to
+3; `draw-bfm`: 15 to 3; `three-way`: 4 to 3; `buffer-color`: 6 to 4).
 
 #The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.
 
@@ -2593,7 +2776,9 @@ The other 43 BVH modules still fail validation after retargeting because of dire
 
 Passing `--sign` to `tools/dxil_retarget.py` (with `--probe root_probe.exe`) re-signs retargeted DXBC containers in place through `dxil.dll` (`IDxcValidator::Validate` with `DxcValidatorFlags_InPlaceEdit`). Adding `--pso-probe root_device_probe.exe` (and optional `--warp-only`) tests `CreateRootSignature` and `CreateComputePipelineState` on desktop D3D12 against the re-signed container.
 
-Each container entry of the `--pe` report also carries `xbox_intrinsics`, a read-only inventory of the `xbox.*` names in the module as it was submitted. `calls` counts the symbols referenced by call instructions, `declarations` lists the function-table entries, and `metadata_only` lists names carried by metadata string values (`!"xbox.…"`) without being declared or called; a named-metadata key such as `!xbox.compiler.options` names the node and is not counted. An unused declaration, or a name that only metadata mentions, is therefore never reported as a call. The inventory changes no retargeting or submission behaviour. Passing `--probe root_probe.exe` in the container mode of the same tool prints the inventory inside `validation.ir.xbox_intrinsics`.
+Each container entry of the `--pe` report also carries `xbox_intrinsics`, a read-only inventory of the `xbox.*` names in the module as it was submitted. `calls` counts the symbols referenced by call instructions, `declarations` lists the function-table entries, and `metadata_only` lists names carried by metadata string values (`!"xbox.…"`) without being declared or called; a named-metadata key such as `!xbox.compiler.options` names the node and is not counted. An unused declaration, or a name that only metadata mentions, is therefore never reported as a call. The inventory itself changes no retargeting or submission behaviour; the submission gate described below does. Passing `--probe root_probe.exe` in the container mode of the same tool prints the inventory inside `validation.ir.xbox_intrinsics`.
+
+`tools/xbox_intrinsic_gate.py` gates the submission path. The module it reads is the one that would be submitted, after retargeting, and it is refused while it still executes an `xbox.*` call: a lowering counts only when the transformed module no longer calls that symbol, because the gate reads instructions and not adapter claims. An adapter status table is advisory — it annotates each blocking call with what the adapter reports and never clears it. A refused module names those calls and the probe process is never started, so it produces zero submissions, and the gate does not fall back to a creation failure such as `E_FAIL`. The inventory is mandatory: without a disassembly, which `--probe` produces, nothing is submitted and the result carries `gate.verdict = "NOT_CHECKED"` with `reason = "module-not-disassembled"`, so an unexamined module cannot look like a cleared one. A declaration, a name that only metadata mentions, and a module whose calls were removed all pass. Each `--pe` entry carries the decision as `gate`, the report counts `gate_rejected` and, with a probe, `pso_refused`, and `python tools/xbox_intrinsic_gate.py check-text <module.ll>` prints the same decision without a probe. `dxil_retarget_controls` covers the refusal, the three admitting shapes, an advisory LOWERED status that still refuses, a missing inventory that starts no probe process, a metadata string that only spells a call and the `--pso-probe` without `--probe` path.
 
 Public CI tests pure-Python bitcode/container/signing controls (`dxil_retarget_controls`) and source-built `compute_root.cso` (SM 6.0) and `CopyBlocksSM65.cso` (SM 6.5) shaders synthetically injected with `dxil-ms-xb2`, `xbox.compiler.options`, `BitcodeOffset=112` and `RTS0` flags `0x03000000` (`dxil_retarget_probe`). Negative controls verify that unmodified `xb2`, `--target-triple dxil-ms` and `--keep-root-flags` fail both validation and `--sign`, and that unsigned (zero-digest) and tampered-digest containers fail `CreateComputePipelineState` on WARP. Re-signed retargeted containers pass `CreateComputePipelineState` on WARP (for `compute_root.cso`, and for `CopyBlocksSM65.cso` when WARP reports SM 6.5 or newer), and the re-signed `compute_root.cso` executes on WARP with CPU-checked readback through `offscreen_check warp --compute-root-file`. `dxil_retarget_probe_hardware` runs the same signing, `CreateComputePipelineState`, and `offscreen_check hardware --compute-root-file` checks against a physical D3D12 adapter and skips with exit code `77` when no hardware adapter is visible.
 
@@ -2985,10 +3170,59 @@ comparison function in the second. Both operations retain their texture and
 coordinates. Set 3 must be free. The supported path has a direct access chain,
 sampler load and sampled image. Decorated sampler paths require separate support.
 
-Run `ctest --preset dev --no-tests=error -R spirv_sampler_views -V` with
-SPIRV-Tools and SPIRV-Cross installed. The source-built PS uses implicit LOD,
-the CS uses explicit LOD, and both compare against a depth reference. The CS
-readback on RTX 4060 Laptop and WARP sampled 0.25 and 0.75 and compared them to
-0.5, yielding 0 and 1. Reversing the ordinary wrap/clamp descriptors exchanged
-only the sampled values. Reversing the comparison descriptors exchanged only
-the two comparison results.
+With SPIRV-Tools and SPIRV-Cross installed, run:
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^spirv_sampler_views_' -V
+```
+
+The fixture compiles both shaders at Shader Model 6.0 and dispatches the compute
+shader for readback. The compiled pixel shader uses implicit LOD and the
+compute shader uses explicit LOD. Both compare against a depth reference.
+
+On Windows 10 build 19045.6456, the GTX 1060 (32.0.15.6094) and in-box WARP
+(10.0.19041.5794) matched all four readback words in each of the three sampler
+orders. Sampling returned 0.25 and 0.75, and comparison against 0.5 returned 0
+and 1. Reversing either pair of wrap/clamp descriptors exchanged only that
+pair's results. App-local WARP 1.0.22 produced identical results with the
+SM 6.0 and SM 6.6 compute shaders. All these runs reported zero D3D12 warnings
+and errors. The original SM 6.6 readback on RTX 4060 Laptop and WARP produced
+the same values.
+
+### Standalone comparison-sampler split in the SPIR-V bridge
+
+When one standalone SPIR-V sampler variable feeds both depth-comparison and ordinary
+sampling, SPIRV-Cross declares a `SamplerComparisonState` and passes it to
+`SampleLevel`, which DXC rejects with
+`no matching member function for call to 'SampleLevel'`. The indexed sampler table
+above is handled by the sampler views. For a standalone sampler, the opt-in
+`tools/spirv_sampler_split.py` keeps the comparison sampler at its binding and moves
+only the ordinary uses to a new sampler at a binding the host supplies with
+`--ordinary-binding`. That binding must be free in the same descriptor set. The pass
+prints the `descriptor_set`, `comparison_binding` and `ordinary_binding` mapping for
+the host.
+
+The pass first looks for a directly loaded standalone sampler that feeds both kinds of
+sampling. Modules without one are returned byte-for-byte unchanged. That includes the
+indexed table above and unrelated samples on other samplers. For the sampler it splits,
+the profile covers direct, non-array float32 `Texture2D` sampling in one compute entry
+point at a constant LOD of zero. Other uses of that sampler, an occupied binding, a
+nonzero LOD and more than one mixed sampler are rejected with a specific diagnostic.
+
+The [source-built fixture](../tests/spirv_window/shared_sampler.spvasm) compares
+references 0.25 and 0.75 against depth 0.5 with point-clamp `LESS_EQUAL`, and
+samples an ordinary texel of 0.375. The test first checks that DXC rejects the
+unsplit module. It then splits the module to ordinary binding 5, validates it for
+Vulkan 1.2, cross-compiles it and compiles it as `cs_6_6`. On RX 9070 XT and WARP,
+both readbacks returned 1.0, 0.0 and 0.375 and left all 13 guard words unchanged.
+A reference claiming that the second comparison passed produced exactly one
+mismatch, at word 1, on each adapter. Two descriptor controls change one static
+sampler at a time. Switching s2 to `GREATER` exchanged only the two comparison
+results. Clamping the ordinary sampler to `MinLOD` 1 changed only the ordinary
+sample, to 0.625 from the value texture's second mip. The occupied-binding,
+nonzero-LOD, already-separated and passthrough controls run without a GPU.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^spirv_compare_sampler_' -V
+```

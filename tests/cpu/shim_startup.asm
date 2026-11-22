@@ -43,7 +43,41 @@ draw_phase:
     call qword ptr [__imp_draw_request]
     test eax, eax
     jz success
+    cmp eax, 10
+    jae draw_texture
+    cmp eax, 6
+    jae draw_two
     mov ecx, eax
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    jmp success
+draw_two:
+    mov dword ptr [rsp+48], eax
+    mov ecx, 6
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    mov ecx, dword ptr [rsp+48]
+    add ecx, 1
+    call qword ptr [__imp_draw_frame]
+    cmp eax, -1
+    je bad_second_draw
+    test eax, eax
+    jnz bad_draw
+    jmp success
+draw_texture:
+    mov dword ptr [rsp+48], eax
+    mov ecx, 10
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    mov ecx, dword ptr [rsp+48]
+    add ecx, 1
+    call qword ptr [__imp_draw_frame]
+    test eax, eax
+    jnz bad_draw
+    mov ecx, 12
     call qword ptr [__imp_draw_frame]
     test eax, eax
     jnz bad_draw
@@ -61,6 +95,9 @@ bad_dispatch:
     jmp done
 bad_draw:
     mov eax, 20
+    jmp done
+bad_second_draw:
+    mov eax, 24
 done:
     add rsp, 56
     ret

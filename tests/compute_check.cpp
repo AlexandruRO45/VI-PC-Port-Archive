@@ -102,9 +102,15 @@ static ComPtr<ID3D12DescriptorHeap> bind_tables(ID3D12Device* device, ID3D12Grap
 }
 
 struct StoreCase {
+    // Group counts: X in bits 0-7, Y in bits 8-15 and Z in bits 16-23; zero Y or Z means one.
     UINT groups;
     std::array<UINT, capacity> expected;
     std::array<UINT, constants.size()> root_constants = constants;
+    UINT axis(UINT index) const
+    {
+        const UINT n = (groups >> (8 * index)) & 0xff;
+        return index && !n ? 1 : n;
+    }
 };
 
 static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE shader,
@@ -140,7 +146,8 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
         const auto& words = store ? store->root_constants : constants;
         list->SetComputeRoot32BitConstants(2, static_cast<UINT>(words.size()), words.data(), 0);
     }
-    list->Dispatch(store ? store->groups : capacity / 64, 1, 1);
+    if (store) list->Dispatch(store->axis(0), store->axis(1), store->axis(2));
+    else list->Dispatch(capacity / 64, 1, 1);
     transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
     commands.submit_and_wait(device);
@@ -163,7 +170,11 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
         }
     }
     readback->Unmap(0, &no_writes);
-    if (store) std::printf("groups=%u compared_words=%u mismatches=%u\n", store->groups, capacity, mismatches);
+    if (store && store->groups <= 0xff)
+        std::printf("groups=%u compared_words=%u mismatches=%u\n", store->groups, capacity, mismatches);
+    else if (store)
+        std::printf("groups=%ux%ux%u compared_words=%u mismatches=%u\n", store->axis(0), store->axis(1),
+                    store->axis(2), capacity, mismatches);
     else std::printf("layout=%s output_words=%u guard_words=%u mismatches=%u\n",
                 tables ? "tables" : "root", active, capacity - active, mismatches);
     if (mismatches) throw std::runtime_error("Compute readback differs from CPU reference");
@@ -192,7 +203,8 @@ void check_compute_file(ID3D12Device* device, const char* path, bool conversion_
         std::ifstream file(reference, std::ios::binary);
         file.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
         file.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
-        if (!file || !store.groups || store.groups > 5)
+        if (!file || store.groups >> 24 || !store.axis(0) || store.axis(0) > 5 || store.axis(1) > 5 ||
+            store.axis(2) > 5)
             throw std::runtime_error("Invalid compute store reference");
         if (file.peek() != std::char_traits<char>::eof()) {
             file.read(reinterpret_cast<char*>(store.root_constants.data()), sizeof(store.root_constants));

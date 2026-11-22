@@ -28,6 +28,21 @@ XBOX_SYMBOL = re.compile(r"xbox\.[\w.$-]+")
 METADATA_STRING = re.compile(r'!"([^"]*)"')
 
 
+def strip_comment(line):
+    """Drop a trailing ';' comment, keeping ';' inside a quoted string.
+
+    LLVM IR comments start at ';', but a metadata string value or a quoted symbol name may
+    contain one, and truncating there loses an intrinsic name.
+    """
+    quoted = False
+    for index, char in enumerate(line):
+        if char == '"':
+            quoted = not quoted
+        elif char == ";" and not quoted:
+            return line[:index]
+    return line
+
+
 def xbox_intrinsic_inventory(text):
     """Classify xbox.* intrinsic names in the disassembler's textual IR.
 
@@ -39,7 +54,7 @@ def xbox_intrinsic_inventory(text):
     """
     declarations, calls, metadata_names = set(), Counter(), set()
     for raw in text.splitlines():
-        line = raw.partition(";")[0].strip()
+        line = strip_comment(raw).strip()
         if not line:
             continue
         if line.startswith("declare"):

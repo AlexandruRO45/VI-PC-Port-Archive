@@ -611,15 +611,34 @@ def sign_container(probe: Path, blob: bytes) -> bytes:
     return signed
 
 
-def check_compute_pso(device_probe: Path, blob: bytes, *, warp_only: bool = False) -> dict:
-    """Test CreateRootSignature and CreateComputePipelineState via root_device_probe --compute-pso."""
+def check_compute_pso(device_probe: Path, blob: bytes, *, warp_only: bool = False,
+                      intrinsics: dict | None = None, status_of=None) -> dict:
+    """Test CreateRootSignature and CreateComputePipelineState via root_device_probe --compute-pso.
+
+    `intrinsics` carries the inventory of the module that would be submitted, and the gate is
+    mandatory: a module that still executes an xbox.* call, or one whose inventory is missing,
+    is decided without starting the probe process, so it produces no submission at all.
+    """
     if len(blob) < 32 or blob[:4] != b"DXBC":
         raise ValueError("Cannot create compute PSO from non-DXBC input")
+    from xbox_intrinsic_gate import ALLOW, decide, not_checked
+
+    if intrinsics is None:
+        gate = not_checked("module-not-disassembled")
+        gate["submitted"] = False
+        return {"gate": gate}
+    gate = decide(intrinsics, status_of)
+    if gate["verdict"] != ALLOW:
+        gate["submitted"] = False
+        return {"gate": gate}
     command = [str(device_probe), "--compute-pso"]
     if warp_only:
         command.append("--warp-only")
     run = subprocess.run(command, input=blob, capture_output=True, check=True, timeout=30)
-    return json.loads(run.stdout)
+    pso = json.loads(run.stdout)
+    gate["submitted"] = True
+    pso["gate"] = gate
+    return pso
 
 
 def validate_pe_containers(
@@ -674,6 +693,10 @@ def validate_pe_containers(
             )
             retargeted_secs = parts(retargeted_blob)
             after = validate_shader(probe, retargeted_blob, retargeted_secs[b"DXIL"], optional_modes=("module",))
+            # The gate reads the final module: calls removed or lowered by the adapter are gone here.
+            from xbox_intrinsic_gate import decide
+
+            gate_decision = decide(after["ir"]["xbox_intrinsics"])
 
             signed = False
             digest = None
@@ -683,7 +706,8 @@ def validate_pe_containers(
                 signed = True
                 digest = retargeted_blob[4:20].hex()
             if pso_probe is not None and after["container"].get("status") == "0x00000000":
-                pso_result = check_compute_pso(pso_probe, retargeted_blob, warp_only=warp_only)
+                pso_result = check_compute_pso(pso_probe, retargeted_blob, warp_only=warp_only,
+                                               intrinsics=after["ir"]["xbox_intrinsics"])
 
             saved_path = None
             if output_dir is not None:
@@ -698,6 +722,7 @@ def validate_pe_containers(
                 "dx_op_count": len(before["ir"]["dx_op_call_sites"]),
                 "xbox_call_count": sum(xbox_calls.values()),
                 "xbox_intrinsics": before["ir"]["xbox_intrinsics"],
+                "gate": gate_decision,
                 "retarget": info,
                 "signed": signed,
                 "digest": digest,
@@ -731,9 +756,13 @@ def validate_pe_containers(
         "container_passed": sum(r["after"]["container_status"] == "0x00000000" for r in results),
         "module_passed": sum(r["after"]["module_status"] == "0x00000000" for r in results),
         "signed_count": sum(r["signed"] for r in results),
+        "gate_rejected": sum(r["gate"]["verdict"] == "REJECT" for r in results),
         "entries": results,
     }
     if pso_probe is not None:
+        report["pso_refused"] = sum(
+            r.get("pso", {}).get("gate", {}).get("verdict") == "REJECT" for r in results
+        )
         report["warp_pso_passed"] = sum(
             r.get("pso", {}).get("warp_pso") == "0x00000000" for r in results
         )
@@ -886,11 +915,25 @@ def main() -> int:
             info["validation"] = {"module": rec}
 
     if args.pso_probe:
+        from xbox_intrinsic_gate import NOT_CHECKED
+
+        # The gate needs the module's disassembly, which only --probe produces. The helper refuses
+        # to submit without it; say why instead of leaving a silent NOT_CHECKED in the report.
+        final_intrinsics = (info.get("validation") or {}).get("ir", {}).get("xbox_intrinsics")
+        # Resolve the probe only when it will actually be used: without an inventory nothing runs.
+        probe_path = args.pso_probe.resolve(strict=True) if final_intrinsics is not None else args.pso_probe
         info["pso"] = check_compute_pso(
-            args.pso_probe.resolve(strict=True),
+            probe_path,
             result_bytes,
             warp_only=args.warp_only,
+            intrinsics=final_intrinsics,
         )
+        if info["pso"]["gate"]["verdict"] == NOT_CHECKED:
+            print(
+                "warning: --pso-probe needs --probe to gate the final module; "
+                "the module was not disassembled, so nothing was submitted",
+                file=sys.stderr,
+            )
 
     print(json.dumps(info, indent=2))
     return 0

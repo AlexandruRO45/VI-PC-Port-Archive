@@ -11,27 +11,38 @@ from resource_inventory import parts
 
 
 CONSTANT_WORDS = 16
+AXES = "xyz"
 
 
-def group_width(psv):
+def checked_group(group):
+    """Return (x, y, z) within the D3D12 cs_6_0 numthreads limits."""
+    x, y, z = (group, 1, 1) if isinstance(group, int) else tuple(group)
+    if not (all(isinstance(n, int) for n in (x, y, z)) and 1 <= x <= 1024 and 1 <= y <= 1024
+            and 1 <= z <= 64 and x * y * z <= 1024):
+        raise ValueError("Unsupported thread group")
+    return x, y, z
+
+
+def group_size(psv):
     size = struct.unpack_from("<I", psv)[0] if len(psv) >= 4 else 0
     if not 48 <= size <= len(psv) - 4 or psv[28] != 5:
         raise ValueError("Expected compute PSV runtime info with thread dimensions")
-    x, y, z = struct.unpack_from("<3I", psv, 40)
-    if x not in (1, 32, 64) or (y, z) != (1, 1):
-        raise ValueError("Unsupported thread group")
-    return x
+    return checked_group(struct.unpack_from("<3I", psv, 40))
 
 
 def is_word(value):
-    return isinstance(value, int) or (isinstance(value, tuple) and value[0] == "constant_word")
+    return isinstance(value, int) or (isinstance(value, tuple) and value[0] in ("constant_word", "thread"))
 
 
-def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, stride=None,
-          constant_descriptor=None):
-    """v0 is local X, group_reg is group X, and descriptors name u0 and optionally b0."""
-    if (width not in (1, 32, 64) or not 0 <= table_reg <= 105
-            or not 0 <= descriptor_offset < 1 << 20 or descriptor_offset % 4):
+def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
+          constant_descriptor=None, group_reg_y=None, group_reg_z=None):
+    """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
+
+    gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
+    group dimension is larger than one. Descriptors name u0 and optionally b0.
+    """
+    dims = checked_group(group)
+    if not 0 <= table_reg <= 105 or not 0 <= descriptor_offset < 1 << 20 or descriptor_offset % 4:
         raise ValueError("Invalid table or thread group binding")
     descriptor_bindings = {descriptor_offset: "uav"}
     if constant_descriptor is not None:
@@ -39,17 +50,20 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
                 or abs(constant_descriptor - descriptor_offset) < 16):
             raise ValueError("Invalid or overlapping constant descriptor binding")
         descriptor_bindings[constant_descriptor] = "cbv"
-    if group_reg is not None and (not 0 <= group_reg <= 105 or group_reg == table_reg):
+    group_regs = {axis: reg for axis, reg in enumerate((group_reg, group_reg_y, group_reg_z)) if reg is not None}
+    if (any(not 0 <= reg <= 105 or reg == table_reg for reg in group_regs.values())
+            or len(set(group_regs.values())) != len(group_regs)):
         raise ValueError("Invalid group register")
-    if stride is not None and (group_reg is None or not 4 <= stride <= 0x3fff or stride % 4):
+    if stride is not None and (not group_regs or not 4 <= stride <= 0x3fff or stride % 4):
         raise ValueError("Indexed stores require a group register and aligned stride")
     scalar = {table_reg: "table"}
-    if group_reg is not None:
-        scalar[group_reg] = "group"
-    vector = {0: "local"}
+    for axis, reg in group_regs.items():
+        scalar[reg] = ("group", axis)
+    vector = {axis: ("local", axis) for axis in range(3) if axis == 0 or dims[axis] > 1}
     pending = set()
     stores = []
     written_spans = []
+    layout = None
     if not instructions or instructions[-1] != "s_endpgm":
         raise ValueError("Missing final program exit")
 
@@ -135,29 +149,60 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
                 vector[dst] = value & 0xffffffff
         elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), s(\d+), (\d+), v(\d+)", line):
             dst, group, shift, local = map(int, m.groups())
-            if (dst > 255 or group in pending or scalar.get(group) != "group"
-                    or shift != width.bit_length() - 1 or vector.get(local) != "local"):
+            tag = scalar.get(group)
+            axis = tag[1] if isinstance(tag, tuple) and tag[0] == "group" else None
+            # The dispatch-thread ID is group * size + local only for a power-of-two size.
+            if (dst > 255 or group in pending or axis is None or dims[axis] & (dims[axis] - 1)
+                    or shift != dims[axis].bit_length() - 1 or vector.get(local) != ("local", axis)):
                 raise ValueError("Unverified dispatch index")
-            vector[dst] = "index"
-        elif m := re.fullmatch(r"buffer_store_dword(?:x([234]))? (v\d+|v\[\d+:\d+\]), (off|v\d+), "
-                               r"s\[(\d+):(\d+)\], 0( idxen)?(?: offset:(\d+))?", line):
+            vector[dst] = ("thread", axis)
+        elif m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line):
+            dst, shift, src = map(int, m.groups())
+            tag = vector.get(src)
+            # The element and row checks at the store bound the shift.
+            if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
+                raise ValueError("Unverified dispatch byte offset")
+            vector[dst] = ("thread_bytes", tag[1], shift)
+        elif m := re.fullmatch(r"buffer_store_dword(?:x([234]))? (v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), "
+                               r"s\[(\d+):(\d+)\], 0( idxen)?( offen)?(?: offset:(\d+))?", line):
             count = int(m[1] or 1)
             first, *last = map(int, re.findall(r"\d+", m[2]))
             base, high = int(m[4]), int(m[5])
-            offset = int(m[7] or 0)
+            offset = int(m[8] or 0)
             if (last != ([] if count == 1 else [first + count - 1])
                     or high != base + 3 or base % 4 or offset % 4 or offset > 4095
                     or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
                 raise ValueError("Unverified raw UAV store")
             address = f"{offset}u"
-            if m[3] == "off" and not m[6] and width == 1 and stride is None:
-                pass
-            elif (stride is not None and m[6] and m[3] != "off"
-                    and vector.get(int(m[3][1:])) == "index" and offset + 4 * count <= stride):
-                address = f"tid.x * {stride}u + {offset}u"
+            addr_regs = list(map(int, re.findall(r"\d+", m[3])))
+            tags = [vector.get(reg) for reg in addr_regs]
+            if (m[3] == "off" and not m[6] and not m[7] and dims == (1, 1, 1) and stride is None):
+                store_layout = ("fixed",)
+            elif (stride is not None and m[6] and not m[7] and len(addr_regs) == 1
+                    and isinstance(tags[0], tuple) and tags[0][0] == "thread" and offset + 4 * count <= stride):
+                # One index axis: every other group dimension must be one, so no two
+                # invocations of a group share an address.
+                index = tags[0][1]
+                store_layout = ("index", index)
+                address = f"tid.{AXES[index]} * {stride}u + {offset}u"
+            elif (stride is not None and m[6] and m[7] and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
+                    and all(isinstance(tag, tuple) for tag in tags)
+                    and tags[0][0] == "thread" and tags[1][0] == "thread_bytes" and tags[0][1] != tags[1][1]):
+                # idxen offen: address = index * stride + byte offset + instruction offset.
+                (_, index), (_, column, shift) = tags
+                if (offset + 4 * count > 1 << shift or dims[column] << shift > stride):
+                    raise ValueError("Store leaves its element or row")
+                store_layout = ("index_offset", index, column, shift)
+                address = f"tid.{AXES[index]} * {stride}u + (tid.{AXES[column]} << {shift}u) + {offset}u"
             else:
                 raise ValueError("Unsupported store address")
+            covered = {store_layout[1], *store_layout[2:3]} if store_layout[0] != "fixed" else set()
+            if any(dims[axis] > 1 for axis in range(3) if axis not in covered):
+                raise ValueError("Store address does not separate every invocation of the group")
+            if layout not in (None, store_layout):
+                raise ValueError("Stores use different address layouts")
+            layout = store_layout
             span_end = offset + 4 * count
             if any(lo < span_end and offset < hi for lo, hi in written_spans):
                 raise ValueError("Overlapping raw UAV stores")
@@ -167,6 +212,7 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Store data is not a known word")
             words = ", ".join(
                 f"0x{value:08x}u" if isinstance(value, int)
+                else f"tid.{AXES[value[1]]}" if value[0] == "thread"
                 else f"params[{value[1] // 4}].{'xyzw'[value[1] % 4]}"
                 for value in values
             )
@@ -179,7 +225,7 @@ def lower(instructions, width, *, table_reg, descriptor_offset, group_reg=None, 
     body = "\n".join(stores)
     cbuffer = (f"cbuffer Constants : register(b0) {{ uint4 params[{CONSTANT_WORDS // 4}]; }};\n"
                if constant_descriptor is not None else "")
-    return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({width},1,1)]\n"
+    return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID) {{\n{body}\n}}\n")
 
 
@@ -191,22 +237,25 @@ def main():
     parser.add_argument("--table-reg", type=int, required=True)
     parser.add_argument("--descriptor-offset", type=lambda n: int(n, 0), required=True)
     parser.add_argument("--constant-descriptor", type=lambda n: int(n, 0), help="Table byte offset bound to b0")
-    parser.add_argument("--group-reg", type=int)
+    parser.add_argument("--group-reg", type=int, help="SGPR holding the group X ID")
+    parser.add_argument("--group-reg-y", type=int, help="SGPR holding the group Y ID")
+    parser.add_argument("--group-reg-z", type=int, help="SGPR holding the group Z ID")
     parser.add_argument("--stride", type=int, help="Indexed raw UAV byte stride")
     args = parser.parse_args()
     if args.output.suffix.lower() != ".hlsl" or args.output.resolve() == args.container.resolve():
         parser.error("Choose an HLSL destination distinct from the input")
     blob = args.container.read_bytes()
     chunks = parts(blob)
-    width = group_width(chunks.get(b"PSV0", b""))
+    group = group_size(chunks.get(b"PSV0", b""))
     code = container_code(chunks.get(b"DXIL", b""), stage=5)
-    source = lower(disassemble(code, args.llvm), width, table_reg=args.table_reg,
+    source = lower(disassemble(code, args.llvm), group, table_reg=args.table_reg,
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
-                   constant_descriptor=args.constant_descriptor)
+                   constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
+                   group_reg_z=args.group_reg_z)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
-                      "native_sha256": hashlib.sha256(code).hexdigest(), "numthreads": [width, 1, 1]}))
+                      "native_sha256": hashlib.sha256(code).hexdigest(), "numthreads": list(group)}))
 
 
 if __name__ == "__main__":

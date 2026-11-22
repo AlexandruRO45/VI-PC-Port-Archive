@@ -85,7 +85,11 @@ def cases(order):
 
 def controls():
     program = enumerate_pcs(MESH)
-    for old, new in (("0x11014fac", "0x11014fad"), ("s_waitcnt vmcnt(0)", "s_nop 0")):
+    for old, new in (
+        ("0x11014fac", "0x11014fad"),
+        ("s_waitcnt vmcnt(0)", "s_nop 0"),
+        ("v_mad_u32_u24 v1, s4, v1, s5", "v_mad_u32_u24 v1, s4, v1, 0"),
+    ):
         try:
             lower(
                 [(pc, line.replace(old, new)) for pc, line in program],
@@ -95,7 +99,7 @@ def controls():
             )
         except ValueError:
             continue
-        raise AssertionError("Unknown descriptor or pending load accepted")
+        raise AssertionError(f"Invalid indexed path accepted after replacing {old!r}")
     for words in ([4099, 0xFFFF, 0], [4099]):
         try:
             lower(program, words, (3, 1), HEADER)
@@ -149,3 +153,21 @@ if __name__ == "__main__":
                 raise AssertionError(
                     "Collapsing a vertex must change both geometry and the partial raster"
                 )
+
+            program = MESH.copy()
+            program[program.index("v_mov_b32_e32 v4, 0x3f800000")] = (
+                "v_mov_b32_e32 v4, 0x40000000"
+            )
+            positions = [(x, y, z, 2) for x, y, z, _ in positions]
+            # W=2 maps the vertices to (10,22), (22,22), (10,10.5),
+            # in source order. Evaluate coverage at twice the pixel centers.
+            pixels = bytearray()
+            for y in range(32):
+                for x in range(32):
+                    inside = x >= 10 and y < 22 and 23 * (2 * x + 1 - 20) < 24 * (2 * y + 1 - 21)
+                    pixels.extend((0, 255 if inside else 0, 0, 255))
+            sys.exit(draw(
+                compiler, renderer, adapter, tmp,
+                lower(enumerate_pcs(program), WORDS, (3, 1), HEADER),
+                [(constants, positions, bytes(pixels))], indexed=True,
+            ))
