@@ -158,8 +158,30 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
+      # Four semantic test files check the translated module with spirv-as and spirv-val and skip without them,
+      # so a job without SPIRV-Tools reports them green although they never ran (TEST-604).
+      - name: Install SPIRV-Tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends spirv-tools
+          spirv-as --version
+          spirv-val --version
       - name: Translator semantic tests
-        run: python -m unittest discover -s tests/semantic -v
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          # Linux has every tool the suite looks for, so a skip there is a test that did not run. Windows has no
+          # SPIRV-Tools, so its SPIRV-Tools checks skip; Linux runs them.
+          FAIL_ON_SKIP: ${{ runner.os == 'Linux' }}
+        run: |
+          log="$RUNNER_TEMP/semantic.log"
+          python -m unittest discover -s tests/semantic -v 2>&1 | tee "$log"
+          if [[ "$FAIL_ON_SKIP" == true ]] && grep -Eq '^(OK|FAILED) \(.*skipped=[0-9]+' "$log"; then
+            echo "::error::semantic tests were skipped on a runner that has every tool they need:"
+            grep -E '\.\.\. skipped' "$log" || true
+            exit 1
+          fi
 
   viewer-tests:
     needs: change-scope

@@ -136,6 +136,50 @@ def defines_a_test(source):
     return False
 
 
+# The package that puts each tool a semantic test looks up with shutil.which() on an Ubuntu runner's PATH.
+APT_PACKAGE_OF = {"spirv-as": "spirv-tools", "spirv-val": "spirv-tools", "spirv-dis": "spirv-tools",
+                  "spirv-opt": "spirv-tools"}
+
+
+def job_text(text, job):
+    """The lines of one job in a workflow: from ``  <job>:`` to the next two-space key."""
+    match = re.search(rf"^  {re.escape(job)}:\n((?:(?:    .*)?\n)*)", text, re.M)
+    if not match:
+        raise AssertionError(f"ci.yml has no {job} job; update tests/test_ci_registration.py with the workflow")
+    return match.group(1)
+
+
+def semantic_job_gaps(root, semantic):
+    """Why the semantic job could pass with tests that never ran: a tool it doesn't install, or no skip check.
+
+    A semantic test that skips without a tool is reported green by ``unittest discover``; the job only runs it
+    if the tool is installed, and only notices when it isn't if it fails on a skip (TEST-604).
+    """
+    job = job_text(read(root, WORKFLOW), "semantic-tests")
+    tools = set()
+    for base, dirs, files in os.walk(os.path.join(root, semantic)):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for name in sorted(files):
+            if name.endswith(".py"):
+                tools.update(re.findall(r"shutil\.which\(\s*['\"]([^'\"]+)['\"]", read(root, os.path.join(base, name))))
+    installed = set()
+    for line in re.findall(r"apt-get install[^\n]*", job):
+        installed.update(line.split())
+    gaps = []
+    for tool in sorted(tools):
+        package = APT_PACKAGE_OF.get(tool)
+        if package is None:
+            gaps.append(f"a semantic test looks up {tool!r}, which APT_PACKAGE_OF doesn't know; install it in the "
+                        "semantic-tests job and add it there")
+        elif package not in installed:
+            gaps.append(f"a semantic test needs {tool!r}, but the semantic-tests job doesn't apt-get install "
+                        f"{package}, so that test skips and the job stays green")
+    if not (re.search(r"FAIL_ON_SKIP:\s*\$\{\{\s*runner\.os\s*==\s*'Linux'\s*\}\}", job)
+            and "skipped=" in job and "exit 1" in job):
+        gaps.append("the semantic-tests job no longer fails on Linux when a test is skipped")
+    return gaps
+
+
 def has_main_guard(source):
     """A real ``if __name__ == "__main__":`` block, not just the word in a comment or a docstring."""
     for node in ast.walk(ast.parse(source)):
@@ -186,6 +230,41 @@ class RepositoryRegistrationTest(unittest.TestCase):
                      if job_of(ROOT, f, self.rules) == "stdlib" and not has_main_guard(read(ROOT, f))]
         self.assertEqual(guardless, [], "the check loop runs these with python -I, which executes no test:\n" +
                          "\n".join(f"  {f}: no `if __name__ == \"__main__\":` block" for f in guardless))
+
+    def test_the_semantic_job_runs_the_tests_that_need_a_tool(self):
+        self.assertEqual(semantic_job_gaps(ROOT, self.rules[3]), [])
+
+    def test_the_semantic_check_flags_a_missing_tool_and_a_missing_skip_check(self):
+        workflow = read(ROOT, WORKFLOW)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".github", "workflows"))
+            os.makedirs(os.path.join(tmp, "tests", "semantic"))
+
+            def write(name, text):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+            write("tests/semantic/test_tool.py", "import shutil\nHAVE = shutil.which('spirv-val')\n")
+
+            write(WORKFLOW, workflow)
+            self.assertEqual(semantic_job_gaps(tmp, "tests/semantic"), [])
+
+            # The job as it was before TEST-604: no SPIRV-Tools, no skip check.
+            job = job_text(workflow, "semantic-tests")
+            before = re.sub(r"(?m)^      # Four semantic.*?(?=^      - name: Translator semantic tests)", "", job,
+                            flags=re.S)
+            before = re.sub(r"(?ms)^      - name: Translator semantic tests\n.*",
+                            "      - name: Translator semantic tests\n"
+                            "        run: python -m unittest discover -s tests/semantic -v\n", before)
+            self.assertNotIn("spirv-tools", before)
+            write(WORKFLOW, workflow.replace(job, before))
+            gaps = semantic_job_gaps(tmp, "tests/semantic")
+            self.assertEqual(len(gaps), 2, gaps)
+            self.assertIn("spirv-tools", gaps[0])
+            self.assertIn("skipped", gaps[1])
+
+            write(WORKFLOW, workflow)
+            write("tests/semantic/test_other.py", "import shutil\nHAVE = shutil.which(\"glslc\")\n")
+            self.assertEqual(len(semantic_job_gaps(tmp, "tests/semantic")), 1)
 
     def test_the_scan_flags_an_unlisted_file_and_a_file_pytest_cannot_collect(self):
         with tempfile.TemporaryDirectory() as tmp:
