@@ -239,5 +239,247 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(lds.read_qword(40), new_val)
 
 
+class DSOpcode(str, enum.Enum):
+    """Opcode enumerations for 64-bit LDS conditional exchange."""
+    DS_CONDXCHG32_RTN_B64 = "ds_condxchg32_rtn_b64"
+    DS_CMPST_RTN_B64 = "ds_cmpst_rtn_b64"
+
+    @property
+    def is_return(self) -> bool:
+        """True if instruction returns prior LDS value to destination VGPR pair."""
+        return True
+
+    @property
+    def bit_width(self) -> int:
+        """Operand bit width."""
+        return 64
+
+
+@dataclasses.dataclass(frozen=True)
+class VGPR:
+    """Vector General Purpose Register operand v[0] .. v[255]."""
+    index: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+
+    def __str__(self) -> str:
+        return f"v{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class VGPRPair:
+    """Consecutive pair of Vector General Purpose Registers v[i:i+1]."""
+    base: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.base <= 254):
+            raise ValueError(f"VGPRPair base index out of range [0, 254]: {self.base}")
+
+    @property
+    def lo(self) -> VGPR:
+        return VGPR(self.base)
+
+    @property
+    def hi(self) -> VGPR:
+        return VGPR(self.base + 1)
+
+    def __str__(self) -> str:
+        return f"v[{self.base}:{self.base + 1}]"
+
+
+@dataclasses.dataclass(frozen=True)
+class OffsetImmediate:
+    """Unsigned 16-bit byte offset immediate [0, 65535]."""
+    value: int = 0
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.value <= 65535):
+            raise ValueError(f"Offset immediate out of range [0, 65535]: {self.value}")
+
+    def __str__(self) -> str:
+        return f"offset:{self.value}" if self.value != 0 else ""
+
+
+@dataclasses.dataclass(frozen=True)
+class DSCondXchg32B64Instruction:
+    """Symbolic AST node representing an RDNA2 DS 64-bit conditional exchange instruction."""
+    opcode: DSOpcode
+    vaddr: VGPR
+    vdata0: VGPRPair
+    vdata1: VGPRPair
+    vdst: Optional[VGPRPair] = None
+    offset: OffsetImmediate = OffsetImmediate(0)
+
+    def __post_init__(self) -> None:
+        if self.vdst is None:
+            raise ValueError(f"Returning opcode {self.opcode.value} requires destination vdst")
+
+    def disasm(self) -> str:
+        """Format symbolic instruction into canonical RDNA2 assembly text."""
+        parts = [self.opcode.value, f"{self.vdst}, {self.vaddr}, {self.vdata0}, {self.vdata1}"]
+        if self.offset.value != 0:
+            parts.append(str(self.offset))
+        return " ".join(parts)
+
+    @classmethod
+    def parse(cls, text: str) -> DSCondXchg32B64Instruction:
+        """Parse canonical RDNA2 assembly string into a DSCondXchg32B64Instruction AST."""
+        tokens = text.strip().split(None, 1)
+        if not tokens:
+            raise ValueError("Empty assembly string")
+        op_str = tokens[0]
+        try:
+            opcode = DSOpcode(op_str)
+        except ValueError:
+            raise ValueError(f"Unknown or unsupported DS opcode: {op_str}")
+
+        if len(tokens) == 1:
+            raise ValueError(f"Missing operands for {op_str}")
+
+        rest = tokens[1].strip()
+        offset_val = 0
+        if "offset:" in rest:
+            m = rest.split("offset:")
+            rest = m[0].strip()
+            offset_part = m[1].split()
+            if not offset_part:
+                raise ValueError("Malformed offset immediate")
+            offset_tok = offset_part[0].rstrip(",")
+            try:
+                offset_val = int(offset_tok, 0)
+            except ValueError:
+                raise ValueError(f"Invalid offset integer: {offset_tok}")
+
+        reg_tokens = [tok.strip().rstrip(",") for tok in rest.split(",") if tok.strip()]
+
+        def parse_vgpr(s: str) -> VGPR:
+            s = s.strip()
+            if not s.startswith("v") or not s[1:].isdigit():
+                raise ValueError(f"Invalid VGPR syntax: {s}")
+            return VGPR(int(s[1:]))
+
+        def parse_vgpr_pair(s: str) -> VGPRPair:
+            s = s.strip()
+            if s.startswith("v[") and s.endswith("]"):
+                inner = s[2:-1]
+                parts = inner.split(":")
+                if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                    raise ValueError(f"Invalid VGPRPair range syntax: {s}")
+                base = int(parts[0])
+                hi = int(parts[1])
+                if hi != base + 1:
+                    raise ValueError(f"VGPRPair must be consecutive [i:i+1], got {s}")
+                return VGPRPair(base)
+            elif s.startswith("v") and s[1:].isdigit():
+                return VGPRPair(int(s[1:]))
+            raise ValueError(f"Invalid VGPRPair syntax: {s}")
+
+        if len(reg_tokens) != 4:
+            raise ValueError(f"{opcode.value} expects 4 operands (vdst, vaddr, vdata0, vdata1), got {reg_tokens}")
+
+        vdst = parse_vgpr_pair(reg_tokens[0])
+        vaddr = parse_vgpr(reg_tokens[1])
+        vdata0 = parse_vgpr_pair(reg_tokens[2])
+        vdata1 = parse_vgpr_pair(reg_tokens[3])
+
+        return cls(
+            opcode=opcode,
+            vaddr=vaddr,
+            vdata0=vdata0,
+            vdata1=vdata1,
+            vdst=vdst,
+            offset=OffsetImmediate(offset_val),
+        )
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions, registers, and assembly parsing."""
+
+    def test_opcode_properties(self) -> None:
+        self.assertTrue(DSOpcode.DS_CONDXCHG32_RTN_B64.is_return)
+        self.assertEqual(DSOpcode.DS_CONDXCHG32_RTN_B64.bit_width, 64)
+        self.assertTrue(DSOpcode.DS_CMPST_RTN_B64.is_return)
+        self.assertEqual(DSOpcode.DS_CMPST_RTN_B64.bit_width, 64)
+
+    def test_vgpr_and_vgpr_pair_validation(self) -> None:
+        v0 = VGPR(0)
+        v255 = VGPR(255)
+        self.assertEqual(str(v0), "v0")
+        self.assertEqual(str(v255), "v255")
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+        with self.assertRaises(ValueError):
+            VGPR(256)
+
+        pair0 = VGPRPair(0)
+        pair254 = VGPRPair(254)
+        self.assertEqual(str(pair0), "v[0:1]")
+        self.assertEqual(str(pair254), "v[254:255]")
+        self.assertEqual(pair0.lo.index, 0)
+        self.assertEqual(pair0.hi.index, 1)
+
+        with self.assertRaises(ValueError):
+            VGPRPair(-1)
+        with self.assertRaises(ValueError):
+            VGPRPair(255)
+
+    def test_offset_immediate_validation(self) -> None:
+        off0 = OffsetImmediate(0)
+        off64 = OffsetImmediate(64)
+        off_max = OffsetImmediate(65535)
+        self.assertEqual(str(off0), "")
+        self.assertEqual(str(off64), "offset:64")
+        self.assertEqual(str(off_max), "offset:65535")
+
+        with self.assertRaises(ValueError):
+            OffsetImmediate(-1)
+        with self.assertRaises(ValueError):
+            OffsetImmediate(65536)
+
+    def test_instruction_post_init_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            DSCondXchg32B64Instruction(
+                opcode=DSOpcode.DS_CONDXCHG32_RTN_B64,
+                vaddr=VGPR(0),
+                vdata0=VGPRPair(2),
+                vdata1=VGPRPair(4),
+                vdst=None,
+            )
+
+    def test_disasm_and_parse_roundtrip(self) -> None:
+        test_cases = [
+            DSCondXchg32B64Instruction(
+                DSOpcode.DS_CONDXCHG32_RTN_B64,
+                vaddr=VGPR(1),
+                vdata0=VGPRPair(4),
+                vdata1=VGPRPair(6),
+                vdst=VGPRPair(2),
+            ),
+            DSCondXchg32B64Instruction(
+                DSOpcode.DS_CONDXCHG32_RTN_B64,
+                vaddr=VGPR(1),
+                vdata0=VGPRPair(4),
+                vdata1=VGPRPair(6),
+                vdst=VGPRPair(2),
+                offset=OffsetImmediate(16),
+            ),
+            DSCondXchg32B64Instruction(
+                DSOpcode.DS_CMPST_RTN_B64,
+                vaddr=VGPR(10),
+                vdata0=VGPRPair(12),
+                vdata1=VGPRPair(14),
+                vdst=VGPRPair(8),
+                offset=OffsetImmediate(64),
+            ),
+        ]
+        for inst in test_cases:
+            with self.subTest(inst=inst):
+                asm = inst.disasm()
+                parsed = DSCondXchg32B64Instruction.parse(asm)
+                self.assertEqual(inst, parsed)
+
+
 if __name__ == "__main__":
     unittest.main()
