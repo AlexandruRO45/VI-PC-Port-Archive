@@ -60,6 +60,18 @@ class MergeShardPartsTest(unittest.TestCase):
         self.assertIn("index.part0.json", message)
         self.assertIn("delete that part", message)
 
+    def test_a_shader_named_by_two_parts_is_refused(self):
+        # Parts from different runs can both list a shader; last-wins would publish one under the other's name.
+        self.part(0, {"a": {"r": 1}})
+        self.part(1, {"a": {"r": 2}})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        message = self.merge_error()
+        self.assertIn("shader 'a' is in both", message)
+        self.assertIn("index.part0.json", message)
+        self.assertIn("index.part1.json", message)
+        self.assertIn("delete index.part", message)
+
     def test_missing_part_is_refused(self):
         self.part(0, {"a": {}})
         self.marker(0, 3)
@@ -244,6 +256,18 @@ class MergeCliTest(unittest.TestCase):
         merged = json.loads((self.out / "index.json").read_text(encoding="utf-8"))
         self.assertEqual(sorted(merged), ["a", "b"])
 
+
+    def test_cli_refuses_a_shader_named_by_two_parts(self):
+        self.part(0, {"a": {"r": 1}})
+        self.part(1, {"a": {"r": 2}})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        result = self.run_merge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("ERROR: shader 'a' is in both", result.stderr)
+        self.assertIn("delete index.part", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.out / "index.json").exists())
 
     def test_cli_refuses_a_marker_count_that_disagrees_with_the_plan(self):
         self.part(0, {})

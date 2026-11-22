@@ -17481,6 +17481,7 @@ def merge_shard_parts(out):
         raise ShardSetError(f"index parts and shard markers disagree: parts {sorted(set(indices))}, "
                             f"markers {sorted(markers)}")
     merged = {}
+    origin = {}
     for part in parts:
         try:
             with open(part, encoding="utf-8") as f:
@@ -17489,6 +17490,13 @@ def merge_shard_parts(out):
             raise ShardSetError(f"cannot read {part}: {e}; delete that part and run --shard <i>/<n> again") from None
         if not isinstance(doc, dict):
             raise ShardSetError(f"{part} does not contain a shader index object")
+        for name in doc:
+            # Two parts listing one shader means the set mixes runs: the later part would publish its translation under
+            # the name with no error, and the other part's module would stay behind under the same name.
+            if name in merged:
+                raise ShardSetError(f"shader {name!r} is in both {origin[name]} and {part}; delete index.part*.json "
+                                    "and run every shard again")
+            origin[name] = part
         merged.update(doc)
     if not merged:
         raise ShardSetError(f"the shard set in {out} holds no shaders: every part is empty; "
