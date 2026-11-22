@@ -353,6 +353,18 @@ def registers(first, last, count):
 
 HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
 
+# s_setreg_imm32_b32 is accepted for two targets only.
+# MODE[3:2] is the rounding mode shared by binary16 and binary64 results (LLVM SIDefines.h, FP_ROUND_MODE_DP):
+# 0 is round to nearest even, which the binary16 lowerings assume and shader entry is taken to hold, and 3 is
+# round toward zero. The directed modes 1 and 2 are refused.
+HALF_ROUNDING = {"0": "nearest even", "3": "toward zero"}
+# Under round toward zero no rounding binary16 or binary64 form has a lowering. These two do not depend on the
+# mode: the widening is exact and the pack always truncates.
+HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32")
+# FLAT_SCR_LO and FLAT_SCR_HI hold the scratch base address. Only scratch_* and flat_* memory instructions and
+# s_getreg_b32 can observe it, and none of them is lowered, so a whole-register write changes no result.
+FLAT_SCRATCH = ("HW_REG_FLAT_SCR_LO", "HW_REG_FLAT_SCR_HI")
+
 ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
     # Same reciprocal; the integer-divide flag it raises has no desktop equivalent.
@@ -481,6 +493,16 @@ uint mul_hi_i32(uint a, uint b) {
         "    if (w == 0u) return 0u;\n"
         "    if (off + w < 32u) return asuint(asint(src << (32u - off - w)) >> (32u - w));\n"
         "    return asuint(asint(src) >> off);\n"
+        "}"
+    ),
+    "s_bfe64": (
+        "uint2 s_bfe64(uint2 src, uint ctrl, bool is_signed) {\n"
+        "    uint offset = ctrl & 63u;\n"
+        "    uint width = min((ctrl >> 16) & 127u, 64u - offset);\n"
+        "    if (width == 0u) return uint2(0u, 0u);\n"
+        "    uint right = 64u - width;\n"
+        "    uint2 aligned = s_lshl_b64(src, right - offset);\n"
+        "    return is_signed ? s_ashr_i64(aligned, right) : s_lshr_b64(aligned, right);\n"
         "}"
     ),
     "dpp_ffbh_u32": (
@@ -1392,6 +1414,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     pending = set()
     scc = None
     helpers = set()
+    half_rounding = HALF_ROUNDING["0"]
     mask = "entry"
     samples = 0
     sample_dest = {}  # VGPR -> issue number of its outstanding image_sample
@@ -1426,6 +1449,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if int(m[2], 0) > HINT_LIMITS[m[1]]:
                 raise ValueError(f"Invalid {m[1]} operand")
             continue
+        # A hardware register write is state, not a hint: it is accepted only where its effect on the
+        # lowered program is known, and every other register, field or value is refused.
+        if m := match(r"s_setreg_imm32_b32 hwreg\((\w+)(?:, (\d+), (\d+))?\), (\S+)"):
+            register, offset, size, value = m.groups()
+            if register in FLAT_SCRATCH and offset is None:
+                if re.fullmatch(r"0x[0-9a-f]{1,8}", value):
+                    continue
+                if re.fullmatch(r"-?[0-9]{1,10}", value) and -0x80000000 <= int(value) <= 0xffffffff:
+                    continue
+            if (register, offset, size) != ("HW_REG_MODE", "2", "2"):
+                raise ValueError(f"Unsupported hardware register write: {line}")
+            if value not in HALF_ROUNDING:
+                raise ValueError(f"Unsupported binary16 rounding mode: {line}")
+            half_rounding = HALF_ROUNDING[value]
+            continue
+        if (half_rounding != HALF_ROUNDING["0"] and re.match(r"v_\w*_f(?:16|64)", line)
+                and not line.startswith(HALF_ROUNDING_EXEMPT)):
+            raise ValueError(f"Unsupported binary16 or binary64 operation under round {half_rounding}: {line.split()[0]}")
         if line == "s_waitcnt lgkmcnt(0)":
             pending.clear()
         elif m := match(r"s_waitcnt vmcnt\((\d+)\)"):
@@ -1472,6 +1513,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
             if op == "not":
                 scc = f"((salu{i}.x | salu{i}.y) != 0u)"
+        elif m := match(r"s_cselect_b64 (s\[\d+:\d+\]), ([^,]+), ([^,]+)"):
+            dst, src0, src1 = m.groups()
+            if scc is None:
+                raise ValueError("Select condition is not a tracked scalar result")
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            a0, a1 = scalar_u64(src0, scalar, pending)
+            b0, b1 = scalar_u64(src1, scalar, pending)
+            lines.append(f"    uint2 salu{i} = {scc} ? uint2({a0}, {a1}) : uint2({b0}, {b1});")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
         elif m := match(rf"s_({'|'.join(SALU_BIT64)})_b64 (s\[\d+:\d+\]), ([^,]+), ([^,]+)"):
             op, dst, src0, src1 = m.groups()
             regs = sgpr_pair(dst)
@@ -1500,6 +1552,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
             if op != "s_bfm_b64":
                 scc = f"((salu{i}.x | salu{i}.y) != 0u)"
+        elif m := match(r"s_bfe_([ui])64 (s\[\d+:\d+\]), ([^,]+), ([^,]+)"):
+            kind, dst, src, ctrl = m.groups()
+            regs = sgpr_pair(dst)
+            if pending.intersection(regs):
+                raise ValueError("Write overlaps an outstanding scalar load")
+            is_signed = kind == "i"
+            lo, hi = scalar_u64(src, scalar, pending, signed=is_signed)
+            field = scalar_u32(ctrl, scalar, pending)
+            helpers.update(("s_lshl_b64", "s_lshr_b64", "s_ashr_i64", "s_bfe64"))
+            lines.append(f"    uint2 salu{i} = s_bfe64(uint2({lo}, {hi}), {field}, {str(is_signed).lower()});")
+            scalar[regs[0]], scalar[regs[1]] = ("uint", f"salu{i}.x"), ("uint", f"salu{i}.y")
+            scc = f"((salu{i}.x | salu{i}.y) != 0u)"
         elif m := match(r"(s_bfe_u32|s_bfe_i32) (s\d+), ([^,]+), ([^,]+)"):
             op, dst, src0, src1 = m.groups()
             sgpr_name(dst)
@@ -1576,6 +1640,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint salu{i} = {value};")
             scalar[dst] = ("uint", f"salu{i}")
             scc = NONZERO.format(r=f"salu{i}")
+        elif m := match(r"(s_addc_u32|s_subb_u32) (s\d+), ([^,]+), ([^,]+)"):
+            op, dst, src0, src1 = m.groups()
+            sgpr_name(dst)
+            if scc is None:
+                raise ValueError("Carry or borrow input is not tracked")
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            a, b = (scalar_u32(t, scalar, pending) for t in (src0, src1))
+            result = f"salu{i}"
+            partial = f"partial{i}"
+            step = f"carry_in{i}"
+            lines.append(f"    uint {step} = {scc} ? 1u : 0u;")
+            # Keep both steps in uint32 so the two possible wrap points remain visible.
+            if op == "s_addc_u32":
+                lines.append(f"    uint {partial} = {a} + {b};")
+                lines.append(f"    uint {result} = {partial} + {step};")
+                scc = f"({partial} < {a} || {result} < {partial})"
+            else:
+                lines.append(f"    uint {partial} = {a} - {b};")
+                lines.append(f"    uint {result} = {partial} - {step};")
+                scc = f"({a} < {b} || {partial} < {step})"
+            scalar[dst] = ("uint", result)
         elif m := match(rf"s_({'|'.join(SCALAR)}) (s\d+), (.+)"):
             # Uniform values become HLSL uint locals; an exec mask does not affect them.
             op, dst, operands = m.groups()

@@ -57,6 +57,8 @@ def check_unreadable_torrent_is_a_usage_error() -> None:
     for label, torrent in (
         ("single-file torrent", single_file),
         ("info is not a dictionary", b"d4:infoi7ee"),
+        ("missing piece hashes", b"d4:infod5:filesld6:lengthi1e4:pathl1:aeee12:piece lengthi16384eee"),
+        ("wrong piece count", b"d4:infod5:filesld6:lengthi1e4:pathl1:aeee12:piece lengthi16384e6:pieces0:ee"),
         ("path is not text", b"d4:infod5:filesld6:lengthi1e4:pathl1:\xffeee12:piece lengthi16384e6:pieces20:"
                              + bytes(20) + b"ee"),
         ("negative size", b"d4:infod5:filesld6:lengthi-1e4:pathl1:aeee12:piece lengthi16384e6:pieces20:"
@@ -65,7 +67,7 @@ def check_unreadable_torrent_is_a_usage_error() -> None:
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory) / "package"
             package.mkdir()
-            (package / "layout.xml").touch()
+            (package / "layout.xml").write_text("<Package/>", encoding="utf-8")
             (package / "payload.torrent").write_bytes(torrent)
             report = Path(directory) / "report.json"
             run = subprocess.run(
@@ -144,6 +146,7 @@ def check_decode_torrent():
     assert decoded[b"info"][b"piece length"] == 262144
     assert len(decoded[b"info"][b"files"]) == 2
     assert decode_torrent(b"d1:Z1:x1:a1:ye") == {b"Z": b"x", b"a": b"y"}
+    assert decode_torrent(b"l" * 32 + b"e" * 32) is not None
 
     for malformed in (
         b"",
@@ -170,6 +173,9 @@ def check_decode_torrent():
         b"d1:a1:x",
         b"l1:x",
         b"i0ei1e",
+        b"l" * 5000 + b"e" * 5000,
+        b"l" * 5000,
+        b"d1:a" * 5000,
     ):
         try:
             decode_torrent(malformed)
