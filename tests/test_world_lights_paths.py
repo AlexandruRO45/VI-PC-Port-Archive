@@ -417,6 +417,17 @@ class ScanTest(unittest.TestCase):
             self.assertEqual(f.read(), "old\n")
         self.assertEqual(sorted(os.listdir(self.tmp.name)), ["bad.jsonl", "entities.jsonl", "levels.rpf", "lights.jsonl"])
 
+    def test_failed_publish_leaves_no_staging_file(self):
+        lights = os.path.join(self.tmp.name, "lights.jsonl")
+        with open(lights, "w", encoding="utf-8") as f:
+            f.write("old\n")
+        with mock.patch.object(T.os, "replace", side_effect=PermissionError("locked")):
+            with self.assertRaises(PermissionError):
+                T.summarize(T.scan(self.rpf, lights_out=True), self.entities, lights)
+        with open(lights, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old\n")
+        self.assertFalse([n for n in os.listdir(self.tmp.name) if n.endswith(".tmp")])
+
     def test_cli_writes_summary_and_placed_lights(self):
         out = os.path.join(self.tmp.name, "summary.json")
         lights = os.path.join(self.tmp.name, "lights.jsonl")

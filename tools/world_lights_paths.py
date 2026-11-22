@@ -705,13 +705,18 @@ def summarize(total, entities=None, lights_out=None):
                                                  separators=(",", ":")) + "\n")
         ok = True
     finally:
-        if out is not None:
-            out.close()
-        if tmp is not None:
+        try:
+            if out is not None:
+                out.close()
             if ok:
                 os.replace(tmp, lights_out)
-            else:
-                os.unlink(tmp)
+                tmp = None
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
     summary["placement"] = dict(placed)
     nodes = [n for part in total["nodes"] for n in part]
     links = [l for part in total["links"] for l in part]
