@@ -7,6 +7,7 @@
 //             hidden return pointer in RDX, so slot 14 wraps it)
 //   slot 62  CreateComputePipelineState
 //   slot 76  resource creation with an Xbox layout word (0x101)
+//   slot 8/36 CreateCommandQueue/CreateFence (return queue and fence proxies that run GPU work)
 // Slot 9 on the device is CreateCommandAllocator on the PC vtable and must still forward, which proves the handle
 // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
 #include <windows.h>
@@ -224,8 +225,10 @@ void test_console_list(ID3D12Device* device, ID3D12CommandAllocator* allocator, 
               rt::d3d12_xs::list_slot_hits(15) == 1,
           "forwarded list slots are counted");
 
-    // The host queue takes the PC list; the Xbox-ABI queue proxy does this replacement for the game.
-    queue->ExecuteCommandLists(1, &real_list);
+    // As the title does: the list proxy to the queue proxy, whose slot 10 hands the host queue the PC list.
+    check(rt::d3d12_xs::is_queue_proxy(queue.Get()), "console list: the queue is a queue proxy");
+    ID3D12CommandList* const console_lists[] = {list.Get()};
+    queue->ExecuteCommandLists(1, console_lists);
     queue->Signal(fence.Get(), 1);
     HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     fence->SetEventOnCompletion(1, done);
@@ -509,6 +512,33 @@ int main() {
     }
 
     if (heap && allocator) test_console_list(device.Get(), allocator.Get(), heap.Get());
+    // Slots 8 and 36 on the device the shim made: a title gets queue and fence proxies, and they run GPU work.
+    {
+        using CreateQueueFn = HRESULT(WINAPI*)(void*, const D3D12_COMMAND_QUEUE_DESC*, const IID*, void**);
+        using CreateFenceFn = HRESULT(WINAPI*)(void*, UINT64, D3D12_FENCE_FLAGS, const IID*, void**);
+        void** vtable = *reinterpret_cast<void***>(device.Get());
+        const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        const IID iid_queue = __uuidof(ID3D12CommandQueue);
+        const IID iid_fence = __uuidof(ID3D12Fence);
+        ComPtr<ID3D12CommandQueue> queue;
+        ComPtr<ID3D12Fence> fence;
+        hr = reinterpret_cast<CreateQueueFn>(vtable[8])(device.Get(), &queue_desc, &iid_queue,
+                                                        reinterpret_cast<void**>(queue.GetAddressOf()));
+        check(SUCCEEDED(hr) && rt::d3d12_xs::is_queue_proxy(queue.Get()), "slot 8 returns a queue proxy");
+        hr = reinterpret_cast<CreateFenceFn>(vtable[36])(device.Get(), 0, D3D12_FENCE_FLAG_NONE, &iid_fence,
+                                                         reinterpret_cast<void**>(fence.GetAddressOf()));
+        check(SUCCEEDED(hr) && rt::d3d12_xs::is_fence_proxy(fence.Get()), "slot 36 returns a fence proxy");
+        if (queue && fence) {
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            check(event && SUCCEEDED(queue->Signal(fence.Get(), 1)) &&
+                      SUCCEEDED(fence->SetEventOnCompletion(1, event)) && WaitForSingleObject(event, 5000) == 0,
+                  "the queue proxy signals the fence proxy on the GPU");
+            if (event) CloseHandle(event);
+            ComPtr<ID3D12Device> owner;
+            check(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()))) && owner.Get() == device.Get(),
+                  "the queue proxy's GetDevice is the device the shim returned");
+        }
+    }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
     if (real) real->AddRef();

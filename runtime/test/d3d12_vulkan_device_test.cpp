@@ -2193,7 +2193,7 @@ int main() {
             EXPECT(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
         }
         // A list from slot 12 is a console-order proxy: a copy (console 15) and Close (9) called by index, then
-        // its PC list executed (the Xbox-ABI queue proxy makes that replacement for the game).
+        // the proxy itself executed on the queue proxy, as the title does.
         {
             Ref<ID3D12CommandAllocator> console_allocator;
             Ref<ID3D12GraphicsCommandList> console_list;
@@ -2224,7 +2224,9 @@ int main() {
                 using CloseFn = HRESULT(WINAPI*)(void*);
                 reinterpret_cast<CopyFn>(vtbl[15])(console_list.p, dst.p, 0, src.p, 0, 256);
                 EXPECT(SUCCEEDED(reinterpret_cast<CloseFn>(vtbl[9])(console_list.p)));
-                queue->ExecuteCommandLists(1, &pc_list);
+                EXPECT(rt::d3d12_xs::is_queue_proxy(queue.p));
+                ID3D12CommandList* const console_lists[] = {console_list.p};
+                queue->ExecuteCommandLists(1, console_lists);
                 EXPECT(submit_and_wait());
                 bool same = SUCCEEDED(dst->Map(0, nullptr, &mapped));
                 for (unsigned i = 0; same && i < 256; ++i)
