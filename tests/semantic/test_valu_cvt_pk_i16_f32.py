@@ -39,8 +39,11 @@ Standard library Python only; zero third-party dependencies; zero game data.
 Python 3.9+ compatible (from __future__ import annotations).
 """
 
+import dataclasses
+import enum
 import math
 import struct
+from typing import Union
 import unittest
 
 MASK16: int = 0xFFFF
@@ -174,6 +177,177 @@ def ref_cvt_pk_i16_f32(
     return pack_i16_to_u32(lo, hi)
 
 
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    """Register kinds in RDNA2 architecture."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """RDNA architectural register."""
+    kind: RegKind
+    index: int
+
+    def __post_init__(self) -> None:
+        if self.index < 0:
+            raise ValueError(f"Register index must be non-negative: {self.index}")
+        if self.kind == RegKind.VGPR and self.index >= 256:
+            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+        if self.kind == RegKind.SGPR and self.index >= 106:
+            raise ValueError(f"SGPR index out of range [0, 105]: {self.index}")
+
+    @property
+    def name(self) -> str:
+        return f"{self.kind.value}{self.index}"
+
+    def to_assembly(self) -> str:
+        return self.name
+
+
+@dataclasses.dataclass(frozen=True)
+class Immediate:
+    """32-bit immediate or inline constant."""
+    value: int
+
+    def to_assembly(self) -> str:
+        val = s32(self.value)
+        if -16 <= val <= 64:
+            return str(val)
+        return f"{u32(self.value):#x}"
+
+
+Operand = Union[Register, Immediate]
+
+
+class Opcode(enum.Enum):
+    """Opcode definitions for VALU and SALU instructions."""
+    V_CVT_PK_I16_F32 = "v_cvt_pk_i16_f32"
+    V_MOV_B32 = "v_mov_b32"
+    S_MOV_B32 = "s_mov_b32"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """RDNA2 instruction representation."""
+    opcode: Opcode
+    dst: Register
+    src0: Operand
+    src1: Operand | None = None
+    modifiers: tuple[str, ...] = dataclasses.field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dst, Register):
+            raise TypeError(f"Destination must be a Register, got {type(self.dst).__name__}")
+        if self.opcode == Opcode.V_CVT_PK_I16_F32:
+            if self.dst.kind != RegKind.VGPR:
+                raise TypeError(f"Destination for {self.opcode.value} must be a VGPR, got {self.dst.kind.name}")
+            if self.src1 is None:
+                raise ValueError(f"{self.opcode.value} requires two source operands")
+
+    def to_assembly(self) -> str:
+        parts = [self.opcode.value, self.dst.to_assembly()]
+        parts.append(self.src0.to_assembly())
+        if self.src1 is not None:
+            parts.append(self.src1.to_assembly())
+        mods = " ".join(self.modifiers)
+        line = f"{parts[0]} {parts[1]}, {', '.join(parts[2:])}"
+        if mods:
+            line = f"{line} {mods}"
+        return line
+
+
+@dataclasses.dataclass
+class Program:
+    """Sequence of instructions forming a shader basic block."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def emit(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class ASTNode:
+    """Base class for all symbolic AST nodes."""
+    pass
+
+
+class ASTExpr(ASTNode):
+    """Base class for typed symbolic expressions."""
+    bitwidth: int = 32
+
+
+@dataclasses.dataclass(frozen=True)
+class VarExpr(ASTExpr):
+    """Symbolic variable operand (e.g. register contents)."""
+    name: str
+    bitwidth: int = 32
+
+
+@dataclasses.dataclass(frozen=True)
+class ConstExpr(ASTExpr):
+    """Symbolic constant expression."""
+    value: int
+    bitwidth: int = 32
+
+
+@dataclasses.dataclass(frozen=True)
+class F32ToI16Expr(ASTExpr):
+    """Symbolic float-to-signed-16-bit integer conversion operator."""
+    child: ASTExpr
+    bitwidth: int = 16
+
+
+@dataclasses.dataclass(frozen=True)
+class PackI16Expr(ASTExpr):
+    """Symbolic packing of two 16-bit expressions into a 32-bit dword."""
+    lo: ASTExpr
+    hi: ASTExpr
+    bitwidth: int = 32
+
+
+def eval_ast(node: ASTExpr, env: dict[str, int]) -> int:
+    """Evaluate symbolic AST expression deterministically in an integer environment."""
+    if isinstance(node, VarExpr):
+        if node.name not in env:
+            raise KeyError(f"Variable {node.name} not found in environment")
+        return u32(env[node.name])
+    if isinstance(node, ConstExpr):
+        return u32(node.value)
+    if isinstance(node, F32ToI16Expr):
+        val = eval_ast(node.child, env)
+        return f32_to_i16(val)
+    if isinstance(node, PackI16Expr):
+        lo = eval_ast(node.lo, env)
+        hi = eval_ast(node.hi, env)
+        return pack_i16_to_u32(lo, hi)
+    raise TypeError(f"Unknown AST node type: {type(node).__name__}")
+
+
+def instruction_to_ast(inst: Instruction) -> PackI16Expr:
+    """Translate a v_cvt_pk_i16_f32 instruction into its canonical typed symbolic AST."""
+    if inst.opcode != Opcode.V_CVT_PK_I16_F32:
+        raise ValueError(f"Cannot translate non-pack opcode to PackI16Expr: {inst.opcode}")
+    assert inst.src1 is not None
+
+    def operand_to_ast(op: Operand) -> ASTExpr:
+        if isinstance(op, Register):
+            return VarExpr(name=op.name, bitwidth=32)
+        elif isinstance(op, Immediate):
+            return ConstExpr(value=op.value, bitwidth=32)
+        raise TypeError(f"Unsupported operand: {type(op).__name__}")
+
+    s0_expr = operand_to_ast(inst.src0)
+    s1_expr = operand_to_ast(inst.src1)
+    return PackI16Expr(lo=F32ToI16Expr(s0_expr), hi=F32ToI16Expr(s1_expr))
+
+
 class TestValuCvtPkI16F32Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -240,6 +414,72 @@ class TestValuCvtPkI16F32Oracle(unittest.TestCase):
         # neg(10.0f) -> -10 -> 0xFFF6
         pos_ten = f32_to_bits(10.0)
         self.assertEqual(ref_cvt_pk_i16_f32(0, pos_ten, neg1=True), 0xFFF60000)
+
+
+class TestValuCvtPkI16F32AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_assembly_formatting(self) -> None:
+        inst1 = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+        )
+        self.assertEqual(inst1.to_assembly(), "v_cvt_pk_i16_f32 v0, v1, v2")
+
+        inst2 = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_F32,
+            dst=Register(RegKind.VGPR, 5),
+            src0=Register(RegKind.SGPR, 2),
+            src1=Immediate(f32_to_bits(1.0)),
+        )
+        self.assertEqual(inst2.to_assembly(), "v_cvt_pk_i16_f32 v5, s2, 0x3f800000")
+
+    def test_program_emission(self) -> None:
+        prog = Program()
+        prog.emit(Instruction(Opcode.S_MOV_B32, Register(RegKind.SGPR, 0), Immediate(POS_ONE_F32)))
+        prog.emit(Instruction(Opcode.V_MOV_B32, Register(RegKind.VGPR, 1), Immediate(NEG_ONE_F32)))
+        prog.emit(Instruction(
+            Opcode.V_CVT_PK_I16_F32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.SGPR, 0),
+        ))
+        expected = (
+            "s_mov_b32 s0, 0x3f800000\n"
+            "v_mov_b32 v1, 0xbf800000\n"
+            "v_cvt_pk_i16_f32 v0, v1, s0"
+        )
+        self.assertEqual(prog.to_assembly(), expected)
+
+    def test_symbolic_ast_evaluation(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I16_F32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+        )
+        ast_tree = instruction_to_ast(inst)
+        self.assertIsInstance(ast_tree, PackI16Expr)
+        self.assertIsInstance(ast_tree.lo, F32ToI16Expr)
+        self.assertIsInstance(ast_tree.hi, F32ToI16Expr)
+
+        # Evaluate with test environment
+        env = {"v1": f32_to_bits(100.5), "v2": f32_to_bits(-50.5)}
+        res = eval_ast(ast_tree, env)
+        expected = ref_cvt_pk_i16_f32(f32_to_bits(100.5), f32_to_bits(-50.5))
+        self.assertEqual(res, expected)
+        self.assertEqual(res, ((s32(-50) & 0xFFFF) << 16) | (100 & 0xFFFF))
+
+    def test_ast_immutability(self) -> None:
+        reg = Register(RegKind.VGPR, 0)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            reg.index = 1  # type: ignore[misc]
+
+        imm = Immediate(42)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            imm.value = 43  # type: ignore[misc]
 
 
 if __name__ == "__main__":
