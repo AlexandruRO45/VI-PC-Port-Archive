@@ -745,5 +745,85 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
                 self.assertEqual(state.get_lane_vgpr(lane, r), expected)
 
 
+class TestRegisterAliasingAndOperandPreservation(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_scalar_operand_preservation_boundary_registers(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(0, 0x11223344)
+        state.set_vgpr(255, 0x55667788)
+        state.set_m0(10)
+
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr_v0 = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, vdata0=v0, offset=1)
+        interp.execute(instr_v0, state)
+        self.assertEqual(state.get_vgpr(0), 0x11223344)
+        self.assertEqual(state.get_m0(), 10)
+
+        v255 = RegisterOperand(255, RegType.VGPR)
+        instr_v255 = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_P, vdata0=v255, offset=1)
+        interp.execute(instr_v255, state, wave_id=1)
+        self.assertEqual(state.get_vgpr(255), 0x55667788)
+        self.assertEqual(state.get_m0(), 10)
+
+    def test_scalar_full_register_file_undisturbed(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        for i in range(DEFAULT_NUM_VGPRS):
+            state.set_vgpr(i, 0xAA000000 | i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            state.set_sgpr(i, 0xBB000000 | i)
+        state.set_m0(0x25)
+
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=5)
+        instr_p = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_P, offset=5)
+
+        interp.execute(instr_v, state)
+        interp.execute(instr_p, state, wave_id=1)
+
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.assertEqual(state.get_vgpr(i), 0xAA000000 | i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.assertEqual(state.get_sgpr(i), 0xBB000000 | i)
+        self.assertEqual(state.get_m0(), 0x25)
+
+    def test_scalar_repeated_operand_use_across_semas(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        common_val = 0xCAFEBABE
+        state.set_vgpr(8, common_val)
+        v8 = RegisterOperand(8, RegType.VGPR)
+
+        for i in range(5):
+            instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, vdata0=v8, offset=i)
+            interp.execute(instr_v, state)
+            self.assertEqual(state.get_vgpr(8), common_val)
+
+        for i in range(5):
+            self.assertEqual(state.gws.read_counter(i), 1)
+
+    def test_simd_multi_lane_preservation_under_divergence(self) -> None:
+        mask = 0x5A5A5A5A5A5A5A5A
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        interp = SIMDInterpreter()
+
+        for lane in range(64):
+            for r in range(16):
+                state.set_lane_vgpr(lane, r, ((lane + 1) * 300) + r)
+
+        instr = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=12)
+        res = interp.execute(instr, state)
+        self.assertIsNotNone(res)
+
+        for lane in range(64):
+            for r in range(16):
+                expected = ((lane + 1) * 300) + r
+                self.assertEqual(state.get_lane_vgpr(lane, r), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
