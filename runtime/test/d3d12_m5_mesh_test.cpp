@@ -21,7 +21,8 @@
 //           without multiDrawIndirect.
 //     Without drawIndirectCount, I2..I4 are left out, and a count-buffer call must fail as unsupported.
 //     --single-calls and --no-count-buffers turn multiDrawIndirect and drawIndirectCount off on the layer's device
-//     (registered as d3d12_m5_mesh_fallbacks), so those paths run on any GPU; --max-draw-indirect-count N lowers the
+//     (registered as d3d12_m5_mesh_fallbacks), so those paths run on every GPU that runs this test (64-wide mesh
+//     subgroups), whatever its features; --max-draw-indirect-count N lowers the
 //     layer's limit (d3d12_m5_mesh_chunks runs N = 3, so I5 is split into calls of 3 records at stride 24). The
 //     one-call-per-record split itself only shows as a validation error on a device without multiDrawIndirect.
 // (c) Refusals: a DISPATCH_MESH signature whose stride is below 12 is E_INVALIDARG; one with a root constant before
