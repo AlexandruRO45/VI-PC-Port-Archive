@@ -16,7 +16,8 @@ from cpu_ranges import function_ranges
 from cpu_sse_aot import translate
 
 SIGNATURES = {"blend_ss": "f:ffqf", "blend_sd": "d:ddqd", "convert": "q:fdq", "from_int": "d:qq",
-              "classify_ss": "q:ff", "classify_sd": "q:dq", "round_trip": "f:f"}
+              "classify_ss": "q:ff", "classify_sd": "q:dq", "round_trip": "f:f",
+              "zero_xorps": "d:d", "zero_pxor": "d:d", "zero_xorpd": "d:d"}
 GUARD = bytes.fromhex("5a5a1234a5a54321")
 FILL = 0xa5
 MASK32 = 0xffffffff
@@ -83,6 +84,8 @@ def cases():
     for i, f in enumerate(SINGLES):
         for step in (0, 1, 5, 11, 17, 23, 29, 31):
             found.append(("convert", (f, DOUBLES[(i + step * (i + 1)) % len(DOUBLES)], None), bytes([FILL]) * 80))
+    for name in ("zero_xorps", "zero_pxor", "zero_xorpd"):
+        found.extend((name, (value,), b"") for value in DOUBLES)
     found += [("from_int", (n, None), bytes([FILL]) * 32) for n in INTEGERS]
     found += [("round_trip", (f,), b"") for f in SINGLES]
     return found
@@ -185,6 +188,9 @@ def known_answers():
         ("classify_sd", (double(2.0), None), struct.pack("<Q", double(1.0)), 2, struct.pack("<Q", double(1.0))),
         ("classify_sd", (double(1.0), None), struct.pack("<Q", double(2.0)), 4, struct.pack("<Q", double(2.0))),
         ("classify_sd", (0x7ff0000000000001, None), struct.pack("<Q", 0), 8, struct.pack("<Q", 0)),
+        ("zero_xorps", (double(1.0),), b"", 0, b""),
+        ("zero_pxor", (double(-2.0),), b"", 0, b""),
+        ("zero_xorpd", (double(3.0),), b"", 0, b""),
         # The conversion pair quiets a signalling NaN and keeps a quiet one and a number unchanged.
         ("round_trip", (0x7f800001,), b"", 0x7fc00001, b""),
         ("round_trip", (0xffa00000,), b"", 0xffe00000, b""),

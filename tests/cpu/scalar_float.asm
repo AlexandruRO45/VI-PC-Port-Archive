@@ -183,4 +183,28 @@ ELSE
 ENDIF
     ret
 round_trip ENDP
+zero_xorps PROC FRAME
+    .endprolog
+IFNDEF SWAP_OPERANDS
+    xorps xmm0, xmm0
+ENDIF
+    ret
+zero_xorps ENDP
+
+zero_pxor PROC FRAME
+    .endprolog
+IFNDEF SWAP_OPERANDS
+    pxor xmm0, xmm0
+ENDIF
+    ret
+zero_pxor ENDP
+
+zero_xorpd PROC FRAME
+    .endprolog
+IFNDEF SWAP_OPERANDS
+    xorpd xmm0, xmm0
+ENDIF
+    ret
+zero_xorpd ENDP
+
 END

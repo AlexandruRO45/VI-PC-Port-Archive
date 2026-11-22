@@ -261,16 +261,33 @@ def check_shader_records():
         ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
         ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
     }
+    sopc_forms = {
+        ("SOPC", "s_cmp_eq_i32"), ("SOPC", "s_cmp_lg_i32"),
+        ("SOPC", "s_cmp_gt_i32"), ("SOPC", "s_cmp_ge_i32"),
+        ("SOPC", "s_cmp_lt_i32"), ("SOPC", "s_cmp_le_i32"),
+        ("SOPC", "s_cmp_eq_u32"), ("SOPC", "s_cmp_lg_u32"),
+        ("SOPC", "s_cmp_gt_u32"), ("SOPC", "s_cmp_ge_u32"),
+        ("SOPC", "s_cmp_lt_u32"), ("SOPC", "s_cmp_le_u32"),
+        ("SOPC", "s_cmp_eq_u64"), ("SOPC", "s_cmp_lg_u64"),
+        ("SOPC", "s_bitcmp0_b32"), ("SOPC", "s_bitcmp1_b32"),
+        ("SOPC", "s_bitcmp0_b64"), ("SOPC", "s_bitcmp1_b64"),
+    }
+    vop2_forms = {
+        ("VOP2", "v_lshrrev_b32"), ("VOP2", "v_ashrrev_i32"), ("VOP2", "v_lshlrev_b32"),
+        ("VOP2", "v_and_b32"), ("VOP2", "v_or_b32"), ("VOP2", "v_xor_b32"),
+        ("VOP2", "v_add_nc_u32"), ("VOP2", "v_sub_nc_u32"),
+    }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
-        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64",
-        "s_cmp_eq_u64", "s_bitcmp1_b64", "s_bfm_b32",
-        "s_add_u32", "s_and_b32", "s_not_b32", "s_cmp_eq_i32", "s_cselect_b32",
+        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64", "s_bfm_b32",
+        "s_add_u32", "s_and_b32", "s_not_b32", "s_cselect_b32",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         covered = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
+        assert sopc_forms <= covered, (name, sopc_forms - covered)
+        assert vop2_forms <= covered, (name, vop2_forms - covered)
 
 
 def check_parsing():
@@ -304,6 +321,20 @@ def check_parsing():
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
     unmatched = full["x64_zen2"]["fixture_forms_not_in_reference"]
     assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
+
+
+def check_gaps():
+    reference = {("VOP1", "v_a"), ("VOP3", "v_a_e64"), ("VOP3", "v_b_e64"), ("VOP1", "v_c")}
+    fixtures = {"passing": ({"v_a_e32"}, "pass"),
+                "skipping": ({"v_a_e32", "v_a_e64"}, "skip"),
+                "failing": ({"v_a_e64", "v_b_e64"}, "fail")}
+    measured = fc.summarize(reference, fixtures, fc.gfx_forms, include_gaps=True)
+    assert measured.pop("gaps") == [
+        ("VOP1", "v_c", "unobserved"),
+        ("VOP3", "v_a_e64", "skipped"),
+        ("VOP3", "v_b_e64", "observed_without_pass"),
+    ]
+    assert measured == fc.summarize(reference, fixtures, fc.gfx_forms)
 
 
 def check_dashboard():
@@ -366,6 +397,164 @@ def check_cpu_records():
             report = fc.measure(results, root, {test: forms})
             assert report['x64_zen2']['covered'] == 0
             assert len(report['x64_zen2']['blocked_by_skip']) == (12 if state == 'skip' else 0)
+def check_avx2_regs():
+    """avx2_regs.asm covers all 28 AVX2 forms in docs/coverage/x64_zen2.tsv group AVX2."""
+    expected_avx2 = {
+        "vbroadcasti128", "vextracti128", "vinserti128", "vperm2i128",
+        "vpbroadcastb", "vpbroadcastw", "vpbroadcastd", "vpbroadcastq",
+        "vpermd", "vpermpd", "vpermps", "vpermq",
+        "vpblendd",
+        "vpsllvd", "vpsllvq", "vpsravd", "vpsrlvd", "vpsrlvq",
+        "vgatherdpd", "vgatherdps", "vgatherqpd", "vgatherqps",
+        "vpgatherdd", "vpgatherdq", "vpgatherqd", "vpgatherqq",
+        "vpmaskmovd", "vpmaskmovq",
+    }
+    reference = fc.load_reference("x64_zen2.tsv")
+    all_avx2 = {form for group, form in reference if group == "AVX2"}
+    assert expected_avx2 == all_avx2 and len(all_avx2) == 28
+
+    asm_text = (fc.ROOT / "tests" / "cpu" / "avx2_regs.asm").read_text(encoding="utf-8")
+    found = fc.masm_mnemonics(asm_text)
+    assert expected_avx2 <= found, expected_avx2 - found
+
+    passed = fc.measure({"cpu_aot_avx2_regs": "pass"})
+    assert passed["fixtures"]["avx2_regs.asm"] == "pass"
+    assert "avx2_regs.asm" not in passed["unclassified"]
+    avx2_group = passed["x64_zen2"]["groups"]["AVX2"]
+    assert avx2_group == {"covered": 28, "total": 28}, avx2_group
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"avx2_regs": asm_text})
+        only_pass = fc.measure({"cpu_aot_avx2_regs": "pass"}, root)["x64_zen2"]
+        only_skip = fc.measure({"cpu_aot_avx2_regs": "skip"}, root)["x64_zen2"]
+        only_fail = fc.measure({"cpu_aot_avx2_regs": "fail"}, root)["x64_zen2"]
+        assert only_pass["groups"]["AVX2"] == {"covered": 28, "total": 28}
+        assert only_pass["fixture_forms_not_in_reference"] == []
+        assert only_skip["groups"]["AVX2"] == {"covered": 0, "total": 28}
+        for form in expected_avx2:
+            assert f"AVX2 {form}" in only_skip["blocked_by_skip"]
+        assert only_fail["groups"]["AVX2"] == {"covered": 0, "total": 28}
+        assert only_fail["blocked_by_skip"] == []
+
+def check_avx_int_regs():
+    """avx_int_regs.asm covers 90 surviving AVX packed-integer forms in docs/coverage/x64_zen2.tsv group AVX."""
+    expected_avx_int = {
+        "vmpsadbw",
+        "vpabsb", "vpabsd", "vpabsw",
+        "vpackssdw", "vpacksswb", "vpackusdw",
+        "vpaddb", "vpaddq", "vpaddsb", "vpaddusb", "vpaddusw",
+        "vpalignr",
+        "vpblendvb", "vpblendw",
+        "vpcmpeqb", "vpcmpeqd", "vpcmpeqq", "vpcmpeqw",
+        "vpcmpgtb", "vpcmpgtd", "vpcmpgtq", "vpcmpgtw",
+        "vpextrb", "vpextrd", "vpextrq", "vpextrw",
+        "vphaddd", "vphaddsw", "vphaddw", "vphminposuw", "vphsubd", "vphsubsw", "vphsubw",
+        "vpinsrb", "vpinsrd", "vpinsrq", "vpinsrw",
+        "vpmaddwd",
+        "vpmaxsb", "vpmaxsd", "vpmaxub", "vpmaxud", "vpmaxuw",
+        "vpminsb", "vpminsd", "vpminub", "vpminud", "vpminuw",
+        "vpmovmskb",
+        "vpmovsxbd", "vpmovsxbq", "vpmovsxbw", "vpmovsxdq", "vpmovsxwd", "vpmovsxwq",
+        "vpmovzxbd", "vpmovzxbq", "vpmovzxbw", "vpmovzxdq", "vpmovzxwd", "vpmovzxwq",
+        "vpmuldq", "vpmulhrsw", "vpmulhuw", "vpmulld", "vpmuludq",
+        "vpsadbw",
+        "vpshufhw", "vpshuflw",
+        "vpsignb", "vpsignd", "vpsignw",
+        "vpslld", "vpsllq", "vpsrld", "vpsrlq",
+        "vpsubb", "vpsubd", "vpsubq", "vpsubsb", "vpsubsw", "vpsubusb", "vpsubusw",
+        "vpunpckhdq", "vpunpckhqdq", "vpunpckldq", "vpunpcklqdq",
+        "vzeroall", "vzeroupper",
+    }
+    carved_avx_int = {
+        "vpackuswb", "vpaddd", "vpaddw", "vpand", "vpor", "vpxor", "vpavgw",
+        "vpmaxsw", "vpminsw", "vpmulhw", "vpsllw", "vpsraw", "vpsrlw", "vpsubw",
+        "vpunpckhbw", "vpunpckhwd", "vpunpcklbw", "vpunpcklwd", "vpavgb",
+        "vpshufb", "vpmaddubsw", "vpaddsw", "vpmullw", "vpandn", "vpsrad",
+        "vpsrldq", "vpslldq", "vpshufd",
+    }
+    assert len(expected_avx_int) == 90 and len(carved_avx_int) == 28
+    assert expected_avx_int.isdisjoint(carved_avx_int)
+    reference = fc.load_reference("x64_zen2.tsv")
+    all_avx = {form for group, form in reference if group == "AVX"}
+    assert expected_avx_int <= all_avx, expected_avx_int - all_avx
+
+    asm_text = (fc.ROOT / "tests" / "cpu" / "avx_int_regs.asm").read_text(encoding="utf-8")
+    found = fc.masm_mnemonics(asm_text)
+    assert expected_avx_int <= found, expected_avx_int - found
+    assert carved_avx_int.isdisjoint(found), carved_avx_int & found
+    # avx_int_regs.asm covers the 90 surviving AVX packed-integer forms plus transport vmovdqu (91 AVX total).
+    expected_avx_total = expected_avx_int | {"vmovdqu"}
+    assert (found & all_avx) == expected_avx_total, (found & all_avx) ^ expected_avx_total
+
+    passed = fc.measure({"cpu_aot_avx_int_regs": "pass"})
+    assert passed["fixtures"]["avx_int_regs.asm"] == "pass"
+    assert "avx_int_regs.asm" not in passed["unclassified"]
+    assert passed["x64_zen2"]["groups"]["AVX"]["covered"] == len(expected_avx_total), passed["x64_zen2"]["groups"]["AVX"]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"avx_int_regs": asm_text})
+        only_pass = fc.measure({"cpu_aot_avx_int_regs": "pass"}, root)["x64_zen2"]
+        only_skip = fc.measure({"cpu_aot_avx_int_regs": "skip"}, root)["x64_zen2"]
+        only_fail = fc.measure({"cpu_aot_avx_int_regs": "fail"}, root)["x64_zen2"]
+        assert only_pass["groups"]["AVX"]["covered"] == len(expected_avx_total)
+        assert only_pass["fixture_forms_not_in_reference"] == []
+        assert only_skip["groups"]["AVX"]["covered"] == 0
+        for form in expected_avx_int:
+            assert f"AVX {form}" in only_skip["blocked_by_skip"]
+        assert only_fail["groups"]["AVX"]["covered"] == 0
+        assert only_fail["blocked_by_skip"] == []
+
+
+def check_avx_move_regs():
+    """avx_move_regs.asm covers 50 surviving AVX move/shuffle/blend/logical forms in docs/coverage/x64_zen2.tsv group AVX."""
+    expected_avx_move = {
+        "vandnpd", "vandnps", "vandpd", "vandps",
+        "vblendpd", "vblendps", "vblendvpd", "vblendvps",
+        "vbroadcastf128", "vbroadcastsd", "vbroadcastss",
+        "vextractf128", "vextractps", "vinsertf128", "vinsertps",
+        "vlddqu", "vmaskmovpd", "vmaskmovps",
+        "vmovapd", "vmovddup",
+        "vmovhlps", "vmovhpd", "vmovhps", "vmovlhps", "vmovlpd", "vmovlps",
+        "vmovmskpd", "vmovmskps",
+        "vmovntdq", "vmovntdqa", "vmovntpd", "vmovntps",
+        "vmovsd", "vmovshdup", "vmovsldup", "vmovss", "vmovupd",
+        "vorpd", "vorps",
+        "vperm2f128", "vpermilpd", "vpermilps",
+        "vshufpd", "vshufps",
+        "vunpckhpd", "vunpckhps", "vunpcklpd", "vunpcklps",
+        "vxorpd", "vxorps",
+    }
+    carved_avx_move_rejected = {"vmovdqa", "vmovups", "vmovaps", "vmovq", "vmovd"}
+    assert len(expected_avx_move) == 50
+    assert expected_avx_move.isdisjoint(carved_avx_move_rejected | {"vmovdqu"})
+    reference = fc.load_reference("x64_zen2.tsv")
+    all_avx = {form for group, form in reference if group == "AVX"}
+    assert expected_avx_move <= all_avx, expected_avx_move - all_avx
+
+    asm_text = (fc.ROOT / "tests" / "cpu" / "avx_move_regs.asm").read_text(encoding="utf-8")
+    found = fc.masm_mnemonics(asm_text)
+    assert expected_avx_move <= found, expected_avx_move - found
+    assert carved_avx_move_rejected.isdisjoint(found), carved_avx_move_rejected & found
+    # 50 surviving AVX move/shuffle/blend/logical forms plus vmovdqu and vzeroupper ABI glue (52 AVX total).
+    expected_avx_total = expected_avx_move | {"vmovdqu", "vzeroupper"}
+    assert (found & all_avx) == expected_avx_total, (found & all_avx) ^ expected_avx_total
+
+    passed = fc.measure({"cpu_aot_avx_move_regs": "pass"})
+    assert passed["fixtures"]["avx_move_regs.asm"] == "pass"
+    assert "avx_move_regs.asm" not in passed["unclassified"]
+    avx_group = passed["x64_zen2"]["groups"]["AVX"]
+    assert avx_group["covered"] == len(expected_avx_total), avx_group
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"avx_move_regs": asm_text})
+        only_pass = fc.measure({"cpu_aot_avx_move_regs": "pass"}, root)["x64_zen2"]
+        only_skip = fc.measure({"cpu_aot_avx_move_regs": "skip"}, root)["x64_zen2"]
+        only_fail = fc.measure({"cpu_aot_avx_move_regs": "fail"}, root)["x64_zen2"]
+        assert only_pass["groups"]["AVX"]["covered"] == len(expected_avx_total)
+        assert only_pass["fixture_forms_not_in_reference"] == []
+        assert only_skip["groups"]["AVX"]["covered"] == 0
+        for form in expected_avx_move:
+            assert f"AVX {form}" in only_skip["blocked_by_skip"]
+        assert only_fail["groups"]["AVX"]["covered"] == 0
+        assert only_fail["blocked_by_skip"] == []
+
 
 if __name__ == "__main__":
     check_denominators()
@@ -377,5 +566,9 @@ if __name__ == "__main__":
     check_cpu_records()
     check_shader_records()
     check_parsing()
+    check_gaps()
     check_dashboard()
+    check_avx2_regs()
+    check_avx_int_regs()
+    check_avx_move_regs()
     print("form coverage checks passed")
