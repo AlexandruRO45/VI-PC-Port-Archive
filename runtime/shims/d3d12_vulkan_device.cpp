@@ -3346,10 +3346,11 @@ public:
     // STUB
     void STDMETHODCALLTYPE RemoveDevice() override { removed_.store(true, std::memory_order_release); }
 
-    // Whether the process token has SE_INC_BASE_PRIORITY_NAME present and enabled (D3D-236).
+    // Whether the process token has SeIncreaseBasePriorityPrivilege present and enabled (D3D-236). The wide name is
+    // spelled out: SE_INC_BASE_PRIORITY_NAME is a TEXT() macro and the runtime builds without UNICODE.
     static bool base_priority_privilege_enabled() {
         LUID luid{};
-        if (!LookupPrivilegeValueW(nullptr, SE_INC_BASE_PRIORITY_NAME, &luid)) return false;
+        if (!LookupPrivilegeValueW(nullptr, L"SeIncreaseBasePriorityPrivilege", &luid)) return false;
         HANDLE token = nullptr;
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
         DWORD size = 0;
