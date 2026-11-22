@@ -962,5 +962,119 @@ class TestIEEE754EdgeCasesAndBoundaryExtremes(unittest.TestCase):
         self.assertEqual(res_clamped, to_u32(INT32_MIN))
 
 
+# ==============================================================================
+# Unit Tests: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Negative controls, parser syntax rejection, and mutant kill verification."""
+
+    def test_parser_unsupported_opcode_rejected(self) -> None:
+        invalid_opcodes = [
+            "v_mad_i64_i32 v0, v1, v2, v3",
+            "v_add_i32 v0, v1, v2, v3",
+            "s_mad_i32_i16 v0, v1, v2, v3",
+        ]
+        for line in invalid_opcodes:
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    parse_v_mad_i32_i16(line)
+
+    def test_parser_invalid_operand_counts_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_v_mad_i32_i16("v_mad_i32_i16 v0, v1, v2")
+        with self.assertRaises(ValueError):
+            parse_v_mad_i32_i16("v_mad_i32_i16 v0, v1, v2, v3, v4")
+
+    def test_ast_type_and_semantic_rejections(self) -> None:
+        with self.assertRaises(TypeError):
+            VMadI32I16Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_mutation_unsigned_multiplication_killed(self) -> None:
+        def mutant_mad(s0: int, s1: int, s2: int) -> int:
+            u0 = s0 & MASK16
+            u1 = s1 & MASK16
+            return to_u32((u0 * u1) + to_i32(s2))
+
+        s0, s1, s2 = -10, 20, 0
+        gold = ref_mad_i32_i16(s0, s1, s2)
+        mut = mutant_mad(s0, s1, s2)
+        self.assertNotEqual(gold, mut)
+
+    def test_mutation_omitted_accumulator_killed(self) -> None:
+        def mutant_mad(s0: int, s1: int, s2: int) -> int:
+            return to_u32(ref_mul_i16(s0, s1))
+
+        s0, s1, s2 = 5, 5, 100
+        gold = ref_mad_i32_i16(s0, s1, s2)
+        mut = mutant_mad(s0, s1, s2)
+        self.assertEqual(gold, 125)
+        self.assertEqual(mut, 25)
+        self.assertNotEqual(gold, mut)
+
+    def test_mutation_clamp_ignored_killed(self) -> None:
+        def mutant_mad(s0: int, s1: int, s2: int, clamp: bool = False) -> int:
+            return to_u32(ref_mul_i16(s0, s1) + to_i32(s2))
+
+        gold = ref_mad_i32_i16(1000, 1000, INT32_MAX, clamp=True)
+        mut = mutant_mad(1000, 1000, INT32_MAX, clamp=True)
+        self.assertEqual(gold, INT32_MAX)
+        self.assertNotEqual(gold, mut)
+
+    def test_mutation_op_sel_ignored_killed(self) -> None:
+        def mutant_mad(s0: int, s1: int, s2: int, op_sel: tuple[int, int] = (0, 0)) -> int:
+            return ref_mad_i32_i16(s0, s1, s2, op_sel=(0, 0))
+
+        packed_s0 = (100 << 16) | 10
+        packed_s1 = 5
+        gold = ref_mad_i32_i16(packed_s0, packed_s1, 0, op_sel=(1, 0))
+        mut = mutant_mad(packed_s0, packed_s1, 0, op_sel=(1, 0))
+        self.assertEqual(gold, 500)
+        self.assertEqual(mut, 50)
+        self.assertNotEqual(gold, mut)
+
+    def test_mutation_simd_exec_mask_bypass_killed(self) -> None:
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VMadI32I16Instruction, state: SIMDState) -> list[int | None]:
+                results: list[int | None] = []
+                for lane in range(state.num_lanes):
+                    s0 = state.read_lane(instr.src0, lane)
+                    s1 = state.read_lane(instr.src1, lane)
+                    s2 = state.read_lane(instr.src2, lane)
+                    res = ref_mad_i32_i16(s0, s1, s2, clamp=instr.clamp, op_sel=instr.op_sel)
+                    state.write_lane(instr.dst, lane, res)
+                    results.append(res)
+                return results
+
+        state = SIMDState(wave_mode=WaveMode.WAVE32, exec_mask=0x0000_0000)
+        sentinel = 0xAAAA_BBBB
+        for lane in range(32):
+            state.write_lane(Operand.vgpr(0), lane, sentinel)
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.literal(1),
+            src1=Operand.literal(1),
+            src2=Operand.literal(1),
+        )
+
+        buggy = BuggySIMDInterpreter()
+        buggy.step(instr, state)
+
+        corrupted = [lane for lane in range(32) if state.vgprs[lane][0] != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
