@@ -109,6 +109,9 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   overlay; fail-if-exists counts a name only the package has. Either side can be a host path.
 - `SetFileAttributes*` sets the attributes on the overlay copy, copying a package file up (or mirroring a package
   folder) first, so the package keeps its own.
+- `<overlay>\.gta6rt-pls` is the title's persistent local storage (`XPersistentLocalStorageGetPath` returns it as a host
+  path, see "Class layouts, measured"). It is not part of `GAME:`: a listing of `GAME:\` skips it, as it skips the
+  marker folder.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
@@ -154,10 +157,12 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
-the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
-the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
-the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
+version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
+`XPersistentLocalStorageImpl`, `XGameRuntimeFeatureImpl`, `XGameEventImpl`, `XSystemAnalyticsImpl` and `XDisplayImpl`
+(below); for any other class it logs the class and interface id and returns `0x80070032`, the documented error for a
+class the runtime doesn't provide, so the first boot with the executable lists the classes to implement next.
+`xgameruntime_test` drives this path through the api-set binding `XCurl.dll` uses, and calls the served classes slot by
+slot.
 
 `XCurl.dll` has a second way in. One of its functions reads `HKLM\Microsoft\GamingServices` value
 `ServiceRetryTimeout`, then `LoadLibraryExW(L"gameplatformservices.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)` and
@@ -195,6 +200,25 @@ connectivity (level None), the port and URL security-information queries fail wi
 `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
 certificate check fails the same way, change registrations return tokens that never fire, and the three
 `IXNetworkingImpl2` additions are `E_NOTIMPL`.
+
+Five more classes are served from `tools/gdk_runtime_calls.py`'s measurement of `libHttpClient.GDK.dll` (it finds the
+thunks in the code without running it and prints, per class, the interface id asked for, the slots called and the
+argument count each passes after `this`). Their thunks are in the DLL but nothing in it calls them; a title linked with
+the same `xgameruntime.lib` gets the same thunks. Every slot is the function at that position of xgameruntime-docs'
+layout with the documented argument count, and each behaves as Microsoft's reference page for that function says
+(`runtime/shims/xgameruntime.cpp` cites both):
+
+| Class | Interface asked for | Slots (args after `this`) | Offline behaviour |
+|---|---|---|---|
+| `XPersistentLocalStorageImpl` | `IXPersistentLocalStorageImpl3` (also answers 1 and 2) | 3 `GetPathSize` (1), 4 `GetPath` (3), 5 `GetSpaceInfo` (1), 6 `PromptUserForSpaceAsync` (2), 7 `PromptUserForSpaceResult` (1), 8 `MountForPackage` (2) | The storage is `<overlay>\.gta6rt-pls\`, made on first use, never in the package and not listed under `GAME:`. Sizes count the terminator; a short buffer is `E_FAIL` (the Xbox answer; `ERROR_INSUFFICIENT_BUFFER` with device type Pc). Space info: no quota on a PC, so available = total free = the volume's free bytes, used = the folder's files, total = both. The prompt completes through XAsync with `E_ABORT` (no UI: "the user chose not to free up space"). Mounting another title's storage: `FILE_NOT_FOUND`, handle cleared |
+| `XGameRuntimeFeatureImpl` | its class id | 3 `XGameRuntimeIsFeatureAvailable` (1, returns `bool`) | True when `QueryApiImpl` serves the class the feature's functions go through and the feature is documented for Windows: today XAsync, XAsyncProvider, XTaskQueue, XThread, XError, XNetworking, XSystem, XPersistentLocalStorage, XGameEvent. False for XDisplay (documented for the consoles only), for every class not served (XStore among them) and for values past the enum |
+| `XGameEventImpl` | its class id | 3 `XGameEventWrite` (6) | Accepted and logged (32 lines, then one saying the rest aren't); nothing is sent. A null user, SCID, play session or event name is `E_INVALIDARG` |
+| `XSystemAnalyticsImpl` | its class id | 3 `XSystemGetAnalyticsInfo` (1: the result's address, as MSVC passes a returned struct to a member function) | The named export's `XSystemAnalyticsInfo` |
+| `XDisplayImpl` | `IXDisplayImpl` | 4 `XDisplayTryEnableHdrMode` (2, returns a 32-bit enum); slot 3 is undocumented and never called | `Disabled`, with the tone-map struct zeroed: the swapchains present SDR. A preference outside the enum is `Unknown`. Slot 3 logs once and returns `E_NOTIMPL` |
+
+Not served yet, though `libHttpClient.GDK.dll` has thunks for them: `XGameStreamingImpl` (slots 3-34, plus four slots of
+an interface xgameruntime-docs doesn't list), `XAccessibilityImpl` (3-21), `XLauncherImpl` (3-5) and `XUserDeviceImpl`
+(3-10), among others; `XStoreImpl` stays unserved because licence checks are not answered.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):

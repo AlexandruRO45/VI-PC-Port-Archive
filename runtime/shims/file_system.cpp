@@ -45,6 +45,9 @@ constexpr wchar_t kDeletedDir[] = L".gta6rt-deleted";
 // A removed package folder is marked by this file inside its marker folder: the marker folder itself can already
 // exist because files below it were deleted, and that alone does not hide the folder.
 constexpr wchar_t kRemovedDirMarker[] = L".gta6rt-dir";
+// XPersistentLocalStorage's folder (persistent_local_storage_dir): in the overlay, but no part of GAME:, so listings
+// of the overlay's root skip it as they skip the marker folder.
+constexpr wchar_t kPersistentLocalStorageDir[] = L".gta6rt-pls";
 
 std::mutex g_mutex;
 std::filesystem::path g_game_dir;
@@ -234,7 +237,9 @@ bool empty_in_view(const Roots& r, const std::vector<std::wstring>& parts) {
         const std::filesystem::path p = join(r.overlay, parts);
         for (auto it = std::filesystem::directory_iterator(p, ec); !ec && it != std::filesystem::directory_iterator();
              it.increment(ec)) {
-            if (parts.empty() && same_name(it->path().filename().c_str(), kDeletedDir)) continue;
+            if (parts.empty() && (same_name(it->path().filename().c_str(), kDeletedDir) ||
+                                  same_name(it->path().filename().c_str(), kPersistentLocalStorageDir)))
+                continue;
             return false;
         }
     }
@@ -396,6 +401,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         if (h == INVALID_HANDLE_VALUE) return;
         do {
             if (overlay_root && same_name(found.cFileName, kDeletedDir)) continue;
+            if (overlay_root && dirs.empty() && same_name(found.cFileName, kPersistentLocalStorageDir)) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
             if (!overlay_root && !dot) {
                 std::vector<std::wstring> entry_parts = dirs;
@@ -452,6 +458,14 @@ std::filesystem::path game_dir() {
 std::filesystem::path overlay_dir() {
     std::lock_guard lock(g_mutex);
     return g_overlay_dir;
+}
+
+std::filesystem::path persistent_local_storage_dir() {
+    const std::filesystem::path overlay = overlay_dir();
+    if (overlay.empty()) return {};
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::absolute(overlay / kPersistentLocalStorageDir, ec);
+    return ec ? overlay / kPersistentLocalStorageDir : dir.lexically_normal();
 }
 
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,

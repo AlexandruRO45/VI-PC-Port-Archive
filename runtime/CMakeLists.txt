@@ -222,10 +222,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(winhttp_offline_test PRIVATE /OPT:NOREF)
 
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
-  # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
+  # a title calls it at boot. Like xmem_test it compiles its own registry.cpp; file_system.cpp holds the overlay
+  # folder XPersistentLocalStorage hands out.
   add_executable(xgameruntime_test
     test/xgameruntime_test.cpp
     shims/xgameruntime.cpp
+    shims/file_system.cpp
     shims/library_loader.cpp
     shims/registry.cpp
   )

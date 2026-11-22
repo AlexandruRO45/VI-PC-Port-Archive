@@ -16,15 +16,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#include "file_system.h"
 #include "shims.h"
 
 namespace {
@@ -40,9 +43,9 @@ std::atomic<int> g_runtime_refs{0};
 // XCurl.dll, docs/runtime_imports.md). Signatures, the options struct and the error for an unknown class follow
 // xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
 // XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl,
-// XErrorImpl and XNetworkingImpl are served (their layouts are measured, below); for any other class QueryApiImpl
-// logs the class and interface id and refuses it, so the first boot with the executable lists the interfaces to
-// implement next.
+// XErrorImpl, XNetworkingImpl, XSystemImpl and the five classes after XPackage are served (their layouts are
+// measured, below); for any other class QueryApiImpl logs the class and interface id and refuses it, so the first
+// boot with the executable lists the interfaces to implement next.
 
 struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
     uint32_t unknown;      // documented as always 1
@@ -340,12 +343,21 @@ RuntimeObject g_error{kErrorVtable, &kErrorClass, nullptr};
 RuntimeObject g_networking{kNetworkingVtable, &kNetworkingClass, kNetworkingIids};
 
 RuntimeObject& system_object();  // XSystemImpl, defined after the XSystem functions it serves
+RuntimeObject* const* measured_objects();  // the classes after XPackage below, null-terminated
+
+// The object QueryApiImpl hands out for a class id, or null when the class isn't served.
+RuntimeObject* find_object(const GUID& class_id) {
+    for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object()})
+        if (class_id == *o->class_id) return o;
+    for (RuntimeObject* const* o = measured_objects(); *o; ++o)
+        if (class_id == *(*o)->class_id) return *o;
+    return nullptr;
+}
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
     if (class_id && out) {
-        for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object()})
-            if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
+        if (RuntimeObject* o = find_object(*class_id)) return object_query_interface(o, interface_id, out);
     }
     char cls[40], iid[40];
     print_guid(cls, class_id);
@@ -694,6 +706,343 @@ bool __stdcall XPackageIsPackagedProcess() {
         if (std::atoi(s) == 0) return false;
     }
     return true;
+}
+
+// ---- XPersistentLocalStorageImpl, XGameRuntimeFeatureImpl, XGameEventImpl, XSystemAnalyticsImpl, XDisplayImpl ----
+//
+// Measured with tools/gdk_runtime_calls.py, which finds xgameruntime.lib's thunks in an image's code without running
+// it: for each class, the interface id the thunks ask QueryApiImpl for, the slots they call and the number of
+// arguments each passes after `this`. On the package's libHttpClient.GDK.dll every slot below is the function at that
+// position of the interface's "Layout" list in xodus-gaming/xgameruntime-docs (GPL-3.0; facts only), and the measured
+// argument count is the documented one. Signatures and semantics are Microsoft's public GDK reference pages,
+// learn.microsoft.com/gaming/gdk/docs/reference/system/<family>/functions/<name>, cited per function as
+// <family>/<name>.
+// The thunks are in libHttpClient.GDK.dll but nothing there calls them; a title linked with the same xgameruntime.lib
+// reaches these classes through the same thunks. docs/runtime_imports.md has the table.
+
+// XPersistentLocalStorageImpl, asked for as IXPersistentLocalStorageImpl3. Slots, as xgameruntime-docs lists them
+// (IXPersistentLocalStorageImpl2 adds no known method) and as measured (arguments after `this`):
+//   3 XPersistentLocalStorageGetPathSize(size_t* pathSize)                                       1
+//   4 XPersistentLocalStorageGetPath(size_t pathSize, char* path, size_t* pathUsed)              3
+//   5 XPersistentLocalStorageGetSpaceInfo(XPersistentLocalStorageSpaceInfo* info)                1
+//   6 XPersistentLocalStoragePromptUserForSpaceAsync(uint64_t requestedBytes, XAsyncBlock*)      2
+//   7 XPersistentLocalStoragePromptUserForSpaceResult(XAsyncBlock*)                              1
+//   8 XPersistentLocalStorageMountForPackage(const char* packageIdentifier, XPackageMountHandle*) 2
+// (slot 8 is IXPersistentLocalStorageImpl3's). All return HRESULT (xpersistentlocalstorage/<name>, "PLS/<name>"
+// below). The storage is a folder of the write overlay, rt::fs::persistent_local_storage_dir()
+// (<overlay>\.gta6rt-pls), made on first use; never in the package.
+constexpr GUID kPlsClass = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
+constexpr GUID kPls2 = {0xd29411df, 0x0794, 0x4553, {0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d}};
+constexpr GUID kPls3 = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
+// IXPersistentLocalStorageImpl's id is the class id; IXPersistentLocalStorageImpl3 : 2 : IXPersistentLocalStorageImpl.
+const GUID* const kPlsIids[] = {&kPls2, &kPls3, nullptr};
+
+struct XPersistentLocalStorageSpaceInfo {  // xpersistentlocalstorage/structs/xpersistentlocalstoragespaceinfo
+    uint64_t availableFreeBytes;
+    uint64_t totalFreeBytes;
+    uint64_t usedBytes;
+    uint64_t totalBytes;
+};
+static_assert(sizeof(XPersistentLocalStorageSpaceInfo) == 32, "four uint64_t");
+
+// The folder, made if it isn't there yet.
+HRESULT pls_dir(std::filesystem::path& dir) {
+    dir = rt::fs::persistent_local_storage_dir();
+    if (dir.empty()) {
+        static std::atomic<bool> s_logged{false};
+        if (!s_logged.exchange(true))
+            std::fprintf(stderr, "[rt] xgameruntime: XPersistentLocalStorage: no overlay folder is set\n");
+        return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return ec ? HRESULT_FROM_WIN32(static_cast<DWORD>(ec.value())) : S_OK;
+}
+
+// The folder as the title sees it: in the code page of the narrow file API (CreateFileA widens with CP_ACP), ending
+// in a separator as a drive root does (PLS/xpersistentlocalstoragegetpath, remarks: on Xbox the storage is "a folder
+// mounted to the root of a drive"), so appending either "name" or "\name" gives a valid path.
+HRESULT pls_path(std::string& out) {
+    std::filesystem::path dir;
+    if (const HRESULT hr = pls_dir(dir); FAILED(hr)) return hr;
+    std::wstring wide = dir.wstring();
+    if (wide.back() != L'\\' && wide.back() != L'/') wide.push_back(L'\\');
+    const bool utf8 = GetACP() == CP_UTF8;  // CP_UTF8 takes no flags and no lossy flag
+    BOOL lossy = FALSE;
+    const int n = WideCharToMultiByte(CP_ACP, utf8 ? 0 : WC_NO_BEST_FIT_CHARS, wide.c_str(), -1, nullptr, 0, nullptr,
+                                      utf8 ? nullptr : &lossy);
+    if (n <= 1 || lossy) return HRESULT_FROM_WIN32(ERROR_NO_UNICODE_TRANSLATION);
+    out.assign(static_cast<size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_ACP, utf8 ? 0 : WC_NO_BEST_FIT_CHARS, wide.c_str(), -1, out.data(), n, nullptr, nullptr);
+    return S_OK;
+}
+
+// Slot 3. "The length, in characters, of the PLS path" (PLS/xpersistentlocalstoragegetpathsize), counting the
+// terminator: the page's example allocates exactly that many characters for GetPath and uses the result as a C string.
+HRESULT STDMETHODCALLTYPE pls_get_path_size(void*, size_t* size) {
+    if (!size) return E_INVALIDARG;
+    *size = 0;
+    std::string path;
+    if (const HRESULT hr = pls_path(path); FAILED(hr)) return hr;
+    *size = path.size() + 1;
+    return S_OK;
+}
+
+// Slot 4. A buffer shorter than the path fails with E_FAIL on Xbox devices and with
+// HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) on PC devices (PLS/xpersistentlocalstoragegetpath, return value), so
+// the answer follows XSystemGetDeviceType. pathUsed (optional) counts the terminator, as GetPathSize does.
+HRESULT STDMETHODCALLTYPE pls_get_path(void*, size_t size, char* path, size_t* used) {
+    if (!path) return E_INVALIDARG;
+    std::string p;
+    if (const HRESULT hr = pls_path(p); FAILED(hr)) return hr;
+    if (size < p.size() + 1)
+        return XSystemGetDeviceType() == static_cast<uint32_t>(XSystemDeviceType::Pc)
+                   ? HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) : E_FAIL;
+    std::memcpy(path, p.c_str(), p.size() + 1);
+    if (used) *used = p.size() + 1;
+    return S_OK;
+}
+
+// Slot 5. On a PC "space is not specifically provisioned for your game" (PLS/xpersistentlocalstoragegetpath,
+// remarks): there is no quota, so the available and the total free bytes are both what the folder's volume has free
+// for this user, used bytes are the sizes of the files in the folder, and the total is the two together.
+HRESULT STDMETHODCALLTYPE pls_get_space_info(void*, XPersistentLocalStorageSpaceInfo* info) {
+    if (!info) return E_INVALIDARG;
+    *info = {};
+    std::filesystem::path dir;
+    if (const HRESULT hr = pls_dir(dir); FAILED(hr)) return hr;
+    ULARGE_INTEGER available{}, volume_total{}, volume_free{};
+    if (!GetDiskFreeSpaceExW(dir.c_str(), &available, &volume_total, &volume_free))
+        return HRESULT_FROM_WIN32(GetLastError());
+    uint64_t used = 0;
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(
+             dir, std::filesystem::directory_options::skip_permission_denied, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        std::error_code entry_ec;
+        if (it->is_regular_file(entry_ec)) {
+            const uintmax_t bytes = it->file_size(entry_ec);
+            if (!entry_ec) used += bytes;
+        }
+    }
+    if (ec) return HRESULT_FROM_WIN32(static_cast<DWORD>(ec.value()));
+    info->availableFreeBytes = available.QuadPart;
+    info->totalFreeBytes = available.QuadPart;
+    info->usedBytes = used;
+    info->totalBytes = used + available.QuadPart;
+    return S_OK;
+}
+
+// Slots 6 and 7. There is no system UI to ask the user offline, so the request completes, through XAsync on the
+// block's queue, with E_ABORT: the documented result when "the user chose not to free up space" (and what the GDK
+// always answers on datacenter streaming servers). The title then reads E_ABORT from slot 7.
+HRESULT STDMETHODCALLTYPE pls_prompt_for_space_async(void*, uint64_t requested, XAsyncBlock* async) {
+    if (!async) return E_INVALIDARG;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr,
+                     "[rt] xgameruntime: XPersistentLocalStoragePromptUserForSpaceAsync(%llu bytes): no prompt "
+                     "offline, completes with E_ABORT\n",
+                     static_cast<unsigned long long>(requested));
+    return XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return E_ABORT; });
+}
+HRESULT STDMETHODCALLTYPE pls_prompt_for_space_result(void*, XAsyncBlock* async) {
+    if (!async) return E_INVALIDARG;
+    return XAsyncGetStatus(async, false);
+}
+
+// Slot 8. Mounts another package's shareable PLS read-only; offline no other title has one, which is the documented
+// FILE_NOT_FOUND ("the PLS for the specified title does not exist", PLS/xpersistentlocalstoragemountforpackage). The
+// handle is cleared, so the title never closes a stale one.
+HRESULT STDMETHODCALLTYPE pls_mount_for_package(void*, const char* package_id, XPackageMountHandle* mount) {
+    if (!package_id || !mount) return E_INVALIDARG;
+    mount->handle = 0;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr,
+                     "[rt] xgameruntime: XPersistentLocalStorageMountForPackage(%.64s): no shared storage offline\n",
+                     package_id);
+    return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+}
+
+#define VT(fn) reinterpret_cast<const void*>(&fn)
+const void* const kPlsVtable[] = {
+    VT(object_query_interface), VT(object_add_ref), VT(object_release),
+    VT(pls_get_path_size),            // 3
+    VT(pls_get_path),                 // 4
+    VT(pls_get_space_info),           // 5
+    VT(pls_prompt_for_space_async),   // 6
+    VT(pls_prompt_for_space_result),  // 7
+    VT(pls_mount_for_package),        // 8 (IXPersistentLocalStorageImpl3)
+};
+static_assert(std::size(kPlsVtable) == 9, "IUnknown + IXPersistentLocalStorageImpl's 5 + Impl3's 1");
+
+// XGameEventImpl (IXGameEventImpl, whose id is the class id): slot 3 is
+//   HRESULT XGameEventWrite(XUserHandle user, const char* serviceConfigId, const char* playSessionId,
+//                           const char* eventName, const char* dimensionsJson, const char* measurementsJson)
+// (xgameevent/xgameeventwrite), measured with 6 arguments. Nothing is sent anywhere offline: a write is accepted and
+// logged (the first kEventLines, then one line saying the rest are not). user, serviceConfigId, playSessionId and
+// eventName are required (_In_ / _In_z_), so a null one is E_INVALIDARG; the two JSON strings are optional.
+constexpr GUID kGameEventClass = {0xbbfbdcc7, 0xbfe7, 0x409b, {0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d}};
+constexpr int kEventLines = 32;
+
+HRESULT STDMETHODCALLTYPE game_event_write(void*, void* user, const char* scid, const char* play_session,
+                                           const char* name, const char* dimensions, const char* measurements) {
+    if (!user || !scid || !play_session || !name) return E_INVALIDARG;
+    static std::atomic<int> s_lines{0};
+    if (s_lines.load(std::memory_order_relaxed) <= kEventLines) {
+        const int line = s_lines.fetch_add(1);
+        if (line < kEventLines)
+            std::fprintf(stderr, "[rt] xgameruntime: XGameEventWrite(%.64s, dimensions %.160s, measurements %.160s): "
+                                 "kept offline\n",
+                         name, dimensions ? dimensions : "none", measurements ? measurements : "none");
+        else if (line == kEventLines)
+            std::fprintf(stderr, "[rt] xgameruntime: further XGameEventWrite calls are accepted without a log line\n");
+    }
+    return S_OK;
+}
+
+const void* const kGameEventVtable[] = {
+    VT(object_query_interface), VT(object_add_ref), VT(object_release),
+    VT(game_event_write),  // 3
+};
+
+// XSystemAnalyticsImpl (IXSystemAnalyticsImpl, whose id is the class id): slot 3 is
+//   XSystemAnalyticsInfo XSystemGetAnalyticsInfo()   (xsystem/xsystemgetanalyticsinfo)
+// The one argument measured after `this` is where the result goes: a member function returning a struct takes its
+// address after `this` and returns it (MSVC x64), and the thunk copies the struct out of the returned pointer. The
+// answer is the named export's.
+constexpr GUID kSystemAnalyticsClass = {0xb884675d, 0xb738, 0x4a9c, {0x81, 0x5d, 0x9a, 0x9a, 0x1e, 0x0c, 0x6c, 0x9b}};
+
+XSystemAnalyticsInfo* STDMETHODCALLTYPE system_analytics_info(void*, XSystemAnalyticsInfo* result) {
+    if (result) *result = XSystemGetAnalyticsInfo();
+    return result;
+}
+
+const void* const kSystemAnalyticsVtable[] = {
+    VT(object_query_interface), VT(object_add_ref), VT(object_release),
+    VT(system_analytics_info),  // 3
+};
+
+// XDisplayImpl, asked for as IXDisplayImpl (an id of its own). xgameruntime-docs lists slot 3 as unknown and slot 4 as
+//   XDisplayHdrModeResult XDisplayTryEnableHdrMode(XDisplayHdrModePreference, XDisplayHdrModeInfo*)
+// (xdisplay/xdisplaytryenablehdrmode), measured with 2 arguments (a 32-bit preference, a pointer) and a 32-bit result;
+// no thunk calls slot 3. The runtime's swapchains present SDR (sRGB non-linear, src/vulkan_present.h), so HDR is
+// not enabled: Disabled, the documented answer when "HDR mode is not enabled". The tone-map values are only given
+// for Enabled; the struct is zeroed rather than left as the caller had it. A preference outside the enum gets
+// Unknown, the documented result of a failed call.
+constexpr GUID kDisplayClass = {0x03f0fe74, 0xfdd9, 0x4e5c, {0xb6, 0x30, 0xf9, 0x33, 0x9c, 0x47, 0xac, 0xc5}};
+constexpr GUID kDisplay1 = {0x35f07670, 0x706e, 0x4bfb, {0x94, 0x76, 0x09, 0x07, 0x98, 0xc5, 0xeb, 0xf3}};
+const GUID* const kDisplayIids[] = {&kDisplay1, nullptr};
+
+enum class XDisplayHdrModeResult : uint32_t { Unknown = 0, Enabled = 1, Disabled = 2 };
+enum class XDisplayHdrModePreference : uint32_t { PreferHdr = 0, PreferRefreshRate = 1 };
+struct XDisplayHdrModeInfo {
+    float minToneMapLuminance;
+    float maxToneMapLuminance;
+    float maxFullFrameToneMapLuminance;
+};
+
+HRESULT STDMETHODCALLTYPE display_unknown_slot(void*) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XDisplayImpl slot 3 (undocumented) called; answering E_NOTIMPL\n");
+    return E_NOTIMPL;
+}
+
+XDisplayHdrModeResult STDMETHODCALLTYPE display_try_enable_hdr(void*, XDisplayHdrModePreference preference,
+                                                               XDisplayHdrModeInfo* info) {
+    if (info) *info = {};
+    if (preference != XDisplayHdrModePreference::PreferHdr &&
+        preference != XDisplayHdrModePreference::PreferRefreshRate)
+        return XDisplayHdrModeResult::Unknown;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XDisplayTryEnableHdrMode: HDR stays disabled (SDR presentation)\n");
+    return XDisplayHdrModeResult::Disabled;
+}
+
+const void* const kDisplayVtable[] = {
+    VT(object_query_interface), VT(object_add_ref), VT(object_release),
+    VT(display_unknown_slot),    // 3 (unknown in xgameruntime-docs)
+    VT(display_try_enable_hdr),  // 4
+};
+
+// XGameRuntimeFeatureImpl (IXGameRuntimeFeatureImpl, whose id is the class id): slot 3 is
+//   bool XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature feature)
+// (xgameruntimefeature/xgameruntimeisfeatureavailable), measured with one 32-bit argument and a byte result. XGameRuntimeFeature : uint32_t has the values of Microsoft's
+// enum page, XAccessibility = 0 to XGameStreaming = 21. Offline a feature is available when both hold:
+//   - this runtime serves the class its functions go through (xgameruntime-docs' layouts), so a call can reach it;
+//     the answer follows each class as it is served, and XStore stays false (licence checks are not answered);
+//   - Microsoft documents it for Windows: an offline PC lacks what is documented only for the consoles (XDisplay:
+//     xdisplay/xdisplaytryenablehdrmode lists only the Xbox consoles as supported platforms).
+// Values past the enum are false.
+constexpr GUID kGameRuntimeFeatureClass = {0x8836fe87, 0xedb9, 0x4fe3, {0x8d, 0xad, 0x05, 0xf0, 0xd2, 0xcd, 0x5b, 0x40}};
+
+constexpr GUID kAccessibilityClass = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
+constexpr GUID kAppCaptureClass = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+constexpr GUID kGameClass = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+constexpr GUID kGameInviteClass = {0x0651aae2, 0x4012, 0x4077, {0xbf, 0x84, 0x8b, 0x90, 0x97, 0x09, 0x0e, 0x2c}};
+constexpr GUID kGameSaveClass = {0x704c3f58, 0xe629, 0x4cc2, {0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}};
+constexpr GUID kGameUiClass = {0xdfcd4649, 0x4ff8, 0x4043, {0xba, 0x07, 0x35, 0xd6, 0x07, 0xdf, 0x98, 0xb0}};
+constexpr GUID kLauncherClass = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
+constexpr GUID kPackageClass = {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
+constexpr GUID kStoreClass = {0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
+constexpr GUID kUserClass = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
+constexpr GUID kGameStreamingClass = {0x0a2192aa, 0xb2d5, 0x4d58, {0x83, 0xbe, 0x38, 0x3b, 0x6d, 0x80, 0x79, 0x9e}};
+
+struct RuntimeFeature {
+    const GUID* class_id;  // the class the feature's functions go through
+    bool console_only;     // documented for the Xbox consoles only
+};
+const RuntimeFeature kRuntimeFeatures[] = {
+    {&kAccessibilityClass, false},     // 0  XAccessibility
+    {&kAppCaptureClass, false},        // 1  XAppCapture
+    {&kThreadingClass, false},         // 2  XAsync
+    {&kThreadingClass, false},         // 3  XAsyncProvider
+    {&kDisplayClass, true},            // 4  XDisplay
+    {&kGameClass, false},              // 5  XGame
+    {&kGameInviteClass, false},        // 6  XGameInvite
+    {&kGameSaveClass, false},          // 7  XGameSave
+    {&kGameUiClass, false},            // 8  XGameUI
+    {&kLauncherClass, false},          // 9  XLauncher
+    {&kNetworkingClass, false},        // 10 XNetworking
+    {&kPackageClass, false},           // 11 XPackage
+    {&kPlsClass, false},               // 12 XPersistentLocalStorage
+    {&kAccessibilityClass, false},     // 13 XSpeechSynthesizer (IXAccessibilityImpl holds its functions)
+    {&kStoreClass, false},             // 14 XStore
+    {&kSystemClass, false},            // 15 XSystem
+    {&kThreadingClass, false},         // 16 XTaskQueue
+    {&kThreadingClass, false},         // 17 XThread
+    {&kUserClass, false},              // 18 XUser
+    {&kErrorClass, false},             // 19 XError
+    {&kGameEventClass, false},         // 20 XGameEvent
+    {&kGameStreamingClass, false},     // 21 XGameStreaming
+};
+static_assert(std::size(kRuntimeFeatures) == 22, "XGameRuntimeFeature has 22 values");
+
+bool STDMETHODCALLTYPE runtime_is_feature_available(void*, uint32_t feature) {
+    if (feature >= std::size(kRuntimeFeatures)) return false;
+    const RuntimeFeature& f = kRuntimeFeatures[feature];
+    return !f.console_only && find_object(*f.class_id) != nullptr;
+}
+
+const void* const kGameRuntimeFeatureVtable[] = {
+    VT(object_query_interface), VT(object_add_ref), VT(object_release),
+    VT(runtime_is_feature_available),  // 3
+};
+#undef VT
+
+RuntimeObject g_pls{kPlsVtable, &kPlsClass, kPlsIids};
+RuntimeObject g_game_runtime_feature{kGameRuntimeFeatureVtable, &kGameRuntimeFeatureClass, nullptr};
+RuntimeObject g_game_event{kGameEventVtable, &kGameEventClass, nullptr};
+RuntimeObject g_system_analytics{kSystemAnalyticsVtable, &kSystemAnalyticsClass, nullptr};
+RuntimeObject g_display{kDisplayVtable, &kDisplayClass, kDisplayIids};
+
+RuntimeObject* const* measured_objects() {
+    static RuntimeObject* const objects[] = {&g_pls, &g_game_runtime_feature, &g_game_event, &g_system_analytics,
+                                             &g_display, nullptr};
+    return objects;
 }
 
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}
