@@ -879,5 +879,149 @@ class TestSIMDMultiLaneAndExecMasking(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(common_addr), 1)
 
 
+# ==============================================================================
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_vdst_equals_vaddr(self) -> None:
+        # ds_inc_rtn_u32 v0, v0, v1 (vdst == vaddr)
+        state = ScalarMachineState(lds_capacity_dwords=1024)
+        interp = ScalarInterpreter()
+
+        addr = 0x100
+        state.lds.write_dword(addr, 42)
+        state.set_vgpr(0, addr)  # v0 is vaddr
+        state.set_vgpr(1, 100)   # v1 is wrap_limit
+
+        instr = DSIncRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata=RegisterOperand(1, RegType.VGPR),
+            offset=0,
+        )
+
+        old, mem = interp.step(instr, state)
+        self.assertEqual(old, 42)
+        self.assertEqual(mem, 43)
+        # v0 now holds the returned old value 42
+        self.assertEqual(state.get_vgpr(0), 42)
+        self.assertEqual(state.lds.read_dword(addr), 43)
+        # v1 (wrap_limit) must be intact
+        self.assertEqual(state.get_vgpr(1), 100)
+
+    def test_alias_vdst_equals_vdata(self) -> None:
+        # ds_inc_rtn_u32 v1, v0, v1 (vdst == vdata)
+        state = ScalarMachineState(lds_capacity_dwords=1024)
+        interp = ScalarInterpreter()
+
+        addr = 0x140
+        state.lds.write_dword(addr, 5)
+        state.set_vgpr(0, addr) # v0 is vaddr
+        state.set_vgpr(1, 5)    # v1 is wrap_limit (5 == 5 -> wrap)
+
+        instr = DSIncRtnInstruction(
+            vdst=RegisterOperand(1, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata=RegisterOperand(1, RegType.VGPR),
+            offset=0,
+        )
+
+        old, mem = interp.step(instr, state)
+        self.assertEqual(old, 5)
+        self.assertEqual(mem, 0)
+        # Memory wrapped to 0
+        self.assertEqual(state.lds.read_dword(addr), 0)
+        # v1 overwritten with old value 5
+        self.assertEqual(state.get_vgpr(1), 5)
+        # v0 preserved
+        self.assertEqual(state.get_vgpr(0), addr)
+
+    def test_alias_vaddr_equals_vdata(self) -> None:
+        # ds_inc_rtn_u32 v2, v0, v0 (vaddr == vdata)
+        state = ScalarMachineState(lds_capacity_dwords=1024)
+        interp = ScalarInterpreter()
+
+        # v0 holds 0x80 (128): address is 0x80, wrap_limit is 128
+        addr_and_limit = 0x80
+        state.lds.write_dword(addr_and_limit, 10)
+        state.set_vgpr(0, addr_and_limit)
+        state.set_vgpr(2, 0xCAFE)
+
+        instr = DSIncRtnInstruction(
+            vdst=RegisterOperand(2, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata=RegisterOperand(0, RegType.VGPR),
+            offset=0,
+        )
+
+        old, mem = interp.step(instr, state)
+        self.assertEqual(old, 10)
+        self.assertEqual(mem, 11)
+        self.assertEqual(state.get_vgpr(2), 10)
+        # v0 is untouched
+        self.assertEqual(state.get_vgpr(0), addr_and_limit)
+        self.assertEqual(state.lds.read_dword(addr_and_limit), 11)
+
+    def test_alias_three_way_all_identical(self) -> None:
+        # ds_inc_rtn_u32 v0, v0, v0 (vdst == vaddr == vdata)
+        state = ScalarMachineState(lds_capacity_dwords=1024)
+        interp = ScalarInterpreter()
+
+        addr_val = 0x40  # 64
+        state.lds.write_dword(addr_val, 3)
+        state.set_vgpr(0, addr_val)
+
+        instr = DSIncRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata=RegisterOperand(0, RegType.VGPR),
+            offset=0,
+        )
+
+        old, mem = interp.step(instr, state)
+        self.assertEqual(old, 3)
+        self.assertEqual(mem, 4)
+        # Memory updated to 4
+        self.assertEqual(state.lds.read_dword(addr_val), 4)
+        # v0 overwritten with old value 3
+        self.assertEqual(state.get_vgpr(0), 3)
+
+    def test_simd_divergent_aliased_operand_preservation(self) -> None:
+        # Wave64 with alternating mask: vdst == vaddr
+        even_mask = 0x5555555555555555
+        state = SIMDState(num_lanes=64, exec_mask=even_mask, lds_capacity_dwords=1024)
+        interp = SIMDInterpreter()
+
+        for lane in range(64):
+            addr = 0x200 + lane * 4
+            state.lds.write_dword(addr, 20 + lane)
+            state.set_lane_vgpr(lane, 0, addr) # v0 is vaddr and vdst
+            state.set_lane_vgpr(lane, 1, 100)  # v1 is limit
+
+        instr = DSIncRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata=RegisterOperand(1, RegType.VGPR),
+        )
+
+        results = interp.execute(instr, state)
+
+        for lane in range(64):
+            addr = 0x200 + lane * 4
+            if lane % 2 == 0:
+                # Active: v0 updated to old value (20 + lane)
+                self.assertEqual(results[lane], (20 + lane, 20 + lane + 1))
+                self.assertEqual(state.get_lane_vgpr(lane, 0), 20 + lane)
+                self.assertEqual(state.lds.read_dword(addr), 20 + lane + 1)
+            else:
+                # Inactive: v0 preserves original address (addr)
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_lane_vgpr(lane, 0), addr)
+                self.assertEqual(state.lds.read_dword(addr), 20 + lane)
+
+
 if __name__ == "__main__":
     unittest.main()
