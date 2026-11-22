@@ -1435,5 +1435,79 @@ class TestDivFixupF32StatusFlagsAndConditionCodes(unittest.TestCase):
         self.assertEqual(vcc_lt, 0xAAAAAAAA)
 
 
+class TestDivFixupF32IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_inputs(self):
+        # Subnormal numerator: sub_min / 1.0 -> sub_min
+        s0 = F32_MIN_SUBNORMAL
+        res = ref_div_fixup_f32(s0, F32_ONE, F32_MIN_SUBNORMAL)
+        self.assertEqual(res, F32_MIN_SUBNORMAL)
+
+        # Negative subnormal numerator -> negative subnormal result
+        neg_sub = F32_MIN_SUBNORMAL | F32_SIGN_MASK
+        res_neg = ref_div_fixup_f32(s0, F32_ONE, neg_sub)
+        self.assertEqual(res_neg, neg_sub)
+
+    def test_signed_zeros_bitwise_representation(self):
+        # +0.0 / -1.0 -> -0.0
+        res1 = ref_div_fixup_f32(F32_POS_ZERO, F32_NEG_ONE, F32_POS_ZERO)
+        self.assertEqual(res1, F32_NEG_ZERO)
+
+        # -0.0 / -1.0 -> +0.0
+        res2 = ref_div_fixup_f32(F32_POS_ZERO, F32_NEG_ONE, F32_NEG_ZERO)
+        self.assertEqual(res2, F32_POS_ZERO)
+
+        # +1.0 / -0.0 -> -inf
+        res3 = ref_div_fixup_f32(F32_ONE, F32_NEG_ZERO, F32_ONE)
+        self.assertEqual(res3, F32_NEG_INF)
+
+        # -1.0 / -0.0 -> +inf
+        res4 = ref_div_fixup_f32(F32_ONE, F32_NEG_ZERO, F32_NEG_ONE)
+        self.assertEqual(res4, F32_POS_INF)
+
+    def test_infinities_propagation_and_invalids(self):
+        # +inf / -5.0 -> -inf
+        s5 = f32_to_u32(5.0)
+        res1 = ref_div_fixup_f32(F32_ONE, f32_to_u32(-5.0), F32_POS_INF)
+        self.assertEqual(res1, F32_NEG_INF)
+
+        # -inf / -5.0 -> +inf
+        res2 = ref_div_fixup_f32(F32_ONE, f32_to_u32(-5.0), F32_NEG_INF)
+        self.assertEqual(res2, F32_POS_INF)
+
+        # 5.0 / -inf -> -0.0
+        res3 = ref_div_fixup_f32(F32_ONE, F32_NEG_INF, s5)
+        self.assertEqual(res3, F32_NEG_ZERO)
+
+        # -5.0 / -inf -> +0.0
+        res4 = ref_div_fixup_f32(F32_ONE, F32_NEG_INF, f32_to_u32(-5.0))
+        self.assertEqual(res4, F32_POS_ZERO)
+
+    def test_nan_handling_and_clamp_mapping(self):
+        # NaN quieting
+        snan = 0x7F800001
+        res_q = ref_div_fixup_f32(F32_ONE, F32_ONE, snan)
+        self.assertEqual(res_q, quiet_f32(snan))
+        self.assertTrue(is_f32_qnan(res_q))
+
+        # Clamp modifier maps any NaN to +0.0
+        res_clamped = ref_div_fixup_f32(F32_ONE, F32_ONE, snan, clamp=True)
+        self.assertEqual(res_clamped, F32_POS_ZERO)
+
+        # Indefinite NaN clamped to +0.0
+        res_00_clamped = ref_div_fixup_f32(F32_POS_ZERO, F32_POS_ZERO, F32_POS_ZERO, clamp=True)
+        self.assertEqual(res_00_clamped, F32_POS_ZERO)
+
+    def test_boundary_max_normal_extremes(self):
+        # MAX_NORMAL / 1.0 -> MAX_NORMAL
+        res = ref_div_fixup_f32(F32_MAX_NORMAL, F32_ONE, F32_MAX_NORMAL)
+        self.assertEqual(res, F32_MAX_NORMAL)
+
+        # MAX_NORMAL / -1.0 -> -MAX_NORMAL
+        res_neg = ref_div_fixup_f32(F32_MAX_NORMAL, F32_NEG_ONE, F32_MAX_NORMAL)
+        self.assertEqual(res_neg, F32_MAX_NORMAL | F32_SIGN_MASK)
+
+
 if __name__ == "__main__":
     unittest.main()
