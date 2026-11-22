@@ -834,8 +834,105 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertEqual(res, self.F32_NEG_ZERO)
 
 
+
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(999, RegType.SGPR)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VAddLshlU32Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_swapped_addition_and_shift_operands(self) -> None:
+        s0, s1, s2 = 10, 20, 3
+        # (10 + 20) << 3 = 240
+        correct = oracle_v_add_lshl_u32(s0, s1, s2)
+        # Swapping an add operand with shift count: (10 + 3) << 20 = 13 << 20 = 13631488
+        swapped = oracle_v_add_lshl_u32(s0, s2, s1)
+        self.assertNotEqual(correct, swapped)
+
+    def test_negative_control_shift_right_instead_of_left(self) -> None:
+        s0, s1, s2 = 100, 200, 2
+        correct = oracle_v_add_lshl_u32(s0, s1, s2)
+        wrong_shr = ((s0 + s1) & MASK32) >> (s2 & SHIFT_MASK)
+        self.assertNotEqual(correct, wrong_shr)
+
+    def test_negative_control_shift_before_add(self) -> None:
+        # v_lshl_add_u32 is (s0 << s2) + s1; v_add_lshl_u32 is (s0 + s1) << s2
+        s0, s1, s2 = 5, 10, 2
+        correct_add_lshl = oracle_v_add_lshl_u32(s0, s1, s2)   # (5 + 10) << 2 = 60
+        lshl_add = ((s0 << s2) + s1) & MASK32                  # (5 << 2) + 10 = 30
+        self.assertNotEqual(correct_add_lshl, lshl_add)
+
+    def test_negative_control_missing_32bit_mask_truncation(self) -> None:
+        s0, s1, s2 = 0x8000_0000, 0x8000_0000, 2
+        correct = oracle_v_add_lshl_u32(s0, s1, s2)  # (0x80000000 + 0x80000000) mod 2^32 = 0 -> 0 << 2 = 0
+        unmasked = (s0 + s1) << s2                    # 0x100000000 << 2 = 0x400000000 (leaks beyond 32 bits)
+        self.assertEqual(correct, 0)
+        self.assertNotEqual(correct, unmasked)
+
+    def test_mutation_unmasked_shift_count_detected(self) -> None:
+        """Mutant: Fails to mask shift operand by 0x1F."""
+        def mutant_add_lshl(s0: int, s1: int, s2: int) -> int:
+            return (((s0 + s1) & MASK32) << s2) & MASK32
+
+        # When s2 = 32:
+        # Hardware: 32 & 31 = 0 -> shift by 0 -> result = (10 + 20) = 30
+        # Mutant: shifts by 32 -> result = 30 << 32 = 0
+        s0, s1, s2 = 10, 20, 32
+        oracle_res = oracle_v_add_lshl_u32(s0, s1, s2)
+        mutant_res = mutant_add_lshl(s0, s1, s2)
+        self.assertEqual(oracle_res, 30)
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_shift_before_add_detected(self) -> None:
+        """Mutant: Executes v_lshl_add_u32 semantics instead of v_add_lshl_u32."""
+        def mutant_lshl_add(s0: int, s1: int, s2: int) -> int:
+            return (((s0 & MASK32) << (s2 & SHIFT_MASK)) + (s1 & MASK32)) & MASK32
+
+        s0, s1, s2 = 7, 3, 3
+        oracle_res = oracle_v_add_lshl_u32(s0, s1, s2)  # (7 + 3) << 3 = 80
+        mutant_res = mutant_lshl_add(s0, s1, s2)        # (7 << 3) + 3 = 59
+        self.assertEqual(oracle_res, 80)
+        self.assertEqual(mutant_res, 59)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_xor_instead_of_add_detected(self) -> None:
+        """Mutant: Replaces addition with bitwise XOR."""
+        def mutant_xor_lshl(s0: int, s1: int, s2: int) -> int:
+            return (((s0 ^ s1) & MASK32) << (s2 & SHIFT_MASK)) & MASK32
+
+        s0, s1, s2 = 1, 1, 2
+        oracle_res = oracle_v_add_lshl_u32(s0, s1, s2)  # (1 + 1) << 2 = 8
+        mutant_res = mutant_xor_lshl(s0, s1, s2)        # (1 ^ 1) << 2 = 0
+        self.assertEqual(oracle_res, 8)
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
