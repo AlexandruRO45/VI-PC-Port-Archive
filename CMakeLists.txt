@@ -811,6 +811,23 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_start_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_start_original>" "$<TARGET_FILE:cpu_exe_start_no_tls>"
         "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>")
+    foreach(variant IN ITEMS original returning no_worker)
+        add_executable(cpu_exe_worker_alive_${variant} tests/cpu/worker_alive_entry.asm)
+        set_target_properties(cpu_exe_worker_alive_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_exe_worker_alive_${variant} PRIVATE /ENTRY:worker_alive_entry
+            /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_exe_worker_alive_${variant} PRIVATE kernel32)
+    endforeach()
+    # The worker decides whether a process outlives its entry thread; the return path stays the
+    # variable so the fixtures can be compared without touching the shared entry.
+    target_compile_definitions(cpu_exe_worker_alive_returning PRIVATE RETURN_FROM_ENTRY)
+    target_compile_definitions(cpu_exe_worker_alive_no_worker PRIVATE RETURN_FROM_ENTRY NO_WORKER)
+    add_test(NAME cpu_native_worker_alive COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/hang_probe.py" --control --launches 2 --timeout 2
+        --eof-timeout 0.5
+        "$<TARGET_FILE:cpu_exe_worker_alive_original>"
+        "$<TARGET_FILE:cpu_exe_worker_alive_returning>"
+        "$<TARGET_FILE:cpu_exe_worker_alive_no_worker>")
     # Two CRT-free DLLs and an EXE: A has no imports, B imports A, the EXE imports both.
     foreach(dll IN ITEMS a a_alt b b_noinit)
         string(REGEX REPLACE "_(noinit|alt)$" "" source "${dll}")
