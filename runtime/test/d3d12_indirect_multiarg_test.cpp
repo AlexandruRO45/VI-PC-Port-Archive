@@ -390,12 +390,24 @@ int main() {
             list->RSSetScissorRects(1, &scissor);
             list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
             list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            // The list's own state, set before the calls: the generated commands leave the push constants and the vertex
+            // and index buffer bindings undefined (VK_EXT_device_generated_commands, vkCmdExecuteGeneratedCommandsEXT:
+            // "command buffer state will become undefined according to the tokens executed"), so the plain draw after
+            // them must still see these, not the last record's.
+            const float own_constants[5] = {-1.0f, -1.0f, 200.0f / 255.0f, 100.0f / 255.0f, 50.0f / 255.0f};
+            list->SetGraphicsRoot32BitConstants(0, 5, own_constants, 0);
+            const D3D12_VERTEX_BUFFER_VIEW own_vbv{vertex_buffer[1]->GetGPUVirtualAddress(), UINT(vertex_bytes), 8};
+            list->IASetVertexBuffers(0, 1, &own_vbv);
+            const D3D12_INDEX_BUFFER_VIEW own_ibv{index_buffer[0]->GetGPUVirtualAddress(), UINT(index16_bytes),
+                                                  DXGI_FORMAT_R16_UINT};
+            list->IASetIndexBuffer(&own_ibv);
             const UINT64 at = first_record;
             list->ExecuteIndirect(signature.p, 8, arguments_buffer.p, at, nullptr, 0);                          // records 0..7
             list->ExecuteIndirect(signature.p, 8, arguments_buffer.p, at + 8 * draw_stride, count_buffer.p, 0);  // 5 of 8
             list->ExecuteIndirect(signature.p, 3, arguments_buffer.p, at + 13 * draw_stride, count_buffer.p, 4);  // count 0
             list->ExecuteIndirect(signature.p, 2, arguments_buffer.p, at + 13 * draw_stride, count_buffer.p, 8);  // 100 of 2: cells 13, 14
             list->ExecuteIndirect(signature.p, 8, exact_buffer.p, 0, nullptr, 0);                               // records 0..7 again
+            list->DrawIndexedInstanced(6, 1, 18, 0, 0);  // the list's state: quad 3 of vertex buffer 1 in cell 0
             const auto to_copy = transition(image.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             list->ResourceBarrier(1, &to_copy);
             D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -413,6 +425,7 @@ int main() {
             for (unsigned r = 0; r < 8; ++r) paint(want, draw_record(r));        // records 0..7
             for (unsigned r = 8; r < 13; ++r) paint(want, draw_record(r));       // 5 of 8
             for (unsigned r = 13; r < 15; ++r) paint(want, draw_record(r));      // count 100 of MaxCommandCount 2: not cell 15
+            paint(want, DrawRecord{0, 3, 1, 0, 0, 200, 100, 50});  // the plain draw after the calls
             cells_drawn = 8 + 5 + 2;
             void* data = nullptr;
             EXPECT(SUCCEEDED(readback->Map(0, nullptr, &data)));
@@ -476,8 +489,14 @@ int main() {
                 transition(count_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)};
             list->ResourceBarrier(2, to_use);
             list->SetComputeRootSignature(root.p);
+            // The list's own arguments, set before the calls and used by the plain dispatch after them (the generated
+            // commands leave the push constants undefined).
+            const std::uint32_t own_constants[4] = {5, 6, 7, 8};
+            list->SetComputeRoot32BitConstants(0, 4, own_constants, 0);
+            list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress() + 7 * region_bytes);
             list->ExecuteIndirect(signature.p, 4, arguments_buffer.p, first_record, nullptr, 0);                  // 0..3
             list->ExecuteIndirect(signature.p, 4, arguments_buffer.p, first_record + 4 * stride, count_buffer.p, 16);  // 3 of 4
+            list->Dispatch(1, 1, 1);  // the list's arguments: region 7, which no record wrote
             const auto to_copy = transition(output.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             list->ResourceBarrier(1, &to_copy);
             list->CopyBufferRegion(readback.p, 0, output.p, 0, output_bytes);
@@ -492,7 +511,8 @@ int main() {
                 const bool ran = r < 7;  // records 4..6 by the count of 3; record 7 is cut off
                 if (ran) groups_run += rec.groups;
                 for (unsigned i = 0; i < region_bytes / 4; ++i) {
-                    const std::uint32_t want = (ran && i < 64 * rec.groups) ? (((i + rec.a) ^ rec.b) + rec.c) - rec.d : 0;
+                    std::uint32_t want = (ran && i < 64 * rec.groups) ? (((i + rec.a) ^ rec.b) + rec.c) - rec.d : 0;
+                    if (r == 7 && i < 64) want = (((i + 5) ^ 6) + 7) - 8;  // the plain dispatch
                     if (got[r * (region_bytes / 4) + i] == want) continue;
                     if (dispatch_mismatches++ < 6)
                         std::fprintf(stderr, "dispatch record %u dword %u: got %08x want %08x\n", r, i,
@@ -574,6 +594,18 @@ int main() {
                 {"two index buffers", {A(D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW), A(D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW), A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)}, 52, false},
                 {"index buffer + draw (not indexed)", {A(D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW), A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 32, false},
             };
+            // A GPU limit the signature alone decides: a stride past maxIndirectCommandsIndirectStride is refused when it
+            // is created (E_NOTIMPL, with a log), where D3D12 itself would accept it.
+            if (d.indirect_properties.max_stride && d.indirect_properties.max_stride < (1u << 20)) {
+                const UINT too_long = (d.indirect_properties.max_stride + 4) & ~3u;
+                const D3D12_INDIRECT_ARGUMENT_DESC args[] = {A(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 0),
+                                                             A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)};
+                const D3D12_COMMAND_SIGNATURE_DESC desc{too_long, 2, args, 0};
+                Ref<ID3D12CommandSignature> refused;
+                EXPECT(device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL);
+                const D3D12_COMMAND_SIGNATURE_DESC ok_desc{d.indirect_properties.max_stride & ~3u, 2, args, 0};
+                EXPECT(SUCCEEDED(device->CreateCommandSignature(&ok_desc, nullptr, IID_PPV_ARGS(&refused.p))));
+            }
             for (const SignatureCase& c : signature_cases) {
                 D3D12_COMMAND_SIGNATURE_DESC desc{c.stride, UINT(c.arguments.size()), c.arguments.data(), 0};
                 Ref<ID3D12CommandSignature> on_layer, on_host;

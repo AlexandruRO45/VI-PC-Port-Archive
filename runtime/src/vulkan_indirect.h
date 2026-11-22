@@ -24,7 +24,10 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <cstdio>
 #include <map>
+#include <set>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <tuple>
@@ -163,6 +166,25 @@ public:
         std::uint64_t heap_base = 0;
     };
 
+    // Why a signature cannot run on this GPU whatever the call (null: it can): the limits of
+    // VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT that a signature alone decides. CreateCommandSignature asks
+    // this too, so the application finds out when it creates the signature.
+    static const char* limit_refusal(const IndirectSignature& sig, const Properties& properties) {
+        if (sig.simple()) return nullptr;
+        if (sig.arguments.size() > properties.max_tokens) return "more arguments than maxIndirectCommandsTokenCount";
+        if (sig.stride > properties.max_stride) return "ByteStride above maxIndirectCommandsIndirectStride";
+        std::uint32_t views = 0;
+        for (const IndirectArgument& a : sig.arguments) {
+            if (a.offset > properties.max_token_offset) return "an argument past maxIndirectCommandsTokenOffset";
+            if (a.type == IndirectArgumentType::vertex_buffer || a.type == IndirectArgumentType::index_buffer) ++views;
+            if (a.type == IndirectArgumentType::index_buffer &&
+                !(properties.input_modes & VK_INDIRECT_COMMANDS_INPUT_MODE_DXGI_INDEX_BUFFER_EXT))
+                return "no DXGI index buffer input mode";
+        }
+        if (views > IndirectPlan::max_patches) return "more vertex/index buffer views than the rebase pass takes";
+        return nullptr;
+    }
+
     // Makes (or finds) the layout for the signature and pipeline layout, and the scratch for the call. False when the
     // GPU cannot run it (a limit, a token, a stage) or scratch could not be had.
     bool prepare(const Request& r, IndirectPlan& out) {
@@ -170,10 +192,11 @@ public:
         const IndirectSignature& sig = **r.signature;
         const bool compute = sig.kind == IndirectKind::dispatch;
         const VkShaderStageFlags stages = compute ? VK_SHADER_STAGE_COMPUTE_BIT : r.push_stages;
-        if ((stages & ~properties_.stages) || sig.stride > properties_.max_stride ||
-            r.max_count > properties_.max_sequences || sig.arguments.size() > properties_.max_tokens)
-            return false;
-        if (!compute && !(stages & VK_SHADER_STAGE_VERTEX_BIT)) return false;
+        if (stages & ~properties_.stages) return refuse("the GPU cannot generate commands for these shader stages");
+        if (const char* reason = limit_refusal(sig, properties_)) return refuse(reason);
+        if (r.max_count > properties_.max_sequences)
+            return refuse("MaxCommandCount is above maxIndirectSequenceCount");
+        if (!compute && !(stages & VK_SHADER_STAGE_VERTEX_BIT)) return refuse("a draw layout needs the vertex stage");
         const VkDeviceSize span = VkDeviceSize(r.max_count - 1) * sig.stride + sig.arguments_size;
         std::lock_guard lock(mutex_);
         out = {};
@@ -194,11 +217,11 @@ public:
             out.count_address = copies_->address(bounded, at);
         }
         out.layout = layout_for(*r.signature, r.pipeline_layout, stages, compute);
-        if (!out.layout) return false;
+        if (!out.layout) return refuse("no indirect commands layout for this signature (token or layout limit, or all cached layouts busy)");
         // Buffer views: rebase them in a scratch copy.
         for (const IndirectArgument& a : sig.arguments) {
             if (a.type != IndirectArgumentType::vertex_buffer && a.type != IndirectArgumentType::index_buffer) continue;
-            if (out.patch_count == IndirectPlan::max_patches) return false;
+            if (out.patch_count == IndirectPlan::max_patches) return refuse("more vertex/index buffer views than the rebase pass takes");
             out.patch_offsets[out.patch_count++] = a.offset / 4;
         }
         if (out.patch_count) {
@@ -206,7 +229,7 @@ public:
             // application's buffer (D3D12 only asks for (n - 1) * stride + the arguments), and the sequences stay
             // `span` bytes long as in the unpatched case.
             const VkDeviceSize dwords = span / 4;
-            if (dwords > UINT32_MAX / 2) return false;
+            if (dwords > UINT32_MAX / 2) return refuse("too many records for the rebase pass");
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
             if (!copies_->get(span, buffer, offset)) return false;
@@ -467,6 +490,14 @@ private:
         return layout;
     }
 
+    // Logs each reason once, and answers false.
+    bool refuse(const char* reason) {
+        if (refused_.insert(reason).second)
+            std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a multi-argument command signature is refused: %s\n",
+                         reason);
+        return false;
+    }
+
     bool patch_ready() {
         if (patch_pipeline_) return true;
         VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -515,6 +546,7 @@ private:
     Functions fn_;
     bool loaded_ = false;
     std::uint64_t clock_ = 0;
+    std::set<std::string> refused_;
     std::vector<Entry*> current_;  // layouts the submission being prepared uses
     std::mutex mutex_;
     std::map<Key, Entry> layouts_;

@@ -2190,9 +2190,13 @@ Not implemented yet:
     with one first runs `indirect_patch.comp` (outside the render pass): it copies the records to scratch and adds
     `heap_base` to each view's address (a null address stays null); the index buffer token takes the DXGI format as
     `D3D12_INDEX_BUFFER_VIEW` holds it (`VK_INDIRECT_COMMANDS_INPUT_MODE_DXGI_INDEX_BUFFER_EXT`). Signatures without
-    views read the application's buffer in place. A count buffer is the sequence count address (the driver takes the
-    smaller of it and `MaxCommandCount`, count 0 draws nothing); this needs no `drawIndirectCount` and works on the
-    AMD GPU, whose `deviceGeneratedCommandsMultiDrawIndirectCount` is false. Scratch (the copy and the preprocess
+    views read the application's buffer in place. A count buffer becomes the sequence count address through
+    a one-invocation pass (`indirect_count.comp`) that writes `min(count, MaxCommandCount)` to scratch first, because
+    VUID-VkGeneratedCommandsInfoEXT-sequenceCountAddress-11068 wants the value at that address to be at most
+    `maxSequenceCount` (count 0 draws nothing). It uses `DRAW` and `DISPATCH` tokens, not the `*_COUNT` ones, so it does
+    not depend on `deviceGeneratedCommandsMultiDrawIndirectCount` nor on `drawIndirectCount`. What was measured:
+    that property is false on the AMD Radeon 880M with Windows driver 26.11.2 and true on the RTX 5070 Laptop with
+    617.42; other AMD drivers (RADV reports true) are not covered here. Scratch (the copy and the preprocess
     buffer) is retired with the submission like the copy scratch (`vulkan_scratch.h`); one layout is cached for each
     description of records and pipeline layout (signatures that describe the same records share it), at most 64: past
     that the least recently used layout that no running submission uses is destroyed, and when every one is busy the
@@ -2203,9 +2207,29 @@ Not implemented yet:
   - Views must point into the GPU address arena (DEFAULT-heap buffers), as for a V# (section 3.3): an upload-heap view
     is a different `VkBuffer`. The records are GPU data, so a view outside the arena cannot be detected when the list is
     recorded or replayed: the pass adds `heap_base` to whatever it finds (which is also how a host buffer's biased VA,
-    section 3.3, comes out right), and an address that names nothing is a GPU fault, not a refusal. Limits of the GPU apply (`maxIndirectCommandsIndirectStride` is 2048 on AMD, 17 views
-    a signature, 32 tokens); past them, or on a device without the extension, the call is refused at
-    `ExecuteCommandLists` (`unsupported`), as before for any signature the layer cannot run. The strip-cut
+    section 3.3, comes out right), and an address that names nothing is a GPU fault, not a refusal. The limits of the GPU apply, per signature
+    (`IndirectExpander::limit_refusal`): `maxIndirectCommandsTokenCount`, `maxIndirectCommandsTokenOffset`,
+    `maxIndirectCommandsIndirectStride` (2048 on the AMD driver measured; RADV is reported to have the same) and the DXGI
+    index-buffer input mode, plus 17 views a signature (the rebase pass). `CreateCommandSignature` refuses a signature
+    past them (`E_NOTIMPL`, with a log) when the extension is on; `maxIndirectSequenceCount` is per call
+    (`MaxCommandCount` above it is refused at `ExecuteCommandLists` with a log, `unsupported`, as is any
+    call on a device without the extension or when all 64 cached layouts are busy). Nothing is chunked.
+  - State after the call: the tokens leave command-buffer state undefined ("After a call to
+    vkCmdExecuteGeneratedCommandsEXT, command buffer state will become undefined according to the tokens executed",
+    Vulkan spec, `vkCmdExecuteGeneratedCommandsEXT`; its Table 1 names push constant data for the push-constant tokens,
+    the index buffer and the vertex buffers, and bound shaders and pipelines for the execution-set token, which this
+    layer does not use). The layer never relies on state surviving between commands: every `Draw`, `Dispatch` and
+    `ExecuteIndirect` pushes the whole 144-byte block, binds the pipeline, the bindless set and every vertex and index
+    buffer of its own captured list state first, so a plain draw or dispatch after a call sees the list's arguments,
+    not the last record's (`d3d12_indirect_multiarg_test` does both, with the list's constants and buffers set before
+    the calls). vkd3d-proton (LGPL-2.1, `libs/vkd3d/command.c`, `d3d12_command_list_execute_indirect_state_template_dgc`)
+    takes the same reading of that sentence: it calls `d3d12_command_list_invalidate_all_state` after the generated
+    commands, with the comment that "all state related to the bind point is undefined after this"; it also lets the
+    driver preprocess explicitly in a batch with a barrier. Only the approach is used here, no code. Not done: explicit
+    preprocess of consecutive calls under one barrier (each call preprocesses and executes in place).
+  - Zero-copy is already the case: the layout's stride is the D3D12 `ByteStride`, so a signature with no vertex or index
+    view reads the application's buffer in place whatever its stride (no copy, and no pass but the count's); only
+    views need the rebase copy. The strip-cut
     primitive restart is taken from the list's own index buffer format, so a restart-index strip drawn through an
     `INDEX_BUFFER_VIEW` argument is not modelled, and a per-instance vertex slot with step rate 0 takes the view's stride
     instead of 0.

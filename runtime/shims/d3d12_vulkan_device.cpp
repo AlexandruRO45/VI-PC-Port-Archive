@@ -3940,6 +3940,14 @@ public:
         // a kind the root signature lacks, constants past a parameter, a slot twice, a view in a dispatch).
         std::shared_ptr<const leonida::IndirectSignature> signature;
         if (const HRESULT hr = build_indirect_signature(desc, root_signature, signature); FAILED(hr)) return hr;
+        // The limits of VK_EXT_device_generated_commands that a signature alone decides are checked now, so the
+        // application is told at creation (a device without the extension still creates it: ExecuteCommandLists then
+        // refuses a call that needs it, with a log).
+        if (state_.info.indirect_commands)
+            if (const char* reason = leonida::IndirectExpander::limit_refusal(*signature, state_.info.indirect_properties)) {
+                std::fprintf(stderr, "[rt] d3d12: CreateCommandSignature refused: %s\n", reason);
+                return E_NOTIMPL;
+            }
         return create_command_signature(std::move(signature), riid, out, identity());
     }
 
