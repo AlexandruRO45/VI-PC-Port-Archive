@@ -36,15 +36,22 @@ happens **on your PC, from your own copy of the game**.
 Discord: https://discord.gg/rexed
 <br>
 
-[![Method bodies](https://raw.githubusercontent.com/omdev74/leonida-progress/main/data/badge-methods.svg)](https://github.com/omdev74/leonida-progress/blob/main/data/report.md)
-[![Tracker refresh](https://github.com/omdev74/leonida-progress/actions/workflows/refresh.yml/badge.svg)](https://github.com/omdev74/leonida-progress/actions/workflows/refresh.yml)
-[![Last successful check](https://raw.githubusercontent.com/omdev74/leonida-progress/main/data/badge-updated.svg)](https://github.com/omdev74/leonida-progress/actions/workflows/refresh.yml)
+[![D3D12 bodies](docs/progress/badge-methods.svg)](docs/progress/report.md)
+[![Shader selectors](docs/progress/badge-shader.svg)](docs/progress/report.md)
+[![Runtime bodies](docs/progress/badge-runtime.svg)](docs/progress/report.md)
+[![Asset tool bodies](docs/progress/badge-assets.svg)](docs/progress/report.md)
+[![Last source check](docs/progress/badge-updated.svg)](docs/progress/report.md)
 
-[![Leonida source tracker](https://raw.githubusercontent.com/omdev74/leonida-progress/main/data/dashboard.svg)](https://github.com/omdev74/leonida-progress)
+[![Leonida subsystem source inventories](docs/progress/dashboard.svg)](docs/progress/report.md)
 
-[![D3D12 source history](https://raw.githubusercontent.com/omdev74/leonida-progress/main/data/history.svg)](https://github.com/omdev74/leonida-progress/blob/main/data/history.md)
+<details>
+<summary>Source inventory history</summary>
 
-Automatically scanned from upstream source. Body presence, not verified correctness or game completion; [counting rules and evidence](https://github.com/omdev74/leonida-progress/blob/main/data/report.md).
+[![Source inventory history](docs/progress/history.svg)](docs/progress/history.md)
+
+</details>
+
+Automatically generated in this repository from committed source. Different units are tracked separately; source presence is not verified correctness or game completion. [Counting rules](tools/progress_tracker/README.md).
 
 ## Project status
 
