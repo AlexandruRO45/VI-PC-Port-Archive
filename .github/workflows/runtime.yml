@@ -214,7 +214,19 @@ jobs:
             # WineHQ's packages need the i386 architecture. https://gitlab.winehq.org/wine/wine/-/wikis/Debian-Ubuntu
             sudo dpkg --add-architecture i386
             sudo mkdir -pm755 /etc/apt/keyrings
-            sudo wget -q -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
+            wine_key="$(mktemp)"
+            trap 'rm -f "$wine_key"' EXIT
+            curl -fsSL https://dl.winehq.org/wine-builds/winehq.key -o "$wine_key"
+            wine_fingerprint="$(gpg --batch --show-keys --with-colons "$wine_key" | awk -F: '
+              $1 == "pub" { kind = "primary"; next }
+              $1 == "sub" { kind = "subkey"; next }
+              $1 == "fpr" && kind == "primary" { print toupper($10); kind = "done" }
+            ')"
+            if [ "$wine_fingerprint" != D43F640145369C51D786DDEA76F1A20FF987672F ]; then
+              echo "Unexpected WineHQ signing-key fingerprint: ${wine_fingerprint:-none}" >&2
+              exit 1
+            fi
+            sudo install -m 0644 "$wine_key" /etc/apt/keyrings/winehq-archive.key
             sudo wget -q -NP /etc/apt/sources.list.d/ \
               "https://dl.winehq.org/wine-builds/ubuntu/dists/$(. /etc/os-release && echo "$VERSION_CODENAME")/winehq-$(. /etc/os-release && echo "$VERSION_CODENAME").sources"
             pkgs+=(winehq-stable)

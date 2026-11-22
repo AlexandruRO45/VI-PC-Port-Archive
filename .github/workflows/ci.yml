@@ -122,7 +122,24 @@ jobs:
       - name: Install llvm-mc (LLVM 21) and spirv-tools
         shell: bash
         run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+          verify_apt_signing_key() {
+            local key_file=$1 expected=$2 repository=$3 actual
+            actual="$(gpg --batch --show-keys --with-colons "$key_file" | awk -F: '
+              $1 == "pub" { kind = "primary"; next }
+              $1 == "sub" { kind = "subkey"; next }
+              $1 == "fpr" && kind == "primary" { print toupper($10); kind = "done" }
+            ')"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::Unexpected $repository signing-key fingerprint: ${actual:-none}" >&2
+              return 1
+            fi
+          }
+          llvm_key="$(mktemp)"
+          trap 'rm -f "$llvm_key"' EXIT
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o "$llvm_key"
+          verify_apt_signing_key "$llvm_key" 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421 apt.llvm.org
+          sudo gpg --batch --dearmor --yes --output /usr/share/keyrings/llvm-snapshot.gpg "$llvm_key"
+          sudo chmod 0644 /usr/share/keyrings/llvm-snapshot.gpg
           echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends llvm-21 spirv-tools
