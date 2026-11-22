@@ -69,23 +69,27 @@ MUTATIONS = [
      "test_ps_ops4"),
     ("v_mul_legacy_f32 drops zero-times-anything guard", TRANSLATOR,
      '        elif op == "v_mul_legacy_f32":\n'
-     '            # Legacy multiply treats 0 * anything (inf/NaN included) as 0.\n'
-     '            x, y = self.src_f(a[1]), self.src_f(a[2])\n'
+     "            # The inferred game's f32 denorm mode is flush-in/flush-out. Unlike an IEEE multiply, the legacy\n"
+     '            # zero override gives +0 even when a negative subnormal operand becomes -0 after input flushing.\n'
+     '            # Flush the product before omod: otherwise FLT_MIN * 0.5 mul:2 becomes FLT_MIN, not zero.\n'
+     '            x, y = (self.flush_f32(self.src_f(t)) for t in a[1:3])\n'
      '            m, zx, zy, either, r = (self.tmp() for _ in range(5))\n'
      '            self.emit(f"{m} = OpFMul %float {x} {y}")\n'
      '            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")\n'
      '            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")\n'
      '            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")\n'
-     '            self.emit(f"{r} = OpSelect %float {either} %f0 {m}")',
+     '            self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")',
      '        elif op == "v_mul_legacy_f32":\n'
-     '            # Legacy multiply treats 0 * anything (inf/NaN included) as 0.\n'
-     '            x, y = self.src_f(a[1]), self.src_f(a[2])\n'
+     "            # The inferred game's f32 denorm mode is flush-in/flush-out. Unlike an IEEE multiply, the legacy\n"
+     '            # zero override gives +0 even when a negative subnormal operand becomes -0 after input flushing.\n'
+     '            # Flush the product before omod: otherwise FLT_MIN * 0.5 mul:2 becomes FLT_MIN, not zero.\n'
+     '            x, y = (self.flush_f32(self.src_f(t)) for t in a[1:3])\n'
      '            m, zx, zy, either, r = (self.tmp() for _ in range(5))\n'
      '            self.emit(f"{m} = OpFMul %float {x} {y}")\n'
      '            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")\n'
      '            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")\n'
      '            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")\n'
-     '            self.emit(f"{r} = OpCopyObject %float {m}")',
+     '            self.emit(f"{r} = OpCopyObject %float {self.flush_f32(m)}")',
      "test_ps_legacy_mul"),
 ]
 
