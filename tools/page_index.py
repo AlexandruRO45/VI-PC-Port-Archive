@@ -38,6 +38,9 @@ import struct
 import sys
 import zlib
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from carve_folder import unfinished  # noqa: E402
+
 # zlib stream start. Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 BASE = 0x50000000
@@ -424,6 +427,9 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
+    reason = unfinished(a.source) if os.path.isdir(a.source) else None
+    if reason:
+        ap.error(reason)
     if os.path.isdir(a.out):
         ap.error(f"{a.out} is a folder, not a .json or .csv file")
     ext = os.path.splitext(a.out)[1].lower()

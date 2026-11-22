@@ -16,6 +16,15 @@ Usage:
 rsc8_audio.parse_adat_header_bytes), so the zlib-compressed audio config at the start of audio.rpf is carved without
 touching the banks and without a build-specific --limit (docs/audio_config.md). The bytes `ADAT` alone are not
 enough: they also occur inside `METADATA` and in compressed data. index.json's summary records the boundary.
+
+The output folder describes one carve. While a carve runs the folder holds `carve_unfinished.json` and no
+index.json; index.json is written in one step at the end and the marker is removed after it, so a carve that was
+stopped can be told from a finished one (carve_folder.py; page_index.py, anim_index.py and rbf0_index.py refuse a
+folder with the marker). Stream files of an earlier carve into the same folder (another archive, or another
+--start/--limit window) that this run did not write again are moved at the end to a new folder beside it,
+`<out_dir>.earlier` (`.earlier.2`, `.earlier.3`, ... when that exists), and counted in the output: they are in no
+index.json any more, and a tool that lists the folder would count them as this archive's. Nothing is deleted or
+overwritten. --index-only writes no stream files, moves none, and leaves the marker of a stopped carve in place.
 """
 import argparse
 import collections
@@ -30,6 +39,7 @@ import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from carve_folder import UNFINISHED  # noqa: E402
 from rsc8_audio import parse_adat_header_bytes  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
@@ -113,6 +123,10 @@ def first_adat_bank(m, start, end):
     return None
 
 
+# A stream file as this tool names it: the archive offset in 12 hex digits. Nothing else in the folder is touched.
+CARVED = re.compile(r"[0-9a-f]{12}\.(?:bin|bk2)")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("archive")
@@ -152,10 +166,28 @@ def main(argv=None) -> int:
         base = a.start
     if os.path.exists(a.out) and not os.path.isdir(a.out):
         sys.exit(f"{a.out}: output path is a file, not a directory")
+    out_dir = os.path.abspath(a.out)
+    if not a.index_only and os.path.dirname(out_dir) == out_dir:
+        # Streams of an earlier carve are moved to a folder beside this one, and a root has nothing beside it.
+        sys.exit(f"{a.out}: the output folder can't be the root of a drive; pass a folder below it")
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:
         sys.exit(f"{a.out}: cannot create output directory: {e.strerror or e}")
+    marker = os.path.join(a.out, UNFINISHED)
+    index_path = os.path.join(a.out, "index.json")
+    written = set()   # the stream files this run wrote
+    if not a.index_only:
+        # --index-only writes no stream, so it neither marks the folder nor clears the marker of a stopped carve.
+        try:
+            # The marker first, then the old index: at no point does the folder have an index.json and no marker
+            # while its streams are not the ones that index lists.
+            with open(marker, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"archive": a.archive}, f)
+            if os.path.lexists(index_path):
+                os.remove(index_path)
+        except OSError as e:
+            sys.exit(f"{a.out}: {e.strerror or e}")
     with open(a.archive, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
         pos = base
         end = min(size, pos + a.limit) if a.limit else size
@@ -200,6 +232,7 @@ def main(argv=None) -> int:
                 rows.append({"off": s, "stored": blen, "size": blen, "type": "bink2", "w": w, "h": h,
                              "frames": struct.unpack_from("<I", m, s + 8)[0], "pre": "", "head": m[s:s + 16].hex()})
                 if not a.index_only:
+                    written.add(f"{s:012x}.bk2")
                     with open(os.path.join(a.out, f"{s:012x}.bk2"), "wb") as f:
                         f.write(m[s:s + blen])
                 last = pos = s + blen
@@ -229,6 +262,7 @@ def main(argv=None) -> int:
             rows.append({"off": s, "stored": used, "size": len(out), "pre": m[max(0, s - 16):s].hex(),
                          "head": out[:16].hex()})
             if not a.index_only:
+                written.add(f"{s:012x}.bin")
                 with open(os.path.join(a.out, f"{s:012x}.bin"), "wb") as f:
                     f.write(out)
             last = pos = s + used
@@ -246,13 +280,48 @@ def main(argv=None) -> int:
                "span": span}
     if a.until_adat:
         summary["first_adat_bank"] = boundary   # None: no bank in the window, the whole window was scanned
-    index_path = os.path.join(a.out, "index.json")
+    stale = [] if a.index_only else sorted(n for n in os.listdir(a.out) if CARVED.fullmatch(n) and n not in written)
+    earlier = None
+    if stale:
+        # Beside the folder (some indexers also read its subfolders), and a folder of their own each time, so
+        # streams moved out by an earlier run are never overwritten: <out>.earlier, <out>.earlier.2, ...
+        try:
+            number = 1
+            while True:
+                earlier = out_dir + ".earlier" + (f".{number}" if number > 1 else "")
+                try:
+                    os.mkdir(earlier)
+                    break
+                except FileExistsError:
+                    number += 1
+            for name in stale:
+                os.rename(os.path.join(a.out, name), os.path.join(earlier, name))
+        except OSError as e:
+            sys.exit(f"{a.out}: can't move the stream files of an earlier carve to {earlier}: {e.strerror or e}. "
+                     f"The carve is not finished ({UNFINISHED} stays); run it again")
+    staged = os.path.join(a.out, "index.partial.json")   # .json: the folder indexers don't take it for a stream
     try:
-        with open(index_path, "w", encoding="utf-8", newline="\n") as f:
+        with open(staged, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": rows, "unread": unread_ranges}, f)
+        os.replace(staged, index_path)
     except OSError as e:
-        sys.exit(f"{index_path}: cannot write: {e.strerror or e}")
+        try:
+            os.remove(staged)
+        except OSError:
+            pass
+        sys.exit(f"{index_path}: cannot write: {e.strerror or e}"
+                 + ("" if a.index_only else f". The carve is not finished ({UNFINISHED} stays); run it again"))
+    if not a.index_only:
+        try:
+            os.remove(marker)
+        except OSError as e:
+            # The streams and index.json are complete, but the folder indexers refuse a folder with the marker.
+            sys.exit(f"{marker}: the carve finished but its marker can't be removed: {e.strerror or e}. "
+                     "Delete the file, or run the carve again")
     print(json.dumps(summary, indent=1))
+    if stale:
+        print(f"moved {len(stale)} stream file(s) of an earlier carve, which this one did not write, from {a.out} "
+              f"to {earlier}")
     span = max(1, span)   # an empty data area (or --start at the end) has nothing to divide by
     print(f"readable: {total / span:.1%}, zero padding {zero / span:.1%}, unread {unread / span:.1%}")
     if unread_ranges:

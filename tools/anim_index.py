@@ -33,6 +33,7 @@ import zlib
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from carve_folder import unfinished  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
@@ -577,6 +578,9 @@ def main():
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
     if a.rigs and os.path.isdir(a.rigs):
         ap.error(f"{a.rigs} is a folder, not a JSON file")
+    reason = unfinished(a.source) if os.path.isdir(a.source) else None
+    if reason:
+        ap.error(reason)
     if os.path.isdir(a.source):
         manifest = os.path.join(a.source, "index.json")
         for flag, path in (("output", a.out), ("--rigs", a.rigs)):

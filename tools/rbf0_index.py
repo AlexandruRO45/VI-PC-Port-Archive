@@ -33,6 +33,7 @@ import zlib
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from carve_folder import unfinished  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
 MAGIC = b"RBF0"
@@ -520,6 +521,9 @@ def main():
         ap.exit(2, f"{ap.prog}: error: argument --strings: must be 0 or more\n")
     if os.path.isdir(a.source) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
+    reason = unfinished(a.source) if os.path.isdir(a.source) else None
+    if reason:
+        ap.error(reason)
     if os.path.isdir(a.out):
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
     folder = os.path.dirname(os.path.abspath(a.out))
