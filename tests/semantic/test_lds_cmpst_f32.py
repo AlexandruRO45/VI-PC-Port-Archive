@@ -227,6 +227,65 @@ class DSCmpstF32Instruction:
 
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarState:
+    """Scalar machine state comprising register files and LDS memory."""
+
+    def __init__(self, lds_size_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(size_dwords=lds_size_dwords)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_reg(self, reg: RegisterOperand) -> int:
+        return self.get_vgpr(reg.index) if reg.reg_type == RegType.VGPR else self.get_sgpr(reg.index)
+
+    def set_reg(self, reg: RegisterOperand, val: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_vgpr(reg.index, val)
+        else:
+            self.set_sgpr(reg.index, val)
+
+    def resolve_operand(self, op: Operand) -> int:
+        return op.val if isinstance(op, ImmediateF32) else self.get_reg(op)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_cmpst_f32."""
+
+    def execute(self, instr: DSCmpstF32Instruction, state: ScalarState) -> Tuple[int, int, bool]:
+        vaddr = state.get_reg(instr.vaddr)
+        cmp_val = state.resolve_operand(instr.vdata0)
+        new_val = state.resolve_operand(instr.vdata1)
+
+        old_val, new_mem, swapped = state.lds.atomic_cmpst_f32(
+            vaddr=vaddr,
+            cmp_val=cmp_val,
+            new_val=new_val,
+            offset=instr.offset,
+        )
+
+        if instr.vdst is not None:
+            state.set_reg(instr.vdst, old_val)
+
+        return old_val, new_mem, swapped
+
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -329,6 +388,79 @@ class TestSymbolicAST(unittest.TestCase):
             DSCmpstF32Instruction(vaddr=v0, vdata0=v0, vdata1=v0, offset=-1)
         with self.assertRaises(ValueError):
             DSCmpstF32Instruction(vaddr=v0, vdata0=v0, vdata1=v0, offset=65536)
+
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState(lds_size_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_non_returning_cmpst_f32(self) -> None:
+        addr = 0x40
+        val = f32_to_bits(12.5)
+        new_val = f32_to_bits(25.0)
+
+        self.state.lds.write_dword(addr, val)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, val)
+        self.state.set_vgpr(3, new_val)
+
+        instr = DSCmpstF32Instruction(
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(3, RegType.VGPR),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, val)
+        self.assertEqual(new_mem, new_val)
+        self.assertEqual(self.state.lds.read_dword(addr), new_val)
+
+    def test_scalar_returning_cmpst_rtn_f32(self) -> None:
+        addr = 0x40
+        val = f32_to_bits(100.0)
+        new_val = f32_to_bits(200.0)
+
+        self.state.lds.write_dword(addr, val)
+        self.state.set_vgpr(0, 0xCAFE) # vdst sentinel
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, val)
+        self.state.set_vgpr(3, new_val)
+
+        instr = DSCmpstF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(3, RegType.VGPR),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, val)
+        self.assertEqual(self.state.get_vgpr(0), val)
+        self.assertEqual(self.state.lds.read_dword(addr), new_val)
+
+    def test_scalar_mismatch_no_write(self) -> None:
+        addr = 0x40
+        val = f32_to_bits(1.0)
+        self.state.lds.write_dword(addr, val)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, f32_to_bits(2.0)) # Mismatch
+        self.state.set_vgpr(3, f32_to_bits(99.0))
+
+        instr = DSCmpstF32Instruction(
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(3, RegType.VGPR),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+        self.assertFalse(swapped)
+        self.assertEqual(self.state.lds.read_dword(addr), val)
 
 
 
