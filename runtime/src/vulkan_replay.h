@@ -886,6 +886,10 @@ struct ReplayFunctions {
     std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t,
                        CountedDispatch&)> prepare_counted_dispatch;
     std::function<void(VkCommandBuffer, const CountedDispatch&)> emit_counted_dispatch;
+    // multiDrawIndirect: one vkCmdDraw*Indirect may take a drawCount above 1; without it each command is its own call.
+    bool multi_draw_indirect = false;
+    // VkPhysicalDeviceLimits::maxDrawIndirectCount: a call takes at most this many records.
+    std::uint32_t max_draw_indirect_count = UINT32_MAX;
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
     // A KHR TLAS built from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS needs a pointer array whose entries are Vulkan
@@ -2201,6 +2205,49 @@ inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
     }
 }
 
+// The graphics state a command draws with: a Draw's own, or an indirect draw's.
+inline const Draw* draw_of(const Command& command) {
+    if (const auto* draw = std::get_if<Draw>(&command)) return draw;
+    if (const auto* indirect = std::get_if<ExecuteIndirect>(&command)) return indirect->state.get();
+    return nullptr;
+}
+
+// The indirect call itself: p.binding is the argument buffer, p.source the count buffer.
+inline void emit_indirect(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const Prepared& p,
+                          const ExecuteIndirect& ind) {
+    const VkDeviceSize arguments = p.binding.buffer_offset + ind.argument_offset;
+    if (ind.count_buffer) {
+        const VkDeviceSize count = p.source.buffer_offset + ind.count_offset;
+        if (ind.kind == IndirectKind::draw) {
+            vk.draw_indirect_count(command_buffer, p.binding.buffer, arguments, p.source.buffer, count, ind.max_count,
+                                   ind.stride);
+        } else if (ind.kind == IndirectKind::draw_indexed) {
+            vk.draw_indexed_indirect_count(command_buffer, p.binding.buffer, arguments, p.source.buffer, count,
+                                           ind.max_count, ind.stride);
+        }
+        return;
+    }
+    // Without multiDrawIndirect a call draws one command: loop over them.
+    const std::uint32_t per_call = vk.multi_draw_indirect ? ind.max_count : 1;
+    if (ind.kind == IndirectKind::draw) {
+        for (std::uint32_t k = 0; k < ind.max_count; k += per_call)
+            vk.draw_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride, per_call,
+                             ind.stride);
+    } else if (ind.kind == IndirectKind::draw_indexed) {
+        for (std::uint32_t k = 0; k < ind.max_count; k += per_call)
+            vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride,
+                                     per_call, ind.stride);
+    } else if (ind.kind == IndirectKind::dispatch) {
+        for (std::uint64_t k = 0; k < ind.max_count; ++k) {
+            if (ind.count_buffer)
+                vk.dispatch_indirect(command_buffer, p.counted_dispatch.indirect,
+                                     p.counted_dispatch.offset + VkDeviceSize(k) * 12);
+            else
+                vk.dispatch_indirect(command_buffer, p.binding.buffer, arguments + VkDeviceSize(k) * ind.stride);
+        }
+    }
+}
+
 // Moves an attachment's tracked pieces to `layout` before rendering (first use zero-fills, as everywhere).
 inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const PreparedDraw::Attachment& a,
                           VkImageLayout layout, VkAccessFlags access, VkPipelineStageFlags stages,
@@ -2951,6 +2998,16 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
+            }
+            // A draw with the list's graphics state: prepared as a Draw is (the argument and count buffers stay in
+            // p.binding and p.source). Recording uses p.draw, as for a Draw.
+            if (ind->state) {
+                if (out.draw_count == out.draws.size()) out.draws.emplace_back();
+                auto& prepared_draw = out.draws[out.draw_count];
+                prepared_draw.reset();
+                p.draw = std::uint32_t(out.draw_count++);
+                if (const auto r = detail::prepare_draw(*ind->state, resolve, vk, prepared_draw); r != ReplayResult::success)
+                    return r;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -3796,51 +3853,28 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
-        } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
-            const VkDeviceSize arguments = p.binding.buffer_offset + ind->argument_offset;
-            if (ind->count_buffer && ind->kind != IndirectKind::dispatch) {
-                const VkDeviceSize count = p.source.buffer_offset + ind->count_offset;
-                if (ind->kind == IndirectKind::draw) {
-                    vk.draw_indirect_count(command_buffer, p.binding.buffer, arguments, p.source.buffer,
-                                           count, ind->max_count, ind->stride);
-                } else if (ind->kind == IndirectKind::draw_indexed) {
-                    vk.draw_indexed_indirect_count(command_buffer, p.binding.buffer, arguments,
-                                                   p.source.buffer, count, ind->max_count, ind->stride);
-                }
-            } else {
-                if (ind->kind == IndirectKind::draw) {
-                    vk.draw_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
-                } else if (ind->kind == IndirectKind::draw_indexed) {
-                    vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
-                } else if (ind->kind == IndirectKind::dispatch) {
-                    if (ind->count_buffer) {
-                        // No D3D12 query must count this internal compute pass as an application dispatch.
-                        end_statistics();
-                        vk.emit_counted_dispatch(command_buffer, p.counted_dispatch);
-                        begin_statistics();
-                    }
-                    if (ind->pipeline) {
-                        ShaderUserData data{};
-                        std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
-                        data.heap_base = vk.heap_base;
-                        data.code_base = p.pipeline.code_base;
-                        vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
-                        if (p.pipeline.bindless_set) {
-                            const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
-                            vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
-                                                    1, &set0, 0, nullptr);
-                        }
-                        vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
-                                          &data);
-                    }
-                    for (std::uint32_t k = 0; k < ind->max_count; ++k) {
-                        vk.dispatch_indirect(command_buffer,
-                            ind->count_buffer ? p.counted_dispatch.indirect : p.binding.buffer,
-                            (ind->count_buffer ? p.counted_dispatch.offset + VkDeviceSize(k) * 12
-                                               : arguments + VkDeviceSize(k) * ind->stride));
-                    }
-                }
+        } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command); ind && !ind->state) {
+            if (ind->kind == IndirectKind::dispatch && ind->count_buffer) {
+                // No D3D12 query must count this internal compute pass as an application dispatch.
+                end_statistics();
+                vk.emit_counted_dispatch(command_buffer, p.counted_dispatch);
+                begin_statistics();
             }
+            if (ind->kind == IndirectKind::dispatch && ind->pipeline) {
+                ShaderUserData data{};
+                std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
+                data.heap_base = vk.heap_base;
+                data.code_base = p.pipeline.code_base;
+                vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+                if (p.pipeline.bindless_set) {
+                    const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
+                    vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
+                                            1, &set0, 0, nullptr);
+                }
+                vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
+                                  &data);
+            }
+            detail::emit_indirect(vk, command_buffer, p, *ind);
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build);
@@ -3917,7 +3951,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
-        } else if (const auto* draw = std::get_if<Draw>(&command)) {
+        } else if (const Draw* draw = detail::draw_of(command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];
             constexpr VkAccessFlags color_access =
                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -3997,10 +4031,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
-            if (draw->mesh) {
+            if (draw->indexed) vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+            if (const auto* indirect = std::get_if<ExecuteIndirect>(&command)) {
+                detail::emit_indirect(vk, command_buffer, p, *indirect);  // the arguments hold the counts
+            } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {
-                vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
                                 draw->first_instance);
             } else {

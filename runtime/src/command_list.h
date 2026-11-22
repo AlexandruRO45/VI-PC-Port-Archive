@@ -10,6 +10,7 @@
 #include <array>
 #include <utility>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <memory>
@@ -596,6 +597,11 @@ struct ExecuteIndirect {
     std::uint64_t argument_offset = 0;
     ResourceId count_buffer = 0;  // 0: fixed max_count; non-zero: vkCmdDraw*IndirectCount
     std::uint64_t count_offset = 0;
+    // The list's graphics state at the call (its count, instances and first fields are unused: the argument buffer
+    // holds them), for the draw kinds. Replay then makes the call a whole draw: it begins rendering into the targets,
+    // binds the pipeline and the dynamic state as for a Draw, and issues the indirect draw. Null: the caller has set
+    // all that up (a raw indirect call), as the unit tests of the indirect path do.
+    std::shared_ptr<const Draw> state;
     // kind == dispatch: the compute pipeline and root arguments in effect, as Dispatch records them, so the dispatches
     // run that pipeline with those arguments whatever the command buffer had bound. A pipeline of 0 leaves the binding
     // as it is.
@@ -883,6 +889,7 @@ public:
 
     bool execute_indirect(const ExecuteIndirect& indirect) {
         if (!indirect.argument_buffer || !indirect.stride) return false;
+        if (indirect.state && (!indirect.state->pipeline || indirect.kind == IndirectKind::dispatch)) return false;
         if (!indirect.max_count) return !closed_;  // the PC runtime takes MaxCommandCount 0 as a no-op
         return append(indirect);
     }

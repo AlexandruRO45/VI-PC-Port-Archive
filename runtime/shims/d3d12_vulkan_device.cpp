@@ -726,6 +726,43 @@ struct DeviceState {
         }
     }
 
+    // One VkPipelineCache for every pipeline the device creates (docs/d3d12_vulkan.md section 3.6): a PSO created a
+    // second time from the same shaders and state is satisfied from it. `pipeline_cache()` (above) makes it on first
+    // use. With Vulkan 1.3 every creation also asks for VkPipelineCreationFeedback, which is how the layer counts the
+    // creations the cache answered.
+    bool vulkan_1_3 = false;  // the physical device's apiVersion allows VkPipelineCreationFeedback without an extension
+    std::atomic<std::uint32_t> pipelines_created{0};
+    std::atomic<std::uint32_t> pipeline_cache_hits{0};
+
+    // The size of the cache's data in bytes, 0 without a cache.
+    std::size_t pipeline_cache_bytes() {
+        const VkPipelineCache cache = pipeline_cache();
+        std::size_t bytes = 0;
+        if (cache && context->vk.vkGetPipelineCacheData &&
+            context->vk.vkGetPipelineCacheData(info.device, cache, &bytes, nullptr) != VK_SUCCESS)
+            bytes = 0;
+        return bytes;
+    }
+
+    // `create(cache, info)` runs vkCreate*Pipelines with the device's cache and `create_info` (a graphics or compute
+    // create-info, taken by value so the feedback struct can be chained in front of its pNext).
+    template<class Info, class Create>
+    VkResult create_pipeline(Create create, Info create_info) {
+        VkPipelineCreationFeedback total{};
+        VkPipelineCreationFeedbackCreateInfo feedback{VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+        feedback.pPipelineCreationFeedback = &total;
+        if (vulkan_1_3) {
+            feedback.pNext = create_info.pNext;
+            create_info.pNext = &feedback;
+        }
+        const VkResult result = create(pipeline_cache(), create_info);
+        if (result == VK_SUCCESS && vulkan_1_3 && (total.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)) {
+            ++pipelines_created;
+            if (total.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) ++pipeline_cache_hits;
+        }
+        return result;
+    }
+
     // The translator's output, loaded on first use.
     std::mutex library_mutex;
     bool library_tried = false;
@@ -3760,8 +3797,11 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
+        if (device_.create_pipeline(
+                [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
+                    return vk.vkCreateComputePipelines(dev, cache, 1, &create, nullptr, &pipeline_.pipeline);
+                },
+                pipeline_info) != VK_SUCCESS)
             return E_FAIL;
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
@@ -3877,8 +3917,12 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
-                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
+        if (device_.create_pipeline(
+                [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& create) {
+                    return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &create,
+                                                                         nullptr, &pipeline);
+                },
+                info) != VK_SUCCESS)
             return VK_NULL_HANDLE;
         return pipeline;
     }
@@ -4738,6 +4782,11 @@ public:
         state_.r9g9b9e5_uav_emulated = state_.probe_r9g9b9e5_uav_emulation();
         memory_properties(info.physical, &state_.memory);
         {
+            VkPhysicalDeviceProperties physical_properties{};
+            device_properties(info.physical, &physical_properties);
+            state_.vulkan_1_3 = physical_properties.apiVersion >= VK_API_VERSION_1_3;
+        }
+        {
             char text[4] = {};
             size_t length = 0;
             const bool sysmem = getenv_s(&length, text, "LEONIDA_UPLOAD_SYSMEM") == 0 && length > 1 && text[0] != '0';
@@ -4812,6 +4861,7 @@ public:
                     return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
                 });
         }
+        state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count);
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {
@@ -5186,6 +5236,7 @@ public:
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
+    DeviceState& mutable_state() { return state_; }
     IUnknown* holder() { return identity(); }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
@@ -8467,6 +8518,20 @@ BindlessRoom bindless_room(ID3D12Device* device) {
     return {set->free_images(leonida::ImageDimension::dim_2d), set->free_samplers()};
 }
 
+PipelineCacheStats pipeline_cache_stats(ID3D12Device* device) {
+    PipelineCacheStats stats{};
+    if (!device) return stats;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return stats;
+    DeviceState& state = d->mutable_state();
+    stats.available = state.vulkan_1_3 && state.pipeline_cache() != VK_NULL_HANDLE;
+    stats.created = state.pipelines_created;
+    stats.hits = state.pipeline_cache_hits;
+    stats.bytes = state.pipeline_cache_bytes();
+    return stats;
+}
+
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
     : device_(device), presenter_(std::move(presenter)) {
     device_->AddRef();
@@ -8931,6 +8996,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                     chosen12.descriptorBindingStorageBufferUpdateAfterBind;
     info.bindless_partially_bound = info.bindless && chosen12.descriptorBindingPartiallyBound;
     info.sampler_anisotropy = chosen_features.samplerAnisotropy;
+    // ExecuteIndirect: several commands per call, and a count buffer.
+    info.multi_draw_indirect = chosen_features.multiDrawIndirect == VK_TRUE;
+    info.draw_indirect_count = chosen12.drawIndirectCount == VK_TRUE;
+    enable12.drawIndirectCount = info.draw_indirect_count;
     info.sampler_mirror_clamp_to_edge = chosen12.samplerMirrorClampToEdge;
     info.sampler_filter_minmax = chosen12.samplerFilterMinmax;
     enable12.runtimeDescriptorArray = info.bindless;
@@ -9004,6 +9073,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (!chosen_features.shaderInt64)
         std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderInt64; translated shaders (all declare Int64) will not load\n");
     enable.samplerAnisotropy = info.sampler_anisotropy;
+    enable.multiDrawIndirect = info.multi_draw_indirect;
+    enable.drawIndirectFirstInstance = chosen_features.drawIndirectFirstInstance;  // StartInstanceLocation in ExecuteIndirect
     enable.occlusionQueryPrecise = chosen_features.occlusionQueryPrecise;  // exact D3D12 occlusion counts
     enable.pipelineStatisticsQuery = chosen_features.pipelineStatisticsQuery;
     info.occlusion_query_precise = chosen_features.occlusionQueryPrecise == VK_TRUE;

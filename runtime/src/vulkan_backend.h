@@ -98,7 +98,7 @@ struct VulkanDeviceFunctions {
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
-    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkGetPipelineCacheData)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -1225,6 +1225,12 @@ public:
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
+    // The indirect-draw features enabled on the device (VulkanDeviceInfo::multi_draw_indirect / draw_indirect_count).
+    void set_indirect_features(bool multi_draw, bool draw_count) {
+        replay_.multi_draw_indirect = multi_draw;
+        if (!draw_count) replay_.draw_indirect_count = replay_.draw_indexed_indirect_count = nullptr;
+    }
+
     void set_heap_base(std::uint64_t heap_base) {
         std::unique_lock lock(resource_mutex_);
         replay_.heap_base = heap_base;

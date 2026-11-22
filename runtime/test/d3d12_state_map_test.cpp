@@ -582,6 +582,7 @@ int main() {
 
         static std::vector<VkDeviceSize> offsets;
         ReplayFunctions vk{};
+        vk.multi_draw_indirect = true;  // one call takes all the records
         vk.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t, std::uint32_t) {
             offsets.push_back(offset);
         };
@@ -606,6 +607,21 @@ int main() {
         CHECK(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success);
         const std::vector<VkDeviceSize> expected{260, 264, 268, 516, 272, 520, 276, 296};
         CHECK(offsets == expected);
+
+        // Without multiDrawIndirect each record is a call of its own.
+        {
+            const std::vector<VkDeviceSize> kept = offsets;  // the later checks go on from these
+            ReplayFunctions single = vk;
+            single.multi_draw_indirect = false;
+            offsets.clear();
+            CommandList one;
+            CHECK(one.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0}));
+            CHECK(one.execute_indirect({IndirectKind::draw_indexed, 20, 3, 1, 8, 0, 0}));
+            CHECK(one.close());
+            CHECK(replay(one, VK_NULL_HANDLE, resolve, single) == ReplayResult::success);
+            CHECK((offsets == std::vector<VkDeviceSize>{260, 276, 264, 284, 304}));
+            offsets = kept;
+        }
 
         // Reject invalid spans before invoking Vulkan, including after adding the backing-buffer base.
         const auto rejected = [&](const ExecuteIndirect& command) {
