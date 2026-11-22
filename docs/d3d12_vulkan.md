@@ -812,8 +812,19 @@ The compute path, end to end:
     every blend factor pair, blend operation, write mask, comparison function and stencil operation, with the stencil
     plane read back, are byte-identical on an RTX 5080 and a Radeon iGPU.
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
-    pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
-    to the viewport's range anyway.
+    pipeline; it skips float formats). **`DepthClipEnable`:** D3D12 clamps a pixel's final depth (`SV_Depth`, or the
+    depth after bias) to the viewport's `MinDepth..MaxDepth` with the flag on or off; it only decides whether
+    primitives are clipped against the near and far planes. Vulkan clamps to the viewport range only with
+    `depthClampEnable`, which also turns clipping off unless `VK_EXT_depth_clip_enable` sets it separately. With
+    that extension (`VulkanDeviceInfo::depth_clip_enable`) and `depthClamp` the pipeline always clamps and the
+    extension carries the flag; without them
+    `FALSE` maps to `depthClampEnable` and `TRUE` keeps clipping but leaves a shader-written or biased depth
+    unclamped (logged once). Confirmed by `d3d12_depth_clamp_test`: on a D32_FLOAT target through a viewport of
+    0.25..0.5, the default adapter and WARP both return 0.5 for `SV_Depth` 0.9, 0.25 for 0.1, and the range's end
+    for a bias that passes it, with `DepthClipEnable` TRUE and FALSE; a triangle at z/w 1.5 or -0.5 leaves the
+    clear value with TRUE and writes 0.5 or 0.25 with FALSE; the layer returns the same floats. A viewport with
+    `MinDepth > MaxDepth` is not defined by D3D12 and the hosts differ (NVIDIA clamps to the range between the two,
+    WARP writes `MaxDepth`'s value for everything), so the test only prints it.
   - **Conservative rasterization (Tier 1/2):** the standalone device enables `VK_EXT_conservative_rasterization`
     when available; caller-owned devices must set `VulkanDeviceInfo::conservative_rasterization` only if they
     enabled it. OPTIONS reports at least Tier 1 only with at least eight subpixel precision bits and a finite, nonnegative
@@ -1365,6 +1376,9 @@ and any validation error fails them.
     padded with `0xcc`) resolves each program to its own translation with its own state;
   - console slot 11 on a slot-67 and a slot-62 pipeline returns an object whose slot 3 points at the dword 0 and whose
     slot 4 gives 4 bytes; it releases to 0, and the pipeline's reference count is unchanged.
+- `d3d12_depth_clamp_test`: output depth against the viewport range, layer and
+  host D3D12 compared on a D32_FLOAT target; a second layer pass runs without `VK_EXT_depth_clip_enable`. Under Wine
+  only the layer is checked, against the measured values.
 - `d3d12_set0_compute_test`: set 0 from the compute bind point, through the proxy and D3D12 alone. The index entry
   of its shader lists set-0 bindings, so the PSO's layout holds the device's bindless set and replay binds it at
   each dispatch; nothing in the test binds it. Four dispatches of `test/glsl/cs_set0_sample.comp` (GLSL written to
