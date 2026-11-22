@@ -11,6 +11,14 @@ INDEX = {"summary": {"files": 1, "bink2_files": 0, "span": 10, "compressed_bytes
                      "inflated_bytes": 5}, "files": []}
 
 
+def short_path(path: Path) -> str:
+    """The 8.3 form of an existing path, or the path itself where the volume keeps no short names."""
+    import ctypes
+    buf = ctypes.create_unicode_buffer(32768)
+    n = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf))
+    return buf.value if 0 < n < len(buf) else str(path)
+
+
 @unittest.skipUnless(os.name == "nt", "PowerShell research script")
 class CarveAllGamePathTest(unittest.TestCase):
     def test_relative_and_trailing_separator_game_paths_find_existing_carves(self):
@@ -23,7 +31,11 @@ class CarveAllGamePathTest(unittest.TestCase):
             for name in ("common", "pack_p1_p1"):
                 (out / name).mkdir(parents=True)
                 (out / name / "index.json").write_text(json.dumps(INDEX), encoding="utf-8")
-            for arg in ("game", ".\\game", str(game) + "\\"):
+            args = ["game", ".\\game", str(game) + "\\"]
+            short = short_path(game)
+            if short != str(game):          # 8.3 form, as GitHub's runner temp dir C:\Users\RUNNER~1\... gives
+                args.append(short + "\\")
+            for arg in args:
                 with self.subTest(game=arg):
                     result = subprocess.run(
                         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),

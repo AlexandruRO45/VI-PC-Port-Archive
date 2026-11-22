@@ -4,7 +4,9 @@ param([Parameter(Mandatory)][string]$Game, [Parameter(Mandatory)][string]$Out)
 $root = Split-Path $PSScriptRoot -Parent
 $tool = Join-Path $root "tools\rpf9_carve.py"
 # -Game may be relative or end in a separator; archive names are cut from the resolved, separator-ended prefix.
-$Game = (Resolve-Path -LiteralPath $Game).ProviderPath
+# Resolve-Path keeps 8.3 short names (C:\Users\RUNNER~1\...) while Get-ChildItem returns long ones, so the prefix
+# is taken from Get-Item, which gives the same long form as the files below it.
+$Game = (Get-Item -LiteralPath (Resolve-Path -LiteralPath $Game).ProviderPath).FullName
 $prefix = $Game.TrimEnd('\') + '\'
 $rows = @()
 foreach ($f in Get-ChildItem $Game -Recurse -Filter *.rpf | Sort-Object Length) {
