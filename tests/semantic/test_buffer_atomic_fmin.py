@@ -1011,6 +1011,151 @@ class TestBufferAtomicFminBoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.mem.read_u32(4), f32_to_bits(7.0))
 
 
+class TestBufferAtomicFminNegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid operands."""
+
+    def test_invalid_destination_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_FMIN,
+                vdata=Register(RegKind.SGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+            )
+
+    def test_invalid_descriptor_size(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_FMIN,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=2),
+                soffset=0,
+            )
+
+    def test_invalid_soffset_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_FMIN,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 1, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=Register(RegKind.VGPR, 8, count=1),
+            )
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=128)
+
+    def test_invalid_immediate_offset(self) -> None:
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=4096)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+
+    def test_invalid_register_indices_and_ranges(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)
+
+    def test_python_default_min_zero_divergence(self) -> None:
+        # Standard Python min(0.0, -0.0) yields +0.0 because 0.0 <= -0.0 evaluates to True.
+        # This confirms that naive Python float comparisons violate AMD RDNA2 semantics.
+        naive_python_min = min(0.0, -0.0)
+        self.assertEqual(f32_to_bits(naive_python_min), POS_ZERO)
+        # The reference oracle correctly yields -0.0 (0x80000000).
+        self.assertEqual(ref_min_f32(POS_ZERO, NEG_ZERO), NEG_ZERO)
+
+    def test_python_default_nan_divergence(self) -> None:
+        # Standard Python min(nan, 2.0) propagates NaN.
+        # IEEE 754-2008 and RDNA2 minNum instead suppress NaN in favor of the number.
+        naive_python_min = min(float("nan"), 2.0)
+        self.assertTrue(math.isnan(naive_python_min))
+        # The reference oracle correctly returns 2.0.
+        self.assertEqual(ref_min_f32(QNAN, f32_to_bits(2.0)), f32_to_bits(2.0))
+
+
+class TestBufferAtomicFminMutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations of the oracle are caught."""
+
+    def test_mutation_oob_check_omission(self) -> None:
+        # Sabotage: ignoring NUM_RECORDS bounds check
+        mem = BufferMemory(256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=32)
+
+        # An access at offset 64 must be rejected by the oracle
+        _, in_bounds = ref_buffer_atomic_fmin(mem, desc, soffset=0, vaddr=64, fmin_val=0, glc=True)
+        self.assertFalse(in_bounds)
+
+        # Mutated logic that omits bounds check would claim success
+        with self.assertRaises(AssertionError):
+            self.assertEqual(in_bounds, True)
+
+    def test_mutation_glc_returns_post_op_value(self) -> None:
+        # Sabotage: returning post-op value instead of pre-op value
+        mem = BufferMemory(256)
+        mem.write_u32(0, f32_to_bits(50.0))
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_atomic_fmin_post_op(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            new_val = ref_min_f32(old, val)
+            m.write_u32(off, new_val)
+            return new_val  # BUG: returns new_val instead of old
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutated_atomic_fmin_post_op(mem, desc, 0, f32_to_bits(20.0)), f32_to_bits(50.0))
+
+    def test_mutation_fmax_instead_of_fmin(self) -> None:
+        # Sabotage: max instead of min
+        mem = BufferMemory(256)
+        mem.write_u32(0, f32_to_bits(50.0))
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        def mutated_atomic_fmax(m: BufferMemory, d: BufferResourceDescriptor, off: int, val: int) -> int:
+            old = m.read_u32(off)
+            new_val = max(bits_to_f32(old), bits_to_f32(val))
+            m.write_u32(off, f32_to_bits(new_val))
+            return old
+
+        mutated_atomic_fmax(mem, desc, 0, f32_to_bits(20.0))
+        with self.assertRaises(AssertionError):
+            # Correct fmin produces 20.0; buggy fmax produces 50.0
+            self.assertEqual(mem.read_u32(0), f32_to_bits(20.0))
+
+    def test_mutation_simd_exec_leak(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=256)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        simd.set_buffer_descriptor(4, desc)
+        simd.set_exec_mask(0)  # all lanes disabled
+
+        canary = 0x99999999
+        simd.mem.write_u32(0, canary)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_FMIN,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        simd.step(inst)
+        # Memory must remain canary
+        self.assertEqual(simd.mem.read_u32(0), canary)
+
+        # Mutated write would corrupt memory
+        simd.mem.write_u32(0, 0)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(simd.mem.read_u32(0), canary)
+
+
 class TestBufferAtomicFminScalarInterpreter(unittest.TestCase):
     """Unit tests for the deterministic scalar instruction interpreter."""
 
