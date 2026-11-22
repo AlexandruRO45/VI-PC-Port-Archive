@@ -1,9 +1,9 @@
-"""vk_pipeline_check --isolate: a module that kills the driver is recorded as failed and the pass goes on.
+"""vk_pipeline_check --isolate: crashes and stopped compiles are recorded and the pass goes on.
 
-No game data: five tiny compute shaders are assembled here. The crash is simulated with the tool's test
-hook VK_PIPELINE_CHECK_SIMULATE_CRASH just before the pipeline of the named module, so no crashing
-driver is needed. Skips when vk_pipeline_check isn't built or there is no usable Vulkan device.
-Pin a GPU with VK_LOADER_DRIVERS_SELECT / LEONIDA_VK_DEVICE as for the other
+No game data: five tiny compute shaders are assembled here with spirv-as. The crash is simulated with the tool's test
+hooks VK_PIPELINE_CHECK_SIMULATE_CRASH and VK_PIPELINE_CHECK_SIMULATE_HANG before pipeline creation.
+Skips when the checker, spirv-as or a usable Vulkan device is unavailable. Pin a GPU
+with VK_LOADER_DRIVERS_SELECT / LEONIDA_VK_DEVICE as for the other
 Vulkan tools. Set LEONIDA_VK_PIPELINE_CHECK to use a binary elsewhere.
 """
 import json
@@ -54,6 +54,8 @@ def find_binary():
 class IsolateTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if os.name not in ("posix", "nt"):
+            raise unittest.SkipTest("POSIX or Windows process supervision is required")
         cls.exe = find_binary()
         if cls.exe is None:
             raise unittest.SkipTest("vk_pipeline_check isn't built (set LEONIDA_VK_PIPELINE_CHECK to its path)")
@@ -71,17 +73,20 @@ class IsolateTest(unittest.TestCase):
             raise unittest.SkipTest("no usable Vulkan device (exit %d): %s" % (probe.returncode, probe.stderr.strip()[-300:]))
 
     @classmethod
-    def run_tool(cls, args, crash=None, cache=None, *, device=None):
+    def run_tool(cls, args, crash=None, cache=None, *, device=None, hang=None, timeout=300):
         env = dict(os.environ)
         env.pop("VK_PIPELINE_CHECK_SIMULATE_CRASH", None)
+        env.pop("VK_PIPELINE_CHECK_SIMULATE_HANG", None)
         if crash:
             env["VK_PIPELINE_CHECK_SIMULATE_CRASH"] = crash
+        if hang:
+            env["VK_PIPELINE_CHECK_SIMULATE_HANG"] = hang
         if device:
             env["LEONIDA_VK_DEVICE"] = device
         # Windows paths ending in a backslash must survive the parent's command-line quoting too.
         directory = str(cls.dir) + (os.sep if WINDOWS else "")
         cmd = [str(cls.exe), directory] + ([str(cache)] if cache else []) + ["--jobs", "2"] + args
-        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
 
     def cache(self, name):
         return Path(self.tmp.name) / name
@@ -145,6 +150,29 @@ class IsolateTest(unittest.TestCase):
         r = self.run_tool(["--isolate"], crash=CRASHER + ":SEGV")
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn(f"MODULE CRASH {CRASHER} (cs, {SEGV_LABEL})", r.stdout)
+
+    def test_isolate_reports_a_timed_out_shader_and_finishes_the_others(self):
+        cache = self.cache("hang.cache")
+        r = self.run_tool(["--isolate", "--isolate-timeout", "2"], hang=CRASHER, cache=cache, timeout=20)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn(f"MODULE TIMEOUT {CRASHER} (cs, child deadline exceeded)", r.stdout)
+        self.assertEqual(r.stdout.count("MODULE TIMEOUT"), 1, r.stdout)
+        self.assertIn("cs: 4 modules ok, 0 failed", r.stdout)
+        self.assertIn("cs pipelines: 4 ok, 1 failed, 0 skipped", r.stdout)
+        self.assertIn("modules that exceeded the child deadline: 1", r.stdout)
+        self.assertNotIn("MODULE CRASH", r.stdout)
+        self.assertTrue(cache.is_file())
+
+    def test_single_timeout_preserves_the_previous_cache(self):
+        cache = self.cache("seeded.cache")
+        clean = self.run_tool([], cache=cache)
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+        saved = cache.read_bytes()
+        r = self.run_tool(["--isolate", "--isolate-timeout", "2", "--start", "2", "--count", "1"],
+                          hang=CRASHER, cache=cache, timeout=12)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("MODULE TIMEOUT " + CRASHER, r.stdout)
+        self.assertEqual(cache.read_bytes(), saved)
 
     def test_isolate_rejects_stats(self):
         r = self.run_tool(["--isolate", "--stats", str(self.cache("s.csv"))])

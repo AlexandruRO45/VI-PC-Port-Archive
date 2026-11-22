@@ -24,6 +24,15 @@ check_invalid(--slow -0.5)
 check_invalid(--slow 1.2.3)  # strtod must consume the whole token, not just its numeric prefix
 check_invalid(--stage --graphics-only)
 check_invalid(--stats)
+check_invalid(--isolate-timeout)
+check_invalid(--isolate-timeout 0)
+check_invalid(--isolate-timeout nan)
+
+execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" --isolate-timeout 1
+                RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+if(NOT code STREQUAL "2" OR NOT log MATCHES "requires --isolate")
+  message(FATAL_ERROR "Expected a deadline without isolation to be rejected, got ${code}\n${log}")
+endif()
 
 function(check_protected_input name)
   execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" ${ARGN}

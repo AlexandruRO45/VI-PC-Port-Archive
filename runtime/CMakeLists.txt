@@ -427,6 +427,13 @@ if(BUILD_TESTING)
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
 
+  add_executable(pipeline_isolate_process_test test/pipeline_isolate_process_test.cpp)
+  if(WIN32)
+    target_compile_definitions(pipeline_isolate_process_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  add_test(NAME pipeline_isolate_process COMMAND pipeline_isolate_process_test)
+  set_tests_properties(pipeline_isolate_process PROPERTIES TIMEOUT 20)
+
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
 

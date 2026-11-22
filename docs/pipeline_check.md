@@ -39,7 +39,8 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 | `--large-module-bytes N` | Compile modules larger than N bytes alone (default 4 MiB; 0 disables isolation). |
 | `--stats FILE` | Write the driver's per-shader statistics as CSV rows `name,stage,statistic,value`. Needs `VK_KHR_pipeline_executable_properties`; use it without `cache.bin`, because a cached pipeline may come without statistics. |
 | `--cache-feedback` | Group successful pipeline creations by `VkPipelineCreationFeedback`: cache hits, no hit reported, and unavailable. |
-| `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
+| `--isolate` | Check in child processes on Windows and POSIX, `--isolate-batch N` modules at a time (default 256). A crashing module is recorded as `MODULE CRASH` and the pass continues. Incompatible with `--stats`. |
+| `--isolate-timeout SEC` | Limit the time each child can run. Split a timed-out batch and report modules that exceed the deadline on their own as `MODULE TIMEOUT`. |
 | `--inflight-file F` | Keep the modules currently in the driver in F as `name<TAB>phase` lines. It is rewritten by the watchdog and when a large module enters or leaves, and emptied at the end; `make_game.py`'s pipelines stage reads it. |
 | `--skip-file F` | Do not compile modules named one per line in F; each is reported as `MODULE CRASH` and counted as a failed pipeline. `make_game.py` writes F after a crash so the next run checks the rest. |
 
@@ -363,7 +364,7 @@ bounded coverage and cache checkpoints, collective memory-crash recovery, a genu
 failures, interruptions, setup failures, inconclusive probes and compatibility with older checkers. It needs no
 game files or GPU.
 
-## Crash isolation (`--isolate`)
+## Crash and hang isolation (`--isolate`)
 
 A driver that dies while compiling one module (for example the RADV `SIGFPE` in
 [#1721](https://github.com/ItsNotRexed/Leonida/issues/1721)) ends the whole process, so the rest of the corpus
@@ -371,7 +372,7 @@ used to need that module excluded by hand with `--start/--count`. With `--isolat
 child processes on native Windows and POSIX:
 
 ```sh
-vk_pipeline_check <spirv dir> cache.bin --isolate [--isolate-batch 256] [--jobs N ...]
+vk_pipeline_check <spirv dir> cache.bin --isolate --isolate-batch 64 --isolate-timeout 120 --jobs 2
 ```
 
 - The parent opens no Vulkan device. It runs this executable, one child at a time, over `--isolate-batch`
@@ -385,21 +386,30 @@ vk_pipeline_check <spirv dir> cache.bin --isolate [--isolate-batch 256] [--jobs 
   counts as a failure. A child that fails before it starts work (no device, bad arguments) stops the run
   with exit status 1.
 - Windows reports exception exit codes in hexadecimal, for example `driver exited with status 0xc0000005`.
+- `--isolate-timeout SEC` sets a wall-clock deadline for each child. It covers Vulkan setup, cache
+  loading, compilation and the final cache save. If an isolated compile hangs, the parent terminates
+  the child's process group (POSIX) or Job Object (Windows) and bisects the batch. A single module
+  that still exceeds the deadline is reported as `MODULE TIMEOUT` and counted as a pipeline failure.
+  If all smaller batches finish, their results count and the parent reports that splitting recovered the
+  deadline. A child that exceeds its deadline before the work loop or during the final cache save stops
+  the run with a setup or cache error. Use a deadline that leaves enough time for cache I/O.
 - The pipeline cache: children run one after another and each seeds from and saves to the same `cache.bin`,
   like the chunked runs above; the save is atomic, a crashed child saves nothing, so the file stays valid and
   holds everything the finished children compiled. The parent prints its size at the end.
-- Exit status: 0 only if no module failed or crashed and the cache saved; 1 otherwise. The summary is
+- Exit status is 0 if all checks completed successfully and the cache saved, and 1 for failures,
+  crashes or unrecovered deadlines. The summary is
   aggregated by the parent (modules, pipelines, skips, `--cache-feedback`); the per-stage wave and compile-time lines
   of a normal run are not repeated. Output of a batch appears when its child finishes.
-- Each child loads the cache again, so a very large cache makes small batches slow; raise `--isolate-batch`.
-  There is no timeout: a hung compile still hangs.
+- Each child loads the cache again. Larger batches reduce repeated cache reads. When
+  `--isolate-timeout` is omitted, children have no deadline.
 
 Test hook, not for normal use: `VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL]` makes the
 process simulate a crash just before creating a matching module's pipeline. The default is `SIGFPE`.
 On Windows, `SIGFPE` and `SIGSEGV` use the corresponding exception exit codes.
-`tests/test_vk_pipeline_check_isolate.py` uses it with five hand-written compute
-shaders to check `--isolate` without a crashing driver; it skips when the tool isn't built or there is no
-Vulkan device.
+`VK_PIPELINE_CHECK_SIMULATE_HANG=<module name substring>` stalls a matching compile.
+`tests/test_vk_pipeline_check_isolate.py` runs five hand-assembled compute shaders through the checker.
+The `pipeline_isolate_process` CTest exercises process launching, argument escaping and deadlines
+without Vulkan.
 
 ## Application pipeline-cache feedback
 

@@ -32,6 +32,7 @@
 //                 that kills the driver is recorded as failed ("MODULE CRASH") and the pass
 //                 goes on. A crashed batch is bisected to the module. Children run one after the other and share
 //                 cache.bin. Not compatible with --stats.
+//   --isolate-timeout SEC   optional deadline for each child, including setup and the final cache save.
 //   --inflight-file F  keep the modules that are in the driver in F, one "name<TAB>phase" line each (phase: module
 //                 while vkCreateShaderModule runs, pipeline while its pipeline is created), so whoever ran the check
 //                 can tell which module was there when the process died. F is rewritten when a module over
@@ -45,7 +46,9 @@
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] simulates a process crash
 //                 just before the pipeline of a matching module is created. For testing --isolate and the
 //                 pipelines stage's retry.
+//   test hook     VK_PIPELINE_CHECK_SIMULATE_HANG=<module name substring> stalls a matching compile.
 #include "vulkan_loader.h"
+#include "pipeline_isolate_process.h"
 #include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
@@ -83,12 +86,6 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-
-#ifndef _WIN32
-#include <sys/wait.h>
-#include <unistd.h>
-#include <cerrno>
-#endif
 
 static PFN_vkGetInstanceProcAddr gipa;
 
@@ -571,215 +568,68 @@ SimulatedCrash read_simulated_crash() {
     return c;
 }
 
-#ifndef _WIN32
 std::string signal_label(int sig) {
     switch (sig) {
     case SIGFPE: return "SIGFPE";
     case SIGSEGV: return "SIGSEGV";
     case SIGABRT: return "SIGABRT";
     case SIGILL: return "SIGILL";
+#ifndef _WIN32
     case SIGBUS: return "SIGBUS";
     case SIGKILL: return "SIGKILL";
+#endif
     case SIGTERM: return "SIGTERM";
     default: return "signal " + std::to_string(sig);
     }
 }
-#endif
 
 // --isolate: one child run of this executable over [start, start + count) of the stage-filtered list.
-struct ChildRun {
+struct ChildRun : leonida::pipeline_isolate::ProcessResult {
     bool ready = false;     // reached the work loop (ISO-READY): Vulkan and the cache were set up
+    bool saving = false;    // checking finished and the final cache save is in progress
     bool done = false;      // finished the pass and saved the cache (ISO-DONE)
     bool cache_ok = true;
-    int sig = 0;            // killed by this signal
-    uint32_t status = 0;    // exit status when it exited (a full DWORD on Windows)
-    std::string runner_error;
-    std::string out;        // its stdout
 };
 
-std::string child_exit_status(uint32_t status) {
-#ifdef _WIN32
-    if (status >= 0x80000000u) {
-        char hex[11];
-        std::snprintf(hex, sizeof hex, "0x%08x", static_cast<unsigned>(status));
-        return hex;
-    }
-#endif
-    return std::to_string(status);
-}
-
-std::filesystem::path self_executable(const char* argv0) {
-#ifdef _WIN32
-    (void)argv0;
-    std::wstring path(32768, L'\0');
-    const DWORD len = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-    if (!len || len == path.size()) return {};
-    path.resize(len);
-    return path;
-#else
-    std::error_code ec;
-    auto self = std::filesystem::read_symlink("/proc/self/exe", ec);
-    return ec ? std::filesystem::path(argv0) : self;
-#endif
-}
-
-#ifdef _WIN32
-// Quote one argument for the Windows CRT, including backslashes before quotes and at the end.
-std::wstring quote_child_arg(std::wstring_view arg) {
-    std::wstring quoted = L"\"";
-    size_t slashes = 0;
-    for (wchar_t c : arg) {
-        if (c == L'\\') {
-            ++slashes;
-        } else {
-            if (c == L'\"') quoted.append(slashes + 1, L'\\');
-            slashes = 0;
-        }
-        quoted += c;
-    }
-    return quoted.append(slashes, L'\\') + L"\"";
-}
-
-void collect_child(const std::filesystem::path& exe, std::vector<std::string>& args, ChildRun& r) {
-    const auto failed = [&](const char* api) {
-        const DWORD error = GetLastError();
-        r.runner_error = std::string(api) + " failed (Win32 error " + std::to_string(error) + ")";
-    };
-    std::wstring command = quote_child_arg(exe.native());
-    for (const auto& arg : args) {
-        // The checker uses narrow CRT argv. Round-trip the arguments through its active ANSI code page.
-        const int len = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, arg.c_str(), -1, nullptr, 0);
-        if (!len) return failed("MultiByteToWideChar");
-        std::wstring wide(len, L'\0');
-        if (!MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, arg.c_str(), -1, wide.data(), len))
-            return failed("MultiByteToWideChar");
-        wide.pop_back();
-        command += L' ';
-        command += quote_child_arg(wide);
-    }
-
-    using Handle = std::unique_ptr<void, decltype(&CloseHandle)>;
-    SECURITY_ATTRIBUTES inherited{sizeof(inherited), nullptr, TRUE};
-    HANDLE read_handle = nullptr, write_handle = nullptr;
-    if (!CreatePipe(&read_handle, &write_handle, &inherited, 0)) return failed("CreatePipe");
-    Handle read_end(read_handle, CloseHandle), write_end(write_handle, CloseHandle);
-    if (!SetHandleInformation(read_end.get(), HANDLE_FLAG_INHERIT, 0)) return failed("SetHandleInformation");
-
-    // Only stdout is captured. Keep stderr live for driver diagnostics and give the child no interactive input.
-    const HANDLE nul_handle = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                         &inherited, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (nul_handle == INVALID_HANDLE_VALUE) return failed("CreateFileW(NUL)");
-    Handle nul(nul_handle, CloseHandle), stderr_copy(nullptr, CloseHandle);
-    const HANDLE stderr_handle = GetStdHandle(STD_ERROR_HANDLE);
-    if (stderr_handle && stderr_handle != INVALID_HANDLE_VALUE) {
-        HANDLE duplicate = nullptr;
-        const HANDLE current = GetCurrentProcess();
-        if (!DuplicateHandle(current, stderr_handle, current, &duplicate, 0, TRUE, DUPLICATE_SAME_ACCESS))
-            return failed("DuplicateHandle(stderr)");
-        stderr_copy.reset(duplicate);
-    }
-
-    STARTUPINFOEXW startup{};
-    startup.StartupInfo.cb = sizeof(startup);
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = nul.get();
-    startup.StartupInfo.hStdOutput = write_end.get();
-    startup.StartupInfo.hStdError = stderr_copy ? stderr_copy.get() : nul.get();
-    // Inherit only the standard handles, even when the caller gave the parent other inheritable handles.
-    HANDLE child_handles[] = {nul.get(), write_end.get(), stderr_copy.get()};
-    SIZE_T attr_bytes = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_bytes);
-    if (!attr_bytes) return failed("InitializeProcThreadAttributeList");
-    std::vector<unsigned char> attrs(attr_bytes);
-    startup.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrs.data());
-    if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &attr_bytes))
-        return failed("InitializeProcThreadAttributeList");
-    std::fflush(nullptr);
-    const bool configured = UpdateProcThreadAttribute(startup.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                                      child_handles, (stderr_copy ? 3 : 2) * sizeof(HANDLE),
-                                                      nullptr, nullptr);
-    PROCESS_INFORMATION process{};
-    const bool started = configured && CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE,
-                                                       EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
-                                                       &startup.StartupInfo, &process);
-    const DWORD start_error = started ? 0 : GetLastError();
-    DeleteProcThreadAttributeList(startup.lpAttributeList);
-    if (!started) {
-        SetLastError(start_error);
-        return failed(configured ? "CreateProcessW" : "UpdateProcThreadAttribute");
-    }
-    CloseHandle(process.hThread);
-    Handle child(process.hProcess, CloseHandle);
-    write_end.reset();   // EOF must depend on the child closing its write handle.
-
-    char buffer[4096];
-    DWORD bytes = 0;
-    while (ReadFile(read_end.get(), buffer, sizeof buffer, &bytes, nullptr)) {
-        if (bytes) r.out.append(buffer, bytes);
-    }
-    if (GetLastError() != ERROR_BROKEN_PIPE) failed("ReadFile(child stdout)");
-    read_end.reset();
-    if (WaitForSingleObject(child.get(), INFINITE) != WAIT_OBJECT_0) return failed("WaitForSingleObject");
-    DWORD status = 0;
-    if (!GetExitCodeProcess(child.get(), &status)) return failed("GetExitCodeProcess");
-    r.status = status;
-}
-#else
-void collect_child(const std::filesystem::path& exe, std::vector<std::string>& args, ChildRun& r) {
-    args.insert(args.begin(), exe.native());
-    std::vector<char*> argv;
-    for (auto& a : args) argv.push_back(a.data());
-    argv.push_back(nullptr);
-    int fds[2];
-    if (pipe(fds) != 0) { r.status = 127; return; }
-    std::fflush(nullptr);
-    const pid_t pid = fork();
-    if (pid < 0) { close(fds[0]); close(fds[1]); r.status = 127; return; }
-    if (pid == 0) {
-        dup2(fds[1], 1);
-        close(fds[0]); close(fds[1]);
-        execv(exe.c_str(), argv.data());
-        _exit(127);
-    }
-    close(fds[1]);
-    char buf[4096];
-    for (;;) {
-        const ssize_t n = read(fds[0], buf, sizeof buf);
-        if (n > 0) r.out.append(buf, size_t(n));
-        else if (n < 0 && errno == EINTR) continue;
-        else break;
-    }
-    close(fds[0]);
-    int st = 0;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    if (WIFSIGNALED(st)) r.sig = WTERMSIG(st);
-    else r.status = WIFEXITED(st) ? WEXITSTATUS(st) : 1;
-}
-#endif
-
-std::string_view next_child_line(std::string_view& output) {
-    const size_t end = output.find('\n');
-    auto line = output.substr(0, end);
-    output.remove_prefix(end == std::string_view::npos ? output.size() : end + 1);
+std::string_view log_line(const std::string& text, size_t& pos) {
+    size_t end = text.find('\n', pos);
+    if (end == std::string::npos) end = text.size();
+    std::string_view line(text.data() + pos, end - pos);
+    pos = end == text.size() ? end : end + 1;
     if (line.ends_with('\r')) line.remove_suffix(1);
     return line;
 }
 
-ChildRun run_child(const std::filesystem::path& exe, const std::string& dir,
-                   const std::vector<std::string>& pass, const std::string& cache_path, size_t start, size_t count) {
-    ChildRun r;
-    std::vector<std::string> args = {dir};
+ChildRun run_child(const std::string& exe, const std::string& dir, const std::vector<std::string>& pass,
+                   const std::string& cache_path, size_t start, size_t count, double timeout) {
+    std::vector<std::string> args = {exe, dir};
     if (!cache_path.empty()) args.push_back(cache_path);
-    for (const auto& a : pass) args.push_back(a);
+    args.insert(args.end(), pass.begin(), pass.end());
     args.insert(args.end(), {"--isolate-child", "--start", std::to_string(start), "--count", std::to_string(count)});
-    collect_child(exe, args, r);
-    std::string_view output = r.out;
-    while (!output.empty()) {
-        const auto line = next_child_line(output);
+    ChildRun r{leonida::pipeline_isolate::run_process(args, timeout)};
+    for (size_t pos = 0; pos < r.output.size();) {
+        const auto line = log_line(r.output, pos);
         if (line == "ISO-READY") r.ready = true;
-        else if (line.rfind("ISO-DONE", 0) == 0) { r.done = true; r.cache_ok = line.find("cache_ok=0") == std::string_view::npos; }
+        else if (line == "ISO-SAVING") r.saving = true;
+        else if (line == "ISO-DONE cache_ok=0" || line == "ISO-DONE cache_ok=1") {
+            r.done = true;
+            r.cache_ok = line.ends_with('1');
+        }
     }
     return r;
+}
+
+std::string child_failure(const ChildRun& r) {
+    if (r.timed_out) return "child deadline exceeded";
+    if (r.signal) return "driver crashed: " + signal_label(r.signal);
+#ifdef _WIN32
+    if (r.status >= 0x80000000u) {
+        char code[11];
+        std::snprintf(code, sizeof(code), "0x%08x", r.status);
+        return std::string("driver exited with status ") + code;
+    }
+#endif
+    return "driver exited with status " + std::to_string(r.status);
 }
 
 }  // namespace
@@ -788,6 +638,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
+            "[--isolate-timeout SEC (with --isolate)] "
             "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
             "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
             "[--skip-file F]\n");
@@ -804,6 +655,7 @@ int main(int argc, char** argv) {
     std::string stage_filter = "all";
     bool cache_feedback = false, isolate = false, iso_child = false;
     size_t isolate_batch = 256;
+    double isolate_timeout = 0.0;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
         auto value = [&]() -> std::string_view {
@@ -847,6 +699,8 @@ int main(int argc, char** argv) {
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
         else if (a == "--cache-feedback") cache_feedback = true;
         else if (a == "--isolate") isolate = true;
+        else if (a == "--isolate-timeout")
+            valid = number(isolate_timeout) && std::isfinite(isolate_timeout) && isolate_timeout > 0.0;
         else if (a == "--isolate-child") iso_child = true;   // internal: the parent's child runs
         else if (a == "--isolate-batch") {   // parsed like the other numbers (#1735); at least one per batch
             valid = number(isolate_batch);
@@ -877,9 +731,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--isolate cannot be combined with --stats\n");
         return 2;
     }
-#ifdef _WIN32
-    if (iso_child) SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-#endif
+    if (isolate_timeout && !isolate) {
+        std::fprintf(stderr, "--isolate-timeout requires --isolate\n");
+        return 2;
+    }
 
     const std::string index_path = dir + "/index.json";
     const auto same_file = [](const std::string& a, const std::string& b) {
@@ -938,11 +793,11 @@ int main(int argc, char** argv) {
         // Parent: no Vulkan here. Run the check in child processes, one at a time, in batches of --isolate-batch
         // modules. A child that dies mid-batch has its output discarded and the batch is bisected until the one
         // module that kills the driver is found; the clean sub-runs partition the rest, so nothing is counted twice.
-        const auto exe = self_executable(argv[0]);
-        if (exe.empty()) {
-            std::fprintf(stderr, "error: could not find the executable for --isolate\n");
-            return 1;
-        }
+        std::string exe = argv[0];
+        std::error_code ec;
+#ifdef __linux__
+        if (auto self = std::filesystem::read_symlink("/proc/self/exe", ec); !ec) exe = self.string();
+#endif
         std::vector<std::string> pass = {"--jobs", std::to_string(jobs), "--slow", std::to_string(slow), "--stage", stage_filter,
                                          "--max-bytes", std::to_string(max_bytes),
                                          "--large-module-bytes", std::to_string(large_module_bytes),
@@ -950,20 +805,22 @@ int main(int argc, char** argv) {
         if (cache_feedback) pass.push_back("--cache-feedback");
         if (!inflight_path.empty()) pass.insert(pass.end(), {"--inflight-file", inflight_path});
         if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
-        struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, fb[3] = {}; };
+        struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, timed_out = 0, fb[3] = {}; };
         std::map<std::string, Agg> agg;
-        std::vector<std::string> crashes;
+        std::vector<std::string> crashes, timeouts;
         bool cache_ok = true, setup_failed = false;
-        size_t unreproduced = 0;
+        size_t unreproduced = 0, split_deadlines = 0;
+        unsigned interrupted_status = 0;
         const auto t_iso = std::chrono::steady_clock::now();
         std::fprintf(stderr, "isolating %zu shaders [%zu, %zu) (stage=%s) in child processes, %zu per batch\n",
                      work.size(), lo, hi, stage_filter.c_str(), isolate_batch);
         auto commit = [&](const ChildRun& r) {
-            std::string_view output = r.out;
-            while (!output.empty()) {
-                const std::string line(next_child_line(output));
+            size_t pos = 0;
+            while (pos < r.output.size()) {
+                const std::string line(log_line(r.output, pos));
                 // The parent prints one cache line at the end instead of one per child.
-                if (line == "ISO-READY" || line.rfind("ISO-DONE", 0) == 0 || line.rfind("pipeline cache: ", 0) == 0) continue;
+                if (line == "ISO-READY" || line == "ISO-SAVING" || line.rfind("ISO-DONE", 0) == 0 ||
+                    line.rfind("pipeline cache: ", 0) == 0) continue;
                 if (line.rfind("ISO-RESULT ", 0) == 0) {
                     char st[16];
                     unsigned v[9] = {};
@@ -983,42 +840,54 @@ int main(int argc, char** argv) {
         // Returns the number of failures recorded for [s, s + n): crashed modules, or 1 for a crash that vanished.
         auto bisect = [&](auto&& self, size_t s, size_t n) -> size_t {
             if (setup_failed) return 0;
-            const ChildRun r = run_child(exe, dir, pass, cache_path, s, n);
-            if (!r.runner_error.empty()) {
-                std::fprintf(stderr, "error: could not run an isolation child: %s\n", r.runner_error.c_str());
+            const ChildRun r = run_child(exe, dir, pass, cache_path, s, n, isolate_timeout);
+            if (r.interrupted) {
+                interrupted_status = r.status;
                 setup_failed = true;
                 return 0;
             }
-            if (r.done) { commit(r); return 0; }
-            const std::string status = child_exit_status(r.status);
-#ifndef _WIN32
-            const std::string signal = r.sig ? signal_label(r.sig) : "";
-#else
-            const std::string signal;
-#endif
-            if (!r.ready) {   // died or exited before the work loop: not a module's fault
-                std::fputs(r.out.c_str(), stdout);
-                if (!signal.empty()) std::fprintf(stderr, "error: a child process died during setup (%s)\n", signal.c_str());
-                else std::fprintf(stderr, "error: a child process failed during setup (exit status %s)\n", status.c_str());
+            if (r.done && !r.signal && !r.timed_out && r.error.empty() && r.status <= 1) {
+                commit(r);
+                return 0;
+            }
+            if (!r.error.empty() || !r.ready) {   // failed before the work loop: no module has started
+                std::fputs(r.output.c_str(), stdout);
+                const auto why = r.error.empty() ? child_failure(r) : r.error;
+                const char* phase = r.error.empty() ? "setup" : "supervision";
+                std::fprintf(stderr, "error: a child process failed during %s (%s)\n", phase, why.c_str());
                 setup_failed = true;
                 return 0;
             }
-            const std::string why = signal.empty() ? "driver exited with status " + status : "driver crashed: " + signal;
+            const std::string why = child_failure(r);
+            if (r.saving) {
+                std::fprintf(stderr, "error: checker child stopped during the final cache save (%s)\n", why.c_str());
+                setup_failed = true;
+                return 0;
+            }
             if (n == 1) {
                 const std::string& name = *all[s].first;
                 const std::string& st = all[s].second->stage;
-                std::printf("MODULE CRASH %s (%s, %s)\n", name.c_str(), st.c_str(), why.c_str());
+                const char* label = r.timed_out ? "MODULE TIMEOUT" : "MODULE CRASH";
+                std::printf("%s %s (%s, %s)\n", label, name.c_str(), st.c_str(), why.c_str());
                 std::fflush(stdout);
-                crashes.push_back(name + " (" + st + ", " + why + ")");
+                auto& failures = r.timed_out ? timeouts : crashes;
+                failures.push_back(name + " (" + st + ", " + why + ")");
+                auto& count = r.timed_out ? agg[st].timed_out : agg[st].crashed;
+                ++count;
                 agg[st].pipe_bad++;
-                agg[st].crashed++;
                 return 1;
             }
-            std::fprintf(stderr, "child over [%zu, %zu) died (%s); bisecting\n", s, s + n, why.c_str());
+            std::fprintf(stderr, "child over [%zu, %zu) stopped (%s); bisecting\n", s, s + n, why.c_str());
             const size_t half = n / 2;
             size_t found = self(self, s, half);
             found += self(self, s + half, n - half);
             if (found == 0 && !setup_failed) {
+                if (r.timed_out) {
+                    // The full batch may simply take longer than the deadline. Every module ran
+                    // successfully to a final result in the smaller children.
+                    ++split_deadlines;
+                    return 0;
+                }
                 std::printf("MODULE CRASH [%zu, %zu) not reproduced when split (%s); counted as failed\n", s, s + n, why.c_str());
                 ++unreproduced;
                 return 1;
@@ -1030,12 +899,13 @@ int main(int argc, char** argv) {
             bisect(bisect, s, batch);
             s += batch;
         }
-        if (setup_failed) return 1;
-        bool failed = !crashes.empty() || unreproduced || !cache_ok;
+        if (setup_failed) return interrupted_status ? static_cast<int>(interrupted_status) : 1;
+        bool failed = !crashes.empty() || !timeouts.empty() || unreproduced || !cache_ok;
         for (const auto& [st, a] : agg) {
             std::printf("%s: %u modules ok, %u failed\n", st.c_str(), a.mod_ok, a.mod_bad);
             std::printf("%s pipelines: %u ok, %u failed, %u skipped\n", st.c_str(), a.pipe_ok, a.pipe_bad, a.pipe_skip);
             if (a.crashed) std::printf("  %s crashed the driver: %u (counted as failed)\n", st.c_str(), a.crashed);
+            if (a.timed_out) std::printf("  %s timed out: %u (counted as failed)\n", st.c_str(), a.timed_out);
             if (cache_feedback)
                 std::printf("  %s cache feedback: %u hits, %u no hit reported, %u unavailable\n", st.c_str(), a.fb[0], a.fb[1], a.fb[2]);
             if (a.mod_bad || a.pipe_bad) failed = true;
@@ -1047,6 +917,11 @@ int main(int argc, char** argv) {
             std::printf("modules that crashed the driver: %zu\n", crashes.size());
             for (const auto& c : crashes) std::printf("  %s\n", c.c_str());
         }
+        if (!timeouts.empty()) {
+            std::printf("modules that exceeded the child deadline: %zu\n", timeouts.size());
+            for (const auto& name : timeouts) std::printf("  %s\n", name.c_str());
+        }
+        if (split_deadlines) std::printf("batch deadlines recovered by splitting: %zu\n", split_deadlines);
         if (unreproduced) std::printf("crashes not reproduced after splitting: %zu\n", unreproduced);
         if (!cache_path.empty()) {
             std::error_code ec;
@@ -1072,6 +947,9 @@ int main(int argc, char** argv) {
         }
     }
 
+#ifdef _WIN32
+    if (iso_child) SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+#endif
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -1551,7 +1429,12 @@ int main(int argc, char** argv) {
     };
 
     const SimulatedCrash sim_crash = read_simulated_crash();
-    auto maybe_simulate_crash = [&](const std::string& name) {   // test hook, see the header
+    const char* sim_hang = std::getenv("VK_PIPELINE_CHECK_SIMULATE_HANG");
+    auto maybe_simulate_crash = [&](const std::string& name) {   // test hooks, see the header
+        if (sim_hang && *sim_hang && name.find(sim_hang) != std::string::npos) {
+            std::fprintf(stderr, "simulating a hang before the pipeline of %s\n", name.c_str());
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+        }
         if (sim_crash.enabled && name.find(sim_crash.pattern) != std::string::npos) {
             std::fprintf(stderr, "simulating signal %d before the pipeline of %s\n", sim_crash.sig, name.c_str());
             std::fflush(nullptr);
@@ -1927,6 +1810,8 @@ int main(int argc, char** argv) {
                         s ? s->pipes_ok : 0u, s ? s->pipes_bad : 0u, s ? s->pipes_skipped : 0u, big,
                         s ? s->feedback[0] : 0u, s ? s->feedback[1] : 0u, s ? s->feedback[2] : 0u);
         }
+        std::printf("ISO-SAVING\n");
+        std::fflush(stdout);
         const bool saved = save_cache(true);
         std::printf("ISO-DONE cache_ok=%d\n", saved ? 1 : 0);
         std::fflush(stdout);
