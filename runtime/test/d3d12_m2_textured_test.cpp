@@ -118,6 +118,10 @@ int main() {
     const auto uoff_container = shader_container(uoff_program);
 
     std::vector<std::uint8_t> pixels(std::size_t(target_pitch) * target_size), control_pixels = pixels, linear_pixels = pixels;
+    const auto static_program = read_file(root_dir / "fssm" / "ps_m2_static.fssm");
+    EXPECT(static_program.size() >= 4 && library.find("ps", leonida::sha256_hex(static_program)));
+    const auto static_container = shader_container(static_program);
+    std::array<std::vector<std::uint8_t>, 2> static_pixels{pixels, pixels};
     unsigned image_hits = 0, sampler_hits = 0;
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -173,6 +177,35 @@ int main() {
         pso_desc.SampleDesc.Count = 1;
         Ref<ID3D12PipelineState> pso, uoff_pso;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+        // Keep MaxLOD at zero: the M2 textures have one level, and the heap samplers have a different S#.
+        // The shader takes the four words by value. Registration must come from CreateRootSignature alone.
+        Ref<ID3D12RootSignature> static_roots[2];
+        Ref<ID3D12PipelineState> static_psos[2];
+        const std::uint32_t static_words[2][4] = {{0x92, 0, 0x04000000, 0}, {0x92, 0, 0x04500000, 0}};
+        D3D12_ROOT_PARAMETER static_params[2] = {params[0], {}};
+        static_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        static_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        static_params[1].Constants = {0, 0, 4};
+        for (unsigned mode = 0; mode < 2; ++mode) {
+            std::uint32_t key[8]{~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+            std::memcpy(key, static_words[mode], sizeof(static_words[mode]));
+            EXPECT(!rt::d3d12::bindless_hash_lookup(device.p, key));
+            D3D12_STATIC_SAMPLER_DESC fixed{};
+            fixed.Filter = mode == 0 ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+            fixed.AddressU = fixed.AddressV = fixed.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            fixed.MaxAnisotropy = 1;
+            fixed.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+            fixed.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            auto desc = root_desc;
+            desc.Desc_1_0 = {2, static_params, 1, &fixed, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+            const auto blob = serialize_root_signature(desc);
+            EXPECT(!blob.empty());
+            EXPECT(SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&static_roots[mode].p))));
+            EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key));
+            pso_desc.pRootSignature = static_roots[mode].p;
+            pso_desc.PS = {static_container.data(), static_container.size()};
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&static_psos[mode].p))));
+        }
         D3D12_DESCRIPTOR_RANGE indexed_range = srv_range;
         indexed_range.NumDescriptors = UINT32_MAX;
         D3D12_ROOT_PARAMETER indexed_params[3] = {params[0], params[1], {}};
@@ -218,8 +251,9 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&upload.p))));
+        const auto filter_readback_desc = buffer_desc(3 * pixels.size());
         const auto readback_desc = buffer_desc(std::size_t(target_pitch) * target_size);
-        EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &filter_readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
@@ -354,8 +388,7 @@ int main() {
         const D3D12_VIEWPORT viewport{0, 0, float(target_size), float(target_size), 0, 1};
         list->RSSetViewports(1, &viewport);
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        auto draw_halves = [&](std::uint64_t sampler) {
-            list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{sampler});
+        auto draw_halves = [&]() {
             for (UINT half = 0; half < 2; ++half) {
                 // The same quad over the whole target; the scissor rectangle keeps one half, and the SRV table names
                 // the texture of that half.
@@ -365,7 +398,8 @@ int main() {
                 list->DrawIndexedInstanced(6, 1, 0, 0, 0);
             }
         };
-        draw_halves(sampler_gpu);
+        list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{sampler_gpu});
+        draw_halves();
 
         D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -381,10 +415,25 @@ int main() {
         auto to_render = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         list->ResourceBarrier(1, &to_render);
         list->ClearRenderTargetView(rtv, clear, 0, nullptr);
-        draw_halves(sampler_gpu + 2 * sampler_step);
+        list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{sampler_gpu + 2 * sampler_step});
+        draw_halves();
         list->ResourceBarrier(1, &to_copy);
         dst.pResource = readback2.p;
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        list->SetDescriptorHeaps(1, heaps);  // SRV heap only, no sampler heap for either static draw
+        for (unsigned mode = 0; mode < 2; ++mode) {
+            list->ResourceBarrier(1, &to_render);
+            list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+            list->SetPipelineState(static_psos[mode].p);
+            list->SetGraphicsRootSignature(static_roots[mode].p);
+            list->SetGraphicsRoot32BitConstants(1, 4, static_words[mode], 0);
+            draw_halves();
+            list->ResourceBarrier(1, &to_copy);
+            dst.pResource = readback.p;
+            dst.PlacedFootprint.Offset = (mode + 1) * pixels.size();
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        dst.PlacedFootprint.Offset = 0;
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
@@ -394,6 +443,10 @@ int main() {
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
+
+        for (unsigned mode = 0; mode < 2; ++mode)
+            std::memcpy(static_pixels[mode].data(), static_cast<const std::uint8_t*>(mapped) + (mode + 1) * pixels.size(),
+                        pixels.size());
 
         void* mapped_linear = nullptr;
         EXPECT(SUCCEEDED(readback2->Map(0, nullptr, &mapped_linear)));
@@ -445,6 +498,8 @@ int main() {
 
         for (auto& texture : textures) texture.reset();
         for (auto* r : {&upload, &readback, &readback2, &target}) r->reset();
+        for (auto& pipeline : static_psos) pipeline.reset();
+        for (auto& signature : static_roots) signature.reset();
         pso.reset();
         uoff_pso.reset();
         list2.reset();
@@ -461,31 +516,33 @@ int main() {
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
 
-    unsigned mismatches = 0, linear_mismatches = 0;
-    int max_linear_error = 0;
-    for (UINT row = 0; row < target_size; ++row) {
-        for (UINT col = 0; col < target_size; ++col) {
-            const UINT tx = col / (target_size / texture_size), ty = row / (target_size / texture_size);
-            const Texel want = col < target_size / 2 ? gradient(tx, ty) : reflected(tx, ty);
-            const std::uint8_t* got = &pixels[std::size_t(row) * target_pitch + col * 4];
-            const Texel filtered = linear_clamp(col, row);
-            const auto* linear = &linear_pixels[std::size_t(row) * target_pitch + col * 4];
-            for (unsigned k = 0; k < filtered.size(); ++k) {
-                const int error = std::abs(int(linear[k]) - filtered[k]);
-                max_linear_error = std::max(max_linear_error, error);
-                if (error > 1 && linear_mismatches++ < 8)
-                    std::fprintf(stderr, "LINEAR (%u, %u) channel %u: got %u want %u\n",
-                                 col, row, k, unsigned(linear[k]), unsigned(filtered[k]));
+    for (unsigned source = 0; source < 2; ++source) {
+        const auto* label = source == 0 ? "heap" : "static";
+        const auto& point = source == 0 ? pixels : static_pixels[0];
+        const auto& linear = source == 0 ? linear_pixels : static_pixels[1];
+        int peak = 0;
+        unsigned mismatches = 0;
+        for (UINT row = 0; row < target_size; ++row) {
+            for (UINT col = 0; col < target_size; ++col) {
+                const UINT tx = col / (target_size / texture_size), ty = row / (target_size / texture_size);
+                const Texel nearest = col < target_size / 2 ? gradient(tx, ty) : reflected(tx, ty);
+                const Texel filtered = linear_clamp(col, row);
+                const auto offset = std::size_t(row) * target_pitch + col * 4;
+                for (unsigned k = 0; k < filtered.size(); ++k) {
+                    const int error = std::abs(int(linear[offset + k]) - filtered[k]);
+                    peak = std::max(peak, error);
+                    if (point[offset + k] == nearest[k] && error <= 1) continue;
+                    if (mismatches++ < 8)
+                        std::fprintf(stderr, "%s (%u,%u) channel %u: POINT %u/%u LINEAR %u/%u (read/expected)\n",
+                                     label, col, row, k, unsigned(point[offset + k]), unsigned(nearest[k]),
+                                     unsigned(linear[offset + k]), unsigned(filtered[k]));
+                }
             }
-            if (std::memcmp(got, want.data(), 4) == 0) continue;
-            if (mismatches++ < 8)
-                std::fprintf(stderr, "pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row, got[0], got[1],
-                             got[2], got[3], want[0], want[1], want[2], want[3]);
         }
+        EXPECT(!mismatches);
+        std::printf("M2 %s: POINT exact, LINEAR maximum RGBA8 error %d over %u pixels each\n",
+                    label, peak, target_size * target_size);
     }
-    EXPECT(!mismatches);
-    EXPECT(!linear_mismatches);
-    std::printf("M2 LINEAR: %u pixels, maximum RGBA8 channel error %d\n", target_size * target_size, max_linear_error);
 
     // The control pass: left half the gradient (WRAP: U + 1 wraps back), right half the reflected texture's last
     // column per row (CLAMP: U + 1 is past the edge). Pixels that differ from the plain pass tell the clamp was used.

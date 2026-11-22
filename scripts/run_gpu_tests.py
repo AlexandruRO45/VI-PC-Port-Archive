@@ -566,6 +566,7 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 # checker runs them: the test program that owns them judges them.
 OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_translated_draw_test",
                  "ps_m2": "d3d12_m2_textured_test", "vs_m2": "d3d12_m2_textured_test", "ps_m2_uoff": "d3d12_m2_textured_test",
+                 "ps_m2_static": "d3d12_m2_textured_test",
                  "ps_m2_array": "d3d12_m2_formats_test",
                  "ps_m3": "d3d12_m3_frame_test", "vs_m3": "d3d12_m3_frame_test",
                  "ps_m3_post": "d3d12_m3_frame_test", "ps_m3_query": "d3d12_m3_frame_test",
@@ -960,7 +961,7 @@ def run_suite(a, work: str) -> int:
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
                 "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
                                         0x5EED0010, 0x5EED0014, 0x5EED0018, 0x5EED001C],
-                # SHADER-52: wave32 lane select & 31 (40 → 8)
+                # SHADER-52: wave32 lane select & 31 (40 â†’ 8)
                 "cs_w32_lane_wrap": [25, 16, 777, 777],
                 # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]] (cs_movrelsd_2.asm)
                 "cs_movrelsd_2": [11, 33, 33, 55, 1717, 77, 1515, 1717],
@@ -1038,7 +1039,7 @@ def run_suite(a, work: str) -> int:
                 # differs per wave (cs_barrier_loop.asm)
                 "cs_barrier_early_end": [127, 126, 125, 124, 123, 122, 121, 120],
                 "cs_barrier_loop": [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE],
-                # SHADER-21 part 2: a mask copied to a VGPR with v_mov_b32 respects EXEC —
+                # SHADER-21 part 2: a mask copied to a VGPR with v_mov_b32 respects EXEC â€”
                 # inactive lanes keep the old VGPR (cs_mask_vgpr_exec.asm)
                 "cs_mask_vgpr_exec": [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
                                       0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF],
