@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_sse3_4_fp
 ; Source-owned differential fixture for 21 SSE3 and SSE4.1 floating-point and data-movement instructions.
 .code
 
