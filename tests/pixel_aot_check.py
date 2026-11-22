@@ -2180,6 +2180,49 @@ def scalar_body():
 PACK_HALVES = ("ll", "lh", "hh")
 
 
+def scalar_carry_chain(subtract, *, initialize_scc=True):
+    low, high = ("s_sub_u32", "s_subb_u32") if subtract else ("s_add_u32", "s_addc_u32")
+    setup = [f"{low} s62, s44, s46", "s_cselect_b32 s63, 1, 0"] if initialize_scc else [
+        "s_mov_b32 s62, 0", "s_mov_b32 s63, 0",
+    ]
+    return uncompressed_export([
+        *setup,
+        f"{high} s45, s45, s47", "s_cselect_b32 s64, 1, 0",
+        "v_mov_b32_e32 v12, s62", "v_mov_b32_e32 v13, s45",
+        "v_mov_b32_e32 v14, s63", "v_mov_b32_e32 v15, s64",
+    ])
+
+
+def check_scalar_carry_chain_draw(directory, compiler, renderer, backend):
+    source, shader, case = (directory / name for name in ("carry-chain.hlsl", "carry-chain.cso", "carry-chain.case"))
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for subtract in (False, True):
+        program = scalar_carry_chain(subtract)
+        source.write_text(translate_int(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        pairs = ((0, 0), (0x100000000, 1), (0, 0x100000000), (0, 1),
+                 (0, 0xffffffff00000001), (0xffffffff00000000, 0xffffffff00000001)) if subtract else (
+                     (0, 0), (0xffffffff, 1), (0xffffffff00000000, 0x100000000),
+                     (0xffffffffffffffff, 1))
+        for a, b in pairs:
+            low_a, low_b = a & 0xffffffff, b & 0xffffffff
+            low = low_a - low_b if subtract else low_a + low_b
+            wide = a - b if subtract else a + b
+            words = (wide & 0xffffffff, (wide >> 32) & 0xffffffff,
+                     not 0 <= low < 1 << 32, not 0 <= wide < 1 << 64)
+            constants = bytearray(256)
+            struct.pack_into("<QQ", constants, 12, a, b)
+            write_case(case, constants, tuple(as_float(w) for w in words), integer_rt=True)
+            subprocess.run(draw, check=True)
+        # The final case wraps only because of the incoming SCC.
+        old, new = ("s_subb_u32", "s_sub_u32") if subtract else ("s_addc_u32", "s_add_u32")
+        source.write_text(translate_int([line.replace(old, new) for line in program]), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Dropping SCC from {old} escaped detection")
+
+
 def scalar_bit_count_values(width):
     src = "s44" if width == 32 else "s[44:45]"
     body = []
@@ -2532,8 +2575,9 @@ def check_scalar_controls():
     # Neighbouring forms that the lowerer does not implement, operand kinds it cannot read, and
     # destinations other than plain scalar registers.
     first = "s_add_u32 s62, s44, s45"
-    for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45",
-                "s_absdiff_i32 s62, s44, s45",
+    for subtract in (False, True):
+        must_reject(translate_int, scalar_carry_chain(subtract, initialize_scc=False))
+    for new in ("s_absdiff_i32 s62, s44, s45",
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
                 "s_bfe_u32 s62, v12, s45", "s_lshl5_add_u32 s62, s44, s45",
                 "s_quadmask_b32 s62, s44", "s_bitset0_b64 s[62:63], s44",
@@ -4824,6 +4868,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((bfm_scalar_ops(), translate_int))
     fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
     fixtures.extend((scalar_bit_count_values(width), translate) for width in (32, 64))
+    fixtures.extend((scalar_carry_chain(subtract), translate_int) for subtract in (False, True))
     fixtures.append((scalar_mul_hi_values(), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
@@ -6336,6 +6381,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_sext_draw(directory, compiler, renderer, backend)
     check_scalar_pack_draw(directory, compiler, renderer, backend)
     check_scalar_bit_count_draw(directory, compiler, renderer, backend)
+    check_scalar_carry_chain_draw(directory, compiler, renderer, backend)
     check_scalar_mul_hi_draw(directory, compiler, renderer, backend)
     check_int16_predicate_draws(directory, compiler, renderer, backend)
     check_sdwa_predicate_draws(directory, compiler, renderer, backend)

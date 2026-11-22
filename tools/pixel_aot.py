@@ -1557,6 +1557,28 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint salu{i} = {value};")
             scalar[dst] = ("uint", f"salu{i}")
             scc = NONZERO.format(r=f"salu{i}")
+        elif m := match(r"(s_addc_u32|s_subb_u32) (s\d+), ([^,]+), ([^,]+)"):
+            op, dst, src0, src1 = m.groups()
+            sgpr_name(dst)
+            if scc is None:
+                raise ValueError("Carry or borrow input is not tracked")
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            a, b = (scalar_u32(t, scalar, pending) for t in (src0, src1))
+            result = f"salu{i}"
+            partial = f"partial{i}"
+            step = f"carry_in{i}"
+            lines.append(f"    uint {step} = {scc} ? 1u : 0u;")
+            # Keep both steps in uint32 so the two possible wrap points remain visible.
+            if op == "s_addc_u32":
+                lines.append(f"    uint {partial} = {a} + {b};")
+                lines.append(f"    uint {result} = {partial} + {step};")
+                scc = f"({partial} < {a} || {result} < {partial})"
+            else:
+                lines.append(f"    uint {partial} = {a} - {b};")
+                lines.append(f"    uint {result} = {partial} - {step};")
+                scc = f"({a} < {b} || {partial} < {step})"
+            scalar[dst] = ("uint", result)
         elif m := match(rf"s_({'|'.join(SCALAR)}) (s\d+), (.+)"):
             # Uniform values become HLSL uint locals; an exec mask does not affect them.
             op, dst, operands = m.groups()
