@@ -820,6 +820,22 @@ def int_predicate_group(kind, encoding, first, *, wave64=False):
     return with_constants(body)
 
 
+def unsigned_less_than(kind="u32"):
+    return with_constants([
+        "v_mov_b32_e32 v18, s44",
+        "v_mov_b32_e32 v19, s45",
+        "v_mov_b32_e32 v20, 1.0",
+        f"v_cmp_lt_{kind}_e32 vcc_lo, s44, v19",
+        "v_cndmask_b32_e32 v12, 0, v20, vcc_lo",
+        f"v_cmp_lt_{kind}_e32 vcc_lo, s45, v18",
+        "v_cndmask_b32_e32 v13, 0, v20, vcc_lo",
+        f"v_cmp_lt_{kind}_e64 s52, v18, v19",
+        "v_cndmask_b32_e64 v14, 0, v20, s52",
+        f"v_cmp_lt_{kind}_e64 s52, v19, v18",
+        "v_cndmask_b32_e64 v15, 0, v20, s52",
+    ])
+
+
 # 16-bit integer comparisons read only the low half of each source. L is s44, R is v18 (a copy of s45);
 # other operands are an integer inline constant or a 16-bit literal. Each (kind, encoding) pair has two
 # groups of four channels, so all six predicates appear with SGPR and VGPR operands, and the second group
@@ -1252,6 +1268,31 @@ def check_int_predicate_draws(directory, compiler, renderer, backend):
                 except AssertionError as error:
                     error.add_note(f"Integer predicate draw on {backend}, {kind} {encoding} first={first}")
                     raise
+
+
+def check_unsigned_less_than_draws(directory, compiler, renderer, backend):
+    source = directory / "unsigned_less_than.hlsl"
+    shader = directory / "unsigned_less_than.cso"
+    source.write_text(translate(unsigned_less_than()), encoding="ascii")
+    compile_shader(compiler, source, shader)
+
+    cases = []
+    # Quieting the first word of the NaN pair would reverse the unsigned ordering.
+    pairs = (("sign-boundary", 0x80000000, 0x7fffffff),
+             ("equal", 0x7fffffff, 0x7fffffff),
+             ("nan-payload", 0x7f800002, 0x7fc00001))
+    for label, left, right in pairs:
+        constants = bytearray(256)
+        struct.pack_into("<II", constants, 12, left, right)
+        order = (float(left < right), float(right < left))
+        case = directory / f"unsigned-less-than-{label}.case"
+        write_case(case, constants, order * 2)
+        cases.append((case, "pass"))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+    source.write_text(translate(unsigned_less_than("i32")), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    run_pixel_batch(renderer, backend, shader, [(cases[0][0], "mismatch")])
 
 
 # Each word is a normal binary32 value, so no float move can flush or quiet it, and its upper half differs
@@ -4792,6 +4833,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((int_predicate_group(kind, encoding, first), translate)
                     for kind in ("i32", "u32") for encoding in ("e32", "e64") for first in (0, 4))
+    fixtures.append((unsigned_less_than(), translate))
     fixtures.extend((int16_group(kind, encoding, group), translate)
                     for kind in ("i16", "u16") for encoding in ("e32", "e64") for group in (0, 1))
 
@@ -6291,6 +6333,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_class_draw(directory, compiler, renderer, backend)
     check_predicate_draws(directory, compiler, renderer, backend)
     check_int_predicate_draws(directory, compiler, renderer, backend)
+    check_unsigned_less_than_draws(directory, compiler, renderer, backend)
     check_sext_draw(directory, compiler, renderer, backend)
     check_scalar_pack_draw(directory, compiler, renderer, backend)
     check_scalar_mul_hi_draw(directory, compiler, renderer, backend)
