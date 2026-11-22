@@ -431,6 +431,7 @@ public:
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
+        enable.depthBiasClamp = features.features.depthBiasClamp;  // d3d12_depth_bias_test's clamped biases
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.

@@ -392,6 +392,15 @@ struct IndexBufferView {
     std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
 };
 
+// RSSetDepthBias (ID3D12GraphicsCommandList9): the three rasterizer values as list state. They replace the PSO's
+// RasterizerState values for pipelines created with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS, and persist
+// across SetPipelineState, as D3D12's other dynamic state does.
+struct DepthBias {
+    float constant_factor = 0.0f;
+    float clamp = 0.0f;
+    float slope_factor = 0.0f;
+};
+
 // DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
 // render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
 // the draw. resource 0 marks an unbound render-target slot or no depth buffer.
@@ -410,6 +419,8 @@ struct Draw {
     std::array<float, 4> blend_factor{1, 1, 1, 1};
     std::uint32_t stencil_front = 0;
     std::uint32_t stencil_back = 0;
+    DepthBias depth_bias{};  // RSSetDepthBias's values, when depth_bias_set
+    bool depth_bias_set = false;  // the list's override; without it the pipeline's static values apply
     bool indexed = false;
     std::uint32_t count = 0;  // vertices or indices per instance
     std::uint32_t instances = 0;

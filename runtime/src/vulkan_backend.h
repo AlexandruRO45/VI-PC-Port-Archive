@@ -83,7 +83,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdPushConstants) X(vkCmdDispatch)                                                                     \
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
-    X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
+    X(vkCmdSetBlendConstants) X(vkCmdSetDepthBias) X(vkCmdDraw)                                                \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse)                                      \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
@@ -110,8 +110,8 @@ struct VulkanDeviceFunctions {
                vkCreateShaderModule && vkDestroyShaderModule && vkCreatePipelineLayout &&
                vkDestroyPipelineLayout && vkCreateComputePipelines && vkDestroyPipeline &&
                vkGetBufferDeviceAddress && vkCmdBindIndexBuffer && vkCmdSetViewport && vkCmdSetScissor &&
-               vkCmdSetStencilReference && vkCmdSetBlendConstants && vkCmdDraw && vkCmdDrawIndexed &&
-               vkCreateGraphicsPipelines;
+               vkCmdSetStencilReference && vkCmdSetBlendConstants && vkCmdSetDepthBias && vkCmdDraw &&
+               vkCmdDrawIndexed && vkCreateGraphicsPipelines;
     }
 
     // Graphics pipelines also need these Vulkan 1.3 entry points (dynamic rendering, extended dynamic state).
@@ -854,6 +854,7 @@ public:
         replay_.set_primitive_restart_enable = vk.vkCmdSetPrimitiveRestartEnable;
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
+        replay_.set_depth_bias = vk.vkCmdSetDepthBias;
         replay_.draw = vk.vkCmdDraw;
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
