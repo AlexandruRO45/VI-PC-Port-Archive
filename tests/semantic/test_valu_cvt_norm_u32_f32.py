@@ -930,5 +930,93 @@ class TestValuCvtNormU32F32ConditionCodes(unittest.TestCase):
         self.assertEqual(simd.vcc, canary_vcc)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormU32F32IEEE754Boundaries(unittest.TestCase):
+    """Exhaustive unit tests for IEEE 754 boundary extremes, subnormals, and NaNs."""
+
+    def test_signed_zeros_and_modifiers(self) -> None:
+        self.assertEqual(ref_cvt_norm_u32_f32(POS_ZERO_F32), UNORM32_MIN)
+        self.assertEqual(ref_cvt_norm_u32_f32(NEG_ZERO_F32), UNORM32_MIN)
+        self.assertEqual(ref_cvt_norm_u32_f32(POS_ZERO_F32, abs_val=True), UNORM32_MIN)
+        self.assertEqual(ref_cvt_norm_u32_f32(NEG_ZERO_F32, abs_val=True), UNORM32_MIN)
+        self.assertEqual(ref_cvt_norm_u32_f32(POS_ZERO_F32, neg=True), UNORM32_MIN)
+        self.assertEqual(ref_cvt_norm_u32_f32(NEG_ZERO_F32, neg=True), UNORM32_MIN)
+
+    def test_subnormal_scale_boundaries(self) -> None:
+        # All positive subnormals in f32 are < 2^-126, which scale to < 2^-94 -> 0
+        self.assertEqual(ref_cvt_norm_u32_f32(MIN_SUBNORMAL_F32), 0)
+        self.assertEqual(ref_cvt_norm_u32_f32(0x00000002), 0)
+        self.assertEqual(ref_cvt_norm_u32_f32(0x00010000), 0)
+        self.assertEqual(ref_cvt_norm_u32_f32(MAX_SUBNORMAL_F32), 0)
+
+    def test_negative_subnormals_saturation(self) -> None:
+        neg_subnormals = [0x80000001, 0x80000002, 0x80010000, 0x807FFFFF]
+        for ns in neg_subnormals:
+            self.assertEqual(ref_cvt_norm_u32_f32(ns), UNORM32_MIN)
+            self.assertEqual(ref_cvt_norm_u32_f32(ns, abs_val=True), UNORM32_MIN)
+
+    def test_small_normals_boundary(self) -> None:
+        # 2^-126 is too small to yield non-zero in UNORM32
+        self.assertEqual(ref_cvt_norm_u32_f32(MIN_NORMAL_F32), 0)
+
+        # 2^-32 float (0x2F800000) scales to ~0.999999999767 -> rounds to 1
+        val_2_pow_minus_32 = f32_to_bits(2.0 ** -32)
+        self.assertEqual(ref_cvt_norm_u32_f32(val_2_pow_minus_32), 1)
+
+        # 2^-31 float (0x30000000) scales to ~1.999999999534 -> rounds to 2
+        val_2_pow_minus_31 = f32_to_bits(2.0 ** -31)
+        self.assertEqual(ref_cvt_norm_u32_f32(val_2_pow_minus_31), 2)
+
+    def test_unit_boundary_and_saturation(self) -> None:
+        # 1.0f -> 4294967295 (0xFFFFFFFF)
+        self.assertEqual(ref_cvt_norm_u32_f32(ONE_F32), UNORM32_MAX)
+
+        # 1.0f - eps (0x3F7FFFFF = 1.0 - 2^-24) -> 4294967039
+        val_one_minus_eps = f32_to_bits(1.0 - (2.0 ** -24))
+        self.assertEqual(ref_cvt_norm_u32_f32(val_one_minus_eps), 4294967039)
+
+        # 1.0f + eps (0x3F800001) -> saturates to UNORM32_MAX
+        val_one_plus_eps = f32_to_bits(1.0 + (2.0 ** -23))
+        self.assertEqual(ref_cvt_norm_u32_f32(val_one_plus_eps), UNORM32_MAX)
+
+    def test_infinities_and_saturation(self) -> None:
+        self.assertEqual(ref_cvt_norm_u32_f32(POS_INF_F32), UNORM32_MAX)
+        self.assertEqual(ref_cvt_norm_u32_f32(NEG_INF_F32), UNORM32_MIN)
+
+        # abs(-inf) -> +inf -> 0xFFFFFFFF
+        self.assertEqual(ref_cvt_norm_u32_f32(NEG_INF_F32, abs_val=True), UNORM32_MAX)
+        # neg(+inf) -> -inf -> 0
+        self.assertEqual(ref_cvt_norm_u32_f32(POS_INF_F32, neg=True), UNORM32_MIN)
+        # neg(-inf) -> +inf -> 0xFFFFFFFF
+        self.assertEqual(ref_cvt_norm_u32_f32(NEG_INF_F32, neg=True), UNORM32_MAX)
+
+    def test_nan_exhaustive_handling(self) -> None:
+        nan_samples = [
+            QNAN_F32,
+            NEG_QNAN_F32,
+            SNAN_F32,
+            NEG_SNAN_F32,
+            0x7F800002,  # sNaN
+            0x7FC00001,  # qNaN with payload
+            0x7FCFFFFF,  # qNaN with payload
+            0x7FFFFFFF,  # all-ones
+            0xFFFFFFFF,  # negative all-ones
+        ]
+        for nan_val in nan_samples:
+            self.assertEqual(ref_cvt_norm_u32_f32(nan_val), UNORM32_MIN)
+            self.assertEqual(ref_cvt_norm_u32_f32(nan_val, abs_val=True), UNORM32_MIN)
+            self.assertEqual(ref_cvt_norm_u32_f32(nan_val, neg=True), UNORM32_MIN)
+            self.assertEqual(ref_cvt_norm_u32_f32(nan_val, clamp=True), UNORM32_MIN)
+
+    def test_round_ties_to_even_halfway(self) -> None:
+        # Halfway case: 0.5f * 4294967295 = 2147483647.5 -> 2147483648 (even)
+        res_half = ref_cvt_norm_u32_f32(HALF_F32)
+        self.assertEqual(res_half, UNORM32_HALF)
+        self.assertEqual(res_half % 2, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
