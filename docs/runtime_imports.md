@@ -154,7 +154,8 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XGameUiImpl` from xgameruntime-docs' layout
+(below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
@@ -195,6 +196,27 @@ connectivity (level None), the port and URL security-information queries fail wi
 `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
 certificate check fails the same way, change registrations return tokens that never fire, and the three
 `IXNetworkingImpl2` additions are `E_NOTIMPL`.
+
+`XGameUiImpl` (`runtime/shims/xgameruntime_ui.cpp`) is served from xgameruntime-docs' layout alone. No package DLL
+calls an `XGameUi*` slot, so its slots are **not measured** yet. The executable's first boot confirms them, or names
+the slots that differ. There is no system UI, so each dialog is answered at once, the way a player would answer it
+without reading, and a title that reports a problem through a system dialog doesn't wait for an answer.
+- **Interfaces:** unlike `XUserImpl` and `XStoreImpl`, the class id isn't `IXGameUiImpl`'s id. Both are accepted, and
+  `IXGameUiImpl`-`4` answer with the same 51-slot vtable.
+- **Dialogs:**
+  - A message dialog is printed to the log (title, content, buttons) and answered with its default button. A default
+    naming a button without text falls back to the first.
+  - An error dialog is printed (HRESULT and context) and closed.
+  - Text entry is answered with the title's default text, as if OK were pressed without typing, cut to `maxTextLength`.
+  - The profile card, achievements, game invite, multiplayer activity invite and state share are shown and closed
+    (`S_OK`).
+- **Not available offline:** the player picker and web authentication need the network. They fail before starting
+  with `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)`.
+- **`E_NOTIMPL`:** the docs' unknown slots, the in-game text-entry handles (`IXGameUiImpl2`) and the custom-UI
+  callbacks (`IXGameUiImpl4`), so a title falls back to the system dialogs above. Every documented function here
+  returns an HRESULT, so `E_NOTIMPL` reads as a failure. Each logs once.
+
+`xgameruntime_ui_test` calls the served slots with the documented arguments.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
