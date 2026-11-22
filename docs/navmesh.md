@@ -217,6 +217,14 @@ world_min_y = (sector_y - 256) * 128.0  #  -9,856 .. +13,056 m (max +13,184 m)
 
 The `24,480` unique static sector IDs form a complete, gap-free `136 Ã— 180` rectangle (`Z âˆˆ [-78.55, +403.84]` m).
 
+### Two-stream `0DRP` pages
+
+On the **2,478** navmesh pages with a contiguous second stream, stream 0 is a 64 KiB multiple on
+**2,478 / 2,478** and a `0x5...` pointer in stream 0 reaches the continuation range on
+**2,478 / 2,478**. The size rule therefore never drops stream 1 on this corpus; pages where
+stream 0 is not a multiple do not occur here. This is the continuation rule independently
+described by [6stars](related_projects.md); it is a property of these pages, not a new decoder.
+
 ### Split arrays and quadtree layout
 
 - Each `aiSplitArray` descriptor (`48` B: `{u64 vtable, u64 total, ptr64 blocks, ptr64 starts, u64 nblocks, u64 0}`)

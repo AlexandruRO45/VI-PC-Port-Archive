@@ -15,6 +15,15 @@ are offset-based (`recovered/...`), not the original paths.
   `story000.rpf` and `shared_minigame000.rpf` is non-zlib. Unread bytes are recorded as a range, never
   guessed.
 
+### Probe-free role split
+
+An independent engine, [6stars](related_projects.md), partitions inflated entries by size:
+`size % 0x10000 == 0` is a graphics/bulk page and `size == 0x800000` is a chained continuation.
+Re-measured against our carve indexes, the rule matches the role our model probe assigns on
+**27,288 / 27,288** `packs.rpf` entries, **2,291 / 2,291** levels-20G, **1,300 / 1,300**
+levels-40G and **6,032 / 6,032** levels-70G. It is a cross-check, not a replacement: an entry
+whose inflated size is not a 64 KiB multiple still needs the probe.
+
 ## Carving
 
 ```powershell
