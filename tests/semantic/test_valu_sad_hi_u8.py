@@ -42,6 +42,7 @@ Mathematical Properties and Bounds:
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
+import struct
 from typing import List, Optional, Tuple, Union
 import unittest
 
@@ -1021,6 +1022,87 @@ class TestVSadHiU8ConditionCodesAndFlags(unittest.TestCase):
             src2=Operand.vgpr(3),
         )
         self.assertEqual(instr.dst.reg_type, RegType.VGPR)
+
+
+# ==============================================================================
+# Unit Tests: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestVSadHiU8IEEE754BitPatterns(unittest.TestCase):
+    """Test suite verifying bit-exact integer handling of IEEE 754 float patterns.
+
+    v_sad_hi_u8 is an integer byte-wise VALU instruction. Operands with bit patterns
+    corresponding to IEEE 754 floating-point specials (+0.0, -0.0, subnormals, infinities,
+    quiet/signaling NaNs) must be interpreted strictly as unsigned 8-bit integers without
+    floating-point normalization, subnormal flush-to-zero (FTZ), or NaN quiet bit mutation.
+    """
+
+    @staticmethod
+    def float_to_u32(val: float) -> int:
+        """Convert Python float to 32-bit unsigned integer bitcast."""
+        return struct.unpack("<I", struct.pack("<f", val))[0]
+
+    def test_ieee754_zero_and_negative_zero(self) -> None:
+        """+0.0 (0x00000000) vs -0.0 (0x80000000) differs in byte 3 sign bit."""
+        pos_zero = self.float_to_u32(+0.0)  # 0x00000000
+        neg_zero = self.float_to_u32(-0.0)  # 0x80000000
+
+        self.assertEqual(pos_zero, 0x0000_0000)
+        self.assertEqual(neg_zero, 0x8000_0000)
+
+        # In float math, +0.0 == -0.0; in v_sad_hi_u8, byte 3 has diff |0x80 - 0x00| = 128
+        sum_diff = ref_sad_u8_sum(pos_zero, neg_zero)
+        self.assertEqual(sum_diff, 128)
+
+        dst = ref_sad_hi_u8(pos_zero, neg_zero, 0)
+        # 128 << 16 = 0x00800000
+        self.assertEqual(dst, 0x0080_0000)
+
+    def test_ieee754_infinity_representations(self) -> None:
+        """+inf (0x7F800000) and -inf (0xFF800000) bit patterns."""
+        pos_inf = self.float_to_u32(float("inf"))   # 0x7F800000
+        neg_inf = self.float_to_u32(float("-inf"))  # 0xFF800000
+
+        self.assertEqual(pos_inf, 0x7F80_0000)
+        self.assertEqual(neg_inf, 0xFF80_0000)
+
+        # Byte 3 differs: |0x7F - 0xFF| = 128
+        self.assertEqual(ref_sad_u8_sum(pos_inf, neg_inf), 128)
+        self.assertEqual(ref_sad_hi_u8(pos_inf, neg_inf, 0), 0x0080_0000)
+
+        # Identical infinities yield zero difference
+        self.assertEqual(ref_sad_u8_sum(pos_inf, pos_inf), 0)
+        self.assertEqual(ref_sad_hi_u8(pos_inf, pos_inf, 0x42), 0x42)
+
+    def test_ieee754_nan_preservation_and_payloads(self) -> None:
+        """Quiet and signaling NaN patterns must not trigger exceptions or canonicalization."""
+        qnan = 0x7FC0_0000  # standard quiet NaN
+        snan = 0x7F80_0001  # signaling NaN
+        custom_nan = 0x7FA5_C301  # NaN with arbitrary payload bits
+
+        # Differences between NaN bit patterns are computed as plain unsigned bytes
+        # |0x7F - 0x7F| = 0, |0xC0 - 0x80| = 0x40 = 64, |0x00 - 0x00| = 0, |0x00 - 0x01| = 1
+        # sum_diff = 64 + 1 = 65 -> shifted = 65 << 16 = 0x00410000
+        self.assertEqual(ref_sad_u8_sum(qnan, snan), 65)
+        self.assertEqual(ref_sad_hi_u8(qnan, snan, 0), 0x0041_0000)
+
+        # Self-difference of NaN is identically 0 (unlike FP where NaN != NaN)
+        self.assertEqual(ref_sad_u8_sum(qnan, qnan), 0)
+        self.assertEqual(ref_sad_hi_u8(custom_nan, custom_nan, 0x1234), 0x1234)
+
+    def test_ieee754_subnormals_no_denorm_flushing(self) -> None:
+        """Subnormal patterns must never be flushed to zero (FTZ mode does not apply to VALU integer)."""
+        subnormal_min = 0x0000_0001  # smallest positive subnormal
+        subnormal_max = 0x007F_FFFF  # largest positive subnormal
+
+        # byte difference against 0:
+        self.assertEqual(ref_sad_u8_sum(subnormal_min, 0), 1)
+        self.assertEqual(ref_sad_hi_u8(subnormal_min, 0, 0), 0x0001_0000)
+
+        # subnormal_max: bytes are (0xFF, 0xFF, 0x7F, 0x00) -> sum = 255 + 255 + 127 = 637 (0x27D)
+        sum_max = ref_sad_u8_sum(subnormal_max, 0)
+        self.assertEqual(sum_max, 637)
+        self.assertEqual(ref_sad_hi_u8(subnormal_max, 0, 0), 637 << 16)
 
 
 if __name__ == "__main__":
