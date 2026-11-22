@@ -835,7 +835,7 @@ int main(int argc, char** argv) {
             if (feat == "meshShader") want_mesh = true;
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
-            else if (feat == "shaderFmaFloat32") want_fma = true;   // OpFmaKHR (rdna2spirv.py --fma khr)
+            else if (feat == "shaderFmaFloat32" || feat == "shaderFmaFloat16") want_fma = true;   // OpFmaKHR (--fma khr)
             else if (feat == "shaderSubgroupClock" || feat == "shaderDeviceClock") want_clock = true;
         }
     }
@@ -1015,6 +1015,10 @@ int main(int argc, char** argv) {
                 if (!fcProps.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
             } else if (fc == "shaderDenormPreserveFloat16") {
                 if (!fcProps.shaderDenormPreserveFloat16) return "no " + fc;
+            } else if (fc == "shaderSignedZeroInfNanPreserveFloat16") {     // rdna2spirv.py --native-f16
+                if (!fcProps.shaderSignedZeroInfNanPreserveFloat16) return "no " + fc;
+            } else if (fc == "shaderRoundingModeRTEFloat16") {
+                if (!fcProps.shaderRoundingModeRTEFloat16) return "no " + fc;
             } else {
                 return "unknown float control " + fc;
             }
@@ -1033,6 +1037,14 @@ int main(int argc, char** argv) {
             }
             if (feat == "shaderSubgroupClock" && !(ext_clock && clock.shaderSubgroupClock)) return "no shaderSubgroupClock";
             if (feat == "shaderDeviceClock" && !(ext_clock && clock.shaderDeviceClock)) return "no shaderDeviceClock";
+            if (feat == "shaderFmaFloat16") {
+#ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
+                if (!(ext_fma && fma.shaderFmaFloat16)) return "no VK_KHR_shader_fma (shaderFmaFloat16)";
+#else
+                return "no VK_KHR_shader_fma (shaderFmaFloat16)";
+#endif
+            }
+            if (feat == "shaderFloat16" && !f12.shaderFloat16) return "no shaderFloat16";
             if (feat == "shaderFloat64" && !f2.features.shaderFloat64) return "no shaderFloat64";
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
             if (feat == "shaderDrawParameters" && !f11.shaderDrawParameters) return "no shaderDrawParameters";

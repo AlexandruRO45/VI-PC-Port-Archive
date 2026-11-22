@@ -1127,7 +1127,8 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--native-f16", "native_f16"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -1826,6 +1827,10 @@ def main() -> int:
                     help="translate without SignedZeroInfNanPreserve and DenormPreserve (Depends on: #664), for "
                          "devices whose vk_pipeline_check skips a shader without "
                          "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16")
+    ap.add_argument("--native-f16", action="store_true",
+                    help="translate f16 add/sub/mul (and fma with --fma khr) as 16-bit float ops, much faster on GPUs "
+                         "with shaderFloat16 and the 16-bit RTE, denorm-preserve and NaN-preserve float controls; same "
+                         "results as the default except NaN payloads; vk_pipeline_check skips a shader the GPU can't run")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="translate raw barycentric reads from an interpolated vec3 input (with a pass-through "
                          "geometry shader the runtime draws), for devices without "

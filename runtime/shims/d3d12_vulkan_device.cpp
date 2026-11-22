@@ -7795,6 +7795,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable12.bufferDeviceAddress = info.buffer_device_address ? VK_TRUE : VK_FALSE;
     info.storage_buffer_8bit = chosen12.storageBuffer8BitAccess == VK_TRUE;
     enable12.storageBuffer8BitAccess = info.storage_buffer_8bit;
+    // 16-bit float arithmetic for shaders translated with rdna2spirv.py --native-f16 (index feature shaderFloat16)
+    enable12.shaderFloat16 = chosen12.shaderFloat16;
     // Where the GPU has them: what the bindless set 0 needs (VulkanDeviceInfo::bindless), and the sampler features
     // D3D12 samplers can ask for.
     info.bindless = chosen12.runtimeDescriptorArray && chosen_features.shaderSampledImageArrayDynamicIndexing &&

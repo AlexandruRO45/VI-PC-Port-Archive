@@ -66,6 +66,8 @@ FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
+NATIVE_F16 = False       # --native-f16: f16 add/sub/mul (and fma with --fma khr), scalar and packed, as 16-bit float
+                         # ops (shaderFloat16, RTE/denorm/NaN-preserve properties for 16-bit); not under MODE writes
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
@@ -251,6 +253,7 @@ class Gen:
         self.uses_minlod = False
         self.uses_img_offset = False
         self.uses_pops = False
+        self.uses_half = False      # --native-f16 ops were emitted: Float16 types and 16-bit float-controls modes
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
@@ -711,6 +714,42 @@ class Gen:
         self.emit(f"{m} = OpLoad %uint %mode_r16")
         self.emit(f"{is_z} = OpIEqual %bool {m} {self.cu(3)}")
         return self.f16_bits(f, exact_tiny=exact_tiny, is_z=is_z)
+
+    def native_f16_ok(self, mods):
+        """--native-f16 applies here: no MODE write (no RTZ16 to rely on), no omod or clamp (kept on the integer path)."""
+        return NATIVE_F16 and FLOAT_CONTROLS and not self.round_mode and \
+            not any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods)
+
+    def half_bits(self, s, hi=0, neg=None, abs_=None):
+        """The 16 bits of f16 operand ``s`` (its high half when ``hi``) in the low half of a %uint, with its neg/abs
+        applied to the bits: no float rule of the driver is involved."""
+        u = self.src_h(s)
+        if hi:
+            t = self.tmp()
+            self.emit(f"{t} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+            u = t
+        m = self.tmp()
+        self.emit(f"{m} = OpBitwiseAnd %uint {u} {self.cu(0x7FFF if (s.get('abs') if abs_ is None else abs_) else 0xFFFF)}")
+        if s.get("neg") if neg is None else neg:
+            n = self.tmp()
+            self.emit(f"{n} = OpBitwiseXor %uint {m} {self.cu(0x8000)}")
+            m = n
+        return m
+
+    def half_of(self, bits):
+        """%half of the low 16 bits of a %uint whose high half is 0."""
+        self.uses_half = True
+        v, h = self.tmp(), self.tmp()
+        self.emit(f"{v} = OpBitcast %v2half {bits}")
+        self.emit(f"{h} = OpCompositeExtract %half {v} 0")
+        return h
+
+    def half_word(self, h):
+        """The bits of %half ``h`` in the low half of a %uint (high half 0)."""
+        v, u = self.tmp(), self.tmp()
+        self.emit(f"{v} = OpCompositeConstruct %v2half {h} %half0")
+        self.emit(f"{u} = OpBitcast %uint {v}")
+        return u
 
     def unless_rtz(self, is_z, v):
         r = self.tmp()
@@ -6754,6 +6793,13 @@ class Gen:
         elif op == "v_fmac_f16":
             # dst = fma(src0, src1, dst). The accumulator is dst itself: low half, or high half under op_sel's dst bit.
             sel, dhi = self.opsel_bits(mods, 3)
+            if FMA_KHR and self.native_f16_ok(mods):
+                hs = [self.half_of(self.half_bits(s, sel[i])) for i, s in enumerate((a[1], a[2], a[0]))]
+                r = self.tmp()
+                self.uses_fma_khr = True
+                self.emit(f"{r} = OpFmaKHR %half {' '.join(hs)}")
+                self.write_half16(a[0], self.half_word(r), dhi)
+                return
             vals = [self.f16_in(a[1], sel[0]), self.f16_in(a[2], sel[1]), self.f16_in(a[0], sel[2])]
             r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
             r = self.clamp_mods(r, mods)
@@ -6969,6 +7015,14 @@ class Gen:
             self.emit(f"OpStore %scc {z}")
         elif op == "v_fma_f16":
             sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
+            if FMA_KHR and self.native_f16_ok(mods):
+                # --native-f16 with --fma khr: OpFmaKHR is correctly rounded, so one rounding to f16 as on RDNA2
+                hs = [self.half_of(self.half_bits(s, sel[i])) for i, s in enumerate(a[1:4])]
+                r = self.tmp()
+                self.uses_fma_khr = True
+                self.emit(f"{r} = OpFmaKHR %half {' '.join(hs)}")
+                self.write_half16(a[0], self.half_word(r), dhi)
+                return
             vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:4])]
             r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
             r = self.clamp_mods(r, mods)
@@ -7008,6 +7062,28 @@ class Gen:
             ns = 3 if op == "v_pk_fma_f16" else 2
             sel, selhi = bits("op_sel", [0] * ns), bits("op_sel_hi", [1] * ns)
             nlo, nhi = bits("neg_lo", [0] * ns), bits("neg_hi", [0] * ns)
+            if op in ("v_pk_add_f16", "v_pk_mul_f16") or (op == "v_pk_fma_f16" and FMA_KHR):
+                if self.native_f16_ok(mods):
+                    # --native-f16: one v2half op; each half's selection and negation done on the bits
+                    vs = []
+                    for i in range(ns):
+                        lo = self.half_bits(a[1 + i], sel[i], neg=bool(nlo[i]), abs_=False)
+                        hi = self.half_bits(a[1 + i], selhi[i], neg=bool(nhi[i]), abs_=False)
+                        sh, w, v = self.tmp(), self.tmp(), self.tmp()
+                        self.emit(f"{sh} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
+                        self.emit(f"{w} = OpBitwiseOr %uint {lo} {sh}")
+                        self.uses_half = True
+                        self.emit(f"{v} = OpBitcast %v2half {w}")
+                        vs.append(v)
+                    r, u = self.tmp(), self.tmp()
+                    if op == "v_pk_fma_f16":
+                        self.uses_fma_khr = True
+                        self.emit(f"{r} = OpFmaKHR %v2half {' '.join(vs)}")
+                    else:
+                        self.emit(f"{r} = {'OpFAdd' if 'add' in op else 'OpFMul'} %v2half {vs[0]} {vs[1]}")
+                    self.emit(f"{u} = OpBitcast %uint {r}")
+                    self.dst(a[0], u)
+                    return
             srcs = []
             for i in range(ns):
                 u = self.src_h(a[1 + i])
@@ -7370,11 +7446,20 @@ class Gen:
             # f16 math on the low halves (op_sel:[src0,src1,dst] in the VOP3 form); the other half of the destination
             # is kept. v_subrev_f16 is S1 - S0: op_sel still names src0 and src1, only the subtraction is swapped.
             sel, dhi = self.opsel_bits(mods, 2)
+            k = {"v_add_f16": "OpFAdd", "v_sub_f16": "OpFSub", "v_subrev_f16": "OpFSub", "v_mul_f16": "OpFMul"}.get(op)
+            if k and self.native_f16_ok(mods):
+                # --native-f16: one 16-bit float op, rounded by the driver under RoundingModeRTE 16
+                hs = [self.half_of(self.half_bits(s, sel[i])) for i, s in enumerate(a[1:3])]
+                if op == "v_subrev_f16":
+                    hs.reverse()
+                r = self.tmp()
+                self.emit(f"{r} = {k} %half {hs[0]} {hs[1]}")
+                self.write_half16(a[0], self.half_word(r), dhi)
+                return
             vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:3])]
             if op == "v_subrev_f16":
                 vals.reverse()
             r = self.tmp()
-            k = {"v_add_f16": "OpFAdd", "v_sub_f16": "OpFSub", "v_subrev_f16": "OpFSub", "v_mul_f16": "OpFMul"}.get(op)
             if k:
                 self.emit(f"{r} = {k} %float {vals[0]} {vals[1]}")
                 if k == "OpFAdd":
@@ -11996,6 +12081,8 @@ def assemble(gen):
         # +0, RTX 3090 and RTX 4070 SUPER; docs/design.md, "Float controls").
         # Core in SPIR-V 1.4, so no extension at vulkan1.2; the runtime checks the properties in "float_controls".
         caps += ["SignedZeroInfNanPreserve", "DenormPreserve"]
+    if gen.uses_half:
+        caps += [c for c in ("Float16", "RoundingModeRTE", "DenormPreserve") if c not in caps]
     pops = gen.uses_pops and gen.stage == "ps"
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if gen.uses_fma_khr:
@@ -12034,6 +12121,9 @@ def assemble(gen):
     if FLOAT_CONTROLS:
         hdr += ["OpExecutionMode %main SignedZeroInfNanPreserve 32",
                 "OpExecutionMode %main DenormPreserve 16"]
+    if gen.uses_half:
+        hdr += [m for m in ("OpExecutionMode %main SignedZeroInfNanPreserve 16", "OpExecutionMode %main RoundingModeRTE 16",
+                            "OpExecutionMode %main DenormPreserve 16") if m not in hdr]
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -12100,6 +12190,8 @@ def assemble(gen):
     types = ["%void = OpTypeVoid", "%fn = OpTypeFunction %void", "%bool = OpTypeBool", "%uint = OpTypeInt 32 0",
              "%int = OpTypeInt 32 1", "%float = OpTypeFloat 32", "%v4float = OpTypeVector %float 4",
              "%v2float = OpTypeVector %float 2", "%umul = OpTypeStruct %uint %uint",
+             *(("%half = OpTypeFloat 16", "%v2half = OpTypeVector %half 2", "%half0 = OpConstantNull %half")
+               if gen.uses_half else ()),
              "%smul = OpTypeStruct %int %int",
              "%n256 = OpConstant %uint 256", f"%n_sgprs = OpConstant %uint {gen.SGPRS + len(gen.parked)}",
              "%arr_v = OpTypeArray %uint %n256", "%arr_s = OpTypeArray %uint %n_sgprs",
@@ -14598,7 +14690,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
              "DrawParameters": "shaderDrawParameters",
-             "FMAKHR": "shaderFmaFloat32"}     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
+             "FMAKHR": "shaderFmaFloat32", "Float16": "shaderFloat16"}     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))} |
@@ -14633,6 +14725,13 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["float_controls"] = ["shaderSignedZeroInfNanPreserveFloat32"]
         if "DenormPreserve" in caps:
             m["float_controls"].append("shaderDenormPreserveFloat16")
+    if "Float16" in caps:
+        # --native-f16: the feature, and the three 16-bit float-controls properties its modes need
+        m.setdefault("float_controls", []).extend(
+            f for f in ("shaderSignedZeroInfNanPreserveFloat16", "shaderRoundingModeRTEFloat16", "shaderDenormPreserveFloat16")
+            if f not in m.get("float_controls", []))
+        if "FMAKHR" in caps:        # an OpFmaKHR on %half
+            m["features"] = sorted(set(m["features"]) | {"shaderFmaFloat16"})
     if g.uses_codebase:
         m["uses_code_base"] = True
     if g.cs:
@@ -14918,6 +15017,10 @@ def main():
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
     ap.add_argument("--dispatch-loop", action="store_true",
                     help="emit control flow the old way, as one loop around a switch (to compare with the default)")
+    ap.add_argument("--native-f16", action="store_true",
+                    help="f16 add/sub/mul (fma too with --fma khr), scalar and packed, as 16-bit float ops; needs "
+                         "shaderFloat16 and the 16-bit RTE, denorm-preserve and NaN-preserve properties. Same results "
+                         "as the default integer narrowing except NaN payloads may differ")
     ap.add_argument("--no-float-controls", action="store_true",
                     help="don't declare SignedZeroInfNanPreserve or DenormPreserve (for a driver whose "
                          "shaderSignedZeroInfNanPreserveFloat32 or shaderDenormPreserveFloat16 is false); NaN, inf, "
@@ -14980,8 +15083,11 @@ def main():
     PC_TAIL_UBO = a.pc_tail_ubo
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
-    global FLOAT_CONTROLS
+    global FLOAT_CONTROLS, NATIVE_F16
     FLOAT_CONTROLS = not a.no_float_controls
+    NATIVE_F16 = a.native_f16
+    if NATIVE_F16 and not FLOAT_CONTROLS:
+        ap.error("--native-f16 needs the float-controls modes; it can't be combined with --no-float-controls")
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
     BARY_FALLBACK = a.bary_fallback
