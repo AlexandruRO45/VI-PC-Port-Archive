@@ -398,6 +398,118 @@ class ScalarVALUInterpreter:
             self.execute(inst)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Wave State and Divergent Interpreter
+# ==============================================================================
+
+@dataclass
+class SIMDWaveState:
+    """Architectural state for a SIMD wavefront (Wave32 or Wave64)."""
+    wave_size: int = 64
+    exec_mask: int = MASK64
+    vgprs: List[List[int]] = field(default_factory=lambda: [[0] * 64 for _ in range(256)])
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    vcc: int = 0
+
+    def __post_init__(self) -> None:
+        if self.wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {self.wave_size}")
+        if self.wave_size == 32:
+            self.exec_mask &= MASK32
+            self.vcc &= MASK32
+            if len(self.vgprs[0]) != 32:
+                self.vgprs = [[0] * 32 for _ in range(256)]
+        else:
+            self.exec_mask &= MASK64
+            self.vcc &= MASK64
+
+    def read_vgpr32(self, lane: int, idx: int) -> int:
+        return self.vgprs[idx][lane] & MASK32
+
+    def write_vgpr32(self, lane: int, idx: int, val: int) -> None:
+        self.vgprs[idx][lane] = val & MASK32
+
+    def read_vgpr64(self, lane: int, idx: int) -> int:
+        lo = self.vgprs[idx][lane] & MASK32
+        hi = self.vgprs[idx + 1][lane] & MASK32
+        return pack_u64(lo, hi)
+
+    def write_vgpr64(self, lane: int, idx: int, val: int) -> None:
+        lo, hi = split_u64(val)
+        self.vgprs[idx][lane] = lo
+        self.vgprs[idx + 1][lane] = hi
+
+    def read_sgpr32(self, idx: int) -> int:
+        return self.sgprs[idx] & MASK32
+
+    def write_sgpr32(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def read_sgpr64(self, idx: int) -> int:
+        lo = self.sgprs[idx] & MASK32
+        hi = self.sgprs[idx + 1] & MASK32
+        return pack_u64(lo, hi)
+
+    def write_sgpr64(self, idx: int, val: int) -> None:
+        lo, hi = split_u64(val)
+        self.sgprs[idx] = lo
+        self.sgprs[idx + 1] = hi
+
+    def read_lane_operand(self, lane: int, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.read_vgpr64(lane, op.index) if op.size_bits == 64 else self.read_vgpr32(lane, op.index)
+        elif op.reg_type == RegType.SGPR:
+            return self.read_sgpr64(op.index) if op.size_bits == 64 else self.read_sgpr32(op.index)
+        elif op.reg_type == RegType.VCC:
+            mask = MASK64 if op.size_bits == 64 else MASK32
+            return self.vcc & mask
+        elif op.reg_type in (RegType.LITERAL, RegType.INLINE_INT):
+            mask = MASK64 if op.size_bits == 64 else MASK32
+            val = op.literal_val if op.literal_val is not None else 0
+            return val & mask
+        raise ValueError(f"Unsupported operand type for lane reading: {op}")
+
+
+class SIMDVALUInterpreter:
+    """SIMD wavefront interpreter enforcing EXEC masking and divergent lane execution."""
+
+    def __init__(self, wave_state: Optional[SIMDWaveState] = None) -> None:
+        self.wave_state = wave_state if wave_state is not None else SIMDWaveState()
+
+    def execute(self, inst: Union[VMadU64U32Instruction, VMadI64I32Instruction]) -> None:
+        ws = self.wave_state
+        carry_mask = 0
+
+        for lane in range(ws.wave_size):
+            is_active = bool(ws.exec_mask & (1 << lane))
+            if not is_active:
+                continue
+
+            s0 = ws.read_lane_operand(lane, inst.src0)
+            s1 = ws.read_lane_operand(lane, inst.src1)
+            s2 = ws.read_lane_operand(lane, inst.src2)
+
+            if isinstance(inst, VMadU64U32Instruction):
+                dst64, carry = ref_mad_u64_u32(s0, s1, s2)
+                ws.write_vgpr64(lane, inst.vdst.index, dst64)
+                if carry:
+                    carry_mask |= (1 << lane)
+            elif isinstance(inst, VMadI64I32Instruction):
+                dst64, overflow = ref_mad_i64_i32(s0, s1, s2)
+                ws.write_vgpr64(lane, inst.vdst.index, dst64)
+                if overflow:
+                    carry_mask |= (1 << lane)
+
+        if not getattr(inst, "is_nc", False) and inst.sdst is not None:
+            if inst.sdst.reg_type == RegType.VCC:
+                ws.vcc = carry_mask
+            elif inst.sdst.reg_type == RegType.SGPR:
+                if ws.wave_size == 64 or inst.sdst.size_bits == 64:
+                    ws.write_sgpr64(inst.sdst.index, carry_mask)
+                else:
+                    ws.write_sgpr32(inst.sdst.index, carry_mask)
+
+
 class TestValuMadU64U32Oracle(unittest.TestCase):
     """Unit tests for the reference mathematical oracle and architectural model."""
 
@@ -831,6 +943,164 @@ class TestValuMadU64U32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(rf.read_vgpr64(0), 100)
         self.assertEqual(rf.read_vgpr64(2), 307)
         self.assertEqual(rf.read_vgpr64(4), 357)
+
+
+class TestValuMadU64U32SIMDMultiLane(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence, EXEC masking, and vector-scalar interactions."""
+
+    def test_wave64_all_lanes_active(self) -> None:
+        ws = SIMDWaveState(wave_size=64, exec_mask=MASK64)
+        for lane in range(64):
+            ws.write_vgpr32(lane, 2, lane * 100)
+            ws.write_vgpr32(lane, 3, lane * 200)
+            ws.write_vgpr64(lane, 4, lane * 50)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.vgpr(3, size_bits=32),
+            src2=Operand.vgpr(4, size_bits=64),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            expected = (lane * 100) * (lane * 200) + (lane * 50)
+            self.assertEqual(ws.read_vgpr64(lane, 0), expected)
+        self.assertEqual(ws.vcc, 0)
+
+    def test_wave32_divergence_and_exec_masking(self) -> None:
+        # Alternating mask: even lanes active (0x55555555)
+        ws = SIMDWaveState(wave_size=32, exec_mask=0x5555_5555)
+        sentinel = 0xDEAD_BEEF_CAFE_BABE
+
+        for lane in range(32):
+            ws.write_vgpr64(lane, 0, sentinel)
+            ws.write_vgpr32(lane, 2, 10)
+            ws.write_vgpr32(lane, 3, 20)
+            ws.write_vgpr64(lane, 4, 30)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=32),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.vgpr(3, size_bits=32),
+            src2=Operand.vgpr(4, size_bits=64),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(ws.read_vgpr64(lane, 0), 10 * 20 + 30)
+            else:
+                self.assertEqual(ws.read_vgpr64(lane, 0), sentinel)
+        self.assertEqual(ws.vcc, 0)
+
+    def test_sparse_exec_mask_single_lane(self) -> None:
+        target_lane = 17
+        ws = SIMDWaveState(wave_size=64, exec_mask=(1 << target_lane))
+        sentinel = 0x1122_3344_5566_7788
+
+        for lane in range(64):
+            ws.write_vgpr64(lane, 0, sentinel)
+            ws.write_vgpr32(lane, 2, 7)
+            ws.write_vgpr32(lane, 3, 9)
+            ws.write_vgpr64(lane, 4, 11)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.vgpr(3, size_bits=32),
+            src2=Operand.vgpr(4, size_bits=64),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            if lane == target_lane:
+                self.assertEqual(ws.read_vgpr64(lane, 0), 7 * 9 + 11)
+            else:
+                self.assertEqual(ws.read_vgpr64(lane, 0), sentinel)
+        self.assertEqual(ws.vcc, 0)
+
+    def test_exec_zero_all_lanes_dormant(self) -> None:
+        ws = SIMDWaveState(wave_size=64, exec_mask=0)
+        sentinel = 0xFEED_FACE_CAFE_BEEF
+
+        for lane in range(64):
+            ws.write_vgpr64(lane, 0, sentinel)
+            ws.write_vgpr32(lane, 2, 100)
+            ws.write_vgpr32(lane, 3, 100)
+            ws.write_vgpr64(lane, 4, 100)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.vgpr(3, size_bits=32),
+            src2=Operand.vgpr(4, size_bits=64),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            self.assertEqual(ws.read_vgpr64(lane, 0), sentinel)
+        self.assertEqual(ws.vcc, 0)
+
+    def test_per_lane_mixed_carry_generation(self) -> None:
+        ws = SIMDWaveState(wave_size=64, exec_mask=MASK64)
+        # Set odd lanes to trigger 64-bit carry out
+        for lane in range(64):
+            ws.write_vgpr32(lane, 2, 2)
+            ws.write_vgpr32(lane, 3, 0x8000_0000)  # prod = 0x1_0000_0000
+            if lane % 2 == 1:
+                # 0x1_0000_0000 + 0xFFFF_FFFF_0000_0000 = 2^64 (wraps to 0, carry = 1)
+                ws.write_vgpr64(lane, 4, 0xFFFF_FFFF_0000_0000)
+            else:
+                ws.write_vgpr64(lane, 4, 0)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.vgpr(3, size_bits=32),
+            src2=Operand.vgpr(4, size_bits=64),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        expected_vcc = 0xAAAA_AAAA_AAAA_AAAA
+        self.assertEqual(ws.vcc, expected_vcc)
+        for lane in range(64):
+            if lane % 2 == 1:
+                self.assertEqual(ws.read_vgpr64(lane, 0), 0)
+            else:
+                self.assertEqual(ws.read_vgpr64(lane, 0), 0x1_0000_0000)
+
+    def test_shared_sgpr_uniform_broadcast_to_simd_lanes(self) -> None:
+        ws = SIMDWaveState(wave_size=64, exec_mask=MASK64)
+        ws.write_sgpr32(4, 42)  # uniform scalar multiplier
+
+        for lane in range(64):
+            ws.write_vgpr32(lane, 2, lane)
+            ws.write_vgpr64(lane, 6, 10)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=64),
+            src0=Operand.sgpr(4, size_bits=32),
+            src1=Operand.vgpr(2, size_bits=32),
+            src2=Operand.vgpr(6, size_bits=64),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        for lane in range(64):
+            self.assertEqual(ws.read_vgpr64(lane, 0), 42 * lane + 10)
+        self.assertEqual(ws.vcc, 0)
 
 
 if __name__ == "__main__":
