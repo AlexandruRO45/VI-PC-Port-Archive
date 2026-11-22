@@ -774,5 +774,139 @@ class TestDivFixupF32SymbolicAST(unittest.TestCase):
         self.assertEqual(u_folded.value, -3.25)
 
 
+class ScalarRegisterFile:
+    """Register file for a single scalar lane with 256 VGPRs and 106 SGPRs."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+
+    def read_vgpr_u32(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def write_vgpr_u32(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def read_vgpr_f32(self, idx: int) -> float:
+        return u32_to_f32(self.read_vgpr_u32(idx))
+
+    def write_vgpr_f32(self, idx: int, val: float) -> None:
+        self.write_vgpr_u32(idx, f32_to_u32(val))
+
+    def read_sgpr_u32(self, idx: int) -> int:
+        return self.sgprs[idx]
+
+    def write_sgpr_u32(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def read_sgpr_f32(self, idx: int) -> float:
+        return u32_to_f32(self.read_sgpr_u32(idx))
+
+    def write_sgpr_f32(self, idx: int, val: float) -> None:
+        self.write_sgpr_u32(idx, f32_to_u32(val))
+
+
+class DivFixupF32ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_div_fixup_f32."""
+
+    def __init__(self, reg_file: ScalarRegisterFile | None = None) -> None:
+        self.reg_file = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def resolve_source_u32(self, src: ASTOperand) -> int:
+        if src.kind == OperandKind.VGPR:
+            val_u32 = self.reg_file.read_vgpr_u32(src.index)
+        elif src.kind == OperandKind.SGPR:
+            val_u32 = self.reg_file.read_sgpr_u32(src.index)
+        elif src.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST):
+            val_u32 = f32_to_u32(float(src.value)) if src.value is not None else 0
+        else:
+            raise ValueError(f"Unsupported operand kind: {src.kind}")
+
+        return apply_src_mods_f32(val_u32, neg=src.neg, abs_val=src.abs_)
+
+    def execute(self, inst: ASTInstruction) -> None:
+        inst.validate()
+        s0 = self.resolve_source_u32(inst.src0)
+        s1 = self.resolve_source_u32(inst.src1)
+        s2 = self.resolve_source_u32(inst.src2)
+
+        res = ref_div_fixup_f32(s0, s1, s2, clamp=inst.clamp, omod=inst.omod.value)
+        self.reg_file.write_vgpr_u32(inst.dst.index, res)
+
+
+class TestDivFixupF32ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = DivFixupF32ScalarInterpreter(self.rf)
+
+    def test_scalar_interpreter_vgprs(self):
+        # 12.0 / 3.0 = 4.0
+        self.rf.write_vgpr_f32(1, 4.0)   # s0 (estimated quotient)
+        self.rf.write_vgpr_f32(2, 3.0)   # s1 (denom)
+        self.rf.write_vgpr_f32(3, 12.0)  # s2 (num)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_f32(0), 4.0)
+
+    def test_scalar_interpreter_sgpr_and_constants(self):
+        # s0 in SGPR, s1 in VGPR, s2 constant
+        self.rf.write_sgpr_f32(0, 5.0)
+        self.rf.write_vgpr_f32(1, 2.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.sgpr(0),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.inline_const(10.0),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_f32(0), 5.0)
+
+    def test_scalar_interpreter_modifiers(self):
+        # Negative numerator via modifier
+        self.rf.write_vgpr_f32(1, 2.5)
+        self.rf.write_vgpr_f32(2, 2.0)
+        self.rf.write_vgpr_f32(3, 5.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3, neg=True),
+        )
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.read_vgpr_f32(0), -2.5)
+
+    def test_scalar_interpreter_deterministic_repeatability(self):
+        self.rf.write_vgpr_f32(1, 1.23456)
+        self.rf.write_vgpr_f32(2, 2.34567)
+        self.rf.write_vgpr_f32(3, -3.45678)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_FIXUP_F32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        self.interp.execute(inst)
+        res1 = self.rf.read_vgpr_u32(0)
+
+        self.interp.execute(inst)
+        res2 = self.rf.read_vgpr_u32(0)
+        self.assertEqual(res1, res2)
+
+
 if __name__ == "__main__":
     unittest.main()
