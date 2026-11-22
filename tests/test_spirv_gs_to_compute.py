@@ -265,6 +265,12 @@ def test_capture_preserves_float_control_modes(tmp_path: Path, controls: tuple[s
     execution_modes = [line for line in lowered.splitlines() if line.startswith("OpExecutionMode ")]
     assert execution_modes == ["OpExecutionMode %main LocalSize 64 1 1", *modes]
 
+@pytest.mark.parametrize("args", [["in.spv", "out.spv", "--layout"], ["in.spv", "out.spv", "--layout", ""]])
+def test_cli_layout_without_path_is_usage_error(args, capsys):
+    assert gsc.main(["spirv_gs_to_compute.py"] + args) == 2
+    err = capsys.readouterr().err
+    assert "--layout" in err
+    assert "requires" in err
 
 def test_help_is_a_clean_exit_zero(capsys):
     for flag in ("-h", "--help"):

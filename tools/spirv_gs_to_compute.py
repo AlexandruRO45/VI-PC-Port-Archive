@@ -357,7 +357,15 @@ def main(argv):
     lay_path = None
     if "--layout" in args:
         i = args.index("--layout")
+        if i + 1 >= len(args):
+            print("--layout requires a following path", file=sys.stderr)
+            print(USAGE, file=sys.stderr)
+            return 2
         lay_path = args[i + 1]
+        if not lay_path:
+            print("--layout requires a non-empty path", file=sys.stderr)
+            print(USAGE, file=sys.stderr)
+            return 2
         del args[i:i + 2]
     if len(args) != 2:
         print(USAGE, file=sys.stderr)
