@@ -803,5 +803,83 @@ class TestValuCvtPkI32I16Aliasing(unittest.TestCase):
                 self.assertEqual(v0, expected_unmodified_v0)
                 self.assertEqual(v1, 0xCAFE_BABE)
 
+# ==============================================================================
+# Unit Tests: Condition Codes and Status Flags
+# ==============================================================================
+
+class TestValuCvtPkI32I16ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scalar_vcc_canary_preservation(self) -> None:
+        canaries = [
+            0x0000_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0xAAAA_AAAA_5555_5555,
+            0x1234_5678_9ABC_DEF0,
+            0x8000_0000_0000_0001,
+        ]
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2),
+        )
+        self.state.write_reg(Register(RegKind.VGPR, 2), 0xFFFF_FFFF)
+
+        for canary in canaries:
+            with self.subTest(canary=hex(canary)):
+                self.state.vcc = canary
+                self.interp.step(inst, self.state)
+                self.assertEqual(self.state.vcc, canary, "VCC must remain untouched by v_cvt_pk_i32_i16")
+
+    def test_simd_vcc_and_exec_preservation_wave32(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0x5555_5555)
+        interp = SIMDWavefrontInterpreter(wave_size=32)
+        vcc_canary = 0x1234_5678_ABCD_EF01
+        exec_canary = 0x5555_5555
+        state.vcc = vcc_canary
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Immediate(0x8000_0001),
+        )
+        interp.step(inst, state)
+
+        self.assertEqual(state.vcc, vcc_canary)
+        self.assertEqual(state.exec_mask, exec_canary)
+
+    def test_simd_vcc_and_exec_preservation_wave64(self) -> None:
+        state = SIMDState(wave_size=64, exec_mask=0xF0F0_F0F0_0F0F_0F0F)
+        interp = SIMDWavefrontInterpreter(wave_size=64)
+        vcc_canary = 0xFEED_FACE_CAFE_BEEF
+        exec_canary = 0xF0F0_F0F0_0F0F_0F0F
+        state.vcc = vcc_canary
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 2, count=2),
+            src0=Immediate(0xFFFF_FFFF),
+        )
+        interp.step(inst, state)
+
+        self.assertEqual(state.vcc, vcc_canary)
+        self.assertEqual(state.exec_mask, exec_canary)
+
+    def test_no_carry_borrow_generation(self) -> None:
+        self.state.vcc = 0
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Immediate(0xFFFF_FFFF),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.vcc, 0)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0xFFFF_FFFF)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), 0xFFFF_FFFF)
+
 if __name__ == "__main__":
     unittest.main()
