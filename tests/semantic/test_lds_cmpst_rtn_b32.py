@@ -1189,8 +1189,215 @@ class TestIEEE754Boundaries(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(addr), MAX_SUBNORMAL_F32)
 
 
+class TestNegativeControlsAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+    def test_syntax_rejection_instruction_operands(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        s0 = RegisterOperand(0, RegType.SGPR)
+
+        with self.assertRaises(ValueError):
+            DSCmpstRtnInstruction(vdst=s0, vaddr=v0, vdata0=v0, vdata1=v0)
+        with self.assertRaises(ValueError):
+            DSCmpstRtnInstruction(vdst=v0, vaddr=s0, vdata0=v0, vdata1=v0)
+        with self.assertRaises(ValueError):
+            DSCmpstRtnInstruction(vdst=v0, vaddr=v0, vdata0=v0, vdata1=v0, offset=-1)
+        with self.assertRaises(ValueError):
+            DSCmpstRtnInstruction(vdst=v0, vaddr=v0, vdata0=v0, vdata1=v0, offset=65536)
+
+    def test_syntax_rejection_memory_and_simd_state(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=-32)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=3000)  # Non-power-of-2
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_perturbation(self) -> None:
+        old_val, new_mem, swapped = ref_ds_cmpst_rtn_b32(0x1000, 0x1000, 0x2000)
+        self.assertTrue(swapped)
+
+        perturbed_old = old_val ^ 1
+        perturbed_new = new_mem ^ 1
+        self.assertNotEqual(old_val, perturbed_old)
+        self.assertNotEqual(new_mem, perturbed_new)
+
+    def test_mutation_detection_unconditional_swap(self) -> None:
+        # Mutant: writes new_val even when cmp_val does not match
+        def mutant_cmpst(mem: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            return u32(mem), u32(new_val), True
+
+        correct_old, correct_new, correct_swap = ref_ds_cmpst_rtn_b32(100, 200, 300)
+        mutant_old, mutant_new, mutant_swap = mutant_cmpst(100, 200, 300)
+
+        self.assertFalse(correct_swap)
+        self.assertEqual(correct_new, 100)
+        self.assertTrue(mutant_swap)
+        self.assertEqual(mutant_new, 300)
+        self.assertNotEqual(correct_new, mutant_new)
+
+    def test_mutation_detection_return_new_instead_of_old(self) -> None:
+        # Mutant: returns new memory value instead of pre-operation old value
+        def mutant_return_post_val(mem: int, cmp_val: int, new_val: int) -> Tuple[int, int, bool]:
+            old, new_m, sw = ref_ds_cmpst_rtn_b32(mem, cmp_val, new_val)
+            return new_m, new_m, sw
+
+        correct_old, correct_new, _ = ref_ds_cmpst_rtn_b32(50, 50, 99)
+        mutant_old, mutant_new, _ = mutant_return_post_val(50, 50, 99)
+
+        self.assertEqual(correct_old, 50)
+        self.assertEqual(mutant_old, 99)
+        self.assertNotEqual(correct_old, mutant_old)
+
+    def test_mutation_detection_dropped_immediate_offset(self) -> None:
+        def mutant_eff_addr(vaddr: int, offset: int = 0) -> int:
+            return vaddr & MASK32
+
+        base = 0x400
+        offset = 0x20
+        correct = calc_lds_effective_address(base, offset)
+        mutant = mutant_eff_addr(base, offset)
+
+        self.assertEqual(correct, 0x420)
+        self.assertEqual(mutant, 0x400)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_simd_exec_leak(self) -> None:
+        # Mutant: SIMD interpreter executes inactive lanes
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def execute(self, instr: DSCmpstRtnInstruction, state: SIMDState) -> List[Optional[int]]:
+                results: List[Optional[int]] = [None] * state.num_lanes
+                for lane in range(state.num_lanes):
+                    # Bug: ignores is_lane_active
+                    vaddr = state.get_lane_vgpr(lane, instr.vaddr.index)
+                    cmp_val = state.resolve_lane_operand(instr.vdata0, lane)
+                    new_val = state.resolve_lane_operand(instr.vdata1, lane)
+                    eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                    dword_idx = calc_lds_dword_index(eff_addr, state.lds.size_dwords)
+                    curr_val = state.lds.memory[dword_idx]
+                    old_val, updated_mem, swapped = ref_ds_cmpst_rtn_b32(curr_val, cmp_val, new_val)
+                    state.lds.memory[dword_idx] = updated_mem
+                    results[lane] = old_val
+                    state.set_lane_vgpr(lane, instr.vdst.index, old_val)
+                return results
+
+        state = SIMDState(num_lanes=32, exec_mask=0, lds_size_dwords=1024)
+        sentinel = 0x9999
+        for lane in range(32):
+            state.set_lane_vgpr(lane, 0, sentinel)
+            state.set_lane_vgpr(lane, 1, 0x40)
+            state.set_lane_vgpr(lane, 2, 10)
+            state.set_lane_vgpr(lane, 3, 20)
+
+        state.lds.write_dword(0x40, 10)
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(3, RegType.VGPR),
+        )
+
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(instr, state)
+
+        # Inactive lanes were corrupted
+        corrupted = [l for l in range(32) if state.get_lane_vgpr(l, 0) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+        self.assertNotEqual(state.lds.read_dword(0x40), 10)
+
+    def test_mutation_detection_premature_writeback_aliasing(self) -> None:
+        # Mutant: writes destination before reading address/operands
+        class PrematureWritebackInterpreter(ScalarInterpreter):
+            def execute(self, instr: DSCmpstRtnInstruction, state: ScalarState) -> Tuple[int, int, bool]:
+                # Bug: sets vdst before reading vaddr
+                state.set_reg(instr.vdst, 0xDEADBEEF)
+                vaddr = state.get_reg(instr.vaddr)
+                cmp_val = state.resolve_operand(instr.vdata0)
+                new_val = state.resolve_operand(instr.vdata1)
+                return state.lds.atomic_cmpst_rtn_b32(vaddr=vaddr, cmp_val=cmp_val, new_val=new_val, offset=instr.offset)
+
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x50
+        state.set_vgpr(0, addr) # v0 is both vdst and vaddr
+        state.set_vgpr(1, 10)
+        state.set_vgpr(2, 20)
+        state.lds.write_dword(addr, 10)
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            vdata1=RegisterOperand(2, RegType.VGPR),
+        )
+
+        buggy = PrematureWritebackInterpreter()
+        old_val, _, _ = buggy.execute(instr, state)
+        self.assertNotEqual(old_val, 10)
+
+    def test_mutation_detection_reversed_collision_order(self) -> None:
+        # Mutant: serializes colliding lanes in reverse order
+        class ReversedCollisionSIMDInterpreter(SIMDInterpreter):
+            def execute(self, instr: DSCmpstRtnInstruction, state: SIMDState) -> List[Optional[int]]:
+                results: List[Optional[int]] = [None] * state.num_lanes
+                # Bug: iterates in reversed lane order
+                for lane in reversed(range(state.num_lanes)):
+                    if not state.is_lane_active(lane):
+                        continue
+                    vaddr = state.get_lane_vgpr(lane, instr.vaddr.index)
+                    cmp_val = state.resolve_lane_operand(instr.vdata0, lane)
+                    new_val = state.resolve_lane_operand(instr.vdata1, lane)
+                    eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+                    dword_idx = calc_lds_dword_index(eff_addr, state.lds.size_dwords)
+                    curr_val = state.lds.memory[dword_idx]
+                    old_val, updated_mem, swapped = ref_ds_cmpst_rtn_b32(curr_val, cmp_val, new_val)
+                    state.lds.memory[dword_idx] = updated_mem
+                    results[lane] = old_val
+                    state.set_lane_vgpr(lane, instr.vdst.index, old_val)
+                return results
+
+        state = SIMDState(num_lanes=32, exec_mask=0x3, lds_size_dwords=1024)
+        common_addr = 0x100
+        state.lds.write_dword(common_addr, 10)
+
+        # Lane 0: 10 -> 20; Lane 1: 20 -> 30
+        state.set_lane_vgpr(0, 1, common_addr)
+        state.set_lane_vgpr(0, 2, 10)
+        state.set_lane_vgpr(0, 3, 20)
+        state.set_lane_vgpr(1, 1, common_addr)
+        state.set_lane_vgpr(1, 2, 20)
+        state.set_lane_vgpr(1, 3, 30)
+
+        instr = DSCmpstRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(3, RegType.VGPR),
+        )
+
+        buggy = ReversedCollisionSIMDInterpreter()
+        results = buggy.execute(instr, state)
+
+        # In reverse order, Lane 1 runs first against 10 (mismatches 20!), fails; Lane 0 turns 10 into 20
+        self.assertEqual(state.lds.read_dword(common_addr), 20)
+        self.assertNotEqual(state.lds.read_dword(common_addr), 30)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
