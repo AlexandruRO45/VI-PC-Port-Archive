@@ -18,6 +18,8 @@ Semantics:
 """
 from __future__ import annotations
 
+import math
+import struct
 import unittest
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -1270,6 +1272,183 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
             eff_addr=0x600,
         )
         self.assertTrue(flags_borrow.borrow)
+
+
+# ==============================================================================
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+# IEEE 754 Single-Precision (binary32) Architectural Constants
+F32_POS_ZERO: int = 0x0000_0000
+F32_NEG_ZERO: int = 0x8000_0000
+F32_POS_INF: int = 0x7F80_0000
+F32_NEG_INF: int = 0xFF80_0000
+F32_CANONICAL_QNAN: int = 0x7FC0_0000
+F32_SIGNALING_NAN: int = 0x7F80_0001
+F32_MIN_SUBNORMAL: int = 0x0000_0001
+F32_MAX_SUBNORMAL: int = 0x007F_FFFF
+F32_MIN_NORMAL: int = 0x0080_0000
+F32_MAX_NORMAL: int = 0x7F7F_FFFF
+
+
+def f32_to_bits(val: float) -> int:
+    """Convert float to IEEE 754 32-bit unsigned integer representation."""
+    return struct.unpack("<I", struct.pack("<f", val))[0]
+
+
+def bits_to_f32(bits: int) -> float:
+    """Convert IEEE 754 32-bit integer representation to Python float."""
+    return struct.unpack("<f", struct.pack("<I", bits & MASK_32))[0]
+
+
+def is_f32_nan(bits: int) -> bool:
+    """Check if bits represent an IEEE 754 NaN."""
+    return ((bits & 0x7F80_0000) == 0x7F80_0000) and ((bits & 0x007F_FFFF) != 0)
+
+
+def is_f32_subnormal(bits: int) -> bool:
+    """Check if bits represent an IEEE 754 subnormal number."""
+    return ((bits & 0x7F80_0000) == 0) and ((bits & 0x007F_FFFF) != 0)
+
+
+class TestIEEE754BoundaryExtremesAndBitwiseLimits(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSModel()
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState(lds=self.lds)
+
+    def test_signed_zeros_bitwise_nand(self) -> None:
+        """NAND with +0.0 results in 0xFFFFFFFF; -0.0 NAND -0.0 clears sign bit."""
+        addr = 0x100
+        self.lds.write_dword(addr, F32_POS_ZERO)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(1),
+            addr=VGPR(0),
+            data=Immediate(F32_POS_ZERO),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, F32_POS_ZERO)
+        self.assertEqual(mem, 0xFFFFFFFF)
+
+        # -0.0 NAND -0.0
+        self.lds.write_dword(addr, F32_NEG_ZERO)
+        instr_neg = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(1),
+            addr=VGPR(0),
+            data=Immediate(F32_NEG_ZERO),
+        )
+        old2, mem2 = self.interp.step(instr_neg, self.state)
+        self.assertEqual(old2, F32_NEG_ZERO)
+        self.assertEqual(mem2, 0x7FFFFFFF)  # Sign bit 31 cleared!
+
+    def test_subnormals_preservation_no_ftz(self) -> None:
+        """Subnormal patterns inverted without flush-to-zero."""
+        self.assertTrue(is_f32_subnormal(F32_MIN_SUBNORMAL))
+        self.assertTrue(is_f32_subnormal(F32_MAX_SUBNORMAL))
+
+        addr = 0x200
+        self.lds.write_dword(addr, F32_MIN_SUBNORMAL)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(2),
+            addr=VGPR(0),
+            data=Immediate(0xFFFFFFFF),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, F32_MIN_SUBNORMAL)
+        self.assertEqual(mem, (~F32_MIN_SUBNORMAL) & MASK_32)
+
+    def test_signaling_nan_inversion(self) -> None:
+        """Signaling NaNs inverted cleanly without unintended alteration."""
+        addr = 0x300
+        self.lds.write_dword(addr, F32_SIGNALING_NAN)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(3),
+            addr=VGPR(0),
+            data=Immediate(0xFFFFFFFF),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, F32_SIGNALING_NAN)
+        self.assertEqual(mem, (~F32_SIGNALING_NAN) & MASK_32)
+
+    def test_infinities_nand_behavior(self) -> None:
+        addr = 0x400
+        self.lds.write_dword(addr, F32_POS_INF)
+        self.state.set_vgpr(0, addr)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(4),
+            addr=VGPR(0),
+            data=Immediate(0xFFFFFFFF),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, F32_POS_INF)
+        self.assertEqual(mem, (~F32_POS_INF) & MASK_32)
+
+    def test_walking_ones_boundary_coverage(self) -> None:
+        """Test NAND of each single bit with 0xFFFFFFFF."""
+        addr = 0x500
+        for bit in range(32):
+            mask = 1 << bit
+            self.lds.write_dword(addr, mask)
+            self.state.set_vgpr(0, addr)
+
+            instr = DSNandInstruction(
+                opcode=DSOpcode.DS_NAND_RTN_B32,
+                dst=VGPR(5),
+                addr=VGPR(0),
+                data=Immediate(0xFFFFFFFF),
+            )
+            old, mem = self.interp.step(instr, self.state)
+            self.assertEqual(old, mask)
+            self.assertEqual(mem, (~mask) & MASK_32)
+
+    def test_walking_zeros_boundary_coverage(self) -> None:
+        """Test NAND of each inverted single-bit mask with 0xFFFFFFFF."""
+        addr = 0x600
+        for bit in range(32):
+            inv_mask = (~(1 << bit)) & MASK_32
+            self.lds.write_dword(addr, inv_mask)
+            self.state.set_vgpr(0, addr)
+
+            instr = DSNandInstruction(
+                opcode=DSOpcode.DS_NAND_RTN_B32,
+                dst=VGPR(6),
+                addr=VGPR(0),
+                data=Immediate(0xFFFFFFFF),
+            )
+            old, mem = self.interp.step(instr, self.state)
+            self.assertEqual(old, inv_mask)
+            self.assertEqual(mem, 1 << bit)
+
+    def test_integer_boundary_extremes(self) -> None:
+        extremes = [0x0000_0000, 0x0000_0001, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0xFFFF_FFFF]
+        addr = 0x700
+        self.state.set_vgpr(0, addr)
+
+        for val in extremes:
+            self.lds.write_dword(addr, val)
+            instr = DSNandInstruction(
+                opcode=DSOpcode.DS_NAND_RTN_B32,
+                dst=VGPR(7),
+                addr=VGPR(0),
+                data=Immediate(0xFFFFFFFF),
+            )
+            old, mem = self.interp.step(instr, self.state)
+            self.assertEqual(old, val)
+            self.assertEqual(mem, (~val) & MASK_32)
 
 
 if __name__ == "__main__":
