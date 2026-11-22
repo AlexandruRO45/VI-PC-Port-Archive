@@ -6,15 +6,20 @@ shader was reported "clean" (and make_game.py translated nothing). The probe now
 
     python -I tests/test_shader_disasm.py
 """
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "shader_disasm.py")
+sys.path.insert(0, os.path.dirname(TOOL))
+import shader_disasm  # noqa: E402
 
 # Two instructions: s_nop 0 then s_endpgm. The probe sends only the s_endpgm, so a fake tool can tell the
 # one-instruction probe from the real shader by the input it receives.
@@ -53,6 +58,26 @@ class DisasmFailureTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             f.write(body)
         return f'"{sys.executable}" "{path}"'  # a command line, not just a path: LLVM_MC must accept both
+
+    def test_a_successful_run_does_not_inherit_an_earlier_failure(self):
+        out = os.path.join(self.dir, "out")
+        argv = [TOOL, self.fssm, "--out", out, "--jobs", "1"]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(shader_disasm, "probe"), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(shader_disasm, "disasm", return_value=("", 0, "tool failed")):
+                with self.assertRaises(SystemExit) as exc:
+                    shader_disasm.main()
+                self.assertEqual(exc.exception.code, 1)
+                self.assertIn("tool failed", err.getvalue())
+
+            err.seek(0)
+            err.truncate()
+            with mock.patch.object(shader_disasm, "disasm", return_value=(ASM, 0, "")):
+                self.assertEqual(shader_disasm.main(), 0)
+            self.assertEqual(err.getvalue(), "")
+            self.assertTrue(os.path.isfile(os.path.join(out, "one.s")))
 
     def test_missing_tool(self):
         out = os.path.join(self.dir, "out")
