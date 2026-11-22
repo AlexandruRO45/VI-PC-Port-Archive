@@ -25,10 +25,10 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import (Skip, clip_test, f16_frexp_ldexp_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test,
-                   fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test)
-from check import F16_FREXP_LDEXP_EXPONENTS   # cs_f16_frexp_ldexp: one dispatch per S1, judged by check.py
+from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
+                   fmt_xy_xyz_test, tbuffer_store_test)
 from compute_fixture import compute_header
+from check import F16_FREXP_LDEXP_EXPONENTS, f16_frexp_ldexp_test   # cs_f16_frexp_ldexp: one dispatch per S1
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
@@ -811,6 +811,11 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_lds":
             rc, msg = run_cmd([vk_compute, spv, "4", "mirror64"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name == "cs_f16_frexp_ldexp":
+            # f16 frexp/ldexp with denormals kept on every binary16 input: check.py's sweep, one dispatch per S1.
+            problem = f16_frexp_ldexp_test(a.build, spirv_dir, cs_env)
+            n = len(F16_FREXP_LDEXP_EXPONENTS)
+            results.append((name, not problem, problem or f"65536 inputs x {n} exponents, every word exact"))
         elif name == "cs_exec64":
             rc, msg = run_cmd([vk_compute, spv, "1", "exec64"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
@@ -929,11 +934,6 @@ def run_suite(a, work: str) -> int:
             n = len(CVT_F32_SAT_CASES)
             results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
                             else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
-        elif name == "cs_f16_frexp_ldexp":
-            # f16 frexp/ldexp with denormals kept on every binary16 input: check.py's sweep, one dispatch per S1.
-            problem = f16_frexp_ldexp_test(a.build, spirv_dir, cs_env)
-            n = len(F16_FREXP_LDEXP_EXPONENTS)
-            results.append((name, not problem, problem or f"65536 inputs x {n} exponents, every word exact"))
         elif name == "cs_fma_fused":
             # Single-rounded f32 FMA (+ f16 round-to-odd): strict under LEONIDA_FMA=khr (OpFmaKHR, exit 77 if
             # unsupported), fused-or-split f32 allowed under default --fma glsl (e.g. Mesa RADV splits 5/7).

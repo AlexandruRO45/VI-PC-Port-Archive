@@ -1601,6 +1601,7 @@ def main():
         results.append((name, compute_test(tools, spirv, name, groups, expect)))
     results.append(("cs_wavemask", compute_test(tools, spirv, "cs_wavemask", "1", "wavemask",
                                                 require_wave64=not W64_EMULATED)))
+    results.append(("cs_f16_frexp_ldexp", f16_frexp_ldexp_test(tools, spirv)))
     for name, want in CS_DUMPS:   # all but cs_store need a 64-wide subgroup unless wave64 is emulated
         results.append((name, compute_test(tools, spirv, name, "1", "dump",
                                            require_wave64=name not in WAVE32_DUMPS and not W64_EMULATED,
@@ -1622,7 +1623,6 @@ def main():
     results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
-    results.append(("cs_f16_frexp_ldexp", f16_frexp_ldexp_test(tools, spirv)))
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
