@@ -432,6 +432,7 @@ struct DeviceState {
     UINT no_output_sample_counts = 0;
     float max_sampler_lod_bias = 0;
     bool conservative_raster_tier1 = false;
+    VkDeviceSize acceleration_structure_scratch_alignment = 256;
     // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
     VkResolveModeFlags depth_resolve_modes = 0;
     VkResolveModeFlags stencil_resolve_modes = 0;
@@ -1515,6 +1516,7 @@ public:
             binding.va = va_;
             binding.buffer = device_.arena.buffer;
             binding.buffer_offset = arena_offset_;
+            binding.host = device_.arena.mapped + arena_offset_;
             // A default-heap AS resource is one of these ranges: a GENERIC acceleration structure covers it where
             // it sits. It is named by its real device address (heap base + offset), as instance descriptors and
             // BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
@@ -1605,6 +1607,7 @@ public:
         }
         binding.buffer = buffer_;
         binding.size = desc_.Width;
+        binding.host = static_cast<const std::uint8_t*>(mapped_);
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
@@ -1651,6 +1654,7 @@ public:
         binding.buffer = device_.arena.buffer;
         binding.buffer_offset = va_;
         binding.va = va_;
+        binding.host = device_.arena.mapped + va_;
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
@@ -4072,6 +4076,12 @@ public:
                 VkPhysicalDeviceConservativeRasterizationPropertiesEXT conservative{
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
                 if (info.conservative_rasterization) resolve.pNext = &conservative;
+                VkPhysicalDeviceAccelerationStructurePropertiesKHR acceleration{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+                if (info.ray_tracing) {
+                    acceleration.pNext = resolve.pNext;
+                    resolve.pNext = &acceleration;
+                }
                 VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
                 get_props2(info.physical, &props);
                 state_.conservative_raster_tier1 = leonida::conservative_raster::tier1(
@@ -4079,6 +4089,9 @@ public:
                     conservative.primitiveOverestimationSize);
                 state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
                 state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
+                if (info.ray_tracing && acceleration.minAccelerationStructureScratchOffsetAlignment)
+                    state_.acceleration_structure_scratch_alignment =
+                        acceleration.minAccelerationStructureScratchOffsetAlignment;
             }
         }
 
@@ -4087,6 +4100,8 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.context->set_acceleration_structure_scratch_alignment(
+            state_.acceleration_structure_scratch_alignment);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -4754,7 +4769,8 @@ public:
             VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
             g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
             g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-            g.geometry.instances.arrayOfPointers = VK_FALSE;
+            g.geometry.instances.arrayOfPointers =
+                desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS ? VK_TRUE : VK_FALSE;
             geoms.push_back(g);
             max_prims.push_back(desc->NumDescs);
         } else {
@@ -4806,6 +4822,22 @@ public:
         out->ResultDataMaxSizeInBytes = sizes.accelerationStructureSize;
         out->ScratchDataSizeInBytes = sizes.buildScratchSize;
         out->UpdateScratchDataSizeInBytes = sizes.updateScratchSize;
+        if (is_tlas && desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS && desc->NumDescs) {
+            const UINT64 bytes = UINT64(desc->NumDescs) * sizeof(UINT64);
+            const UINT64 alignment = std::max<UINT64>(1, state_.acceleration_structure_scratch_alignment);
+            if (bytes > UINT64_MAX - (alignment - 1)) {
+                *out = {};
+                return;
+            }
+            const UINT64 prefix = (bytes + alignment - 1) / alignment * alignment;
+            if (out->ScratchDataSizeInBytes > UINT64_MAX - prefix ||
+                (out->UpdateScratchDataSizeInBytes && out->UpdateScratchDataSizeInBytes > UINT64_MAX - prefix)) {
+                *out = {};
+                return;
+            }
+            out->ScratchDataSizeInBytes += prefix;
+            if (out->UpdateScratchDataSizeInBytes) out->UpdateScratchDataSizeInBytes += prefix;
+        }
     }
 
     HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid,

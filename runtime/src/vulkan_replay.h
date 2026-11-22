@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <map>
@@ -89,6 +90,7 @@ struct ResourceBinding {
     bool color_attachment = false;     // has COLOR_ATTACHMENT usage: unordered-access rectangle clears need it
     bool sampled = false;              // has SAMPLED usage (no DENY_SHADER_RESOURCE): the present compose pass reads it
     bool host_readable = false;        // D3D12_HEAP_TYPE_READBACK (or CUSTOM write-back): needs host-read flush
+    const std::uint8_t* host = nullptr;  // host mapping of a buffer range, when the runtime has one
     bool sparse_buffer = false;
 };
 
@@ -819,11 +821,14 @@ struct ReplayFunctions {
     // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
     // of it.
     std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer&, VkDeviceSize&)> buffer_at;
+    // Host mapping of a console VA range, used while preparing pointer arrays; `size` is cut at the buffer's end.
+    std::function<bool(std::uint64_t va, std::uint64_t& size, const std::uint8_t*&)> host_at;
     // Zeroed memory that unbound vertex-buffer slots and an unbound index buffer read (D3D12 reads zeros there).
     VkBuffer zero_buffer = VK_NULL_HANDLE;
     VkDeviceSize zero_offset = 0;
     VkDeviceSize zero_size = 0;
     std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
+    VkDeviceSize acceleration_structure_scratch_alignment = 256;
     // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
                        VkBuffer dst, VkDeviceSize offset)> resolve_binary_occlusion;
@@ -962,6 +967,10 @@ struct Prepared {
     ComputePipeline pipeline;  // dispatches
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
+    std::vector<std::uint64_t> accel_instance_pointers;  // console VAs rebased for a KHR pointer-array TLAS
+    VkBuffer accel_pointer_buffer = VK_NULL_HANDLE;
+    VkDeviceSize accel_pointer_offset = 0;
+    VkDeviceSize accel_scratch_prefix = 0;
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
@@ -2771,6 +2780,36 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     p.accel_src = vk.resolve_acceleration_structure(build->src_va);
                     if (!p.accel_src) return ReplayResult::unresolved_resource;
                 }
+                if (build->is_tlas && build->instance_array_of_pointers && build->instance_count) {
+                    const std::uint64_t bytes = std::uint64_t(build->instance_count) * sizeof(std::uint64_t);
+                    const std::uint8_t* pointer_data = nullptr;
+                    std::uint64_t pointer_room = bytes;
+                    // Snapshot the application pointers at submission preparation, as the XDXR gather path does.
+                    // A pointer table produced by the GPU earlier in this same submission is not visible here.
+                    if (!vk.host_at || !vk.host_at(build->instances_va, pointer_room, pointer_data) ||
+                        pointer_room < bytes)
+                        return ReplayResult::unresolved_resource;
+                    p.accel_instance_pointers.resize(build->instance_count);
+                    for (std::uint32_t n = 0; n < build->instance_count; ++n) {
+                        std::uint64_t pointer = 0;
+                        std::memcpy(&pointer, pointer_data + n * sizeof(pointer), sizeof(pointer));
+                        std::uint64_t desc_room = sizeof(VkAccelerationStructureInstanceKHR);
+                        VkBuffer desc_buffer = VK_NULL_HANDLE;
+                        VkDeviceSize desc_offset = 0;
+                        if (!pointer || !vk.buffer_at || !vk.buffer_at(pointer, desc_room, desc_buffer, desc_offset) ||
+                            desc_room < sizeof(VkAccelerationStructureInstanceKHR))
+                            return ReplayResult::unresolved_resource;
+                        p.accel_instance_pointers[n] = vk.heap_base + pointer;
+                    }
+                    const VkDeviceSize alignment = std::max<VkDeviceSize>(1, vk.acceleration_structure_scratch_alignment);
+                    if (bytes > UINT64_MAX - (alignment - 1)) return ReplayResult::unsupported;
+                    p.accel_scratch_prefix = (bytes + alignment - 1) / alignment * alignment;
+                    std::uint64_t room = p.accel_scratch_prefix;
+                    if (!vk.update_buffer || !vk.buffer_at ||
+                        !vk.buffer_at(build->scratch_va, room, p.accel_pointer_buffer, p.accel_pointer_offset) ||
+                        room < p.accel_scratch_prefix || build->scratch_va > UINT64_MAX - p.accel_scratch_prefix)
+                        return ReplayResult::unresolved_resource;
+                }
             }
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             // XDXR only (a KHR copy needs VkAccelerationStructureKHR handles and vkCmdCopyAccelerationStructureKHR);
@@ -3609,14 +3648,33 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.
             const VkDeviceSize heap_base = vk.heap_base;
             const auto addr = [&](std::uint64_t va) -> VkDeviceAddress { return va ? heap_base + va : 0; };
+            if (!p.accel_instance_pointers.empty()) {
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+                constexpr VkDeviceSize max_update = 65536;
+                const VkDeviceSize bytes = p.accel_instance_pointers.size() * sizeof(std::uint64_t);
+                const auto* data = reinterpret_cast<const std::uint8_t*>(p.accel_instance_pointers.data());
+                for (VkDeviceSize done = 0; done < bytes; done += max_update) {
+                    const VkDeviceSize part = std::min(max_update, bytes - done);
+                    vk.update_buffer(command_buffer, p.accel_pointer_buffer, p.accel_pointer_offset + done, part,
+                                     data + done);
+                }
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                                       VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+            }
             std::vector<VkAccelerationStructureGeometryKHR> geoms;
             std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
             if (build->is_tlas) {
                 VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
                 g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
                 g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-                g.geometry.instances.arrayOfPointers = VK_FALSE;
-                g.geometry.instances.data.deviceAddress = addr(build->instances_va);
+                g.geometry.instances.arrayOfPointers = build->instance_array_of_pointers ? VK_TRUE : VK_FALSE;
+                g.geometry.instances.data.deviceAddress = addr(build->instance_array_of_pointers
+                                                                    ? build->scratch_va
+                                                                    : build->instances_va);
                 geoms.push_back(g);
                 ranges.push_back({build->instance_count, 0, 0, 0});
             } else {
@@ -3654,7 +3712,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             info.dstAccelerationStructure = p.accel_dst;
             info.geometryCount = static_cast<std::uint32_t>(geoms.size());
             info.pGeometries = geoms.data();
-            info.scratchData.deviceAddress = addr(build->scratch_va);
+            info.scratchData.deviceAddress = addr(build->scratch_va + p.accel_scratch_prefix);
             const VkAccelerationStructureBuildRangeInfoKHR* range_ptr = ranges.data();
             vk.build_acceleration_structures(command_buffer, 1, &info, &range_ptr);
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {

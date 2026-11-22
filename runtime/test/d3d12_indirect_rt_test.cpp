@@ -2,7 +2,7 @@
 //   1) ExecuteIndirect with CountBuffer (ID3D12Device::CreateCommandSignature +
 //      ID3D12GraphicsCommandList::ExecuteIndirect -> vkCmdDrawIndirectCount, Vulkan 1.2 core).
 //   2) Hardware Ray Tracing / BVH (ID3D12Device5::GetRaytracingAccelerationStructurePrebuildInfo +
-//      ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure BLAS + TLAS + RayQueryKHR
+//      ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure BLAS + pointer-array TLAS + RayQueryKHR
 //      hit vs. miss; clean SKIP on GPUs without VK_KHR_acceleration_structure / VK_KHR_ray_query).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (Core + Synchronization Validation).
 
@@ -662,7 +662,7 @@ int main() {
         tlas_in.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
         tlas_in.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
         tlas_in.NumDescs = 1;
-        tlas_in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        tlas_in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
 
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlas_info{};
         dev->GetRaytracingAccelerationStructurePrebuildInfo(&tlas_in, &tlas_info);
@@ -704,7 +704,10 @@ int main() {
         inst.InstanceMask = 0xFF;
         inst.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
         inst.AccelerationStructure = blas_buf->GetGPUVirtualAddress();
-        std::memcpy(p, &inst, sizeof(inst));
+        constexpr UINT64 instance_offset = 64;
+        const D3D12_GPU_VIRTUAL_ADDRESS instance_va = inst_buf->GetGPUVirtualAddress() + instance_offset;
+        std::memcpy(p, &instance_va, sizeof(instance_va));
+        std::memcpy(static_cast<std::uint8_t*>(p) + instance_offset, &inst, sizeof(inst));
         inst_buf->Unmap(0, nullptr);
 
         tlas_in.InstanceDescs = inst_buf->GetGPUVirtualAddress();
@@ -864,8 +867,8 @@ int main() {
             std::fprintf(stderr, "FAIL: RayQueryKHR expected hit=1 miss=0, got hit=%u miss=%u\n", hit, miss);
             return 1;
         }
-        std::printf("  [PASS] BLAS + TLAS BuildRaytracingAccelerationStructure + RayQueryKHR (hit=%u, miss=%u)\n", hit,
-                    miss);
+        std::printf("  [PASS] BLAS + pointer-array TLAS BuildRaytracingAccelerationStructure + RayQueryKHR "
+                    "(hit=%u, miss=%u)\n", hit, miss);
 #endif
         inst_buf->Release();
         scratch_buf->Release();

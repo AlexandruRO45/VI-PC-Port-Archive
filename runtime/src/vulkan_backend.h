@@ -874,6 +874,15 @@ public:
             size = std::min<std::uint64_t>(size, b->size - (va - b->va));
             return true;
         };
+        replay_.host_at = [this](std::uint64_t va, std::uint64_t& size, const std::uint8_t*& host) {
+            BufferVaIndex<ResourceId>::Hit hit{};
+            if (!buffer_vas_.find(va, hit)) return false;
+            const ResourceBinding* b = resolve(hit.id);
+            if (!b || !b->host) return false;
+            host = b->host + (va - b->va);
+            size = std::min<std::uint64_t>(size, b->size - (va - b->va));
+            return true;
+        };
         if (xdxr && loaded_) {
             xdxr_ = std::make_unique<XdxrBuilder>(get, device);
             if (xdxr_->loaded()) {
@@ -1056,6 +1065,11 @@ public:
     void set_heap_base(std::uint64_t heap_base) {
         std::unique_lock lock(resource_mutex_);
         replay_.heap_base = heap_base;
+    }
+
+    void set_acceleration_structure_scratch_alignment(VkDeviceSize alignment) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.acceleration_structure_scratch_alignment = std::max<VkDeviceSize>(1, alignment);
     }
 
     // Zeroed memory for unbound vertex and index buffers to read (ReplayFunctions::zero_buffer).

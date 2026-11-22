@@ -598,6 +598,7 @@ struct RtTriangleGeometry {
 struct BuildAccelerationStructure {
     bool is_tlas = false;
     bool update = false;
+    bool instance_array_of_pointers = false;
     std::uint32_t build_flags = 0;
     std::uint64_t dst_va = 0;
     std::uint64_t src_va = 0;
