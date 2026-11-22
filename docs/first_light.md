@@ -110,16 +110,19 @@ single-sample game pixel shader (`PS_Copy_3ea4b38a_Wrapped`, FSSM SHA-256
 `19e2e7612505b9d3b19e6607b47e09dcdde02a2c9987a63e834d9586f217090f`, wave32, `inputs=[0]`, `outputs=[0]`,
 `shader_link_check.py check`: compatible with `VS_main_170e32e6_Wrapped`). `first_light.py` decodes the DDS
 (for example a BCPack-decoded TTPF albedo) with `tools/dds_png.py`, writes `texture.rgba` (`u32 width, u32 height` +
-`R8G8B8A8_UNORM` texels) into the output folder, and passes `VKH_TEX_RGBA`, `VKH_TSHARP_VA` (`0x100`),
+RGBA8 texels) into the output folder, and passes `VKH_TEX_RGBA`, `VKH_TSHARP_VA` (`0x100`),
 `VKH_SSHARP` (the shader's literal sampler `0x92, 0xc00000, 0x14500000, 0`, bilinear + clamp-to-edge) and
 `VKH_SGPRS` (`s9 = 0x100`) to `vk_harness`.
+An explicit DXGI sRGB format sets `texture.srgb` in the manifest and `VKH_TEX_SRGB=1` for the draw.
+Linear formats, legacy DDS headers and manifests without this field use UNORM sampling.
 
 `vk_harness` enables `bufferDeviceAddress`, `runtimeDescriptorArray` and `descriptorIndexing` only when
 `VKH_TEX_RGBA` is set (inert otherwise), writes the 8-dword `T#` at `VKH_TSHARP_VA` in the 64 KiB heap, binds
 set 0 (`binding 0` 2D images with a 1×1 magenta fallback at index 0 and the decoded texture at index 1; `binding 1`
 samplers with the decoded `S#` at index 1; `binding 2` the `DescriptorTable` hash buffer), and draws the mesh.
 
-The CPU oracle (`check_image`) samples the decoded `R8G8B8A8_UNORM` texture bilinearly (clamp-to-edge) at
+The CPU oracle decodes sRGB color channels to linear light before bilinear filtering. Alpha is always linear.
+It samples the texture with clamp-to-edge addressing at
 `centre_uv` and each `uv_probes` entry and requires the GPU readback to match within `0.02` (rejecting the
 magenta unbound-texture fallback and wrong-colour probes). Verified on Windows 11 with an NVIDIA GeForce RTX 3060
 (driver 621.24, Vulkan 1.4.357): **12,804/16,384 (0.781)** covered. Without `LEONIDA_FIRST_LIGHT_DIR`,

@@ -352,6 +352,37 @@ class TexturedOracleTests(unittest.TestCase):
         self.assertEqual(env["VKH_SUBGROUP_SIZE"], "32")
         self.assertTrue(env["VKH_TEX_RGBA"].endswith("texture.rgba"))
 
+    def test_manifest_overrides_inherited_sampling_mode(self):
+        for srgb in (None, False, True):
+            with self.subTest(srgb=srgb):
+                if srgb is not None:
+                    self.manifest["texture"]["srgb"] = srgb
+                env = fl.harness_env(self.manifest, ".", base_env={"VKH_TEX_SRGB": "1"})
+                self.assertEqual(env["VKH_TEX_SRGB"], "1" if srgb else "0")
+
+    def test_dx10_rgb_transfer_precedes_bilinear_filter_and_alpha_stays_linear(self):
+        # Same two texels. The black/white midpoint is 0.5 if the endpoints are decoded
+        # first, or about 0.214 if the filter is applied to encoded bytes first.
+        pixels = bytes((0, 128, 10, 32, 255, 128, 10, 224))
+        header = bytearray(128)
+        header[:4] = b"DDS "
+        struct.pack_into("<IIII", header, 4, 124, 0x1007, 1, 2)
+        struct.pack_into("<II4s", header, 76, 32, 4, b"DX10")
+        struct.pack_into("<I", header, 108, 0x1000)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "two-colors.dds"
+            for dxgi, expected_srgb, green, blue in (
+                (28, False, 128 / 255, 10 / 255),
+                (29, True, 0.2158605001, 0.0030352698),
+            ):
+                with self.subTest(dxgi=dxgi):
+                    path.write_bytes(header + struct.pack("<5I", dxgi, 3, 0, 1, 0) + pixels)
+                    w, h, rgba, _, srgb = fl.read_dds_texture(str(path))
+                    self.assertEqual((w, h, rgba, srgb), (2, 1, pixels, expected_srgb))
+                    mid = fl.sample_rgba_bilinear(w, h, rgba, 0.5, 0.5, srgb=srgb)
+                    for actual, expected in zip(mid, (0.5, green, blue, 128 / 255)):
+                        self.assertAlmostEqual(actual, expected, places=6)
+
     def test_harness_rejects_wrapped_tsharp_va_overflow(self):
         h = harness()
         if not h:
@@ -398,6 +429,7 @@ class TexturedOracleTests(unittest.TestCase):
             with open(dds_path, "wb") as f:
                 f.write(dds)
             w, h, rgba, sha = fl.decode_dds_to_rgba(dds_path)
+            self.assertFalse(fl.read_dds_texture(dds_path)[4])  # legacy header has no sRGB declaration
             self.assertEqual((w, h), (2, 2))
             self.assertEqual(rgba, pixels)
             self.assertEqual(len(sha), 64)

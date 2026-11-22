@@ -25,6 +25,7 @@
 //                                set 0 image index 1 (with 1x1 magenta at index 0), writes a T# at VKH_TSHARP_VA
 //                                (default 0x100) in the 64 KiB heap, and registers VKH_SSHARP (4 comma-separated
 //                                dwords, default 0x92,0xc00000,0x14500000,0) at sampler index 1.
+//   VKH_TEX_SRGB=1                samples that texture as sRGB (RGB decodes before filtering; alpha stays linear).
 //
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
@@ -191,12 +192,21 @@ int main(int argc, char** argv) {
     }
     const char* tex_rgba_path = std::getenv("VKH_TEX_RGBA");
     if (tex_rgba_path && !*tex_rgba_path) tex_rgba_path = nullptr;
+    bool tex_srgb = false;
     uint32_t tsharp_va = 0x100;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
     uint32_t tex_w = 0, tex_h = 0;
     std::vector<uint8_t> tex_pixels;
     if (tex_rgba_path) {
+        if (const char* srgb_env = std::getenv("VKH_TEX_SRGB"); srgb_env && *srgb_env) {
+            if (!std::strcmp(srgb_env, "1")) {
+                tex_srgb = true;
+            } else if (std::strcmp(srgb_env, "0")) {
+                std::fprintf(stderr, "VKH_TEX_SRGB: expected 0 or 1, got \"%s\"\n", srgb_env);
+                return 2;
+            }
+        }
         if (const char* va_env = std::getenv("VKH_TSHARP_VA"); va_env && *va_env) {
             const char* p = va_env;
             if (!parse_u32(p, tsharp_va) || *p || (tsharp_va & 3u) || tsharp_va > heap_bytes - 32) {
@@ -829,7 +839,8 @@ int main(int argc, char** argv) {
         std::memcpy(imap, mesh_indices.data(), mesh_indices.size() * 4);
     }
     void* heap_map = nullptr;
-    uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(VK_FORMAT_R8G8B8A8_UNORM) << 20, 0x33333333,
+    const VkFormat tex_format = tex_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(tex_format) << 20, 0x33333333,
                           0x44444444, 0x55555555, 0x66666666, 0x77777777, 0x88888888};
     if (need_heap) {
         LOADD(vkGetBufferDeviceAddress);
@@ -878,9 +889,10 @@ int main(int argc, char** argv) {
             CHECK(vkMapMemory(dev, tbm, 0, tbi.size, 0, &tbp));
             std::memcpy(tbp, table.data(), table.size() * 4);
         }
-        auto make_sampled_tex = [&](uint32_t tw, uint32_t th, VkImage& out_img, VkImageView& out_view) -> int {
+        auto make_sampled_tex = [&](uint32_t tw, uint32_t th, VkFormat format,
+                                    VkImage& out_img, VkImageView& out_view) -> int {
             VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-            ii.imageType = VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R8G8B8A8_UNORM; ii.extent = {tw, th, 1};
+            ii.imageType = VK_IMAGE_TYPE_2D; ii.format = format; ii.extent = {tw, th, 1};
             ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT;
             ii.tiling = VK_IMAGE_TILING_OPTIMAL;
             ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -892,14 +904,14 @@ int main(int argc, char** argv) {
             VkDeviceMemory mem; CHECK(vkAllocateMemory(dev, &mai, nullptr, &mem));
             CHECK(vkBindImageMemory(dev, out_img, mem, 0));
             VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-            vi.image = out_img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+            vi.image = out_img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = format;
             vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             CHECK(vkCreateImageView(dev, &vi, nullptr, &out_view));
             return 0;
         };
         VkImageView tex_views[2]{};
-        if (make_sampled_tex(1, 1, tex_fallback_img, tex_views[0]) ||
-            make_sampled_tex(tex_w, tex_h, tex_img, tex_views[1])) return 1;
+        if (make_sampled_tex(1, 1, VK_FORMAT_R8G8B8A8_UNORM, tex_fallback_img, tex_views[0]) ||
+            make_sampled_tex(tex_w, tex_h, tex_format, tex_img, tex_views[1])) return 1;
         {
             const VkDeviceSize stage_bytes = 4 + tex_pixels.size();
             VkBufferCreateInfo sbi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};

@@ -40,6 +40,9 @@ import sys
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
+sys.path.insert(0, TOOLS)  # -I keeps sibling tools off sys.path.
+import dds_png  # noqa: E402
+
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 from compute_fixture import find_test_program  # noqa: E402
 
@@ -247,16 +250,18 @@ def write_mesh(path: str, vertices, indices) -> None:
         f.write(struct.pack(f"<{len(indices)}I", *indices))
 
 
-def decode_dds_to_rgba(path: str) -> tuple[int, int, bytes, str]:
-    """Decode a DDS texture (BC1/BC3/BC7/RGBA8/etc.) via tools/dds_png.py."""
-    if TOOLS not in sys.path:
-        sys.path.insert(0, TOOLS)
-    import dds_png
-
+def read_dds_texture(path: str) -> tuple[int, int, bytes, str, bool]:
+    """Decode the texels and retain the transfer function declared by the DDS."""
     with open(path, "rb") as f:
         raw = f.read()
     width, height, rgba = dds_png.decode_dds(raw)
-    return width, height, rgba, hashlib.sha256(raw).hexdigest()
+    srgb = dds_png.parse_dds_header(raw)["dxgi_format"] in dds_png._SRGB_DXGI_FORMATS
+    return width, height, rgba, hashlib.sha256(raw).hexdigest(), srgb
+
+
+def decode_dds_to_rgba(path: str) -> tuple[int, int, bytes, str]:
+    """Return decoded RGBA8 and the DDS digest."""
+    return read_dds_texture(path)[:4]
 
 
 def write_texture_rgba(path: str, width: int, height: int, rgba: bytes) -> None:
@@ -268,9 +273,9 @@ def write_texture_rgba(path: str, width: int, height: int, rgba: bytes) -> None:
 
 
 def sample_rgba_bilinear(
-    width: int, height: int, rgba: bytes, u: float, v: float
+    width: int, height: int, rgba: bytes, u: float, v: float, *, srgb: bool = False
 ) -> list[float]:
-    """Bilinear sample of an R8G8B8A8_UNORM texture with clamp-to-edge addressing."""
+    """Clamp to edge and filter in linear space, decoding sRGB color before interpolation."""
     u = max(0.0, min(1.0, u))
     v = max(0.0, min(1.0, v))
     fx = u * width - 0.5
@@ -284,12 +289,11 @@ def sample_rgba_bilinear(
 
     def texel(x: int, y: int) -> tuple[float, float, float, float]:
         off = (y * width + x) * 4
-        return (
-            rgba[off] / 255.0,
-            rgba[off + 1] / 255.0,
-            rgba[off + 2] / 255.0,
-            rgba[off + 3] / 255.0,
-        )
+        r, g, b, a = rgba[off:off + 4]
+        if srgb:
+            linear = dds_png._SRGB_TO_LINEAR
+            return linear[r], linear[g], linear[b], a / 255.0
+        return r / 255.0, g / 255.0, b / 255.0, a / 255.0
 
     c00, c10 = texel(x0, y0), texel(x1, y0)
     c01, c11 = texel(x0, y1), texel(x1, y1)
@@ -315,6 +319,7 @@ def harness_env(manifest: dict, out_dir: str, base_env: dict | None = None) -> d
         sgprs = ["0"] * (ptr_sgpr + 1)
         sgprs[ptr_sgpr] = hex(tsharp_va)
         env["VKH_TEX_RGBA"] = os.path.join(out_dir, tex_file)
+        env["VKH_TEX_SRGB"] = "1" if tex.get("srgb") is True else "0"
         env["VKH_TSHARP_VA"] = hex(tsharp_va)
         env["VKH_SSHARP"] = ",".join(hex(int(w)) for w in ssharp)
         env["VKH_SGPRS"] = ",".join(sgprs)
@@ -725,7 +730,7 @@ def main(argv=None) -> int:
         },
     }
     if a.dds:
-        tw, th, rgba, dds_sha = decode_dds_to_rgba(a.dds)
+        tw, th, rgba, dds_sha, srgb = read_dds_texture(a.dds)
         write_texture_rgba(os.path.join(out_dir, "texture.rgba"), tw, th, rgba)
         ps_meta = meta["ps"]
         ptr_sgpr = next(
@@ -742,6 +747,7 @@ def main(argv=None) -> int:
             "width": tw,
             "height": th,
             "dds_sha256": dds_sha,
+            "srgb": srgb,
             "ptr_sgpr": ptr_sgpr,
             "tsharp_va": DEFAULT_TSHARP_VA,
             "ssharp": ssharp,
@@ -750,14 +756,14 @@ def main(argv=None) -> int:
         manifest["rgba_tolerance"] = 0.02
         if centre_uv is not None:
             manifest["centre_rgba"] = sample_rgba_bilinear(
-                tw, th, rgba, centre_uv[0], centre_uv[1]
+                tw, th, rgba, centre_uv[0], centre_uv[1], srgb=srgb
             )
         if probes:
             manifest["rgba_probes"] = [
                 {
                     "pixel": p["pixel"],
                     "uv": p["uv"],
-                    "rgba": sample_rgba_bilinear(tw, th, rgba, p["uv"][0], p["uv"][1]),
+                    "rgba": sample_rgba_bilinear(tw, th, rgba, p["uv"][0], p["uv"][1], srgb=srgb),
                 }
                 for p in probes
             ]
