@@ -1552,6 +1552,15 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # D3D-314: a flush that replaces the set while another queue's submission is pending does not wait for it.
+      add_executable(d3d12_bindless_retire_test test/d3d12_bindless_retire_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_CS_SET0_SAMPLE})
+      target_link_libraries(d3d12_bindless_retire_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_bindless_retire_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SET0_SAMPLE_SPV="${LEONIDA_TEST_CS_SET0_SAMPLE}")
+      target_compile_options(d3d12_bindless_retire_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_bindless_retire COMMAND d3d12_bindless_retire_test)
+      set_tests_properties(d3d12_bindless_retire PROPERTIES SKIP_RETURN_CODE 77)
       add_executable(d3d12_pipeline_library_test test/d3d12_pipeline_library_test.cpp
                      ${LEONIDA_TEST_CS} ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
       target_link_libraries(d3d12_pipeline_library_test PRIVATE gta6rt_d3d12_com)

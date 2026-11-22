@@ -872,10 +872,10 @@ int main(int argc, char** argv) {
                 while ((hash_descriptor_key(key) & (slots - 1)) != target) ++key[7];
             }
             for (std::uint32_t i = 0; i < kDescriptorProbes; ++i) set.insert_key(keys[i], decoy_index);
-            EXPECT(!set.flush_needs_idle() && flush());
+            EXPECT(!set.flush_replaces_set() && flush());
             EXPECT(set.insert_key(keys.back(), gradient_index));
-            EXPECT(slot_count() == slots && set.flush_needs_idle());
-            EXPECT(flush() && !set.flush_needs_idle());
+            EXPECT(slot_count() == slots && set.flush_replaces_set());
+            EXPECT(flush() && !set.flush_replaces_set());
             for (const auto& key : keys) {
                 EXPECT(table.lookup(key) == (key == keys.back() ? gradient_index : decoy_index));
                 EXPECT(set.erase_key(key));
@@ -894,7 +894,7 @@ int main(int argc, char** argv) {
         set.insert_key(make_ssharp_key(ssharp.data()), sampler_index);
         for (std::uint32_t k = 100000; k < 100006; ++k) set.insert_key(numbered(k), decoy_index);
         const std::uint32_t depth = probe_depth(table.build_gpu_buffer(), tsharp);
-        EXPECT(slot_count() == slots && depth == 3 && !set.flush_needs_idle());
+        EXPECT(slot_count() == slots && depth == 3 && !set.flush_replaces_set());
         EXPECT(flush());
         CHECK(draw());
         compare("1 gradient", nullptr);
@@ -902,48 +902,58 @@ int main(int argc, char** argv) {
         // 2. Without its key the T# is a miss: index 0, the fallback image of zeros.
         const float zeros[4] = {0, 0, 0, 0};
         EXPECT(set.erase_key(tsharp) && !set.erase_key(tsharp));
-        EXPECT(!set.flush_needs_idle());  // erasing empties its slot only: the three keys ahead stay where they are
-        EXPECT(flush() && !set.flush_needs_idle());
+        EXPECT(!set.flush_replaces_set());  // erasing empties its slot only: the three keys ahead stay where they are
+        EXPECT(flush() && !set.flush_replaces_set());
         CHECK(draw());
         compare("2 miss", zeros);
 
         // 3. The table grows: a new, larger buffer behind binding 2.
         set.insert_key(tsharp, gradient_index);
-        EXPECT(!set.flush_needs_idle());  // one more entry, in place
+        EXPECT(!set.flush_replaces_set());  // one more entry, in place
         for (std::uint32_t k = 200000; k < 200200; ++k) set.insert_key(numbered(k), decoy_index);
-        EXPECT(slot_count() > slots && table.lookup(tsharp) == gradient_index && set.flush_needs_idle());
+        EXPECT(slot_count() > slots && table.lookup(tsharp) == gradient_index && set.flush_replaces_set());
         EXPECT(flush());
         CHECK(draw());
         compare("3 grown", nullptr);
         set.release_retired();
 
         const float orange_colour[4] = {1.0f, 128.0f / 255.0f, 0.0f, 1.0f};
-        // Rewriting the same mapping is a no-op. Changing it needs idle even with no table growth.
+        // Rewriting the same mapping is a no-op. Changing it changes a live entry even with no table growth.
         const std::uint32_t grown_slots = slot_count();
-        EXPECT(set.insert_key(tsharp, gradient_index) && !set.flush_needs_idle());
-        EXPECT(set.insert_key(tsharp, decoy_index) && slot_count() == grown_slots && set.flush_needs_idle());
-        EXPECT(flush() && !set.flush_needs_idle());
+        EXPECT(set.insert_key(tsharp, gradient_index) && !set.flush_replaces_set());
+        EXPECT(set.insert_key(tsharp, decoy_index) && slot_count() == grown_slots && set.flush_replaces_set());
+        EXPECT(flush() && !set.flush_replaces_set());
         CHECK(draw());
         compare("4 rebound", orange_colour);
-        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_needs_idle());
-        EXPECT(flush());
+        // The same change through a replacement set: the old set and table stay, whole, until the ticket of their
+        // last user has completed; the new set holds every descriptor and the new mapping.
+        const VkDescriptorSet replaced = set.set();
+        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_replaces_set() && set.prepare_replacement());
+        vkResetCommandBuffer(cmd, 0);
+        CHECK(vkBeginCommandBuffer(cmd, &begin));
+        EXPECT(set.flush(cmd, 7) && set.set() != replaced && set.retired_count() == 1);
+        CHECK(submit());
+        set.release_retired(6);
+        EXPECT(set.retired_count() == 1);
+        set.release_retired(7);
+        EXPECT(set.retired_count() == 0);
         CHECK(draw());
-        compare("5 restored", nullptr);
+        compare("5 restored in a new set", nullptr);
 
         // A submit that never reached the queue must keep the table upload pending: the retry has to see the new
         // mapping instead of the fallback or the old index (a recovered submit failure, the case a device reports
         // through table_upload_result(false)).
-        EXPECT(set.insert_key(tsharp, decoy_index) && set.flush_needs_idle());
+        EXPECT(set.insert_key(tsharp, decoy_index) && set.flush_replaces_set());
         vkResetCommandBuffer(cmd, 0);
         CHECK(vkBeginCommandBuffer(cmd, &begin));
         EXPECT(set.flush(cmd));  // recorded in a command buffer that is never submitted
         CHECK(vkEndCommandBuffer(cmd));
         set.table_upload_result(false);
-        EXPECT(set.flush_needs_idle());  // the retry rewrites the whole table: the device must idle first
+        EXPECT(set.flush_replaces_set());  // the retry rewrites the whole table: a new set, or an idle device first
         EXPECT(flush());
         CHECK(draw());
         compare("6 rebound after a failed submit", orange_colour);
-        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_needs_idle());
+        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_replaces_set());
         EXPECT(flush());
 
         // Another view at the same index, then removal of the index.

@@ -30,6 +30,18 @@ int main() {
     queue_one_destroyed = true;
     if (tickets.completed(query) != 4 || queried_destroyed) return 4;
 
+    // A wait for ticket 6 waits on the submissions up to it that are neither retired nor on an idle queue.
+    tickets.record(5, 0, 1);
+    tickets.record(6, 2, 3);
+    tickets.record(7, 0, 2);
+    std::array<std::uint64_t, 3> waited{};
+    unsigned waits = 0;
+    tickets.pending_through(6, [&](int queue, std::uint64_t value) {
+        waited[queue] = value;
+        ++waits;
+    });
+    if (waits != 2 || waited[0] != 1 || waited[2] != 3) return 5;
+
     std::puts("out-of-order queue completion kept the retirement prefix safe");
     return 0;
 }

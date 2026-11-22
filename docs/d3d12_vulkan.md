@@ -476,12 +476,13 @@ What is implemented (all of it testable without the game):
 Descriptors and the bindless set (milestone M2, without the pipelines that will bind the set), from the shader's
 side inwards:
 - **`runtime/src/vulkan_bindless.h`**: set 0 includes the twenty bindings the translator declares, and
-  `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1) behind binding 2. One set for the device.
-  The translator declares every array as a runtime array, so the counts are the runtime's choice. Details:
-  - The device sizes the arrays once, when it creates the set. It does not recreate the set, because pipeline
-    layouts are built on `bindless_set_layout()`. `bindless::size_bindings` reads the update-after-bind limits
-    (`maxPerStageDescriptorUpdateAfterBind*`, `maxDescriptorSetUpdateAfterBind*`,
-    `maxPerStageUpdateAfterBindResources`, `maxUpdateAfterBindDescriptorsInAllPools`), or the plain limits for a
+  `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1) behind binding 2. One set for the device at a
+  time. The translator declares every array as a runtime array, so the counts are the runtime's choice. Details:
+  - The device sizes the arrays once, when it creates the set. It never changes the layout (a replacement set,
+    below, has the same counts), because pipeline layouts are built on `bindless_set_layout()`.
+    `bindless::size_bindings` reads the update-after-bind limits (`maxPerStageDescriptorUpdateAfterBind*`,
+    `maxDescriptorSetUpdateAfterBind*`, `maxPerStageUpdateAfterBindResources`,
+    `maxUpdateAfterBindDescriptorsInAllPools`), or the plain limits for a
     set without update-after-bind. It starts from the default counts below (4096 sampled 2D images, 1024
     samplers, 1024 2D-array, 256 1D, 256 3D and 256 per storage array). Where a limit is lower, it clamps the
     sampler, storage and 2D arrays, in that order, and the device logs it. Next come the MS pairs that fit. Then it
@@ -516,10 +517,14 @@ side inwards:
     puts a new entry in an empty slot, and the copy of an entry is not atomic; a running lookup that does not know
     the key cannot resolve to it, which is accepted. Erasing a key empties its slot and moves no other entry
     (every lookup, CPU and shader, compares all eight probe slots and never stops at an empty one), so it is
-    uploaded like an add. Replacing a live key's index, an insert that relocates a live entry, and a table that
-    has grown (a new buffer behind binding 2) change what running lookups see: `flush_needs_idle()` says when a
-    flush would do one of those, and the device waits for the queue before flushing in that case. Erasing used to
-    compact the probe cluster, which moved other keys and made every texture release wait for the whole GPU.
+    uploaded like an add. Replacing a live key's index, an insert that relocates a live entry, a whole-table
+    rewrite after a failed submit, and a table that has grown (a new buffer behind binding 2) change what running
+    lookups see: `flush_replaces_set()` says when a flush would do one of those. Such a flush moves to a new set,
+    in a pool of its own (`prepare_replacement()`): a copy of every image and sampler descriptor, with binding 2
+    naming a new table that the flush uploads whole. Command buffers already submitted keep the set and table they
+    bound; the old ones are retired with the ticket of the last submission so far, and `release_retired()` frees
+    them once that ticket has completed (D3D-314). Erasing used to compact the probe cluster, which moved other
+    keys and made every texture release wait for the whole GPU.
 - **`runtime/src/gfx10_descriptors.h`**: the T#, S# and V# structures (section 5.3), encoded and decoded, with
   their mapping to Vulkan formats, view types, component mappings and samplers. Field positions are Mesa's
   (`src/amd/registers/gfx10-rsrc.json`) and agree with what the translator and the GPU tests already use. Bits
@@ -585,10 +590,18 @@ which image format a sampler will be paired with — on Radeon iGPUs `BC*` forma
 formats support it, whereas RTX supports all queried formats); the storage arrays hold 255 images a dimension at the default counts, more
 where the device has room (4095 2D and 1023 2D-array on an RTX 5070); nothing writes through a
 storage view in a D3D12-level test yet (`vk_bindless_test` goes through the storage bindings at the Vulkan
-level). The set is flushed at every `ExecuteCommandLists`; a flush that erases keys or moves the table to a larger
-buffer (`BindlessSet::flush_needs_idle()`) first waits for the device to be idle and then frees the retired table
-buffers, so no running lookup misses (D3D-76). That wait stalls every queue, which is correct but slow if the game
-destroys textures every frame; a per-queue wait is open.
+level). The set is flushed at every `ExecuteCommandLists`. A flush that changes entries running lookups see or moves
+the table to a larger buffer (`BindlessSet::flush_replaces_set()`) moves to a new set and table instead of waiting:
+the submission binds the new set (`ReplayFunctions::bindless_set`, the set its pipelines' set 0 is bound to at every
+dispatch and draw), and the old set and table are retired with the global retire ticket of the last submission so
+far. That ticket is the contiguous completed prefix of every queue's progress timeline
+(`VulkanContext::completed_retire_ticket`), so they are freed, polled at every later `ExecuteCommandLists` and at
+device destruction, once each queue's submissions up to then have completed, while every queue keeps running
+(D3D-314; before, the flush waited for the device to be idle, D3D-76). The submission that uploads the new table is
+the one every other queue's next submission waits for, as for storage images moved to `GENERAL` (D3D-314). A device
+whose update-after-bind pool limit has no room for a second set falls back to changing the set in place after
+waiting on the progress timelines of the queues with submissions still pending (`wait_retire_ticket`), not for
+the device. `d3d12_bindless_retire_test` grows the table while another queue's submission waits on a fence.
 
 A typed 3D color target supports default and explicit RTVs. The default covers mip 0; `FirstWSlice` and
 `WSize` select the depth slices in an explicit view's mip. `d3d12_clear_test --volume` checks full and

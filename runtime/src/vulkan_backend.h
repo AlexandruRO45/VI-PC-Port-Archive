@@ -754,6 +754,14 @@ struct BufferTileRange {
     std::uint64_t count;
 };
 
+// What the device's bindless prepare (VulkanContext::set_bindless_prepare) gives one ExecuteCommandLists.
+struct BindlessPrepared {
+    VkDescriptorSet set = VK_NULL_HANDLE;  // set 0 for every dispatch and draw of the submission
+    // The flush replaced the set, or changed in place what running lookups see (BindlessSet::flush_replaces_set()),
+    // and this submission uploads the table: other queues' next submissions wait for it.
+    bool replaced = false;
+};
+
 // Per device: what the queues share. Resources are registered by their stable ID (the COM resource pointer).
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -1107,9 +1115,10 @@ public:
     }
 
     // `prepare` is called at the start of the command buffer of every ExecuteCommandLists, before the lists are
-    // written: the device brings the bindless set 0 of the translated shaders up to date there (vulkan_bindless.h)
-    // and records what the set needs first. When it fails, nothing of that call is executed.
-    void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
+    // written: the device brings the bindless set 0 of the translated shaders up to date there (vulkan_bindless.h),
+    // records what the set needs first and says which set the lists bind. When it fails, nothing of that call is
+    // executed.
+    void set_bindless_prepare(std::function<bool(VkCommandBuffer, BindlessPrepared&)> prepare) {
         std::unique_lock lock(resource_mutex_);
         bindless_prepare_ = std::move(prepare);
     }
@@ -1172,6 +1181,50 @@ public:
             std::uint64_t done = 0;
             return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
         });
+    }
+
+    // The ticket of the last submission so far, on any queue: completed_retire_ticket() reaches it once that
+    // submission and every one before it has completed.
+    std::uint64_t submitted_retire_ticket() const { return submitted_ticket_.load(std::memory_order_acquire); }
+
+    // Blocks until completed_retire_ticket() reaches `ticket`, waiting on the progress timelines of the queues
+    // whose submissions up to it are still pending rather than for the whole device. The submit lock is dropped
+    // between waits of at most a millisecond, so other threads keep submitting (a Signal this wait depends on).
+    // False when the device is lost.
+    bool wait_retire_ticket(std::uint64_t ticket) {
+        std::vector<VkSemaphore> semaphores;
+        std::vector<std::uint64_t> values;
+        for (;;) {
+            std::lock_guard lock(submit_mutex_);
+            if (is_device_lost()) return false;
+            const auto reached = [this](VkSemaphore semaphore, std::uint64_t value) {
+                std::uint64_t done = 0;
+                return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
+            };
+            if (retire_tickets_.completed(reached) >= ticket) return true;
+            semaphores.clear();
+            values.clear();
+            retire_tickets_.pending_through(ticket, [&](VkSemaphore semaphore, std::uint64_t value) {
+                const auto at = std::find(semaphores.begin(), semaphores.end(), semaphore);
+                if (at == semaphores.end()) {
+                    semaphores.push_back(semaphore);
+                    values.push_back(value);
+                } else {
+                    auto& known = values[std::size_t(at - semaphores.begin())];
+                    known = std::max(known, value);
+                }
+            });
+            // Under the lock: a queue marks its entries idle under it before it destroys its semaphore.
+            VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wait.semaphoreCount = std::uint32_t(semaphores.size());
+            wait.pSemaphores = semaphores.data();
+            wait.pValues = values.data();
+            const VkResult result = vk.vkWaitSemaphores(device_, &wait, 1000000);
+            if (result != VK_SUCCESS && result != VK_TIMEOUT) {
+                if (result == VK_ERROR_DEVICE_LOST) mark_device_lost();
+                return false;
+            }
+        }
     }
 
     void drain_deleted_resources(std::uint64_t current_ticket) {
@@ -1268,16 +1321,17 @@ private:
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
-    std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ only
+    std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and init_*
     std::unordered_set<ResourceId> storage_pending_;
-    // The last submission that initialized storage images (its queue's progress semaphore and ticket) and a counter
-    // that says which one: every other queue's next submission waits for it, so no queue uses such an image before
-    // the zero-fill that put it in GENERAL has run.
-    VkSemaphore storage_init_semaphore_ = VK_NULL_HANDLE;
-    std::uint64_t storage_init_value_ = 0;
-    std::uint64_t storage_init_version_ = 0;
+    // The last submission that initialized something every queue uses (its queue's progress semaphore and ticket)
+    // and a counter that says which one: every other queue's next submission waits for it. So no queue uses a
+    // storage image before the zero-fill that put it in GENERAL has run, or reads a bindless table a flush replaced
+    // (BindlessPrepared::replaced) before its upload. Each such submission waits for the one before.
+    VkSemaphore init_semaphore_ = VK_NULL_HANDLE;
+    std::uint64_t init_value_ = 0;
+    std::uint64_t init_version_ = 0;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
-    std::function<bool(VkCommandBuffer)> bindless_prepare_;
+    std::function<bool(VkCommandBuffer, BindlessPrepared&)> bindless_prepare_;
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::function<void(bool)> bindless_commit_;
@@ -1392,6 +1446,9 @@ public:
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
             if (context_.scratch_) context_.scratch_->forget(progress_);
+            // Its submissions are done: no other queue needs to wait for them, and the semaphore is about to go.
+            std::lock_guard storage(context_.storage_mutex_);
+            if (context_.init_semaphore_ == progress_) context_.init_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
@@ -1638,7 +1695,8 @@ public:
             return ReplayResult::unsupported;
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
-        if (context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
+        BindlessPrepared bindless;
+        if (context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer, bindless)) {
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
@@ -1655,6 +1713,7 @@ public:
             if (bindless_commit) bindless_commit(submitted);
             return ReplayResult::unsupported;
         }
+        replay.bindless_set = bindless.set;
         auto next_tracker = context_.tracker_;
         // Images with a UAV view are moved to GENERAL (zeroed) by the first submission that can use a shader on them:
         // not a copy queue (its family may not clear images), and one whose lists dispatch or draw.
@@ -1666,11 +1725,11 @@ public:
         std::vector<ResourceId> storage_images;
         {
             std::lock_guard lock(context_.storage_mutex_);
-            if (context_.storage_init_semaphore_ && context_.storage_init_semaphore_ != progress_ &&
-                context_.storage_init_version_ != storage_init_seen_) {
-                waits_.push_back(context_.storage_init_semaphore_);
-                wait_values_.push_back(context_.storage_init_value_);
-                storage_init_seen_ = context_.storage_init_version_;
+            if (context_.init_semaphore_ && context_.init_semaphore_ != progress_ &&
+                context_.init_version_ != init_seen_) {
+                waits_.push_back(context_.init_semaphore_);
+                wait_values_.push_back(context_.init_value_);
+                init_seen_ = context_.init_version_;
             }
             if (kind_ != QueueKind::copy && runs_shaders)
                 storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
@@ -1729,12 +1788,12 @@ public:
             std::lock_guard lock(context_.storage_mutex_);
             context_.storage_pending_.insert(storage_images.begin(), storage_images.end());
         }
-        if (submitted && !storage_images.empty()) {
+        if (submitted && (!storage_images.empty() || bindless.replaced)) {
             std::lock_guard lock(context_.storage_mutex_);
-            context_.storage_init_semaphore_ = progress_;
-            context_.storage_init_value_ = submitted_;
-            ++context_.storage_init_version_;
-            storage_init_seen_ = context_.storage_init_version_;
+            context_.init_semaphore_ = progress_;
+            context_.init_value_ = submitted_;
+            ++context_.init_version_;
+            init_seen_ = context_.init_version_;
         }
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
@@ -1997,7 +2056,7 @@ private:
     std::uint64_t submitted_ = 0;
     std::vector<CommandSlot> buffers_;
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
-    std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
+    std::uint64_t init_seen_ = 0;  // the context's init_version_ this queue has waited for
     std::uint64_t last_sparse_ = 0;
     std::deque<PendingBindings> pending_bindings_;
     std::vector<VkSemaphore> waits_;

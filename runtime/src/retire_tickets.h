@@ -35,6 +35,16 @@ public:
             if (entry.semaphore == semaphore) entry.idle = true;
     }
 
+    // Calls fn(semaphore, value) for every recorded submission up to `ticket` that completed() has not retired and
+    // whose queue is not known idle: what a wait for `ticket` waits on.
+    template<class Fn>
+    void pending_through(std::uint64_t ticket, Fn&& fn) const {
+        for (const Entry& entry : pending_) {
+            if (entry.ticket > ticket) break;
+            if (!entry.idle) fn(entry.semaphore, entry.value);
+        }
+    }
+
 private:
     struct Entry {
         std::uint64_t ticket;

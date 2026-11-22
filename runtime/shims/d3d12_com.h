@@ -202,12 +202,17 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
-// brought up to date at every ExecuteCommandLists.
+// brought up to date at every ExecuteCommandLists, which may replace it (BindlessSet::flush_replaces_set): this
+// returns the set as the last one left it. A test that binds it in its own command buffers takes it after the
+// ExecuteCommandLists whose descriptors it needs and lets them complete before the next one, which may free it.
 VkDescriptorSet bindless_set(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
 // 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]);
+// Sets and tables replaced by a flush that a submission still pending may use, not freed yet. For tests, with no
+// other thread executing.
+std::size_t bindless_retired_count(ID3D12Device* device);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be

@@ -2574,7 +2574,7 @@ public:
             set0_layout = device_.bindless->layout();
             layout_info.setLayoutCount = 1;
             layout_info.pSetLayouts = &set0_layout;
-            graphics_.bindless_set = device_.bindless->set();
+            graphics_.bindless = true;
         }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
 
@@ -2689,7 +2689,7 @@ public:
             set0_layout = device_.bindless->layout();
             layout_info.setLayoutCount = 1;
             layout_info.pSetLayouts = &set0_layout;
-            pipeline_.bindless_set = device_.bindless->set();
+            pipeline_.bindless = true;
         }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -3459,19 +3459,25 @@ public:
                 if (st->bindless) st->bindless->remove_image(static_cast<leonida::ImageDimension>(dim), idx);
             },
             &state_);
-        state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
+        state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer, leonida::BindlessPrepared& out) {
+            auto& context = *state_.context;
             std::lock_guard lock(state_.descriptor_mutex);
-            if (!state_.bindless->fallbacks_ready()) state_.bindless->record_fallback_init(command_buffer);
-            if (state_.bindless->flush_needs_idle()) {
-                // Entries a running shader probes are about to change, or binding 2 is about to name a new buffer:
-                // wait until nothing that uses the set still runs, then free the generations that were retired.
-                {
-                    std::lock_guard submit(state_.context->submit_mutex());
-                    state_.context->vk.vkDeviceWaitIdle(state_.info.device);
-                }
-                state_.bindless->release_retired();
+            auto& set = *state_.bindless;
+            // Sets and tables retired by earlier flushes go once every submission that could bind them is done.
+            set.release_retired(context.completed_retire_ticket());
+            if (!set.fallbacks_ready()) set.record_fallback_init(command_buffer);
+            const bool replaces = set.flush_replaces_set();
+            if (replaces && !set.prepare_replacement()) {
+                // No room for a second set: the flush changes entries running lookups see, or binding 2, in place.
+                // Wait for every submission so far on each queue's timeline (not for the device), then free.
+                if (!context.wait_retire_ticket(context.submitted_retire_ticket())) return false;
+                set.release_retired(context.completed_retire_ticket());
             }
-            return state_.bindless->flush(command_buffer);
+            // Every submission so far may bind the set as it is; this one binds what flush() leaves.
+            if (!set.flush(command_buffer, context.submitted_retire_ticket())) return false;
+            out.set = set.set();
+            out.replaced = replaces;
+            return true;
         });
         state_.context->set_bindless_commit([this](bool submitted) {
             std::lock_guard lock(state_.descriptor_mutex);
@@ -6233,6 +6239,11 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device) {
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]) {
     const leonida::BindlessSet* set = bindless_of(device);
     return set ? set->table().lookup(key) : 0;
+}
+
+std::size_t bindless_retired_count(ID3D12Device* device) {
+    const leonida::BindlessSet* set = bindless_of(device);
+    return set ? set->retired_count() : 0;
 }
 
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)

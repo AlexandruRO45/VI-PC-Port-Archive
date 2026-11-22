@@ -699,9 +699,8 @@ int main() {
         //    and 4) and sample back decoded HDR floats through the E5B9G9R9 sampled view (binding 0).
 #ifdef LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV
         if (d.bindless) {
-            const VkDescriptorSet set0 = rt::d3d12::bindless_set(device.p);
             const VkDescriptorSetLayout set0_layout = rt::d3d12::bindless_set_layout(device.p);
-            EXPECT(set0 && set0_layout);
+            EXPECT(rt::d3d12::bindless_set(device.p) && set0_layout);
 
             const auto desc_rt = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4, 1, 1,
                                           DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -765,6 +764,8 @@ int main() {
                 0x88040280u,  // (2.5, 1.0, 2.0)
             };
             std::array<float, 64> sampled{};
+            // The set as the ExecuteCommandLists above left it: a flush can replace it.
+            const VkDescriptorSet set0 = rt::d3d12::bindless_set(device.p);
             EXPECT(run_bindless_roundtrip(d, set0, set0_layout, rt_uav_words, rt_srv_words, smp_words,
                                           !native_storage, input_words, sampled));
             for (UINT i = 0; i < 16; ++i) {

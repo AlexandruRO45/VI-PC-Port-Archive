@@ -366,8 +366,8 @@ int test_relocation_marks_both_slots() {
     return 0;
 }
 
-// Shaders keep probing the GPU copy of the table while an erase is uploaded without waiting for idle
-// (BindlessSet::flush_needs_idle), so an erase must leave every other key's slot exactly as it was.
+// Shaders keep probing the GPU copy of the table while an erase is uploaded in place, without a new set
+// (BindlessSet::flush_replaces_set), so an erase must leave every other key's slot exactly as it was.
 int test_erase_moves_no_other_entry() {
     DescriptorTable table(64);
     const std::uint32_t slots = std::uint32_t(table.capacity());
