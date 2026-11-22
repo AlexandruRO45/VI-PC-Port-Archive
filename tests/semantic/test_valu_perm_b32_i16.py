@@ -511,5 +511,49 @@ class TestPermB32I16RegisterAliasing(unittest.TestCase):
         self.interp.execute(instr)
         self.assertEqual(self.rf.get_vgpr(0), pack_halves(0x3333, 0x2222))
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Classifications
+# ==============================================================================
+
+@dataclass
+class I16StatusFlags:
+    zero: bool = False
+    negative: bool = False
+    has_min: bool = False
+    has_max: bool = False
+
+
+def eval_i16_status(val32: int) -> I16StatusFlags:
+    h0 = val32 & MASK16
+    h1 = (val32 >> 16) & MASK16
+
+    both_zero = (h0 == 0) and (h1 == 0)
+    is_neg = bool(h0 & SIGN16) or bool(h1 & SIGN16)
+    has_min = (h0 == INT16_MIN) or (h1 == INT16_MIN)
+    has_max = (h0 == INT16_MAX) or (h1 == INT16_MAX)
+
+    return I16StatusFlags(
+        zero=both_zero,
+        negative=is_neg,
+        has_min=has_min,
+        has_max=has_max,
+    )
+
+
+class TestPermB32I16ConditionCodesAndStatus(unittest.TestCase):
+    def test_status_flags_zero_result(self):
+        sel = make_selector(SEL_CONST_ZERO, SEL_CONST_ZERO)
+        res = oracle_v_perm_b32_i16(0, 0, sel)
+        flags = eval_i16_status(res)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+
+    def test_status_flags_min_max(self):
+        sel = make_selector(SEL_CONST_MIN, SEL_CONST_MAX)
+        res = oracle_v_perm_b32_i16(0, 0, sel)
+        flags = eval_i16_status(res)
+        self.assertTrue(flags.has_min)
+        self.assertTrue(flags.has_max)
+
 if __name__ == "__main__":
     unittest.main()
