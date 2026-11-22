@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_adx
 ; Source-owned differential fixture for ADX instructions (ADCX, ADOX) in 32-bit and 64-bit forms,
 ; plus interleaved ADCX/ADOX proving independent CF and OF carry chains.
 ; Output slot receives (CF << 1) | OF.
