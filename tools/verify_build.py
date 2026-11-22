@@ -177,7 +177,10 @@ def main():
     parser.add_argument("directory", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    root = args.directory.resolve(strict=True)
+    try:
+        root = args.directory.resolve(strict=True)
+    except OSError as exc:
+        parser.error(f"cannot read {args.directory}: {exc.strerror or exc}")
     destination = args.output or Path(__file__).resolve().parents[1] / "out" / "integrity" / (root.name + ".json")
     if destination.resolve().is_relative_to(root):
         parser.error("Choose an output outside the input directory")
@@ -192,12 +195,15 @@ def main():
     layout = manifest("layout*.xml")
     start = datetime.now(timezone.utc)
     raw = torrent.read_bytes()
-    info = decode_torrent(raw)[b"info"]
-    entries = [{"path": "/".join(s.decode("utf-8") for s in f[b"path"]), "bytes": f[b"length"]}
-               for f in info[b"files"]]
-    payload = {row["path"] for row in entries}
-    if len(payload) != len(entries) or any(row["bytes"] < 0 for row in entries) or info[b"piece length"] <= 0:
-        raise ValueError("Invalid torrent file list or piece length")
+    try:
+        info = decode_torrent(raw)[b"info"]
+        entries = [{"path": "/".join(s.decode("utf-8") for s in f[b"path"]), "bytes": f[b"length"]}
+                   for f in info[b"files"]]
+        payload = {row["path"] for row in entries}
+        if len(payload) != len(entries) or any(row["bytes"] < 0 for row in entries) or info[b"piece length"] <= 0:
+            raise ValueError("Invalid torrent file list or piece length")
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        parser.error(f"{torrent.name} is not a readable multi-file torrent: {type(exc).__name__}: {exc}")
     before = inventory(root)
     sizes = {p: stat[0] for p, stat in before.items()}
     missing = sorted(payload - sizes.keys())
