@@ -749,5 +749,46 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
+class Wave64VccHalfFixture(unittest.TestCase):
+    """runtime/test/shaders/cs_w64_vcc_half.asm: 32-bit writes to vcc_lo and vcc_hi while VCC holds a wave64 lane
+    mask update only their own 32 lanes and keep the other half. Run on all 64 lanes of one wave; words match
+    check.py CS_DUMPS and the derivations in the .asm header."""
+
+    WANT = [4128, 4112, 0, 10240, 10248, 7200, 10252, 7]
+
+    def test_words(self):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", "cs_w64_vcc_half.asm"))
+        spv = support.translate_fixture("cs_w64_vcc_half", fssm=bytes(header))
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        si.run_workgroup(spv, 64, 64,
+                         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                         push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual([memory[4 * i] for i in range(8)], self.WANT)
+        self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
+
+    def test_words_follow_from_the_masks(self):
+        def word(m):
+            return 0 if m == 0 else (bin(m).count("1") << 8) | ((m & -m).bit_length() - 1)
+        m16_47 = ((1 << 48) - 1) ^ ((1 << 16) - 1)
+        m40_47 = ((1 << 48) - 1) ^ ((1 << 40) - 1)
+        m8_15 = ((1 << 16) - 1) ^ ((1 << 8) - 1)
+        m4_59 = ((1 << 60) - 1) ^ ((1 << 4) - 1)
+        m12_19 = ((1 << 20) - 1) ^ ((1 << 12) - 1)
+        lo32, hi32 = 0xFFFFFFFF, 0xFFFFFFFF << 32
+        derived = [
+            word(m16_47 & hi32),           # 1) vcc_lo = 0
+            word(m16_47 & lo32),           # 2) vcc_hi = 0
+            word(m40_47 & lo32),           # 3) vcc_hi = 0 -> 0
+            word((m40_47 & hi32) | lo32),  # 4) vcc_lo = -1
+            word((m8_15 & lo32) | hi32),   # 5) vcc_hi = -1
+            word(m4_59 & hi32),            # 6) s_and_b32 vcc_lo, vcc_lo, 0
+            word((m12_19 & lo32) | hi32),  # 7) s_or_b32 vcc_hi, vcc_hi, -1
+            1 | 2 | 4,                     # 8) branch flags
+        ]
+        self.assertEqual(derived, self.WANT)
+
+
 if __name__ == "__main__":
     unittest.main()

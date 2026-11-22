@@ -131,6 +131,7 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-99: -0 and NaN survive translation (SignedZeroInfNanPreserve); words 0, 2, 3 on Apple: see below
             ("cs_signed_zero_nan", SIGNED_ZERO_NAN),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
+            ("cs_w64_vcc_half", [4128, 4112, 0, 10240, 10248, 7200, 10252, 7]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
             # mask-only wave64: s_bcnt1_i32_b64 on ordinary SGPRs, no WAVE64_RE EXEC markers (#210 / SHADER-28)
