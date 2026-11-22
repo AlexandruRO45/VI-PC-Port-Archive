@@ -687,5 +687,112 @@ class TestValuCvtNormI32F16RegisterAliasing(unittest.TestCase):
         # v0 low half is 0x0000 (+0.0f), which converts to 0
         self.assertEqual(r2, SNORM32_ZERO)
 
+# ---------------------------------------------------------------------------
+# Condition Codes, Status Flags, and Carry/Borrow Isolation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class ConditionCodes:
+    """Architectural condition codes evaluating properties of converted SNORM32 results."""
+    zero: bool
+    negative: bool
+    max_pos: bool
+    min_neg: bool
+    even: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class FPStatusFlags:
+    """IEEE 754 and hardware status flags for f16 to snorm32 conversion."""
+    invalid: bool       # e.g., sNaN operand
+    denormal: bool      # e.g., subnormal f16 operand
+    inexact: bool       # non-integer scaling requiring rounding
+    overflow: bool      # finite input > 1.0 clamped to SNORM32_MAX
+    underflow: bool     # finite input < -1.0 clamped to SNORM32_MIN
+
+
+def compute_condition_codes_i32(result: int) -> ConditionCodes:
+    """Computes condition codes evaluating attributes of a 32-bit SNORM result."""
+    u32 = result & MASK32
+    i32 = u32 if u32 < 0x80000000 else u32 - 0x100000000
+    return ConditionCodes(
+        zero=(i32 == 0),
+        negative=(i32 < 0),
+        max_pos=(i32 == SNORM32_MAX),
+        min_neg=(i32 == SNORM32_MIN),
+        even=(i32 % 2 == 0),
+    )
+
+
+def compute_fp_status_flags_cvt_norm_i32_f16(src16: int, result32: int) -> FPStatusFlags:
+    """Computes IEEE 754 / architectural exception status flags."""
+    src16 &= MASK16
+    invalid = is_snan_f16(src16)
+    denormal = is_subnormal_f16(src16)
+
+    overflow = False
+    underflow = False
+    inexact = False
+
+    if not is_nan_f16(src16) and not is_inf_f16(src16):
+        f_val = bits_to_f16(src16)
+        if f_val > 1.0:
+            overflow = True
+            inexact = True
+        elif f_val < -1.0:
+            underflow = True
+            inexact = True
+        elif -1.0 < f_val < 1.0 and f_val != 0.0:
+            scaled = Fraction(f_val) * 2147483647
+            if scaled.denominator != 1:
+                inexact = True
+
+    return FPStatusFlags(
+        invalid=invalid,
+        denormal=denormal,
+        inexact=inexact,
+        overflow=overflow,
+        underflow=underflow,
+    )
+
+
+class TestValuCvtNormI32F16ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes(self) -> None:
+        cc_zero = compute_condition_codes_i32(SNORM32_ZERO)
+        self.assertTrue(cc_zero.zero)
+        self.assertFalse(cc_zero.negative)
+
+        cc_pos = compute_condition_codes_i32(SNORM32_MAX)
+        self.assertTrue(cc_pos.max_pos)
+        self.assertFalse(cc_pos.negative)
+
+        cc_neg = compute_condition_codes_i32(SNORM32_MIN_RAW)
+        self.assertTrue(cc_neg.min_neg)
+        self.assertTrue(cc_neg.negative)
+
+    def test_status_flags_snan(self) -> None:
+        res = ref_cvt_norm_i32_f16(SNAN_F16)
+        flags = compute_fp_status_flags_cvt_norm_i32_f16(SNAN_F16, res)
+        self.assertTrue(flags.invalid)
+
+    def test_status_flags_denormal(self) -> None:
+        res = ref_cvt_norm_i32_f16(MIN_SUBNORMAL_F16)
+        flags = compute_fp_status_flags_cvt_norm_i32_f16(MIN_SUBNORMAL_F16, res)
+        self.assertTrue(flags.denormal)
+
+    def test_carry_borrow_vcc_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary = 0xCAFECAFE12345678
+        interp.vcc = canary
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(1.0),
+        )
+        interp.step(inst)
+        self.assertEqual(interp.vcc, canary)
+
 if __name__ == "__main__":
     unittest.main()
