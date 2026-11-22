@@ -836,6 +836,75 @@ class TestBufferAtomicXorX2ConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, canary)
 
 
+class TestBufferAtomicXorX2BoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, address wrapping, and 64-bit IEEE 754 bit representations."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_qword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Last valid 8-byte qword starts at offset 92 (92 + 8 = 100)
+        self.mem.write_u64(92, 0xFFFFFFFFFFFFFFFF)
+        ret, in_bounds = ref_buffer_atomic_xor_x2(
+            self.mem, desc, soffset=0, vaddr=92, xor_val=0x000000000000000F, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(self.mem.read_u64(92), 0xFFFFFFFFFFFFFFF0)
+
+        # Offsets 93..100 all exceed num_records (e.g. 93 + 8 = 101 > 100)
+        for oob_off in (93, 94, 95, 96, 97, 98, 99, 100):
+            ret, in_bounds = ref_buffer_atomic_xor_x2(
+                self.mem, desc, soffset=0, vaddr=oob_off, xor_val=0xFF, glc=True
+            )
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_xor_x2(
+            self.mem, desc, soffset=0, vaddr=0, xor_val=0xFF, glc=True
+        )
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_64bit_bitwise_masks_and_inversion(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # 0x5555555555555555 ^ 0xAAAAAAAAAAAAAAAA = 0xFFFFFFFFFFFFFFFF
+        self.mem.write_u64(0, 0x5555555555555555)
+        ret, in_bounds = ref_buffer_atomic_xor_x2(
+            self.mem, desc, soffset=0, vaddr=0, xor_val=0xAAAAAAAAAAAAAAAA, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x5555555555555555)
+        self.assertEqual(self.mem.read_u64(0), 0xFFFFFFFFFFFFFFFF)
+
+    def test_ieee754_double_bit_patterns_raw_bitwise(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        # 1. Double Positive Infinity (0x7FF0000000000000) ^ sign bit -> Double Negative Infinity (0xFFF0000000000000)
+        double_pos_inf = 0x7FF0000000000000
+        double_neg_inf = 0xFFF0000000000000
+        self.mem.write_u64(8, double_pos_inf)
+        ret, in_bounds = ref_buffer_atomic_xor_x2(
+            self.mem, desc, soffset=0, vaddr=8, xor_val=0x8000000000000000, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, double_pos_inf)
+        self.assertEqual(self.mem.read_u64(8), double_neg_inf)
+
+        # 2. Double Quiet NaN (0x7FF8000000000000) ^ 0 -> untouched
+        double_qnan = 0x7FF8000000000000
+        self.mem.write_u64(16, double_qnan)
+        ret, in_bounds = ref_buffer_atomic_xor_x2(
+            self.mem, desc, soffset=0, vaddr=16, xor_val=0, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, double_qnan)
+        self.assertEqual(self.mem.read_u64(16), double_qnan)
+
+
 class TestBufferAtomicXorX2ScalarInterpreter(unittest.TestCase):
     """Unit tests for deterministic scalar instruction interpreter."""
 
