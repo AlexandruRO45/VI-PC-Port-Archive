@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+"""Semantic reference oracle and architectural model for AMD RDNA2 v_sad_u16.
+
+AMD RDNA VALU Instruction Set Architecture:
+  v_sad_u16 dst, src0, src1, src2
+
+Format:
+  VOP3 (3-operand vector ALU instruction, 32-bit destination, three 32-bit inputs).
+
+Operation:
+  Computes the 2-channel sum of unsigned 16-bit absolute differences between
+  packed halfword lanes of src0 and src1, and accumulates into the 32-bit
+  unsigned accumulator src2:
+    diff0 = |src0[15:0]  - src1[15:0]|
+    diff1 = |src0[31:16] - src1[31:16]|
+    sum_diff = diff0 + diff1
+    dst = (sum_diff + src2) & 0xFFFFFFFF
+
+Mathematical Properties and Bounds:
+  - Operands src0, src1 are treated as two packed 16-bit unsigned integers in [0, 65535].
+  - Each halfword absolute difference diff0, diff1 is in [0, 65535] (0x0000 to 0xFFFF).
+  - Total sum of absolute differences sum_diff is in [0, 2 * 65535] = [0, 131070] (0x00000 to 0x1FFFE).
+  - sum_diff strictly fits within 17 bits (< 2^17 = 131072).
+  - Adding unsigned 32-bit src2 produces a full sum in [0, 131070 + 0xFFFFFFFF] = [0, 0x1_0001_FFFD].
+  - Destination wraps modulo 2^32: dst = (sum_diff + src2) & 0xFFFFFFFF.
+  - Carry-out into the 33rd bit is: (sum_diff + src2) >> 32 in {0, 1}.
+  - Symmetry / Commutativity:
+    v_sad_u16(src0, src1, src2) == v_sad_u16(src1, src0, src2).
+"""
+
+from typing import List, Optional, Tuple, Union
+import unittest
+
+# Architectural bitmasks and constants
+MASK16: int = 0xFFFF
+MASK32: int = 0xFFFF_FFFF
+MASK64: int = 0xFFFF_FFFF_FFFF_FFFF
+
+
+def u16(val: int) -> int:
+    """Normalize integer to unsigned 16-bit halfword."""
+    return val & MASK16
+
+
+def u32(val: int) -> int:
+    """Normalize integer to unsigned 32-bit dword."""
+    return val & MASK32
+
+
+def u64(val: int) -> int:
+    """Normalize integer to unsigned 64-bit qword."""
+    return val & MASK64
+
+
+def unpack_halfwords_u32(val: int) -> Tuple[int, int]:
+    """Unpack a 32-bit unsigned word into two 16-bit unsigned halfword lanes (h0, h1)."""
+    val &= MASK32
+    return (
+        val & MASK16,
+        (val >> 16) & MASK16,
+    )
+
+
+def pack_halfwords_u32(h0: int, h1: int) -> int:
+    """Pack two 16-bit unsigned integers into a 32-bit unsigned dword."""
+    return ((h0 & MASK16) | ((h1 & MASK16) << 16)) & MASK32
+
+
+def ref_abs_diff_u16(h0: int, h1: int) -> int:
+    """Pure-Python reference oracle for 16-bit unsigned absolute difference: |h0 - h1|."""
+    u0 = h0 & MASK16
+    u1 = h1 & MASK16
+    return (u0 - u1) if u0 >= u1 else (u1 - u0)
+
+
+def ref_sad_u16_sum(s0: int, s1: int) -> int:
+    """Compute the 2-channel sum of 16-bit unsigned absolute differences in [0, 131070]."""
+    h0_0, h0_1 = unpack_halfwords_u32(s0)
+    h1_0, h1_1 = unpack_halfwords_u32(s1)
+    return ref_abs_diff_u16(h0_0, h1_0) + ref_abs_diff_u16(h0_1, h1_1)
+
+
+def ref_sad_u16(s0: int, s1: int, s2: int) -> int:
+    """Reference mathematical oracle for AMD RDNA2 v_sad_u16:
+
+    dst = (sum_abs_diff_u16(s0, s1) + s2) & 0xFFFFFFFF
+    """
+    sum_diff = ref_sad_u16_sum(s0, s1)
+    acc = s2 & MASK32
+    return (sum_diff + acc) & MASK32
+
+
+def ref_sad_u16_full(s0: int, s1: int, s2: int) -> Tuple[int, int, int]:
+    """Return (dst_u32, carry_out, full_sum64) for v_sad_u16."""
+    sum_diff = ref_sad_u16_sum(s0, s1)
+    acc = s2 & MASK32
+    full = sum_diff + acc
+    dst = full & MASK32
+    carry = (full >> 32) & 1
+    return dst, carry, full
+
+
+# ==============================================================================
+# Unit Tests: Reference Mathematical Oracle and Architectural Model
+# ==============================================================================
+
+class TestVSadU16Oracle(unittest.TestCase):
+    """Test suite verifying mathematical bounds, properties, and edge cases of the oracle."""
+
+    def test_oracle_zero_inputs(self) -> None:
+        """All-zero inputs yield zero result."""
+        self.assertEqual(ref_sad_u16(0, 0, 0), 0)
+        dst, carry, full = ref_sad_u16_full(0, 0, 0)
+        self.assertEqual(dst, 0)
+        self.assertEqual(carry, 0)
+        self.assertEqual(full, 0)
+
+    def test_oracle_identical_inputs(self) -> None:
+        """When s0 == s1, absolute differences are all zero and result is s2."""
+        patterns = [0x00000000, 0x12345678, 0xAAAAAAAA, 0x55555555, 0xFFFFFFFF]
+        for pat in patterns:
+            acc = 0xDEADBEEF
+            self.assertEqual(ref_sad_u16(pat, pat, acc), acc)
+            self.assertEqual(ref_sad_u16_sum(pat, pat), 0)
+
+    def test_oracle_maximum_difference(self) -> None:
+        """Max difference across both 16-bit lanes (0x0000 vs 0xFFFF): sum_diff = 131070 (0x1FFFE)."""
+        s0 = 0x00000000
+        s1 = 0xFFFFFFFF
+        sum_diff = ref_sad_u16_sum(s0, s1)
+        self.assertEqual(sum_diff, 131070)
+        self.assertEqual(sum_diff, 0x1FFFE)
+
+        dst = ref_sad_u16(s0, s1, 0)
+        self.assertEqual(dst, 0x1FFFE)
+
+    def test_oracle_single_halfword_lanes(self) -> None:
+        """Verify each 16-bit lane contributes independently."""
+        # Lane 0 (bits 15:0)
+        self.assertEqual(ref_sad_u16(0x0000FFFF, 0, 0), 0xFFFF)
+        # Lane 1 (bits 31:16)
+        self.assertEqual(ref_sad_u16(0xFFFF0000, 0, 0), 0xFFFF)
+
+        # Difference of 1 in each lane
+        self.assertEqual(ref_sad_u16(0x00000001, 0, 0), 1)
+        self.assertEqual(ref_sad_u16(0x00010000, 0, 0), 1)
+
+    def test_oracle_commutativity(self) -> None:
+        """Commutativity: ref_sad_u16(a, b, c) == ref_sad_u16(b, a, c)."""
+        test_pairs = [
+            (0x12345678, 0x9ABCDEF0),
+            (0xFFFF0000, 0x0000FFFF),
+            (0x80008000, 0x00010001),
+            (0xFFFFFFFF, 0x00000000),
+            (0x7FFF7FFF, 0x80008000),
+        ]
+        acc = 0xCAFEBABE
+        for s0, s1 in test_pairs:
+            self.assertEqual(ref_sad_u16(s0, s1, acc), ref_sad_u16(s1, s0, acc))
+            self.assertEqual(ref_sad_u16_sum(s0, s1), ref_sad_u16_sum(s1, s0))
+
+    def test_oracle_accumulation_no_overflow(self) -> None:
+        """Accumulator adds directly to diff sum without wrapping when sum < 2^32."""
+        s0 = pack_halfwords_u32(100, 200)
+        s1 = pack_halfwords_u32(0, 0)
+        # sum_diff = 300
+        acc = 0x1000
+        self.assertEqual(ref_sad_u16(s0, s1, acc), 0x1000 + 300)
+
+    def test_oracle_accumulation_with_wrap(self) -> None:
+        """32-bit truncation when sum_diff + s2 exceeds 0xFFFFFFFF."""
+        s0 = 0xFFFFFFFF
+        s1 = 0x00000000
+        # sum_diff = 131070 (0x1FFFE)
+        acc = 0xFFFF_0000
+        # 0x1FFFE + 0xFFFF0000 = 0x1_0000FFFE -> wrapped = 0x0000FFFE
+        dst, carry, full = ref_sad_u16_full(s0, s1, acc)
+        self.assertEqual(dst, 0x0000_FFFE)
+        self.assertEqual(carry, 1)
+        self.assertEqual(full, 0x1_0000_FFFE)
+        self.assertEqual(ref_sad_u16(s0, s1, acc), 0x0000_FFFE)
+
+    def test_oracle_bounds(self) -> None:
+        """sum_diff is strictly in [0, 131070]."""
+        for h0 in (0, 1, 32767, 32768, 65534, 65535):
+            for h1 in (0, 1, 32767, 32768, 65534, 65535):
+                s0 = pack_halfwords_u32(h0, h0)
+                s1 = pack_halfwords_u32(h1, h1)
+                diff = ref_sad_u16_sum(s0, s1)
+                self.assertGreaterEqual(diff, 0)
+                self.assertLessEqual(diff, 131070)
+
+
+if __name__ == "__main__":
+    unittest.main()
