@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Leonida — Recompilação Nativa &amp; GUI Multiplataforma</title>
-  <meta name="description" content="Leonida: construtor gráfico (Windows, Linux e macOS), tradutor RDNA2 → SPIR-V e validador de integridade para sua própria cópia.">
+  <title>Recomp GTA 6 — Fork do Leonida por FelipeMzero</title>
+  <meta name="description" content="Recomp GTA 6: fork do projeto Leonida por FelipeMzero com interface gráfica (Windows, Linux e macOS), tradutor RDNA2 → SPIR-V e validador de integridade.">
   <link rel="icon" type="image/png" href="assets/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -18,8 +18,8 @@
   <header class="navbar">
     <div class="container nav-inner">
       <a class="brand" href="#top">
-        <img src="assets/logo.png" alt="Leonida" width="36" height="36">
-        <span>Leonida</span>
+        <img src="assets/logo.png" alt="Recomp GTA 6" width="36" height="36">
+        <span>Recomp GTA 6</span>
       </a>
       <nav class="nav-links">
         <a href="#downloads" data-i18n="nav_downloads">Downloads</a>
@@ -39,14 +39,14 @@
           <span class="dot"></span>
           <span id="release-badge" data-i18n="badge_loading">Carregando última release...</span>
         </div>
-        <h1 data-i18n="hero_title">Recompilação estática com interface gráfica nativa.</h1>
+        <h1 data-i18n="hero_title">Recomp GTA 6 com interface gráfica nativa.</h1>
         <p class="lead" data-i18n="hero_desc">
-          Construa, valide e acompanhe todo o pipeline do Leonida no Windows, Linux e macOS —
+          Fork do projeto <a class="inline-link" href="https://github.com/ItsNotRexed/Leonida" target="_blank" rel="noopener">Leonida</a> feito por <strong>FelipeMzero</strong>. Construa, valide e acompanhe todo o pipeline no Windows, Linux e macOS —
           sem precisar decorar comandos de terminal. Tudo roda localmente a partir da sua própria cópia.
         </p>
         <div class="hero-actions">
-          <a id="primary-download" class="btn-primary" href="https://github.com/FelipeMzero/Leonida/releases/latest">
-            <span data-i18n="hero_cta">Baixar Leonida GUI</span>
+          <a id="primary-download" class="btn-primary" href="https://github.com/FelipeMzero/Leonida/releases/latest/download/Leonida-windows-x64.exe">
+            <span data-i18n="hero_cta">Baixar Recomp GTA 6</span>
           </a>
           <a class="btn-secondary" href="https://github.com/FelipeMzero/Leonida" target="_blank" rel="noopener" data-i18n="hero_repo">
             Ver Código-Fonte
@@ -129,24 +129,24 @@
           <div class="dl-os">Windows</div>
           <div class="dl-arch">x64 · Executável portátil (.exe)</div>
           <p data-i18n="dl_win_desc">Duplo clique para abrir a GUI com detecção automática de pasta e validador embutido.</p>
-          <a id="dl-windows" class="btn-primary full" href="https://github.com/FelipeMzero/Leonida/releases/latest">Baixar para Windows</a>
+          <a id="dl-windows" class="btn-primary full" href="https://github.com/FelipeMzero/Leonida/releases/latest/download/Leonida-windows-x64.exe">Baixar para Windows</a>
         </article>
         <article class="dl-card" data-os="linux">
           <div class="dl-os">Linux</div>
           <div class="dl-arch">x64 · Pacote portátil (.tar.gz)</div>
-          <p data-i18n="dl_linux_desc">Inclui executável Qt6 com fonte Outfit embutida e integração com Wine/Proton.</p>
-          <a id="dl-linux" class="btn-secondary full" href="https://github.com/FelipeMzero/Leonida/releases/latest">Baixar para Linux</a>
+          <p data-i18n="dl_linux_desc">Inclui executável Qt6 com interface gráfica completa e integração com Wine/Proton.</p>
+          <a id="dl-linux" class="btn-secondary full" href="https://github.com/FelipeMzero/Leonida/releases/latest/download/Leonida-linux-x64.tar.gz">Baixar para Linux</a>
         </article>
         <article class="dl-card" data-os="macos">
           <div class="dl-os">macOS</div>
-          <div class="dl-arch">Apple Silicon / Universal (.zip)</div>
+          <div class="dl-arch">Apple Silicon (.zip)</div>
           <p data-i18n="dl_mac_desc">App bundle nativo com suporte a detecção de iCloud Drive e validação local.</p>
-          <a id="dl-macos" class="btn-secondary full" href="https://github.com/FelipeMzero/Leonida/releases/latest">Baixar para macOS</a>
+          <a id="dl-macos" class="btn-secondary full" href="https://github.com/FelipeMzero/Leonida/releases/latest/download/Leonida-macos-arm64.zip">Baixar para macOS</a>
         </article>
       </div>
       <div class="checksum-bar">
         <span data-i18n="dl_checksums">Verifique a integridade dos binários baixados:</span>
-        <a id="dl-sha256" href="https://github.com/FelipeMzero/Leonida/releases/latest" target="_blank" rel="noopener">SHA256SUMS.txt</a>
+        <a id="dl-sha256" href="https://github.com/FelipeMzero/Leonida/releases/latest/download/SHA256SUMS.txt" target="_blank" rel="noopener">SHA256SUMS.txt</a>
       </div>
     </section>
 
@@ -198,9 +198,10 @@
   </main>
 
   <footer class="footer container">
-    <span>Leonida · GPLv3 · Fonte: Outfit</span>
+    <span data-i18n="footer_credit">Recomp GTA 6 · Fork do projeto Leonida feito por FelipeMzero · GPLv3</span>
     <div class="footer-links">
       <a href="https://github.com/FelipeMzero/Leonida" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/ItsNotRexed/Leonida" target="_blank" rel="noopener">Leonida Original</a>
       <a href="https://github.com/FelipeMzero/Leonida/releases" target="_blank" rel="noopener">Releases</a>
       <a href="https://github.com/FelipeMzero/Leonida/actions" target="_blank" rel="noopener">Actions / CI</a>
     </div>

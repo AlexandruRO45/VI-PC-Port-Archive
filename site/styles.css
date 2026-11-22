@@ -157,6 +157,16 @@ h1 {
   margin-bottom: 28px;
 }
 
+.inline-link {
+  color: var(--cyan);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.inline-link:hover {
+  text-decoration: underline;
+}
+
 .hero-actions {
   display: flex;
   flex-wrap: wrap;
