@@ -431,6 +431,168 @@ class SIMDInterpreter64:
         return results
 
 
+# ---------------------------------------------------------------------------
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestLdsMinRtnU64Aliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and operand preservation for 64-bit operands."""
+
+    def test_alias_dst_overlaps_addr(self) -> None:
+        """vdst pair v[0:1] overlaps address register v0."""
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        addr = 0x180
+        initial_val = 0x8888000044440000
+        state.lds.write_qword(addr, initial_val)
+        state.set_vgpr(0, addr)  # v0 = addr
+        state.set_vgpr64(2, 0x1111000022220000)  # v[2:3] = data (smaller)
+
+        # ds_min_rtn_u64 v[0:1], v0, v[2:3]
+        inst = DSMinRtnU64Instruction(
+            opcode=Opcode.DS_MIN_RTN_U64,
+            dst=VGPR64(0),
+            addr=VGPR(0),
+            data=VGPR64(2),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_val, 0x1111000022220000)
+        self.assertTrue(mod)
+
+        # v[0:1] receives previous memory value
+        self.assertEqual(state.get_vgpr64(0), initial_val)
+        # Memory updated
+        self.assertEqual(state.lds.read_qword(addr), 0x1111000022220000)
+
+    def test_alias_dst_equals_data(self) -> None:
+        """vdst pair v[0:1] is identical to data pair v[0:1]."""
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        addr = 0x240
+        initial_val = 0x9000000000000000
+        state.lds.write_qword(addr, initial_val)
+        state.set_vgpr(2, addr)  # v2 = addr
+        data_val = 0x3000000000000000  # smaller than initial_val
+        state.set_vgpr64(0, data_val)  # v[0:1] = data
+
+        # ds_min_rtn_u64 v[0:1], v2, v[0:1]
+        inst = DSMinRtnU64Instruction(
+            opcode=Opcode.DS_MIN_RTN_U64,
+            dst=VGPR64(0),
+            addr=VGPR(2),
+            data=VGPR64(0),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_val, data_val)
+        self.assertTrue(mod)
+
+        # v[0:1] receives old_val
+        self.assertEqual(state.get_vgpr64(0), initial_val)
+        # Memory receives data_val
+        self.assertEqual(state.lds.read_qword(addr), data_val)
+
+    def test_alias_partial_overlap_dst_and_data(self) -> None:
+        """Partial overlap: vdst is v[0:1], vdata is v[1:2]."""
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        addr = 0x300
+        initial_val = 0x7777000088880000
+        state.lds.write_qword(addr, initial_val)
+        state.set_vgpr(5, addr)
+
+        # Setup v[1:2]: v1 = 0x1111, v2 = 0x2222 -> v[1:2] = 0x2222000000001111
+        data_val = 0x0000222200001111
+        state.set_vgpr64(1, data_val)
+
+        # ds_min_rtn_u64 v[0:1], v5, v[1:2]
+        inst = DSMinRtnU64Instruction(
+            opcode=Opcode.DS_MIN_RTN_U64,
+            dst=VGPR64(0),
+            addr=VGPR(5),
+            data=VGPR64(1),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_val, data_val)
+        self.assertTrue(mod)
+
+        # Destination v[0:1] receives old value
+        self.assertEqual(state.get_vgpr64(0), initial_val)
+        # Memory receives data_val
+        self.assertEqual(state.lds.read_qword(addr), data_val)
+
+    def test_alias_tri_dst_addr_data(self) -> None:
+        """Full tri-aliasing: v[0:1] is dst, v0 is addr, v[0:1] is data."""
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        addr_val = 0x80  # 128
+        initial_val = 0x5000000000000000
+        state.lds.write_qword(addr_val, initial_val)
+
+        # Set v[0:1] to have low 32 bits = 0x80, high 32 bits = 0x10000000
+        input_data = 0x1000000000000080
+        state.set_vgpr64(0, input_data)
+
+        # ds_min_rtn_u64 v[0:1], v0, v[0:1]
+        inst = DSMinRtnU64Instruction(
+            opcode=Opcode.DS_MIN_RTN_U64,
+            dst=VGPR64(0),
+            addr=VGPR(0),
+            data=VGPR64(0),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, initial_val)
+        self.assertEqual(new_val, input_data)
+        self.assertTrue(mod)
+
+        # v[0:1] receives initial_val
+        self.assertEqual(state.get_vgpr64(0), initial_val)
+        # Memory updated to input_data
+        self.assertEqual(state.lds.read_qword(addr_val), input_data)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        """Multi-lane SIMD wave with aliasing across active lanes."""
+        state = SIMDState64(num_lanes=32, exec_mask=0x3)  # Lanes 0 and 1
+        interp = SIMDInterpreter64()
+
+        # Lane 0: vdst == vaddr
+        state.lds.write_qword(0x10, 0x4000)
+        state.set_vgpr(0, 0, 0x10)  # v0: addr
+        state.set_vgpr64(0, 2, 0x2000)  # v[2:3]: data
+
+        # Lane 1: vdst == vdata
+        state.lds.write_qword(0x20, 0x8000)
+        state.set_vgpr(1, 4, 0x20)  # v4: addr
+        state.set_vgpr64(1, 0, 0x5000)  # v[0:1]: data
+
+        inst0 = DSMinRtnU64Instruction(Opcode.DS_MIN_RTN_U64, VGPR64(0), VGPR(0), VGPR64(2))
+        inst1 = DSMinRtnU64Instruction(Opcode.DS_MIN_RTN_U64, VGPR64(0), VGPR(4), VGPR64(0))
+
+        # Test lane 0 aliasing
+        state.exec_mask = 0x1
+        res0 = interp.step(inst0, state)
+        self.assertEqual(res0[0], (0, 0x4000, 0x2000))
+        self.assertEqual(state.get_vgpr64(0, 0), 0x4000)
+        self.assertEqual(state.lds.read_qword(0x10), 0x2000)
+
+        # Test lane 1 aliasing
+        state.exec_mask = 0x2
+        res1 = interp.step(inst1, state)
+        self.assertEqual(res1[0], (1, 0x8000, 0x5000))
+        self.assertEqual(state.get_vgpr64(1, 0), 0x8000)
+        self.assertEqual(state.lds.read_qword(0x20), 0x5000)
+
+
 class TestLdsMinRtnU64ReferenceOracle(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
