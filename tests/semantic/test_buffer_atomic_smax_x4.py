@@ -340,6 +340,211 @@ class TestBufferAtomicSmaxX4AST(unittest.TestCase):
         self.assertIn("v[0:3]", lines[0])
         self.assertIn("glc", lines[1])
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarBufferInterpreter:
+    """Single-lane scalar interpreter for buffer_atomic_smax_x4."""
+
+    def __init__(self, mem_size: int = 65536) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.mem: BufferMemory = BufferMemory(mem_size)
+        self.vcc: int = 0
+        self.trace: list[str] = []
+        self.last_condition_codes: BufferAtomicConditionCodes | None = None
+        self.last_status_flags: BufferStatusFlags | None = None
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[idx] & MASK32
+        return self.sgprs[idx] & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def read_reg_u128(self, idx: int) -> int:
+        d0 = self.read_reg_u32(RegKind.VGPR, idx)
+        d1 = self.read_reg_u32(RegKind.VGPR, idx + 1)
+        d2 = self.read_reg_u32(RegKind.VGPR, idx + 2)
+        d3 = self.read_reg_u32(RegKind.VGPR, idx + 3)
+        return pack_u128(d0, d1, d2, d3)
+
+    def write_reg_u128(self, idx: int, val: int) -> None:
+        d0, d1, d2, d3 = unpack_u128(val)
+        self.write_reg_u32(RegKind.VGPR, idx, d0)
+        self.write_reg_u32(RegKind.VGPR, idx + 1, d1)
+        self.write_reg_u32(RegKind.VGPR, idx + 2, d2)
+        self.write_reg_u32(RegKind.VGPR, idx + 3, d3)
+
+    def set_buffer_descriptor(self, idx: int, desc: BufferResourceDescriptor) -> None:
+        d0, d1, d2, d3 = desc.to_dwords()
+        self.write_reg_u32(RegKind.SGPR, idx, d0)
+        self.write_reg_u32(RegKind.SGPR, idx + 1, d1)
+        self.write_reg_u32(RegKind.SGPR, idx + 2, d2)
+        self.write_reg_u32(RegKind.SGPR, idx + 3, d3)
+
+    def get_buffer_descriptor(self, idx: int) -> BufferResourceDescriptor:
+        d0 = self.read_reg_u32(RegKind.SGPR, idx)
+        d1 = self.read_reg_u32(RegKind.SGPR, idx + 1)
+        d2 = self.read_reg_u32(RegKind.SGPR, idx + 2)
+        d3 = self.read_reg_u32(RegKind.SGPR, idx + 3)
+        return BufferResourceDescriptor.from_dwords(d0, d1, d2, d3)
+
+    def step(self, inst: Instruction) -> tuple[int, bool]:
+        """Executes a single buffer_atomic_smax_x4 instruction deterministically."""
+        smax_val = self.read_reg_u128(inst.vdata.index)
+        vaddr = self.read_reg_u32(RegKind.VGPR, inst.vaddr.index)
+        desc = self.get_buffer_descriptor(inst.srsrc.index)
+
+        soffset = (
+            self.read_reg_u32(inst.soffset.kind, inst.soffset.index)
+            if isinstance(inst.soffset, Register)
+            else inst.soffset
+        )
+
+        eff_off = (soffset & MASK32) + (inst.mods.offset & 0xFFF) + (vaddr if inst.mods.offen else 0)
+        in_bounds_flag = (eff_off + 16 <= desc.num_records)
+        old_val = self.mem.read_u128((desc.base_address + eff_off) & MASK64) if in_bounds_flag else 0
+
+        ret_val, in_bounds = ref_buffer_atomic_smax_x4(
+            self.mem,
+            desc,
+            soffset=soffset,
+            vaddr=vaddr,
+            smax_val=smax_val,
+            inst_offset=inst.mods.offset,
+            glc=inst.mods.glc,
+            offen=inst.mods.offen,
+        )
+
+        if inst.mods.glc:
+            self.write_reg_u128(inst.vdata.index, ret_val)
+
+        if "compute_buffer_condition_codes" in globals():
+            self.last_condition_codes = compute_buffer_condition_codes(
+                old_val if inst.mods.glc else ret_val, smax_val, ret_val
+            )
+            self.last_status_flags = compute_buffer_status_flags(in_bounds)
+
+        self.trace.append(
+            f"{inst.to_assembly()} => ret={ret_val:#034x}, in_bounds={in_bounds}"
+        )
+        return ret_val, in_bounds
+
+    def run_program(self, prog: Program) -> list[tuple[int, bool]]:
+        return [self.step(inst) for inst in prog.instructions]
+
+
+class TestBufferAtomicSmaxX4ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_scalar_smax_x4_no_glc(self) -> None:
+        self.interp.mem.write_u128(64, 100)
+        self.interp.write_reg_u128(0, 300)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 64)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 300)
+        self.assertEqual(self.interp.mem.read_u128(64), 300)
+        self.assertEqual(self.interp.read_reg_u128(0), 300)
+
+    def test_scalar_smax_x4_with_glc(self) -> None:
+        self.interp.mem.write_u128(128, 500)
+        self.interp.write_reg_u128(0, 800)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 128)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 500)
+        self.assertEqual(self.interp.mem.read_u128(128), 800)
+        self.assertEqual(self.interp.read_reg_u128(0), 500)
+
+    def test_scalar_sgpr_soffset(self) -> None:
+        self.interp.mem.write_u128(200, 10)
+        self.interp.write_reg_u128(0, 20)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 100)
+        self.interp.write_reg_u32(RegKind.SGPR, 8, 100)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=Register(RegKind.SGPR, 8, count=1),
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 10)
+        self.assertEqual(self.interp.mem.read_u128(200), 20)
+
+    def test_scalar_immediate_offset(self) -> None:
+        self.interp.mem.write_u128(300, 42)
+        self.interp.write_reg_u128(0, 99)
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 200)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(offset=100, glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 42)
+        self.assertEqual(self.interp.mem.read_u128(300), 99)
+
+    def test_scalar_oob_glc_clears_destination(self) -> None:
+        self.interp.write_reg_u128(0, pack_u128(1, 2, 3, 4))
+        self.interp.write_reg_u32(RegKind.VGPR, 4, 2000)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X4,
+            vdata=Register(RegKind.VGPR, 0, count=4),
+            vaddr=Register(RegKind.VGPR, 4, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.interp.read_reg_u128(0), 0)
+
 class TestBufferAtomicSmaxX4Oracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and architectural model."""
 
