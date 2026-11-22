@@ -242,8 +242,16 @@ def parse_obj(
     # Preserve order of appearance for (group_index, material_name) primitives.
     builders: dict[tuple[int, str], dict] = {}
 
+    continued = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
+        if line.endswith("\\") and "#" not in line:
+            continued.append(line[:-1].rstrip())
+            continue
+        if continued:
+            continued.append(line)
+            line = " ".join(continued).strip()
+            continued.clear()
         if not line or line[0] == "#":
             continue
 

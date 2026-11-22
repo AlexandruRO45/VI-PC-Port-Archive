@@ -722,6 +722,18 @@ class TestWriteGlbFilesystem(unittest.TestCase):
 class TestObjParserAndBounds(unittest.TestCase):
     """Tests Wavefront OBJ parsing, coordinate transforms, UV flipping, and bounds."""
 
+    def test_continued_face_matches_single_line_with_uvs(self):
+        vertices = ["v 0 0 0", "v 2 0 0", "v 2 2 0", "v 0 2 0",
+                    "vt 0 0", "vt 1 0", "vt 1 1", "vt 0 1"]
+        face = "f -4/1 -3/2 -2/3 -1/4"
+        reference = glb_writer.parse_obj("\n".join([*vertices, face]), is_path=False)
+        self.assertEqual(len(reference[0]["indices"]), 6)
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=newline):
+                obj = newline.join([*vertices, "# a comment ending with \\", "f -4/1 \\  ",
+                                    "  -3/2 -2/3 \\", " -1/4 # last corner"])
+                self.assertEqual(glb_writer.parse_obj(obj, is_path=False), reference)
+
     def test_parse_obj_zup_to_yup(self):
         # OBJ coordinate (1, 2, 3) in Z-up becomes (1, 3, -2) in glTF Y-up
         obj_text = "\n".join([
