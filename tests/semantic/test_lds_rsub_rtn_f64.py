@@ -569,5 +569,174 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertAlmostEqual(u64_to_f64(self.interp.mem.read_qword(0x22)), 8.0, places=9)
 
 
+# ==============================================================================
+# SIMD Wavefront Multi-Lane Divergence & 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDLDSWavefrontInterpreter64:
+    """Multi-lane SIMD architectural interpreter modeling Wave32 and Wave64 execution for 64-bit LDS."""
+
+    def __init__(self, wave_size: int = 64, lds_size_qwords: int = LDS_SIZE_QWORDS) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size} (must be 32 or 64)")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: List[List[int]] = [[0] * DEFAULT_NUM_VGPRS for _ in range(wave_size)]
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.mem: LDSMemory64 = LDSMemory64(size_qwords=lds_size_qwords)
+
+    def set_exec_mask(self, mask: int) -> None:
+        valid_mask = (1 << self.wave_size) - 1
+        self.exec_mask = mask & valid_mask
+
+    def read_lane_reg_u32(self, lane: int, op: RegisterOperand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[lane][op.index]
+        return self.sgprs[op.index]
+
+    def read_lane_reg_u64(self, lane: int, op: RegisterOperand) -> int:
+        idx = op.index
+        if op.reg_type == RegType.VGPR:
+            lo = self.vgprs[lane][idx]
+            hi = self.vgprs[lane][idx + 1]
+            return u64((hi << 32) | lo)
+        lo = self.sgprs[idx]
+        hi = self.sgprs[idx + 1]
+        return u64((hi << 32) | lo)
+
+    def write_lane_reg_u64(self, lane: int, op: RegisterOperand, val: int) -> None:
+        val64 = u64(val)
+        lo = val64 & MASK32
+        hi = (val64 >> 32) & MASK32
+        idx = op.index
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[lane][idx] = lo
+            self.vgprs[lane][idx + 1] = hi
+        else:
+            self.sgprs[idx] = lo
+            self.sgprs[idx + 1] = hi
+
+    def step(self, instr: DSRsubRtnF64Instruction) -> List[Optional[Tuple[int, int]]]:
+        """Execute instruction across all lanes with EXEC masking."""
+        lane_inputs: List[Tuple[int, int]] = []
+        for lane in range(self.wave_size):
+            va = self.read_lane_reg_u32(lane, instr.vaddr)
+            vd = self.read_lane_reg_u64(lane, instr.vdata0)
+            lane_inputs.append((va, vd))
+
+        results: List[Optional[Tuple[int, int]]] = []
+        for lane in range(self.wave_size):
+            is_active = (self.exec_mask & (1 << lane)) != 0
+            if not is_active:
+                results.append(None)
+                continue
+
+            va_val, vd_val = lane_inputs[lane]
+            old_val, new_val = self.mem.atomic_rsub_rtn_f64(
+                vaddr=va_val,
+                vdata0=vd_val,
+                offset=instr.offset,
+            )
+            self.write_lane_reg_u64(lane, instr.vdst, old_val)
+            results.append((old_val, new_val))
+
+        return results
+
+
+class TestSIMDWavefrontDivergence(unittest.TestCase):
+    """Unit tests for SIMD wavefront multi-lane divergence and EXEC masking."""
+
+    def test_wave32_divergent_addresses(self) -> None:
+        sim = SIMDLDSWavefrontInterpreter64(wave_size=32, lds_size_qwords=1024)
+        # Pre-seed each lane's qword with 1.0
+        for i in range(32):
+            sim.mem.write_qword(i, ONE_F64)
+            sim.vgprs[i][2] = i * 8  # vaddr = i * 8
+            # vdata0 = v[4:5] = 5.0
+            sim.write_lane_reg_u64(i, RegisterOperand(4, count=2), FIVE_F64)
+
+        instr = DSRsubRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+        res = sim.step(instr)
+
+        for i in range(32):
+            self.assertIsNotNone(res[i])
+            old_val, new_val = res[i]  # type: ignore
+            # 5.0 - 1.0 = 4.0
+            self.assertEqual(old_val, ONE_F64)
+            self.assertAlmostEqual(u64_to_f64(new_val), 4.0, places=9)
+            self.assertEqual(sim.read_lane_reg_u64(i, RegisterOperand(0, count=2)), ONE_F64)
+            self.assertAlmostEqual(u64_to_f64(sim.mem.read_qword(i)), 4.0, places=9)
+
+    def test_wave64_exec_masking(self) -> None:
+        sim = SIMDLDSWavefrontInterpreter64(wave_size=64, lds_size_qwords=1024)
+        odd_mask = 0xAAAA_AAAA_AAAA_AAAA
+        sim.set_exec_mask(odd_mask)
+
+        for i in range(64):
+            sim.mem.write_qword(i, TWO_F64)
+            sim.vgprs[i][2] = i * 8
+            sim.write_lane_reg_u64(i, RegisterOperand(4, count=2), TEN_F64)
+            sim.write_lane_reg_u64(i, RegisterOperand(0, count=2), 0xDEAD_BEEF_CAFE_BABE)
+
+        instr = DSRsubRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+        res = sim.step(instr)
+
+        for i in range(64):
+            if i % 2 == 1:
+                # Active lane: 10.0 - 2.0 = 8.0
+                self.assertIsNotNone(res[i])
+                old_val, new_val = res[i]  # type: ignore
+                self.assertEqual(old_val, TWO_F64)
+                self.assertAlmostEqual(u64_to_f64(new_val), 8.0, places=9)
+                self.assertEqual(sim.read_lane_reg_u64(i, RegisterOperand(0, count=2)), TWO_F64)
+                self.assertAlmostEqual(u64_to_f64(sim.mem.read_qword(i)), 8.0, places=9)
+            else:
+                # Inactive lane: untouched memory and register
+                self.assertIsNone(res[i])
+                self.assertEqual(sim.read_lane_reg_u64(i, RegisterOperand(0, count=2)), 0xDEAD_BEEF_CAFE_BABE)
+                self.assertEqual(sim.mem.read_qword(i), TWO_F64)
+
+    def test_atomic_serialization_same_address(self) -> None:
+        sim = SIMDLDSWavefrontInterpreter64(wave_size=32, lds_size_qwords=1024)
+        sim.set_exec_mask(0b111)  # only lanes 0, 1, 2
+        sim.mem.write_qword(3, ONE_F64)  # initial 1.0 at qword 3 (byte address 24)
+
+        # Lane 0: vdata0 = 10.0 -> new = 10.0 - 1.0 = 9.0, returns 1.0
+        # Lane 1: vdata0 = 20.0 -> new = 20.0 - 9.0 = 11.0, returns 9.0
+        # Lane 2: vdata0 = 15.0 -> new = 15.0 - 11.0 = 4.0, returns 11.0
+        sim.vgprs[0][2] = 24
+        sim.write_lane_reg_u64(0, RegisterOperand(4, count=2), TEN_F64)
+
+        sim.vgprs[1][2] = 24
+        sim.write_lane_reg_u64(1, RegisterOperand(4, count=2), f64_to_u64(20.0))
+
+        sim.vgprs[2][2] = 24
+        sim.write_lane_reg_u64(2, RegisterOperand(4, count=2), f64_to_u64(15.0))
+
+        instr = DSRsubRtnF64Instruction(
+            vdst=RegisterOperand(0, count=2),
+            vaddr=RegisterOperand(2, count=1),
+            vdata0=RegisterOperand(4, count=2),
+        )
+        res = sim.step(instr)
+
+        self.assertAlmostEqual(u64_to_f64(res[0][0]), 1.0, places=9)  # type: ignore
+        self.assertAlmostEqual(u64_to_f64(res[0][1]), 9.0, places=9)  # type: ignore
+        self.assertAlmostEqual(u64_to_f64(res[1][0]), 9.0, places=9)  # type: ignore
+        self.assertAlmostEqual(u64_to_f64(res[1][1]), 11.0, places=9)  # type: ignore
+        self.assertAlmostEqual(u64_to_f64(res[2][0]), 11.0, places=9)  # type: ignore
+        self.assertAlmostEqual(u64_to_f64(res[2][1]), 4.0, places=9)  # type: ignore
+
+        self.assertAlmostEqual(u64_to_f64(sim.mem.read_qword(3)), 4.0, places=9)
+
+
 if __name__ == "__main__":
     unittest.main()
