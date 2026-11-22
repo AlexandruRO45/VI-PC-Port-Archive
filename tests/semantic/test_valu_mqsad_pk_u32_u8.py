@@ -211,6 +211,142 @@ def ref_mqsad_pk_u32_u8_details(
 
 
 # ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Represents a register operand or inline literal constant."""
+    reg_type: RegType
+    index: int = 0
+    size: int = 1  # 1 = 32-bit dword, 2 = 64-bit pair, 4 = 128-bit quad
+    literal_value: int | None = None
+    literal_bits: int = 32
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            max_idx = 256 - self.size
+            if not (0 <= self.index <= max_idx):
+                raise ValueError(f"VGPR index {self.index} out of range [0, {max_idx}] for size {self.size}")
+        elif self.reg_type == RegType.SGPR:
+            max_idx = 106 - self.size
+            if not (0 <= self.index <= max_idx):
+                raise ValueError(f"SGPR index {self.index} out of range [0, {max_idx}] for size {self.size}")
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_value is None:
+                raise ValueError("Literal operand requires literal_value")
+            if self.literal_bits == 32:
+                if not (0 <= self.literal_value <= MASK32):
+                    raise ValueError(f"32-bit literal {self.literal_value:#x} out of range [0, 0xFFFFFFFF]")
+            elif self.literal_bits == 64:
+                if not (0 <= self.literal_value <= MASK64):
+                    raise ValueError(f"64-bit literal {self.literal_value:#x} out of range [0, 0xFFFFFFFFFFFFFFFF]")
+            elif self.literal_bits == 128:
+                if not (0 <= self.literal_value <= MASK128):
+                    raise ValueError(f"128-bit literal {self.literal_value:#x} out of range [0, 2^128 - 1]")
+            else:
+                raise ValueError(f"Unsupported literal bit width: {self.literal_bits}")
+
+    @classmethod
+    def vgpr(cls, index: int) -> Operand:
+        return cls(RegType.VGPR, index=index, size=1)
+
+    @classmethod
+    def vgpr_pair(cls, index: int) -> Operand:
+        return cls(RegType.VGPR, index=index, size=2)
+
+    @classmethod
+    def vgpr_quad(cls, index: int) -> Operand:
+        return cls(RegType.VGPR, index=index, size=4)
+
+    @classmethod
+    def sgpr(cls, index: int) -> Operand:
+        return cls(RegType.SGPR, index=index, size=1)
+
+    @classmethod
+    def sgpr_pair(cls, index: int) -> Operand:
+        return cls(RegType.SGPR, index=index, size=2)
+
+    @classmethod
+    def sgpr_quad(cls, index: int) -> Operand:
+        return cls(RegType.SGPR, index=index, size=4)
+
+    @classmethod
+    def literal(cls, value: int) -> Operand:
+        return cls(RegType.LITERAL, literal_value=value, literal_bits=32)
+
+    @classmethod
+    def literal64(cls, value: int) -> Operand:
+        return cls(RegType.LITERAL, literal_value=value, literal_bits=64)
+
+    @classmethod
+    def literal128(cls, value: int) -> Operand:
+        return cls(RegType.LITERAL, literal_value=value, literal_bits=128)
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            if self.size == 1:
+                return f"v{self.index}"
+            return f"v[{self.index}:{self.index + self.size - 1}]"
+        if self.reg_type == RegType.SGPR:
+            if self.size == 1:
+                return f"s{self.index}"
+            return f"s[{self.index}:{self.index + self.size - 1}]"
+        assert self.literal_value is not None
+        if self.literal_bits == 128:
+            return f"0x{self.literal_value:032X}"
+        if self.literal_bits == 64:
+            return f"0x{self.literal_value:016X}"
+        return f"0x{self.literal_value:08X}"
+
+
+@dataclass(frozen=True)
+class VMqsadPkU32U8Instruction:
+    """Symbolic AST node for AMD RDNA2 v_mqsad_pk_u32_u8 instruction."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+        if self.dst.size != 4:
+            raise ValueError("Destination of v_mqsad_pk_u32_u8 must be a 128-bit VGPR quad (size=4)")
+
+        # src0 must be 64-bit (register pair or 64-bit literal)
+        if self.src0.reg_type in (RegType.VGPR, RegType.SGPR) and self.src0.size != 2:
+            raise ValueError("src0 must be a 64-bit register pair (size=2)")
+        if self.src0.reg_type == RegType.LITERAL and self.src0.literal_bits != 64:
+            raise ValueError("src0 literal must be 64-bit")
+
+        # src1 must be 32-bit (single register or 32-bit literal)
+        if self.src1.size != 1 or (self.src1.reg_type == RegType.LITERAL and self.src1.literal_bits != 32):
+            raise ValueError("src1 must be 32-bit (size=1)")
+
+        # src2 must be 128-bit (register quad or 128-bit literal)
+        if self.src2.reg_type in (RegType.VGPR, RegType.SGPR) and self.src2.size != 4:
+            raise ValueError("src2 must be a 128-bit register quad (size=4)")
+        if self.src2.reg_type == RegType.LITERAL and self.src2.literal_bits != 128:
+            raise ValueError("src2 literal must be 128-bit")
+
+    def disassemble(self) -> str:
+        clamp_str = " clamp" if self.clamp else ""
+        return (
+            f"v_mqsad_pk_u32_u8 {self.dst.disassemble()}, "
+            f"{self.src0.disassemble()}, {self.src1.disassemble()}, "
+            f"{self.src2.disassemble()}{clamp_str}"
+        )
+
+
+# ==============================================================================
 # Unit Tests: Model and Reference Oracle
 # ==============================================================================
 
@@ -310,6 +446,112 @@ class TestValuMqsadPkU32U8Oracle(unittest.TestCase):
         self.assertEqual(raw_sums, (0, 40 + 0xFFFF_FFFF, 80, 120))
         self.assertEqual(carries, (False, True, False, False))
         self.assertEqual(unpack_u32x4(packed), (0, (40 + 0xFFFF_FFFF) & MASK32, 80, 120))
+
+
+class TestValuMqsadPkU32U8SymbolicAST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_operand_creation_and_disassembly(self) -> None:
+        v_quad = Operand.vgpr_quad(0)
+        v_pair = Operand.vgpr_pair(4)
+        v_single = Operand.vgpr(8)
+        s_quad = Operand.sgpr_quad(0)
+        s_pair = Operand.sgpr_pair(4)
+        s_single = Operand.sgpr(8)
+        lit32 = Operand.literal(0x12345678)
+        lit64 = Operand.literal64(0x0123456789ABCDEF)
+        lit128 = Operand.literal128((1 << 100) | 42)
+
+        self.assertEqual(v_quad.disassemble(), "v[0:3]")
+        self.assertEqual(v_pair.disassemble(), "v[4:5]")
+        self.assertEqual(v_single.disassemble(), "v8")
+        self.assertEqual(s_quad.disassemble(), "s[0:3]")
+        self.assertEqual(s_pair.disassemble(), "s[4:5]")
+        self.assertEqual(s_single.disassemble(), "s8")
+        self.assertEqual(lit32.disassemble(), "0x12345678")
+        self.assertEqual(lit64.disassemble(), "0x0123456789ABCDEF")
+        self.assertIn("0x", lit128.disassemble())
+
+    def test_operand_bounds_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.vgpr_pair(255)
+        with self.assertRaises(ValueError):
+            Operand.vgpr_quad(253)  # max base is 252 (256 - 4)
+        with self.assertRaises(ValueError):
+            Operand.sgpr_quad(103)  # max base is 102 (106 - 4)
+        with self.assertRaises(ValueError):
+            Operand.literal(-1)
+        with self.assertRaises(ValueError):
+            Operand.literal(0x1_0000_0000)
+        with self.assertRaises(ValueError):
+            Operand.literal64(0x1_0000_0000_0000_0000)
+        with self.assertRaises(ValueError):
+            Operand.literal128(1 << 128)
+
+    def test_instruction_construction_and_disassembly(self) -> None:
+        instr = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.sgpr(2),
+            src2=Operand.vgpr_quad(8),
+            clamp=False,
+        )
+        self.assertEqual(instr.disassemble(), "v_mqsad_pk_u32_u8 v[0:3], v[4:5], s2, v[8:11]")
+
+        instr_clamp = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.vgpr_pair(4),
+            src1=Operand.literal(0x12345678),
+            src2=Operand.literal128(0),
+            clamp=True,
+        )
+        self.assertTrue(instr_clamp.disassemble().endswith(" clamp"))
+
+    def test_instruction_validation_rejection(self) -> None:
+        # Destination must be VGPR
+        with self.assertRaises(TypeError):
+            VMqsadPkU32U8Instruction(
+                dst=Operand.sgpr_quad(0),
+                src0=Operand.vgpr_pair(4),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr_quad(8),
+            )
+        # Destination must be quad (size=4)
+        with self.assertRaises(ValueError):
+            VMqsadPkU32U8Instruction(
+                dst=Operand.vgpr_pair(0),
+                src0=Operand.vgpr_pair(4),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr_quad(8),
+            )
+        # src0 must be 64-bit pair
+        with self.assertRaises(ValueError):
+            VMqsadPkU32U8Instruction(
+                dst=Operand.vgpr_quad(0),
+                src0=Operand.vgpr(4),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr_quad(8),
+            )
+        # src1 must be 32-bit single
+        with self.assertRaises(ValueError):
+            VMqsadPkU32U8Instruction(
+                dst=Operand.vgpr_quad(0),
+                src0=Operand.vgpr_pair(4),
+                src1=Operand.vgpr_pair(2),
+                src2=Operand.vgpr_quad(8),
+            )
+        # src2 must be 128-bit quad
+        with self.assertRaises(ValueError):
+            VMqsadPkU32U8Instruction(
+                dst=Operand.vgpr_quad(0),
+                src0=Operand.vgpr_pair(4),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr_pair(8),
+            )
 
 
 if __name__ == "__main__":
