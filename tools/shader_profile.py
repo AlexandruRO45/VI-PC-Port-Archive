@@ -316,7 +316,8 @@ def main():
         return 2
     try:
         with os.scandir(a.src) as entries:
-            shader_files = [entry for entry in entries if entry.name.endswith(".s") and entry.is_file()]
+            shader_files = sorted((entry for entry in entries if entry.name.endswith(".s") and entry.is_file()),
+                                  key=lambda entry: entry.name)
     except OSError as e:
         print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
         return 2

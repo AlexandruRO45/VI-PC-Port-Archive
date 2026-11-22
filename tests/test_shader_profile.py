@@ -8,12 +8,15 @@ Run:
     python -I tests/test_shader_profile.py
     python -m unittest discover -s tests -v
 """
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -366,6 +369,24 @@ class TestCommandLineEndToEnd(unittest.TestCase):
                 self.assertIn(message, res.stderr)
                 self.assertNotIn("Traceback", res.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "profile.json")))
+
+    def test_tied_ranks_do_not_follow_directory_order(self):
+        self.write("ps_a", "\tv_mov_b32 v0, 1.0\n")
+        self.write("ps_b", "\ts_mov_b32 s0, 1\n")
+        with os.scandir(self.disasm_dir) as entries:
+            first, second = sorted(entries, key=lambda entry: entry.name)
+
+        out = os.path.join(self.tmp.name, "profile.json")
+        reports = []
+        for order in ((first, second), (second, first)):
+            stdout = io.StringIO()
+            with mock.patch.object(P.os, "scandir", return_value=contextlib.nullcontext(iter(order))), \
+                    mock.patch.object(sys, "argv", ["shader_profile.py", self.disasm_dir, "--out", out]), \
+                    contextlib.redirect_stdout(stdout):
+                P.main()
+            with open(out, "rb") as f:
+                reports.append((f.read(), stdout.getvalue()))
+        self.assertEqual(reports[0], reports[1])
 
     def test_cli_alu_without_memory_writes_null(self):
         with open(os.path.join(self.disasm_dir, "ps_001.s"), "w", encoding="utf-8") as f:
