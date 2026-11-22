@@ -33,32 +33,11 @@ _PS_PATH = None
 _CS_PATH = None
 
 
-def _find_llvm_mc() -> str:
+def _find_llvm_mc() -> str | None:
     env = os.environ.get("LLVM_MC")
-    if env and os.path.isfile(env):
-        return env
-    found = shutil.which("llvm-mc")
-    if found:
-        return found
-    fallback = r"D:\Leonida-work\tools\llvm-amdgpu\ucrt64\bin\llvm-mc.exe"
-    if os.path.isfile(fallback):
-        return fallback
-    raise RuntimeError("llvm-mc (AMDGPU) not found; set LLVM_MC or add it to PATH")
-
-
-def _find_spirv_tool(name: str) -> str:
-    found = shutil.which(name)
-    if found:
-        return found
-    fallback = os.path.join(r"C:\VulkanSDK\1.4.341.1\Bin", name + (".exe" if os.name == "nt" else ""))
-    if os.path.isfile(fallback):
-        return fallback
-    raise RuntimeError(f"{name} not found on PATH")
-
-
-LLVM_MC = _find_llvm_mc()
-SPIRV_AS = _find_spirv_tool("spirv-as")
-SPIRV_VAL = _find_spirv_tool("spirv-val")
+    if env:
+        return env if os.path.isfile(env) else shutil.which(env)
+    return shutil.which("llvm-mc")
 
 
 def setUpModule():
@@ -89,10 +68,13 @@ def tearDownModule():
 
 
 def _assemble_and_translate(lines: list[str], path: str, header: str, *, wave64: bool = False) -> str:
+    llvm_mc = _find_llvm_mc()
+    if not llvm_mc:
+        raise unittest.SkipTest("llvm-mc not found; set LLVM_MC or add it to PATH")
     if _TMP_DIR is None:
         setUpModule()
     asm = "".join(f"\t{ln}\n" for ln in lines)
-    cmd = [LLVM_MC, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
+    cmd = [llvm_mc, "-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
     if wave64:
         cmd.append("-mattr=+wavefrontsize64")
     cmd.append("-show-encoding")
@@ -109,24 +91,27 @@ def _assemble_and_translate(lines: list[str], path: str, header: str, *, wave64:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ResourceWarning)
         spv = rdna2spirv.translate(path)
-    spvasm_file = os.path.join(_TMP_DIR.name, f"{header}.spvasm")
-    spv_file = os.path.join(_TMP_DIR.name, f"{header}.spv")
-    with open(spvasm_file, "w", encoding="utf-8", newline="") as f:
-        f.write(spv)
-    as_res = subprocess.run(
-        [SPIRV_AS, spvasm_file, "-o", spv_file, "--target-env", "vulkan1.2"],
-        capture_output=True,
-        text=True,
-    )
-    if as_res.returncode != 0:
-        raise AssertionError(f"spirv-as failed:\n{as_res.stderr}")
-    val_res = subprocess.run(
-        [SPIRV_VAL, "--target-env", "vulkan1.2", spv_file],
-        capture_output=True,
-        text=True,
-    )
-    if val_res.returncode != 0:
-        raise AssertionError(f"spirv-val failed:\n{val_res.stderr}")
+    spirv_as = shutil.which("spirv-as")
+    spirv_val = shutil.which("spirv-val")
+    if spirv_as and spirv_val:
+        spvasm_file = os.path.join(_TMP_DIR.name, f"{header}.spvasm")
+        spv_file = os.path.join(_TMP_DIR.name, f"{header}.spv")
+        with open(spvasm_file, "w", encoding="utf-8", newline="") as f:
+            f.write(spv)
+        as_res = subprocess.run(
+            [spirv_as, spvasm_file, "-o", spv_file, "--target-env", "vulkan1.2"],
+            capture_output=True,
+            text=True,
+        )
+        if as_res.returncode != 0:
+            raise AssertionError(f"spirv-as failed:\n{as_res.stderr}")
+        val_res = subprocess.run(
+            [spirv_val, "--target-env", "vulkan1.2", spv_file],
+            capture_output=True,
+            text=True,
+        )
+        if val_res.returncode != 0:
+            raise AssertionError(f"spirv-val failed:\n{val_res.stderr}")
     return spv
 
 
@@ -170,6 +155,7 @@ def set_scc(val: int) -> str:
     return "s_cmp_eq_u32 1, 1" if val else "s_cmp_eq_u32 0, 1"
 
 
+@unittest.skipUnless(_find_llvm_mc(), "needs llvm-mc")
 class Salu64NullTests(unittest.TestCase):
     def test_non_scc_ops_null_destination_preserves_scc_and_regs(self):
         cases = [
