@@ -539,6 +539,116 @@ class TestValuLshlOrB32SIMDDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), self.CANARY_OLD)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuLshlOrB32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_dst_aliases_src0(self) -> None:
+        # v0 = (v0 << v1) | v2
+        self.state.set_vgpr(0, 0x12)
+        self.state.set_vgpr(1, 4)
+        self.state.set_vgpr(2, 0x05)
+        instr = VLshlOrB32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x125)
+        self.assertEqual(self.state.get_vgpr(0), 0x125)
+        self.assertEqual(self.state.get_vgpr(1), 4)
+        self.assertEqual(self.state.get_vgpr(2), 0x05)
+
+    def test_dst_aliases_src1(self) -> None:
+        # v1 = (v0 << v1) | v2
+        self.state.set_vgpr(0, 0xAB)
+        self.state.set_vgpr(1, 8)
+        self.state.set_vgpr(2, 0xCD)
+        instr = VLshlOrB32Instruction(
+            dst=Reg(1, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0xABCD)
+        self.assertEqual(self.state.get_vgpr(1), 0xABCD)
+        self.assertEqual(self.state.get_vgpr(0), 0xAB)
+        self.assertEqual(self.state.get_vgpr(2), 0xCD)
+
+    def test_dst_aliases_src2(self) -> None:
+        # v2 = (v0 << v1) | v2
+        self.state.set_vgpr(0, 0x50)
+        self.state.set_vgpr(1, 4)
+        self.state.set_vgpr(2, 0x0A)
+        instr = VLshlOrB32Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x50A)
+        self.assertEqual(self.state.get_vgpr(2), 0x50A)
+        self.assertEqual(self.state.get_vgpr(0), 0x50)
+        self.assertEqual(self.state.get_vgpr(1), 4)
+
+    def test_dst_aliases_src0_and_src2_bit_pattern_replication(self) -> None:
+        # v0 = (v0 << 16) | v0 => duplicates 16-bit pattern into both halves
+        self.state.set_vgpr(0, 0xCAFE)
+        instr = VLshlOrB32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Literal32(16)),
+            src2=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0xCAFECAFE)
+        self.assertEqual(self.state.get_vgpr(0), 0xCAFECAFE)
+
+    def test_dst_aliases_all_operands(self) -> None:
+        # v0 = (v0 << v0) | v0 with v0 = 1 => (1 << 1) | 1 = 3
+        self.state.set_vgpr(0, 1)
+        instr = VLshlOrB32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            src2=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 3)
+        self.assertEqual(self.state.get_vgpr(0), 3)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        simd = SIMDInterpreter()
+        state = SIMDState(num_lanes=64)
+        for lane in range(64):
+            state.set_vgpr(lane, 0, lane)
+            state.set_vgpr(lane, 1, 0x80)
+
+        # v0 = (v0 << 8) | v1 => (lane << 8) | 0x80
+        instr = VLshlOrB32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Literal32(8)),
+            src2=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+        simd.step(instr, state)
+        for lane in range(64):
+            expected = ((lane << 8) | 0x80) & MASK32
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+            self.assertEqual(state.get_vgpr(lane, 1), 0x80)
+
+
+
 
 
 
