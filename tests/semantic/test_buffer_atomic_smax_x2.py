@@ -1303,5 +1303,151 @@ class TestBufferAtomicSmaxX2Flags(unittest.TestCase):
         self.assertFalse(flags_no_carry.carry)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+F64_POS_ZERO: int = 0x0000000000000000
+F64_NEG_ZERO: int = 0x8000000000000000
+F64_POS_INF: int = 0x7FF0000000000000
+F64_NEG_INF: int = 0xFFF0000000000000
+F64_QUIET_NAN: int = 0x7FF8000000000000
+F64_SIGNALING_NAN: int = 0x7FF0000000000001
+F64_MIN_SUBNORMAL: int = 0x0000000000000001
+F64_MAX_SUBNORMAL: int = 0x000FFFFFFFFFFFFF
+F64_MIN_NORMAL: int = 0x0010000000000000
+F64_MAX_NORMAL: int = 0x7FEFFFFFFFFFFFFF
+
+
+def is_f64_nan(bits: int) -> bool:
+    """Check if 64-bit pattern represents an IEEE 754 Double NaN."""
+    exp = (bits >> 52) & 0x7FF
+    mant = bits & 0xFFFFFFFFFFFFF
+    return exp == 0x7FF and mant != 0
+
+
+def is_f64_subnormal(bits: int) -> bool:
+    """Check if 64-bit pattern represents a denormalized/subnormal float64."""
+    exp = (bits >> 52) & 0x7FF
+    mant = bits & 0xFFFFFFFFFFFFF
+    return exp == 0 and mant != 0
+
+
+class TestBufferAtomicSmaxX2IEEE754(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_bitwise_exact_float64_zeros_signed_comparison(self) -> None:
+        # In signed 64-bit integer interpretation:
+        # +0.0 (0x0000000000000000) = 0
+        # -0.0 (0x8000000000000000) = -2^63 (minimum possible signed 64-bit integer!)
+        # Therefore max(-0.0, +0.0) must yield +0.0!
+        addr = 64
+        self.interp.mem.write_u64(addr, F64_NEG_ZERO)
+        self.interp.write_reg_u64(0, F64_POS_ZERO)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, F64_NEG_ZERO)
+        # Memory updated to max(-2^63, 0) = 0 (+0.0)
+        self.assertEqual(self.interp.mem.read_u64(addr), F64_POS_ZERO)
+        self.assertEqual(self.interp.read_reg_u64(0), F64_NEG_ZERO)
+
+    def test_float64_nan_treated_as_signed_integer(self) -> None:
+        # Quiet NaN 0x7FF8000000000000 has MSB=0 (positive signed integer ~9.22e18)
+        # Negative Inf 0xFFF0000000000000 has MSB=1 (negative signed integer)
+        addr = 128
+        self.interp.mem.write_u64(addr, F64_NEG_INF)
+        self.interp.write_reg_u64(0, F64_QUIET_NAN)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, F64_NEG_INF)
+        self.assertEqual(self.interp.mem.read_u64(addr), F64_QUIET_NAN)
+
+    def test_float64_subnormals_preserved_as_integers(self) -> None:
+        self.assertTrue(is_f64_subnormal(F64_MIN_SUBNORMAL))
+        self.assertTrue(is_f64_subnormal(F64_MAX_SUBNORMAL))
+
+        addr = 200
+        self.interp.mem.write_u64(addr, F64_MIN_SUBNORMAL)
+        self.interp.write_reg_u64(0, F64_MAX_SUBNORMAL)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_SMAX_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, F64_MIN_SUBNORMAL)
+        # max(1, 0x000FFFFFFFFFFFFF) = 0x000FFFFFFFFFFFFF
+        self.assertEqual(self.interp.mem.read_u64(addr), F64_MAX_SUBNORMAL)
+
+    def test_64bit_signed_integer_extremes(self) -> None:
+        # Strictly ascending signed values:
+        # -2^63, -1000, -1, 0, 1, 1000, 2^63 - 1
+        ascending = [
+            0x8000000000000000,  # min int64
+            u64(-1000),
+            u64(-1),
+            0,
+            1,
+            1000,
+            0x7FFFFFFFFFFFFFFF,  # max int64
+        ]
+        addr = 300
+        self.interp.write_reg_u32(RegKind.VGPR, 2, addr)
+        self.interp.mem.write_u64(addr, ascending[0])
+
+        for i in range(len(ascending) - 1):
+            next_val = ascending[i + 1]
+            self.interp.write_reg_u64(0, next_val)
+
+            inst = Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_SMAX_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                srsrc=Register(RegKind.SGPR, 4, count=4),
+                soffset=0,
+                mods=BufferAtomicModifiers(glc=True),
+            )
+            ret, in_bounds = self.interp.step(inst)
+            self.assertTrue(in_bounds)
+            # Memory should update to next_val because each is larger than the previous
+            self.assertEqual(ret, ascending[i])
+            self.assertEqual(self.interp.mem.read_u64(addr), next_val)
+
+
 if __name__ == "__main__":
     unittest.main()
