@@ -816,16 +816,16 @@ class RcpF16ExecutionTests(unittest.TestCase):
                     self.assertEqual(got & 0xFFFF0000, OLD & 0xFFFF0000)
                     self.assertTrue(is_f16_nan(got & 0xFFFF), f"expected NaN in low half, got {got:#010x}")
 
-    def test_zero_inputs_raise_unsupported_construct(self):
-        for line, v1 in (
-            ("v_rcp_f16_e32 v0, v1", (H_1P0 << 16) | H_POS_ZERO),
-            ("v_rcp_f16_e32 v0, v1", (H_1P0 << 16) | H_NEG_ZERO),
-            ("v_rcp_f16_e64 v0, v1 op_sel:[1,0]", (H_POS_ZERO << 16) | H_1P0),
-            ("v_rcp_f16_e64 v0, v1 op_sel:[1,1]", (H_NEG_ZERO << 16) | H_1P0),
+    def test_zero_inputs_return_signed_infinity(self):
+        for line, v1, want_h in (
+            ("v_rcp_f16_e32 v0, v1", (H_1P0 << 16) | H_POS_ZERO, H_POS_INF),
+            ("v_rcp_f16_e32 v0, v1", (H_1P0 << 16) | H_NEG_ZERO, H_NEG_INF),
+            ("v_rcp_f16_e64 v0, v1 op_sel:[1,0]", (H_POS_ZERO << 16) | H_1P0, H_POS_INF),
+            ("v_rcp_f16_e64 v0, v1 op_sel:[1,1]", (H_NEG_ZERO << 16) | H_1P0, H_NEG_INF),
         ):
+            dst_hi = 1 if "op_sel:[1,1]" in line else 0
             with self.subTest(line=line, v1=hex(v1)):
-                with self.assertRaises(si.UnsupportedConstruct):
-                    run_op(line, v1)
+                self.assertEqual(run_op(line, v1), merge_half(OLD, want_h, dst_hi))
 
     def test_op_sel_all_combinations(self):
         # v1 = (hi: -4.0, lo: 0.5) -> rcp(hi) = -0.25, rcp(lo) = 2.0.

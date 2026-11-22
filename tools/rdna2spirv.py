@@ -4071,6 +4071,51 @@ class Gen:
         self.emit(f"{out} = OpSelect %float {hit} %f0 {r}")
         return out
 
+    def f16_trans(self, op, f):
+        """Evaluate f16 transcendental ``op`` on f32-widened ``f``, sanitizing inputs undefined in SPIR-V before
+        OpFDiv / Log2 / InverseSqrt / Sqrt and selecting the RDNA2 hardware-verified special results (gfx1031, FUZZ-29)
+        before clamp_mods:
+          - v_log_f16(+-0) = -inf; v_log_f16(x < 0) = -qNaN (0xffc00000 -> 0xfe00)
+          - v_rcp_f16(+-0) = +-inf
+          - v_rsq_f16(+0) = +inf; v_rsq_f16(-0) = -inf; v_rsq_f16(x < 0) = -qNaN
+          - v_sqrt_f16(-0) = -0; v_sqrt_f16(x < 0) = -qNaN
+        NaN inputs compare false to 0.0 under OpFOrd* and pass through unchanged."""
+        glsl_fn = {"v_rsq_f16": "InverseSqrt", "v_sqrt_f16": "Sqrt", "v_log_f16": "Log2"}.get(op)
+        bits = self.tou(f)
+        z_cond = self.tmp()
+        if op == "v_sqrt_f16":
+            self.emit(f"{z_cond} = OpIEqual %bool {bits} {self.cu(0x80000000)}")
+            z_res = self.tof(self.cu(0x80000000))
+        else:
+            self.emit(f"{z_cond} = OpFOrdEqual %bool {f} %f0")
+            if op == "v_log_f16":
+                z_res = self.tof(self.cu(0xFF800000))
+            else:
+                sgn, inf_b = self.tmp(), self.tmp()
+                self.emit(f"{sgn} = OpBitwiseAnd %uint {bits} {self.cu(0x80000000)}")
+                self.emit(f"{inf_b} = OpBitwiseOr %uint {sgn} {self.cu(0x7F800000)}")
+                z_res = self.tof(inf_b)
+        neg_nan = op in ("v_log_f16", "v_rsq_f16", "v_sqrt_f16")
+        if neg_nan:
+            is_neg, bad = self.tmp(), self.tmp()
+            self.emit(f"{is_neg} = OpFOrdLessThan %bool {f} %f0")
+            self.emit(f"{bad} = OpLogicalOr %bool {z_cond} {is_neg}")
+        else:
+            bad = z_cond
+        safe, r = self.tmp(), self.tmp()
+        self.emit(f"{safe} = OpSelect %float {bad} %f1 {f}")
+        if glsl_fn:
+            self.emit(f"{r} = OpExtInst %float %glsl {glsl_fn} {safe}")
+        else:
+            self.emit(f"{r} = OpFDiv %float %f1 {safe}")
+        r_z = self.tmp()
+        self.emit(f"{r_z} = OpSelect %float {z_cond} {z_res} {r}")
+        if not neg_nan:
+            return r_z
+        r_out = self.tmp()
+        self.emit(f"{r_out} = OpSelect %float {is_neg} {self.tof(self.cu(0xFFC00000))} {r_z}")
+        return r_out
+
     def fconst(self, x):
         bits = struct.unpack("<I", struct.pack("<f", x))[0]
         return self.tof(self.cu(bits))
@@ -4689,14 +4734,18 @@ class Gen:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             u = self.src_h(a[1])
-            v2, f, r = self.tmp(), self.tmp(), self.tmp()
+            v2, f, is_inf, f_safe, r, out = (self.tmp() for _ in range(6))
             self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
             self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
             f = self.modify_f(f, a[1])
-            t = self.turn_angle(f)
+            # RDNA2 hardware (gfx1031, FUZZ-29): sin/cos(+-inf) = 0xfe00 (-qNaN); sanitize +-inf before turn_angle/Sin/Cos.
+            self.emit(f"{is_inf} = OpIsInf %bool {f}")
+            self.emit(f"{f_safe} = OpSelect %float {is_inf} %f0 {f}")
+            t = self.turn_angle(f_safe)
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
-            r = self.trig_exact_zero(op, f, r)
-            r = self.clamp_mods(r, mods)
+            r = self.trig_exact_zero(op, f_safe, r)
+            self.emit(f"{out} = OpSelect %float {is_inf} {self.tof(self.cu(0xFFC00000))} {r}")
+            r = self.clamp_mods(out, mods)
             self.write_lo16(a[0], self.f16_bits(r))    # sin ignores MODE rounding on hardware (RX 6800, SHADER-35); cos is unmeasured, assumed like it
         elif op in ("v_pk_add_u16", "v_pk_add_i16", "v_pk_sub_u16", "v_pk_sub_i16", "v_pk_mul_lo_u16",
                     "v_pk_mad_u16", "v_pk_mad_i16", "v_pk_max_u16", "v_pk_max_i16", "v_pk_min_u16", "v_pk_min_i16"):
@@ -6316,16 +6365,15 @@ class Gen:
             # the other half of the destination is kept.
             sel, dhi = self.opsel_bits(mods, 1)
             f = self.f16_in(a[1], sel[0])
-            r = self.tmp()
-            fn = {"v_rsq_f16": "InverseSqrt", "v_sqrt_f16": "Sqrt", "v_exp_f16": "Exp2", "v_log_f16": "Log2",
-                  "v_floor_f16": "Floor", "v_fract_f16": "Fract", "v_ceil_f16": "Ceil", "v_trunc_f16": "Trunc",
-                  "v_rndne_f16": "RoundEven"}.get(op)
+            fn = {"v_exp_f16": "Exp2", "v_floor_f16": "Floor", "v_fract_f16": "Fract",
+                  "v_ceil_f16": "Ceil", "v_trunc_f16": "Trunc", "v_rndne_f16": "RoundEven"}.get(op)
             if fn:
+                r = self.tmp()
                 self.emit(f"{r} = OpExtInst %float %glsl {fn} {f}")
+                if fn == "Fract":
+                    r = self.fract_below_one(r)
             else:
-                self.emit(f"{r} = OpFDiv %float %f1 {f}")
-            if fn == "Fract":
-                r = self.fract_below_one(r)
+                r = self.f16_trans(op, f)
             r = self.clamp_mods(r, mods)
             # 0x3c00 -> 0x3bff only when 0x3c00 is Fract's own rounding: after mul:2 fract(0.5) is a true 1.0.
             omod = any(m in ("mul:2", "mul:4", "div:2") for m in mods)
