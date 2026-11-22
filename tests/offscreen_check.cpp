@@ -362,15 +362,21 @@ int main(int argc, char** argv)
     const std::string_view operation = argv[2];
     if (operation == "--check-pixel-batch") {
         if (argc < 5) return 2;
+    } else if (operation == "--compute-to-pixel") {
+        if (argc != 6 && argc != 7) return 2;
     } else if (operation == "--check-pixel-quad-lod") {
         if (argc != 4) return 2;
     } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
-        if (argc != 6) return 2;
+        if (argc != 6 && !(operation == "--mesh-entry" && argc == 7 &&
+            (std::string_view(argv[6]) == "ab" || std::string_view(argv[6]) == "ba"))) return 2;
+    } else if (operation == "--mesh-entry-table") {
+        if (argc != 6 && (argc != 7 || std::string_view(argv[6]) != "--swap")) return 2;
     } else if (operation == "--check-bc7-tail") {
         if (argc < 6) return 2;
     } else if ((operation == "--depth-mask" || operation == "--depth-mask-swapped")) {
         if (argc != 6) return 2;
-    } else if ((operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
+    } else if (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion" ||
+               operation == "--spirv-address-window") {
         if (argc != 4) return 2;
     } else {
         if (argc != 3 && argc != 5 && argc != 6) return 2;
@@ -444,6 +450,18 @@ int main(int argc, char** argv)
         if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");
+        } else if (operation == "--spirv-address-window") {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
+            check(check_feature(device.Get(), D3D12_FEATURE_D3D12_OPTIONS1, &options, sizeof(options)),
+                  "Query 64-bit shader integer support");
+            D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+            auto model_hr = check_feature(device.Get(), D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
+            if (model_hr != E_INVALIDARG) check(model_hr, "Query address-window shader model");
+            if (!options.Int64ShaderOps || model_hr == E_INVALIDARG || model.HighestShaderModel < D3D_SHADER_MODEL_6_6) {
+                std::puts("skip: address window fixture requires SM 6.6 and 64-bit shader integer operations");
+                return 77;
+            }
+            check_spirv_window(device.Get(), argv[3]);
         } else if (argc == 4 && (operation == "--compute-root-file" || operation == "--ffx-immediate-conversion")) {
             check_compute_file(device.Get(), argv[3], operation == "--ffx-immediate-conversion");
         } else if (argc == 5 && operation == "--compute-store-case") {
@@ -466,6 +484,8 @@ int main(int argc, char** argv)
             check_sampled_coverage(device.Get(), argv[3], argv[4]);
         } else if (argc == 5 && operation == "--check-pixel-case") {
             check_translated_pixel(device.Get(), argv[3], false, argv[4]);
+        } else if (operation == "--compute-to-pixel") {
+            check_compute_to_pixel(device.Get(), argv[3], argv[4], argv[5], argc == 7 ? argv[6] : nullptr);
         } else if (argc == 5 && (operation == "--check-pixel-attribute" || operation == "--check-pixel-attribute-rg")) {
             check_attribute_pixel(device.Get(), argv[3], argv[4], operation == "--check-pixel-attribute-rg");
         } else if (argc == 5 && operation == "--check-pixel-case-rg") {
@@ -492,7 +512,14 @@ int main(int argc, char** argv)
         } else if (argc == 3 && operation == "--dxr-update") {
             if (!check_dxr_update(device.Get())) return 77;
         } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
-            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5], operation == "--mesh-indexed")) return 77;
+            auto binding = MeshConstantBinding::root;
+            if (argc == 7)
+                binding = argv[6][0] == 'b' ? MeshConstantBinding::swapped_root_pair : MeshConstantBinding::root_pair;
+            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
+                                       operation == "--mesh-indexed", binding)) return 77;
+        } else if (operation == "--mesh-entry-table") {
+            const auto binding = argc == 7 ? MeshConstantBinding::swapped_table : MeshConstantBinding::table;
+            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5], false, binding)) return 77;
         } else if (argc == 3 && operation == "--dxr-facing") {
             if (!check_dxr_facing(device.Get())) return 77;
         } else if (argc == 3 && operation == "--dxr-opacity") {

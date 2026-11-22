@@ -305,16 +305,29 @@ class TestRdna2Disasm(unittest.TestCase):
     def test_vopc_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import VOPC_OPS
         for op, (expected_name, _) in VOPC_OPS.items():
-            w0 = 0x7c000000 | (op << 17) | (2 << 9) | 1  # vsrc1=v2, src0=s1
-            raw = struct.pack("<I", w0)
-            insns = disasm_rdna2(raw)
+            wide = expected_name.endswith(("_f64_e32", "_i64_e32", "_u64_e32"))
+            src0 = 0 if wide else 1
+            w0 = 0x7c000000 | (op << 17) | (2 << 9) | src0
+            insns = disasm_rdna2(struct.pack("<I", w0))
             self.assertEqual(len(insns), 1, f"Failed decoding VOPC op 0x{op:02x}")
             self.assertEqual(insns[0]["opcode"], expected_name)
             self.assertEqual(insns[0]["length"], 4)
-            if expected_name.startswith("v_cmpx_"):
-                self.assertEqual(insns[0]["assembly"], f"{expected_name} s1, v2")
-            else:
-                self.assertEqual(insns[0]["assembly"], f"{expected_name} vcc_lo, s1, v2")
+            lhs = "s[0:1]" if wide else "s1"
+            rhs = "v[2:3]" if wide and "_class_" not in expected_name else "v2"
+            dest = "" if expected_name.startswith("v_cmpx_") else "vcc_lo, "
+            self.assertEqual(insns[0]["assembly"], f"{expected_name} {dest}{lhs}, {rhs}")
+
+        # Independent GFX10 encodings from LLVM MC's gfx10_asm_vopc/vopcx fixtures.
+        for raw, expected in (
+            ("6404427c", "v_cmp_lt_f64_e32 vcc_lo, s[100:101], v[2:3]"),
+            ("01fd437c", "v_cmp_lt_f64_e32 vcc_lo, v[1:2], v[254:255]"),
+        ):
+            self.assertEqual(disasm_rdna2(bytes.fromhex(raw))[0]["assembly"], expected)
+        sdwa = bytes.fromhex("f904247c01001606")
+        insns = disasm_rdna2(sdwa + bytes.fromhex("000081bf"))
+        self.assertEqual([i["opcode"] for i in insns], ["vopc_sdwa", "s_endpgm"])
+        self.assertEqual(insns[0]["length"], 8)
+        self.assertEqual(disasm_rdna2(sdwa[:4])[0]["opcode"], "vopc_truncated")
 
         # Truncated VOPC literal
         w0_lit = 0x7c000000 | (0x01 << 17) | (2 << 9) | 255
@@ -339,7 +352,7 @@ class TestRdna2Disasm(unittest.TestCase):
 
     def test_vop2_integer_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import VOP2_OPS
-        target_ops = {0x16, 0x18, 0x1a, 0x1b, 0x1c, 0x1d, 0x25, 0x26}
+        target_ops = {0x16, 0x18, 0x1a, 0x1b, 0x1c, 0x1d, 0x25, 0x26, 0x27}
         for op in target_ops:
             expected_name, _ = VOP2_OPS[op]
             w0 = (op << 25) | (2 << 17) | (1 << 9) | 0
@@ -1302,8 +1315,12 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(63)"))
         self.assertTrue(is_instruction_supported("s_waitcnt vmcnt(0) lgkmcnt(0)"))
         self.assertTrue(is_instruction_supported("s_waitcnt lgkmcnt(0) vmcnt(0)"))
+        self.assertTrue(is_instruction_supported("v_nop"))
+        self.assertFalse(is_instruction_supported("v_nop 0"))
+        self.assertFalse(is_instruction_supported("v_nop v0"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e32 v1, v2, v3"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e64 v1, v2, v3 clamp"))
+        self.assertTrue(is_instruction_supported("v_subrev_nc_u32_e32 v1, v2, v3"))
         self.assertTrue(is_opcode_recognized("v_mov_b32_sdwa"))
         self.assertTrue(is_opcode_recognized("v_cvt_f32_f16_sdwa"))
         self.assertTrue(is_opcode_recognized("v_pk_add_f16"))
@@ -1312,11 +1329,18 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_instruction_supported("v_cvt_f32_u32_e64 v1, v2 clamp"))
         self.assertTrue(is_instruction_supported("v_cvt_f32_i32_e32 v1, v2"))
         self.assertTrue(is_instruction_supported("v_cvt_f32_i32_e64 v1, v2 clamp"))
+        self.assertTrue(is_instruction_supported("s_nand_b32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_nor_b32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_xnor_b32 s1, s2, s3"))
         for unsupported in ("v_cvt_f32_i32 v1, v2",
                             "v_cvt_f32_i32_e32 v1, v2 clamp",
                             "v_cvt_f32_u32_e64 v1, -v2",
                             "v_cvt_f32_u32_e64 v1, v2 omod:2",
-                            "v_cvt_f32_i32_e32 v1, 1.5"):
+                            "v_cvt_f32_i32_e32 v1, 1.5",
+                            "s_nand_b32 s1, s2",
+                            "s_nor_b32 s1, s2",
+                            "s_xnor_b32 s1, s2",
+                            "s_nand_b32 v1, s2, s3"):
             self.assertFalse(is_instruction_supported(unsupported), unsupported)
 
         # Verify unsupported operands or spellings are rejected by scanner
@@ -1382,6 +1406,60 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(res_full["translator_accepted"])
         hlsl = lower(full_shader, 20, 24, [1, 2, 3, 4])
         self.assertIn("return float4(", hlsl)
+
+    def test_gfx1013_v_nop_decode_and_lower(self):
+        """Assemble/decode GFX1013 v_nop binary bytes and lower with pixel_aot."""
+        from pixel_aot import lower
+        code_bytes = bytes.fromhex(
+            "0000007e"  # v_nop
+            "000080bf"  # s_nop 0
+            "000081bf"  # s_endpgm
+        )
+        decoded = disassemble_binary_shader(code_bytes)
+        self.assertEqual(decoded[0], "v_nop")
+        self.assertEqual(decoded[1], "s_nop 0")
+        self.assertEqual(decoded[2], "s_endpgm")
+
+        res = analyze_shader_instructions("v_nop_test", decoded)
+        self.assertTrue(res["opcodes_recognized"])
+        self.assertEqual(res["supported_instructions"], 3)
+        self.assertEqual(res["unsupported_count"], 0)
+        self.assertEqual(res["support_percentage"], 100.0)
+
+        full_shader = ["v_nop"] + [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "v_nop",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        res_full = analyze_shader_instructions("canonical_ps_with_v_nop", full_shader)
+        self.assertTrue(res_full["is_fully_supported"])
+        self.assertTrue(res_full["translator_accepted"])
+        hlsl = lower(full_shader, 20, 24, [1, 2, 3, 4])
+        self.assertIn("return float4(", hlsl)
+
+        # Negative control: v_nop after color export must be rejected
+        with_v_nop_after_exp = full_shader[:-1] + ["v_nop", "s_endpgm"]
+        with self.assertRaises(ValueError):
+            lower(with_v_nop_after_exp, 20, 24, [1, 2, 3, 4])
 
 
 if __name__ == "__main__":

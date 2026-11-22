@@ -663,19 +663,36 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0 = w0 & 0x1ff
         op_info = VOPC_OPS.get(op, (f"v_vopc_{op:02x}", "Unknown VOPC"))
         op_name, comment = op_info
-        has_literal = src0 == 255
         length = 4
         literal = None
-        if has_literal:
+        if src0 in (249, 255):
+            extension = "SDWA" if src0 == 249 else "literal"
             if offset + 8 > len(data):
-                return (4, "vopc_truncated", f"{op_name} <truncated>", "Incomplete VOPC literal")
+                return (4, "vopc_truncated", f"{op_name} <truncated>", f"Incomplete VOPC {extension}")
+            if src0 == 249:
+                return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "VOPC SDWA is not decoded")
             literal, = struct.unpack_from("<I", data, offset + 4)
             length = 8
-        src0_str = f"0x{literal:x}" if src0 == 255 and literal is not None else decode_v_reg(src0)
-        if op_name.startswith("v_cmpx_"):
-            asm = f"{op_name} {src0_str}, v{vsrc1}"
+        wide0 = op_name.endswith(("_f64_e32", "_i64_e32", "_u64_e32"))
+        wide1 = wide0 and "_class_" not in op_name
+        if literal is not None:
+            src0_str = f"0x{literal:x}"
+        elif wide0:
+            if src0 >= 256:
+                vreg = src0 - 256
+                src0_str = f"v[{vreg}:{vreg + 1}]" if vreg < 255 else "<invalid VGPR pair>"
+            else:
+                src0_str = decode_s_reg64(src0)
         else:
-            asm = f"{op_name} vcc_lo, {src0_str}, v{vsrc1}"
+            src0_str = decode_v_reg(src0)
+        if wide1:
+            src1_str = f"v[{vsrc1}:{vsrc1 + 1}]" if vsrc1 < 255 else "<invalid VGPR pair>"
+        else:
+            src1_str = f"v{vsrc1}"
+        if op_name.startswith("v_cmpx_"):
+            asm = f"{op_name} {src0_str}, {src1_str}"
+        else:
+            asm = f"{op_name} vcc_lo, {src0_str}, {src1_str}"
         return (length, op_name, asm, comment)
 
     # 7. VOP2: [31] == 0

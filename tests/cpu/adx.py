@@ -16,18 +16,23 @@ EXPORTS = ("adcx32_op", "adcx64_op", "adox32_op", "adox64_op", "adx_dual64",
            "mul_seto32", "xadd_seto32", "cmpxchg_seto32",
            "rol_seto32", "ror_seto32", "rcl_seto32", "rcr_seto32", "shld_seto32", "shrd_seto32")
 
+# Exported from a translated DLL so a check can skip native ADX code on hosts without it.
+HOST_HAS_ADX = (
+    'extern "C" __declspec(dllexport) int host_has_adx() {\n'
+    "    int regs[4]{};\n"
+    "    __cpuid(regs, 0);\n"
+    "    if (regs[0] < 7) return 0;\n"
+    "    __cpuidex(regs, 7, 0);\n"
+    "    return (regs[1] & (1 << 19)) != 0;\n"
+    "}\n"
+)
+
 
 def emit(image, output):
     parts = [
         "#include <intrin.h>\n",
         INTEGER_HEADER,
-        'extern "C" __declspec(dllexport) int host_has_adx() {\n'
-        "    int regs[4]{};\n"
-        "    __cpuid(regs, 0);\n"
-        "    if (regs[0] < 7) return 0;\n"
-        "    __cpuidex(regs, 7, 0);\n"
-        "    return (regs[1] & (1 << 19)) != 0;\n"
-        "}\n",
+        HOST_HAS_ADX,
     ]
     with pefile.PE(str(image), fast_load=True) as pe:
         for name in EXPORTS:

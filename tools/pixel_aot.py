@@ -113,7 +113,7 @@ def _check_two_exits(code, llvm):
         pending.append(following[pc])
     # A direct branch may skip alignment NOPs. Keep them in the original span.
     unreachable = instructions.keys() - visited
-    if exits[0] + 4 not in targets or any(instructions[pc].split()[0] != "s_nop" for pc in unreachable):
+    if exits[0] + 4 not in targets or any(instructions[pc].split()[0] not in ("s_nop", "v_nop") for pc in unreachable):
         raise ValueError("Unreachable code or unverified alternate exit")
 
 
@@ -392,6 +392,16 @@ INTEGER = {
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
     "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
     "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
+    "mul_u32_u24": (2, "mul24_u32({0}, {1})"),
+    "mul_i32_i24": (2, "mul24_i32({0}, {1})"),
+    "mul_hi_u32_u24": (2, "mul24_hi_u32({0}, {1})"),
+    "mul_hi_i32_i24": (2, "mul24_hi_i32({0}, {1})"),
+}
+MUL24_HELPERS = {
+    "mul_u32_u24": ("mul24_u32",),
+    "mul_i32_i24": ("mul24_i32",),
+    "mul_hi_u32_u24": ("mul24_hi_u32",),
+    "mul_hi_i32_i24": ("mul24_hi_u32", "mul24_hi_i32"),
 }
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
@@ -455,6 +465,46 @@ SALU_HELPERS = {
         "    if (w == 0u) return 0u;\n"
         "    if (off + w < 32u) return asuint(asint(src << (32u - off - w)) >> (32u - w));\n"
         "    return asuint(asint(src) >> off);\n"
+        "}"
+    ),
+    "dpp_ffbh_u32": (
+        "uint dpp_ffbh_u32(uint x) {\n"
+        "    return x == 0u ? 0xffffffffu : (31u - firstbithigh(x));\n"
+        "}"
+    ),
+    "dpp_ffbh_i32": (
+        "uint dpp_ffbh_i32(uint x) {\n"
+        "    uint m = asint(x) < 0 ? ~x : x;\n"
+        "    return m == 0u ? 0xffffffffu : (31u - firstbithigh(m));\n"
+        "}"
+    ),
+    "dpp_mul_hi_u24": (
+        "uint dpp_mul_hi_u24(uint a, uint b) {\n"
+        "    a &= 0xffffffu;\n"
+        "    b &= 0xffffffu;\n"
+        "    uint a0 = a & 0xfffu, a1 = a >> 12;\n"
+        "    uint b0 = b & 0xfffu, b1 = b >> 12;\n"
+        "    uint p0 = a0 * b0;\n"
+        "    uint mid = a0 * b1 + a1 * b0 + (p0 >> 12);\n"
+        "    uint p2 = a1 * b1 + (mid >> 12);\n"
+        "    return p2 >> 8;\n"
+        "}"
+    ),
+    "dpp_mul_hi_i24": (
+        "uint dpp_mul_hi_i24(uint a, uint b) {\n"
+        "    int sa = asint(a << 8) >> 8;\n"
+        "    int sb = asint(b << 8) >> 8;\n"
+        "    uint ma = asuint(sa < 0 ? -sa : sa);\n"
+        "    uint mb = asuint(sb < 0 ? -sb : sb);\n"
+        "    uint a0 = ma & 0xfffu, a1 = ma >> 12;\n"
+        "    uint b0 = mb & 0xfffu, b1 = mb >> 12;\n"
+        "    uint p0 = a0 * b0;\n"
+        "    uint mid = a0 * b1 + a1 * b0 + (p0 >> 12);\n"
+        "    uint p2 = a1 * b1 + (mid >> 12);\n"
+        "    uint mag_lo = (p0 & 0xfffu) | ((mid & 0xfffu) << 12) | ((p2 & 0xffu) << 24);\n"
+        "    uint mag_hi = p2 >> 8;\n"
+        "    if ((sa < 0) != (sb < 0)) return ~mag_hi + (mag_lo == 0u ? 1u : 0u);\n"
+        "    return mag_hi;\n"
         "}"
     ),
     "pack16_rne": (
@@ -576,6 +626,71 @@ SALU_HELPERS = {
         "    return sat ? dot_u64_sat(s) : s.x;\n"
         "}"
     ),
+    "mul24_u32": (
+        "uint mul24_u32(uint a, uint b) {\n"
+        "    return (a & 0xffffffu) * (b & 0xffffffu);\n"
+        "}"
+    ),
+    "mul24_i32": (
+        "uint mul24_i32(uint a, uint b) {\n"
+        "    int sa = asint(a << 8u) >> 8;\n"
+        "    int sb = asint(b << 8u) >> 8;\n"
+        "    return asuint(sa) * asuint(sb);\n"
+        "}"
+    ),
+    "mul24_hi_u32": (
+        "uint mul24_hi_u32(uint a, uint b) {\n"
+        "    uint ua = a & 0xffffffu;\n"
+        "    uint ub = b & 0xffffffu;\n"
+        "    uint al = ua & 0xfffu;\n"
+        "    uint ah = ua >> 12u;\n"
+        "    uint bl = ub & 0xfffu;\n"
+        "    uint bh = ub >> 12u;\n"
+        "    uint p0 = al * bl;\n"
+        "    uint p1 = al * bh + ah * bl;\n"
+        "    uint p2 = ah * bh;\n"
+        "    uint mid = (p0 >> 12u) + p1;\n"
+        "    return (p2 + (mid >> 12u)) >> 8u;\n"
+        "}"
+    ),
+    "mul24_hi_i32": (
+        "uint mul24_hi_i32(uint a, uint b) {\n"
+        "    int sa = asint(a << 8u) >> 8;\n"
+        "    int sb = asint(b << 8u) >> 8;\n"
+        "    bool neg = (sa < 0) != (sb < 0);\n"
+        "    uint ua = (uint)(sa < 0 ? -sa : sa);\n"
+        "    uint ub = (uint)(sb < 0 ? -sb : sb);\n"
+        "    uint lo = ua * ub;\n"
+        "    uint hi = mul24_hi_u32(ua, ub);\n"
+        "    if (neg && (lo != 0u || hi != 0u)) return ~hi + (lo == 0u ? 1u : 0u);\n"
+        "    return hi;\n"
+        "}"
+    ),
+}
+DPP_INT32 = {
+    "not_b32": (1, "(~{0})", None),
+    "bfrev_b32": (1, "reversebits({0})", None),
+    "ffbl_b32": (1, "firstbitlow({0})", None),
+    "ffbh_u32": (1, "dpp_ffbh_u32({0})", "dpp_ffbh_u32"),
+    "ffbh_i32": (1, "dpp_ffbh_i32({0})", "dpp_ffbh_i32"),
+    "add_nc_u32": (2, "({0} + {1})", None),
+    "sub_nc_u32": (2, "({0} - {1})", None),
+    "subrev_nc_u32": (2, "({1} - {0})", None),
+    "min_i32": (2, "asuint(min(asint({0}), asint({1})))", None),
+    "max_i32": (2, "asuint(max(asint({0}), asint({1})))", None),
+    "min_u32": (2, "min({0}, {1})", None),
+    "max_u32": (2, "max({0}, {1})", None),
+    "mul_u32_u24": (2, "(({0} & 0xffffffu) * ({1} & 0xffffffu))", None),
+    "mul_hi_u32_u24": (2, "dpp_mul_hi_u24({0}, {1})", "dpp_mul_hi_u24"),
+    "mul_i32_i24": (2, "(asuint(asint({0} << 8) >> 8) * asuint(asint({1} << 8) >> 8))", None),
+    "mul_hi_i32_i24": (2, "dpp_mul_hi_i24({0}, {1})", "dpp_mul_hi_i24"),
+    "and_b32": (2, "({0} & {1})", None),
+    "or_b32": (2, "({0} | {1})", None),
+    "xor_b32": (2, "({0} ^ {1})", None),
+    "xnor_b32": (2, "(~({0} ^ {1}))", None),
+    "lshlrev_b32": (2, "({1} << ({0} & 31u))", None),
+    "lshrrev_b32": (2, "({1} >> ({0} & 31u))", None),
+    "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))", None),
 }
 
 VOP3P_F16 = {
@@ -674,6 +789,9 @@ def lane_mask(token):
 # {r} names the result. Shift counts use their low five bits; signed overflow sets SCC for _i32 add/sub.
 NONZERO = "{r} != 0u"
 SCALAR = {
+    "pack_ll_b32_b16": (2, "({0} & 0xffffu) | ({1} << 16)", None),
+    "pack_lh_b32_b16": (2, "({0} & 0xffffu) | ({1} & 0xffff0000u)", None),
+    "pack_hh_b32_b16": (2, "({0} >> 16) | ({1} & 0xffff0000u)", None),
     "sext_i32_i8": (1, "asuint(asint({0} << 24) >> 24)", None),
     "sext_i32_i16": (1, "asuint(asint({0} << 16) >> 16)", None),
     "add_u32": (2, "{0} + {1}", "{r} < {0}"), "sub_u32": (2, "{0} - {1}", "{0} < {1}"),
@@ -686,6 +804,8 @@ SCALAR = {
     "and_b32": (2, "{0} & {1}", NONZERO), "or_b32": (2, "{0} | {1}", NONZERO),
     "xor_b32": (2, "{0} ^ {1}", NONZERO), "andn2_b32": (2, "{0} & ~{1}", NONZERO),
     "orn2_b32": (2, "{0} | ~{1}", NONZERO), "not_b32": (1, "~{0}", NONZERO),
+    "nand_b32": (2, "~({0} & {1})", NONZERO), "nor_b32": (2, "~({0} | {1})", NONZERO),
+    "xnor_b32": (2, "~({0} ^ {1})", NONZERO),
     "lshl_b32": (2, "{0} << ({1} & 31u)", NONZERO), "lshr_b32": (2, "{0} >> ({1} & 31u)", NONZERO),
     "ashr_i32": (2, "asuint(asint({0}) >> ({1} & 31u))", NONZERO),
 }
@@ -827,14 +947,19 @@ def emit_quad_swizzle_u32(lines, idx, base_expr, perm):
     bits = f"asuint({base_expr})"
     if perm == [0, 1, 2, 3]:
         return bits
+    svar = f"dpp{idx}_s"
     if perm == [1, 0, 3, 2]:
-        return f"QuadReadAcrossX({bits})"
+        lines.append(f"    uint {svar} = QuadReadAcrossX({bits});")
+        return svar
     if perm == [2, 3, 0, 1]:
-        return f"QuadReadAcrossY({bits})"
+        lines.append(f"    uint {svar} = QuadReadAcrossY({bits});")
+        return svar
     if perm == [3, 2, 1, 0]:
-        return f"QuadReadAcrossDiagonal({bits})"
+        lines.append(f"    uint {svar} = QuadReadAcrossDiagonal({bits});")
+        return svar
     if len(set(perm)) == 1:
-        return f"QuadReadLaneAt({bits}, {perm[0]})"
+        lines.append(f"    uint {svar} = QuadReadLaneAt({bits}, {perm[0]});")
+        return svar
     lines.append(f"    uint dpp{idx}_in = {bits};")
     lines.append(f"    uint dpp{idx}_q = WaveGetLaneIndex() & 3u;")
     lane_vars = {}
@@ -843,7 +968,6 @@ def emit_quad_swizzle_u32(lines, idx, base_expr, perm):
         lines.append(f"    uint {lv} = QuadReadLaneAt(dpp{idx}_in, {lane});")
         lane_vars[lane] = lv
     l0, l1, l2, l3 = (lane_vars[p] for p in perm)
-    svar = f"dpp{idx}_s"
     lines.append(f"    uint {svar} = (dpp{idx}_q == 0u ? {l0} : (dpp{idx}_q == 1u ? {l1} : (dpp{idx}_q == 2u ? {l2} : {l3})));")
     return svar
 
@@ -1248,6 +1372,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             continue
         if exported and line != "s_endpgm":
             raise ValueError("Unexpected instruction after color export")
+        if line == "v_nop":
+            if mask != "entry":
+                raise ValueError("Unexpected v_nop with non-entry mask")
+            continue
         # Scheduling hints with no effect on results. Each operand is limited to the width
         # of its RDNA 2 field: clause length minus one, wave priority and sleep duration.
         if m := match(r"(s_clause|s_setprio|s_sleep) (0x[0-9a-f]+|\d+)"):
@@ -1622,9 +1750,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             op, dst, sources = m.groups()
             tokens = sources.split(", ")
             arity, template = INTEGER[op]
-            if mask != "entry" or dst in sample_dest or len(tokens) != arity:
+            if mask != "entry" or int(dst[1:]) > 255 or dst in sample_dest or len(tokens) != arity:
                 raise ValueError("Invalid integer operation")
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
+            if op in MUL24_HELPERS:
+                helpers.update(MUL24_HELPERS[op])
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
@@ -1643,15 +1773,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             lines.append(f"    bool cmp{i} = (class32({operand}) & {bits}) != 0u;")
 
-        elif m := match(r"v_(add|sub)_nc_u32(?:_e32)? (v\d+), ([^,]+), ([^,]+)"):
+        elif m := match(r"v_(add|sub|subrev)_nc_u32(?:_e32)? (v\d+), ([^,]+), ([^,]+)"):
             op, dst, src0, src1 = m.groups()
             if mask != "entry" or dst in sample_dest:
                 raise ValueError("Invalid integer operation")
             a = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
             b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
-            operator = "+" if op == "add" else "-"
+            if op == "add":
+                expr = f"{a} + {b}"
+            elif op == "sub":
+                expr = f"{a} - {b}"
+            else:
+                expr = f"{b} - {a}"
             vector[dst] = f"alu{i}"
-            lines.append(f"    precise float alu{i} = asfloat({a} {operator} {b});")
+            lines.append(f"    precise float alu{i} = asfloat({expr});")
         elif m := match(r"v_(min|max)_(i32|u32)(?:_e32|_e64)? (v\d+), ([^,]+), ([^,]+)"):
             op, kind, dst, *tokens = m.groups()
             if mask != "entry":
@@ -1767,6 +1902,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_({'|'.join(DPP_INT32)})_dpp (v\d+), (.+)"):
+            op, dst, rest = m.groups()
+            arity, template, helper = DPP_INT32[op]
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid integer DPP operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, _ = parse_dpp(rest, arity)
+            src0_val, _, _ = dpp_vgpr(tokens[0], vector, sample_dest, allow_mods=False)
+            s0_u32 = emit_quad_swizzle_u32(lines, i, src0_val, perm)
+            args = [s0_u32]
+            if arity == 2:
+                src1_val, _, _ = dpp_vgpr(tokens[1], vector, sample_dest, allow_mods=False)
+                args.append(f"asuint({src1_val})")
+            if helper is not None:
+                helpers.add(helper)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_(mov_b32|cvt_f32_f16|cndmask_b32|(?:{'|'.join(DPP_ALU)})_f32)_dpp (v\d+), (.+)"):
             op, dst, rest = m.groups()
             if mask != "entry" or not 0 <= int(dst[1:]) <= 255:

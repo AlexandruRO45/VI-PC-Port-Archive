@@ -25,15 +25,19 @@ def pipeline_case(top_y, rgb):
     return constants, [points[i] for i in (1, 2, 0)], bytes(pixels)
 
 
-def main(tmp, compiler, renderer, adapter):
-    mesh = lower(enumerate_pcs(MESH), WORDS, (3, 1), HEADER)
+def buffer_color_program():
     # Use the existing source-built descriptor setup, with RG and BA separately packed for export.
     program = ["s_mov_b32 s30, s9", "s_mov_b32 s31, 0",
                "s_load_dwordx4 s[12:15], s[30:31], null", "s_waitcnt lgkmcnt(0)",
                "s_buffer_load_dwordx4 s[4:7], s[12:15], 0x40", "s_waitcnt lgkmcnt(0)"]
     program.extend(f"v_mov_b32_e32 v{20+i}, s{4+i}" for i in range(4))
-    program += ["v_cvt_pkrtz_f16_f32_e32 v25, v20, v21", "v_cvt_pkrtz_f16_f32_e32 v26, v22, v23",
-                "exp mrt0 v25, v25, v26, v26 done compr vm", "s_endpgm"]
+    return program + ["v_cvt_pkrtz_f16_f32_e32 v25, v20, v21", "v_cvt_pkrtz_f16_f32_e32 v26, v22, v23",
+                      "exp mrt0 v25, v25, v26, v26 done compr vm", "s_endpgm"]
+
+
+def main(tmp, compiler, renderer, adapter):
+    mesh = lower(enumerate_pcs(MESH), WORDS, (3, 1), HEADER)
+    program = buffer_color_program()
     cases = [pipeline_case(5, (1, 0.75, 0)), pipeline_case(5, (0, 0.75, 1)), pipeline_case(13, (1, 0.75, 0))]
     result = draw(compiler, renderer, adapter, tmp, mesh, cases, indexed=True,
                   pixel_source=translate_buffer_color(program))

@@ -54,6 +54,7 @@ SDWA_SEL_PATTERN = r"(?:BYTE_[0-3]|WORD_[01]|DWORD)"
 SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_inst_prefetch\s+.*",
     r"s_nop\s+.*",
+    r"v_nop",
     r"s_clause\s+(?:0x[0-3]?[0-9a-f]|[0-5]?[0-9]|6[0-3])",
     r"s_setprio\s+(?:0x[0-3]|[0-3])",
     r"s_sleep\s+(?:0x[0-7]?[0-9a-f]|[0-9]|[1-9][0-9]|1[01][0-9]|12[0-7])",
@@ -91,7 +92,7 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_cvt_f32_(?:u32|i32)_e32\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+)",
     r"v_cvt_f32_(?:u32|i32)_e64\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+)(?:\s+clamp)?",
     r"v_ldexp_f32(?:_e64)?\s+v\d+,\s+[^,]+,\s+[^,]+?(?:\s+clamp)?",
-    rf"v_(?:add|sub)_nc_u32(?:_e32)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
+    rf"v_(?:add|sub|subrev)_nc_u32(?:_e32)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:min|max)_(?:i32|u32)(?:_e32|_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_(?:min3|max3|med3)_(?:i32|u32)(?:_e64)?\s+v\d+,\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}",
     rf"v_cmp_class_f32(?:_e32|_e64)?\s+{PIXEL_LANE_MASK},\s+[^,]+,\s+[^,]+",
