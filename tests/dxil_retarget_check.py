@@ -427,6 +427,12 @@ define void @main() {
     assert inventory["declarations"] == [], inventory
     assert inventory["metadata_only"] == ["xbox.V_ALIGNBYTE_B32"], inventory
 
+    # A metadata description that looks like a call still contains no instruction.
+    inventory = xbox_intrinsic_inventory('!0 = !{!"call void @xbox.inventory_example("}')
+    assert inventory == dict(calls={}, declarations=[], metadata_only=["xbox.inventory_example"]), inventory
+    inventory = xbox_intrinsic_inventory('  %"call result" = tail call i32 @"xbox.inventory_example"()')
+    assert inventory["calls"] == {"xbox.inventory_example": 1}, inventory
+
     # (e) Named-metadata key alone: the Xbox compiler option node carries no intrinsic name.
     named_metadata = """
 define void @main() {

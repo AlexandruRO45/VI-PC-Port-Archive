@@ -1,9 +1,11 @@
 """Exercise offline pixel translation with independently assembled test programs."""
+from fractions import Fraction
 from pathlib import Path
 import hashlib
 import json
 import math
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -24,6 +26,9 @@ SOPC_OPS = (
     "s_cmp_eq_u64", "s_cmp_lg_u64",
     "s_bitcmp0_b32", "s_bitcmp1_b32",
     "s_bitcmp0_b64", "s_bitcmp1_b64",
+)
+SOP2_LSHL_ADD_OPS = (
+    "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32",
 )
 VOP2_INT_OPS = (
     "v_lshrrev_b32_e32", "v_ashrrev_i32_e32", "v_lshlrev_b32_e32",
@@ -1113,6 +1118,49 @@ def check_mad_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"A fused or denormal-preserving result escaped detection: {wrong_values}")
 
 
+# v_madak_f32 computes S0 * S1 + K and v_madmk_f32 computes S0 * K + S1, with K a 32-bit literal. Unlike the
+# fma forms they round the product before the add and flush binary32 denormals, like v_mad_f32.
+# 4097 * 4097 - 16785408 is 0 unfused and 1.0 fused; 2^-127 * 2^126 + 0.5 is 0.5 with the denormal input flushed.
+MAD_LITERAL_BODY = [
+    "v_mov_b32_e32 v13, s44",
+    "v_madak_f32 v12, s44, v13, 0xcb801000",
+    "v_mov_b32_e32 v13, s45",
+    "v_madmk_f32 v13, s44, 0x45800800, v13",
+    "v_mov_b32_e32 v15, s47",
+    "v_madak_f32 v14, s46, v15, 0x3f000000",
+    "v_mov_b32_e32 v15, 0.5",
+    "v_madmk_f32 v15, s46, 0x7e800000, v15",
+]
+
+
+def check_mad_literal_draw(directory, compiler, renderer, backend):
+    source = directory / "mad_literal.hlsl"
+    shader = directory / "mad_literal.cso"
+    case = directory / "mad_literal.case"
+    source.write_text(translate(with_constants(MAD_LITERAL_BODY)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, *MAD_INPUTS)
+    a, c, tiny, large = MAD_INPUTS
+    # Exact rational arithmetic gives the fused result; the unfused one rounds the product to binary32 first.
+    fused = float(Fraction(a) * Fraction(a) + Fraction(c))
+    unfused = single(single(a * a) + c)
+    assert fused == 1.0 and unfused == 0.0
+    assert single(tiny) == tiny and 0 < tiny < 2.0 ** -126 and single(tiny * large) == 0.5
+    expected = [unfused, unfused, 0.5, 0.5]
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    write_case(case, constants, tuple(map(half_rtz, expected)))
+    subprocess.run(draw, check=True)
+    # A reference that fuses the first two rows or keeps the denormal in the last two exports 1.0 there.
+    for k in range(4):
+        wrong_values = list(expected)
+        wrong_values[k] = 1.0
+        write_case(case, constants, tuple(map(half_rtz, wrong_values)))
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"A fused or denormal-preserving literal result escaped detection in channel {k}")
+
+
 def check_predicate_draws(directory, compiler, renderer, backend):
     source = directory / "predicates.hlsl"
     shader = directory / "predicates.cso"
@@ -2132,6 +2180,81 @@ def scalar_body():
 PACK_HALVES = ("ll", "lh", "hh")
 
 
+def scalar_bit_count_values(width):
+    src = "s44" if width == 32 else "s[44:45]"
+    body = []
+    for bit in (0, 1):
+        # Seed SCC from a runtime word. The reference always seeds the opposite of the expected SCC.
+        body.extend([
+            f"s_cmp_eq_u32 s{46 + bit}, 1",
+            f"s_bcnt{bit}_i32_b{width} s62, {src}",
+            "s_cselect_b32 s63, 0x3f800000, 0", f"v_mov_b32_e32 v{14 + bit}, s63",
+            "s_lshl_b32 s62, s62, 13", "s_or_b32 s62, s62, 0x3f800000",
+            f"v_mov_b32_e32 v{12 + bit}, s62",
+        ])
+    return with_constants(body)
+
+
+def check_scalar_bit_count_draw(directory, compiler, renderer, backend):
+    source, shader, case = (directory / name for name in ("bit-count.hlsl", "bit-count.cso", "bit-count.case"))
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for width in (32, 64):
+        program = scalar_bit_count_values(width)
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader, ieee=False)
+        for lo, hi in ((0, 0), (0xffffffff, 0xffffffff), (0x1234abcd, 0x5678ef90), (0, 0x80000000)):
+            word = lo if width == 32 else lo | (hi << 32)
+            ones = word.bit_count()
+            zeros = width - ones
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, lo, hi, zeros == 0, ones == 0)
+            case.write_bytes(constants + struct.pack("<4f", 1 + zeros / 1024, 1 + ones / 1024,
+                                                      zeros != 0, ones != 0) * 64)
+            subprocess.run(draw, check=True)
+    # The last input has one bit set in the high word and none in the low word.
+    program = [line.replace("s_bcnt1_i32_b64 s62, s[44:45]", "s_bcnt1_i32_b32 s62, s44")
+               for line in scalar_bit_count_values(64)]
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Dropping the high word matched the original reference")
+
+
+def scalar_mul_hi_values(signed="i32"):
+    return with_constants([
+        "s_cmp_eq_u32 s44, s45",
+        f"s_mul_hi_{signed} s62, s44, s45",
+        "s_mul_hi_u32 s63, s44, s45",
+        "s_cselect_b32 s64, 0x3f800000, 0",
+        "v_mov_b32_e32 v14, s64",
+        "s_cmp_eq_u32 s62, s46", "s_cselect_b32 s64, 0x3f800000, 0",
+        "v_mov_b32_e32 v12, s64",
+        "s_cmp_eq_u32 s63, s47", "s_cselect_b32 s64, 0x3f800000, 0",
+        "v_mov_b32_e32 v13, s64", "v_mov_b32_e32 v15, 0",
+    ])
+
+
+def check_scalar_mul_hi_draw(directory, compiler, renderer, backend):
+    source, shader, case = (directory / name for name in ("mul-hi.hlsl", "mul-hi.cso", "mul-hi.case"))
+    source.write_text(translate(scalar_mul_hi_values()), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for a, b in ((0, 0x80000000), (0x7fffffff, 0x7fffffff), (0x80000000, 3),
+                 (3, 0x80000000), (0x1234abcd, 0x5678ef90), (0xffffffff, 0xffffffff)):
+        signed_a, signed_b = struct.unpack("<ii", struct.pack("<II", a, b))
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, a, b, (signed_a * signed_b >> 32) & 0xffffffff, a * b >> 32)
+        case.write_bytes(constants + struct.pack("<4f", 1, 1, a == b, 0) * 64)
+        subprocess.run(draw, check=True)
+    # For the final inputs, signed high is zero and unsigned high is 0xfffffffe.
+    source.write_text(translate(scalar_mul_hi_values("u32")), encoding="ascii")
+    compile_shader(compiler, source, shader, ieee=False)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Unsigned high product matched the signed reference")
+
+
 def scalar_pack_values(halves):
     return with_constants([
         "s_cmp_eq_u32 s47, 1", f"s_pack_{halves}_b32_b16 s44, s44, s45",
@@ -2235,6 +2358,36 @@ def sop1_scalar_ops_reference(words):
     bitset = (s46 & ~(1 << (s47 & 31))) | (1 << 31)
     cmov_lit = 0x12345678 if scc else s46
     return (abs44, cmov_reg, bitset & 0xffffffff, cmov_lit)
+
+
+# s_bfm_b32/s_bfm_b64: count words s44 (S0) and s45 (S1 offset) feed both widths; s46/s47 give a second 32-bit mask.
+BFM_WORDS = (
+    (0, 0, 1, 31),
+    (31, 1, 32, 32),
+    (32, 31, 33, 0xffffffff),
+    (63, 33, 64, 63),
+    (64, 5, 0xffffffe1, 0xffffffc3),
+)
+
+
+def bfm_scalar_ops() -> list[str]:
+    return uncompressed_export([
+        "s_bfm_b32 s50, s44, s45",
+        "s_bfm_b32 s51, s46, s47",
+        "s_bfm_b64 s[52:53], s44, s45",
+        "v_mov_b32_e32 v12, s50",
+        "v_mov_b32_e32 v13, s51",
+        "v_mov_b32_e32 v14, s52",
+        "v_mov_b32_e32 v15, s53",
+    ])
+
+
+def bfm_scalar_ops_reference(words):
+    """Counts are masked to 5 (b32) or 6 (b64) bits; the mask is (1 << count) - 1, shifted left by the offset."""
+    s44, s45, s46, s47 = words
+    b32 = lambda count, offset: (((1 << (count & 31)) - 1) << (offset & 31)) & 0xffffffff
+    b64 = (((1 << (s44 & 63)) - 1) << (s45 & 63)) & 0xffffffffffffffff
+    return (b32(s44, s45), b32(s46, s47), b64 & 0xffffffff, b64 >> 32)
 
 
 def scalar():
@@ -2379,10 +2532,10 @@ def check_scalar_controls():
     # Neighbouring forms that the lowerer does not implement, operand kinds it cannot read, and
     # destinations other than plain scalar registers.
     first = "s_add_u32 s62, s44, s45"
-    for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45", "s_mul_hi_u32 s62, s44, s45",
+    for new in ("s_addc_u32 s62, s44, s45", "s_subb_u32 s62, s44, s45",
                 "s_absdiff_i32 s62, s44, s45",
                 "s_nand_b32 s62, v12, s45", "s_nor_b32 v62, s44, s45", "s_xnor_b32 s62, s44",
-                "s_bfe_u32 s62, v12, s45", "s_lshl1_add_u32 s62, s44, s45",
+                "s_bfe_u32 s62, v12, s45", "s_lshl5_add_u32 s62, s44, s45",
                 "s_quadmask_b32 s62, s44", "s_bitset0_b64 s[62:63], s44",
                 "s_brev_b32 s62, s44", "s_and_b64 s[62:63], s[44:46], s[46:47]",
                 "s_add_u32 s62, s[44:45], s45", "s_add_u32 s62, s44", "s_add_u32 s62, s44, s45, s46",
@@ -2436,6 +2589,43 @@ def check_scalar_controls():
                      ("s_bitset0_b32 s52, s47", "s_bitset0_b32 s52, v12")):
         changed = [line.replace(old, new) for line in sop1_program]
         assert changed != sop1_program, new
+        must_reject(translate_int, changed)
+
+    # s_bfm_b32: the lowering masks both counts to five bits and leaves SCC untouched.
+    bfm_program = bfm_scalar_ops()
+    bfm_source = translate_int(bfm_program)
+    assert ("= ((1u << (asuint(params[0].w) & 31u)) - 1u) << (asuint(params[1].x) & 31u);" in bfm_source), bfm_source
+    assert "s_bfm_b64(" in bfm_source
+    refs = [bfm_scalar_ops_reference(words) for words in BFM_WORDS]
+    # Counts 0, 1, 31, 32 and 33 for b32 and 63 and 64 for b64 are all covered with distinct results.
+    assert [r[0] for r in refs] == [0, 0xfffffffe, 0, 0xfffffffe, 0]
+    assert [r[1] for r in refs] == [0x80000000, 0, 0x80000000, 0, 8]
+    assert refs[1][2:] == (0xfffffffe, 0) and refs[0][2:] == (0, 0)
+    assert refs[2][2:] == (0x80000000, 0x7fffffff) and refs[3][2:] == (0, 0xfffffffe) and refs[4][2:] == (0, 0)
+    with_scc = ["s_cmp_eq_u32 s44, s44"]
+    scc_program = bfm_program[:]
+    at = scc_program.index("v_mov_b32_e32 v12, s50")
+    scc_program[at:at] = with_scc + ["s_bfm_b32 s54, 4, 8", "s_cselect_b32 s55, s44, s45"]
+    scc_source = translate_int(scc_program)
+    assert re.search(r"= scc\d+ \? asuint\(params\[0\]\.w\) : asuint\(params\[1\]\.x\);", scc_source), scc_source
+    # Without a tracked SCC the select is rejected even after s_bfm_b32 (it does not create one).
+    at = bfm_program.index("v_mov_b32_e32 v12, s50")
+    must_reject(translate_int, bfm_program[:at] + ["s_bfm_b32 s54, 4, 8", "s_cselect_b32 s55, s44, s45"] + bfm_program[at:])
+    wait = bfm_program.index("s_waitcnt lgkmcnt(0)", bfm_program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    # Before the s_waitcnt, s44..s47 are still pending scalar loads: reading them, or overwriting s44, must be refused.
+    for bad in ("s_bfm_b32 s50, s44, 1", "s_bfm_b32 s44, 1, 1", "s_bfm_b32 s50, 1, s47"):
+        must_reject(translate_int, bfm_program[:wait] + [bad] + bfm_program[wait:])
+    for old, new in (("s_bfm_b32 s50, s44, s45", "s_bfm_b32 v12, s44, s45"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, v12, s45"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s44, v12"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s44"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s44, s45, s46"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s106, s44, s45"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s[50:51], s44, s45"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s[44:45], s45"),
+                     ("s_bfm_b32 s50, s44, s45", "s_bfm_b32 s50, s90, s45")):
+        changed = [line.replace(old, new) for line in bfm_program]
+        assert changed != bfm_program, new
         must_reject(translate_int, changed)
 
 
@@ -3355,6 +3545,23 @@ def nc_integer_group(group):
     return ["v_mov_b32_e32 v18, s45", *NC_INT_BODIES[group]]
 
 
+def sop2_lshl_add_group() -> list[str]:
+    return with_constants([
+        "s_lshl1_add_u32 s60, s44, s45",
+        "s_cselect_b32 s71, 1, 0",
+        "s_lshl2_add_u32 s61, s44, s45",
+        "s_cselect_b32 s72, 2, 0",
+        "s_lshl3_add_u32 s62, s44, s45",
+        "s_cselect_b32 s73, 4, 0",
+        "s_lshl4_add_u32 s63, s44, s45",
+        "s_cselect_b32 s74, 8, 0",
+        "v_mov_b32_e32 v12, s60",
+        "v_mov_b32_e32 v13, s61",
+        "v_mov_b32_e32 v14, s62",
+        "v_mov_b32_e32 v15, s63",
+    ])
+
+
 def pack_f16_pair(lo, hi):
     lo_b = struct.unpack("<H", struct.pack("<e", lo))[0]
     hi_b = struct.unpack("<H", struct.pack("<e", hi))[0]
@@ -3747,6 +3954,29 @@ def check_controls(directory):
     ):
         must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop2]))
     check_nc_integer_lowering()
+    lshl_add_source = translate(sop2_lshl_add_group())
+    assert set(SOP2_LSHL_ADD_OPS) <= ACCEPTED
+    for expected in (
+        "(asuint(params[0].w) << 1u) + asuint(params[1].x)",
+        "(asuint(params[0].w) << 2u) + asuint(params[1].x)",
+        "(asuint(params[0].w) << 3u) + asuint(params[1].x)",
+        "(asuint(params[0].w) << 4u) + asuint(params[1].x)",
+        "asuint(params[0].w) >> 31u != 0u",
+        "asuint(params[0].w) >> 30u != 0u",
+        "asuint(params[0].w) >> 29u != 0u",
+        "asuint(params[0].w) >> 28u != 0u",
+    ):
+        assert expected in lshl_add_source, expected
+    for bad_lshl_add in (
+        "s_lshl0_add_u32 s62, s44, s45",
+        "s_lshl5_add_u32 s62, s44, s45",
+        "s_lshl1_add_u32 s62, s44",
+        "s_lshl2_add_u32 s62, s44, s45, s46",
+        "s_lshl3_add_u32 s62, v12, s45",
+        "s_lshl4_add_u32 s62, s44, v13",
+        "s_lshl1_add_u32 v12, s44, s45",
+    ):
+        must_reject(translate, with_constants([bad_lshl_add]))
     rgb = rgb_sample()
     translate(rgb)
     for old, new in (("v[12:14]", "v[12:15]"), ("dmask:0x7", "dmask:0xb")):
@@ -4218,6 +4448,17 @@ def check_controls(directory):
     assert body.count("mad32(") == 4 and " mad(" not in body, body
     must_reject(translate, with_constants(["v_mad_f32 v12, s44, s45"]))
     must_reject(translate, with_constants(["v_mac_f32_e32 v14, s44, v15, v14"]))
+    # v_madak_f32 and v_madmk_f32 use the same helper. The literal is the last operand of madak and the
+    # second of madmk; a register there, a missing operand, and the e64, DPP and SDWA spellings are refused.
+    body = translate(with_constants(MAD_LITERAL_BODY)).split("float4 main", 1)[1]
+    assert body.count("mad32(") == 4 and " mad(" not in body and "asfloat(3414167552u)" in body, body
+    must_reject(translate, with_constants(["v_madak_f32 v12, s44, v13, v14"]))
+    must_reject(translate, with_constants(["v_madmk_f32 v12, s44, v13, 0x3e800000"]))
+    must_reject(translate, with_constants(["v_madak_f32 v12, s44, 0x3e800000"]))
+    must_reject(translate, with_constants(["v_madak_f32_e64 v12, s44, v13, 0x3e800000"]))
+    must_reject(translate, with_constants(["v_madmk_f32_e64 v12, s44, 0x3e800000, v13"]))
+    must_reject(translate, with_constants(["v_madak_f32_dpp v12, v13, v14, 0x3e800000 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf"]))
+    must_reject(translate, with_constants(["v_madmk_f32_sdwa v12, v13, 0x3e800000, v14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"]))
 
     # 64-bit scalar ALU and 32-bit BFE controls.
     program = scalar64()
@@ -4267,7 +4508,11 @@ def check_controls(directory):
         "s_cselect_b64 s[70:71], s[52:53], s[54:55]",
         "s_bfe_u64 s[70:71], s[52:53], s61",
         "s_bfe_i64 s[70:71], s[52:53], s61",
-        "s_bfm_b32 s70, 4, 8",
+        "s_bfm_b32 s70, v12, 8",  # VGPR source
+        "s_bfm_b32 s106, 4, 8",  # out-of-range SGPR
+        "s_bfm_b32 s[70:71], 4, 8",  # pair destination
+        "s_bfm_b32 s70, 4",  # missing operand
+        "s_bfm_b32 s70, s90, 8",  # unset source
         "s_cselect_b32 s70, s56, s57",
     ):
         must_reject(translate, program[:body_start] + [bad] + program[body_start:])
@@ -4275,6 +4520,7 @@ def check_controls(directory):
         "s_add_u32 s70, s56, s57",
         "s_and_b32 s70, s56, s57",
         "s_not_b32 s70, s56",
+        "s_bfm_b32 s70, 4, 8",
         "s_cmp_eq_i32 s56, s57",
     ):
         translate(program[:body_start] + [supported] + program[body_start:])
@@ -4575,7 +4821,10 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((sext_values(), translate))
     fixtures.append((sop1_scalar_ops(), translate_int))
+    fixtures.append((bfm_scalar_ops(), translate_int))
     fixtures.extend((scalar_pack_values(halves), translate) for halves in PACK_HALVES)
+    fixtures.extend((scalar_bit_count_values(width), translate) for width in (32, 64))
+    fixtures.append((scalar_mul_hi_values(), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
     fixtures.append((fract_values(), translate))
@@ -4607,6 +4856,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((scalar(), translate))
     fixtures.append((lod_zero_sample(), translate))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
+    fixtures.append((with_constants(MAD_LITERAL_BODY), translate))
     fixtures.append((unpack_bytes(), translate))
     fixtures.append((reciprocal_iflag(), translate))
     fixtures.append((offset_nibbles(), translate))
@@ -4940,6 +5190,75 @@ def check_integer_nc_draws(directory, compiler, renderer, backend):
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("Swapped sub and subrev words escaped the integer readback")
     return 0
+
+
+def check_lshl_add_u32_draw(directory, compiler, renderer, backend):
+    source = directory / "lshl_add_u32.hlsl"
+    shader = directory / "lshl_add_u32.cso"
+    program = uncompressed_export([
+        "s_lshl1_add_u32 s60, s44, s45",
+        "s_lshl2_add_u32 s61, s44, s45",
+        "s_lshl3_add_u32 s62, s44, s45",
+        "s_lshl4_add_u32 s63, s44, s45",
+        "v_mov_b32_e32 v12, s60",
+        "v_mov_b32_e32 v13, s61",
+        "v_mov_b32_e32 v14, s62",
+        "v_mov_b32_e32 v15, s63",
+    ])
+    source.write_text(lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                            integer_export=True), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    # Check normal shifted addition, shift-overflow wrap, and add-overflow wrap.
+    for name, inputs, words, status in (
+        ("oracle-mismatch", (3, 5), (11, 17, 29, 999), "mismatch"),
+        ("normal", (3, 5), (11, 17, 29, 53), "pass"),
+        ("shift-wrap", (0x80000001, 10), (12, 14, 18, 26), "pass"),
+        ("add-wrap", (1, 0xffffffff), (1, 3, 7, 15), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<2I", constants, 12, *inputs)
+        case = directory / f"lshl-add-u32-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+        cases.append((case, status))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+    # Check SCC carry-out across selective shift-overflow and add-overflow conditions.
+    scc_source = directory / "lshl_add_scc.hlsl"
+    scc_shader = directory / "lshl_add_scc.cso"
+    scc_program = uncompressed_export([
+        "s_lshl1_add_u32 s60, s44, s45",
+        "s_cselect_b32 s71, 1, 0",
+        "s_lshl2_add_u32 s61, s44, s45",
+        "s_cselect_b32 s72, 1, 0",
+        "s_lshl3_add_u32 s62, s44, s45",
+        "s_cselect_b32 s73, 1, 0",
+        "s_lshl4_add_u32 s63, s44, s45",
+        "s_cselect_b32 s74, 1, 0",
+        "v_mov_b32_e32 v12, s71",
+        "v_mov_b32_e32 v13, s72",
+        "v_mov_b32_e32 v14, s73",
+        "v_mov_b32_e32 v15, s74",
+    ])
+    scc_source.write_text(lower(scc_program, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                                integer_export=True), encoding="ascii")
+    compile_shader(compiler, scc_source, scc_shader)
+    scc_cases = []
+    for name, inputs, words, status in (
+        ("oracle-mismatch", (1, 1), (1, 0, 0, 0), "mismatch"),
+        ("none", (1, 1), (0, 0, 0, 0), "pass"),
+        ("carry-4", (0x10000000, 0), (0, 0, 0, 1), "pass"),
+        ("carry-3-4", (0x20000000, 0), (0, 0, 1, 1), "pass"),
+        ("carry-2-3-4", (0x40000000, 0), (0, 1, 1, 1), "pass"),
+        ("carry-all-shift", (0x80000000, 0), (1, 1, 1, 1), "pass"),
+        ("carry-all-add", (1, 0xfffffffe), (1, 1, 1, 1), "pass"),
+    ):
+        constants = bytearray(256)
+        struct.pack_into("<2I", constants, 12, *inputs)
+        case = directory / f"lshl-add-scc-{name}.case"
+        case.write_bytes(constants + struct.pack("<4I", *words) * 64 + b"\x01")
+        scc_cases.append((case, status))
+    run_pixel_batch(renderer, backend, scc_shader, scc_cases)
 
 
 # v_cvt_f32_u32_e32 and v_cvt_f32_i32_e32 convert one 32-bit word to binary32, reading it unsigned
@@ -6016,6 +6335,8 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_int_predicate_draws(directory, compiler, renderer, backend)
     check_sext_draw(directory, compiler, renderer, backend)
     check_scalar_pack_draw(directory, compiler, renderer, backend)
+    check_scalar_bit_count_draw(directory, compiler, renderer, backend)
+    check_scalar_mul_hi_draw(directory, compiler, renderer, backend)
     check_int16_predicate_draws(directory, compiler, renderer, backend)
     check_sdwa_predicate_draws(directory, compiler, renderer, backend)
     check_literal_fma_draw(directory, compiler, renderer, backend)
@@ -6086,6 +6407,7 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
     check_mad_draw(directory, compiler, renderer, backend)
+    check_mad_literal_draw(directory, compiler, renderer, backend)
     source.write_text(translate(scalar()), encoding="ascii")
     compile_shader(compiler, source, shader, ieee=False)
     for words in SCALAR_WORDS:
@@ -6137,6 +6459,43 @@ def check_sop1_scalar_ops_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"Mutating {label} escaped detection")
 
 
+def check_bfm_draw(directory, compiler, renderer, backend):
+    """s_bfm_b32 and s_bfm_b64 against the Python reference, then controls that must mismatch."""
+    source = directory / "bfm.hlsl"
+    shader = directory / "bfm.cso"
+    case = directory / "bfm.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    program = bfm_scalar_ops()
+    lowered = translate_int(program)
+
+    def write_words(words):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        expected = bfm_scalar_ops_reference(words)
+        write_case(case, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+
+    source.write_text(lowered, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    for words in BFM_WORDS:
+        write_words(words)
+        subprocess.run(draw, check=True)
+    # Controls on the generated HLSL: a narrower count mask and swapped count/offset. Words 1 and 4 distinguish both.
+    for old, new, label in (("(1u << (asuint(params[0].w) & 31u))", "(1u << (asuint(params[0].w) & 15u))", "b32 count mask"),
+                            ("((1u << (asuint(params[0].w) & 31u)) - 1u) << (asuint(params[1].x) & 31u)",
+                             "((1u << (asuint(params[1].x) & 31u)) - 1u) << (asuint(params[0].w) & 31u)", "b32 operand order")):
+        mutated = lowered.replace(old, new)
+        assert mutated != lowered, label
+        source.write_text(mutated, encoding="ascii")
+        compile_shader(compiler, source, shader)
+        mismatches = 0
+        for words in BFM_WORDS:
+            write_words(words)
+            wrong = subprocess.run(draw, capture_output=True, text=True)
+            mismatches += wrong.returncode == 1 and "pixel_mismatch" in wrong.stderr
+        if not mismatches:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+
 def check_e64_render(directory, compiler, renderer, backend):
     """The e64 draw cases on their own, so they run as a separate CTest entry per backend. A renderer that reports an
     unavailable adapter (exit 77) makes this a skip, as for the other pixel draws."""
@@ -6151,6 +6510,7 @@ def check_e64_render(directory, compiler, renderer, backend):
     check_nan_class_draw(directory, compiler, renderer, backend)
     check_integer_readback_draw(directory, compiler, renderer, backend)
     check_subrev_u32_draw(directory, compiler, renderer, backend)
+    check_lshl_add_u32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend)
     check_cvt_float_int_draw(directory, compiler, renderer, backend)
@@ -6165,11 +6525,12 @@ def main():
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc"):
+        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc", "draw-bfm"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
-                        "draw-integer-nc": check_integer_nc_draws}[mode]
+                        "draw-integer-nc": check_integer_nc_draws,
+                        "draw-bfm": check_bfm_draw}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):

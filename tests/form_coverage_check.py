@@ -272,7 +272,7 @@ def check_shader_records():
         ("SOP2", "s_andn2_b64"), ("SOP2", "s_orn2_b64"),
         ("SOP2", "s_nand_b64"), ("SOP2", "s_nor_b64"), ("SOP2", "s_xnor_b64"),
         ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
-        ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
+        ("SOP2", "s_bfm_b32"), ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
     }
     sopc_forms = {
         ("SOPC", "s_cmp_eq_i32"), ("SOPC", "s_cmp_lg_i32"),
@@ -296,10 +296,15 @@ def check_shader_records():
         ("VOP2", "v_mul_hi_i32_i24"), ("VOP3", "v_mul_hi_i32_i24_e64"),
         ("VOP2", "v_mul_hi_u32_u24"), ("VOP3", "v_mul_hi_u32_u24_e64"),
     }
+    sop2_lshl_add_forms = {
+        ("SOP2", "s_lshl1_add_u32"), ("SOP2", "s_lshl2_add_u32"),
+        ("SOP2", "s_lshl3_add_u32"), ("SOP2", "s_lshl4_add_u32"),
+    }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
-        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64", "s_bfm_b32",
+        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64",
         "v_mul_i32_i24_sdwa",
+        "s_lshl0_add_u32", "s_lshl5_add_u32",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
     for name in ("gfx1013.tsv", "rdna2.tsv"):
@@ -308,6 +313,7 @@ def check_shader_records():
         assert sopc_forms <= covered, (name, sopc_forms - covered)
         assert vop2_forms <= covered, (name, vop2_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
+        assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
     # Integer comparisons: e32 counts as VOPC and e64 as VOP3, for every 16- and 32-bit predicate the
     # translator lowers; the rejected exec-writing, 64-bit and f16 class neighbours stay out.
     int_compares = {f"v_cmp_{op}_{kind}" for op in ("eq", "ne", "lt", "le", "gt", "ge")

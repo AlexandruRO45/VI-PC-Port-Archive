@@ -20,11 +20,11 @@ Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to 
 
 The chart counts instruction forms exercised by passing source-built fixtures. The experiments above measure program outputs and package shader records.
 
-![Instruction forms exercised by the Windows fixtures at a46dac3](docs/coverage/dashboard.svg)
+![Instruction forms exercised by the latest published Windows CI fixtures](https://raw.githubusercontent.com/R0Y00/Xbox2Windows/refs/heads/coverage-dashboard/dashboard.svg)
 
-[Snapshot at `a46dac3`](https://github.com/R0Y00/Xbox2Windows/actions/runs/45002764202) · [Latest successful Windows runs on main](https://github.com/R0Y00/Xbox2Windows/actions/workflows/windows.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) · [Find forms without a passing fixture](CONTRIBUTING.md#share-a-reproducible-finding)
+Both Windows jobs on `main` must pass before CI publishes a new chart. The image shows the measured commit and run ID.
 
-To see a newer measurement, download `coverage-dashboard` from the run's **Artifacts** section.
+[Chart source commit and CI run](https://github.com/R0Y00/Xbox2Windows/tree/coverage-dashboard#instruction-coverage) · [Find forms without a passing fixture](CONTRIBUTING.md#share-a-reproducible-finding)
 
 ## Community and contributions
 
@@ -69,6 +69,8 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | Native, mapped and recompiled archive reader | `ctest --preset dev --no-tests=error -R '^cpu_native_archive_blast$' -V` |
 | Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
 | Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
+
+The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#repeated-memory-copies-in-the-control-flow-cpu-lifter). REP MOVSB/MOVSW/MOVSD/MOVSQ copy 1-, 2-, 4- and 8-byte elements.
 
 ### Tests by area
 

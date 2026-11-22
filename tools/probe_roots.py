@@ -19,7 +19,10 @@ from resource_inventory import parts
 PROJECT = Path(__file__).resolve().parents[1]
 
 XBOX_PREFIX = "xbox."
-CALL_SITE = re.compile(r'\bcall\b[^@\n]*@(?:"([^"]+)"|([\w.$-]+))\s*\(')
+CALL_SITE = re.compile(
+    r'^\s*(?:%(?:"[^"]+"|[\w.$-]+)\s*=\s*)?(?:(?:musttail|tail|notail)\s+)?'
+    r'call\b[^@\n]*@(?:"([^"]+)"|([\w.$-]+))\s*\('
+)
 DECLARATION = re.compile(r'^declare\b[^@\n]*@(?:"([^"]+)"|([\w.$-]+))\s*\(')
 XBOX_SYMBOL = re.compile(r"xbox\.[\w.$-]+")
 METADATA_STRING = re.compile(r'!"([^"]*)"')

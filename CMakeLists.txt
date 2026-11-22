@@ -531,6 +531,40 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_flag_conditions PROPERTIES
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_flag_conditions.txt")
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
+    cpu_asm_fixture(cpu_switch_strings switch_strings)
+    cpu_asm_fixture(cpu_string_probe string_probe)
+    set(switch_strings_source "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_lifted.cpp")
+    add_custom_command(OUTPUT "${switch_strings_source}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/switch_strings_check.py"
+            emit "$<TARGET_FILE:cpu_switch_strings>" "${switch_strings_source}"
+        DEPENDS cpu_switch_strings tests/cpu/switch_strings_check.py tools/cpu_switch_aot.py
+            tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_switch_strings_lifted SHARED "${switch_strings_source}")
+    set(switch_strings_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_lifted_o2.dll")
+    add_custom_command(OUTPUT "${switch_strings_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${switch_strings_source}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_lifted_o2.obj" "/Fe${switch_strings_o2}"
+        DEPENDS "${switch_strings_source}" VERBATIM)
+    add_custom_target(cpu_switch_strings_lifted_o2 ALL DEPENDS "${switch_strings_o2}")
+    set(switch_strings_mutants "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_mutants.cpp")
+    add_custom_command(OUTPUT "${switch_strings_mutants}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/switch_strings_check.py"
+            mutants "$<TARGET_FILE:cpu_switch_strings>" "${switch_strings_mutants}"
+        DEPENDS cpu_switch_strings tests/cpu/switch_strings_check.py tools/cpu_switch_aot.py
+            tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    set(switch_strings_mutants_dll "${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_mutants.dll")
+    add_custom_command(OUTPUT "${switch_strings_mutants_dll}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${switch_strings_mutants}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_switch_strings_mutants.obj" "/Fe${switch_strings_mutants_dll}"
+        DEPENDS "${switch_strings_mutants}" VERBATIM)
+    add_custom_target(cpu_switch_strings_mutants ALL DEPENDS "${switch_strings_mutants_dll}")
+    add_test(NAME cpu_aot_switch_strings COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_strings_check.py" check "$<TARGET_FILE:cpu_string_probe>"
+        "$<TARGET_FILE:cpu_guarded_call>" "$<TARGET_FILE:cpu_switch_strings>"
+        "$<TARGET_FILE:cpu_switch_strings_lifted>" "${switch_strings_o2}"
+        "${switch_strings_mutants_dll}")
+    set_tests_properties(cpu_aot_switch_strings PROPERTIES TIMEOUT 60
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_switch_strings.txt")
     cpu_translation(cpu_switch_addr32 cpu_switch_aot lea_wrap,lea_back,load_back,store_ahead)
     add_test(NAME cpu_aot_switch_addr32 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_addr32_check.py" "$<TARGET_FILE:cpu_switch_addr32>"
@@ -682,7 +716,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "op_pextrd_reg,op_pextrd_mem,op_pextrq_reg,op_pextrq_mem,"
         "op_pinsrb_reg,op_pinsrb_mem,op_pinsrw_reg,op_pinsrw_mem,"
         "op_pinsrd_reg,op_pinsrd_mem,op_pinsrq_reg,op_pinsrq_mem,"
-        "op_zeroupper,op_zeroall,op_pipeline,op_movdqu_copy128,op_mov_store32,op_movdqu_regcopy,op_movdqu_store128")
+        "op_zeroupper,op_zeroall,op_pipeline,op_movdqu_copy128,op_mov_store32,op_movdqu_regcopy,op_movdqu_store128,"
+        "op_palignr_69,op_mpsadbw_6,op_pshuflw_1b,op_psllq_imm_129,op_pextrw_reg_2,op_pextrd_reg_2,"
+        "op_pinsrb_reg_upper,op_pinsrw_reg_3,op_zeroupper_ymm1,op_movdqu_load128")
     string(CONCAT cpu_avx_int_exports ${cpu_avx_int_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_avx_int_regs_${variant} avx_int_regs)
@@ -2012,18 +2048,26 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_tls_value COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_tls_value_check.py" "$<TARGET_FILE:cpu_tls_value>"
         "$<TARGET_FILE:cpu_tls_original>" "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:pe_map>")
+    # Provider variant that starts a ready worker inside mix_args; the control installs it as cpu_import_provider.dll.
+    add_library(cpu_import_live SHARED tests/cpu/import_provider.cpp tests/cpu/named_provider.def)
+    target_compile_definitions(cpu_import_live PRIVATE LIVE_WORKER)
+    target_link_libraries(cpu_import_live PRIVATE cpu_exe_io)
+    # Simulation control: finish_exe never terminates; the control installs it as cpu_exe_io.dll.
+    add_library(cpu_exe_io_hang SHARED tests/cpu/exe_io.cpp)
+    target_compile_definitions(cpu_exe_io_hang PRIVATE FINISH_HANG)
     foreach(variant IN ITEMS original no_tls)
-        add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm)
+        add_executable(cpu_exe_start_${variant} tests/cpu/exe_start.asm tests/cpu/exe_startup.asm)
         set_target_properties(cpu_exe_start_${variant} PROPERTIES LINKER_LANGUAGE CXX)
-        target_link_options(cpu_exe_start_${variant} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
-            /DYNAMICBASE /INCREMENTAL:NO)
-        target_link_libraries(cpu_exe_start_${variant} PRIVATE cpu_import_provider)
+        target_link_options(cpu_exe_start_${variant} PRIVATE /ENTRY:native_startup /EXPORT:native_entry
+            /EXPORT:body_status,DATA /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_exe_start_${variant} PRIVATE cpu_import_provider cpu_exe_io)
     endforeach()
     target_compile_definitions(cpu_exe_start_no_tls PRIVATE NO_TLS)
     add_test(NAME cpu_native_exe_start COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_start_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_start_original>" "$<TARGET_FILE:cpu_exe_start_no_tls>"
-        "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>")
+        "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_import_altered>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_live>" "$<TARGET_FILE:cpu_exe_io_hang>")
     foreach(variant IN ITEMS original returning no_worker)
         add_executable(cpu_exe_worker_alive_${variant} tests/cpu/worker_alive_entry.asm)
         set_target_properties(cpu_exe_worker_alive_${variant} PROPERTIES LINKER_LANGUAGE CXX)
@@ -2239,6 +2283,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-blend-scalar "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_blend_scalar_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_bfm_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-bfm "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_bfm_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_e64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-e64 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

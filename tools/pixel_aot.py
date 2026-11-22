@@ -416,6 +416,19 @@ SALU_BIT64 = {
     "xnor": "uint2(~({0} ^ {2}), ~({1} ^ {3}))",
 }
 SALU_HELPERS = {
+    "scalar_mul_hi": """uint mul_hi_u32(uint a, uint b) {
+    // Carry the low halfword product into the two cross products.
+    uint low_a = a & 0xffffu;
+    uint low_b = b & 0xffffu;
+    uint middle = (a >> 16) * low_b + ((low_a * low_b) >> 16);
+    return (a >> 16) * (b >> 16) + (middle >> 16)
+         + (((middle & 0xffffu) + low_a * (b >> 16)) >> 16);
+}
+uint mul_hi_i32(uint a, uint b) {
+    // Reinterpreting either operand as signed subtracts its partner from the high word.
+    return mul_hi_u32(a, b) - ((a >> 31) != 0u ? b : 0u) - ((b >> 31) != 0u ? a : 0u);
+}
+""",
     "s_lshl_b64": (
         "uint2 s_lshl_b64(uint2 v, uint s) {\n"
         "    s &= 63u;\n"
@@ -803,6 +816,10 @@ def lane_mask(token):
 # {r} names the result. Shift counts use their low five bits; signed overflow sets SCC for _i32 add/sub.
 NONZERO = "{r} != 0u"
 SCALAR = {
+    "bcnt0_i32_b32": (1, "32u - countbits({0})", NONZERO),
+    "bcnt1_i32_b32": (1, "countbits({0})", NONZERO),
+    "mul_hi_u32": (2, "mul_hi_u32({0}, {1})", None),
+    "mul_hi_i32": (2, "mul_hi_i32({0}, {1})", None),
     "pack_ll_b32_b16": (2, "({0} & 0xffffu) | ({1} << 16)", None),
     "pack_lh_b32_b16": (2, "({0} & 0xffffu) | ({1} & 0xffff0000u)", None),
     "pack_hh_b32_b16": (2, "({0} >> 16) | ({1} & 0xffff0000u)", None),
@@ -821,8 +838,14 @@ SCALAR = {
     "orn2_b32": (2, "{0} | ~{1}", NONZERO), "not_b32": (1, "~{0}", NONZERO),
     "nand_b32": (2, "~({0} & {1})", NONZERO), "nor_b32": (2, "~({0} | {1})", NONZERO),
     "xnor_b32": (2, "~({0} ^ {1})", NONZERO),
+    # SCC is not written. Both counts are masked to five bits, so every shift stays below 32.
+    "bfm_b32": (2, "((1u << ({0} & 31u)) - 1u) << ({1} & 31u)", None),
     "lshl_b32": (2, "{0} << ({1} & 31u)", NONZERO), "lshr_b32": (2, "{0} >> ({1} & 31u)", NONZERO),
     "ashr_i32": (2, "asuint(asint({0}) >> ({1} & 31u))", NONZERO),
+    "lshl1_add_u32": (2, "({0} << 1u) + {1}", "({0} >> 31u != 0u) || ({r} < {1})"),
+    "lshl2_add_u32": (2, "({0} << 2u) + {1}", "({0} >> 30u != 0u) || ({r} < {1})"),
+    "lshl3_add_u32": (2, "({0} << 3u) + {1}", "({0} >> 29u != 0u) || ({r} < {1})"),
+    "lshl4_add_u32": (2, "({0} << 4u) + {1}", "({0} >> 28u != 0u) || ({r} < {1})"),
 }
 
 
@@ -1523,6 +1546,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError("Invalid movk immediate")
                 val = (val if val < 0x8000 else val - 0x10000) & 0xffffffff
             scalar[dst] = val
+        elif m := match(r"s_bcnt([01])_i32_b64 (s\d+), ([^,]+)"):
+            bit, dst, src = m.groups()
+            sgpr_name(dst)
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            lo, hi = scalar_u64(src, scalar, pending)
+            ones = f"(countbits({lo}) + countbits({hi}))"
+            value = f"64u - {ones}" if bit == "0" else ones
+            lines.append(f"    uint salu{i} = {value};")
+            scalar[dst] = ("uint", f"salu{i}")
+            scc = NONZERO.format(r=f"salu{i}")
         elif m := match(rf"s_({'|'.join(SCALAR)}) (s\d+), (.+)"):
             # Uniform values become HLSL uint locals; an exec mask does not affect them.
             op, dst, operands = m.groups()
@@ -1533,6 +1567,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Write overlaps an outstanding scalar load")
             if len(tokens) != arity:
                 raise ValueError("Invalid scalar operation")
+            if op in ("mul_hi_u32", "mul_hi_i32"):
+                helpers.add("scalar_mul_hi")
             values = [scalar_u32(t, scalar, pending) for t in tokens]
             lines.append(f"    uint salu{i} = {template.format(*values)};")
             if carry:
@@ -1699,16 +1735,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
                 sample_dest[f"v{n}"] = samples
-        elif m := match(r"v_(fmaak|fmamk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+        elif m := match(r"v_(fmaak|fmamk|madak|madmk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+            # The mad forms use the unfused, denormal-flushing helper; the fma forms are fused.
             op, dst, *tokens = m.groups()
-            literal = tokens[2] if op == "fmaak" else tokens[1]
+            literal = tokens[2] if op.endswith("ak") else tokens[1]
             if mask != "entry" or not re.fullmatch(r"0x[0-9a-f]{1,8}", literal):
                 raise ValueError("Invalid literal multiply-add")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
             vector[dst] = f"alu{i}"
-            lines.append(f"    precise float alu{i} = {ALU['fma'][1].format(*values)};")
+            lines.append(f"    precise float alu{i} = {ALU['fma' if op.startswith('fma') else 'mad'][1].format(*values)};")
         elif m := match(r"v_mov_b32_sdwa (v\d+), (sext\()?([vs]\d+|-?\d+(?:\.\d+)?)(\))? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
             dst, sext, src, close, dst_sel, unused, src_sel = m.groups()
             if mask != "entry" or bool(sext) != bool(close):
