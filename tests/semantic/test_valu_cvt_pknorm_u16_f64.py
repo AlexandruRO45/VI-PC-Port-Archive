@@ -458,5 +458,180 @@ class TestValuCvtPknormU16F64AST(unittest.TestCase):
         self.assertEqual(prog.disassemble(), expected)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclasses.dataclass
+class ScalarMachineState:
+    """Architectural register file state for a single lane."""
+    vgprs: list[int] = dataclasses.field(default_factory=lambda: [0] * 256)
+    sgprs: list[int] = dataclasses.field(default_factory=lambda: [0] * 256)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & MASK32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+    def get_vgpr_pair(self, index: int) -> int:
+        return join_dwords(self.vgprs[index], self.vgprs[index + 1])
+
+    def set_vgpr_pair(self, index: int, val64: int) -> None:
+        lo, hi = split_dwords(val64)
+        self.vgprs[index] = lo
+        self.vgprs[index + 1] = hi
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK32
+
+    def get_sgpr_pair(self, index: int) -> int:
+        return join_dwords(self.sgprs[index], self.sgprs[index + 1])
+
+    def set_sgpr_pair(self, index: int, val64: int) -> None:
+        lo, hi = split_dwords(val64)
+        self.sgprs[index] = lo
+        self.sgprs[index + 1] = hi
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_cvt_pknorm_u16_f64."""
+
+    def resolve_operand_64(self, op: VOP3Operand64, state: ScalarMachineState) -> int:
+        if isinstance(op.source, Reg):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr_pair(op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr_pair(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal64):
+            return op.source.bits & MASK64
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VCvtPknormU16F64Instruction, state: ScalarMachineState) -> int:
+        # Atomic operand fetch phase
+        s0_raw = self.resolve_operand_64(instr.src0, state)
+        s1_raw = self.resolve_operand_64(instr.src1, state)
+
+        # Computation phase via architectural oracle
+        result = oracle_v_cvt_pknorm_u16_f64(
+            src0_bits=s0_raw,
+            src1_bits=s1_raw,
+            abs0=instr.src0.abs_mod,
+            neg0=instr.src0.neg_mod,
+            abs1=instr.src1.abs_mod,
+            neg1=instr.src1.neg_mod,
+        )
+
+        # Atomic write-back phase
+        state.set_vgpr(instr.dst.index, result)
+        return result
+
+    def run_program(self, program: Program, state: ScalarMachineState) -> list[int]:
+        results: list[int] = []
+        for instr in program.instructions:
+            results.append(self.step(instr, state))
+        return results
+
+
+class TestValuCvtPknormU16F64ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_basic_step_vgprs(self) -> None:
+        self.state.set_vgpr_pair(2, POS_ONE_F64)
+        self.state.set_vgpr_pair(4, HALF_F64)
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(4, RegType.VGPR, is_double=True)),
+        )
+        res = self.interp.step(instr, self.state)
+        # S0: 1.0 -> 0xFFFF; S1: 0.5 -> 32768
+        expected = (32768 << 16) | 0xFFFF
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_vgpr(0), expected)
+
+    def test_step_with_sgpr_and_literal(self) -> None:
+        self.state.set_sgpr_pair(2, QUARTER_F64)
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(1, RegType.VGPR),
+            src0=VOP3Operand64(Reg(2, RegType.SGPR, is_double=True)),
+            src1=VOP3Operand64(Literal64.from_f64(1.0)),
+        )
+        res = self.interp.step(instr, self.state)
+        # S0: 0.25 -> 16384; S1: 1.0 -> 0xFFFF
+        expected = (0xFFFF << 16) | 16384
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_vgpr(1), expected)
+
+    def test_step_with_modifiers(self) -> None:
+        self.state.set_vgpr_pair(2, NEG_QUARTER_F64)
+        self.state.set_vgpr_pair(4, HALF_F64)
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True), abs_mod=True),
+            src1=VOP3Operand64(Reg(4, RegType.VGPR, is_double=True), neg_mod=True),
+        )
+        res = self.interp.step(instr, self.state)
+        # S0: |-0.25| = 0.25 -> 16384; S1: -0.5 -> 0
+        expected = (0 << 16) | 16384
+        self.assertEqual(res, expected)
+        self.assertEqual(self.state.get_vgpr(0), expected)
+
+    def test_full_32bit_destination_overwrite(self) -> None:
+        self.state.set_vgpr(7, 0xDEADBEEF)
+        self.state.set_vgpr_pair(2, POS_ZERO_F64)
+        self.state.set_vgpr_pair(4, POS_ZERO_F64)
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(7, RegType.VGPR),
+            src0=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(4, RegType.VGPR, is_double=True)),
+        )
+        res = self.interp.step(instr, self.state)
+        self.assertEqual(res, 0x00000000)
+        self.assertEqual(self.state.get_vgpr(7), 0x00000000)
+
+    def test_deterministic_repeatability(self) -> None:
+        self.state.set_vgpr_pair(2, HALF_F64)
+        self.state.set_vgpr_pair(4, QUARTER_F64)
+        instr = VCvtPknormU16F64Instruction(
+            dst=Reg(6, RegType.VGPR),
+            src0=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(4, RegType.VGPR, is_double=True)),
+        )
+        res0 = self.interp.step(instr, self.state)
+        for _ in range(50):
+            res_n = self.interp.step(instr, self.state)
+            self.assertEqual(res0, res_n)
+
+    def test_run_program_sequential(self) -> None:
+        prog = Program()
+        self.state.set_vgpr_pair(2, POS_ONE_F64)
+        self.state.set_vgpr_pair(4, HALF_F64)
+        prog.append(VCvtPknormU16F64Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(4, RegType.VGPR, is_double=True)),
+        ))
+        prog.append(VCvtPknormU16F64Instruction(
+            dst=Reg(1, RegType.VGPR),
+            src0=VOP3Operand64(Reg(4, RegType.VGPR, is_double=True)),
+            src1=VOP3Operand64(Reg(2, RegType.VGPR, is_double=True)),
+        ))
+        results = self.interp.run_program(prog, self.state)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], (32768 << 16) | 0xFFFF)
+        self.assertEqual(results[1], (0xFFFF << 16) | 32768)
+
+
 if __name__ == "__main__":
     unittest.main()
