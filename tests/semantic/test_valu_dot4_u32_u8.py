@@ -908,5 +908,126 @@ class TestValuDot4U32U8IEEE754Boundaries(unittest.TestCase):
                 self.assertEqual(ref_dot4_u32_u8(w0, w1, 0), expected)
 
 
+class TestValuDot4U32U8NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_syntax_rejection_invalid_types(self) -> None:
+        # dst cannot be SGPR or literal
+        with self.assertRaises(TypeError):
+            VDot4U32U8Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+            )
+        with self.assertRaises(TypeError):
+            VDot4U32U8Instruction(
+                dst=Operand.literal(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+            )
+        # clamp is unsupported
+        with self.assertRaises(ValueError):
+            VDot4U32U8Instruction(
+                dst=Operand.vgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+                clamp=True,
+            )
+
+    def test_mutation_signed_byte_product_detected(self) -> None:
+        """Mutant: interprets bytes as signed int8 instead of unsigned uint8."""
+        def mutant_dot4(s0: int, s1: int, s2: int = 0) -> int:
+            b = unpack_u8(s0)
+            c = unpack_u8(s1)
+            dot = 0
+            for i in range(4):
+                sb = b[i] - 256 if b[i] >= 128 else b[i]
+                sc = c[i] - 256 if c[i] >= 128 else c[i]
+                dot += sb * sc
+            return ((s2 & MASK32) + dot) & MASK32
+
+        oracle_res = ref_dot4_u32_u8(0x000000FF, 0x00000001, 0)
+        mutant_res = mutant_dot4(0x000000FF, 0x00000001, 0)
+        self.assertEqual(oracle_res, 255)
+        self.assertEqual(mutant_res, 0xFFFF_FFFF)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_omitted_accumulator_detected(self) -> None:
+        """Mutant: forgets to add src2 accumulator."""
+        def mutant_dot4(s0: int, s1: int, s2: int = 0) -> int:
+            b = unpack_u8(s0)
+            c = unpack_u8(s1)
+            dot = sum(b[i] * c[i] for i in range(4))
+            return dot & MASK32
+
+        s0 = 0x01020304
+        s1 = 0x05060708
+        s2 = 1000
+        oracle_res = ref_dot4_u32_u8(s0, s1, s2)
+        mutant_res = mutant_dot4(s0, s1, s2)
+        self.assertEqual(oracle_res, 1070)
+        self.assertEqual(mutant_res, 70)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_byte_shift_stride_error_detected(self) -> None:
+        """Mutant: shifts byte 3 by 32 instead of 24."""
+        def mutant_unpack(dword: int) -> Tuple[int, int, int, int]:
+            return (
+                dword & 0xFF,
+                (dword >> 8) & 0xFF,
+                (dword >> 16) & 0xFF,
+                (dword >> 32) & 0xFF,
+            )
+
+        s = 0xFF000000
+        oracle_b = unpack_u8(s)
+        mutant_b = mutant_unpack(s)
+        self.assertEqual(oracle_b[3], 255)
+        self.assertEqual(mutant_b[3], 0)
+        self.assertNotEqual(oracle_b, mutant_b)
+
+    def test_mutation_ignore_simd_exec_mask_detected(self) -> None:
+        """Mutant: SIMD interpreter overwrites inactive lanes ignoring EXEC mask."""
+        sentinel = 0xCAFEBABE
+        state = SIMDState(num_lanes=32, exec_mask=0x00000000)
+        for lane in range(32):
+            state.write_lane(Operand.vgpr(0), lane, sentinel)
+
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VDot4U32U8Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    # Bug: no exec mask check
+                    res = ref_dot4_u32_u8(1, 1, 0)
+                    state.write_lane(instr.dst, lane, res)
+                    results.append(res)
+                return results
+
+        buggy = BuggySIMDInterpreter()
+        instr = VDot4U32U8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.literal(1),
+            src1=Operand.literal(1),
+            src2=Operand.literal(0),
+        )
+        buggy.step(instr, state)
+
+        corrupted = [lane for lane in range(32) if state.read_lane(Operand.vgpr(0), lane) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
