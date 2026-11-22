@@ -6962,6 +6962,26 @@ class Gen:
             self.emit(f"{s} = OpUMulExtended %umul {x} {y}")
             self.emit(f"{r} = OpCompositeExtract %uint {s} 1")
             self.dst(a[0], r)
+        elif op == "v_sat_pk_u8_i16":
+            # D = {sat8(S0.i16[31:16]) << 8 | sat8(S0.i16[15:0])}: each signed 16-bit half clamped to [0, 255], the high
+            # byte of the result from the high half of S0. Bits 31:16 of D are written as zero (measured on gfx1036:
+            # a preloaded 0xdeadbeef destination comes back 0x0000hhll). The VOP3 form has no clamp or op_sel (the
+            # assembler refuses both), so nothing but the plain operands is modelled.
+            if "clamp" in mods or any(m.startswith("op_sel") for m in mods):
+                raise Unsupported(op + " modifiers")
+            x = self.src_u(a[1])
+            halves = []
+            for off in (0, 16):
+                sx, cl, raw = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{sx} = OpBitFieldSExtract %uint {x} {self.cu(off)} {self.cu(16)}")
+                self.emit(f"{cl} = OpExtInst %int %glsl SClamp {self.as_int(sx)} {self.as_int(self.cu(0))} "
+                          f"{self.as_int(self.cu(255))}")
+                self.emit(f"{raw} = OpBitcast %uint {cl}")
+                halves.append(raw)
+            sh, r = self.tmp(), self.tmp()
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {halves[1]} {self.cu(8)}")
+            self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {sh}")
+            self.dst(a[0], r)
         elif op in ("v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32"):
             # D = {sat16(S1), sat16(S0)} (RDNA ISA pseudocode: u32_to_u16 / i32_to_i16 saturate): the low half from
             # S0, the high half from S1; u16 clamps to [0, 0xFFFF], i16 to [-32768, 32767]. The whole dword is
