@@ -287,8 +287,8 @@ int main() {
     if (!create_factory2 || create_factory2(0, __uuidof(IDXGIFactory4), nullptr) != DXGI_ERROR_INVALID_CALL)
         return fail("CreateDXGIFactory2 null out argument check");
 
-    IUnknown* parent = reinterpret_cast<IUnknown*>(0x1);
-    if (factory->GetParent(__uuidof(IUnknown), reinterpret_cast<void**>(&parent)) != E_NOINTERFACE || parent != nullptr)
+    IUnknown* factory_parent = reinterpret_cast<IUnknown*>(0x1);
+    if (factory->GetParent(__uuidof(IUnknown), reinterpret_cast<void**>(&factory_parent)) != E_NOINTERFACE || factory_parent != nullptr)
         return fail("IDXGIFactory::GetParent must return E_NOINTERFACE and null *out");
 
     D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
