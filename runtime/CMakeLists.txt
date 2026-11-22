@@ -4,6 +4,13 @@ project(gta6rt LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# The sources are UTF-8 (comments use →, ×, …). Without /utf-8, MSVC reads them in the system code page and reports
+# C4819 (936, 1252, ...) or misreads a literal. Set it for every target here, so a new target can't miss it; the
+# per-target /utf-8 flags below are now redundant but harmless.
+if(MSVC)
+  add_compile_options(/utf-8)
+endif()
+
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "gta6rt must be built for x64 (run from an x64 Native Tools prompt or vcvars64.bat)")
 endif()
