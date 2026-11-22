@@ -61,9 +61,48 @@ if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNO
 $bat = Join-Path $out "_build.cmd"
 "@echo off`r`nset `"PATH=$installer;%PATH%`"`r`ncall `"$vcvars`" >nul || exit /b 1`r`n$body" | Set-Content -Encoding ascii $bat
 
-$p = Start-Process cmd.exe -ArgumentList "/c", "`"$bat`"" -NoNewWindow -PassThru
+# -NoNewWindow attaches cmd/cmake to the parent console, so "Configuring done" / ninja status paint
+# over make_game.py's LEONIDA board. Hidden + file redirects keep the console clean; we then emit the
+# logs on our stdout so the board's pipe capture still sees them.
+$stdoutLog = Join-Path $out "_build.stdout.log"
+$stderrLog = Join-Path $out "_build.stderr.log"
+foreach ($log in @($stdoutLog, $stderrLog)) {
+    if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -Force }
+}
+$p = Start-Process -FilePath cmd.exe -ArgumentList "/c", "`"$bat`"" -PassThru `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput $stdoutLog `
+    -RedirectStandardError $stderrLog
 $null = $p.Handle  # keeps the exit code readable after WaitForExit
 try { $p.PriorityClass = "BelowNormal" } catch {}
-$p.WaitForExit()
+
+function Emit-NewLogLines {
+    param([ref]$Offset, [string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::ReadWrite)
+    try {
+        if ($fs.Length -lt $Offset.Value) { $Offset.Value = 0 }
+        [void]$fs.Seek($Offset.Value, [System.IO.SeekOrigin]::Begin)
+        $sr = New-Object System.IO.StreamReader($fs)
+        while (($line = $sr.ReadLine()) -ne $null) {
+            Write-Output $line
+        }
+        # Keep a partial trailing line for the next poll (ReadLine consumed only complete lines).
+        $Offset.Value = $fs.Position
+    } finally {
+        $fs.Dispose()
+    }
+}
+
+$outOff = 0
+$errOff = 0
+while (-not $p.HasExited) {
+    Emit-NewLogLines -Offset ([ref]$outOff) -Path $stdoutLog
+    Emit-NewLogLines -Offset ([ref]$errOff) -Path $stderrLog
+    Start-Sleep -Milliseconds 150
+}
+Emit-NewLogLines -Offset ([ref]$outOff) -Path $stdoutLog
+Emit-NewLogLines -Offset ([ref]$errOff) -Path $stderrLog
 if ($p.ExitCode -ne 0) { throw "build failed ($($p.ExitCode))" }
-Write-Host "built $out\gta6rt.exe"
+Write-Output "built $out\gta6rt.exe"

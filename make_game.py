@@ -33,6 +33,10 @@ rpf9dump; a solo assets run still lets rpf9dump use every core.
 
 Long steps log percent and a rough ETA (shader translation shards, asset exports, XMA decode, and overall
 weighted stage completion while they overlap).
+
+On an interactive terminal, a LEONIDA setup screen asks for --jobs and whether to overlap stages, then a
+key-switchable per-stage log view (1-4 / Tab) keeps parallel output demuxed; full logs land in <work>/logs/.
+Pass --no-tui (or redirect stdout) for the plain interleaved console.
 """
 import argparse
 import functools
@@ -54,6 +58,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
+import leonida_tui  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
 STAGES = ["check", "shaders", "assets", "runtime", "pipelines"]
@@ -73,10 +78,23 @@ MODEL_ARCHIVES = [
 
 
 def log(msg: str) -> None:
-    print(f"{time.strftime('%H:%M:%S')}  {msg}", flush=True)
+    line = f"{time.strftime('%H:%M:%S')}  {msg}"
+    board = leonida_tui.current_board()
+    if board is not None:
+        board.write(leonida_tui.current_stage(), line)
+        return
+    print(line, flush=True)
 
 
 def fail(msg: str) -> "None":
+    board = leonida_tui.current_board()
+    if board is not None:
+        stage = leonida_tui.current_stage()
+        board.write(stage, f"ERROR: {msg}")
+        if stage:
+            board.set_status(stage, "failed")
+        # Do not print through the board's stderr proxy (would duplicate into the pane).
+        sys.exit(1)
     print(f"\nERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -152,7 +170,15 @@ class StageBoard:
         self._t0 = time.monotonic()
         self._lock = threading.Lock()
         if self.weights:
-            log(f"build: 0% · waiting on {', '.join(self.weights)}")
+            self._announce(f"build: 0% · waiting on {', '.join(self.weights)}")
+
+    def _announce(self, text: str) -> None:
+        board = leonida_tui.current_board()
+        if board is not None:
+            board.set_summary(text)
+            board.note(text)
+        else:
+            log(text)
 
     def complete(self, name: str) -> None:
         with self._lock:
@@ -171,7 +197,7 @@ class StageBoard:
             else:
                 eta = ""
             rest = f" · still {', '.join(left)}" if left else ""
-            log(f"build: {pct}% · {name} done{rest}{eta}")
+            self._announce(f"build: {pct}% · {name} done{rest}{eta}")
 
 
 def below_normal() -> None:
@@ -190,6 +216,23 @@ def below_normal() -> None:
 
 def run(args: list, hint: str = "", **kw) -> None:
     log("  " + " ".join(os.path.basename(str(a)) if i == 0 else str(a) for i, a in enumerate(args)))
+    board = leonida_tui.current_board()
+    # Capture into the stage pane when the LEONIDA board is up and the caller did not set its own pipes.
+    if (board is not None and kw.get("stdout") is None and kw.get("stderr") is None
+            and not kw.get("capture_output")):
+        cmd = [str(a) for a in args]
+        capture = leonida_tui.capture_popen_kwargs()
+        # Caller flags (cwd, env, …) merge in; capture owns the stdio / console-detach bits.
+        extra = {k: v for k, v in kw.items()
+                 if k not in ("stdout", "stderr", "capture_output", "text",
+                              "universal_newlines", "encoding", "errors", "creationflags")}
+        if "creationflags" in kw and os.name == "nt":
+            capture["creationflags"] = capture.get("creationflags", 0) | int(kw["creationflags"])
+        proc = subprocess.Popen(cmd, **capture, **extra)
+        code = leonida_tui.pump_process(proc, leonida_tui.current_stage(), board)
+        if code != 0:
+            fail(f"{os.path.basename(str(args[0]))} exited with {code}" + (f". {hint}" if hint else ""))
+        return
     r = subprocess.run([str(a) for a in args], **kw)
     if r.returncode != 0:
         fail(f"{os.path.basename(str(args[0]))} exited with {r.returncode}" + (f". {hint}" if hint else ""))
@@ -998,9 +1041,18 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         which = f"0..{jobs - 1}" if len(todo) == jobs else ",".join(str(i) for i in todo)
         log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{jobs}" + "".join(" " + e for e in extra))
     # --no-asm: keep only the .spv modules; the .spvasm text would add ~35 GB for the corpus
+    board = leonida_tui.current_board()
+    stage = leonida_tui.current_stage()
+    popen_kw = leonida_tui.capture_popen_kwargs() if board is not None else {}
     procs = {i: subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}",
-                                  "--no-asm", *extra])
+                                  "--no-asm", *extra], **popen_kw)
              for i in todo}
+    pumps = {}
+    if board is not None:
+        for i, p in procs.items():
+            t = threading.Thread(target=leonida_tui.pump_process, args=(p, stage, board), daemon=True)
+            pumps[i] = t
+            t.start()
     progress = Progress("shaders: translate", jobs, every_s=10.0)
     progress.set(jobs - len(todo), force=True)
     bad = []
@@ -1010,6 +1062,10 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
             if code is None:
                 continue
             del procs[i]
+            if i in pumps:
+                pumps[i].join(timeout=30)
+                del pumps[i]
+            # When pumping, pump_process already waited; poll still returns the code.
             if code != 0:
                 bad.append(f"shard {i} exited with {code}")
             progress.tick(force=True)
@@ -1022,14 +1078,17 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
 
 # ---------------------------------------------------------------- assets
 def rpf9dump(work: str) -> str:
-    exe = os.path.join(work, "tools", "rpf9dump", "rpf9dump.exe" if os.name == "nt" else "rpf9dump")
+    # Build under the repo, not --work: a remote or locked -o path can make dotnet fail copying
+    # RpfPreview.Core.dll (MSB3027).
+    out_dir = os.path.join(ROOT, "tools", "rpf9dump", "bin", "Release", "net8.0")
+    exe = os.path.join(out_dir, "rpf9dump.exe" if os.name == "nt" else "rpf9dump")
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if not os.path.isdir(core):
         fail("third_party/rpf9-explorer is empty. Run: git submodule update --init")
     need("dotnet", "Install the .NET 8 SDK.")
     log("assets: building rpf9dump")
     run(["dotnet", "build", os.path.join(TOOLS, "rpf9dump", "rpf9dump.csproj"), "-c", "Release",
-         "-o", os.path.dirname(exe), "--nologo", "-v", "q"])
+         "-o", out_dir, "--nologo", "-v", "q"])
     return exe
 
 
@@ -1356,36 +1415,63 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
     log("pipelines: done")
 
 
-def _invoke_stage(fn) -> None:
-    """Run a stage in a worker thread. fail() uses sys.exit; turn that into an exception the pool can collect
-    so siblings can finish before the process stops."""
-    try:
-        fn()
-    except SystemExit as e:
-        if e.code in (0, None):
-            return
-        raise RuntimeError(f"stage exited with {e.code}") from e
+def _invoke_stage(name: str, fn) -> None:
+    """Run a stage (optionally on a worker thread). fail() uses sys.exit; turn that into an exception the pool
+    can collect so siblings can finish before the process stops."""
+    with leonida_tui.stage_scope(name):
+        try:
+            fn()
+        except SystemExit as e:
+            if e.code in (0, None):
+                return
+            raise RuntimeError(f"stage exited with {e.code}") from e
 
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
                      runtime_build: str | None, emulate: bool, keep_emulated: bool,
-                     fallbacks: tuple[str, ...]) -> None:
-    """Run independent stages together after check. pipelines starts once shaders (if selected) and
-    vk_pipeline_check are ready, so it can overlap a still-running assets stage."""
+                     fallbacks: tuple[str, ...], overlap: bool = True) -> None:
+    """Run build stages after check. With overlap=True (default), shaders/assets/runtime share the machine and
+    pipelines starts once shaders and vk_pipeline_check are ready. With overlap=False, stages run in order."""
     cpu_heavy = [s for s in ("shaders", "assets") if s in stages]
-    split = max(1, jobs // len(cpu_heavy)) if len(cpu_heavy) > 1 else jobs
-    dump_jobs = split if len(cpu_heavy) > 1 and "assets" in stages else None
-    shader_jobs = split if len(cpu_heavy) > 1 and "shaders" in stages else jobs
-    board = StageBoard([s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages])
+    split = max(1, jobs // len(cpu_heavy)) if (overlap and len(cpu_heavy) > 1) else jobs
+    dump_jobs = split if (overlap and len(cpu_heavy) > 1 and "assets" in stages) else None
+    shader_jobs = split if (overlap and len(cpu_heavy) > 1 and "shaders" in stages) else jobs
+    progress = StageBoard([s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages])
 
-    work_items: list[tuple[str, object]] = []
-    if "shaders" in stages:
-        work_items.append(("shaders", lambda: shaders(
-            game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)))
-    if "assets" in stages:
-        work_items.append(("assets", lambda: assets(game, work, wav, jobs, dump_jobs=dump_jobs)))
-    if "runtime" in stages:
-        work_items.append(("runtime", lambda: runtime(game, out, v, runtime_build, jobs)))
+    def fn_shaders():
+        shaders(game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
+
+    def fn_assets():
+        assets(game, work, wav, jobs, dump_jobs=dump_jobs)
+
+    def fn_runtime():
+        runtime(game, out, v, runtime_build, jobs)
+
+    def fn_pipelines():
+        pipelines(work, out, jobs)
+
+    builders = {
+        "shaders": fn_shaders,
+        "assets": fn_assets,
+        "runtime": fn_runtime,
+        "pipelines": fn_pipelines,
+    }
+
+    if not overlap:
+        order = [s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages]
+        if not order:
+            return
+        log(f"running {', '.join(order)} in series")
+        for name in order:
+            try:
+                _invoke_stage(name, builders[name])
+                progress.complete(name)
+            except Exception:
+                sys.exit(1)
+        return
+
+    work_items: list[tuple[str, object]] = [(n, builders[n]) for n in ("shaders", "assets", "runtime")
+                                            if n in stages]
 
     if len(work_items) > 1:
         if dump_jobs is not None:
@@ -1398,15 +1484,16 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         return
 
     failed = False
-    with ThreadPoolExecutor(max_workers=max(1, len(work_items) + (1 if "pipelines" in stages else 0))) as ex:
-        futures = {name: ex.submit(_invoke_stage, fn) for name, fn in work_items}
+    ex = ThreadPoolExecutor(max_workers=max(1, len(work_items) + (1 if "pipelines" in stages else 0)))
+    try:
+        futures = {name: ex.submit(_invoke_stage, name, fn) for name, fn in work_items}
 
         def wait(name: str) -> bool:
             """True when the stage finished cleanly. Marks the build failed on error."""
             nonlocal failed
             try:
                 futures[name].result()
-                board.complete(name)
+                progress.complete(name)
                 return True
             except Exception:
                 failed = True
@@ -1418,14 +1505,24 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
                 # Checker may already be on disk from an earlier run; only wait on runtime when it is missing.
                 if not pipeline_check_exe() and "runtime" in futures:
                     wait("runtime")
-                futures["pipelines"] = ex.submit(_invoke_stage, lambda: pipelines(work, out, jobs))
+                futures["pipelines"] = ex.submit(_invoke_stage, "pipelines", fn_pipelines)
 
         for name, fut in list(futures.items()):
             try:
                 fut.result()
-                board.complete(name)
+                progress.complete(name)
             except Exception:
                 failed = True
+        ex.shutdown(wait=True)
+    except KeyboardInterrupt:
+        # Default ThreadPoolExecutor.__exit__ waits for workers; a worker blocked in
+        # readline()/cmake would ignore Ctrl+C forever. Kill children and abandon workers.
+        leonida_tui.kill_live_processes()
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            ex.shutdown(wait=False)
+        raise
 
     if failed:
         # The failing stage already printed through fail(); stop without a second message.
@@ -1468,6 +1565,9 @@ def main() -> int:
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader")
+    ap.add_argument("--no-tui", action="store_true",
+                    help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
+                         "and per-stage log view")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:
@@ -1535,13 +1635,30 @@ def main() -> int:
             "fragmentShaderBarycentric): translating with --f16-interp-fallback")
         a.f16_interp_fallback = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
+    overlap = True
+    a.jobs = leonida_tui.clamp_jobs(a.jobs)
+    use_tui = leonida_tui.tui_eligible(a.no_tui)
+    if use_tui:
+        cfg = leonida_tui.run_setup(a.jobs, default_overlap=True)
+        a.jobs = leonida_tui.clamp_jobs(cfg.jobs)
+        overlap = cfg.overlap
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
-    run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
-                     runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                     fallbacks=fallbacks)
+    build_stages = [s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages]
+    if use_tui and build_stages:
+        log_dir = os.path.join(work, "logs")
+        with leonida_tui.LeonidaBoard(build_stages, log_dir) as tui_board:
+            tui_board.set_summary(f"build 0% · {', '.join(build_stages)}")
+            run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
+                             runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
+                             fallbacks=fallbacks, overlap=overlap)
+            tui_board.set_summary(f"finished in {(time.time() - t0) / 60:.0f} min")
+    else:
+        run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
+                         runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
+                         fallbacks=fallbacks, overlap=overlap)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 
@@ -1559,7 +1676,13 @@ def cli() -> int:
     try:
         return main()
     except KeyboardInterrupt:
-        print("\nStopped. Run it again to continue where it left off.", file=sys.stderr)
+        leonida_tui.kill_live_processes()
+        # Board __exit__ usually restored the console; if Ctrl+C hit outside it, clear leftovers.
+        try:
+            leonida_tui.restore_console(ansi=leonida_tui.enable_ansi(), leave_alt=True)
+        except Exception:
+            pass
+        print("Stopped. Run it again to continue where it left off.", file=sys.stderr)
         return 130
 
 

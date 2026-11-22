@@ -50,6 +50,10 @@ class TranslateFallbacksTest(unittest.TestCase):
         class FakeProc:
             def __init__(self, args):
                 started.append(args)
+                self.stdout = None
+
+            def poll(self):
+                return 0
 
             def wait(self):
                 return 0
@@ -151,7 +155,7 @@ class MainWiringTest(unittest.TestCase):
     """main() parses the four flags and hands the same tuple to preflight() and shaders()."""
 
     def run_main(self, *extra_argv, per_vertex=None):
-        argv = ["make_game.py", "--stages", "shaders", *extra_argv]
+        argv = ["make_game.py", "--stages", "shaders", "--no-tui", *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
                 mock.patch("make_game.choose_game", return_value=os.path.abspath("C:/dummy_game")), \

@@ -159,9 +159,13 @@ else if (mode is "models" or "textures")
         Console.WriteLine($"  {c - recovered:N0} of {c:N0} scan candidates were not recovered (rejected before decoding)");
     string sub = Path.Combine(outDir, mode); Directory.CreateDirectory(sub);
     // The manifest is streamed row by row: holding 150k rows (each capturing its decoded model through lazy
-    // projections) ran out of memory on levels.rpf. Written to a .partial file and renamed when complete.
-    string manifestPath = Path.Combine(sub, "manifest.json"), partial = manifestPath + ".partial";
-    using var mstream = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+    // projections) ran out of memory on levels.rpf. Written to a unique .partial and renamed when complete.
+    // A fixed "manifest.json.partial" name can collide with a previous run's leftover or another
+    // process briefly holding the file — IOException: being used by another process.
+    string manifestPath = Path.Combine(sub, "manifest.json");
+    Util.TryDelete(manifestPath + ".partial");
+    string partial = Util.PartialName(manifestPath);
+    using var mstream = Util.OpenExclusiveCreate(partial);
     using var writer = new Utf8JsonWriter(mstream, new JsonWriterOptions { Indented = true });
     writer.WriteStartObject();
     writer.WriteString("src", src);
@@ -268,7 +272,7 @@ else if (mode is "models" or "textures")
     writer.WriteEndObject();
     writer.Dispose();          // flushes; the later using-dispose is a no-op
     mstream.Dispose();
-    File.Move(partial, manifestPath, true);
+    Util.MoveReplace(partial, manifestPath);
 }
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
 return mode == "ttpf" && fail != 0 ? 1 : 0;

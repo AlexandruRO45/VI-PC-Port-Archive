@@ -147,6 +147,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
             "--game", self.game_dir,
             "--out", self.out_dir,
             "--work", self.work_dir,
+            "--no-tui",
             *extra_args,
         ]
         with patch.object(sys, "argv", base_argv):
@@ -226,7 +227,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
         """shaders/assets/runtime overlap; pipelines still runs once shaders (and the checker) are ready."""
         manager = MagicMock()
         with patch.object(sys, "argv", ["make_game.py", "--game", self.game_dir,
-                                        "--out", self.out_dir, "--work", self.work_dir,
+                                        "--out", self.out_dir, "--work", self.work_dir, "--no-tui",
                                         "--stages", "pipelines,runtime,assets,shaders"]):
             with patch("make_game.below_normal"):
                 with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
@@ -314,7 +315,7 @@ class JobsHandlingTest(unittest.TestCase):
             work = os.path.join(tmp, "work")
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
-                                            "--stages", "shaders", "--jobs", "6"]):
+                                            "--no-tui", "--stages", "shaders", "--jobs", "6"]):
                 with patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight") as mock_preflight:
@@ -338,7 +339,7 @@ class JobsHandlingTest(unittest.TestCase):
             work = os.path.join(tmp, "work")
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
-                                            "--stages", "assets", "--wav", "--jobs", "10"]):
+                                            "--no-tui", "--stages", "assets", "--wav", "--jobs", "10"]):
                 with patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight"):
