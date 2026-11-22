@@ -75,6 +75,14 @@ def assembly(swap):
     ]
 
 
+def rgb_sample() -> list[str]:
+    program = assembly(False)
+    sample = next(i for i, line in enumerate(program) if line.startswith("image_sample"))
+    program[sample] = program[sample].replace("v[12:15]", "v[12:14]").replace("dmask:0xf", "dmask:0x7")
+    program.insert(sample, "v_mov_b32_e32 v15, 0.5")
+    return program
+
+
 DUAL_CASES = ("forward", "reverse", "reuse", "partial")
 
 
@@ -2548,6 +2556,14 @@ def check_controls(directory):
         "v_and_b32_e32 v12, s44, v106",
     ):
         must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop2]))
+    rgb = rgb_sample()
+    translate(rgb)
+    for old, new in (("v[12:14]", "v[12:15]"), ("dmask:0x7", "dmask:0xb")):
+        must_reject(translate, [line.replace(old, new) for line in rgb])
+    wait = rgb.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, rgb[:wait] + rgb[wait+1:])
+    must_reject(translate, rgb[:wait] + ["v_mov_b32_e32 v14, 1.0"] + rgb[wait:])
+    translate(rgb[:wait] + ["v_mov_b32_e32 v15, 1.0"] + rgb[wait:])
     # v_cvt_f32_f16 widens the low half through widen16 and applies modifiers after widening.
     body = translate(with_constants(HALF_BODY)).split("float4 main", 1)[1]
     assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body
@@ -3016,6 +3032,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
                 (scalar64(), translate), (sopk_scalar(), translate)]
+    fixtures.append((rgb_sample(), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
@@ -3338,6 +3355,25 @@ def check_reciprocal_iflag_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing the reciprocal with a square root escaped detection")
 
 
+def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend: str) -> None:
+    hlsl = directory / "rgb-sample.hlsl"
+    shader = directory / "rgb-sample.cso"
+    case = directory / "rgb-sample.case"
+    hlsl.write_text(translate(rgb_sample()), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, hlsl], check=True)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    for alpha in (0.5, 1.0):
+        colors = (struct.pack("<4f", half_rtz(red / 255), half_rtz(green / 255), half_rtz(128 / 255), alpha)
+                  for green in RAMP for red in RAMP)
+        case.write_bytes(bytes(256) + b"".join(colors))
+        if alpha == 0.5:
+            subprocess.run(draw, check=True)
+        else:
+            wrong = subprocess.run(draw, capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch x=0 y=0" not in wrong.stderr:
+                raise AssertionError("RGB sample with an overwritten alpha register escaped detection")
+
+
 def check_render(directory, compiler, renderer, backend, *, core_only=False):
     for swap in (False, True):
         source = directory / "fixture.hlsl"
@@ -3364,6 +3400,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
         source.write_text(translate(exp_program), encoding="ascii")
         subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
         subprocess.run([renderer, backend, "--check-pixel", shader, "rgba"], check=True)
+    check_rgb_sample_draw(directory, compiler, renderer, backend)
     program = arithmetic()
     source.write_text(translate(program), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)

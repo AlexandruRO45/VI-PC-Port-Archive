@@ -1130,6 +1130,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_cmov_setcc COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/cmov_setcc.py"
         check "$<TARGET_FILE:cpu_cmov_setcc>" "$<TARGET_FILE:cpu_cmov_setcc_lifted>")
 
+    cpu_asm_fixture(cpu_adx adx)
+    set(adx_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_adx_lifted.cpp")
+    add_custom_command(OUTPUT "${adx_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/adx.py"
+            emit "$<TARGET_FILE:cpu_adx>" "${adx_fixture}"
+        DEPENDS cpu_adx tests/cpu/adx.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_adx_lifted SHARED "${adx_fixture}")
+    add_test(NAME cpu_aot_adx COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/adx.py"
+        check "$<TARGET_FILE:cpu_adx>" "$<TARGET_FILE:cpu_adx_lifted>")
+    set_tests_properties(cpu_aot_adx PROPERTIES SKIP_RETURN_CODE 77)
+
     cpu_asm_fixture(cpu_avx2_shifts avx2_shifts)
     set(avx2_shifts_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx2_shifts_lifted.cpp")
     add_custom_command(OUTPUT "${avx2_shifts_fixture}"
