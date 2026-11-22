@@ -1084,6 +1084,97 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
         self.assertEqual(state.get_vgpr_qword(0), 0x5555_6666_7777_8888)
 
 
+# ============================================================================
+# Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ============================================================================
+
+@dataclass(frozen=True)
+class Add64ConditionFlags:
+    """Status flags and condition codes derived from 64-bit unsigned addition."""
+    z: bool            # Zero flag: result == 0
+    n: bool            # Sign flag: bit 63 set
+    carry_out: bool    # 64-bit carry out: True if (a + b) > MASK_64
+    carry_dword: bool  # 32-bit dword boundary carry: True if low 32-bit sum > MASK_32
+
+
+def compute_add64_condition_flags(a_u64: int, b_u64: int) -> Add64ConditionFlags:
+    """Compute condition flags for unsigned 64-bit addition (a + b)."""
+    a = u64(a_u64)
+    b = u64(b_u64)
+    res = u64(a + b)
+
+    z = (res == 0)
+    n = bool(res & 0x8000_0000_0000_0000)
+    carry_out = (a + b) > MASK_64
+    carry_dword = ((a & MASK_32) + (b & MASK_32)) > MASK_32
+
+    return Add64ConditionFlags(
+        z=z,
+        n=n,
+        carry_out=carry_out,
+        carry_dword=carry_dword,
+    )
+
+
+class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow relations."""
+
+    def test_ds_instruction_hardware_flag_isolation(self) -> None:
+        """DS instructions do not modify hardware scalar condition code (SCC)."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.set_sgpr(0, 1)  # SCC set
+        state.lds.write_qword(0x10, 100)
+        state.set_vgpr(4, 0x10)
+        state.set_vgpr_qword(2, 25)
+
+        instr = DSAddRtnU64Instruction(
+            dst=VGPRPair(0), addr=VGPR(4), data0=VGPRPair(2)
+        )
+        interp.step(instr, state)
+
+        # SCC is preserved unchanged
+        self.assertEqual(state.get_sgpr(0), 1)
+
+    def test_zero_flag_on_zero_sum(self) -> None:
+        """Sum is 0 when 0 + 0 or MASK_64 + 1 wraps to 0."""
+        flags_zero = compute_add64_condition_flags(0, 0)
+        self.assertTrue(flags_zero.z)
+        self.assertFalse(flags_zero.n)
+        self.assertFalse(flags_zero.carry_out)
+
+        flags_wrap = compute_add64_condition_flags(MASK_64, 1)
+        self.assertTrue(flags_wrap.z)
+        self.assertFalse(flags_wrap.n)
+        self.assertTrue(flags_wrap.carry_out)
+
+    def test_sign_flag_transitions(self) -> None:
+        """Bit 63 set in result sets N flag."""
+        flags = compute_add64_condition_flags(0x4000_0000_0000_0000, 0x4000_0000_0000_0000)
+        self.assertTrue(flags.n)
+        self.assertFalse(flags.z)
+        self.assertFalse(flags.carry_out)
+
+    def test_carry_out_detection(self) -> None:
+        """Carry out occurs if and only if (A + B) exceeds 2^64 - 1."""
+        flags_carry = compute_add64_condition_flags(MASK_64, 5)
+        self.assertTrue(flags_carry.carry_out)
+
+        flags_nocarry = compute_add64_condition_flags(100, 200)
+        self.assertFalse(flags_nocarry.carry_out)
+
+    def test_dword_boundary_carry(self) -> None:
+        """Carry occurs across 32-bit dword boundary when low dword overflows."""
+        a = 0x0000_0000_FFFF_FFFF
+        b = 0x0000_0000_0000_0001
+        flags = compute_add64_condition_flags(a, b)
+        self.assertTrue(flags.carry_dword)
+        self.assertFalse(flags.carry_out)
+        self.assertFalse(flags.z)
+
+
+
 
 
 
