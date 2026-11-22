@@ -142,6 +142,35 @@ class ManifestCreateVerifyTest(unittest.TestCase):
         self.assertEqual(serial_doc["files"], parallel_doc["files"])
         self.assertEqual(json.dumps(serial_doc["files"]), json.dumps(parallel_doc["files"]))
 
+    def test_create_cannot_overwrite_a_file_it_hashes(self):
+        target = os.path.join(self.pkg, "alpha.bin")
+        with open(target, "rb") as f:
+            before = f.read()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(manifest.ManifestError):
+                manifest.create(self.pkg, target, jobs=1)
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_create_cannot_overwrite_a_hard_link_to_a_hashed_file(self):
+        alias = os.path.join(self.tmp.name, "alias.json")
+        try:
+            os.link(os.path.join(self.pkg, "alpha.bin"), alias)
+        except OSError:
+            self.skipTest("hard links are not available")
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(manifest.ManifestError):
+            manifest.create(self.pkg, alias, jobs=1)
+
+    def test_create_can_still_write_a_new_manifest_inside_the_package(self):
+        out = os.path.join(self.pkg, "manifest.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(manifest.create(self.pkg, out, jobs=1), 0)
+        self.assertTrue(os.path.isfile(out))
+
+    def test_create_rejects_a_folder_as_out(self):
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(manifest.ManifestError):
+            manifest.create(self.pkg, self.pkg, jobs=1)
+
     def test_verify_intact_directory_returns_zero(self):
         with contextlib.redirect_stdout(io.StringIO()):
             manifest.create(self.pkg, self.out_manifest, jobs=1)
@@ -297,6 +326,17 @@ class ManifestCliTest(unittest.TestCase):
         self.assertEqual(p_verify.returncode, 0, p_verify.stderr)
         self.assertIn("OK", p_verify.stdout)
 
+    def test_in_tree_manifest_is_ignored_on_create_and_verify(self):
+        manifest_path = os.path.join(self.pkg, "reports", "manifest.json")
+        for _ in range(2):
+            result = self.run_cli("create", self.pkg, "--out", manifest_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with open(manifest_path, encoding="utf-8") as f:
+            self.assertEqual(set(json.load(f)["files"]), {"sample.dat"})
+        result = self.run_cli("verify", self.pkg, "--manifest", manifest_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "OK")
+
     def test_cli_verify_failure_exit_code(self):
         self.assertEqual(self.run_cli("create", self.pkg, "--out", self.out_manifest, "--jobs", "1").returncode, 0)
 
@@ -361,9 +401,34 @@ class ManifestAtomicCreateTest(unittest.TestCase):
             f.write(b"atomic create payload")
         self.out = os.path.join(self.tmp.name, "manifest.json")
 
-    def create(self):
+    def create(self, jobs=1):
         with contextlib.redirect_stdout(io.StringIO()):
-            return manifest.create(self.pkg, self.out, jobs=1)
+            return manifest.create(self.pkg, self.out, jobs=jobs)
+
+    def test_create_preserves_an_existing_partial_sibling(self):
+        sibling = self.out + ".partial"
+        with open(sibling, "wb") as f:
+            f.write(b"existing report")
+
+        self.assertEqual(self.create(), 0)
+        with open(sibling, "rb") as f:
+            self.assertEqual(f.read(), b"existing report")
+
+    def test_overlapping_creates_each_publish_their_own_manifest(self):
+        empty_pkg = os.path.join(self.tmp.name, "empty")
+        os.mkdir(empty_pkg)
+        replace = os.replace
+
+        def publish_inner_first(staged, destination):
+            with patch.object(manifest.os, "replace", replace):
+                self.assertEqual(manifest.create(empty_pkg, self.out), 0)
+            self.assertEqual(manifest.load_manifest(self.out), {})
+            replace(staged, destination)
+
+        with patch.object(manifest.os, "replace", side_effect=publish_inner_first):
+            self.assertEqual(self.create(), 0)
+        self.assertEqual(set(manifest.load_manifest(self.out)), {"sample.dat"})
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["empty", "manifest.json", "pkg"])
 
     def test_an_interrupted_create_keeps_the_previous_manifest(self):
         self.assertEqual(self.create(), 0)
@@ -386,6 +451,55 @@ class ManifestAtomicCreateTest(unittest.TestCase):
 
         self.assertEqual(self.create(), 0)
         self.assertEqual(sorted(manifest.load_manifest(self.out)), ["added.dat", "sample.dat"])
+
+    def test_size_change_before_open_keeps_the_previous_manifest(self):
+        self.assertEqual(self.create(), 0)
+        with open(self.out, "rb") as f:
+            previous = f.read()
+        source = os.path.join(self.pkg, "sample.dat")
+
+        def open_after_growth(path, mode, **kwargs):
+            if path == source and mode == "rb":
+                with open(source, "ab") as f:
+                    f.write(b"more bytes")
+            return open(path, mode, **kwargs)
+
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                with patch.object(manifest, "open", side_effect=open_after_growth, create=True):
+                    with self.assertRaisesRegex(manifest.ManifestError, r"sample\.dat.*changed"):
+                        self.create(jobs=jobs)
+                with open(self.out, "rb") as f:
+                    self.assertEqual(f.read(), previous)
+
+    def test_same_size_change_during_read_keeps_the_previous_manifest(self):
+        self.assertEqual(self.create(), 0)
+        with open(self.out, "rb") as f:
+            previous = f.read()
+        source = os.path.join(self.pkg, "sample.dat")
+
+        def open_with_edit(path, mode, **kwargs):
+            stream = open(path, mode, **kwargs)
+            if path == source and mode == "rb":
+                original_read = stream.read
+
+                def read_then_edit(size):
+                    chunk = original_read(size)
+                    stream.read = original_read
+                    stamp = os.stat(source)
+                    with open(source, "r+b") as f:
+                        f.write(b"X")
+                    os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000))
+                    return chunk
+
+                stream.read = read_then_edit
+            return stream
+
+        with patch.object(manifest, "open", side_effect=open_with_edit, create=True):
+            with self.assertRaisesRegex(manifest.ManifestError, r"sample\.dat.*changed"):
+                self.create()
+        with open(self.out, "rb") as f:
+            self.assertEqual(f.read(), previous)
 
 
 class ManifestBelowNormalTest(unittest.TestCase):

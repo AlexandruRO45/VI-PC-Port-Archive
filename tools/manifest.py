@@ -5,6 +5,7 @@ Usage:
     python -I manifest.py verify <game_dir> [--manifest FILE] [--jobs N]
 
 Files are hashed with up to --jobs threads (default: half the CPU count; 1 = serial).
+The manifest itself is excluded when its path is inside the scanned folder.
 On Windows it lowers its own priority to BelowNormal so the PC stays usable.
 """
 import argparse
@@ -12,6 +13,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -20,7 +22,7 @@ DEFAULT = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.jso
 
 
 class ManifestError(Exception):
-    """A manifest that isn't valid JSON or doesn't have the layout create() writes."""
+    """An input or manifest error that the CLI reports without a traceback."""
 
 
 def default_jobs() -> int:
@@ -40,32 +42,100 @@ def positive_int(text: str) -> int:
 def below_normal() -> None:
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+
         k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.argtypes = ()
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k32.SetPriorityClass.restype = wintypes.BOOL
         k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
 
 
-def sha256(path: str) -> str:
+def _file_stamp(st: os.stat_result) -> tuple[int, int, int]:
+    return st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+def _hash_file(path: str, *, expected_size: int | None = None) -> tuple[int, str]:
+    """Return the size and digest of the same open file, or fail if it changes."""
     h = hashlib.sha256()
     with open(path, "rb", buffering=0) as f:
-        while chunk := f.read(CHUNK):
+        before = os.fstat(f.fileno())
+        size = before.st_size
+        if expected_size is not None and size != expected_size:
+            raise ManifestError(f"{path}: file size changed before hashing")
+        remaining = size
+        while remaining and (chunk := f.read(min(CHUNK, remaining))):
             h.update(chunk)
-    return h.hexdigest()
+            remaining -= len(chunk)
+        # Compare timestamps from the same handle. Windows can report different times by path.
+        # Compare the path by identity so a replacement of the open file is detected too.
+        if (remaining or _file_stamp(os.fstat(f.fileno())) != _file_stamp(before)
+                or not os.path.samestat(before, os.stat(path))):
+            raise ManifestError(f"{path}: file changed while hashing")
+    return size, h.hexdigest()
 
 
-def walk(game_dir: str):
+def sha256(path: str) -> str:
+    return _hash_file(path)[1]
+
+
+def same_output_path(first: str, second: str) -> bool:
+    """True when writing ``second`` would truncate ``first`` (same path, case variant or hard link)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def walk(game_dir: str, *, exclude=None):
     def scan_failed(error: OSError) -> None:
         raise error
 
+    excluded_dir = excluded_name = None
+    if exclude is not None:
+        directory, name = os.path.split(os.path.abspath(exclude))
+        excluded_dir = os.path.normcase(os.path.realpath(directory))
+        excluded_name = os.path.normcase(name)
+
     # os.walk otherwise treats missing or unreadable directories as empty.
     for root, _, files in os.walk(game_dir, onerror=scan_failed):
+        contains_manifest = excluded_dir is not None and os.path.normcase(os.path.realpath(root)) == excluded_dir
         for name in sorted(files):
+            if contains_manifest and os.path.normcase(name) == excluded_name:
+                continue
             p = os.path.join(root, name)
             yield os.path.relpath(p, game_dir).replace("\\", "/"), p
 
 
 def create(game_dir: str, out: str, jobs: int = 1) -> int:
-    files = sorted(walk(game_dir))
-    total = sum(os.path.getsize(p) for _, p in files)
+    # walk() excludes the manifest path itself, so an existing game file named like --out would otherwise be
+    # hashed first and replaced by the manifest (os.replace below), leaving the recorded hash wrong. Allow only an
+    # existing file that already reads as a manifest (re-creating one in place); refuse any other existing target
+    # inside the folder and every hard link to a file that will be hashed.
+    if os.path.isdir(out):
+        raise ManifestError(f"--out is a folder, not a manifest file: {out}")
+    if os.path.isfile(out):
+        try:
+            inside = os.path.normcase(os.path.commonpath(
+                [os.path.realpath(game_dir), os.path.realpath(out)])) == os.path.normcase(os.path.realpath(game_dir))
+        except ValueError:
+            inside = False
+        if inside:
+            try:
+                load_manifest(out)
+            except (ManifestError, OSError):
+                raise ManifestError(f"--out would overwrite the input {out}; "
+                                    "choose a manifest path that is not one of the hashed files") from None
+    files = sorted(walk(game_dir, exclude=out))
+    for _rel, path in files:
+        if same_output_path(out, path):
+            raise ManifestError(f"--out would overwrite the input {path}; "
+                                "choose a manifest path that is not one of the hashed files")
+    sizes = {path: os.path.getsize(path) for _, path in files}
+    total = sum(sizes.values())
     entries = {}
     done = count = 0
     t0 = time.time()
@@ -82,7 +152,8 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
         print(f"[{pct:6.1%}] {count}/{len(files)} files {rate:7.0f} MiB/s", flush=True)
 
     def work(rel: str, path: str) -> tuple[str, int, str]:
-        return rel, os.path.getsize(path), sha256(path)
+        size, digest = _hash_file(path, expected_size=sizes[path])
+        return rel, size, digest
 
     if jobs == 1:
         for rel, p in files:
@@ -95,20 +166,13 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
 
     # Re-insert in walk order so the JSON is independent of which worker finished first.
     entries = {rel: entries[rel] for rel, _ in files}
-    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    # Written beside the target and swapped in, so an interrupted run keeps the old manifest instead of leaving a
-    # truncated one for verify to trip over.
-    tmp = out + ".partial"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
+    out_dir = os.path.dirname(os.path.abspath(out))
+    os.makedirs(out_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out_dir) as staging:
+        staged = os.path.join(staging, "manifest.json")
+        with open(staged, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"created": time.strftime("%Y-%m-%d %H:%M:%S"), "files": entries}, f, indent=1)
-        os.replace(tmp, out)
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
+        os.replace(staged, out)
     print(f"{len(entries)} files, {total / 2**30:.1f} GiB -> {out}")
     return 0
 
@@ -132,7 +196,7 @@ def load_manifest(manifest: str) -> dict:
 
 def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
     want = load_manifest(manifest)
-    have = dict(walk(game_dir))
+    have = dict(walk(game_dir, exclude=manifest))
     problems = {}
     pending = []
     for rel, info in want.items():
@@ -195,4 +259,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

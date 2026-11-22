@@ -2,14 +2,20 @@
 // Vulkan-backed device behind the Xbox-ABI proxy, with no Vulkan validation errors. Each frame resets the list,
 // moves the back buffer PRESENT -> RENDER_TARGET, clears it, moves it back, executes, presents and signals a fence.
 // The window is then resized, which recreates the swapchain and scales the blit. Last, the colour on screen is read
-// back with GDI when the window is in front (skipped otherwise, e.g. on a locked desktop). No shaders or game data.
+// back with GDI when the window is in front and the display is in SDR (skipped otherwise, e.g. in HDR
+// or on a locked desktop). No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
+#include <dxgi1_6.h>
+
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <string_view>
+#include <vector>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -30,6 +36,37 @@ struct Ref {
     T* operator->() const { return p; }
 };
 
+// Returns true when the monitor containing the window is running with Windows HDR enabled
+// (DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020). On an HDR desktop, DWM scales SDR GDI reads
+// by the user's SDR white level, so fixed-tolerance on-screen colour checks do not hold (TEST-209).
+bool is_hdr_monitor(HWND window) {
+    const HMONITOR target = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    if (!target) return false;
+    Ref<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return false;
+    for (UINT i = 0;; ++i) {
+        Ref<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(i, &adapter.p) == DXGI_ERROR_NOT_FOUND) break;
+        if (!adapter.p) continue;
+        for (UINT j = 0;; ++j) {
+            Ref<IDXGIOutput> output;
+            if (adapter->EnumOutputs(j, &output.p) == DXGI_ERROR_NOT_FOUND) break;
+            if (!output.p) continue;
+            DXGI_OUTPUT_DESC desc{};
+            if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == target) {
+                Ref<IDXGIOutput6> output6;
+                if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output6.p)))) {
+                    DXGI_OUTPUT_DESC1 desc1{};
+                    if (SUCCEEDED(output6->GetDesc1(&desc1)) &&
+                        desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
     return DefWindowProcW(window, message, w, l);
 }
@@ -42,6 +79,15 @@ void pump() {
     }
 }
 
+bool has_interactive_window_station() {
+    HWINSTA station = GetProcessWindowStation();
+    if (!station) return true;  // Unknown environment: let window creation report the real failure.
+    USEROBJECTFLAGS flags{};
+    DWORD bytes = 0;
+    if (!GetUserObjectInformationW(station, UOI_FLAGS, &flags, sizeof(flags), &bytes)) return true;
+    return (flags.dwFlags & WSF_VISIBLE) != 0;
+}
+
 void set_client_size(HWND window, int width, int height) {
     RECT rect{0, 0, width, height};
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
@@ -49,18 +95,163 @@ void set_client_size(HWND window, int width, int height) {
                  SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
 }
 
+// A driver double around the real driver: the device and the presenter get their functions through it
+// (VulkanDeviceInfo::get_instance_proc). It forwards every call, and when armed makes one queue submission fail
+// without submitting, reports one present that succeeded as another status, or fails one semaphore allocation. It
+// also counts the presents the real driver reported out of date, and the binary semaphores alive.
+namespace driver {
+PFN_vkGetInstanceProcAddr real_get_instance = nullptr;
+PFN_vkGetDeviceProcAddr real_get_device = nullptr;
+PFN_vkQueueSubmit real_submit = nullptr;
+PFN_vkQueuePresentKHR real_present = nullptr;
+PFN_vkCreateSemaphore real_create_semaphore = nullptr;
+PFN_vkDestroySemaphore real_destroy_semaphore = nullptr;
+PFN_vkGetPhysicalDeviceSurfaceFormatsKHR real_surface_formats = nullptr;
+PFN_vkCreateSwapchainKHR real_create_swapchain = nullptr;
+PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR real_get_caps = nullptr;
+VkResult fail_next_submit = VK_SUCCESS;  // armed: the next vkQueueSubmit returns this and submits nothing
+VkResult next_present = VK_SUCCESS;      // armed: the next present that succeeds reports this instead
+int fail_semaphore_in = 0;               // armed: the n-th vkCreateSemaphore from now fails
+bool fail_surface_formats = false;       // armed: the next surface-format query fails before creation
+bool observe_next_swapchain = false;
+bool report_undefined_extent = false;    // armed: surface capabilities reports undefined extent (0xFFFFFFFF)
+bool undefined_extent_queried = false;
+VkExtent2D last_swapchain_extent{};
+VkSwapchainKHR last_created_swapchain = VK_NULL_HANDLE;
+VkSwapchainKHR observed_old_swapchain = VK_NULL_HANDLE;
+unsigned out_of_date = 0;                // presents the real driver reported out of date
+std::vector<VkSemaphore> binary;         // binary semaphores alive (the device's fences are timeline ones)
+
+VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits,
+                                            VkFence fence) {
+    if (fail_next_submit != VK_SUCCESS) {
+        const VkResult failure = fail_next_submit;
+        fail_next_submit = VK_SUCCESS;
+        return failure;
+    }
+    return real_submit(queue, count, submits, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL queue_present(VkQueue queue, const VkPresentInfoKHR* info) {
+    VkResult result = real_present(queue, info);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) ++out_of_date;
+    if (result == VK_SUCCESS && next_present != VK_SUCCESS) {
+        result = next_present;
+        next_present = VK_SUCCESS;
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL create_semaphore(VkDevice device, const VkSemaphoreCreateInfo* info,
+                                                const VkAllocationCallbacks* allocator, VkSemaphore* out) {
+    if (fail_semaphore_in && --fail_semaphore_in == 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    const VkResult result = real_create_semaphore(device, info, allocator, out);
+    bool timeline = false;
+    for (auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next; next = next->pNext)
+        if (next->sType == VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO)
+            timeline = reinterpret_cast<const VkSemaphoreTypeCreateInfo*>(next)->semaphoreType ==
+                       VK_SEMAPHORE_TYPE_TIMELINE;
+    if (result == VK_SUCCESS && !timeline) binary.push_back(*out);
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL destroy_semaphore(VkDevice device, VkSemaphore semaphore,
+                                            const VkAllocationCallbacks* allocator) {
+    std::erase(binary, semaphore);
+    real_destroy_semaphore(device, semaphore, allocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL surface_formats(VkPhysicalDevice physical, VkSurfaceKHR surface,
+                                               std::uint32_t* count, VkSurfaceFormatKHR* formats) {
+    if (fail_surface_formats) {
+        fail_surface_formats = false;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    return real_surface_formats(physical, surface, count, formats);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
+                                                const VkAllocationCallbacks* allocator, VkSwapchainKHR* out) {
+    if (info) last_swapchain_extent = info->imageExtent;
+    if (observe_next_swapchain) {
+        observed_old_swapchain = info->oldSwapchain;
+        observe_next_swapchain = false;
+    }
+    const VkResult result = real_create_swapchain(device, info, allocator, out);
+    if (result == VK_SUCCESS) last_created_swapchain = *out;
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL get_surface_capabilities(VkPhysicalDevice physical, VkSurfaceKHR surface,
+                                                        VkSurfaceCapabilitiesKHR* caps) {
+    const VkResult result = real_get_caps(physical, surface, caps);
+    if (result == VK_SUCCESS && report_undefined_extent && caps) {
+        caps->currentExtent.width = 0xFFFFFFFF;
+        caps->currentExtent.height = 0xFFFFFFFF;
+        undefined_extent_queried = true;
+    }
+    return result;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
+    const std::string_view n = name;
+    if (n == "vkQueueSubmit") return reinterpret_cast<PFN_vkVoidFunction>(queue_submit);
+    if (n == "vkQueuePresentKHR") return reinterpret_cast<PFN_vkVoidFunction>(queue_present);
+    if (n == "vkCreateSemaphore") return reinterpret_cast<PFN_vkVoidFunction>(create_semaphore);
+    if (n == "vkDestroySemaphore") return reinterpret_cast<PFN_vkVoidFunction>(destroy_semaphore);
+    if (n == "vkCreateSwapchainKHR") return reinterpret_cast<PFN_vkVoidFunction>(create_swapchain);
+    return real_get_device(device, name);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
+    const std::string_view n = name;
+    if (n == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+    if (n == "vkGetPhysicalDeviceSurfaceFormatsKHR")
+        return reinterpret_cast<PFN_vkVoidFunction>(surface_formats);
+    if (n == "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+        return reinterpret_cast<PFN_vkVoidFunction>(get_surface_capabilities);
+    return real_get_instance(instance, name);
+}
+
+void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDevice device) {
+    real_get_instance = instance_proc;
+    real_get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instance_proc(instance, "vkGetDeviceProcAddr"));
+    real_submit = reinterpret_cast<PFN_vkQueueSubmit>(real_get_device(device, "vkQueueSubmit"));
+    real_present = reinterpret_cast<PFN_vkQueuePresentKHR>(real_get_device(device, "vkQueuePresentKHR"));
+    real_create_semaphore = reinterpret_cast<PFN_vkCreateSemaphore>(real_get_device(device, "vkCreateSemaphore"));
+    real_destroy_semaphore = reinterpret_cast<PFN_vkDestroySemaphore>(real_get_device(device, "vkDestroySemaphore"));
+    real_surface_formats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
+        instance_proc(instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
+    real_create_swapchain = reinterpret_cast<PFN_vkCreateSwapchainKHR>(real_get_device(device, "vkCreateSwapchainKHR"));
+    real_get_caps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
+        instance_proc(instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+}
+}  // namespace driver
+
 }  // namespace
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create(true));
+    const auto device_status = d.initialize(true);
+    if (device_status == vktest::DeviceStatus::unavailable) {
+        std::fprintf(stderr, "SKIP: no usable Vulkan presentation device\n");
+        return 77;
+    }
+    EXPECT(device_status == vktest::DeviceStatus::ready);
 
     WNDCLASSW window_class{};
     window_class.lpfnWndProc = window_proc;
     window_class.hInstance = GetModuleHandleW(nullptr);
     window_class.lpszClassName = L"LeonidaPresentTest";
     window_class.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
-    EXPECT(RegisterClassW(&window_class));
+    if (!has_interactive_window_station()) {
+        std::fprintf(stderr, "SKIP: the process has no interactive window station\n");
+        return 77;
+    }
+    if (!RegisterClassW(&window_class)) {
+        std::fprintf(stderr, "FAIL: cannot register a window class (Win32 error %lu)\n", GetLastError());
+        return 1;
+    }
     constexpr int width = 320, height = 240;
     RECT frame_rect{0, 0, width, height};
     AdjustWindowRect(&frame_rect, WS_OVERLAPPEDWINDOW, FALSE);
@@ -68,7 +259,10 @@ int main() {
                                   WS_OVERLAPPEDWINDOW, 100, 100, frame_rect.right - frame_rect.left,
                                   frame_rect.bottom - frame_rect.top, nullptr, nullptr, window_class.hInstance,
                                   nullptr);
-    EXPECT(window);
+    if (!window) {
+        std::fprintf(stderr, "FAIL: cannot create the presentation window (Win32 error %lu)\n", GetLastError());
+        return 1;
+    }
     ShowWindow(window, SW_SHOWNORMAL);
     SetForegroundWindow(window);
     UpdateWindow(window);
@@ -77,8 +271,9 @@ int main() {
     const FLOAT colour[4] = {0.2f, 0.6f, 0.9f, 1.0f};
     bool screen_checked = false;
     {
+        driver::install(d.instance_proc, d.instance, d.device);
         rt::d3d12::VulkanDeviceInfo info{};
-        info.get_instance_proc = d.instance_proc;
+        info.get_instance_proc = driver::get_instance;
         info.instance = d.instance;
         info.physical = d.physical;
         info.device = d.device;
@@ -132,7 +327,8 @@ int main() {
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         ID3D12CommandList* lists[] = {list.p};
         UINT64 signalled = 0;
-        const auto frame = [&](UINT sync_interval) -> bool {
+        // `arm` runs just before the present, so an injection it sets up hits the presenter, not the list's work.
+        const auto frame = [&](UINT sync_interval, const std::function<void()>& arm = {}) -> bool {
             pump();
             if (FAILED(fence->SetEventOnCompletion(signalled, nullptr))) return false;  // the list's last run is done
             if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return false;
@@ -146,12 +342,21 @@ int main() {
             if (FAILED(list->Close())) return false;
             queue->ExecuteCommandLists(1, lists);
             if (rt::d3d12::last_execute_result(queue.p) != leonida::ReplayResult::success) return false;
-            if (FAILED(presenter->present(back_buffer.p, sync_interval))) return false;
+            if (arm) arm();
+            const HRESULT presented = presenter->present(back_buffer.p, sync_interval);
+            driver::fail_next_submit = VK_SUCCESS;  // whatever the present did not use
+            driver::next_present = VK_SUCCESS;
+            driver::fail_semaphore_in = 0;
+            driver::fail_surface_formats = false;
+            driver::observe_next_swapchain = false;
+            if (FAILED(presented)) return false;
             return SUCCEEDED(queue->Signal(fence.p, ++signalled));
         };
 
+        // Every present is counted unless the surface reported it out of date, which the driver may do around a
+        // resize; the double counts those.
         for (int i = 0; i < 60; ++i) EXPECT(frame(1));
-        EXPECT(presenter->presented() == 60);
+        EXPECT(presenter->presented() == 60 - driver::out_of_date);
         const VkExtent2D first = presenter->extent();
         EXPECT(first.width == width && first.height == height);
 
@@ -160,25 +365,90 @@ int main() {
         set_client_size(window, 400, 300);
         for (int i = 0; i < 10; ++i) EXPECT(frame(i < 5 ? 1 : 0));
         EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
-        EXPECT(presenter->presented() == 70);
+        EXPECT(presenter->presented() == 70 - driver::out_of_date);
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr)));
+        const unsigned real_out_of_date = driver::out_of_date;
+
+        // Failures injected by the driver double (VictorJulianiR's review of the presenter):
+        // 1. Present statuses: OUT_OF_DATE was not shown, so it is not counted; SUBOPTIMAL was, so it is.
+        std::uint64_t before = presenter->presented();
+        EXPECT(frame(0, [] { driver::next_present = VK_ERROR_OUT_OF_DATE_KHR; }));
+        EXPECT(presenter->presented() == before);
+        EXPECT(frame(0));  // recreates the swapchain the out-of-date present asked for
+        before = presenter->presented();
+        EXPECT(frame(0, [] { driver::next_present = VK_SUBOPTIMAL_KHR; }));
+        EXPECT(presenter->presented() == before + 1);
+        EXPECT(frame(0));
+
+        // A transient surface-format query failure happens before vkCreateSwapchainKHR can retire the old one.
+        // A retry can still use the old swapchain for replacement; before this, its handle was lost on failure.
+        before = presenter->presented();
+        const VkSwapchainKHR old_swapchain = driver::last_created_swapchain;
+        EXPECT(old_swapchain);
+        EXPECT(!frame(1, [] { driver::fail_surface_formats = true; }));
+        EXPECT(presenter->presented() == before);
+        EXPECT(frame(0, [] { driver::observe_next_swapchain = true; }));
+        EXPECT(driver::observed_old_swapchain == old_swapchain);
+
+        // 2. A swapchain recreation (here for a vsync change) whose second per-image semaphore cannot be made fails
+        //    whole: the half-made semaphores and swapchain go, and a retry at the same vsync makes a complete one
+        //    instead of acquiring an image without its semaphore (validation would report a null semaphore).
+        //    The device makes only timeline semaphores, so the binary ones are the presenter's: one acquire
+        //    semaphore per frame in flight (2) and one per swapchain image.
+        EXPECT(driver::binary.size() > 2);
+        EXPECT(!frame(1, [] { driver::fail_semaphore_in = 2; }));
+        EXPECT(driver::binary.size() == 2);  // the old swapchain's went, and nothing of the new set is left
+        before = presenter->presented();
+        EXPECT(frame(1));
+        EXPECT(presenter->presented() == before + 1 && driver::binary.size() > 2);
+
+        // 3. A submit that fails after an image was acquired: present reports it, and the next present neither
+        //    waits forever on the frame's fence nor reuses a semaphore that is still pending.
+        before = presenter->presented();
+        EXPECT(!frame(1, [] { driver::fail_next_submit = VK_ERROR_OUT_OF_HOST_MEMORY; }));
+        EXPECT(presenter->presented() == before);
+        const unsigned out_of_date_before = driver::out_of_date;
+        for (int i = 0; i < 4; ++i) EXPECT(frame(1));  // both frames in flight come round again
+        EXPECT(presenter->presented() == before + 4 - (driver::out_of_date - out_of_date_before));
+        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr)));
+
+        // 4. Undefined surface extent (0xFFFFFFFF, reported by Intel UHD graphics / Win32 WSI; D3D-165):
+        //    switch vsync to 0 to force swapchain recreation, verifying that vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+        //    is reached while armed and that vkCreateSwapchainKHR receives the clamped client extent (400x300)
+        //    instead of 0xFFFFFFFF.
+        driver::report_undefined_extent = true;
+        driver::undefined_extent_queried = false;
+        EXPECT(frame(0));
+        EXPECT(driver::undefined_extent_queried);
+        EXPECT(driver::last_swapchain_extent.width == 400 && driver::last_swapchain_extent.height == 300);
+        EXPECT(presenter->extent().width == 400 && presenter->extent().height == 300);
+        driver::report_undefined_extent = false;
+
+        std::printf("injected: out-of-date and suboptimal presents counted apart, a failed swapchain recreation "
+                    "released and retried, a failed blit submission recovered, undefined surface extent resolved "
+                    "(%u real out-of-date presents)\n",
+                    real_out_of_date);
 
         // What reached the screen: the centre of the client area, if the window is in front.
         Sleep(200);
         pump();
         if (GetForegroundWindow() == window && !IsIconic(window)) {
-            RECT client{};
-            GetClientRect(window, &client);
-            POINT centre{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
-            ClientToScreen(window, &centre);
-            HDC screen = GetDC(nullptr);
-            const COLORREF pixel = GetPixel(screen, centre.x, centre.y);
-            ReleaseDC(nullptr, screen);
-            const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
-            std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
-            EXPECT(pixel != CLR_INVALID);
-            EXPECT(std::abs(r - 51) <= 3 && std::abs(g - 153) <= 3 && std::abs(b - 230) <= 3);
-            screen_checked = true;
+            if (is_hdr_monitor(window)) {
+                std::printf("the monitor is in HDR mode: on-screen colour check skipped\n");
+            } else {
+                RECT client{};
+                GetClientRect(window, &client);
+                POINT centre{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
+                ClientToScreen(window, &centre);
+                HDC screen = GetDC(nullptr);
+                const COLORREF pixel = GetPixel(screen, centre.x, centre.y);
+                ReleaseDC(nullptr, screen);
+                const int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
+                std::printf("screen pixel at the window centre: %d,%d,%d (cleared to 51,153,230)\n", r, g, b);
+                EXPECT(pixel != CLR_INVALID);
+                EXPECT(std::abs(r - 51) <= 3 && std::abs(g - 153) <= 3 && std::abs(b - 230) <= 3);
+                screen_checked = true;
+            }
         } else {
             std::printf("the window is not in front: on-screen colour check skipped\n");
         }

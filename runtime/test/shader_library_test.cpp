@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -61,30 +62,44 @@ void put32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) out.push_back(std::uint8_t(v >> (8 * i)));
 }
 
-// A shader container shaped like the game's: DXBC with a DXIL part holding an XDAT table whose 0x0D entry is
-// XBCH + a zlib stream (tools/fssm_unpack.py documents the layout).
-std::vector<std::uint8_t> container(const std::vector<std::uint8_t>& zlib, std::uint32_t unpacked) {
-    std::vector<std::uint8_t> xbch = {'X', 'B', 'C', 'H'};
-    put32(xbch, 1);
-    put32(xbch, std::uint32_t(zlib.size()));
-    put32(xbch, 0);
-    put32(xbch, unpacked);
-    put32(xbch, 0);
-    xbch.insert(xbch.end(), zlib.begin(), zlib.end());
+struct Payload {
+    const std::vector<std::uint8_t>& zlib;
+    std::uint32_t unpacked;
+};
+
+// A shader container shaped like the game's: DXBC with a DXIL part holding an XDAT table: a 16-byte 0x12 entry,
+// then one 0x0D entry per payload, each XBCH + a zlib stream (tools/fssm_unpack.py documents the layout).
+std::vector<std::uint8_t> container(std::initializer_list<Payload> payloads) {
+    std::vector<std::vector<std::uint8_t>> blobs;
+    for (const Payload& p : payloads) {
+        std::vector<std::uint8_t> xbch = {'X', 'B', 'C', 'H'};
+        put32(xbch, 1);
+        put32(xbch, std::uint32_t(p.zlib.size()));
+        put32(xbch, 0);
+        put32(xbch, p.unpacked);
+        put32(xbch, 0);
+        xbch.insert(xbch.end(), p.zlib.begin(), p.zlib.end());
+        blobs.push_back(std::move(xbch));
+    }
+    const std::uint32_t entries = 1 + std::uint32_t(blobs.size());
     std::vector<std::uint8_t> dxil(16, 0);  // stands in for the DxilProgramHeader stub
     const std::uint32_t xdat_at = std::uint32_t(dxil.size());
     dxil.insert(dxil.end(), {'X', 'D', 'A', 'T'});
-    put32(dxil, 2);   // entries
+    put32(dxil, entries);
     put32(dxil, 12);  // header size
-    const std::uint32_t first = xdat_at + 12 + 2 * 12;
+    std::uint32_t at = xdat_at + 12 + entries * 12;
     put32(dxil, 0x12);  // a 16-byte hash entry, ignored
-    put32(dxil, first);
+    put32(dxil, at);
     put32(dxil, 16);
-    put32(dxil, 0x0d);
-    put32(dxil, first + 16);
-    put32(dxil, std::uint32_t(xbch.size()));
+    at += 16;
+    for (const auto& blob : blobs) {
+        put32(dxil, 0x0d);
+        put32(dxil, at);
+        put32(dxil, std::uint32_t(blob.size()));
+        at += std::uint32_t(blob.size());
+    }
     dxil.insert(dxil.end(), 16, 0xab);
-    dxil.insert(dxil.end(), xbch.begin(), xbch.end());
+    for (const auto& blob : blobs) dxil.insert(dxil.end(), blob.begin(), blob.end());
 
     std::vector<std::uint8_t> out = {'D', 'X', 'B', 'C'};
     out.resize(28, 0);  // hash, version, total size (unchecked)
@@ -137,19 +152,49 @@ int main() {
     CHECK(!JsonReader("{\"a\": }").parse(json));
     CHECK(!JsonReader("[1, 2").parse(json));
     CHECK(!JsonReader("{} extra").parse(json));
+    // Malformed numbers and escapes are refused, never thrown.
+    CHECK(!JsonReader("[-]").parse(json));
+    CHECK(!JsonReader("[1e999]").parse(json));
+    CHECK(!JsonReader("[1.2.3]").parse(json));
+    CHECK(!JsonReader("\"\\uzzzz\"").parse(json));
+    CHECK(!JsonReader("\"\\u0x41\"").parse(json));
+    CHECK(!JsonReader("\"\\u00").parse(json));
+    CHECK(JsonReader("\"\\u0041\"").parse(json) && json.string == "A");
 
-    const auto shader = container(dynamic, 600);
+    const auto shader = container({{dynamic, 600}});
     CHECK(dxbc_part(shader, "PRIV").size() == 4 && !dxbc_part(shader, "DXIL").empty() && dxbc_part(shader, "RTS0").empty());
     CHECK(fssm_program(shader) == skewed(600));
     auto fssm = bytes("FSSM and a native program");
     CHECK(fssm_program(fssm) == fssm);  // a bare FSSM blob passes through
-    CHECK(fssm_program(container(dynamic, 601)).empty());  // stated size wrong
+    CHECK(fssm_program(container({{dynamic, 601}})).empty());  // stated size wrong
     CHECK(fssm_program(bytes("DXBC")).empty());
+    // Truncated DXBC part table: must return empty immediately instead of reading out-of-bounds offset 0
+    // (which would match "DXBC" at offset 0 or spin 0xFFFFFFFF iterations on a 32-byte header).
+    {
+        std::vector<std::uint8_t> trunc(32, 0);
+        std::memcpy(trunc.data(), "DXBC", 4);
+        trunc[4] = 4;   // if offset 0 is read as a part header, size=4 fits inside 32 bytes
+        trunc[28] = 1;  // parts = 1, but 0 bytes of part-offset table follow
+        CHECK(dxbc_part(trunc, "DXBC").empty());
+
+        std::vector<std::uint8_t> huge_parts(32, 0);
+        std::memcpy(huge_parts.data(), "DXBC", 4);
+        huge_parts[28] = 0xff;
+        huge_parts[29] = 0xff;
+        huge_parts[30] = 0xff;
+        huge_parts[31] = 0xff;  // parts = 0xFFFFFFFF with 0 bytes of part table
+        CHECK(dxbc_part(huge_parts, "DXIL").empty());
+        CHECK(fssm_program(huge_parts).empty());
+    }
+    // Two different 0x0D payloads: the last one is the program, as tools/fssm_unpack.py (and so fssm_sha256) has it.
+    CHECK(fssm_program(container({{fixed, 25}, {dynamic, 600}})) == skewed(600));
+    CHECK(fssm_program(container({{dynamic, 600}, {fixed, 25}})) == bytes("hello hello hello leonida"));
 
     // An index with one findable shader, one without a hash, and the module next to it.
     const auto dir = std::filesystem::temp_directory_path() / "leonida_shader_library_test";
     std::filesystem::create_directories(dir);
     const std::string hash = sha256_hex(skewed(600));
+    const std::string hash2 = sha256_hex(bytes("another program"));
     {
         std::ofstream index(dir / "index.json", std::ios::binary);
         index << "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
@@ -160,7 +205,14 @@ int main() {
                  "\"system_value\": 0, \"component_type\": \"float\"}, "
                  "{\"semantic\": \"SV_VertexID\", \"semantic_index\": 0, \"register\": 2, \"mask\": 1, \"rw_mask\": 1, "
                  "\"system_value\": 6, \"component_type\": \"uint\"}]},\n"
+                 " \"vs_same_program\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
+                 "{\"semantic\": \"TEXCOORD\", \"semantic_index\": 3, \"register\": -1, \"system_value\": 0, "
+                 "\"component_type\": \"float\"}]},\n"
                  " \"ps_out\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash << "\", \"outputs\": [0, 2]},\n"
+                 " \"ps_native\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
+                 "\"subgroup_size\": 64},\n"
+                 " \"cs_emulated\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash2 << "\", \"wave64\": true, "
+                 "\"subgroup_size\": null, \"wave64_exchange\": \"workgroup\"},\n"
                  " \"ps_unhashed\": {\"stage\": \"ps\", \"bindings\": []}}";
         std::ofstream spv(dir / "cs_test.spv", std::ios::binary);
         const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
@@ -168,19 +220,38 @@ int main() {
     }
     ShaderLibrary library;
     std::string error;
-    CHECK(library.load(dir.string(), &error) && library.size() == 3);
+    CHECK(library.load(dir.string(), &error) && library.size() == 6);
     const ShaderEntry* vs = library.find("vs", hash);
     CHECK(vs && vs->input_signature.size() == 2 && vs->input_signature[0].semantic == "COLOR");
     CHECK(vs->input_signature[1].register_index == 2 && vs->input_signature[1].system_value == 6 &&
           vs->input_signature[1].component_type == "uint");
+    // Two containers with the same program and different input signatures: both are kept, in index order, and an
+    // out-of-range number (register -1) reads as 0 instead of wrapping.
+    const auto vs_all = library.candidates("vs", hash);
+    CHECK(vs_all.size() == 2 && vs_all[0] == vs && vs_all[1]->name == "vs_same_program");
+    CHECK(vs_all[1]->input_signature.size() == 1 && vs_all[1]->input_signature[0].semantic_index == 3 &&
+          vs_all[1]->input_signature[0].register_index == 0);
     const ShaderEntry* ps = library.find("ps", hash);
     CHECK(ps && ps->outputs.size() == 2 && ps->outputs[1] == 2);
     const ShaderEntry* entry = library.find("cs", sha256_hex(fssm_program(shader)));
     CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
     CHECK(!library.find("ms", hash));  // no mesh shader with this hash
+    // The subgroup fields of the index (wave64 / subgroup_size / wave64_exchange): absent, native and emulated.
+    CHECK(!entry->subgroup_size && entry->wave64_exchange.empty() && !entry->emulated());
+    const ShaderEntry* native = library.find("ps", hash2);
+    CHECK(native && native->wave64 && native->subgroup_size == 64 && !native->emulated());
+    const ShaderEntry* emulated = library.find("cs", hash2);
+    CHECK(emulated && emulated->wave64 && emulated->subgroup_size == 0 && emulated->wave64_exchange == "workgroup" &&
+          emulated->emulated());
     CHECK(library.spirv(*entry).size() == 5);
     CHECK(!library.load((dir / "missing").string(), &error) && !error.empty());
+    {
+        std::ofstream index(dir / "index.json", std::ios::binary | std::ios::trunc);
+        index << "{\"bad\": {\"stage\": \"cs\", \"fssm_sha256\": \"00\", \"push_constant_bytes\": -}}";
+    }
+    error.clear();
+    CHECK(!library.load(dir.string(), &error) && !error.empty());  // refused, not thrown
     std::filesystem::remove_all(dir);
 
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction and index lookup OK\n");

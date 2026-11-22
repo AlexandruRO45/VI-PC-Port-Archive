@@ -25,6 +25,9 @@ The walker starts at `--start` or the header's data offset, finds a zlib header 
 magic, inflates the stream, and continues after the bytes it actually consumed. `--index-only` records the
 streams without writing the inflated files; `--limit` bounds a sample; `--start` starts at a known offset.
 
+`--start` must be 0 or more and `--limit` at least 1 (decimal or `0x` hex). An out-of-range value stops with a
+one-line error and exit code 2 before any output is written, rather than silently scanning everything or nothing.
+
 `<out_dir>/index.json` contains:
 
 - `summary`: archive, files, compressed/inflated bytes, Bink 2 bytes/files, zero padding, unread bytes, span;
@@ -61,6 +64,17 @@ textures; the original RPF paths still require the missing executable/key.
 
 `tools/manifest.py` is independent of RPF: it hashes a directory tree and verifies it later, with `--jobs` on
 both paths. It is used to check exported assets without keeping a second copy.
+
+`tools/rpf9_names.py` is the lightweight lookup pass: it walks the same data area, inflates a bounded prefix
+of each zlib stream and indexes the measured `name.#dr`/`#ft`/`#dd` spellings with their archive offsets. It
+does not decode a resource or need the TOC; see [resource_names.md](resource_names.md).
+
+### Viewing a header in ImHex
+
+[tools/imhex/rpf9.hexpat](../tools/imhex/rpf9.hexpat) is a pattern for the [ImHex](https://imhex.werwolv.net/) hex
+editor. It names the magic and the data offset at `+4`, shows the u32s at `+8` and `+12` unnamed, and shows the range
+from `+0x10` to the data offset (the rest of the header and the TOC) as one opaque byte array. It decodes nothing in
+that range. `python -I tests/test_imhex_patterns.py` runs it on a synthetic header when ImHex is installed.
 
 ## Limits
 

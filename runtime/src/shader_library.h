@@ -9,7 +9,9 @@
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -380,12 +382,24 @@ private:
         if (literal("true")) return out.kind = Json::Kind::boolean, out.boolean = true, true;
         if (literal("false")) return out.kind = Json::Kind::boolean, out.boolean = false, true;
         if (literal("null")) return out.kind = Json::Kind::null, true;
+        // Numbers through strtod: Apple's libc++ does not provide the floating-point from_chars overload. The
+        // token is already limited to JSON number characters, and the end check requires all of it to be consumed.
         const std::size_t start = pos_;
         while (pos_ < text_.size() && std::strchr("+-0123456789.eE", text_[pos_])) ++pos_;
         if (pos_ == start) return false;
         out.kind = Json::Kind::number;
-        out.number = std::stod(std::string(text_.substr(start, pos_ - start)));
-        return true;
+        const std::string token(text_.substr(start, pos_ - start));
+        char* end = nullptr;
+        errno = 0;
+        out.number = std::strtod(token.c_str(), &end);
+        return errno != ERANGE && end == token.c_str() + token.size();
+    }
+
+    static int hex_digit(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
     }
 
     bool string(std::string& out) {
@@ -408,8 +422,12 @@ private:
             case 't': out.push_back('\t'); break;
             case 'u': {
                 if (pos_ + 4 > text_.size()) return false;
-                const unsigned code = unsigned(std::stoul(std::string(text_.substr(pos_, 4)), nullptr, 16));
-                pos_ += 4;
+                unsigned code = 0;
+                for (int i = 0; i < 4; ++i) {  // exactly four hex digits
+                    const int digit = hex_digit(text_[pos_++]);
+                    if (digit < 0) return false;
+                    code = code << 4 | unsigned(digit);
+                }
                 if (code < 0x80) {
                     out.push_back(char(code));
                 } else if (code < 0x800) {
@@ -445,10 +463,11 @@ inline std::span<const std::uint8_t> dxbc_part(std::span<const std::uint8_t> con
     };
     if (container.size() < 32 || std::memcmp(container.data(), "DXBC", 4) != 0) return {};
     const std::uint32_t parts = u32(28);
+    if (parts > (container.size() - 32) / 4) return {};
     for (std::uint32_t i = 0; i < parts; ++i) {
         const std::uint32_t at = u32(32 + 4 * std::size_t(i));
         if (std::size_t(at) + 8 > container.size()) return {};
-        const std::uint32_t size = u32(at + 4);
+        const std::uint32_t size = u32(std::size_t(at) + 4);
         if (std::size_t(at) + 8 + size > container.size()) return {};
         if (std::memcmp(container.data() + at, fourcc, 4) == 0) return container.subspan(at + 8, size);
     }
@@ -471,22 +490,24 @@ inline std::vector<std::uint8_t> fssm_program(std::span<const std::uint8_t> byte
     for (; xdat + 4 <= dxil.size(); ++xdat)
         if (std::memcmp(dxil.data() + xdat, "XDAT", 4) == 0) break;
     if (xdat + 12 > dxil.size()) return {};
+    // Some containers carry two different 0x0D payloads (195 of 26,503, tools/fssm_unpack.py). The translator's
+    // fssm_sha256 is taken from the last one (fssm_unpack.py's default, which make_game.py uses), so this does too.
     const std::uint32_t count = u32(xdat + 4);
+    std::span<const std::uint8_t> blob;
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::size_t entry = xdat + 12 + 12 * std::size_t(i);
         if (entry + 12 > dxil.size()) return {};
         const std::uint32_t tag = u32(entry), offset = u32(entry + 4), size = u32(entry + 8);
         if (tag != 0x0d) continue;
         if (std::size_t(offset) + size > dxil.size() || size < 24) return {};
-        const auto blob = dxil.subspan(offset, size);
-        if (std::memcmp(blob.data(), "XBCH", 4) != 0) return {};
-        std::uint32_t unpacked;
-        std::memcpy(&unpacked, blob.data() + 16, 4);
-        std::vector<std::uint8_t> out;
-        if (!zlib_inflate(blob.subspan(24), out, unpacked) || out.size() != unpacked) return {};
-        return out;
+        blob = dxil.subspan(offset, size);
     }
-    return {};
+    if (blob.empty() || std::memcmp(blob.data(), "XBCH", 4) != 0) return {};
+    std::uint32_t unpacked;
+    std::memcpy(&unpacked, blob.data() + 16, 4);
+    std::vector<std::uint8_t> out;
+    if (!zlib_inflate(blob.subspan(24), out, unpacked) || out.size() != unpacked) return {};
+    return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -511,6 +532,13 @@ struct ShaderEntry {
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
     bool uses_code_base = false;
     bool wave64 = false;
+    // The subgroup size the translator assumed (64 for a wave64 shader, 32 otherwise); 0 when the entry says null,
+    // as one translated with --wave64-emulate does, or has none.
+    std::uint32_t subgroup_size = 0;
+    // "workgroup" for a shader translated with --wave64-emulate: it uses no subgroup operation and is exact on any
+    // subgroup size. Empty for a native translation.
+    std::string wave64_exchange;
+    bool emulated() const { return !wave64_exchange.empty(); }
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
     std::vector<std::uint32_t> outputs;             // pixel shaders: the render-target locations written
 };
@@ -523,53 +551,30 @@ public:
             if (error) *error = why;
             return false;
         };
-        std::ifstream file(dir + "/index.json", std::ios::binary);
-        if (!file) return fail("cannot open " + dir + "/index.json");
-        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        Json root;
-        if (!JsonReader(text).parse(root) || root.kind != Json::Kind::object) return fail("index.json is not a JSON object");
-        dir_ = dir;
-        entries_.clear();
-        for (const auto& [name, meta] : root.object) {
-            const Json* hash = meta.find("fssm_sha256");
-            const Json* stage = meta.find("stage");
-            if (!hash || hash->kind != Json::Kind::string || !stage || stage->kind != Json::Kind::string) continue;
-            ShaderEntry e;
-            e.name = name;
-            e.stage = stage->string;
-            e.fssm_sha256 = hash->string;
-            if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
-            if (const Json* p = meta.find("push_constant_bytes"); p && p->kind == Json::Kind::number)
-                e.push_constant_bytes = std::uint32_t(p->number);
-            if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
-                for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = std::uint32_t(l->array[i].number);
-            if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
-            if (const Json* w = meta.find("wave64"); w && w->kind == Json::Kind::boolean) e.wave64 = w->boolean;
-            if (const Json* s = meta.find("input_signature"); s && s->kind == Json::Kind::array) {
-                for (const Json& item : s->array) {
-                    SignatureElement element;
-                    if (const Json* v = item.find("semantic"); v && v->kind == Json::Kind::string) element.semantic = v->string;
-                    if (const Json* v = item.find("semantic_index")) element.semantic_index = std::uint32_t(v->number);
-                    if (const Json* v = item.find("register")) element.register_index = std::uint32_t(v->number);
-                    if (const Json* v = item.find("system_value")) element.system_value = std::uint32_t(v->number);
-                    if (const Json* v = item.find("component_type"); v && v->kind == Json::Kind::string)
-                        element.component_type = v->string;
-                    e.input_signature.push_back(std::move(element));
-                }
-            }
-            if (const Json* o = meta.find("outputs"); o && o->kind == Json::Kind::array)
-                for (const Json& item : o->array) e.outputs.push_back(std::uint32_t(item.number));
-            entries_[{e.stage, e.fssm_sha256}] = std::move(e);
+        // Nothing here may throw into the D3D12 shim (only allocation can, and that is caught too).
+        try {
+            return load_index(dir, fail);
+        } catch (...) {
+            return fail("index.json could not be read");
         }
-        return true;
     }
 
     bool loaded() const { return !dir_.empty(); }
-    std::size_t size() const { return entries_.size(); }
+    std::size_t size() const { return count_; }
 
+    // The first entry for this program. Two containers can hold the same FSSM program with different input
+    // signatures; `candidates` returns all of them.
     const ShaderEntry* find(std::string_view stage, std::string_view fssm_sha256) const {
+        const auto all = candidates(stage, fssm_sha256);
+        return all.empty() ? nullptr : all.front();
+    }
+
+    std::vector<const ShaderEntry*> candidates(std::string_view stage, std::string_view fssm_sha256) const {
+        std::vector<const ShaderEntry*> out;
         const auto it = entries_.find({std::string(stage), std::string(fssm_sha256)});
-        return it == entries_.end() ? nullptr : &it->second;
+        if (it != entries_.end())
+            for (const ShaderEntry& e : it->second) out.push_back(&e);
+        return out;
     }
 
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
@@ -584,8 +589,65 @@ public:
     }
 
 private:
+    // A non-negative integer field, or 0 when it is missing, not a number or out of range.
+    static std::uint32_t u32(const Json* value) {
+        if (!value || value->kind != Json::Kind::number) return 0;
+        const double n = value->number;
+        return n >= 0 && n <= 4294967295.0 ? std::uint32_t(n) : 0;
+    }
+
+    template<typename Fail>
+    bool load_index(const std::string& dir, Fail&& fail) {
+        std::ifstream file(dir + "/index.json", std::ios::binary);
+        if (!file) return fail("cannot open " + dir + "/index.json");
+        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        Json root;
+        if (!JsonReader(text).parse(root) || root.kind != Json::Kind::object) return fail("index.json is not a JSON object");
+        dir_ = dir;
+        entries_.clear();
+        count_ = 0;
+        for (const auto& [name, meta] : root.object) {
+            const Json* hash = meta.find("fssm_sha256");
+            const Json* stage = meta.find("stage");
+            if (!hash || hash->kind != Json::Kind::string || !stage || stage->kind != Json::Kind::string) continue;
+            ShaderEntry e;
+            e.name = name;
+            e.stage = stage->string;
+            e.fssm_sha256 = hash->string;
+            if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
+            e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
+            if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
+                for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);
+            if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
+            if (const Json* w = meta.find("wave64"); w && w->kind == Json::Kind::boolean) e.wave64 = w->boolean;
+            if (const Json* g = meta.find("subgroup_size"); g && g->kind == Json::Kind::number)
+                e.subgroup_size = u32(g);
+            if (const Json* x = meta.find("wave64_exchange"); x && x->kind == Json::Kind::string)
+                e.wave64_exchange = x->string;
+            if (const Json* s = meta.find("input_signature"); s && s->kind == Json::Kind::array) {
+                for (const Json& item : s->array) {
+                    SignatureElement element;
+                    if (const Json* v = item.find("semantic"); v && v->kind == Json::Kind::string) element.semantic = v->string;
+                    element.semantic_index = u32(item.find("semantic_index"));
+                    element.register_index = u32(item.find("register"));
+                    element.system_value = u32(item.find("system_value"));
+                    if (const Json* v = item.find("component_type"); v && v->kind == Json::Kind::string)
+                        element.component_type = v->string;
+                    e.input_signature.push_back(std::move(element));
+                }
+            }
+            if (const Json* o = meta.find("outputs"); o && o->kind == Json::Kind::array)
+                for (const Json& item : o->array) e.outputs.push_back(u32(&item));
+            entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
+            ++count_;
+        }
+        return true;
+    }
+
     std::string dir_;
-    std::map<std::pair<std::string, std::string>, ShaderEntry> entries_;
+    std::size_t count_ = 0;
+    // Entries by (stage, fssm_sha256), in index order.
+    std::map<std::pair<std::string, std::string>, std::vector<ShaderEntry>> entries_;
 };
 
 } // namespace leonida

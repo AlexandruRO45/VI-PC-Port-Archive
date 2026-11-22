@@ -79,6 +79,37 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertIn("produced no disassembly", p.stderr)
         self.assertEqual(sorted(os.listdir(out)), [])
 
+    def test_llvm_error_discards_partial_disassembly(self):
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "if '-show-encoding' in sys.argv:\n"
+                       "    print('s_nop 0')\n"
+                       "    sys.stderr.write('error: disassembly stopped\\n')\n"
+                       "    sys.exit(1)\n"
+                       "print('s_endpgm')\n")
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("'failed': 1", p.stdout)
+        self.assertIn(self.fssm, p.stderr)
+        self.assertIn("error: disassembly stopped", p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertEqual(sorted(os.listdir(out)), [])
+
+    def test_no_code_is_an_error_when_no_listings_are_written(self):
+        with open(self.fssm, "wb") as f:
+            f.write(b"FSSM\x01\x01" + bytes(320))
+        mc = self.fake("import sys\n"
+                       "sys.stdin.read()\n"
+                       "print('s_endpgm')\n")
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("'no s_endpgm': 1", p.stdout)
+        self.assertIn(self.fssm, p.stderr)
+        self.assertEqual(len(p.stderr.splitlines()), 1)
+        self.assertEqual(sorted(os.listdir(out)), [])
+
     def test_a_real_disassembly_is_written(self):
         mc = self.fake("import sys\n"
                        "probe = sys.stdin.read().strip() == %r\n"
@@ -143,6 +174,16 @@ class DisasmInputTest(unittest.TestCase):
         self.assertIn("'clean': 2", p.stdout)
         self.assertIn("'scan failed': 1", p.stdout)
 
+    def test_directory_with_fssm_suffix_does_not_count_toward_limit(self):
+        os.mkdir(os.path.join(self.src, "a_cache.fssm"))
+        self.write("b_shader.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+
+        result = self.run_tool(self.src, "--out", out, "--limit", "1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(out), ["b_shader.s"])
+
     def test_jobs_and_limit_must_be_at_least_one(self):
         self.write("one.fssm", fssm())
         out = os.path.join(self.dir, "out")
@@ -166,6 +207,18 @@ class DisasmInputTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertIn("is not a file or folder", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
+
+    def test_an_out_that_is_a_file_is_an_error(self):
+        self.write("one.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("keep")
+        p = self.run_tool(self.src, "--out", out)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("cannot create the output folder", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep")
 
 
 if __name__ == "__main__":

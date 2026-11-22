@@ -74,6 +74,8 @@ def disasm(code: bytes, mcpu: str):
     except OSError as e:
         return "", 0, str(e)
     bad = p.stderr.count("invalid instruction encoding")
+    if p.returncode != 0:
+        return "", bad, p.stderr.strip() or f"llvm-mc exited with code {p.returncode}"
     return p.stdout, bad, p.stderr
 
 
@@ -96,7 +98,8 @@ def code_range(b: bytes):
 
 
 def one(path, out, mcpu):
-    b = open(path, "rb").read()
+    with open(path, "rb") as f:
+        b = f.read()
     start, end, how = code_range(b)
     if end is None:
         return "no s_endpgm"
@@ -116,7 +119,7 @@ def one(path, out, mcpu):
         FAILED.append((path, reason))
         return "failed"
     name = os.path.splitext(os.path.basename(path))[0]
-    with open(os.path.join(out, name + ".s"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out, name + ".s"), "w", encoding="utf-8", newline="\n") as f:
         f.write(f"; {name}  code 0x{start:x}..0x{end:x} ({how}), {mcpu}, {bad} invalid words\n")
         f.write(asm)
         if err.strip():
@@ -132,15 +135,22 @@ def main():
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
-    if not os.path.isfile(a.src) and not os.path.isdir(a.src):
+    if os.path.isfile(a.src):
+        files = [a.src]
+    elif os.path.isdir(a.src):
+        with os.scandir(a.src) as entries:
+            files = sorted(entry.path for entry in entries
+                           if entry.name.endswith(".fssm") and entry.is_file())
+    else:
         fail(f"{a.src} is not a file or folder")
-    files = [a.src] if os.path.isfile(a.src) else sorted(
-        os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".fssm"))
     if not files:
         fail(f"no .fssm files in {a.src}")
     files = files[: a.limit] if a.limit else files
     out = a.out or os.path.join(os.path.dirname(files[0]), "..", "disasm")
-    os.makedirs(out, exist_ok=True)
+    try:
+        os.makedirs(out, exist_ok=True)
+    except OSError as e:
+        fail(f"cannot create the output folder {out}: {e.strerror or e}")
     probe(a.mcpu)
     from collections import Counter
     with ThreadPoolExecutor(a.jobs) as ex:
@@ -148,11 +158,15 @@ def main():
     print(f"{len(files)} shaders -> {os.path.abspath(out)}: {dict(res)}")
     if FAILED:
         path, reason = FAILED[0]
-        print(f"ERROR: {len(FAILED)} shader(s) produced no disassembly, first {os.path.basename(path)}: {reason}",
-              file=sys.stderr)
-        return 1
+        fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
+    if not (res["clean"] or res["invalid words"]):
+        fail(f"no disassembly produced for {a.src}")
     return 0
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())
