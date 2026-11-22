@@ -13,7 +13,7 @@ import os
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PAGES = ("design.md", "README.md", "testing.md")
+PAGES = ("design.md", "README.md", "testing.md", "gameinput.md")
 
 
 def repeated_topics(lines):
