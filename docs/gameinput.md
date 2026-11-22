@@ -4,7 +4,8 @@ The Xbox build reads controllers through Microsoft's GameInput API. `runtime/shi
 `GameInputCreate` with its own implementation of that API, backed by [SDL3](https://libsdl.org) gamepads, so
 every controller SDL supports works the way an Xbox pad would: DualSense, DualShock 4, Switch Pro, Xbox pads, and the
 rest of SDL's controller database. On a DualSense the impulse-trigger rumble becomes adaptive-trigger effects, and
-the lightbar colour can be set.
+the lightbar colour can be set. Racing wheels, flight sticks and arcade sticks are reported as their own GameInput
+kinds ([below](#wheels-flight-sticks-and-arcade-sticks)).
 
 Without the shim the loader would bind `GameInputCreate` to the host's `GameInput.dll` if there is one
 ([#279](https://github.com/ItsNotRexed/Leonida/pull/279)). That works for Xbox pads only, and gives no DualSense
@@ -159,6 +160,41 @@ sensors are enabled when the pad is opened, at SDL's requested rate, and every p
   reading history cap bound the cost.
 - `gameinput_probe` prints the accel and gyro fractions when the pad has sensors (a resting pad shows ~0.5 g).
 
+## Wheels, flight sticks and arcade sticks
+
+GameInput has a state for three more device kinds, and the shim fills them from SDL:
+
+- A joystick whose SDL type is `SDL_JOYSTICK_TYPE_WHEEL`, `..._FLIGHT_STICK` or `..._ARCADE_STICK` reports
+  `GameInputKindRacingWheel`, `GameInputKindFlightStick` or `GameInputKindArcadeStick` in `supportedInput` and in
+  the reading's `GetInputKind`, so `GetCurrentReading(GameInputKindRacingWheel, ...)` finds a wheel and never returns
+  a plain pad. `GetRacingWheelState`, `GetFlightStickState` and `GetArcadeStickState` return its state; the two
+  states the device is not are `false`, as is `GetGamepadState` on a device SDL only exposes as a joystick.
+- When SDL also maps the device as a gamepad (its controller database has an entry, as for most wheels), the device
+  reports the gamepad kinds as well and `GetGamepadState` works; when it does not, the device reports the controller
+  axis/button kinds and the number of axes and buttons SDL reports. `SDL_IsGamepad` decides at connect time.
+- The per-kind info (`arcadeStickInfo`, `flightStickInfo`, `racingWheelInfo`) carries Xbox-style control labels. SDL
+  does not expose a wheel's clutch, handbrake, gear lever or steering range, so those stay `false`, and
+  `GetRacingWheelState` reports clutch and handbrake 0 and `patternShifterGear` 0 rather than a guess.
+- A raw wheel or stick rumbles through `SDL_RumbleJoystick`; force feedback and haptic motors are not reported (that
+  is RT-160, still open, in the coordination issue).
+
+This mapping is the shim's choice, not measured from a console or from any particular wheel (`VERIFY` below):
+
+| kind | state | from the SDL gamepad mapping | from a raw joystick |
+|---|---|---|---|
+| racing wheel | wheel | left X, -1..1 | axis 0, -1..1 |
+| | throttle / brake | right / left trigger, 0..1 | axes 1 / 2, 0..1 |
+| | clutch / handbrake | 0 (no gamepad axis) | axes 3 / 4, 0..1 |
+| | buttons | Menu, View, LB/RB = previous/next gear, D-pad | buttons 0-7 in the header's bit order |
+| flight stick | roll / pitch / yaw | left X, left Y (+Y up), right X | axis 0, -1 x axis 1, axis 2 |
+| | throttle | right trigger, 0..1 | axis 3, 0..1 |
+| | hat switch | the D-pad as an 8-way switch | centred (SDL shows a hat as buttons) |
+| | buttons | Menu, View, A = fire primary, B = fire secondary | buttons 0-3 in the header's bit order |
+| arcade stick | buttons | Menu, View, D-pad, A/B/X/Y = actions 1-4, LB/RB = 5-6, stick clicks = specials 1-2 | buttons 0-13 in the header's bit order |
+
+A pedal axis reads 0..1 from its low end, so an axis left at SDL's centre reads 0.5; a real pedal at rest sits at
+its low end.
+
 ## Environment variables
 
 | variable | default | effect |
@@ -188,7 +224,7 @@ The API surface:
 | interface | implemented | not implemented |
 |---|---|---|
 | `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetTemporalReading`, `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
-| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state | raw report, keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
+| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state, arcade stick / flight stick / racing wheel state | raw report, keyboard, mouse, touch (all return nothing) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState` | force feedback and haptic motors (none reported), raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch`, `OpenWaitHandle` | the quota (the queue is short) |
 
@@ -262,7 +298,9 @@ shim fills (`GameInputDeviceInfo` 320 bytes with `deviceFamily` at 96 and the in
   virtual-joystick description, fed with `SDL_SendJoystickVirtualSensorData`): the kind and `motionInfo` on a sensor
   pad and not on a plain one, no motion before the first sample, normalisation against the `motionInfo` maxima, the
   accuracy values, the ±1 clamp, the ~8 ms cadence, and that a motion query on a pad without sensors is
-  `GAMEINPUT_E_READING_NOT_FOUND`. The keyboard pad is
+  `GAMEINPUT_E_READING_NOT_FOUND`. Three more SDL virtual joysticks, of type wheel, flight stick and arcade stick
+  (no gamepad mapping, so the raw path), check each kind's state, its axis and button counts, the label info, the
+  raw index convention, and that a gamepad or motion query finds none of them. The keyboard pad is
   driven through `rt::gameinput::set_keyboard_source` and `set_cursor_source` with fake keys, focus and cursor: every
   binding, two keys at once, each WASD direction, opposite keys cancelling, diagonals, the mouse moving the right
   stick, clamping and decaying to 0, the mouse-button triggers, no input out of focus, release of buttons, sticks and
@@ -290,6 +328,13 @@ These need the game executable or a test on hardware:
   DualSense exposes can also be wider than 2 g, so hard shakes may clamp at 1.0.
 - **Motion members the shim does not provide** (magnetic field, orientation) are zero with
   `GameInputMotionAccuracyUnknown`; whether a title wants a synthesised quaternion there is unknown.
+- **Wheel, flight stick and arcade stick mapping** is this shim's choice: SDL standardises neither a raw joystick's
+  axes and buttons nor a wheel's layout, so the table above (left stick = steering, triggers = brake and throttle,
+  raw axes and buttons in header order) is a starting point. It needs a real wheel and flight stick and the game to
+  confirm or replace; no such device has driven it yet.
+- **Wheel features**: clutch, handbrake, gear lever, steering range and force feedback are reported as absent, because
+  SDL does not expose them through the gamepad or joystick API the shim uses. A title that requires one of them sees
+  a wheel without it.
 - **Device family**: every pad is reported as `GameInputFamilyXboxOne`; a title that filters on family sees only
   that.
 - **Identical pads at start**: twins are numbered in the order the shim opens them. For pads already connected when

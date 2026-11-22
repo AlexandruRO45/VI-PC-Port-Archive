@@ -52,9 +52,16 @@ namespace {
 
 constexpr uint32_t kBaseKinds =
     GameInputKindControllerAxis | GameInputKindControllerButton | GameInputKindGamepad | GameInputKindUiNavigation;
-constexpr uint32_t kSupportedKinds = kBaseKinds | GameInputKindMotion;  // everything a reading may carry
-constexpr uint32_t kAxisCount = 6;  // LX, LY, RX, RY, LT, RT
+// What a joystick SDL does not map as a gamepad reports: the controller arrays plus the kind its SDL type names.
+constexpr uint32_t kControllerKinds = GameInputKindControllerAxis | GameInputKindControllerButton;
+constexpr uint32_t kSpecialKinds = GameInputKindArcadeStick | GameInputKindFlightStick | GameInputKindRacingWheel;
+// Everything a reading may carry. The kind filters take this as the outer bound and each device's own set
+// (info.supportedInput) as the inner one.
+constexpr uint32_t kSupportedKinds = kBaseKinds | kSpecialKinds | GameInputKindMotion;
+constexpr uint32_t kAxisCount = 6;  // a gamepad's LX, LY, RX, RY, LT, RT
 constexpr uint32_t kButtonCount = SDL_GAMEPAD_BUTTON_COUNT;
+constexpr uint32_t kMaxAxes = 16;     // axes kept per raw joystick (SDL has no bound of its own)
+constexpr uint32_t kMaxButtons = 32;  // buttons kept per raw joystick (SDL allows up to SDL_JOYSTICK_BUTTON_MAX)
 constexpr uint32_t kConnectedStatus = GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled;
 constexpr Uint32 kRumbleDurationMs = 0xFFFF;  // SDL's maximum; refreshed well before it runs out
 constexpr uint64_t kRumbleRefreshUs = 20'000'000;
@@ -138,18 +145,30 @@ class Device;
 
 struct Snapshot {
     GameInputGamepadState gamepad{};
+    GameInputArcadeStickState arcade{};
+    GameInputFlightStickState flight{};
+    GameInputRacingWheelState wheel{};
     uint32_t ui = 0;
-    float axes[kAxisCount] = {};
-    bool buttons[kButtonCount] = {};
+    float axes[kMaxAxes] = {};
+    bool buttons[kMaxButtons] = {};
     bool guide = false;
+    uint32_t axis_count = kAxisCount, button_count = kButtonCount;
     GameInputMotionState motion{};  // valid only when has_motion; does not take part in operator==
     bool has_motion = false;
     bool operator==(const Snapshot& o) const {  // field by field: the padding is not initialised
         const GameInputGamepadState &a = gamepad, &b = o.gamepad;
+        const GameInputFlightStickState &f = flight, &g = o.flight;
+        const GameInputRacingWheelState &w = wheel, &v = o.wheel;
         return a.buttons == b.buttons && a.leftTrigger == b.leftTrigger && a.rightTrigger == b.rightTrigger &&
                a.leftThumbstickX == b.leftThumbstickX && a.leftThumbstickY == b.leftThumbstickY &&
                a.rightThumbstickX == b.rightThumbstickX && a.rightThumbstickY == b.rightThumbstickY && ui == o.ui &&
-               std::memcmp(buttons, o.buttons, sizeof buttons) == 0 && guide == o.guide;
+               arcade.buttons == o.arcade.buttons && f.buttons == g.buttons && f.hatSwitch == g.hatSwitch &&
+               f.roll == g.roll && f.pitch == g.pitch && f.yaw == g.yaw && f.throttle == g.throttle &&
+               w.buttons == v.buttons && w.patternShifterGear == v.patternShifterGear && w.wheel == v.wheel &&
+               w.throttle == v.throttle && w.brake == v.brake && w.clutch == v.clutch && w.handbrake == v.handbrake &&
+               axis_count == o.axis_count && button_count == o.button_count &&
+               std::memcmp(axes, o.axes, axis_count * sizeof(float)) == 0 &&
+               std::memcmp(buttons, o.buttons, button_count * sizeof(bool)) == 0 && guide == o.guide;
     }
 };
 
@@ -176,7 +195,7 @@ public:
     }
 
     uint32_t STDMETHODCALLTYPE GetInputKind() override {
-        return s_.has_motion ? kSupportedKinds : kBaseKinds;  // a reading of a pad without sensors carries no motion
+        return s_.has_motion ? kinds_ | GameInputKindMotion : kinds_;  // a pad without sensors carries no motion
     }
     uint64_t STDMETHODCALLTYPE GetSequenceNumber(uint32_t) override { return seq_; }
     uint64_t STDMETHODCALLTYPE GetTimestamp() override { return ts_; }
@@ -185,15 +204,15 @@ public:
         if (report) *report = nullptr;
         return false;
     }
-    uint32_t STDMETHODCALLTYPE GetControllerAxisCount() override { return kAxisCount; }
+    uint32_t STDMETHODCALLTYPE GetControllerAxisCount() override { return s_.axis_count; }
     uint32_t STDMETHODCALLTYPE GetControllerAxisState(uint32_t count, float* out) override {
-        const uint32_t n = out ? std::min(count, kAxisCount) : 0;
+        const uint32_t n = out ? std::min(count, s_.axis_count) : 0;
         std::memcpy(out, s_.axes, n * sizeof(float));
         return n;
     }
-    uint32_t STDMETHODCALLTYPE GetControllerButtonCount() override { return kButtonCount; }
+    uint32_t STDMETHODCALLTYPE GetControllerButtonCount() override { return s_.button_count; }
     uint32_t STDMETHODCALLTYPE GetControllerButtonState(uint32_t count, bool* out) override {
-        const uint32_t n = out ? std::min(count, kButtonCount) : 0;
+        const uint32_t n = out ? std::min(count, s_.button_count) : 0;
         std::memcpy(out, s_.buttons, n * sizeof(bool));
         return n;
     }
@@ -209,16 +228,28 @@ public:
         *static_cast<GameInputMotionState*>(state) = s_.motion;
         return true;
     }
-    bool STDMETHODCALLTYPE GetArcadeStickState(void*) override { return false; }
-    bool STDMETHODCALLTYPE GetFlightStickState(void*) override { return false; }
+    bool STDMETHODCALLTYPE GetArcadeStickState(void* state) override {
+        if (!state || !(kinds_ & GameInputKindArcadeStick)) return false;
+        *static_cast<GameInputArcadeStickState*>(state) = s_.arcade;
+        return true;
+    }
+    bool STDMETHODCALLTYPE GetFlightStickState(void* state) override {
+        if (!state || !(kinds_ & GameInputKindFlightStick)) return false;
+        *static_cast<GameInputFlightStickState*>(state) = s_.flight;
+        return true;
+    }
     bool STDMETHODCALLTYPE GetGamepadState(GameInputGamepadState* state) override {
-        if (!state) return false;
+        if (!state || !(kinds_ & GameInputKindGamepad)) return false;
         *state = s_.gamepad;
         return true;
     }
-    bool STDMETHODCALLTYPE GetRacingWheelState(void*) override { return false; }
+    bool STDMETHODCALLTYPE GetRacingWheelState(void* state) override {
+        if (!state || !(kinds_ & GameInputKindRacingWheel)) return false;
+        *static_cast<GameInputRacingWheelState*>(state) = s_.wheel;
+        return true;
+    }
     bool STDMETHODCALLTYPE GetUiNavigationState(GameInputUiNavigationState* state) override {
-        if (!state) return false;
+        if (!state || !(kinds_ & GameInputKindUiNavigation)) return false;
         state->buttons = s_.ui;
         return true;
     }
@@ -230,6 +261,7 @@ private:
     std::atomic<ULONG> refs_{1};
     Device* device_;
     Snapshot s_;
+    uint32_t kinds_;  // GameInputKind of the device that made the reading
     uint64_t seq_, ts_;
     uint64_t order_;  // place among every pad's readings, the order GetNextReading/GetPreviousReading follow
 };
@@ -294,10 +326,16 @@ public:
     GameInputDeviceInfo info{};
     std::string name;
     GameInputString display_name{};
-    GameInputControllerAxisInfo axis_info[kAxisCount]{};
-    GameInputControllerButtonInfo button_info[kButtonCount]{};
+    GameInputControllerAxisInfo axis_info[kMaxAxes]{};
+    GameInputControllerButtonInfo button_info[kMaxButtons]{};
     GameInputGamepadInfo gamepad_info{};
     GameInputUiNavigationInfo ui_info{};
+    GameInputArcadeStickInfo arcade_info{};
+    GameInputFlightStickInfo flight_info{};
+    GameInputRacingWheelInfo wheel_info{};
+    uint32_t kinds = kBaseKinds;  // GameInputKind this device reports (info.supportedInput)
+    bool is_gamepad = true;          // opened with SDL_OpenGamepad; otherwise js holds an SDL_Joystick
+    uint32_t axis_count = kAxisCount, button_count = kButtonCount;
     GameInputMotionInfo motion_info{};  // filled only when the pad has sensors; info.motionInfo points at it
     std::atomic<uint32_t> status{GameInputDeviceNoStatus};
     std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
@@ -309,7 +347,8 @@ public:
     AppLocalDeviceId base_id{};  // id_bytes of the identity alone: twins share it, info.deviceId tells them apart
 
     // Poll-thread state.
-    SDL_Gamepad* pad = nullptr;
+    SDL_Gamepad* pad = nullptr;  // is_gamepad
+    SDL_Joystick* js = nullptr;  // !is_gamepad: a wheel, flight stick or arcade stick SDL has no gamepad mapping for
     SDL_JoystickID id = 0;
     int player = -1;
     bool is_dualsense = false, has_rumble = false, has_trigger_rumble = false, has_motion = false;
@@ -324,7 +363,7 @@ private:
 };
 
 Reading::Reading(Device* device, const Snapshot& s, uint64_t seq, uint64_t ts, uint64_t order)
-    : device_(device), s_(s), seq_(seq), ts_(ts), order_(order) {
+    : device_(device), s_(s), kinds_(device->kinds), seq_(seq), ts_(ts), order_(order) {
     device_->AddRef();
 }
 Reading::~Reading() { device_->Release(); }
@@ -401,7 +440,7 @@ bool matches(const Callback& c, const Event& e) {
             if (!(c.kind & e.device->info.supportedInput) && c.kind != GameInputKindUnknown) return false;
             return e.only || ((e.current ^ e.previous) & c.status_filter);
         case CbType::Reading:
-            return (c.kind & kSupportedKinds) || c.kind == GameInputKindUnknown;
+            return (c.kind & e.reading->GetInputKind()) || c.kind == GameInputKindUnknown;
         default:
             return true;
     }
@@ -467,6 +506,138 @@ float axis(SDL_Gamepad* p, SDL_GamepadAxis a) { return std::max(-1.0f, SDL_GetGa
 
 float norm(float v, float max) { return std::clamp(v / max, -1.0f, 1.0f); }
 
+// The D-pad as a GameInput hat switch (directions only; the diagonals need both buttons down).
+GameInputSwitchPosition hat_from_dpad(uint32_t b) {
+    const bool up = b & GameInputGamepadDPadUp, down = b & GameInputGamepadDPadDown;
+    const bool left = b & GameInputGamepadDPadLeft, right = b & GameInputGamepadDPadRight;
+    if (up && right) return GameInputSwitchUpRight;
+    if (down && right) return GameInputSwitchDownRight;
+    if (down && left) return GameInputSwitchDownLeft;
+    if (up && left) return GameInputSwitchUpLeft;
+    if (up) return GameInputSwitchUp;
+    if (down) return GameInputSwitchDown;
+    if (left) return GameInputSwitchLeft;
+    if (right) return GameInputSwitchRight;
+    return GameInputSwitchCenter;
+}
+
+// The per-kind states of a device SDL opens as a gamepad, from the standard gamepad mapping: the left stick is the
+// wheel or roll axis, the triggers are throttle and brake, and the D-pad is the flight stick's hat. A title that asks
+// a wheel for its state gets one whether SDL mapped the wheel as a gamepad or (read_joystick) as a raw joystick.
+// This mapping is the shim's choice (VERIFY: against a real wheel and flight stick, docs/gameinput.md).
+void fill_specialized_from_gamepad(Snapshot& s, uint32_t kinds) {
+    const uint32_t b = s.gamepad.buttons;
+    if (kinds & GameInputKindArcadeStick) {
+        uint32_t& a = s.arcade.buttons;
+        a = 0;
+        if (b & GameInputGamepadMenu) a |= GameInputArcadeStickMenu;
+        if (b & GameInputGamepadView) a |= GameInputArcadeStickView;
+        if (b & GameInputGamepadDPadUp) a |= GameInputArcadeStickUp;
+        if (b & GameInputGamepadDPadDown) a |= GameInputArcadeStickDown;
+        if (b & GameInputGamepadDPadLeft) a |= GameInputArcadeStickLeft;
+        if (b & GameInputGamepadDPadRight) a |= GameInputArcadeStickRight;
+        if (b & GameInputGamepadA) a |= GameInputArcadeStickAction1;
+        if (b & GameInputGamepadB) a |= GameInputArcadeStickAction2;
+        if (b & GameInputGamepadX) a |= GameInputArcadeStickAction3;
+        if (b & GameInputGamepadY) a |= GameInputArcadeStickAction4;
+        if (b & GameInputGamepadLeftShoulder) a |= GameInputArcadeStickAction5;
+        if (b & GameInputGamepadRightShoulder) a |= GameInputArcadeStickAction6;
+        if (b & GameInputGamepadLeftThumbstick) a |= GameInputArcadeStickSpecial1;
+        if (b & GameInputGamepadRightThumbstick) a |= GameInputArcadeStickSpecial2;
+    }
+    if (kinds & GameInputKindFlightStick) {
+        uint32_t& f = s.flight.buttons;
+        f = 0;
+        if (b & GameInputGamepadMenu) f |= GameInputFlightStickMenu;
+        if (b & GameInputGamepadView) f |= GameInputFlightStickView;
+        if (b & GameInputGamepadA) f |= GameInputFlightStickFirePrimary;
+        if (b & GameInputGamepadB) f |= GameInputFlightStickFireSecondary;
+        s.flight.hatSwitch = hat_from_dpad(b);
+        s.flight.roll = s.gamepad.leftThumbstickX;
+        s.flight.pitch = s.gamepad.leftThumbstickY;  // already +Y up
+        s.flight.yaw = s.gamepad.rightThumbstickX;
+        s.flight.throttle = s.gamepad.rightTrigger;  // 0..1, inside the header's [-1, 1]
+    }
+    if (kinds & GameInputKindRacingWheel) {
+        uint32_t& w = s.wheel.buttons;
+        w = 0;
+        if (b & GameInputGamepadMenu) w |= GameInputRacingWheelMenu;
+        if (b & GameInputGamepadView) w |= GameInputRacingWheelView;
+        if (b & GameInputGamepadLeftShoulder) w |= GameInputRacingWheelPreviousGear;
+        if (b & GameInputGamepadRightShoulder) w |= GameInputRacingWheelNextGear;
+        if (b & GameInputGamepadDPadUp) w |= GameInputRacingWheelDpadUp;
+        if (b & GameInputGamepadDPadDown) w |= GameInputRacingWheelDpadDown;
+        if (b & GameInputGamepadDPadLeft) w |= GameInputRacingWheelDpadLeft;
+        if (b & GameInputGamepadDPadRight) w |= GameInputRacingWheelDpadRight;
+        s.wheel.wheel = s.gamepad.leftThumbstickX;
+        s.wheel.throttle = s.gamepad.rightTrigger;
+        s.wheel.brake = s.gamepad.leftTrigger;
+        // SDL's gamepad mapping has no clutch, handbrake or gear lever; reporting 0 is honest, not a guess.
+        s.wheel.clutch = s.wheel.handbrake = 0.0f;
+        s.wheel.patternShifterGear = 0;
+    }
+}
+
+// A raw joystick axis in -1..1; SDL reports -32768..32767 with 0 at rest.
+float raw_axis(SDL_Joystick* js, int i) { return std::max(-1.0f, SDL_GetJoystickAxis(js, i) / 32767.0f); }
+
+// A wheel, flight stick or arcade stick SDL has no gamepad mapping for. SDL does not standardise these axes and
+// buttons, so this is the shim's convention (VERIFY: against real hardware, docs/gameinput.md): the kind's axes in
+// header order, then its buttons in the enum's bit order.
+Snapshot read_joystick(Device* d) {
+    SDL_Joystick* js = d->js;
+    Snapshot s;
+    s.axis_count = d->axis_count;
+    s.button_count = d->button_count;
+    s.guide = false;
+    for (uint32_t i = 0; i < s.axis_count; ++i) s.axes[i] = (raw_axis(js, static_cast<int>(i)) + 1) * 0.5f;
+    for (uint32_t i = 0; i < s.button_count; ++i) s.buttons[i] = SDL_GetJoystickButton(js, static_cast<int>(i));
+    const auto button = [&s](uint32_t i) { return i < s.button_count && s.buttons[i]; };
+    if (d->kinds & GameInputKindRacingWheel) {
+        uint32_t& w = s.wheel.buttons;
+        w = 0;
+        static const uint32_t kBits[] = {GameInputRacingWheelMenu, GameInputRacingWheelView,
+                                         GameInputRacingWheelPreviousGear, GameInputRacingWheelNextGear,
+                                         GameInputRacingWheelDpadUp, GameInputRacingWheelDpadDown,
+                                         GameInputRacingWheelDpadLeft, GameInputRacingWheelDpadRight};
+        for (uint32_t i = 0; i < std::size(kBits); ++i)
+            if (button(i)) w |= kBits[i];
+        s.wheel.wheel = raw_axis(js, 0);
+        s.wheel.throttle = (raw_axis(js, 1) + 1) * 0.5f;
+        s.wheel.brake = (raw_axis(js, 2) + 1) * 0.5f;
+        s.wheel.clutch = (raw_axis(js, 3) + 1) * 0.5f;
+        s.wheel.handbrake = (raw_axis(js, 4) + 1) * 0.5f;
+        s.wheel.patternShifterGear = 0;
+    }
+    if (d->kinds & GameInputKindFlightStick) {
+        uint32_t& f = s.flight.buttons;
+        f = 0;
+        static const uint32_t kBits[] = {GameInputFlightStickMenu, GameInputFlightStickView,
+                                         GameInputFlightStickFirePrimary, GameInputFlightStickFireSecondary};
+        for (uint32_t i = 0; i < std::size(kBits); ++i)
+            if (button(i)) f |= kBits[i];
+        s.flight.hatSwitch = GameInputSwitchCenter;  // SDL exposes a hat as buttons, not as a switch
+        s.flight.roll = raw_axis(js, 0);
+        s.flight.pitch = -raw_axis(js, 1);  // SDL's +Y is down; GameInput's pitch is +Y up
+        s.flight.yaw = raw_axis(js, 2);
+        s.flight.throttle = (raw_axis(js, 3) + 1) * 0.5f;
+    }
+    if (d->kinds & GameInputKindArcadeStick) {
+        uint32_t& a = s.arcade.buttons;
+        a = 0;
+        static const uint32_t kBits[] = {GameInputArcadeStickMenu, GameInputArcadeStickView,
+                                         GameInputArcadeStickUp, GameInputArcadeStickDown,
+                                         GameInputArcadeStickLeft, GameInputArcadeStickRight,
+                                         GameInputArcadeStickAction1, GameInputArcadeStickAction2,
+                                         GameInputArcadeStickAction3, GameInputArcadeStickAction4,
+                                         GameInputArcadeStickAction5, GameInputArcadeStickAction6,
+                                         GameInputArcadeStickSpecial1, GameInputArcadeStickSpecial2};
+        for (uint32_t i = 0; i < std::size(kBits); ++i)
+            if (button(i)) a |= kBits[i];
+    }
+    return s;
+}
+
 Snapshot read_pad(Device* d) {
     SDL_Gamepad* p = d->pad;
     Snapshot s;
@@ -505,8 +676,11 @@ Snapshot read_pad(Device* d) {
     s.axes[3] = (s.gamepad.rightThumbstickY + 1) * 0.5f;
     s.axes[4] = s.gamepad.leftTrigger;
     s.axes[5] = s.gamepad.rightTrigger;
+    s.axis_count = kAxisCount;
+    s.button_count = kButtonCount;
     for (uint32_t i = 0; i < kButtonCount; ++i) s.buttons[i] = down(static_cast<SDL_GamepadButton>(i));
     s.guide = down(SDL_GAMEPAD_BUTTON_GUIDE);
+    fill_specialized_from_gamepad(s, d->kinds);
 
     // Motion, normalised against the maxima motionInfo reports (the ABI's fraction convention). Sensors were enabled
     // when the pad was opened; a pad whose sensor read fails just reports no motion this poll. SDL answers reads
@@ -575,25 +749,41 @@ void id_bytes(const std::string& identity, const SDL_GUID& guid, uint32_t twin, 
     id_bytes(twin ? "t:" + std::to_string(twin) + ":" + identity : identity, guid, out);
 }
 
-void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
+void fill_info(Device* d, const AppLocalDeviceId& id) {
     GameInputDeviceInfo& i = d->info;
     i = {};
     i.infoSize = sizeof(GameInputDeviceInfo);
-    i.vendorId = SDL_GetGamepadVendor(p);
-    i.productId = SDL_GetGamepadProduct(p);
-    i.revisionNumber = SDL_GetGamepadProductVersion(p);
     i.usage = {0x01, 0x05};  // HID generic desktop / game pad
-    const uint16_t fw = SDL_GetGamepadFirmwareVersion(p);
-    i.firmwareVersion = {static_cast<uint16_t>(fw >> 8), static_cast<uint16_t>(fw & 0xFF), 0, 0};
+    const char* name = nullptr;
+    if (d->is_gamepad) {
+        SDL_Gamepad* p = d->pad;
+        i.vendorId = SDL_GetGamepadVendor(p);
+        i.productId = SDL_GetGamepadProduct(p);
+        i.revisionNumber = SDL_GetGamepadProductVersion(p);
+        const uint16_t fw = SDL_GetGamepadFirmwareVersion(p);
+        i.firmwareVersion = {static_cast<uint16_t>(fw >> 8), static_cast<uint16_t>(fw & 0xFF), 0, 0};
+        if (SDL_GetGamepadConnectionState(p) == SDL_JOYSTICK_CONNECTION_WIRELESS)
+            i.capabilities |= GameInputDeviceCapabilityWireless;
+        name = SDL_GetGamepadName(p);
+    } else {
+        SDL_Joystick* js = d->js;
+        i.vendorId = SDL_GetJoystickVendor(js);
+        i.productId = SDL_GetJoystickProduct(js);
+        i.revisionNumber = SDL_GetJoystickProductVersion(js);
+        const uint16_t fw = SDL_GetJoystickFirmwareVersion(js);
+        i.firmwareVersion = {static_cast<uint16_t>(fw >> 8), static_cast<uint16_t>(fw & 0xFF), 0, 0};
+        if (SDL_GetJoystickConnectionState(js) == SDL_JOYSTICK_CONNECTION_WIRELESS)
+            i.capabilities |= GameInputDeviceCapabilityWireless;
+        name = SDL_GetJoystickName(js);
+    }
     i.deviceId = id;
     i.deviceRootId = id;
     // Every pad is presented as an Xbox gamepad, which is all a console title expects (VERIFY: whether a title
-    // filters on the family).
+    // filters on the family). A raw wheel or stick gets the same family: GameInput has no family of its own for them.
     i.deviceFamily = GameInputFamilyXboxOne;
-    if (SDL_GetGamepadConnectionState(p) == SDL_JOYSTICK_CONNECTION_WIRELESS) i.capabilities |= GameInputDeviceCapabilityWireless;
     // The per-device kind set: the reading-kind searches take the global kSupportedKinds as the outer bound and this
-    // as the per-device one, so only pads with sensors answer a motion query.
-    i.supportedInput = kBaseKinds;
+    // as the per-device one, so only a wheel answers a racing-wheel query and only a pad with sensors a motion one.
+    i.supportedInput = d->kinds;
     if (d->has_rumble) i.supportedRumbleMotors |= GameInputRumbleLowFrequency | GameInputRumbleHighFrequency;
     if (d->has_trigger_rumble || (d->is_dualsense && g().config.ds_triggers != rt::gameinput::DsTriggerMode::Off))
         i.supportedRumbleMotors |= GameInputRumbleLeftTrigger | GameInputRumbleRightTrigger;
@@ -604,30 +794,73 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
         d->motion_info = {kMaxAcceleration, kMaxAngularVelocity, 0.0f};
         i.motionInfo = &d->motion_info;
     }
-    i.controllerAxisCount = kAxisCount;
-    i.controllerButtonCount = kButtonCount;
-    for (uint32_t a = 0; a < kAxisCount; ++a) {
+    i.controllerAxisCount = d->axis_count;
+    i.controllerButtonCount = d->button_count;
+    const uint32_t mapped = d->kinds & (GameInputKindGamepad | kSpecialKinds);
+    for (uint32_t a = 0; a < d->axis_count; ++a) {
         d->axis_info[a] = {};
-        d->axis_info[a].mappedInputKinds = GameInputKindGamepad;
+        d->axis_info[a].mappedInputKinds = mapped;
         d->axis_info[a].isContinuous = true;
         d->axis_info[a].hasRestValue = true;
-        d->axis_info[a].restValue = a < 4 ? 0.5f : 0.0f;
+        d->axis_info[a].restValue = 0.5f;  // both sticks and a raw axis rest at the centre of 0..1
         d->axis_info[a].resolution = 65536;
         d->axis_info[a].legacyHidIndex = static_cast<uint16_t>(a);
         d->axis_info[a].legacyDInputIndex = static_cast<uint16_t>(a);
     }
-    for (uint32_t b = 0; b < kButtonCount; ++b) {
+    for (uint32_t b = 0; b < d->button_count; ++b) {
         d->button_info[b] = {};
-        d->button_info[b].mappedInputKinds = GameInputKindGamepad;
+        d->button_info[b].mappedInputKinds = mapped;
         d->button_info[b].legacyHidIndex = static_cast<uint16_t>(b);
         d->button_info[b].legacyDInputIndex = static_cast<uint16_t>(b);
     }
     i.controllerAxisInfo = d->axis_info;
     i.controllerButtonInfo = d->button_info;
-    i.gamepadInfo = &d->gamepad_info;
-    i.uiNavigationInfo = &d->ui_info;
-    const char* n = SDL_GetGamepadName(p);
-    d->name = n ? n : "Gamepad";
+    if (d->is_gamepad) i.gamepadInfo = &d->gamepad_info;
+    if (d->kinds & GameInputKindUiNavigation) i.uiNavigationInfo = &d->ui_info;
+    // The per-kind info: v0 carries the labels of the physical controls. SDL knows a pad's layout, not a wheel's, so
+    // these are Xbox-style labels everywhere (VERIFY: a title that shows its own prompts).
+    if (d->kinds & GameInputKindArcadeStick) {
+        GameInputArcadeStickInfo& a = d->arcade_info;
+        a = {};
+        a.menuButtonLabel = GameInputLabelXboxMenu;
+        a.viewButtonLabel = GameInputLabelXboxView;
+        a.stickUpLabel = GameInputLabelXboxDPadUp;
+        a.stickDownLabel = GameInputLabelXboxDPadDown;
+        a.stickLeftLabel = GameInputLabelXboxDPadLeft;
+        a.stickRightLabel = GameInputLabelXboxDPadRight;
+        a.actionButton1Label = GameInputLabelXboxA;
+        a.actionButton2Label = GameInputLabelXboxB;
+        a.actionButton3Label = GameInputLabelXboxX;
+        a.actionButton4Label = GameInputLabelXboxY;
+        a.actionButton5Label = GameInputLabelXboxLeftShoulder;
+        a.actionButton6Label = GameInputLabelXboxRightShoulder;
+        i.arcadeStickInfo = &a;
+    }
+    if (d->kinds & GameInputKindFlightStick) {
+        GameInputFlightStickInfo& f = d->flight_info;
+        f = {};
+        f.menuButtonLabel = GameInputLabelXboxMenu;
+        f.viewButtonLabel = GameInputLabelXboxView;
+        f.firePrimaryButtonLabel = GameInputLabelXboxA;
+        f.fireSecondaryButtonLabel = GameInputLabelXboxB;
+        f.hatSwitchKind = GameInput8WaySwitch;
+        i.flightStickInfo = &f;
+    }
+    if (d->kinds & GameInputKindRacingWheel) {
+        GameInputRacingWheelInfo& w = d->wheel_info;
+        w = {};
+        w.menuButtonLabel = GameInputLabelXboxMenu;
+        w.viewButtonLabel = GameInputLabelXboxView;
+        w.previousGearButtonLabel = GameInputLabelXboxLeftShoulder;
+        w.nextGearButtonLabel = GameInputLabelXboxRightShoulder;
+        w.dpadUpLabel = GameInputLabelXboxDPadUp;
+        w.dpadDownLabel = GameInputLabelXboxDPadDown;
+        w.dpadLeftLabel = GameInputLabelXboxDPadLeft;
+        w.dpadRightLabel = GameInputLabelXboxDPadRight;
+        // No clutch, handbrake, gear lever or wheel-angle range from SDL; zeros say "unknown", not a guess.
+        i.racingWheelInfo = &w;
+    }
+    d->name = name && *name ? name : (d->is_gamepad ? "Gamepad" : "Joystick");
     uint32_t points = 0;
     for (unsigned char c : d->name) points += (c & 0xC0) != 0x80;
     d->display_name = {static_cast<uint32_t>(d->name.size()), points, d->name.c_str()};
@@ -649,21 +882,36 @@ Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
     return h.back();
 }
 
-void open_pad(SDL_JoystickID jid, uint64_t ts) {
+// The GameInput kind an SDL joystick type stands for, or 0 for the types GameInput has no state for (guitar, drum
+// kit, dance pad, throttle).
+uint32_t kind_for_type(SDL_JoystickType type) {
+    switch (type) {
+        case SDL_JOYSTICK_TYPE_ARCADE_STICK: return GameInputKindArcadeStick;
+        case SDL_JOYSTICK_TYPE_FLIGHT_STICK: return GameInputKindFlightStick;
+        case SDL_JOYSTICK_TYPE_WHEEL: return GameInputKindRacingWheel;
+        default: return 0;
+    }
+}
+
+void open_device(SDL_JoystickID jid, uint64_t ts) {
     State& s = g();
-    SDL_Gamepad* p = SDL_OpenGamepad(jid);
-    if (!p) {
-        std::fprintf(stderr, "[rt] gameinput: cannot open gamepad %u: %s\n", static_cast<unsigned>(jid), SDL_GetError());
+    const uint32_t extra = kind_for_type(SDL_GetJoystickTypeForID(jid));
+    const bool gamepad = SDL_IsGamepad(jid);
+    if (!gamepad && !extra) return;
+    SDL_Gamepad* p = gamepad ? SDL_OpenGamepad(jid) : nullptr;
+    SDL_Joystick* js = gamepad ? nullptr : SDL_OpenJoystick(jid);
+    if (!p && !js) {
+        std::fprintf(stderr, "[rt] gameinput: cannot open joystick %u: %s\n", static_cast<unsigned>(jid), SDL_GetError());
         return;
     }
-    const char* serial = SDL_GetGamepadSerial(p);
-    const char* path = SDL_GetGamepadPath(p);
+    const char* serial = gamepad ? SDL_GetGamepadSerial(p) : SDL_GetJoystickSerial(js);
+    const char* path = gamepad ? SDL_GetGamepadPath(p) : SDL_GetJoystickPath(js);
     const std::string identity = (serial && *serial) ? std::string("s:") + serial : (path && *path) ? std::string("p:") + path : "";
-    const SDL_GUID guid = SDL_GetGamepadGUIDForID(jid);
+    const SDL_GUID guid = gamepad ? SDL_GetGamepadGUIDForID(jid) : SDL_GetJoystickGUID(js);
     AppLocalDeviceId base{};
     id_bytes(identity, guid, &base);
 
-    const SDL_PropertiesID props = SDL_GetGamepadProperties(p);
+    const SDL_PropertiesID props = gamepad ? SDL_GetGamepadProperties(p) : SDL_GetJoystickProperties(js);
     std::lock_guard lock(s.mu);
     // The same pad coming back gets its old object. Pads with the same GUID and serial or path (identical pads with
     // neither, mostly) are twins sharing one base id, told apart by order alone: the lowest disconnected twin is
@@ -690,13 +938,23 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
         s.devices.push_back(d);
     }
     d->pad = p;
+    d->js = js;
+    d->is_gamepad = gamepad;
     d->id = jid;
-    d->is_dualsense = SDL_GetGamepadType(p) == SDL_GAMEPAD_TYPE_PS5;
-    d->has_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
-    d->has_trigger_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
+    // A wheel or stick SDL mapped as a gamepad reports both the gamepad kinds and its own; one it opens as a raw
+    // joystick reports the controller arrays and its own kind.
+    d->kinds = gamepad ? (kBaseKinds | extra) : (kControllerKinds | extra);
+    d->axis_count = gamepad ? kAxisCount
+                            : std::min<uint32_t>(static_cast<uint32_t>(std::max(0, SDL_GetNumJoystickAxes(js))), kMaxAxes);
+    d->button_count = gamepad ? kButtonCount
+                              : std::min<uint32_t>(static_cast<uint32_t>(std::max(0, SDL_GetNumJoystickButtons(js))), kMaxButtons);
+    d->is_dualsense = gamepad && SDL_GetGamepadType(p) == SDL_GAMEPAD_TYPE_PS5;
+    d->has_rumble = SDL_GetBooleanProperty(
+        props, gamepad ? SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN : SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN, false);
+    d->has_trigger_rumble = gamepad && SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
     // Motion needs both sensors; SDL's orientation quaternion is left alone (no title asks for it, and a synthesised
     // one would lie). Enabling at open: SDL delivers samples only for enabled sensors.
-    d->has_motion = SDL_GamepadHasSensor(p, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(p, SDL_SENSOR_ACCEL);
+    d->has_motion = gamepad && SDL_GamepadHasSensor(p, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(p, SDL_SENSOR_ACCEL);
     if (d->has_motion) {
         SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_GYRO, kMotionSensorRate);
         SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_ACCEL, kMotionSensorRate);
@@ -707,40 +965,54 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->ds_sent_once = false;
     d->motors_sent_at = d->triggers_sent_at = d->battery_at = 0;
     d->wanted = {};
-    fill_info(d, p, id);
+    fill_info(d, id);
 
-    // Player LEDs and SDL's default lightbar colour follow the slot: the lowest one not in use.
-    int player = 0;
-    for (bool used = true; used; ++player) {
-        used = false;
-        for (Device* c : s.connected) used |= c->player == player;
-        if (!used) break;
+    // Player LEDs and SDL's default lightbar colour follow the slot: the lowest one not in use. Only gamepads take a
+    // slot; a raw wheel or stick neither drives a player LED nor counts as one.
+    d->player = -1;
+    if (gamepad) {
+        int player = 0;
+        for (bool used = true; used; ++player) {
+            used = false;
+            for (Device* c : s.connected) used |= c->player == player;
+            if (!used) break;
+        }
+        d->player = player;
+        SDL_SetGamepadPlayerIndex(p, player);
+        if (s.config.lightbar_set && SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false))
+            SDL_SetGamepadLED(p, s.config.lightbar[0], s.config.lightbar[1], s.config.lightbar[2]);
     }
-    d->player = player;
-    SDL_SetGamepadPlayerIndex(p, player);
-    if (s.config.lightbar_set && SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false))
-        SDL_SetGamepadLED(p, s.config.lightbar[0], s.config.lightbar[1], s.config.lightbar[2]);
 
     uint32_t status = kConnectedStatus;
     if (d->info.capabilities & GameInputDeviceCapabilityWireless) status |= GameInputDeviceWireless;
     d->status = status;
     s.connected.push_back(d);
 
-    const Snapshot snap = read_pad(d);
+    const Snapshot snap = d->is_gamepad ? read_pad(d) : read_joystick(d);
     d->last_snap = snap;
     push_reading(d, snap, ts);
     queue_event({CbType::Device, d, nullptr, ts, status, GameInputDeviceNoStatus, false, 0});
-    std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, player %d%s%s%s)\n", d->name.c_str(),
-                 d->info.vendorId, d->info.productId, player + 1, d->is_dualsense ? ", DualSense trigger effects" : "",
-                 d->has_trigger_rumble ? ", trigger rumble" : "", d->has_motion ? ", gyro" : "");
+    if (gamepad)
+        std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, player %d%s%s%s)\n", d->name.c_str(),
+                     d->info.vendorId, d->info.productId, d->player + 1,
+                     d->is_dualsense ? ", DualSense trigger effects" : "",
+                     d->has_trigger_rumble ? ", trigger rumble" : "", d->has_motion ? ", gyro" : "");
+    else
+        std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, %s)\n", d->name.c_str(), d->info.vendorId,
+                     d->info.productId,
+                     (d->kinds & GameInputKindRacingWheel)     ? "racing wheel"
+                     : (d->kinds & GameInputKindFlightStick)   ? "flight stick"
+                                                              : "arcade stick");
 }
 
 void close_pad(Device* d, uint64_t ts) {
     State& s = g();
     std::lock_guard lock(s.mu);
     const uint32_t old = d->status.exchange(GameInputDeviceNoStatus);
-    SDL_CloseGamepad(d->pad);
+    if (d->pad) SDL_CloseGamepad(d->pad);
+    if (d->js) SDL_CloseJoystick(d->js);
     d->pad = nullptr;
+    d->js = nullptr;
     d->player = -1;
     if (!d->history.empty()) d->evicted_order = d->history.back()->order();  // the history ends with the session
     for (Reading* r : d->history) r->Release();
@@ -782,7 +1054,9 @@ void apply_output(Device* d, uint64_t now) {
         const uint16_t lo = to_u16(want.low), hi = to_u16(want.high);
         const bool stale = (lo || hi) && now - d->motors_sent_at > kRumbleRefreshUs;
         if (lo != o.low || hi != o.high || stale) {
-            SDL_RumbleGamepad(d->pad, lo, hi, kRumbleDurationMs);
+            // A raw wheel or stick rumbles through SDL_RumbleJoystick; a gamepad through SDL_RumbleGamepad.
+            if (d->is_gamepad) SDL_RumbleGamepad(d->pad, lo, hi, kRumbleDurationMs);
+            else SDL_RumbleJoystick(d->js, lo, hi, kRumbleDurationMs);
             o.low = lo;
             o.high = hi;
             d->motors_sent_at = now;
@@ -819,6 +1093,7 @@ void apply_output(Device* d, uint64_t now) {
 void refresh_battery(Device* d, uint64_t now) {
     if (now - d->battery_at < kBatteryRefreshUs && d->battery_at) return;
     d->battery_at = now;
+    if (!d->is_gamepad) return;  // SDL reports power state for gamepads; a raw joystick stays unknown
     int percent = -1;
     const SDL_PowerState ps = SDL_GetGamepadPowerInfo(d->pad, &percent);
     GameInputBatteryState b{0, 0, 0, 0, GameInputBatteryUnknown};
@@ -840,7 +1115,7 @@ void refresh_battery(Device* d, uint64_t now) {
 // ---- keyboard pad (poll thread only) ----------------------------------------------------------------------------
 //
 // The title reads gamepads, not the keyboard, so keys reach it as one more pad: an SDL virtual gamepad that this
-// code presses buttons on each poll. It then goes through open_pad and read_pad like any controller, so it gets a
+// code presses buttons on each poll. It then goes through open_device and read_pad like any controller, so it gets a
 // device object, a player slot, readings, callbacks and UI navigation the same way. It has no motors, so rumble sent
 // to it is dropped. Keys are read with GetAsyncKeyState, which needs no window or message loop and works under Wine.
 // WASD is the left stick, the mouse the right stick, and the right/left mouse buttons the left/right triggers.
@@ -1021,8 +1296,10 @@ void poll_once() {
     SDL_UpdateGamepads();
     const uint64_t now = now_us();
 
+    // Every joystick, not just the gamepads: a wheel, flight stick or arcade stick SDL has no gamepad mapping for is
+    // only listed here.
     int count = 0;
-    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    SDL_JoystickID* ids = SDL_GetJoysticks(&count);
     std::vector<SDL_JoystickID> present(ids, ids + (ids ? count : 0));
     SDL_free(ids);
 
@@ -1032,7 +1309,8 @@ void poll_once() {
         connected = s.connected;
     }
     for (Device* d : connected)
-        if (std::find(present.begin(), present.end(), d->id) == present.end() || !SDL_GamepadConnected(d->pad))
+        if (std::find(present.begin(), present.end(), d->id) == present.end() ||
+            (d->is_gamepad ? !SDL_GamepadConnected(d->pad) : !SDL_JoystickConnected(d->js)))
             close_pad(d, now);
     for (SDL_JoystickID jid : present) {
         bool known = false;
@@ -1040,7 +1318,7 @@ void poll_once() {
             std::lock_guard lock(s.mu);
             for (Device* d : s.connected) known |= d->id == jid;
         }
-        if (!known) open_pad(jid, now);
+        if (!known) open_device(jid, now);
     }
 
     {
@@ -1048,7 +1326,7 @@ void poll_once() {
         connected = s.connected;
     }
     for (Device* d : connected) {
-        const Snapshot snap = read_pad(d);
+        const Snapshot snap = d->is_gamepad ? read_pad(d) : read_joystick(d);
         const bool guide_changed = d->last_snap.guide != snap.guide;
         const bool changed = !(d->last_snap == snap);
         d->last_snap = snap;
@@ -1205,6 +1483,10 @@ HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* de
         }
     } else {
         horizon = r->device()->evicted_order;
+        if (kind != GameInputKindUnknown)
+            scope.erase(std::remove_if(scope.begin(), scope.end(),
+                                       [kind](Device* d) { return !(kind & d->info.supportedInput); }),
+                        scope.end());
     }
     for (Device* d : scope) horizon = std::max(horizon, d->evicted_order);
     if (forward ? horizon > r->order() : horizon >= r->order()) return GAMEINPUT_E_REFERENCE_READING_TOO_OLD;
@@ -1258,8 +1540,10 @@ public:
                 best = d->latest();
             }
         } else {
-            for (Device* d : g().connected)  // the most recent reading from any gamepad
-                if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+            // The most recent reading from any connected device that carries the requested kind.
+            for (Device* d : g().connected)
+                if (kind == GameInputKindUnknown || (kind & d->info.supportedInput))
+                    if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
         }
         if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
         best->AddRef();

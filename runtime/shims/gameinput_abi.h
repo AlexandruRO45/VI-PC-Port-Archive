@@ -59,6 +59,53 @@ enum GameInputGamepadButtons : uint32_t {
     GameInputGamepadRightThumbstick = 0x00002000,
 };
 
+enum GameInputArcadeStickButtons : uint32_t {
+    GameInputArcadeStickNone = 0x00000000,
+    GameInputArcadeStickMenu = 0x00000001,
+    GameInputArcadeStickView = 0x00000002,
+    GameInputArcadeStickUp = 0x00000004,
+    GameInputArcadeStickDown = 0x00000008,
+    GameInputArcadeStickLeft = 0x00000010,
+    GameInputArcadeStickRight = 0x00000020,
+    GameInputArcadeStickAction1 = 0x00000040,
+    GameInputArcadeStickAction2 = 0x00000080,
+    GameInputArcadeStickAction3 = 0x00000100,
+    GameInputArcadeStickAction4 = 0x00000200,
+    GameInputArcadeStickAction5 = 0x00000400,
+    GameInputArcadeStickAction6 = 0x00000800,
+    GameInputArcadeStickSpecial1 = 0x00001000,
+    GameInputArcadeStickSpecial2 = 0x00002000,
+};
+
+enum GameInputFlightStickButtons : uint32_t {
+    GameInputFlightStickNone = 0x00000000,
+    GameInputFlightStickMenu = 0x00000001,
+    GameInputFlightStickView = 0x00000002,
+    GameInputFlightStickFirePrimary = 0x00000004,
+    GameInputFlightStickFireSecondary = 0x00000008,
+};
+
+// Note the values: the public header starts the axes at 0x10, not 0x01.
+enum GameInputFlightStickAxes : uint32_t {
+    GameInputFlightStickAxesNone = 0x00000000,
+    GameInputFlightStickRoll = 0x00000010,
+    GameInputFlightStickPitch = 0x00000020,
+    GameInputFlightStickYaw = 0x00000040,
+    GameInputFlightStickThrottle = 0x00000080,
+};
+
+enum GameInputRacingWheelButtons : uint32_t {
+    GameInputRacingWheelNone = 0x00000000,
+    GameInputRacingWheelMenu = 0x00000001,
+    GameInputRacingWheelView = 0x00000002,
+    GameInputRacingWheelPreviousGear = 0x00000004,
+    GameInputRacingWheelNextGear = 0x00000008,
+    GameInputRacingWheelDpadUp = 0x00000010,
+    GameInputRacingWheelDpadDown = 0x00000020,
+    GameInputRacingWheelDpadLeft = 0x00000040,
+    GameInputRacingWheelDpadRight = 0x00000080,
+};
+
 enum GameInputUiNavigationButtons : uint32_t {
     GameInputUiNavigationNone = 0x00000000,
     GameInputUiNavigationMenu = 0x00000001,
@@ -131,8 +178,45 @@ enum GameInputRumbleMotors : uint32_t {
     GameInputRumbleRightTrigger = 0x00000008,
 };
 
-enum GameInputSwitchPosition : int32_t { GameInputSwitchCenter = 0 };
+enum GameInputSwitchKind : int32_t {
+    GameInputUnknownSwitchKind = -1,
+    GameInput2WaySwitch = 0,
+    GameInput4WaySwitch = 1,
+    GameInput8WaySwitch = 2,
+};
+
+enum GameInputSwitchPosition : int32_t {
+    GameInputSwitchCenter = 0,
+    GameInputSwitchUp = 1,
+    GameInputSwitchUpRight = 2,
+    GameInputSwitchRight = 3,
+    GameInputSwitchDownRight = 4,
+    GameInputSwitchDown = 5,
+    GameInputSwitchDownLeft = 6,
+    GameInputSwitchLeft = 7,
+    GameInputSwitchUpLeft = 8,
+};
+
 enum GameInputFocusPolicy : uint32_t { GameInputDefaultFocusPolicy = 0 };
+
+// Labels name a physical control for UI prompts. Only the values the shim reports are listed; the public header's
+// numbering is kept, so a title sees the same value it would from the real API.
+enum GameInputLabel : int32_t {
+    GameInputLabelUnknown = -1,
+    GameInputLabelNone = 0,
+    GameInputLabelXboxMenu = 4,
+    GameInputLabelXboxView = 5,
+    GameInputLabelXboxA = 7,
+    GameInputLabelXboxB = 8,
+    GameInputLabelXboxX = 9,
+    GameInputLabelXboxY = 10,
+    GameInputLabelXboxDPadUp = 11,
+    GameInputLabelXboxDPadDown = 12,
+    GameInputLabelXboxDPadLeft = 13,
+    GameInputLabelXboxDPadRight = 14,
+    GameInputLabelXboxLeftShoulder = 15,
+    GameInputLabelXboxRightShoulder = 18,
+};
 
 using GameInputCallbackToken = uint64_t;
 constexpr GameInputCallbackToken kInvalidCallbackToken = 0;
@@ -157,6 +241,29 @@ struct GameInputGamepadState {
     float leftThumbstickY;
     float rightThumbstickX;
     float rightThumbstickY;
+};
+
+struct GameInputArcadeStickState {
+    uint32_t buttons;  // GameInputArcadeStickButtons
+};
+
+struct GameInputFlightStickState {
+    uint32_t buttons;  // GameInputFlightStickButtons
+    GameInputSwitchPosition hatSwitch;
+    float roll;      // -1..1
+    float pitch;     // -1..1, +Y up
+    float yaw;       // -1..1
+    float throttle;  // 0..1
+};
+
+struct GameInputRacingWheelState {
+    uint32_t buttons;  // GameInputRacingWheelButtons
+    int32_t patternShifterGear;
+    float wheel;      // -1..1, left to right
+    float throttle;   // 0..1
+    float brake;      // 0..1
+    float clutch;     // 0..1
+    float handbrake;  // 0..1
 };
 
 struct GameInputUiNavigationState {
@@ -223,6 +330,50 @@ struct GameInputControllerButtonInfo {
 // Empty in v0 (one byte in C++); a title only checks the pointer.
 struct GameInputGamepadInfo {};
 struct GameInputUiNavigationInfo {};
+
+// The per-kind device info. In v0 these carry the labels of the physical controls, so a title can show the right
+// prompt; the shim reports Xbox-style labels for everything SDL opens (docs/gameinput.md).
+struct GameInputArcadeStickInfo {
+    GameInputLabel menuButtonLabel;
+    GameInputLabel viewButtonLabel;
+    GameInputLabel stickUpLabel;
+    GameInputLabel stickDownLabel;
+    GameInputLabel stickLeftLabel;
+    GameInputLabel stickRightLabel;
+    GameInputLabel actionButton1Label;
+    GameInputLabel actionButton2Label;
+    GameInputLabel actionButton3Label;
+    GameInputLabel actionButton4Label;
+    GameInputLabel actionButton5Label;
+    GameInputLabel actionButton6Label;
+    GameInputLabel specialButton1Label;
+    GameInputLabel specialButton2Label;
+};
+
+struct GameInputFlightStickInfo {
+    GameInputLabel menuButtonLabel;
+    GameInputLabel viewButtonLabel;
+    GameInputLabel firePrimaryButtonLabel;
+    GameInputLabel fireSecondaryButtonLabel;
+    GameInputSwitchKind hatSwitchKind;
+};
+
+struct GameInputRacingWheelInfo {
+    GameInputLabel menuButtonLabel;
+    GameInputLabel viewButtonLabel;
+    GameInputLabel previousGearButtonLabel;
+    GameInputLabel nextGearButtonLabel;
+    GameInputLabel dpadUpLabel;
+    GameInputLabel dpadDownLabel;
+    GameInputLabel dpadLeftLabel;
+    GameInputLabel dpadRightLabel;
+    bool hasClutch;
+    bool hasHandbrake;
+    bool hasPatternShifter;
+    int32_t minPatternShifterGear;
+    int32_t maxPatternShifterGear;
+    float maxWheelAngle;
+};
 
 // Motion: layouts from Microsoft's v0 documentation (learn.microsoft.com GameInputMotionInfo / GameInputMotionState /
 // GameInputMotionAccuracy; the GDK public header spells the same members). Accuracy is deprecated only in GameInput
@@ -317,6 +468,17 @@ struct GameInputDeviceInfo {
 // Layout checks. The offsets were compared with the public v0 header by compiling both side by side (see
 // docs/gameinput.md); they hold for x64 MSVC.
 static_assert(sizeof(GameInputGamepadState) == 28);
+static_assert(sizeof(GameInputArcadeStickState) == 4);
+static_assert(sizeof(GameInputFlightStickState) == 24);
+static_assert(sizeof(GameInputRacingWheelState) == 28);
+static_assert(sizeof(GameInputArcadeStickInfo) == 56);  // 14 labels
+static_assert(sizeof(GameInputFlightStickInfo) == 20);
+static_assert(sizeof(GameInputRacingWheelInfo) == 48);
+static_assert(offsetof(GameInputFlightStickState, hatSwitch) == 4);
+static_assert(offsetof(GameInputFlightStickState, throttle) == 20);
+static_assert(offsetof(GameInputRacingWheelState, patternShifterGear) == 4);
+static_assert(offsetof(GameInputRacingWheelInfo, hasClutch) == 32);
+static_assert(offsetof(GameInputRacingWheelInfo, maxWheelAngle) == 44);
 static_assert(sizeof(GameInputRumbleParams) == 16);
 static_assert(sizeof(GameInputBatteryState) == 20);
 static_assert(sizeof(GameInputString) == 16);

@@ -26,8 +26,10 @@ std::vector<IGameInputDevice*> g_devices;
 
 void CALLBACK on_device(GameInputCallbackToken, void*, IGameInputDevice* device, uint64_t, uint32_t current, uint32_t previous) {
     const GameInputDeviceInfo* i = device->GetDeviceInfo();
-    std::printf("\n%s %s (%04x:%04x) motors=0x%x\n", (current & GameInputDeviceConnected) ? "connected   " : "disconnected",
-                i->displayName ? i->displayName->data : "?", i->vendorId, i->productId, i->supportedRumbleMotors);
+    std::printf("\n%s %s (%04x:%04x) input=0x%08x motors=0x%x\n",
+                (current & GameInputDeviceConnected) ? "connected   " : "disconnected",
+                i->displayName ? i->displayName->data : "?", i->vendorId, i->productId, i->supportedInput,
+                i->supportedRumbleMotors);
     if ((current & GameInputDeviceConnected) && !(previous & GameInputDeviceConnected)) {
         device->AddRef();
         g_devices.push_back(device);
@@ -63,9 +65,9 @@ int main(int argc, char** argv) {
     }
     Sleep(500);  // let the poll thread open what is connected
     GameInputCallbackToken token = 0;
-    input->RegisterDeviceCallback(nullptr, GameInputKindGamepad, GameInputDeviceAnyStatus, GameInputBlockingEnumeration,
+    input->RegisterDeviceCallback(nullptr, GameInputKindUnknown, GameInputDeviceAnyStatus, GameInputBlockingEnumeration,
                                   nullptr, on_device, &token);
-    if (g_devices.empty()) std::printf("no gamepad connected; plug one in (watching for %d s)\n", seconds);
+    if (g_devices.empty()) std::printf("no controller connected; plug one in (watching for %d s)\n", seconds);
 
     if (rumble && !g_devices.empty()) {
         const auto& c = rt::gameinput::config();
@@ -96,6 +98,29 @@ int main(int argc, char** argv) {
             if (motion)  // fractions of motionInfo's maxima: accel includes gravity, so a resting pad shows ~0.5 g
                 std::printf("\n[a]=(%+.2f,%+.2f,%+.2f) [w]=(%+.2f,%+.2f,%+.2f)   ", m.accelerationX, m.accelerationY,
                             m.accelerationZ, m.angularVelocityX, m.angularVelocityY, m.angularVelocityZ);
+            std::fflush(stdout);
+            r->Release();
+        }
+        // The wheel, flight stick and arcade stick states, when one of those is connected.
+        if (input->GetCurrentReading(GameInputKindRacingWheel, nullptr, &r) == S_OK && r) {
+            GameInputRacingWheelState w{};
+            if (r->GetRacingWheelState(&w))
+                std::printf("\rwheel=%+.2f throttle=%.2f brake=%.2f clutch=%.2f handbrake=%.2f buttons=%02x gear=%d   ",
+                            w.wheel, w.throttle, w.brake, w.clutch, w.handbrake, w.buttons, w.patternShifterGear);
+            std::fflush(stdout);
+            r->Release();
+        }
+        if (input->GetCurrentReading(GameInputKindFlightStick, nullptr, &r) == S_OK && r) {
+            GameInputFlightStickState f{};
+            if (r->GetFlightStickState(&f))
+                std::printf("\rflight roll=%+.2f pitch=%+.2f yaw=%+.2f throttle=%.2f hat=%d buttons=%02x   ", f.roll,
+                            f.pitch, f.yaw, f.throttle, static_cast<int>(f.hatSwitch), f.buttons);
+            std::fflush(stdout);
+            r->Release();
+        }
+        if (input->GetCurrentReading(GameInputKindArcadeStick, nullptr, &r) == S_OK && r) {
+            GameInputArcadeStickState a{};
+            if (r->GetArcadeStickState(&a)) std::printf("\rarcade buttons=%04x   ", a.buttons);
             std::fflush(stdout);
             r->Release();
         }

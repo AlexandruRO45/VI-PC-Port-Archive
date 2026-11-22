@@ -720,6 +720,142 @@ void test_twins(IGameInput* input) {
 
 }  // namespace
 
+// ---- racing wheel, flight stick and arcade stick ----
+// SDL virtual joysticks of those types have no gamepad mapping, so the shim opens them with SDL_OpenJoystick and
+// reads their raw axes and buttons (docs/gameinput.md has the index convention).
+void attach_kind(Pad& pad, const char* name, SDL_JoystickType type, int axes, int buttons) {
+    SDL_VirtualJoystickDesc d;
+    SDL_INIT_INTERFACE(&d);
+    d.type = static_cast<Uint16>(type);
+    d.vendor_id = 0x1234;
+    d.product_id = 0x5678;
+    d.naxes = static_cast<Uint16>(axes);
+    d.nbuttons = static_cast<Uint16>(buttons);
+    d.button_mask = buttons > 0 ? (1u << buttons) - 1 : 0;
+    d.axis_mask = axes > 0 ? (1u << axes) - 1 : 0;
+    d.name = name;
+    d.userdata = &pad;
+    d.Rumble = on_rumble;
+    pad.id = SDL_AttachVirtualJoystick(&d);
+    pad.js = pad.id ? SDL_OpenJoystick(pad.id) : nullptr;
+}
+
+void test_special_kinds(IGameInput* input) {
+    Pad wheel, flight, arcade;
+    attach_kind(wheel, "Leonida virtual wheel", SDL_JOYSTICK_TYPE_WHEEL, 5, 8);
+    attach_kind(flight, "Leonida virtual flight stick", SDL_JOYSTICK_TYPE_FLIGHT_STICK, 4, 4);
+    attach_kind(arcade, "Leonida virtual arcade stick", SDL_JOYSTICK_TYPE_ARCADE_STICK, 0, 14);
+    check(wheel.js && flight.js && arcade.js, "special: a wheel, a flight stick and an arcade stick attached");
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 3, "special: all three are reported as devices");
+
+    // The wheel: its own kind (no gamepad kind, since SDL has no mapping for it) and the raw axis/button convention.
+    IGameInputReading* r = nullptr;
+    check(input->GetCurrentReading(GameInputKindRacingWheel, nullptr, &r) == S_OK && r,
+          "special: a racing-wheel reading is found by kind");
+    IGameInputDevice* wdev = nullptr;
+    if (r) r->GetDevice(&wdev);
+    if (r) {
+        check((r->GetInputKind() & GameInputKindRacingWheel) != 0 && (r->GetInputKind() & GameInputKindGamepad) == 0,
+              "special: the wheel reading carries the racing-wheel kind, not the gamepad kind");
+        GameInputGamepadState gp{};
+        check(!r->GetGamepadState(&gp), "special: a raw wheel has no gamepad state");
+        GameInputRacingWheelState st{};
+        check(r->GetRacingWheelState(&st) && st.wheel == 0 && st.throttle == 0.5f && st.brake == 0.5f,
+              "special: a wheel at rest reports centred axes");
+        r->Release();
+    }
+    if (wdev) {
+        const GameInputDeviceInfo* info = wdev->GetDeviceInfo();
+        const auto* winfo = static_cast<const GameInputRacingWheelInfo*>(info->racingWheelInfo);
+        check((info->supportedInput & GameInputKindRacingWheel) != 0 && (info->supportedInput & GameInputKindGamepad) == 0,
+              "special: the wheel's device info reports its kind only");
+        check(info->controllerAxisCount == 5 && info->controllerButtonCount == 8,
+              "special: the wheel's axis and button counts come from the joystick");
+        check(winfo && winfo->menuButtonLabel == GameInputLabelXboxMenu &&
+                  winfo->nextGearButtonLabel == GameInputLabelXboxRightShoulder,
+              "special: racingWheelInfo carries the control labels");
+        check(winfo && !winfo->hasClutch && !winfo->hasHandbrake && !winfo->hasPatternShifter,
+              "special: a wheel SDL exposes no clutch or shifter for says so");
+    }
+
+    SDL_SetJoystickVirtualAxis(wheel.js, 0, 32767);   // steering full right
+    SDL_SetJoystickVirtualAxis(wheel.js, 1, 32767);   // throttle full
+    SDL_SetJoystickVirtualAxis(wheel.js, 2, -32768);  // brake released
+    SDL_SetJoystickVirtualAxis(wheel.js, 3, -32768);  // clutch released
+    SDL_SetJoystickVirtualAxis(wheel.js, 4, -32768);  // handbrake released
+    SDL_SetJoystickVirtualButton(wheel.js, 2, true);  // PreviousGear (bit order: Menu, View, Prev, Next, ...)
+    rt::gameinput::poll();
+    if (wdev) {
+        IGameInputReading* w = nullptr;
+        if (input->GetCurrentReading(GameInputKindRacingWheel, wdev, &w) == S_OK && w) {
+            GameInputRacingWheelState st{};
+            check(w->GetRacingWheelState(&st) && approx(st.wheel, 1.0f) && approx(st.throttle, 1.0f) &&
+                      st.brake == 0 && st.clutch == 0 && st.handbrake == 0 && st.patternShifterGear == 0,
+                  "special: wheel, throttle and brake come from axes 0-2");
+            check((st.buttons & GameInputRacingWheelPreviousGear) != 0 && (st.buttons & GameInputRacingWheelNextGear) == 0,
+                  "special: raw buttons follow the racing-wheel bit order");
+            w->Release();
+        } else {
+            check(false, "special: wheel reading after a change");
+        }
+    }
+    SDL_SetJoystickVirtualButton(wheel.js, 2, false);
+
+    // The flight stick: pitch is +Y up, so SDL's full-down axis reads +1.
+    SDL_SetJoystickVirtualAxis(flight.js, 0, -32768);  // roll full left
+    SDL_SetJoystickVirtualAxis(flight.js, 1, -32768);  // nose down in SDL's +Y-down space: pitch +1
+    SDL_SetJoystickVirtualAxis(flight.js, 2, 0);       // yaw centred
+    SDL_SetJoystickVirtualAxis(flight.js, 3, 0);       // throttle half
+    SDL_SetJoystickVirtualButton(flight.js, 3, true);  // FireSecondary
+    rt::gameinput::poll();
+    IGameInputReading* fr = nullptr;
+    if (input->GetCurrentReading(GameInputKindFlightStick, nullptr, &fr) == S_OK && fr) {
+        GameInputFlightStickState st{};
+        check(fr->GetFlightStickState(&st) && approx(st.roll, -1.0f) && approx(st.pitch, 1.0f) && st.yaw == 0 &&
+                  approx(st.throttle, 0.5f),
+              "special: flight stick roll, pitch (inverted), yaw and throttle");
+        check((st.buttons & GameInputFlightStickFireSecondary) != 0 &&
+                  (st.buttons & GameInputFlightStickFirePrimary) == 0,
+              "special: flight stick buttons follow the header's bit order");
+        check(st.hatSwitch == GameInputSwitchCenter, "special: a raw flight stick reports the hat switch centred");
+        fr->Release();
+    } else {
+        check(false, "special: a flight-stick reading is found by kind");
+    }
+
+    // The arcade stick has no axes at all, and every button is one of its 14 bits.
+    SDL_SetJoystickVirtualButton(arcade.js, 0, true);   // Menu
+    SDL_SetJoystickVirtualButton(arcade.js, 6, true);   // Action1
+    SDL_SetJoystickVirtualButton(arcade.js, 13, true);  // Special2
+    rt::gameinput::poll();
+    IGameInputReading* ar = nullptr;
+    if (input->GetCurrentReading(GameInputKindArcadeStick, nullptr, &ar) == S_OK && ar) {
+        GameInputArcadeStickState st{};
+        const uint32_t want = GameInputArcadeStickMenu | GameInputArcadeStickAction1 | GameInputArcadeStickSpecial2;
+        check(ar->GetArcadeStickState(&st) && st.buttons == want,
+              "special: arcade stick buttons follow the header's bit order");
+        check(ar->GetControllerAxisCount() == 0, "special: an arcade stick reports the axes the joystick has");
+        ar->Release();
+    } else {
+        check(false, "special: an arcade-stick reading is found by kind");
+    }
+
+    // A gamepad query no longer matches a device that has no gamepad kind.
+    IGameInputReading* gp = nullptr;
+    check(input->GetCurrentReading(GameInputKindGamepad, nullptr, &gp) == GAMEINPUT_E_READING_NOT_FOUND && !gp,
+          "special: a gamepad query finds nothing while only wheels and sticks are connected");
+    check(input->GetCurrentReading(GameInputKindMotion, nullptr, &gp) == GAMEINPUT_E_READING_NOT_FOUND && !gp,
+          "special: and neither does a motion query");
+
+    if (wdev) wdev->Release();
+    detach(wheel);
+    detach(flight);
+    detach(arcade);
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "special: all three closed after detaching");
+}
+
 int main() {
     // Only virtual pads: no real controller on the test machine may show up.
     for (const char* hint : {SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT, SDL_HINT_JOYSTICK_WGI,
@@ -1170,6 +1306,7 @@ int main() {
     test_keyboard_pad(input);
     test_motion(input);
     test_aggregate_device(input);
+    test_special_kinds(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
