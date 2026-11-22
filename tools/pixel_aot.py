@@ -575,24 +575,6 @@ SALU_HELPERS = {
         "    return sat ? dot_u64_sat(s) : s.x;\n"
         "}"
     ),
-    # v_cvt_u32_f32 and v_cvt_i32_f32 truncate toward zero, map NaN to 0 and saturate (issue #360 reading of
-    # the RDNA 2 ISA). HLSL leaves out-of-range and NaN casts undefined (LLVM fptoui/fptosi give poison), so
-    # the cast is applied only to an operand made NaN-free and clamped to the largest binary32 below 2^32
-    # (4294967040 = 0xffffff00) or 2^31 (2147483520 = 0x7fffff80); the guards then select the saturated or
-    # zero result. NaN fails every compare, so it reaches the cast as y = 0 and gives 0.
-    "cvt_u32_f32": (
-        "uint cvt_u32_f32(float x) {\n"
-        "    float y = isnan(x) ? 0.0f : clamp(x, 0.0f, 4294967040.0f);\n"
-        "    return x <= 0.0f ? 0u : x >= 4294967296.0f ? 0xffffffffu : uint(y);\n"
-        "}"
-    ),
-    "cvt_i32_f32": (
-        "uint cvt_i32_f32(float x) {\n"
-        "    float y = isnan(x) ? 0.0f : clamp(x, -2147483648.0f, 2147483520.0f);\n"
-        "    return x <= -2147483648.0f ? 0x80000000u\n"
-        "         : x >= 2147483648.0f ? 0x7fffffffu : asuint(int(y));\n"
-        "}"
-    ),
 }
 
 VOP3P_F16 = {
@@ -1157,6 +1139,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     result_type = "uint4" if integer_export else "float4"
     lines.append(f"{result_type} main(float2 uv : TEXCOORD0) : SV_Target0 {{")
     attribute_input = False
+    interpolated = False
     for i, line in enumerate(instructions):
         def match(pattern):
             return re.fullmatch(pattern, line)
@@ -1411,6 +1394,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if phase == "1" and vector.get(src) == "bary_i":
                 vector[dst] = ("partial", component, mask)
             elif phase == "2" and vector.get(src) == "bary_j" and vector.get(dst) == ("partial", component, mask):
+                interpolated = True
                 if entry_interp:
                     attribute_input = True
                     vector[dst] = f"alu{i}"
@@ -1722,6 +1706,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 helpers.add(f"{op}16_num")
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({packed_lanes[0]} | ({packed_lanes[1]} << 16));")
+        elif m := match(r"v_cvt_u32_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8})"):
+            dst, src = m.groups()
+            if int(dst[1:]) > 255 or (src.startswith(("v", "s")) and
+                    int(src[1:]) > (255 if src.startswith("v") else 105)):
+                raise ValueError("Invalid unsigned conversion register")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if src.startswith("v") and src not in vector:
+                raise ValueError(f"Unbound pixel input {src} at v_cvt_u32_f32_e32")
+            quad = mask == "quad"
+            operand = fp_operand(src, scalar, vector, pending, sample_dest,
+                                 quad_values=quad_values if quad else None)
+            if quad and not quad_values.get(vector.get(src), False):
+                # Uniform inputs stay uniform. A varying conversion is not an affine sample coordinate.
+                quad_values[f"alu{i}"] = False
+            helpers.add("cvt_u32_f32")
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat(cvt_u32_f32(asuint({operand})));")
         elif m := match(r"v_cvt_f32_ubyte([0-3])(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
             # Byte N of the source word as an unsigned integer. The source is read as bits,
             # so float modifiers do not apply and are rejected by the pattern.
@@ -1869,8 +1871,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({high} | narrow16({value}));")
         elif m := match(r"v_cvt_f32_(u32|i32)_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|-?\d+)"):
-            # Integer to binary32, plain e32 only: modifiers, clamp and omod belong to e64, and
-            # DPP or SDWA variants must not slip through the anchored operand list.
+            # Integer to binary32, plain e32 only: the e32 encoding carries no modifiers, so clamp
+            # or omod suffixes and DPP or SDWA variants must not slip through the anchored operand
+            # list; the e64 branch below carries clamp.
             op, dst, src = m.groups()
             if mask != "entry":
                 raise ValueError("Invalid conversion")
@@ -1880,18 +1883,37 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             expression = f"float(asuint({source}))" if op == "u32" else f"float(asint({source}))"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := match(r"v_cvt_(u32|i32)_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8})"):
-            # Binary32 to word, plain e32 only. Decimal inline constants are refused because
-            # fp_operand reads them as bit patterns and the f32 reading is unchecked.
-            op, dst, src = m.groups()
+        elif m := match(r"v_cvt_f32_(u32|i32)_e64 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|-?\d+)( clamp)?"):
+            # The e64 encoding of the same conversion adds clamp. omod stays refused in every
+            # spelling: the LLVM 15 assembler rejects it on these forms, so it cannot round-trip;
+            # abs/neg on the integer source are refused by the assembler too, and DPP or SDWA
+            # variants must not slip through the anchored operand list.
+            op, dst, src, clamp = m.groups()
             if mask != "entry":
                 raise ValueError("Invalid conversion")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             source = fp_operand(src, scalar, vector, pending, sample_dest)
-            helpers.add(f"cvt_{op}_f32")
+            expression = f"float(asuint({source}))" if op == "u32" else f"float(asint({source}))"
+            if clamp:
+                expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
-            lines.append(f"    precise float alu{i} = asfloat(cvt_{op}_f32({source}));")
+            lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"v_cvt_i32_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8})"):
+            dst, src = m.groups()
+            if int(dst[1:]) > 255 or (src.startswith(("v", "s")) and
+                    int(src[1:]) > (255 if src.startswith("v") else 105)):
+                raise ValueError("Invalid signed conversion register")
+            if mask != "entry":
+                raise ValueError("Invalid conversion")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if src.startswith("v") and src not in vector:
+                raise ValueError(f"Unbound pixel input {src} at v_cvt_i32_f32_e32")
+            operand = fp_operand(src, scalar, vector, pending, sample_dest)
+            helpers.add("cvt_i32_f32")
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat(cvt_i32_f32(asuint({operand})));")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             if dst in sample_dest:
@@ -1908,8 +1930,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
                 raise ValueError("Unsupported export")
             args = [f"export16({v})" for pair in pairs for v in pair]
-            input_type = "float4" if attribute_input else "float2"
-            lines[entry_line] = f"float{len(args)} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
+            inputs = "float4 uv : TEXCOORD0" if attribute_input else "float2 uv : TEXCOORD0"
+            if not bindings and not interpolated:
+                inputs = ""
+            lines[entry_line] = f"float{len(args)} main({inputs}) : SV_Target0 {{"
             lines.append(f"    return float{len(args)}({', '.join(args)});")
             exported = True
         elif m := match(r"exp mrt0,? (v\d+), (v\d+), (v\d+), (v\d+) done vm"):
@@ -1933,6 +1957,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
+        if helpers & {"cvt_u32_f32", "cvt_i32_f32"}:
+            defs.append((Path(__file__).resolve().parents[1] / "src/ffx_float_to_int.hlsli").read_text())
         lines[:0] = defs
     return "\n".join([*lines, "}",""])
 

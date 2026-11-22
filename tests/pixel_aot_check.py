@@ -2622,6 +2622,20 @@ def buffer_color(rg):
     ]
 
 
+def unsigned_conversion(quad):
+    prefix = buffer_color(False)[:6]  # word at byte 16 is in s4 after the wait
+    if quad:
+        prefix += ["s_mov_b64 s[40:41], exec", "s_wqm_b64 exec, exec",
+                   "v_cvt_u32_f32_e32 v32, s4", "s_and_b64 exec, exec, s[40:41]"]
+    else:
+        prefix += ["v_mov_b32_e32 v32, s4", "v_cvt_u32_f32_e32 v32, v32"]
+    # Every possible byte is an exact binary16 and binary32 value.
+    return prefix + [f"v_cvt_f32_ubyte{i}_e32 v{20+i}, v32" for i in range(4)] + [
+        "v_cvt_pkrtz_f16_f32_e32 v24, v20, v21", "v_cvt_pkrtz_f16_f32_e32 v25, v22, v23",
+        "exp mrt0 v24, v24, v25, v25 done compr vm", "s_endpgm",
+    ]
+
+
 def translate_buffer_color(instructions):
     return lower(instructions, 9, 24, None, 0)
 
@@ -3123,7 +3137,8 @@ def check_controls(directory):
     assert "narrow16(asfloat(4294967295u))" in body and "narrow16((-abs(0.5f)))" in body, body
     for register in ("v0", "v1", "v8", "v9"):
         must_reject(translate, with_constants([f"v_cvt_f16_f32_e32 {register}, s44"]))
-    # v_cvt_f32_u32_e32/v_cvt_f32_i32_e32 lower only the plain e32 encoding of the word conversions.
+    # v_cvt_f32_u32/v_cvt_f32_i32 lower the plain e32 encoding without modifiers and the e64
+    # encoding with its optional clamp; every other modifier or variant is refused.
     program = uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000))
     body = translate(program).split("float4 main", 1)[1]
     assert body.count("float(asuint(") == 2 and body.count("float(asint(") == 2, body
@@ -3131,9 +3146,23 @@ def check_controls(directory):
     assert modern != program and translate(modern) == translate(program)
     wait = program.index("s_waitcnt lgkmcnt(0)", program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
     must_reject(translate, program[:wait] + ["v_cvt_f32_u32_e32 v19, s45"] + program[wait:])
-    for bad in ("v_cvt_f32_u32_e64 v12, s44", "v_cvt_f32_i32_e64 v12, s44",
+    program = uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True))
+    body = translate(program).split("float4 main", 1)[1]
+    assert body.count("float(asuint(") == 2 and body.count("float(asint(") == 2, body
+    modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
+    assert modern != program and translate(modern) == translate(program)
+    program = uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True, clamp=True))
+    body = translate(program).split("float4 main", 1)[1]
+    assert body.count("saturate(float(asuint(") == 2 and body.count("saturate(float(asint(") == 2, body
+    # The e64 pending-load guard mirrors the e32 one; the modifier list pins the assembler-measured
+    # refusals: omod in every probed spelling (LLVM 15 rejects it, so it cannot round-trip), abs/neg
+    # on the integer source, the DPP/SDWA variants, and clamp on the modifier-free e32 encoding.
+    must_reject(translate, program[:wait] + ["v_cvt_f32_u32_e64 v19, s45"] + program[wait:])
+    for bad in ("v_cvt_f32_u32_e32 v12, s44 clamp", "v_cvt_f32_i32_e32 v12, s44 clamp",
                 "v_cvt_f32_u32_e64 v12, |s44|", "v_cvt_f32_i32_e64 v12, -s44",
-                "v_cvt_f32_u32_e64 v12, s44 clamp", "v_cvt_f32_i32_e64 v12, s44 omod:2",
+                "v_cvt_f32_u32_e64 v12, s44 omod:1", "v_cvt_f32_i32_e64 v12, s44 omod:2",
+                "v_cvt_f32_u32_e64 v12, s44 omod:3", "v_cvt_f32_i32_e64 v12, s44 clamp omod:2",
+                "v_cvt_f32_u32_e64 v12, s44 omod(2)", "v_cvt_f32_i32_e64 v12, s44 mul:2",
                 "v_cvt_f32_u32_dpp v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
                 "v_cvt_f32_i32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD"):
         must_reject(translate, with_constants([bad]))
@@ -3142,7 +3171,7 @@ def check_controls(directory):
     full = translate_int(program)
     body = full.split("uint4 main", 1)[1]
     assert body.count("cvt_u32_f32(") == 2 and body.count("cvt_i32_f32(") == 2, body
-    assert full.count("uint cvt_u32_f32(float x)") == 1 and full.count("uint cvt_i32_f32(float x)") == 1
+    assert full.count("uint cvt_u32_f32(uint bits)") == 1 and full.count("uint cvt_i32_f32(uint bits)") == 1
     modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
     assert modern != program and translate_int(modern) == full
     assert "asfloat(1077936128u)" in translate_int(uncompressed_export(["v_cvt_u32_f32_e32 v12, 0x40400000"]))
@@ -3157,6 +3186,9 @@ def check_controls(directory):
                 "v_cvt_u32_f32_e32 v12, 0.5", "v_cvt_u32_f32_e32 v12, 1", "v_cvt_i32_f32_e32 v12, -1",
                 "v_cvt_rpi_i32_f32_e32 v12, v13", "v_cvt_flr_i32_f32_e32 v12, v13"):
         expect_value_error(translate, with_constants([bad]), "Unsupported instruction")
+    for inst, diagnostic in (("v_cvt_i32_f32_e32 v256, s44", "Invalid signed conversion register"),
+                             ("v_cvt_i32_f32_e32 v12, v255", "Unbound pixel input v255")):
+        expect_value_error(translate, with_constants([inst]), diagnostic)
     # Positive control: the same harness accepts the plain forms, so the rejections above come from the form.
     for good in ("v_cvt_u32_f32_e32 v12, s44", "v_cvt_i32_f32_e32 v12, s44", "v_cvt_u32_f32_e32 v12, 0x40400000"):
         translate(with_constants([good]))
@@ -3169,9 +3201,10 @@ def check_controls(directory):
         ok = with_constants([])
         ok.insert(sample + 1, f"v_cvt_{op}_f32_e32 v20, 0x40400000")
         translate(ok)
-        quad = with_constants([])
-        quad.insert(quad.index("s_wqm_b64 exec, exec") + 1, f"v_cvt_{op}_f32_e32 v20, 0x40400000")
-        expect_value_error(translate, quad, "Invalid conversion")
+        if op == "i32":
+            quad = with_constants([])
+            quad.insert(quad.index("s_wqm_b64 exec, exec") + 1, f"v_cvt_{op}_f32_e32 v20, 0x40400000")
+            expect_value_error(translate, quad, "Invalid conversion")
         entry = with_constants([])
         entry.insert(entry.index("s_and_b64 exec, exec, s[50:51]") + 1, f"v_cvt_{op}_f32_e32 v20, 0x40400000")
         translate(entry)
@@ -3798,6 +3831,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((offset_nibbles(), translate))
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
+    fixtures.extend((unsigned_conversion(quad), translate_buffer_color) for quad in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
     fixtures.extend((with_constants(body), translate) for body, *_ in SDWA_ARITH)
     fixtures.append((with_constants(PK_INT16_BODY), translate))
@@ -3806,6 +3840,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((exp_sync_program, translate))
     fixtures.append((with_constants(DOT_BODY), translate, "gfx1030"))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000)), translate))
+    fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True)), translate))
+    fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True, clamp=True)), translate))
     fixtures.append((uncompressed_export(cvt_float_body(0x3fc00000, 0xc0300000)), translate_int))
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
@@ -3990,14 +4026,18 @@ CVT_INT_WORDS = (
 )
 
 
-def cvt_int_body(w0, w1, *, swap=False):
+def cvt_int_body(w0, w1, *, swap=False, e64=False, clamp=False):
     """Convert each literal word twice: unsigned into the lower channel of its pair, signed into the
-    upper. Swapping the conversions changes every channel whose word has the sign bit set."""
+    upper. Swapping the conversions changes every channel whose word has the sign bit set. The e64
+    encoding additionally carries the clamp modifier; the default e32 encoding carries neither, so
+    asking for clamp without e64 builds the text the translator must refuse."""
     unsigned, signed = ("i32", "u32") if swap else ("u32", "i32")
+    encoding = "_e64" if e64 else "_e32"
+    suffix = " clamp" if clamp else ""
     body = []
     for dst, word in ((12, w0), (13, w0), (14, w1), (15, w1)):
         op = unsigned if dst % 2 == 0 else signed
-        body += [f"v_mov_b32_e32 v{dst}, {word:#x}", f"v_cvt_f32_{op}_e32 v{dst}, v{dst}"]
+        body += [f"v_mov_b32_e32 v{dst}, {word:#x}", f"v_cvt_f32_{op}{encoding} v{dst}, v{dst}{suffix}"]
     return body
 
 
@@ -4024,6 +4064,56 @@ def check_cvt_int_f32_draw(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapping the unsigned and signed conversions escaped detection")
+
+
+def check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend):
+    source = directory / "cvt_int_f32_e64.hlsl"
+    shader = directory / "cvt_int_f32_e64.cso"
+    case = directory / "cvt_int_f32_e64.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    constants = bytes(256)
+    # The plain e64 encoding performs the same conversion as e32, so the same word pairs and
+    # nearest-even references prove the two encodings agree, ties included.
+    for w0, w1 in CVT_INT_WORDS:
+        program = uncompressed_export(cvt_int_body(w0, w1, e64=True))
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        write_case(case, constants, (u32f(w0), i32f(w0), u32f(w1), i32f(w1)))
+        subprocess.run(draw, check=True)
+    # Clamp rows: the modifier maps the conversion through min(1.0, max(0.0, .)), computed from
+    # the same u32f/i32f references. The words cover the interior 0 and 1, values past 1 (2,
+    # 0xFFFFFFFF and 0x7FFFFFFF, which rounds to 2147483648.0 before clamping) and the negative
+    # signed words 0xFFFFFFFF and 0x80000000, which clamp to 0.
+    for w0, w1 in ((0, 1), (2, 0xFFFFFFFF), (0x80000000, 0x7FFFFFFF)):
+        program = uncompressed_export(cvt_int_body(w0, w1, e64=True, clamp=True))
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        expected = tuple(min(1.0, max(0.0, ref(word)))
+                         for word, ref in ((w0, u32f), (w0, i32f), (w1, u32f), (w1, i32f)))
+        write_case(case, constants, expected)
+        subprocess.run(draw, check=True)
+    # Dropping clamp must fail the clamped reference still on disk: without it u32 of 2 exports
+    # 2.0 where the reference holds 1.0.
+    write_case(case, constants, (1.0, 1.0, 1.0, 0.0))
+    source.write_text(translate(uncompressed_export(cvt_int_body(2, 0xFFFFFFFF, e64=True))), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Dropping clamp from the e64 conversion escaped detection")
+    # The last pair's words all have the sign bit set, so under clamp swapping the two conversions
+    # exchanges 1.0 and 0.0 on every channel: u32 clamps to 1 where i32 of the same word clamps to 0.
+    w0, w1 = CVT_INT_WORDS[-1]
+    program = uncompressed_export(cvt_int_body(w0, w1, e64=True, clamp=True))
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    write_case(case, constants, tuple(min(1.0, max(0.0, ref(word)))
+                                      for word, ref in ((w0, u32f), (w0, i32f), (w1, u32f), (w1, i32f))))
+    subprocess.run(draw, check=True)
+    source.write_text(translate(uncompressed_export(cvt_int_body(w0, w1, e64=True, clamp=True, swap=True))), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Swapping the clamped unsigned and signed conversions escaped detection")
 
 
 def cvt_u32_ref(word):
@@ -4756,6 +4846,7 @@ def check_e64_render(directory, compiler, renderer, backend):
     check_nan_class_draw(directory, compiler, renderer, backend)
     check_integer_readback_draw(directory, compiler, renderer, backend)
     check_cvt_int_f32_draw(directory, compiler, renderer, backend)
+    check_cvt_int_f32_e64_draw(directory, compiler, renderer, backend)
     check_cvt_float_int_draw(directory, compiler, renderer, backend)
     return 0
 
