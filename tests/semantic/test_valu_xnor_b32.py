@@ -527,8 +527,82 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), 0x0000_0000)
 
 
+
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, 0xAAAA_AAAA)
+        state.set_vgpr(1, 0x5555_5555)
+        # v0 = xnor(v0, v1) = ~(0xAAAA_AAAA ^ 0x5555_5555) = ~0xFFFF_FFFF = 0
+        instr = VXnorB32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP2Operand(Reg(0, RegType.VGPR)),
+            src1=VOP2Operand(Reg(1, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0x0000_0000)
+        self.assertEqual(state.get_vgpr(0), 0x0000_0000)
+        # v1 must be preserved
+        self.assertEqual(state.get_vgpr(1), 0x5555_5555)
+
+    def test_dst_alias_src1(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, 0x1234_5678)
+        state.set_vgpr(1, 0xFFFF_FFFF)
+        # v0 = xnor(v1, v0) = xnor(0xFFFFFFFF, v0) = v0
+        instr = VXnorB32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP2Operand(Reg(1, RegType.VGPR)),
+            src1=VOP2Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0x1234_5678)
+        self.assertEqual(state.get_vgpr(0), 0x1234_5678)
+        self.assertEqual(state.get_vgpr(1), 0xFFFF_FFFF)
+
+    def test_dst_alias_both_srcs(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, 0xDEAD_BEEF)
+        # v0 = xnor(v0, v0) = 0xFFFFFFFF
+        instr = VXnorB32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP2Operand(Reg(0, RegType.VGPR)),
+            src1=VOP2Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0xFFFF_FFFF)
+        self.assertEqual(state.get_vgpr(0), 0xFFFF_FFFF)
+
+    def test_simd_multi_lane_aliased_inversion(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, lane)
+
+        # In-place lane bitwise inversion: v0 = xnor(v0, 0) == ~v0
+        instr = VXnorB32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP2Operand(Reg(0, RegType.VGPR)),
+            src1=VOP2Operand(Literal32(0)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            expected = (~lane) & MASK32
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
