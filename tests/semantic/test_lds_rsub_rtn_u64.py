@@ -468,6 +468,95 @@ class TestLdsRsubRtnU64SIMD(unittest.TestCase):
             self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), 7777)
 
 
+class TestLdsRsubRtnU64RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter64(lds_size_bytes=4096)
+
+    def test_aliasing_vdst_equals_vdata0(self) -> None:
+        # vdst = v[0:1], vdata0 = v[0:1], vaddr = v2
+        self.interp.lds.write_qword(0x30, 40)
+        self.interp.write_reg_u64(RegKind.VGPR, 0, 100)   # vdata0 and vdst
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0x30)  # vaddr
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 0, count=2),
+        )
+        old_val, new_mem = self.interp.step(inst)
+        self.assertEqual(old_val, 40)
+        self.assertEqual(new_mem, 60)
+        # v[0:1] receives pre-op value 40
+        self.assertEqual(self.interp.read_reg_u64(RegKind.VGPR, 0), 40)
+        # LDS at 0x30 updated to 100 - 40 = 60
+        self.assertEqual(self.interp.lds.read_qword(0x30), 60)
+
+    def test_aliasing_vaddr_in_vdst_range(self) -> None:
+        # vdst = v[0:1], vaddr = v0, vdata0 = v[2:3]
+        self.interp.lds.write_qword(0x20, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x20)  # vaddr (low word of vdst)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0)
+        self.interp.write_reg_u64(RegKind.VGPR, 2, 150)   # vdata0
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 0, count=1),
+            vdata0=Register(RegKind.VGPR, 2, count=2),
+        )
+        old_val, new_mem = self.interp.step(inst)
+        self.assertEqual(old_val, 100)
+        self.assertEqual(new_mem, 50)
+        # v[0:1] receives pre-op value 100
+        self.assertEqual(self.interp.read_reg_u64(RegKind.VGPR, 0), 100)
+        # LDS at 0x20 updated to 150 - 100 = 50
+        self.assertEqual(self.interp.lds.read_qword(0x20), 50)
+
+    def test_unrelated_vgprs_preserved(self) -> None:
+        for idx in range(10, 20):
+            self.interp.write_reg_u32(RegKind.VGPR, idx, 0x88000000 + idx)
+
+        self.interp.lds.write_qword(0, 10)
+        self.interp.write_reg_u64(RegKind.VGPR, 0, 0)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0)
+        self.interp.write_reg_u64(RegKind.VGPR, 4, 50)
+
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+        self.interp.step(inst)
+
+        for idx in range(10, 20):
+            self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, idx), 0x88000000 + idx)
+
+    def test_simd_aliasing_vdst_equals_vdata0(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter64(wave_size=32, lds_size_bytes=4096)
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 0, count=2),
+        )
+        for lane in range(32):
+            simd.lds.write_qword(lane * 8, 100 * (lane + 1))
+            simd.write_lane_reg_u64(lane, RegKind.VGPR, 0, 1000)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, lane * 8)
+
+        results = simd.step(inst)
+        for lane in range(32):
+            expected_old = 100 * (lane + 1)
+            expected_new = (1000 - expected_old) & MASK64
+            self.assertEqual(results[lane], (expected_old, expected_new))
+            self.assertEqual(simd.read_lane_reg_u64(lane, RegKind.VGPR, 0), expected_old)
+            self.assertEqual(simd.lds.read_qword(lane * 8), expected_new)
+
+
 class TestLdsRsubRtnU64ScalarInterpreter(unittest.TestCase):
     """Unit tests for the deterministic scalar instruction interpreter."""
 
