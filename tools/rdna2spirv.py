@@ -6958,12 +6958,21 @@ class Gen:
             self.emit(f"{r} = OpGroupNonUniformShuffle %uint {self.cu(3)} {v} {first}")
             self.dst(a[0], r)
         elif op in ("image_sample_o", "image_sample_lz_o", "image_sample_l_o", "image_sample_b_o",
-                    "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o", "image_sample_b_cl_o",
-                    "image_sample_c_cl_o", "image_sample_c_b_cl_o") or                 op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
-                    "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl", "image_sample_b_cl", "image_sample_c_cl",
-                    "image_sample_c_b_cl",
-                    "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
-                    "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
+                    "image_sample_c_lz_o", "image_sample_c_o", "image_sample_c_b_o", "image_sample_cl_o",
+                    "image_sample_b_cl_o", "image_sample_c_cl_o", "image_sample_c_b_cl_o",
+                    "image_sample_d_o", "image_sample_d_cl_o",
+                    "image_sample_cd_o", "image_sample_cd_cl_o",
+                    "image_sample_c_d_o", "image_sample_c_d_cl_o",
+                    "image_sample_c_cd_o", "image_sample_c_cd_cl_o") or \
+                op in ("image_sample", "image_sample_lz", "image_sample_l", "image_sample_b", "image_sample_c_lz",
+                       "image_sample_c_l", "image_sample_c", "image_sample_c_b", "image_sample_cl",
+                       "image_sample_b_cl", "image_sample_c_cl", "image_sample_c_b_cl",
+                       "image_sample_d", "image_sample_d_cl",
+                       "image_sample_cd", "image_sample_cd_cl",
+                       "image_sample_c_d", "image_sample_c_d_cl",
+                       "image_sample_c_cd", "image_sample_c_cd_cl",
+                       "image_load", "image_gather4_lz", "image_gather4_l",
+                       "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             u = self.src_h(a[1])
@@ -12518,7 +12527,8 @@ class Gen:
             extras = extras[:-2] if w_off else extras
             extras = extras[:-3] if extras.endswith("_cl") else extras      # the clamp is packed with the coordinates
             w_bias = 1 if extras in ("_b", "_c_b") else 0
-            w_grad = 2 * grad_width if extras in ("_d", "_d_cl") else 0
+            w_grad = 2 * grad_width if extras in (
+                "_d", "_d_cl", "_cd", "_cd_cl", "_c_d", "_c_d_cl", "_c_cd", "_c_cd_cl") else 0
             whole = w_off + w_bias + (1 if extras.startswith("_c") else 0) + w_grad
             unpacked = []
             for i, c in enumerate(coords):
@@ -12747,18 +12757,24 @@ class Gen:
             clamp = kind.endswith("_cl")   # a min-LOD clamp, read after the coordinates (after the gradients for _d)
             if clamp:
                 kind = kind[:-3]
-                if kind not in ("", "_b", "_c", "_c_b", "_d"):
+                if kind not in ("", "_b", "_c", "_c_b", "_d", "_cd", "_c_d", "_c_cd"):
                     raise Unsupported(op)
                 self.uses_minlod = True
+            if kind == "_cd":
+                kind = "_d"
+            elif kind == "_c_cd":
+                kind = "_c_d"
             # Address order after the offset: bias, z-compare, gradients, coordinates, LOD, clamp.
             bias = None
             if kind in ("_b", "_c_b"):
+                if not f:
+                    raise Unsupported(op + " coords")
                 bias, f = f[0], f[1:]
             ref = None
             if kind.startswith("_c"):
                 ref, f = f[0], f[1:]
             grads = None
-            if kind == "_d":
+            if kind in ("_d", "_c_d"):
                 # Address order: all dP/dx components, all dP/dy components, then the coordinates.
                 if len(f) < 2 * grad_width + ncoord:
                     raise Unsupported(op + " coords")
@@ -12810,7 +12826,7 @@ class Gen:
                                       dmask, vdata, d16, sample)
                 return
             res = self.tmp()
-            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b"):
+            if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b", "_d", "_c_d"):
                 raise Unsupported(op)
             implicit = kind in ("", "_b", "_c", "_c_b") and self.stage == "ps"
             # A min-LOD clamp (_cl): MinLod goes with the implicit-LOD forms and Grad. Without derivatives (outside the
@@ -12841,11 +12857,23 @@ class Gen:
                     masks.append("MinLod")
                     vals.append(minlod)
                 return f" {'|'.join(masks)} {' '.join(vals)}" if masks else ""
-            if kind == "_d":
+            if kind in ("_d", "_c_d"):
+                masks, g_args = ["Grad"], [grads[0], grads[1]]
+                if off is not None:
+                    masks.append("Offset")
+                    g_args.append(off)
                 if minlod is not None:
-                    self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad|MinLod {grads[0]} {grads[1]} {minlod}")
+                    masks.append("MinLod")
+                    g_args.append(minlod)
+                img_ops = f"{'|'.join(masks)} {' '.join(g_args)}"
+                if kind == "_d":
+                    self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} {img_ops}")
                 else:
-                    self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad {grads[0]} {grads[1]}")
+                    d = self.tmp()
+                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref} {img_ops}")
+                    r = self.f16_bits(d) if d16 else self.tou(d)
+                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, r)
+                    return
             elif grads_fb is not None and not kind.startswith("_c"):
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad{'|MinLod' if minlod else ''} "
                           f"{grads_fb[0]} {grads_fb[1]}{' ' + minlod if minlod else ''}")
