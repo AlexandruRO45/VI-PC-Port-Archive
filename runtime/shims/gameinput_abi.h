@@ -785,6 +785,58 @@ static_assert(sizeof(GameInputMouseState) == 40 && offsetof(GameInputMouseState,
 static_assert(sizeof(GameInputKeyboardInfo) == 40 && offsetof(GameInputKeyboardInfo, nativeLanguage) == 32);
 static_assert(sizeof(GameInputMouseInfo) == 16 && offsetof(GameInputMouseInfo, hasWheelX) == 12);
 
+// Touch (RT-167). Layouts checked against the v0 header of Microsoft.GameInput 0.2303.22621.3038; the asserts below
+// pin them.
+enum GameInputTouchShape : int32_t {
+    GameInputTouchShapeUnknown = -1,
+    GameInputTouchShapePoint = 0,
+    GameInputTouchShape1DLinear = 1,
+    GameInputTouchShape1DRadial = 2,
+    GameInputTouchShape1DIrregular = 3,
+    GameInputTouchShape2DRectangular = 4,
+    GameInputTouchShape2DElliptical = 5,
+    GameInputTouchShape2DIrregular = 6,
+};
+
+enum GameInputLabel : int32_t {
+    GameInputLabelUnknown = -1,
+    GameInputLabelNone = 0,
+};
+
+// One active contact of a touch reading. Positions, contact rectangle and pressure are normalised to 0..1.
+struct GameInputTouchState {
+    uint64_t touchId;
+    uint32_t sensorIndex;
+    float positionX;
+    float positionY;
+    float pressure;
+    float proximity;
+    float contactRectTop;
+    float contactRectLeft;
+    float contactRectRight;
+    float contactRectBottom;
+};
+
+struct GameInputTouchSensorInfo {
+    uint32_t mappedInputKinds;  // GameInputKind
+    GameInputLabel label;
+    GameInputLocation location;
+    uint32_t locationId;
+    uint64_t resolutionX;
+    uint64_t resolutionY;
+    GameInputTouchShape shape;
+    float aspectRatio;
+    float orientation;
+    float physicalWidth;
+    float physicalHeight;
+    float maxPressure;
+    float maxProximity;
+    uint32_t maxTouchPoints;
+};
+
+static_assert(sizeof(GameInputTouchState) == 48 && offsetof(GameInputTouchState, contactRectBottom) == 40);
+static_assert(sizeof(GameInputTouchSensorInfo) == 64 && offsetof(GameInputTouchSensorInfo, maxTouchPoints) == 60);
+
 using GameInputCreateFn = HRESULT(WINAPI*)(IGameInput** gameInput);
 
 }  // namespace gi

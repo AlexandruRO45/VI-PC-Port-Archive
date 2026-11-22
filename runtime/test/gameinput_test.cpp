@@ -1607,6 +1607,168 @@ void test_keyboard_mouse(IGameInput* input) {
     rt::gameinput::set_cursor_source(nullptr);
 }
 
+uint32_t custom_touch_source(GameInputTouchState* out, uint32_t max_count) {
+    if (!out || max_count == 0) return 0;
+    out[0] = {42, 0, 0.25f, 0.75f, 0.5f, 0.0f, 0.75f, 0.25f, 0.25f, 0.75f};
+    return 1;
+}
+
+// The touch device (LEONIDA_TOUCH, RT-167), driven through rt::gameinput::touch_contact and set_touch_source under the
+// keyboard pad's focus rule. No pad is connected while this runs.
+void test_touch(IGameInput* input) {
+    rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
+    rt::gameinput::clear_touch_contacts();
+    rt::gameinput::set_touch_source(nullptr);
+    g_focus = true;
+
+    set_env("LEONIDA_TOUCH", nullptr);
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    IGameInputReading* r = nullptr;
+    check(input->GetCurrentReading(GameInputKindTouch, nullptr, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+          "touch: off by default, no touch reading");
+
+    set_env("LEONIDA_TOUCH", "1");
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().touch == rt::gameinput::KeyboardPadMode::Focused,
+          "touch: LEONIDA_TOUCH=1 is the focused mode");
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "touch: not counted as a gamepad");
+
+    IGameInputDevice* tch = nullptr;
+    if (input->GetCurrentReading(GameInputKindTouch, nullptr, &r) == S_OK && r) {
+        r->GetDevice(&tch);
+        GameInputTouchState none[2]{};
+        GameInputGamepadState pad{};
+        GameInputMouseState mse{};
+        check(r->GetInputKind() == GameInputKindTouch && r->GetTouchCount() == 0 && r->GetTouchState(2, none) == 0,
+              "touch: initial reading has zero contacts");
+        check(!r->GetGamepadState(&pad) && !r->GetMouseState(&mse) && r->GetKeyCount() == 0 &&
+                  r->GetControllerAxisCount() == 0 && r->GetControllerButtonCount() == 0,
+              "touch: a touch reading has no pad, keyboard or mouse state");
+        r->Release();
+    }
+    check(tch != nullptr, "touch: device connected with an initial reading");
+    if (!tch) return;
+    const GameInputDeviceInfo* ti = tch->GetDeviceInfo();
+    const auto* si = static_cast<const GameInputTouchSensorInfo*>(ti->touchSensorInfo);
+    check(ti->supportedInput == GameInputKindTouch && ti->touchPointCount == 10 && ti->touchSensorCount == 1 && si &&
+              !ti->gamepadInfo && si->maxTouchPoints == 10 && approx(si->maxPressure, 1.0f) &&
+              si->location == GameInputLocationDisplay && si->shape == GameInputTouchShape2DRectangular,
+          "touch: device info (10 touch points, 1 sensor, no gamepad info)");
+    check(ti->displayName && std::strcmp(ti->displayName->data, "Touch (Leonida)") == 0, "touch: display name");
+    IGameInputDevice* found = nullptr;
+    check(input->FindDeviceFromId(&ti->deviceId, &found) == S_OK && found == tch,
+          "touch: FindDeviceFromId finds the touch device");
+    if (found) found->Release();
+
+    // Two contacts added out of id order, with out-of-range coordinates to check clamping.
+    rt::gameinput::touch_contact(7, 1.5f, -0.25f, 0.8f, true);
+    rt::gameinput::touch_contact(2, 0.25f, 0.5f, 1.2f, true);
+    rt::gameinput::poll();
+    IGameInputReading* two_reading = nullptr;
+    if (input->GetCurrentReading(GameInputKindTouch, tch, &two_reading) == S_OK && two_reading) {
+        GameInputTouchState pts[4]{};
+        const uint32_t n = two_reading->GetTouchState(4, pts);
+        check(two_reading->GetTouchCount() == 2 && n == 2, "touch: two contacts held");
+        check(pts[0].touchId == 2 && pts[1].touchId == 7, "touch: contacts in ascending touchId order");
+        check(approx(pts[0].positionX, 0.25f) && approx(pts[0].positionY, 0.5f) && approx(pts[0].pressure, 1.0f) &&
+                  approx(pts[0].contactRectLeft, 0.25f) && approx(pts[0].contactRectTop, 0.5f),
+              "touch: contact 2 position, clamped pressure and contact rect");
+        check(approx(pts[1].positionX, 1.0f) && approx(pts[1].positionY, 0.0f) && approx(pts[1].pressure, 0.8f),
+              "touch: contact 7 coordinates clamped to 0..1");
+        check(two_reading->GetTouchState(1, pts) == 1 && two_reading->GetTouchState(4, nullptr) == 0,
+              "touch: GetTouchState honours stateArrayCount and null output");
+    } else {
+        check(false, "touch: reading after contacts go down");
+    }
+
+    // Move contact 2 and release contact 7; check history walk across both readings.
+    rt::gameinput::touch_contact(2, 0.4f, 0.6f, 0.5f, true);
+    rt::gameinput::touch_contact(7, 0.0f, 0.0f, 0.0f, false);
+    rt::gameinput::poll();
+    if (input->GetCurrentReading(GameInputKindTouch, tch, &r) == S_OK && r) {
+        GameInputTouchState pt{};
+        check(r->GetTouchCount() == 1 && r->GetTouchState(1, &pt) == 1 && pt.touchId == 2 &&
+                  approx(pt.positionX, 0.4f) && approx(pt.positionY, 0.6f) && approx(pt.pressure, 0.5f),
+              "touch: moved contact updated and released contact removed");
+        IGameInputReading* prev = nullptr;
+        check(input->GetPreviousReading(r, GameInputKindTouch, tch, &prev) == S_OK && prev == two_reading,
+              "touch: GetPreviousReading steps back to the two-finger reading");
+        if (prev) prev->Release();
+        r->Release();
+    } else {
+        check(false, "touch: reading after contact move and release");
+    }
+    if (two_reading) two_reading->Release();
+
+    // A gamepad query, with no pad connected, never answers with a touch reading.
+    check(input->GetCurrentReading(GameInputKindGamepad, nullptr, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+          "touch: no gamepad reading from the touch device");
+
+    // Cap at maxTouchPoints (10): contacts beyond 10 are ignored until a slot frees up.
+    rt::gameinput::clear_touch_contacts();
+    for (uint64_t id = 1; id <= 12; ++id) rt::gameinput::touch_contact(id, 0.1f, 0.1f, 0.5f, true);
+    rt::gameinput::poll();
+    if (input->GetCurrentReading(GameInputKindTouch, tch, &r) == S_OK && r) {
+        GameInputTouchState pts[12]{};
+        const uint32_t n = r->GetTouchState(12, pts);
+        check(r->GetTouchCount() == 10 && n == 10 && pts[0].touchId == 1 && pts[9].touchId == 10,
+              "touch: at most maxTouchPoints (10) simultaneous contacts");
+        r->Release();
+    }
+
+    // Out of focus reports zero contacts; LEONIDA_TOUCH=always reads them without focus.
+    g_focus = false;
+    rt::gameinput::poll();
+    if (input->GetCurrentReading(GameInputKindTouch, tch, &r) == S_OK && r) {
+        check(r->GetTouchCount() == 0, "touch: no contacts while another window has focus");
+        r->Release();
+    }
+    set_env("LEONIDA_TOUCH", "always");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    if (input->GetCurrentReading(GameInputKindTouch, tch, &r) == S_OK && r) {
+        check(r->GetTouchCount() == 10, "touch: LEONIDA_TOUCH=always reads contacts without focus");
+        r->Release();
+    }
+
+    // Custom touch source seam and aggregate touch device.
+    g_focus = true;
+    set_env("LEONIDA_TOUCH", "1");
+    rt::gameinput::reload_config();
+    rt::gameinput::set_touch_source(custom_touch_source);
+    rt::gameinput::poll();
+    IGameInputDevice* agg = nullptr;
+    check(input->CreateAggregateDevice(GameInputKindTouch, &agg) == S_OK && agg,
+          "touch: CreateAggregateDevice supports GameInputKindTouch");
+    if (input->GetCurrentReading(GameInputKindTouch, agg, &r) == S_OK && r) {
+        GameInputTouchState pt{};
+        check(r->GetTouchCount() == 1 && r->GetTouchState(1, &pt) == 1 && pt.touchId == 42 &&
+                  approx(pt.positionX, 0.25f) && approx(pt.positionY, 0.75f),
+              "touch: set_touch_source seam and aggregate device reading");
+        r->Release();
+    } else {
+        check(false, "touch: aggregate reading from custom touch source");
+    }
+    if (agg) agg->Release();
+    rt::gameinput::set_touch_source(nullptr);
+
+    set_env("LEONIDA_TOUCH", "off");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    check(tch->GetDeviceStatus() == GameInputDeviceNoStatus, "touch: off again disconnects the touch device");
+    check(input->GetCurrentReading(GameInputKindTouch, nullptr, &r) == GAMEINPUT_E_READING_NOT_FOUND && !r,
+          "touch: no touch reading once off");
+    tch->Release();
+
+    g_focus = false;
+    set_env("LEONIDA_TOUCH", nullptr);
+    rt::gameinput::reload_config();
+    rt::gameinput::clear_touch_contacts();
+    rt::gameinput::set_keyboard_source(nullptr, nullptr);
+}
+
 int main() {
     // Only virtual pads: no real controller on the test machine may show up.
     for (const char* hint : {SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT, SDL_HINT_JOYSTICK_WGI,
@@ -2116,6 +2278,7 @@ int main() {
     test_twins(input);
     test_keyboard_pad(input);
     test_keyboard_mouse(input);
+    test_touch(input);
     test_motion(input);
     test_aggregate_device(input);
     test_force_feedback(input);

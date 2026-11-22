@@ -60,8 +60,9 @@ constexpr uint32_t kBaseKinds =
     GameInputKindControllerAxis | GameInputKindControllerButton | GameInputKindGamepad | GameInputKindUiNavigation;
 // Everything a reading may carry: motion on pads with sensors, raw reports on pads opened through HID (RT-175).
 constexpr uint32_t kSupportedKinds = kBaseKinds | GameInputKindMotion | GameInputKindRawDeviceReport;
-// What a reading search may ask for: a pad's kinds, or the keyboard and mouse devices'.
-constexpr uint32_t kReadableKinds = kSupportedKinds | GameInputKindKeyboard | GameInputKindMouse;
+// What a reading search may ask for: a pad's kinds, or the keyboard, mouse and touch devices'.
+constexpr uint32_t kReadableKinds =
+    kSupportedKinds | GameInputKindKeyboard | GameInputKindMouse | GameInputKindTouch;
 constexpr uint32_t kAxisCount = 6;  // LX, LY, RX, RY, LT, RT
 constexpr uint32_t kButtonCount = SDL_GAMEPAD_BUTTON_COUNT;
 constexpr uint32_t kConnectedStatus = GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled;
@@ -174,6 +175,12 @@ rt::gameinput::Config read_config() {
     else if (!km.empty() && km != "0" && km != "off")
         std::fprintf(stderr, "[rt] gameinput: LEONIDA_KEYBOARD_MOUSE=%s unknown (1, always or off), keyboard and mouse "
                              "devices off\n", km.c_str());
+    const std::string tc = env("LEONIDA_TOUCH");
+    if (tc == "1" || tc == "on" || tc == "focus") c.touch = rt::gameinput::KeyboardPadMode::Focused;
+    else if (tc == "always") c.touch = rt::gameinput::KeyboardPadMode::Always;
+    else if (!tc.empty() && tc != "0" && tc != "off")
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_TOUCH=%s unknown (1, always or off), touch device off\n",
+                     tc.c_str());
     const std::string k = env("LEONIDA_KEYBOARD_PAD");
     if (k == "1" || k == "on" || k == "focus") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Focused;
     else if (k == "always") c.keyboard_pad = rt::gameinput::KeyboardPadMode::Always;
@@ -201,15 +208,18 @@ rt::gameinput::Config read_config() {
 class Device;
 class ForceFeedbackEffect;
 
-constexpr uint32_t kMaxKeys = 16;  // keys one keyboard reading holds (GameInputKeyboardInfo::maxSimultaneousKeys)
+constexpr uint32_t kMaxKeys = 16;     // keys one keyboard reading holds (GameInputKeyboardInfo::maxSimultaneousKeys)
+constexpr uint32_t kMaxTouches = 10;  // contacts one touch reading holds (GameInputTouchSensorInfo::maxTouchPoints)
 
 struct Snapshot {
-    // Set on the keyboard and mouse devices' readings only (GameInputKindKeyboard or GameInputKindMouse): such a
-    // reading carries keys or mouse state and none of the pad parts below.
+    // Set on the keyboard, mouse and touch devices' readings only (GameInputKindKeyboard, GameInputKindMouse or
+    // GameInputKindTouch): such a reading carries keys, mouse or touch state and none of the pad parts below.
     uint32_t kbm_kind = 0;
     uint32_t key_count = 0;
     GameInputKeyState keys[kMaxKeys]{};
     GameInputMouseState mouse{};
+    uint32_t touch_count = 0;
+    GameInputTouchState touches[kMaxTouches]{};
     GameInputGamepadState gamepad{};
     uint32_t ui = 0;
     float axes[kAxisCount] = {};
@@ -293,8 +303,15 @@ public:
         *static_cast<GameInputMouseState*>(out) = s_.mouse;
         return true;
     }
-    uint32_t STDMETHODCALLTYPE GetTouchCount() override { return 0; }
-    uint32_t STDMETHODCALLTYPE GetTouchState(uint32_t, void*) override { return 0; }
+    uint32_t STDMETHODCALLTYPE GetTouchCount() override {
+        return (s_.kbm_kind & GameInputKindTouch) ? s_.touch_count : 0;
+    }
+    uint32_t STDMETHODCALLTYPE GetTouchState(uint32_t count, void* out) override {
+        if (!out || !(s_.kbm_kind & GameInputKindTouch)) return 0;
+        const uint32_t n = std::min(count, s_.touch_count);
+        std::memcpy(out, s_.touches, n * sizeof(GameInputTouchState));
+        return n;
+    }
     bool STDMETHODCALLTYPE GetMotionState(void* state) override {
         if (!state || !s_.has_motion) return false;
         *static_cast<GameInputMotionState*>(state) = s_.motion;
@@ -532,6 +549,7 @@ public:
     GameInputKeyboardInfo keyboard_info{};  // the keyboard device's; info.keyboardInfo points at it
     GameInputMouseInfo mouse_info{};        // the mouse device's; info.mouseInfo points at it
     GameInputString native_language{0, 0, ""};  // keyboard_info.nativeLanguage points at it: unknown, never null
+    GameInputTouchSensorInfo touch_info{};  // the touch device's; info.touchSensorInfo points at it
     std::atomic<uint32_t> status{GameInputDeviceNoStatus};
     std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
     uint64_t evicted_order = 0;    // order of the newest reading dropped from history
@@ -843,6 +861,7 @@ struct State {
     // (SDL, rumble, battery, player slots) applies to them. kbm_devices lives for the process, kbm is the connected
     // ones. Every reading search and enumeration covers both lists (readable()).
     Device* kbm_devices[2] = {nullptr, nullptr};  // keyboard, mouse
+    Device* touch_device = nullptr;               // Touch (Leonida), LEONIDA_TOUCH
     std::vector<Device*> kbm;
     std::vector<Callback> callbacks;
     std::vector<Event> queue;
@@ -2081,6 +2100,120 @@ void update_keyboard_mouse(uint64_t now) {
     }
 }
 
+// ---- touch device (poll thread only, fed by rt::gameinput::touch_contact or set_touch_source) -------------------
+//
+// RT-167. With LEONIDA_TOUCH the shim connects one Touch (Leonida) device whose readings carry GameInputKindTouch and
+// nothing else. SDL3's touch subsystem lives inside SDL_INIT_VIDEO (built with SDL_VIDEO=OFF here, and requiring main-
+// thread initialization and an SDL window), so contacts enter through rt::gameinput::touch_contact() (a thread-safe
+// bridge any host window's WndProc on WM_POINTER* can call) or through set_touch_source() in tests, under the keyboard
+// pad's focus rule. Contacts are kept in ascending touchId order, up to kMaxTouches (10).
+//
+// VERIFY: the device family, sensor resolution and contact-rect convention a console title expects if it reads touch.
+struct TouchPoll {
+    Snapshot touch{};
+    bool touch_read = false;
+};
+TouchPoll g_touch;
+
+std::mutex g_touch_mu;
+std::vector<GameInputTouchState> g_touch_contacts;  // under g_touch_mu, sorted by touchId, at most kMaxTouches
+
+uint32_t bridge_touch_contacts(GameInputTouchState* out, uint32_t max_count) {
+    if (!out || max_count == 0) return 0;
+    std::lock_guard lock(g_touch_mu);
+    const uint32_t n = std::min(max_count, static_cast<uint32_t>(g_touch_contacts.size()));
+    if (n) std::memcpy(out, g_touch_contacts.data(), n * sizeof(GameInputTouchState));
+    return n;
+}
+
+std::atomic<rt::gameinput::TouchSourceFn> g_touch_source{bridge_touch_contacts};
+
+Device* get_touch_device() {
+    State& s = g();
+    if (s.touch_device) return s.touch_device;
+    Device* d = new Device;
+    GameInputDeviceInfo& i = d->info;
+    i.infoSize = sizeof(GameInputDeviceInfo);
+    AppLocalDeviceId id{};
+    id_bytes("leonida-touch", SDL_GUID{}, &id);
+    i.deviceId = id;
+    i.deviceRootId = id;
+    i.deviceFamily = GameInputFamilyHid;  // VERIFY
+    i.usage = {0x0D, 0x04};               // HID digitizers / touch screen
+    i.supportedInput = GameInputKindTouch;
+    i.touchPointCount = kMaxTouches;
+    i.touchSensorCount = 1;
+    const int cx = GetSystemMetrics(SM_CXSCREEN);
+    const int cy = GetSystemMetrics(SM_CYSCREEN);
+    const uint64_t res_x = cx > 0 ? static_cast<uint64_t>(cx) : 1920;
+    const uint64_t res_y = cy > 0 ? static_cast<uint64_t>(cy) : 1080;
+    d->touch_info = {
+        GameInputKindTouch,
+        GameInputLabelNone,
+        GameInputLocationDisplay,
+        0,
+        res_x,
+        res_y,
+        GameInputTouchShape2DRectangular,
+        static_cast<float>(res_x) / static_cast<float>(res_y),
+        0.0f,
+        0.0f,
+        0.0f,
+        1.0f,
+        0.0f,
+        kMaxTouches,
+    };
+    i.touchSensorInfo = &d->touch_info;
+    d->name = "Touch (Leonida)";
+    d->display_name = {static_cast<uint32_t>(d->name.size()), static_cast<uint32_t>(d->name.size()), d->name.c_str()};
+    i.displayName = &d->display_name;
+    s.touch_device = d;
+    return d;
+}
+
+bool same_touch(const Snapshot& a, const Snapshot& b) {
+    if (a.touch_count != b.touch_count) return false;
+    for (uint32_t i = 0; i < a.touch_count; ++i) {
+        const GameInputTouchState &ta = a.touches[i], &tb = b.touches[i];
+        if (ta.touchId != tb.touchId || ta.sensorIndex != tb.sensorIndex || ta.positionX != tb.positionX ||
+            ta.positionY != tb.positionY || ta.pressure != tb.pressure || ta.proximity != tb.proximity ||
+            ta.contactRectTop != tb.contactRectTop || ta.contactRectLeft != tb.contactRectLeft ||
+            ta.contactRectRight != tb.contactRectRight || ta.contactRectBottom != tb.contactRectBottom)
+            return false;
+    }
+    return true;
+}
+
+void update_touch(uint64_t now) {
+    State& s = g();
+    rt::gameinput::KeyboardPadMode mode;
+    {
+        std::lock_guard lock(s.mu);
+        mode = s.config.touch;
+        if (mode == rt::gameinput::KeyboardPadMode::Off) {
+            if (s.touch_device) kbm_disconnect(s.touch_device, now);
+            g_touch = {};
+            rt::gameinput::clear_touch_contacts();
+            return;
+        }
+        kbm_connect(get_touch_device(), now);
+    }
+    const bool focus = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
+    Snapshot touch{};
+    touch.kbm_kind = GameInputKindTouch;
+    if (focus) {
+        const uint32_t n = g_touch_source.load()(touch.touches, kMaxTouches);
+        touch.touch_count = std::min(n, kMaxTouches);
+    }
+    std::lock_guard lock(s.mu);
+    Device* td = s.touch_device;
+    if (!g_touch.touch_read || !same_touch(g_touch.touch, touch)) {
+        g_touch.touch = touch;
+        g_touch.touch_read = true;
+        queue_event({CbType::Reading, td, push_reading(td, touch, now), now, 0, 0, false, 0});
+    }
+}
+
 bool init_sdl() {
     State& s = g();
     if (s.sdl_ready) return true;
@@ -2172,6 +2305,7 @@ void poll_once() {
         apply_output(d, now);
     }
     update_keyboard_mouse(now);
+    update_touch(now);
 }
 
 void poll_and_deliver() {
@@ -2682,7 +2816,7 @@ public:
         // Combining multiple kinds into a single call is unsupported per Microsoft GDK spec
         if ((kind & (kind - 1)) != 0) return E_INVALIDARG;
         constexpr uint32_t kAllowedKinds =
-            GameInputKindKeyboard | GameInputKindMouse | GameInputKindGamepad |
+            GameInputKindKeyboard | GameInputKindMouse | GameInputKindTouch | GameInputKindGamepad |
             GameInputKindArcadeStick | GameInputKindFlightStick | GameInputKindRacingWheel;
         if (!(kind & kAllowedKinds)) return E_INVALIDARG;
 
@@ -2723,6 +2857,7 @@ public:
         std::vector<Device*> known = g().devices;
         for (Device* d : g().kbm_devices)
             if (d) known.push_back(d);
+        if (g().touch_device) known.push_back(g().touch_device);
         for (Device* d : known)
             if (std::memcmp(&d->info.deviceId, id, sizeof *id) == 0) {
                 d->AddRef();
@@ -2815,6 +2950,37 @@ void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus) {
 void set_cursor_source(CursorPosFn cursor_pos) { g_cursor_pos = cursor_pos ? cursor_pos : system_cursor_pos; }
 
 void set_haptic_source(const HapticApi* api) { g_haptic_api = api ? api : &kSdlHaptic; }
+
+void touch_contact(uint64_t id, float x, float y, float pressure, bool down) {
+    std::lock_guard lock(g_touch_mu);
+    auto it = std::find_if(g_touch_contacts.begin(), g_touch_contacts.end(),
+                           [id](const GameInputTouchState& t) { return t.touchId == id; });
+    if (!down) {
+        if (it != g_touch_contacts.end()) g_touch_contacts.erase(it);
+        return;
+    }
+    const float cx = std::clamp(x, 0.0f, 1.0f);
+    const float cy = std::clamp(y, 0.0f, 1.0f);
+    const float cp = std::clamp(pressure, 0.0f, 1.0f);
+    const GameInputTouchState st{id, 0, cx, cy, cp, 0.0f, cy, cx, cx, cy};
+    if (it != g_touch_contacts.end()) {
+        *it = st;
+        return;
+    }
+    if (g_touch_contacts.size() >= kMaxTouches) return;
+    const auto pos = std::lower_bound(g_touch_contacts.begin(), g_touch_contacts.end(), id,
+                                      [](const GameInputTouchState& t, uint64_t rhs) { return t.touchId < rhs; });
+    g_touch_contacts.insert(pos, st);
+}
+
+void clear_touch_contacts() {
+    std::lock_guard lock(g_touch_mu);
+    g_touch_contacts.clear();
+}
+
+void set_touch_source(TouchSourceFn source) {
+    g_touch_source = source ? source : bridge_touch_contacts;
+}
 
 const KeyBinding* keyboard_bindings(int* count) {
     if (count) *count = static_cast<int>(std::size(kKeyBindings));

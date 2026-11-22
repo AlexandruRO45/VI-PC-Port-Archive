@@ -162,6 +162,25 @@ above is the route for a title that reads only gamepads, and the two can be on t
 - **VERIFY:** the device family (`GameInputFamilyHid` here), keyboard kind and layout a console title expects, and
   whether it reads `codePoint` (shifted or not).
 
+## Touch device
+
+For touchscreen PCs and handhelds (RT-167), `LEONIDA_TOUCH` connects a `Touch (Leonida)` device next to the pads. It
+is off by default.
+
+- Its readings carry `GameInputKindTouch` and nothing else: `GetTouchCount` and `GetTouchState` list the active
+  contacts in ascending `touchId` order, up to 10 (`maxTouchPoints` in `GameInputTouchSensorInfo`). Pad, keyboard and
+  mouse getters return nothing on a touch reading.
+- SDL3's touch subsystem is part of `SDL_INIT_VIDEO` (which this build leaves out and which must run on the main
+  thread with an SDL window), so contacts enter through `rt::gameinput::touch_contact(id, x, y, pressure, down)` — a
+  thread-safe bridge any host window's `WndProc` on `WM_POINTER*` can call — or through `rt::gameinput::set_touch_source`
+  in tests. Coordinates and pressure are normalised and clamped to `0..1`, and `down == false` removes the contact.
+- Like the keyboard and mouse devices, it follows the keyboard pad's focus rule (`1` = only while this process has
+  focus, `always` = whatever has focus), is not counted in `connected_count`, never answers a gamepad query, and is
+  covered by enumeration, `GetCurrentReading`/`GetNextReading`/`GetPreviousReading`, `CreateAggregateDevice`,
+  `FindDeviceFromId` and reading callbacks.
+- **VERIFY:** the device family (`GameInputFamilyHid`), sensor resolution and contact-rectangle convention a console
+  title expects if it reads touch.
+
 ## Rumble and triggers
 
 `IGameInputDevice::SetRumbleState` takes four motor levels, 0..1. The two body motors go to `SDL_RumbleGamepad` on
@@ -322,6 +341,7 @@ line is logged when it takes effect); tracking goes on underneath, so clearing i
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
 | `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 |
 | `LEONIDA_KEYBOARD_MOUSE` | `off` | `1` adds the [keyboard and mouse devices](#keyboard-and-mouse-devices), read while this process has focus; `always` whatever has focus |
+| `LEONIDA_TOUCH` | `off` | `1` adds the [touch device](#touch-device), read while this process has focus; `always` whatever has focus |
 
 SDL's own hints (`SDL_JOYSTICK_*`, see SDL's `SDL_hints.h`) also apply, for example `SDL_JOYSTICK_HIDAPI_PS5=0` to
 leave a DualSense to the generic driver, or `SDL_GAMECONTROLLERCONFIG` to add a mapping for an unknown pad.
@@ -343,7 +363,7 @@ The API surface:
 | interface | implemented | not implemented |
 |---|---|---|
 | `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetTemporalReading` (`E_NOTIMPL`, as in GameInput v0 itself; see below), `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
-| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state, raw report (pads opened through HID, see [Raw HID](#raw-hid)), keys and mouse state (with `LEONIDA_KEYBOARD_MOUSE`) | touch, arcade/flight stick, racing wheel (all return nothing) |
+| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state, raw report (pads opened through HID, see [Raw HID](#raw-hid)), keys and mouse state (with `LEONIDA_KEYBOARD_MOUSE`), touch state (with `LEONIDA_TOUCH`) | arcade/flight stick, racing wheel (all return nothing) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState`, force-feedback motors with `CreateForceFeedbackEffect`/`IGameInputForceFeedbackEffect`, `IsForceFeedbackMotorPoweredOn`, `SetForceFeedbackMotorGain`, haptic trigger motors with `SetHapticMotorState`, `CreateRawDeviceReport`, `GetRawDeviceFeature`, `SetRawDeviceFeature`, `SendRawDeviceOutput` (pads opened through HID) | `SendRawDeviceOutputWithResponse`, `ExecuteRawDeviceIoControl`, exclusive raw access, power off, input synchronization (no-ops) |
 | `IGameInputRawDeviceReport` | device, report info (kind, id, size), raw data size, get and set raw data | item values (`Get/Set/ResetItemValue`, `ResetAllItems` answer false: no item tables) |
 | `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state | raw report, keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |

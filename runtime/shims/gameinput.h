@@ -7,6 +7,10 @@
 
 #include "../src/active_input.h"  // leonida::InputFamily (and std::optional) for Config::prompts and active_input()
 
+namespace gi {
+struct GameInputTouchState;
+}
+
 namespace rt::gameinput {
 
 // How the impulse-trigger motors (GameInputRumbleParams::leftTrigger/rightTrigger) reach a DualSense.
@@ -33,6 +37,9 @@ struct Config {
     // A keyboard device and a mouse device whose readings carry keys and mouse state (RT-159), for a title that
     // reads them through GameInput. Same focus modes as the keyboard pad. LEONIDA_KEYBOARD_MOUSE=1|focus|always|off
     KeyboardPadMode keyboard_mouse = KeyboardPadMode::Off;
+    // A touch device whose readings carry touch contacts (RT-167), for touchscreen PCs and handhelds. Same focus
+    // modes as the keyboard pad. LEONIDA_TOUCH=1|focus|always|off
+    KeyboardPadMode touch = KeyboardPadMode::Off;
 };
 
 // The configuration in use. Read from the environment on the first GameInputCreate.
@@ -133,6 +140,18 @@ struct HidBackend {
 // Test seam: the backend for pads opened from now on (pads already open keep theirs until they reconnect). nullptr
 // restores SDL's.
 void set_hid_backend(const HidBackend* backend);
+
+// Reports or removes a touch contact on the Touch (Leonida) device (RT-167). Any window owner (a future presenter or
+// PresentX window's WndProc on WM_POINTER*) or test may call this from any thread; the next poll publishes a reading
+// when the active contacts changed. Coordinates and pressure are clamped to 0..1; `down == false` removes `id`.
+void touch_contact(uint64_t id, float x, float y, float pressure, bool down);
+void clear_touch_contacts();
+
+// Where the touch device reads active contacts from on each poll (RT-167). Test seam: replaces the default contact
+// table fed by touch_contact() and writes up to `max_count` contacts into `out`, returning how many it wrote.
+// nullptr restores the default table.
+using TouchSourceFn = uint32_t (*)(gi::GameInputTouchState* out, uint32_t max_count);
+void set_touch_source(TouchSourceFn source);
 
 // One row of the keyboard pad's key map: a Windows virtual-key code and the SDL gamepad button it presses.
 struct KeyBinding {
