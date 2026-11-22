@@ -846,7 +846,7 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             if name == "ps_texture_sample_d16":
                 Path(raw).unlink(missing_ok=True)
-                cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
+                cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "92", "c00000", "14500000", "0"]
             else:
                 mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"],
                         "ps_sample_c_lz_a16": ["dref_a16"]}.get(name, [])
