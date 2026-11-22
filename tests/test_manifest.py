@@ -347,6 +347,28 @@ class ManifestCliTest(unittest.TestCase):
         self.assertEqual(p_verify.returncode, 1)
         self.assertIn("problem(s)", p_verify.stdout)
 
+    def test_cli_rejects_repeated_json_keys(self):
+        payload = b"cli test payload bytes"
+        info = json.dumps({"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()})
+        entry = f'"sample.dat": {info}'
+        files = "{" + entry + "}"
+        duplicate_hash = entry.replace('"sha256":', '"sha256": "wrong", "sha256":')
+        cases = (
+            ("files", f'{{"files": {files}, "files": {files}}}'),
+            ("sample.dat", '{"files": {' + entry + ", " + entry + "}}"),
+            ("sha256", '{"files": {' + duplicate_hash + "}}"),
+        )
+        for key, document in cases:
+            with self.subTest(key=key):
+                with open(self.out_manifest, "w", encoding="utf-8") as f:
+                    f.write(document)
+                result = self.run_cli("verify", self.pkg, "--manifest", self.out_manifest, "--jobs", "1")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(f"duplicate JSON key {key!r}", result.stderr)
+                self.assertIn(self.out_manifest, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(result.stdout, "")
+
     def test_cli_rejects_invalid_game_directories(self):
         # Start with a valid empty manifest, which would otherwise verify even if the scan never ran.
         empty = os.path.join(self.tmp.name, "empty")
