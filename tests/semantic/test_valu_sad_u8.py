@@ -995,5 +995,95 @@ class TestValuSadU8SIMDMultiLane(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][0], 0xAAAA_BBBB)
 
 
+class TestValuSadU8RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter(self.rf)
+
+    def test_alias_dst_src0(self) -> None:
+        # v0 = sad_u8(v0, v1, v2)
+        self.rf.vgprs[0] = pack_bytes(50, 60, 70, 80)
+        self.rf.vgprs[1] = pack_bytes(20, 20, 20, 20)
+        self.rf.vgprs[2] = 10
+        # diffs: 30 + 40 + 50 + 60 = 180. Result = 180 + 10 = 190
+        instr = VSadU8Instruction(Operand.vgpr(0), Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 190)
+        self.assertEqual(self.rf.vgprs[0], 190)
+        # Other registers preserved
+        self.assertEqual(self.rf.vgprs[1], pack_bytes(20, 20, 20, 20))
+        self.assertEqual(self.rf.vgprs[2], 10)
+
+    def test_alias_dst_src1(self) -> None:
+        # v0 = sad_u8(v1, v0, v2)
+        self.rf.vgprs[0] = pack_bytes(10, 20, 30, 40)
+        self.rf.vgprs[1] = pack_bytes(15, 25, 35, 45)
+        self.rf.vgprs[2] = 500
+        # diffs = 5 * 4 = 20. Result = 520
+        instr = VSadU8Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(0), Operand.vgpr(2))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 520)
+        self.assertEqual(self.rf.vgprs[0], 520)
+
+    def test_alias_dst_src2_accumulator_loop(self) -> None:
+        # Canonical loop accumulation pattern: v0 = sad_u8(v1, v2, v0)
+        self.rf.vgprs[0] = 1000
+        self.rf.vgprs[1] = pack_bytes(1, 2, 3, 4)
+        self.rf.vgprs[2] = pack_bytes(2, 4, 6, 8)
+        # diffs: 1 + 2 + 3 + 4 = 10. Result = 1000 + 10 = 1010
+        instr = VSadU8Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(0))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 1010)
+        self.assertEqual(self.rf.vgprs[0], 1010)
+
+    def test_alias_all_same_register(self) -> None:
+        # v0 = sad_u8(v0, v0, v0)
+        self.rf.vgprs[0] = 0x1234_5678
+        instr = VSadU8Instruction(Operand.vgpr(0), Operand.vgpr(0), Operand.vgpr(0), Operand.vgpr(0))
+        res = self.interp.step(instr)
+        # |v0 - v0| = 0 -> 0 + v0 = v0
+        self.assertEqual(res, 0x1234_5678)
+        self.assertEqual(self.rf.vgprs[0], 0x1234_5678)
+
+    def test_alias_sad_hi_dst_src2(self) -> None:
+        # v0 = sad_hi_u8(v1, v2, v0)
+        self.rf.vgprs[0] = 0x0001_0000
+        self.rf.vgprs[1] = pack_bytes(5, 5, 5, 5)
+        self.rf.vgprs[2] = pack_bytes(3, 3, 3, 3)
+        # diff = 4 * 2 = 8. Shifted = 8 << 16 = 0x0008_0000. Total = 0x0009_0000
+        instr = VSadHiU8Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(0))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 0x0009_0000)
+        self.assertEqual(self.rf.vgprs[0], 0x0009_0000)
+
+    def test_alias_msad_dst_src2(self) -> None:
+        # v0 = msad_u8(v1, v2, v0)
+        self.rf.vgprs[0] = 50
+        self.rf.vgprs[1] = pack_bytes(10, 20, 30, 40)
+        self.rf.vgprs[2] = pack_bytes(0, 10, 0, 20)  # masked bytes 0, 2
+        # diffs: |20-10| + |40-20| = 30. Result = 50 + 30 = 80
+        instr = VMsadU8Instruction(Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(0))
+        res = self.interp.step(instr)
+        self.assertEqual(res, 80)
+        self.assertEqual(self.rf.vgprs[0], 80)
+
+    def test_operand_preservation_unmodified_registers(self) -> None:
+        # Ensure only the destination register is modified and all other 255 VGPRs are preserved
+        for i in range(256):
+            self.rf.vgprs[i] = 0x1000 + i
+        instr = VSadU8Instruction(
+            dst=Operand.vgpr(42),
+            src0=Operand.vgpr(10),
+            src1=Operand.vgpr(20),
+            src2=Operand.vgpr(30),
+        )
+        self.interp.step(instr)
+        for i in range(256):
+            if i != 42:
+                self.assertEqual(self.rf.vgprs[i], 0x1000 + i)
+
+
 if __name__ == "__main__":
     unittest.main()
