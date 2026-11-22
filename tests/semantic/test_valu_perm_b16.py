@@ -1140,8 +1140,71 @@ class TestPermB16ConditionCodesAndStatus(unittest.TestCase):
         self.assertEqual(vcc_mask, expected_vcc)
 
 
+# ==============================================================================
+# Unit Tests: Commit 7 (IEEE 754 Boundaries, Subnormals, and NaN Handling)
+# ==============================================================================
+
+class TestPermB16IEEE754Boundaries(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, and NaN byte handling."""
+
+    def test_subnormal_byte_swizzling(self):
+        # 0x0001 (smallest positive subnormal) and 0x03FF (largest positive subnormal)
+        src1 = 0x0001
+        src0 = 0x03FF
+        sel = PermSelectorB16Word.identity_src1().raw
+        res = oracle_v_perm_b16(src0, src1, sel)
+        self.assertEqual(res, 0x0001)
+
+        # Swapping bytes of subnormal
+        sel_swap = PermSelectorB16Word.bswap_src1().raw
+        res_swap = oracle_v_perm_b16(0, 0x0001, sel_swap)
+        self.assertEqual(res_swap, 0x0100)
+
+    def test_infinity_byte_preservation(self):
+        # +Inf (0x7C00) and -Inf (0xFC00)
+        src1 = 0x7C00
+        src0 = 0xFC00
+        sel = make_selector_16(SEL_SRC1_B1, SEL_SRC0_B1)
+        res = oracle_v_perm_b16(src0, src1, sel)
+        # Low byte gets high byte of S1 (0x7C), high byte gets high byte of S0 (0xFC) -> 0xFC7C
+        self.assertEqual(res, 0xFC7C)
+
+    def test_quiet_nan_payload_byte_preservation(self):
+        # Canonical Quiet NaN 0x7E00 and custom NaN 0x7EFF
+        src1 = 0x7E00
+        src0 = 0x7EFF
+        sel = PermSelectorB16Word.identity_src0().raw
+        res = oracle_v_perm_b16(src0, src1, sel)
+        self.assertEqual(res, 0x7EFF)
+
+    def test_signaling_nan_byte_preservation(self):
+        # Signaling NaN 0x7C01
+        src1 = 0x7C01
+        sel = PermSelectorB16Word.bswap_src1().raw
+        res = oracle_v_perm_b16(0, src1, sel)
+        self.assertEqual(res, 0x017C)
+
+    def test_signed_zero_sign_bit_extension(self):
+        # -0.0 has bit 15 set (0x8000), +0.0 has bit 15 clear (0x0000)
+        neg_zero = 0x8000
+        pos_zero = 0x0000
+
+        # Code 4: sign-extension of S1 bit 15
+        sel_sign = make_selector_16(SEL_SIGN_EXT_SRC1_B1, SEL_SIGN_EXT_SRC1_B1)
+        self.assertEqual(oracle_v_perm_b16(0, neg_zero, sel_sign), 0xFFFF)
+        self.assertEqual(oracle_v_perm_b16(0, pos_zero, sel_sign), 0x0000)
+
+    def test_max_min_finite_boundaries(self):
+        # Max finite float 0x7BFF (65504.0)
+        src1 = 0x7BFF
+        sel = PermSelectorB16Word.identity_src1().raw
+        res = oracle_v_perm_b16(0, src1, sel)
+        self.assertEqual(res, 0x7BFF)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
