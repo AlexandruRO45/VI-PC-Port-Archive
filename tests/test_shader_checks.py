@@ -33,7 +33,7 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 TOTAL = (len(check.COMPUTE) + 3 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 3
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
-         + 8)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat and ps_gather_wrap
+         + 9)  # three mesh fixtures, ps_tex, cs_cmpx_class_f32, cs_user_sgprs, cs_cvt_f32_sat, cs_fma_fused and ps_gather_wrap
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -66,6 +66,10 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_cvt_f32_sat":
                 return cvt_answer(env)
+            if name == "cs_fma_fused":
+                # The operands come in through VKC_SGPRS; without them the fused words are not produced.
+                self.assertEqual((env or {}).get("VKC_SGPRS"), check.FMA_FUSED_ENV["VKC_SGPRS"])
+                return 0, "out[0..7] = " + " ".join(map(str, check.FMA_FUSED)) + "\n"
             self.assertNotIn("VKC_SGPRS", env or {})
             if name in PARTIAL:
                 self.assertNotIn("--require-wave64", args)
@@ -106,9 +110,7 @@ class Wave64Checks(unittest.TestCase):
                 words = (dict(check.BOUNDS)[name] + [0xEEEEEEEE] * 8)[:8]
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_store":
-                words = (0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE,
-                         0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000)
-                return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
+                return 0, "out[0..7] = " + " ".join(map(str, (check.CS_STORE + [0] * 8)[:8])) + "\n"
             if name == "cs_smem_soffset_imm":
                 return 0, "out[0..7] = " + " ".join(map(str, check.CS_SMEM)) + "\n"
             if name in WAVE32_WORDS:           # wave32 dumps run on any subgroup size
