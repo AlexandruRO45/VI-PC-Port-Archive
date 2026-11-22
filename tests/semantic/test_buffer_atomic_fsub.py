@@ -1188,5 +1188,91 @@ class TestBufferAtomicFsubConditionCodes(unittest.TestCase):
         self.interp.step(inst)
         self.assertEqual(self.interp.vcc, canary)
 
+class TestBufferAtomicFsubBoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, overflows, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_dword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        c_val = f32_to_u32(10.0)
+        c_sub = f32_to_u32(4.0)
+        c_exp = f32_to_u32(6.0)
+
+        # Last valid 4-byte dword starts at offset 96 (96 + 4 = 100)
+        self.mem.write_u32(96, c_val)
+        ret, in_bounds = ref_buffer_atomic_fsub(self.mem, desc, soffset=0, vaddr=96, sub_val=c_sub, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, c_val)
+        self.assertEqual(self.mem.read_u32(96), c_exp)
+
+        # Offsets 97, 98, 99, 100 all exceed num_records
+        for oob_off in (97, 98, 99, 100):
+            ret, in_bounds = ref_buffer_atomic_fsub(self.mem, desc, soffset=0, vaddr=oob_off, sub_val=c_sub, glc=True)
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_fsub(self.mem, desc, soffset=0, vaddr=0, sub_val=f32_to_u32(1.0), glc=True)
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_subnormal_floating_point_subtraction(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+
+        # Smallest positive subnormals: 3 LSB - 1 LSB = 2 LSB
+        self.mem.write_u32(0, 0x00000003)
+        ret, in_bounds = ref_buffer_atomic_fsub(self.mem, desc, soffset=0, vaddr=0, sub_val=0x00000001, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x00000003)
+        self.assertEqual(self.mem.read_u32(0), 0x00000002)
+
+        # Smallest normal float (0x00800000) - 1 LSB transitions to largest subnormal (0x007FFFFF)
+        self.mem.write_u32(4, 0x00800000)
+        ret, in_bounds = ref_buffer_atomic_fsub(self.mem, desc, soffset=0, vaddr=4, sub_val=0x00000001, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 0x00800000)
+        self.assertEqual(self.mem.read_u32(4), 0x007FFFFF)
+
+    def test_float_overflow_to_infinity(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        flt_max = 0x7F7FFFFF
+        neg_flt_max = flt_max | SIGN_MASK
+
+        # FLT_MAX - (-FLT_MAX) overflows to +Infinity
+        self.mem.write_u32(0, flt_max)
+        ret, in_bounds = ref_buffer_atomic_fsub(self.mem, desc, soffset=0, vaddr=0, sub_val=neg_flt_max, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, flt_max)
+        self.assertEqual(self.mem.read_u32(0), POS_INF)
+
+        # -FLT_MAX - FLT_MAX overflows to -Infinity
+        self.mem.write_u32(4, neg_flt_max)
+        ret, in_bounds = ref_buffer_atomic_fsub(self.mem, desc, soffset=0, vaddr=4, sub_val=flt_max, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, neg_flt_max)
+        self.assertEqual(self.mem.read_u32(4), NEG_INF)
+
+    def test_nan_propagation_and_signaling_nan(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        c_one = f32_to_u32(1.0)
+        snan = 0x7F800001
+
+        # Quiet NaN - 1.0 = QNAN
+        self.mem.write_u32(0, QNAN_DEFAULT)
+        ret, in_bounds = ref_buffer_atomic_fsub(self.mem, desc, soffset=0, vaddr=0, sub_val=c_one, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, QNAN_DEFAULT)
+        self.assertEqual(self.mem.read_u32(0), QNAN_DEFAULT)
+
+        # Signaling NaN - 1.0 = QNAN
+        self.mem.write_u32(4, snan)
+        ret, in_bounds = ref_buffer_atomic_fsub(self.mem, desc, soffset=0, vaddr=4, sub_val=c_one, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, snan)
+        self.assertEqual(self.mem.read_u32(4), QNAN_DEFAULT)
+
 if __name__ == "__main__":
     unittest.main()
