@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "anim_glb.py")
@@ -355,6 +356,108 @@ class ClipChannelTest(unittest.TestCase):
         self.assertEqual([c["hash"] for c in anim_glb.select_clips(d, ["0x_intro"])], [0x22222222])
         with self.assertRaisesRegex(anim_glb.ExportError, "0xbad"):
             anim_glb.select_clips(d, ["0xbad"])
+
+
+class ClipBoundaryTest(unittest.TestCase):
+    def channels(self, samples, *, path="translation", start=0.2, end=0.3, rate=1.0):
+        animation = {"offset": 0x100, "duration": 1.0,
+                     "tracks": [(joaat32("skel_a"), joaat32("bone" + path),
+                                 anim_glb.PATH_FORMATS[path])]}
+        dictionary = {"packs": [{"animations": [animation]}]}
+        clip = {"animations": [{"animation": 0x100, "start": start, "end": end, "rate": rate}]}
+        tally = __import__("collections").Counter()
+        with mock.patch.object(anim_clips, "decode_animation", return_value=({0: samples}, len(samples))):
+            return anim_glb.clip_channels(None, dictionary, clip, {joaat32("skel_a"): 0}, False, tally)
+
+    def assert_keys(self, keys, expected):
+        self.assertEqual(len(keys), len(expected))
+        for (time, value), (want_time, want_value) in zip(keys, expected):
+            self.assertAlmostEqual(time, want_time, places=12)
+            self.assertEqual(len(value), len(want_value))
+            for got, want in zip(value, want_value):
+                self.assertAlmostEqual(got, want, places=12)
+
+    def test_a_window_between_two_frames_keeps_both_boundary_poses(self):
+        channels = self.channels([(0.0, 0.0, 0.0), (1.0, 2.0, -1.0)])
+        self.assert_keys(channels[(0, "translation")],
+                         [(0.0, (0.2, 0.4, -0.2)), (0.1, (0.3, 0.6, -0.3))])
+
+    def test_interior_frame_and_rate_survive_in_the_glb_sampler(self):
+        channels = self.channels([(0.0, 0.0, 0.0), (5.0, 0.0, 0.0), (10.0, 0.0, 0.0)],
+                                 start=0.2, end=0.8, rate=2.0)
+        self.assert_keys(channels[(0, "translation")],
+                         [(0.0, (2.0, 0.0, 0.0)), (0.15, (5.0, 0.0, 0.0)), (0.3, (8.0, 0.0, 0.0))])
+        joints, _ = anim_glb.read_skeleton(skeleton_resource(), 0)
+        data, gltf = anim_glb.build(joints, [], [("synthetic_window", channels)], root_motion=False)
+        json_length, = struct.unpack_from("<I", data, 12)
+        binary = data[28 + json_length:]
+        sampler = gltf["animations"][0]["samplers"][0]
+        times = accessor_values(gltf, binary, sampler["input"])
+        values = accessor_values(gltf, binary, sampler["output"])
+        self.assertEqual(len(times), 3)
+        for got, want in zip(times, (0.0, 0.15, 0.3)):
+            self.assertAlmostEqual(got[0], want, places=7)
+        self.assertEqual(values, [(2.0, 0.0, 0.0), (5.0, 0.0, 0.0), (8.0, 0.0, 0.0)])
+        self.assertEqual(gltf["accessors"][sampler["input"]]["min"], [0.0])
+        self.assertAlmostEqual(gltf["accessors"][sampler["input"]]["max"][0], 0.3)
+
+    def test_scale_boundaries_interpolate_all_three_components(self):
+        channels = self.channels([(1.0, 2.0, 3.0), (3.0, 6.0, 9.0)],
+                                 path="scale", start=0.25, end=0.75)
+        self.assert_keys(channels[(0, "scale")],
+                         [(0.0, (1.5, 3.0, 4.5)), (0.5, (2.5, 5.0, 7.5))])
+
+    def test_an_interior_frame_rounding_to_the_end_time_keeps_the_boundary(self):
+        end = 0.500000001
+        channels = self.channels([(0.0, 0.0, 0.0), (0.5, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                                 start=0.2, end=end)
+        self.assert_keys(channels[(0, "translation")],
+                         [(0.0, (0.2, 0.0, 0.0)), (end - 0.2, (end, 0.0, 0.0))])
+        joints, _ = anim_glb.read_skeleton(skeleton_resource(), 0)
+        data, gltf = anim_glb.build(joints, [], [("synthetic_window", channels)], root_motion=False)
+        json_length, = struct.unpack_from("<I", data, 12)
+        sampler = gltf["animations"][0]["samplers"][0]
+        times = [v[0] for v in accessor_values(gltf, data[28 + json_length:], sampler["input"])]
+        self.assertTrue(all(b > a for a, b in zip(times, times[1:])), times)
+        encoded_duration, = struct.unpack("<f", struct.pack("<f", end - 0.2))
+        self.assertEqual(times, [0.0, encoded_duration])
+
+    def test_rotation_boundaries_follow_the_shortest_spherical_path(self):
+        # The negated endpoint still represents a 120-degree turn about Z. Its
+        # quarter/three-quarter poses are 30/90 degrees, not a 240-degree detour.
+        samples = [(0.0, 0.0, 0.0, 1.0), (0.0, 0.0, -math.sin(math.pi / 3), -math.cos(math.pi / 3))]
+        channels = self.channels(samples, path="rotation", start=0.25, end=0.75)
+        self.assert_keys(channels[(0, "rotation")],
+                         [(0.0, (0.0, 0.0, math.sin(math.pi / 12), math.cos(math.pi / 12))),
+                          (0.5, (0.0, 0.0, math.sin(math.pi / 4), math.cos(math.pi / 4)))])
+
+    def test_antipodal_quaternions_keep_a_constant_rotation(self):
+        channels = self.channels([(0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.0, -1.0)],
+                                 path="rotation", start=0.25, end=0.75)
+        self.assert_keys(channels[(0, "rotation")],
+                         [(0.0, (0.0, 0.0, 0.0, 1.0)), (0.5, (0.0, 0.0, 0.0, 1.0))])
+
+    def test_nearly_equal_quaternions_produce_finite_unit_boundary_rotations(self):
+        angle = 1e-5
+        channels = self.channels([(0.0, 0.0, 0.0, 1.0), (math.sin(angle / 2), 0.0, 0.0, math.cos(angle / 2))],
+                                 path="rotation", start=0.2, end=0.8)
+        self.assert_keys(channels[(0, "rotation")],
+                         [(0.0, (math.sin(angle * 0.1), 0.0, 0.0, math.cos(angle * 0.1))),
+                          (0.6, (math.sin(angle * 0.4), 0.0, 0.0, math.cos(angle * 0.4)))])
+        for _, quaternion in channels[(0, "rotation")]:
+            self.assertTrue(all(math.isfinite(v) for v in quaternion))
+            self.assertAlmostEqual(sum(v * v for v in quaternion), 1.0, places=12)
+
+    def test_one_frame_animation_holds_its_pose_for_the_whole_window(self):
+        channels = self.channels([(2.0, -3.0, 4.0)], start=0.2, end=0.8, rate=2.0)
+        self.assert_keys(channels[(0, "translation")],
+                         [(0.0, (2.0, -3.0, 4.0)), (0.3, (2.0, -3.0, 4.0))])
+
+    def test_a_positive_window_smaller_than_the_old_tolerance_keeps_both_poses(self):
+        channels = self.channels([(0.0, 0.0, 0.0), (0.5, 0.0, 0.0), (1.0, 0.0, 0.0)],
+                                 start=0.50001, end=0.50002)
+        self.assert_keys(channels[(0, "translation")],
+                         [(0.0, (0.50001, 0.0, 0.0)), (0.00001, (0.50002, 0.0, 0.0))])
 
 
 class ExportTest(unittest.TestCase):

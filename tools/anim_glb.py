@@ -428,6 +428,54 @@ def select_clips(dictionary, wanted):
     return out
 
 
+def _sample_track(values, frame, path):
+    """Evaluate the exported LINEAR curve: vec3 lerp or shortest-path quaternion slerp (glTF 2.0, Appendix C)."""
+    frame = min(max(frame, 0.0), len(values) - 1)
+    lo = int(frame)
+    hi = min(lo + 1, len(values) - 1)
+    amount = frame - lo
+    a, b = tuple(values[lo]), tuple(values[hi])
+    if lo == hi or amount == 0.0:
+        return a
+    if path != "rotation":
+        return tuple(x + amount * (y - x) for x, y in zip(a, b))
+
+    def unit(q):
+        norm = math.sqrt(sum(x * x for x in q))
+        require(norm > 0.0 and math.isfinite(norm), "cannot interpolate an invalid rotation quaternion")
+        return tuple(x / norm for x in q)
+
+    a, b = unit(a), unit(b)
+    dot = sum(x * y for x, y in zip(a, b))
+    if dot < 0.0:
+        b, dot = tuple(-x for x in b), -dot
+    if dot > 0.9995:
+        return unit(tuple(x + amount * (y - x) for x, y in zip(a, b)))
+    angle = math.acos(min(dot, 1.0))
+    scale = math.sin(angle)
+    left, right = math.sin((1.0 - amount) * angle) / scale, math.sin(amount * angle) / scale
+    return unit(tuple(left * x + right * y for x, y in zip(a, b)))
+
+
+def _clip_timeline(start, end, rate, step, frames):
+    """Both requested boundaries and every interior source frame, with distinct glTF float32 timestamps."""
+    duration = (end - start) / rate
+    packed_end = struct.pack("<f", duration)
+    previous = struct.pack("<f", 0.0)
+    require(previous != packed_end, "clip window is too short for float32 timestamps")
+    timeline = [(0.0, start / step)]
+    for k in range(frames):
+        time = (k * step - start) / rate
+        if 0.0 < time < duration:
+            packed = struct.pack("<f", time)
+            # A boundary can round to the same float32 time as a nearby original frame.
+            if packed != previous and packed != packed_end:
+                timeline.append((time, float(k)))
+                previous = packed
+    timeline.append((duration, end / step))
+    return timeline
+
+
 def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
     """-> {(target, path): [(time, value)]} for one clip. target is a joint index or 'mover'."""
     animations = {a["offset"]: a for p in dictionary["packs"] for a in p["animations"]}
@@ -449,6 +497,7 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
             keep = [min(range(frames), key=lambda k: abs(k * step - target_time))] if frames else []
         if not keep:
             continue
+        timeline = _clip_timeline(start, end, rate, step, frames) if end > start else None
         tally["animations"] += 1
         for t, (bone, ttype, fmt) in enumerate(anim["tracks"]):
             path = TRACK_PATHS.get(ttype)
@@ -471,10 +520,12 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
             tally["tracks_exported"] += 1
             if (target, path) in channels:
                 tally["tracks_overridden"] += 1
-            # a frame kept by the 1e-4 tolerance before `start` would get a slightly negative time
-            if fallback:
+            if timeline is not None:
+                channels[(target, path)] = [(time, _sample_track(tracks[t], frame, path)) for time, frame in timeline]
+            elif fallback:
                 channels[(target, path)] = [(0.0, tuple(tracks[t][k])) for k in keep]
             else:
+                # A pose frame kept by the tolerance before `start` must not get a negative time.
                 channels[(target, path)] = [(max(0.0, (k * step - start) / rate), tuple(tracks[t][k])) for k in keep]
     return channels
 

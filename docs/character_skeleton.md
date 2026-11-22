@@ -246,6 +246,9 @@ it does and why:
   plays its animation's `[start, end]` window at `rate`, so animation time `t` is clip time
   `(t − start) / rate`. In 300 sampled dictionaries, `(end − start) / rate` equals the clip's
   `+0x78` duration for all 4,471 entries.
+  Positive-duration exports include both window boundaries and the interior source frames:
+  translation and scale boundaries use linear interpolation, and rotations use shortest-path
+  quaternion interpolation, following [glTF's LINEAR sampler rules](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#interpolation).
 - The whole skeleton sits under one node that turns RAGE Z-up into glTF Y-up. Skinned mesh nodes
   sit at the scene root, because glTF ignores a skinned mesh node's own transform.
 
