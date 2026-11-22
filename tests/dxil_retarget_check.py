@@ -379,6 +379,82 @@ def check_pure_python_controls() -> None:
             raise AssertionError("_probe_compute_pso swallowed non-adapter error exit 6")
         mock_run.side_effect = None
 
+    # 6. Read-only xbox.* intrinsic inventory: declarations, actual calls and metadata-only names.
+    from probe_roots import xbox_intrinsic_inventory
+
+    # (a) Declared and called: the call instruction reports it, and a metadata mention does not
+    # turn it into a metadata-only name.
+    called = """
+declare i32 @xbox.V_ALIGNBYTE_B32(i32, i32, i32, i32)
+
+define void @main() {
+  %v = call i32 @xbox.V_ALIGNBYTE_B32(i32 332, i32 %a, i32 %b, i32 %sel)
+  ret void
+}
+
+!0 = !{!"xbox.V_ALIGNBYTE_B32"}
+"""
+    inventory = xbox_intrinsic_inventory(called)
+    assert inventory["calls"] == {"xbox.V_ALIGNBYTE_B32": 1}, inventory
+    assert inventory["declarations"] == ["xbox.V_ALIGNBYTE_B32"], inventory
+    assert inventory["metadata_only"] == [], inventory
+
+    # (b) Declared only: an unused declaration is not a call.
+    declared = """
+declare void @xbox.global_store_dwordx3_with_cache(i32, i64, i32, i32)
+
+define void @main() {
+  ret void
+}
+"""
+    inventory = xbox_intrinsic_inventory(declared)
+    assert inventory["calls"] == {}, inventory
+    assert inventory["declarations"] == ["xbox.global_store_dwordx3_with_cache"], inventory
+    assert inventory["metadata_only"] == [], inventory
+
+    # (c) Metadata only: the name lives in a metadata string value, never declared or called.
+    # The named-metadata key !xbox.module names the node and is not an intrinsic name.
+    metadata = """
+define void @main() {
+  ret void
+}
+
+!xbox.module = !{!0}
+!0 = !{!"xbox.V_ALIGNBYTE_B32", i32 332}
+"""
+    inventory = xbox_intrinsic_inventory(metadata)
+    assert inventory["calls"] == {}, inventory
+    assert inventory["declarations"] == [], inventory
+    assert inventory["metadata_only"] == ["xbox.V_ALIGNBYTE_B32"], inventory
+
+    # (e) Named-metadata key alone: the Xbox compiler option node carries no intrinsic name.
+    named_metadata = """
+define void @main() {
+  ret void
+}
+
+!xbox.compiler.options = !{!1}
+!1 = !{!"__XBOX_ENABLE_WAVE32=1"}
+"""
+    inventory = xbox_intrinsic_inventory(named_metadata)
+    assert inventory == dict(calls={}, declarations=[], metadata_only=[]), inventory
+
+    # (d) Ordinary module: dx.op calls and unrelated metadata report three empty groups.
+    ordinary = """
+target triple = "dxil-ms-dx"
+
+define void @main() {
+  %v = call i32 @dx.op.unary.f32(i32 12, float 0.000000e+00)
+  %w = call i32 @"dx.op.threadId.i32"(i32 93, i32 0)
+  ret void
+}
+
+!llvm.module.flags = !{!0}
+!0 = !{i32 2, !"DXC version", !"1.8.2407"}
+"""
+    inventory = xbox_intrinsic_inventory(ordinary)
+    assert inventory == dict(calls={}, declarations=[], metadata_only=[]), inventory
+
     print("pure-python dxil_retarget controls: ok")
 
 
