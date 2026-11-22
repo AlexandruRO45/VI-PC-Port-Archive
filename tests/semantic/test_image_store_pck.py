@@ -85,12 +85,38 @@ class ImageStorePckTests(unittest.TestCase):
         self.assertIn("%stv1_2", spv_3d_a16)
         self.assertIn("OpImageWrite ", spv_3d_a16)
 
+    def test_packed_only_shader_defines_all_constant_composite_operands(self):
+        # Regression test: a packed-only shader (without any unpacked image_store) must still define every
+        # %c... constant referenced by %fmt_uint_init / %fmt_sint_init OpConstantComposite.
+        spv = translate_and_assemble([
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v4, 0",
+            "v_mov_b32 v5, 0",
+            "image_store_pck v0, v[4:5], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+        ])
+        defined = set()
+        for line in spv.splitlines():
+            m_def = re.match(r"^\s*(%\w+)\s*=\s*Op", line)
+            m_comp = re.match(r"^\s*(%\w+)\s*=\s*OpConstantComposite\s+%\w+\s+(.+)$", line)
+            if m_comp:
+                for opnd in m_comp.group(2).split():
+                    self.assertIn(opnd, defined, f"{m_comp.group(1)} references undefined constant {opnd}")
+            if m_def:
+                defined.add(m_def.group(1))
+        self.assertIn("%fmt_uint_init", defined)
+        self.assertIn("%fmt_sint_init", defined)
+
     def test_unsupported_forms(self):
+        spv_cube = translate_and_assemble([
+            "image_store_pck v[0:3], v[4:6], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE",
+        ])
+        self.assertIn("%stv1_1", spv_cube)
+
         bad_lines = [
             "image_store_pck v[0:3], v[4:5], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D d16",
             "image_store_pck v[0:3], v4, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
             "image_store_pck v[0:3], v[4:5], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_3D",
-            "image_store_pck v[0:3], v[4:6], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE",
+            "image_store_pck v[0:3], v[4:6], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA",
         ]
         for line in bad_lines:
             with self.subTest(line=line):

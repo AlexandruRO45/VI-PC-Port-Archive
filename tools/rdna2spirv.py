@@ -13132,7 +13132,9 @@ class Gen:
         """image_store[_pck] vData, vAddr, T#: write the dmask components to a storage image. For image_store,
         the view is picked at run time from T# word1 FORMAT [28:20] (uint/sint/float). With d16 on image_store,
         enabled components are packed two 16-bit values per consecutive VGPR (low half first). For image_store_pck,
-        pre-packed raw texel dwords are written directly to the uint view (%stv1) without format conversion."""
+        pre-packed raw texel dwords are written directly to the uint view (%stv1): 32-bit-per-component UINT
+        formats match hardware bit-for-bit, while sub-32-bit packed formats (8_8_8_8, 16_16_16_16, 8_8) and
+        non-UINT format unpacking require per-format bit splitting (follow-up)."""
         # Cube storage images are bound as 6-layer 2D arrays (runtime/src/vulkan_bindless.h).
         view_dim = "dim:SQ_RSRC_IMG_2D_ARRAY" if dim == "dim:SQ_RSRC_IMG_CUBE" else dim
         name = "image_store_pck" if pck else "image_store"
@@ -13190,6 +13192,8 @@ class Gen:
         coords = [self.as_int(c) for c in raw[:nc]]
         idx = self.desc_lookup_sgpr(a[2], 8)
         self.uses_store_views.add(di)
+        for w in [16] + sum(self.int_format_masks(), []):      # constants used by assemble's format masks
+            self.cu(w)
         if nc == 1:
             iv = coords[0]
         else:
@@ -13216,8 +13220,6 @@ class Gen:
             return
 
         t1 = self.sgpr_word(a[2], 1)
-        for w in [16] + sum(self.int_format_masks(), []):      # constants used by assemble's format masks
-            self.cu(w)
         is_u, is_s = self.fmt_int_flags(t1)
         v4f, v4s = self.tmp(), self.tmp()
         self.emit(f"{v4f} = OpCompositeConstruct %v4float {' '.join(fv)}")
