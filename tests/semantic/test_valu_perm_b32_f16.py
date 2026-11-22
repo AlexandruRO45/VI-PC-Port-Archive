@@ -855,5 +855,62 @@ class TestPermB32F16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(extract_half(res, 0), POS_ZERO)
         self.assertEqual(extract_half(res, 1), POS_ONE)
 
+# ==============================================================================
+# Negative Controls, Fault Injection, and Mutation Operators
+# ==============================================================================
+
+def mutated_perm_off_by_one(src0: int, src1: int, selector: int) -> int:
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    sel0 = ((selector & 0xFF) + 1) & 0xFF
+    sel1 = (((selector >> 8) & 0xFF) + 1) & 0xFF
+    h0 = permute_single_half(s0, s1, sel0)
+    h1 = permute_single_half(s0, s1, sel1)
+    return pack_halves(h0, h1)
+
+
+def mutated_perm_inverted_sources(src0: int, src1: int, selector: int) -> int:
+    return oracle_v_perm_b32_f16(src0=src1, src1=src0, selector=selector)
+
+
+class TestPermB32F16NegativeControlsAndMutations(unittest.TestCase):
+    def test_negative_sgpr_destination_rejected(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_negative_multiple_literals_rejected(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.literal(0x1111_1111),
+            src1=ASTOperand.literal(0x2222_2222),
+            src2=ASTOperand.vgpr(3),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_mutation_off_by_one_detected(self):
+        src0 = pack_halves(0x1111, 0x2222)
+        src1 = pack_halves(0x3333, 0x4444)
+        sel = PermSelectorWord.identity_src1().raw
+        expected = oracle_v_perm_b32_f16(src0, src1, sel)
+        mutated = mutated_perm_off_by_one(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
+    def test_mutation_inverted_sources_detected(self):
+        src0 = pack_halves(0x1111, 0x2222)
+        src1 = pack_halves(0x3333, 0x4444)
+        sel = PermSelectorWord.identity_src1().raw
+        expected = oracle_v_perm_b32_f16(src0, src1, sel)
+        mutated = mutated_perm_inverted_sources(src0, src1, sel)
+        self.assertNotEqual(expected, mutated)
+
 if __name__ == "__main__":
     unittest.main()
