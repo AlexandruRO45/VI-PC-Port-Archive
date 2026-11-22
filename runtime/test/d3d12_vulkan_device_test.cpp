@@ -4248,7 +4248,16 @@ int main() {
                         EXPECT(command_queue(device.p, rt_desc) == S_OK);
                         Ref<ID3D12Device> host;
                         if (create_host_device(host)) {
-                            EXPECT(command_queue(host.p, rt_desc) == S_OK);
+                            // The host driver decides too: AMD's D3D12 driver (680M, 25.10.30.14) refuses a
+                            // global realtime queue even with the privilege enabled, where NVIDIA's accepts it.
+                            // Its DXGI_ERROR_UNSUPPORTED says nothing about the layer, so it is reported and not compared.
+                            const HRESULT host_hr = command_queue(host.p, rt_desc);
+                            EXPECT(host_hr == S_OK || host_hr == DXGI_ERROR_UNSUPPORTED);
+                            if (host_hr == DXGI_ERROR_UNSUPPORTED) {
+                                std::printf("global realtime queue with the privilege enabled: the host D3D12 "
+                                            "driver refuses it (0x%08lx), skipped\n",
+                                            static_cast<unsigned long>(host_hr));
+                            }
                         }
                         tp.Privileges[0].Attributes = 0;
                         if (AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
