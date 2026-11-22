@@ -52,6 +52,13 @@ The two-target fixture gives each branch its own direct call site. One caller ad
 
 `cpu_native_exe_chain` gives the original EXE and its AOT build the same selector byte as above. A third child maps that exact original EXE, binds its ordinary imports to the two source-built Windows DLLs and calls `pe_map_run`. The child passes the guest's returned DWORD back as its process exit code. All three paths produce the same 16 argument bytes, eight output bytes and exit codes in the table.
 
+`cpu_native_exe_frame_chain` adds a direct call inside the EXE before the selector branch. The existing `call_bare` fixture saves RBX, reserves home space, calls the unexported leaf `bare_mix`, writes its result through the trace pointer and restores its frame. The linker map supplies the leaf bounds for this EXE's SHA-256. The AOT build compiles the switch translator's generated caller and leaf alongside the translated entry. With `y = 5`, the leaf returns `5 * selector - 5`. On Windows x64, selectors 0 and 1 therefore took the opposite paths to the original fixture on all three runners, producing exit codes `0x57` and `0x60d` respectively. Bypassing the framed call changes the import arguments, eight output bytes and exit code for both inputs.
+
+```powershell
+cmake --build --preset dev --target cpu_exe_framed_lifted cpu_exe_original_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_native_exe_(frame_)?chain$' -V
+```
+
 The first host dependency appears during IAT binding, before any guest instruction runs. Before the startup wrapper was added, the tested MSVC build with an empty binding table stopped at `cpu_exe_io.dll!emit_trace`. Supplying just the I/O DLL stops at `cpu_import_provider.dll!mix_args`. The first import invoked at runtime is `read_selector`.
 
 The PE entry points to a [startup wrapper](../tests/cpu/exe_startup.asm). It calls the same return-based body in both cases. After it returns, the I/O DLL compares the fixture's mapped base with the main process module. A native process exits with the body's DWORD via `ExitProcess`. A host mapping returns that DWORD to `pe_map_run`. The regression starts a worker that signals readiness and stays alive. It checks process termination, both pipe EOFs and exact output and exit status for both selectors and empty input. A separate marker proves that the host gets control back after running the exact same image. A temporary copy with its startup RVA set directly to the body is the negative control, whose live worker and open pipes are sampled before cleanup. [Issue #281](https://github.com/R0Y00/Xbox2Windows/issues/281)

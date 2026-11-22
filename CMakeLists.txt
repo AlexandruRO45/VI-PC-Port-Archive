@@ -896,10 +896,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_import_original_lifted>" "$<TARGET_FILE:cpu_import_provider>"
         "$<TARGET_FILE:cpu_import_altered>" "$<TARGET_FILE:cpu_register_probe>")
     add_library(cpu_exe_io SHARED tests/cpu/exe_io.cpp)
-    foreach(variant IN ITEMS original inverted pair swapped)
+    foreach(variant IN ITEMS original inverted pair swapped framed)
         set(native cpu_exe_${variant})
         set(lifted ${native}_lifted)
         add_executable(${native} tests/cpu/exe_entry.asm tests/cpu/direct.asm)
+        set(entry_options)
+        if(variant STREQUAL "framed")
+            target_sources(${native} PRIVATE tests/cpu/bare_calls.asm)
+            target_compile_definitions(${native} PRIVATE FRAME_SELECTOR)
+            target_link_options(${native} PRIVATE /EXPORT:call_bare "/MAP:${CMAKE_CURRENT_BINARY_DIR}/${native}.map")
+            list(APPEND entry_options --frame-selector)
+        endif()
         if(variant STREQUAL "pair" OR variant STREQUAL "swapped")
             target_sources(${native} PRIVATE tests/cpu/alt.asm)
             target_compile_definitions(${native} PRIVATE TWO_TARGETS)
@@ -918,11 +925,23 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_custom_command(OUTPUT "${source}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_exe_aot.py"
                 "$<TARGET_FILE:${native}>" "$<TARGET_FILE:cpu_exe_io>"
-                "$<TARGET_FILE:cpu_import_provider>" "${source}" --entry-export native_entry
+                "$<TARGET_FILE:cpu_import_provider>" "${source}" --entry-export native_entry ${entry_options}
             DEPENDS ${native} cpu_exe_io cpu_import_provider tools/cpu_exe_aot.py
                 tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py tools/ffx_version_query.py
             VERBATIM)
         add_executable(${lifted} "${source}")
+        if(variant STREQUAL "framed")
+            set(ranges "${CMAKE_CURRENT_BINARY_DIR}/${native}_ranges.json")
+            set(selector "${CMAKE_CURRENT_BINARY_DIR}/${native}_selector.cpp")
+            add_custom_command(OUTPUT "${selector}" BYPRODUCTS "${ranges}"
+                COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/range_manifest.py"
+                    "$<TARGET_FILE:${native}>" "${CMAKE_CURRENT_BINARY_DIR}/${native}.map" "${ranges}" bare_mix
+                COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_switch_aot.py"
+                    "$<TARGET_FILE:${native}>" call_bare "${selector}" --bind-ranges "${ranges}"
+                DEPENDS ${native} tools/range_manifest.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+                VERBATIM)
+            target_sources(${lifted} PRIVATE "${selector}")
+        endif()
         target_link_options(${lifted} PRIVATE /INCREMENTAL:NO)
         foreach(program IN ITEMS ${native} ${lifted})
             target_link_libraries(${program} PRIVATE cpu_exe_io cpu_import_provider)
@@ -951,6 +970,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_original>" "$<TARGET_FILE:cpu_exe_original_lifted>"
         "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>")
+    add_test(NAME cpu_native_exe_frame_chain COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/mapped_exe_chain_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_framed>" "$<TARGET_FILE:cpu_exe_framed_lifted>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_import_provider>" "$<TARGET_FILE:cpu_exe_original>")
     target_compile_features(pe_map PRIVATE cxx_std_17)
     add_test(NAME cpu_native_exe_termination COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/exe_termination_check.py" "$<TARGET_FILE:pe_map>"
