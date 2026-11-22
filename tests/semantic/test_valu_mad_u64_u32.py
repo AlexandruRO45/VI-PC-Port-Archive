@@ -1387,5 +1387,101 @@ class TestValuMadU64U32StatusFlags(unittest.TestCase):
         self.assertTrue(flags_s2.s2_zero)
 
 
+class TestValuMadU64U32IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-pattern extremes, subnormals, and NaN handling."""
+
+    POS_ZERO_F32: int = 0x0000_0000
+    NEG_ZERO_F32: int = 0x8000_0000
+    POS_INF_F32: int = 0x7F80_0000
+    NEG_INF_F32: int = 0xFF80_0000
+    QNAN_F32: int = 0x7FC0_0000
+    SNAN_F32: int = 0x7F80_0001
+    MIN_NORMAL_F32: int = 0x0080_0000
+    MAX_SUBNORMAL_F32: int = 0x007F_FFFF
+    MIN_SUBNORMAL_F32: int = 0x0000_0001
+
+    POS_ZERO_F64: int = 0x0000_0000_0000_0000
+    NEG_ZERO_F64: int = 0x8000_0000_0000_0000
+    POS_INF_F64: int = 0x7FF0_0000_0000_0000
+    NEG_INF_F64: int = 0xFFF0_0000_0000_0000
+    QNAN_F64: int = 0x7FF8_0000_0000_0000
+    SNAN_F64: int = 0x7FF0_0000_0000_0001
+
+    @staticmethod
+    def f32_to_bits(val: float) -> int:
+        return struct.unpack("<I", struct.pack("<f", val))[0]
+
+    @staticmethod
+    def f64_to_bits(val: float) -> int:
+        return struct.unpack("<Q", struct.pack("<d", val))[0]
+
+    def test_ieee754_zero_bit_patterns(self) -> None:
+        # +0.0f is 0, so multiplication by 2 is 0
+        dst_pos, carry_pos = ref_mad_u64_u32(self.POS_ZERO_F32, 2, 0)
+        self.assertEqual(dst_pos, 0)
+        self.assertEqual(carry_pos, 0)
+
+        # -0.0f has sign bit 31 set: 0x80000000 = 2147483648
+        # Multiplying by 2 produces 0x1_0000_0000
+        dst_neg, carry_neg = ref_mad_u64_u32(self.NEG_ZERO_F32, 2, 0)
+        self.assertEqual(dst_neg, 0x1_0000_0000)
+        self.assertEqual(carry_neg, 0)
+
+    def test_subnormal_no_flush_to_zero(self) -> None:
+        # VALU integer operations must strictly preserve subnormal bit patterns without flushing to zero
+        dst_min, _ = ref_mad_u64_u32(self.MIN_SUBNORMAL_F32, 0x1000, 5)
+        self.assertEqual(dst_min, 0x1005)
+
+        dst_max, _ = ref_mad_u64_u32(self.MAX_SUBNORMAL_F32, 1, 0)
+        self.assertEqual(dst_max, self.MAX_SUBNORMAL_F32)
+
+    def test_nan_payload_preservation(self) -> None:
+        # Quiet NaN and Signaling NaN bit patterns treated as raw unsigned integers
+        dst_qnan, _ = ref_mad_u64_u32(self.QNAN_F32, 1, 0)
+        self.assertEqual(dst_qnan, self.QNAN_F32)
+
+        dst_snan, _ = ref_mad_u64_u32(self.SNAN_F32, 1, 0)
+        self.assertEqual(dst_snan, self.SNAN_F32)
+
+    def test_infinity_bit_patterns(self) -> None:
+        # Infinity bit patterns operate as raw integers
+        dst_pos_inf, _ = ref_mad_u64_u32(self.POS_INF_F32, 2, 0)
+        self.assertEqual(dst_pos_inf, self.POS_INF_F32 * 2)
+
+        dst_neg_inf, carry = ref_mad_u64_u32(self.NEG_INF_F32, 2, 0)
+        expected = (self.NEG_INF_F32 * 2) & MASK64
+        self.assertEqual(dst_neg_inf, expected)
+        self.assertEqual(carry, 0)
+
+    def test_double_precision_src2_patterns(self) -> None:
+        # Double precision IEEE 754 constants in src2 accumulator
+        dst_qnan64, carry = ref_mad_u64_u32(0, 0, self.QNAN_F64)
+        self.assertEqual(dst_qnan64, self.QNAN_F64)
+        self.assertEqual(carry, 0)
+
+        dst_inf64, carry = ref_mad_u64_u32(0, 0, self.POS_INF_F64)
+        self.assertEqual(dst_inf64, self.POS_INF_F64)
+        self.assertEqual(carry, 0)
+
+    def test_fixed_point_16_16_arithmetic(self) -> None:
+        # Emulate 16.16 fixed-point arithmetic using v_mad_u64_u32:
+        # 1.5 * 2.5 + 0.5 = 4.25
+        fp_1_5 = int(1.5 * (1 << 16))  # 0x00018000
+        fp_2_5 = int(2.5 * (1 << 16))  # 0x00028000
+        # In 32.32 format, 0.5 is 0.5 * 2^32 = 0x80000000
+        fp_acc_0_5 = int(0.5 * (1 << 32))  # 0x80000000
+
+        dst64, carry = ref_mad_u64_u32(fp_1_5, fp_2_5, fp_acc_0_5)
+        # Expected in 32.32: 4.25 * 2^32 = 18253611008 = 0x4_4000_0000
+        expected_32_32 = int(4.25 * (1 << 32))
+        self.assertEqual(dst64, expected_32_32)
+        self.assertEqual(carry, 0)
+
+        # Truncate back to 16.16 by shifting right by 16 bits
+        res_16_16 = (dst64 >> 16) & MASK32
+        expected_16_16 = int(4.25 * (1 << 16))
+        self.assertEqual(res_16_16, expected_16_16)
+
+
 if __name__ == "__main__":
     unittest.main()
