@@ -1,3 +1,4 @@
+; coverage: source cpu_aot_vex_words
 ; VEX.128 16-bit packed-integer leaf functions. Each takes RCX and RDX, the addresses of two
 ; 16-byte inputs, and R8, the address of a 16-byte output, and returns nothing.
 .code
