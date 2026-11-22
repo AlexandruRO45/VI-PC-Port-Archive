@@ -555,5 +555,18 @@ class TestPermB32I16ConditionCodesAndStatus(unittest.TestCase):
         self.assertTrue(flags.has_min)
         self.assertTrue(flags.has_max)
 
+# ==============================================================================
+# Integer Extremes and Boundary Handling
+# ==============================================================================
+
+class TestPermB32I16Boundaries(unittest.TestCase):
+    def test_min_max_boundary_preservation(self):
+        src1 = pack_halves(INT16_MIN, INT16_MAX)
+        src0 = pack_halves(INT16_NEG_ONE, INT16_ONE)
+        sel = PermSelectorWord.identity_src1().raw
+        res = oracle_v_perm_b32_i16(src0, src1, sel)
+        self.assertEqual(extract_half(res, 0), INT16_MIN)
+        self.assertEqual(extract_half(res, 1), INT16_MAX)
+
 if __name__ == "__main__":
     unittest.main()
