@@ -104,13 +104,14 @@ D3D12; Leonida translates to Vulkan. The ABI facts carry over, the forwarding ar
 <https://github.com/ivall/xcl>, <https://github.com/omonkeyz/xbox-emulator>
 
 Two Rust compatibility layers for Xbox Series titles, each with a translator from the same RDNA2 shader code to
-HLSL. xbox-emulator continues TomBox; xcl draws on TomBox's findings, so where the two agree that is one
-observation, not two independent ones. Neither targets this game, and almost none of their instruction rules are
-measured on RDNA2 hardware; what they add is conventions observed while running other titles.
+HLSL. xbox-emulator continues TomBox. The notes of xcl cite TomBox's library map, so we do not count the two as
+independent: where they agree, treat it as one observation. Neither runs this game. What they add is conventions
+seen while running titles.
 
 **Licence:** xcl is **GPL-2.0-only**, which is incompatible with GPL-3.0-or-later: **no xcl code may be copied**,
-as for americas-recomp above. xbox-emulator is GPL-3.0, which is compatible, and the SCARAB rule applies: facts
-first, our own implementation, and the pull request names the file a fact came from.
+as for americas-recomp above. xbox-emulator is GPL-3.0-or-later (its README and `Cargo.toml`; the `LICENSE` file is
+GPL v3), which is compatible, and the SCARAB rule applies: facts first, our own implementation, and the pull
+request names the file a fact came from.
 
 **What we use them for:** leads to check on this package. So far one: a fetch-calling vertex shader finds its
 attributes in the registers of the inputs it reads, not of every declared input ([design.md](design.md), row
