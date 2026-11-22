@@ -5889,8 +5889,7 @@ class Gen:
             self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
-        elif op in ("v_cmp_class_f32", "v_cmpx_class_f32", "v_cmp_class_f16", "v_cmpx_class_f16",
-                    "v_cmp_class_f64", "v_cmpx_class_f64"):
+        elif op in ("v_cmp_class_f32", "v_cmpx_class_f32", "v_cmp_class_f16", "v_cmpx_class_f16"):
             self.cmp_class(a, exec_only=op.startswith("v_cmpx_"), ty=op.rsplit("_", 1)[1], mods=mods)
         elif op in ("v_ffbl_b32", "v_ffbh_u32", "s_flbit_i32_b32") or \
                 (op == "s_ff1_i32_b32" and not self.holds_lane_mask(a[1])):       # of a lane mask: further down
