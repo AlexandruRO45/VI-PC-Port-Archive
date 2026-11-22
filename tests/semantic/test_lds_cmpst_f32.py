@@ -360,6 +360,48 @@ class SIMDInterpreter:
 
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Comparison Evaluation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FloatComparisonFlags:
+    equal: bool
+    less: bool
+    greater: bool
+    unordered: bool
+    zero_result: bool
+    sign_result: bool
+
+
+def evaluate_f32_cmpst_flags(old_raw: int, cmp_raw: int, new_raw: int) -> FloatComparisonFlags:
+    nan_old = is_f32_nan(old_raw)
+    nan_cmp = is_f32_nan(cmp_raw)
+
+    if nan_old or nan_cmp:
+        return FloatComparisonFlags(
+            equal=False,
+            less=False,
+            greater=False,
+            unordered=True,
+            zero_result=(new_raw & 0x7FFFFFFF) == 0,
+            sign_result=bool(new_raw & 0x80000000),
+        )
+
+    f_old = bits_to_f32(old_raw)
+    f_cmp = bits_to_f32(cmp_raw)
+
+    return FloatComparisonFlags(
+        equal=(f_old == f_cmp),
+        less=(f_old < f_cmp),
+        greater=(f_old > f_cmp),
+        unordered=False,
+        zero_result=(new_raw & 0x7FFFFFFF) == 0,
+        sign_result=bool(new_raw & 0x80000000),
+    )
+
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -647,6 +689,38 @@ class TestRegisterAliasing(unittest.TestCase):
         self.assertEqual(old_val, val)
         self.assertEqual(new_mem, val)
         self.assertEqual(state.get_vgpr(2), val)
+
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_float_equal_flags(self) -> None:
+        val = f32_to_bits(10.0)
+        flags = evaluate_f32_cmpst_flags(val, val, f32_to_bits(20.0))
+        self.assertTrue(flags.equal)
+        self.assertFalse(flags.less)
+        self.assertFalse(flags.greater)
+        self.assertFalse(flags.unordered)
+
+    def test_float_less_flags(self) -> None:
+        flags = evaluate_f32_cmpst_flags(f32_to_bits(5.0), f32_to_bits(10.0), 0)
+        self.assertFalse(flags.equal)
+        self.assertTrue(flags.less)
+        self.assertFalse(flags.greater)
+        self.assertFalse(flags.unordered)
+
+    def test_float_nan_unordered_flags(self) -> None:
+        flags = evaluate_f32_cmpst_flags(QNAN_F32, f32_to_bits(1.0), QNAN_F32)
+        self.assertTrue(flags.unordered)
+        self.assertFalse(flags.equal)
+        self.assertFalse(flags.less)
+        self.assertFalse(flags.greater)
+
+    def test_signed_zero_equal_flags(self) -> None:
+        flags = evaluate_f32_cmpst_flags(POS_ZERO_F32, NEG_ZERO_F32, 0)
+        self.assertTrue(flags.equal)
+        self.assertTrue(flags.zero_result)
 
 
 
