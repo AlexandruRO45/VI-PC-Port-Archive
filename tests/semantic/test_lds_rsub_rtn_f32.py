@@ -251,5 +251,174 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<I", self.lds_bytes, addr)[0], THREE_F32)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Strongly-typed register operand."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index < DEFAULT_NUM_VGPRS):
+                raise ValueError(f"VGPR index out of bounds [0, {DEFAULT_NUM_VGPRS - 1}]: {self.index}")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index < DEFAULT_NUM_SGPRS):
+                raise ValueError(f"SGPR index out of bounds [0, {DEFAULT_NUM_SGPRS - 1}]: {self.index}")
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+class DSOpcode(Enum):
+    """LDS DS-encoding opcode identifier."""
+    DS_RSUB_RTN_F32 = "ds_rsub_rtn_f32"
+
+
+@dataclass(frozen=True)
+class DSRsubRtnInstruction:
+    """Symbolic AST node representing a ds_rsub_rtn_f32 instruction."""
+    vdst: RegisterOperand
+    vaddr: RegisterOperand
+    vdata0: RegisterOperand
+    offset: int = 0
+    gds: bool = False
+    opcode: DSOpcode = DSOpcode.DS_RSUB_RTN_F32
+
+    def __post_init__(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR:
+            raise TypeError(f"vdst must be a VGPR, got {self.vdst}")
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise TypeError(f"vaddr must be a VGPR, got {self.vaddr}")
+        if self.vdata0.reg_type != RegType.VGPR:
+            raise TypeError(f"vdata0 must be a VGPR, got {self.vdata0}")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"Immediate byte offset out of unsigned 16-bit range [0, 65535]: {self.offset}")
+
+    def disasm(self) -> str:
+        base = f"{self.opcode.value} {self.vdst.name}, {self.vaddr.name}, {self.vdata0.name}"
+        mods = []
+        if self.offset != 0:
+            mods.append(f"offset:{self.offset}")
+        if self.gds:
+            mods.append("gds")
+        return f"{base} {' '.join(mods)}".rstrip()
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_enumeration(self) -> None:
+        self.assertEqual(DSOpcode.DS_RSUB_RTN_F32.value, "ds_rsub_rtn_f32")
+
+    def test_register_operands(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        v255 = RegisterOperand(255, RegType.VGPR)
+        s0 = RegisterOperand(0, RegType.SGPR)
+        s105 = RegisterOperand(105, RegType.SGPR)
+
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(v255.name, "v255")
+        self.assertEqual(s0.name, "s0")
+        self.assertEqual(s105.name, "s105")
+
+    def test_ast_construction_and_disassembly(self) -> None:
+        instr_basic = DSRsubRtnInstruction(
+            vdst=RegisterOperand(5),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=0,
+        )
+        self.assertEqual(instr_basic.disasm(), "ds_rsub_rtn_f32 v5, v1, v2")
+
+        instr_offset = DSRsubRtnInstruction(
+            vdst=RegisterOperand(5),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=16,
+        )
+        self.assertEqual(instr_offset.disasm(), "ds_rsub_rtn_f32 v5, v1, v2 offset:16")
+
+        instr_gds = DSRsubRtnInstruction(
+            vdst=RegisterOperand(5),
+            vaddr=RegisterOperand(1),
+            vdata0=RegisterOperand(2),
+            offset=8,
+            gds=True,
+        )
+        self.assertEqual(instr_gds.disasm(), "ds_rsub_rtn_f32 v5, v1, v2 offset:8 gds")
+
+    def test_ast_immutability_and_equality(self) -> None:
+        instr1 = DSRsubRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(4),
+            vdata0=RegisterOperand(5),
+            offset=64,
+        )
+        instr2 = DSRsubRtnInstruction(
+            vdst=RegisterOperand(3),
+            vaddr=RegisterOperand(4),
+            vdata0=RegisterOperand(5),
+            offset=64,
+        )
+        self.assertEqual(instr1, instr2)
+        self.assertEqual(hash(instr1), hash(instr2))
+
+    def test_ast_validation_and_type_checks(self) -> None:
+        # Register index out of bounds
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+        # RegType SGPR in vdst, vaddr, or vdata0
+        with self.assertRaises(TypeError):
+            DSRsubRtnInstruction(
+                vdst=RegisterOperand(0, RegType.SGPR),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2),
+            )
+        with self.assertRaises(TypeError):
+            DSRsubRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1, RegType.SGPR),
+                vdata0=RegisterOperand(2),
+            )
+        with self.assertRaises(TypeError):
+            DSRsubRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2, RegType.SGPR),
+            )
+
+        # Offset out of range
+        with self.assertRaises(ValueError):
+            DSRsubRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2),
+                offset=-1,
+            )
+        with self.assertRaises(ValueError):
+            DSRsubRtnInstruction(
+                vdst=RegisterOperand(0),
+                vaddr=RegisterOperand(1),
+                vdata0=RegisterOperand(2),
+                offset=65536,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
