@@ -334,6 +334,66 @@ class ScalarInterpreter:
 
 
 # ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class WaveMode(Enum):
+    WAVE32 = 32
+    WAVE64 = 64
+
+
+@dataclass
+class SIMDState:
+    """RDNA2 SIMD Wavefront execution state."""
+    wave_mode: WaveMode = WaveMode.WAVE32
+    exec_mask: int = 0xFFFF_FFFF
+    num_lanes: int = 32
+    vgprs: list[list[int]] = field(default_factory=list)
+    sgprs: list[int] = field(default_factory=lambda: [0] * NUM_SGPRS)
+
+    def __post_init__(self) -> None:
+        self.num_lanes = self.wave_mode.value
+        if not self.vgprs:
+            self.vgprs = [[0] * NUM_VGPRS for _ in range(self.num_lanes)]
+        if self.wave_mode == WaveMode.WAVE32:
+            self.exec_mask &= MASK32
+        else:
+            self.exec_mask &= (1 << 64) - 1
+
+    def read_lane(self, op: Operand, lane: int) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[lane][op.index] & MASK32
+        if op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        if op.reg_type in (RegType.LITERAL, RegType.INLINE_CONST):
+            assert op.literal_val is not None
+            return to_u32(op.literal_val)
+        raise ValueError(f"Unsupported operand type: {op.reg_type}")
+
+    def write_lane(self, op: Operand, lane: int, val: int) -> None:
+        if op.reg_type == RegType.VGPR:
+            self.vgprs[lane][op.index] = val & MASK32
+        else:
+            raise TypeError(f"Lane write target must be VGPR, got {op.reg_type}")
+
+
+class SIMDInterpreter:
+    """SIMD wavefront instruction interpreter handling divergence and EXEC masking."""
+
+    def step(self, instr: VMadI32I16Instruction, state: SIMDState) -> list[int | None]:
+        results: list[int | None] = [None] * state.num_lanes
+        for lane in range(state.num_lanes):
+            if bool(state.exec_mask & (1 << lane)):
+                s0 = state.read_lane(instr.src0, lane)
+                s1 = state.read_lane(instr.src1, lane)
+                s2 = state.read_lane(instr.src2, lane)
+                res = ref_mad_i32_i16(s0, s1, s2, clamp=instr.clamp, op_sel=instr.op_sel)
+                state.write_lane(instr.dst, lane, res)
+                results[lane] = res
+        return results
+
+
+# ==============================================================================
 # Unit Tests: Reference Mathematical Oracle
 # ==============================================================================
 
@@ -546,6 +606,100 @@ class TestDeterministicScalarInterpreter(unittest.TestCase):
 
         self.interp.step(instr, self.state)
         self.assertEqual(self.state.rf.read_vgpr(0), 60)
+
+
+# ==============================================================================
+# Unit Tests: SIMD Multi-Lane Divergence and EXEC Masking
+# ==============================================================================
+
+class TestSIMDMultiLaneDivergence(unittest.TestCase):
+    """Multi-lane divergence and Wave32/Wave64 EXEC mask tests."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpreter()
+
+    def test_wave32_all_lanes_active(self) -> None:
+        state = SIMDState(wave_mode=WaveMode.WAVE32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.vgprs[lane][1] = lane
+            state.vgprs[lane][2] = 2
+            state.vgprs[lane][3] = 100
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            expected = lane * 2 + 100
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.vgprs[lane][0], expected)
+
+    def test_wave64_divergence(self) -> None:
+        state = SIMDState(wave_mode=WaveMode.WAVE64, exec_mask=(1 << 64) - 1)
+        for lane in range(64):
+            state.vgprs[lane][1] = lane
+            state.vgprs[lane][2] = -1
+            state.vgprs[lane][3] = 0
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+
+        results = self.interp.step(instr, state)
+        for lane in range(64):
+            expected = to_u32(-lane)
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.vgprs[lane][0], expected)
+
+    def test_partial_exec_mask_preserves_inactive_lanes(self) -> None:
+        state = SIMDState(wave_mode=WaveMode.WAVE32, exec_mask=0x0000_000F)
+        sentinel = 0xDEAD_BEEF
+        for lane in range(32):
+            state.vgprs[lane][0] = sentinel
+            state.vgprs[lane][1] = 10
+            state.vgprs[lane][2] = 10
+            state.vgprs[lane][3] = 0
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+
+        results = self.interp.step(instr, state)
+        for lane in range(4):
+            self.assertEqual(results[lane], 100)
+            self.assertEqual(state.vgprs[lane][0], 100)
+
+        for lane in range(4, 32):
+            self.assertIsNone(results[lane])
+            self.assertEqual(state.vgprs[lane][0], sentinel)
+
+    def test_zero_exec_mask(self) -> None:
+        state = SIMDState(wave_mode=WaveMode.WAVE32, exec_mask=0)
+        sentinel = 0xCAFE_BABE
+        for lane in range(32):
+            state.vgprs[lane][0] = sentinel
+
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.literal(5),
+            src1=Operand.literal(5),
+            src2=Operand.literal(5),
+        )
+
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            self.assertIsNone(results[lane])
+            self.assertEqual(state.vgprs[lane][0], sentinel)
 
 
 if __name__ == "__main__":
