@@ -673,7 +673,8 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
   31 are not decoded further.
 - **Skeleton (feature object `+0x28`).** 3,918 bones over the 180 clips. One root and every parent before its
   child on 180 of 180, the bones' parent field is the `+0x40` array, and the tag table holds exactly two tags per
-  bone, `joaat32` of its name and its u16 id, on 180 of 180 (the root's id is 0, measured separately). The local
+  bone, `joaat32` of its name and its u16 id, on 180 of 180. The root's id is 0 and every other bone's is the ELF
+  hash of its upper-cased name, mod 0xFE8F, plus 0x170, on 180 of 180 (3,738 bones; `bone_id`). The local
   matrix is the bone's rotation and translation, and the inverse bind matrix times the product of the local
   matrices up the chain is the identity (to 2e-3), on 180 of 180. `+0x48` is a prefix tree of the bone names
   (shared prefixes stored once): walking it, a node whose value lands in the u16 array after the tree names the
@@ -714,7 +715,7 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
 - Not decoded: the second word of a clip table slot and what the clip table hashes, the hash of the features'
   `+0x48` table (not joaat32, one-at-a-time, FNV-1/1a, ELF or CRC-32 of the bone name in any case, nor of the
   feature's `+0x18`/`+0x1C` words; measured separately), the features with `+0x0E` = 5 (their `+0x18`, `+0x1C`
-  and `+0x24` are in none of the clip's tables, measured separately), how the bone ids are made, what the pose
+  and `+0x24` are in none of the clip's tables, measured separately), what the pose
   columns mean beyond their feature (and any normalisation), the meaning of the `+0x98` values, the `+0x30`
   object's other floats and form 1's values, what the `+0xB8` values are, and the f32 at `+0xC0`.
 

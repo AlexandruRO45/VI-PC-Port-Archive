@@ -378,6 +378,8 @@ def skeleton_name_tree(s, at):
     the bone the name belongs to. -> [(name, bone index)] in tree order, or [] for a null pointer"""
     if at is None:
         return []
+    if at + 4 > len(s.d):
+        raise DecodeError("motionmatcher bone name tree runs past the pages")
     n, size = s.u16(at), s.u16(at + 2)
     if at + size + 2 * n > len(s.d):
         raise DecodeError("motionmatcher bone name tree runs past the pages")
@@ -453,6 +455,18 @@ def matcher_pose(s, poses, sample):
         return list(struct.unpack_from(f"<{cols}e", s.d, at + 2 * sample * stride))
     base = at + 2 * (sample // 8) * stride * 8
     return [struct.unpack_from("<e", s.d, base + 2 * (c * 8 + sample % 8))[0] for c in range(cols)]
+
+
+def bone_id(name):
+    """A non-root bone's u16 id: the ELF hash of its upper-cased name, mod 0xFE8F, plus 0x170."""
+    h = 0
+    for c in name.upper().encode("latin-1"):
+        h = ((h << 4) + c) & 0xFFFFFFFF
+        top = h & 0xF0000000
+        if top:
+            h ^= top >> 24
+        h &= ~top & 0xFFFFFFFF
+    return h % 0xFE8F + 0x170
 
 
 def quaternion_rows(x, y, z, w):
@@ -555,6 +569,8 @@ def count_matcher(c, dictionary_hash, stats):
         p < 0 for p in parents) == 1 and all(0 <= p < i for i, p in enumerate(parents) if p >= 0)
     stats["matcher_skeleton_tags_are_name_hash_and_id"] += bool(bones) and sorted(sk["tags"]) == sorted(
         [(anim_index.joaat32(b[0]), i) for i, b in enumerate(bones)] + [(b[2], i) for i, b in enumerate(bones)])
+    stats["matcher_skeleton_bone_ids_from_names_root_0"] += bool(bones) and all(
+        b[2] == (0 if b[1] < 0 else bone_id(b[0])) for b in bones)
     stats["matcher_skeleton_name_tree_maps_each_name_to_its_bone"] += bool(bones) and sorted(
         sk["name_tree"], key=lambda x: x[1]) == [(b[0], i) for i, b in enumerate(bones)]
     local_ok, inverse_ok = skeleton_checks(sk)
