@@ -831,5 +831,133 @@ class TestValuCvtNormI32F16IEEE754Boundaries(unittest.TestCase):
         for n in nan_list:
             self.assertEqual(ref_cvt_norm_i32_f16(n), SNORM32_ZERO)
 
+# ---------------------------------------------------------------------------
+# Mutated Oracles and Negative Controls / Syntax Rejection
+# ---------------------------------------------------------------------------
+
+def mutant_nan_to_max(src16: int) -> int:
+    if is_nan_f16(src16):
+        return SNORM32_MAX
+    return ref_cvt_norm_i32_f16(src16)
+
+
+def mutant_drop_sign(src16: int) -> int:
+    return ref_cvt_norm_i32_f16(src16 & ~SIGN_MASK_F16)
+
+
+def mutant_scale_factor(src16: int) -> int:
+    # Uses 2147483648 instead of 2147483647
+    f_val = bits_to_f16(src16)
+    return int(f_val * 2147483648) & MASK32
+
+
+def mutant_leak_vcc(interp: ScalarVALUInterpreter, inst: Instruction) -> None:
+    interp.step(inst)
+    interp.vcc ^= 0x1
+
+
+def parse_register(tok: str) -> Register:
+    tok = tok.strip()
+    subword = SubWord.FULL
+    if "." in tok:
+        base_tok, sub_tok = tok.split(".", 1)
+        if sub_tok == "l":
+            subword = SubWord.LO
+        elif sub_tok == "h":
+            subword = SubWord.HI
+        tok = base_tok
+
+    if tok.startswith("v"):
+        kind = RegKind.VGPR
+    elif tok.startswith("s"):
+        kind = RegKind.SGPR
+    else:
+        raise ValueError(f"Invalid register: {tok}")
+    idx = int(tok[1:])
+    return Register(kind=kind, index=idx, subword=subword)
+
+
+def parse_vop_cvt(asm_str: str) -> Instruction:
+    asm_str = asm_str.strip()
+    tokens = asm_str.split(None, 1)
+    if not tokens:
+        raise ValueError("Empty instruction")
+
+    op_str = tokens[0]
+    rest = tokens[1] if len(tokens) > 1 else ""
+
+    encoding = Encoding.VOP1
+    if op_str.endswith("_e64"):
+        encoding = Encoding.VOP3
+        base_op = op_str[:-4]
+    elif op_str.endswith("_e32"):
+        encoding = Encoding.VOP1
+        base_op = op_str[:-4]
+    else:
+        base_op = op_str
+
+    if base_op != "v_cvt_norm_i32_f16":
+        raise ValueError(f"Unknown opcode: {op_str}")
+
+    parts = [p.strip() for p in rest.split(",")]
+    if len(parts) != 2:
+        raise ValueError("Expected 2 operands")
+
+    dst = parse_register(parts[0])
+    src_tokens = parts[1].split()
+    clamp = "clamp" in src_tokens
+    if clamp:
+        src_tokens.remove("clamp")
+
+    raw_src = src_tokens[0]
+    abs_src = False
+    neg_src = False
+    if raw_src.startswith("-"):
+        neg_src = True
+        raw_src = raw_src[1:]
+    if raw_src.startswith("|") and raw_src.endswith("|"):
+        abs_src = True
+        raw_src = raw_src[1:-1]
+
+    if raw_src.startswith("v") or raw_src.startswith("s"):
+        src0 = parse_register(raw_src)
+    else:
+        src0 = Immediate(float(raw_src) if "." in raw_src else int(raw_src))
+
+    if encoding == Encoding.VOP1 and (abs_src or neg_src or clamp):
+        raise ValueError("VOP1 does not support modifiers")
+
+    return Instruction(
+        opcode=Opcode.V_CVT_NORM_I32_F16,
+        dst=dst,
+        src0=src0,
+        abs_src0=abs_src,
+        neg_src0=neg_src,
+        clamp=clamp,
+        encoding=encoding,
+    )
+
+
+class TestValuCvtNormI32F16NegativeControls(unittest.TestCase):
+    """Negative controls, syntax rejection tests, and mutation detection validation."""
+
+    def test_syntax_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_add_f16 v0, v1.l")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_i32_f16 s0, v1.l")
+        with self.assertRaises(ValueError):
+            parse_vop_cvt("v_cvt_norm_i32_f16_e32 v0, -v1.l")
+
+    def test_mutation_detection(self) -> None:
+        self.assertNotEqual(ref_cvt_norm_i32_f16(QNAN_F16), mutant_nan_to_max(QNAN_F16))
+        self.assertNotEqual(ref_cvt_norm_i32_f16(NEG_ONE_F16), mutant_drop_sign(NEG_ONE_F16))
+
+        interp = ScalarVALUInterpreter()
+        inst = parse_vop_cvt("v_cvt_norm_i32_f16 v0, v1.l")
+        interp.vcc = 0x5555
+        mutant_leak_vcc(interp, inst)
+        self.assertNotEqual(interp.vcc, 0x5555)
+
 if __name__ == "__main__":
     unittest.main()
