@@ -1147,5 +1147,183 @@ class TestValuCvtPknormI16F32RegisterAliasing(unittest.TestCase):
                 self.assertEqual(state.get_vgpr(lane, 0), initial_val)
 
 
+# ==============================================================================
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class CvtPknormStatusFlags:
+    """Architectural condition codes and status flags for packed SNORM16 conversion."""
+    ch0_zero: bool
+    ch1_zero: bool
+    both_zero: bool
+    ch0_negative: bool
+    ch1_negative: bool
+    ch0_clamped_max: bool
+    ch0_clamped_min: bool
+    ch1_clamped_max: bool
+    ch1_clamped_min: bool
+    overflow_or_clamped: bool
+    nan_encountered: bool
+    invalid_op: bool
+
+
+def compute_status_flags(src0_bits: int, src1_bits: int, packed_result: int) -> CvtPknormStatusFlags:
+    """Compute architectural condition codes and floating-point exception flags."""
+    s0_nan = is_nan_f32(src0_bits)
+    s1_nan = is_nan_f32(src1_bits)
+    s0_snan = is_snan_f32(src0_bits)
+    s1_snan = is_snan_f32(src1_bits)
+
+    ch0_s16, ch1_s16 = unpack_pknorm_i16(packed_result)
+
+    ch0_zero = (ch0_s16 == 0)
+    ch1_zero = (ch1_s16 == 0)
+    both_zero = ((packed_result & MASK32) == 0)
+
+    ch0_negative = (ch0_s16 < 0)
+    ch1_negative = (ch1_s16 < 0)
+
+    ch0_clamped_max = (ch0_s16 == 32767)
+    ch0_clamped_min = (ch0_s16 == -32767)
+    ch1_clamped_max = (ch1_s16 == 32767)
+    ch1_clamped_min = (ch1_s16 == -32767)
+
+    # Check if either input magnitude exceeded 1.0f or was inf
+    f0 = bits_to_f32(src0_bits) if not s0_nan else 0.0
+    f1 = bits_to_f32(src1_bits) if not s1_nan else 0.0
+
+    s0_clamped = is_inf_f32(src0_bits) or (abs(f0) > 1.0)
+    s1_clamped = is_inf_f32(src1_bits) or (abs(f1) > 1.0)
+    overflow_or_clamped = s0_clamped or s1_clamped
+
+    return CvtPknormStatusFlags(
+        ch0_zero=ch0_zero,
+        ch1_zero=ch1_zero,
+        both_zero=both_zero,
+        ch0_negative=ch0_negative,
+        ch1_negative=ch1_negative,
+        ch0_clamped_max=ch0_clamped_max,
+        ch0_clamped_min=ch0_clamped_min,
+        ch1_clamped_max=ch1_clamped_max,
+        ch1_clamped_min=ch1_clamped_min,
+        overflow_or_clamped=overflow_or_clamped,
+        nan_encountered=s0_nan or s1_nan,
+        invalid_op=s0_snan or s1_snan,
+    )
+
+
+class TestValuCvtPknormI16F32StatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and exception detection."""
+
+    def test_zero_flags(self) -> None:
+        """Verify zero flags for zero inputs, non-zero inputs, and mixed channels."""
+        # Both channels zero
+        res_zero = oracle_v_cvt_pknorm_i16_f32(POS_ZERO_F32, NEG_ZERO_F32)
+        flags_zero = compute_status_flags(POS_ZERO_F32, NEG_ZERO_F32, res_zero)
+        self.assertTrue(flags_zero.ch0_zero)
+        self.assertTrue(flags_zero.ch1_zero)
+        self.assertTrue(flags_zero.both_zero)
+
+        # Ch0 non-zero, Ch1 zero
+        res_mixed = oracle_v_cvt_pknorm_i16_f32(POS_ONE_F32, POS_ZERO_F32)
+        flags_mixed = compute_status_flags(POS_ONE_F32, POS_ZERO_F32, res_mixed)
+        self.assertFalse(flags_mixed.ch0_zero)
+        self.assertTrue(flags_mixed.ch1_zero)
+        self.assertFalse(flags_mixed.both_zero)
+
+        # Both channels non-zero
+        res_nonzero = oracle_v_cvt_pknorm_i16_f32(POS_HALF_F32, NEG_HALF_F32)
+        flags_nonzero = compute_status_flags(POS_HALF_F32, NEG_HALF_F32, res_nonzero)
+        self.assertFalse(flags_nonzero.ch0_zero)
+        self.assertFalse(flags_nonzero.ch1_zero)
+        self.assertFalse(flags_nonzero.both_zero)
+
+    def test_negative_flags(self) -> None:
+        """Verify negative flags properly distinguish signed channels."""
+        # Mixed sign
+        res = oracle_v_cvt_pknorm_i16_f32(POS_HALF_F32, NEG_HALF_F32)
+        flags = compute_status_flags(POS_HALF_F32, NEG_HALF_F32, res)
+        self.assertFalse(flags.ch0_negative)
+        self.assertTrue(flags.ch1_negative)
+
+        # Both negative
+        res_neg = oracle_v_cvt_pknorm_i16_f32(NEG_ONE_F32, NEG_HALF_F32)
+        flags_neg = compute_status_flags(NEG_ONE_F32, NEG_HALF_F32, res_neg)
+        self.assertTrue(flags_neg.ch0_negative)
+        self.assertTrue(flags_neg.ch1_negative)
+
+    def test_clamp_and_saturation_flags(self) -> None:
+        """Verify clamped flags for boundary and out-of-range inputs."""
+        # Normal in-range value (no clamp)
+        res_normal = oracle_v_cvt_pknorm_i16_f32(POS_HALF_F32, NEG_HALF_F32)
+        flags_normal = compute_status_flags(POS_HALF_F32, NEG_HALF_F32, res_normal)
+        self.assertFalse(flags_normal.overflow_or_clamped)
+        self.assertFalse(flags_normal.ch0_clamped_max)
+        self.assertFalse(flags_normal.ch1_clamped_min)
+
+        # Out-of-range positive clamp (> 1.0f)
+        res_pos_ovf = oracle_v_cvt_pknorm_i16_f32(POS_TWO_F32, POS_HALF_F32)
+        flags_pos_ovf = compute_status_flags(POS_TWO_F32, POS_HALF_F32, res_pos_ovf)
+        self.assertTrue(flags_pos_ovf.overflow_or_clamped)
+        self.assertTrue(flags_pos_ovf.ch0_clamped_max)
+        self.assertFalse(flags_pos_ovf.ch1_clamped_max)
+
+        # Out-of-range negative clamp (< -1.0f)
+        res_neg_ovf = oracle_v_cvt_pknorm_i16_f32(POS_HALF_F32, NEG_TWO_F32)
+        flags_neg_ovf = compute_status_flags(POS_HALF_F32, NEG_TWO_F32, res_neg_ovf)
+        self.assertTrue(flags_neg_ovf.overflow_or_clamped)
+        self.assertFalse(flags_neg_ovf.ch0_clamped_min)
+        self.assertTrue(flags_neg_ovf.ch1_clamped_min)
+
+        # Infinity clamping
+        res_inf = oracle_v_cvt_pknorm_i16_f32(POS_INF_F32, NEG_INF_F32)
+        flags_inf = compute_status_flags(POS_INF_F32, NEG_INF_F32, res_inf)
+        self.assertTrue(flags_inf.overflow_or_clamped)
+        self.assertTrue(flags_inf.ch0_clamped_max)
+        self.assertTrue(flags_inf.ch1_clamped_min)
+
+    def test_nan_and_invalid_op_flags(self) -> None:
+        """Verify quiet NaN and signaling NaN exception detection."""
+        # Quiet NaN
+        res_qnan = oracle_v_cvt_pknorm_i16_f32(CANONICAL_QNAN_F32, POS_ONE_F32)
+        flags_qnan = compute_status_flags(CANONICAL_QNAN_F32, POS_ONE_F32, res_qnan)
+        self.assertTrue(flags_qnan.nan_encountered)
+        self.assertFalse(flags_qnan.invalid_op)
+
+        # Signaling NaN
+        res_snan = oracle_v_cvt_pknorm_i16_f32(POS_ONE_F32, CANONICAL_SNAN_F32)
+        flags_snan = compute_status_flags(POS_ONE_F32, CANONICAL_SNAN_F32, res_snan)
+        self.assertTrue(flags_snan.nan_encountered)
+        self.assertTrue(flags_snan.invalid_op)
+
+    def test_simd_vector_condition_mask(self) -> None:
+        """Verify SIMD lane mask generation from per-lane status condition codes."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        for lane in range(32):
+            val = -1.0 if lane % 2 == 0 else 1.0
+            state.set_vgpr(lane, 1, f32_to_bits(val))
+            state.set_vgpr(lane, 2, POS_ZERO_F32)
+
+        interp = SIMDInterpreter()
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+
+        results = interp.step(instr, state)
+        vcc_neg_mask = 0
+        for lane in range(32):
+            res = results[lane]
+            assert res is not None
+            flags = compute_status_flags(state.get_vgpr(lane, 1), state.get_vgpr(lane, 2), res)
+            if flags.ch0_negative:
+                vcc_neg_mask |= (1 << lane)
+
+        # Even lanes should have ch0_negative=True (mask = 0x55555555)
+        self.assertEqual(vcc_neg_mask, 0x55555555)
+
+
 if __name__ == "__main__":
     unittest.main()
