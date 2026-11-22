@@ -30,6 +30,12 @@ VOP2_INT_OPS = (
     "v_and_b32_e32", "v_or_b32_e32", "v_xor_b32_e32",
     "v_add_nc_u32_e32", "v_sub_nc_u32_e32", "v_subrev_nc_u32_e32",
 )
+# The 32-bit no-carry forms of nc_integer_group(1..3), as ACCEPTED records them (first word of the line).
+NC_INT_OPS = (
+    "v_add_nc_u32_e32", "v_sub_nc_u32_e32", "v_subrev_nc_u32_e32",
+    "v_add_nc_u32_e64", "v_sub_nc_u32_e64", "v_subrev_nc_u32_e64",
+    "v_add_nc_i32", "v_sub_nc_i32",
+)
 
 
 def lower(instructions, *args, **kwargs):
@@ -347,6 +353,7 @@ def translate(instructions):
 
 
 def translate_int(instructions):
+    """translate() for a program that exports through the bit-exact R32G32B32A32_UINT target."""
     return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True)
 
 
@@ -3315,6 +3322,39 @@ def vop2_integer_group() -> list[str]:
         "v_sub_nc_u32_e32 v15, s44, v18",
         "v_subrev_nc_u32_e32 v16, s44, v18",
     ])
+
+
+# Bodies for uncompressed_export(): s44 = A and s45 = B from the constants, v18 = B, and each channel v12..v15
+# holds its own result. Group 3 uses inline constants and register-first operands.
+NC_INT_BODIES = {
+    1: ["v_add_nc_u32_e64 v12, s44, v18", "v_sub_nc_u32_e64 v13, s44, v18",
+        "v_subrev_nc_u32_e32 v14, s44, v18", "v_subrev_nc_u32_e64 v15, s44, v18"],
+    2: ["v_add_nc_i32 v12, s44, v18", "v_sub_nc_i32 v13, s44, v18",
+        "v_add_nc_u32_e32 v14, s44, v18", "v_sub_nc_u32_e32 v15, s44, v18"],
+    3: ["v_subrev_nc_u32_e64 v12, 64, v18", "v_add_nc_i32 v13, 64, v18",
+        "v_sub_nc_u32_e64 v14, s44, 64", "v_subrev_nc_u32_e64 v15, v18, s44"],
+}
+# Reference results by group, from the operand order A (s44) and B (s45): sub is src0 - src1 and subrev is
+# src1 - src0, both modulo 2**32. Both follow the translator's float subrev convention; see the docs.
+NC_INT_RESULTS = {
+    1: lambda a, b: (a + b, a - b, b - a, b - a),
+    2: lambda a, b: (a + b, a - b, a + b, a - b),
+    3: lambda a, b: (b - 64, 64 + b, a - 64, a - b),
+}
+# (A, B) as binary32 words; the inputs and every result are normal numbers or zero (asserted at the draw).
+NC_INT_ROWS = (
+    (0xC0000000, 0x7F000000),  # unsigned wrap
+    (0x7F000000, 0x3F800000),  # signed overflow
+    (0x40400000, 0x3E800000),  # sub differs from subrev
+    (0x3E800000, 0x40400000),  # borrow
+    (0x80800000, 0x80800000),  # high-bit wrap, sub is zero
+)
+
+
+def nc_integer_group(group):
+    return ["v_mov_b32_e32 v18, s45", *NC_INT_BODIES[group]]
+
+
 def pack_f16_pair(lo, hi):
     lo_b = struct.unpack("<H", struct.pack("<e", lo))[0]
     hi_b = struct.unpack("<H", struct.pack("<e", hi))[0]
@@ -3573,6 +3613,46 @@ def check_f16_denorm_controls():
     assert "widen16(" in body and "pack16_rne(" in body, body
 
 
+def check_nc_integer_lowering():
+    """Static checks for the 32-bit no-carry add/sub forms of nc_integer_group(1..3)."""
+    # v18 is written by the mov at index 20, and the four group instructions follow at 21..24. A and B are
+    # s44 (params[0].w) and s45. sub is src0 - src1; subrev swaps the operands and is src1 - src0.
+    a, b = "asuint(params[0].w)", "asuint(alu20)"
+    expected = {
+        1: (f"{a} + {b}", f"{a} - {b}", f"{b} - {a}", f"{b} - {a}"),
+        2: (f"{a} + {b}", f"{a} - {b}", f"{a} + {b}", f"{a} - {b}"),
+        3: (f"{b} - 64u", f"64u + {b}", f"{a} - 64u", f"{a} - {b}"),
+    }
+    for group, expressions in expected.items():
+        program = uncompressed_export(nc_integer_group(group))
+        assert program.index("v_mov_b32_e32 v18, s45") == 20, group
+        source = translate_int(program)
+        for offset, expression in enumerate(expressions, start=21):
+            statement = f"    precise float alu{offset} = asfloat({expression});"
+            assert statement in source.splitlines(), (group, statement)
+    assert set(NC_INT_OPS) <= ACCEPTED, set(NC_INT_OPS) - ACCEPTED
+    # sub and subrev with the same operands must not lower alike.
+    sub_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_sub_nc_u32_e64 v12, s44, v18"]))
+    rev_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_subrev_nc_u32_e64 v12, s44, v18"]))
+    assert sub_source != rev_source
+    # Each refused spelling is paired with its nearest accepted one, so a refusal for another reason shows up.
+    for bad, good in (
+        ("v_add_nc_u32_e64 v12, s44, v18 clamp", "v_add_nc_u32_e64 v12, s44, v18"),
+        ("v_subrev_nc_u32_e64 v12, s44, v18 clamp", "v_subrev_nc_u32_e64 v12, s44, v18"),
+        ("v_add_nc_i32 v12, s44, v18 clamp", "v_add_nc_i32 v12, s44, v18"),
+        ("v_sub_nc_i32 v12, s44, v18 clamp", "v_sub_nc_i32 v12, s44, v18"),
+        ("v_add_nc_i32_e64 v12, s44, v18", "v_add_nc_i32 v12, s44, v18"),
+        ("v_sub_nc_u32_e64 v12, abs(v18), v18", "v_sub_nc_u32_e64 v12, v18, v18"),
+        ("v_add_nc_u32_e64 v12, s44, -v18", "v_add_nc_u32_e64 v12, s44, v18"),
+        ("v_subrev_nc_u32_dpp v12, v18, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+         "v_subrev_nc_u32_e32 v12, v18, v18"),
+        ("v_subrev_nc_u32_sdwa v12, v18, v18 src0_sel:DWORD src1_sel:DWORD",
+         "v_subrev_nc_u32_e32 v12, v18, v18"),
+    ):
+        translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
+        must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+
+
 def check_controls(directory):
     # A syntactically valid DPP VGPR must already have a tracked numeric value.
     must_reject(translate, with_constants([
@@ -3653,9 +3733,6 @@ def check_controls(directory):
     ):
         assert expected in vop2_source, expected
     for bad_vop2 in (
-        "v_add_nc_u32_e64 v12, s44, v18",
-        "v_sub_nc_u32_e64 v12, s44, v18",
-        "v_subrev_nc_u32_e64 v12, s44, v18",
         "v_sub_nc_u32_e32 v12, abs(v18), v18",
         "v_subrev_nc_u32_e32 v12, abs(v18), v18",
         "v_and_b32_e32 v12, -v18, v18",
@@ -3664,6 +3741,7 @@ def check_controls(directory):
         "v_and_b32_e32 v12, s44, v106",
     ):
         must_reject(translate, with_constants(["v_mov_b32_e32 v18, s45", bad_vop2]))
+    check_nc_integer_lowering()
     rgb = rgb_sample()
     translate(rgb)
     for old, new in (("v[12:14]", "v[12:15]"), ("dmask:0x7", "dmask:0xb")):
@@ -4543,6 +4621,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True)), translate))
     fixtures.append((uncompressed_export(cvt_int_body(0xFFFFFFFF, 0x80000000, e64=True, clamp=True)), translate))
     fixtures.append((uncompressed_export(cvt_float_body(0x3fc00000, 0xc0300000)), translate_int))
+    fixtures.extend((uncompressed_export(nc_integer_group(group)), translate_int) for group in (1, 2, 3))
     for index, entry in enumerate(fixtures):
         instructions, lower_fixture = entry[:2]
         cpu = entry[2] if len(entry) > 2 else "gfx1013"
@@ -4805,6 +4884,57 @@ def check_subrev_u32_draw(directory, compiler, renderer, backend):
         case.write_bytes(constants + struct.pack("<4I", *words, 0, 0) * 64 + b"\x01")
         cases.append((case, status))
     run_pixel_batch(renderer, backend, shader, cases)
+
+
+def binary32_normal_or_zero(word):
+    """True for a normal binary32 or a signed zero: no NaN, infinity or subnormal pattern."""
+    exponent = (word >> 23) & 0xff
+    return 0 < exponent < 0xff or word & 0x7fffffff == 0
+
+
+def check_integer_nc_draws(directory, compiler, renderer, backend):
+    """Draw the 32-bit no-carry add/sub forms through the integer readback target and compare the words.
+
+    Group 1 and 2 run on every row of NC_INT_ROWS and group 3 on the third row: 11 draws from 3 compiles.
+    The expected words follow the sub and subrev operand order of the translator (see the docs); on a desktop
+    GPU the draws establish that the translated shader computes exactly that, not what the console does.
+    """
+    source = directory / "integer_nc.hlsl"
+    shader = directory / "integer_nc.cso"
+    case = directory / "integer_nc.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+
+    def words_as_floats(words):
+        return tuple(struct.unpack("<f", struct.pack("<I", word))[0] for word in words)
+
+    def expected_words(group, a, b):
+        words = tuple(word & 0xffffffff for word in NC_INT_RESULTS[group](a, b))
+        # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+        assert all(binary32_normal_or_zero(word) for word in (a, b, *words)), (group, hex(a), hex(b))
+        return words
+
+    for group, rows in ((1, NC_INT_ROWS), (2, NC_INT_ROWS), (3, NC_INT_ROWS[2:3])):
+        source.write_text(translate_int(uncompressed_export(nc_integer_group(group))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        for a, b in rows:
+            constants = bytearray(256)
+            struct.pack_into("<II", constants, 12, a, b)
+            words = expected_words(group, a, b)
+            write_case(case, constants, words_as_floats(words), integer_rt=True)
+            subprocess.run(draw, check=True)
+        if group == 1:
+            # Negative control: the third row has A - B != B - A, so swapped sub and subrev words must mismatch.
+            a, b = NC_INT_ROWS[2]
+            constants = bytearray(256)
+            struct.pack_into("<II", constants, 12, a, b)
+            words = expected_words(1, a, b)
+            assert words[1] != words[2]
+            swapped = (words[0], words[2], words[1], words[3])
+            write_case(case, constants, words_as_floats(swapped), integer_rt=True)
+            wrong = subprocess.run(draw, capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                raise AssertionError("Swapped sub and subrev words escaped the integer readback")
+    return 0
 
 
 # v_cvt_f32_u32_e32 and v_cvt_f32_i32_e32 convert one 32-bit word to binary32, reading it unsigned
@@ -6030,9 +6160,11 @@ def main():
     mode, *args = sys.argv[1:]
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
-        if mode in ("draw-blend-scalar", "draw-predicate-rounding"):
+        if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc"):
             try:
-                draw = check_blend_and_scalar_draws if mode == "draw-blend-scalar" else check_predicate_and_rounding_draws
+                draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
+                        "draw-predicate-rounding": check_predicate_and_rounding_draws,
+                        "draw-integer-nc": check_integer_nc_draws}[mode]
                 return draw(directory, *args)
             except subprocess.CalledProcessError as error:
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):

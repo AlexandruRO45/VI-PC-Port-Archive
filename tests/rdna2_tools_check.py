@@ -1320,7 +1320,26 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(is_instruction_supported("v_nop v0"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e32 v1, v2, v3"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e64 v1, v2, v3 clamp"))
-        self.assertTrue(is_instruction_supported("v_subrev_nc_u32_e32 v1, v2, v3"))
+        # The 32-bit no-carry family. The INTEGER_SOURCE class is coarser than the translator, so this
+        # pins the spellings and the refused modifiers, not the operand ranges.
+        for line in (
+            "v_add_nc_u32_e32 v1, v2, v3", "v_sub_nc_u32 v1, s2, 64", "v_subrev_nc_u32_e32 v1, v2, v3",
+            "v_add_nc_u32_e64 v1, s2, v3", "v_sub_nc_u32_e64 v1, s2, 64", "v_subrev_nc_u32_e64 v1, v2, s3",
+            "v_add_nc_i32 v1, s2, v3", "v_sub_nc_i32 v1, 64, v3",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_add_nc_u32_e64 v1, s2, v3 clamp", "v_subrev_nc_u32_e64 v1, s2, v3 clamp",
+            "v_add_nc_i32 v1, s2, v3 clamp", "v_sub_nc_i32 v1, s2, v3 clamp",
+            "v_add_nc_i32_e64 v1, s2, v3", "v_sub_nc_i32_e64 v1, s2, v3",
+            "v_subrev_nc_i32 v1, s2, v3",
+            "v_subrev_nc_u32_dpp v1, v2, v3 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+            "v_subrev_nc_u32_sdwa v1, v2, v3 src0_sel:DWORD src1_sel:DWORD",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_add_nc_i32", "v_sub_nc_i32", "v_subrev_nc_u32_e64"):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
+        self.assertFalse(is_opcode_recognized("v_subrev_nc_i32"))
         self.assertTrue(is_opcode_recognized("v_mov_b32_sdwa"))
         self.assertTrue(is_opcode_recognized("v_cvt_f32_f16_sdwa"))
         self.assertTrue(is_opcode_recognized("v_pk_add_f16"))
