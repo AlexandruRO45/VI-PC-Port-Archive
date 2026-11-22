@@ -83,7 +83,7 @@ WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wr
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
-WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const")
+WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const", "cs_barrier_loop")
 CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
