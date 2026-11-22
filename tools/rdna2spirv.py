@@ -12821,7 +12821,12 @@ def translate(path):
         reads = {r for r in read_before_write_vgprs(insns) if r >= 4}
         if not reads <= predicted:
             raise Unsupported("fetch mapping")
-        g.vertex_inputs = [(reg, ctype) for reg, _, _, ctype in sig]
+        vins = {}
+        for reg, _, _, ctype in sig:
+            if reg in vins and vins[reg] != ctype:
+                raise Unsupported("conflicting vertex input component types")
+            vins[reg] = ctype
+        g.vertex_inputs = sorted(vins.items())
         g.vertex_signature = [{"register": reg, "mask": mask, "system_value": sv, "component_type": ctype}
                               for reg, mask, sv, ctype in sig]
         for reg, _ in g.vertex_inputs:          # register the VGPR index constants before assembly
