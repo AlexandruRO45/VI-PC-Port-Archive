@@ -1333,7 +1333,7 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_add_nc_i32 v1, s2, v3 clamp", "v_sub_nc_i32 v1, s2, v3 clamp",
             "v_add_nc_i32_e64 v1, s2, v3", "v_sub_nc_i32_e64 v1, s2, v3",
             "v_subrev_nc_i32 v1, s2, v3",
-            "v_subrev_nc_u32_dpp v1, v2, v3 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+            "v_subrev_nc_u32_dpp v1, v2, v3 row_shl:1 row_mask:0xf bank_mask:0xf",
             "v_subrev_nc_u32_sdwa v1, v2, v3 src0_sel:DWORD src1_sel:DWORD",
         ):
             self.assertFalse(is_instruction_supported(line), line)

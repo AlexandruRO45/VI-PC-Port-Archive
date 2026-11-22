@@ -3638,6 +3638,8 @@ def check_nc_integer_lowering():
     # A float-written inline constant on an integer form is taken as its binary32 bits, as for the #495 forms.
     float_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_add_nc_u32_e64 v12, 1.0, v18"]))
     assert "1065353216u" in float_source, float_source
+    neg_source = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_add_nc_u32_e64 v12, -1.0, v18"]))
+    assert "3212836864u" in neg_source, neg_source
     # Each refused spelling is paired with its nearest accepted one, so a refusal for another reason shows up.
     for bad, good in (
         ("v_add_nc_u32_e64 v12, s44, v18 clamp", "v_add_nc_u32_e64 v12, s44, v18"),
