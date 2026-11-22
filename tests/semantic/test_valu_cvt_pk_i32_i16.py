@@ -348,5 +348,158 @@ class TestValuCvtPkI32I16AST(unittest.TestCase):
         self.assertEqual(s_lo.eval({}), 0x0000_0042)
         self.assertEqual(s_hi.eval({}), 0xFFFF_FFFF)
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarMachineState:
+    """Architectural register state for a single execution lane."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.vcc: int = 0
+        self.scc: int = 0
+
+    def read_reg(self, reg: Register) -> int:
+        if reg.kind == RegKind.VGPR:
+            if not 0 <= reg.index + reg.count - 1 < 256:
+                raise IndexError(f"VGPR index out of bounds: {reg}")
+            if reg.count == 1:
+                return self.vgprs[reg.index] & MASK32
+            elif reg.count == 2:
+                lo = self.vgprs[reg.index] & MASK32
+                hi = self.vgprs[reg.index + 1] & MASK32
+                return (hi << 32) | lo
+        elif reg.kind == RegKind.SGPR:
+            if not 0 <= reg.index + reg.count - 1 < 106:
+                raise IndexError(f"SGPR index out of bounds: {reg}")
+            if reg.count == 1:
+                return self.sgprs[reg.index] & MASK32
+            elif reg.count == 2:
+                lo = self.sgprs[reg.index] & MASK32
+                hi = self.sgprs[reg.index + 1] & MASK32
+                return (hi << 32) | lo
+        raise TypeError(f"Unknown register kind: {reg.kind}")
+
+    def write_reg(self, reg: Register, val: int) -> None:
+        if reg.kind == RegKind.VGPR:
+            if not 0 <= reg.index + reg.count - 1 < 256:
+                raise IndexError(f"VGPR index out of bounds: {reg}")
+            if reg.count == 1:
+                self.vgprs[reg.index] = val & MASK32
+            elif reg.count == 2:
+                self.vgprs[reg.index] = val & MASK32
+                self.vgprs[reg.index + 1] = (val >> 32) & MASK32
+        elif reg.kind == RegKind.SGPR:
+            if not 0 <= reg.index + reg.count - 1 < 106:
+                raise IndexError(f"SGPR index out of bounds: {reg}")
+            if reg.count == 1:
+                self.sgprs[reg.index] = val & MASK32
+            elif reg.count == 2:
+                self.sgprs[reg.index] = val & MASK32
+                self.sgprs[reg.index + 1] = (val >> 32) & MASK32
+        else:
+            raise TypeError(f"Unknown register kind: {reg.kind}")
+
+    def read_operand(self, op: Operand) -> int:
+        if isinstance(op, Register):
+            return self.read_reg(op)
+        if isinstance(op, Immediate):
+            return op.value & MASK32
+        raise TypeError(f"Invalid operand type: {type(op)}")
+
+
+class ScalarVALUInterpreter:
+    """Deterministic single-lane scalar VALU instruction interpreter."""
+
+    def step(self, inst: Instruction, state: ScalarMachineState) -> None:
+        if inst.opcode == Opcode.V_CVT_PK_I32_I16:
+            s0 = state.read_operand(inst.src0)
+            if inst.src1 is None:
+                d0, d1 = ref_cvt_pk_i32_i16(s0)
+            else:
+                s1 = state.read_operand(inst.src1)
+                d0, d1 = ref_cvt_pk_i32_i16_dual(s0, s1, inst.op_sel)
+            state.write_reg(Register(inst.dst.kind, inst.dst.index, count=1), d0)
+            state.write_reg(Register(inst.dst.kind, inst.dst.index + 1, count=1), d1)
+        elif inst.opcode == Opcode.V_MOV_B32:
+            s0 = state.read_operand(inst.src0)
+            state.write_reg(inst.dst, s0)
+        else:
+            raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+    def run(self, program: List[Instruction], state: ScalarMachineState) -> None:
+        for inst in program:
+            self.step(inst, state)
+
+
+# ==============================================================================
+# Unit Tests: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class TestValuCvtPkI32I16ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_step_single_source_vgpr(self) -> None:
+        self.state.write_reg(Register(RegKind.VGPR, 2), 0xFFFF_0010)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 0, count=2),
+            src0=Register(RegKind.VGPR, 2),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 0)), 0x0000_0010)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 1)), 0xFFFF_FFFF)
+
+    def test_step_dual_source_with_sgpr(self) -> None:
+        self.state.write_reg(Register(RegKind.VGPR, 5), 0x7FFF)
+        self.state.write_reg(Register(RegKind.SGPR, 2), 0x8000)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 6, count=2),
+            src0=Register(RegKind.VGPR, 5),
+            src1=Register(RegKind.SGPR, 2),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 6)), 0x0000_7FFF)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 7)), 0xFFFF_8000)
+
+    def test_step_with_immediate_constant(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_I32_I16,
+            dst=Register(RegKind.VGPR, 10, count=2),
+            src0=Immediate(0xFFFE_0002),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 10)), 0x0000_0002)
+        self.assertEqual(self.state.read_reg(Register(RegKind.VGPR, 11)), 0xFFFF_FFFE)
+
+    def test_sequential_program_determinism(self) -> None:
+        program = [
+            Instruction(Opcode.V_MOV_B32, Register(RegKind.VGPR, 4), Immediate(0x8001_7FFF)),
+            Instruction(
+                Opcode.V_CVT_PK_I32_I16,
+                Register(RegKind.VGPR, 0, count=2),
+                Register(RegKind.VGPR, 4),
+            ),
+        ]
+        self.interp.run(program, self.state)
+        res_v0 = self.state.read_reg(Register(RegKind.VGPR, 0))
+        res_v1 = self.state.read_reg(Register(RegKind.VGPR, 1))
+        self.assertEqual(res_v0, 0x0000_7FFF)
+        self.assertEqual(res_v1, 0xFFFF_8001)
+
+        fresh_state = ScalarMachineState()
+        self.interp.run(program, fresh_state)
+        self.assertEqual(fresh_state.read_reg(Register(RegKind.VGPR, 0)), res_v0)
+        self.assertEqual(fresh_state.read_reg(Register(RegKind.VGPR, 1)), res_v1)
+
 if __name__ == "__main__":
     unittest.main()
