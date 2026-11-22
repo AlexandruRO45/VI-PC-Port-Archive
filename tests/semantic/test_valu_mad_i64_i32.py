@@ -26,7 +26,10 @@ Operands:
 """
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
+import re
 import struct
+from typing import Optional, Union
 import unittest
 
 # Architectural Constants
@@ -122,6 +125,176 @@ def ref_mad_i64_i32_split(s0: int, s1: int, s2_lo: int, s2_hi: int) -> tuple[int
 
 
 # ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+    INLINE_CONST = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Represents a vector register, scalar register, inline constant, or literal."""
+    reg_type: RegType
+    index: int = 0
+    is_64bit: bool = False
+    literal_val: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            max_idx = NUM_VGPRS - 2 if self.is_64bit else NUM_VGPRS - 1
+            if not (0 <= self.index <= max_idx):
+                raise ValueError(
+                    f"VGPR {'pair ' if self.is_64bit else ''}index {self.index} out of range [0, {max_idx}]"
+                )
+        elif self.reg_type == RegType.SGPR:
+            max_idx = NUM_SGPRS - 2 if self.is_64bit else NUM_SGPRS - 1
+            if not (0 <= self.index <= max_idx):
+                raise ValueError(
+                    f"SGPR {'pair ' if self.is_64bit else ''}index {self.index} out of range [0, {max_idx}]"
+                )
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_val is None:
+                raise ValueError("Literal operand requires literal_val")
+            limit = MASK64 if self.is_64bit else MASK32
+            if not (0 <= self.literal_val <= limit):
+                raise ValueError(
+                    f"Literal value {self.literal_val:#x} out of range [0, {limit:#x}]"
+                )
+        elif self.reg_type == RegType.INLINE_CONST:
+            if self.literal_val is None:
+                raise ValueError("Inline constant operand requires literal_val")
+
+    @classmethod
+    def vgpr(cls, index: int, is_64bit: bool = False) -> Operand:
+        return cls(RegType.VGPR, index=index, is_64bit=is_64bit)
+
+    @classmethod
+    def sgpr(cls, index: int, is_64bit: bool = False) -> Operand:
+        return cls(RegType.SGPR, index=index, is_64bit=is_64bit)
+
+    @classmethod
+    def literal(cls, value: int, is_64bit: bool = False) -> Operand:
+        val = to_u64(value) if is_64bit else to_u32(value)
+        return cls(RegType.LITERAL, is_64bit=is_64bit, literal_val=val)
+
+    @classmethod
+    def inline_const(cls, value: int) -> Operand:
+        return cls(RegType.INLINE_CONST, literal_val=value)
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v[{self.index}:{self.index + 1}]" if self.is_64bit else f"v{self.index}"
+        if self.reg_type == RegType.SGPR:
+            return f"s[{self.index}:{self.index + 1}]" if self.is_64bit else f"s{self.index}"
+        if self.reg_type == RegType.LITERAL:
+            assert self.literal_val is not None
+            return f"0x{self.literal_val:016X}" if self.is_64bit else f"0x{self.literal_val:08X}"
+        if self.reg_type == RegType.INLINE_CONST:
+            assert self.literal_val is not None
+            return str(self.literal_val)
+        raise ValueError(f"Unknown RegType: {self.reg_type}")
+
+
+@dataclass(frozen=True)
+class VMadI64I32Instruction:
+    """Symbolic AST node for RDNA2 v_mad_i64_i32 instruction."""
+    dst: Operand
+    sdst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+        if not self.dst.is_64bit:
+            raise ValueError("Destination VGPR must be a 64-bit register pair v[d:d+1]")
+        if self.sdst.reg_type != RegType.SGPR:
+            raise TypeError(f"Scalar destination sdst must be an SGPR, got {self.sdst.reg_type}")
+        if self.src0.is_64bit:
+            raise ValueError("src0 must be a 32-bit operand")
+        if self.src1.is_64bit:
+            raise ValueError("src1 must be a 32-bit operand")
+        if not self.src2.is_64bit:
+            raise ValueError("src2 must be a 64-bit operand (register pair or 64-bit literal)")
+
+    def disassemble(self) -> str:
+        return (
+            f"v_mad_i64_i32 {self.dst.disassemble()}, {self.sdst.disassemble()}, "
+            f"{self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}"
+        )
+
+
+def parse_v_mad_i64_i32(asm_line: str) -> VMadI64I32Instruction:
+    """Parse assembly string into VMadI64I32Instruction AST node."""
+    line = asm_line.strip()
+    if not line.startswith("v_mad_i64_i32"):
+        raise ValueError(f"Expected opcode 'v_mad_i64_i32', got '{line}'")
+
+    args_part = line[len("v_mad_i64_i32"):].strip()
+    tokens = [tok.strip() for tok in args_part.split(",")]
+    if len(tokens) != 5:
+        raise ValueError(f"v_mad_i64_i32 requires 5 operands, got {len(tokens)}: {tokens}")
+
+    def parse_op(tok: str, expect_64bit: bool) -> Operand:
+        # Check VGPR pair: v[x:y]
+        m_vgpr_pair = re.fullmatch(r"v\[(\d+):(\d+)\]", tok)
+        if m_vgpr_pair:
+            lo, hi = int(m_vgpr_pair.group(1)), int(m_vgpr_pair.group(2))
+            if hi != lo + 1:
+                raise ValueError(f"Invalid VGPR pair span: {tok}")
+            return Operand.vgpr(lo, is_64bit=True)
+
+        # Single VGPR: vx
+        m_vgpr = re.fullmatch(r"v(\d+)", tok)
+        if m_vgpr:
+            idx = int(m_vgpr.group(1))
+            return Operand.vgpr(idx, is_64bit=expect_64bit)
+
+        # Check SGPR pair: s[x:y]
+        m_sgpr_pair = re.fullmatch(r"s\[(\d+):(\d+)\]", tok)
+        if m_sgpr_pair:
+            lo, hi = int(m_sgpr_pair.group(1)), int(m_sgpr_pair.group(2))
+            if hi != lo + 1:
+                raise ValueError(f"Invalid SGPR pair span: {tok}")
+            return Operand.sgpr(lo, is_64bit=True)
+
+        # Single SGPR: sx
+        m_sgpr = re.fullmatch(r"s(\d+)", tok)
+        if m_sgpr:
+            idx = int(m_sgpr.group(1))
+            return Operand.sgpr(idx, is_64bit=expect_64bit)
+
+        # Hex literal
+        if tok.startswith("0x") or tok.startswith("-0x"):
+            val = int(tok, 16)
+            return Operand.literal(val, is_64bit=expect_64bit)
+
+        # Integer literal / inline constant
+        try:
+            val = int(tok, 10)
+            if -16 <= val <= 64 and not expect_64bit:
+                return Operand.inline_const(val)
+            return Operand.literal(val, is_64bit=expect_64bit)
+        except ValueError:
+            pass
+
+        raise ValueError(f"Cannot parse operand token: '{tok}'")
+
+    dst = parse_op(tokens[0], expect_64bit=True)
+    sdst = parse_op(tokens[1], expect_64bit=True)
+    src0 = parse_op(tokens[2], expect_64bit=False)
+    src1 = parse_op(tokens[3], expect_64bit=False)
+    src2 = parse_op(tokens[4], expect_64bit=True)
+
+    return VMadI64I32Instruction(dst=dst, sdst=sdst, src0=src0, src1=src1, src2=src2)
+
+
+# ==============================================================================
 # Architectural Hardware Model
 # ==============================================================================
 
@@ -184,62 +357,51 @@ class TestReferenceMathematicalOracle(unittest.TestCase):
     """Exhaustive mathematical verification of pure-Python reference oracle."""
 
     def test_zero_identities(self) -> None:
-        # 0 * x + 0 = 0, carry = 0
         self.assertEqual(ref_mad_i64_i32(0, 0, 0), (0, 0))
         self.assertEqual(ref_mad_i64_i32(0, 12345, 0), (0, 0))
         self.assertEqual(ref_mad_i64_i32(12345, 0, 0), (0, 0))
         self.assertEqual(ref_mad_i64_i32(0, 0, 0x1234_5678_9ABC_DEF0), (0x1234_5678_9ABC_DEF0, 0))
 
     def test_one_identity(self) -> None:
-        # 1 * x + 0 = x, carry = 0
         self.assertEqual(ref_mad_i64_i32(1, 42, 0), (42, 0))
         self.assertEqual(ref_mad_i64_i32(42, 1, 100), (142, 0))
 
     def test_signed_multiplication_signs(self) -> None:
-        # positive * positive
         dst, c = ref_mad_i64_i32(100, 200, 0)
         self.assertEqual(dst, 20000)
         self.assertEqual(c, 0)
 
-        # positive * negative
         dst, c = ref_mad_i64_i32(100, -200, 0)
         expected = to_u64(-20000)
         self.assertEqual(dst, expected)
         self.assertEqual(c, 0)
 
-        # negative * positive
         dst, c = ref_mad_i64_i32(-100, 200, 0)
         self.assertEqual(dst, expected)
         self.assertEqual(c, 0)
 
-        # negative * negative
         dst, c = ref_mad_i64_i32(-100, -200, 0)
         self.assertEqual(dst, 20000)
         self.assertEqual(c, 0)
 
     def test_signed_boundary_products(self) -> None:
-        # INT32_MIN * INT32_MIN = (-2^31) * (-2^31) = 2^62 = 0x4000_0000_0000_0000
         dst, c = ref_mad_i64_i32(INT32_MIN, INT32_MIN, 0)
         self.assertEqual(dst, 0x4000_0000_0000_0000)
         self.assertEqual(c, 0)
 
-        # INT32_MIN * 1 = -2^31 = 0xFFFF_FFFF_8000_0000
         dst, c = ref_mad_i64_i32(INT32_MIN, 1, 0)
         self.assertEqual(dst, to_u64(INT32_MIN))
         self.assertEqual(c, 0)
 
-        # INT32_MIN * -1 = 2^31 = 0x0000_0000_8000_0000
         dst, c = ref_mad_i64_i32(INT32_MIN, -1, 0)
         self.assertEqual(dst, 0x8000_0000)
         self.assertEqual(c, 0)
 
-        # INT32_MAX * INT32_MAX = (2^31 - 1)^2 = 2^62 - 2^32 + 1
         expected = (INT32_MAX * INT32_MAX) & MASK64
         dst, c = ref_mad_i64_i32(INT32_MAX, INT32_MAX, 0)
         self.assertEqual(dst, expected)
         self.assertEqual(c, 0)
 
-        # INT32_MIN * INT32_MAX = (-2^31) * (2^31 - 1) = -2^62 + 2^31
         expected = (INT32_MIN * INT32_MAX) & MASK64
         dst, c = ref_mad_i64_i32(INT32_MIN, INT32_MAX, 0)
         self.assertEqual(dst, expected)
@@ -263,19 +425,14 @@ class TestReferenceMathematicalOracle(unittest.TestCase):
                     self.assertEqual(c1, c2)
 
     def test_carry_out_generation_boundary(self) -> None:
-        # (-1 * 1) = -1 (0xFFFF_FFFF_FFFF_FFFF).
-        # Adding 1 gives 0x1_0000_0000_0000_0000 -> dst = 0, carry = 1
         dst, c = ref_mad_i64_i32(-1, 1, 1)
         self.assertEqual(dst, 0)
         self.assertEqual(c, 1)
 
-        # Adding 0 gives 0xFFFF_FFFF_FFFF_FFFF -> dst = MASK64, carry = 0
         dst, c = ref_mad_i64_i32(-1, 1, 0)
         self.assertEqual(dst, MASK64)
         self.assertEqual(c, 0)
 
-        # Max positive product with s2 = UINT64_MAX:
-        # 1 * 1 + UINT64_MAX = 0 with carry = 1
         dst, c = ref_mad_i64_i32(1, 1, UINT64_MAX)
         self.assertEqual(dst, 0)
         self.assertEqual(c, 1)
@@ -311,6 +468,105 @@ class TestReferenceMathematicalOracle(unittest.TestCase):
             rf.read_sgpr(106)
         with self.assertRaises(IndexError):
             rf.read_sgpr_64(105)
+
+
+# ==============================================================================
+# Unit Tests: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class TestSymbolicAST(unittest.TestCase):
+    """Validation and syntax testing for AST nodes and operand expressions."""
+
+    def test_operand_creation_valid(self) -> None:
+        v0_64 = Operand.vgpr(0, is_64bit=True)
+        self.assertEqual(v0_64.reg_type, RegType.VGPR)
+        self.assertEqual(v0_64.index, 0)
+        self.assertTrue(v0_64.is_64bit)
+        self.assertEqual(v0_64.disassemble(), "v[0:1]")
+
+        s2_64 = Operand.sgpr(2, is_64bit=True)
+        self.assertEqual(s2_64.disassemble(), "s[2:3]")
+
+        v5 = Operand.vgpr(5, is_64bit=False)
+        self.assertEqual(v5.disassemble(), "v5")
+
+        lit32 = Operand.literal(0x12345678, is_64bit=False)
+        self.assertEqual(lit32.disassemble(), "0x12345678")
+
+        lit64 = Operand.literal(0x1234_5678_9ABC_DEF0, is_64bit=True)
+        self.assertEqual(lit64.disassemble(), "0x123456789ABCDEF0")
+
+        inline = Operand.inline_const(42)
+        self.assertEqual(inline.disassemble(), "42")
+
+    def test_operand_index_bounds(self) -> None:
+        Operand.vgpr(254, is_64bit=True)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(255, is_64bit=True)
+
+        Operand.sgpr(104, is_64bit=True)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(105, is_64bit=True)
+
+    def test_instruction_creation_valid(self) -> None:
+        instr = VMadI64I32Instruction(
+            dst=Operand.vgpr(0, is_64bit=True),
+            sdst=Operand.sgpr(2, is_64bit=True),
+            src0=Operand.vgpr(4),
+            src1=Operand.sgpr(6),
+            src2=Operand.vgpr(8, is_64bit=True),
+        )
+        self.assertEqual(instr.disassemble(), "v_mad_i64_i32 v[0:1], s[2:3], v4, s6, v[8:9]")
+
+    def test_instruction_destination_vgpr_validation(self) -> None:
+        with self.assertRaises(TypeError):
+            VMadI64I32Instruction(
+                dst=Operand.sgpr(0, is_64bit=True),
+                sdst=Operand.sgpr(2, is_64bit=True),
+                src0=Operand.vgpr(4),
+                src1=Operand.vgpr(5),
+                src2=Operand.vgpr(6, is_64bit=True),
+            )
+
+        with self.assertRaises(ValueError):
+            VMadI64I32Instruction(
+                dst=Operand.vgpr(0, is_64bit=False),  # Not 64-bit pair
+                sdst=Operand.sgpr(2, is_64bit=True),
+                src0=Operand.vgpr(4),
+                src1=Operand.vgpr(5),
+                src2=Operand.vgpr(6, is_64bit=True),
+            )
+
+    def test_instruction_operand_width_validation(self) -> None:
+        # src0 cannot be 64-bit
+        with self.assertRaises(ValueError):
+            VMadI64I32Instruction(
+                dst=Operand.vgpr(0, is_64bit=True),
+                sdst=Operand.sgpr(2, is_64bit=True),
+                src0=Operand.vgpr(4, is_64bit=True),
+                src1=Operand.vgpr(6),
+                src2=Operand.vgpr(8, is_64bit=True),
+            )
+        # src2 must be 64-bit
+        with self.assertRaises(ValueError):
+            VMadI64I32Instruction(
+                dst=Operand.vgpr(0, is_64bit=True),
+                sdst=Operand.sgpr(2, is_64bit=True),
+                src0=Operand.vgpr(4),
+                src1=Operand.vgpr(6),
+                src2=Operand.vgpr(8, is_64bit=False),
+            )
+
+    def test_parse_assembly_roundtrip(self) -> None:
+        asm = "v_mad_i64_i32 v[0:1], s[2:3], v4, s6, v[8:9]"
+        instr = parse_v_mad_i64_i32(asm)
+        self.assertEqual(instr.disassemble(), asm)
+
+        asm_lit = "v_mad_i64_i32 v[10:11], s[0:1], 42, -5, 0x0000000000001000"
+        instr_lit = parse_v_mad_i64_i32(asm_lit)
+        self.assertEqual(instr_lit.dst.index, 10)
+        self.assertEqual(instr_lit.src0.literal_val, 42)
+        self.assertEqual(instr_lit.src1.literal_val, -5)
 
 
 if __name__ == "__main__":
