@@ -489,6 +489,19 @@ OpStore %f32_control %control
         self.assertEqual(run_word("%b = OpLogicalAnd %bool %t %f\n%res = OpSelect %uint %b %c1 %c2\n"), 2)
         self.assertEqual(run_word("%b = OpLogicalOr %bool %f %t\n%res = OpSelect %uint %b %c1 %c2\n"), 1)
 
+    def test_a_nan_the_operation_creates_is_the_same_on_every_host(self):
+        floats = "%inf = OpBitcast %float %cInf\n%zero = OpBitcast %float %c0\n"
+        for op in ("OpFMul %float %zero %inf", "OpFMul %float %inf %zero", "OpFSub %float %inf %inf",
+                   "OpFAdd %float %inf %ninf", "OpExtInst %float %glsl Fma %zero %inf %f1"):
+            with self.subTest(op=op):
+                body = floats + "%ninf = OpFNegate %float %inf\n" + f"%x = {op}\n%res = OpBitcast %uint %x\n"
+                self.assertEqual(run_word(body), 0xFFC00000)
+        header = HEADER.replace("%main = OpFunction", "%cNaN = OpConstant %uint 2143289345\n%main = OpFunction")
+        for op in ("OpFAdd %float %nan %f1", "OpFMul %float %nan %f2", "OpExtInst %float %glsl Fma %nan %f2 %f1"):
+            with self.subTest(op=op, propagated=True):
+                text = header + f"%nan = OpBitcast %float %cNaN\n%x = {op}\n%res = OpBitcast %uint %x\n"
+                self.assertEqual(si.run_fragment(text + "OpStore %out %res\n" + FOOTER)["%out"][0], 0x7FC00001)
+
     def test_ordered_integer_comparisons(self):
         # 2 vs 0xFFFFFFFF: unsigned 2 < 4294967295, signed 2 > -1
         for op, want in (("OpULessThan", 1), ("OpULessThanEqual", 1), ("OpUGreaterThan", 0),
