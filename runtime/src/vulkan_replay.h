@@ -1869,7 +1869,9 @@ namespace detail {
 // Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
 // typeless texture is viewed as the format the pipeline renders.
 template<typename Resolve>
-ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, Prepared& p) {
+ReplayResult prepare_draw(const Draw& draw, std::span<const TargetView> render_targets,
+                          std::span<const VertexBufferView> vertex_buffers, Resolve&& resolve,
+                          const ReplayFunctions& vk, Prepared& p) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
         !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
         !vk.set_primitive_topology || !vk.set_primitive_restart_enable || !vk.set_stencil_reference ||
@@ -1889,8 +1891,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     };
 
     p.colors.assign(pipeline->color_formats.size(), {});
-    for (std::size_t slot = 0; slot < draw.render_target_count && slot < draw.render_targets.size() && slot < p.colors.size(); ++slot) {
-        const TargetView& target = draw.render_targets[slot];
+    for (std::size_t slot = 0; slot < render_targets.size() && slot < p.colors.size(); ++slot) {
+        const TargetView& target = render_targets[slot];
         if (!target.resource) continue;
         const ResourceBinding* binding = resolve(target.resource);
         if (!binding) return ReplayResult::unresolved_resource;
@@ -1948,7 +1950,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         p.vertex_offsets.resize(slot + 1, 0);
         p.vertex_sizes.resize(slot + 1, VK_WHOLE_SIZE);
         p.vertex_strides.resize(slot + 1, 0);
-        const bool bound = slot < draw.vertex_buffers.size() && draw.vertex_buffers[slot].va;
+        const bool bound = slot < vertex_buffers.size() && vertex_buffers[slot].va;
         if (!bound) {
             if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
             p.vertex_buffers[slot] = vk.zero_buffer;
@@ -1957,7 +1959,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             p.vertex_strides[slot] = 0;
             continue;
         }
-        const VertexBufferView& view = draw.vertex_buffers[slot];
+        const VertexBufferView& view = vertex_buffers[slot];
         std::uint64_t size = view.size;
         if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))
             return ReplayResult::unresolved_resource;
@@ -2746,7 +2748,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
-            if (const auto r = detail::prepare_draw(*draw, resolve, vk, p); r != ReplayResult::success) return r;
+            if (const auto r = detail::prepare_draw(*draw, list.draw_render_targets(*draw),
+                                                    list.draw_vertex_buffers(*draw), resolve, vk, p);
+                r != ReplayResult::success)
+                return r;
         }
     }
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;

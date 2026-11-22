@@ -395,28 +395,29 @@ struct IndexBufferView {
 // DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
 // render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
 // the draw. resource 0 marks an unbound render-target slot or no depth buffer.
-// Render targets and vertex buffer views are inlined (8 simultaneous targets, 32 input slots), eliminating heap allocations
-// during command list recording (D3D-289).
+// Render targets and vertex buffer views live out of line in CommandList's own storage (reused across reset()),
+// keeping Command compact without per-draw heap allocations (D3D-391).
 struct Draw {
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
-    std::array<TargetView, 8> render_targets{};
     TargetView depth{};
-    std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
     IndexBufferView index{};
-    std::uint32_t topology = 0;  // D3D_PRIMITIVE_TOPOLOGY
     Viewport viewport{};       // the first; more viewports are not modelled yet
     Rect scissor{};            // the first; D3D12 always scissors
     std::array<float, 4> blend_factor{1, 1, 1, 1};
+    std::uint32_t topology = 0;  // D3D_PRIMITIVE_TOPOLOGY
     std::uint32_t stencil_front = 0;
     std::uint32_t stencil_back = 0;
-    bool indexed = false;
     std::uint32_t count = 0;  // vertices or indices per instance
     std::uint32_t instances = 0;
     std::uint32_t first = 0;  // first vertex or first index
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
-    std::uint32_t render_target_count = 8;
+    std::uint32_t render_target_offset = 0;
+    std::uint32_t render_target_count = 0;
+    std::uint32_t vertex_buffer_offset = 0;
+    std::uint32_t vertex_buffer_count = 0;
+    bool indexed = false;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -713,15 +714,29 @@ public:
     }
 
     // A draw with no vertices or instances does nothing in D3D12, and is not recorded.
-    bool draw(const Draw& draw) {
+    bool draw(Draw draw, std::span<const TargetView> render_targets = {},
+              std::span<const VertexBufferView> vertex_buffers = {}) {
         if (!draw.pipeline) return false;
         if (!draw.count || !draw.instances) return !closed_;
-        return append(draw);
-    }
-    bool draw(Draw&& draw) {
-        if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances) return !closed_;
-        return append(std::move(draw));
+        if (closed_) return false;
+
+        const std::size_t rt_count = std::min<std::size_t>(render_targets.size(), 8);
+        draw.render_target_offset = static_cast<std::uint32_t>(draw_render_targets_.size());
+        draw.render_target_count = static_cast<std::uint32_t>(rt_count);
+        if (rt_count)
+            draw_render_targets_.insert(draw_render_targets_.end(), render_targets.begin(),
+                                        render_targets.begin() + std::ptrdiff_t(rt_count));
+
+        std::size_t vb_count = std::min<std::size_t>(vertex_buffers.size(), 32);
+        while (vb_count > 0 && !vertex_buffers[vb_count - 1].va) --vb_count;
+        draw.vertex_buffer_offset = static_cast<std::uint32_t>(draw_vertex_buffers_.size());
+        draw.vertex_buffer_count = static_cast<std::uint32_t>(vb_count);
+        if (vb_count)
+            draw_vertex_buffers_.insert(draw_vertex_buffers_.end(), vertex_buffers.begin(),
+                                        vertex_buffers.begin() + std::ptrdiff_t(vb_count));
+
+        commands_.push_back(std::move(draw));
+        return true;
     }
 
     // ClearRenderTargetView; the resource must be in render_target state at execution. No rects: the whole view.
@@ -786,9 +801,20 @@ public:
     bool execute_bundle(const CommandList& bundle, std::size_t first = 0, std::size_t last = std::size_t(-1)) {
         if (this == &bundle || closed_ || !bundle.closed_) return false;
         last = std::min(last, bundle.commands_.size());
-        if (first < last)
-            commands_.insert(commands_.end(), bundle.commands_.begin() + std::ptrdiff_t(first),
-                             bundle.commands_.begin() + std::ptrdiff_t(last));
+        for (std::size_t i = first; i < last; ++i) {
+            commands_.push_back(bundle.commands_[i]);
+            if (auto* d = std::get_if<Draw>(&commands_.back())) {
+                const auto rts = bundle.draw_render_targets(*d);
+                d->render_target_offset = static_cast<std::uint32_t>(draw_render_targets_.size());
+                d->render_target_count = static_cast<std::uint32_t>(rts.size());
+                if (!rts.empty()) draw_render_targets_.insert(draw_render_targets_.end(), rts.begin(), rts.end());
+
+                const auto vbs = bundle.draw_vertex_buffers(*d);
+                d->vertex_buffer_offset = static_cast<std::uint32_t>(draw_vertex_buffers_.size());
+                d->vertex_buffer_count = static_cast<std::uint32_t>(vbs.size());
+                if (!vbs.empty()) draw_vertex_buffers_.insert(draw_vertex_buffers_.end(), vbs.begin(), vbs.end());
+            }
+        }
         return true;
     }
 
@@ -869,6 +895,8 @@ public:
     bool reset() {
         if (!closed_) return false;
         commands_.clear();
+        draw_render_targets_.clear();
+        draw_vertex_buffers_.clear();
         active_.clear();
         closed_ = false;
         return true;
@@ -876,6 +904,18 @@ public:
 
     bool closed() const { return closed_; }
     std::span<const Command> commands() const { return commands_; }
+    std::span<const TargetView> draw_render_targets(const Draw& draw) const {
+        if (!draw.render_target_count || draw.render_target_offset >= draw_render_targets_.size()) return {};
+        const std::size_t count = std::min<std::size_t>(
+            draw.render_target_count, draw_render_targets_.size() - draw.render_target_offset);
+        return {draw_render_targets_.data() + draw.render_target_offset, count};
+    }
+    std::span<const VertexBufferView> draw_vertex_buffers(const Draw& draw) const {
+        if (!draw.vertex_buffer_count || draw.vertex_buffer_offset >= draw_vertex_buffers_.size()) return {};
+        const std::size_t count = std::min<std::size_t>(
+            draw.vertex_buffer_count, draw_vertex_buffers_.size() - draw.vertex_buffer_offset);
+        return {draw_vertex_buffers_.data() + draw.vertex_buffer_offset, count};
+    }
 
 private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
@@ -912,6 +952,8 @@ private:
     }
 
     std::vector<Command> commands_;
+    std::vector<TargetView> draw_render_targets_;
+    std::vector<VertexBufferView> draw_vertex_buffers_;
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
     bool closed_ = false;
 };

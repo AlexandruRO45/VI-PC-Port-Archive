@@ -307,5 +307,44 @@ int main() {
     CHECK(query_fits_heap(h::so_statistics, q::so_statistics_stream3) && !query_fits_heap(6, q::occlusion));
     CHECK(query_result_size(q::occlusion) == 8 && query_result_size(q::timestamp) == 8);
     CHECK(query_result_size(q::pipeline_statistics) == 88 && query_result_size(q::so_statistics_stream0) == 0);
+
+    // Draw views live out of line in CommandList's own storage, keeping Command <= 328 bytes (D3D-391)
+    // and rebasing offsets when a bundle is executed into a parent list.
+    static_assert(sizeof(Command) <= 328);
+    CHECK(list.close() && list.reset());
+    const TargetView rts1[2] = {{11, 0, 0, 1}, {12, 1, 2, 1}};
+    const VertexBufferView vbs1[4] = {{0x1000, 64, 16}, {}, {0x2000, 128, 32}, {}};
+    Draw d1{};
+    d1.pipeline = 0x10;
+    d1.count = 3;
+    d1.instances = 1;
+    CHECK(list.draw(d1, rts1, vbs1));
+    CHECK(list.draw_render_targets(std::get<Draw>(list.commands()[0])).size() == 2);
+    CHECK(list.draw_render_targets(std::get<Draw>(list.commands()[0]))[1].resource == 12);
+    // Trailing unbound vertex buffer slot (slot 3) is trimmed; slot 2 is preserved.
+    CHECK(list.draw_vertex_buffers(std::get<Draw>(list.commands()[0])).size() == 3);
+    CHECK(list.draw_vertex_buffers(std::get<Draw>(list.commands()[0]))[2].va == 0x2000);
+    CHECK(list.close());
+
+    CommandList draw_bundle;
+    const TargetView rts2[1] = {{21, 0, 0, 1}};
+    const VertexBufferView vbs2[1] = {{0x3000, 48, 12}};
+    Draw d2{};
+    d2.pipeline = 0x20;
+    d2.count = 6;
+    d2.instances = 2;
+    CHECK(draw_bundle.draw(d2, rts2, vbs2));
+    CHECK(draw_bundle.close());
+
+    CHECK(list.reset());
+    CHECK(list.draw(d1, rts1, vbs1));
+    CHECK(list.execute_bundle(draw_bundle));
+    CHECK(list.close());
+    CHECK(list.commands().size() == 2);
+    const auto& first_draw = std::get<Draw>(list.commands()[0]);
+    const auto& bundle_draw = std::get<Draw>(list.commands()[1]);
+    CHECK(list.draw_render_targets(first_draw).size() == 2 && list.draw_render_targets(first_draw)[0].resource == 11);
+    CHECK(list.draw_render_targets(bundle_draw).size() == 1 && list.draw_render_targets(bundle_draw)[0].resource == 21);
+    CHECK(list.draw_vertex_buffers(bundle_draw).size() == 1 && list.draw_vertex_buffers(bundle_draw)[0].va == 0x3000);
     return 0;
 }

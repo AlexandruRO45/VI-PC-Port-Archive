@@ -31,8 +31,7 @@ struct Ref {
 
 static_assert(std::is_move_constructible_v<leonida::Draw>);
 static_assert(std::is_move_assignable_v<leonida::Draw>);
-static_assert(sizeof(leonida::Draw::render_targets) == sizeof(leonida::TargetView) * 8);
-static_assert(sizeof(leonida::Draw::vertex_buffers) == sizeof(leonida::VertexBufferView) * 32);
+static_assert(sizeof(leonida::Command) <= 328);
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--trace-d3d12") == 0) rt::d3d12_trace::set_enabled(true);
