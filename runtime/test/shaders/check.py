@@ -84,7 +84,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_flbit_mask", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec", "cs_w32_fcmpswap", "cs_w32_permlane_fi")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
@@ -92,7 +92,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const",
-                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi")
+                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi", "cs_w32_flbit_mask")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -117,6 +117,7 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # ops merged on 2026-11-22 with CPU-only checks (derivations in cs_w32_new_ops.asm)
             # ds_cmpst_f32 and buffer_atomic_fcmpswap: float compare (cs_w32_fcmpswap.asm)
             ("cs_w32_fcmpswap", [0, 0x3F800000, 0x7FC00000, 0x3F800000, 0x80000000, 0x40400000, 0x3F800000, 0x7FC00000]),
+            ("cs_w32_flbit_mask", [19, 19, 0, 12, 1, 19, 19, 0]),
             ("cs_w32_new_ops", [0x55, 0x8001, 0xC0000000, 0x80014000, 0x4000FFFF, 0x77, 0x99, 0x1234]),
             ("cs_w32_misc_ext", [0x0FFF0FFF, 0xE2C4A688, 0x0007FFFF, 0x7FFF8000, 0xFFFE0002, 0xFFFF0005, 0x509, 0xCAFEF00D]),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
