@@ -46,6 +46,7 @@ public:
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
+    bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
 
     Device() = default;
     Device(const Device&) = delete;
@@ -246,16 +247,38 @@ public:
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
+
+        // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
+        const auto enumerate_extensions =
+            instance_fn<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
+        std::uint32_t device_extension_count = 0;
+        enumerate_extensions(physical, nullptr, &device_extension_count, nullptr);
+        std::vector<VkExtensionProperties> device_extensions_available(device_extension_count);
+        enumerate_extensions(physical, nullptr, &device_extension_count, device_extensions_available.data());
+        VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
+        for (const auto& extension : device_extensions_available) {
+            if (std::strcmp(extension.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_copy};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            host_image_copy = host_copy.hostImageCopy == VK_TRUE;
+        }
+        const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
+        if (host_image_copy) {
+            host_copy.pNext = enable13.pNext;  // after the conditional rendering features, if any
+            enable13.pNext = &host_copy;
+        }
+
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.pEnabledFeatures = &enable;
-        const char* extension_names[2];
-        std::uint32_t extension_count = 0;
-        if (conditional_rendering) extension_names[extension_count++] = conditional_extension;
-        if (presentation) extension_names[extension_count++] = "VK_KHR_swapchain";
-        device_info.enabledExtensionCount = extension_count;
-        device_info.ppEnabledExtensionNames = extension_names;
+        std::vector<const char*> device_extensions;
+        if (conditional_rendering) device_extensions.push_back(conditional_extension);
+        if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+        if (presentation) device_extensions.push_back("VK_KHR_swapchain");
+        device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
+        device_info.ppEnabledExtensionNames = device_extensions.data();
         if (instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device) != VK_SUCCESS)
             return false;
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
