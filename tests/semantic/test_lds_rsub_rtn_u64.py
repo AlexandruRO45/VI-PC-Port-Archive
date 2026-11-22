@@ -140,6 +140,179 @@ class LDSMemory64:
         return old_val, new_mem
 
 
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class RegKind(enum.Enum):
+    """Register file domain."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Symbolic register operand representation."""
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= 256:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count not in (1, 2, 4):
+            raise ValueError(f"Unsupported register count: {self.count}")
+        if self.index + self.count > 256:
+            raise ValueError(f"Register range exceeds register file boundary: {self.index}")
+
+    @property
+    def is_vgpr(self) -> bool:
+        return self.kind == RegKind.VGPR
+
+    @property
+    def is_sgpr(self) -> bool:
+        return self.kind == RegKind.SGPR
+
+    def format_asm(self) -> str:
+        if self.count > 1:
+            return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+        return f"{self.kind.value}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class DSOffset:
+    """Immediate byte offset modifier for DS instructions."""
+    offset16: int = 0
+
+    def __post_init__(self) -> None:
+        if self.offset16 < 0 or self.offset16 > 65535:
+            raise ValueError(f"offset16 must be in unsigned 16-bit range [0, 65535]: {self.offset16}")
+
+
+class Opcode(enum.Enum):
+    """LDS 64-bit instruction opcodes."""
+    DS_RSUB_RTN_U64 = "ds_rsub_rtn_u64"
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST node representing a ds_rsub_rtn_u64 instruction."""
+    opcode: Opcode
+    vdst: Register
+    vaddr: Register
+    vdata0: Register
+    offset: DSOffset = dataclasses.field(default_factory=DSOffset)
+
+    def __post_init__(self) -> None:
+        if not self.vdst.is_vgpr or self.vdst.count != 2:
+            raise ValueError(f"vdst must be a 64-bit VGPR pair (count=2): {self.vdst}")
+        if not self.vaddr.is_vgpr or self.vaddr.count != 1:
+            raise ValueError(f"vaddr must be a single 32-bit VGPR (count=1): {self.vaddr}")
+        if not self.vdata0.is_vgpr or self.vdata0.count != 2:
+            raise ValueError(f"vdata0 must be a 64-bit VGPR pair (count=2): {self.vdata0}")
+
+    def to_assembly(self) -> str:
+        vd_str = self.vdst.format_asm()
+        va_str = self.vaddr.format_asm()
+        v0_str = self.vdata0.format_asm()
+        off_str = f" offset:{self.offset.offset16}" if self.offset.offset16 != 0 else ""
+        return f"{self.opcode.value} {vd_str}, {va_str}, {v0_str}{off_str}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Symbolic sequence of LDS instructions."""
+    instructions: list[Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, inst: Instruction) -> None:
+        self.instructions.append(inst)
+
+    def to_assembly(self) -> str:
+        return "\n".join(inst.to_assembly() for inst in self.instructions)
+
+
+class TestLdsRsubRtnU64AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_construction(self) -> None:
+        v0_pair = Register(RegKind.VGPR, 0, count=2)
+        v2 = Register(RegKind.VGPR, 2, count=1)
+        v4_pair = Register(RegKind.VGPR, 4, count=2)
+        self.assertEqual(v0_pair.format_asm(), "v[0:1]")
+        self.assertEqual(v2.format_asm(), "v2")
+        self.assertEqual(v4_pair.format_asm(), "v[4:5]")
+
+    def test_instruction_formatting(self) -> None:
+        inst_no_off = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+        )
+        self.assertEqual(inst_no_off.to_assembly(), "ds_rsub_rtn_u64 v[0:1], v2, v[4:5]")
+
+        inst_with_off = Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 6, count=2),
+            vaddr=Register(RegKind.VGPR, 8, count=1),
+            vdata0=Register(RegKind.VGPR, 10, count=2),
+            offset=DSOffset(offset16=256),
+        )
+        self.assertEqual(inst_with_off.to_assembly(), "ds_rsub_rtn_u64 v[6:7], v8, v[10:11] offset:256")
+
+    def test_instruction_validation(self) -> None:
+        # vdst cannot be count=1
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_RSUB_RTN_U64,
+                vdst=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                vdata0=Register(RegKind.VGPR, 4, count=2),
+            )
+
+        # vaddr cannot be count=2
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_RSUB_RTN_U64,
+                vdst=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=2),
+                vdata0=Register(RegKind.VGPR, 4, count=2),
+            )
+
+        # vdata0 cannot be SGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_RSUB_RTN_U64,
+                vdst=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2, count=1),
+                vdata0=Register(RegKind.SGPR, 4, count=2),
+            )
+
+    def test_offset_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            DSOffset(offset16=-1)
+        with self.assertRaises(ValueError):
+            DSOffset(offset16=65536)
+
+    def test_program_assembly(self) -> None:
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 4, count=2),
+            offset=DSOffset(offset16=8),
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.DS_RSUB_RTN_U64,
+            vdst=Register(RegKind.VGPR, 6, count=2),
+            vaddr=Register(RegKind.VGPR, 2, count=1),
+            vdata0=Register(RegKind.VGPR, 8, count=2),
+        ))
+        expected = "ds_rsub_rtn_u64 v[0:1], v2, v[4:5] offset:8\nds_rsub_rtn_u64 v[6:7], v2, v[8:9]"
+        self.assertEqual(prog.to_assembly(), expected)
+
+
 class TestLDSMemoryAndOracle64(unittest.TestCase):
     """Unit tests for reference mathematical oracle and architectural LDS 64-bit memory model."""
 
