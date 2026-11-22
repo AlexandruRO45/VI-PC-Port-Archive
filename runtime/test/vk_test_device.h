@@ -105,6 +105,7 @@ public:
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    bool depth_bias_exact = false;  // VK_EXT_depth_bias_control with depthBiasControl and depthBiasExact enabled
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
@@ -500,6 +501,23 @@ public:
             *v13_.next() = &custom_border;
         }
 
+        // VK_EXT_depth_bias_control with depthBiasExact where the device has it: D3D's depth bias is exactly one
+        // step of the depth format, which Vulkan only promises with depthBiasExact.
+        VkPhysicalDeviceDepthBiasControlFeaturesEXT bias_control{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &bias_control};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            depth_bias_exact = bias_control.depthBiasControl == VK_TRUE && bias_control.depthBiasExact == VK_TRUE;
+        }
+        if (depth_bias_exact) {
+            bias_control.leastRepresentableValueForceUnormRepresentation = VK_FALSE;
+            bias_control.floatRepresentation = VK_FALSE;
+            bias_control.pNext = *v13_.next();
+            *v13_.next() = &bias_control;
+        }
+
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
         device_info.pQueueCreateInfos = queue_infos.data();
@@ -539,6 +557,7 @@ public:
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
+        if (depth_bias_exact) device_extensions.push_back(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

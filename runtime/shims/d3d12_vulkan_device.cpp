@@ -2871,6 +2871,15 @@ public:
         recipe_.bindings = std::move(bindings);
         recipe_.assembly = assembly;
         recipe_.raster = raster;
+        // D3D's DepthBias is exactly one step of the depth format; Vulkan promises that only with depthBiasExact
+        // (otherwise up to twice on fixed-point formats). The struct lives in the recipe, which outlives draw-time
+        // variants.
+        if (raster.depthBiasEnable && device_.info.depth_bias_exact) {
+            recipe_.bias_representation.depthBiasRepresentation =
+                VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT;
+            recipe_.bias_representation.depthBiasExact = VK_TRUE;
+            recipe_.raster.pNext = &recipe_.bias_representation;
+        }
         recipe_.multisample = multisample;
         graphics_.samples = samples;
         recipe_.sample_mask = sample_mask;
@@ -3015,6 +3024,7 @@ private:
         std::vector<VkVertexInputBindingDescription> bindings;
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         VkPipelineRasterizationStateCreateInfo raster{};
+        VkDepthBiasRepresentationInfoEXT bias_representation{VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT};
         VkPipelineMultisampleStateCreateInfo multisample{};
         VkSampleMask sample_mask = ~0u;
         VkPipelineDepthStencilStateCreateInfo depth{};
@@ -7591,6 +7601,22 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     } else {
         std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
+    // Optional: VK_EXT_depth_bias_control's depthBiasExact makes DepthBias exactly one step of the depth format.
+    VkPhysicalDeviceDepthBiasControlFeaturesEXT bias_control{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
+    if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &bias_control};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.depth_bias_exact = bias_control.depthBiasControl == VK_TRUE && bias_control.depthBiasExact == VK_TRUE;
+    }
+    if (info.depth_bias_exact) {
+        bias_control.leastRepresentableValueForceUnormRepresentation = VK_FALSE;
+        bias_control.floatRepresentation = VK_FALSE;
+        bias_control.pNext = *v13.next();
+        *v13.next() = &bias_control;
+    }
 
     // The pixel-shader extensions translated shaders can declare (VulkanDeviceInfo::fragment_shader_barycentric and
     // the two after it). Each is queried, and enabled with its feature where the GPU has it.
@@ -7753,6 +7779,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
 #endif
+    if (info.depth_bias_exact) device_extensions.push_back(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif

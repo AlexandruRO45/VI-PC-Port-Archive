@@ -669,6 +669,13 @@ The compute path, end to end:
     disabled depth clipping need `independentBlend`, `fillModeNonSolid`, `depthBiasClamp`, `dualSrcBlend`, `logicOp`
     and `depthClamp`. The standalone device enables those the GPU has and reports them in
     `VulkanDeviceInfo::features`. A PSO that needs a missing one is refused with a log.
+  - **Exact depth bias** (D3D-325): D3D's `DepthBias` is exactly one step of the depth format (1 / (2^n - 1) for
+    an n-bit UNORM, 2^(exponent(z) - 23) for D32_FLOAT), while Vulkan lets a fixed-point attachment's step be up to
+    twice that. The RTX 5070 (617.42) uses twice on D16 and D24, and so does AMD's Windows driver on D16. Where the
+    GPU has `VK_EXT_depth_bias_control` with `depthBiasExact`, the standalone device enables it
+    (`VulkanDeviceInfo::depth_bias_exact`) and each PSO with a bias chains `VkDepthBiasRepresentationInfoEXT`
+    (`LEAST_REPRESENTABLE_VALUE_FORMAT`, `depthBiasExact`), which makes all three formats exact
+    (`d3d12_depth_bias_test`). Without the extension (AMD's Windows driver), fixed-point bias stays the driver's.
   - **Shader features:** the standalone device also enables `shaderInt64` (declared by 25,803 of 26,503 index
     entries), `shaderFloat64`, `shaderInt16`, `shaderClipDistance` and `shaderCullDistance` where the GPU has them.
     Without one, `vkCreateShaderModule` reports the capability (`VUID-VkShaderModuleCreateInfo-pCode-08740`). The
