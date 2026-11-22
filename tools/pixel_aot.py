@@ -437,6 +437,22 @@ SALU_HELPERS = {
         "    return sign | half_m;\n"
         "}"
     ),
+    "pack16_rtz": (
+        "// v_cvt_pkrtz_f16_f32: binary32 to binary16 rounding toward zero, in integer arithmetic so that desktop\n"
+        "// conversion and denormal handling cannot change it. A finite value past the range gives the largest\n"
+        "// finite half, as LLVM folds llvm.amdgcn.cvt.pkrtz with rmTowardZero; a binary16 subnormal result is kept.\n"
+        "uint pack16_rtz(float value) {\n"
+        "    uint bits = asuint(value);\n"
+        "    uint sign = (bits >> 16) & 0x8000u;\n"
+        "    uint abs_bits = bits & 0x7fffffffu;\n"
+        "    if (abs_bits > 0x7f800000u) return sign | 0x7e00u | ((abs_bits >> 13) & 0x3ffu);\n"
+        "    if (abs_bits == 0x7f800000u) return sign | 0x7c00u;\n"
+        "    if (abs_bits >= 0x47800000u) return sign | 0x7bffu;\n"
+        "    if (abs_bits >= 0x38800000u) return sign | ((abs_bits - 0x38000000u) >> 13);\n"
+        "    if (abs_bits < 0x33800000u) return sign;\n"
+        "    return sign | ((0x00800000u | (abs_bits & 0x007fffffu)) >> (126u - (abs_bits >> 23)));\n"
+        "}"
+    ),
     "min16_num": (
         "float min16_num(float a, float b) {\n"
         "    return isnan(a) ? b : (isnan(b) ? a : min(a, b));\n"
@@ -808,6 +824,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     mask = "entry"
     samples = 0
     sample_dest = {}  # VGPR -> issue number of its outstanding image_sample
+    pack_pairs = {}  # v_cvt_pkrtz_f16_f32_e32 result -> its (low, high) VGPR values, for the compressed export
     exported = False
     ended = False
     entry_line = len(lines)
@@ -1342,18 +1359,27 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     packed = f"(mix{i}_p & 0x0000ffffu) | (pack16_rne(mix{i}) << 16)"
                 vector[dst] = f"alu{i}"
                 lines.append(f"    precise float alu{i} = asfloat({packed});")
-        elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
-            dst, lo, hi = m.groups()
+        elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?), (v\d+)"
+                        r"|v_cvt_pkrtz_f16_f32_e64 (v\d+), ([^,\s]+), ([^,\s]+)"):
+            # S0 goes to the low half and S1 to the high half, each rounded toward zero. The e64 form takes
+            # neg and abs on binary32 sources; clamp and output modifiers are refused.
+            dst, lo, hi = m.group(1, 2, 3) if m.group(1) else m.group(4, 5, 6)
+            if mask != "entry":
+                raise ValueError("Unsupported pack operand")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
-            pair = (vector[lo], vector[hi])
-            if mask != "entry" or lo in sample_dest or hi in sample_dest or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in pair):
-                raise ValueError("Unsupported pack operand")
-            vector[dst] = pair
+            halves = [fp_operand(t, scalar, vector, pending, sample_dest) for t in (lo, hi)]
+            helpers.add("pack16_rtz")
+            word = f"alu{i}"
+            vector[dst] = word
+            lines.append(f"    precise float {word} = asfloat(pack16_rtz({halves[0]}) | (pack16_rtz({halves[1]}) << 16));")
+            # The compressed export keeps its own path for a pack of two sampled or computed VGPRs.
+            if (m.group(1) and lo.startswith("v")
+                    and all(isinstance(h, str) and h.startswith(("sample", "alu")) for h in halves)):
+                pack_pairs[word] = tuple(halves)
         elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+|off), \2 done compr vm"):
-            pairs = [vector[v] for v in m.groups() if v != "off"]
-            if mask != "entry" or exported or not all(isinstance(p, tuple) and len(p)==2 and
-                    all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
+            pairs = [pack_pairs.get(vector[v]) if isinstance(vector[v], str) else None for v in m.groups() if v != "off"]
+            if mask != "entry" or exported or not all(pairs):
                 raise ValueError("Unsupported export")
             args = [f"export16({v})" for pair in pairs for v in pair]
             input_type = "float4" if attribute_input else "float2"

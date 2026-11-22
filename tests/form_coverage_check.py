@@ -287,6 +287,13 @@ def check_shader_records():
         assert scalar64_forms <= covered, (name, scalar64_forms - covered)
         assert sopc_forms <= covered, (name, sopc_forms - covered)
         assert vop2_forms <= covered, (name, vop2_forms - covered)
+    # v_cvt_pkrtz_f16_f32 counts in its VOP2 and VOP3 encodings; the SDWA form and v_cvt_f16_u16, which the
+    # controls reject, stay out.
+    assert not {"v_cvt_pkrtz_f16_f32_sdwa", "v_cvt_f16_u16_e32"} & pixel.ACCEPTED
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        covered = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
+        assert {("VOP2", "v_cvt_pkrtz_f16_f32"), ("VOP3", "v_cvt_pkrtz_f16_f32_e64")} <= covered, name
+        assert not {form for _, form in covered} & {"v_cvt_pkrtz_f16_f32_sdwa", "v_cvt_f16_u16"}, name
     # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
     # reject (s_addc_u32, s_cmp_eq_u64, s_cmpk_eq_u32, s_cselect_b64) stay out.
     scalar = {"s_movk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_mul_i32",

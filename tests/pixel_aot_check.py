@@ -972,6 +972,174 @@ def check_half_draw(directory, compiler, renderer, backend):
         raise AssertionError("A wrong s_ashr_i64 count escaped detection in channel 1")
 
 
+# v_cvt_pkrtz_f16_f32 packs S0 into the low half and S1 into the high half, each rounded toward zero. The
+# body reads the packed word as four bytes, so every bit of both halves reaches the render target exactly.
+# The e32 form takes words 3 and 4 directly; the e64 form takes -word 3 and |word 4|.
+def pkrtz_body(encoding):
+    convert = {"e32": ["v_mov_b32_e32 v19, s45", "v_cvt_pkrtz_f16_f32_e32 v20, s44, v19"],
+               "e64": ["v_cvt_pkrtz_f16_f32_e64 v20, -s44, |s45|"]}[encoding]
+    return [*convert, *(f"v_cvt_f32_ubyte{n}_e32 v{12 + n}, v20" for n in range(4))]
+
+
+def f32_word(x):
+    return struct.unpack("<I", struct.pack("<f", x))[0]
+
+
+def f32_value(word):
+    return struct.unpack("<f", struct.pack("<I", word))[0]
+
+
+def rtz_f16(x):
+    """Binary16 encoding of the binary32 value x rounded toward zero, computed on exact binary64 values.
+    A finite value past the range gives the largest finite half (LLVM folds llvm.amdgcn.cvt.pkrtz with
+    rmTowardZero); binary16 subnormals are kept."""
+    assert not math.isnan(x)
+    sign = 0x8000 if math.copysign(1.0, x) < 0 else 0
+    a = abs(x)
+    if math.isinf(a):
+        return sign | 0x7c00
+    if a >= 65536.0:
+        return sign | 0x7bff
+    if a < 2.0 ** -14:
+        return sign | math.floor(a * 2.0 ** 24)
+    exponent = math.frexp(a)[1] - 1
+    return sign | ((exponent + 15) << 10) | math.floor((a / 2.0 ** exponent - 1.0) * 1024)
+
+
+def rne_f16_bits(x):
+    """The same conversion rounding to nearest even: Python's binary16 packing, with overflow to infinity."""
+    try:
+        return struct.unpack("<H", struct.pack("<e", x))[0]
+    except OverflowError:
+        return (0x8000 if x < 0 else 0) | 0x7c00
+
+
+def pkrtz_word(lo, hi, encoding, convert=rtz_f16):
+    if encoding == "e64":
+        lo, hi = -lo, abs(hi)
+    return convert(lo) | (convert(hi) << 16)
+
+
+# Each set separates rounding toward zero from rounding to nearest even in at least one half: a tie that RNE
+# rounds up (1 + 3 x 2^-11, 2051), a value just above a tie or below a representable value, a finite value
+# past the range (2^100, -65520), subnormal halves (1.75 x 2^-24, the largest subnormal plus half an ulp) and
+# -2^-25 x 1.5, which RTZ takes to -0. Negative high halves make e64 |S1| observable. In each packed word that
+# the GPU computes, the high half keeps the word a normal binary32 value, so no float move can flush it.
+PKRTZ_SETS = (
+    (1 + 3 * 2.0 ** -11, -(1 + 2.0 ** -11 + 2.0 ** -23)),
+    (2.0 ** 100, -65520.0),
+    (1.75 * 2.0 ** -24, -(2.0 ** -14 - 2.0 ** -25)),
+    (-1.5 * 2.0 ** -25, 2051.0),
+    (-math.inf, 1 + 2.0 ** -10 - 2.0 ** -23),
+)
+
+
+def pkrtz_case(case, constants_words, word):
+    constants = bytearray(256)
+    struct.pack_into("<2I", constants, 12, *constants_words)
+    case.write_bytes(constants + struct.pack("<4f", *(float((word >> 8 * n) & 0xff) for n in range(4))) * 64)
+
+
+def check_pkrtz_controls():
+    """Translation-only checks for v_cvt_pkrtz_f16_f32 as an ALU result; they run on every host."""
+    for encoding in ("e32", "e64"):
+        source = translate(with_constants(pkrtz_body(encoding)))
+        assert "uint pack16_rtz(float value)" in source
+        main_body = source.split("float4 main", 1)[1]
+        operands = {"e32": "pack16_rtz(params[0].w) | (pack16_rtz(alu"
+                    , "e64": "pack16_rtz((-params[0].w)) | (pack16_rtz(abs(params[1].x)) << 16)"}[encoding]
+        assert operands in main_body, main_body
+    body = with_constants(pkrtz_body("e64"))
+    for old, new in (
+        ("|s45|", "|s45| clamp"),
+        ("|s45|", "|s45| mul:2"),
+        ("|s45|", "|s45| op_sel:[1,0,0]"),
+        ("v_cvt_pkrtz_f16_f32_e64 v20, -s44, |s45|", "v_cvt_pkrtz_f16_f32_sdwa v20, v12, v13 dst_sel:DWORD "
+         "dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 src1_sel:DWORD"),
+        ("v_cvt_pkrtz_f16_f32_e64 v20, -s44, |s45|", "v_cvt_f16_u16_e32 v20, v12"),
+        ("v_cvt_pkrtz_f16_f32_e64 v20, -s44, |s45|", "v_cvt_pkrtz_f16_f32_e64 v20, -s44"),
+    ):
+        changed = [line.replace(old, new) for line in body]
+        assert changed != body
+        must_reject(translate, changed)
+    # The e32 form takes S1 from a VGPR only, as the encoding does.
+    must_reject(translate, [line.replace("s44, v19", "s44, s45") for line in with_constants(pkrtz_body("e32"))])
+    # Neither form may read a sample before its wait or overwrite an outstanding sample destination.
+    base = with_constants(pkrtz_body("e64"))
+    wait = base.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, base[:wait] + ["v_cvt_pkrtz_f16_f32_e64 v20, v12, 1.0"] + base[wait:])
+    must_reject(translate, base[:wait] + ["v_cvt_pkrtz_f16_f32_e32 v13, 1.0, v19"] + base[wait:])
+    # A pack with a scalar or modified operand is a plain word: the compressed export refuses it, as before.
+    program = assembly(False)
+    for old, new in (("v16, v12, v13", "v16, s40, v13"),):
+        changed = [line.replace(old, new) for line in program]
+        assert changed != program
+        must_reject(translate, changed)
+    changed = [line.replace("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13", "v_cvt_pkrtz_f16_f32_e64 v16, v12, v13")
+               for line in program]
+    assert changed != program
+    must_reject(translate, changed)
+    # The CPU reference: each set must separate RTZ from RNE, and swapping the halves must change the word.
+    for lo, hi in PKRTZ_SETS:
+        assert f32_value(f32_word(lo)) == lo and f32_value(f32_word(hi)) == hi
+        for encoding in ("e32", "e64"):
+            word = pkrtz_word(lo, hi, encoding)
+            assert word != pkrtz_word(lo, hi, encoding, rne_f16_bits), (lo, hi, encoding)
+            assert word != (word >> 16 | (word & 0xffff) << 16), (lo, hi, encoding)
+            assert 0 < (word >> 23) & 0xff < 0xff, hex(word)  # a normal binary32 pattern
+    assert [rtz_f16(x) for x in (1 + 3 * 2.0 ** -11, 65520.0, -2.0 ** 100, 1.75 * 2.0 ** -24, -1.5 * 2.0 ** -25)] == [
+        0x3c01, 0x7bff, 0xfbff, 0x0001, 0x8000]
+    assert [rne_f16_bits(x) for x in (1 + 3 * 2.0 ** -11, 65520.0, 1.75 * 2.0 ** -24, -1.5 * 2.0 ** -25)] == [
+        0x3c02, 0x7c00, 0x0002, 0x8001]
+
+
+def check_pkrtz_draws(directory, compiler, renderer, backend):
+    source = directory / "pkrtz.hlsl"
+    shader = directory / "pkrtz.cso"
+    case = directory / "pkrtz.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+
+    def mismatches():
+        result = subprocess.run(draw, capture_output=True, text=True)
+        return result.returncode == 1 and "pixel_mismatch" in result.stderr
+
+    for encoding in ("e32", "e64"):
+        program = with_constants(pkrtz_body(encoding))
+        translated = translate(program)
+        source.write_text(translated, encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for lo, hi in PKRTZ_SETS:
+            words = (f32_word(lo), f32_word(hi))
+            word = pkrtz_word(lo, hi, encoding)
+            pkrtz_case(case, words, word)
+            subprocess.run(draw, check=True)
+            # References that round to nearest even or swap the halves must each report a mismatch.
+            for wrong in (pkrtz_word(lo, hi, encoding, rne_f16_bits), word >> 16 | (word & 0xffff) << 16):
+                pkrtz_case(case, words, wrong)
+                if not mismatches():
+                    raise AssertionError(f"A wrong {encoding} pack reference escaped detection for {(lo, hi)}")
+        # The same program with the helper swapped for round-to-nearest-even must disagree on a tie.
+        lo, hi = PKRTZ_SETS[0]
+        pkrtz_case(case, (f32_word(lo), f32_word(hi)), pkrtz_word(lo, hi, encoding))
+        swapped = translated.replace("pack16_rtz(", "pack16_rne(")
+        source.write_text(pixel_aot.SALU_HELPERS["pack16_rne"] + "\n" + swapped, encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        if not mismatches():
+            raise AssertionError(f"Rounding the {encoding} pack to nearest even escaped detection")
+    # Dropping a modifier or exchanging the e64 operands must change the drawn word.
+    program = with_constants(pkrtz_body("e64"))
+    lo, hi = PKRTZ_SETS[1]
+    pkrtz_case(case, (f32_word(lo), f32_word(hi)), pkrtz_word(lo, hi, "e64"))
+    for new in ("v20, s44, |s45|", "v20, -s44, s45", "v20, |s45|, -s44"):
+        changed = [line.replace("v20, -s44, |s45|", new) for line in program]
+        assert changed != program
+        source.write_text(translate(changed), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        if not mismatches():
+            raise AssertionError(f"An e64 pack with {new} escaped detection")
+
+
 def pack_f16_pair(lo, hi):
     lo_bits = lo if isinstance(lo, int) else struct.unpack("<H", struct.pack("<e", lo))[0]
     hi_bits = hi if isinstance(hi, int) else struct.unpack("<H", struct.pack("<e", hi))[0]
@@ -2209,6 +2377,7 @@ def check_controls(directory):
     must_reject(translate_buffer_color, [s for s in program if s != "s_waitcnt lgkmcnt(0)"])
     must_reject(translate_buffer_color, [s.replace("off, off", "off, v26") for s in program])
     check_scheduling_hints()
+    check_pkrtz_controls()
     check_constant_descriptor_bounds()
     check_scalar_constant_reads()
     check_affine_coordinates()
@@ -2430,8 +2599,13 @@ def check_controls(directory):
     assert free.index("tex.Sample") < free.index("= 1.0f;") < free.index("= sample16.x;")
     late = translate(program[:wait+1] + ["v_mov_b32_e32 v12, 1.0"] + program[wait+1:])
     assert "= 1.0f;" in late and "= sample16.x;" not in late
+    # A pack result is a 32-bit word that a move may copy, but only the pack itself feeds the compressed
+    # export: exporting the copy is refused.
     pos = program.index("v_cvt_pkrtz_f16_f32_e32 v17, v14, v15")
-    must_reject(translate, program[:pos] + ["v_mov_b32_e32 v20, v16"] + program[pos:])
+    copied = program[:pos] + ["v_mov_b32_e32 v20, v16"] + program[pos:]
+    pack = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
+    assert f"alu{pos} = alu{pack};" in translate(copied)
+    must_reject(translate, [line.replace("exp mrt0 v16, v16,", "exp mrt0 v20, v20,") for line in copied])
     pos = program.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, program[:pos] + ["v_mov_b32_e32 v20, 1.0"] + program[pos:])
     pos = program.index("v_interp_p1_f32_e32 v9, v0, attr0.y")
@@ -2725,6 +2899,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((dual_program(case), translate_dual) for case in DUAL_CASES)
     fixtures.append((with_constants(MOVK_BODY), translate))
     fixtures.append((with_constants(HALF_BODY), translate))
+    fixtures.extend((with_constants(pkrtz_body(encoding)), translate) for encoding in ("e32", "e64"))
     fixtures.append((with_constants(VOP3P_BODY), translate))
     fixtures.append((with_constants(FMA_MIX_BODY), translate))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
@@ -3130,6 +3305,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
         raise AssertionError("The renderer failed to detect the missing absolute value")
     check_ceiling_draws(directory, compiler, renderer, backend)
     check_unpack_byte_draws(directory, compiler, renderer, backend)
+    check_pkrtz_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):
