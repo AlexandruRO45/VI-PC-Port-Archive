@@ -2,8 +2,9 @@
 //   - a graphics PSO whose VS and PS come from containers shaped like the game's, found in a translator-style
 //     index by the SHA-256 of their FSSM programs; the input layout (POSITION, COLOR) is matched to the VS input
 //     signature by semantic, and the VS declares them in the opposite register order;
-//   - vertex buffers in the GPU address arena and in an upload heap, with upload-backed indices and root CBVs;
-//   - three indexed draws (top-left red, bottom-right green, top-right white) on a blue target, and one
+//   - vertex buffers in the GPU address arena and in an upload heap, with upload-backed indices, root CBVs and
+//     pixel-shader filters addressed through a descriptor table;
+//   - three indexed draws (top-left red, bottom-right green, top-right (64, 255, 0)) on a blue target, and one
 //     back-facing triangle in the bottom-left quadrant that culling must remove;
 //   - the image read back through CopyTextureRegion and compared pixel by pixel. Where the quadrants land also
 //     checks the viewport flip (D3D clip space is y-up) and the front-face winding.
@@ -81,15 +82,18 @@ int main() {
                                                            reinterpret_cast<void**>(&device.p))));
         rt::d3d12::set_device_outer(inner, device.p);
 
-        // Root signature: [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint).
-        D3D12_ROOT_PARAMETER params[2] = {};
+        // Must match ps_draw.frag: s2:s3 holds the root tint CBV and s4:s5 the filter table.
+        const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 2, 0, 0};
+        D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants = {0, 0, 2};
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[1].Descriptor = {1, 0};
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2].DescriptorTable = {1, &range};
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-        root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+        root_desc.Desc_1_0 = {3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
         const auto root_blob = serialize_root_signature(root_desc);
         EXPECT(!root_blob.empty());
         Ref<ID3D12RootSignature> root;
@@ -129,9 +133,11 @@ int main() {
 
         constexpr UINT upload_vertex_offset = 1024, upload_index_offset = 1088, upload_tint_offset = 1280;
         const Vertex upload_vertices[] = {
-            {1, 0, 255, 0, 255, 255}, {1, 1, 255, 0, 255, 255}, {0, 0, 255, 0, 255, 255}, {0, 1, 255, 0, 255, 255}};
+            {1, 0, 64, 0, 255, 255}, {1, 1, 64, 0, 255, 255}, {0, 0, 64, 0, 255, 255}, {0, 1, 64, 0, 255, 255}};
         const std::uint16_t upload_indices[] = {3, 1, 2, 2, 1, 0};
         const float upload_tint[] = {1, 1, 1};
+        constexpr UINT filter_offsets[] = {2048, 2304};
+        const float filters[2][3] = {{1, 1, 1}, {1, 1, 0}};
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -172,6 +178,20 @@ int main() {
         std::memcpy(up + upload_tint_offset, upload_tint, sizeof(upload_tint));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
 
+        const D3D12_DESCRIPTOR_HEAP_DESC table_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        Ref<ID3D12DescriptorHeap> table_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&table_desc, IID_PPV_ARGS(&table_heap.p))));
+        const auto table_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(table_heap.p, 9))(table_heap.p);
+        const auto table_gpu = reinterpret_cast<XboxHeapHandleFn>(slot(table_heap.p, 10))(table_heap.p);
+        const UINT table_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        EXPECT(table_cpu && table_gpu && table_stride >= sizeof(upload_va));
+        for (size_t i = 0; i < std::size(filters); ++i) {
+            std::memcpy(up + filter_offsets[i], filters[i], sizeof(filters[i]));
+            const auto filter_va = upload_va + filter_offsets[i];
+            std::memcpy(reinterpret_cast<void*>(table_cpu + i * table_stride), &filter_va, sizeof(filter_va));
+        }
+
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         Ref<ID3D12DescriptorHeap> rtv_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap.p))));
@@ -200,7 +220,10 @@ int main() {
         list->ClearRenderTargetView(rtv, blue, 0, nullptr);
 
         // State for the draws; the pipeline came with CreateCommandList.
+        ID3D12DescriptorHeap* heaps[] = {table_heap.p};
+        list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootSignature(root.p);
+        list->SetGraphicsRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{table_gpu});
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const D3D12_VERTEX_BUFFER_VIEW vbv{vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
         list->IASetVertexBuffers(0, 1, &vbv);
@@ -231,6 +254,7 @@ int main() {
         list->IASetVertexBuffers(0, 1, &upload_vbv);
         list->IASetIndexBuffer(&upload_ibv);
         list->SetGraphicsRootConstantBufferView(1, upload_va + upload_tint_offset);
+        list->SetGraphicsRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{table_gpu + table_stride});
         list->DrawIndexedInstanced(UINT(std::size(upload_indices)), 1, 0, 0, 0);
 
         D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -264,6 +288,7 @@ int main() {
         pso.reset();
         root.reset();
         rtv_heap.reset();
+        table_heap.reset();
         list.reset();
         allocator.reset();
         queue.reset();
@@ -273,7 +298,7 @@ int main() {
     std::filesystem::remove_all(library);
 
     constexpr std::array<std::uint8_t, 4> quadrants[2][2] = {
-        {{255, 0, 0, 255}, {255, 255, 255, 255}},
+        {{255, 0, 0, 255}, {64, 255, 0, 255}},
         {{0, 0, 255, 255}, {0, 255, 0, 255}}};
     unsigned mismatches = 0;
     for (UINT row = 0; row < size; ++row) {
@@ -291,7 +316,7 @@ int main() {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("M1: indexed draws from default and upload vertex buffers and a culled triangle matched all %u pixels\n",
+    std::printf("M1: indexed draws with upload-backed descriptors and a culled triangle matched all %u pixels\n",
                 size * size);
     return 0;
 }
