@@ -3,3 +3,5 @@ EXPORTS
     select_rel
     run_ops
     shift_narrow
+    flag_select
+    cmov_read

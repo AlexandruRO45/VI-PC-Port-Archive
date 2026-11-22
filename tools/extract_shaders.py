@@ -66,16 +66,20 @@ def extract_native_rdna2_code(program: bytes) -> bytes | None:
         return None
 
     offset, length = native_entries[0]
-    if offset + length > len(program) or length < 24 or program[offset:offset + 4] != b"XBCH":
+    table_end = table_idx + 12 + count * 12
+    if offset < table_end or offset + length > len(program) or length < 24 or program[offset:offset + 4] != b"XBCH":
         return None
 
     size, = struct.unpack_from("<I", program, offset + 16)
+    if not 196 <= size <= 16 << 20:
+        return None
+    decoder = zlib.decompressobj(15)
     try:
-        image = zlib.decompress(program[offset + 24:offset + length], 15)
+        image = decoder.decompress(program[offset + 24:offset + length], size + 1)
     except zlib.error:
         return None
 
-    if len(image) < 196 or image[:4] != b"FSSM":
+    if len(image) != size or not decoder.eof or image[:4] != b"FSSM":
         return None
 
     start = struct.unpack_from("<I", image, 192)[0] + 40
@@ -96,6 +100,8 @@ def extract_shaders(
     target_stages: set[str] | None = None,
     limit: int | None = None,
     extract_format: str = "native",
+    *,
+    length_prefixed_names: bool = False,
 ):
     """
     Scan shaders.rpf and extract shaders into organized folders.
@@ -110,114 +116,127 @@ def extract_shaders(
         print(f"[!] Warning: Cannot write to '{output_dir}'. Falling back to '{fallback}'.", file=sys.stderr)
         output_dir = fallback
 
-    print(f"[*] Opening archive: {archive_path.name} ({archive_path.stat().st_size / (1024*1024):.1f} MB)...")
+    archive_size = archive_path.stat().st_size
+    print(f"[*] Opening archive: {archive_path.name} ({archive_size / (1024*1024):.1f} MB)...")
     start_time = time.time()
 
     names_pattern = re.compile(rb"[!-~]{4,}")
     stage_counters = Counter()
-    stage_name_counts = Counter()
+    used_stems = set()
     extracted_records = []
     total_found = 0
     extracted_count = 0
 
-    with archive_path.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-        data_len = len(data)
-        cursor = 0
+    if archive_size > 0:
+        with archive_path.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            data_len = len(data)
+            cursor = 0
 
-        while match := names_pattern.search(data, cursor):
-            cursor = match.end()
-            if cursor + 18 > data_len or data[cursor] != 0:
-                continue
+            while match := names_pattern.search(data, cursor):
+                scan_start = cursor
+                cursor = match.end()
+                if cursor + 18 > data_len or data[cursor] != 0:
+                    continue
 
-            stored, _, repeated, decoded = struct.unpack_from("<4I", data, cursor + 2)
-            if not (16 < stored <= 8 << 20 and stored == repeated and cursor + 18 + stored <= data_len):
-                continue
+                stored, _, repeated, decoded = struct.unpack_from("<4I", data, cursor + 2)
+                if not (16 < stored <= 8 << 20 and 32 <= decoded <= 16 << 20 and stored == repeated and cursor + 18 + stored <= data_len):
+                    continue
 
-            record_name = match.group().decode("ascii", "replace")
-            start_payload = cursor + 18
-            cursor = start_payload + stored
-            total_found += 1
+                start_payload = cursor + 18
 
-            # Decompress raw-DEFLATE container
-            try:
-                blob = zlib.decompress(data[start_payload:start_payload + stored], -15)
-            except zlib.error:
-                continue
+                # Decompress raw-DEFLATE container within the declared decoded length
+                stream = zlib.decompressobj(-15)
+                try:
+                    blob = stream.decompress(data[start_payload:start_payload + stored], decoded + 1)
+                except zlib.error:
+                    continue
 
-            if len(blob) != decoded:
-                continue
+                if len(blob) != decoded or not stream.eof:
+                    continue
 
-            # Parse DXBC sections
-            if parts is not None:
+                # Parse DXBC sections
+                if parts is None:
+                    continue
                 try:
                     sections = parts(blob)
                 except ValueError:
                     continue
-            else:
-                continue
 
-            program = sections.get(b"DXIL", b"")
-            if len(program) < 24:
-                continue
+                program = sections.get(b"DXIL", b"")
+                if len(program) < 24:
+                    continue
 
-            kind = struct.unpack_from("<H", program, 2)[0]
-            stage = STAGE_NAMES.get(kind, f"stage_{kind}")
-            stage_counters[stage] += 1
+                name = match.group()
+                # The length includes the terminator. A printable length byte can join the name's run.
+                if length_prefixed_names and name[0] == len(name):
+                    name_start = match.start()
+                    if name_start == scan_start or data[name_start - 1] != len(name) + 1:
+                        name = name[1:]
+                record_name = name.decode("ascii", "replace")
+                cursor = start_payload + (stored - len(stream.unused_data))
+                total_found += 1
 
-            # Filter by stage if requested
-            if target_stages and stage not in target_stages and "all" not in target_stages:
-                continue
+                kind = struct.unpack_from("<H", program, 2)[0]
+                stage = STAGE_NAMES.get(kind, f"stage_{kind}")
+                stage_counters[stage] += 1
 
-            # Extract native RDNA 2 code
-            native_code = extract_native_rdna2_code(program)
+                # Filter by stage if requested
+                if target_stages and stage not in target_stages and "all" not in target_stages:
+                    continue
 
-            # Stage folder
-            stage_dir = output_dir / stage
-            stage_dir.mkdir(parents=True, exist_ok=True)
+                # Extract native RDNA 2 code
+                native_code = extract_native_rdna2_code(program)
 
-            safe_name = sanitize_filename(record_name)
-            name_occ = stage_name_counts[(stage, safe_name)]
-            stage_name_counts[(stage, safe_name)] += 1
-            file_stem = safe_name if name_occ == 0 else f"{safe_name}_{name_occ}"
+                # Stage folder
+                stage_dir = output_dir / stage
+                stage_dir.mkdir(parents=True, exist_ok=True)
 
-            record_info = {
-                "name": record_name,
-                "stage": stage,
-                "dxbc_size": len(blob),
-                "native_size": len(native_code) if native_code else 0,
-            }
+                safe_name = sanitize_filename(record_name)
+                file_stem = safe_name
+                suffix = 1
+                while (stage, file_stem.casefold()) in used_stems:
+                    file_stem = f"{safe_name}_{suffix}"
+                    suffix += 1
+                used_stems.add((stage, file_stem.casefold()))
 
-            # Save formats
-            if extract_format in ("dxbc", "both"):
-                dxbc_path = stage_dir / f"{file_stem}.dxbc"
-                with dxbc_path.open("wb") as out_f:
-                    out_f.write(blob)
-                record_info["dxbc_file"] = f"{stage}/{file_stem}.dxbc"
+                record_info = {
+                    "name": record_name,
+                    "stage": stage,
+                    "dxbc_size": len(blob),
+                    "native_size": len(native_code) if native_code else 0,
+                }
 
-            if extract_format in ("native", "both"):
-                if native_code:
-                    bin_path = stage_dir / f"{file_stem}.bin"
-                    with bin_path.open("wb") as out_f:
-                        out_f.write(native_code)
-                    record_info["native_file"] = f"{stage}/{file_stem}.bin"
-                    record_info["sha256"] = hashlib.sha256(native_code).hexdigest()
-                else:
-                    # Fallback to dxbc if native code not unpackable
+                # Save formats
+                if extract_format in ("dxbc", "both"):
                     dxbc_path = stage_dir / f"{file_stem}.dxbc"
                     with dxbc_path.open("wb") as out_f:
                         out_f.write(blob)
                     record_info["dxbc_file"] = f"{stage}/{file_stem}.dxbc"
 
-            extracted_records.append(record_info)
-            extracted_count += 1
+                if extract_format in ("native", "both"):
+                    if native_code:
+                        bin_path = stage_dir / f"{file_stem}.bin"
+                        with bin_path.open("wb") as out_f:
+                            out_f.write(native_code)
+                        record_info["native_file"] = f"{stage}/{file_stem}.bin"
+                        record_info["sha256"] = hashlib.sha256(native_code).hexdigest()
+                    elif extract_format == "native":
+                        # Fallback to dxbc if native code not unpackable
+                        dxbc_path = stage_dir / f"{file_stem}.dxbc"
+                        with dxbc_path.open("wb") as out_f:
+                            out_f.write(blob)
+                        record_info["dxbc_file"] = f"{stage}/{file_stem}.dxbc"
 
-            if extracted_count % 1000 == 0:
-                elapsed = time.time() - start_time
-                print(f"    [+] Extracted {extracted_count} shaders ({elapsed:.1f}s)...")
+                extracted_records.append(record_info)
+                extracted_count += 1
 
-            if limit is not None and extracted_count >= limit:
-                print(f"[*] Reached limit of {limit} shaders.")
-                break
+                if extracted_count % 1000 == 0:
+                    elapsed = time.time() - start_time
+                    print(f"    [+] Extracted {extracted_count} shaders ({elapsed:.1f}s)...")
+
+                if limit is not None and extracted_count >= limit:
+                    print(f"[*] Reached limit of {limit} shaders.")
+                    break
 
     # Save manifest.json
     manifest_path = output_dir / "manifest.json"
@@ -261,7 +280,7 @@ def main():
         "--stage",
         nargs="+",
         default=["all"],
-        choices=["all", "pixel", "vertex", "compute", "mesh", "geometry"],
+        choices=["all", *STAGE_NAMES.values()],
         help="Filter by shader stage (default: all)",
     )
     parser.add_argument(
@@ -275,6 +294,11 @@ def main():
         choices=["native", "dxbc", "both"],
         default="native",
         help="Extraction format: 'native' (raw AMD RDNA 2 .bin, default), 'dxbc' (DXBC container), or 'both'",
+    )
+    parser.add_argument(
+        "--length-prefixed-names",
+        action="store_true",
+        help="Interpret a matching printable byte as a record name's length prefix",
     )
 
     args = parser.parse_args()
@@ -290,6 +314,7 @@ def main():
         target_stages=target_stages,
         limit=args.limit,
         extract_format=args.format,
+        length_prefixed_names=args.length_prefixed_names,
     )
     return 0
 

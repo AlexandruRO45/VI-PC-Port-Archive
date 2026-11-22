@@ -181,9 +181,18 @@ bool short_checks()
     exact.back() = 0x5a;
     const auto exact_written = era_query::query(GetCurrentProcess(), exact.data(), exact.data(), exact.size() - 1);
     std::printf("short_query_bytes=%zu last_error=%lu\n", written, error);
+    for (const std::size_t length : {buffer.size() - 1, buffer.size(), sizeof(QueryBuffer)}) {
+        SetLastError(ERROR_SUCCESS);
+        const auto native = VirtualQueryEx(GetCurrentProcess(), exact.data(), nullptr, length);
+        const DWORD native_error = GetLastError();
+        SetLastError(ERROR_SUCCESS);
+        const auto result = era_query::query(GetCurrentProcess(), exact.data(), nullptr, length);
+        const DWORD shim_error = GetLastError();
+        std::printf("null_query_length=%zu native_error=%lu shim_error=%lu\n", length, native_error, shim_error);
+        if (native || result || native_error == ERROR_SUCCESS || shim_error != native_error) return false;
+    }
     return written == 0 && error == ERROR_BAD_LENGTH && untouched &&
-           exact_written == sizeof(MEMORY_BASIC_INFORMATION) && exact.back() == 0x5a &&
-           era_query::query(GetCurrentProcess(), exact.data(), nullptr, 64) == 0;
+           exact_written == sizeof(MEMORY_BASIC_INFORMATION) && exact.back() == 0x5a;
 }
 }
 

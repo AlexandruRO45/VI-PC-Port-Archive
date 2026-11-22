@@ -109,8 +109,9 @@ def check_translation(image, dropped):
             path.write_bytes(damaged)
             return path
 
-        cases = (((None, callee + 1), "call to a second target"),
-                 ((callee + 1, None), "call to a second target"),
+        # A call into the callee interior names no function interval of its own.
+        cases = (((None, callee + 1), "no unique function interval"),
+                 ((callee + 1, None), "no unique function interval"),
                  ((callee + 1, callee + 1), "no unique function interval"),
                  ((caller, caller), "overlapping call target"))
         for targets, reason in cases:
@@ -129,12 +130,16 @@ def check_translation(image, dropped):
 
 
 def check_mixed_calls():
-    # A direct call and an import call in either order would need two callees.
+    # An import call may repeat one IAT slot, but not mix with direct calls or name a second slot.
     prologue = bytes.fromhex("53 56 48 83 ec 28")
     epilogue = bytes.fromhex("48 83 c4 28 5e 5b c3")
-    direct, imported = bytes.fromhex("e8 00 01 00 00"), bytes.fromhex("ff 15 00 02 00 00")
-    for calls, reason in (((direct, imported), "unexpected additional call"),
-                          ((imported, direct), "call to a second target")):
+    direct = bytes.fromhex("e8 00 01 00 00")
+    imported = bytes.fromhex("ff 15 00 02 00 00")
+    # Second IAT call targets a different slot from the first.
+    other_imported = bytes.fromhex("ff 15 02 02 00 00")
+    for calls, reason in (((direct, imported), "mixed import and direct calls"),
+                          ((imported, direct), "mixed import and direct calls"),
+                          ((imported, other_imported), "call to a second IAT slot")):
         try:
             lift_body(0x1000, prologue + b"".join(calls) + epilogue,
                       caller=True, bind_import=lambda slot: "mix_args")
@@ -142,14 +147,29 @@ def check_mixed_calls():
             if reason not in str(exc):
                 raise AssertionError(str(exc)) from exc
         else:
-            raise AssertionError(f"accepted mixed calls, expected {reason!r}")
-    print("a direct call and an import call are rejected in either order")
+            raise AssertionError(f"accepted mixed or distinct calls, expected {reason!r}")
+    print("mixed direct/import calls and two distinct IAT slots are rejected")
+
+
+def check_repeated_import(probe_path, import_path, import_lifted_path):
+    probe = register_probe(probe_path)
+    native = ctypes.CDLL(import_path)
+    lifted = ctypes.CDLL(import_lifted_path)
+    inputs = input_pairs()
+    for x, y in inputs:
+        original = observe(probe, native.call_twice, x, y)
+        actual = observe(probe, lifted.lifted, x, y)
+        if original != reference(x, y, caller=True) or actual != original:
+            raise AssertionError(f"repeat_import({x:#x}, {y:#x}): {original=} {actual=}")
+    print(f"{len(inputs)} repeated-import input pairs match native execution, guarded trace, RBX and RSI")
 
 
 if __name__ == "__main__":
-    probe_path, original_path, lifted_path, altered_path, dropped_path = sys.argv[1:]
+    probe_path, original_path, lifted_path, altered_path, dropped_path = sys.argv[1:6]
     check(probe_path, original_path, lifted_path, altered_path)
     check_translation(original_path, dropped_path)
     check_mixed_calls()
     for path in (lifted_path, altered_path):
         call_sites(path, "lifted", "lifted_callee")
+    if len(sys.argv) > 6:
+        check_repeated_import(probe_path, sys.argv[6], sys.argv[7])

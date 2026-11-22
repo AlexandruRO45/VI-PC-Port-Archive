@@ -122,6 +122,13 @@ class GpuReportFormatChecks(unittest.TestCase):
                 with self.subTest(path=path.name, line=number):
                     self.assertTrue(line.isascii(), line.decode("utf-8", "replace"))
 
+    def test_clean_build_report_links_to_an_installed_issue_template(self):
+        guide = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        link = re.search(r"\[build bug report\]\(https://github\.com/R0Y00/Xbox2Windows/issues/new\?template=([^/)]+)\)", guide)
+        self.assertIsNotNone(link)
+        template = ROOT / ".github" / "ISSUE_TEMPLATE" / link.group(1)
+        self.assertTrue(template.is_file(), template)
+
     def test_instructions_say_not_to_open_a_new_issue(self):
         for path in (README, PACKAGE_README):
             text = path.read_text(encoding="utf-8")

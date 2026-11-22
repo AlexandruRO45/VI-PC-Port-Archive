@@ -1,8 +1,10 @@
 ## Change
 
-Describe the observable change and link the issue with `Refs #123` or
-`Fixes #123`. For a documentation patch, identify the contributor task the
-edit helps someone complete.
+Describe the observable change and the task or milestone it advances, or the
+independent problem it solves. Link related issues with `Refs #123` or
+`Fixes #123`. If the change touches a shared interface, name it and link any
+overlapping work or PR that must land first. For a documentation patch,
+identify the contributor task the edit helps someone complete.
 
 ## Verification
 

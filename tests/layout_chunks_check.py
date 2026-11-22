@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check the per-chunk layout summary emitted by verify_build.compare_layout."""
 
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -44,8 +45,51 @@ def main():
     assert chunks["1001"]["absent_from_torrent"] == ["game_scarlett_master.exe"], chunks
     assert chunks["3009"]["marker"] == "Launch", chunks
     assert chunks["3009"]["absent_from_disk"] == [], chunks
+    check_layout_destination_paths()
     check_decode_torrent()
+    check_manifest_selection()
     print("layout chunk summary ok")
+
+
+def check_manifest_selection() -> None:
+    for pattern, files, count in (
+        ("*.torrent", ["layout.xml"], 0),
+        ("*.torrent", ["a.torrent", "b.torrent", "layout.xml"], 2),
+        ("layout*.xml", ["a.torrent"], 0),
+        ("layout*.xml", ["a.torrent", "layout_a.xml", "layout_b.xml"], 2),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "package"
+            package.mkdir()
+            (package / "directory.torrent").mkdir()
+            (package / "layout_directory.xml").mkdir()
+            for name in files:
+                (package / name).touch()
+            report = Path(directory) / "report.json"
+            run = subprocess.run(
+                [sys.executable, "-B", str(PROJECT / "tools/verify_build.py"), str(package), "--output", str(report)],
+                capture_output=True, text=True,
+            )
+            assert run.returncode == 2, run.stderr
+            assert pattern in run.stderr and f"found {count}" in run.stderr, run.stderr
+            assert "Traceback" not in run.stderr and not report.exists(), run.stderr
+
+
+def check_layout_destination_paths() -> None:
+    layout = r"""<Package><Chunk Id="3000">
+      <FileGroup SourcePath="." DestinationPath="\fixture\\.\nested\" Include="item.bin" />
+      <FileGroup SourcePath="." DestinationPath="." Include="root.bin" />
+      <FileGroup SourcePath="." DestinationPath="\fixture\..\unresolved" Include="held.bin" />
+    </Chunk></Package>"""
+    inventory = {"fixture/nested/item.bin", "root.bin", "unresolved/held.bin"}
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "layout_destinations.xml"
+        path.write_text(layout, encoding="utf-8")
+        report = compare_layout(path, inventory, inventory)
+    unresolved = {"fixture/../unresolved/held.bin": ["3000"]}
+    assert report["absent_from_disk"] == unresolved, report
+    assert report["absent_from_torrent"] == unresolved, report
+    assert report["torrent_paths_outside_layout"] == ["unresolved/held.bin"], report
 
 
 def check_decode_torrent():

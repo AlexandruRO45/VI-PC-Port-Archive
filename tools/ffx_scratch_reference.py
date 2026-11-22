@@ -20,6 +20,15 @@ def signed(x):
     return x if x < 0x80000000 else x - 0x100000000
 
 
+def simm16(token):
+    value = int(token, 0)
+    if -0x8000 <= value < 0:
+        return value & 0xffffffff
+    if 0 <= value <= 0xffff:
+        return (value - 0x10000 if value & 0x8000 else value) & 0xffffffff
+    raise ValueError(f"Invalid 16-bit signed immediate: {token}")
+
+
 def seed(x, y, c):
     return ((x + 13*y + 19*c + 1)*0x19660d + 0x3c6ef35f) & 0xffffffff
 
@@ -62,10 +71,14 @@ def network(program, taps, initializer, stage):
         if None not in args:
             if op in ("s_mov_b32", "v_mov_b32"):
                 result = args[0]
+            elif op == "s_movk_i32":
+                result = simm16(src[0])
             elif op == "s_add_u32":
                 result = sum(args)
             elif op == "s_addk_i32" and regs.get(dst) is not None:
-                result = regs[dst]+args[0]
+                result = regs[dst] + simm16(src[0])
+            elif op == "s_mulk_i32" and regs.get(dst) is not None:
+                result = regs[dst] * simm16(src[0])
             elif op == "s_brev_b32":
                 result = int(f"{args[0]:032b}"[::-1],2)
             elif op == "v_add_f32":

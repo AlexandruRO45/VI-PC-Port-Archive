@@ -63,8 +63,12 @@ bool unregister_gpu_region(const void* base) noexcept
 
 std::size_t query(void* process, const void* address, void* buffer, std::size_t length) noexcept
 {
-    if (!buffer || length < sizeof(MEMORY_BASIC_INFORMATION)) {
+    if (length < sizeof(MEMORY_BASIC_INFORMATION)) {
         SetLastError(ERROR_BAD_LENGTH);
+        return 0;
+    }
+    if (!buffer) {
+        SetLastError(ERROR_NOACCESS);
         return 0;
     }
     MEMORY_BASIC_INFORMATION info{};

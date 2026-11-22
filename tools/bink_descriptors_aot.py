@@ -14,7 +14,7 @@ from ffx_version_query import INTEGER_HEADER, checked_image, lower, region
 BINK_SHA256 = "9eaf045d004cd7d6a8382aaff0c6ea23a29fec4ef8bfacd726b54f5bc26fafd0"
 
 
-def frame_body(pe: pefile.PE, package: bool) -> str:
+def frame_body(pe: pefile.PE, package: bool, bind_group: bool = False) -> str:
     if package:
         # One loop iteration after pitch selection. The cursor starts at plane 0's pitch.
         start, end = 0x2257, 0x2325
@@ -28,8 +28,12 @@ def frame_body(pe: pefile.PE, package: bool) -> str:
         (bounds,) = function_ranges(pe, export_rva(pe, "frame_planes"))
         body = region(pe, *bounds)
         initial = ["rsp = reinterpret_cast<word>(frame + 12); rcx = frames; rdx = index;",
-                   "r8 = reinterpret_cast<word>(pitches); r9 = reinterpret_cast<word>(observe);"]
-        calls = {ins.ip: "reinterpret_cast<Observer>(r9)(rcx, uint32_t(rdx));" for ins in body
+                   "r8 = reinterpret_cast<word>(pitches);"]
+        binding = "rax = group_append(group, rcx, uint32_t(rdx));"
+        if not bind_group:
+            initial.append("r9 = reinterpret_cast<word>(observe);")
+            binding = "reinterpret_cast<Observer>(r9)(rcx, uint32_t(rdx));"
+        calls = {ins.ip: binding for ins in body
                  if ins.mnemonic == M.CALL and ins.op0_register == R.R9}
         exits = {}
     if len(calls) != 5:
@@ -55,6 +59,10 @@ def generate(image: Path, package: bool, frame_planes: bool = False) -> str:
             planes = ('using Observer = void (*)(word, uint32_t);\n'
                       'extern "C" __declspec(dllexport) word frame_planes(word frames, uint32_t index, '
                       'const uint32_t* pitches, Observer observe) {\n' + frame_body(pe, package) + '\n}\n')
+            if not package:
+                planes += ('extern "C" word append_frame(word frames, uint32_t index, '
+                           'const uint32_t* pitches, word group) {\n'
+                           + frame_body(pe, False, bind_group=True) + '\n}\n')
     return (INTEGER_HEADER
             + 'extern "C" __declspec(dllexport) word group_init(word group, uint32_t capacity) {\n'
             + init_body + '\n}\n'

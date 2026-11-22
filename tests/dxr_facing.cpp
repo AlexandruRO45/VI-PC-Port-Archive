@@ -68,6 +68,14 @@ bool check_dxr_facing(ID3D12Device* device) {
     const auto scene = dxr_facing::instances();
     const auto probes = dxr_facing::rays();
     const auto mesh = dxr_facing::vertices();
+    // Instance 8 lies at world z=1.5. Its hit at t=2 must fall outside the
+    // reference's open interval. Keep this exact endpoint check on the CPU.
+    const dxr_facing::Ray clipped{{64.25f, .25f, -.5f}, {0,0,1}, 0, 2, 0};
+    if (const auto hit = dxr_facing::closest(mesh, scene, clipped); hit.hit) {
+        std::fprintf(stderr, "Scaled CPU ray: expected miss at farT=2, instance=%u t=%.17g\n",
+                     hit.instance, hit.distance);
+        throw std::runtime_error("Scaled ray entered the open interval");
+    }
     if (dxr_facing::first_reference_mismatch() != probes.size())
         throw std::runtime_error("Facing reference disagrees with its hand-derived table");
     const bool supported = dxr_fixture::supported(device);
@@ -115,6 +123,6 @@ bool check_dxr_facing(ID3D12Device* device) {
     std::printf("dxr_facing rays=%zu hits=%u front_hits=%u culled=%zu mismatches=%u\n",
                 rays.size(), hits, frontHits, rays.size() - hits, mismatches);
     if (mismatches) throw std::runtime_error("DXR facing or culling disagrees with the CPU reference");
-    if (hits != 64 || frontHits != 32) throw std::runtime_error("Facing fixture lost its expected coverage");
+    if (hits != 72 || frontHits != 36) throw std::runtime_error("Facing fixture lost its expected coverage");
     return true;
 }

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 FFX_LOADER = "431bdd2e26c0c8214fd7601140eb9fe6d8a249f5000539453a9a9b6a0b7c0ee8"
+FFX_LOADER_NAME = "amd_fidelityfx_loader_xbox.dll"
 FFX_EXPORTS = ("ffxConfigure", "ffxCreateContext", "ffxDestroyContext", "ffxDispatch", "ffxQuery")
 
 
@@ -31,6 +32,7 @@ def trace(report, entry):
         reached[image] = dict(conditional=conditional, path=path, reasons=reasons)
         targets = set()
         forwarded = defaultdict(set)
+        known_hops = set()
         for row in imports[image]:
             dll, symbol, kind = row["dll"], row["symbol"], row["kind"]
             providers = by_name[dll.casefold()]
@@ -38,6 +40,22 @@ def trace(report, entry):
                           "LoadLibraryExA", "LoadLibraryExW"}:
                 lookups.append(dict(image=image, symbol=symbol, kind=kind))
             package = row.get("package_resolution")
+            if package and package["chain"][0].get("known_dll"):
+                # The loader maps a known DLL from System32, so a package copy with that name is not loaded.
+                providers = []
+                # A forwarder in the System32 module can still name packaged modules; those are loaded,
+                # and the package chain's terminal status decides the edge.
+                hops = tuple(dict.fromkeys(s["provider"] for s in package["chain"][1:]
+                                           if s["package"] and s["provider"]))
+                if hops:
+                    known_hops.add((kind, hops))
+                if any(s["package"] for s in package["chain"][1:]):
+                    if package["status"] != "export_present":
+                        findings.append(dict(path=path, reasons=reasons + (kind,),
+                                             conditional=conditional or kind == "delay", dll=dll, symbol=symbol,
+                                             problem=package["status"], candidates=[],
+                                             package_chain=package["chain"]))
+                    continue
             if len(providers) == 1:
                 targets.add((kind, providers[0]))
                 if providers[0] in row["bundle_exports_in"]:
@@ -84,12 +102,24 @@ def trace(report, entry):
                     problem = "conditional_module_absent_from_package" if not providers else "ambiguous_package_basename"
                 findings.append(dict(path=path, reasons=reasons + (condition,), conditional=True, dll=dll,
                                      missing_exports=missing, problem=problem, candidates=providers))
+        elif Path(image).name.casefold() == FFX_LOADER_NAME:
+            # The conditional routes are pinned to one loader hash. Report a different build instead
+            # of returning no conditional edge and exiting successfully.
+            findings.append(dict(path=path, reasons=reasons, dll=Path(image).name,
+                                 problem="unverified_loader_hash",
+                                 sha256=images[image]["sha256"], expected=FFX_LOADER))
         for edge, target in sorted(targets):
             heapq.heappush(queue, (conditional or edge != "normal", depth + 1, path + (target,), reasons + (edge,)))
             for hops in sorted(forwarded[(edge, target)]):
                 for n in range(1, len(hops) + 1):
                     heapq.heappush(queue, (conditional or edge != "normal", depth + 1 + n,
                                            path + (target, *hops[:n]), reasons + (edge,) + ("forwarder",) * n))
+        # Packaged modules reached through a forwarder of a known System32 module: the System32
+        # module itself is not part of the package graph, so the first packaged hop follows the image.
+        for edge, hops in sorted(known_hops):
+            for n in range(1, len(hops) + 1):
+                heapq.heappush(queue, (conditional or edge != "normal", depth + n,
+                                       path + hops[:n], reasons + ("forwarder",) * n))
     return dict(entry=entry, reachable=reached, findings=findings, dynamic_lookup_imports=lookups,
                 unlinked_in_this_graph=sorted(set(images) - set(reached)),
                 scope="Package imports, packaged export forwarders and identified FFX routes. Desktop findings "

@@ -2,12 +2,52 @@
 
 import ctypes
 from pathlib import Path
+import struct
 import shutil
 import sys
 from tempfile import TemporaryDirectory
 
+import pefile
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from native_map_check import LOAD_SEARCH, Mapper, Resolver, STATUS, kernel  # noqa: E402
+
+
+def check_forwarder_bounds(mapper, original, directory):
+    data = original.read_bytes()
+    with pefile.PE(data=data) as pe:
+        entry = next(e for e in pe.DIRECTORY_ENTRY_EXPORT.symbols if e.name == b"mix_args")
+        offset = pe.get_offset_from_rva(entry.address)
+        exports = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]
+        size_field = exports.get_field_absolute_offset("Size")
+        distance = entry.address - exports.VirtualAddress
+        capacity = len(entry.forwarder) + 1
+
+    cases = [(b"Host.#1", 1), (b"Host.#65535", 65535), (b"Host.#0", None),
+             (b"Host.#65536", None), (b"Host.#+1", None), (b"Host.# 1", None)]
+    for text, expected in cases + [(b"Host.Name", None)]:
+        variant = bytearray(data)
+        assert len(text) + 1 <= capacity
+        variant[offset:offset + len(text) + 1] = text + b"\0"
+        if text == b"Host.Name":
+            # Keep the terminator in the image, immediately outside the directory.
+            struct.pack_into("<I", variant, size_field, distance + len(text))
+        path = directory / "forwarder_variant.dll"
+        path.write_bytes(variant)
+        calls = []
+        def record(module, name, ordinal):
+            calls.append((module, name, ordinal))
+            return 12345
+        mapped, status, detail, _ = mapper(path, {})
+        if not mapped:
+            raise AssertionError(f"cannot map {text!r}: {status}, {detail}")
+        try:
+            result = mapper.resolved(mapped, b"mix_args", Resolver(record))
+            wanted = [] if expected is None else [(b"Host", None, expected)]
+            assert calls == wanted and result == (12345 if wanted else None), (text, calls, result)
+            assert mapper.resolved(mapped, b"mix_args", Resolver()) is None
+        finally:
+            mapper.release(mapped)
 
 
 def main(mapper_path, forwarder, provider):
@@ -40,6 +80,7 @@ def main(mapper_path, forwarder, provider):
                       "cpu_import_provider.dll": windows_provider}.get(key)
             return kernel.GetProcAddress(target._handle, name if name else ordinal) if target else None
 
+        check_forwarder_bounds(mapper, forwarder_copy, Path(temp))
         callback = Resolver(resolve)
         base, status, detail, _ = mapper(forwarder_copy, {})
         if not base or status != STATUS["ok"]:

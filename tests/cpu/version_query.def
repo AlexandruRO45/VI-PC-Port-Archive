@@ -2,3 +2,4 @@ EXPORTS
     fixture_query
     fixture_name DATA
     high_byte_probe
+    addr32_probe

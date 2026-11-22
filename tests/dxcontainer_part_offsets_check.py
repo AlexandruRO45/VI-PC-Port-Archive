@@ -5,12 +5,13 @@ from pathlib import Path
 import struct
 import sys
 import unittest
+import zlib
 
 import pefile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from call_evidence import shader_containers
-from resource_inventory import dxil_program, parts, shader_markers
+from resource_inventory import dxil_program, parts, scene_records, shader_markers
 
 
 def minimal_pe(section_payload, *, overlay=b"", image_base=0x180000000):
@@ -39,10 +40,10 @@ def minimal_pe(section_payload, *, overlay=b"", image_base=0x180000000):
     return bytes(buf) + overlay
 
 
-def container(*, reversed_directory=False, overlapping=False, extra_fourcc=None):
+def container(*, reversed_directory=False, overlapping=False, extra_fourcc=None, stage_kind=0):
     # This is a deliberately minimal framing probe, not executable DXIL.
     # No third-party shaders or game assets are required.
-    program = struct.pack("<II4sIII", 0, 8, b"DXIL", 0, 16, 4) + b"BC\xc0\xde" + bytes(4)
+    program = struct.pack("<II4sIII", stage_kind << 16, 8, b"DXIL", 0, 16, 4) + b"BC\xc0\xde" + bytes(4)
     assert len(program) == 32
     dxil = b"DXIL" + struct.pack("<I", len(program)) + program
     note = b"NOTE" + struct.pack("<I", 4) + b"test"
@@ -79,6 +80,19 @@ class DXContainerPartOffsets(unittest.TestCase):
         self.assertTrue(dxil_program(reversed_offsets, 0))
         self.assertEqual(shader_markers(normal)["framed_dxil_programs"], 1)
         self.assertEqual(shader_markers(reversed_offsets)["framed_dxil_programs"], 1)
+
+    def test_non_dxbc_magic_and_negative_offsets_rejected(self):
+        valid = container()
+        for magic in (b"XXXX", b"DXIL", b"\0\0\0\0"):
+            corrupted = magic + valid[4:]
+            with self.assertRaisesRegex(ValueError, "Expected a DXBC container"):
+                parts(corrupted)
+            self.assertFalse(dxil_program(corrupted, 0))
+            self.assertEqual(shader_markers(corrupted)["framed_dxil_programs"], 0)
+        padded = b"prefix" + valid + b"tail"
+        self.assertTrue(dxil_program(padded, 6))
+        for bad_offset in (-1, -len(padded), -len(padded) + 6, len(padded) - 31):
+            self.assertFalse(dxil_program(padded, bad_offset))
 
     def test_overlap_rejected_regardless_of_directory_order(self):
         for reversed_directory in (False, True):
@@ -148,6 +162,38 @@ class DXContainerPartOffsets(unittest.TestCase):
                 self.assertEqual(row["size_pointer_pairs"], [
                     dict(pointer_slot="0x1108", size_slot="0x1100", pointer_code_refs=[], size_code_refs=[]),
                 ])
+
+    def test_scene_records_advances_cursor_by_consumed_deflate_bytes(self):
+        def make_record(blob, *, name=b"owned", tail=b"", extra_stored=0):
+            encoder = zlib.compressobj(wbits=-15)
+            payload = encoder.compress(blob) + encoder.flush() + tail
+            stored = len(payload) + extra_stored
+            return name + b"\0\0" + struct.pack("<4I", stored, 0, stored, len(blob)) + payload
+
+        pixel = container(stage_kind=0)
+        compute = container(stage_kind=5)
+
+        # Normal trailing padding bytes still preserve the following record and tail count.
+        padded = make_record(pixel, tail=b"pad") + make_record(compute)
+        padded_result = scene_records(padded)
+        self.assertEqual(padded_result["records"], 2)
+        self.assertEqual(padded_result["stages"], {"pixel": 1, "compute": 1})
+        self.assertEqual(padded_result["framed_bitcode"], 2)
+        self.assertEqual(padded_result["trailing_byte_counts"], {3: 1, 0: 1})
+        self.assertEqual(padded_result["candidate_rejections"], {})
+
+        # Oversized claimed span covering a following record inside unused_data must not skip it.
+        second = make_record(compute, name=b"second")
+        for tail in (b"", b"\x00\x01"):
+            with self.subTest(tail=tail):
+                data = make_record(pixel, name=b"first", tail=tail, extra_stored=len(second)) + second
+                result = scene_records(data)
+                self.assertEqual(result["records"], 2)
+                self.assertEqual(result["stages"], {"pixel": 1, "compute": 1})
+                self.assertEqual(result["framed_bitcode"], 2)
+                self.assertEqual(result["section_counts"]["DXIL"], 2)
+                self.assertEqual(result["trailing_byte_counts"], {len(tail) + len(second): 1, 0: 1})
+                self.assertEqual(result["candidate_rejections"], {})
 
 
 if __name__ == "__main__":

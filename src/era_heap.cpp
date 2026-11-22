@@ -1,6 +1,7 @@
 #include "era_heap.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <malloc.h>
@@ -24,11 +25,46 @@ bool is_graphics(std::uint32_t memory_type) noexcept
     return memory_type >= graphics_first && memory_type <= graphics_last;
 }
 
+struct PageGeometry {
+    std::size_t page;
+    std::uintptr_t granularity;
+};
+
+const PageGeometry& geometry() noexcept
+{
+    static const PageGeometry value = [] {
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        return PageGeometry{info.dwPageSize, info.dwAllocationGranularity};
+    }();
+    return value;
+}
+
 std::size_t allocation_granularity() noexcept
 {
-    SYSTEM_INFO info{};
-    GetSystemInfo(&info);
-    return info.dwAllocationGranularity;
+    return geometry().granularity;
+}
+
+// Alignments above the page size come from their own reservation. Only the pages that
+// hold the payload are committed, and VirtualAlloc already returns them zeroed.
+void* allocate_pages(std::size_t bytes, std::size_t alignment) noexcept
+{
+    const auto page = geometry().page;
+    const auto committed = (bytes + page - 1) & ~(page - 1);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        auto* probe = VirtualAlloc(nullptr, committed + alignment, MEM_RESERVE, PAGE_NOACCESS);
+        if (!probe) {
+            return nullptr;
+        }
+        const auto aligned = (reinterpret_cast<std::uintptr_t>(probe) + alignment - 1) & ~(alignment - 1);
+        VirtualFree(probe, 0, MEM_RELEASE);
+        // Another thread can take the range between the release and this call.
+        if (auto* p = VirtualAlloc(reinterpret_cast<void*>(aligned), committed,
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
+            return p;
+        }
+    }
+    return nullptr;
 }
 }
 
@@ -59,7 +95,12 @@ void* allocate(std::size_t bytes, std::uint64_t attributes) noexcept
     }
 
     if (fields.memory_type == heap) {
-        // As in SlimEra, the page size does not affect heap requests.
+        // As in SlimEra, the page size does not affect heap requests. Unlike SlimEra, which
+        // uses _aligned_malloc for every alignment, alignments above a page commit only the
+        // payload pages instead of the CRT's alignment padding.
+        if (alignment > geometry().page) {
+            return allocate_pages(bytes, alignment);
+        }
         void* allocation = _aligned_malloc(bytes, alignment);
         if (allocation) {
             std::memset(allocation, 0, bytes);
@@ -85,6 +126,16 @@ void* allocate(std::size_t bytes, std::uint64_t attributes) noexcept
 
 void release(void* allocation) noexcept
 {
+    // _aligned_malloc keeps its base pointer below the returned address, so a CRT block
+    // never starts its own allocation. Only page-backed blocks satisfy this test.
+    const auto address = reinterpret_cast<std::uintptr_t>(allocation);
+    MEMORY_BASIC_INFORMATION info{};
+    if (allocation && (address & (geometry().granularity - 1)) == 0 &&
+        VirtualQuery(allocation, &info, sizeof(info)) == sizeof(info) &&
+        info.AllocationBase == allocation) {
+        VirtualFree(allocation, 0, MEM_RELEASE);
+        return;
+    }
     _aligned_free(allocation);
 }
 
@@ -95,7 +146,7 @@ void release_with_attributes(void* allocation, std::uint64_t attributes) noexcep
     }
     const auto memory_type = decode(attributes).memory_type;
     if (memory_type == heap) {
-        _aligned_free(allocation);
+        release(allocation);
     } else if (is_graphics(memory_type)) {
         VirtualFree(allocation, 0, MEM_RELEASE);
     }

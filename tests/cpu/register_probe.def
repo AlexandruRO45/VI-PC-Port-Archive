@@ -1,3 +1,4 @@
 EXPORTS
     probe
     clobber_control
+    probe4

@@ -1,0 +1,13 @@
+EXPORTS
+    andn32
+    andn64
+    bextr32
+    bextr64
+    blsi32
+    blsi64
+    blsmsk32
+    blsmsk64
+    blsr32
+    blsr64
+    tzcnt32
+    tzcnt64

@@ -67,4 +67,12 @@ even_high:
 done:
     ret
 high_byte_probe ENDP
+
+addr32_probe PROC FRAME
+    .endprolog
+    lea rax,[ecx+edx*2+4]
+    lea r8,[ecx+1]
+    xor rax,r8
+    ret
+addr32_probe ENDP
 END
