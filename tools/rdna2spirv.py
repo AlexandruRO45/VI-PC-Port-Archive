@@ -7367,7 +7367,7 @@ class Gen:
                 word = self.tmp()
                 self.emit(f"{word} = OpCompositeExtract %uint {words} {index}")
                 self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, word)
-        elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
+        elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_fract_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
                 lo, hi = self.f64_source_words(sv, op)
@@ -7412,10 +7412,27 @@ class Gen:
                     x = f64(a[1])
                     r = self.tmp()
                     self.emit(f"{r} = OpExtInst %double %glsl InverseSqrt {x}")
-                else:  # v_sqrt_f64
+                elif op == "v_sqrt_f64":
                     x = f64(a[1])
                     r = self.tmp()
                     self.emit(f"{r} = OpExtInst %double %glsl Sqrt {x}")
+                else:  # v_fract_f64
+                    # Measured natively on gfx1036 (wave32 & wave64): a tiny negative input whose x - floor(x)
+                    # rounds up to 1.0 returns 0x3FEFFFFFFFFFFFFF (largest double below 1.0), and fract(+-inf)
+                    # returns canonical negative qNaN 0xFFF8000000000000 (matching v_fract_f32's 0x3F7FFFFF
+                    # and 0xFFC00000).
+                    x = f64(a[1])
+                    raw, one, below_v2, below, clamped = (self.tmp() for _ in range(5))
+                    self.emit(f"{raw} = OpExtInst %double %glsl Fract {x}")
+                    self.emit(f"{one} = OpFOrdEqual %bool {raw} {self.dconst(1.0)}")
+                    self.emit(f"{below_v2} = OpCompositeConstruct %v2uint_d {self.cu(0xFFFFFFFF)} {self.cu(0x3FEFFFFF)}")
+                    self.emit(f"{below} = OpBitcast %double {below_v2}")
+                    self.emit(f"{clamped} = OpSelect %double {one} {below} {raw}")
+                    is_inf, qnan_v2, qnan, r = (self.tmp() for _ in range(4))
+                    self.emit(f"{is_inf} = OpIsInf %bool {x}")
+                    self.emit(f"{qnan_v2} = OpCompositeConstruct %v2uint_d {self.cu(0)} {self.cu(0xFFF80000)}")
+                    self.emit(f"{qnan} = OpBitcast %double {qnan_v2}")
+                    self.emit(f"{r} = OpSelect %double {is_inf} {qnan} {clamped}")
                 # VOP3 f64 ops carry HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type).
                 self.dst_f64(a[0], r, mods, op)
         elif op in ("v_cmp_class_f64", "v_cmpx_class_f64"):
