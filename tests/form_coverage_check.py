@@ -207,12 +207,13 @@ def check_shader_records():
         ("SOP1", "s_cmov_b64"), ("SOP1", "s_not_b64"), ("SOP1", "s_brev_b64"),
         ("SOP2", "s_and_b64"), ("SOP2", "s_or_b64"), ("SOP2", "s_xor_b64"),
         ("SOP2", "s_andn2_b64"), ("SOP2", "s_orn2_b64"),
+        ("SOP2", "s_nand_b64"), ("SOP2", "s_nor_b64"), ("SOP2", "s_xnor_b64"),
         ("SOP2", "s_lshl_b64"), ("SOP2", "s_lshr_b64"), ("SOP2", "s_ashr_i64"),
         ("SOP2", "s_bfm_b64"), ("SOP2", "s_bfe_u32"), ("SOP2", "s_bfe_i32"),
     }
     rejected_forms = {
         "s_and_saveexec_b64", "s_or_saveexec_b64", "s_andn2_saveexec_b64",
-        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64", "s_nand_b64", "s_nor_b64", "s_xnor_b64",
+        "s_cselect_b64", "s_bfe_u64", "s_bfe_i64",
         "s_cmp_eq_u64", "s_bitcmp1_b64", "s_bfm_b32",
         "s_add_u32", "s_and_b32", "s_not_b32", "s_cmp_eq_i32", "s_cselect_b32",
     }

@@ -813,12 +813,31 @@ def scalar64():
     capture_scc(9)
     mix_acc("s[72:73]")
 
-    # Fold all 64 bits of acc into bits [29:0] of s64, then export 4 x 10-bit fields as 1 + k/1024.
+    # s_nand_b64, s_nor_b64 and s_xnor_b64: the register pair, then an SCC probe. Channel 3 exports
+    # only SCC bits 0-9, so each probe's SCC reaches acc through s_cmov_b64 of a distinct literal.
+    # nand(-1, -1) and nor(alt, -1) are zero, and xnor(alt, -1) = alt is zero only in Set 2.
+    for op, probe, marker in (("s_nand_b64", "-1, -1", "0x2468ace0"),
+                              ("s_nor_b64", "s[82:83], -1", "0x13579bdf"),
+                              ("s_xnor_b64", "s[82:83], -1", "0x0fedcba9")):
+        body.append(f"{op} s[72:73], s[52:53], s[54:55]")
+        mix_acc("s[72:73]")
+        body.extend([
+            "s_mov_b32 s78, 0",
+            "s_mov_b32 s79, 0",
+            f"{op} s[72:73], {probe}",
+            f"s_cmov_b64 s[78:79], {marker}",
+        ])
+        mix_acc("s[72:73]")
+        mix_acc("s[78:79]")
+
+    # Fold all 64 bits of acc into bits [29:0] of s64: acc ^ (acc >> 30) ^ (acc >> 60), both shifts of the
+    # original acc, so every bit reaches the export. Repeating x ^= x >> 30 instead gives x ^ (x >> 60)
+    # and drops bits 30-59. Then export 4 x 10-bit fields as 1 + k/1024.
     body.extend([
         "s_lshr_b64 s[68:69], s[64:65], 30",
+        "s_lshr_b64 s[70:71], s[64:65], 60",
         "s_xor_b64 s[64:65], s[64:65], s[68:69]",
-        "s_lshr_b64 s[68:69], s[64:65], 30",
-        "s_xor_b64 s[64:65], s[64:65], s[68:69]",
+        "s_xor_b64 s[64:65], s[64:65], s[70:71]",
     ])
     for channel, (src, ctrl) in enumerate((("s64", "0xa0000"), ("s64", "0xa000a"),
                                            ("s64", "0xa0014"), ("s66", "0xa0000"))):
@@ -890,6 +909,11 @@ def scalar64_reference(program, words):
             scc = v != 0
         elif op == "s_orn2_b64":
             v = read64(ops[1]) | (~read64(ops[2]) & mask64)
+            write64(ops[0], v)
+            scc = v != 0
+        elif op in ("s_nand_b64", "s_nor_b64", "s_xnor_b64"):
+            a, b = read64(ops[1]), read64(ops[2])
+            v = ~{"s_nand_b64": a & b, "s_nor_b64": a | b, "s_xnor_b64": a ^ b}[op] & mask64
             write64(ops[0], v)
             scc = v != 0
         elif op == "s_not_b64":
@@ -1273,9 +1297,6 @@ def check_controls(directory):
         "s_cselect_b64 s[70:71], s[52:53], s[54:55]",
         "s_bfe_u64 s[70:71], s[52:53], s61",
         "s_bfe_i64 s[70:71], s[52:53], s61",
-        "s_nand_b64 s[70:71], s[52:53], s[54:55]",
-        "s_nor_b64 s[70:71], s[52:53], s[54:55]",
-        "s_xnor_b64 s[70:71], s[52:53], s[54:55]",
         "s_cmp_eq_u64 s[52:53], s[54:55]",
         "s_bitcmp1_b64 s[52:53], 0",
         "s_bfm_b32 s70, 4, 8",
@@ -1510,6 +1531,10 @@ def check_render(directory, compiler, renderer, backend):
         ("s_bfe_i32 s72, s60, s61", "s_bfe_u32 s72, s60, s61", "signed bitfield extract"),
         ("s_andn2_b64 s[72:73], s[52:53], s[54:55]", "s_and_b64 s[72:73], s[52:53], s[54:55]", "andn2 inversion"),
         ("s_cmov_b64 s[78:79], -1", "s_cmov_b64 s[78:79], 0", "conditional move"),
+        ("s_nand_b64 s[72:73], s[52:53], s[54:55]", "s_and_b64 s[72:73], s[52:53], s[54:55]", "nand inversion"),
+        ("s_nor_b64 s[72:73], s[52:53], s[54:55]", "s_or_b64 s[72:73], s[52:53], s[54:55]", "nor inversion"),
+        ("s_xnor_b64 s[72:73], s[52:53], s[54:55]", "s_xor_b64 s[72:73], s[52:53], s[54:55]", "xnor inversion"),
+        ("s_nor_b64 s[72:73], s[82:83], -1", "s_nor_b64 s[72:73], s[82:83], 0", "nor SCC probe"),
     ):
         mutated = [line.replace(old, new) for line in program]
         assert mutated != program, label
