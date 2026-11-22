@@ -50,6 +50,8 @@ _FOURCC_MAP: dict[bytes, str] = {
     b"BC5S": "BC5_SNORM",
 }
 
+_PIXEL_BYTES = {"R8": 1, "A8": 1, "RG8": 2, "RGBA8": 4, "RGBX8": 4, "BGRA8": 4, "BGRX8": 4}
+
 _DXGI_MAP: dict[int, str] = {
     28: "RGBA8",
     29: "RGBA8",
@@ -79,8 +81,6 @@ _DXGI_MAP: dict[int, str] = {
     98: "BC7",
     99: "BC7",
 }
-
-_PIXEL_BYTES = {"R8": 1, "A8": 1, "RG8": 2, "RGBA8": 4, "RGBX8": 4, "BGRA8": 4, "BGRX8": 4}
 
 _CANONICAL_MASKS: dict[tuple[int, int, int, int], str] = {
     (0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000): "BGRA8",
