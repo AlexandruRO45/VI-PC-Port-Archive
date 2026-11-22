@@ -387,8 +387,8 @@ def check_dotnet(options: RunOptions) -> CheckResult:
     return _run_steps("dotnet", started, steps, options)
 
 
-def _find_ctest_executable() -> str | None:
-    found = shutil.which("ctest")
+def _find_cmake_tool(name: str) -> str | None:
+    found = shutil.which(name)
     if found:
         return found
     if os.name == "nt":
@@ -422,11 +422,15 @@ def _find_ctest_executable() -> str | None:
                         / "CMake"
                         / "CMake"
                         / "bin"
-                        / "ctest.exe"
+                        / f"{name}.exe"
                     )
                     if cand.is_file():
                         return str(cand)
     return None
+
+
+def _find_ctest_executable() -> str | None:
+    return _find_cmake_tool("ctest")
 
 
 def select_cmake_preset(presets_data: dict, platform: str | None = None) -> str | None:
@@ -477,9 +481,9 @@ def _run_cmake_preset(
     else:
         steps.append(([cmake, "--build", str(binary_dir)], options.repo_root))
     if preset in test_names:
-        steps.append(([ctest, "--preset", preset, "--output-on-failure"], runtime_dir))
+        steps.append(([ctest, "--preset", preset, "--output-on-failure", "--no-tests=error"], runtime_dir))
     else:
-        steps.append(([ctest, "--test-dir", str(binary_dir), "--output-on-failure"], options.repo_root))
+        steps.append(([ctest, "--test-dir", str(binary_dir), "--output-on-failure", "--no-tests=error"], options.repo_root))
     return _run_steps("runtime", started, steps, options, pass_detail=f"preset {preset}")
 
 
@@ -499,40 +503,7 @@ def check_runtime(options: RunOptions) -> CheckResult:
             presets_data = {}
         preset = select_cmake_preset(presets_data)
 
-    if sys.platform == "win32":
-        cmake = shutil.which("cmake")
-        ctest = _find_ctest_executable()
-        if preset is not None and cmake and shutil.which("cl") and ctest:
-            return _run_cmake_preset(started, cmake, ctest, preset, presets_data, runtime_dir, options)
-
-        build_script = options.repo_root / "scripts" / "build_runtime.ps1"
-        ps_exe = shutil.which("pwsh") or shutil.which("powershell")
-        if build_script.is_file() and ps_exe:
-            steps: list[tuple[list[str], Path]] = [
-                (
-                    [ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(build_script)],
-                    options.repo_root,
-                )
-            ]
-            if ctest:
-                steps.append(([ctest, "--test-dir", "runtime/build", "--output-on-failure"], options.repo_root))
-            res = _run_steps("runtime", started, steps, options)
-            if res.status == "PASS" and not ctest:
-                res.detail = "built via build_runtime.ps1 (ctest not found on PATH)"
-            return res
-    elif preset is not None:
-        cmake = shutil.which("cmake")
-        ctest = _find_ctest_executable()
-        if not cmake or not ctest:
-            return _skip_or_fail(
-                "runtime",
-                started,
-                "cmake/ctest not found on PATH",
-                options,
-            )
-        return _run_cmake_preset(started, cmake, ctest, preset, presets_data, runtime_dir, options)
-
-    cmake = shutil.which("cmake")
+    cmake = _find_cmake_tool("cmake")
     ctest = _find_ctest_executable()
     if not cmake or not ctest:
         return _skip_or_fail(
@@ -541,16 +512,41 @@ def check_runtime(options: RunOptions) -> CheckResult:
             "cmake/ctest not found on PATH",
             options,
         )
-    has_ninja = shutil.which("ninja") is not None
+
+    if sys.platform == "win32":
+        has_cl = shutil.which("cl") is not None
+        if preset is not None:
+            if has_cl:
+                return _run_cmake_preset(started, cmake, ctest, preset, presets_data, runtime_dir, options)
+            build_script = options.repo_root / "scripts" / "build_runtime.ps1"
+            ps_exe = shutil.which("pwsh") or shutil.which("powershell")
+            if build_script.is_file() and ps_exe:
+                binary_dir = _preset_binary_dir(presets_data, preset, runtime_dir)
+                steps: list[tuple[list[str], Path]] = [
+                    (
+                        [ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(build_script)],
+                        options.repo_root,
+                    ),
+                    (
+                        [ctest, "--test-dir", str(binary_dir), "--output-on-failure", "--no-tests=error"],
+                        options.repo_root,
+                    ),
+                ]
+                return _run_steps("runtime", started, steps, options, pass_detail=f"build_runtime.ps1 + {preset}")
+    elif preset is not None:
+        return _run_cmake_preset(started, cmake, ctest, preset, presets_data, runtime_dir, options)
+
+    use_ninja = shutil.which("ninja") is not None and (sys.platform != "win32" or shutil.which("cl") is not None)
     configure_cmd = [cmake, "-S", "runtime", "-B", "runtime/build"]
-    if has_ninja:
-        configure_cmd.extend(["-G", "Ninja"])
-    configure_cmd.append("-DCMAKE_BUILD_TYPE=RelWithDebInfo")
+    if use_ninja:
+        configure_cmd.extend(["-G", "Ninja", "-DCMAKE_BUILD_TYPE=RelWithDebInfo"])
+    elif sys.platform != "win32":
+        configure_cmd.append("-DCMAKE_BUILD_TYPE=RelWithDebInfo")
     if sys.platform == "win32":
         configure_cmd.append("-DLEONIDA_D3D12_SHIM_TESTS=ON")
     build_cmd = [cmake, "--build", "runtime/build"]
-    ctest_cmd = [ctest, "--test-dir", "runtime/build", "--output-on-failure"]
-    if sys.platform == "win32" and not has_ninja:
+    ctest_cmd = [ctest, "--test-dir", "runtime/build", "--output-on-failure", "--no-tests=error"]
+    if sys.platform == "win32" and not use_ninja:
         build_cmd.extend(["--config", "RelWithDebInfo"])
         ctest_cmd.extend(["-C", "RelWithDebInfo"])
     steps = [

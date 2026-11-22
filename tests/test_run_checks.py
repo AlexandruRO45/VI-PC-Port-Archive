@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -196,6 +198,125 @@ class TestRuntimePresetSelection(unittest.TestCase):
         self.assertIsNone(run_checks.select_cmake_preset(empty, platform="win32"))
         self.assertIsNone(run_checks.select_cmake_preset(empty, platform="linux"))
         self.assertIsNone(run_checks.select_cmake_preset({}, platform="linux"))
+
+
+class TestRuntimeCheckCommands(unittest.TestCase):
+    def _run_with_capture(self, root: Path, *, platform: str, which_map: dict[str, str | None], strict: bool = False):
+        captured: list[tuple[list[str], Path]] = []
+
+        def fake_run_steps(name, started, steps, options, pass_detail=""):
+            captured.extend(steps)
+            return run_checks.CheckResult(name=name, status="PASS", elapsed=0.0, detail=pass_detail)
+
+        def fake_find_tool(name: str) -> str | None:
+            return which_map.get(name)
+
+        opts = run_checks.RunOptions(repo_root=root, strict=strict, verbose=False)
+        with (
+            mock.patch.object(run_checks.sys, "platform", platform),
+            mock.patch.object(run_checks, "_find_cmake_tool", side_effect=fake_find_tool),
+            mock.patch.object(run_checks.shutil, "which", side_effect=lambda name: which_map.get(name)),
+            mock.patch.object(run_checks, "_run_steps", side_effect=fake_run_steps),
+        ):
+            res = run_checks.check_runtime(opts)
+        return res, captured
+
+    def test_windows_without_presets_uses_cmake_with_shim_tests_and_no_tests_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "runtime").mkdir()
+            (root / "scripts").mkdir()
+            (root / "scripts" / "build_runtime.ps1").write_text("# stub\n", encoding="utf-8")
+
+            # Plain shell (no cl on PATH): uses default VS generator with -DLEONIDA_D3D12_SHIM_TESTS=ON
+            res, steps = self._run_with_capture(
+                root,
+                platform="win32",
+                which_map={"cmake": "cmake.exe", "ctest": "ctest.exe", "pwsh": "pwsh.exe", "ninja": "ninja.exe"},
+            )
+            self.assertEqual(res.status, "PASS")
+            cmds = [cmd for cmd, _ in steps]
+            self.assertEqual(len(cmds), 3)
+            self.assertIn("-DLEONIDA_D3D12_SHIM_TESTS=ON", cmds[0])
+            self.assertNotIn("-G", cmds[0])
+            self.assertIn("--config", cmds[1])
+            self.assertIn("-C", cmds[2])
+            self.assertIn("--no-tests=error", cmds[2])
+
+            # Developer Prompt (cl + ninja on PATH): uses Ninja with -DLEONIDA_D3D12_SHIM_TESTS=ON
+            res, steps = self._run_with_capture(
+                root,
+                platform="win32",
+                which_map={"cmake": "cmake.exe", "ctest": "ctest.exe", "cl": "cl.exe", "ninja": "ninja.exe"},
+            )
+            self.assertEqual(res.status, "PASS")
+            cmds = [cmd for cmd, _ in steps]
+            self.assertIn("-G", cmds[0])
+            self.assertIn("Ninja", cmds[0])
+            self.assertIn("-DLEONIDA_D3D12_SHIM_TESTS=ON", cmds[0])
+            self.assertIn("--no-tests=error", cmds[2])
+
+    def test_windows_with_presets_passes_no_tests_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "runtime").mkdir()
+            (root / "scripts").mkdir()
+            (root / "scripts" / "build_runtime.ps1").write_text("# stub\n", encoding="utf-8")
+            (root / "runtime" / "CMakePresets.json").write_text(
+                json.dumps(
+                    {
+                        "configurePresets": [{"name": "windows-ninja", "binaryDir": "${sourceDir}/build"}],
+                        "buildPresets": [{"name": "windows-ninja"}],
+                        "testPresets": [{"name": "windows-ninja"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # Plain shell: build_runtime.ps1 + ctest --no-tests=error
+            res, steps = self._run_with_capture(
+                root,
+                platform="win32",
+                which_map={"cmake": "cmake.exe", "ctest": "ctest.exe", "pwsh": "pwsh.exe"},
+            )
+            self.assertEqual(res.status, "PASS")
+            self.assertEqual(len(steps), 2)
+            self.assertTrue(steps[0][0][-1].endswith("build_runtime.ps1"))
+            self.assertIn("--no-tests=error", steps[1][0])
+
+            # Dev prompt: preset configure/build/test with --no-tests=error
+            res, steps = self._run_with_capture(
+                root,
+                platform="win32",
+                which_map={"cmake": "cmake.exe", "ctest": "ctest.exe", "cl": "cl.exe"},
+            )
+            self.assertEqual(res.status, "PASS")
+            self.assertEqual(len(steps), 3)
+            self.assertIn("--preset", steps[2][0])
+            self.assertIn("--no-tests=error", steps[2][0])
+
+    def test_missing_cmake_or_ctest_skips_instead_of_passing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "runtime").mkdir()
+            (root / "scripts").mkdir()
+            (root / "scripts" / "build_runtime.ps1").write_text("# stub\n", encoding="utf-8")
+
+            res, steps = self._run_with_capture(
+                root,
+                platform="win32",
+                which_map={"pwsh": "pwsh.exe"},
+            )
+            self.assertEqual(res.status, "SKIP")
+            self.assertEqual(steps, [])
+
+            res_strict, _ = self._run_with_capture(
+                root,
+                platform="win32",
+                which_map={"pwsh": "pwsh.exe"},
+                strict=True,
+            )
+            self.assertEqual(res_strict.status, "FAIL")
 
 
 if __name__ == "__main__":
