@@ -307,5 +307,190 @@ class TestPermB16ReferenceOracle(unittest.TestCase):
         self.assertEqual(sw.raw, 0x0302)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class Opcode(Enum):
+    """VALU instruction opcodes modeled for semantic analysis."""
+    V_PERM_B16 = auto()
+    V_NOP = auto()
+
+
+class OperandKind(Enum):
+    """Hardware operand categories for RDNA2 instructions."""
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL_CONST = auto()
+    INLINE_CONST = auto()
+
+
+class DataType(Enum):
+    """Architectural data types for operands and intermediate evaluations."""
+    U16 = auto()
+    B16 = auto()
+    U32 = auto()
+
+
+@dataclass
+class ASTOperand:
+    """Symbolic AST node representing an instruction operand."""
+    kind: OperandKind
+    reg_num: int = 0
+    constant_val: int = 0
+    data_type: DataType = DataType.B16
+
+    @classmethod
+    def vgpr(cls, num: int, dtype: DataType = DataType.B16) -> ASTOperand:
+        if not 0 <= num <= 255:
+            raise IndexError(f"VGPR index out of range [0, 255]: {num}")
+        return cls(kind=OperandKind.VGPR, reg_num=num, data_type=dtype)
+
+    @classmethod
+    def sgpr(cls, num: int, dtype: DataType = DataType.B16) -> ASTOperand:
+        if not 0 <= num <= 105:
+            raise IndexError(f"SGPR index out of range [0, 105]: {num}")
+        return cls(kind=OperandKind.SGPR, reg_num=num, data_type=dtype)
+
+    @classmethod
+    def literal(cls, val: int, dtype: DataType = DataType.U16) -> ASTOperand:
+        return cls(kind=OperandKind.LITERAL_CONST, constant_val=val & MASK16, data_type=dtype)
+
+    @classmethod
+    def inline_const(cls, val: int, dtype: DataType = DataType.U16) -> ASTOperand:
+        return cls(kind=OperandKind.INLINE_CONST, constant_val=val & MASK16, data_type=dtype)
+
+    def validate(self) -> None:
+        if self.kind == OperandKind.VGPR and not (0 <= self.reg_num <= 255):
+            raise IndexError(f"VGPR out of bounds: {self.reg_num}")
+        if self.kind == OperandKind.SGPR and not (0 <= self.reg_num <= 105):
+            raise IndexError(f"SGPR out of bounds: {self.reg_num}")
+
+
+@dataclass
+class ASTInstruction:
+    """Symbolic AST node representing a complete v_perm_b16 instruction."""
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+    src2: ASTOperand
+
+    def validate(self) -> None:
+        """Validate RDNA2 architectural encoding rules."""
+        if self.dst.kind != OperandKind.VGPR:
+            raise ValueError(f"VALU instruction destination must be a VGPR, got {self.dst.kind}")
+        self.dst.validate()
+        self.src0.validate()
+        self.src1.validate()
+        self.src2.validate()
+
+        # Enforce max one 32-bit literal constant in instruction word
+        literals = sum(1 for src in (self.src0, self.src1, self.src2) if src.kind == OperandKind.LITERAL_CONST)
+        if literals > 1:
+            raise ValueError(f"Hardware encoding permits at most one literal constant, got {literals}")
+
+
+@dataclass
+class ASTExpression:
+    """Symbolic typed expression tree representing the operation semantics."""
+    opcode: Opcode
+    operands: List[Union[ASTOperand, ASTExpression]]
+
+    def to_symbolic_string(self) -> str:
+        ops_str = ", ".join(
+            op.to_symbolic_string() if isinstance(op, ASTExpression)
+            else f"{op.kind.name}{op.reg_num if op.kind in (OperandKind.VGPR, OperandKind.SGPR) else f'({hex(op.constant_val)})'}"
+            for op in self.operands
+        )
+        return f"{self.opcode.name}({ops_str})"
+
+
+# ==============================================================================
+# Unit Tests: Commit 2 (Symbolic AST & Typed Expressions)
+# ==============================================================================
+
+class TestPermB16SymbolicAST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instruction_creation(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.sgpr(0),
+        )
+        self.assertEqual(instr.opcode, Opcode.V_PERM_B16)
+        self.assertEqual(instr.dst.reg_num, 0)
+        self.assertEqual(instr.src0.reg_num, 1)
+        self.assertEqual(instr.src1.reg_num, 2)
+        self.assertEqual(instr.src2.reg_num, 0)
+
+    def test_ast_operand_factories(self):
+        v = ASTOperand.vgpr(42)
+        self.assertEqual(v.kind, OperandKind.VGPR)
+        self.assertEqual(v.reg_num, 42)
+
+        s = ASTOperand.sgpr(10)
+        self.assertEqual(s.kind, OperandKind.SGPR)
+        self.assertEqual(s.reg_num, 10)
+
+        lit = ASTOperand.literal(0x1234)
+        self.assertEqual(lit.kind, OperandKind.LITERAL_CONST)
+        self.assertEqual(lit.constant_val, 0x1234)
+
+        inline = ASTOperand.inline_const(0)
+        self.assertEqual(inline.kind, OperandKind.INLINE_CONST)
+        self.assertEqual(inline.constant_val, 0)
+
+    def test_ast_instruction_validation_valid(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(5),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.sgpr(2),
+            src2=ASTOperand.literal(0x0100),
+        )
+        instr.validate()
+
+    def test_ast_instruction_validation_rejects_sgpr_dst(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.sgpr(5),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.literal(0x0100),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_ast_instruction_validation_rejects_multiple_literals(self):
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(5),
+            src0=ASTOperand.literal(0x1111),
+            src1=ASTOperand.literal(0x2222),
+            src2=ASTOperand.vgpr(0),
+        )
+        with self.assertRaises(ValueError):
+            instr.validate()
+
+    def test_ast_expression_tree_representation(self):
+        expr = ASTExpression(
+            opcode=Opcode.V_PERM_B16,
+            operands=[
+                ASTOperand.vgpr(1),
+                ASTOperand.vgpr(2),
+                ASTOperand.literal(0x0302),
+            ],
+        )
+        sym_str = expr.to_symbolic_string()
+        self.assertIn("V_PERM_B16", sym_str)
+        self.assertIn("VGPR1", sym_str)
+        self.assertIn("0x302", sym_str)
+
+
 if __name__ == "__main__":
     unittest.main()
+
