@@ -225,6 +225,26 @@ class TestCensus(unittest.TestCase):
         self.assertNotIn("reads", rows[0])
         self.assertEqual(R.summarize(rows)["read_scan"], {})
 
+    def test_report_cannot_replace_a_scanned_input(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        disasm = os.path.join(self.tmp.name, "disasm")
+        os.mkdir(disasm)
+        listing = os.path.join(disasm, "sig.s")
+        with open(listing, "w", encoding="utf-8", newline="\n") as f:
+            f.write(asm("s_nop 0"))
+        for source in (os.path.join(self.tmp.name, "sig.dxbc"),
+                       os.path.join(self.tmp.name, "fspx", "sig.json"), listing):
+            with self.subTest(source=source):
+                with open(source, "rb") as f:
+                    before = f.read()
+                result = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name,
+                                         "--disasm", disasm, "--json", source],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("would overwrite", result.stderr)
+                with open(source, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
     def test_cli_writes_the_json_and_exits_zero(self):
         self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
         out = os.path.join(self.tmp.name, "census.json")

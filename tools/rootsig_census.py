@@ -36,6 +36,9 @@ import struct
 import sys
 from collections import Counter
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 KNOWN_VERSIONS = {1: "1.0", 2: "1.1", 3: "1.2"}
 TYPE_NAMES = {0: "table", 1: "constants", 2: "cbv", 3: "srv", 4: "uav"}
 # D3D12_SHADER_VISIBILITY. ALL is 0, so anything else is a stage-specific parameter; compute has no value of its own
@@ -223,19 +226,26 @@ def _read_summary(rows):
     }
 
 
-def census(root, disasm=None):
+def census(root, disasm=None, *, report_path=None):
     """Rows for every container in `root`, joined with the program's measured USER_SGPR count.
 
     With `disasm`, the `--disasm` folder of tools/fspx_unpack.py, each row also carries the program's reads.
     """
     rows, errors = [], []
+
+    def protect_input(path):
+        if report_path and same_report_path(path, report_path):
+            raise ValueError(f"--json would overwrite the input {path}")
+
     for path in sorted(glob.glob(os.path.join(glob.escape(root), "*.dxbc"))):
         name = os.path.basename(path)[:-5]
+        protect_input(path)
         with open(path, "rb") as fh:
             chunks = parts(fh.read())
         state_path = os.path.join(root, "fspx", name + ".json")
         user_sgprs = None
         if os.path.exists(state_path):
+            protect_input(state_path)
             with open(state_path, encoding="utf-8") as fh:
                 user_sgprs = json.load(fh).get("user_sgprs")
         if b"RTS0" not in chunks:
@@ -256,6 +266,7 @@ def census(root, disasm=None):
             row["spare_table1"] = user_sgprs - row["span_table1"]
             asm_path = os.path.join(disasm, name + ".s") if disasm else None
             if asm_path and os.path.exists(asm_path):
+                protect_input(asm_path)
                 with open(asm_path, encoding="utf-8") as fh:
                     row["reads"] = read_scan(fh.read(), user_sgprs)
         rows.append(row)
@@ -289,17 +300,18 @@ def main(argv=None):
     ap.add_argument("--json", help="also write the rows and the summary here")
     ap.add_argument("--disasm", help="a tools/fspx_unpack.py --disasm folder; adds each program's reads")
     a = ap.parse_args(argv)
-    if a.json:
-        try:
-            if os.path.samefile(a.root, a.json):
-                ap.error("--json must not be the input folder")
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            pass
+    if a.json and os.path.isdir(a.json):
+        ap.error("--json must be a file, not a directory")
     if not os.path.isdir(a.root):
         ap.error(f"not a folder: {a.root}")
     if a.disasm and not os.path.isdir(a.disasm):
         ap.error(f"not a folder: {a.disasm}")
-    rows, errors = census(a.root, a.disasm)
+    try:
+        existing_report = a.json if a.json and os.path.exists(a.json) else None
+        rows, errors = census(a.root, a.disasm, report_path=existing_report)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     summary = summarize(rows)
     for row in rows:
         if "error" in row:
