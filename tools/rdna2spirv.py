@@ -146,6 +146,28 @@ def imm64(v, signed):
     return v
 
 
+def f64_inline(v):
+    """The 64-bit value of a float inline constant (0.5, 1.0, 2.0, 4.0, their negatives, 1/(2pi)) in a 64-bit integer
+    operand: its f64 encoding, as for an f64 op (measured on RDNA2, gfx1036: docs/design.md "64-bit operand
+    literals"). 1/(2pi) is the f64 constant 0x3FC45F306DC9C882 however the disassembly spells it."""
+    if struct.unpack("<I", struct.pack("<f", v))[0] == 0x3E22F983:
+        return 0x3FC45F306DC9C882
+    return struct.unpack("<Q", struct.pack("<d", v))[0]
+
+
+# The 64-bit integer source operands (argument indices) that take a float inline constant as its f64 encoding.
+INT64_SRCS = {
+    **dict.fromkeys(("s_mov_b64", "s_not_b64", "s_brev_b64", "s_cmov_b64", "s_lshl_b64", "s_lshr_b64", "s_ashr_i64",
+                     "s_bfe_u64", "s_bfe_i64", "s_bcnt1_i32_b64", "s_flbit_i32_b64",
+                     "s_flbit_i32_i64"), (1,)),
+    **dict.fromkeys(("s_and_b64", "s_or_b64", "s_xor_b64", "s_andn2_b64", "s_cselect_b64"), (1, 2)),
+    **dict.fromkeys(("s_cmp_eq_u64", "s_cmp_lg_u64"), (0, 1)),
+    "s_bitcmp1_b64": (0,),
+    **dict.fromkeys(("v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64"), (2,)),
+    **dict.fromkeys(("v_mad_u64_u32", "v_mad_i64_i32"), (4,)),
+}
+
+
 class Unsupported(Exception):
     pass
 
@@ -3974,6 +3996,9 @@ class Gen:
 
     def _insn(self, ins):
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
+        if op in INT64_SRCS and any(a[i].get("k") == "fimm" for i in INT64_SRCS[op] if i < len(a)):
+            a = [{"k": "imm", "v": f64_inline(x["v"])} if i in INT64_SRCS[op] and x.get("k") == "fimm" else x
+                 for i, x in enumerate(a)]
         if op in NOOPS or op.startswith("s_waitcnt"):
             return
         if op == "s_sendmsg" and a and self.stage == "gs":
