@@ -388,6 +388,15 @@ MIP_TEST_PASSES = {
 # i = 8y + x) and the r32 uint volume with 200 + i (texel i = 16z + 4y + x), and prints the three after the dispatch.
 # Per fixture: the words it changes, {word index: value}, in the uint image, the sint image and the volume, as
 # derived in the .asm header. Every other word must still hold its fill.
+# The texels vk_store_test fills the packed-load images with (see its "words" mode): byte n of the rgba8 image is
+# (0x81 + 0x0b n) & 0xFF, byte n of the rgba16 image (0x35 + 0x13 n) & 0xFF, texel i of the r8 image (0x7c + 0x0d i) & 0xFF.
+def _dword(byte, first):
+    return sum(byte(first + k) << (8 * k) for k in range(4))
+RGBA8_DW = [_dword(lambda n: (0x81 + 0x0b * n) & 0xFF, 4 * i) for i in range(64)]
+RGBA16_DW0 = [_dword(lambda n: (0x35 + 0x13 * n) & 0xFF, 8 * i) for i in range(64)]
+RGBA16_DW1 = [_dword(lambda n: (0x35 + 0x13 * n) & 0xFF, 8 * i + 4) for i in range(64)]
+R8_BYTES = [(0x7c + 0x0d * i) & 0xFF for i in range(64)]
+R8_SIGNED = [b | 0xFFFFFF00 if b & 0x80 else b for b in R8_BYTES]
 STORE_IMAGES = ("uint", "sint", "volume")
 STORE_FILL = (lambda i: 100 + i, lambda i: -2 * i & 0xFFFFFFFF, lambda i: 200 + i)
 STORE_WORDS = {
@@ -399,6 +408,11 @@ STORE_WORDS = {
     # 3D image atomics: the data register afterwards (sint image) and the six texels afterwards (volume)
     "cs_imgatomic3d": ({}, dict(enumerate([0x101, 0xDB, 0xF4, 0xCE, 0xE6, 0xFF])),
                        {57: 0x111, 19: 3, 44: 0xF4, 6: 0xD00D, 30: 0xE6, 39: 0x10}),
+    # image_load_pck / image_load_pck_sgn / image_load_mip_pck: the raw texel dwords (measured on gfx1036), every one of the 64
+    # words of the uint and the sint image (formulas in the .asm headers; the fill bytes in vk_store_test.cpp)
+    "cs_imgpck_rgba8": (dict(enumerate(RGBA8_DW)), dict(enumerate(RGBA8_DW)), {}),
+    "cs_imgpck_rgba16": (dict(enumerate(RGBA16_DW1)), dict(enumerate(RGBA16_DW0)), {}),
+    "cs_imgpck_r8": (dict(enumerate(R8_BYTES)), dict(enumerate(R8_SIGNED)), {}),
     # image_get_resinfo on a 16x4 image with five levels: (width, height, depth, levels) of levels 0, 1 and 3, then
     # width and height of level 2 and an untouched register, height and levels of level 1, the levels alone
     "cs_resinfo": ({**dict(enumerate([16, 4, 1, 5, 8, 2, 1, 5, 2, 1, 1, 5, 4, 1, 0xABCD])), 16: 2, 17: 5, 18: 5},

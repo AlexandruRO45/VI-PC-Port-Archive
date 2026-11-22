@@ -209,6 +209,8 @@ class Gen:
         self.dpp_guard = None       # per-lane bool: a DPP instruction's row/bank/valid write mask
         self.parked = {}               # (vgpr, lane) a mask is parked in -> the spare SGPR slot that keeps it per lane
         self.uses_lds = False
+        self.uses_pck = False          # an image_load_*pck*: the Private %fmt_pck table
+        self.pck = None                # while translating one: "raw" or "sgn"
         self.lds_dwords = 16384        # CS: set from RSRC2 LDS_SIZE (power of two, covers every offset used)
         self.lds_need = 0              # CS: dwords the program needs (LDS_SIZE, largest constant offset)
         self.lds_declared = 0          # CS: dwords RSRC2 LDS_SIZE allocates (the hardware allocation, unclipped)
@@ -4958,6 +4960,22 @@ class Gen:
                 self.emit(f"{z} = OpIEqual %bool {x} {self.cu(0)}")
                 self.emit(f"{r} = OpSelect %uint {z} {self.cu(0xFFFFFFFF)} {d}")
             self.dst(a[0], r)
+        elif op in ("image_load_pck", "image_load_pck_sgn", "image_load_mip_pck", "image_load_mip_pck_sgn"):
+            # raw texel dwords, no format conversion (image_pck_words): the typed 2D/array/3D fetch of image_load
+            # and image_load_mip, read back as the texel's bytes
+            bad = [m for m in mods if m in ("d16", "a16", "glc", "tfe", "lwe", "slc", "dlc") or m.startswith("r128")]
+            dim = next((m for m in mods if m.startswith("dim:")), "")
+            mip = "_mip" in op
+            if bad or dim not in self.STORE_DIMS or (mip and dim != "dim:SQ_RSRC_IMG_2D"):
+                raise Unsupported(op + " " + " ".join(bad + [dim.split("SQ_RSRC_IMG_")[-1]]))
+            self.pck = "sgn" if op.endswith("_sgn") else "raw"
+            try:
+                if mip:
+                    self.image_misc("image_load_mip", a, mods)
+                else:
+                    self.image_op("image_load", a, mods)
+            finally:
+                self.pck = None
         elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_atomic_cmpswap") or op in self.IMG_ATOMICS:
             self.image_misc(op, a, mods)
         elif op in ("v_cubema_f32", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32"):
@@ -8714,6 +8732,114 @@ class Gen:
             flags.append(nz)
         return flags
 
+    PCK_SIZES = {8: 1, 16: 2, 32: 3, 64: 4, 96: 5, 128: 6}     # texel bits -> size code (1, 2, 4, 8, 12, 16 bytes)
+
+    @staticmethod
+    def pck_format_table():
+        """512 words, one per T# FORMAT: bits 2:0 size code (PCK_SIZES), 5:3 kind (1 integer UINT/SINT, 2 UNORM,
+        3 FLOAT16, 4 FLOAT32), then four 6-bit component widths. Only formats made of 8, 16 or 32-bit components with a
+        kind the raw bits can be rebuilt from are listed; every other FORMAT is 0 (image_load_pck returns 0 for it)."""
+        out = []
+        for code in range(512):
+            parts = GFX10_FORMATS.get(code, "").replace("GFX10_FORMAT_", "").split("_")
+            nums, ty = parts[:-1], parts[-1]
+            word = 0
+            if nums and len(nums) <= 4 and all(n.isdigit() for n in nums):
+                ws = [int(n) for n in nums]
+                size = Gen.PCK_SIZES.get(sum(ws)) if all(w in (8, 16, 32) for w in ws) else None
+                kind = 0
+                if ty in ("UINT", "SINT"):
+                    kind = 1
+                elif ty == "UNORM" and all(w in (8, 16) for w in ws):
+                    kind = 2
+                elif ty == "FLOAT" and all(w == 16 for w in ws):
+                    kind = 3
+                elif ty == "FLOAT" and all(w == 32 for w in ws):
+                    kind = 4
+                if size and kind:
+                    word = size | kind << 3 | sum(w << (6 + 6 * i) for i, w in enumerate(ws))
+            out.append(word)
+        return out
+
+    def image_pck_words(self, word1, v4u, sgn):
+        """The raw texel dwords of image_load_pck / image_load_pck_sgn, from the four components the typed fetch gave
+        (v4u: uint bits, floats for a non-integer FORMAT) and the FORMAT of T# word1. Measured on gfx1036: the result
+        ignores the format's numeric conversion and the DST_SEL swizzle; it is the texel's memory bytes as dwords
+        (little endian, zero padded), and dmask bit k selects dword k. image_load_pck_sgn sign-extends dword 0 of a
+        1 or 2 byte texel. The components are put back with the FORMAT's own widths: integers masked, UNORM
+        rounded to the integer, FLOAT16 narrowed, FLOAT32 as is (exact for those; other formats give 0). Returns the
+        four dword ids."""
+        if not self.uses_pck:
+            self.uses_pck = True
+            for w in [512] + self.pck_format_table():      # the table's constants exist before the types that use them
+                self.cu(w)
+        fmt, ent_p, ent = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{fmt} = OpBitFieldUExtract %uint {word1} {self.cu(20)} {self.cu(9)}")
+        self.emit(f"{ent_p} = OpAccessChain %_ptr_Private_uint_pck %fmt_pck {fmt}")
+        self.emit(f"{ent} = OpLoad %uint {ent_p}")
+        size, kind = self.tmp(), self.tmp()
+        self.emit(f"{size} = OpBitwiseAnd %uint {ent} {self.cu(7)}")
+        self.emit(f"{kind} = OpBitFieldUExtract %uint {ent} {self.cu(3)} {self.cu(3)}")
+        is_k = {}
+        for k in (1, 2, 3, 4):
+            is_k[k] = self.tmp()
+            self.emit(f"{is_k[k]} = OpIEqual %bool {kind} {self.cu(k)}")
+        offs, vals = self.cu(0), []
+        for c in range(4):
+            w, cu_, f = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{w} = OpBitFieldUExtract %uint {ent} {self.cu(6 + 6 * c)} {self.cu(6)}")
+            self.emit(f"{cu_} = OpCompositeExtract %uint {v4u} {c}")
+            self.emit(f"{f} = OpBitcast %float {cu_}")
+            r_int, wm, sh, top, mx, scaled, plus, fl, hi, lo, clamped, r_un, r_f16 = (self.tmp() for _ in range(13))
+            self.emit(f"{r_int} = OpBitFieldUExtract %uint {cu_} {self.cu(0)} {w}")
+            self.emit(f"{wm} = OpExtInst %uint %glsl UMax {w} {self.cu(1)}")
+            self.emit(f"{sh} = OpISub %uint {self.cu(32)} {wm}")
+            self.emit(f"{top} = OpShiftRightLogical %uint {self.cu(0xFFFFFFFF)} {sh}")        # 2^w - 1
+            self.emit(f"{mx} = OpConvertUToF %float {top}")
+            self.emit(f"{scaled} = OpFMul %float {f} {mx}")
+            self.emit(f"{plus} = OpFAdd %float {scaled} {self.cf(0.5) if hasattr(self, 'cf') else '%fhalf_g'}")
+            self.emit(f"{fl} = OpExtInst %float %glsl Floor {plus}")
+            self.emit(f"{hi} = OpExtInst %float %glsl FMin {fl} {mx}")
+            self.emit(f"{lo} = OpExtInst %float %glsl FMax {hi} {self.tof(self.cu(0))}")
+            self.emit(f"{clamped} = OpConvertFToU %uint {lo}")
+            self.emit(f"{r_un} = OpSelect %uint {is_k[2]} {clamped} {self.cu(0)}")
+            self.uses_fhalf = True
+            self.emit(f"{r_f16} = OpBitwiseAnd %uint {self.f16_bits(f)} {self.cu(0xFFFF)}")
+            a1, a2, a3, a4 = (self.tmp() for _ in range(4))
+            self.emit(f"{a1} = OpSelect %uint {is_k[1]} {r_int} {self.cu(0)}")
+            self.emit(f"{a2} = OpSelect %uint {is_k[2]} {r_un} {a1}")
+            self.emit(f"{a3} = OpSelect %uint {is_k[3]} {r_f16} {a2}")
+            self.emit(f"{a4} = OpSelect %uint {is_k[4]} {cu_} {a3}")
+            # place it at this component's bit offset (components are 8, 16 or 32 bits wide: never across dwords)
+            dk, shl, placed = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{dk} = OpShiftRightLogical %uint {offs} {self.cu(5)}")
+            self.emit(f"{shl} = OpBitwiseAnd %uint {offs} {self.cu(31)}")
+            self.emit(f"{placed} = OpShiftLeftLogical %uint {a4} {shl}")
+            vals.append((dk, placed))
+            nxt = self.tmp()
+            self.emit(f"{nxt} = OpIAdd %uint {offs} {w}")
+            offs = nxt
+        words = []
+        for k in range(4):
+            acc = self.cu(0)
+            for dk, placed in vals:
+                eq, sel, nxt = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{eq} = OpIEqual %bool {dk} {self.cu(k)}")
+                self.emit(f"{sel} = OpSelect %uint {eq} {placed} {self.cu(0)}")
+                self.emit(f"{nxt} = OpBitwiseOr %uint {acc} {sel}")
+                acc = nxt
+            words.append(acc)
+        if sgn:
+            one, two, small, cnt, ext, w0 = (self.tmp() for _ in range(6))
+            self.emit(f"{one} = OpIEqual %bool {size} {self.cu(1)}")
+            self.emit(f"{two} = OpIEqual %bool {size} {self.cu(2)}")
+            self.emit(f"{small} = OpLogicalOr %bool {one} {two}")
+            self.emit(f"{cnt} = OpSelect %uint {one} {self.cu(8)} {self.cu(16)}")
+            self.emit(f"{ext} = OpBitFieldSExtract %uint {words[0]} {self.cu(0)} {cnt}")
+            self.emit(f"{w0} = OpSelect %uint {small} {ext} {words[0]}")
+            words[0] = w0
+        return words
+
     def saturate_int16(self, bits: str, signed: bool) -> str:
         """Return the saturated integer as 16 bits in the low half of a uint."""
         half = self.tmp()
@@ -8732,7 +8858,7 @@ class Gen:
             res = self.tmp()
             self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Lod {lod}")
             return res
-        self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch)
+        self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch, pck=self.pck)
 
     def image_load_coherent(self, dim, t1, iv, idx, dmask, vdata, d16):
         """image_load with glc: a coherent read. On GFX10 a device-scope load is glc + dlc and a device-scope store
@@ -8759,7 +8885,7 @@ class Gen:
             return res
         self.image_read_typed(dim, t1, None, idx, dmask, vdata, d16, read, view)
 
-    def image_read_typed(self, dim, t1, img, idx, dmask, vdata, d16, read, view=None):
+    def image_read_typed(self, dim, t1, img, idx, dmask, vdata, d16, read, view=None, pck=None):
         """Read an image using the component type selected by FORMAT in T# word 1.
         read(image, cls, ty) emits the fetch or gather and returns its four components. The float view also
         handles a lookup miss: index zero holds the RGBA8_UNORM fallback. view(cls) loads the image of class cls
@@ -8786,6 +8912,15 @@ class Gen:
         L = {k: self.tmp() + "_" + k for k in ("s", "rest", "e2", "u", "f", "e3")}
 
         def write(v4u, numeric_class):
+            if pck:
+                # image_load_pck: the raw texel dwords; dmask bit k picks dword k, the picked ones go to consecutive VGPRs
+                words = self.image_pck_words(t1, v4u, pck == "sgn")
+                out = 0
+                for k in range(4):
+                    if dmask >> k & 1:
+                        self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, words[k])
+                        out += 1
+                return
             xs = []
             for c in range(4):
                 if dmask >> c & 1:
@@ -10069,7 +10204,7 @@ def assemble(gen):
             gen.cu(v)
     model = "Vertex" if vs else "GLCompute" if cs or msc else "MeshEXT" if ms else "Geometry" if gsx else "Fragment"
     ms_blk = ms and not msc and (gen.uses_clip or gen.uses_cull)
-    iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (
+    iface = list(gen.outputs) + list(gen.inputs) + (["%vertex_index", "%instance_index"] if vs else []) +        (["%wg_id", "%local_id"] if cs else []) + (["%lds"] if gen.uses_lds else []) + (["%fmt_pck"] if gen.uses_pck else []) + (
         (["%wg_id", "%num_wg", "%local_index", "%ms_counts"] + ([] if msc else
          [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)] +
@@ -10373,6 +10508,13 @@ def assemble(gen):
         types += ["%fhalf_g = OpConstant %float 0.5"]
     if gen.uses_f64:
         types += ["%double = OpTypeFloat 64", "%v2uint_d = OpTypeVector %uint 2"]
+    if gen.uses_pck:
+        ids = " ".join(gen.cu(w) for w in Gen.pck_format_table())
+        types += [f"%pck_arr = OpTypeArray %uint {gen.cu(512)}",
+                  "%_ptr_Private_pck = OpTypePointer Private %pck_arr",
+                  "%_ptr_Private_uint_pck = OpTypePointer Private %uint",
+                  f"%pck_init = OpConstantComposite %pck_arr {ids}"]
+        gvars += ["%fmt_pck = OpVariable %_ptr_Private_pck Private %pck_init"]
     if gen.uses_ballot:
         types += ["%v4uint_bal = OpTypeVector %uint 4"]
     if gen.uses_store_views or gen.uses_int_fetch:

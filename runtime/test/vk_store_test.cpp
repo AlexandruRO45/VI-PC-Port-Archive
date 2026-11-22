@@ -9,7 +9,7 @@
 // "load" (cs_imgload.asm): the uint and sint images are filled before the dispatch, and the shader loads both
 // texels with image_load and stores their sum into the sint image. The device is made without
 // shaderStorageImageReadWithoutFormat, and a module that declares StorageImageReadWithoutFormat fails (SHADER-151).
-// "words" (cs_imgatomic.asm, cs_imgatomic3d.asm, cs_resinfo.asm): the uint and sint images are filled as for "load"
+// "words" (cs_imgatomic.asm, cs_imgatomic3d.asm, cs_resinfo.asm, cs_imgpck_*.asm): the uint and sint images are filled as for "load"
 // and a 4x4x4 r32 uint volume with 200 + i, and nothing is judged here: the 64 words of each are printed after the
 // dispatch (texel (x, y) at i = 8y + x, (x, y, z) at i = 16z + 4y + x) for check.py to compare. Three things are
 // bound for these shaders in every mode: the uint image as an r32ui storage image at set 0 binding 4 and the volume
@@ -196,6 +196,16 @@ int main(int argc, char** argv) {
     wide_desc.mip_count = wide_desc.resource_mips = WIDE_MIPS;
     const leonida::gfx10::ImageWords wide_key = leonida::gfx10::encode(wide_desc);
     table_insert(table, wide_key.data(), 4);
+    // Elements 5..7 of the sampled array, for image_load_pck (cs_imgpck_*.asm, "words" mode): the rgba8 image's texels
+    // as an R8G8B8A8_UINT view (FORMAT 60), an R16G16B16A16_UINT image (69) and an R8_UINT image (5). Element 1 is
+    // the rgba8 image itself as UNORM (FORMAT 56), filled the same way. T# word0 = 0x1000 * (k + 1) and words 2..7 =
+    // 0x11 * (k + 1) for k = 5, 6, 7 (the pattern of the first three).
+    const uint32_t pck_fmt[3] = {60, 69, 5};
+    for (uint32_t k = 0; k < 3; k++) {
+        uint32_t t[8] = {0x1000 * (k + 6), pck_fmt[k] << 20};
+        for (int j = 2; j < 8; j++) t[j] = 0x11 * (k + 6);
+        table_insert(table, t, 5 + k);
+    }
     // The volume of the 3D atomics: index 1 of the 3D arrays, behind a T# of the 2D images' pattern (k = 4).
     const uint32_t VOL = 4;
     {
@@ -224,6 +234,31 @@ int main(int argc, char** argv) {
         vi.image = img[k]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = vkf[k];
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &view[k]));
+    }
+    // The images image_load_pck reads: texel i = 8y + x of each is filled before the dispatch in "words" mode.
+    const VkFormat pxf[3] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_UINT, VK_FORMAT_R8_UINT};
+    const uint32_t pxb[3] = {4, 8, 1};                       // bytes a texel
+    VkImage px[3]; VkImageView pxv[4];                       // pxv[1]: px[0] again, as R8G8B8A8_UINT
+    for (int k = 0; k < 3; k++) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.flags = k == 0 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = pxf[k]; ii.extent = {W, W, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        CHECK(vkCreateImage(dev, &ii, nullptr, &px[k]));
+        VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, px[k], &mr);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory m; CHECK(vkAllocateMemory(dev, &mai, nullptr, &m));
+        CHECK(vkBindImageMemory(dev, px[k], m, 0));
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = px[k]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = pxf[k];
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        CHECK(vkCreateImageView(dev, &vi, nullptr, &pxv[k == 0 ? 0 : k + 1]));
+        if (k == 0) {
+            vi.format = VK_FORMAT_R8G8B8A8_UINT;
+            CHECK(vkCreateImageView(dev, &vi, nullptr, &pxv[1]));
+        }
     }
     VkImage wide; VkImageView wide_view;
     {
@@ -267,7 +302,7 @@ int main(int argc, char** argv) {
     // through integer aliases); every element of a storage array holds the image of its class, so all of them are
     // valid descriptors. Bindings 4 and 7 = the 2D and 3D r32ui storage images of the image atomics: the uint image
     // and the volume, in every element.
-    constexpr uint32_t N = 5;
+    constexpr uint32_t N = 8;
     VkDescriptorSetLayoutBinding b[8]{};
     b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -295,7 +330,11 @@ int main(int argc, char** argv) {
                                     {VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL},
                                     {VK_NULL_HANDLE, view[1], VK_IMAGE_LAYOUT_GENERAL},
                                     {VK_NULL_HANDLE, view[2], VK_IMAGE_LAYOUT_GENERAL},
-                                    {VK_NULL_HANDLE, wide_view, VK_IMAGE_LAYOUT_GENERAL}};
+                                    {VK_NULL_HANDLE, wide_view, VK_IMAGE_LAYOUT_GENERAL},
+                                    {VK_NULL_HANDLE, pxv[1], VK_IMAGE_LAYOUT_GENERAL},
+                                    {VK_NULL_HANDLE, pxv[2], VK_IMAGE_LAYOUT_GENERAL},
+                                    {VK_NULL_HANDLE, pxv[3], VK_IMAGE_LAYOUT_GENERAL}};
+    sii[1].imageView = pxv[0];     // element 1 is the filled rgba8 image as UNORM (the store modes never sample it)
     VkDescriptorImageInfo smpi{sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkDescriptorImageInfo dii[3][N];
     VkDescriptorImageInfo r32ui[N], r32ui_3d[N];
@@ -416,6 +455,37 @@ int main(int argc, char** argv) {
         }
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
                              nullptr, 0, nullptr, 2, ib + 1);
+    }
+    // The packed-load images: transition, fill in "words" mode, then GENERAL for the shader's reads.
+    {
+        VkBuffer pxfill[3]; void* pxfillp[3];
+        VkImageMemoryBarrier pb[3]{};
+        for (int k = 0; k < 3; k++) {
+            CHECK(make_buffer(W * W * pxb[k], VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &pxfill[k], &pxfillp[k]));
+            uint8_t* d = static_cast<uint8_t*>(pxfillp[k]);
+            for (uint32_t i = 0; i < W * W; i++)
+                for (uint32_t j = 0; j < pxb[k]; j++) {
+                    const uint32_t n = pxb[k] * i + j;
+                    // byte j of texel i: rgba8 0x81 + 0x0b n, rgba16 0x35 + 0x13 n, r8 0x7c + 0x0d i (crosses 0x80)
+                    d[n] = uint8_t(k == 0 ? 0x81 + 0x0b * n : k == 1 ? 0x35 + 0x13 * n : 0x7c + 0x0d * i);
+                }
+            pb[k].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER; pb[k].image = px[k];
+            pb[k].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; pb[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            pb[k].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            pb[k].srcQueueFamilyIndex = pb[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            pb[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        }
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 3, pb);
+        for (int k = 0; k < 3; k++) {
+            VkBufferImageCopy bic{};
+            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bic.imageExtent = {W, W, 1};
+            if (words_mode) vkCmdCopyBufferToImage(cmd, pxfill[k], px[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+            pb[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; pb[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            pb[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; pb[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        }
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 3, pb);
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, nullptr);
