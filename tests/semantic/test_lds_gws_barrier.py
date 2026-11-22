@@ -157,6 +157,86 @@ class GWSMemory:
         return rid, satisfied, arrived
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    """Data Share (DS) GWS opcodes."""
+    DS_GWS_BARRIER = "ds_gws_barrier"
+
+
+class RegType(Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation."""
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(
+                f"Register index out of bounds: {self.reg_type.value}[{self.index}] "
+                f"(expected 0 <= index < {max_limit})"
+            )
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}[{self.index}]"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class Immediate:
+    """32-bit immediate constant operand."""
+    val: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "val", u32(self.val))
+
+    def __str__(self) -> str:
+        return f"0x{self.val:X}"
+
+
+Operand = Union[RegisterOperand, Immediate]
+
+
+@dataclass(frozen=True)
+class DSGWSBarrierInstruction:
+    """Symbolic AST node for ds_gws_barrier instruction."""
+    vdata0: RegisterOperand
+    offset: int = 0
+    gds: bool = True
+    opcode: DSOpcode = DSOpcode.DS_GWS_BARRIER
+
+    def __post_init__(self) -> None:
+        if self.vdata0.reg_type != RegType.VGPR:
+            raise ValueError(f"vdata0 must be a VGPR, got {self.vdata0.reg_type}")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(
+                f"offset out of bounds: {self.offset} (expected 0 <= offset <= {OFFSET16_MASK})"
+            )
+        if not self.gds:
+            raise ValueError("gds modifier is mandatory for GWS instructions")
+
+    def disassemble(self) -> str:
+        """Emit canonical AMD assembly string."""
+        parts = [self.opcode.value, str(self.vdata0)]
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return f"{parts[0]} {', '.join(parts[1:])}"
+
+
 class TestGWSBarrierReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -233,6 +313,63 @@ class TestGWSBarrierReferenceOracleAndArchitecturalModel(unittest.TestCase):
         gws.barriers[8].reset()
         self.assertEqual(gws.read_arrived(8), 0)
         self.assertEqual(gws.read_releases(8), 0)
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_valid_ast_construction(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr = DSGWSBarrierInstruction(vdata0=v0, offset=0, gds=True)
+
+        self.assertEqual(instr.opcode, DSOpcode.DS_GWS_BARRIER)
+        self.assertEqual(instr.vdata0.index, 0)
+        self.assertEqual(instr.offset, 0)
+        self.assertTrue(instr.gds)
+
+    def test_valid_ast_with_offset(self) -> None:
+        v5 = RegisterOperand(5, RegType.VGPR)
+        instr = DSGWSBarrierInstruction(vdata0=v5, offset=16, gds=True)
+
+        self.assertEqual(instr.vdata0.index, 5)
+        self.assertEqual(instr.offset, 16)
+        self.assertTrue(instr.gds)
+
+    def test_disassembly_formatting(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        v7 = RegisterOperand(7, RegType.VGPR)
+
+        instr_no_offset = DSGWSBarrierInstruction(vdata0=v0, offset=0, gds=True)
+        self.assertEqual(instr_no_offset.disassemble(), "ds_gws_barrier v[0], gds")
+
+        instr_with_offset = DSGWSBarrierInstruction(vdata0=v7, offset=32, gds=True)
+        self.assertEqual(instr_with_offset.disassemble(), "ds_gws_barrier v[7], offset:32, gds")
+
+    def test_rejection_sgpr_vdata0(self) -> None:
+        s0 = RegisterOperand(0, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            DSGWSBarrierInstruction(vdata0=s0, offset=0, gds=True)
+
+    def test_rejection_out_of_bounds_offset(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            DSGWSBarrierInstruction(vdata0=v0, offset=-1, gds=True)
+
+        with self.assertRaises(ValueError):
+            DSGWSBarrierInstruction(vdata0=v0, offset=65536, gds=True)
+
+    def test_rejection_missing_gds_modifier(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            DSGWSBarrierInstruction(vdata0=v0, offset=0, gds=False)
+
+    def test_register_operand_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
 
 
 if __name__ == "__main__":
