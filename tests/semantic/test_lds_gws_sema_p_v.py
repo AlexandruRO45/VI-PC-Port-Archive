@@ -275,6 +275,88 @@ class DSGWSSemaphoreInstruction:
         return f"{parts[0]} {', '.join(parts[1:])}"
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarState:
+    """Scalar machine state comprising register files, m0, and GWS memory."""
+
+    def __init__(self, num_gws_resources: int = GWS_NUM_RESOURCES) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.m0: int = 0
+        self.vcc: int = 0
+        self.scc: int = 0
+        self.gws: GWSMemory = GWSMemory(num_resources=num_gws_resources)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+    def get_m0(self) -> int:
+        return self.m0
+
+    def set_m0(self, val: int) -> None:
+        self.m0 = u32(val)
+
+    def get_reg(self, reg: RegisterOperand) -> int:
+        if reg.reg_type == RegType.VGPR:
+            return self.get_vgpr(reg.index)
+        return self.get_sgpr(reg.index)
+
+    def set_reg(self, reg: RegisterOperand, val: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_vgpr(reg.index, val)
+        else:
+            self.set_sgpr(reg.index, val)
+
+    def resolve_operand(self, op: Operand) -> int:
+        if isinstance(op, Immediate):
+            return op.val
+        return self.get_reg(op)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_gws_sema_p and ds_gws_sema_v."""
+
+    def execute(
+        self,
+        instr: DSGWSSemaphoreInstruction,
+        state: ScalarState,
+        wave_id: int = 0,
+    ) -> Tuple[int, Union[bool, int], Union[int, Optional[int]]]:
+        """Execute a semaphore instruction on scalar state.
+
+        Returns:
+            For ds_gws_sema_p: Tuple[int, bool, int] -> (resource_id, acquired, current_counter)
+            For ds_gws_sema_v: Tuple[int, int, Optional[int]] -> (resource_id, new_counter, woken_wave_or_none)
+        """
+        m0 = state.get_m0()
+
+        if instr.opcode == DSOpcode.DS_GWS_SEMA_P:
+            rid, acquired, cnt = state.gws.sema_p(
+                offset=instr.offset,
+                m0=m0,
+                wave_id=wave_id,
+            )
+            return rid, acquired, cnt
+        else:
+            rid, cnt, woken = state.gws.sema_v(
+                offset=instr.offset,
+                m0=m0,
+            )
+            return rid, cnt, woken
+
+
 class TestGWSSemaphoreReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -410,6 +492,79 @@ class TestSymbolicAST(unittest.TestCase):
             RegisterOperand(256, RegType.VGPR)
         with self.assertRaises(ValueError):
             RegisterOperand(106, RegType.SGPR)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_sema_p_and_v_cycle(self) -> None:
+        # Initially counter 0 on resource 5
+        instr_p = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_P, offset=5)
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=5)
+
+        # 1. P operation blocks because counter is 0
+        rid_p, acq1, cnt1 = self.interp.execute(instr_p, self.state, wave_id=10)
+        self.assertEqual(rid_p, 5)
+        self.assertFalse(acq1)
+        self.assertEqual(cnt1, 0)
+        self.assertEqual(len(self.state.gws.semaphores[5].waiting_waves), 1)
+
+        # 2. V operation wakes wave 10
+        rid_v, cnt_v, woken = self.interp.execute(instr_v, self.state)
+        self.assertEqual(rid_v, 5)
+        self.assertEqual(woken, 10)
+        self.assertEqual(len(self.state.gws.semaphores[5].waiting_waves), 0)
+
+        # 3. Another V operation increments counter to 1
+        rid_v2, cnt_v2, woken2 = self.interp.execute(instr_v, self.state)
+        self.assertEqual(cnt_v2, 1)
+        self.assertIsNone(woken2)
+        self.assertEqual(self.state.gws.read_counter(5), 1)
+
+        # 4. P operation succeeds immediately
+        rid_p2, acq2, cnt2 = self.interp.execute(instr_p, self.state, wave_id=11)
+        self.assertTrue(acq2)
+        self.assertEqual(cnt2, 0)
+        self.assertEqual(self.state.gws.read_counter(5), 0)
+
+    def test_scalar_with_offset_and_m0(self) -> None:
+        self.state.set_m0(16)
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=4)
+        rid, cnt, _ = self.interp.execute(instr_v, self.state)
+        self.assertEqual(rid, 20)
+        self.assertEqual(cnt, 1)
+        self.assertEqual(self.state.get_m0(), 16)
+
+    def test_scalar_registers_unmodified(self) -> None:
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.state.set_vgpr(i, 0x5500 + i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.state.set_sgpr(i, 0x6600 + i)
+        self.state.set_m0(3)
+
+        instr = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=1)
+        self.interp.execute(instr, self.state)
+
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.assertEqual(self.state.get_vgpr(i), 0x5500 + i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.assertEqual(self.state.get_sgpr(i), 0x6600 + i)
+        self.assertEqual(self.state.get_m0(), 3)
+
+    def test_scalar_multi_resource_isolation(self) -> None:
+        instr_v0 = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=0)
+        instr_v1 = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=1)
+
+        self.interp.execute(instr_v0, self.state)
+        self.interp.execute(instr_v0, self.state)
+        self.interp.execute(instr_v1, self.state)
+
+        self.assertEqual(self.state.gws.read_counter(0), 2)
+        self.assertEqual(self.state.gws.read_counter(1), 1)
 
 
 if __name__ == "__main__":
