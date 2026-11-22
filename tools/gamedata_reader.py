@@ -108,11 +108,18 @@ class Reader:
         self.type_handlers = TYPE_HANDLERS if type_handlers is None else type_handlers
         self.stats = Counter()
         self.types = Counter()
+        self._in_type_handler = {}
 
     def convert(self, el, use_type_handler=True):
         """The generic value of element ``el`` (a registered ``type`` handler first, unless told not to). Attributes
         no convention uses (``name``, ``userFlags``, ...) are kept as ``"@name"`` entries."""
+        eid = id(el)
+        if not use_type_handler and eid in self._in_type_handler:
+            self._in_type_handler[eid] = True
+            return self.with_attributes(el.attrib, self._convert(el, False))
         value = self._convert(el, use_type_handler)
+        if self._in_type_handler.pop(eid, False):
+            return value
         return self.with_attributes(el.attrib, value)
 
     def with_attributes(self, attrib, value):
@@ -131,11 +138,17 @@ class Reader:
             self.stats["null"] += 1
             return None
         if t is not None:
-            self.types[t] += 1
+            if id(el) not in self._in_type_handler:
+                self.types[t] += 1
             handler = self.type_handlers.get(t) if use_type_handler else None
             if handler:
                 self.stats["type handler"] += 1
-                return handler(el, self)
+                self._in_type_handler[id(el)] = False
+                try:
+                    return handler(el, self)
+                except Exception:
+                    self._in_type_handler.pop(id(el), None)
+                    raise
         if "content" in a:
             self.stats["array"] += 1
             return parse_content(a["content"], el.text)
@@ -196,7 +209,9 @@ class Reader:
                     root = el
                 continue
             depth -= 1
-            if depth == 1 and root.tag not in self.root_handlers:
+            if (depth == 1 and root.tag not in self.root_handlers
+                    and root.attrib.get("type") not in self.type_handlers
+                    and root.attrib.get("type") != "NULL"):
                 # a top-level field is complete: convert it now and drop its sub-tree
                 parts.append((el.tag, el.attrib.get("key"), self.convert(el)))
                 el.clear()
@@ -211,6 +226,7 @@ class Reader:
         t = root.attrib.get("type")
         if t is not None and t != "NULL":
             self.types[t] += 1
+            self.stats["object"] += 1
             if not isinstance(value, dict):
                 value = {"$items": value}
             value = {"$type": t, **value}
@@ -233,7 +249,7 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
             continue
         try:
             tag, _, value = reader.read(doc["data"])
-        except ET.ParseError as e:
+        except (ET.ParseError, LookupError, ValueError) as e:
             failed[str(e).split(":")[0]] += 1
             continue
         read += 1

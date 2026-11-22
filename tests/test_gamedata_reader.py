@@ -97,8 +97,14 @@ class Conventions(unittest.TestCase):
 
     def test_polymorphic_root_and_list_root(self):
         reader = R.Reader(root_handlers={}, type_handlers={})
-        self.assertEqual(reader.read(b'<R type="CRootType"><a value="1"/></R>'), ("R", "CRootType",
-                                                                                  {"$type": "CRootType", "a": 1}))
+        raw = b'<R type="CRootType"><a value="1"/></R>'
+        self.assertEqual(reader.read(raw), ("R", "CRootType", {"$type": "CRootType", "a": 1}))
+        self.assertEqual(reader.stats["object"], 1)
+        tree_reader = R.Reader(root_handlers={}, type_handlers={})
+        self.assertEqual(tree_reader.convert(ET.fromstring(raw)), {"$type": "CRootType", "a": 1})
+        self.assertEqual(reader.stats, tree_reader.stats)
+        self.assertEqual(reader.types, tree_reader.types)
+        self.assertEqual(reader.read(b'<R type="NULL"><a value="1"/></R>'), ("R", "NULL", None))
         self.assertEqual(reader.read(b'<R><Item value="1"/><Item value="2"/></R>')[2], [1, 2])
         self.assertEqual(reader.read(b'<R>leaf</R>')[2], "leaf")
 
@@ -117,6 +123,27 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(value["items"], [("thing", 2), None, {"size": 3}])
         self.assertEqual(calls, ["Item"])
         self.assertEqual(reader.stats["type handler"], 1)
+        self.assertEqual(reader.types, {"CThing": 1})
+
+    def test_type_handler_extra_attrs_and_root_dispatch(self):
+        def thing(el, reader):
+            generic = reader.convert(el, use_type_handler=False)
+            return ("thing", generic["size"], generic.get("@name"))
+
+        reader = R.Reader(root_handlers={}, type_handlers={"CThing": thing})
+        _, _, val = reader.read(b'<A><Item type="CThing" name="first"><size value="2"/></Item></A>')
+        self.assertEqual(val, [("thing", 2, "first")])
+        self.assertEqual(reader.types, {"CThing": 1})
+        self.assertEqual(reader.stats["extra attributes"], 1)
+
+        root_reader = R.Reader(root_handlers={}, type_handlers={"CThing": thing})
+        self.assertEqual(
+            root_reader.read(b'<R type="CThing" name="root_thing"><size value="5"/></R>'),
+            ("R", "CThing", ("thing", 5, "root_thing")),
+        )
+        self.assertEqual(root_reader.types, {"CThing": 1})
+        self.assertEqual(root_reader.stats["type handler"], 1)
+        self.assertEqual(root_reader.stats["extra attributes"], 1)
 
     def test_root_handler_gets_the_whole_root(self):
         def root(el, reader):
@@ -168,6 +195,15 @@ class Run(unittest.TestCase):
     def test_root_filter(self):
         s = R.run([self.dir], root_filter="COther", reader=R.Reader(root_handlers={}, type_handlers={}))
         self.assertEqual(s["documents"], 1)
+
+    def test_malformed_content_and_vector_counted_as_failed(self):
+        with open(os.path.join(self.dir, "d.xml"), "wb") as f:
+            f.write(b'<COther><v content="vec3v_array">1 2 3 4</v></COther>')
+        with open(os.path.join(self.dir, "e.xml"), "wb") as f:
+            f.write(b'<COther><v x="bad" y="1"/></COther>')
+        s = R.run([self.dir], reader=R.Reader(root_handlers={}, type_handlers={}))
+        self.assertEqual((s["documents"], s["roots"], s["not_well_formed"]), (2, 2, 3))
+        self.assertIn("vec3v_array", s["parse_errors"])
 
     def test_cli_prints_counts_and_writes_json(self):
         out = os.path.join(self.tmp.name, "json", "nested")
