@@ -68,6 +68,7 @@ method, scope and caveats. No game data is included.
 | [pipeline_check.md](pipeline_check.md) | Driver-level corpus check: 10/12 shards, 22,092 modules, 2,217 compute pipelines, 0 failures. |
 | [shader_validation.md](shader_validation.md) | Differential CPU/GPU validation design and the current CPU interpreter prototype. |
 | [isa_coverage.md](isa_coverage.md) | RDNA2 ISA coverage of the translator against AMD's machine-readable XML: which of its 1,153 instructions have a rule, and which matched names are not RDNA2. |
+| [graphics_progress.md](graphics_progress.md) | Graphics-path progress counted from the committed code: D3D12 to Vulkan milestones and interface coverage, RDNA2 ISA, formats, tests, unsupported sites. Says nothing about whether the game runs. |
 | [buffer_bounds.md](buffer_bounds.md) | V# `OOB_SELECT` bounds measured natively: RDNA2 (gfx1036) follows Mesa's GFX11 column (729/732 cases), not GFX10; raw mode also counts `soffset`. |
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |
 | [fspx.md](fspx.md) | `FSPX`, the FidelityFX DLL's native compute programs (its shaders' `ACCC` part): directory as the DLL reads it, kind-0 dispatch state, the hash prologue, `gfx1030` for its `v_dot4` code; 13 of 29 translate with `tools/fspx_unpack.py`. |

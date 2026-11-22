@@ -1,0 +1,799 @@
+{
+ "about": "Method names of the ID3D12 interfaces (Windows SDK d3d12.h) and the DXGI_FORMAT names (dxgiformat.h). Names only, no declarations. Regenerate with tools/graphics_progress.py --refresh-data --d3d12-header <d3d12.h> --dxgi-header <dxgiformat.h>.",
+ "d3d12": {
+  "ID3D12CommandAllocator": {
+   "base": "ID3D12Pageable",
+   "methods": [
+    "Reset"
+   ]
+  },
+  "ID3D12CommandList": {
+   "base": "ID3D12DeviceChild",
+   "methods": [
+    "GetType"
+   ]
+  },
+  "ID3D12CommandQueue": {
+   "base": "ID3D12Pageable",
+   "methods": [
+    "UpdateTileMappings",
+    "CopyTileMappings",
+    "ExecuteCommandLists",
+    "SetMarker",
+    "BeginEvent",
+    "EndEvent",
+    "Signal",
+    "Wait",
+    "GetTimestampFrequency",
+    "GetClockCalibration",
+    "GetDesc"
+   ]
+  },
+  "ID3D12CommandSignature": {
+   "base": "ID3D12Pageable",
+   "methods": []
+  },
+  "ID3D12DSRDeviceFactory": {
+   "base": "IUnknown",
+   "methods": [
+    "CreateDSRDevice"
+   ]
+  },
+  "ID3D12DescriptorHeap": {
+   "base": "ID3D12Pageable",
+   "methods": [
+    "GetDesc",
+    "GetCPUDescriptorHandleForHeapStart",
+    "GetGPUDescriptorHandleForHeapStart"
+   ]
+  },
+  "ID3D12Device": {
+   "base": "ID3D12Object",
+   "methods": [
+    "GetNodeCount",
+    "CreateCommandQueue",
+    "CreateCommandAllocator",
+    "CreateGraphicsPipelineState",
+    "CreateComputePipelineState",
+    "CreateCommandList",
+    "CheckFeatureSupport",
+    "CreateDescriptorHeap",
+    "GetDescriptorHandleIncrementSize",
+    "CreateRootSignature",
+    "CreateConstantBufferView",
+    "CreateShaderResourceView",
+    "CreateUnorderedAccessView",
+    "CreateRenderTargetView",
+    "CreateDepthStencilView",
+    "CreateSampler",
+    "CopyDescriptors",
+    "CopyDescriptorsSimple",
+    "GetResourceAllocationInfo",
+    "GetCustomHeapProperties",
+    "CreateCommittedResource",
+    "CreateHeap",
+    "CreatePlacedResource",
+    "CreateReservedResource",
+    "CreateSharedHandle",
+    "OpenSharedHandle",
+    "OpenSharedHandleByName",
+    "MakeResident",
+    "Evict",
+    "CreateFence",
+    "GetDeviceRemovedReason",
+    "GetCopyableFootprints",
+    "CreateQueryHeap",
+    "SetStablePowerState",
+    "CreateCommandSignature",
+    "GetResourceTiling",
+    "GetAdapterLuid"
+   ]
+  },
+  "ID3D12Device1": {
+   "base": "ID3D12Device",
+   "methods": [
+    "CreatePipelineLibrary",
+    "SetEventOnMultipleFenceCompletion",
+    "SetResidencyPriority"
+   ]
+  },
+  "ID3D12Device10": {
+   "base": "ID3D12Device9",
+   "methods": [
+    "CreateCommittedResource3",
+    "CreatePlacedResource2",
+    "CreateReservedResource2"
+   ]
+  },
+  "ID3D12Device11": {
+   "base": "ID3D12Device10",
+   "methods": [
+    "CreateSampler2"
+   ]
+  },
+  "ID3D12Device12": {
+   "base": "ID3D12Device11",
+   "methods": [
+    "GetResourceAllocationInfo3"
+   ]
+  },
+  "ID3D12Device13": {
+   "base": "ID3D12Device12",
+   "methods": [
+    "OpenExistingHeapFromAddress1"
+   ]
+  },
+  "ID3D12Device14": {
+   "base": "ID3D12Device13",
+   "methods": [
+    "CreateRootSignatureFromSubobjectInLibrary"
+   ]
+  },
+  "ID3D12Device2": {
+   "base": "ID3D12Device1",
+   "methods": [
+    "CreatePipelineState"
+   ]
+  },
+  "ID3D12Device3": {
+   "base": "ID3D12Device2",
+   "methods": [
+    "OpenExistingHeapFromAddress",
+    "OpenExistingHeapFromFileMapping",
+    "EnqueueMakeResident"
+   ]
+  },
+  "ID3D12Device4": {
+   "base": "ID3D12Device3",
+   "methods": [
+    "CreateCommandList1",
+    "CreateProtectedResourceSession",
+    "CreateCommittedResource1",
+    "CreateHeap1",
+    "CreateReservedResource1",
+    "GetResourceAllocationInfo1"
+   ]
+  },
+  "ID3D12Device5": {
+   "base": "ID3D12Device4",
+   "methods": [
+    "CreateLifetimeTracker",
+    "RemoveDevice",
+    "EnumerateMetaCommands",
+    "EnumerateMetaCommandParameters",
+    "CreateMetaCommand",
+    "CreateStateObject",
+    "GetRaytracingAccelerationStructurePrebuildInfo",
+    "CheckDriverMatchingIdentifier"
+   ]
+  },
+  "ID3D12Device6": {
+   "base": "ID3D12Device5",
+   "methods": [
+    "SetBackgroundProcessingMode"
+   ]
+  },
+  "ID3D12Device7": {
+   "base": "ID3D12Device6",
+   "methods": [
+    "AddToStateObject",
+    "CreateProtectedResourceSession1"
+   ]
+  },
+  "ID3D12Device8": {
+   "base": "ID3D12Device7",
+   "methods": [
+    "GetResourceAllocationInfo2",
+    "CreateCommittedResource2",
+    "CreatePlacedResource1",
+    "CreateSamplerFeedbackUnorderedAccessView",
+    "GetCopyableFootprints1"
+   ]
+  },
+  "ID3D12Device9": {
+   "base": "ID3D12Device8",
+   "methods": [
+    "CreateShaderCacheSession",
+    "ShaderCacheControl",
+    "CreateCommandQueue1"
+   ]
+  },
+  "ID3D12DeviceChild": {
+   "base": "ID3D12Object",
+   "methods": [
+    "GetDevice"
+   ]
+  },
+  "ID3D12DeviceConfiguration": {
+   "base": "IUnknown",
+   "methods": [
+    "GetDesc",
+    "GetEnabledExperimentalFeatures",
+    "SerializeVersionedRootSignature",
+    "CreateVersionedRootSignatureDeserializer"
+   ]
+  },
+  "ID3D12DeviceConfiguration1": {
+   "base": "ID3D12DeviceConfiguration",
+   "methods": [
+    "CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary"
+   ]
+  },
+  "ID3D12DeviceFactory": {
+   "base": "IUnknown",
+   "methods": [
+    "InitializeFromGlobalState",
+    "ApplyToGlobalState",
+    "SetFlags",
+    "GetFlags",
+    "GetConfigurationInterface",
+    "EnableExperimentalFeatures",
+    "CreateDevice"
+   ]
+  },
+  "ID3D12DeviceRemovedExtendedData": {
+   "base": "IUnknown",
+   "methods": [
+    "GetAutoBreadcrumbsOutput",
+    "GetPageFaultAllocationOutput"
+   ]
+  },
+  "ID3D12DeviceRemovedExtendedData1": {
+   "base": "ID3D12DeviceRemovedExtendedData",
+   "methods": [
+    "GetAutoBreadcrumbsOutput1",
+    "GetPageFaultAllocationOutput1"
+   ]
+  },
+  "ID3D12DeviceRemovedExtendedData2": {
+   "base": "ID3D12DeviceRemovedExtendedData1",
+   "methods": [
+    "GetPageFaultAllocationOutput2",
+    "GetDeviceState"
+   ]
+  },
+  "ID3D12DeviceRemovedExtendedDataSettings": {
+   "base": "IUnknown",
+   "methods": [
+    "SetAutoBreadcrumbsEnablement",
+    "SetPageFaultEnablement",
+    "SetWatsonDumpEnablement"
+   ]
+  },
+  "ID3D12DeviceRemovedExtendedDataSettings1": {
+   "base": "ID3D12DeviceRemovedExtendedDataSettings",
+   "methods": [
+    "SetBreadcrumbContextEnablement"
+   ]
+  },
+  "ID3D12DeviceRemovedExtendedDataSettings2": {
+   "base": "ID3D12DeviceRemovedExtendedDataSettings1",
+   "methods": [
+    "UseMarkersOnlyAutoBreadcrumbs"
+   ]
+  },
+  "ID3D12DeviceTools": {
+   "base": "IUnknown",
+   "methods": [
+    "SetNextAllocationAddress"
+   ]
+  },
+  "ID3D12DeviceTools1": {
+   "base": "ID3D12DeviceTools",
+   "methods": [
+    "GetApplicationSpecificDriverState",
+    "GetApplicationSpecificDriverBlobStatus"
+   ]
+  },
+  "ID3D12Fence": {
+   "base": "ID3D12Pageable",
+   "methods": [
+    "GetCompletedValue",
+    "SetEventOnCompletion",
+    "Signal"
+   ]
+  },
+  "ID3D12Fence1": {
+   "base": "ID3D12Fence",
+   "methods": [
+    "GetCreationFlags"
+   ]
+  },
+  "ID3D12GBVDiagnostics": {
+   "base": "IUnknown",
+   "methods": [
+    "GetGBVEntireSubresourceStatesData",
+    "GetGBVSubresourceState",
+    "GetGBVResourceUniformState",
+    "GetGBVResourceInfo",
+    "GBVReserved0",
+    "GBVReserved1"
+   ]
+  },
+  "ID3D12GraphicsCommandList": {
+   "base": "ID3D12CommandList",
+   "methods": [
+    "Close",
+    "Reset",
+    "ClearState",
+    "DrawInstanced",
+    "DrawIndexedInstanced",
+    "Dispatch",
+    "CopyBufferRegion",
+    "CopyTextureRegion",
+    "CopyResource",
+    "CopyTiles",
+    "ResolveSubresource",
+    "IASetPrimitiveTopology",
+    "RSSetViewports",
+    "RSSetScissorRects",
+    "OMSetBlendFactor",
+    "OMSetStencilRef",
+    "SetPipelineState",
+    "ResourceBarrier",
+    "ExecuteBundle",
+    "SetDescriptorHeaps",
+    "SetComputeRootSignature",
+    "SetGraphicsRootSignature",
+    "SetComputeRootDescriptorTable",
+    "SetGraphicsRootDescriptorTable",
+    "SetComputeRoot32BitConstant",
+    "SetGraphicsRoot32BitConstant",
+    "SetComputeRoot32BitConstants",
+    "SetGraphicsRoot32BitConstants",
+    "SetComputeRootConstantBufferView",
+    "SetGraphicsRootConstantBufferView",
+    "SetComputeRootShaderResourceView",
+    "SetGraphicsRootShaderResourceView",
+    "SetComputeRootUnorderedAccessView",
+    "SetGraphicsRootUnorderedAccessView",
+    "IASetIndexBuffer",
+    "IASetVertexBuffers",
+    "SOSetTargets",
+    "OMSetRenderTargets",
+    "ClearDepthStencilView",
+    "ClearRenderTargetView",
+    "ClearUnorderedAccessViewUint",
+    "ClearUnorderedAccessViewFloat",
+    "DiscardResource",
+    "BeginQuery",
+    "EndQuery",
+    "ResolveQueryData",
+    "SetPredication",
+    "SetMarker",
+    "BeginEvent",
+    "EndEvent",
+    "ExecuteIndirect"
+   ]
+  },
+  "ID3D12GraphicsCommandList1": {
+   "base": "ID3D12GraphicsCommandList",
+   "methods": [
+    "AtomicCopyBufferUINT",
+    "AtomicCopyBufferUINT64",
+    "OMSetDepthBounds",
+    "SetSamplePositions",
+    "ResolveSubresourceRegion",
+    "SetViewInstanceMask"
+   ]
+  },
+  "ID3D12GraphicsCommandList10": {
+   "base": "ID3D12GraphicsCommandList9",
+   "methods": [
+    "SetProgram",
+    "DispatchGraph"
+   ]
+  },
+  "ID3D12GraphicsCommandList2": {
+   "base": "ID3D12GraphicsCommandList1",
+   "methods": [
+    "WriteBufferImmediate"
+   ]
+  },
+  "ID3D12GraphicsCommandList3": {
+   "base": "ID3D12GraphicsCommandList2",
+   "methods": [
+    "SetProtectedResourceSession"
+   ]
+  },
+  "ID3D12GraphicsCommandList4": {
+   "base": "ID3D12GraphicsCommandList3",
+   "methods": [
+    "BeginRenderPass",
+    "EndRenderPass",
+    "InitializeMetaCommand",
+    "ExecuteMetaCommand",
+    "BuildRaytracingAccelerationStructure",
+    "EmitRaytracingAccelerationStructurePostbuildInfo",
+    "CopyRaytracingAccelerationStructure",
+    "SetPipelineState1",
+    "DispatchRays"
+   ]
+  },
+  "ID3D12GraphicsCommandList5": {
+   "base": "ID3D12GraphicsCommandList4",
+   "methods": [
+    "RSSetShadingRate",
+    "RSSetShadingRateImage"
+   ]
+  },
+  "ID3D12GraphicsCommandList6": {
+   "base": "ID3D12GraphicsCommandList5",
+   "methods": [
+    "DispatchMesh"
+   ]
+  },
+  "ID3D12GraphicsCommandList7": {
+   "base": "ID3D12GraphicsCommandList6",
+   "methods": [
+    "Barrier"
+   ]
+  },
+  "ID3D12GraphicsCommandList8": {
+   "base": "ID3D12GraphicsCommandList7",
+   "methods": [
+    "OMSetFrontAndBackStencilRef"
+   ]
+  },
+  "ID3D12GraphicsCommandList9": {
+   "base": "ID3D12GraphicsCommandList8",
+   "methods": [
+    "RSSetDepthBias",
+    "IASetIndexBufferStripCutValue"
+   ]
+  },
+  "ID3D12Heap": {
+   "base": "ID3D12Pageable",
+   "methods": [
+    "GetDesc"
+   ]
+  },
+  "ID3D12Heap1": {
+   "base": "ID3D12Heap",
+   "methods": [
+    "GetProtectedResourceSession"
+   ]
+  },
+  "ID3D12LifetimeOwner": {
+   "base": "IUnknown",
+   "methods": [
+    "LifetimeStateUpdated"
+   ]
+  },
+  "ID3D12LifetimeTracker": {
+   "base": "ID3D12DeviceChild",
+   "methods": [
+    "DestroyOwnedObject"
+   ]
+  },
+  "ID3D12MetaCommand": {
+   "base": "ID3D12Pageable",
+   "methods": [
+    "GetRequiredParameterResourceSize"
+   ]
+  },
+  "ID3D12Object": {
+   "base": "IUnknown",
+   "methods": [
+    "GetPrivateData",
+    "SetPrivateData",
+    "SetPrivateDataInterface",
+    "SetName"
+   ]
+  },
+  "ID3D12Pageable": {
+   "base": "ID3D12DeviceChild",
+   "methods": []
+  },
+  "ID3D12PageableTools": {
+   "base": "IUnknown",
+   "methods": [
+    "GetAllocation"
+   ]
+  },
+  "ID3D12PipelineLibrary": {
+   "base": "ID3D12DeviceChild",
+   "methods": [
+    "StorePipeline",
+    "LoadGraphicsPipeline",
+    "LoadComputePipeline",
+    "GetSerializedSize",
+    "Serialize"
+   ]
+  },
+  "ID3D12PipelineLibrary1": {
+   "base": "ID3D12PipelineLibrary",
+   "methods": [
+    "LoadPipeline"
+   ]
+  },
+  "ID3D12PipelineState": {
+   "base": "ID3D12Pageable",
+   "methods": [
+    "GetCachedBlob"
+   ]
+  },
+  "ID3D12ProtectedResourceSession": {
+   "base": "ID3D12ProtectedSession",
+   "methods": [
+    "GetDesc"
+   ]
+  },
+  "ID3D12ProtectedResourceSession1": {
+   "base": "ID3D12ProtectedResourceSession",
+   "methods": [
+    "GetDesc1"
+   ]
+  },
+  "ID3D12ProtectedSession": {
+   "base": "ID3D12DeviceChild",
+   "methods": [
+    "GetStatusFence",
+    "GetSessionStatus"
+   ]
+  },
+  "ID3D12QueryHeap": {
+   "base": "ID3D12Pageable",
+   "methods": []
+  },
+  "ID3D12Resource": {
+   "base": "ID3D12Pageable",
+   "methods": [
+    "Map",
+    "Unmap",
+    "GetDesc",
+    "GetGPUVirtualAddress",
+    "WriteToSubresource",
+    "ReadFromSubresource",
+    "GetHeapProperties"
+   ]
+  },
+  "ID3D12Resource1": {
+   "base": "ID3D12Resource",
+   "methods": [
+    "GetProtectedResourceSession"
+   ]
+  },
+  "ID3D12Resource2": {
+   "base": "ID3D12Resource1",
+   "methods": [
+    "GetDesc1"
+   ]
+  },
+  "ID3D12RootSignature": {
+   "base": "ID3D12DeviceChild",
+   "methods": []
+  },
+  "ID3D12RootSignatureDeserializer": {
+   "base": "IUnknown",
+   "methods": [
+    "GetRootSignatureDesc"
+   ]
+  },
+  "ID3D12SDKConfiguration": {
+   "base": "IUnknown",
+   "methods": [
+    "SetSDKVersion"
+   ]
+  },
+  "ID3D12SDKConfiguration1": {
+   "base": "ID3D12SDKConfiguration",
+   "methods": [
+    "CreateDeviceFactory",
+    "FreeUnusedSDKs"
+   ]
+  },
+  "ID3D12ShaderCacheSession": {
+   "base": "ID3D12DeviceChild",
+   "methods": [
+    "FindValue",
+    "StoreValue",
+    "SetDeleteOnDestroy",
+    "GetDesc"
+   ]
+  },
+  "ID3D12StateObject": {
+   "base": "ID3D12Pageable",
+   "methods": []
+  },
+  "ID3D12StateObjectProperties": {
+   "base": "IUnknown",
+   "methods": [
+    "GetShaderIdentifier",
+    "GetShaderStackSize",
+    "GetPipelineStackSize",
+    "SetPipelineStackSize"
+   ]
+  },
+  "ID3D12StateObjectProperties1": {
+   "base": "ID3D12StateObjectProperties",
+   "methods": [
+    "GetProgramIdentifier"
+   ]
+  },
+  "ID3D12SwapChainAssistant": {
+   "base": "IUnknown",
+   "methods": [
+    "GetLUID",
+    "GetSwapChainObject",
+    "GetCurrentResourceAndCommandQueue",
+    "InsertImplicitSync"
+   ]
+  },
+  "ID3D12Tools": {
+   "base": "IUnknown",
+   "methods": [
+    "EnableShaderInstrumentation",
+    "ShaderInstrumentationEnabled"
+   ]
+  },
+  "ID3D12Tools1": {
+   "base": "ID3D12Tools",
+   "methods": [
+    "ReserveGPUVARangesAtCreate",
+    "ClearReservedGPUVARangesList"
+   ]
+  },
+  "ID3D12Tools2": {
+   "base": "ID3D12Tools1",
+   "methods": [
+    "SetApplicationSpecificDriverState"
+   ]
+  },
+  "ID3D12VersionedRootSignatureDeserializer": {
+   "base": "IUnknown",
+   "methods": [
+    "GetRootSignatureDescAtVersion",
+    "GetUnconvertedRootSignatureDesc"
+   ]
+  },
+  "ID3D12VirtualizationGuestDevice": {
+   "base": "IUnknown",
+   "methods": [
+    "ShareWithHost",
+    "CreateFenceFd"
+   ]
+  },
+  "ID3D12WorkGraphProperties": {
+   "base": "IUnknown",
+   "methods": [
+    "GetNumWorkGraphs",
+    "GetProgramName",
+    "GetWorkGraphIndex",
+    "GetNumNodes",
+    "GetNodeID",
+    "GetNodeIndex",
+    "GetNodeLocalRootArgumentsTableIndex",
+    "GetNumEntrypoints",
+    "GetEntrypointID",
+    "GetEntrypointIndex",
+    "GetEntrypointRecordSizeInBytes",
+    "GetWorkGraphMemoryRequirements",
+    "GetEntrypointRecordAlignmentInBytes"
+   ]
+  }
+ },
+ "dxgi_formats": [
+  "R32G32B32A32_TYPELESS",
+  "R32G32B32A32_FLOAT",
+  "R32G32B32A32_UINT",
+  "R32G32B32A32_SINT",
+  "R32G32B32_TYPELESS",
+  "R32G32B32_FLOAT",
+  "R32G32B32_UINT",
+  "R32G32B32_SINT",
+  "R16G16B16A16_TYPELESS",
+  "R16G16B16A16_FLOAT",
+  "R16G16B16A16_UNORM",
+  "R16G16B16A16_UINT",
+  "R16G16B16A16_SNORM",
+  "R16G16B16A16_SINT",
+  "R32G32_TYPELESS",
+  "R32G32_FLOAT",
+  "R32G32_UINT",
+  "R32G32_SINT",
+  "R32G8X24_TYPELESS",
+  "D32_FLOAT_S8X24_UINT",
+  "R32_FLOAT_X8X24_TYPELESS",
+  "X32_TYPELESS_G8X24_UINT",
+  "R10G10B10A2_TYPELESS",
+  "R10G10B10A2_UNORM",
+  "R10G10B10A2_UINT",
+  "R11G11B10_FLOAT",
+  "R8G8B8A8_TYPELESS",
+  "R8G8B8A8_UNORM",
+  "R8G8B8A8_UNORM_SRGB",
+  "R8G8B8A8_UINT",
+  "R8G8B8A8_SNORM",
+  "R8G8B8A8_SINT",
+  "R16G16_TYPELESS",
+  "R16G16_FLOAT",
+  "R16G16_UNORM",
+  "R16G16_UINT",
+  "R16G16_SNORM",
+  "R16G16_SINT",
+  "R32_TYPELESS",
+  "D32_FLOAT",
+  "R32_FLOAT",
+  "R32_UINT",
+  "R32_SINT",
+  "R24G8_TYPELESS",
+  "D24_UNORM_S8_UINT",
+  "R24_UNORM_X8_TYPELESS",
+  "X24_TYPELESS_G8_UINT",
+  "R8G8_TYPELESS",
+  "R8G8_UNORM",
+  "R8G8_UINT",
+  "R8G8_SNORM",
+  "R8G8_SINT",
+  "R16_TYPELESS",
+  "R16_FLOAT",
+  "D16_UNORM",
+  "R16_UNORM",
+  "R16_UINT",
+  "R16_SNORM",
+  "R16_SINT",
+  "R8_TYPELESS",
+  "R8_UNORM",
+  "R8_UINT",
+  "R8_SNORM",
+  "R8_SINT",
+  "A8_UNORM",
+  "R1_UNORM",
+  "R9G9B9E5_SHAREDEXP",
+  "R8G8_B8G8_UNORM",
+  "G8R8_G8B8_UNORM",
+  "BC1_TYPELESS",
+  "BC1_UNORM",
+  "BC1_UNORM_SRGB",
+  "BC2_TYPELESS",
+  "BC2_UNORM",
+  "BC2_UNORM_SRGB",
+  "BC3_TYPELESS",
+  "BC3_UNORM",
+  "BC3_UNORM_SRGB",
+  "BC4_TYPELESS",
+  "BC4_UNORM",
+  "BC4_SNORM",
+  "BC5_TYPELESS",
+  "BC5_UNORM",
+  "BC5_SNORM",
+  "B5G6R5_UNORM",
+  "B5G5R5A1_UNORM",
+  "B8G8R8A8_UNORM",
+  "B8G8R8X8_UNORM",
+  "R10G10B10_XR_BIAS_A2_UNORM",
+  "B8G8R8A8_TYPELESS",
+  "B8G8R8A8_UNORM_SRGB",
+  "B8G8R8X8_TYPELESS",
+  "B8G8R8X8_UNORM_SRGB",
+  "BC6H_TYPELESS",
+  "BC6H_UF16",
+  "BC6H_SF16",
+  "BC7_TYPELESS",
+  "BC7_UNORM",
+  "BC7_UNORM_SRGB",
+  "AYUV",
+  "Y410",
+  "Y416",
+  "NV12",
+  "P010",
+  "P016",
+  "420_OPAQUE",
+  "YUY2",
+  "Y210",
+  "Y216",
+  "NV11",
+  "AI44",
+  "IA44",
+  "P8",
+  "A8P8",
+  "B4G4R4A4_UNORM",
+  "P208",
+  "V208",
+  "V408",
+  "SAMPLER_FEEDBACK_MIN_MIP_OPAQUE",
+  "SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE",
+  "A4B4G4R4_UNORM"
+ ]
+}
