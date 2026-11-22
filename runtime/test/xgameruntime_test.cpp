@@ -16,6 +16,8 @@
 #include <fstream>
 #include <string>
 #include <system_error>
+#include <thread>
+#include <vector>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -327,6 +329,44 @@ void check_run_time_load() {
         const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
         check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        // RT-258: a callback and its context are one registration. Two threads re-register pair A or pair B while
+        // two others report; each callback checks it got its own context, never the other pair's.
+        {
+            static std::atomic<int> s_wrong{0}, s_calls{0};
+            static int s_tag_a = 1, s_tag_b = 2;
+            Callback cb_a = [](HRESULT, const char*, void* ctx) {
+                s_calls.fetch_add(1, std::memory_order_relaxed);
+                if (ctx != &s_tag_a) s_wrong.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            };
+            Callback cb_b = [](HRESULT, const char*, void* ctx) {
+                s_calls.fetch_add(1, std::memory_order_relaxed);
+                if (ctx != &s_tag_b) s_wrong.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            };
+            const auto set_callback = reinterpret_cast<SetCallback>(slot(e, 4));
+            const auto report = reinterpret_cast<Report>(slot(e, 3));
+            set_callback(e, cb_a, &s_tag_a);
+            std::atomic<bool> stop{false};
+            std::vector<std::thread> threads;
+            for (int w = 0; w < 2; ++w)
+                threads.emplace_back([&, w] {
+                    for (int i = 0; i < 200000 && !stop.load(); ++i)
+                        (i + w) % 2 ? set_callback(e, cb_a, &s_tag_a) : set_callback(e, cb_b, &s_tag_b);
+                });
+            for (int w = 0; w < 2; ++w)
+                threads.emplace_back([&] {
+                    for (int i = 0; i < 200000; ++i) report(e, E_FAIL, nullptr);
+                });
+            for (std::size_t w = 2; w < threads.size(); ++w) threads[w].join();
+            stop = true;
+            threads[0].join();
+            threads[1].join();
+            check(s_calls.load() == 400000 && s_wrong.load() == 0,
+                  "a report racing XErrorSetCallback gets a callback with its own context (RT-258)");
+            if (s_wrong.load()) std::printf("  %d of %d callbacks got the other pair's context\n", s_wrong.load(),
+                                            s_calls.load());
+        }
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
         using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
         reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None
