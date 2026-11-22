@@ -4809,6 +4809,13 @@ public:
         out->ResultDataMaxSizeInBytes = sizes.accelerationStructureSize;
         out->ScratchDataSizeInBytes = sizes.buildScratchSize;
         out->UpdateScratchDataSizeInBytes = sizes.updateScratchSize;
+        // An ARRAY_OF_POINTERS top-level build gathers its instance descs into the start of the scratch first
+        // (vulkan_replay.h, khr_instance_gather_bytes), for the build and for an update alike.
+        if (is_tlas && desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS && desc->NumDescs) {
+            const UINT64 gather = leonida::khr_instance_gather_bytes(desc->NumDescs);
+            out->ScratchDataSizeInBytes += gather;
+            out->UpdateScratchDataSizeInBytes += gather;
+        }
     }
 
     HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid,

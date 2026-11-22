@@ -782,6 +782,12 @@ struct XdxrGather {
     std::vector<std::pair<VkBuffer, VkBufferCopy>> copies;  // sorted by source buffer
 };
 
+// The KHR path (LEONIDA_RT_AS=khr) gathers ARRAY_OF_POINTERS instance descs the same way, into the first bytes of
+// the build's scratch: `count` descs of 64 bytes, rounded up to 256 so the driver's scratch after them keeps the
+// 256-byte alignment D3D12 gives the scratch address. GetRaytracingAccelerationStructurePrebuildInfo adds this to
+// the driver's scratch sizes for an ARRAY_OF_POINTERS top-level build, so the application's scratch has the room.
+constexpr std::uint64_t khr_instance_gather_bytes(std::uint64_t count) { return (64 * count + 255) / 256 * 256; }
+
 struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
@@ -870,6 +876,12 @@ struct ReplayFunctions {
     // resource has; and one postbuild value (COMPACTED_SIZE, CURRENT_SIZE) of the structure at `src` to `dest`.
     std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dst_va, std::uint64_t bytes)> xdxr_copy;
     std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dest_va)> xdxr_postbuild;
+    // KHR builds from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS: `gather_instances` resolves the pointer array while
+    // the list is prepared into copies to `dst_va` (khr_instance_gather_bytes at the start of the scratch), and
+    // `record_instance_gather` records them before the build, which then reads the descs as an ARRAY. Without them
+    // such a build is refused instead of handing the driver console VAs it would read as instance descs.
+    std::function<ReplayResult(const BuildAccelerationStructure&, std::uint64_t dst_va, XdxrGather&)> gather_instances;
+    std::function<void(VkCommandBuffer, const XdxrGather&)> record_instance_gather;
     std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
     // Preparation only allocates a slot; capture records the GPU snapshot at the SetPredication command.
     std::function<bool(VkBuffer, VkDeviceSize, PredicateCapture&)> prepare_predicate;
@@ -2787,6 +2799,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     p.accel_src = vk.resolve_acceleration_structure(build->src_va);
                     if (!p.accel_src) return ReplayResult::unresolved_resource;
                 }
+                if (build->is_tlas && build->instance_pointers && build->instance_count) {
+                    if (!vk.gather_instances || !vk.record_instance_gather) return ReplayResult::unsupported;
+                    if (!build->scratch_va || !build->instances_va) return ReplayResult::unresolved_resource;
+                    if (const auto r = vk.gather_instances(*build, build->scratch_va, p.xdxr_gather);
+                        r != ReplayResult::success)
+                        return r;
+                }
             }
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             // XDXR only (a KHR copy needs VkAccelerationStructureKHR handles and vkCmdCopyAccelerationStructureKHR);
@@ -3627,12 +3646,24 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const auto addr = [&](std::uint64_t va) -> VkDeviceAddress { return va ? heap_base + va : 0; };
             std::vector<VkAccelerationStructureGeometryKHR> geoms;
             std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
+            // ARRAY_OF_POINTERS: the pointers are console VAs, which the driver can't follow (arrayOfPointers would
+            // read them as device addresses). The descs they name were gathered into the start of the scratch when
+            // the list was prepared; they are copied there now and the build reads them as an ARRAY, with the
+            // driver's scratch after them.
+            const bool gathered = build->is_tlas && build->instance_pointers && build->instance_count;
+            std::uint64_t instances_va = build->instances_va;
+            std::uint64_t scratch_va = build->scratch_va;
+            if (gathered) {
+                vk.record_instance_gather(command_buffer, p.xdxr_gather);
+                instances_va = build->scratch_va;
+                scratch_va = build->scratch_va + khr_instance_gather_bytes(build->instance_count);
+            }
             if (build->is_tlas) {
                 VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
                 g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
                 g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
                 g.geometry.instances.arrayOfPointers = VK_FALSE;
-                g.geometry.instances.data.deviceAddress = addr(build->instances_va);
+                g.geometry.instances.data.deviceAddress = addr(instances_va);
                 geoms.push_back(g);
                 ranges.push_back({build->instance_count, 0, 0, 0});
             } else {
@@ -3670,7 +3701,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             info.dstAccelerationStructure = p.accel_dst;
             info.geometryCount = static_cast<std::uint32_t>(geoms.size());
             info.pGeometries = geoms.data();
-            info.scratchData.deviceAddress = addr(build->scratch_va);
+            info.scratchData.deviceAddress = addr(scratch_va);
             const VkAccelerationStructureBuildRangeInfoKHR* range_ptr = ranges.data();
             vk.build_acceleration_structures(command_buffer, 1, &info, &range_ptr);
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {

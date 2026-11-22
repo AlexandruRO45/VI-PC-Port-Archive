@@ -882,7 +882,8 @@ public:
                     if (!xdxr_inputs(b, nullptr, 0) || !layout.compute(xdxr_elements(b), b.is_tlas) || !b.dst_va ||
                         !b.scratch_va || (b.is_tlas && b.instance_count && !b.instances_va))
                         return ReplayResult::unsupported;
-                    if (b.is_tlas && b.instance_pointers && b.instance_count) return xdxr_gather(b, layout, gather);
+                    if (b.is_tlas && b.instance_pointers && b.instance_count)
+                        return gather_instances(b, b.scratch_va + layout.gather_off, gather);
                     return ReplayResult::success;
                 };
                 replay_.xdxr_record = [this](VkCommandBuffer cb, const BuildAccelerationStructure& b,
@@ -898,7 +899,7 @@ public:
                     if (b.is_tlas) {
                         std::uint64_t instances = b.instances_va ? base + b.instances_va : 0;
                         if (b.instance_pointers && b.instance_count) {
-                            record_xdxr_gather(cb, gather);
+                            record_instance_gather(cb, gather, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
                             instances = base + b.scratch_va + layout.gather_off;
                         }
                         xdxr_->record_tlas(cb, layout, instances, base + b.dst_va, base + b.scratch_va, base, from);
@@ -925,6 +926,11 @@ public:
             replay_.resolve_acceleration_structure = [this](std::uint64_t va) {
                 const auto it = acceleration_structures_.find(va);
                 return it == acceleration_structures_.end() ? VK_NULL_HANDLE : it->second;
+            };
+            replay_.gather_instances = [this](const BuildAccelerationStructure& b, std::uint64_t dst_va,
+                                              XdxrGather& gather) { return gather_instances(b, dst_va, gather); };
+            replay_.record_instance_gather = [this](VkCommandBuffer cb, const XdxrGather& gather) {
+                record_instance_gather(cb, gather, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
             };
         }
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
@@ -1178,21 +1184,23 @@ public:
     }
 
     // A top-level build from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS, while the list is prepared (resource_mutex_
-    // held). The pointer array is read now, through its buffer's host mapping, and each pointer must name 64 bytes
-    // of one known buffer: a null pointer, one into no resource, or one whose desc runs past its buffer's end refuses
-    // the list (unresolved_resource) before the GPU reads anything. The descs themselves are copied on the GPU when the
-    // build runs, so a desc written earlier in the same list is seen; the pointers are the values at submission
-    // (a pointer array the GPU writes in the same or an unfinished submission is not seen).
-    ReplayResult xdxr_gather(const BuildAccelerationStructure& b, const XdxrLayout& layout, XdxrGather& out) const {
+    // held), gathered to `dst_va`: XdxrLayout::gather_off into the scratch on the XDXR path, the start of the scratch
+    // on the KHR path (khr_instance_gather_bytes). The pointer array is read now, through its buffer's host mapping,
+    // and each pointer must name 64 bytes of one known buffer: a null pointer, one into no resource, or one whose desc
+    // runs past its buffer's end refuses the list (unresolved_resource) before the GPU reads anything. The descs
+    // themselves are copied on the GPU when the build runs, so a desc written earlier in the same list is seen; the
+    // pointers are the values at submission (a pointer array the GPU writes in the same or an unfinished submission is
+    // not seen).
+    ReplayResult gather_instances(const BuildAccelerationStructure& b, std::uint64_t dst_va, XdxrGather& out) const {
         out = XdxrGather{};
         const std::uint64_t n = b.instance_count;
         const ResourceBinding* array = xdxr_buffer_holding(b.instances_va, 8 * n);
         if (!array || !array->host) return ReplayResult::unresolved_resource;
         const std::uint8_t* pointers = array->host + (b.instances_va - array->va);
-        const ResourceBinding* scratch = xdxr_buffer_holding(b.scratch_va + layout.gather_off, 64 * n);
+        const ResourceBinding* scratch = xdxr_buffer_holding(dst_va, 64 * n);
         if (!scratch) return ReplayResult::unresolved_resource;
         out.dst = scratch->buffer;
-        const VkDeviceSize dst = scratch->buffer_offset + (b.scratch_va + layout.gather_off - scratch->va);
+        const VkDeviceSize dst = scratch->buffer_offset + (dst_va - scratch->va);
         const ResourceBinding* source = nullptr;
         for (std::uint64_t i = 0; i < n; ++i) {
             std::uint64_t va = 0;
@@ -1219,8 +1227,9 @@ public:
 
     // The gather an ARRAY_OF_POINTERS build was prepared with: earlier writes to the descs (any stage, as the
     // application's barrier may name a shader stage, not a copy) and earlier use of the scratch are done first, and
-    // the build's compute pass reads the gathered descs after. One vkCmdCopyBuffer per source buffer.
-    void record_xdxr_gather(VkCommandBuffer cb, const XdxrGather& gather) const {
+    // the build reads the gathered descs after, at `build_stage`: the XDXR builder's compute pass, or the driver's
+    // acceleration-structure build (which reads instance data as SHADER_READ). One vkCmdCopyBuffer per source buffer.
+    void record_instance_gather(VkCommandBuffer cb, const XdxrGather& gather, VkPipelineStageFlags build_stage) const {
         VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
                                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
         vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before,
@@ -1235,8 +1244,7 @@ public:
         }
         VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
                               VK_ACCESS_SHADER_READ_BIT};
-        vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &after,
-                                0, nullptr, 0, nullptr);
+        vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, build_stage, 0, 1, &after, 0, nullptr, 0, nullptr);
     }
 
     void register_acceleration_structure(std::uint64_t va, VkAccelerationStructureKHR as) {

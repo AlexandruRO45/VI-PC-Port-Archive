@@ -277,6 +277,7 @@ int main() {
     DF(vkGetDeviceQueue);
     DF(vkCreateCommandPool);
     DF(vkDestroyCommandPool);
+    DF(vkResetCommandPool);
     DF(vkAllocateCommandBuffers);
     DF(vkBeginCommandBuffer);
     DF(vkEndCommandBuffer);
@@ -669,6 +670,18 @@ int main() {
         if (tlas_info.ResultDataMaxSizeInBytes == 0 || tlas_info.ScratchDataSizeInBytes == 0)
             return fail("GetRaytracingAccelerationStructurePrebuildInfo(TLAS)");
 
+        // The same TLAS from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS (D3D-425): its scratch also holds the gathered
+        // instance descs, 256 bytes for one desc in front of the driver's scratch.
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlas_ptr_in = tlas_in;
+        tlas_ptr_in.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlas_ptr_info{};
+        dev->GetRaytracingAccelerationStructurePrebuildInfo(&tlas_ptr_in, &tlas_ptr_info);
+        if (tlas_ptr_info.ResultDataMaxSizeInBytes != tlas_info.ResultDataMaxSizeInBytes ||
+            tlas_ptr_info.ScratchDataSizeInBytes != tlas_info.ScratchDataSizeInBytes + 256u ||
+            tlas_ptr_info.UpdateScratchDataSizeInBytes != tlas_info.UpdateScratchDataSizeInBytes + 256u)
+            return fail("GetRaytracingAccelerationStructurePrebuildInfo(TLAS, ARRAY_OF_POINTERS): expected the ARRAY "
+                        "sizes plus 256 scratch bytes");
+
         const auto align256 = [](UINT64 v) -> UINT64 { return (v + 255u) & ~UINT64(255u); };
         auto blas_desc = make_buf_desc(align256(blas_info.ResultDataMaxSizeInBytes),
                                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -709,6 +722,48 @@ int main() {
 
         tlas_in.InstanceDescs = inst_buf->GetGPUVirtualAddress();
 
+        // ARRAY_OF_POINTERS inputs: the desc 192 bytes into its own buffer, the one pointer in another. Read as the
+        // descs themselves (the D3D-425 bug), the pointer buffer is an instance with InstanceMask 0, which no ray hits.
+        auto ptr_tlas_desc = make_buf_desc(align256(tlas_ptr_info.ResultDataMaxSizeInBytes),
+                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto ptr_scratch_desc = make_buf_desc(align256(tlas_ptr_info.ScratchDataSizeInBytes),
+                                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto ptr_descs_desc = make_buf_desc(512);
+        auto ptr_array_desc = make_buf_desc(256);
+        ID3D12Resource* ptr_tlas_buf = nullptr;
+        ID3D12Resource* ptr_scratch_buf = nullptr;
+        ID3D12Resource* ptr_descs_buf = nullptr;
+        ID3D12Resource* ptr_array_buf = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &ptr_tlas_desc,
+                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                IID_PPV_ARGS(&ptr_tlas_buf))) ||
+            FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &ptr_scratch_desc,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                IID_PPV_ARGS(&ptr_scratch_buf))) ||
+            FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &ptr_descs_desc,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&ptr_descs_buf))) ||
+            FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &ptr_array_desc,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&ptr_array_buf))))
+            return fail("CreateCommittedResource(ARRAY_OF_POINTERS buffers)");
+        constexpr UINT64 ptr_desc_offset = 192;
+        ptr_descs_buf->Map(0, nullptr, &p);
+        std::memset(p, 0, 512);
+        std::memcpy(static_cast<std::uint8_t*>(p) + ptr_desc_offset, &inst, sizeof(inst));
+        ptr_descs_buf->Unmap(0, nullptr);
+        ptr_array_buf->Map(0, nullptr, &p);
+        std::memset(p, 0, 256);
+        const D3D12_GPU_VIRTUAL_ADDRESS desc_pointer = ptr_descs_buf->GetGPUVirtualAddress() + ptr_desc_offset;
+        std::memcpy(p, &desc_pointer, sizeof(desc_pointer));
+        ptr_array_buf->Unmap(0, nullptr);
+        tlas_ptr_in.InstanceDescs = ptr_array_buf->GetGPUVirtualAddress();
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC ptr_tlas_build{};
+        ptr_tlas_build.DestAccelerationStructureData = ptr_tlas_buf->GetGPUVirtualAddress();
+        ptr_tlas_build.Inputs = tlas_ptr_in;
+        ptr_tlas_build.ScratchAccelerationStructureData = ptr_scratch_buf->GetGPUVirtualAddress();
+
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC blas_build{};
         blas_build.DestAccelerationStructureData = blas_buf->GetGPUVirtualAddress();
         blas_build.Inputs = blas_in;
@@ -727,6 +782,7 @@ int main() {
         cl->BuildRaytracingAccelerationStructure(&blas_build, 0, nullptr);
         cl->ResourceBarrier(1, &uav_b);
         cl->BuildRaytracingAccelerationStructure(&tlas_build, 0, nullptr);
+        cl->BuildRaytracingAccelerationStructure(&ptr_tlas_build, 0, nullptr);
         cl->ResourceBarrier(1, &uav_b);
         if (FAILED(cl->Close())) return fail("RT build Close");
 
@@ -738,6 +794,9 @@ int main() {
         VkAccelerationStructureKHR tlas_vk =
             rt::d3d12::vulkan_acceleration_structure(dev, tlas_buf->GetGPUVirtualAddress());
         if (!tlas_vk) return fail("vulkan_acceleration_structure(TLAS)");
+        VkAccelerationStructureKHR ptr_tlas_vk =
+            rt::d3d12::vulkan_acceleration_structure(dev, ptr_tlas_buf->GetGPUVirtualAddress());
+        if (!ptr_tlas_vk) return fail("vulkan_acceleration_structure(TLAS, ARRAY_OF_POINTERS)");
 
 #if defined(LEONIDA_TEST_CS_RAYQUERY_SPV)
         std::vector<std::uint32_t> rq_words;
@@ -828,30 +887,54 @@ int main() {
         cbai.commandBufferCount = 1;
         vkAllocateCommandBuffers(vk_dev, &cbai, &cb);
 
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cb, &bi);
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pso);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, nullptr);
-        vkCmdDispatch(cb, 1, 1, 1);
-        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr,
-                             0, nullptr);
-        vkEndCommandBuffer(cb);
+        // Both TLASes, one after the other: the ARRAY one, then the ARRAY_OF_POINTERS one (D3D-425). The results are
+        // set to 7 first, so a ray query that writes nothing doesn't pass on the previous run's words.
+        const struct {
+            VkAccelerationStructureKHR tlas;
+            const char* name;
+        } rq_cases[] = {{tlas_vk, "TLAS"}, {ptr_tlas_vk, "TLAS from ARRAY_OF_POINTERS"}};
+        std::uint32_t hit = 0, miss = 0;
+        const char* failed = nullptr;
+        for (const auto& rq_case : rq_cases) {
+            out_buf->Map(0, nullptr, &p);
+            const std::uint32_t unset[2] = {7u, 7u};
+            std::memcpy(p, unset, sizeof(unset));
+            out_buf->Unmap(0, nullptr);
+            as_write.pAccelerationStructures = &rq_case.tlas;
+            vkUpdateDescriptorSets(vk_dev, 1, &writes[0], 0, nullptr);
 
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cb;
-        vkQueueSubmit(vk_queue, 1, &si, VK_NULL_HANDLE);
-        vkQueueWaitIdle(vk_queue);
+            vkResetCommandPool(vk_dev, pool, 0);
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(cb, &bi);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pso);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, nullptr);
+            vkCmdDispatch(cb, 1, 1, 1);
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
+                                 nullptr, 0, nullptr);
+            vkEndCommandBuffer(cb);
 
-        out_buf->Map(0, nullptr, &p);
-        const auto* res = static_cast<const std::uint32_t*>(p);
-        const std::uint32_t hit = res[0];
-        const std::uint32_t miss = res[1];
-        out_buf->Unmap(0, nullptr);
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &cb;
+            vkQueueSubmit(vk_queue, 1, &si, VK_NULL_HANDLE);
+            vkQueueWaitIdle(vk_queue);
+
+            out_buf->Map(0, nullptr, &p);
+            const auto* res = static_cast<const std::uint32_t*>(p);
+            hit = res[0];
+            miss = res[1];
+            out_buf->Unmap(0, nullptr);
+            if (hit != 1u || miss != 0u) {
+                failed = rq_case.name;
+                break;
+            }
+            std::printf("  [PASS] BLAS + %s BuildRaytracingAccelerationStructure + RayQueryKHR (hit=%u, miss=%u)\n",
+                        rq_case.name, hit, miss);
+        }
 
         vkDestroyCommandPool(vk_dev, pool, nullptr);
         vkDestroyPipeline(vk_dev, pso, nullptr);
@@ -860,13 +943,16 @@ int main() {
         vkDestroyDescriptorSetLayout(vk_dev, dsl, nullptr);
         out_buf->Release();
 
-        if (hit != 1u || miss != 0u) {
-            std::fprintf(stderr, "FAIL: RayQueryKHR expected hit=1 miss=0, got hit=%u miss=%u\n", hit, miss);
+        if (failed) {
+            std::fprintf(stderr, "FAIL: RayQueryKHR on the %s expected hit=1 miss=0, got hit=%u miss=%u\n", failed,
+                         hit, miss);
             return 1;
         }
-        std::printf("  [PASS] BLAS + TLAS BuildRaytracingAccelerationStructure + RayQueryKHR (hit=%u, miss=%u)\n", hit,
-                    miss);
 #endif
+        ptr_array_buf->Release();
+        ptr_descs_buf->Release();
+        ptr_scratch_buf->Release();
+        ptr_tlas_buf->Release();
         inst_buf->Release();
         scratch_buf->Release();
         tlas_buf->Release();

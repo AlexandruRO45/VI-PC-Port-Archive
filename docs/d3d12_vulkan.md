@@ -2776,7 +2776,10 @@ Vulkan AS would be invisible to them. Two paths:
    through its buffer's host mapping when the list is submitted. Each pointer must name 64 bytes of one known buffer,
    or the list is refused (`unresolved_resource`) before anything runs. The descs are then copied into the build's
    scratch on the GPU and built as an `ARRAY`; the scratch size counts that room for both layouts. So the pointers are
-   their values at submission, and an array the GPU writes in the same submission is not supported. Procedural (AABB)
+   their values at submission, and an array the GPU writes in the same submission is not supported. The
+   `LEONIDA_RT_AS=khr` builds gather the same way, into the first `khr_instance_gather_bytes` (64 bytes per desc,
+   rounded up to 256) of the scratch, which their prebuild scratch sizes add for that layout; the driver's own scratch
+   starts after them (D3D-425; checked by `runtime/test/d3d12_indirect_rt_test.cpp` with a ray query). Procedural (AABB)
    geometry is refused. Serialization and the Xbox batched/streaming builds are not implemented. The
    reported `RaytracingTier` is unchanged (`NOT_SUPPORTED`). Checked by `runtime/test/d3d12_xdxr_rt_test.cpp` through
    the D3D12 API.
