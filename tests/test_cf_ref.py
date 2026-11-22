@@ -838,7 +838,7 @@ class ExportHaltStepAndErrorTests(CfRefTestCase):
             (["ds_read_b32 v0, v1", "s_endpgm"], 32),
             (["s_waitcnt vmcnt(0)", "s_endpgm"], 32),
             (["s_andn1_wrexec_b32 s0, vcc_lo", "s_endpgm"], 32),
-            (["s_cmp_eq_u64 s[0:1], s[2:3]", "s_endpgm"], 64),
+            (["s_cmp_eq_u64 s[0:1], s[2:3]", "s_endpgm"], 32),   # modelled in wave64 only (FUZZ-8)
             (["s_cmp_eq_u32 v0, 0", "s_endpgm"], 32),
             (["v_cmp_eq_f32_e32 vcc, v0, v1", "s_endpgm"], 32),
             (["v_cmpx_eq_u32_e64 s[0:1], v0, v1", "s_endpgm"], 64),

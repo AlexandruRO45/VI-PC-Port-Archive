@@ -131,6 +131,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # wave32 SCC of lane-mask SALU ops is one vote per wave (cs_scc_mask32.asm, #477)
             ("cs_scc_mask32", [7, 0, 0, 9, 11, 13, 7, 13]),
+            # wave64 32-bit ops on one half of EXEC / VCC (cs_w64_exec_half.asm, FUZZ-8)
+            ("cs_w64_exec_half", [1, 0, 1, 1, 0, 3, 9, 9]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
             ("cs_movrelsd_2", [11, 33, 33, 55, 1717, 77, 1515, 1717]),
             # SHADER-90: ds_permute_b32, the forward (scatter) permute; unwritten lane 0, EXEC gates the destination
