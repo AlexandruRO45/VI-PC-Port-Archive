@@ -19,9 +19,9 @@ Semantics:
 from __future__ import annotations
 
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 # RDNA2 Local Data Share (LDS) Architectural Constants
 LDS_SIZE_BYTES: int = 65536         # 64 KiB default capacity
@@ -439,6 +439,218 @@ class TestSymbolicAST(unittest.TestCase):
         imm1 = Immediate(42)
         imm2 = Immediate(42)
         self.assertEqual(imm1, imm2)
+
+
+# ==============================================================================
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    """Architectural register and scratchpad state for scalar execution."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    lds: LDSModel = field(default_factory=LDSModel)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index] & MASK_32
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK_32
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK_32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK_32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar interpreter for ds_nand_rtn_b32 / ds_nand_b32."""
+
+    def resolve_operand(self, op: Operand, state: ScalarMachineState) -> int:
+        if isinstance(op, VGPR):
+            return state.get_vgpr(op.index)
+        if isinstance(op, SGPR):
+            return state.get_sgpr(op.index)
+        if isinstance(op, Immediate):
+            return op.value & MASK_32
+        raise TypeError(f"Unknown operand type: {type(op).__name__}")
+
+    def step(
+        self,
+        instr: DSNandInstruction,
+        state: ScalarMachineState,
+    ) -> Tuple[Optional[int], int]:
+        """Execute a single ds_nand_rtn_b32 / ds_nand_b32 instruction deterministically.
+        
+        All operands are latched before write-back to ensure operand preservation.
+        Returns:
+            (returned_old_val if returning else None, updated_mem_val)
+        """
+        # 1. Latch inputs
+        vaddr = state.get_vgpr(instr.addr.index)
+        data_val = self.resolve_operand(instr.data, state)
+
+        # 2. Compute effective byte address and fetch current LDS value
+        eff_addr = calc_lds_effective_address(vaddr, instr.offset)
+        curr_mem = state.lds.read_dword(eff_addr)
+
+        # 3. Compute bitwise NAND
+        old_val, next_mem = oracle_ds_nand_b32(curr_mem, data_val)
+
+        # 4. Atomic memory writeback
+        state.lds.write_dword(eff_addr, next_mem)
+
+        # 5. Write return value to destination VGPR if returning variant
+        if instr.opcode.is_return:
+            assert instr.dst is not None
+            state.set_vgpr(instr.dst.index, old_val)
+            return old_val, next_mem
+
+        return None, next_mem
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_step_returning_vgpr_operand(self) -> None:
+        addr = 0x200
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 0x00FF00FF)
+        self.state.lds.write_dword(addr, 0x0F0F0F0F)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(0),
+            addr=VGPR(1),
+            data=VGPR(2),
+        )
+        # old & data = 0x000F000F
+        # ~0x000F000F = 0xFFF0FFF0
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, 0x0F0F0F0F)
+        self.assertEqual(mem, 0xFFF0FFF0)
+        self.assertEqual(self.state.get_vgpr(0), 0x0F0F0F0F)
+        self.assertEqual(self.state.lds.read_dword(addr), 0xFFF0FFF0)
+
+    def test_scalar_step_returning_sgpr_operand(self) -> None:
+        addr = 0x300
+        self.state.set_vgpr(1, addr)
+        self.state.set_sgpr(10, 0xFFFFFFFF)
+        self.state.lds.write_dword(addr, 0x12345678)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(3),
+            addr=VGPR(1),
+            data=SGPR(10),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, 0x12345678)
+        self.assertEqual(mem, (~0x12345678) & MASK_32)
+        self.assertEqual(self.state.get_vgpr(3), 0x12345678)
+
+    def test_scalar_step_returning_immediate_operand(self) -> None:
+        addr = 0x400
+        self.state.set_vgpr(1, addr)
+        self.state.lds.write_dword(addr, 0xAAAA5555)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(4),
+            addr=VGPR(1),
+            data=Immediate(0x00000000),
+        )
+        # Any value NAND 0 is 0xFFFFFFFF
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, 0xAAAA5555)
+        self.assertEqual(mem, 0xFFFFFFFF)
+        self.assertEqual(self.state.get_vgpr(4), 0xAAAA5555)
+        self.assertEqual(self.state.lds.read_dword(addr), 0xFFFFFFFF)
+
+    def test_scalar_step_non_returning_opcode(self) -> None:
+        addr = 0x500
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, 0xFF00FF00)
+        self.state.lds.write_dword(addr, 0xFF00FF00)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_B32,
+            dst=None,
+            addr=VGPR(1),
+            data=VGPR(2),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertIsNone(old)
+        self.assertEqual(mem, 0x00FF00FF)
+        self.assertEqual(self.state.lds.read_dword(addr), 0x00FF00FF)
+
+    def test_scalar_step_with_immediate_offset(self) -> None:
+        base_addr = 0x600
+        offset = 0x08
+        eff_addr = base_addr + offset
+        self.state.set_vgpr(2, base_addr)
+        self.state.lds.write_dword(eff_addr, 0xF0F0F0F0)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(5),
+            addr=VGPR(2),
+            data=Immediate(0xFFFFFFFF),
+            offset=offset,
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, 0xF0F0F0F0)
+        self.assertEqual(mem, 0x0F0F0F0F)
+        self.assertEqual(self.state.get_vgpr(5), 0xF0F0F0F0)
+        self.assertEqual(self.state.lds.read_dword(eff_addr), 0x0F0F0F0F)
+        self.assertEqual(self.state.lds.read_dword(base_addr), 0)
+
+    def test_scalar_step_nand_double_inversion_cycle(self) -> None:
+        """Two sequential NAND with 0xFFFFFFFF inverts and then restores original bits."""
+        addr = 0x700
+        initial_val = 0x1234ABCD
+        self.state.set_vgpr(1, addr)
+        self.state.lds.write_dword(addr, initial_val)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(6),
+            addr=VGPR(1),
+            data=Immediate(0xFFFFFFFF),
+        )
+        # Step 1: invert
+        old1, mem1 = self.interp.step(instr, self.state)
+        self.assertEqual(old1, initial_val)
+        self.assertEqual(mem1, (~initial_val) & MASK_32)
+
+        # Step 2: invert again
+        old2, mem2 = self.interp.step(instr, self.state)
+        self.assertEqual(old2, (~initial_val) & MASK_32)
+        self.assertEqual(mem2, initial_val)
+
+    def test_scalar_step_out_of_bounds_address_wrapping(self) -> None:
+        cap_bytes = 65536
+        addr = cap_bytes + 0x100
+        eff_wrapped = 0x100
+        self.state.set_vgpr(1, addr)
+        self.state.lds.write_dword(eff_wrapped, 0x11110000)
+
+        instr = DSNandInstruction(
+            opcode=DSOpcode.DS_NAND_RTN_B32,
+            dst=VGPR(8),
+            addr=VGPR(1),
+            data=Immediate(0x00000000),
+        )
+        old, mem = self.interp.step(instr, self.state)
+        self.assertEqual(old, 0x11110000)
+        self.assertEqual(mem, 0xFFFFFFFF)
+        self.assertEqual(self.state.lds.read_dword(eff_wrapped), 0xFFFFFFFF)
 
 
 if __name__ == "__main__":
