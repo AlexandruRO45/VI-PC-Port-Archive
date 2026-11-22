@@ -754,6 +754,135 @@ class ReferenceInversionTest(unittest.TestCase):
             _, _, _, exp_mips = calib.read_dds(exp_dds)
             self.assertEqual(exp_mips, mip_linear)
 
+    def test_ref_dds_composites_multi_mip_packed_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            width, height, mips_n, fmt = 64, 64, 3, 98  # DXGI_FORMAT_BC7_UNORM: mip 0 standalone, mips 1+2 in tail
+            lay = ttpf.surface_layout(width, height, fmt, mips_n, ttpf.tile_bytes(4))
+            self.assertEqual(lay["mips"][1]["offset"], 0)
+            self.assertEqual(lay["mips"][2]["offset"], 0)
+
+            def solid_bc7_mode6(r, g, b):
+                acc = 1 << 6
+                pos = 7
+                for v in (r >> 1, r >> 1, g >> 1, g >> 1, b >> 1, b >> 1, 127, 127):
+                    acc |= (v & 0x7F) << pos
+                    pos += 7
+                acc |= (r & 1) << pos
+                acc |= (r & 1) << (pos + 1)
+                return acc.to_bytes(16, "little")
+
+            mip_linear = []
+            for m, mip in enumerate(lay["mips"]):
+                buf = bytearray()
+                scale = 1 << m
+                half = 4 * (scale - 1)
+                for by in range(mip["blocks_h"]):
+                    for bx in range(mip["blocks_w"]):
+                        r = min(254, (40 + bx * 8 * scale + half) & 0xFE)
+                        g = min(254, (60 + by * 8 * scale + half) & 0xFE)
+                        buf += solid_bc7_mode6(r, g, 120)
+                mip_linear.append(bytes(buf))
+
+            dds_path = os.path.join(tmp, "ref_3mip.dds")
+            _write_dx10_dds(dds_path, fmt, width, height, mip_linear)
+
+            # Build the ground-truth composite 4096B tail containing BOTH mip 1 and mip 2,
+            # with valid Mode-6 blocks in unused tail slots so BCPack encoding is well-formed.
+            fill_blk = solid_bc7_mode6(20, 20, 20)
+            tiled_tail = bytearray(fill_blk * (lay["mips"][1]["region"] // 16))
+            for m in (1, 2):
+                mip = lay["mips"][m]
+                for by in range(mip["blocks_h"]):
+                    for bx in range(mip["blocks_w"]):
+                        off = calib.tiled_offset(lay, mip, bx, by)
+                        src = (by * mip["blocks_w"] + bx) * 16
+                        tiled_tail[off:off + 16] = mip_linear[m][src:src + 16]
+            tiled_top = calib.retile_mip(mip_linear[0], lay, lay["mips"][0])
+
+            # Encode the packed tail with BCPack codec 7 referencing unknown history entries
+            # at one block inside mip 1 (block 128) and one block inside mip 2 (block 96).
+            mip1_blk = calib.tiled_offset(lay, lay["mips"][1], 0, 0) // 16
+            mip2_blk = calib.tiled_offset(lay, lay["mips"][2], 0, 0) // 16
+            k_mip1, k_mip2 = 200, 199
+            sec_ep1 = tuple([0x44, 0x66, 0x88, 0xFE, 0x44, 0x66, 0x88, 0xFE] * 3)
+            sec_ep2 = tuple([0x52, 0x74, 0x96, 0xFE, 0x52, 0x74, 0x96, 0xFE] * 3)
+            sec_ix1 = tuple([1, 3, 5, 7] * 4 + [0] * 16)
+            sec_ix2 = tuple([2, 4, 6, 8] * 4 + [0] * 16)
+
+            tab = bptc.load_bc7()
+            rank = tab["config"].index((6, 0, 0, 0))
+            s15a, s15b = divmod(tab["rank_of"].index(rank), 16)
+            lanes = [[] for _ in range(16)]
+            for i in range(len(tiled_tail) // 16):
+                acc = int.from_bytes(tiled_tail[i * 16:(i + 1) * 16], "little")
+                pos = 7
+                ch = [[0, 0] for _ in range(4)]
+                for c in range(4):
+                    for e in range(2):
+                        ch[c][e] = (acc >> pos) & 0x7F
+                        pos += 7
+                p0 = (acc >> pos) & 1
+                p1 = (acc >> (pos + 1)) & 1
+                pos += 2
+                ch[0][0] = (ch[0][0] << 1) | p0
+                ch[0][1] = (ch[0][1] << 1) | p1
+                ixs = []
+                for p in range(16):
+                    nb = 3 if p == 0 else 4
+                    ixs.append((acc >> pos) & ((1 << nb) - 1))
+                    pos += nb
+                if i == mip1_blk:
+                    di = de = 256 + i - k_mip1
+                    rep, rix = sec_ep1, sec_ix1
+                elif i == mip2_blk:
+                    di = de = 256 + i - k_mip2
+                    rep, rix = sec_ep2, sec_ix2
+                else:
+                    di = de = 0
+                    rep, rix = (0,) * 24, (0,) * 32
+                lanes[0].extend(_deint4(_zig(_signed_mod_delta_m(de, di, 256))))
+                lanes[1].extend(_deint4(di))
+                lanes[15].extend([s15a, s15b])
+                for c, ln in enumerate((2, 3, 4, 5)):
+                    bits = 8 if c == 0 else 7
+                    sh = 8 - bits
+                    lanes[ln].extend([
+                        _zig(_signed_mod_delta(ch[c][0], rep[c] >> sh, bits)),
+                        _zig(_signed_mod_delta(ch[c][1], rep[4 + c] >> sh, bits)),
+                    ])
+                for ln in (6, 7, 8, 9, 10):
+                    lanes[ln].extend([0, 0])
+                for y in range(4):
+                    ds = [_zig(_signed_mod_delta(ixs[y * 4 + x], rix[y * 4 + x], 4)) for x in range(4)]
+                    lanes[11 + y].extend([_pack_ix_pair(ds[0], ds[1], y), _pack_ix_pair(ds[2], ds[3], y)])
+            raw_tail = encode_lanes(lanes, 7)
+
+            pool_path = os.path.join(tmp, "packed_tail.ttpf")
+            base = ttpf.align(16 + 24 + 32, 4096)
+            rec = _pack_etpf(width, height, 2, 1, fmt, base, mode=4)
+            _write_custom_rds5_pool(
+                pool_path,
+                [rec],
+                [
+                    (7, lay["mips"][1]["region"], raw_tail),
+                    (8, lay["mips"][0]["region"], zlib.compress(tiled_top, 9)),
+                ],
+            )
+
+            hist_dir = os.path.join(tmp, "hist")
+            spec = f"{pool_path}:0={dds_path}"
+            with redirect_stdout(io.StringIO()):
+                rc = calib.main(["--ref-dds", spec, "--codec", "bc7", "--out", hist_dir, "--check"])
+            self.assertEqual(rc, 0)
+
+            # Both k_mip1 (from mip 1) and k_mip2 (from mip 2) must be recovered for strict export to succeed.
+            exp_dds = os.path.join(tmp, "exported_3mip.dds")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(ttpf.main(["check", pool_path, "0", "--history", hist_dir]), 0)
+            self.assertEqual(ttpf.main(["export", pool_path, "0", exp_dds, "--history", hist_dir]), 0)
+            _, _, _, exp_mips = calib.read_dds(exp_dds)
+            self.assertEqual(exp_mips, mip_linear)
+
 
 class PoolSelfCalibrationTest(unittest.TestCase):
     def test_mixed_bc7_and_bc6h_pool_self_calibration_unlocks_provisional_check_and_export(self):

@@ -325,14 +325,13 @@ def make_inverse_tile_lookup(layout, mip):
     return lookup
 
 
-def retile_mip(linear, layout, mip):
-    """Place a linear DDS mip payload into its RDNA2 tiled byte buffer."""
+def _retile_mip_into(linear, layout, mip, out):
+    """Write a linear DDS mip payload into an existing RDNA2 tiled byte buffer."""
     eb = layout["element_bytes"]
     bw, bh = mip["blocks_w"], mip["blocks_h"]
     expected = bw * bh * eb
     if len(linear) < expected:
         raise ValueError(f"DDS mip payload truncated ({len(linear)} < {expected} bytes)")
-    out = bytearray(mip["region"])
     mv = memoryview(linear)
     row_stride = bw * eb
     for by in range(bh):
@@ -341,6 +340,12 @@ def retile_mip(linear, layout, mip):
             off = tiled_offset(layout, mip, bx, by)
             src = row_at + bx * eb
             out[off:off + eb] = mv[src:src + eb]
+
+
+def retile_mip(linear, layout, mip):
+    """Place a linear DDS mip payload into its RDNA2 tiled byte buffer."""
+    out = bytearray(mip["region"])
+    _retile_mip_into(linear, layout, mip, out)
     return bytes(out)
 
 
@@ -2102,12 +2107,21 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
         lay = a["layout"]
         seen_chunks = set()
         # Build virtual-offset map of retiled DDS mip bytes.
-        tiled_ranges = []
+        # Packed-tail mips share one virtual region at disjoint (tile_x, tile_y)
+        # block positions, so composite all mips sharing a start offset into one buffer.
+        tiled_by_start = {}
         for m, mip in enumerate(lay["mips"]):
             if m >= len(mips):
                 break
-            tiled = retile_mip(mips[m], lay, mip)
-            tiled_ranges.append((d["base"] + mip["offset"], tiled))
+            mstart = d["base"] + mip["offset"]
+            buf = tiled_by_start.get(mstart)
+            if buf is None:
+                buf = bytearray(mip["region"])
+                tiled_by_start[mstart] = buf
+            elif len(buf) < mip["region"]:
+                buf.extend(bytes(mip["region"] - len(buf)))
+            _retile_mip_into(mips[m], lay, mip, buf)
+        tiled_ranges = [(mstart, bytes(buf)) for mstart, buf in tiled_by_start.items()]
         # Match every BCPack chunk touching those mips.
         for m, mip in enumerate(lay["mips"]):
             if m >= len(mips):
