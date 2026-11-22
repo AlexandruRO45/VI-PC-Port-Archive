@@ -232,6 +232,56 @@ class DSAndRtnB64Instruction:
         return " ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarMachineState:
+    """Architectural state for scalar execution context with 64-bit VGPR pair access."""
+
+    def __init__(self, lds_bytes: int = DEFAULT_LDS_SIZE_BYTES) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(size_bytes=lds_bytes)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_vgpr64(self, reg: RegPair) -> int:
+        lo = self.vgprs[reg.lo]
+        hi = self.vgprs[reg.hi]
+        return u64(lo | (hi << 32))
+
+    def set_vgpr64(self, reg: RegPair, val: int) -> None:
+        val = u64(val)
+        self.vgprs[reg.lo] = u32(val)
+        self.vgprs[reg.hi] = u32(val >> 32)
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = u32(val)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar interpreter for ds_and_rtn_b64."""
+
+    def execute(self, instr: DSAndRtnB64Instruction, state: ScalarMachineState) -> int:
+        """Executes a scalar ds_and_rtn_b64 instruction."""
+        if instr.opcode != DSOpcode.DS_AND_RTN_B64:
+            raise NotImplementedError(f"Unsupported opcode: {instr.opcode}")
+
+        vaddr = state.get_vgpr(instr.addr.index)
+        vdata = state.get_vgpr64(instr.data)
+        old_val = ref_ds_and_rtn_b64(state.lds, vaddr=vaddr, vdata=vdata, offset=instr.offset)
+        state.set_vgpr64(instr.dst, old_val)
+        return old_val
+
+
 class TestSymbolicAST(unittest.TestCase):
     """Unit tests for symbolic AST opcode definitions and typed expressions."""
 
@@ -303,6 +353,66 @@ class TestSymbolicAST(unittest.TestCase):
 
         with self.assertRaises(Exception):
             i1.offset = 32  # type: ignore
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState(lds_bytes=4096)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_and_and_return(self) -> None:
+        # Pre-seed LDS qword at byte 32 with 0x0123456789ABCDEF
+        self.state.lds.write_qword(32, 0x0123456789ABCDEF)
+        self.state.set_vgpr(2, 32)  # vaddr = 32
+        self.state.set_vgpr64(RegPair(4), 0x00FF00FF00FF00FF)  # vdata
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(2),
+            data=RegPair(4),
+            offset=0,
+        )
+        old_val = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, 0x0123456789ABCDEF)
+        self.assertEqual(self.state.get_vgpr64(RegPair(0)), 0x0123456789ABCDEF)
+        self.assertEqual(self.state.lds.read_qword(32), 0x0123456789ABCDEF & 0x00FF00FF00FF00FF)
+
+    def test_scalar_offset_handling(self) -> None:
+        self.state.lds.write_qword(64, 0xAAAAAAAAAAAAAAAA)
+        self.state.set_vgpr(1, 48)  # vaddr = 48, offset = 16 -> 64
+        self.state.set_vgpr64(RegPair(6), 0x5555555555555555)
+
+        instr = DSAndRtnB64Instruction(
+            dst=RegPair(4),
+            addr=RegSingle(1),
+            data=RegPair(6),
+            offset=16,
+        )
+        old_val = self.interp.execute(instr, self.state)
+
+        self.assertEqual(old_val, 0xAAAAAAAAAAAAAAAA)
+        self.assertEqual(self.state.get_vgpr64(RegPair(4)), 0xAAAAAAAAAAAAAAAA)
+        self.assertEqual(self.state.lds.read_qword(64), 0)
+
+    def test_scalar_determinism(self) -> None:
+        runs: list[tuple[int, int]] = []
+        for _ in range(50):
+            st = ScalarMachineState(lds_bytes=2048)
+            st.lds.write_qword(16, 0xFEDCBA9876543210)
+            st.set_vgpr(0, 16)
+            st.set_vgpr64(RegPair(2), 0x0F0F0F0F0F0F0F0F)
+            instr = DSAndRtnB64Instruction(
+                dst=RegPair(4),
+                addr=RegSingle(0),
+                data=RegPair(2),
+            )
+            ret = self.interp.execute(instr, st)
+            runs.append((ret, st.lds.read_qword(16)))
+
+        self.assertTrue(all(r == (0xFEDCBA9876543210, 0x0E0C0A0806040200) for r in runs))
 
 
 if __name__ == '__main__':
