@@ -462,8 +462,8 @@ public:
             shader_image_int64_atomics = image_int64.shaderImageInt64Atomics == VK_TRUE;
             if (shader_image_int64_atomics) {
                 image_int64.sparseImageInt64Atomics = VK_FALSE;
-                image_int64.pNext = enable13.pNext;
-                enable13.pNext = &image_int64;
+                image_int64.pNext = *v13_.next();
+                *v13_.next() = &image_int64;
             }
         }
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available

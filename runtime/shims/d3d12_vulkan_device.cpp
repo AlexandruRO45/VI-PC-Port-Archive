@@ -6418,8 +6418,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         info.shader_image_int64_atomics = image_int64.shaderImageInt64Atomics == VK_TRUE;
         if (info.shader_image_int64_atomics) {
             image_int64.sparseImageInt64Atomics = VK_FALSE;
-            image_int64.pNext = enable13.pNext;
-            enable13.pNext = &image_int64;
+            image_int64.pNext = *v13.next();
+            *v13.next() = &image_int64;
         }
     }
     // What graphics PSOs may ask for: different blend state per render target, wireframe, a depth-bias clamp and
