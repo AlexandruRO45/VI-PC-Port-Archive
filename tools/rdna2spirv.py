@@ -8119,8 +8119,9 @@ class Gen:
             self.emit(f"{sh} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {sh}")
             self.dst(a[0], r)
-        elif op in ("v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32"):
-            # D = {norm16(S1), norm16(S0)}: each f32 clamped to [-1, 1] (i16) or [0, 1] (u16), scaled by 32767 or
+        elif op in ("v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32",
+                    "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16"):
+            # D = {norm16(S1), norm16(S0)}: each float clamped to [-1, 1] (i16) or [0, 1] (u16), scaled by 32767 or
             # 65535 and rounded to nearest even. Mesa ACO emits these for NIR pack_snorm_2x16 / pack_unorm_2x16,
             # which nir_opcodes.py defines as fround_even(fclamp(x) * 32767.0 / 65535.0). NaN gives 0, as
             # v_cvt_i32_f32 does (measured on gfx1036, SHADER-339). The whole dword is written.
@@ -8128,12 +8129,29 @@ class Gen:
             # exact product is just below or above it, and RoundEven then picks the even neighbour. The product's
             # error e = Fma(c, s, -p) is exact, and on such a tie its sign decides: floor(p) + 1 above, floor(p)
             # below, RoundEven when e is 0. Away from a tie both roundings agree, since k + 0.5 is an f32 here.
+            if ins["op"].endswith(("_dpp", "_sdwa")):
+                raise Unsupported(ins["op"])
             if "clamp" in mods:
                 raise Unsupported(op + " clamp")
-            snorm = op == "v_cvt_pknorm_i16_f32"
+            is_f16 = op.endswith("_f16")
+            if is_f16:
+                sel = [0, 0, 0]
+                for m in mods:
+                    if not m.startswith("op_sel:"):
+                        raise Unsupported(f"{op} modifier {m}")
+                    try:
+                        bits = [int(v) for v in m.split("[", 1)[1].rstrip("]").split(",")]
+                    except (IndexError, ValueError):
+                        raise Unsupported(f"{op} {m}") from None
+                    if len(bits) != 3 or any(b not in (0, 1) for b in bits) or bits[2] != 0:
+                        raise Unsupported(f"{op} {m}")
+                    sel = bits
+                srcs_f = [self.f16_in(a[1], sel[0]), self.f16_in(a[2], sel[1])]
+            else:
+                srcs_f = [self.src_f(src) for src in a[1:3]]
+            snorm = "_i16_" in op
             halves = []
-            for src in a[1:3]:
-                f = self.src_f(src)
+            for f in srcs_f:
                 nan, z, c, m, rr, i, h = (self.tmp() for _ in range(7))
                 self.emit(f"{nan} = OpIsNan %bool {f}")
                 self.emit(f"{z} = OpSelect %float {nan} %f0 {f}")
