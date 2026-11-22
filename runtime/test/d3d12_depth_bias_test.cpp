@@ -9,7 +9,7 @@
 // stored depth is read back through a footprint. D24 is skipped where the layer stores it as D32 (no D24 on the
 // GPU): that path has its own bias handling (D3D-309).
 //
-// The vertex shader is GLSL written to the translator's contract (test/glsl/vs_depth.vert). No game data.
+// The vertex shader is GLSL written to the translator's contract (test/glsl/vs_depth_bias.vert). No game data.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -22,8 +22,8 @@
 #include <fstream>
 #include <string>
 
-#ifndef LEONIDA_TEST_VS_DEPTH_SPV
-#error "LEONIDA_TEST_VS_DEPTH_SPV must name the compiled test shader"
+#ifndef LEONIDA_TEST_VS_DEPTH_BIAS_SPV
+#error "LEONIDA_TEST_VS_DEPTH_BIAS_SPV must name the compiled test shader"
 #endif
 
 #define EXPECT(condition) do { \
@@ -79,7 +79,7 @@ int main() {
     const auto vs_program = fssm_program({0x56530311, 0xbf810000});
     const auto library = std::filesystem::temp_directory_path() / "leonida_depth_bias_test";
     std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_VS_DEPTH_SPV, library / "vs_depth.spv",
+    std::filesystem::copy_file(LEONIDA_TEST_VS_DEPTH_BIAS_SPV, library / "vs_depth.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);

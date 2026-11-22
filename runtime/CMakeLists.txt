@@ -1706,23 +1706,6 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_geometry_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_geometry COMMAND d3d12_geometry_test)
       set_tests_properties(d3d12_geometry PROPERTIES SKIP_RETURN_CODE 77)
-      # DepthBias exactly one step of the depth format (VK_EXT_depth_bias_control's depthBiasExact, where available).
-      set(LEONIDA_TEST_VS_DEPTH ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_depth.spv)
-      add_custom_command(
-        OUTPUT ${LEONIDA_TEST_VS_DEPTH}
-        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_VS_DEPTH}
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_depth.vert
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_depth.vert
-        COMMENT "Compiling the depth bias test shader vs_depth.vert"
-        VERBATIM)
-      add_executable(d3d12_depth_bias_test test/d3d12_depth_bias_test.cpp shims/d3d12_xs_device.cpp
-                     ${LEONIDA_TEST_VS_DEPTH})
-      target_link_libraries(d3d12_depth_bias_test PRIVATE gta6rt_d3d12_com)
-      target_compile_definitions(d3d12_depth_bias_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
-                                 LEONIDA_TEST_VS_DEPTH_SPV="${LEONIDA_TEST_VS_DEPTH}")
-      target_compile_options(d3d12_depth_bias_test PRIVATE /W4 /permissive- /utf-8)
-      add_test(NAME d3d12_depth_bias COMMAND d3d12_depth_bias_test)
-      set_tests_properties(d3d12_depth_bias PROPERTIES SKIP_RETURN_CODE 77)
       # Set 0 from the compute bind point: a compute PSO whose shader declares set-0 bindings samples through the
       # device's bindless set, which nothing but the layer binds.
       set(LEONIDA_TEST_CS_SET0_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_set0_sample.spv)
@@ -1741,6 +1724,23 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # DepthBias exactly one step of the depth format (VK_EXT_depth_bias_control's depthBiasExact, where available).
+      set(LEONIDA_TEST_VS_DEPTH_BIAS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_depth_bias.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_VS_DEPTH_BIAS}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_VS_DEPTH_BIAS}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_depth_bias.vert
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_depth_bias.vert
+        COMMENT "Compiling the depth bias test shader vs_depth_bias.vert"
+        VERBATIM)
+      add_executable(d3d12_depth_bias_test test/d3d12_depth_bias_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_VS_DEPTH_BIAS})
+      target_link_libraries(d3d12_depth_bias_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_depth_bias_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_DEPTH_BIAS_SPV="${LEONIDA_TEST_VS_DEPTH_BIAS}")
+      target_compile_options(d3d12_depth_bias_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_depth_bias COMMAND d3d12_depth_bias_test)
+      set_tests_properties(d3d12_depth_bias PROPERTIES SKIP_RETURN_CODE 77)
       add_executable(d3d12_pipeline_library_test test/d3d12_pipeline_library_test.cpp
                      ${LEONIDA_TEST_CS} ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
       target_link_libraries(d3d12_pipeline_library_test PRIVATE gta6rt_d3d12_com)
