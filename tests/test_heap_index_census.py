@@ -165,6 +165,22 @@ class HeapIndexCensus(unittest.TestCase):
         self.assertEqual(out["skipped"], {"embedded data words": 1})
         self.assertEqual(out["groups"], {})
 
+    def test_cli_report_cannot_replace_the_carve_index_or_listing(self):
+        self.work.add("ps_heap", "ps", SFI0_RES, PS_HEAP)
+        tool = os.path.join(ROOT, "tools", "heap_index_census.py")
+        index = os.path.join(os.path.dirname(self.work.disasm), "index.json")
+        listing = os.path.join(self.work.disasm, "ps_heap.s")
+        for source in (index, listing):
+            with self.subTest(source=source):
+                with open(source, "rb") as f:
+                    before = f.read()
+                result = subprocess.run([sys.executable, "-I", tool, self.work.disasm, "--json", source],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("would overwrite", result.stderr)
+                with open(source, "rb") as f:
+                    self.assertEqual(f.read(), before)
+
     def test_cli_json_and_missing_folder(self):
         self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
         js = os.path.join(self.work.root, "out", "census.json")

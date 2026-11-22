@@ -41,6 +41,7 @@ from collections import Counter, defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shader_ir  # noqa: E402
 import shader_meta  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 USER_SGPRS = 32          # graphics stages: user data s0..s31 (tools/rdna2spirv.py USER_SGPRS)
 SYSTEM_SGPRS = {"ms": (3,), "gs": (3,)}   # NGG wave info in s3 (tools/rdna2spirv.py sys_sgprs)
@@ -319,12 +320,20 @@ def role_of(load):
     return "mixed"
 
 
-def census(disasm_dir, limit=None, progress=None, stages=None):
+def census(disasm_dir, limit=None, progress=None, stages=None, *, report_path=None):
     if stages is None:
         stages = stage_index(disasm_dir)
     names = sorted(n[:-2] for n in os.listdir(disasm_dir) if n.endswith(".s"))
     if limit:
         names = names[:limit]
+    if report_path:
+        parent = os.path.dirname(os.path.abspath(disasm_dir))
+        for name in names:
+            inputs = (os.path.join(disasm_dir, name + ".s"), os.path.join(parent, name + ".dxbc"),
+                      os.path.join(parent, "fssm", name + ".fssm"))
+            for path in inputs:
+                if same_report_path(report_path, path):
+                    raise ValueError(f"--json would overwrite the input {path}")
     skipped = Counter()
     shaders = Counter()                                  # (stage, sfi0) -> shaders
     with_loads = Counter()                               # (stage, sfi0) -> shaders with a descriptor load
@@ -409,13 +418,22 @@ def main(argv=None):
     if not os.path.isdir(args.disasm):
         print(f"ERROR: {args.disasm} is not a folder", file=sys.stderr)
         return 2
+    existing_report = args.json if args.json and os.path.isfile(args.json) else None
+    index_path = os.path.join(os.path.dirname(os.path.abspath(args.disasm)), "index.json")
+    if existing_report and same_report_path(existing_report, index_path):
+        print(f"ERROR: --json would overwrite the input {index_path}", file=sys.stderr)
+        return 2
     try:
         stages = stage_index(args.disasm)
     except (OSError, ValueError, KeyError, TypeError) as e:
         print(f"ERROR: cannot read the carve index next to {args.disasm}: {e}", file=sys.stderr)
         return 2
-    out = census(args.disasm, args.limit, stages=stages,
-                 progress=lambda k, n: print(f"  {k}/{n}", file=sys.stderr, flush=True))
+    try:
+        out = census(args.disasm, args.limit, stages=stages, report_path=existing_report,
+                     progress=lambda k, n: print(f"  {k}/{n}", file=sys.stderr, flush=True))
+    except (OSError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     print_report(out)
     if args.json:
         try:
