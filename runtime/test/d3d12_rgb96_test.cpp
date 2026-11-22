@@ -537,6 +537,7 @@ bool refusals(ID3D12Device* device) {
 struct Answer {
     std::string what;
     UINT64 value = 0;
+    bool driver_defined = false;  // compared with WARP only (see the standard-swizzle control below)
 };
 constexpr UINT64 kNotAsked = ~UINT64(1);  // no heap (no GPU address arena) or no ID3D12Device10 on that device
 
@@ -643,13 +644,19 @@ std::vector<Answer> tiled_answers(ID3D12Device* device, const DXGI_FORMAT (&form
                                       std::to_string(desc.Width) + " layout " + std::to_string(int(layout));
             add(wide, shape + " GetResourceAllocationInfo size", info.SizeInBytes);
             add(wide, shape + " GetResourceAllocationInfo alignment", info.Alignment);
+            // A GPU without 64KB_STANDARD_SWIZZLE (OPTIONS.StandardSwizzle64KBSupported FALSE) sizes it as its driver
+            // likes: in tiles on an RTX 3060 (NVIDIA 32.0.16.1714), 0 on an RX 7600 (AMD 26.11.2). The layer follows
+            // WARP, so these two answers are compared with WARP only.
+            if (layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE)
+                out[out.size() - 1].driver_defined = out[out.size() - 2].driver_defined = true;
         }
     return out;
 }
 
 // The layer's tiled answers against one host's; false on any difference. An answer one device was not asked (no
 // heap, no ID3D12Device10) is not compared.
-bool same_tiled_answers(const std::vector<Answer>& ours, const std::vector<Answer>& host, const char* host_name) {
+bool same_tiled_answers(const std::vector<Answer>& ours, const std::vector<Answer>& host, const char* host_name,
+                        bool skip_driver_defined) {
     if (ours.size() != host.size()) {
         std::fprintf(stderr, "tiled 96-bit: %zu answers, %s %zu\n", ours.size(), host_name, host.size());
         return false;
@@ -657,6 +664,7 @@ bool same_tiled_answers(const std::vector<Answer>& ours, const std::vector<Answe
     unsigned compared = 0, differ = 0;
     for (std::size_t i = 0; i < ours.size(); ++i) {
         if (ours[i].value == kNotAsked || host[i].value == kNotAsked) continue;
+        if (skip_driver_defined && ours[i].driver_defined) continue;
         ++compared;
         if (ours[i].value == host[i].value) continue;
         if (differ++ < 16)
@@ -786,7 +794,7 @@ int main() {
         info.buffer_device_address = vk.buffer_device_address;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours_tiled.p)))) return 1;
         const std::vector<Answer> tiled = tiled_answers(ours_tiled.p, formats);
-        if (!same_tiled_answers(tiled, tiled_answers(host.p, formats), "WARP")) return 1;
+        if (!same_tiled_answers(tiled, tiled_answers(host.p, formats), "WARP", false)) return 1;
         VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
         VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
         vk.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(vk.physical, &properties);
@@ -800,7 +808,7 @@ int main() {
             SUCCEEDED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&same.p)))) {
             char name[128]{};
             WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, name, sizeof(name), nullptr, nullptr);
-            if (!same_tiled_answers(tiled, tiled_answers(same.p, formats), name)) return 1;
+            if (!same_tiled_answers(tiled, tiled_answers(same.p, formats), name, true)) return 1;
         } else {
             std::printf("tiled 96-bit: no host D3D12 device on the layer's adapter, compared with WARP only\n");
         }
