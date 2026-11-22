@@ -16217,6 +16217,41 @@ def restore_mix_literal(ins, raw, literal):
         if (w1 >> (9 * i)) & 0x1FF == 0xFF and ins["args"][1 + i].get("k") == "imm":
             ins["args"][1 + i] = {**ins["args"][1 + i], "v": literal}
 
+# VOP3P half selects: op_sel[2:0] (bits 13:11), op_sel_hi[2] (bit 14), op_sel_hi[1:0] (bits 60:59).
+VOP3P_SELECT_BITS = (0x7 << 11) | (1 << 14) | (0x3 << 59)
+VOP3P_SELECT_DEFAULT = (1 << 14) | (0x3 << 59)       # op_sel:[0,0,0] op_sel_hi:[1,1,1]
+# Ops whose op_sel/op_sel_hi llvm-mc drops, and that the translator reads from mods. llvm-mc 23 refuses the
+# modifiers on gfx1030's v_dot4_i32_i8 when assembling. When disassembling it prints the instruction without them
+# and re-encodes the default, so op_sel_hi:[1,0,1] comes back as [1,1,1] (checked on synthetic words; 2 of the 29
+# FSPX programs of the 1.0.2.1 package store it). The hardware does read them (docs/design.md, "Signed-byte dot
+# products").
+SELECTS_LLVM_DROPS = ("v_dot4_i32_i8",)
+
+
+def dropped_op_sel(raw, printed, op):
+    """(op_sel, op_sel_hi) as stored in ``raw`` when llvm-mc printed ``op`` with the default selects instead, else None.
+
+    Only the select bits may differ: the printed instruction carries the defaults, the stored one doesn't, and with
+    the printed selects put back the bytes are the printed instruction (same_encoding). Any other difference still
+    refuses."""
+    if op not in SELECTS_LLVM_DROPS or len(raw) != len(printed) or len(raw) < 8 or printed[3] != 0xCC:
+        return None
+    r, p = int.from_bytes(raw[:8], "little"), int.from_bytes(printed[:8], "little")
+    if p & VOP3P_SELECT_BITS != VOP3P_SELECT_DEFAULT or r & VOP3P_SELECT_BITS == VOP3P_SELECT_DEFAULT:
+        return None
+    merged = (r & ~VOP3P_SELECT_BITS) | (p & VOP3P_SELECT_BITS)
+    if not same_encoding(merged.to_bytes(8, "little") + raw[8:], printed, op):
+        return None
+    return [(r >> b) & 1 for b in (11, 12, 13)], [(r >> b) & 1 for b in (59, 60, 14)]
+
+
+def restore_op_sel(ins, sel, selhi):
+    """Give ``ins`` the op_sel/op_sel_hi modifiers the blob stores, in llvm-mc's spelling."""
+    ins["mods"] = [m for m in ins["mods"] if not m.startswith(("op_sel:", "op_sel_hi:"))]
+    if sel != [0, 0, 0]:
+        ins["mods"].append("op_sel:[%s]" % ",".join(map(str, sel)))
+    ins["mods"].append("op_sel_hi:[%s]" % ",".join(map(str, selhi)))
+
 
 def output_signature(path, name):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
@@ -16398,6 +16433,10 @@ def check_printed_encodings(path, info):
             if literal is not None:
                 restore_mix_literal(ins, raw, literal)
                 continue
+            selects = dropped_op_sel(raw, enc, base_op(ins["op"]))
+            if selects is not None:
+                restore_op_sel(ins, *selects)
+                continue
             raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
                               f"{enc.hex()} (a field the disassembler dropped)")
 
@@ -16453,6 +16492,10 @@ def translate(path):
                 literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
                 if literal is not None:
                     restore_mix_literal(ins, blob[at:at + len(enc)], literal)
+                    break
+                selects = dropped_op_sel(blob[at:at + len(enc)], enc, base_op(op))
+                if selects is not None:
+                    restore_op_sel(ins, *selects)
                     break
                 at += 4
                 skipped += 4
