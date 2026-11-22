@@ -180,6 +180,35 @@ class RunStdlibTestsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, out)
         self.assertEqual(re.findall(r"^== (\S+)$", out, re.M), ["tests/test_env_check.py"], out)
 
+    def test_captured_non_ascii_output_matches_child_encoding(self):
+        encoding = self.runner.child_output_encoding()
+        probe = None
+        for candidate in ("caf\u00e9", "\u043f\u0440\u0438\u0432\u0435\u0442", "\u3042"):
+            try:
+                candidate.encode(encoding)
+            except UnicodeEncodeError:
+                continue
+            probe = candidate
+            break
+        if probe is None:
+            self.skipTest(f"locale encoding {encoding!r} cannot represent probe strings")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_file(
+                tmp,
+                "tests/test_non_ascii.py",
+                f'if __name__ == "__main__":\n    print({probe!r})\n',
+            )
+            res = self.runner.run_one(tmp, "tests/test_non_ascii.py")
+
+        self.assertEqual(res.returncode, 0, res.output)
+        self.assertIn(probe, res.output)
+        self.assertNotIn("\ufffd", res.output)
+        self.assertNotIn("\r\n", res.output)
+
+    def test_decode_bytes_uses_explicit_child_encoding_and_normalizes_crlf(self):
+        self.assertEqual(self.runner._decode_bytes(b"caf\xe9\r\n", encoding="cp1252"), "caf\u00e9\n")
+
 
 if __name__ == "__main__":
     unittest.main()

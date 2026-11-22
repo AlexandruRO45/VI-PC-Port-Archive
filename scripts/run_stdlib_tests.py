@@ -16,6 +16,7 @@ import argparse
 import concurrent.futures
 from dataclasses import dataclass
 import fnmatch
+import locale
 import os
 import re
 import subprocess
@@ -96,12 +97,22 @@ def discover_tests(
     return selected
 
 
-def _decode_bytes(data):
+def child_output_encoding():
+    """Encoding a piped `python -I` child uses for stdout/stderr on this platform."""
+    get_encoding = getattr(locale, "getencoding", None)
+    if get_encoding is not None:
+        return get_encoding()
+    return locale.getpreferredencoding(False) or "utf-8"
+
+
+def _decode_bytes(data, encoding=None):
     if not data:
         return ""
     if isinstance(data, bytes):
-        return data.decode("utf-8", errors="replace")
-    return str(data)
+        text = data.decode(encoding or child_output_encoding(), errors="replace")
+    else:
+        text = str(data)
+    return text.replace("\r\n", "\n")
 
 
 def run_one(root, rel, python_exe=None, timeout=DEFAULT_TIMEOUT):
