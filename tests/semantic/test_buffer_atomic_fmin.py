@@ -595,6 +595,118 @@ class TestBufferAtomicFminSIMD(unittest.TestCase):
                 self.assertEqual(simd.mem.read_u32(lane * 4), f32_to_bits(100.0))
 
 
+class TestBufferAtomicFminRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarBufferInterpreter(mem_size=4096)
+        self.desc = BufferResourceDescriptor(
+            base_address=0,
+            stride=0,
+            num_records=1024,
+        )
+        self.interp.set_buffer_descriptor(4, self.desc)
+
+    def test_vdata_vaddr_aliasing_same_vgpr(self) -> None:
+        # v0 acts as both vdata (fmin_val) and vaddr (address offset)
+        addr_and_val = 32
+        self.interp.mem.write_u32(addr_and_val, f32_to_bits(50.0))
+        self.interp.write_reg_u32(RegKind.VGPR, 0, addr_and_val)
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_FMIN,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 0, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        ret, in_bounds = self.interp.step(inst)
+        self.assertTrue(in_bounds)
+        # Pre-op memory value was 50.0
+        self.assertEqual(ret, f32_to_bits(50.0))
+        # Memory at 32 becomes min(50.0, bits_to_f32(32)) = 32 (tiny subnormal < 50.0)
+        self.assertEqual(self.interp.mem.read_u32(addr_and_val), 32)
+        # v0 overwritten with pre-op value (50.0)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), f32_to_bits(50.0))
+
+    def test_canary_neighbor_vgprs_unmodified(self) -> None:
+        # Preload canary values into VGPRs 0..31
+        canaries = [0xDEAD0000 + i for i in range(32)]
+        for i, val in enumerate(canaries):
+            self.interp.write_reg_u32(RegKind.VGPR, i, val)
+
+        # Set address to 64 and value to 5.0
+        self.interp.write_reg_u32(RegKind.VGPR, 0, f32_to_bits(5.0))
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 64)
+        self.interp.mem.write_u32(64, f32_to_bits(20.0))
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_FMIN,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=False),
+        )
+        self.interp.step(inst)
+
+        # Registers 2..31 must strictly retain their canaries
+        for idx in range(2, 32):
+            self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, idx), canaries[idx])
+
+    def test_sgpr_descriptor_and_offset_preserved(self) -> None:
+        d0, d1, d2, d3 = self.desc.to_dwords()
+        self.interp.write_reg_u32(RegKind.SGPR, 8, 16)  # soffset
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_FMIN,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 1, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=Register(RegKind.SGPR, 8, count=1),
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        self.interp.step(inst)
+
+        # SGPR descriptor and soffset registers must be completely untouched
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 4), d0)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 5), d1)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 6), d2)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 7), d3)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.SGPR, 8), 16)
+
+    def test_simd_aliasing_with_divergent_exec_mask(self) -> None:
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        simd.set_buffer_descriptor(4, self.desc)
+        exec_mask = 0x0000000F  # Lanes 0..3 active
+        simd.set_exec_mask(exec_mask)
+        simd.mem.write_u32(16, f32_to_bits(100.0))
+
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, 16)  # address and value = 16
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_FMIN,
+            vdata=Register(RegKind.VGPR, 0, count=1),
+            vaddr=Register(RegKind.VGPR, 0, count=1),
+            srsrc=Register(RegKind.SGPR, 4, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        simd.step(inst)
+
+        # Active lanes: v0 updated to pre-op memory values in sequential order
+        # Lane 0 sees 100.0 and writes min(100.0, 16) = 16.
+        # Lanes 1, 2, 3 see 16 and write min(16, 16) = 16.
+        self.assertEqual(simd.read_lane_reg_u32(0, RegKind.VGPR, 0), f32_to_bits(100.0))
+        for lane in range(1, 4):
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 16)
+        # Inactive lanes: v0 untouched (16)
+        for lane in range(4, 32):
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 16)
+
+
 class TestBufferAtomicFminScalarInterpreter(unittest.TestCase):
     """Unit tests for the deterministic scalar instruction interpreter."""
 
