@@ -421,5 +421,167 @@ class TestValuCvtNormU16F16AST(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar VALU Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Architectural scalar register file and execution engine for VALU conversion instructions."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.vcc: int = 0
+        self.exec_mask: int = MASK64
+        self.m0: int = 0
+        self.status: int = 0
+
+    def read_reg32(self, kind: RegKind, index: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[index] & MASK32
+        return self.sgprs[index] & MASK32
+
+    def write_reg32(self, kind: RegKind, index: int, val32: int) -> None:
+        val32 &= MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[index] = val32
+        else:
+            self.sgprs[index] = val32
+
+    def read_reg16(self, reg: Register) -> int:
+        raw32 = self.read_reg32(reg.kind, reg.index)
+        if reg.subword == SubWord.HI:
+            return (raw32 >> 16) & MASK16
+        return raw32 & MASK16
+
+    def write_reg16(self, reg: Register, val16: int) -> None:
+        if reg.kind != RegKind.VGPR:
+            raise ValueError("VALU destination register must be a VGPR")
+        val16 &= MASK16
+        old32 = self.read_reg32(reg.kind, reg.index)
+        if reg.subword == SubWord.HI:
+            new32 = (old32 & 0x0000FFFF) | (val16 << 16)
+        else:
+            # SubWord.LO or SubWord.FULL writes lower 16 bits and preserves D[31:16]
+            new32 = (old32 & 0xFFFF0000) | val16
+        self.write_reg32(reg.kind, reg.index, new32)
+
+    def read_operand16(self, op: Union[Register, Immediate]) -> int:
+        if isinstance(op, Immediate):
+            return op.bits16()
+        return self.read_reg16(op)
+
+    def step(self, inst: Instruction) -> int:
+        if inst.opcode != Opcode.V_CVT_NORM_U16_F16:
+            raise ValueError(f"Unsupported opcode in VALU interpreter: {inst.opcode}")
+
+        src_bits = self.read_operand16(inst.src0)
+        res_unorm16 = ref_cvt_norm_u16_f16(
+            src_bits,
+            clamp=inst.clamp,
+            neg=inst.neg_src0,
+            abs_val=inst.abs_src0,
+        )
+        self.write_reg16(inst.dst, res_unorm16)
+        return res_unorm16
+
+
+class TestValuCvtNormU16F16ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar VALU instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_basic_vgpr_to_vgpr_execution(self) -> None:
+        # v1 = 1.0 (0x3C00) in lower half
+        self.interp.write_reg32(RegKind.VGPR, 1, ONE_F16)
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Register(RegKind.VGPR, 1, SubWord.LO),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, UNORM16_MAX)
+        self.assertEqual(self.interp.read_reg16(Register(RegKind.VGPR, 0, SubWord.LO)), UNORM16_MAX)
+
+    def test_sgpr_source_execution(self) -> None:
+        # s2 = 0.5 (0x3800)
+        self.interp.write_reg32(RegKind.SGPR, 2, HALF_F16)
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Register(RegKind.SGPR, 2, SubWord.LO),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, UNORM16_HALF)
+
+    def test_immediate_source_execution(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Immediate(0.25),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 16384)
+
+    def test_destination_high16_preservation(self) -> None:
+        # Preset v0 to 0x12345678. Writing v0.l must preserve 0x1234 in upper 16 bits.
+        self.interp.write_reg32(RegKind.VGPR, 0, 0x12345678)
+        self.interp.write_reg32(RegKind.VGPR, 1, ONE_F16)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Register(RegKind.VGPR, 1, SubWord.LO),
+        )
+        self.interp.step(inst)
+
+        full_dst = self.interp.read_reg32(RegKind.VGPR, 0)
+        self.assertEqual(full_dst >> 16, 0x1234)
+        self.assertEqual(full_dst & 0xFFFF, UNORM16_MAX)
+
+    def test_destination_high16_write_with_low16_preservation(self) -> None:
+        # Preset v0 to 0x12345678. Writing v0.h must preserve 0x5678 in lower 16 bits.
+        self.interp.write_reg32(RegKind.VGPR, 0, 0x12345678)
+        self.interp.write_reg32(RegKind.VGPR, 1, HALF_F16)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.HI),
+            src0=Register(RegKind.VGPR, 1, SubWord.LO),
+            encoding=Encoding.VOP3,
+        )
+        self.interp.step(inst)
+
+        full_dst = self.interp.read_reg32(RegKind.VGPR, 0)
+        self.assertEqual(full_dst & 0xFFFF, 0x5678)
+        self.assertEqual(full_dst >> 16, UNORM16_HALF)
+
+    def test_source_high16_selection(self) -> None:
+        # Pack two f16 in v1: lo=0.25 (0x3400), hi=0.5 (0x3800)
+        packed = (HALF_F16 << 16) | QUARTER_F16
+        self.interp.write_reg32(RegKind.VGPR, 1, packed)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Register(RegKind.VGPR, 1, SubWord.HI),
+            encoding=Encoding.VOP3,
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, UNORM16_HALF)
+
+    def test_vcc_unmodified_during_step(self) -> None:
+        canary = 0xDEADBEEFCAFE1234
+        self.interp.vcc = canary
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Immediate(1.0),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.vcc, canary)
+
+
 if __name__ == "__main__":
     unittest.main()
