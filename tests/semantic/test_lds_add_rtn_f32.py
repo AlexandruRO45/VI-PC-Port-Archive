@@ -467,6 +467,183 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
         self.assertEqual(expr.evaluate(env), 10.0)
 
 
+# ============================================================================
+# Section 3: Deterministic Scalar Instruction Interpreter
+# ============================================================================
+
+class ScalarMachineState:
+    """Register and memory state for scalar single-thread RDNA2 execution."""
+
+    def __init__(self, lds_capacity_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: List[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSModel = LDSModel(capacity_dwords=lds_capacity_dwords)
+
+    def get_vgpr(self, idx: int) -> int:
+        if not (0 <= idx < DEFAULT_NUM_VGPRS):
+            raise IndexError(f"VGPR index out of range: {idx}")
+        return self.vgprs[idx]
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx < DEFAULT_NUM_VGPRS):
+            raise IndexError(f"VGPR index out of range: {idx}")
+        self.vgprs[idx] = u32(val)
+
+    def get_sgpr(self, idx: int) -> int:
+        if not (0 <= idx < DEFAULT_NUM_SGPRS):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        return self.sgprs[idx]
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx < DEFAULT_NUM_SGPRS):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        self.sgprs[idx] = u32(val)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_add_rtn_f32."""
+
+    def resolve_operand(
+        self,
+        op: Union[VGPR, Immediate],
+        state: ScalarMachineState,
+    ) -> int:
+        if isinstance(op, VGPR):
+            return state.get_vgpr(op.index)
+        elif isinstance(op, Immediate):
+            return op.value
+        raise TypeError(f"Unsupported operand type: {type(op)}")
+
+    def step(
+        self,
+        instr: DSAddRtnF32Instruction,
+        state: ScalarMachineState,
+    ) -> Tuple[int, int]:
+        """Execute a single ds_add_rtn_f32 instruction deterministically.
+
+        Latching behavior:
+        Both vaddr and vdata0 operands are latched before memory is updated or
+        the return value is written to vdst.
+        """
+        vaddr = state.get_vgpr(instr.addr.index)
+        data = self.resolve_operand(instr.data0, state)
+
+        # Atomic memory update
+        old_val, new_val = state.lds.atomic_add_f32(vaddr, data, offset=instr.offset)
+
+        # Writeback to destination register
+        state.set_vgpr(instr.dst.index, old_val)
+
+        return old_val, new_val
+
+    def execute_sequence(
+        self,
+        instructions: List[DSAddRtnF32Instruction],
+        state: ScalarMachineState,
+    ) -> List[Tuple[int, int]]:
+        """Execute an ordered sequence of instructions."""
+        return [self.step(instr, state) for instr in instructions]
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_basic_execution(self) -> None:
+        addr = 0x80
+        init_mem = f32_to_u32(10.5)
+        add_val = f32_to_u32(2.25)
+        self.state.lds.write_dword(addr, init_mem)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, add_val)
+
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, init_mem)
+        self.assertEqual(u32_to_f32(new_val), 12.75)
+        self.assertEqual(self.state.get_vgpr(0), init_mem)
+        self.assertEqual(self.state.lds.read_dword(addr), f32_to_u32(12.75))
+
+    def test_scalar_with_immediate_operand(self) -> None:
+        addr = 0x100
+        init_mem = f32_to_u32(-5.0)
+        imm = f32_to_u32(8.0)
+        self.state.lds.write_dword(addr, init_mem)
+        self.state.set_vgpr(5, addr)
+
+        instr = DSAddRtnF32Instruction(dst=VGPR(6), addr=VGPR(5), data0=Immediate(imm))
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, init_mem)
+        self.assertEqual(u32_to_f32(new_val), 3.0)
+        self.assertEqual(self.state.get_vgpr(6), init_mem)
+        self.assertEqual(self.state.lds.read_dword(addr), f32_to_u32(3.0))
+
+    def test_scalar_offset_applied(self) -> None:
+        base_addr = 0x200
+        offset = 0x10
+        eff_addr = base_addr + offset
+        self.state.lds.write_dword(eff_addr, f32_to_u32(100.0))
+        self.state.set_vgpr(1, base_addr)
+        self.state.set_vgpr(2, f32_to_u32(25.0))
+
+        instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2), offset=offset)
+        old_val, new_val = self.interp.step(instr, self.state)
+
+        self.assertEqual(old_val, f32_to_u32(100.0))
+        self.assertEqual(u32_to_f32(new_val), 125.0)
+        self.assertEqual(self.state.get_vgpr(0), f32_to_u32(100.0))
+        self.assertEqual(self.state.lds.read_dword(eff_addr), f32_to_u32(125.0))
+
+    def test_scalar_deterministic_instruction_sequence(self) -> None:
+        addr = 0x300
+        self.state.lds.write_dword(addr, f32_to_u32(0.0))
+        self.state.set_vgpr(1, addr)
+
+        seq = [
+            DSAddRtnF32Instruction(dst=VGPR(10), addr=VGPR(1), data0=Immediate(f32_to_u32(1.0))),
+            DSAddRtnF32Instruction(dst=VGPR(11), addr=VGPR(1), data0=Immediate(f32_to_u32(2.0))),
+            DSAddRtnF32Instruction(dst=VGPR(12), addr=VGPR(1), data0=Immediate(f32_to_u32(4.0))),
+            DSAddRtnF32Instruction(dst=VGPR(13), addr=VGPR(1), data0=Immediate(f32_to_u32(8.0))),
+        ]
+        results = self.interp.execute_sequence(seq, self.state)
+
+        self.assertEqual(results[0], (f32_to_u32(0.0), f32_to_u32(1.0)))
+        self.assertEqual(results[1], (f32_to_u32(1.0), f32_to_u32(3.0)))
+        self.assertEqual(results[2], (f32_to_u32(3.0), f32_to_u32(7.0)))
+        self.assertEqual(results[3], (f32_to_u32(7.0), f32_to_u32(15.0)))
+
+        self.assertEqual(self.state.get_vgpr(10), f32_to_u32(0.0))
+        self.assertEqual(self.state.get_vgpr(11), f32_to_u32(1.0))
+        self.assertEqual(self.state.get_vgpr(12), f32_to_u32(3.0))
+        self.assertEqual(self.state.get_vgpr(13), f32_to_u32(7.0))
+        self.assertEqual(self.state.lds.read_dword(addr), f32_to_u32(15.0))
+
+    def test_scalar_matches_oracle_across_floats(self) -> None:
+        addr = 0x400
+        patterns = [
+            (f32_to_u32(0.0), f32_to_u32(0.0)),
+            (f32_to_u32(1.0), f32_to_u32(-1.0)),
+            (f32_to_u32(3.14159), f32_to_u32(2.71828)),
+            (f32_to_u32(1e6), f32_to_u32(1e-3)),
+            (f32_to_u32(-100.5), f32_to_u32(50.25)),
+        ]
+        for initial, operand in patterns:
+            self.state.lds.write_dword(addr, initial)
+            self.state.set_vgpr(1, addr)
+            self.state.set_vgpr(2, operand)
+            instr = DSAddRtnF32Instruction(dst=VGPR(0), addr=VGPR(1), data0=VGPR(2))
+            old_interp, new_interp = self.interp.step(instr, self.state)
+            old_oracle, new_oracle = oracle_ds_add_rtn_f32(initial, operand)
+            self.assertEqual(old_interp, old_oracle)
+            self.assertEqual(new_interp, new_oracle)
+
+
+
 
 if __name__ == "__main__":
     unittest.main()
