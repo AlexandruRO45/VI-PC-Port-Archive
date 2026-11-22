@@ -608,21 +608,24 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
 
 - **Arrays** keep a u32 count at pointer − 4 and a u32 capacity at pointer − 8, not the `{ptr; u16 count}` of the
   rest of the dictionary.
-- **Records (`+0x58`).** 4,562 records, 1–346 per clip. The third float is −1.0 in all of them, and the u32 is the
-  record's position on 175 of 180 clips. The first float is 0 or 0.03–2.37 and the second one of 2.5, 5, 6.667, 10,
-  15, 20, 30 or 40; that they are a start time and a sample rate is a hypothesis.
+- **Records (`+0x58`).** 4,562 records (1–346 per clip, measured separately). The third float is −1.0 in all of
+  them, and the u32 is the record's position on 175 of 180 clips. The first float is 0 or 0.03–2.37 and the second
+  one of 2.5, 5, 6.667, 10, 15, 20, 30 or 40 (also measured separately); that they are a start time and a sample
+  rate is a hypothesis.
 - **Offsets (`+0x68`).** One more than the records on 180 of 180, starting at 0 and never decreasing, so an offset
   table into data not decoded here.
-- **Clip table (`+0xA0`).** An open-addressing hash table: the group count is a power of two (2 on 151 clips), every
-  control byte is 0x80 or below 0x80, and the full slots equal the entry count on 180 of 180. Its 4,381 slots hold
-  a clip hash that is a clip in anim.rpf (4,381 of 4,381) and a record index; the indices are 0..n−1 on 180 of 180,
-  and one per record on 175. How the control byte and the group come from the hash is not known (the low 7 bits and
-  hash mod groups don't fit).
+- **Clip table (`+0xA0`).** An open-addressing hash table: the group count is a power of two (2 on 151 clips,
+  measured separately), every control byte is 0x80 or below 0x80, the last word of every slot is 0 (measured
+  separately), and the full slots equal the entry count on 180 of 180. Its 4,381 slots hold a clip hash that is a
+  clip in anim.rpf (4,381 of 4,381) and a record index; the indices are 0..n−1 over the entries on 180 of 180, and
+  one per record on 175 (on the other 5 the entry count is not the record count). How the control byte and the group
+  come from the hash is not known (the low 7 bits and hash mod groups don't fit).
 - **References (`+0x98`).** 36 clips have one `{clip hash, dictionary hash}` per record (439). All 439 resolve to a
   clip of that dictionary in anim.rpf, and the item at each table slot's record index names that slot's clip on all
   36. The other 144 clips have only the table, which gives the clip hash without its dictionary.
 - **Key table (`+0x170`).** The same table with 8-byte slots, 2 groups on all 180: 403 entries of `{u32 hash, u32
-  index}`, the indices 0..n−1 on 180 of 180. 23 distinct hashes; 38 entries are clip hashes.
+  index}`, the indices 0..n−1 on 180 of 180. 38 entries are clip hashes in anim.rpf; there are 23 distinct hashes
+  (measured separately).
 - **Self (`+0x188`).** The clip's own hash and the dictionary's `joaat32(name)` on 180 of 180.
 - Not decoded: the `+0x20` object (two pointers and a u32 count/capacity pair), the one 0x28-byte item at `+0x48`,
   the u16 array at `+0x78`, the u8 array at `+0xB8`, the arrays at `+0x118` and `+0x128`, the second word of a clip

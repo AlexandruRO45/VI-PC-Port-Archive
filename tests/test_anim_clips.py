@@ -401,7 +401,8 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual(m["self"], (c["hash"], self.d["hash"]))
         stats = anim_clips.new_stats()
         anim_clips.count_matcher(c, self.d["hash"], stats)
-        for k in ("matcher_record_index_is_position", "matcher_record_third_is_minus_one",
+        for k in ("matcher_record_index_is_position", "matcher_clip_table_indices_0_to_n",
+                  "matcher_record_third_is_minus_one",
                   "matcher_offsets_one_more_than_records", "matcher_offsets_from_0_nondecreasing",
                   "matcher_clip_table_one_per_record", "matcher_refs_one_per_record",
                   "matcher_refs_name_the_table_clip", "matcher_key_table_indices_0_to_n", "matcher_self_is_own_key"):
@@ -422,6 +423,16 @@ class DecodeTest(unittest.TestCase):
         s.d[s.ptr(at + 0xA8) + 5] = 0x22                                            # a third full slot for 2 entries
         with self.assertRaises(anim_clips.DecodeError):
             anim_clips.parse_matcher(s, at)
+        struct.pack_into("<I", s.d, at + 0xA0, 3)                                   # 3 groups: not a power of two
+        with self.assertRaises(anim_clips.DecodeError):
+            anim_clips.parse_matcher(s, at)
+        # through parse_dictionary a broken matcher keeps its name, and the stats count it as unreadable
+        d = anim_clips.parse_dictionary(s)
+        c = [c for c in d["clips"] if c["kind"] == "motionmatcher"][0]
+        self.assertEqual((c["name"], c["matcher"]), ("pack:/one.motionmatcher", None))
+        stats = anim_clips.new_stats()
+        anim_clips.count_matcher(c, d["hash"], stats)
+        self.assertEqual(stats["matcher_unreadable"], 1)
 
     def test_structure(self):
         d = self.d
@@ -647,8 +658,9 @@ class ArchiveTest(unittest.TestCase):
                           c["motion_children_dictionary_here"], c["motion_children_resolved_to_clip"]), (3, 3, 2, 1))
         # `.motionmatcher`: each has one clip in this archive (its dictionary's own) and one that is not
         self.assertEqual((c["matcher_records"], c["matcher_refs"], c["matcher_table_clips_found_here"],
-                          c["matcher_refs_resolved_to_clip"], c["matcher_self_is_own_key"], c.get("matcher_unreadable", 0)),
-                         (4, 4, 2, 2, 2, 0))
+                          c["matcher_refs_resolved_to_clip"], c["matcher_self_is_own_key"],
+                          c["matcher_key_table_hashes_that_are_clips"], c.get("matcher_unreadable", 0)),
+                         (4, 4, 2, 2, 2, 2, 0))
         self.assertEqual((c["external_refs_to_a_dictionary_here"], c["external_hashes_distinct"],
                           c["external_hashes_distinct_found_here"]), (1, 2, 1))
         self.assertEqual(c["motion_parameters:1"], 2)

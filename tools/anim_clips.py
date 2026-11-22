@@ -255,6 +255,7 @@ def count_matcher(c, dictionary_hash, stats):
     stats["matcher_offsets_one_more_than_records"] += len(o) == n + 1
     stats["matcher_offsets_from_0_nondecreasing"] += bool(o) and o[0] == 0 and all(a <= b for a, b in zip(o, o[1:]))
     stats["matcher_clip_table_entries"] += len(m["clips"])
+    stats["matcher_clip_table_indices_0_to_n"] += sorted(i for _c, _k, i in m["clips"]) == list(range(len(m["clips"])))
     stats["matcher_clip_table_one_per_record"] += sorted(i for _c, _k, i in m["clips"]) == list(range(n))
     stats["matcher_with_refs"] += bool(m["refs"])
     stats["matcher_refs"] += len(m["refs"])
@@ -812,6 +813,7 @@ def decode_resource(path, segments, budget=None):
     matchers = [c["matcher"] for c in d["clips"] if c["kind"] == "motionmatcher" and c.get("matcher")]
     row["_matcher_clips"] = [ch for m in matchers for ch, _k, _i in m["clips"]]
     row["_matcher_refs"] = [r for m in matchers for r in m["refs"]]
+    row["_matcher_keys"] = [h for m in matchers for h, _i in m["keys"]]
     row.update(hash=f"0x{d['hash']:08x}", name=d["name"], clips=len(d["clips"]), packs=len(d["packs"]),
                external_packs=d["external_packs"], animations=ok + failed + skipped, decoded=ok,
                seconds=round(time.monotonic() - started, 3))
@@ -846,6 +848,8 @@ def join_references(rows, stats):
                     stats["motion_child_duration_equals_clip"] += duration.get((dh, ch)) == t
         for ch in r.pop("_matcher_clips", []):
             stats["matcher_table_clips_found_here"] += ch in all_clips
+        for h in r.pop("_matcher_keys", []):
+            stats["matcher_key_table_hashes_that_are_clips"] += h in all_clips
         for ch, dh in r.pop("_matcher_refs", []):
             stats["matcher_refs_resolved_to_clip"] += ch in clips_by_dict.get(dh, ())
         r.pop("_clip_hashes", None)
