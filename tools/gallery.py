@@ -97,7 +97,8 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             mpath = os.path.normpath(os.path.join(self.models_dir, rel))
             # Security: ensure mpath is inside models_dir
             if os.path.isfile(mpath) and mpath.startswith(self.models_dir):
-                self._send_file(mpath, "model/gltf-binary")
+                content_type = "model/gltf+json" if mpath.lower().endswith(".gltf") else "model/gltf-binary"
+                self._send_file(mpath, content_type)
             else:
                 self.send_error(404, "Model not found")
             return

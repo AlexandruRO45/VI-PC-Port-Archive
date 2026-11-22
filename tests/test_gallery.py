@@ -46,6 +46,9 @@ class TestGalleryServer(unittest.TestCase):
         with open(os.path.join(self.models_dir, "test_car.glb"), "wb") as f:
             f.write(b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00")
 
+        with open(os.path.join(self.models_dir, "test_scene.gltf"), "wb") as f:
+            f.write(b'{"asset":{"version":"2.0"}}')
+
         with open(os.path.join(self.textures_dir, "test_tex.png"), "wb") as f:
             f.write(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
 
@@ -83,7 +86,7 @@ class TestGalleryServer(unittest.TestCase):
         with urllib.request.urlopen(f"{base}/api/models", timeout=3) as r:
             self.assertEqual(r.status, 200)
             data = json.loads(r.read())
-            self.assertEqual(data["count"], 1)
+            self.assertEqual(data["count"], 2)
             self.assertEqual(data["models"][0]["name"], "test_car.glb")
             self.assertEqual(data["models"][0]["category"], "Транспорт (Vehicles)")
 
@@ -102,6 +105,17 @@ class TestGalleryServer(unittest.TestCase):
         with urllib.request.urlopen(f"{base}/textures/test_tex.png", timeout=3) as r:
             self.assertEqual(r.status, 200)
             self.assertTrue(r.read().startswith(b"\x89PNG"))
+
+    def test_model_content_types(self) -> None:
+        base = f"http://127.0.0.1:{self.port}/models"
+        for name, expected_type in (
+            ("test_scene.gltf", "model/gltf+json"),
+            ("test_car.glb", "model/gltf-binary"),
+        ):
+            with self.subTest(name=name):
+                with urllib.request.urlopen(f"{base}/{name}", timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers["Content-Type"], expected_type)
 
 
 if __name__ == "__main__":
