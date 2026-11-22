@@ -1064,5 +1064,181 @@ class TestValuCvtPkU16U32IEEE754Bitpatterns(unittest.TestCase):
             self.assertEqual(res, 0xFFFF_FFFF)
 
 
+# ==============================================================================
+# Unit Tests: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuCvtPkU16U32NegativeControls(unittest.TestCase):
+    """Negative controls verifying that corrupted or invalid operations are caught."""
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Register(RegKind.SGPR, 0)
+        src = Register(RegKind.VGPR, 1)
+        with self.assertRaises(TypeError):
+            Instruction(opcode=Opcode.V_CVT_PK_U16_U32, dst=dst_sgpr, src0=src, src1=src)
+
+    def test_syntax_rejection_negative_reg_index(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, -5)
+
+    def test_syntax_rejection_out_of_bounds_reg_index(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106)
+
+    def test_syntax_rejection_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDState(wave_size=128)
+        with self.assertRaises(ValueError):
+            SIMDWavefrontInterpreter(wave_size=60)
+
+    def test_syntax_rejection_simd_lane_out_of_bounds(self) -> None:
+        state = SIMDState(wave_size=32)
+        with self.assertRaises(IndexError):
+            state.read_lane_reg(-1, Register(RegKind.VGPR, 0))
+        with self.assertRaises(IndexError):
+            state.read_lane_reg(32, Register(RegKind.VGPR, 0))
+
+    def test_syntax_rejection_missing_src1_operand(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_PK_U16_U32,
+                dst=Register(RegKind.VGPR, 0),
+                src0=Register(RegKind.VGPR, 1),
+                src1=None,
+            )
+
+    def test_syntax_rejection_unsupported_opcode(self) -> None:
+        class FakeOpcode(enum.Enum):
+            V_UNKNOWN = "v_unknown"
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(1),
+            src1=Immediate(2),
+        )
+        object.__setattr__(inst, "opcode", FakeOpcode.V_UNKNOWN)
+
+        interp = ScalarVALUInterpreter()
+        state = ScalarMachineState()
+        with self.assertRaises(NotImplementedError):
+            interp.step(inst, state)
+
+    def test_negative_control_operand_order_reversal(self) -> None:
+        s0, s1 = 0x1234, 0x5678
+        correct = ref_cvt_pk_u16_u32(s0, s1)
+        reversed_order = ref_cvt_pk_u16_u32(s1, s0)
+        self.assertNotEqual(correct, reversed_order)
+
+    def test_negative_control_raw_truncation_discrepancy(self) -> None:
+        # Raw truncation modulo 65536 wraps 0x10005 to 5, whereas saturating cvt gives 0xFFFF
+        s0 = 0x0001_0005
+        s1 = 0x0002_000A
+        correct = ref_cvt_pk_u16_u32(s0, s1)
+        wrapped_bug = (s0 & MASK16) | ((s1 & MASK16) << 16)
+        self.assertEqual(correct, 0xFFFF_FFFF)
+        self.assertEqual(wrapped_bug, 0x000A_0005)
+        self.assertNotEqual(correct, wrapped_bug)
+
+    def test_negative_control_missing_high_half_shift(self) -> None:
+        s0, s1 = 0x1111, 0x2222
+        correct = ref_cvt_pk_u16_u32(s0, s1)
+        buggy_unshifted = (u16_sat(s0)) | (u16_sat(s1))
+        self.assertNotEqual(correct, buggy_unshifted)
+
+    def test_negative_control_off_by_one_shift(self) -> None:
+        s0, s1 = 0x1111, 0x2222
+        correct = ref_cvt_pk_u16_u32(s0, s1)
+        shift_15 = (u16_sat(s0)) | (u16_sat(s1) << 15)
+        shift_17 = (u16_sat(s0)) | ((u16_sat(s1) << 17) & MASK32)
+        self.assertNotEqual(correct, shift_15)
+        self.assertNotEqual(correct, shift_17)
+
+
+class TestValuCvtPkU16U32MutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations are caught."""
+
+    def test_mutation_raw_truncation_instead_of_saturation(self) -> None:
+        def mutant_cvt(s0: int, s1: int) -> int:
+            # Bug: fails to saturate values > 65535
+            return ((s1 & MASK16) << 16) | (s0 & MASK16)
+
+        in_range_match = mutant_cvt(0x10, 0x20) == ref_cvt_pk_u16_u32(0x10, 0x20)
+        self.assertTrue(in_range_match)
+
+        # But caught when inputs exceed 65535:
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutant_cvt(0x10000, 0x20), ref_cvt_pk_u16_u32(0x10000, 0x20))
+
+    def test_mutation_reversed_pack_halves(self) -> None:
+        def mutant_cvt(s0: int, s1: int) -> int:
+            # Bug: swaps halves (s0 into high half, s1 into low half)
+            return ((u16_sat(s0) & MASK16) << 16) | (u16_sat(s1) & MASK16)
+
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutant_cvt(0x1111, 0x2222), ref_cvt_pk_u16_u32(0x1111, 0x2222))
+
+    def test_mutation_addition_instead_of_or(self) -> None:
+        def mutant_pack(lo: int, hi: int) -> int:
+            # Bug: addition causes carry into high half if lo bits overflow
+            return ((hi << 16) + lo) & MASK32
+
+        # Clean bits match
+        self.assertEqual(mutant_pack(0x10, 0x20), pack_u16(0x10, 0x20))
+        # Dirty unmasked lo bits trigger failure
+        dirty_lo = 0x10005
+        with self.assertRaises(AssertionError):
+            self.assertEqual(mutant_pack(dirty_lo, 0x20), pack_u16(dirty_lo, 0x20))
+
+    def test_mutation_exec_mask_leak(self) -> None:
+        state = SIMDState(wave_size=32, exec_mask=0x0000_0000)  # all inactive
+        interp = SIMDWavefrontInterpreter(wave_size=32)
+        canary = 0xCAFE_BABE
+        for lane in range(32):
+            state.write_lane_reg(lane, Register(RegKind.VGPR, 0), canary)
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(1),
+            src1=Immediate(2),
+        )
+        interp.step(inst, state)
+
+        # Standard interpreter preserves canary
+        self.assertEqual(state.read_lane_reg(0, Register(RegKind.VGPR, 0)), canary)
+
+        # Mutant unconditionally writes to lane 0 despite inactive mask
+        state.write_lane_reg(0, Register(RegKind.VGPR, 0), 0x1234)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(state.read_lane_reg(0, Register(RegKind.VGPR, 0)), canary)
+
+    def test_mutation_vcc_clobber(self) -> None:
+        interp = ScalarVALUInterpreter()
+        state = ScalarMachineState()
+        canary_vcc = 0xFEDC_BA98_7654_3210
+        state.vcc = canary_vcc
+
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Immediate(0xFFFF_FFFF),
+            src1=Immediate(0xFFFF_FFFF),
+        )
+        interp.step(inst, state)
+        self.assertEqual(state.vcc, canary_vcc)
+
+        # Mutant corrupts VCC
+        state.vcc = 0
+        with self.assertRaises(AssertionError):
+            self.assertEqual(state.vcc, canary_vcc)
+
+
 if __name__ == "__main__":
     unittest.main()
