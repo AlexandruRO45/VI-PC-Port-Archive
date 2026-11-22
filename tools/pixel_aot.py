@@ -316,6 +316,8 @@ HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
 
 ALU = {
     "log": (1, "log2({0})"), "exp": (1, "exp2({0})"), "rcp": (1, "(1.0f / {0})"),
+    # Same reciprocal; the integer-divide flag it raises has no desktop equivalent.
+    "rcp_iflag": (1, "(1.0f / {0})"),
     "sqrt": (1, "sqrt({0})"), "rsq": (1, "rsqrt({0})"),
     "floor": (1, "floor({0})"), "ceil": (1, "ceil({0})"), "fract": (1, "fract32({0})"),
     "trunc": (1, "trunc({0})"), "frexp_mant": (1, "frexp_mant32({0})"),
@@ -651,6 +653,8 @@ def fp_operand(token, scalar, vector, pending, sample_dest, *, quad_values: dict
         value = (vector if token.startswith("v") else scalar)[token]
         if quad_values is not None and token.startswith("v") and value not in quad_values:
             raise ValueError("Operand lacks a helper-lane definition")
+        if isinstance(value, tuple) and value[0] == "uint":
+            return f"asfloat({value[1]})"
         if isinstance(value, int):
             return f"asfloat({value}u)"
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "uint":
@@ -1108,6 +1112,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             values = [scalar_u32(t, scalar, pending) for t in tokens]
             lines.append(f"    uint salu{i} = {scc} ? {values[0]} : {values[1]};")
             scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"(s_addk_i32|s_mulk_i32) (s\d+), (-?\d+|0x[0-9a-f]+)"):
+            op, dst, imm = m.groups()
+            operand = scalar_u32(dst, scalar, pending)
+            word = int(imm, 16) if imm.startswith("0x") else int(imm)
+            if not -0x8000 <= word <= 0xffff:
+                raise ValueError("Invalid sopk immediate")
+            signed = word - 0x10000 if word >= 0 and word & 0x8000 else word
+            addend = signed & 0xffffffff
+            operation = "+" if op == "s_addk_i32" else "*"
+            scalar[dst] = ("uint", f"alu{i}")
+            lines.append(f"    uint alu{i} = ({operand} {operation} {addend}u);")
+
+            if op == "s_addk_i32":
+                scc = f"((({operand} ^ alu{i}) & ({addend}u ^ alu{i}) & 0x80000000u) != 0u)"
         elif m := match(r"s_load_dwordx8 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)"):
             dst = registers(*m.groups()[:2], 8)
             addr = registers(*m.groups()[2:4], 2)
@@ -1227,7 +1245,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             value = fp_operand(src, scalar, vector, pending, sample_dest)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {value};")
-        elif m := match(r"v_(log|exp|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac|min3|max3|med3)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
+        elif m := match(r"v_(log|exp|rcp_iflag|rcp|sqrt|rsq|floor|ceil|fract|trunc|frexp_mant|add|mul|max|min|sub|subrev|mul_legacy|fma|fmac|mad|mac|min3|max3|med3)_f32(?:_e32|_e64)? (v\d+), (.+?)( clamp)?"):
             op, dst, operands, clamp = m.groups()
             tokens = operands.split(", ")
             if op in ("fmac", "mac"):

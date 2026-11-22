@@ -404,6 +404,17 @@ def truncate_values() -> list[str]:
     ])
 
 
+def sopk_scalar() -> list[str]:
+    return with_constants([
+        "s_mov_b32 s50, s44",
+        "s_mulk_i32 s50, 0x3",
+        "s_mov_b32 s51, s45",
+        "s_addk_i32 s51, 0xfffe",
+        "v_mov_b32_e32 v12, s50",
+        "v_mov_b32_e32 v13, s51",
+    ])
+
+
 def select(wave64=False):
     """Compare into lane masks and select; LLVM names the masks by wavefront width."""
     vcc, first, second = ("vcc", "s[52:53]", "s[54:55]") if wave64 else ("vcc_lo", "s52", "s53")
@@ -496,6 +507,15 @@ def ldexp_values():
         "v_ldexp_f32 v13, -|s44|, 2",
         "v_ldexp_f32 v14, s46, -2",
         "v_ldexp_f32 v15, s47, 3 clamp",
+    ])
+
+
+def reciprocal_iflag():
+    return with_constants([
+        "v_rcp_iflag_f32_e32 v12, s44",
+        "v_rcp_iflag_f32_e64 v13, -|s45|",
+        "v_rcp_iflag_f32_e64 v14, |s46|",
+        "v_rcp_iflag_f32_e64 v15, |s47| clamp",
     ])
 
 
@@ -1181,6 +1201,24 @@ def truncate_case(directory: Path, bias: float, green: float, blue: float, alpha
             red = math.modf(bias + x / 255)[1]
             case.extend(struct.pack("<4f", red, green, blue, alpha))
     path = directory / "truncate.case"
+    path.write_bytes(case)
+    return path
+
+
+def sopk_case(directory, red: float, green: float) -> Path:
+    case = bytearray(256)
+    struct.pack_into("<4f", case, 12, red, green, 0, 1)
+    
+    def bits(value):
+        return struct.unpack("<I", struct.pack("<f", value))[0]
+
+    results = (bits(red) * 3, bits(green) - 2)
+    expected = [struct.unpack("<f", struct.pack("<I", value & 0xffffffff))[0]
+                for value in results]
+    for _ in RAMP:
+        for x in RAMP:
+            case.extend(struct.pack("<4f", half_rtz(expected[0]), half_rtz(expected[1]), half_rtz(128 / 255), 1))
+    path = directory / "sopk.case"
     path.write_bytes(case)
     return path
 
@@ -2476,6 +2514,33 @@ def check_controls(directory):
     assert body.count("class32(") == 4 and "& 512u" in body and "asuint(alu" in body, body
     must_reject(translate, with_constants(["v_cmp_class_f32_e64 vcc_lo, s44, -s45"]))
     must_reject(translate, with_constants(["v_cmp_class_f32_e64 vcc_lo, s44"]))
+    program = sopk_scalar()
+    source = translate(program)
+    assert "(asuint(params[0].w) * 3u)" in source and "(asuint(params[1].x) + 4294967294u)" in source
+    
+    scc_program = with_constants([
+        "s_mov_b32 s52, 0", "s_mov_b32 s53, 0", "s_mov_b32 s54, 0", "s_mov_b32 s55, 0",
+        "s_mov_b32 s50, s44", "s_addk_i32 s50, 0xfffe",
+        "s_mov_b32 s70, 0", "s_mov_b32 s71, 0", "s_mov_b32 s74, 1", "s_mov_b32 s75, 0",
+        "s_cmov_b64 s[70:71], s[74:75]",
+    ])
+
+    assert "0x80000000u" in translate(scc_program)
+    cmov = scc_program.index("s_cmov_b64 s[70:71], s[74:75]")
+    after_mul = scc_program[:cmov] + ["s_mulk_i32 s50, 0x3"] + scc_program[cmov:]
+    assert "0x80000000u" in translate(after_mul)
+
+    for old, new in (("s_mulk_i32 s50, 0x3", "s_mulk_i32 s50, 0x10000"),
+                     ("s_addk_i32 s51, 0xfffe", "s_addk_i32 s51, 0x10001"),
+                     ("s_mov_b32 s50, s44", "s_mov_b32 s50, s28"),
+                     ("s_mulk_i32 s50, 0x3", "s_mulk_i32 v50, 0x3"),
+                     ("s_addk_i32 s51, 0xfffe", "s_addk_i32 s51, v45")):
+        changed = [line.replace(old, new) for line in program]
+        assert changed != program
+        must_reject(translate, changed)
+    
+    wait = program.index("s_waitcnt lgkmcnt(0)", program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    must_reject(translate, program[:wait] + ["s_mulk_i32 s44, 0x3"] + program[wait:])
 
     program = absolute_value()
     alternate = [line.replace("|v12|", "abs(v12)") for line in program]
@@ -2823,7 +2888,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
-                (scalar64(), translate)]
+                (scalar64(), translate), (sopk_scalar(), translate)]
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
     fixtures.append((bitwise_program(), translate))
@@ -2850,6 +2915,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((scalar(), translate))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((unpack_bytes(), translate))
+    fixtures.append((reciprocal_iflag(), translate))
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
@@ -3116,6 +3182,32 @@ def check_unpack_byte_draws(directory, compiler, renderer, backend):
     result = subprocess.run(draw, capture_output=True, text=True)
     if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
         raise AssertionError("Reading the wrong byte escaped detection")
+def check_reciprocal_iflag_draws(directory, compiler, renderer, backend):
+    instructions = reciprocal_iflag()
+    source = directory / "rcp_iflag.hlsl"
+    shader = directory / "rcp_iflag.cso"
+    case = directory / "rcp_iflag.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(instructions), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    inf = math.inf
+    # Powers of two have exact reciprocals, so no rounding difference can hide a fault.
+    # A zero operand gives an infinity of its sign, and clamp turns +inf into 1.
+    for (a, b, c, d), expected in (((2.0, 4.0, -0.125, 0.5), (0.5, -0.25, 8.0, 1.0)),
+                                   ((-0.25, 0.5, 16.0, 4.0), (-4.0, -2.0, 0.0625, 0.25)),
+                                   ((0.0, 0.0, -0.0, 0.0), (inf, -inf, inf, 1.0))):
+        constants = bytearray(256)
+        struct.pack_into("<4f", constants, 12, a, b, c, d)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+
+    wrong = [line.replace("v_rcp_iflag_f32", "v_sqrt_f32") for line in instructions]
+    source.write_text(translate(wrong), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+        raise AssertionError("Replacing the reciprocal with a square root escaped detection")
 
 
 def check_render(directory, compiler, renderer, backend, *, core_only=False):
@@ -3236,6 +3328,23 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Rounding toward negative infinity escaped detection")
 
+    program = sopk_scalar()
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    for red, green in ((0.5, 0.25), (0.125, 1.0)):
+        case = sopk_case(directory, red, green)
+        subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
+    
+    case = sopk_case(directory, 0.5, 0.25)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    changed = [line.replace("s_mulk_i32 s50, 0x3", "s_mulk_i32 s50, 0x5") for line in program]
+    source.write_text(translate(changed), encoding="ascii")
+    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("Changing the sopk multiply escaped detection")
+
     program = absolute_value()
     case = absolute_case(directory)
     draw = [renderer, backend, "--check-pixel-case", shader, case]
@@ -3251,6 +3360,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
         raise AssertionError("The renderer failed to detect the missing absolute value")
     check_ceiling_draws(directory, compiler, renderer, backend)
     check_unpack_byte_draws(directory, compiler, renderer, backend)
+    check_reciprocal_iflag_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):
