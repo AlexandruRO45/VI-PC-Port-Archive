@@ -63,22 +63,26 @@ int main(int argc, char** argv) {
         auto* entry = reinterpret_cast<void (*)()>(module.base + module.entry_rva);
         entry();
 
-        int wsi = 0, frames = 0;
+        int wsi = 0, frames = 0, shared_device = 0;
         {
             std::FILE* log = std::fopen("leonida_window.log", "rb");
             if (log) {
                 char line[160]{};
                 if (std::fgets(line, sizeof(line), log)) {
                     wsi = std::strstr(line, "wsi=1") ? 1 : 0;
+                    shared_device = std::strstr(line, "shared_device=1") ? 1 : 0;
                     const char* at = std::strstr(line, "frames=");
                     if (at) std::sscanf(at, "frames=%d", &frames);
                 }
                 std::fclose(log);
             }
         }
-        std::printf("pe_hello_test: wsi=%d frames=%d\\n", wsi, frames);
+        std::printf("pe_hello_test: wsi=%d shared_device=%d frames=%d\\n", wsi, shared_device, frames);
         EXPECT(frames > 0);
         if (wsi) {
+            // The animation renders and presents on the device the shim DLL created for the harness: one VkDevice
+            // (shared-device WSI, PR C step 5).
+            EXPECT(shared_device);
             EXPECT(frames > 60);
         } else {
             const std::vector<std::uint8_t> bmp = read_file("hello_triangle.bmp");

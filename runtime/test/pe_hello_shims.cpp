@@ -19,6 +19,8 @@
 #include "../test/animated_shaders.h"
 
 extern "C" int __cdecl leonida_run_animation(void* hwnd);
+// In wsi_presenter.cpp: the device the animation renders and presents on (shared-device WSI).
+extern "C" void leonida_set_shared_device(ID3D12Device* device);
 
 namespace {
 
@@ -350,7 +352,14 @@ extern "C" void* __stdcall shim_create_window_ex_w(unsigned long ex_style, const
                              static_cast<HMENU>(menu), static_cast<HINSTANCE>(instance), param);
 }
 extern "C" long __stdcall shim_d3d12_create_device(void*, int, const GUID&, void** out) {
-    return rt::d3d12::create_vulkan_device_standalone(__uuidof(ID3D12Device), out);
+    // Presentable, because LeonidaRunAnimation presents on this device (shared-device WSI, docs/d3d12_vulkan.md
+    // section 8). The harness never releases it, so the animation's window keeps working.
+    ID3D12Device* device = nullptr;
+    const HRESULT hr = rt::d3d12::create_vulkan_device_standalone(__uuidof(ID3D12Device),
+                                                                  reinterpret_cast<void**>(&device), true);
+    if (SUCCEEDED(hr)) leonida_set_shared_device(device);
+    if (out) *out = device;
+    return hr;
 }
 extern "C" int __cdecl LeonidaRunAnimation(void* hwnd) { return leonida_run_animation(hwnd); }
 // --- engine-facing system shims (threads, clocks, file I/O, D3D12 helpers) --------------------------------

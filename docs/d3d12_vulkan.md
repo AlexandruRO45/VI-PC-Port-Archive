@@ -747,6 +747,31 @@ is not in the public `d3d12.h` vtable; its slot and struct layouts are **Open**.
 must compose the present planes (source rects, destination placement) into the swapchain image and present. For
 the first boot, implement the DXGI path and stub PresentX with a clear log.
 
+**What is implemented: shared-device WSI (PR C, step 5).** The renderer and the window share one `VkInstance`,
+`VkPhysicalDevice`, `VkDevice` and graphics queue: `create_vulkan_device_standalone(..., presentable = true)` enables
+`VK_KHR_surface`/`VK_KHR_win32_surface` on the instance and `VK_KHR_swapchain` on the device, and
+`rt::d3d12::vulkan_device_info()` hands those objects to `leonida::wsi::Presenter`
+(`runtime/test/wsi_presenter.{h,cpp}`). The presenter creates the surface for the `HWND` and a FIFO swapchain whose
+images have `COLOR_ATTACHMENT | TRANSFER_DST` usage, then presents a rendered image with
+`vkCmdCopyImage` (same format and size) or `vkCmdBlitImage` with nearest filtering, followed by
+`vkQueuePresentKHR`. Nothing goes through the host: the render target the D3D12 list rendered into is copied on the
+GPU straight into the swapchain image.
+
+The one thing the bridge must respect is the layer's layout tracker: it cannot see barriers issued outside the
+layer, so the presenter moves the source from the layout it is given (`rt::d3d12::vulkan_image_layout()`) to
+`TRANSFER_SRC_OPTIMAL` and back again, leaving the tracker correct for the next frame. Presentation synchronisation
+is one fence plus a `render_finished` semaphore per swapchain image (a semaphore may only be signalled again once the
+present that consumed it finished, which per-image semaphores guarantee); `image_available` is reused because the
+fence wait before each acquire means its previous wait was consumed.
+
+`window_draw_test` is the end-to-end proof: a visible 640×480 window, a presentable device, an orange triangle
+recorded through the COM list (`OMSetRenderTargets`/`IASetVertexBuffers`/`DrawInstanced`) into a committed render
+target, and every frame presented through the bridge. It captures one presented swapchain image back to the host
+(only for the check), which shows exactly the pixels that reached the screen: 98 304 of 307 200 orange, nothing else.
+On the RTX 5080 Laptop that is ~433 frames in 3 s (~144 fps, FIFO present), with `LEONIDA_VK_VALIDATION=1` clean.
+The PE harness's window (`leonida_run_animation`) now receives the device its `D3D12CreateDevice` shim created and
+renders/presents on that same `VkDevice`, and reports `wsi=1 shared_device=1 frames=N` in `leonida_window.log`.
+
 ### 4.6 Queries
 
 - Occlusion: `D3D12_QUERY_TYPE_OCCLUSION` → `VK_QUERY_TYPE_OCCLUSION` with `VK_QUERY_CONTROL_PRECISE_BIT`;

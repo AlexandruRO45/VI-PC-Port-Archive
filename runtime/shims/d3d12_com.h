@@ -46,7 +46,21 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
 
 // The same, on a Vulkan instance and device of its own (destroyed with the D3D12 device). Picks the first discrete
 // GPU with the features above. LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation.
-HRESULT create_vulkan_device_standalone(REFIID riid, void** out);
+// `presentable` additionally enables VK_KHR_surface/VK_KHR_win32_surface on the instance and VK_KHR_swapchain on the
+// device, which a presenter sharing these objects (shared-device WSI) needs. The queue family is still the graphics
+// one; a surface that family cannot present on is refused when the swapchain is created, not here (the window does
+// not exist yet).
+HRESULT create_vulkan_device_standalone(REFIID riid, void** out, bool presentable = false);
+
+// The Vulkan objects behind a device from create_vulkan_device*, for a presenter that has to share them: the
+// instance, physical device, device, queue and queue family it renders on. Empty when `device` is not one of ours.
+VulkanDeviceInfo vulkan_device_info(ID3D12Device* device);
+
+// The layout the layer's tracker holds for subresource 0 of an image resource (UNDEFINED when it is not tracked). A
+// presenter that copies a render target into a swapchain changes the layout between the layer's commands, so it has
+// to restore this one afterwards; the tracker cannot see barriers issued outside the layer.
+VkImageLayout vulkan_image_layout(ID3D12Device* device, ID3D12Resource* resource);
+
 
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's
 // GetDevice must return. No reference is taken: the outer object owns the device.

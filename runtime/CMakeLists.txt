@@ -492,6 +492,21 @@ if(Vulkan_FOUND)
     target_link_options(leonida_shims PRIVATE "/DEF:${LEONIDA_SHIMS_DEF}")
     set_target_properties(leonida_shims PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
+    # Shared-device WSI (PR C, step 5): a real window showing a frame recorded through the D3D12 COM surface and
+    # copied into the swapchain image on the GPU. The presenter builds its surface/swapchain on the renderer's own
+    # instance and VkDevice, so it is compiled into the test rather than reached through the shim DLL.
+    add_executable(window_draw_test test/window_draw_test.cpp test/wsi_presenter.cpp)
+    target_include_directories(window_draw_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                        ${CMAKE_CURRENT_SOURCE_DIR}/shims
+                                                        ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    target_link_libraries(window_draw_test PRIVATE gta6rt_d3d12_com Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(LEONIDA_VULKAN_LIB)
+      target_link_libraries(window_draw_test PRIVATE ${LEONIDA_VULKAN_LIB})
+    endif()
+    target_compile_definitions(window_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(window_draw_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME window_draw COMMAND window_draw_test)
+
     # Import libraries the harness links against (loader binds the imports to the shim DLL).
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/leonida_d3d12.def "LIBRARY d3d12.dll\nEXPORTS\n  LeonidaRunAnimation\n  D3D12CreateDevice\n")
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/leonida_kernel32.def "LIBRARY kernel32.dll\nEXPORTS\n  VirtualAlloc\n  CreateThread\n  WaitForSingleObject\n  QueryPerformanceCounter\n  QueryPerformanceFrequency\n  GetTickCount64\n  CreateFileW\n  ReadFile\n  WriteFile\n  CloseHandle\n")

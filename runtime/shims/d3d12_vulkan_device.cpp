@@ -17,6 +17,8 @@
 #include "d3d12_com_object.h"
 #include "d3d12_xs_device.h"
 
+#include <vulkan/vulkan_win32.h>  // VK_KHR_win32_surface: the instance extension a presentable device needs
+
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -1821,6 +1823,22 @@ VkDevice vulkan_device(ID3D12Device* device) {
     return d ? d->info().device : VK_NULL_HANDLE;
 }
 
+VulkanDeviceInfo vulkan_device_info(ID3D12Device* device) {
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    Device* d = Device::from<Device>(real);
+    return d ? d->info() : VulkanDeviceInfo{};
+}
+
+VkImageLayout vulkan_image_layout(ID3D12Device* device, ID3D12Resource* resource) {
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    Device* d = Device::from<Device>(real);
+    const Resource* r = Resource::from<Resource>(resource);
+    if (!d || !r || !d->state_.context) return VK_IMAGE_LAYOUT_UNDEFINED;
+    return d->state_.context->layout(r->id(), 0);
+}
+
 VkBuffer vulkan_buffer_for_va(ID3D12Device* device, std::uint64_t va, std::uint64_t* base_va) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     if (!real) real = device;
@@ -1849,7 +1867,9 @@ bool device_push_constants_need_fallback(ID3D12Device* device) {
 }
 
 // Creates its own Vulkan 1.3 instance and device. LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
-HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
+// With `presentable` the instance gets the surface extensions and the device VK_KHR_swapchain, so a presenter can
+// create a swapchain on exactly these objects (shared-device WSI, docs/d3d12_vulkan.md section 8).
+HRESULT create_vulkan_device_standalone(REFIID riid, void** out, bool presentable) {
     if (!out) return E_POINTER;
     *out = nullptr;
     static const HMODULE library = LoadLibraryA("vulkan-1.dll");
@@ -1864,8 +1884,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "gta6rt";
     app.apiVersion = VK_API_VERSION_1_3;
+    const char* surface_extensions[] = {VK_KHR_SURFACE_EXTENSION_NAME, "VK_KHR_win32_surface"};
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app;
+    if (presentable) {
+        instance_info.enabledExtensionCount = 2;
+        instance_info.ppEnabledExtensionNames = surface_extensions;
+    }
     const char* layer = "VK_LAYER_KHRONOS_validation";
     char validation[8] = {};
     size_t length = 0;
@@ -1952,6 +1977,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     device_info.pEnabledFeatures = &enable;
+    const char* device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    if (presentable) {
+        device_info.enabledExtensionCount = 1;
+        device_info.ppEnabledExtensionNames = device_extensions;
+    }
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;
