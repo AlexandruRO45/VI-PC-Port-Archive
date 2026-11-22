@@ -823,5 +823,84 @@ class TestValuDot2F32F16ConditionCodesAndFlags(unittest.TestCase):
         self.assertFalse(flags_nan_clamped.is_nan)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestValuDot2F32F16IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, infinities, and NaNs."""
+
+    # F16 Constants
+    F16_POS_ZERO = 0x0000
+    F16_NEG_ZERO = 0x8000
+    F16_POS_ONE = 0x3C00
+    F16_NEG_ONE = 0xBC00
+    F16_POS_INF = 0x7C00
+    F16_NEG_INF = 0xFC00
+    F16_QNAN = 0x7E00
+    F16_SNAN = 0x7D00
+    F16_SUB_MIN = 0x0001  # +2^-24 (~5.96e-8)
+    F16_SUB_MAX = 0x03FF  # max subnormal
+
+    # F32 Constants
+    F32_POS_ZERO = 0x0000_0000
+    F32_NEG_ZERO = 0x8000_0000
+    F32_POS_INF = 0x7F80_0000
+    F32_NEG_INF = 0xFF80_0000
+    F32_QNAN = 0x7FC0_0000
+
+    def test_subnormal_promotion_to_float32(self) -> None:
+        """F16 subnormals are promoted to normal float32 numbers without precision loss."""
+        # 1.0 * sub_min + 0.0 = 2^-24
+        s0 = pack_f16x2(self.F16_SUB_MIN, self.F16_POS_ZERO)
+        s1 = pack_f16x2(self.F16_POS_ONE, self.F16_POS_ZERO)
+        res = ref_dot2_f32_f16(s0, s1, self.F32_POS_ZERO)
+        expected = 2.0 ** -24
+        self.assertAlmostEqual(res, expected, places=12)
+
+    def test_signed_zero_multiplication_and_addition(self) -> None:
+        """(-0.0) * (+1.0) = -0.0. (-0.0) + (-0.0) = -0.0."""
+        s0 = pack_f16x2(self.F16_NEG_ZERO, self.F16_NEG_ZERO)
+        s1 = pack_f16x2(self.F16_POS_ONE, self.F16_POS_ONE)
+        s2 = self.F32_NEG_ZERO
+        res_bits = ref_dot2_f32_f16_bits(s0, s1, s2)
+        # Result is -0.0 (bit 31 is set, bits 30:0 are zero)
+        self.assertEqual(res_bits, self.F32_NEG_ZERO)
+
+    def test_nan_propagation_and_invalidation(self) -> None:
+        """NaN in any element propagates to result NaN."""
+        # qNaN in s0
+        s0 = pack_f16x2(self.F16_QNAN, self.F16_POS_ZERO)
+        s1 = pack_f16x2(self.F16_POS_ONE, self.F16_POS_ZERO)
+        res = ref_dot2_f32_f16(s0, s1, self.F32_POS_ZERO)
+        self.assertTrue(math.isnan(res))
+
+    def test_infinity_arithmetic(self) -> None:
+        """+inf * 1.0 + 5.0 = +inf."""
+        s0 = pack_f16x2(self.F16_POS_INF, self.F16_POS_ZERO)
+        s1 = pack_f16x2(self.F16_POS_ONE, self.F16_POS_ZERO)
+        s2 = f32_to_bits(5.0)
+        res_bits = ref_dot2_f32_f16_bits(s0, s1, s2)
+        self.assertEqual(res_bits, self.F32_POS_INF)
+
+    def test_clamp_with_boundary_extremes(self) -> None:
+        """Clamp maps +inf -> 1.0, -inf -> 0.0, NaN -> 0.0."""
+        # +inf clamped
+        s0_inf = pack_f16x2(self.F16_POS_INF, self.F16_POS_ZERO)
+        s1_one = pack_f16x2(self.F16_POS_ONE, self.F16_POS_ZERO)
+        res_inf_clamped = ref_dot2_f32_f16(s0_inf, s1_one, 0, clamp=True)
+        self.assertEqual(res_inf_clamped, 1.0)
+
+        # -inf clamped
+        s0_ninf = pack_f16x2(self.F16_NEG_INF, self.F16_POS_ZERO)
+        res_ninf_clamped = ref_dot2_f32_f16(s0_ninf, s1_one, 0, clamp=True)
+        self.assertEqual(res_ninf_clamped, 0.0)
+
+        # NaN clamped
+        s0_nan = pack_f16x2(self.F16_QNAN, self.F16_POS_ZERO)
+        res_nan_clamped = ref_dot2_f32_f16(s0_nan, s1_one, 0, clamp=True)
+        self.assertEqual(res_nan_clamped, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
