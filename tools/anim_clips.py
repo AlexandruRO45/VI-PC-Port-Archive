@@ -263,8 +263,59 @@ def matcher_features(s, at):
     names = [(s.u32(o), s.u32(o + 4)) for o in hash_table(s, obj + 0x48, 8)]
     if s.ptr(obj + 0x28) is None:
         raise DecodeError("motionmatcher feature object without its +0x28 object")
+    second = s.ptr(obj + 0x30) is not None
+    columns = features[-1][0] + features[-1][1] if features else 0
     return {"features": features, "feature_names": names,                  # (column, width, name hash); (hash, index)
-            "feature_second": s.ptr(obj + 0x30) is not None}                # +0x30 object present (not decoded)
+            "feature_second": second,                                       # +0x30 object present (not decoded)
+            **matcher_poses(s, obj, columns, second)}
+
+
+def matcher_poses(s, obj, columns, rows_layout):
+    """The pose matrix of a `.motionmatcher`: one row of f16 feature values per sample, at the feature object's
+    `+0xF0` (pointer) with its count of 32-byte chunks at `+0xEC`. Two layouts, told apart by the `+0x30` object:
+    with it, row-major, `+0xF8` samples, `+0xFC` columns, `+0x100` chunks per row (a row padded to 16 columns with
+    zeros); without it, blocks of 8 samples, column-major inside a block (column c of sample r at
+    `(r // 8) * D' * 8 + c * 8 + r % 8`, D' = columns rounded up to even), the samples at `+0x128`, and the lanes
+    after the last sample copy it. With rows, `+0xA8` holds one 48-byte `{f32 quaternion[4]; f32 vec3; f32 0; f32
+    1, 1, 1; f32 0}` per sample (count at `+0xA4`). -> {"poses": {...}, "pose_transforms": [...]}"""
+    chunks, data = s.u32(obj + 0xEC), s.ptr(obj + 0xF0)
+    if data is None:
+        raise DecodeError("motionmatcher without a pose matrix")
+    if rows_layout:
+        samples, cols, per_row = s.u32(obj + 0xF8), s.u32(obj + 0xFC), s.u32(obj + 0x100)
+        stride, layout = 16 * per_row, "rows"
+        if cols != columns or chunks != samples * per_row or stride < cols:
+            raise DecodeError("motionmatcher pose matrix size does not fit its rows")
+    else:
+        samples, cols = s.u32(obj + 0x128), s.u32(obj + 0xFC)
+        stride, layout = cols + (cols & 1), "blocks of 8"
+        if cols != columns or 16 * chunks != -(-samples // 8) * 8 * stride:
+            raise DecodeError("motionmatcher pose matrix size does not fit its blocks")
+    h = struct.unpack_from(f"<{16 * chunks}e", s.d, data)
+    if layout == "rows":
+        padding = all(h[r * stride + c] == 0 for r in range(samples) for c in range(cols, stride))
+    else:
+        last, base = samples - 1, (samples - 1) // 8 * stride * 8
+        padding = samples > 0 and all(h[base + c * 8 + lane] == h[base + c * 8 + last % 8]
+                                      for c in range(cols) for lane in range(last % 8 + 1, 8))
+    transforms = []
+    if rows_layout:
+        tr, nt = matcher_array(s, obj + 0xA8)
+        transforms = [struct.unpack_from("<12f", s.d, tr + 48 * i) for i in range(nt)]
+    poses = {"layout": layout, "samples": samples, "columns": cols, "stride": stride, "at": data,
+             "finite": all(map(math.isfinite, h)), "padding": padding}
+    return {"poses": poses, "pose_transforms": transforms}
+
+
+def matcher_pose(s, poses, sample):
+    """One row of the pose matrix (see `matcher_poses`): the f16 feature values of `sample`, as floats."""
+    if not 0 <= sample < poses["samples"]:
+        raise IndexError(sample)
+    cols, stride, at = poses["columns"], poses["stride"], poses["at"]
+    if poses["layout"] == "rows":
+        return list(struct.unpack_from(f"<{cols}e", s.d, at + 2 * sample * stride))
+    base = at + 2 * (sample // 8) * stride * 8
+    return [struct.unpack_from("<e", s.d, base + 2 * (c * 8 + sample % 8))[0] for c in range(cols)]
 
 
 def count_matcher(c, dictionary_hash, stats):
@@ -308,6 +359,18 @@ def count_matcher(c, dictionary_hash, stats):
     stats["matcher_feature_name_table_indices_0_to_f"] += bool(f) and sorted(
         i for _h, i in m["feature_names"]) == list(range(len(f)))
     stats["matcher_feature_object_second_pointer"] += m["feature_second"]
+    p = m["poses"]
+    stats["matcher_pose_layout_rows" if p["layout"] == "rows" else "matcher_pose_layout_blocks_of_8"] += 1
+    stats["matcher_pose_samples"] += p["samples"]
+    stats["matcher_pose_samples_are_offsets_end"] += bool(m["offsets"]) and p["samples"] == m["offsets"][-1]
+    stats["matcher_pose_values_finite"] += p["finite"]
+    stats["matcher_pose_padding_as_expected"] += p["padding"]
+    t = m["pose_transforms"]
+    if t:
+        stats["matcher_pose_transforms_one_per_sample"] += len(t) == p["samples"]
+        stats["matcher_pose_transforms_unit_quaternion_scale_1"] += all(
+            abs(sum(x * x for x in q[:4]) - 1) < 1e-3 and q[7] == 0 and q[8:11] == (1.0, 1.0, 1.0) and q[11] == 0
+            for q in t)
 
 
 def parse_clip(s, at):

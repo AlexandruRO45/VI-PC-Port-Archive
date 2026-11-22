@@ -448,6 +448,10 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | matcher feature object | `+0x18` u32, `+0x28` pointer, `+0x30` pointer or null | 1 (measured separately), then two objects not decoded here, see below |
 | | `+0x40` pointer, count at `+0x3C` | pointers to the features, 0x30 bytes each: `{+0x08 u32 column; +0x0C u16 width; +0x0E u16; +0x18 u32 name hash; +0x1C u32}` |
 | | `+0x48` u32 groups, `+0x4C` u32 entries, `+0x50` pointer | a hash table like the clip table, 8-byte slots `{u32 hash; u32 feature index}` |
+| | `+0xF0` pointer, count at `+0xEC` | the pose matrix, f16, in 32-byte chunks: one row of feature values per sample (layouts below) |
+| | with `+0x30`: `+0xF8` u32, `+0xFC` u32, `+0x100` u32 | samples, columns, 32-byte chunks per row (rows are padded to 16 columns) |
+| | with `+0x30`: `+0xA8` pointer, count at `+0xA4` | one 48-byte `{f32 quaternion[4]; f32 vec3; f32 0; f32 1, 1, 1; f32 0}` per sample |
+| | without `+0x30`: `+0xFC` u32, `+0x128` u32 | columns, samples (the matrix is in blocks of 8 samples) |
 | animation | `+0x24` u16 | frame count |
 | | `+0x28` f32 | duration = (frames − 1) / fps |
 | | `+0x50` array | sequence pointers |
@@ -639,14 +643,31 @@ A `.motionmatcher` object has fields up to `+0x18F`; they are in the object tabl
 - **Features (`+0x20`).** Each matcher points to a feature object with a list of features: 1,873 in all, distinct
   name hashes within each clip on 180 of 180 (1–21 per clip and 53 distinct names overall, measured separately). Widths are multiples of 3 on 180 of 180
   (3, 6, 9 or 12, measured separately), and the columns chain from 0 (each feature starts where the one before
-  ends) on 180 of 180, so a clip's features fill 6–126 columns (11,616 in all; the range measured separately); that a pose is a row of these
-  columns, in vec3 groups, is a hypothesis. The `+0x48` table has one slot per feature, with the indices 0..F−1 on
+  ends) on 180 of 180, so a clip's features fill 6–126 columns (11,616 in all; the range measured separately),
+  and the pose matrix below has one column per feature column. The `+0x48` table has one slot per feature, with the indices 0..F−1 on
   180 of 180; its hashes are not the `+0x18` name hashes (0 of 180, measured separately). `+0x0E` is 1 or 5
   (measured separately), and `+0x1C` is 3 on 1,608 of the 1,873 features (measured separately).
+- **Pose matrix (feature object `+0xF0`).** One row of f16 values per sample, one column per feature column. The
+  sample count equals the last `+0x68` offset on 180 of 180 (36,436 samples), so record i owns the rows from
+  offset i to offset i+1, and the column count is the features' total on 180 of 180. Two layouts, told apart by
+  the feature object's `+0x30` object (149 with it, 31 without):
+  - **Rows** (149): row-major, each row padded with zero columns to a multiple of 16 (`+0x100` chunks of 16).
+  - **Blocks of 8** (31): 8 samples at a time, column-major inside a block, so column c of sample r is at
+    `(r // 8) · D' · 8 + c · 8 + r mod 8`, with D' the column count rounded up to even. The lanes after the last
+    sample repeat it.
+
+  The sizes fit these layouts on 180 of 180 (`parse_matcher` refuses one that doesn't), every value is finite and
+  the padding is as described on 180 of 180. On the 149 with rows, `+0xA8` has one 48-byte item per sample: a
+  unit quaternion, a vec3 and a scale of (1, 1, 1) on 149 of 149; that it is the root's pose at that sample is a
+  hypothesis. `anim_clips.matcher_pose` reads one row. A record's rows cover part of its clip, not all of it:
+  with rows 1 / (the record's second float) seconds apart, they fit inside the clip's duration on 2,108 of the
+  2,155 records whose clip duration is known without ambiguity (measured separately), which fits the sample-rate
+  hypothesis above. Which part of the clip they cover is not decoded.
 - Not decoded: the feature object's `+0x28` object (`parse_matcher` requires it, and it is there on all 180; 128
   bytes with six pointers in the examples looked at, measured separately) and its `+0x30` object (on 149), the one 0x28-byte item at `+0x48` of the matcher, the one-item arrays at `+0x118` and
   `+0x128`, the second word of a clip table slot, the features' `+0x0E` and `+0x1C`, how the table hashes are made,
-  and where the pose data the offsets point into is.
+  what the pose columns mean beyond their feature (and any normalisation), and the feature object's `+0x98`
+  (one u32 per sample), `+0xB8` and `+0xC0`.
 
 ### Other archives
 

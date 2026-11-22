@@ -224,12 +224,35 @@ def matcher_array(p, field, data, count):
     p.ptr(field, p.alloc(data))
 
 
-def features(p):
-    """A `.motionmatcher` feature object: a vec3 feature at column 0 and a two-vec3 one at column 3, and a name table
-    that maps another hash of each name to its index."""
-    obj = p.alloc(bytes(0x60))
+def pose_value(sample, column):
+    """The fixture's pose matrix: exact in f16."""
+    return sample + column / 16
+
+
+def features(p, rows=True):
+    """A `.motionmatcher` feature object: a vec3 feature at column 0 and a two-vec3 one at column 3, a name table
+    that maps another hash of each name to its index, and a 9-sample x 9-column pose matrix, row-major when the
+    `+0x30` object is there (`rows`), else in blocks of 8 samples."""
+    obj = p.alloc(bytes(0x140))
     struct.pack_into("<I", p.b, obj + 0x18, 1)
-    p.ptr(obj + 0x28, p.alloc(bytes(0x80)))           # not decoded; +0x30 stays null
+    p.ptr(obj + 0x28, p.alloc(bytes(0x80)))           # not decoded
+    samples, cols = 9, 9
+    if rows:
+        p.ptr(obj + 0x30, p.alloc(bytes(0x70)))       # not decoded
+        stride = 16
+        h = [pose_value(r, c) if c < cols else 0.0 for r in range(samples) for c in range(stride)]
+        struct.pack_into("<IIII", p.b, obj + 0xF8, samples, cols, 1, 1)
+        transforms = b"".join(struct.pack("<12f", 0, 0, 0, 1, r, 0, 0, 0, 1, 1, 1, 0) for r in range(samples))
+        matcher_array(p, obj + 0xA8, transforms, samples)
+    else:
+        stride = cols + 1
+        h = [0.0] * (2 * 8 * stride)
+        for r in range(16):
+            for c in range(stride):
+                h[(r // 8) * stride * 8 + c * 8 + r % 8] = pose_value(min(r, samples - 1), c) if c < cols else 0.0
+        struct.pack_into("<II", p.b, obj + 0xF8, cols, cols)
+        struct.pack_into("<I", p.b, obj + 0x128, samples)
+    matcher_array(p, obj + 0xF0, struct.pack(f"<{len(h)}e", *h), len(h) // 16)
     items = []
     for column, width, name in ((0, 3, 0xF1), (3, 6, 0xF2)):
         f = p.alloc(bytes(0x30))
@@ -241,11 +264,11 @@ def features(p):
     return obj
 
 
-def motion_matcher(p, name, refs=True):
+def motion_matcher(p, name, refs=True, pose_rows=True):
     """A `.motionmatcher` with two records: record 0 is the dictionary's own `.clip` (hash 1), record 1 a clip that
     is not in the archive. Its own key is (3, joaat32(name))."""
     m = p.alloc(bytes(0x190))
-    p.ptr(m + 0x20, features(p))                      # the feature object
+    p.ptr(m + 0x20, features(p, pose_rows))           # the feature object
     p.b[m + 0x28:m + 0x38] = bytes(range(0x80, 0x90))   # 16-byte id; +0x30 is not a pointer
     p.string(m + 0x38, "pack:/one.motionmatcher")
     records = struct.pack("<fffIQ", 0.0, 30.0, -1.0, 0, 0) + struct.pack("<fffIQ", 0.5, 15.0, -1.0, 1, 0)
@@ -265,7 +288,8 @@ def motion_matcher(p, name, refs=True):
 
 
 def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, external=0, children=(),
-               external_hashes=(), parameters=1, times=None, axis=None, matcher_refs=True):
+               external_hashes=(), parameters=1, times=None, axis=None, matcher_refs=True,
+               pose_rows=True):
     """One clip dictionary page: one `.clip`, one `.motion`, one `.motionmatcher`, one local pack with one animation."""
     p = Page()
     pm = p.alloc(bytes(16))
@@ -323,7 +347,7 @@ def dictionary(name="synthetic@dict", sequences=None, frames=None, tracks=None, 
             p.ptr(block + 0x18, node)
             p.ptr(motion + 0x120, block)
             struct.pack_into("<HH", p.b, motion + 0x128, 1, 1)
-    matcher = motion_matcher(p, name, refs=matcher_refs)
+    matcher = motion_matcher(p, name, refs=matcher_refs, pose_rows=pose_rows)
     p.atmap(0x48, [(joaat32(name) << 32 | 1, clip), (joaat32(name) << 32 | 2, motion),
                    (joaat32(name) << 32 | 3, matcher)])
     hashes = [0x1000 + i for i in range(external)] + list(external_hashes)
@@ -421,7 +445,13 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual((m["u16_78"], m["u8_b8"]), ([0, 1, 2], [0, 1]))
         self.assertEqual(m["features"], [(0, 3, 0xF1), (3, 6, 0xF2)])
         self.assertEqual(m["feature_names"], [(0xA1, 1), (0xA2, 0)])
-        self.assertFalse(m["feature_second"])
+        self.assertTrue(m["feature_second"])
+        self.assertEqual((m["poses"]["layout"], m["poses"]["samples"], m["poses"]["columns"]), ("rows", 9, 9))
+        for r in range(9):
+            self.assertEqual(anim_clips.matcher_pose(self.s, m["poses"], r), [pose_value(r, c) for c in range(9)])
+        with self.assertRaises(IndexError):
+            anim_clips.matcher_pose(self.s, m["poses"], 9)
+        self.assertEqual(len(m["pose_transforms"]), 9)
         stats = anim_clips.new_stats()
         anim_clips.count_matcher(c, self.d["hash"], stats)
         for k in ("matcher_record_index_is_position", "matcher_clip_table_indices_0_to_n",
@@ -431,11 +461,56 @@ class DecodeTest(unittest.TestCase):
                   "matcher_refs_name_the_table_clip", "matcher_key_table_indices_0_to_n", "matcher_self_is_own_key",
                   "matcher_u16_78_from_0_to_records", "matcher_u8_b8_one_per_record", "matcher_u8_b8_0_or_1",
                   "matcher_u8_b8_set", "matcher_feature_columns_chain_from_0", "matcher_feature_widths_multiple_of_3",
-                  "matcher_feature_names_distinct", "matcher_feature_name_table_indices_0_to_f"):
+                  "matcher_feature_names_distinct", "matcher_feature_name_table_indices_0_to_f",
+                  "matcher_feature_object_second_pointer", "matcher_pose_layout_rows",
+                  "matcher_pose_samples_are_offsets_end", "matcher_pose_values_finite",
+                  "matcher_pose_padding_as_expected", "matcher_pose_transforms_one_per_sample",
+                  "matcher_pose_transforms_unit_quaternion_scale_1"):
             self.assertEqual(stats[k], 1, k)
         self.assertEqual((stats["matcher_records"], stats["matcher_clip_table_entries"], stats["matcher_refs"],
                           stats["matcher_key_table_entries"], stats["matcher_features"],
                           stats["matcher_feature_columns"]), (2, 2, 2, 3, 2, 9))
+
+    def test_motionmatcher_poses_in_blocks_of_8(self):
+        s = anim_clips.System(bytearray(two_sequence_dictionary(pose_rows=False)))
+        d = anim_clips.parse_dictionary(s)
+        c = [c for c in d["clips"] if c["kind"] == "motionmatcher"][0]
+        m = c["matcher"]
+        self.assertEqual((m["poses"]["layout"], m["poses"]["samples"], m["poses"]["stride"]), ("blocks of 8", 9, 10))
+        for r in range(9):
+            self.assertEqual(anim_clips.matcher_pose(s, m["poses"], r), [pose_value(r, c) for c in range(9)])
+        self.assertEqual((m["feature_second"], m["pose_transforms"]), (False, []))
+        stats = anim_clips.new_stats()
+        anim_clips.count_matcher(c, d["hash"], stats)
+        for k in ("matcher_pose_layout_blocks_of_8", "matcher_pose_samples_are_offsets_end",
+                  "matcher_pose_values_finite", "matcher_pose_padding_as_expected"):
+            self.assertEqual(stats[k], 1, k)
+        self.assertEqual(stats.get("matcher_pose_transforms_one_per_sample", 0), 0)
+        at = [v for k, v in s.atmap(0x48) if k & 0xFFFFFFFF == 3][0]
+        obj = s.ptr(at + 0x20)
+        last = s.ptr(obj + 0xF0) + 2 * (1 * 10 * 8 + 0 * 8 + 7)                    # column 0, last lane
+        struct.pack_into("<e", s.d, last, 99.0)                                     # padding that doesn't copy
+        self.assertFalse(anim_clips.parse_matcher(s, at)["poses"]["padding"])
+        struct.pack_into("<I", s.d, obj + 0x128, 17)                                # 17 samples need 3 blocks
+        with self.assertRaises(anim_clips.DecodeError):
+            anim_clips.parse_matcher(s, at)
+
+    def test_motionmatcher_pose_rows_that_do_not_fit(self):
+        s = anim_clips.System(bytearray(two_sequence_dictionary()))
+        at = [v for k, v in s.atmap(0x48) if k & 0xFFFFFFFF == 3][0]
+        obj = s.ptr(at + 0x20)
+        struct.pack_into("<e", s.d, s.ptr(obj + 0xF0) + 2 * 12, 1.0)                # a padding column not 0
+        self.assertFalse(anim_clips.parse_matcher(s, at)["poses"]["padding"])
+        for field, value in ((obj + 0xFC, 8), (obj + 0xF8, 10), (obj + 0xF0, 0)):  # columns, samples, no data
+            kept = s.u64(field) if field == obj + 0xF0 else s.u32(field)
+            if field == obj + 0xF0:
+                struct.pack_into("<Q", s.d, field, value)
+            else:
+                struct.pack_into("<I", s.d, field, value)
+            with self.assertRaises(anim_clips.DecodeError, msg=hex(field - obj)):
+                anim_clips.parse_matcher(s, at)
+            struct.pack_into("<Q" if field == obj + 0xF0 else "<I", s.d, field, kept)
+        anim_clips.parse_matcher(s, at)
 
     def test_motionmatcher_without_refs_and_with_a_bad_table(self):
         d = anim_clips.parse_dictionary(anim_clips.System(two_sequence_dictionary(matcher_refs=False)))
