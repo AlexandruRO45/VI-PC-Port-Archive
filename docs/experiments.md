@@ -1488,6 +1488,23 @@ python3 -B tests/mesh_textured_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 ctest --preset dev --no-tests=error -R "^mesh_textured_draw_" -V
 ```
 
+The compute-to-mesh texture fixture reuses that translated mesh and pixel
+shader. A translated compute program writes four packed RGBA8 texels to a raw
+default-heap UAV, with rows at byte offsets 0 and 256. After a UAV-to-copy-source
+transition, a GPU copy places those rows in a 2×2 texture. The draw samples the
+texture after its transition to pixel-shader-resource state. The dispatch,
+copy, and draw share one direct command list. The test reads back the final
+1,024 pixels and the mesh export trace.
+
+Two independently generated palettes match their CPU references. In the
+stale-binding control, both producers run but the draw binds the first texture
+while expecting the second. All 276 covered pixels differ while the mesh
+export trace and all 748 clear pixels match.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_mesh_texture_(warp|hardware)$' -V
+```
+
 The mesh depth-pair fixture draws two partially overlapping indexed triangles
 with translated mesh and pixel stages. The two dispatches share one RGBA8
 target and one D32_FLOAT depth buffer with depth writes and LESS enabled.

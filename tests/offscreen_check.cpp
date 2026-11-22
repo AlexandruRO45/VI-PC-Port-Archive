@@ -364,6 +364,8 @@ int main(int argc, char** argv)
         if (argc < 5) return 2;
     } else if (operation == "--compute-to-pixel") {
         if (argc != 6 && argc != 7) return 2;
+    } else if (operation == "--compute-mesh-texture") {
+        if (argc != 7 && argc != 8 && (argc != 9 || std::string_view(argv[8]) != "--stale")) return 2;
     } else if (operation == "--check-pixel-quad-lod") {
         if (argc != 4) return 2;
     } else if (operation == "--mesh-entry" || operation == "--mesh-indexed" || operation == "--mesh-textured") {
@@ -525,6 +527,10 @@ int main(int argc, char** argv)
         } else if (operation == "--mesh-textured") {
             if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
                                        true, MeshConstantBinding::root, MeshDrawMode::textured)) return 77;
+        } else if (operation == "--compute-mesh-texture") {
+            const MeshTextureProducers producers{argv[6], argc >= 8 ? argv[7] : nullptr, argc == 9};
+            if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
+                                       true, MeshConstantBinding::root, MeshDrawMode::textured, &producers)) return 77;
         } else if (operation == "--mesh-depth-pair") {
             if (!check_mesh_entry_draw(device.Get(), argv[3], argv[4], argv[5],
                                        true, MeshConstantBinding::root, MeshDrawMode::depth_pair)) return 77;
