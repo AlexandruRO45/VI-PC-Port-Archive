@@ -2187,8 +2187,37 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_m5_world_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m5_world COMMAND d3d12_m5_world_test)
       set_tests_properties(d3d12_m5_world PROPERTIES SKIP_RETURN_CODE 77)
+      # M5, the mesh part: ms_m5.asm (a translated NGG wave64 mesh shader; build.py makes its PSV0 container from the
+      # "psv0:" header) with ps_m5_mesh.asm, drawn by DispatchMesh and by ExecuteIndirect with DISPATCH_MESH
+      # signatures; vs_m3/ps_m5_flat make the VS PSO of the wrong-kind checks. Exits 77 without VK_EXT_mesh_shader.
+      set(LEONIDA_M5_MESH_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m5_mesh_shaders)
+      set(LEONIDA_M5_MESH_FILES ${LEONIDA_M5_MESH_DIR}/spirv/index.json ${LEONIDA_M5_MESH_DIR}/fssm/ms_m5.fssm
+                                ${LEONIDA_M5_MESH_DIR}/fssm/ps_m5_mesh.fssm ${LEONIDA_M5_MESH_DIR}/fssm/vs_m3.fssm
+                                ${LEONIDA_M5_MESH_DIR}/fssm/ps_m5_flat.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_M5_MESH_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M5_MESH_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_M5_MESH_DIR} ms_m5 ps_m5_mesh vs_m3 ps_m5_flat
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_m5.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_mesh.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_flat.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating ms_m5, ps_m5_mesh, vs_m3 and ps_m5_flat for the M5 mesh test"
+        VERBATIM)
+      add_executable(d3d12_m5_mesh_test test/d3d12_m5_mesh_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M5_MESH_FILES})
+      target_link_libraries(d3d12_m5_mesh_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_m5_mesh_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_M5_MESH_DIR="${LEONIDA_M5_MESH_DIR}")
+      target_compile_options(d3d12_m5_mesh_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_m5_mesh COMMAND d3d12_m5_mesh_test)
+      set_tests_properties(d3d12_m5_mesh PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test, d3d12_m2_textured_test, d3d12_m2_formats_test, d3d12_m3_frame_test, d3d12_m4_compute_test, d3d12_buffer_uav_test and d3d12_m5_world_test are not built")
+      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test, d3d12_m2_textured_test, d3d12_m2_formats_test, d3d12_m3_frame_test, d3d12_m4_compute_test, d3d12_buffer_uav_test, d3d12_m5_world_test and d3d12_m5_mesh_test are not built")
     endif()
     # ID3D12Resource::GetHeapProperties and ID3D12DescriptorHeap::GetDesc (node masks, resolved heap flags) against the
     # host runtime and WARP; run explicitly on a Vulkan GPU.
