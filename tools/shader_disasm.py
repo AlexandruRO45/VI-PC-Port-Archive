@@ -82,7 +82,7 @@ def disasm(code: bytes, mcpu: str):
 
 def check_madk(mcpu: str) -> None:
     """Detect the K-literal corruption and FP16 crash reported in LLVM issue #237158."""
-    # GFX10 VOP2 encodings: v0 destination, s0 source, v0 second VGPR source. K is the next dword.
+    # GFX10 VOP2 encodings with zero register fields. K is the next dword.
     cases = (("v_fmamk_f16", 0x6e, 2), ("v_fmaak_f16", 0x70, 3),
              ("v_fmamk_f32", 0x58, 2), ("v_fmaak_f32", 0x5a, 3))
     tool = " ".join(MC)
@@ -165,13 +165,14 @@ def one(path, out, mcpu):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src", nargs="?", help="shader file or directory (optional with --check-madk)")
-    ap.add_argument("--check-madk", action="store_true", help="probe LLVM issue #237158 before disassembling")
+    ap.add_argument("--check-madk", action="store_true", help="probe GFX10 MADK disassembly for LLVM issue #237158")
     ap.add_argument("--out")
     ap.add_argument("--mcpu", default="gfx1013")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
     if a.check_madk:
+        probe(a.mcpu)
         check_madk(a.mcpu)
         if a.src is None:
             return 0
@@ -193,7 +194,8 @@ def main():
         os.makedirs(out, exist_ok=True)
     except OSError as e:
         fail(f"cannot create the output folder {out}: {e.strerror or e}")
-    probe(a.mcpu)
+    if not a.check_madk:
+        probe(a.mcpu)
     from collections import Counter
     with ThreadPoolExecutor(a.jobs) as ex:
         res = Counter(ex.map(lambda p: one(p, out, a.mcpu), files))

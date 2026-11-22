@@ -63,6 +63,9 @@ class DisasmFailureTest(unittest.TestCase):
             "import sys\n"
             "code = bytes(int(word, 0) for word in sys.stdin.read().split())\n"
             "assert '--disassemble' in sys.argv and '-mcpu=gfx1013' in sys.argv\n"
+            "if code == bytes.fromhex('000081bf'):\n"
+            "    print('s_endpgm')\n"
+            "    sys.exit(0)\n"
             "assert len(code) == 8 and code[:3] == bytes(3) and code[5:] == bytes(3)\n"
             "op = {0x6e: 'v_fmamk_f16', 0x70: 'v_fmaak_f16',\n"
             "      0x58: 'v_fmamk_f32', 0x5a: 'v_fmaak_f32'}[code[3]]\n"
@@ -94,6 +97,13 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stdout)
         self.assertIn("v_fmamk_f16, K=0xff", p.stderr)
         self.assertIn("synthetic disassembler crash", p.stderr)
+
+    def test_madk_check_explains_missing_tool(self):
+        p = self.run_madk_check("definitely-not-an-llvm-mc")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("could not be started", p.stderr)
+        self.assertIn("LLVM_MC", p.stderr)
+        self.assertIn("build_llvm_mc.ps1", p.stderr)
 
     def test_missing_tool(self):
         out = os.path.join(self.dir, "out")
