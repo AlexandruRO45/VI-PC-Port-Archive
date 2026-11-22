@@ -696,14 +696,15 @@ def with_debug(age: int = 3, guid: str = GUID, cv: bytes | None = None, use_poin
     return bytes(buf)
 
 
-def build_pdb(guid: str = GUID, info_age: int = 3, dbi_age: int | None = 3, block: int = 512) -> bytes:
+def build_pdb(guid: str = GUID, info_age: int = 3, dbi_age: int | None = 3, block: int = 512,
+              dbi_pad: int = 52) -> bytes:
     """A minimal MSF 7.0 PDB: superblock, two free-block maps, the block map, the stream directory, then the PDB
     info stream (1) and, unless dbi_age is None, a DBI stream (3) whose header carries the age."""
     import uuid
     info = struct.pack("<III", 20000404, 0x5F000000, info_age) + uuid.UUID(guid).bytes_le
     streams = [b"", info, None, b""]   # stream 2 is a nil stream (size 0xFFFFFFFF)
     if dbi_age is not None:
-        streams[3] = struct.pack("<iII", -1, 19990903, dbi_age) + bytes(52)
+        streams[3] = struct.pack("<iII", -1, 19990903, dbi_age) + bytes(dbi_pad)
     blocks = [b"", b"", b"", None, None]   # 0 superblock, 1-2 free maps, 3 block map, 4 directory
     directory = struct.pack("<I", len(streams))
     lists = b""
@@ -757,7 +758,9 @@ class DebugDirectoryTest(unittest.TestCase):
 
     def test_record_cut_short_is_not_read_past_its_declared_size(self):
         cv = self.report(with_debug(cv=b"RSDS" + bytes(10)))["debug"][0]["codeview"]
-        self.assertEqual(cv, {"format": "RSDS"})
+        self.assertEqual(cv, {"format": "RSDS", "truncated": True})
+        cv = self.report(with_debug(cv=b"NB10" + bytes(6)))["debug"][0]["codeview"]
+        self.assertEqual(cv, {"format": "NB10", "truncated": True})
         unterminated = b"RSDS" + bytes(20) + b"name-without-end"
         cv = self.report(with_debug(cv=unterminated))["debug"][0]["codeview"]
         self.assertIsNone(cv["pdb"])
@@ -774,6 +777,20 @@ class DebugDirectoryTest(unittest.TestCase):
         self.assertIn("## Debug directory", md)
         self.assertIn(f"RSDS {GUID} age 3", md)
         self.assertIn("| POGO |", md)
+
+    def test_short_records_still_give_both_reports(self):
+        for cv in (b"RSDS" + bytes(10), b"NB10" + bytes(6)):
+            with self.subTest(cv=cv[:4]):
+                path = self.write("short.dll", with_debug(cv=cv))
+                out = os.path.join(self.dir, "out")
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(pe_inspect.main([path, "--out", out]), 0)
+                with open(os.path.join(out, "short.dll.md"), encoding="utf-8") as f:
+                    self.assertIn(f"{cv[:4].decode()} record cut short (not read)", f.read())
+
+    def test_debug_type_names_follow_the_pe_specification(self):
+        self.assertEqual([pe_inspect.DEBUG_TYPES[k] for k in (17, 18, 19, 20)],
+                         ["EMBEDDED_PORTABLE_PDB", "SPGO", "PDBCHECKSUM", "EX_DLLCHARACTERISTICS"])
 
     def test_every_cut_length_gives_a_report_or_a_pe_format_error(self):
         full = with_debug()
@@ -876,6 +893,45 @@ class PdbMatchTest(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             self.assertEqual(pe_inspect.main([self.image, self.image, "--pdb", "x.pdb"]), 2)
         self.assertIn("exactly one image", err.getvalue())
+
+    def test_short_rsds_record_is_a_mismatch_not_a_crash(self):
+        short = os.path.join(self.dir, "short.dll")
+        with open(short, "wb") as f:
+            f.write(with_debug(cv=b"RSDS" + bytes(10)))
+        rc, result, err = self.check(build_pdb(), image=short)
+        self.assertEqual((rc, result["match"]), (1, False))
+        self.assertIn("cut short", result["reason"])
+        self.assertEqual(err, "")
+
+    def test_out_and_game_dir_are_refused_with_pdb(self):
+        for extra in (["--out", self.dir], ["--game-dir", self.dir]):
+            with self.subTest(extra=extra[0]):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(pe_inspect.main([self.image, "--pdb", "x.pdb", *extra]), 2)
+                self.assertIn("not used with --pdb", err.getvalue())
+
+    def test_only_the_needed_blocks_are_read(self):
+        # A PDB whose DBI stream runs to many blocks: only its first block, the directory and the info stream's
+        # block are read, and the result matches reading the bytes.
+        data = build_pdb(block=512, dbi_age=3, dbi_pad=20 * 512)
+        self.assertGreater(len(data), 24 * 512)
+        reads = []
+
+        class Tracking(io.BytesIO):
+            def read(self, n=-1):
+                reads.append(n)
+                return super().read(n)
+
+        self.assertEqual(pe_inspect.read_pdb_identity(Tracking(data)), pe_inspect.read_pdb_identity(data))
+        self.assertNotIn(-1, reads)
+        self.assertLessEqual(sum(reads), 0x38 + 4 * 512)   # block map, directory, info, first DBI block
+
+    def test_a_cut_inside_a_long_dbi_stream_is_still_refused(self):
+        good = build_pdb(block=512, dbi_pad=20 * 512)
+        rc, _result, err = self.check(good[:len(good) - 512])
+        self.assertEqual(rc, 1)
+        self.assertIn("past the end", err)
 
 
 if __name__ == "__main__":
