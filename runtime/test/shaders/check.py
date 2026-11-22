@@ -158,6 +158,10 @@ BOUNDS = [("cs_bounds", [0x12345678, 0x12345678, 0x00000000, 0xEEEEEEEE]),
           # swizzled MUBUF addressing (RDNA2 ISA 8.1.5) and ADD_TID_ENABLE on lanes 0 and 1, derived in the .asm header
           ("cs_buf_swizzle", [0x5eed0024, 0x5eed0044, 0x5eed004c, 0x5eed0008, 0x5eed0028, 0, 0xbeef0000, 0xbeef0001])]
 CMPX_CLASS_WORDS = [0xEEEEEEEE] * 3 + [0x22] + [0x11] * 4
+# cs_cvt16.asm: 16-bit and ubyte conversions, derived by hand in the .asm header
+CVT16_WORDS = [0xAAAA6800, 0xAAAA6802, 0xAAAAE800, 0xAAAAF800, 0xAAAAC500, 0xAAAA6800, 0xAAAA7BC0, 0xAAAA7C00,
+               0xAAAA7800, 0xAAAAFFFE, 0xAAAA7FFF, 0xAAAA8000, 0xAAAA7FFF, 0xAAAA0000, 0xAAAA0000, 0xAAAA0002,
+               0xAAAA0000, 0xAAAAFFE0, 0xAAAAFFFF, 0xAAAA0000, 0x436F0000, 0x434D0000, 0x432B0000, 0x43090000]
 # cs_fmt_1010102.asm: descriptor loads, immediate-format load, raw input words and the two packed stores.
 FMT_1010102_WORDS = [0, 0x3F800000, 0, 0x3F800000, 0x3F800000, 0, 0x3F800000, 0,
                      0, 0x3F800000, 0, 0x3F800000, 0xC00FFC00, 0x003FF003, 0xE00003FF, 0xFFE00003]
@@ -274,6 +278,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
               "ps_f64_mods": (0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000),
+              "ps_cvt_f32_f64": (0x3f800000, 0x3f800001, 0x3f800002, 0xff800000),   # RNE ties and f64 overflow (.asm header)
               # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
               "ps_f16_med3_opsel": (0xaaaa4100, 0xaaaa4200, 0xaaaa3e00, 0x40005555),
               "ps_f16_med3_mods": (0x41005555, 0x3c005555, 0x41003800, 0xaaaaba00),
@@ -473,6 +478,11 @@ def fmt_1010102_test(tools, spirv, env=None):
 
 def fmt_sint32_test(tools, spirv, env=None):
     return dump_test(tools, spirv, "cs_fmt_sint32", FMT_SINT32_WORDS, len(FMT_SINT32_WORDS), env)
+
+
+def cvt16_test(tools, spirv, env=None):
+    """The 24 words of cs_cvt16 and the untouched words after them, up to one group's 64."""
+    return dump_test(tools, spirv, "cs_cvt16", CVT16_WORDS + [0xEEEEEEEE] * 40, 64, env)
 
 
 def fmt_xy_xyz_test(tools, spirv, env=None):
@@ -1286,6 +1296,7 @@ def main():
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
+    results.append(("cs_cvt16", cvt16_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:

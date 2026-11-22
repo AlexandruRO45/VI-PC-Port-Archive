@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import Skip, clip_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
+from check import Skip, clip_test, cvt16_test, fmt_1010102_test, fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
@@ -834,6 +834,9 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_fmt_1010102":
             problem = fmt_1010102_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
+        elif name == "cs_cvt16":
+            problem = cvt16_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "64/64 dumped words exact"))
         elif name == "cs_fmt_sint32":
             problem = fmt_sint32_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
@@ -1127,6 +1130,7 @@ def run_suite(a, work: str) -> int:
                 "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
                 "ps_fma_literal": (0x41B80000, 0x41800000, 0x40E00000, 0x41A40000),
                 "ps_f64_mods": (0x40040000, 0x3FF00000, 0x3FE40000, 0x3FF00000),   # needs shaderFloat64
+                "ps_cvt_f32_f64": (0x3F800000, 0x3F800001, 0x3F800002, 0xFF800000),   # needs shaderFloat64
                 # f16 op_sel / partial writes / inline constants: RDNA2 hardware words (see the .asm headers)
                 "ps_f16_med3_opsel": (0xAAAA4100, 0xAAAA4200, 0xAAAA3E00, 0x40005555),
                 "ps_f16_med3_mods": (0x41005555, 0x3C005555, 0x41003800, 0xAAAABA00),

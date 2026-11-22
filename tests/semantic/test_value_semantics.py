@@ -76,6 +76,40 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+# cs_cvt16 (out[0..23]) and ps_cvt_f32_f64: derived by hand in the .asm headers; CVT16_CASES / cvt16_reference below
+# recompute them with Python's binary16 and binary32 packers.
+EXPECTED_CVT16 = [0xAAAA6800, 0xAAAA6802, 0xAAAAE800, 0xAAAAF800, 0xAAAAC500, 0xAAAA6800, 0xAAAA7BC0, 0xAAAA7C00,
+                  0xAAAA7800, 0xAAAAFFFE, 0xAAAA7FFF, 0xAAAA8000, 0xAAAA7FFF, 0xAAAA0000, 0xAAAA0000, 0xAAAA0002,
+                  0xAAAA0000, 0xAAAAFFE0, 0xAAAAFFFF, 0xAAAA0000, 0x436F0000, 0x434D0000, 0x432B0000, 0x43090000]
+EXPECTED_CVT_F32_F64 = [0x3F800000, 0x3F800001, 0x3F800002, 0xFF800000]
+CVT16_CASES = [("i16_to_f16", 0x0801), ("i16_to_f16", 0x0803), ("i16_to_f16", 0xF7FF), ("i16_to_f16", 0x8001),
+               ("i16_to_f16", 0xFFFB), ("u16_to_f16", 0x0801), ("u16_to_f16", 0xF801), ("u16_to_f16", 0xFFFF),
+               ("u16_to_f16", 0x8001),
+               ("f16_to_i16", 0xC180), ("f16_to_i16", 0x78E2), ("f16_to_i16", 0xF8E2), ("f16_to_i16", 0x7C00),
+               ("f16_to_i16", 0x7E00), ("f16_to_i16", 0xB800),
+               ("f16_to_u16", 0x4180), ("f16_to_u16", 0xBE00), ("f16_to_u16", 0x7BFF), ("f16_to_u16", 0x7C00),
+               ("f16_to_u16", 0xFE00)]
+
+
+def cvt16_reference(kind, half):
+    """Low 16 bits of the result (the destination's high half 0xaaaa is kept by the caller)."""
+    if kind in ("i16_to_f16", "u16_to_f16"):
+        value = half - 0x10000 if kind == "i16_to_f16" and half & 0x8000 else half
+        return struct.unpack("<H", struct.pack("<e", value))[0] if abs(value) < 65520 \
+            else (0x7C00 if value > 0 else 0xFC00)
+    x = struct.unpack("<e", struct.pack("<H", half))[0]
+    lo, hi = (-32768, 32767) if kind == "f16_to_i16" else (0, 65535)
+    if x != x:
+        return 0
+    return max(lo, min(hi, int(x) if abs(x) != math.inf else (hi if x > 0 else lo))) & 0xFFFF
+
+
+def cvt_f32_f64_reference(double_bits):
+    x = struct.unpack("<d", struct.pack("<Q", double_bits))[0]
+    try:
+        return struct.unpack("<I", struct.pack("<f", x))[0]
+    except OverflowError:   # too large for binary32 (struct refuses instead of rounding to infinity)
+        return 0x7F800000 if x > 0 else 0xFF800000
 
 
 def _f32_bits(x):
@@ -403,6 +437,26 @@ class TranslatorValueSemantics(unittest.TestCase):
         # S1 - S0 in the _e32 and _e64 forms (neg, clamp), low half out, the destination's high half kept, also
         # when the destination is a source.
         self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
+
+    def test_cvt16_and_ubyte_conversions_cs_cvt16(self):
+        # i16/u16 -> f16 round to nearest even (2049 -> 2048, 2051 -> 2052, 65535 -> +inf), i16 sign-extends;
+        # f16 -> i16/u16 truncate, saturate and give 0 for NaN; each 16-bit result keeps the destination's 0xaaaa
+        # high half and each source's high half is ignored; v_cvt_f32_ubyte0..3 pick bytes 0xef 0xcd 0xab 0x89.
+        want = [0xAAAA0000 | cvt16_reference(kind, half) for kind, half in CVT16_CASES]
+        want += [struct.unpack("<I", struct.pack("<f", float(b)))[0] for b in (0xEF, 0xCD, 0xAB, 0x89)]
+        self.assertEqual([f"{w:#010x}" for w in want], [f"{w:#010x}" for w in EXPECTED_CVT16])
+        spv = support.translate_fixture("cs_cvt16", fssm=CS_BOUNDS_FSSM)
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                             push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(24)], [f"{w:#010x}" for w in EXPECTED_CVT16])
+        self.assertEqual(memory[0x60], 0xEEEEEEEE, "only the 24 words are written")
+
+    def test_cvt_f32_f64_rounds_to_nearest_even_and_overflows_to_inf(self):
+        doubles = [0x3FF0000010000000, 0x3FF0000010001000, 0x3FF0000030000000, 0xCC70000000000000]
+        self.assertEqual([f"{cvt_f32_f64_reference(d):#010x}" for d in doubles],
+                         [f"{w:#010x}" for w in EXPECTED_CVT_F32_F64])
+        # The interpreter has no 64-bit floats (ps_f64_mods is not run here either): the words are the GPU test's, and\n        # the translation is checked to be one OpFConvert of the pair, bitcast as a double, to a float.\n        spv = support.translate_fixture("ps_cvt_f32_f64")\n        self.assertEqual(spv.count("OpFConvert %float"), 4)\n        self.assertIn("OpCapability Float64", spv)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
