@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -95,6 +96,42 @@ void destroy_capture(const rt::d3d12::VulkanDeviceInfo& info, CaptureBuffer& cap
     }
     if (capture.buffer) vkDestroyBuffer(info.device, capture.buffer, nullptr);
     capture = CaptureBuffer{};
+}
+
+// The captured frame as a BGRA BMP, so the presented image can be looked at outside the test.
+bool write_bmp(const char* path, const std::uint8_t* pixels, std::uint32_t width, std::uint32_t height) {
+    const std::uint32_t row_bytes = (width * 3 + 3) & ~3u;
+    const std::uint32_t image_bytes = row_bytes * height;
+    std::vector<std::uint8_t> file(54 + image_bytes, 0);
+    file[0] = 'B';
+    file[1] = 'M';
+    const std::uint32_t total = 54 + image_bytes;
+    std::memcpy(file.data() + 2, &total, 4);
+    const std::uint32_t offset = 54;
+    std::memcpy(file.data() + 10, &offset, 4);
+    const std::uint32_t header = 40;
+    std::memcpy(file.data() + 14, &header, 4);
+    const std::int32_t w = std::int32_t(width), h = std::int32_t(height);
+    std::memcpy(file.data() + 18, &w, 4);
+    std::memcpy(file.data() + 22, &h, 4);
+    const std::uint16_t planes = 1, bits = 24;
+    std::memcpy(file.data() + 26, &planes, 2);
+    std::memcpy(file.data() + 28, &bits, 2);
+    std::memcpy(file.data() + 34, &image_bytes, 4);
+    for (std::uint32_t y = 0; y < height; ++y) {
+        std::uint8_t* out = file.data() + 54 + std::size_t(height - 1 - y) * row_bytes;
+        const std::uint8_t* line = pixels + std::size_t(y) * width * 4;
+        for (std::uint32_t x = 0; x < width; ++x) {
+            out[x * 3 + 0] = line[x * 4 + 2];  // B
+            out[x * 3 + 1] = line[x * 4 + 1];  // G
+            out[x * 3 + 2] = line[x * 4 + 0];  // R
+        }
+    }
+    std::FILE* out_file = std::fopen(path, "wb");
+    if (!out_file) return false;
+    const bool ok = std::fwrite(file.data(), 1, file.size(), out_file) == file.size();
+    std::fclose(out_file);
+    return ok;
 }
 
 }  // namespace
@@ -288,6 +325,9 @@ int main() {
     }
     UINT last_present = 0;
     swapchain->GetLastPresentCount(&last_present);
+    if (capture.mapped && orange)
+        write_bmp("dxgi_window.bmp", static_cast<const std::uint8_t*>(capture.mapped), swap_desc.Width,
+                  swap_desc.Height);
     std::printf("dxgi_window_test: %d frames (%d via PresentX), %zu/%u captured pixels lit (%zu orange), last "
                 "present count %u\n",
                 frames, present_x_frames, lit, swap_desc.Width * swap_desc.Height, orange, last_present);
