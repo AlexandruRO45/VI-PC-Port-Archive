@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "../src/root_signature.h"
+#include "../src/subgroup_size.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -55,6 +56,9 @@ struct VulkanDeviceInfo {
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;
+    // The subgroup sizes the device offers and whether subgroupSizeControl / computeFullSubgroups are enabled on it
+    // (src/subgroup_size.h). Default: nothing, so pipelines request no size.
+    leonida::SubgroupSizeCaps subgroup;
     // Enabled: runtimeDescriptorArray, the dynamic indexing of sampled- and storage-image arrays, and update after
     // bind for sampled images, storage images and storage buffers. The device then keeps the bindless set 0 of
     // the translated shaders (docs section 3.4), and texture views and samplers are put in it as they are
@@ -134,6 +138,8 @@ struct RootArgumentLayout {
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+// What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
+const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 
 // The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
 inline constexpr UINT descriptor_size = 32;
