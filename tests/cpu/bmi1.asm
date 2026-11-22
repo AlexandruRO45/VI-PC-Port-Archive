@@ -1,11 +1,15 @@
 ; Source-owned differential fixture for BMI1 bit-manipulation instructions
 ; (ANDN, BEXTR, BLSI, BLSMSK, BLSR, TZCNT) in 32-bit and 64-bit forms.
-; Each export writes (CF << 1) | ZF to the output pointer and returns RAX.
+; Each export writes (CF << 1) | ZF to the output pointer and returns RAX. ANDN and BEXTR
+; follow a compare that sets CF, and BLSMSK one that sets ZF, so the flags they clear are
+; observed rather than inherited.
 .code
 
 andn32 PROC FRAME
     .endprolog
     mov rax, -1
+    xor r9d, r9d
+    cmp r9, 1                ; CF = 1, which the next instruction must clear
     andn eax, ecx, edx
     mov r9d, 0
     jae short @F
@@ -20,6 +24,8 @@ andn32 ENDP
 
 andn64 PROC FRAME
     .endprolog
+    xor r9d, r9d
+    cmp r9, 1                ; CF = 1, which the next instruction must clear
     andn rax, rcx, rdx
     mov r9d, 0
     jae short @F
@@ -35,6 +41,8 @@ andn64 ENDP
 bextr32 PROC FRAME
     .endprolog
     mov rax, -1
+    xor r9d, r9d
+    cmp r9, 1                ; CF = 1, which the next instruction must clear
     bextr eax, ecx, edx
     mov r9d, 0
     jae short @F
@@ -49,6 +57,8 @@ bextr32 ENDP
 
 bextr64 PROC FRAME
     .endprolog
+    xor r9d, r9d
+    cmp r9, 1                ; CF = 1, which the next instruction must clear
     bextr rax, rcx, rdx
     mov r9d, 0
     jae short @F
@@ -93,6 +103,7 @@ blsi64 ENDP
 blsmsk32 PROC FRAME
     .endprolog
     mov rax, -1
+    cmp ecx, ecx             ; ZF = 1, which BLSMSK must clear
     blsmsk eax, ecx
     mov r9d, 0
     jae short @F
@@ -107,6 +118,7 @@ blsmsk32 ENDP
 
 blsmsk64 PROC FRAME
     .endprolog
+    cmp ecx, ecx             ; ZF = 1, which BLSMSK must clear
     blsmsk rax, rcx
     mov r9d, 0
     jae short @F

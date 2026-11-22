@@ -1,5 +1,6 @@
 ; 8- and 16-bit register writes and returns that define 0, 1, 2 or 8 low bytes of RAX, for the
-; jump-table translator.
+; jump-table translator. qword_ops and flag_results cover 64-bit IMUL, CL shifts and MOVSX and
+; the flags of INC, TEST and CMP.
 ; Every export takes RCX, RDX and R8 = address of three writable QWORDs. An 8- or 16-bit write
 ; leaves the other bytes of its register unchanged; a 32-bit write zero-extends.
 .code
@@ -144,6 +145,37 @@ spin:
     jmp spin
 self_loop ENDP
 
+qword_ops PROC FRAME
+    .endprolog
+    mov rax, rcx
+    imul rax, rdx
+    mov r9, rdx
+    shl r9, cl
+    mov QWORD PTR [r8], r9
+    mov r10, rdx
+    sar r10, cl
+    mov QWORD PTR [r8+8], r10
+    movsx r11, dl
+    mov QWORD PTR [r8+16], r11
+    ret
+qword_ops ENDP
+
+flag_results PROC FRAME
+    .endprolog
+    movzx eax, cl
+    inc al
+    sete al
+    mov QWORD PTR [r8], rax
+    test rcx, rdx
+    setb al
+    mov QWORD PTR [r8+8], rax
+    cmp rcx, rdx
+    setle al
+    mov QWORD PTR [r8+16], rax
+    sets al
+    ret
+flag_results ENDP
+
 ; Rejected: after the join only AL is defined on one path, and ADD reads all of EAX.
 join_wide PROC FRAME
     .endprolog
@@ -173,4 +205,24 @@ address_return PROC FRAME
     lea rax, byte_merge
     ret
 address_return ENDP
+
+; Three-operand IMUL writes its destination without reading it: R10, R9 and RAX are not defined
+; before the multiplies. The 16-bit form merges into R9W, and MOVZX reads only that word.
+imul3_fresh PROC FRAME
+    .endprolog
+    imul r10, rdx, -5
+    mov QWORD PTR [r8], r10
+    imul r9w, cx, 7FFFh
+    movzx r9d, r9w
+    mov QWORD PTR [r8+8], r9
+    imul eax, ecx, 1010101h
+    ret
+imul3_fresh ENDP
+
+; Rejected: two-operand IMUL reads its destination, and EAX is not defined at entry.
+imul2_undefined PROC FRAME
+    .endprolog
+    imul eax, ecx
+    ret
+imul2_undefined ENDP
 END
