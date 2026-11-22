@@ -136,6 +136,13 @@ def check_protections(mapper, folder, probe):
     patched = folder / "protect_pdata.dll"
     edit_header(probe, patched, unreadable_pdata)
     for case, image in (("unpatched", unpatched), (".pdata without read access", patched)):
+        if image is patched:
+            base, status, detail, _ = mapper(image, {})
+            if base:
+                mapper.release(base)
+            if base or status != STATUS["unsupported"] or "exception table is not readable" not in detail:
+                raise AssertionError(f"{case}: expected unsupported, got {status} ({detail})")
+            continue
         sections = layout(image)
         module = kernel.LoadLibraryExW(str(image), None, 0)
         if not module:
@@ -153,8 +160,6 @@ def check_protections(mapper, folder, probe):
             mapper.release(base)
         if mapped != native:
             raise AssertionError(f"{case}: pe_map protections {mapped} differ from Windows {native}")
-        if image is patched and native[".pdata"] != 0x01:
-            raise AssertionError(f"{case}: Windows maps .pdata as {native['.pdata']:#x}, not PAGE_NOACCESS")
         print(f"{case}: {len(sections)} section protections match the Windows loader")
 
 

@@ -428,29 +428,40 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         return rva >= opt.SizeOfHeaders && image.at<std::uint64_t>(rva) && !overlaps(rva, driver);
     };
 
+    // Only complete relocation blocks and complete WORD entries can be applied.
     const auto delta = reinterpret_cast<std::uint64_t>(base) - opt.ImageBase;
-    const auto& relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    // Like the Windows loader (RtlImageDirectoryEntryToData), a relocation directory at address 0
+    // is absent whatever its Size: the image maps as relocation-free instead of the headers being
+    // parsed as relocation blocks.
+    const auto& linked_relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    static const IMAGE_DATA_DIRECTORY no_relocs{};
+    const auto& relocs = linked_relocs.VirtualAddress ? linked_relocs : no_relocs;
     if (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED)
         return release(fail(MAP_RELOCATION, "relocations stripped"));
     if (!inside(relocs.VirtualAddress, relocs.Size, opt.SizeOfImage))
         return release(fail(MAP_RELOCATION, "relocation directory outside image"));
-    for (std::uint64_t offset = 0; offset + sizeof(IMAGE_BASE_RELOCATION) <= relocs.Size;) {
-        const auto* block = image.at<IMAGE_BASE_RELOCATION>(relocs.VirtualAddress + offset);
-        const DWORD page = block->VirtualAddress, length = block->SizeOfBlock;
-        if (length < sizeof(IMAGE_BASE_RELOCATION) || length > relocs.Size - offset)
-            return release(fail(MAP_RELOCATION, "bad relocation block"));
-        const auto* entry = reinterpret_cast<const WORD*>(block + 1);
-        const DWORD count = (length - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-        for (DWORD k = 0; k < count; ++k) {
-            const WORD type = entry[k] >> 12;
-            const std::uint64_t target = page + std::uint64_t{entry[k] & 0xfffu};
-            if (type == IMAGE_REL_BASED_ABSOLUTE) continue;
-            if (type != IMAGE_REL_BASED_DIR64 || !writable(target, relocs))
-                return release(fail(MAP_RELOCATION, "unsupported relocation at RVA %#llx",
-                                    static_cast<unsigned long long>(target)));
-            *image.at<std::uint64_t>(target) += delta;
+    if (relocs.VirtualAddress && relocs.Size) {
+        std::uint64_t offset = 0;
+        while (offset + sizeof(IMAGE_BASE_RELOCATION) <= relocs.Size) {
+            const auto* block = image.at<IMAGE_BASE_RELOCATION>(relocs.VirtualAddress + offset);
+            const DWORD page = block->VirtualAddress, length = block->SizeOfBlock;
+            if (length < sizeof(IMAGE_BASE_RELOCATION) || length > relocs.Size - offset || length % sizeof(WORD))
+                return release(fail(MAP_RELOCATION, "bad relocation block"));
+            const auto* entry = reinterpret_cast<const WORD*>(block + 1);
+            const DWORD count = (length - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+            for (DWORD k = 0; k < count; ++k) {
+                const WORD type = entry[k] >> 12;
+                const std::uint64_t target = page + std::uint64_t{entry[k] & 0xfffu};
+                if (type == IMAGE_REL_BASED_ABSOLUTE) continue;
+                if (type != IMAGE_REL_BASED_DIR64 || !writable(target, relocs))
+                    return release(fail(MAP_RELOCATION, "unsupported relocation at RVA %#llx",
+                                        static_cast<unsigned long long>(target)));
+                *image.at<std::uint64_t>(target) += delta;
+            }
+            offset += length;
         }
-        offset += length;
+        if (offset != relocs.Size)
+            return release(fail(MAP_RELOCATION, "bad relocation block"));
     }
 
     // The delay-import directory is found by its address, like Windows; Size is not used. Walk both
@@ -566,39 +577,33 @@ extern "C" __declspec(dllexport) void* pe_map_image(const wchar_t* path, Resolve
         }
     }
 
-    // Register .pdata while every page is still read/write. RtlAddFunctionTable reads the table to find
-    // its address range, and the section protections below may leave it unreadable: Windows maps an
-    // image whose exception directory lies in a section without IMAGE_SCN_MEM_READ and keeps that page
-    // PAGE_NOACCESS.
-    const auto& pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
-    if (pdata.Size) {
-        auto* table = image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress, pdata.Size / sizeof(RUNTIME_FUNCTION));
-        if (!table || !RtlAddFunctionTable(table, pdata.Size / sizeof(RUNTIME_FUNCTION),
-                                           reinterpret_cast<DWORD64>(base)))
-            return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
-    }
-    const auto unregister = [&] {
-        if (pdata.Size) RtlDeleteFunctionTable(image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress));
-    };
-
     // Record the actual base in the mapped headers, as the Windows loader does.
     reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew)->OptionalHeader.ImageBase =
         reinterpret_cast<std::uint64_t>(base);
     DWORD old = 0;
-    if (!VirtualProtect(base, opt.SizeOfHeaders, PAGE_READONLY, &old)) {
-        unregister();
+    if (!VirtualProtect(base, opt.SizeOfHeaders, PAGE_READONLY, &old))
         return release(fail(MAP_PROTECT, "cannot protect headers"));
-    }
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
         const auto& s = sections[i];
         const DWORD span = s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData;
-        if (span && !VirtualProtect(base + s.VirtualAddress, span, protection(s.Characteristics), &old)) {
-            unregister();
+        if (span && !VirtualProtect(base + s.VirtualAddress, span, protection(s.Characteristics), &old))
             return release(fail(MAP_PROTECT, "cannot protect section %.8s", reinterpret_cast<const char*>(s.Name)));
-        }
     }
     FlushInstructionCache(GetCurrentProcess(), base, opt.SizeOfImage);
 
+    // An empty exception directory registers nothing. Require complete entries otherwise.
+    const auto& pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
+    if (pdata.Size) {
+        if (!pdata.VirtualAddress || pdata.Size % sizeof(RUNTIME_FUNCTION))
+            return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
+        const auto count = pdata.Size / sizeof(RUNTIME_FUNCTION);
+        auto* table = image.at<RUNTIME_FUNCTION>(pdata.VirtualAddress, count);
+        if (table && !readable(table, pdata.Size))
+            return release(fail(MAP_UNSUPPORTED, "exception table is not readable after section protection"));
+        if (!table || !RtlAddFunctionTable(table, static_cast<DWORD>(count),
+                                           reinterpret_cast<DWORD64>(base)))
+            return release(fail(MAP_FUNCTION_TABLE, "cannot register .pdata"));
+    }
     std::vector<PIMAGE_TLS_CALLBACK> callbacks;
     const auto* mapped_nt = image.headers();
     if (const char* reason = tls_callbacks(image, mapped_nt, callbacks)) {
