@@ -135,6 +135,10 @@ SOP2_OPS = {
     0x21: ("s_lshr_b64", "Scalar logical shift right 64-bit"),
     0x22: ("s_ashr_i32", "Scalar arithmetic shift right 32-bit"),
     0x26: ("s_mul_i32", "Scalar multiply signed 32-bit"),
+    0x2e: ("s_lshl1_add_u32", "Scalar shift left 1 and add 32-bit"),
+    0x2f: ("s_lshl2_add_u32", "Scalar shift left 2 and add 32-bit"),
+    0x30: ("s_lshl3_add_u32", "Scalar shift left 3 and add 32-bit"),
+    0x31: ("s_lshl4_add_u32", "Scalar shift left 4 and add 32-bit"),
 }
 
 SOPK_OPS = {
@@ -521,6 +525,251 @@ EXP_TARGETS = {
     12: "pos0", 13: "pos1", 14: "pos2", 15: "pos3",
     **{32 + i: f"param{i}" for i in range(32)},
 }
+
+# GFX1013 / RDNA 2 MUBUF opcodes: op -> (mnemonic, vdata_width, comment)
+MUBUF_OPS = {
+    0x00: ("buffer_load_format_x", 1, "Untyped/typed buffer format load 1 dword"),
+    0x01: ("buffer_load_format_xy", 2, "Untyped/typed buffer format load 2 dwords"),
+    0x02: ("buffer_load_format_xyz", 3, "Untyped/typed buffer format load 3 dwords"),
+    0x03: ("buffer_load_format_xyzw", 4, "Untyped/typed buffer format load 4 dwords"),
+    0x04: ("buffer_store_format_x", 1, "Buffer format store 1 dword"),
+    0x05: ("buffer_store_format_xy", 2, "Buffer format store 2 dwords"),
+    0x06: ("buffer_store_format_xyz", 3, "Buffer format store 3 dwords"),
+    0x07: ("buffer_store_format_xyzw", 4, "Buffer format store 4 dwords"),
+    0x08: ("buffer_load_ubyte", 1, "Buffer load unsigned byte"),
+    0x09: ("buffer_load_sbyte", 1, "Buffer load signed byte"),
+    0x0a: ("buffer_load_ushort", 1, "Buffer load unsigned 16-bit"),
+    0x0b: ("buffer_load_sshort", 1, "Buffer load signed 16-bit"),
+    0x0c: ("buffer_load_dword", 1, "Buffer load 1 dword"),
+    0x0d: ("buffer_load_dwordx2", 2, "Buffer load 2 dwords"),
+    0x0e: ("buffer_load_dwordx4", 4, "Buffer load 4 dwords"),
+    0x0f: ("buffer_load_dwordx3", 3, "Buffer load 3 dwords"),
+    0x18: ("buffer_store_byte", 1, "Buffer store byte"),
+    0x19: ("buffer_store_byte_d16_hi", 1, "Buffer store byte from high 16-bit lane"),
+    0x1a: ("buffer_store_short", 1, "Buffer store 16-bit short"),
+    0x1b: ("buffer_store_short_d16_hi", 1, "Buffer store 16-bit short from high lane"),
+    0x1c: ("buffer_store_dword", 1, "Buffer store 1 dword"),
+    0x1d: ("buffer_store_dwordx2", 2, "Buffer store 2 dwords"),
+    0x1e: ("buffer_store_dwordx4", 4, "Buffer store 4 dwords"),
+    0x1f: ("buffer_store_dwordx3", 3, "Buffer store 3 dwords"),
+    0x20: ("buffer_load_ubyte_d16", 1, "Buffer load unsigned byte to low 16 bits"),
+    0x21: ("buffer_load_ubyte_d16_hi", 1, "Buffer load unsigned byte to high 16 bits"),
+    0x22: ("buffer_load_sbyte_d16", 1, "Buffer load signed byte to low 16 bits"),
+    0x23: ("buffer_load_sbyte_d16_hi", 1, "Buffer load signed byte to high 16 bits"),
+    0x24: ("buffer_load_short_d16", 1, "Buffer load 16-bit short to low 16 bits"),
+    0x25: ("buffer_load_short_d16_hi", 1, "Buffer load 16-bit short to high 16 bits"),
+    0x30: ("buffer_atomic_swap", 1, "Buffer atomic swap 32-bit"),
+    0x31: ("buffer_atomic_cmpswap", 2, "Buffer atomic compare-and-swap 32-bit"),
+    0x32: ("buffer_atomic_add", 1, "Buffer atomic add 32-bit"),
+    0x33: ("buffer_atomic_sub", 1, "Buffer atomic subtract 32-bit"),
+    0x35: ("buffer_atomic_smin", 1, "Buffer atomic signed min 32-bit"),
+    0x36: ("buffer_atomic_umin", 1, "Buffer atomic unsigned min 32-bit"),
+    0x37: ("buffer_atomic_smax", 1, "Buffer atomic signed max 32-bit"),
+    0x38: ("buffer_atomic_umax", 1, "Buffer atomic unsigned max 32-bit"),
+    0x39: ("buffer_atomic_and", 1, "Buffer atomic bitwise AND 32-bit"),
+    0x3a: ("buffer_atomic_or", 1, "Buffer atomic bitwise OR 32-bit"),
+    0x3b: ("buffer_atomic_xor", 1, "Buffer atomic bitwise XOR 32-bit"),
+    0x3c: ("buffer_atomic_inc", 1, "Buffer atomic increment 32-bit"),
+    0x3d: ("buffer_atomic_dec", 1, "Buffer atomic decrement 32-bit"),
+    0x3e: ("buffer_atomic_fcmpswap", 2, "Buffer atomic float32 compare-and-swap"),
+    0x3f: ("buffer_atomic_fmin", 1, "Buffer atomic float32 min"),
+    0x40: ("buffer_atomic_fmax", 1, "Buffer atomic float32 max"),
+    0x50: ("buffer_atomic_swap_x2", 2, "Buffer atomic swap 64-bit"),
+    0x51: ("buffer_atomic_cmpswap_x2", 4, "Buffer atomic compare-and-swap 64-bit"),
+    0x52: ("buffer_atomic_add_x2", 2, "Buffer atomic add 64-bit"),
+    0x53: ("buffer_atomic_sub_x2", 2, "Buffer atomic subtract 64-bit"),
+    0x55: ("buffer_atomic_smin_x2", 2, "Buffer atomic signed min 64-bit"),
+    0x56: ("buffer_atomic_umin_x2", 2, "Buffer atomic unsigned min 64-bit"),
+    0x57: ("buffer_atomic_smax_x2", 2, "Buffer atomic signed max 64-bit"),
+    0x58: ("buffer_atomic_umax_x2", 2, "Buffer atomic unsigned max 64-bit"),
+    0x59: ("buffer_atomic_and_x2", 2, "Buffer atomic bitwise AND 64-bit"),
+    0x5a: ("buffer_atomic_or_x2", 2, "Buffer atomic bitwise OR 64-bit"),
+    0x5b: ("buffer_atomic_xor_x2", 2, "Buffer atomic bitwise XOR 64-bit"),
+    0x5c: ("buffer_atomic_inc_x2", 2, "Buffer atomic increment 64-bit"),
+    0x5d: ("buffer_atomic_dec_x2", 2, "Buffer atomic decrement 64-bit"),
+    0x5e: ("buffer_atomic_fcmpswap_x2", 4, "Buffer atomic float64 compare-and-swap"),
+    0x5f: ("buffer_atomic_fmin_x2", 2, "Buffer atomic float64 min"),
+    0x60: ("buffer_atomic_fmax_x2", 2, "Buffer atomic float64 max"),
+    0x71: ("buffer_gl0_inv", 0, "Invalidate GL0 vector cache"),
+    0x72: ("buffer_gl1_inv", 0, "Invalidate GL1 vector cache"),
+    0x80: ("buffer_load_format_d16_x", 1, "Buffer format load 1 packed 16-bit channel"),
+    0x81: ("buffer_load_format_d16_xy", 1, "Buffer format load 2 packed 16-bit channels"),
+    0x82: ("buffer_load_format_d16_xyz", 2, "Buffer format load 3 packed 16-bit channels"),
+    0x83: ("buffer_load_format_d16_xyzw", 2, "Buffer format load 4 packed 16-bit channels"),
+    0x84: ("buffer_store_format_d16_x", 1, "Buffer format store 1 packed 16-bit channel"),
+    0x85: ("buffer_store_format_d16_xy", 1, "Buffer format store 2 packed 16-bit channels"),
+    0x86: ("buffer_store_format_d16_xyz", 2, "Buffer format store 3 packed 16-bit channels"),
+    0x87: ("buffer_store_format_d16_xyzw", 2, "Buffer format store 4 packed 16-bit channels"),
+}
+
+# GFX1013 / RDNA 2 MTBUF opcodes: op -> (mnemonic, vdata_width, comment)
+MTBUF_OPS = {
+    0x00: ("tbuffer_load_format_x", 1, "Typed buffer load 1 channel"),
+    0x01: ("tbuffer_load_format_xy", 2, "Typed buffer load 2 channels"),
+    0x02: ("tbuffer_load_format_xyz", 3, "Typed buffer load 3 channels"),
+    0x03: ("tbuffer_load_format_xyzw", 4, "Typed buffer load 4 channels"),
+    0x04: ("tbuffer_store_format_x", 1, "Typed buffer store 1 channel"),
+    0x05: ("tbuffer_store_format_xy", 2, "Typed buffer store 2 channels"),
+    0x06: ("tbuffer_store_format_xyz", 3, "Typed buffer store 3 channels"),
+    0x07: ("tbuffer_store_format_xyzw", 4, "Typed buffer store 4 channels"),
+    0x08: ("tbuffer_load_format_d16_x", 1, "Typed buffer load 1 packed 16-bit channel"),
+    0x09: ("tbuffer_load_format_d16_xy", 1, "Typed buffer load 2 packed 16-bit channels"),
+    0x0a: ("tbuffer_load_format_d16_xyz", 2, "Typed buffer load 3 packed 16-bit channels"),
+    0x0b: ("tbuffer_load_format_d16_xyzw", 2, "Typed buffer load 4 packed 16-bit channels"),
+    0x0c: ("tbuffer_store_format_d16_x", 1, "Typed buffer store 1 packed 16-bit channel"),
+    0x0d: ("tbuffer_store_format_d16_xy", 1, "Typed buffer store 2 packed 16-bit channels"),
+    0x0e: ("tbuffer_store_format_d16_xyz", 2, "Typed buffer store 3 packed 16-bit channels"),
+    0x0f: ("tbuffer_store_format_d16_xyzw", 2, "Typed buffer store 4 packed 16-bit channels"),
+}
+
+# GFX1013 MTBUF 7-bit format identifiers; format 1 (BUF_FMT_8_UNORM) is LLVM's omitted default.
+MTBUF_FORMATS = {
+    0: "BUF_FMT_INVALID",
+    2: "BUF_FMT_8_SNORM",
+    3: "BUF_FMT_8_USCALED",
+    4: "BUF_FMT_8_SSCALED",
+    5: "BUF_FMT_8_UINT",
+    6: "BUF_FMT_8_SINT",
+    7: "BUF_FMT_16_UNORM",
+    8: "BUF_FMT_16_SNORM",
+    9: "BUF_FMT_16_USCALED",
+    10: "BUF_FMT_16_SSCALED",
+    11: "BUF_FMT_16_UINT",
+    12: "BUF_FMT_16_SINT",
+    13: "BUF_FMT_16_FLOAT",
+    14: "BUF_FMT_8_8_UNORM",
+    15: "BUF_FMT_8_8_SNORM",
+    16: "BUF_FMT_8_8_USCALED",
+    17: "BUF_FMT_8_8_SSCALED",
+    18: "BUF_FMT_8_8_UINT",
+    19: "BUF_FMT_8_8_SINT",
+    20: "BUF_FMT_32_UINT",
+    21: "BUF_FMT_32_SINT",
+    22: "BUF_FMT_32_FLOAT",
+    23: "BUF_FMT_16_16_UNORM",
+    24: "BUF_FMT_16_16_SNORM",
+    25: "BUF_FMT_16_16_USCALED",
+    26: "BUF_FMT_16_16_SSCALED",
+    27: "BUF_FMT_16_16_UINT",
+    28: "BUF_FMT_16_16_SINT",
+    29: "BUF_FMT_16_16_FLOAT",
+    30: "BUF_FMT_10_11_11_UNORM",
+    31: "BUF_FMT_10_11_11_SNORM",
+    32: "BUF_FMT_10_11_11_USCALED",
+    33: "BUF_FMT_10_11_11_SSCALED",
+    34: "BUF_FMT_10_11_11_UINT",
+    35: "BUF_FMT_10_11_11_SINT",
+    36: "BUF_FMT_10_11_11_FLOAT",
+    37: "BUF_FMT_11_11_10_UNORM",
+    38: "BUF_FMT_11_11_10_SNORM",
+    39: "BUF_FMT_11_11_10_USCALED",
+    40: "BUF_FMT_11_11_10_SSCALED",
+    41: "BUF_FMT_11_11_10_UINT",
+    42: "BUF_FMT_11_11_10_SINT",
+    43: "BUF_FMT_11_11_10_FLOAT",
+    44: "BUF_FMT_10_10_10_2_UNORM",
+    45: "BUF_FMT_10_10_10_2_SNORM",
+    46: "BUF_FMT_10_10_10_2_USCALED",
+    47: "BUF_FMT_10_10_10_2_SSCALED",
+    48: "BUF_FMT_10_10_10_2_UINT",
+    49: "BUF_FMT_10_10_10_2_SINT",
+    50: "BUF_FMT_2_10_10_10_UNORM",
+    51: "BUF_FMT_2_10_10_10_SNORM",
+    52: "BUF_FMT_2_10_10_10_USCALED",
+    53: "BUF_FMT_2_10_10_10_SSCALED",
+    54: "BUF_FMT_2_10_10_10_UINT",
+    55: "BUF_FMT_2_10_10_10_SINT",
+    56: "BUF_FMT_8_8_8_8_UNORM",
+    57: "BUF_FMT_8_8_8_8_SNORM",
+    58: "BUF_FMT_8_8_8_8_USCALED",
+    59: "BUF_FMT_8_8_8_8_SSCALED",
+    60: "BUF_FMT_8_8_8_8_UINT",
+    61: "BUF_FMT_8_8_8_8_SINT",
+    62: "BUF_FMT_32_32_UINT",
+    63: "BUF_FMT_32_32_SINT",
+    64: "BUF_FMT_32_32_FLOAT",
+    65: "BUF_FMT_16_16_16_16_UNORM",
+    66: "BUF_FMT_16_16_16_16_SNORM",
+    67: "BUF_FMT_16_16_16_16_USCALED",
+    68: "BUF_FMT_16_16_16_16_SSCALED",
+    69: "BUF_FMT_16_16_16_16_UINT",
+    70: "BUF_FMT_16_16_16_16_SINT",
+    71: "BUF_FMT_16_16_16_16_FLOAT",
+    72: "BUF_FMT_32_32_32_UINT",
+    73: "BUF_FMT_32_32_32_SINT",
+    74: "BUF_FMT_32_32_32_FLOAT",
+    75: "BUF_FMT_32_32_32_32_UINT",
+    76: "BUF_FMT_32_32_32_32_SINT",
+    77: "BUF_FMT_32_32_32_32_FLOAT",
+}
+
+
+def _format_vgpr_range(reg: int, width: int) -> str:
+    """Format a VGPR operand covering `width` consecutive 32-bit registers."""
+    return f"v{reg}" if width == 1 else f"v[{reg}:{reg + width - 1}]"
+
+
+def _format_srsrc4(srsrc: int) -> str:
+    """Format a 4-SGPR buffer resource descriptor (s[n:n+3] or ttmp[n:n+3])."""
+    if 108 <= srsrc <= 120:
+        t = srsrc - 108
+        return f"ttmp[{t}:{t + 3}]"
+    return f"s[{srsrc}:{srsrc + 3}]"
+
+
+def _format_buffer_operands_and_mods(
+    w0: int,
+    w1: int,
+    vdata_width: int,
+    *,
+    format_mod: str | None = None,
+    allow_lds: bool = False,
+    allow_tfe: bool = True,
+) -> tuple[list[str], list[str]]:
+    """Decode operands and modifiers shared by MUBUF and MTBUF encodings."""
+    imm_offset = w0 & 0xfff
+    offen = (w0 >> 12) & 1
+    idxen = (w0 >> 13) & 1
+    glc = (w0 >> 14) & 1
+    dlc = (w0 >> 15) & 1
+    lds = ((w0 >> 16) & 1) if allow_lds else 0
+
+    vaddr = w1 & 0xff
+    vdata = (w1 >> 8) & 0xff
+    srsrc = ((w1 >> 16) & 0x1f) * 4
+    slc = (w1 >> 22) & 1
+    tfe = (w1 >> 23) & 1
+    soffset = (w1 >> 24) & 0xff
+
+    vaddr_str = f"v[{vaddr}:{vaddr + 1}]" if (idxen and offen) else (f"v{vaddr}" if (idxen or offen) else "off")
+    srsrc_str = _format_srsrc4(srsrc)
+    soffset_str = decode_s_reg(soffset)
+
+    if lds:
+        operands = [vaddr_str, srsrc_str, soffset_str]
+    else:
+        operands = [_format_vgpr_range(vdata, vdata_width), vaddr_str, srsrc_str, soffset_str]
+
+    mods = []
+    if format_mod is not None:
+        mods.append(format_mod)
+    if idxen:
+        mods.append("idxen")
+    if offen:
+        mods.append("offen")
+    if imm_offset:
+        mods.append(f"offset:{imm_offset}")
+    if glc:
+        mods.append("glc")
+    if slc:
+        mods.append("slc")
+    if dlc:
+        mods.append("dlc")
+    if lds:
+        mods.append("lds")
+    if allow_tfe and tfe:
+        mods.append("tfe")
+    return operands, mods
 
 
 def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
@@ -929,6 +1178,51 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             asm += " clamp"
 
         return (length, op_name, asm, comment)
+
+    # 12. MUBUF: 64-bit [31:26] == 0b111000 (0xe0000000)
+    if (w0 & 0xfc000000) == 0xe0000000:
+        if offset + 8 > len(data):
+            return (4, "mubuf_truncated", "mubuf <truncated>", "Incomplete 64-bit MUBUF instruction")
+        w1, = struct.unpack_from("<I", data, offset + 4)
+        op = (w0 >> 18) & 0xff
+        op_name, vdata_width, comment = MUBUF_OPS.get(
+            op, (f"buffer_mubuf_{op:02x}", 1, "Unknown MUBUF")
+        )
+        if vdata_width == 0:
+            return (8, op_name, op_name, comment)
+        allow_lds = op_name.startswith("buffer_load_") and "_d16" not in op_name
+        allow_tfe = not op_name.startswith("buffer_atomic_")
+        operands, mods = _format_buffer_operands_and_mods(
+            w0, w1, vdata_width, allow_lds=allow_lds, allow_tfe=allow_tfe
+        )
+        asm = f"{op_name} {', '.join(operands)}"
+        if mods:
+            asm += f" {' '.join(mods)}"
+        return (8, op_name, asm, comment)
+
+    # 13. MTBUF: 64-bit [31:26] == 0b111010 (0xe8000000)
+    if (w0 & 0xfc000000) == 0xe8000000:
+        if offset + 8 > len(data):
+            return (4, "mtbuf_truncated", "mtbuf <truncated>", "Incomplete 64-bit MTBUF instruction")
+        w1, = struct.unpack_from("<I", data, offset + 4)
+        fmt = (w0 >> 19) & 0x7f
+        op = ((w0 >> 16) & 0x7) | (((w1 >> 21) & 1) << 3)
+        op_name, vdata_width, comment = MTBUF_OPS.get(
+            op, (f"tbuffer_mtbuf_{op:02x}", 1, "Unknown MTBUF")
+        )
+        if fmt == 1:
+            format_mod = None
+        elif fmt in MTBUF_FORMATS:
+            format_mod = f"format:[{MTBUF_FORMATS[fmt]}]"
+        else:
+            format_mod = f"format:{fmt}"
+        operands, mods = _format_buffer_operands_and_mods(
+            w0, w1, vdata_width, format_mod=format_mod
+        )
+        asm = f"{op_name} {', '.join(operands)}"
+        if mods:
+            asm += f" {' '.join(mods)}"
+        return (8, op_name, asm, comment)
 
     # Default fallback: unknown 32-bit word
     return (4, f"word_0x{w0:08x}", f".long 0x{w0:08x}", "Unrecognized RDNA 2 instruction encoding")

@@ -211,6 +211,29 @@ class TestRdna2Disasm(unittest.TestCase):
             ("1a8012cc18e10118", "v_pk_max_f16", "v_pk_max_f16 v26, v24, 0.5 clamp"),
             ("0c4013cc12275a1c", "v_dot2_f32_f16", "v_dot2_f32_f16 v12, v18, v19, v22"),
             ("0c0020cc2c265204", "v_fma_mix_f32", "v_fma_mix_f32 v12, s44, v19, v20"),
+            # MUBUF: untyped, format, d16, atomics, cache invalidation, and buffer modifiers
+            ("000030e000050203", "buffer_load_dword", "buffer_load_dword v5, off, s[8:11], s3"),
+            ("40d030e000054203", "buffer_load_dword", "buffer_load_dword v5, v0, s[8:11], s3 offen offset:64 glc slc dlc"),
+            ("ff3f30e000050280", "buffer_load_dword", "buffer_load_dword v5, v[0:1], s[8:11], 0 idxen offen offset:4095"),
+            ("000031e000000203", "buffer_load_dword", "buffer_load_dword off, s[8:11], s3 lds"),
+            ("000030e00005827d", "buffer_load_dword", "buffer_load_dword v5, off, s[8:11], null tfe"),
+            ("000030e000051b03", "buffer_load_dword", "buffer_load_dword v5, off, ttmp[0:3], s3"),
+            ("102038e00008037c", "buffer_load_dwordx4", "buffer_load_dwordx4 v[8:11], v0, s[12:15], m0 idxen offset:16"),
+            ("00000ce200050280", "buffer_load_format_d16_xyzw", "buffer_load_format_d16_xyzw v[5:6], off, s[8:11], 0"),
+            ("0c1070e000050203", "buffer_store_dword", "buffer_store_dword v5, v0, s[8:11], s3 offen offset:12"),
+            ("001078e004000280", "buffer_store_dwordx4", "buffer_store_dwordx4 v[0:3], v4, s[8:11], 0 offen"),
+            ("000010e200050203", "buffer_store_format_d16_x", "buffer_store_format_d16_x v5, off, s[8:11], s3"),
+            ("0050c8e000050203", "buffer_atomic_add", "buffer_atomic_add v5, v0, s[8:11], s3 offen glc"),
+            ("0010c4e000050203", "buffer_atomic_cmpswap", "buffer_atomic_cmpswap v[5:6], v0, s[8:11], s3 offen"),
+            ("005044e100050280", "buffer_atomic_cmpswap_x2", "buffer_atomic_cmpswap_x2 v[5:8], v0, s[8:11], 0 offen glc"),
+            ("0000c4e100000000", "buffer_gl0_inv", "buffer_gl0_inv"),
+            ("0000c8e100000000", "buffer_gl1_inv", "buffer_gl1_inv"),
+            # MTBUF: typed buffer loads/stores and format field decoding
+            ("0000b0e800050203", "tbuffer_load_format_x", "tbuffer_load_format_x v5, off, s[8:11], s3 format:[BUF_FMT_32_FLOAT]"),
+            ("40d06bea00054203", "tbuffer_load_format_xyzw", "tbuffer_load_format_xyzw v[5:8], v0, s[8:11], s3 format:[BUF_FMT_32_32_32_32_FLOAT] offen offset:64 glc slc dlc"),
+            ("0030ede800052280", "tbuffer_store_format_d16_xy", "tbuffer_store_format_d16_xy v5, v[0:1], s[8:11], 0 format:[BUF_FMT_16_16_FLOAT] idxen offen"),
+            ("000008e800050203", "tbuffer_load_format_x", "tbuffer_load_format_x v5, off, s[8:11], s3"),
+            ("0000f8eb00050203", "tbuffer_load_format_x", "tbuffer_load_format_x v5, off, s[8:11], s3 format:127"),
         ]
         for hex_str, expected_op, expected_asm in vectors:
             raw = bytes.fromhex(hex_str)
@@ -349,6 +372,18 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertTrue(is_opcode_recognized("v_cmpx_gt_i32_e32"))
         self.assertEqual(classify_isa_category("v_cmp_lt_f32_e32"), "VOPC (Vector Compare)")
         self.assertEqual(classify_isa_category("v_cmpx_gt_i32_e32"), "VOPC (Vector Compare)")
+
+    def test_sop2_lshl_add_opcode_table_synthetic_forms(self):
+        from disasm_rdna2 import SOP2_OPS
+        target_ops = {0x2e, 0x2f, 0x30, 0x31}
+        for op in target_ops:
+            expected_name, _ = SOP2_OPS[op]
+            w0 = 0x80000000 | (op << 23) | (2 << 16) | (1 << 8) | 0
+            raw = struct.pack("<I", w0)
+            insns = disasm_rdna2(raw)
+            self.assertEqual(len(insns), 1, f"Failed decoding SOP2 op 0x{op:02x}")
+            self.assertEqual(insns[0]["opcode"], expected_name)
+            self.assertEqual(insns[0]["length"], 4)
 
     def test_vop2_integer_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import VOP2_OPS
@@ -489,6 +524,117 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(res_rec["opcode"], "v_pk_add_u16_unsupported")
             self.assertIn("<unsupported_reserved_bits>", res_rec["assembly"])
 
+    def test_mubuf_opcode_table_synthetic_forms(self):
+        """Every GFX1013 MUBUF opcode must decode with exact width, scanner recognition, and 8-byte alignment."""
+        from disasm_rdna2 import MUBUF_OPS
+
+        self.assertEqual(len(MUBUF_OPS), 72)
+        for op, (expected_name, width, _) in MUBUF_OPS.items():
+            with self.subTest(op=op, name=expected_name):
+                w0 = 0xe0000000 | (op << 18)
+                w1 = 0 if width == 0 else ((3 << 24) | (2 << 16) | (8 << 8))
+                raw = struct.pack("<2I", w0, w1)
+                insns = disasm_rdna2(raw)
+                self.assertEqual(len(insns), 1)
+                self.assertEqual(insns[0]["opcode"], expected_name)
+                self.assertEqual(insns[0]["length"], 8)
+                if width == 0:
+                    self.assertEqual(insns[0]["assembly"], expected_name)
+                else:
+                    vdata = "v8" if width == 1 else f"v[8:{8 + width - 1}]"
+                    self.assertEqual(insns[0]["assembly"], f"{expected_name} {vdata}, off, s[8:11], s3")
+                self.assertTrue(is_opcode_recognized(expected_name))
+                self.assertEqual(classify_isa_category(expected_name), "VMEM (Vector Memory / Buffer)")
+
+        # Truncated MUBUF header reports mubuf_truncated instead of crashing or misdecoding.
+        trunc = disasm_rdna2(struct.pack("<I", 0xe0300000))
+        self.assertEqual(len(trunc), 1)
+        self.assertEqual(trunc[0]["opcode"], "mubuf_truncated")
+        self.assertIn("<truncated>", trunc[0]["assembly"])
+
+        # Unknown MUBUF opcodes keep 8-byte alignment so subsequent instructions decode cleanly.
+        stream = struct.pack("<3I", 0xe0000000 | (0x10 << 18), (3 << 24) | (2 << 16) | (8 << 8), 0xbf810000)
+        decoded = disasm_rdna2(stream)
+        self.assertEqual([(r["opcode"], r["length"]) for r in decoded], [("buffer_mubuf_10", 8), ("s_endpgm", 4)])
+
+    def test_mtbuf_opcode_table_synthetic_forms(self):
+        """Every GFX1013 MTBUF opcode and format identifier must decode accurately and stay aligned."""
+        from disasm_rdna2 import MTBUF_FORMATS, MTBUF_OPS
+
+        self.assertEqual(len(MTBUF_OPS), 16)
+        for op, (expected_name, width, _) in MTBUF_OPS.items():
+            with self.subTest(op=op, name=expected_name):
+                op_lo = op & 0x7
+                op_hi = (op >> 3) & 1
+                w0 = 0xe8000000 | (22 << 19) | (op_lo << 16)
+                w1 = (3 << 24) | (op_hi << 21) | (2 << 16) | (8 << 8)
+                insns = disasm_rdna2(struct.pack("<2I", w0, w1))
+                self.assertEqual(len(insns), 1)
+                self.assertEqual(insns[0]["opcode"], expected_name)
+                self.assertEqual(insns[0]["length"], 8)
+                vdata = "v8" if width == 1 else f"v[8:{8 + width - 1}]"
+                self.assertEqual(
+                    insns[0]["assembly"],
+                    f"{expected_name} {vdata}, off, s[8:11], s3 format:[BUF_FMT_32_FLOAT]",
+                )
+                self.assertTrue(is_opcode_recognized(expected_name))
+                self.assertEqual(classify_isa_category(expected_name), "VMEM (Vector Memory / Buffer)")
+
+        # Format 1 is LLVM's omitted default; named formats print in brackets; >=78 print numerically.
+        for fmt, expected_suffix in [
+            (0, " format:[BUF_FMT_INVALID]"),
+            (1, ""),
+            *[(code, f" format:[{name}]") for code, name in MTBUF_FORMATS.items() if code != 0],
+            (78, " format:78"),
+            (127, " format:127"),
+        ]:
+            w0 = 0xe8000000 | (fmt << 19)
+            w1 = (3 << 24) | (2 << 16) | (5 << 8)
+            asm = disasm_rdna2(struct.pack("<2I", w0, w1))[0]["assembly"]
+            self.assertEqual(asm, f"tbuffer_load_format_x v5, off, s[8:11], s3{expected_suffix}")
+
+        # Truncated MTBUF reports mtbuf_truncated and full instructions keep stream alignment.
+        trunc = disasm_rdna2(struct.pack("<I", 0xe8b00000))
+        self.assertEqual(len(trunc), 1)
+        self.assertEqual(trunc[0]["opcode"], "mtbuf_truncated")
+        self.assertIn("<truncated>", trunc[0]["assembly"])
+
+        aligned = disasm_rdna2(struct.pack("<3I", 0xe8b00000, (3 << 24) | (2 << 16) | (5 << 8), 0xbf810000))
+        self.assertEqual([(r["opcode"], r["length"]) for r in aligned], [("tbuffer_load_format_x", 8), ("s_endpgm", 4)])
+
+    def test_mubuf_mtbuf_distinguishes_modifiers(self):
+        """Buffer addressing, cache, LDS, TFE, and format modifiers must produce distinct disassembly."""
+        base_w0 = 0xe0000000 | (0x0c << 18)  # buffer_load_dword
+        base_w1 = (3 << 24) | (2 << 16) | (5 << 8) | 1
+        variants = {
+            "base": disasm_rdna2(struct.pack("<2I", base_w0, base_w1))[0]["assembly"],
+            "offen": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 12), base_w1))[0]["assembly"],
+            "idxen": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 13), base_w1))[0]["assembly"],
+            "idxen+offen": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 12) | (1 << 13), base_w1))[0]["assembly"],
+            "offset": disasm_rdna2(struct.pack("<2I", base_w0 | 64, base_w1))[0]["assembly"],
+            "glc": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 14), base_w1))[0]["assembly"],
+            "slc": disasm_rdna2(struct.pack("<2I", base_w0, base_w1 | (1 << 22)))[0]["assembly"],
+            "dlc": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 15), base_w1))[0]["assembly"],
+            "lds": disasm_rdna2(struct.pack("<2I", base_w0 | (1 << 16), base_w1))[0]["assembly"],
+            "tfe": disasm_rdna2(struct.pack("<2I", base_w0, base_w1 | (1 << 23)))[0]["assembly"],
+            "soffset_m0": disasm_rdna2(struct.pack("<2I", base_w0, (124 << 24) | (2 << 16) | (5 << 8) | 1))[0]["assembly"],
+        }
+        self.assertEqual(len(set(variants.values())), len(variants))
+        self.assertEqual(variants["idxen+offen"], "buffer_load_dword v5, v[1:2], s[8:11], s3 idxen offen")
+        self.assertEqual(variants["lds"], "buffer_load_dword off, s[8:11], s3 lds")
+        self.assertEqual(variants["tfe"], "buffer_load_dword v5, off, s[8:11], s3 tfe")
+        self.assertEqual(variants["soffset_m0"], "buffer_load_dword v5, off, s[8:11], m0")
+
+        # Atomics suppress tfe, matching LLVM AMDGPU disassembly.
+        atomic_asm = disasm_rdna2(struct.pack("<2I", 0xe0000000 | (0x32 << 18), base_w1 | (1 << 23)))[0]["assembly"]
+        self.assertEqual(atomic_asm, "buffer_atomic_add v5, off, s[8:11], s3")
+
+        # Trap-handler temporary buffer descriptors (srsrc idx 27..30 -> ttmp[0:3]..ttmp[12:15]).
+        for srsrc_idx, t in ((27, 0), (28, 4), (29, 8), (30, 12)):
+            ttmp_w1 = (3 << 24) | (srsrc_idx << 16) | (5 << 8)
+            ttmp_asm = disasm_rdna2(struct.pack("<2I", base_w0, ttmp_w1))[0]["assembly"]
+            self.assertEqual(ttmp_asm, f"buffer_load_dword v5, off, ttmp[{t}:{t + 3}], s3")
+
     def test_cli_hex_entry_point(self):
         script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
         res = subprocess.run(
@@ -574,6 +720,22 @@ class TestRdna2Disasm(unittest.TestCase):
             "v_cmp_lt_f32_e32 vcc_lo, v1, v2",
             "v_cmp_eq_u32_e32 vcc_lo, s1, v2",
             "v_cmpx_gt_i32_e32 v1, v2",
+            "buffer_load_dword v5, off, s[8:11], s3",
+            "buffer_load_dword v5, v[0:1], s[8:11], 0 idxen offen offset:4095 glc slc dlc",
+            "buffer_load_dword off, s[8:11], s3 lds",
+            "buffer_load_dword v5, off, s[8:11], null tfe",
+            "buffer_load_dword v5, off, ttmp[0:3], s3",
+            "buffer_load_format_d16_xyzw v[5:6], off, s[8:11], 0",
+            "buffer_store_dwordx4 v[0:3], v4, s[8:11], 0 offen",
+            "buffer_atomic_add v5, v0, s[8:11], s3 offen glc",
+            "buffer_atomic_cmpswap_x2 v[5:8], v0, s[8:11], 0 offen glc",
+            "buffer_gl0_inv",
+            "buffer_gl1_inv",
+            "tbuffer_load_format_x v5, off, s[8:11], s3 format:[BUF_FMT_32_FLOAT]",
+            "tbuffer_load_format_xyzw v[5:8], v0, s[8:11], s3 format:[BUF_FMT_32_32_32_32_FLOAT] offen offset:64 glc slc dlc",
+            "tbuffer_store_format_d16_xy v5, v[0:1], s[8:11], 0 format:[BUF_FMT_16_16_FLOAT] idxen offen",
+            "tbuffer_load_format_x v5, off, s[8:11], s3",
+            "tbuffer_load_format_x v5, off, s[8:11], s3 format:127",
             "s_endpgm",
         ]
 
@@ -628,7 +790,7 @@ class TestRdna2Disasm(unittest.TestCase):
                 rdna2_op, llvm_op,
                 f"Instruction {i}: disasm_rdna2 opcode '{rdna2_op}' does not match LLVM opcode '{llvm_op}'"
             )
-            if orig_op.startswith(("v_", "exp", "image_")):
+            if orig_op.startswith(("v_", "exp", "image_", "buffer_", "tbuffer_")):
                 self.assertEqual(
                     " ".join(rdna2_rec["assembly"].lower().split()),
                     " ".join(llvm_line.lower().split()),
@@ -1051,6 +1213,15 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertTrue(is_instruction_supported(line), line)
         self.assertFalse(is_instruction_supported("s_mulk_i32 v50, 0x3"))
 
+    def test_literal_mad_forms_take_four_operands(self):
+        """v_madak_f32 and v_madmk_f32 are supported with four operands; e64 and a missing operand are not."""
+        for line in ("v_madak_f32 v5, v1, v2, 0x11213141", "v_madmk_f32 v5, v1, 0x11213141, v3"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_madak_f32_e64 v5, v1, v2, 0x11213141", "v_madmk_f32 v5, v1, 0x11213141",
+                     "v_madak_f32_dpp v5, v1, v2, 0x11213141 quad_perm:[0,1,2,3]",
+                     "v_madak_f32 v5, v1, v2, v3", "v_madmk_f32 v5, v1, v2, v3"):
+            self.assertFalse(is_instruction_supported(line), line)
+
     def test_float_to_word_conversions_are_plain_e32_only(self):
         """v_cvt_u32_f32 and v_cvt_i32_f32 are supported as e32 with a register or hex literal source."""
         for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
@@ -1320,7 +1491,26 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertFalse(is_instruction_supported("v_nop v0"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e32 v1, v2, v3"))
         self.assertTrue(is_instruction_supported("v_subrev_f32_e64 v1, v2, v3 clamp"))
-        self.assertTrue(is_instruction_supported("v_subrev_nc_u32_e32 v1, v2, v3"))
+        # The 32-bit no-carry family. The INTEGER_SOURCE class is coarser than the translator, so this
+        # pins the spellings and the refused modifiers, not the operand ranges.
+        for line in (
+            "v_add_nc_u32_e32 v1, v2, v3", "v_sub_nc_u32 v1, s2, 64", "v_subrev_nc_u32_e32 v1, v2, v3",
+            "v_add_nc_u32_e64 v1, s2, v3", "v_sub_nc_u32_e64 v1, s2, 64", "v_subrev_nc_u32_e64 v1, v2, s3",
+            "v_add_nc_i32 v1, s2, v3", "v_sub_nc_i32 v1, 64, v3",
+        ):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in (
+            "v_add_nc_u32_e64 v1, s2, v3 clamp", "v_subrev_nc_u32_e64 v1, s2, v3 clamp",
+            "v_add_nc_i32 v1, s2, v3 clamp", "v_sub_nc_i32 v1, s2, v3 clamp",
+            "v_add_nc_i32_e64 v1, s2, v3", "v_sub_nc_i32_e64 v1, s2, v3",
+            "v_subrev_nc_i32 v1, s2, v3",
+            "v_subrev_nc_u32_dpp v1, v2, v3 row_shl:1 row_mask:0xf bank_mask:0xf",
+            "v_subrev_nc_u32_sdwa v1, v2, v3 src0_sel:DWORD src1_sel:DWORD",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_add_nc_i32", "v_sub_nc_i32", "v_subrev_nc_u32_e64"):
+            self.assertTrue(is_opcode_recognized(opcode), opcode)
+        self.assertFalse(is_opcode_recognized("v_subrev_nc_i32"))
         self.assertTrue(is_opcode_recognized("v_mov_b32_sdwa"))
         self.assertTrue(is_opcode_recognized("v_cvt_f32_f16_sdwa"))
         self.assertTrue(is_opcode_recognized("v_pk_add_f16"))
@@ -1332,6 +1522,10 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_instruction_supported("s_nand_b32 s1, s2, s3"))
         self.assertTrue(is_instruction_supported("s_nor_b32 s1, s2, s3"))
         self.assertTrue(is_instruction_supported("s_xnor_b32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl1_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl2_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl3_add_u32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_lshl4_add_u32 s1, s2, s3"))
         self.assertTrue(is_instruction_supported("s_bfm_b32 s1, s2, s3"))
         self.assertTrue(is_instruction_supported("s_bfm_b32 s1, 4, 8"))
         for unsupported in ("v_cvt_f32_i32 v1, v2",
