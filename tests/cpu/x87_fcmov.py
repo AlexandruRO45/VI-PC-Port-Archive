@@ -9,9 +9,9 @@ Usage:
 The exports, harness and guards follow tests/cpu/x87_add.py, and the other steps use the format of
 tests/cpu/x87_moves.py. emit checks that every decoded x87 instruction is the form its sequence names.
 The flags come from an integer CMP of two input dwords or from FCOMI; the model evaluates each condition
-itself and copies raw encodings, independent of tools/x87_soft.h. Two native-only exports (ENTRY) move
-before any flag writer: they run through x87_call_flags under each caller CF and ZF, and translation must
-reject them.
+itself and copies raw encodings, independent of tools/x87_soft.h. Seven native-only exports (ENTRY) move
+on the caller's CF or ZF, directly or through ADC, SBB, RCL or CMC: they run through x87_call_flags under
+each caller CF and ZF, and translation must reject each of them.
 """
 from pathlib import Path
 import platform
@@ -50,16 +50,35 @@ SEQUENCES = {
                                                                   ("fstp", "m80", 0), ("fstp", "m80", 16),
                                                                   ("fstp", "m80", 32)]),
     "fcmove_st0": ("pairint", P2 + [CMP, ("fcmove", 0)] + OUT2),
+    # Readers of the CF that CMP defines, ahead of the move: ADC and SBB set ZF from it, CMC inverts it, and
+    # RCL carries it through EAX to the ZF of TEST.
+    "fcmove_adc": ("pairint", P2 + [CMP, ("mov_eax", 0xFFFFFFFF), ("adc_eax0",), ("fcmove", 1)] + OUT2),
+    "fcmove_sbb": ("pairint", P2 + [CMP, ("mov_eax", 0), ("sbb_eax0",), ("fcmove", 1)] + OUT2),
+    "fcmovb_cmc": ("pairint", P2 + [CMP, ("cmc",), ("fcmovb", 1)] + OUT2),
+    "fcmovne_rcl": ("pairint", P2 + [CMP, ("mov_eax", 0), ("rcl_eax1",), ("test_eax",), ("fcmovne", 1)] + OUT2),
     # The deepest operand: ST(7) at depth 8, stored back as m64.
     "fcmovnb_st7": ("m64x8int", [("fld", "m64", 8 * k) for k in range(8)] + [CMP, ("fcmovnb", 7)]
                     + [("fstp", "m64", 8 * k) for k in range(8)]),
 }
-# Native only: no instruction writes the flags before the move, so it reads the caller's CF or ZF. The
-# lowered function has no such input, and translation must reject both.
+# Native only: the move depends on the caller's CF or ZF, directly or through an integer instruction that
+# reads the caller's CF. The lowered function has no such input, and translation must reject each export.
+# The value is the export's undefined flag and the first instruction that reads it.
 ENTRY = {
     "fcmovb_entry": ("pair80", P2 + [("fcmovb", 1)] + OUT2),
     "fcmove_entry": ("pair80", P2 + [("fcmove", 1)] + OUT2),
+    # ZF of ADC and SBB: FFFFFFFFh + 0 + CF is zero only for CF = 1, and 0 - 0 - CF only for CF = 0.
+    "adc_entry": ("pair80", P2 + [("mov_eax", 0xFFFFFFFF), ("adc_eax0",), ("fcmove", 1)] + OUT2),
+    "sbb_entry": ("pair80", P2 + [("mov_eax", 0), ("sbb_eax0",), ("fcmove", 1)] + OUT2),
+    # The caller's CF in EAX, from ADC or RCL, then a defined ZF from TEST.
+    "adc_test_entry": ("pair80", P2 + [("mov_eax", 0), ("adc_eax0",), ("test_eax",), ("fcmovne", 1)] + OUT2),
+    "rcl_test_entry": ("pair80", P2 + [("mov_eax", 0), ("rcl_eax1",), ("test_eax",), ("fcmovne", 1)] + OUT2),
+    # CMC inverts the caller's CF.
+    "cmc_entry": ("pair80", P2 + [("cmc",), ("fcmovb", 1)] + OUT2),
 }
+ENTRY_READER = {"fcmovb_entry": ("CF", "fcmovb"), "fcmove_entry": ("ZF", "fcmove"), "adc_entry": ("CF", "adc"),
+                "sbb_entry": ("CF", "sbb"), "adc_test_entry": ("CF", "adc"), "rcl_test_entry": ("CF", "rcl"),
+                "cmc_entry": ("CF", "cmc")}
+INTEGER_STEPS = {"cmp", "mov_eax", "adc_eax0", "sbb_eax0", "rcl_eax1", "test_eax", "cmc"}
 STEPS = {**SEQUENCES, **ENTRY}
 
 MOVE = r"x87_slot\[(\d)\] = x87_slot\[(\d)\];  // (fcmov\w*) "
@@ -77,6 +96,10 @@ CONTROLS = {
     # The copy quiets a signaling NaN.
     "quiet": (re.compile(MOVE),
               r"x87_slot[\1] = x87_is_nan(x87_slot[\2]) ? x87_quiet(x87_slot[\2]) : x87_slot[\2];  // \3 "),
+    # CMC is dropped, so fcmovb_cmc moves on the CF of CMP.
+    "cmcdrop": (re.compile(r"carry = !carry;"), ";"),
+    # ADC and SBB ignore the incoming CF, so the ZF of fcmove_adc and fcmove_sbb no longer follows it.
+    "nocarryin": (re.compile(r" [+-] word\(carry\)\)"), ")"),
 }
 
 
@@ -86,6 +109,16 @@ def asm_line(step):
     op, *args = step
     if op == "cmp":
         return "    mov eax, dword ptr [rcx+48]\n    cmp eax, dword ptr [rcx+52]"
+    if op == "mov_eax":
+        return f"    mov eax, 0{args[0]:X}h"
+    if op in ("adc_eax0", "sbb_eax0"):
+        return f"    {op[:3]} eax, 0"
+    if op == "rcl_eax1":
+        return "    rcl eax, 1"
+    if op == "test_eax":
+        return "    test eax, eax"
+    if op == "cmc":
+        return "    cmc"
     if op in FCMOV:
         return f"    {op} st, st({args[0]})"
     if op == "fcomi":
@@ -135,7 +168,7 @@ def emit(image, output, control="lifted"):
             (bounds,) = function_ranges(pe, export_rva(pe, name))
             body = region(pe, *bounds)
             decoded = [decoded_form(i) for i in body if is_x87(i)]
-            wanted = [expected_form(s) for s in steps if s[0] != "cmp"]
+            wanted = [expected_form(s) for s in steps if s[0] not in INTEGER_STEPS]
             if decoded != wanted:
                 raise AssertionError(f"{name} assembled as {decoded}, expected {wanted}")
             code = lower(body, ["rcx = a; rdx = b;"], {}, {}, {}, x87=True)
@@ -157,6 +190,7 @@ def reference(name, data, moves=True, flags=None):
     flags gives the caller's (ZF, CF) for the ENTRY exports."""
     slots, out = [], bytearray(b"\xcc" * OUTPUT)
     zero, carry = flags if flags is not None else (None, None)
+    eax = None
 
     def read(kind, offset):
         return int.from_bytes(data[offset:offset + SIZE[kind]], "little")
@@ -165,6 +199,21 @@ def reference(name, data, moves=True, flags=None):
         if op == "cmp":
             a, b = read("m32", 48), read("m32", 52)
             zero, carry = a == b, a < b
+        elif op == "mov_eax":
+            eax = args[0]
+        elif op == "adc_eax0":
+            total = eax + carry
+            eax, carry = total & 0xFFFFFFFF, total > 0xFFFFFFFF
+            zero = eax == 0
+        elif op == "sbb_eax0":
+            carry, eax = eax < carry, (eax - carry) & 0xFFFFFFFF
+            zero = eax == 0
+        elif op == "rcl_eax1":  # ZF is unchanged
+            eax, carry = (eax << 1 | carry) & 0xFFFFFFFF, bool(eax >> 31)
+        elif op == "test_eax":
+            zero, carry = eax == 0, False
+        elif op == "cmc":
+            carry = not carry
         elif op == "fcomi":
             r = compare.compare(slots[-1], slots[-1 - args[0]])  # 0 less, 1 equal, 2 greater, 3 unordered
             zero, carry = r in (1, 3), r in (0, 3)
@@ -301,18 +350,19 @@ def check_entry_flags(harness_path, native_path):
             if len(outputs) != 2:
                 raise AssertionError(f"native {name} did not depend on the caller's flags")
     with pefile.PE(str(native_path), fast_load=True) as pe:
-        for name, flag in (("fcmovb_entry", "CF"), ("fcmove_entry", "ZF")):
+        for name, (flag, reader) in ENTRY_READER.items():
             (bounds,) = function_ranges(pe, export_rva(pe, name))
             try:
                 lower(region(pe, *bounds), ["rcx = a; rdx = b;"], {}, {}, {}, x87=True)
             except ValueError as exc:
-                if f"reads {flag}, which no instruction defines" not in str(exc):
+                if not str(exc).startswith(reader) or f"reads {flag}, which no instruction defines" not in str(exc):
                     raise
             else:
                 raise AssertionError(f"translation accepted {name}, which reads the caller's {flag}")
-    print(f"native fcmovb_entry and fcmove_entry moved as the caller's CF and ZF (set by SAHF before the call) "
-          f"select in all {runs} runs over {len(blocks)} value pairs and the four flag pairs; translation rejects "
-          "both: the flag each reads is not defined on every path from the entry")
+    print(f"native {', '.join(ENTRY)} followed the caller's CF or ZF (set by SAHF before the call) in all {runs} "
+          f"runs over {len(blocks)} value pairs and the four flag pairs; translation rejects each at its first "
+          "reader of the flag, which no instruction defines on every path from the entry: "
+          + "; ".join(f"{name} at {reader} ({flag})" for name, (flag, reader) in ENTRY_READER.items()))
 
 
 def check_rejections():
@@ -348,6 +398,11 @@ def check_rejections():
         "fcmovb after shl eax, cl with no earlier writer": (attempt(f"{two} d3 e0 da c1 {out}"),
                                                             "reads CF, " + undefined),
         "fcmovb after shl ax, 16": (attempt(f"{two} 66 c1 e0 10 da c1 {out}"), "reads CF, " + undefined),
+        # A reader of CF that no instruction defines, in a function with a move whose own flags are defined.
+        "cmc before a cmp and fcmovb": (attempt(f"{two} f5 {cmp} da c1 {out}"), "reads CF, " + undefined),
+        # The rule covers every status flag. The integer lowering would also reject SETO, but the flag rule
+        # comes first.
+        "seto before a cmp and fcmovb": (attempt(f"{two} 0f 90 c0 {cmp} da c1 {out}"), "reads OF, " + undefined),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:
@@ -358,6 +413,12 @@ def check_rejections():
         "fcmove after a join where both paths write ZF": attempt(f"{two} {cmp} e3 06 {cmp} da c9 {out}"),
         "fcmove after xor eax, eax": attempt(f"{two} 31 c0 da c9 {out}"),
         "fcmovnbe after fcomi": attempt(f"{two} db f1 db d1 {out}"),
+        # A reader of CF after an explicit producer: CLC before ADC, STC before SBB, CMP before CMC, and CLC
+        # before RCL and TEST.
+        "fcmove after clc and adc": attempt(f"{two} b8 ff ff ff ff f8 83 d0 00 da c9 {out}"),
+        "fcmove after stc and sbb": attempt(f"{two} 31 c0 f9 83 d8 00 da c9 {out}"),
+        "fcmovb after cmp and cmc": attempt(f"{two} {cmp} f5 da c1 {out}"),
+        "fcmovne after clc, rcl and test": attempt(f"{two} 31 c0 f8 d1 d0 85 c0 db c9 {out}"),
     }
     for case, message in accepted.items():
         if message is not None:

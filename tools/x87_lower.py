@@ -9,9 +9,10 @@ The profile accepts:
 - FCOMI, FCOMIP, FUCOMI and FUCOMIP ST(0), ST(i), which set ZF and CF for the integer lowering (PF is
   not modelled, and the integer lowering rejects every instruction that reads it);
 - FCMOVB, FCMOVE, FCMOVBE, FCMOVNB, FCMOVNE and FCMOVNBE ST(0), ST(i), which read ZF and CF (FCMOVU
-  and FCMOVNU read PF and stay outside the profile). Each flag a move reads must be written by an earlier
-  instruction on every path from the entry: the caller's flags are not an input of the lowered function,
-  and a call leaves them undefined;
+  and FCMOVNU read PF and stay outside the profile). In a function with a move, each status flag that any
+  instruction reads must be written by an earlier instruction on every path from the entry: the caller's
+  flags are not an input of the lowered function, a call leaves them undefined, and ADC, SBB, RCL, RCR
+  and CMC carry an undefined CF on into the flags and registers they write;
 - FADD, FSUB, FSUBR, FMUL, FDIV and FDIVR with an m32 or m64 operand, with ST(0), ST(i) and with
   ST(i), ST(0), and their popping forms FADDP, FSUBP, FSUBRP, FMULP, FDIVP and FDIVRP ST(i), ST(0) for
   i from 1 to 7.
@@ -20,7 +21,7 @@ must return with the stack empty. The stack depth before every instruction is fi
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
 instruction outside the profile (including control-word and status-word access, a popping form with
 ST(0) as the destination, and the undocumented FSTP and FXCH alias encodings), a stack overflow or
-underflow, a depth that differs where control flow joins, an x87 instruction it cannot reach from the entry through direct edges, a conditional move that reads an undefined flag, and x87 state that is
+underflow, a depth that differs where control flow joins, an x87 instruction it cannot reach from the entry through direct edges, an undefined flag read in a function with a conditional move, and x87 state that is
 live at a call, a return, an indirect branch or an external edge. The helpers are in tools/x87_soft.h,
 which the generated source must include before the lowered functions (X87_HEADER).
 """
@@ -196,20 +197,26 @@ def depths(body, exits):
     for i in body:
         if i.ip not in depth and is_x87(i):
             raise ValueError(f"unknown x87 stack depth at {i.ip:#x}: {i}")
-    moves = [i for i in body if i.mnemonic in FCMOV]
-    if moves:
+    if any(i.mnemonic in FCMOV for i in body):
+        # Every reader counts, not only the moves: ADC, SBB, RCL, RCR and CMC pass an undefined CF on into
+        # the flags and registers they write, and a later writer of ZF or CF can carry it to a move. The
+        # same holds for a reader of any other status flag (SETO into a register, then TEST).
         defined = defined_flags(body)
-        for i in moves:
-            missing = i.rflags_read & ZF_CF & ~defined[i.ip]
+        for i in body:
+            if i.ip not in defined:
+                continue  # not reachable from the entry
+            missing = i.rflags_read & STATUS_FLAGS & ~defined[i.ip]
             if missing:
-                names = " and ".join(name for name, bit in (("ZF", F.ZF), ("CF", F.CF)) if missing & bit)
+                names = " and ".join(name for name, bit in FLAG_NAMES if missing & bit)
                 raise ValueError(f"{i} at {i.ip:#x} reads {names}, which no instruction defines on every path "
                                  "from the entry")
     return depth
 
 
-# The flags the integer lowering models and FCMOV reads.
-ZF_CF = F.ZF | F.CF
+# The six status flags. FCMOV reads ZF and CF; DF is not tracked, because the Windows x64 calling
+# convention clears it at every call and return.
+FLAG_NAMES = (("CF", F.CF), ("PF", F.PF), ("AF", F.AF), ("ZF", F.ZF), ("SF", F.SF), ("OF", F.OF))
+STATUS_FLAGS = F.CF | F.PF | F.AF | F.ZF | F.SF | F.OF
 # Shifts and rotates leave the flags unchanged when the masked count is 0 (an immediate 0 already writes
 # no flags in iced).
 SHIFTS = frozenset({M.SHL, M.SAL, M.SHR, M.SAR, M.ROL, M.ROR, M.RCL, M.RCR, M.SHLD, M.SHRD})
@@ -220,11 +227,11 @@ def _width(i):
 
 
 def _flags_after(i, before):
-    """ZF and CF (as RflagsBits) defined after i, given those defined before it."""
+    """The status flags (as RflagsBits) defined after i, given those defined before it."""
     if i.flow_control in (FlowControl.CALL, FlowControl.INDIRECT_CALL):
         return 0  # the callee may leave any flags
-    undefined = i.rflags_undefined & ZF_CF
-    defines = (i.rflags_written | i.rflags_set | i.rflags_cleared) & ZF_CF & ~undefined
+    undefined = i.rflags_undefined & STATUS_FLAGS
+    defines = (i.rflags_written | i.rflags_set | i.rflags_cleared) & STATUS_FLAGS & ~undefined
     if i.mnemonic in SHIFTS and defines:
         count = i.op2_kind if i.mnemonic in (M.SHLD, M.SHRD) else i.op1_kind
         width = _width(i)
@@ -246,9 +253,9 @@ def _flags_after(i, before):
 
 
 def defined_flags(body):
-    """The ZF and CF bits defined on entry to each reachable instruction of body: those that an earlier
-    instruction writes on every path from body[0]. The integer lowering starts both as false, which is not
-    what a native caller passes in, so a reader of an undefined flag would see that initializer."""
+    """The status flags defined on entry to each reachable instruction of body: those that an earlier
+    instruction writes on every path from body[0]. The integer lowering starts its flags as false, which is
+    not what a native caller passes in, so a reader of an undefined flag would see that initializer."""
     index = {i.ip: i for i in body}
     defined = {body[0].ip: 0}
     work = [body[0].ip]

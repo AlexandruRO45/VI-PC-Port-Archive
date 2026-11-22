@@ -10,6 +10,15 @@ EXPORTS
     fcomi_min
     fcmovne_fcmove
     fcmove_st0
+    fcmove_adc
+    fcmove_sbb
+    fcmovb_cmc
+    fcmovne_rcl
     fcmovnb_st7
     fcmovb_entry
     fcmove_entry
+    adc_entry
+    sbb_entry
+    adc_test_entry
+    rcl_test_entry
+    cmc_entry

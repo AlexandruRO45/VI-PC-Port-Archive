@@ -1083,9 +1083,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_scale>"
         "$<TARGET_FILE:cpu_x87_scale_lifted>" ${x87_scale_control_files})
     cpu_asm_fixture(cpu_x87_fcmov x87_fcmov)
-    # The lifted DLL and six mutated controls that the check requires to mismatch.
+    # The lifted DLL and eight mutated controls that the check requires to mismatch.
     set(x87_fcmov_control_files "")
-    foreach(variant IN ITEMS lifted invert beonly nbeor neverne always quiet)
+    foreach(variant IN ITEMS lifted invert beonly nbeor neverne always quiet cmcdrop nocarryin)
         set(x87_fcmov_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_fcmov_${variant}.cpp")
         add_custom_command(OUTPUT "${x87_fcmov_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fcmov.py"

@@ -140,6 +140,62 @@ fcmove_st0 PROC FRAME
     ret
 fcmove_st0 ENDP
 
+fcmove_adc PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    mov eax, dword ptr [rcx+48]
+    cmp eax, dword ptr [rcx+52]
+    mov eax, 0FFFFFFFFh
+    adc eax, 0
+    fcmove st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+fcmove_adc ENDP
+
+fcmove_sbb PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    mov eax, dword ptr [rcx+48]
+    cmp eax, dword ptr [rcx+52]
+    mov eax, 00h
+    sbb eax, 0
+    fcmove st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+fcmove_sbb ENDP
+
+fcmovb_cmc PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    mov eax, dword ptr [rcx+48]
+    cmp eax, dword ptr [rcx+52]
+    cmc
+    fcmovb st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+fcmovb_cmc ENDP
+
+fcmovne_rcl PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    mov eax, dword ptr [rcx+48]
+    cmp eax, dword ptr [rcx+52]
+    mov eax, 00h
+    rcl eax, 1
+    test eax, eax
+    fcmovne st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+fcmovne_rcl ENDP
+
 fcmovnb_st7 PROC FRAME
     .endprolog
     fld qword ptr [rcx+0]
@@ -183,5 +239,66 @@ fcmove_entry PROC FRAME
     fstp tbyte ptr [rdx+16]
     ret
 fcmove_entry ENDP
+
+adc_entry PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    mov eax, 0FFFFFFFFh
+    adc eax, 0
+    fcmove st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+adc_entry ENDP
+
+sbb_entry PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    mov eax, 00h
+    sbb eax, 0
+    fcmove st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+sbb_entry ENDP
+
+adc_test_entry PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    mov eax, 00h
+    adc eax, 0
+    test eax, eax
+    fcmovne st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+adc_test_entry ENDP
+
+rcl_test_entry PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    mov eax, 00h
+    rcl eax, 1
+    test eax, eax
+    fcmovne st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+rcl_test_entry ENDP
+
+cmc_entry PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx+16]
+    fld tbyte ptr [rcx+0]
+    cmc
+    fcmovb st, st(1)
+    fstp tbyte ptr [rdx+0]
+    fstp tbyte ptr [rdx+16]
+    ret
+cmc_entry ENDP
 
 END
