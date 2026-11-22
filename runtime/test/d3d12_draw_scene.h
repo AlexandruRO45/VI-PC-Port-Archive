@@ -2,8 +2,10 @@
 // committed resources, the pipeline-state stream of the two test shaders, and a fence wait.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <vector>
 
 #include "d3d12_com.h"
@@ -82,8 +84,10 @@ inline void add(std::vector<std::uint8_t>& stream, D3D12_PIPELINE_STATE_SUBOBJEC
     std::memcpy(stream.data() + start + 8, &payload, sizeof(T));
 }
 
-// A graphics pipeline for the two test shaders: one R32G32_FLOAT attribute, no culling, one RGBA8 target.
-inline HRESULT create_pipeline(ID3D12Device* device, DXGI_FORMAT color_format, ID3D12PipelineState** out) {
+// A graphics pipeline for the two test shaders: one R32G32_FLOAT attribute, no culling, one attachment per colour
+// format in `color_formats` (up to eight).
+inline HRESULT create_pipeline(ID3D12Device* device, std::span<const DXGI_FORMAT> color_formats,
+                               ID3D12PipelineState** out) {
     D3D12_SHADER_BYTECODE vs{first_draw::triangle_vert_spv, sizeof(first_draw::triangle_vert_spv)};
     D3D12_SHADER_BYTECODE ps{first_draw::triangle_frag_spv, sizeof(first_draw::triangle_frag_spv)};
     D3D12_INPUT_ELEMENT_DESC element{"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
@@ -96,8 +100,8 @@ inline HRESULT create_pipeline(ID3D12Device* device, DXGI_FORMAT color_format, I
     raster.FillMode = D3D12_FILL_MODE_SOLID;
     raster.CullMode = D3D12_CULL_MODE_NONE;
     D3D12_RT_FORMAT_ARRAY formats{};
-    formats.NumRenderTargets = 1;
-    formats.RTFormats[0] = color_format;
+    formats.NumRenderTargets = std::uint32_t(std::min<std::size_t>(color_formats.size(), 8));
+    for (std::uint32_t i = 0; i < formats.NumRenderTargets; ++i) formats.RTFormats[i] = color_formats[i];
 
     std::vector<std::uint8_t> stream;
     add(stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, vs);
@@ -118,6 +122,10 @@ inline HRESULT create_pipeline(ID3D12Device* device, DXGI_FORMAT color_format, I
     Ref<ID3D12Device2> device2;
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(device2.out())))) return E_NOINTERFACE;
     return device2->CreatePipelineState(&desc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(out));
+}
+
+inline HRESULT create_pipeline(ID3D12Device* device, DXGI_FORMAT color_format, ID3D12PipelineState** out) {
+    return create_pipeline(device, std::span<const DXGI_FORMAT>(&color_format, 1), out);
 }
 
 // Blocks until the queue has reached `value` on `fence`, the way a frame does before it touches what the GPU wrote.

@@ -365,8 +365,19 @@ if(Vulkan_FOUND)
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
+    # DXGI's factory/swapchain objects: same generator, a different SDK header pair.
+    set(LEONIDA_DXGI_STUBS ${CMAKE_CURRENT_BINARY_DIR}/generated/dxgi_stubs.h)
+    add_custom_command(
+      OUTPUT ${LEONIDA_DXGI_STUBS}
+      COMMAND Python3::Interpreter -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_DXGI_STUBS}
+              --header dxgi.h --header dxgi1_2.h --include dxgi.h --include dxgi1_2.h
+              IDXGIAdapter1 IDXGIFactory2 IDXGISwapChain1
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
+      COMMENT "Generating DXGI COM stubs"
+      VERBATIM)
     add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp
-                ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
+                shims/wsi_presenter.cpp shims/dxgi.cpp shims/d3d12_present.cpp ${LEONIDA_STUBS}
+                ${LEONIDA_DXGI_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -474,13 +485,20 @@ if(Vulkan_FOUND)
   target_compile_definitions(com_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(com_draw_test PRIVATE /W4 /permissive- /utf-8)
   add_test(NAME com_draw COMMAND com_draw_test)
+  # Multiple render targets: a pipeline declaring two formats and one draw writing both attachments.
+  add_executable(mrt_test test/mrt_test.cpp)
+  target_include_directories(mrt_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  target_link_libraries(mrt_test PRIVATE gta6rt_d3d12_com)
+  target_compile_definitions(mrt_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(mrt_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME mrt COMMAND mrt_test)
   # PE loader hello triangle: harness EXE -> shim DLL exports -> Vulkan WSI swapchain window.
   find_program(LEONIDA_LIB_EXE NAMES lib)
   find_library(LEONIDA_VULKAN_LIB NAMES vulkan-1 HINTS "$ENV{VULKAN_SDK}/Lib")
   if(LEONIDA_LIB_EXE)
     set(LEONIDA_SHIMS_DEF ${CMAKE_CURRENT_BINARY_DIR}/leonida_shims.def)
-    file(WRITE ${LEONIDA_SHIMS_DEF} "LIBRARY leonida_shims.dll\nEXPORTS\n  VirtualAlloc=shim_virtual_alloc\n  Sleep=shim_sleep\n  CreateFileW=shim_create_file_w\n  CreateFileA=shim_create_file_a\n  ReadFile=shim_read_file\n  WriteFile=shim_write_file\n  SetFilePointerEx=shim_set_file_pointer_ex\n  GetFileSizeEx=shim_get_file_size_ex\n  CloseHandle=shim_close_handle\n  CreateThread=shim_create_thread\n  WaitForSingleObject=shim_wait_for_single_object\n  QueryPerformanceCounter=shim_query_performance_counter\n  QueryPerformanceFrequency=shim_query_performance_frequency\n  GetTickCount64=shim_get_tick_count64\n  CreateWindowExW=shim_create_window_ex_w\n  D3D12CreateDevice=shim_d3d12_create_device\n  D3D12CreateRootSignatureDeserializer=shim_d3d12_create_root_signature_deserializer\n  Map=shim_map\n  Unmap=shim_unmap\n  ExecuteCommandLists=shim_execute_command_lists\n  CreateCommittedResource=shim_create_committed_resource\n  LeonidaRunAnimation\n  LeonidaRenderTriangle\n  LeonidaPresentWindow\n")
-    add_library(leonida_shims SHARED test/pe_hello_shims.cpp test/wsi_presenter.cpp shims/registry.cpp)
+    file(WRITE ${LEONIDA_SHIMS_DEF} "LIBRARY leonida_shims.dll\nEXPORTS\n  VirtualAlloc=shim_virtual_alloc\n  Sleep=shim_sleep\n  CreateFileW=shim_create_file_w\n  CreateFileA=shim_create_file_a\n  ReadFile=shim_read_file\n  WriteFile=shim_write_file\n  SetFilePointerEx=shim_set_file_pointer_ex\n  GetFileSizeEx=shim_get_file_size_ex\n  CloseHandle=shim_close_handle\n  CreateThread=shim_create_thread\n  WaitForSingleObject=shim_wait_for_single_object\n  QueryPerformanceCounter=shim_query_performance_counter\n  QueryPerformanceFrequency=shim_query_performance_frequency\n  GetTickCount64=shim_get_tick_count64\n  CreateWindowExW=shim_create_window_ex_w\n  D3D12CreateDevice=shim_d3d12_create_device\n  D3D12CreateRootSignatureDeserializer=shim_d3d12_create_root_signature_deserializer\n  Map=shim_map\n  Unmap=shim_unmap\n  ExecuteCommandLists=shim_execute_command_lists\n  CreateCommittedResource=shim_create_committed_resource\n  CreateDXGIFactory=CreateDXGIFactory\n  CreateDXGIFactory1=CreateDXGIFactory1\n  CreateDXGIFactory2=CreateDXGIFactory2\n  LeonidaRunAnimation\n  LeonidaRenderTriangle\n  LeonidaPresentWindow\n")
+    add_library(leonida_shims SHARED test/pe_hello_shims.cpp test/wsi_animation.cpp shims/registry.cpp)
     target_include_directories(leonida_shims PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                      ${CMAKE_CURRENT_SOURCE_DIR}/shims
                                                      ${CMAKE_CURRENT_SOURCE_DIR}/test)
@@ -495,7 +513,7 @@ if(Vulkan_FOUND)
     # Shared-device WSI (PR C, step 5): a real window showing a frame recorded through the D3D12 COM surface and
     # copied into the swapchain image on the GPU. The presenter builds its surface/swapchain on the renderer's own
     # instance and VkDevice, so it is compiled into the test rather than reached through the shim DLL.
-    add_executable(window_draw_test test/window_draw_test.cpp test/wsi_presenter.cpp)
+    add_executable(window_draw_test test/window_draw_test.cpp)
     target_include_directories(window_draw_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
                                                         ${CMAKE_CURRENT_SOURCE_DIR}/shims
                                                         ${CMAKE_CURRENT_SOURCE_DIR}/test)
@@ -506,6 +524,21 @@ if(Vulkan_FOUND)
     target_compile_definitions(window_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(window_draw_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME window_draw COMMAND window_draw_test)
+
+    # DXGI + PresentX over the same presenter (API compatibility): a window whose frame goes through
+    # CreateDXGIFactory1 -> CreateSwapChainForHwnd -> Present, and through ID3D12CommandQueue::PresentX, with
+    # ResizeBuffers in the middle.
+    add_executable(dxgi_window_test test/dxgi_window_test.cpp)
+    target_include_directories(dxgi_window_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                        ${CMAKE_CURRENT_SOURCE_DIR}/shims
+                                                        ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    target_link_libraries(dxgi_window_test PRIVATE gta6rt_d3d12_com Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(LEONIDA_VULKAN_LIB)
+      target_link_libraries(dxgi_window_test PRIVATE ${LEONIDA_VULKAN_LIB})
+    endif()
+    target_compile_definitions(dxgi_window_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_window_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_window COMMAND dxgi_window_test)
 
     # Import libraries the harness links against (loader binds the imports to the shim DLL).
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/leonida_d3d12.def "LIBRARY d3d12.dll\nEXPORTS\n  LeonidaRunAnimation\n  D3D12CreateDevice\n")

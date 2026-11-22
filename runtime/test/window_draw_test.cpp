@@ -10,7 +10,7 @@
 // No game data, no keys. Exit 77 means the machine has no usable Vulkan device or window. Set
 // LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 
-#include "wsi_presenter.h"  // first: the Vulkan prototypes the presenter uses
+#include "wsi_presenter.h"  // first: it pulls in the Vulkan prototypes this test uses (d3d12_com.h disables them)
 
 #include "d3d12_draw_scene.h"
 

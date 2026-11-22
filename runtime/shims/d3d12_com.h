@@ -38,6 +38,11 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // VkPhysicalDeviceFeatures::independentBlend is enabled: D3D12 pipelines blend each render target on its own,
+    // and Vulkan only allows different per-attachment blend states with that feature. The standalone factory enables
+    // it when the GPU has it; a caller of create_vulkan_device must do the same or per-target blends collapse to the
+    // first target's state.
+    bool independent_blend = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive

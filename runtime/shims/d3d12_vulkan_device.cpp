@@ -877,6 +877,12 @@ inline HRESULT build_pipeline(DeviceState& state, const D3D12_PIPELINE_STATE_STR
         }
     }
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    if (!state.info.independent_blend && attachments.size() > 1) {
+        // Without independentBlend Vulkan requires every attachment state to be identical; D3D12 does not, so the
+        // first target's state is used for all of them and the collapse is reported once.
+        log_once("independentBlend is not enabled: per-target blend state collapsed", int(attachments.size()));
+        std::fill(attachments.begin() + 1, attachments.end(), attachments.front());
+    }
     blend.attachmentCount = std::uint32_t(attachments.size());
     blend.pAttachments = attachments.data();
     VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -897,14 +903,20 @@ inline HRESULT build_pipeline(DeviceState& state, const D3D12_PIPELINE_STATE_STR
     dynamic.pDynamicStates = dynamic_states;
 
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    VkFormat color_format = stream.rtv_count ? dxgi_format(stream.rtv_formats[0]) : VK_FORMAT_UNDEFINED;
-    if (color_format == VK_FORMAT_UNDEFINED) {
-        log_once("pipeline color format not mapped, using R8G8B8A8_UNORM; DXGI format",
-                 int(stream.rtv_count ? stream.rtv_formats[0] : DXGI_FORMAT_UNKNOWN));
-        color_format = VK_FORMAT_R8G8B8A8_UNORM;
+    // Every render-target format the stream declares, in order: a deferred-rendering pipeline writes several
+    // attachments in one pass, and dynamic rendering needs the whole list up front.
+    std::vector<VkFormat> color_formats;
+    for (std::uint32_t i = 0; i < stream.rtv_count && i < leonida::max_render_targets; ++i) {
+        VkFormat format = dxgi_format(stream.rtv_formats[i]);
+        if (format == VK_FORMAT_UNDEFINED) {
+            log_once("pipeline color format not mapped, using R8G8B8A8_UNORM; DXGI format", int(stream.rtv_formats[i]));
+            format = VK_FORMAT_R8G8B8A8_UNORM;
+        }
+        color_formats.push_back(format);
     }
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachmentFormats = &color_format;
+    if (color_formats.empty()) color_formats.push_back(VK_FORMAT_R8G8B8A8_UNORM);  // a pipeline with no render target
+    rendering.colorAttachmentCount = std::uint32_t(color_formats.size());
+    rendering.pColorAttachmentFormats = color_formats.data();
     if (has_depth) {
         rendering.depthAttachmentFormat = depth_format;
         rendering.stencilAttachmentFormat =
@@ -1928,6 +1940,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, bool presentabl
     info.separate_depth_stencil_layouts = true;
     VkPhysicalDeviceProperties chosen{};
     bool chosen_bc = false;
+    bool chosen_independent_blend = false;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
@@ -1951,6 +1964,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, bool presentabl
                 info.queue_family = i;
                 chosen = props;
                 chosen_bc = bc;
+                chosen_independent_blend = features.features.independentBlend == VK_TRUE;
             }
             break;
         }
@@ -1972,6 +1986,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, bool presentabl
     queue_info.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures enable{};
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
+    // D3D12 blends each render target separately; Vulkan needs this feature for that (MRT/GBuffer pipelines).
+    enable.independentBlend = chosen_independent_blend ? VK_TRUE : VK_FALSE;
+    if (!enable.independentBlend)
+        std::fprintf(stderr, "[rt] d3d12: the GPU has no independentBlend: per-target blends collapse to target 0\n");
     if (!chosen_bc) std::fprintf(stderr, "[rt] d3d12: the GPU has no BC texture support\n");
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;
@@ -1990,6 +2008,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, bool presentabl
         owned.device, info.queue_family, 0, &info.queue);
     info.max_push_constants_size = chosen.limits.maxPushConstantsSize;
     info.push_constants_need_fallback = (info.max_push_constants_size < 144);
+    info.independent_blend = enable.independentBlend == VK_TRUE;
     std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s (maxPushConstantsSize: %u bytes)\n", chosen.deviceName,
                  chosen.limits.maxPushConstantsSize);
     if (info.push_constants_need_fallback) {

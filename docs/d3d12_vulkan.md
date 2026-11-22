@@ -10,11 +10,11 @@ exactly the shader-visible contract that `tools/rdna2spirv.py` already emits aga
 
 The document is deliberately conservative about what is known. Every claim is marked:
 
-- **Verified** — observed in this repository or in the game package, with a way to reproduce it.
-- **Public** — documented in the Windows SDK, Microsoft's public GDK/D3D12 documentation, or the Vulkan
+- **Verified** â€” observed in this repository or in the game package, with a way to reproduce it.
+- **Public** â€” documented in the Windows SDK, Microsoft's public GDK/D3D12 documentation, or the Vulkan
   specification.
-- **Assumption** — a design choice that must be checked against the game's executable when it is available.
-- **Open** — unknown; listed with a way to resolve it.
+- **Assumption** â€” a design choice that must be checked against the game's executable when it is available.
+- **Open** â€” unknown; listed with a way to resolve it.
 
 Nothing here uses game data, keys or decryption. The package is read-only; the executable that would answer most
 of the open questions is not in it.
@@ -49,7 +49,7 @@ call it accepts must behave like D3D12.
 | The package layout lists `game_scarlett_master.exe`, but the file is not in the package folder. | `layout_..._xs.xml`, chunk 1001; directory listing | Verified |
 | `gameos.xvd` is an XVD (`msft-xvd` at file offset 0x200, format version 3) with a high-entropy payload and no plaintext PE headers or D3D12 strings. Extracting `d3d12_xs.dll` from it would require keys, which this project does not do. | Entropy and string scan; Appendix A | Verified |
 | Prior art runs the package DLLs against a PC D3D12 device and measured the Xbox ABI: 6 Xbox-specific static imports across the 16 DLLs, `D3D12XboxCreateDevice`, device slots 62/76, descriptor-heap start handles in RAX, root-signature flags `0x03000000`, and the BVH builder's Xbox DXIL shaders. | [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md), [platform README](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md) | Verified by the prior art (running the package DLLs / static imports; section 7) |
-| The translator and its GPU tests already define the shader contract: set 0 bindings 0–19, 144-byte push constants, heap/code base, FNV-1a descriptor hash table, buffer device addresses. | [design.md](design.md#translator-status-and-runtime-contract); `runtime/test/vk_texture_test.cpp` | Verified |
+| The translator and its GPU tests already define the shader contract: set 0 bindings 0â€“19, 144-byte push constants, heap/code base, FNV-1a descriptor hash table, buffer device addresses. | [design.md](design.md#translator-status-and-runtime-contract); `runtime/test/vk_texture_test.cpp` | Verified |
 
 What this does **not** tell us: the full `d3d12_xs.dll` export list, the `D3D12XboxCreateDevice` params/flag
 layout, the remaining Xbox slot deviations (presentation, command lists, queues, fences), the
@@ -171,7 +171,12 @@ What is implemented (all of it testable without the game):
   the same sample count and has no footprint. Draws bind the pipeline the list selected and the bindless set, and set
   the viewport and scissor from the area the attachments share (D3D12 sizes its output from `OMSetRenderTargets`
   until `RSSetViewports` is in the IR; a list without attachments uses the values the caller supplied).
-  `OMSetRenderTargets` gives `emit` the rendering scope. The attachment set stays bound across state and barrier
+  `OMSetRenderTargets` gives `emit` the rendering scope: all its colour views (up to eight) and the optional
+  depth-stencil view go into one `vkCmdBeginRendering`, so a deferred-rendering draw writes its whole GBuffer in one
+  pass. The pipeline side is `CreatePipelineState`'s: the stream's `D3D12_RT_FORMAT_ARRAY` becomes the full
+  `pColorAttachmentFormats` list and the per-target blend states, which the device enables through
+  `independentBlend` (without it Vulkan requires identical attachment states, so the layer collapses them and says
+  so once). The attachment set stays bound across state and barrier
   commands, but the instance only lives while draws need it: it opens before the first draw that uses the
   attachments and closes before any command that cannot run inside one (a barrier, clear, copy or the next
   `OMSetRenderTargets`) and at the end of the list. Each opening moves the attachments from their tracked layout to
@@ -190,7 +195,7 @@ What is implemented (all of it testable without the game):
   The pipeline registry is keyed by the `ID3D12PipelineState` address and holds the `VkPipeline` with the
   `VkPipelineLayout` it was created with, because `vkCmdBindDescriptorSets` must be given that layout; a draw whose
   state is not registered is skipped instead of being bound half-way. `set_draw_resources` installs set 0, the
-  console VA → `VkBuffer` lookup that `IASetVertexBuffers` / `IASetIndexBuffer` resolve their addresses through, and
+  console VA â†’ `VkBuffer` lookup that `IASetVertexBuffers` / `IASetIndexBuffer` resolve their addresses through, and
   a hook recorded at the start of every submission (the bindless set's fallback initialisation, which has to run
   once before anything samples an unwritten slot).
 - **COM** (`runtime/shims/d3d12_com.cpp`): `ID3D12GraphicsCommandList8` (the GCL7 chain plus
@@ -204,7 +209,7 @@ What is implemented (all of it testable without the game):
   consumes the dynamic state can, and `emit` does not set a stencil reference. `OMSetRenderTargets` records the
   captured views: the CPU handles are read from the device's RTV/DSV heaps, including a single-handle descriptor
   range, whose stride is the fixed RTV slot size. The queue side of the draw path is wired: the device installs set 0
-  and the VA → buffer lookup once its bindless set exists, and every `CreatePipelineState` object registers its
+  and the VA â†’ buffer lookup once its bindless set exists, and every `CreatePipelineState` object registers its
   `VkPipeline` and layout for the life of the object, so a draw recorded through COM really draws. `com_draw_test`
   drives a whole frame this way: `CreateCommittedResource` for the vertex buffer and the render target, `Map` to fill
   the vertices, an RTV in a descriptor heap, `CreatePipelineState`, a list with `OMSetRenderTargets` /
@@ -229,11 +234,11 @@ What is implemented (all of it testable without the game):
   - `CreatePipelineState`: a D3D12 subobject stream becomes a real `VkPipeline` (`build_pipeline`), and the object
     registers the pipeline and its layout in the device's registry for as long as it lives, which is how a recorded
     `SetPipelineState` resolves at execute time (PR C, step 3);
-  - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1–7 and the two-plane depth-stencil formats.
+  - `GetCopyableFootprints` for buffers, 2D textures and volumes, including BC1â€“7 and the two-plane depth-stencil formats.
     The test compares every output with the PC runtime's; that comparison found that planar
     depth-stencil rows are padded to 512 bytes, not 256.
 
-  BC1–7 textures need `textureCompressionBC`, which the device enables when the GPU has it.
+  BC1â€“7 textures need `textureCompressionBC`, which the device enables when the GPU has it.
 
   New textures are not touched at creation. They are tracked as `UNDEFINED`, and the first command that uses a
   part of one zero-fills it (D3D12 committed resources start zeroed; `CREATE_NOT_ZEROED` skips this) and moves it
@@ -331,7 +336,7 @@ The shader contract is the constraint that shapes everything else. The translato
 host_address = heap_base + console_va
 ```
 
-where `heap_base` is push-constant dwords 32–33 and `console_va` is an Xbox GPU virtual address the game writes
+where `heap_base` is push-constant dwords 32â€“33 and `console_va` is an Xbox GPU virtual address the game writes
 into a descriptor, a root argument, or a buffer. This applies to buffer, descriptor-table and shader-code
 addresses. Image descriptors (T#) are hashed by the translator, not dereferenced, so an image's base can be a
 separate key range (below). Some shaders also force the high dword of a descriptor-table pointer to zero, so
@@ -368,7 +373,7 @@ uses an image VA as a raw pointer.
 
 **Memory type policy.** The first boot needs correctness, not bandwidth:
 
-- M0–M3: allocate the arena as `HOST_VISIBLE | HOST_COHERENT` (preferably also `DEVICE_LOCAL` when large BAR is
+- M0â€“M3: allocate the arena as `HOST_VISIBLE | HOST_COHERENT` (preferably also `DEVICE_LOCAL` when large BAR is
   available). The CPU can then write descriptor heaps, shader blobs and uploaded buffers directly. Images are
   already device-local, so rendering still uses fast memory for textures. This is slow for dynamic buffers but
   removes staging and host/console address translation from the bring-up path.
@@ -422,9 +427,9 @@ The layer's descriptor model:
   which is the assumption to verify. If it uses an opaque format, the layer must translate at bind time.
 - At execution, for each bound table (or the whole bound heap when direct indexing is enabled), the layer walks
   the declared descriptor range with the heap's stride, parses each T#/S#, and ensures a bindless entry exists:
-  - image T# → `VkImageView` (format, view type, mip range, array layers) → bindless image index;
-  - sampler S# → `VkSampler` (filter, address modes, LOD, compare, anisotropy) → bindless sampler index;
-  - buffer V# / CBV → no Vulkan view; the descriptor already contains a console VA the shader dereferences.
+  - image T# â†’ `VkImageView` (format, view type, mip range, array layers) â†’ bindless image index;
+  - sampler S# â†’ `VkSampler` (filter, address modes, LOD, compare, anisotropy) â†’ bindless sampler index;
+  - buffer V# / CBV â†’ no Vulkan view; the descriptor already contains a console VA the shader dereferences.
 - Unbounded descriptor ranges (`NumDescriptors = UINT_MAX`) have no end. Scan from the table handle to the end of
   the bound heap, and cache parsed descriptors by key so unchanged slots cost nothing. **Open:** whether the game
   uses unbounded tables; the trace will show the root-signature ranges.
@@ -479,8 +484,8 @@ refused loudly (`pack` returns the offending parameter) instead of being truncat
 
 Reconciliation: `tools/root_sig_contract.py` checks a candidate root signature against every shader's
 `user_sgpr_reads` from `spirv/index.json` (const32 vs constant dwords, 64-bit VAs vs view/table pairs) and fails
-the build on the first contradiction. Until the console mapping in §3.5 is confirmed by a PSO, this check — not
-a rendered frame — is the acceptance gate for the mapping above.
+the build on the first contradiction. Until the console mapping in Â§3.5 is confirmed by a PSO, this check â€” not
+a rendered frame â€” is the acceptance gate for the mapping above.
 
 **Root-signature flag quirk.** Prior art measured Xbox root-signature descriptors carrying flags `0x03000000`; the
 PC serializer rejects them with `E_INVALIDARG` because its flags live in the low 16 bits. Clear the high byte on a
@@ -564,7 +569,7 @@ Pipeline creation:
 - `D3D12_GRAPHICS_PIPELINE_STATE_DESC` and the `D3D12_PIPELINE_STATE_STREAM_DESC` subobjects are both supported.
   Parse the stream subobjects in order; unknown types are a hard error with the type number logged.
 - Build `VkPipelineShaderStageCreateInfo` from the translated module and the index entry. Mesh shaders use
-  `VK_EXT_mesh_shader` (`AS`/`MS` subobjects → task/mesh stages); geometry uses the geometry stage; compute uses a
+  `VK_EXT_mesh_shader` (`AS`/`MS` subobjects â†’ task/mesh stages); geometry uses the geometry stage; compute uses a
   compute pipeline.
 - The index's `max_vertices`/`max_primitives` already size the SPIR-V mesh output arrays. Vulkan has no
   per-pipeline mesh output limit: check them against
@@ -590,19 +595,19 @@ The trace will enumerate them.
 
 | D3D12 / Xbox object | Vulkan / layer object | Notes |
 |---|---|---|
-| `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
-| `ID3D12CommandQueue` | `Queue` over one or more `VkQueue`s | Start with one graphics+compute+transfer queue; add dedicated queues when the game uses async compute. `PresentX` is Xbox-specific and not in the public vtable (**Open**). |
+| `ID3D12Device` â€¦ `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
+| `ID3D12CommandQueue` | `Queue` over one or more `VkQueue`s | Start with one graphics+compute+transfer queue; add dedicated queues when the game uses async compute. `PresentX` is Xbox-specific and not in the public vtable (**Open** slot); its present body exists (`rt::d3d12::present_x`). |
 | `ID3D12CommandAllocator` | IR arena + `VkCommandPool` | Reset only when the previous submission's fence is complete. |
-| `ID3D12GraphicsCommandList` … `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers; records the GCL8 front/back stencil references (applied only once a pipeline path consumes them). |
+| `ID3D12GraphicsCommandList` â€¦ `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers; records the GCL8 front/back stencil references (applied only once a pipeline path consumes them). |
 | `ID3D12RootSignature` | `RootSignature` + `VkPipelineLayout` | Deserialize the blob with the host `D3D12CreateVersionedRootSignatureDeserializer` when possible; clear the measured `0x03000000` flag byte on a copy first; fall back to a local parser. Build the user-SGPR map and static samplers. |
-| `ID3D12PipelineState` | `VkPipeline` + a `PipelineInfo` | Shader hash → SPIR-V + index entry; PSO state → Vulkan state; dynamic state where possible. The BVH builder's compute PSOs arrive at device slot 62 with a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`. |
+| `ID3D12PipelineState` | `VkPipeline` + a `PipelineInfo` | Shader hash â†’ SPIR-V + index entry; PSO state â†’ Vulkan state; dynamic state where possible. The BVH builder's compute PSOs arrive at device slot 62 with a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`. |
 | `ID3D12DescriptorHeap` | `DescriptorHeap` (shadow + optional arena range) | CBV/SRV/UAV and sampler heaps can be shader-visible; RTV/DSV are host-only. Start handles use the measured RAX return at heap slots 9/10. Increments are layer-chosen (32/32) pending the console value. |
 | `ID3D12Resource` | `Resource` (a range in the arena buffer; a separate `VkImage` for textures) | Committed and placed; reserved is stubbed as linear for now. Xbox textures may arrive through device slot 76 rather than `CreateCommittedResource` (section 4.2). `GetGPUVirtualAddress` returns a console VA (a buffer offset or an image key). |
 | `ID3D12Heap` | `Heap` (a reserved VA range) | Buffer ranges are backed by the arena; images get their own `VkDeviceMemory`. Residency calls are no-ops. True buffer/image aliasing inside a heap is **Open**. |
 | `ID3D12Fence` / `ID3D12Fence1` | `Fence` over a timeline `VkSemaphore` | `GetCompletedValue` = counter value; `SetEventOnCompletion` = wait thread + Win32 event; CPU `Signal` = host signal. |
 | Resource barriers (legacy) | `vkCmdPipelineBarrier` | Per-subresource state tracking; `BEGIN_ONLY`/`END_ONLY` become conservative full barriers at the begin point. |
 | Enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`) | `vkCmdPipelineBarrier2` | Direct mapping of sync/access/layout; prefer it when the game uses it. |
-| `IDXGISwapChain` / `IDXGIFactory` | `Swapchain` over `VkSwapchainKHR` + Win32 surface | Shim DXGI; do not bind host DXGI. `PresentX` planes need a compose path (**Open**). |
+| `IDXGISwapChain` / `IDXGIFactory` | `Swapchain` over `VkSwapchainKHR` + Win32 surface | Shim DXGI; do not bind host DXGI. Implemented in `runtime/shims/dxgi.cpp` (factory, adapter, swapchain, `Present`, `ResizeBuffers`); `PresentX` planes still need a compose path (**Open**). |
 | `ID3D12QueryHeap` | `VkQueryPool` | Occlusion, binary occlusion, pipeline statistics, timestamps. Binary results clamped to 0/1. |
 | `ID3D12CommandSignature` | `IndirectLayout` | Simple draw/dispatch signatures map to indirect calls; root-constant/vertex/index/descriptor changes need expansion. |
 | `ID3D12PipelineLibrary` | map + `VkPipelineCache` | D3D12 cached blobs are ignored. |
@@ -652,19 +657,19 @@ The trace will enumerate them.
   tiled value from slot 76. Row-major textures need `VK_IMAGE_TILING_LINEAR` (not usable for RT/DS) or a staging
   copy; `64KB_STANDARD_SWIZZLE` and `0x101` have no direct Vulkan equivalent. If the game uploads console-tiled data,
   the layer needs a detile step or a matching tiled image. **Open**; the ABI value is known, the data layout is not.
-- Formats: a `DXGI_FORMAT` → `VkFormat` table, including sRGB and typeless variants. Typeless resources get a
+- Formats: a `DXGI_FORMAT` â†’ `VkFormat` table, including sRGB and typeless variants. Typeless resources get a
   concrete image format plus `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and a `VK_KHR_image_format_list` when views cast
   within the family; unsupported casts are logged and fall back to the resource format. Depth/stencil, BCn and
   packed formats map directly; any format the device rejects is a hard error with the DXGI value.
 - `Map`/`Unmap`: upload/readback buffers map their host-visible memory; default-heap resources return
   `E_INVALIDARG` as D3D12 does. `WriteToSubresource`/`ReadFromSubresource` use a staging copy at the next submit.
-- Resource flags map to Vulkan usage: `ALLOW_RENDER_TARGET` → `COLOR_ATTACHMENT`, `ALLOW_DEPTH_STENCIL` →
-  `DEPTH_STENCIL_ATTACHMENT`, `ALLOW_UNORDERED_ACCESS` → `STORAGE`, `ALLOW_SIMULTANEOUS_ACCESS` → concurrent
-  sharing, `DENY_*` → omit the corresponding usage. Buffers get the union of usages their states and flags imply;
+- Resource flags map to Vulkan usage: `ALLOW_RENDER_TARGET` â†’ `COLOR_ATTACHMENT`, `ALLOW_DEPTH_STENCIL` â†’
+  `DEPTH_STENCIL_ATTACHMENT`, `ALLOW_UNORDERED_ACCESS` â†’ `STORAGE`, `ALLOW_SIMULTANEOUS_ACCESS` â†’ concurrent
+  sharing, `DENY_*` â†’ omit the corresponding usage. Buffers get the union of usages their states and flags imply;
   images copy dimension, format, mip levels, array layers and sample count.
-- Copies: `CopyBufferRegion` → `vkCmdCopyBuffer` with arena offsets; `CopyTextureRegion` →
+- Copies: `CopyBufferRegion` â†’ `vkCmdCopyBuffer` with arena offsets; `CopyTextureRegion` â†’
   `vkCmdCopyBufferToImage`/`vkCmdCopyImageToBuffer`/`vkCmdCopyImage`, using the `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`
-  row pitch and height; `CopyResource` → a whole-subresource copy; `ResolveSubresource` → `vkCmdResolveImage`.
+  row pitch and height; `CopyResource` â†’ a whole-subresource copy; `ResolveSubresource` â†’ `vkCmdResolveImage`.
   Partial resolve regions need a shader or a region copy.
 - Clears: a full-subresource clear maps to `vkCmdClearColorImage`/`vkCmdClearDepthStencilImage` (UAV buffers to
   `vkCmdFillBuffer`); a rect clear uses `vkCmdClearAttachments` inside the rendering scope. UAV image clears use
@@ -731,27 +736,43 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 The game package does not include `dxgi.dll`, so the executable imports it from the system (or from the GDK).
 That import must be shimmed. The shim provides:
 
-- `CreateDXGIFactory`/`CreateDXGIFactory2` → one fake factory with one adapter describing the host Vulkan device.
-  `IDXGIAdapter::GetDesc` reports host memory/LUID; the game may use these for settings. **Open:** whether it
-  expects Xbox Series X values (16 GB, fixed clocks) instead.
-- `IDXGIFactory::CreateSwapChain`/`CreateSwapChainForHwnd` → `VkSurfaceKHR` for the HWND + `VkSwapchainKHR`.
-  `GetBuffer(i)` wraps each swapchain image as an `ID3D12Resource` so the game can create RTVs.
-- `Present` → `vkQueuePresentKHR`; `ResizeBuffers`/`ResizeTarget` recreate the swapchain; `SetFullscreenState`
-  toggles borderless/fullscreen; `GetFrameStatistics` is a stub.
-- `DXGI_PRESENT_TEST`/`DO_NOT_WAIT` map to a no-op/`VK_NOT_READY` path.
+- `CreateDXGIFactory`/`CreateDXGIFactory1`/`CreateDXGIFactory2` â†’ one factory with one adapter. The adapter calls
+  itself "Leonida (host Vulkan GPU)" with the console's AMD vendor/device ids; a game uses the description for
+  settings only. **Open:** whether it expects Xbox Series X values (16 GB, fixed clocks) instead.
+- `IDXGIFactory::CreateSwapChain`/`IDXGIFactory2::CreateSwapChainForHwnd` â†’ a `SwapChain` that builds
+  `VkSurfaceKHR` + `VkSwapchainKHR` on the *device's own* instance/device (shared-device WSI, below).
+  `GetBuffer(i)` creates a D3D12 committed render target of the swapchain's format and size on first use and returns
+  it, so the game creates RTVs on it exactly as on a real back buffer.
+- `Present` â†’ the presenter's GPU copy into the swapchain image + `vkQueuePresentKHR`; `ResizeBuffers` releases the
+  back buffers and recreates the presenter at the new size; `ResizeTarget` is accepted; `SetFullscreenState` is a
+  stub; `GetFrameStatistics` is a stub and `GetLastPresentCount` counts presents.
+- `DXGI_PRESENT_TEST` is a no-op.
+
+**What is implemented (PR C, API compatibility).** `runtime/shims/dxgi.cpp` holds the factory, the adapter and the
+swapchain; their vtables come from stubs generated at build time out of `dxgi.h`/`dxgi1_2.h` by the same
+`tools/gen_d3d12_stubs.py`, so every unimplemented method keeps the SDK's order and logs itself once.
+`CreateDXGIFactory1` and friends are also exported from `leonida_shims.dll` and registered in the shim registry as
+`dxgi.dll` imports. `dxgi_window_test` drives the whole path: `CreateDXGIFactory1` â†’ `EnumAdapters1` â†’
+`CreateSwapChainForHwnd` â†’ `GetBuffer(0)` â†’ a triangle recorded through the COM list â†’ `Present`, then
+`ResizeBuffers(2, 320, 240, â€¦)` half-way through the run and presents again. It captures one presented swapchain
+image and checks the pixels, and it presents five frames through `PresentX` instead of the swapchain (both paths
+are covered).
 
 **PresentX.** Public Xbox documentation mentions `ID3D12CommandQueue::PresentX`,
 `D3D12XBOX_FRAME_PIPELINE_TOKEN` and `D3D12XBOX_PRESENT_PLANE_PARAMETERS` in the game-streaming APIs
 ([example](https://docs.xbox.com/reference/system/xgamestreaming/functions/xgamestreamingsetresolution)). PresentX
-is not in the public `d3d12.h` vtable; its slot and struct layouts are **Open**. If the game uses it, the layer
-must compose the present planes (source rects, destination placement) into the swapchain image and present. For
-the first boot, implement the DXGI path and stub PresentX with a clear log.
+is not in the public `d3d12.h` vtable; its slot and struct layouts are **Open**. The layer now has the body a queue
+proxy will call: `rt::d3d12::present_x(queue, planes)` (`runtime/shims/d3d12_present.{h,cpp}`) presents a plane's
+resource through the swapchain the process registered (`set_presentation_target`, called by the DXGI swapchain), so
+PresentX ends in the same `vkQueuePresentKHR` as `Present`. Source/destination rectangles and additional planes are
+logged and not composited yet; plane composition is the remaining piece. The queue slot stays open until the trace
+shows the call.
 
 **What is implemented: shared-device WSI (PR C, step 5).** The renderer and the window share one `VkInstance`,
 `VkPhysicalDevice`, `VkDevice` and graphics queue: `create_vulkan_device_standalone(..., presentable = true)` enables
 `VK_KHR_surface`/`VK_KHR_win32_surface` on the instance and `VK_KHR_swapchain` on the device, and
 `rt::d3d12::vulkan_device_info()` hands those objects to `leonida::wsi::Presenter`
-(`runtime/test/wsi_presenter.{h,cpp}`). The presenter creates the surface for the `HWND` and a FIFO swapchain whose
+(`runtime/shims/wsi_presenter.{h,cpp}`). The presenter creates the surface for the `HWND` and a FIFO swapchain whose
 images have `COLOR_ATTACHMENT | TRANSFER_DST` usage, then presents a rendered image with
 `vkCmdCopyImage` (same format and size) or `vkCmdBlitImage` with nearest filtering, followed by
 `vkQueuePresentKHR`. Nothing goes through the host: the render target the D3D12 list rendered into is copied on the
@@ -764,7 +785,7 @@ is one fence plus a `render_finished` semaphore per swapchain image (a semaphore
 present that consumed it finished, which per-image semaphores guarantee); `image_available` is reused because the
 fence wait before each acquire means its previous wait was consumed.
 
-`window_draw_test` is the end-to-end proof: a visible 640×480 window, a presentable device, an orange triangle
+`window_draw_test` is the end-to-end proof: a visible 640Ă—480 window, a presentable device, an orange triangle
 recorded through the COM list (`OMSetRenderTargets`/`IASetVertexBuffers`/`DrawInstanced`) into a committed render
 target, and every frame presented through the bridge. It captures one presented swapchain image back to the host
 (only for the check), which shows exactly the pixels that reached the screen: 98 304 of 307 200 orange, nothing else.
@@ -774,8 +795,8 @@ renders/presents on that same `VkDevice`, and reports `wsi=1 shared_device=1 fra
 
 ### 4.6 Queries
 
-- Occlusion: `D3D12_QUERY_TYPE_OCCLUSION` → `VK_QUERY_TYPE_OCCLUSION` with `VK_QUERY_CONTROL_PRECISE_BIT`;
-  `BINARY_OCCLUSION` → the same pool without the precise bit, clamping the result to 0/1. `ResolveQueryData` →
+- Occlusion: `D3D12_QUERY_TYPE_OCCLUSION` â†’ `VK_QUERY_TYPE_OCCLUSION` with `VK_QUERY_CONTROL_PRECISE_BIT`;
+  `BINARY_OCCLUSION` â†’ the same pool without the precise bit, clamping the result to 0/1. `ResolveQueryData` â†’
   `vkCmdCopyQueryPoolResults` with `VK_QUERY_RESULT_64_BIT` (D3D12 returns UINT64).
 - Pipeline statistics: `VK_QUERY_TYPE_PIPELINE_STATISTICS` with the flags implied by
   `D3D12_QUERY_DATA_PIPELINE_STATISTICS`; map the fields one-to-one.
@@ -830,7 +851,7 @@ shaders are changed to `OpTraceRayKHR`.** The game's 64 RT compute shaders trave
 Vulkan AS would be invisible to them. Two paths:
 
 1. If `XboxBvhBuilder` does the build with its own compute dispatches (the likely case, given it ships as a DLL
-   with a device and command lists), the layer must translate and run its Xbox DXIL compute shaders — it cannot
+   with a device and command lists), the layer must translate and run its Xbox DXIL compute shaders â€” it cannot
    feed DXIL to Vulkan directly. Buffers, UAVs, descriptors, barriers and indirect dispatch are necessary but not
    sufficient; the 53 builder shaders need the DXIL path described above, and the 31 raw-address shaders need a
    VA-to-resource mapping. The standard `BuildRaytracingAccelerationStructure` calls may never reach our command
@@ -866,16 +887,16 @@ store, load, mesh, geometry and BVH tests; this layer is the other half.
 | Contract | Runtime source |
 |---|---|
 | `s0..s31` user data | Root signature state at draw/dispatch: root constants copied, root CBV/SRV/UAV addresses and descriptor-table base addresses as 64-bit console VAs. Mapping per section 3.5; absent parameters zero. |
-| `heap_base` (dwords 32–33) | The arena's `vkGetBufferDeviceAddress`. One value per command buffer; updated only if the arena is recreated. |
-| `code_base` (dwords 34–35) | The console VA of the current shader's FSSM blob in the arena. Per-stage conflict: see below. |
+| `heap_base` (dwords 32â€“33) | The arena's `vkGetBufferDeviceAddress`. One value per command buffer; updated only if the arena is recreated. |
+| `code_base` (dwords 34â€“35) | The console VA of the current shader's FSSM blob in the arena. Per-stage conflict: see below. |
 | Descriptor hash table (set 0, binding 2) | `uint mask` + entries of `key[8], index, pad`; FNV-1a over the 8 key dwords; linear probe up to 8; miss = index 0. Implemented in `runtime/src/descriptor_table.h` (`DescriptorTable`). The layer inserts every T#/S# it sees and keeps a fallback image/sampler at index 0. |
 | Bindless images (bindings 0, 3, 5, 6) | 2D, 2D-array/cube, 1D, 3D sampled-image arrays; one `VkImageView` per distinct T#. Cube textures are 6-layer 2D arrays and cube arrays 6N-layer ones, as the translator expects. |
 | Samplers (binding 1) | One `VkSampler` per distinct S#; literal S# values from shader constants are pre-registered. |
-| Storage images (bindings 4, 7, 8–19) | r32ui/float/sint views by dimension and numeric class; the layer binds each storage image into the float/uint/sint arrays of its dimension (the translator picks by the T# format at run time), with all three arrays as the safe default. |
+| Storage images (bindings 4, 7, 8â€“19) | r32ui/float/sint views by dimension and numeric class; the layer binds each storage image into the float/uint/sint arrays of its dimension (the translator picks by the T# format at run time), with all three arrays as the safe default. |
 | Buffer/image binding | Descriptors contain console VAs, never host BDAs. Buffers are in the arena at their VA; images are keyed by T# through the hash table. |
 | Vertex fetch | PSO input layout + ISG1 signature; location = D3D input register; format from `DXGI_FORMAT`; instance step rate from the layout. The fetch subroutine is already replaced by Vulkan inputs. |
 | PS system inputs | `FragCoord` (xy/z/w), `FrontFacing`, barycentrics; enable `fragmentShaderBarycentric` and `fragmentShaderPixelInterlock` when the index entry asks. |
-| Mesh/geometry stages | `VK_EXT_mesh_shader`; the index's max vertices/primitives size the SPIR-V output arrays and are checked against the device's mesh properties; geometry stage for the 195 voxelize shaders; `DispatchMesh` → `vkCmdDrawMeshTasksEXT`. |
+| Mesh/geometry stages | `VK_EXT_mesh_shader`; the index's max vertices/primitives size the SPIR-V output arrays and are checked against the device's mesh properties; geometry stage for the 195 voxelize shaders; `DispatchMesh` â†’ `vkCmdDrawMeshTasksEXT`. |
 | POPS collision | The runtime puts 0 (no collision, bit 31 clear) in the POPS collision SGPR; the translator uses fragment-shader interlock for ordering. **Open:** the exact SGPR location is a translator/driver detail not named in the current contract. |
 | Wave size | `requiredSubgroupSize = 64` when supported (AMD); otherwise the translator's 32-wide approximation is explicit in the log. |
 | Code-embedded data | The whole FSSM blob is in the arena; `s_getpc_b64` becomes `code_base + next-instruction offset`. |
@@ -901,7 +922,7 @@ struct entry {               // 10 uints = 40 bytes
   the rebuild, at a point where no in-flight command buffer reads the old table.
 - Insert on `CreateShaderResourceView`, `CreateUnorderedAccessView`, `CreateSampler`, `CopyDescriptors` and heap
   scans. A duplicate key updates the index in place.
-- Index 0 is the fallback: a 1×1 texture and a default sampler (and a valid dummy storage image for the storage
+- Index 0 is the fallback: a 1Ă—1 texture and a default sampler (and a valid dummy storage image for the storage
   arrays). The translator returns 0 on a miss, so index 0 must always be valid.
 - The table buffer is a normal storage buffer, not part of the arena. It can be host-visible and updated directly
   (host-coherent, or flushed before submit); if the game is sensitive to PCIe traffic, stage it like any other
@@ -912,7 +933,7 @@ struct entry {               // 10 uints = 40 bytes
 
 ### 5.2 Per-stage code base
 
-The current 144-byte block has one 64-bit code base at dwords 34–35. A graphics pipeline has at least a vertex and
+The current 144-byte block has one 64-bit code base at dwords 34â€“35. A graphics pipeline has at least a vertex and
 a pixel shader, and each may use `s_getpc_b64` for its own constant table. One block cannot hold two different
 code bases at the same offset. The pipeline layout declares the block for every stage that may read it (or for all
 graphics stages), and `vkCmdPushConstants` is called with those stage bits. This is a real gap in the current
@@ -922,7 +943,7 @@ contract, not a runtime bug:
   MS+PS). If only one stage in a pipeline uses it, the layer can set that stage's code base; the other stage never
   reads it. This probably covers the first boot. **Assumption.**
 - If both stages use it, the layer cannot satisfy both with the current contract. The clean fix is a translator
-  change: give each stage its own code-base slot (for example dwords 34–35 VS, 36–37 PS, 38–39 CS, 40–41 GS/MS,
+  change: give each stage its own code-base slot (for example dwords 34â€“35 VS, 36â€“37 PS, 38â€“39 CS, 40â€“41 GS/MS,
   extending the block to 168 bytes) and have each compiled shader read its stage's slot. A 168-byte push-constant
   block is still under the 256-byte limit of common desktop GPUs, but above Vulkan's 128-byte minimum; the device
   requirement must be checked.
@@ -930,7 +951,7 @@ contract, not a runtime bug:
   adds a descriptor binding and a load per `s_getpc`, but avoids growing push constants. Decide after measuring
   how many real PSOs have two code-base stages.
 
-**Measured:** across the GPU test fleet (Issue #166), desktop NVIDIA (Turing, Ampere, Ada, Blackwell: 256 bytes), desktop AMD (RDNA2: 256 bytes) and Apple Silicon (MoltenVK: 4096 bytes) all satisfy the 144-byte contract natively (`maxPushConstantsSize >= 144`). On Intel Arc (Alchemist, Battlemage), Vulkan exposes the 128-byte specification minimum (`maxPushConstantsSize == 128`), which cannot fit the 16-byte tail (dwords 32–35: heap base and code base) inside push constants. The runtime detects `maxPushConstantsSize < 144` at device creation (`d3d12_vulkan_device.cpp`) and flags `push_constants_need_fallback` for the uniform-buffer fallback.
+**Measured:** across the GPU test fleet (Issue #166), desktop NVIDIA (Turing, Ampere, Ada, Blackwell: 256 bytes), desktop AMD (RDNA2: 256 bytes) and Apple Silicon (MoltenVK: 4096 bytes) all satisfy the 144-byte contract natively (`maxPushConstantsSize >= 144`). On Intel Arc (Alchemist, Battlemage), Vulkan exposes the 128-byte specification minimum (`maxPushConstantsSize == 128`), which cannot fit the 16-byte tail (dwords 32â€“35: heap base and code base) inside push constants. The runtime detects `maxPushConstantsSize < 144` at device creation (`d3d12_vulkan_device.cpp`) and flags `push_constants_need_fallback` for the uniform-buffer fallback.
 Measured per stage (all 26,503, `tools/feature_scan.py`): `s_getpc_b64` is kept to read code-embedded data in 54
 VS, 93 PS, 266 MS and 263 CS (0 GS); the 147 VS/PS match the translator's own note. Both stages of a VS+PS or
 MS+PS pipeline can therefore need a code base.
@@ -958,14 +979,14 @@ GPU texture test already proves the shader-side contract on a synthetic T#/S#; t
 ## 6. Boot milestones
 
 Each milestone is a capability gate with a synthetic test; the game is the integration test once it is available.
-M0–M2 do not need the executable.
+M0â€“M2 do not need the executable.
 
 | # | Scope | What it proves | Done when |
 |---|---|---|---|
 | **M0** | `D3D12XboxCreateDevice` and the measured device overrides (heap start handles in RAX), one direct queue, allocator/list, fence, fake DXGI factory/adapter/swapchain, clear + present | COM interception, the known Xbox device entry point and ABI overrides, swapchain, frame loop, clean shutdown | A window shows a stable clear colour for 60 frames, no Vulkan validation errors, every D3D12 call traced |
 | **M1** | Root signature with root constants (mask the measured `0x03000000` flag byte on a copy), one translated VS+PS, PSO, vertex buffer in the arena, draw, push constants `s0..s31` + heap base | PSO translation, shader hash lookup, vertex input, root-constant packing, heap base, present | The triangle matches a CPU/GPU reference; the existing texture-test style comparison passes with error 0 |
-| **M2** | Descriptor heap (heap slots 9/10 return in RAX), `CreateShaderResourceView`, sampler, root descriptor table, hash-table insert, bindless sampling | The full D3D12 descriptor path and the shader's T#/S# contract | A textured quad matches the synthetic 8×8 gradient or a known texture with error 0; the hash table has the expected entries |
-| **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2–3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report |
+| **M2** | Descriptor heap (heap slots 9/10 return in RAX), `CreateShaderResourceView`, sampler, root descriptor table, hash-table insert, bindless sampling | The full D3D12 descriptor path and the shader's T#/S# contract | A textured quad matches the synthetic 8Ă—8 gradient or a known texture with error 0; the hash table has the expected entries |
+| **M3** | Depth/stencil, multiple render targets, resource barriers, render passes, occlusion queries, fences, 2â€“3 frames in flight; run the game's first frames | Real frame structure and the first game code | The game reaches its first rendered frame (loading screen/menu or whatever the executable does) or stops on a single unsupported call with a clean report |
 | **M4** | Compute PSOs, UAVs, storage images, indirect dispatch, copy queues, async streaming | Asset loading and GPU compute | The world's streaming path runs without device loss; compute results match a CPU/reference check |
 | **M5** | Mesh shaders, `ExecuteIndirect`, bindless-table pressure, multi-threaded command lists, pipeline cache | World rendering | A stable open-world frame at any frame rate; then profile and optimise |
 | **M6** | Ray tracing/XDXR: standard AS builds or the shipped `XboxBvhBuilder` compute path; BVH node format; Xbox DXIL path for the builder's 53 shaders (22 lowered so far) | RT shadows and any RT effects | RT output matches a reference; the builder's shaders run through the DXIL path or a substitute; no unknown XDXR call remains |
@@ -973,7 +994,7 @@ M0–M2 do not need the executable.
 
 ### 6.1 Minimum API set for the first frame
 
-M0–M3's synthetic tests need only this subset. The game itself may need more as soon as its first frame does;
+M0â€“M3's synthetic tests need only this subset. The game itself may need more as soon as its first frame does;
 everything else can be absent or a clean failure:
 
 - `D3D12XboxCreateDevice` and `CheckFeatureSupport`; the measured device overrides (heap start handles in RAX;
@@ -993,14 +1014,14 @@ everything else can be absent or a clean failure:
 Not needed for the first frame: compute, mesh, geometry, ray tracing, VRS, PresentX, reserved/tiled resources,
 heap aliasing, indirect draws, multiple queues, pipeline libraries.
 
-**Why this order.** M0–M2 isolate the layer from the game: they exercise every contract piece with known data.
+**Why this order.** M0â€“M2 isolate the layer from the game: they exercise every contract piece with known data.
 M3 is the first point where the game's own root signatures, PSOs and descriptors appear; expect the trace to
 rewrite parts of section 3.5. M4/M5 are ordered by dependency: assets must stream before the world can draw, and
 the corpus's 9,282 mesh shaders (and, very likely, indirect draws) are world-rendering features. M6 is last
 because the game ships its own BVH builder; the layer may only need to run its compute work, not implement a full
 DXR path.
 
-**First-boot minimum.** Strictly, the first boot needs M0–M3 plus whatever the game does before its first frame.
+**First-boot minimum.** Strictly, the first boot needs M0â€“M3 plus whatever the game does before its first frame.
 If the first frame is a loading screen with a simple UI draw, M3 may be enough; if it is the world, M5 is the real
 minimum. The trace decides, not the milestone labels.
 
@@ -1015,14 +1036,14 @@ DLLs were executed against a PC D3D12 device through the Xbox-ABI proxy.
 
 | Finding | Basis and link | Consequence for this design |
 |---|---|---|
-| Across the 16 package DLLs there are only 6 Xbox-specific static imports: `xmem.dll` → `XMemAlloc`, `XMemFree`, `XMemGetWorkingSetStatistics`, `XMemVirtualQuery`; `d3d12_xs.dll` → `D3D12SerializeVersionedRootSignature`, `D3D12CreateRootSignatureDeserializer`. Both `d3d12_xs` names exist with the same names in the PC `d3d12.dll`. The other 492 functions are standard Windows and 113 are shipped in the package. Argument shapes for the less common `xmem` calls come from caller disassembly; some attribute bits are inferred. | *Static imports* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Confirms the middleware surface is tiny. The repo's `xmem` shim already covers all four; `d3d12_xs` still forwards only the two root-signature functions. The device/queue/command-list surface belongs to the executable. |
-| `D3D12XboxCreateDevice(adapter, params, riid, out)` returns a PC `ID3D12Device` behind the Xbox-ABI proxy. The params struct is 24 words and is only logged; the signature comes from public documentation, not a header. | *Run* — [platform README](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md), [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Corrects "device entry point unknown": the entry point is named. The params/flag layout remains **Open**. Do not assume `D3D12CreateDevice`. |
-| Xbox texture creation is device slot 76 (heap properties / heap flags / description / initial state / clear value / iid / out), not `CreateCommittedResource`. The description is 56 bytes plus extension words; its layout field is `0x101` (tiled) or `0x1` (row-major buffer), and the PC proxy forwards it to `CreateCommittedResource` slot 27 with a driver-chosen layout. The FidelityFX upscaler creates 10 default-heap resources this way. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Adds a required Xbox-specific device method and a non-public layout value. `0x101` must not be passed to the public layout enum; the tiled data layout/detile path remains **Open**. See section 4.2. |
-| Device slot 14 is the public `CreateDescriptorHeap`; the returned heap is wrapped because `GetCPUDescriptorHandleForHeapStart` / `GetGPUDescriptorHandleForHeapStart` (heap slots 9/10) return the 8-byte handle in RAX on the Xbox build. The PC call returns it through a hidden pointer in RDX, so the proxy special-cases the return. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Adds a return-convention quirk to the descriptor-heap ABI. A generic IDL/sret thunk will corrupt the handle. See section 3.4. |
-| Xbox root-signature descriptors carry flags `0x03000000`. The PC serializer rejects them with `E_INVALIDARG`; the proxy clears the high byte on a copy. The v1.0 `D3D12SerializeRootSignature` path keeps flags at +32, and `0x3000001` also fails on the PC runtime. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Narrows the root-signature reflection risk. Mask the high byte on a private copy; the meaning of the bits remains **Open**. See section 3.5. |
-| The BVH builder's constructor creates 53 compute pipelines through device slot 62, called with a compute-PSO shape (a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`, two zero words, iid, out). On the PC interface the prior art forwards to, slot 62 is `CreateStateObject` (wrong arity), so the proxy overrides it. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Corrects the assumption that the whole device vtable is public order. Slot 62 must be compute-PSO creation for the builder, not a state object. Slots 1/15/18/19/27/38 did match the desktop order. |
-| A reusable `xbox_device_proxy.h` forwards every slot to a PC object, counts hits per slot and logs first calls with `XS_TRACE=1`; the observed device slots include 1, 14, 15, 16, 18, 19, 27, 38, 62 and 76. Their `xgr` stand-in covers 48 of 398 methods; Xodus (LGPL-2.1) covers 152 of 396 via IDL-generated stubs. | *Run* — [platform README](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md), [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Confirms the trace-first approach and shows the long tail. We adopt the *method* (per-slot counters, first-call logging), not the code. |
-| The BVH builder's 53 compute shaders are Xbox DXIL with `@xbox.*` intrinsics; 44 of 53 fail the PC D3D12 shader compiler, 22 have been lowered to standard DXIL and accepted as pipelines, and 31 use raw 64-bit GPU addresses. | *Run* — [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | A separate translation path from the FSSM RDNA2 corpus. See section 4.8 and the paragraph below. |
+| Across the 16 package DLLs there are only 6 Xbox-specific static imports: `xmem.dll` â†’ `XMemAlloc`, `XMemFree`, `XMemGetWorkingSetStatistics`, `XMemVirtualQuery`; `d3d12_xs.dll` â†’ `D3D12SerializeVersionedRootSignature`, `D3D12CreateRootSignatureDeserializer`. Both `d3d12_xs` names exist with the same names in the PC `d3d12.dll`. The other 492 functions are standard Windows and 113 are shipped in the package. Argument shapes for the less common `xmem` calls come from caller disassembly; some attribute bits are inferred. | *Static imports* â€” [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Confirms the middleware surface is tiny. The repo's `xmem` shim already covers all four; `d3d12_xs` still forwards only the two root-signature functions. The device/queue/command-list surface belongs to the executable. |
+| `D3D12XboxCreateDevice(adapter, params, riid, out)` returns a PC `ID3D12Device` behind the Xbox-ABI proxy. The params struct is 24 words and is only logged; the signature comes from public documentation, not a header. | *Run* â€” [platform README](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md), [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Corrects "device entry point unknown": the entry point is named. The params/flag layout remains **Open**. Do not assume `D3D12CreateDevice`. |
+| Xbox texture creation is device slot 76 (heap properties / heap flags / description / initial state / clear value / iid / out), not `CreateCommittedResource`. The description is 56 bytes plus extension words; its layout field is `0x101` (tiled) or `0x1` (row-major buffer), and the PC proxy forwards it to `CreateCommittedResource` slot 27 with a driver-chosen layout. The FidelityFX upscaler creates 10 default-heap resources this way. | *Run* â€” [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Adds a required Xbox-specific device method and a non-public layout value. `0x101` must not be passed to the public layout enum; the tiled data layout/detile path remains **Open**. See section 4.2. |
+| Device slot 14 is the public `CreateDescriptorHeap`; the returned heap is wrapped because `GetCPUDescriptorHandleForHeapStart` / `GetGPUDescriptorHandleForHeapStart` (heap slots 9/10) return the 8-byte handle in RAX on the Xbox build. The PC call returns it through a hidden pointer in RDX, so the proxy special-cases the return. | *Run* â€” [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Adds a return-convention quirk to the descriptor-heap ABI. A generic IDL/sret thunk will corrupt the handle. See section 3.4. |
+| Xbox root-signature descriptors carry flags `0x03000000`. The PC serializer rejects them with `E_INVALIDARG`; the proxy clears the high byte on a copy. The v1.0 `D3D12SerializeRootSignature` path keeps flags at +32, and `0x3000001` also fails on the PC runtime. | *Run* â€” [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Narrows the root-signature reflection risk. Mask the high byte on a private copy; the meaning of the bits remains **Open**. See section 3.5. |
+| The BVH builder's constructor creates 53 compute pipelines through device slot 62, called with a compute-PSO shape (a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`, two zero words, iid, out). On the PC interface the prior art forwards to, slot 62 is `CreateStateObject` (wrong arity), so the proxy overrides it. | *Run* â€” [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Corrects the assumption that the whole device vtable is public order. Slot 62 must be compute-PSO creation for the builder, not a state object. Slots 1/15/18/19/27/38 did match the desktop order. |
+| A reusable `xbox_device_proxy.h` forwards every slot to a PC object, counts hits per slot and logs first calls with `XS_TRACE=1`; the observed device slots include 1, 14, 15, 16, 18, 19, 27, 38, 62 and 76. Their `xgr` stand-in covers 48 of 398 methods; Xodus (LGPL-2.1) covers 152 of 396 via IDL-generated stubs. | *Run* â€” [platform README](https://github.com/realdody/americas-recomp/blob/xbox-series/tools/xbox/platform/README.md), [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | Confirms the trace-first approach and shows the long tail. We adopt the *method* (per-slot counters, first-call logging), not the code. |
+| The BVH builder's 53 compute shaders are Xbox DXIL with `@xbox.*` intrinsics; 44 of 53 fail the PC D3D12 shader compiler, 22 have been lowered to standard DXIL and accepted as pipelines, and 31 use raw 64-bit GPU addresses. | *Run* â€” [PLATFORM_SURFACE.md](https://github.com/realdody/americas-recomp/blob/xbox-series/docs/xbox/PLATFORM_SURFACE.md) | A separate translation path from the FSSM RDNA2 corpus. See section 4.8 and the paragraph below. |
 
 ### 7.1 What this confirms, corrects and narrows
 
@@ -1075,8 +1096,8 @@ map one-to-one to RDNA instructions (global load/store/atomic with 64-bit addres
 bitfield insert, alignbyte, cndmask, packed f16 min/max and lane/wave operations). The standard PC DXIL compiler
 rejects 44 of the 53; 22 have been lowered to standard DXIL and compile; the 31 that use raw 64-bit addresses also
 need a table mapping those addresses to resources. This is separate from the FSSM RDNA2 translator, which covers
-the game's 26,503 shaders. A port that uses `XboxBvhBuilder` needs both: FSSM → SPIR-V for the game, and an Xbox
-DXIL → standard DXIL → SPIR-V path (or a substitute builder) for the BVH helper. The prior art has compiled
+the game's 26,503 shaders. A port that uses `XboxBvhBuilder` needs both: FSSM â†’ SPIR-V for the game, and an Xbox
+DXIL â†’ standard DXIL â†’ SPIR-V path (or a substitute builder) for the BVH helper. The prior art has compiled
 lowered shaders but has no reference output yet, so correctness is unverified.
 
 ### 7.3 Licence
@@ -1260,7 +1281,7 @@ little-endian GUIDs from `d3d12.h`.
 - GUID byte scan found `IID_ID3D12Device` (0x0472f0), `IID_ID3D12Resource` (0x047310),
   `IID_ID3D12RootSignatureDeserializer` (0x047320), `IID_ID3D12PipelineState` (0x047330),
   `IID_ID3D12Heap` (0x047340), `IID_ID3D12RootSignature` (0x047350), `IID_ID3D12DescriptorHeap` (0x0472e0) and
-  `IID_ID3D12CommandSignature` (0x047300). Again, presence ≠ use.
+  `IID_ID3D12CommandSignature` (0x047300). Again, presence â‰  use.
 
 ### A.4 Other DLLs and the executable
 

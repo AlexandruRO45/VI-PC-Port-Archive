@@ -8,6 +8,9 @@
 //
 // The source image's layout is the caller's business: present() moves it to TRANSFER_SRC_OPTIMAL and back to the
 // layout it was given, so the layer's layout tracker stays correct (it cannot see barriers issued outside the layer).
+//
+// Every Vulkan entry point is resolved from the instance/device the caller passes, so nothing here links against
+// vulkan-1.lib: the layer loads Vulkan at run time, and a game process must not gain a static import.
 #pragma once
 
 #ifndef NOMINMAX
@@ -18,6 +21,7 @@
 #endif
 #include <windows.h>
 #include <vulkan/vulkan.h>
+#include <vulkan/vulkan_win32.h>  // VkWin32SurfaceCreateInfoKHR and its PFN types
 
 #include <cstdint>
 #include <vector>
@@ -51,6 +55,8 @@ public:
     VkExtent2D extent() const { return extent_; }
     std::uint32_t image_count() const { return std::uint32_t(images_.size()); }
     int frames_presented() const { return frames_; }
+    VkDevice device() const { return gpu_.device; }
+    VkQueue queue() const { return gpu_.queue; }
 
     // Copies `source` (same device, in `source_layout`) into the next swapchain image and presents it. Equal format
     // and size are a plain copy; anything else is blitted with nearest filtering, cropped to the common area.
@@ -62,9 +68,48 @@ public:
     void capture_next_frame(VkBuffer buffer) { capture_ = buffer; }
 
 private:
+    // Resolved from the caller's instance/device, never linked: the layer loads Vulkan at run time.
+    struct Functions {
+#define LEONIDA_WSI_INSTANCE_FUNCTION(name) PFN_##name name = nullptr;
+        LEONIDA_WSI_INSTANCE_FUNCTION(vkCreateWin32SurfaceKHR)
+        LEONIDA_WSI_INSTANCE_FUNCTION(vkDestroySurfaceKHR)
+        LEONIDA_WSI_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceSupportKHR)
+        LEONIDA_WSI_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
+        LEONIDA_WSI_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceFormatsKHR)
+#undef LEONIDA_WSI_INSTANCE_FUNCTION
+#define LEONIDA_WSI_DEVICE_FUNCTION(name) PFN_##name name = nullptr;
+        LEONIDA_WSI_DEVICE_FUNCTION(vkCreateSwapchainKHR)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkDestroySwapchainKHR)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkGetSwapchainImagesKHR)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkAcquireNextImageKHR)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkQueuePresentKHR)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkQueueSubmit)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkQueueWaitIdle)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkDeviceWaitIdle)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkCreateCommandPool)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkDestroyCommandPool)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkAllocateCommandBuffers)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkFreeCommandBuffers)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkResetCommandBuffer)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkBeginCommandBuffer)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkEndCommandBuffer)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkCmdPipelineBarrier)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkCmdCopyImage)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkCmdBlitImage)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkCmdCopyImageToBuffer)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkCreateSemaphore)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkDestroySemaphore)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkCreateFence)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkDestroyFence)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkWaitForFences)
+        LEONIDA_WSI_DEVICE_FUNCTION(vkResetFences)
+#undef LEONIDA_WSI_DEVICE_FUNCTION
+    };
+
     void destroy();
 
     Gpu gpu_{};
+    Functions fn_{};
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;

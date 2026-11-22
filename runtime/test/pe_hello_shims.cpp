@@ -15,6 +15,7 @@
 
 #include "shims.h"
 #include "d3d12_com.h"
+#include "dxgi.h"
 #include <d3d12.h>
 #include "../test/animated_shaders.h"
 
@@ -440,6 +441,9 @@ SHIM_TABLE(d3d12, {"d3d12.dll", "LeonidaRunAnimation", reinterpret_cast<void*>(&
                     {"d3d12.dll", "Unmap", reinterpret_cast<void*>(&shim_unmap)},
                     {"d3d12.dll", "ExecuteCommandLists", reinterpret_cast<void*>(&shim_execute_command_lists)},
                     {"d3d12.dll", "CreateCommittedResource", reinterpret_cast<void*>(&shim_create_committed_resource)},
+                    {"dxgi.dll", "CreateDXGIFactory", reinterpret_cast<void*>(&CreateDXGIFactory)},
+                    {"dxgi.dll", "CreateDXGIFactory1", reinterpret_cast<void*>(&CreateDXGIFactory1)},
+                    {"dxgi.dll", "CreateDXGIFactory2", reinterpret_cast<void*>(&CreateDXGIFactory2)},
                     {"user32.dll", "CreateWindowExW", reinterpret_cast<void*>(&shim_create_window_ex_w)},
                     {"d3d12.dll", "LeonidaPresentWindow", reinterpret_cast<void*>(&LeonidaPresentWindow)},
                     {"d3d12.dll", "LeonidaRenderTriangle", reinterpret_cast<void*>(&LeonidaRenderTriangle)});
