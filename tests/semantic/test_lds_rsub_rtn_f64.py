@@ -898,5 +898,71 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(scc_initial, 1)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Unit tests for IEEE 754 binary64 special values, boundary extremes, and NaN propagation."""
+
+    def test_signed_zeros(self) -> None:
+        # (+0.0) - (+0.0) = +0.0
+        self.assertEqual(ieee754_rsub_f64(POS_ZERO_F64, POS_ZERO_F64), POS_ZERO_F64)
+
+        # (-0.0) - (-0.0) = +0.0
+        self.assertEqual(ieee754_rsub_f64(NEG_ZERO_F64, NEG_ZERO_F64), POS_ZERO_F64)
+
+        # (-0.0) - (+0.0) = -0.0
+        self.assertEqual(ieee754_rsub_f64(NEG_ZERO_F64, POS_ZERO_F64), NEG_ZERO_F64)
+
+        # (+0.0) - (-0.0) = +0.0
+        self.assertEqual(ieee754_rsub_f64(POS_ZERO_F64, NEG_ZERO_F64), POS_ZERO_F64)
+
+    def test_infinities(self) -> None:
+        # (+Inf) - (+Inf) -> QNaN
+        self.assertEqual(ieee754_rsub_f64(POS_INF_F64, POS_INF_F64), CANONICAL_QNAN64)
+
+        # (-Inf) - (-Inf) -> QNaN
+        self.assertEqual(ieee754_rsub_f64(NEG_INF_F64, NEG_INF_F64), CANONICAL_QNAN64)
+
+        # (+Inf) - (-Inf) = +Inf
+        self.assertEqual(ieee754_rsub_f64(POS_INF_F64, NEG_INF_F64), POS_INF_F64)
+
+        # (-Inf) - (+Inf) = -Inf
+        self.assertEqual(ieee754_rsub_f64(NEG_INF_F64, POS_INF_F64), NEG_INF_F64)
+
+        # Finite - (+Inf) = -Inf (vdata0 is finite, old_val is +Inf)
+        self.assertEqual(ieee754_rsub_f64(FIVE_F64, POS_INF_F64), NEG_INF_F64)
+
+        # (+Inf) - Finite = +Inf (vdata0 is +Inf, old_val is finite)
+        self.assertEqual(ieee754_rsub_f64(POS_INF_F64, FIVE_F64), POS_INF_F64)
+
+    def test_nan_propagation(self) -> None:
+        # QNaN as minuend
+        self.assertEqual(ieee754_rsub_f64(CANONICAL_QNAN64, ONE_F64), CANONICAL_QNAN64)
+
+        # QNaN as subtrahend
+        self.assertEqual(ieee754_rsub_f64(ONE_F64, CANONICAL_QNAN64), CANONICAL_QNAN64)
+
+        # SNaN as minuend -> quieted to canonical QNaN
+        self.assertEqual(ieee754_rsub_f64(CANONICAL_SNAN64, TWO_F64), CANONICAL_QNAN64)
+
+        # SNaN as subtrahend -> quieted to canonical QNaN
+        self.assertEqual(ieee754_rsub_f64(TWO_F64, CANONICAL_SNAN64), CANONICAL_QNAN64)
+
+    def test_subnormals(self) -> None:
+        subnorm1 = 0x0000_0000_0000_0001  # Smallest positive binary64 subnormal (2^-1074)
+        subnorm2 = 0x0000_0000_0000_0002
+        res = ieee754_rsub_f64(subnorm2, subnorm1)
+        self.assertEqual(res, subnorm1)
+
+    def test_overflow_to_infinity(self) -> None:
+        max_norm_pos = 0x7FEF_FFFF_FFFF_FFFF
+        max_norm_neg = 0xFFEF_FFFF_FFFF_FFFF
+        # max_pos - (-max_pos) overflows to +Infinity
+        res = ieee754_rsub_f64(max_norm_pos, max_norm_neg)
+        self.assertEqual(res, POS_INF_F64)
+
+
 if __name__ == "__main__":
     unittest.main()
