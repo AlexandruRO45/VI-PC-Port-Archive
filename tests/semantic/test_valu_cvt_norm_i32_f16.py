@@ -249,5 +249,125 @@ class TestValuCvtNormI32F16Oracle(unittest.TestCase):
         # clamp modifier clips negatives to 0
         self.assertEqual(ref_cvt_norm_i32_f16(NEG_HALF_F16, clamp=True), SNORM32_ZERO)
 
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class Opcode(Enum):
+    V_CVT_NORM_I32_F16 = "v_cvt_norm_i32_f16"
+
+
+class Encoding(Enum):
+    VOP1 = "vop1"
+    VOP3 = "vop3"
+
+
+class RegKind(Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+
+
+class SubWord(Enum):
+    FULL = "full"
+    LO = "lo"
+    HI = "hi"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Typed architectural register descriptor with optional 16-bit sub-dword indexing."""
+    kind: RegKind
+    index: int
+    subword: SubWord = SubWord.FULL
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index > 255:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+
+    def name(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        base = f"{prefix}{self.index}"
+        if self.subword == SubWord.LO:
+            return f"{base}.l"
+        elif self.subword == SubWord.HI:
+            return f"{base}.h"
+        return base
+
+
+@dataclasses.dataclass(frozen=True)
+class Immediate:
+    """Immediate floating-point or integer constant operand."""
+    value: Union[int, float]
+    is_f16: bool = True
+
+    def bits16(self) -> int:
+        if isinstance(self.value, float):
+            return f16_to_bits(self.value)
+        return int(self.value) & MASK16
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST representation of a VALU conversion instruction."""
+    opcode: Opcode
+    dst: Register
+    src0: Union[Register, Immediate]
+    abs_src0: bool = False
+    neg_src0: bool = False
+    clamp: bool = False
+    encoding: Encoding = Encoding.VOP1
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != RegKind.VGPR:
+            raise ValueError("VALU destination must be a VGPR")
+        if self.encoding == Encoding.VOP1 and (self.abs_src0 or self.neg_src0 or self.clamp):
+            raise ValueError("VOP1 encoding does not support modifiers or clamp")
+
+    def asm(self) -> str:
+        suffix = "_e64" if self.encoding == Encoding.VOP3 else "_e32"
+        s0_str = self.src0.name() if isinstance(self.src0, Register) else f"{self.src0.bits16():#06x}"
+        if self.abs_src0:
+            s0_str = f"|{s0_str}|"
+        if self.neg_src0:
+            s0_str = f"-{s0_str}"
+        clamp_str = " clamp" if self.clamp else ""
+        return f"{self.opcode.value}{suffix} {self.dst.name()}, {s0_str}{clamp_str}"
+
+
+class TestValuCvtNormI32F16AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_and_encoding(self) -> None:
+        self.assertEqual(Opcode.V_CVT_NORM_I32_F16.value, "v_cvt_norm_i32_f16")
+        self.assertEqual(Encoding.VOP1.value, "vop1")
+        self.assertEqual(Encoding.VOP3.value, "vop3")
+
+    def test_register_descriptors(self) -> None:
+        v0 = Register(RegKind.VGPR, 0)
+        v1_l = Register(RegKind.VGPR, 1, SubWord.LO)
+        s2_h = Register(RegKind.SGPR, 2, SubWord.HI)
+        self.assertEqual(v0.name(), "v0")
+        self.assertEqual(v1_l.name(), "v1.l")
+        self.assertEqual(s2_h.name(), "s2.h")
+
+    def test_immediate_wrapping(self) -> None:
+        imm = Immediate(0.5)
+        self.assertEqual(imm.bits16(), HALF_F16)
+
+    def test_instruction_construction_and_validation(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CVT_NORM_I32_F16,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1, SubWord.LO),
+        )
+        self.assertEqual(inst.asm(), "v_cvt_norm_i32_f16_e32 v0, v1.l")
+
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_NORM_I32_F16,
+                dst=Register(RegKind.SGPR, 0),
+                src0=Register(RegKind.VGPR, 1),
+            )
+
 if __name__ == "__main__":
     unittest.main()
