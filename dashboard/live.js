@@ -378,7 +378,7 @@ function renderQueue() {
   const chains = coord && coord.chains.length
     ? coord.chains.map(c => `<div class="chain">${c.map(n => `<a href="${GH}/pull/${esc(n.slice(1))}" target="_blank" rel="noopener">${esc(n)}</a>`).join(' → ')}</div>`).join('')
     : '<span style="color:var(--muted)">No chains listed.</span>';
-  $('#queueBody').innerHTML = `<div class="tiles">${tiles}</div>
+  const html = `<div class="tiles">${tiles}</div>
     ${bottleneckHtml(coord)}
     <div class="queue-grid">
       <div class="card"><div class="subhead" style="margin-top:0">Ready: CI green, no conflicts, oldest first</div>
@@ -392,8 +392,12 @@ function renderQueue() {
       <div class="card"><div class="subhead" style="margin-top:0">Merge in this order</div>${chains}
         <p class="footnote">Chains of PRs that build on each other, from the coordination issue.</p></div>
     </div>
-    <p class="footnote">CI waiting mostly means a fork's first run waits for a maintainer to approve it. The counts come from the same load as the pipeline above, every ${Math.round(pipeInterval() / 60000)} minute${pipeInterval() > 60000 ? 's' : ''}.</p>`;
+    <p class="footnote">CI waiting mostly means a fork's first run waits for a maintainer to approve it. The counts come from the same load as the pipeline above, ${graphCovers() ? `your token's sweep every ${Math.round(GRAPH_MS / 60000)} minutes` : `every ${Math.round(pipeInterval() / 60000)} minute${pipeInterval() > 60000 ? 's' : ''}`}.</p>`;
+  if (html === queueHtml) return;   // runs after every feed update: leave an unchanged section alone
+  queueHtml = html;
+  $('#queueBody').innerHTML = html;
 }
+let queueHtml = '';
 
 /** The bottleneck the open PRs point at. */
 function bottleneckHtml(coord) {
@@ -634,25 +638,34 @@ function renderParts() {
     status = `<span class="wait">⏳ Still loading: ${esc(list)}. GitHub allows ${esc(limitText(res))}, so the rest continues in <b>${mmss(next - Date.now())}</b>, by itself.</span>`;
   } else status = `<span class="busy">↻ Loading: ${esc(list)}…</span>`;
   const offer = !activeToken() && pending.length ? ' <button class="linkbtn" id="offerToken" type="button">Load faster with a free token</button>' : '';
-  bar.innerHTML = `<div class="wrap">
+  const html = `<div class="wrap">
       <div class="nb-status">${status}${offer}</div>
-      <div class="nb-rates">GitHub requests ${activeToken() ? 'with your token' : 'without a token'} · this page made <b>${fmt(apiCalls)}</b> · ${rateLine('search', 'search', 'minute')} · ${rateLine('core', 'other', 'hour')}${coreSpare() ? '' : ' · <span class="low">saving the hourly allowance: claims and commits wait</span>'} · ${attention() === 'active' ? 'updates every minute' : 'idle: updates every 5 minutes'}</div>
+      <div class="nb-rates">GitHub requests ${activeToken() ? 'with your token' : 'without a token'} · this page made <b>${fmt(apiCalls)}</b> · ${rateLine('search', 'search', 'minute')} · ${rateLine('core', 'other', 'hour')}${rate.graphql ? ' · ' + rateLine('graphql', 'GraphQL', 'hour') : ''}${coreSpare() ? '' : ' · <span class="low">saving the hourly allowance: claims and commits wait</span>'} · ${attention() === 'active' ? 'updates every minute' : 'idle: updates every 5 minutes'}</div>
     </div>`;
-  const btn = $('#offerToken');
-  if (btn) btn.addEventListener('click', () => { bannerOffer = true; bannerClosed = ''; bannerKey = null; renderBanner(); window.scrollTo({ top: 0, behavior: 'smooth' }); });
+  // This runs every second: writing the same HTML or text again would still make the browser lay out and repaint.
+  if (html !== netbarHtml) {
+    netbarHtml = html;
+    bar.innerHTML = html;
+    const btn = $('#offerToken');
+    if (btn) btn.addEventListener('click', () => { bannerOffer = true; bannerClosed = ''; bannerKey = null; renderBanner(); window.scrollTo({ top: 0, behavior: 'smooth' }); });
+  }
   for (const el of document.querySelectorAll('[data-part]')) {
     const key = el.dataset.part;
     const state = parts[key].state;
     el.classList.toggle('warn', state === 'waiting');
     el.classList.toggle('bad', state === 'error');
-    const title = el.querySelector('.pending-title');
-    if (title) title.textContent = partTitle(key);
-    const msg = el.querySelector('.pending-msg');
-    if (msg) msg.textContent = boxMessage(key);
+    setText(el.querySelector('.pending-title'), partTitle(key));
+    setText(el.querySelector('.pending-msg'), boxMessage(key));
     const btn = el.querySelector('.pb-token');
     if (btn) btn.hidden = !(state === 'waiting' && !activeToken());
   }
-  for (const el of document.querySelectorAll('[data-part-msg]')) el.textContent = partMessage(el.dataset.partMsg);
+  for (const el of document.querySelectorAll('[data-part-msg]')) setText(el, partMessage(el.dataset.partMsg));
+}
+let netbarHtml = '';
+
+/** Set an element's text only when it differs. */
+function setText(el, text) {
+  if (el && el.textContent !== text) el.textContent = text;
 }
 
 /* ================= attention: active, idle or away ================= */
@@ -741,8 +754,10 @@ async function runSync(force) {
       addCommitEvents();
       renderLive();
     }
-    // What is left of the search limit goes to the pipeline first, then to the activity chart.
-    const pipeState = await loadPipeline(Date.now());
+    // With a token one GraphQL sweep (triage.js) brings every open PR; otherwise, or when it fails, what is left of
+    // the search limit goes to the pipeline first, then to the activity chart.
+    const graphState = await loadGraph(Date.now());
+    const pipeState = graphState === 'done' || graphState === 'idle' ? graphState : await loadPipeline(Date.now());
     if (pipeState === 'waiting') setPart('pipeline', { state: 'waiting', ...waitingOn() });
     else if (pipeState === 'error') setPart('pipeline', { state: 'error', msg: 'the search failed' });
     else if (pipe.fullAt) setPart('pipeline', { state: 'done' });
@@ -795,8 +810,10 @@ function renderClock() {
   else if (anyStale) { cls = 'stale'; text = `Partly cached · data from ${hhmm(staleSince)} · next in ${next}`; }
   else if (sync.failed) { cls = 'err'; text = `Partly offline · retry in ${next}`; }
   else text = `Live · updated ${ago(sync.last)} · next in ${next}`;
-  $('#liveDot').className = 'dot' + (cls ? ' ' + cls : '');
-  $('#liveTxt').textContent = text;
+  const dot = $('#liveDot');
+  const dotClass = 'dot' + (cls ? ' ' + cls : '');
+  if (dot.className !== dotClass) dot.className = dotClass;
+  setText($('#liveTxt'), text);
 }
 
 function renderRate() {

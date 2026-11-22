@@ -18,7 +18,7 @@ const PIPE_CI_MS_NO_TOKEN = 5 * 60 * 1000;
 const PIPE_CI_MS_TOKEN = 60 * 1000;
 const PIPE_FULL_MS = 30 * 60 * 1000;
 const PIPE_PAGE = 100;
-const PIPE_MAX_PAGES = 8;                 // up to 800 open PRs
+const PIPE_MAX_PAGES = 10;                // search answers at most 1,000 results; a token's sweep has no cap
 const PIPE_KEY = 'pipe:v2';
 const PIPE_JOB_KEY = 'pipe:job';
 const JOB_KEEP_MS = 10 * 60 * 1000;      // a load interrupted by F5 goes on if it is younger than this
@@ -74,12 +74,14 @@ const pickPipeList = d => ({
   items: (d.items || []).map(i => ({
     n: i.number, title: i.title, user: i.user ? i.user.login : '', avatar: i.user ? i.user.avatar_url : '',
     url: i.html_url, created: i.created_at, draft: !!i.draft, comments: i.comments || 0,
+    tids: refIds(i.title), ...bodyRefs(i.body),
   })),
 });
 
+/** `conflict` is GitHub's live merge state from a token's sweep; without it the coordination issue's rebase list. */
 function stageOf(pr, ok, bad, rebase) {
   if (pr.draft) return 'draft';
-  if (rebase.has(pr.n)) return 'rebase';
+  if (pr.conflict === true || (pr.conflict == null && rebase.has(pr.n))) return 'rebase';
   if (bad.has(pr.n)) return 'failing';
   if (ok.has(pr.n)) return pr.checked ? 'ready' : 'green';
   if (pr.ciRunning) return 'running';
@@ -109,6 +111,7 @@ async function pipeCall(path, key) {
  * are due. Returns 'done', 'waiting' (budget ran out, goes on later), 'idle' or 'error'.
  */
 async function loadPipeline(now) {
+  if (graphCovers()) { pipe.job = null; return 'idle'; }   // the token's sweep (triage.js) brings all of this
   if (!pipe.job) {
     if (!pipe.fullAt || now - pipe.fullAt >= PIPE_FULL_MS) pipe.job = { full: true, ok: null, bad: null, items: [], total: null, page: 1, startedAt: now };
     else if (now - pipe.ciAt >= pipeInterval()) pipe.job = { full: false, ok: null, bad: null, startedAt: now };
@@ -156,7 +159,18 @@ function coordSets() {
 
 function withCoord(item, review) {
   const r = review[item.n] || {};
-  return { ...item, checked: r.checked || 0, ciRunning: !!r.ciRunning, group: r.group || '', item: r.item || '' };
+  return { ...item, checked: r.checked || 0, ciRunning: !!r.ciRunning || !!item.ciPending, group: r.group || '', item: r.item || '' };
+}
+
+/** A token's GraphQL sweep (triage.js): every open PR with its CI result and merge state, in place of the searches. */
+function applyGraph(items) {
+  const slim = p => ({ n: p.n, title: p.title, user: p.user, avatar: p.avatar, url: p.url, created: p.created, draft: p.draft, comments: p.comments });
+  const ok = items.filter(p => p.ci === 'ok').map(slim);
+  const bad = items.filter(p => p.ci === 'bad').map(slim);
+  pipe.ok = { total: ok.length, items: ok };
+  pipe.bad = { total: bad.length, items: bad };
+  pipe.ciAt = Date.now();
+  applySnapshot(items);
 }
 
 /** A full load: the open PR list replaces what the page had. */
@@ -276,6 +290,7 @@ function queueFromPipeline() {
     draft: { total: counts.draft },
   };
   renderQueue();
+  renderTriage();
 }
 
 function restorePipeline() {

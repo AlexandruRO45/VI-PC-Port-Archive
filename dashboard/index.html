@@ -51,7 +51,8 @@ code { font: 500 .86em var(--mono); background: rgba(255,255,255,.07); padding: 
 @media (max-width: 640px) { .wrap { padding: 0 16px; } }
 
 /* ---------- top bar ---------- */
-.topbar { position: sticky; top: 0; z-index: 20; backdrop-filter: blur(14px); background: rgba(10,7,24,.72); border-bottom: 1px solid var(--line); }
+/* Solid, not a backdrop blur: a blur behind a sticky bar is redrawn on every scrolled frame (slow on integrated GPUs). */
+.topbar { position: sticky; top: 0; z-index: 20; background: rgba(10,7,24,.97); border-bottom: 1px solid var(--line); }
 .topbar .wrap { display: flex; align-items: center; gap: 16px; height: 56px; }
 .brand { font: 900 15px var(--display); letter-spacing: .14em; text-transform: uppercase;
   background: linear-gradient(90deg, var(--pink), var(--orange)); -webkit-background-clip: text; background-clip: text; color: transparent; }
@@ -59,10 +60,13 @@ code { font: 500 .86em var(--mono); background: rgba(255,255,255,.07); padding: 
 .nav a { color: var(--muted); }
 .nav a:hover { color: var(--text); text-decoration: none; }
 .live { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); white-space: nowrap; }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 0 0 rgba(46,230,200,.7); animation: pulse 2s infinite; }
-.dot.stale { background: var(--wip); animation: none; }
-.dot.err { background: var(--todo); animation: none; }
-@keyframes pulse { 70% { box-shadow: 0 0 0 10px rgba(46,230,200,0); } 100% { box-shadow: 0 0 0 0 rgba(46,230,200,0); } }
+.dot { position: relative; width: 9px; height: 9px; border-radius: 50%; background: var(--teal); }
+/* The ring grows and fades with transform and opacity only: an animated box-shadow repaints the whole page every frame. */
+.dot::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: rgba(46,230,200,.7); animation: pulse 2s infinite; }
+.dot.stale { background: var(--wip); }
+.dot.err { background: var(--todo); }
+.dot.stale::after, .dot.err::after { animation: none; opacity: 0; }
+@keyframes pulse { 0% { transform: scale(1); opacity: .7; } 70%, 100% { transform: scale(3.2); opacity: 0; } }
 .btn { font: 500 13px var(--body); color: var(--text); background: var(--card-hi); border: 1px solid var(--line); border-radius: 999px; padding: 6px 14px; cursor: pointer; white-space: nowrap; }
 .btn:hover { background: rgba(255,255,255,.12); }
 .btn.primary { background: linear-gradient(90deg, var(--pink), var(--orange)); border: 0; color: #1a0816; font-weight: 700; }
@@ -320,13 +324,13 @@ body.card-mode .card-url { display: block; }
 /* ---------- live feed ---------- */
 .live-grid { display: grid; grid-template-columns: 1.3fr .7fr; gap: 16px; align-items: start; }
 @media (max-width: 900px) { .live-grid, .queue-grid { grid-template-columns: 1fr; } }
-.round { border-radius: 14px; padding: 14px 16px; margin-bottom: 12px; background: linear-gradient(90deg, rgba(255,61,139,.18), rgba(139,92,246,.14)); border: 1px solid rgba(255,61,139,.4); }
-.round.now { animation: glow 1.6s ease-in-out infinite alternate; }
+.round { position: relative; border-radius: 14px; padding: 14px 16px; margin-bottom: 12px; background: linear-gradient(90deg, rgba(255,61,139,.18), rgba(139,92,246,.14)); border: 1px solid rgba(255,61,139,.4); }
+.round.now::after { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; box-shadow: 0 0 22px 2px rgba(255,61,139,.35); opacity: 0; animation: glow 1.6s ease-in-out infinite alternate; }
 .round b { font: 700 16px var(--display); }
 .round .meta { font-size: 13px; color: var(--muted); margin-top: 4px; }
 .round .faces { display: flex; margin-top: 10px; flex-wrap: wrap; }
 .round .faces img { width: 24px; height: 24px; border-radius: 50%; border: 2px solid var(--bg2); margin-right: -6px; background: var(--card-hi); }
-@keyframes glow { from { box-shadow: 0 0 0 0 rgba(255,61,139,0); } to { box-shadow: 0 0 22px 2px rgba(255,61,139,.35); } }
+@keyframes glow { to { opacity: 1; } }
 .evs { display: flex; flex-direction: column; gap: 2px; max-height: 560px; overflow: auto; }
 .ev { display: grid; grid-template-columns: 26px 28px 1fr auto; gap: 10px; align-items: center; padding: 8px; border-radius: 10px; color: var(--text); font-size: 13.5px; }
 .ev:hover { background: var(--card-hi); text-decoration: none; }
@@ -367,8 +371,24 @@ body.card-mode .card-url { display: block; }
 .authors .who { font-weight: 700; }
 .chain { font: 500 13px var(--mono); margin: 4px 0; }
 
+/* ---------- triage (triage.js) ---------- */
+#triageBody .queue-grid > .card { contain: content; }
+.sdot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 7px; vertical-align: 0; }
+.tag { font: 700 10.5px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--research); border: 1px solid currentColor; border-radius: 6px; padding: 0 5px; margin-left: 4px; }
+.dup { padding: 8px 0; border-top: 1px solid var(--line); }
+.subhead + .dup { border-top: 0; padding-top: 2px; }
+.dup-head { font-size: 13.5px; padding: 0 8px; }
+.dup-head span { color: var(--muted); }
+.dup .prs { margin-top: 2px; }
+.hot { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(60px, 1fr) auto; gap: 12px; align-items: center; padding: 5px 0; font-size: 13px; }
+.hot code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hot .bar { height: 8px; border-radius: 4px; background: rgba(255,255,255,.06); overflow: hidden; }
+.hot .bar i { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, var(--pink), var(--orange)); }
+.hot .num { font: 700 13px var(--mono); white-space: nowrap; }
+.hot .num small { font-weight: 500; color: var(--dim); }
+
 /* ---------- status bar: requests, limits, what is still loading ---------- */
-.netbar { position: sticky; top: 56px; z-index: 19; background: rgba(19,12,44,.92); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); font-size: 13px; }
+.netbar { position: sticky; top: 56px; z-index: 19; background: rgb(19,12,44); border-bottom: 1px solid var(--line); font-size: 13px; }
 .netbar .wrap { display: flex; flex-wrap: wrap; gap: 4px 18px; justify-content: space-between; padding-top: 7px; padding-bottom: 7px; }
 .nb-status .ok { color: var(--done); }
 .nb-status .busy { color: var(--sun); }
@@ -473,6 +493,7 @@ body.card-mode .card-url { display: block; }
       <a href="#graphics">Graphics layer</a>
       <a href="#pulse">Activity</a>
       <a href="#queue">Merge queue</a>
+      <a href="#triage">Triage</a>
       <a href="#work">Work board</a>
       <a href="#faq">Q&amp;A</a>
     </nav>
@@ -614,6 +635,19 @@ body.card-mode .card-url { display: block; }
         </div>
       </div>
       <div id="queueBody"><div class="pending" data-part="pipeline"><div class="skeleton"></div><div class="pending-box"><b class="pending-title">Loading from GitHub…</b><p class="pending-msg"></p><button class="linkbtn pb-token" type="button" hidden>Load faster with a free token</button></div></div></div>
+    </div>
+  </section>
+
+  <section id="triage">
+    <div class="wrap">
+      <div class="sec-head">
+        <div>
+          <div class="eyebrow">For maintainers</div>
+          <h2>Triage</h2>
+          <p class="lede">What to merge together and what to close: green PRs that can go in one round without making each other conflict, items that more than one author has a PR for, and the files most PRs fight over.</p>
+        </div>
+      </div>
+      <div id="triageBody"><div class="pending" data-part="pipeline"><div class="skeleton"></div><div class="pending-box"><b class="pending-title">Loading from GitHub…</b><p class="pending-msg"></p><button class="linkbtn pb-token" type="button" hidden>Load faster with a free token</button></div></div></div>
     </div>
   </section>
 
@@ -1690,5 +1724,6 @@ document.addEventListener('DOMContentLoaded', init);
 <script src="live.js"></script>
 <script src="activity.js"></script>
 <script src="pipeline.js"></script>
+<script src="triage.js"></script>
 </body>
 </html>
