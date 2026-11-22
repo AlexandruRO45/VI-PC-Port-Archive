@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 import zlib
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -339,6 +339,30 @@ class CliTest(unittest.TestCase):
             f.write(b"\x00" * 64)
         self.assertIn("--out", self.cli_error([path, "--out", os.path.join(path, "sub", "r.json")]))
         self.assertIn("folder", self.cli_error([path, "--out", self.tmp.name]))
+
+    def test_invalid_archive_window_leaves_report_untouched(self):
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        data = rpf(list(scene()))
+        with open(path, "wb") as f:
+            f.write(data)
+        out = os.path.join(self.tmp.name, "out.json")
+        with open(out, "wb") as f:
+            f.write(b"existing report")
+        for option, value, message in (
+            ("--start", "-1", "at least 0"),
+            ("--limit", "0", "at least 1"),
+            ("--limit", "-1", "at least 1"),
+            ("--start", str(len(data)), "outside the data area"),
+        ):
+            with self.subTest(option=option, value=value):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as exc:
+                    WA.main([path, "--out", out, option, value])
+                self.assertEqual(exc.exception.code, 2)
+                self.assertIn(option, err.getvalue())
+                self.assertIn(message, err.getvalue())
+                with open(out, "rb") as f:
+                    self.assertEqual(f.read(), b"existing report")
 
     def test_missing_path_is_an_error(self):
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):

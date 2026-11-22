@@ -289,18 +289,23 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.exists(a.path):
         ap.error("no such file or folder: %s" % a.path)
-    # Check the report path before the scan: --out equal to the archive used to truncate the input after the run, and
-    # an --out under a regular file or naming a folder raised a traceback once all the work was done.
     if same_report_path(a.out, a.path):
         ap.error("--out would overwrite the input %s" % a.path)
     if os.path.isdir(a.out):
         ap.error("--out %s is a folder, not a file" % a.out)
+    if a.start is not None and a.start < 0:
+        ap.error("--start must be at least 0")
+    if a.limit is not None and a.limit < 1:
+        ap.error("--limit must be at least 1")
     out_dir = os.path.dirname(os.path.abspath(a.out))
     try:
         os.makedirs(out_dir, exist_ok=True)
     except OSError as e:
         ap.error("--out %s: cannot create %s: %s" % (a.out, out_dir, e.strerror or e))
-    doc = run(a.path, a.start, a.limit, a.check_extents)
+    try:
+        doc = run(a.path, a.start, a.limit, a.check_extents)
+    except (OSError, ValueError) as e:
+        ap.error(str(e))
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
     try:
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:
