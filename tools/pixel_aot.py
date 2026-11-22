@@ -347,6 +347,12 @@ INT_COMPARE = {
 }
 # 32-bit integer operations on register bits. Shift counts use their low five bits, as on the target.
 INTEGER = {
+    # VOP3-only byte and bit funnel forms. {S0, S1} is a 64-bit value with S0 in the high word. Shifting S0 left by 1
+    # and then by 31 - n is S0 << (32 - n) for n in 1..31 and 0 for n = 0, so neither shift reaches 32.
+    "alignbit_b32": (3, "({1} >> ({2} & 31u)) | (({0} << 1u) << (31u - ({2} & 31u)))"),
+    "alignbyte_b32": (3, "({1} >> (({2} & 3u) * 8u)) | (({0} << 1u) << (31u - ({2} & 3u) * 8u))"),
+    "perm_b32": (3, "perm_b32({0}, {1}, {2})"), "lerp_u8": (3, "lerp_u8({0}, {1}, {2})"),
+    "sad_u8": (3, "sad_u8({0}, {1}, {2})"), "sad_u16": (3, "sad_u16({0}, {1}, {2})"),
     "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
     "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
@@ -437,6 +443,49 @@ SALU_HELPERS = {
         "    uint mid = 1u << (shift - 1u);\n"
         "    if (rem > mid || (rem == mid && (half_m & 1u) != 0u)) half_m += 1u;\n"
         "    return sign | half_m;\n"
+        "}"
+    ),
+    # Byte selection of v_perm_b32 on {S0, S1}: 0-7 pick a byte (0-3 from S1), 8-11 replicate bit 15, 31, 47 or 63,
+    # 12 gives 0x00 and 13-255 give 0xff.
+    "perm_b32": (
+        "uint perm_byte(uint s0, uint s1, uint sel) {\n"
+        "    if (sel >= 13u) return 0xffu;\n"
+        "    if (sel == 12u) return 0u;\n"
+        "    uint word = sel < 4u || sel == 8u || sel == 9u ? s1 : s0;\n"
+        "    if (sel >= 8u) return ((word >> ((sel & 1u) != 0u ? 31u : 15u)) & 1u) * 0xffu;\n"
+        "    return (word >> ((sel & 3u) * 8u)) & 0xffu;\n"
+        "}\n"
+        "uint perm_b32(uint s0, uint s1, uint sel) {\n"
+        "    uint d = 0u;\n"
+        "    for (uint n = 0u; n < 32u; n += 8u) d |= perm_byte(s0, s1, (sel >> n) & 0xffu) << n;\n"
+        "    return d;\n"
+        "}"
+    ),
+    # Per byte: (S0 + S1 + bit 0 of the S2 byte) >> 1; the 9-bit sum cannot carry into the next byte.
+    "lerp_u8": (
+        "uint lerp_u8(uint a, uint b, uint c) {\n"
+        "    uint d = 0u;\n"
+        "    for (uint n = 0u; n < 32u; n += 8u)\n"
+        "        d |= ((((a >> n) & 0xffu) + ((b >> n) & 0xffu) + ((c >> n) & 1u)) >> 1) << n;\n"
+        "    return d;\n"
+        "}"
+    ),
+    "sad_u8": (
+        "uint sad_u8(uint a, uint b, uint c) {\n"
+        "    for (uint n = 0u; n < 32u; n += 8u) {\n"
+        "        uint x = (a >> n) & 0xffu, y = (b >> n) & 0xffu;\n"
+        "        c += max(x, y) - min(x, y);\n"
+        "    }\n"
+        "    return c;\n"
+        "}"
+    ),
+    "sad_u16": (
+        "uint sad_u16(uint a, uint b, uint c) {\n"
+        "    for (uint n = 0u; n < 32u; n += 16u) {\n"
+        "        uint x = (a >> n) & 0xffffu, y = (b >> n) & 0xffffu;\n"
+        "        c += max(x, y) - min(x, y);\n"
+        "    }\n"
+        "    return c;\n"
         "}"
     ),
     "min16_num": (
@@ -1438,6 +1487,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or dst in sample_dest or len(tokens) != arity:
                 raise ValueError("Invalid integer operation")
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
+            if op in SALU_HELPERS:
+                helpers.add(op)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):

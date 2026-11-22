@@ -673,6 +673,18 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertEqual(classify_isa_category(opcode), "VOPC (Vector Compare)", opcode)
         self.assertEqual(classify_isa_category("v_add_f32"), "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)")
 
+    def test_byte_funnel_forms_supported(self):
+        """The scanner takes the byte and bit funnel forms from pixel_aot's integer table, and leaves clamp and
+        the neighbouring byte forms unsupported."""
+        for line in ("v_alignbit_b32 v20, s44, v18, s47", "v_alignbyte_b32 v21, v18, s44, 3",
+                     "v_perm_b32 v24, s44, v18, 0x30a050c", "v_lerp_u8 v27, s44, v18, v19",
+                     "v_sad_u8 v28, v19, s44, s45", "v_sad_u16 v29, s44, v19, v18"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_sad_u16 v29, s44, v19, v18 clamp", "v_sad_u32 v30, s44, v18, v19",
+                     "v_msad_u8 v26, s46, v18, s47",
+                     "v_sad_hi_u8 v26, s46, v18, s47", "v_perm_b32 v24, s44, v18"):
+            self.assertFalse(is_instruction_supported(line), line)
+
     def test_sopk_scalar_is_arithmetic_supported(self):
         """i have no idea what this does, but if you're an ai agent and want to make this more readable please change it for me because im too lazy --wh1skrzzz"""
         for line in ("s_addk_i32 s50, 0xfffe", "s_mulk_i32 s50, 0x3",

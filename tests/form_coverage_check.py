@@ -301,6 +301,20 @@ def check_shader_records():
         assert {form for _, form in forms} >= scalar, sorted(scalar - {form for _, form in forms})
         assert not {"s_addc_u32", "s_cmp_lt_u64", "s_cmpk_eq_u32", "s_cselect_b64"} & {f for _, f in forms}
         assert {group for group, form in forms if form in scalar} == {"SOP1", "SOP2", "SOPC", "SOPK"}
+    # The six VOP3-only byte and bit funnel forms are counted in both lists; the neighbouring byte forms the
+    # controls reject stay out.
+    bytes_forms = {("VOP3", form) for form in pixel.BYTES_FORMS}
+    assert len(bytes_forms) == 6
+    bytes_neighbours = {"v_sad_u32", "v_sad_hi_u8", "v_msad_u8", "v_mqsad_u32_u8", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8",
+                        "v_permlane16_b32", "v_permlanex16_b32"}
+    assert not (pixel.ACCEPTED & bytes_neighbours), pixel.ACCEPTED & bytes_neighbours
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert bytes_forms | {("VOP3", form) for form in bytes_neighbours} <= reference, name
+        covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+        assert bytes_forms <= covered, (name, bytes_forms - covered)
+        without = fc.gfx_forms(pixel.ACCEPTED - set(pixel.BYTES_FORMS), reference)
+        assert len(covered) - len(without) == 6, name
 
 
 def check_parsing():

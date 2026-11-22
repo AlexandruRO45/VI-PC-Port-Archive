@@ -528,6 +528,90 @@ def ldexp_values():
     ])
 
 
+# The VOP3-only byte and bit funnel forms. Each result goes to its own register and bytes_program(k) exports the
+# four bytes of result k through v_cvt_f32_ubyte0-3, so each channel is an exact integer 0..255.
+BYTES_FORMS = ("v_alignbit_b32", "v_alignbyte_b32", "v_perm_b32", "v_lerp_u8", "v_sad_u8", "v_sad_u16")
+BYTES_OPS = (
+    "v_alignbit_b32 v20, s44, v18, s47",
+    "v_alignbyte_b32 v21, v18, s44, s47",
+    "v_alignbit_b32 v22, v19, s45, 44",
+    "v_alignbyte_b32 v23, s44, v19, 4",
+    "v_perm_b32 v24, s44, v18, 0x30a050c",
+    "v_perm_b32 v25, v19, s45, 0x106080d",
+    "v_perm_b32 v26, s46, v18, s47",
+    "v_lerp_u8 v27, s44, v18, v19",
+    "v_sad_u8 v28, v19, s44, s45",
+    "v_sad_u16 v29, s44, v19, v18",
+)
+# Constant words 3 to 6 (s44 to s47). Every input and result is the bit pattern of a normal binary32 value, so no
+# register move can flush or quiet it on the desktop side. s47 is the shift (19 and 9 for v_alignbit_b32, 3 and 1
+# bytes for v_alignbyte_b32) and the register selector of v_perm_b32. With the two literal selectors, the perm
+# selector bytes are 0 to 13, 19 and 199; the bits that selectors 8 and 10 replicate differ between the sets.
+BYTES_WORDS = ((0xf3a1b8eb, 0x17272174, 0xdf3bd605, 0xc7040b13),
+               (0x8e7641fb, 0x94f1e1b4, 0x3b12b4b7, 0x02070009))
+
+
+def bytes_program(k):
+    return with_constants([
+        "v_mov_b32_e32 v18, s45",
+        "v_mov_b32_e32 v19, s46",
+        *BYTES_OPS,
+        *(f"v_cvt_f32_ubyte{n}_e32 v{12 + n}, v{20 + k}" for n in range(4)),
+    ])
+
+
+def perm_reference(s0, s1, selector, misread=None):
+    """byte_permute of the RDNA 2 ISA reference on the eight bytes of {S0, S1}, S1 in bytes 0 to 3. misread names a
+    wrong reading of the selector for the negative controls."""
+    data = (s0 << 32) | s1
+    result = 0
+    for n in range(4):
+        sel = (selector >> 8 * n) & 0xff
+        if misread == "low3":
+            sel &= 7
+        elif misread == "nibble":
+            sel &= 15
+        if misread == "sign-bit7" and 8 <= sel <= 11:
+            byte = 0xff * ((data >> (8 * (sel - 8) + 7)) & 1)
+        elif sel >= 13:
+            byte = 0xff
+        elif sel == 12:
+            byte = 0
+        elif sel >= 8:
+            byte = 0xff * ((data >> (16 * (sel - 8) + 15)) & 1)
+        else:
+            byte = (data >> 8 * sel) & 0xff
+        result |= byte << 8 * n
+    return result
+
+
+def bytes_reference(a, b, c, d, lerp_round=True, misread=None):
+    """Independent CPU model of the RDNA 2 ISA definitions, in Python integers. lerp_round=False and misread are
+    the wrong models of the negative controls."""
+    mask = 0xffffffff
+
+    def lanes(word, width):
+        return [(word >> shift) & ((1 << width) - 1) for shift in range(0, 32, width)]
+
+    results = (
+        (((a << 32) | b) >> (d & 31)) & mask,          # v_alignbit_b32: ({S0, S1} >> S2[4:0])[31:0]
+        (((b << 32) | a) >> 8 * (d & 3)) & mask,       # v_alignbyte_b32: ({S0, S1} >> 8 * S2[1:0])[31:0]
+        (((c << 32) | b) >> (44 & 31)) & mask,
+        (((a << 32) | c) >> 8 * (4 & 3)) & mask,       # S2[1:0] = 0 returns S1
+        perm_reference(a, b, 0x030a050c, misread),
+        perm_reference(c, b, 0x0106080d, misread),
+        perm_reference(c, b, d, misread),
+        # v_lerp_u8: per byte (S0 + S1 + bit 0 of the S2 byte) >> 1
+        sum(((x + y + (z & 1 if lerp_round else 0)) >> 1) << 8 * n
+            for n, (x, y, z) in enumerate(zip(lanes(a, 8), lanes(b, 8), lanes(c, 8)))),
+        (sum(abs(x - y) for x, y in zip(lanes(c, 8), lanes(a, 8))) + b) & mask,    # v_sad_u8
+        (sum(abs(x - y) for x, y in zip(lanes(a, 16), lanes(c, 16))) + b) & mask,  # v_sad_u16
+    )
+    for word in (a, b, c, d, *results) if lerp_round and misread is None else ():
+        assert 0 < (word >> 23) & 0xff < 0xff, hex(word)
+    return results
+
+
 def reciprocal_iflag():
     return with_constants([
         "v_rcp_iflag_f32_e32 v12, s44",
@@ -3078,6 +3162,80 @@ def check_controls(directory):
         changed = [line.replace("v_ldexp_f32 v12, v18, s45", bad) for line in ldexp_values()]
         assert changed != ldexp_values()
         must_reject(translate, changed)
+    # Byte and bit funnel controls and rejections.
+    bytes_source = translate(bytes_program(0))
+    assert set(BYTES_FORMS) <= ACCEPTED
+    for expected in (
+        "asfloat((asuint(alu20) >> (asuint(params[1].z) & 31u)) | ((asuint(params[0].w) << 1u) << "
+        "(31u - (asuint(params[1].z) & 31u))))",
+        "asfloat((asuint(params[0].w) >> ((asuint(params[1].z) & 3u) * 8u)) | ((asuint(alu20) << 1u) << "
+        "(31u - (asuint(params[1].z) & 3u) * 8u)))",
+        "asfloat((asuint(params[1].x) >> (44u & 31u)) | ((asuint(alu21) << 1u) << (31u - (44u & 31u))))",
+        "asfloat((asuint(alu21) >> ((4u & 3u) * 8u)) | ((asuint(params[0].w) << 1u) << (31u - (4u & 3u) * 8u)))",
+        "asfloat(perm_b32(asuint(params[0].w), asuint(alu20), 50988300u))",
+        "asfloat(perm_b32(asuint(alu21), asuint(params[1].x), 17172493u))",
+        "asfloat(perm_b32(asuint(params[1].y), asuint(alu20), asuint(params[1].z)))",
+        "asfloat(lerp_u8(asuint(params[0].w), asuint(alu20), asuint(alu21)))",
+        "asfloat(sad_u8(asuint(alu21), asuint(params[0].w), asuint(params[1].x)))",
+        "asfloat(sad_u16(asuint(params[0].w), asuint(alu21), asuint(alu20)))",
+        "uint perm_byte(uint s0, uint s1, uint sel) {", "uint lerp_u8(uint a, uint b, uint c) {",
+        "uint sad_u8(uint a, uint b, uint c) {", "uint sad_u16(uint a, uint b, uint c) {",
+    ):
+        assert expected in bytes_source, expected
+    # A program without the helper forms carries no helper definitions.
+    assert "perm_byte" not in translate(with_constants(["v_alignbit_b32 v12, s44, s45, 7"]))
+    # These forms take no source modifiers or op_sel on gfx1013, and the translator does not accept them either.
+    for bad in (
+        "v_perm_b32 v26, -s46, v18, s47",
+        "v_perm_b32 v26, s46, |v18|, s47",
+        "v_perm_b32 v26, s46, v18, s47 op_sel:[1,0,0,0]",
+        "v_perm_b32 v26, s46, v18",
+        "v_perm_b32 v26, s46, v18, s47, s47",
+        "v_perm_b32 v26, s46, v18, 0x100000000",
+        "v_perm_b32 v26, s46, v18, v31",
+        "v_perm_b32 v26, s46, v18, s106",
+    ):
+        changed = [line.replace("v_perm_b32 v26, s46, v18, s47", bad) for line in bytes_program(6)]
+        assert changed != bytes_program(6)
+        must_reject(translate, changed)
+    # The clamp bit saturates the v_sad sums; the lowering wraps, so clamp stays rejected for each form.
+    for line in BYTES_OPS[8:]:
+        must_reject(translate, [entry.replace(line, f"{line} clamp") for entry in bytes_program(0)])
+    # Neighbouring VOP3 byte forms stay rejected. For v_sad_u32 the ISA text, abs(S0.i - S1.i), and LLVM's
+    # selection pattern, umax - umin, disagree on operands of mixed sign, and Scarlett is not measured.
+    for neighbour in (
+        "v_sad_u32 v26, s46, v18, s47",
+        "v_sad_hi_u8 v26, s46, v18, s47", "v_msad_u8 v26, s46, v18, s47",
+        "v_mqsad_u32_u8 v[26:29], s[46:47], v18, v[20:23]", "v_qsad_pk_u16_u8 v[26:27], s[46:47], v18, v[20:21]",
+        "v_mqsad_pk_u16_u8 v[26:27], s[46:47], v18, v[20:21]", "v_permlane16_b32 v26, v18, s46, s47",
+        "v_permlanex16_b32 v26, v18, s46, s47",
+    ):
+        must_reject(translate, [line.replace("v_perm_b32 v26, s46, v18, s47", neighbour) for line in bytes_program(6)])
+    base_bytes = bytes_program(0)
+    wait = base_bytes.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, base_bytes[:wait] + ["v_perm_b32 v20, v12, 1, 2"] + base_bytes[wait:])
+    load = next(i for i, line in enumerate(base_bytes) if line.startswith("s_buffer_load_dwordx4"))
+    lgkm = base_bytes.index("s_waitcnt lgkmcnt(0)", load)
+    must_reject(translate, base_bytes[:lgkm] + ["v_alignbit_b32 v20, s44, 1, 2"] + base_bytes[lgkm:])
+    wqm = base_bytes.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, base_bytes[:wqm] + ["v_sad_u16 v20, 1, 2, 3"] + base_bytes[wqm:])
+    # The selector table: every class of byte on fixed data.
+    s0, s1 = 0x8899aabb, 0x44f5e67f
+    assert perm_reference(s0, s1, 0x03020100) == s1 and perm_reference(s0, s1, 0x07060504) == s0
+    assert perm_reference(s0, s1, 0x0b0a0908) == 0xffff00ff
+    assert perm_reference(s0, s1, 0xff800d0c) == 0xffffff00
+    # Each draw mutation computes a different word on the first input set.
+    a, b, c, d = BYTES_WORDS[0]
+    good = bytes_reference(a, b, c, d)
+    assert (((a << 32) | b) >> 8 * (d & 3)) & 0xffffffff != good[0]  # alignbyte in place of alignbit
+    assert (((b << 32) | a) >> (d & 31)) & 0xffffffff != good[1]       # alignbit in place of alignbyte
+    assert (((b << 32) | a) >> (d & 31)) & 0xffffffff != good[0]       # alignbit with S0 and S1 swapped
+    assert perm_reference(b, a, 0x030a050c) != good[4]                  # perm with S0 and S1 swapped
+    assert (abs((c >> 16) - (a >> 16)) + abs((c & 0xffff) - (a & 0xffff)) + b) & 0xffffffff != good[8]  # sad_u16
+    assert (((a << 32) | c) >> 32) != good[3]                           # S2 = 4 read as four bytes
+    for model in ({"misread": "low3"}, {"misread": "nibble"}, {"misread": "sign-bit7"}, {"lerp_round": False}):
+        assert any(bytes_reference(*words, **model) != bytes_reference(*words) for words in BYTES_WORDS), model
+
     base_ld = ldexp_values()
     wait = base_ld.index("s_waitcnt vmcnt(0)")
     must_reject(translate, base_ld[:wait] + ["v_frexp_mant_f32_e32 v12, 1.0"] + base_ld[wait:])
@@ -3157,6 +3315,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((unpack_bytes(), translate))
     fixtures.append((reciprocal_iflag(), translate))
+    fixtures.extend((bytes_program(k), translate) for k in (0, len(BYTES_OPS) - 1))
     fixtures.append((offset_nibbles(), translate))
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
@@ -3773,6 +3932,70 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
     return 0
 
 
+def check_bytes_draws(directory, compiler, renderer, backend):
+    source = directory / "bytes.hlsl"
+    shader = directory / "bytes.cso"
+    case = directory / "bytes.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+
+    def write_case(words, result):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        case.write_bytes(constants + struct.pack("<4f", *[float((result >> 8 * n) & 0xff) for n in range(4)]) * 64)
+
+    def expect_mismatch(what):
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"{what} escaped detection")
+
+    wrong_models = {"low3": {"misread": "low3"}, "nibble": {"misread": "nibble"},
+                    "sign-bit7": {"misread": "sign-bit7"}, "no lerp rounding": {"lerp_round": False}}
+    for k in range(len(BYTES_OPS)):
+        source.write_text(translate(bytes_program(k)), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for words in BYTES_WORDS:
+            write_case(words, bytes_reference(*words)[k])
+            subprocess.run(draw, check=True)
+        # Reference-side controls on the shader just drawn: the first result and input set for which a wrong model
+        # predicts other bytes must report a mismatch. check_controls asserts that each model differs somewhere.
+        for what, model in list(wrong_models.items()):
+            for words in BYTES_WORDS:
+                wrong_word = bytes_reference(*words, **model)[k]
+                if wrong_word != bytes_reference(*words)[k]:
+                    write_case(words, wrong_word)
+                    expect_mismatch(f"The {what} model of {BYTES_OPS[k].split()[0]}")
+                    del wrong_models[what]
+                    break
+
+    # Each mutated program gives a different word for the first input set, so the draw must report a mismatch.
+    for k, old, new in (
+        (0, "v_alignbit_b32 v20", "v_alignbyte_b32 v20"),
+        (1, "v_alignbyte_b32 v21", "v_alignbit_b32 v21"),
+        (0, "v_alignbit_b32 v20, s44, v18", "v_alignbit_b32 v20, v18, s44"),
+        (4, "v_perm_b32 v24, s44, v18", "v_perm_b32 v24, v18, s44"),
+        (8, "v_sad_u8 v28", "v_sad_u16 v28"),
+    ):
+        mutated = [line.replace(old, new) for line in bytes_program(k)]
+        assert mutated != bytes_program(k), old
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        write_case(BYTES_WORDS[0], bytes_reference(*BYTES_WORDS[0])[k])
+        expect_mismatch(f"Replacing {old} with {new}")
+    assert not wrong_models, wrong_models
+
+
+def check_bytes_render(directory, compiler, renderer, backend):
+    """The byte and bit funnel draws as their own CTest entry per backend; exit 77 from the renderer is a skip."""
+    try:
+        check_bytes_draws(directory, compiler, renderer, backend)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 77:
+            return 77
+        raise
+    return 0
+
+
 def check_e64_render(directory, compiler, renderer, backend):
     """The e64 draw cases on their own, so they run as a separate CTest entry per backend. A renderer that reports an
     unavailable adapter (exit 77) makes this a skip, as for the other pixel draws."""
@@ -3801,6 +4024,9 @@ def main():
                 if error.returncode == 77 and str(error.cmd[0]) == str(args[1]):
                     return 77
                 raise
+        if mode == "draw-bytes":
+            # As for draw-e64, the controls run in the binary and draw modes; this mode only draws.
+            return check_bytes_render(directory, *args)
         if mode == "draw-e64":
             # The controls already run in the binary and draw modes; this mode only draws.
             return check_e64_render(directory, *args)

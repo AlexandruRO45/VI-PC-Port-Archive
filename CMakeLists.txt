@@ -1981,6 +1981,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-blend-scalar "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_blend_scalar_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME pixel_aot_bytes_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-bytes "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_bytes_${adapter} PROPERTIES TIMEOUT 60)
         add_test(NAME pixel_aot_e64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-e64 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -1994,6 +1998,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         pixel_aot_three_way_hardware pixel_aot_e64_hardware pixel_aot_blend_scalar_hardware pixel_aot_predicate_rounding_hardware bc7_draw_hardware
         PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(compute_store_aot_hardware PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(pixel_aot_bytes_hardware PROPERTIES SKIP_RETURN_CODE 77)
     foreach(adapter IN ITEMS hardware warp)
         # The gfx programs this test translated, for tools/form_coverage.py.
         set_tests_properties(pixel_aot_${adapter} PROPERTIES
@@ -2002,6 +2007,8 @@ if(EXISTS "${INTAKE_PYTHON}")
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_predicate_rounding_${adapter}.txt")
         set_tests_properties(pixel_aot_blend_scalar_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_blend_scalar_${adapter}.txt")
+        set_tests_properties(pixel_aot_bytes_${adapter} PROPERTIES
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_bytes_${adapter}.txt")
         set_tests_properties(pixel_aot_e64_${adapter} PROPERTIES
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_e64_${adapter}.txt")
     endforeach()
