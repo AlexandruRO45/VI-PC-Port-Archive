@@ -249,6 +249,7 @@ VOP1_OPS = {
     0x2a: ("v_rcp_f32_e32", "Reciprocal 1/x float32"),
     0x2e: ("v_rsq_f32_e32", "Reciprocal square root 1/sqrt(x)"),
     0x33: ("v_sqrt_f32_e32", "Square root sqrt(x) float32"),
+    0x34: ("v_frexp_mant_f32_e32", "Vector extract float32 mantissa"),
     0x35: ("v_sin_f32_e32", "Sine float32"),
     0x36: ("v_cos_f32_e32", "Cosine float32"),
     0x37: ("v_not_b32_e32", "Vector bitwise NOT"),
@@ -281,6 +282,42 @@ VOP2_OPS = {
     0x2c: ("v_fmamk_f32", "Vector fused multiply-add with literal multiplier"),
     0x2d: ("v_fmaak_f32", "Vector fused multiply-add with literal addend"),
     0x2f: ("v_cvt_pkrtz_f16_f32_e32", "Convert two float32 to packed float16 (round to zero)"),
+}
+
+VOP3P_OPS = {
+    0x00: ("v_pk_mad_i16", "Multiply-add signed 16-bit packed"),
+    0x01: ("v_pk_mul_lo_u16", "Multiply low unsigned 16-bit packed"),
+    0x02: ("v_pk_add_i16", "Add signed 16-bit packed"),
+    0x03: ("v_pk_sub_i16", "Subtract signed 16-bit packed"),
+    0x04: ("v_pk_lshlrev_b16", "Logical shift left reverse 16-bit packed"),
+    0x05: ("v_pk_lshrrev_b16", "Logical shift right reverse 16-bit packed"),
+    0x06: ("v_pk_ashrrev_i16", "Arithmetic shift right reverse 16-bit packed"),
+    0x07: ("v_pk_max_i16", "Maximum signed 16-bit packed"),
+    0x08: ("v_pk_min_i16", "Minimum signed 16-bit packed"),
+    0x09: ("v_pk_mad_u16", "Multiply-add unsigned 16-bit packed"),
+    0x0a: ("v_pk_add_u16", "Add unsigned 16-bit packed"),
+    0x0b: ("v_pk_sub_u16", "Subtract unsigned 16-bit packed"),
+    0x0c: ("v_pk_max_u16", "Maximum unsigned 16-bit packed"),
+    0x0d: ("v_pk_min_u16", "Minimum unsigned 16-bit packed"),
+    0x0e: ("v_pk_fma_f16", "Fused multiply-add float16 packed"),
+    0x0f: ("v_pk_add_f16", "Add float16 packed"),
+    0x10: ("v_pk_mul_f16", "Multiply float16 packed"),
+    0x11: ("v_pk_min_f16", "Minimum float16 packed"),
+    0x12: ("v_pk_max_f16", "Maximum float16 packed"),
+    0x13: ("v_dot2_f32_f16", "Dot product 2-element float16 accumulate to float32"),
+    0x14: ("v_dot2_i32_i16", "Dot product 2-element signed 16-bit accumulate to int32"),
+    0x15: ("v_dot2_u32_u16", "Dot product 2-element unsigned 16-bit accumulate to uint32"),
+    0x16: ("v_dot4_i32_i8", "Dot product 4-element signed 8-bit accumulate to int32"),
+    0x17: ("v_dot4_u32_u8", "Dot product 4-element unsigned 8-bit accumulate to uint32"),
+    0x18: ("v_dot8_i32_i4", "Dot product 8-element signed 4-bit accumulate to int32"),
+    0x19: ("v_dot8_u32_u4", "Dot product 8-element unsigned 4-bit accumulate to uint32"),
+    0x20: ("v_fma_mix_f32", "Fused multiply-add mixed precision to float32"),
+    0x21: ("v_fma_mixlo_f16", "Fused multiply-add mixed precision to float16 low"),
+    0x22: ("v_fma_mixhi_f16", "Fused multiply-add mixed precision to float16 high"),
+}
+
+VOP3P_3SRC = {
+    0x00, 0x09, 0x0e, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x20, 0x21, 0x22,
 }
 
 EXP_TARGETS = {
@@ -583,6 +620,81 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("d16")
         asm = f"{op_name} {', '.join(operands)} {' '.join(mods)}"
         comment = "Image memory load/store/sample operation"
+        return (length, op_name, asm, comment)
+
+    # 11. VOP3P: 64-bit [31:23] == 0b110011000 (0xcc000000)
+    if (w0 & 0xff800000) == 0xcc000000:
+        if offset + 8 > len(data):
+            return (4, "vop3p_truncated", "vop3p <truncated>", "Incomplete 64-bit VOP3P instruction")
+        w1, = struct.unpack_from("<I", data, offset + 4)
+        op = (w0 >> 16) & 0x7f
+        clamp = (w0 >> 15) & 1
+        vdst = w0 & 0xff
+        src0 = w1 & 0x1ff
+        src1 = (w1 >> 9) & 0x1ff
+        src2 = (w1 >> 18) & 0x1ff
+
+        op_info = VOP3P_OPS.get(op, (f"v_vop3p_{op:02x}", "Unknown VOP3P"))
+        op_name, comment = op_info
+        is_3src = op in VOP3P_3SRC
+        arity = 3 if is_3src else 2
+
+        length = 8
+        literal = None
+        if src0 == 255 or src1 == 255 or (is_3src and src2 == 255):
+            if offset + 12 > len(data):
+                return (8, "vop3p_truncated", f"{op_name} <truncated>", "Incomplete VOP3P literal")
+            literal, = struct.unpack_from("<I", data, offset + 8)
+            length = 12
+
+        # Check for unmodeled / reserved bits in 2-source VOP3P encodings.
+        # Note: bit 14 of w0 is op_sel_hi[2], which LLVM's MC assembler defaults to 1 (op_sel_hi = 0b111)
+        # for all packed VOP3P instructions regardless of arity, so bit 14 is ignored on 2-source forms.
+        if not is_3src and (src2 != 0 or ((w0 >> 10) & 1) or ((w0 >> 13) & 1) or ((w1 >> 31) & 1)):
+            return (length, f"{op_name}_unsupported", f"{op_name} <unsupported_reserved_bits>", "Reserved bitfields set in 2-source VOP3P encoding")
+
+        def vop3p_operand(reg_id: int) -> str:
+            if reg_id == 255 and literal is not None:
+                return f"0x{literal:x}"
+            return decode_v_reg(reg_id)
+
+        if is_3src:
+            asm = f"{op_name} v{vdst}, {vop3p_operand(src0)}, {vop3p_operand(src1)}, {vop3p_operand(src2)}"
+            op_sel = [(w0 >> 11) & 1, (w0 >> 12) & 1, (w0 >> 13) & 1]
+            op_sel_hi = [(w1 >> 27) & 1, (w1 >> 28) & 1, (w0 >> 14) & 1]
+            neg_lo = [(w1 >> 29) & 1, (w1 >> 30) & 1, (w1 >> 31) & 1]
+            neg_hi = [(w0 >> 8) & 1, (w0 >> 9) & 1, (w0 >> 10) & 1]
+        else:
+            asm = f"{op_name} v{vdst}, {vop3p_operand(src0)}, {vop3p_operand(src1)}"
+            op_sel = [(w0 >> 11) & 1, (w0 >> 12) & 1]
+            op_sel_hi = [(w1 >> 27) & 1, (w1 >> 28) & 1]
+            neg_lo = [(w1 >> 29) & 1, (w1 >> 30) & 1]
+            neg_hi = [(w0 >> 8) & 1, (w0 >> 9) & 1]
+
+        # Architectural defaults:
+        # Standard packed instructions (v_pk_*, v_dot*): default op_sel is all 0, op_sel_hi is all 1, neg_lo/neg_hi all 0.
+        # Mixed-precision FMA (v_fma_mix*): default op_sel and op_sel_hi are all 0 (f32, low half).
+        if op_name.startswith("v_fma_mix"):
+            default_op_sel = [0] * arity
+            default_op_sel_hi = [0] * arity
+        else:
+            default_op_sel = [0] * arity
+            default_op_sel_hi = [1] * arity
+        default_neg_lo = [0] * arity
+        default_neg_hi = [0] * arity
+
+        if op_sel != default_op_sel:
+            asm += f" op_sel:[{','.join(str(b) for b in op_sel)}]"
+        if op_sel_hi != default_op_sel_hi:
+            asm += f" op_sel_hi:[{','.join(str(b) for b in op_sel_hi)}]"
+        if neg_lo != default_neg_lo:
+            asm += f" neg_lo:[{','.join(str(b) for b in neg_lo)}]"
+        if neg_hi != default_neg_hi:
+            asm += f" neg_hi:[{','.join(str(b) for b in neg_hi)}]"
+
+        if clamp:
+            asm += " clamp"
+
         return (length, op_name, asm, comment)
 
     # Default fallback: unknown 32-bit word

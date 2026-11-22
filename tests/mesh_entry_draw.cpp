@@ -1,9 +1,11 @@
 #include "desktop_gpu.h"
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 using Microsoft::WRL::ComPtr;
 
@@ -32,7 +34,8 @@ struct MeshPipeline {
 };
 }
 
-bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* second, const char* fixture, bool vertices)
+bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* second, const char* fixture,
+                           bool vertices, MeshConstantBinding binding)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
     check(check_feature(device, D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options)), "Query mesh tier");
@@ -50,14 +53,23 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
     auto shader = read_bytes(first);
     auto pixel = read_bytes(second);
     D3D12_ROOT_PARAMETER params[4]{};
-    for (UINT i = 0; i < 2; ++i) {
-        params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        params[i].Descriptor.ShaderRegister = i;
+    D3D12_DESCRIPTOR_RANGE cbv_range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 2, 0, 0, 0};
+    const bool uses_table = binding == MeshConstantBinding::table || binding == MeshConstantBinding::swapped_table;
+    if (uses_table) {
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[0].DescriptorTable = {1, &cbv_range};
+    } else {
+        for (UINT i = 0; i < 2; ++i) {
+            params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            params[i].Descriptor.ShaderRegister = i;
+        }
     }
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    const UINT trace_slot = uses_table ? 1 : 2;
+    const UINT vertex_slot = trace_slot + 1;
+    params[trace_slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     D3D12_ROOT_SIGNATURE_DESC layout{};
-    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    layout.NumParameters = vertices ? 4 : 3;
+    params[vertex_slot].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    layout.NumParameters = vertex_slot + vertices;
     layout.pParameters = params;
     ComPtr<ID3DBlob> blob;
     check(D3D12SerializeRootSignature(&layout, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr), "Serialize draw root");
@@ -111,9 +123,44 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
     auto* list = commands.list.Get();
     list->SetGraphicsRootSignature(root.Get());
     const auto base = upload->GetGPUVirtualAddress();
-    list->SetGraphicsRootConstantBufferView(0, base);
-    list->SetGraphicsRootConstantBufferView(1, base + cb_bytes);
-    if (vertices) list->SetGraphicsRootShaderResourceView(3, base + 2 * cb_bytes);
+    std::array<ComPtr<ID3D12Resource>, 2> constants;
+    ComPtr<ID3D12DescriptorHeap> cbv_heap;
+    ComPtr<ID3D12Resource> buffer_b;
+    if (uses_table) {
+        D3D12_DESCRIPTOR_HEAP_DESC cbv_heap_desc{};
+        cbv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        cbv_heap_desc.NumDescriptors = static_cast<UINT>(constants.size());
+        cbv_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check(device->CreateDescriptorHeap(&cbv_heap_desc, IID_PPV_ARGS(&cbv_heap)), "Create mesh CBV heap");
+        const UINT increment = device->GetDescriptorHandleIncrementSize(cbv_heap_desc.Type);
+        const auto first_slot = cbv_heap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < constants.size(); ++i) {
+            constants[i] = make_buffer(device, cb_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            check(constants[i]->Map(0, &empty, &mapped), "Map mesh CBV");
+            std::memcpy(mapped, input.data() + i * cb_bytes, cb_bytes);
+            constants[i]->Unmap(0, nullptr);
+            const UINT slot = binding == MeshConstantBinding::swapped_table ? 1 - i : i;
+            const D3D12_CONSTANT_BUFFER_VIEW_DESC view{constants[i]->GetGPUVirtualAddress(), cb_bytes};
+            device->CreateConstantBufferView(&view, {first_slot.ptr + slot * increment});
+        }
+        ID3D12DescriptorHeap* heaps[]{cbv_heap.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetGraphicsRootDescriptorTable(0, cbv_heap->GetGPUDescriptorHandleForHeapStart());
+    } else {
+        D3D12_GPU_VIRTUAL_ADDRESS cbv[2]{base, base + cb_bytes};
+        if (binding != MeshConstantBinding::root) {
+            // Keep A and B in distinct resources with identical contents across binding orders.
+            buffer_b = make_buffer(device, cb_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            check(buffer_b->Map(0, &empty, &mapped), "Map constant buffer B");
+            std::memcpy(mapped, input.data() + cb_bytes, cb_bytes);
+            buffer_b->Unmap(0, nullptr);
+            cbv[1] = buffer_b->GetGPUVirtualAddress();
+            if (binding == MeshConstantBinding::swapped_root_pair) std::swap(cbv[0], cbv[1]);
+        }
+        list->SetGraphicsRootConstantBufferView(0, cbv[0]);
+        list->SetGraphicsRootConstantBufferView(1, cbv[1]);
+    }
+    if (vertices) list->SetGraphicsRootShaderResourceView(vertex_slot, base + 2 * cb_bytes);
     const D3D12_VIEWPORT viewport{0, 0, side, side, 0, 1};
     const D3D12_RECT scissor{0, 0, side, side};
     list->RSSetViewports(1, &viewport);
@@ -122,7 +169,7 @@ bool check_mesh_entry_draw(ID3D12Device* device, const char* first, const char* 
                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     list->CopyBufferRegion(trace.Get(), 0, upload.Get(), input_bytes, trace_bytes);
     transition(list, trace.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    list->SetGraphicsRootUnorderedAccessView(2, trace->GetGPUVirtualAddress());
+    list->SetGraphicsRootUnorderedAccessView(trace_slot, trace->GetGPUVirtualAddress());
     list->OMSetRenderTargets(1, &handle, FALSE, nullptr);
     const float clear[4]{0, 0, 0, 1};
     list->ClearRenderTargetView(handle, clear, 0, nullptr);

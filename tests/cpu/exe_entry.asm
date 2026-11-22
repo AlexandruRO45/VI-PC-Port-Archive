@@ -7,6 +7,9 @@ EXTERN call_mix:PROC
 IFDEF FRAME_SELECTOR
 EXTERN call_bare:PROC
 ENDIF
+IFDEF NESTED_TARGET
+EXTERN call_nested:PROC
+ENDIF
 IFDEF TWO_TARGETS
 EXTERN call_alt:PROC
 ENDIF
@@ -53,7 +56,9 @@ wide_input:
     mov rdx, 100000000h
 dispatch:
     lea r8, [rsp+32]
-IFDEF SWAP_TARGETS
+IFDEF NESTED_TARGET
+    call call_nested
+ELSEIFDEF SWAP_TARGETS
     call call_alt
 ELSE
 IFDEF TWO_PROVIDERS

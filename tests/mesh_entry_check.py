@@ -68,9 +68,9 @@ def fixture(constants, positions, visible, traced):
     return constants + trace + pixels
 
 
-def draw(dxc, renderer, adapter, tmp, source, cases, *, indexed=False):
+def draw(dxc, renderer, adapter, tmp, source, cases, *, indexed=False, pixel_source=PIXEL):
     pixel = tmp / "pixel.hlsl"
-    pixel.write_text(PIXEL)
+    pixel.write_text(pixel_source)
     ps = tmp / "pixel.dxil"
     subprocess.run([dxc, "-T", "ps_6_0", "-E", "main", "-Fo", ps, pixel], check=True)
     shader = tmp / "mesh.hlsl"

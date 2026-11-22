@@ -70,6 +70,15 @@ def check_scanner_tracks_pixel_aot():
         opcode = f"v_pk_{name}"
         assert is_opcode_recognized(opcode), opcode
         assert is_instruction_supported(f"{opcode} v0, v1, v2"), opcode
+    for op in ("v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16"):
+        assert is_opcode_recognized(op), op
+        assert is_instruction_supported(f"{op} v1, v2, v3, v4"), op
+    for op in (
+        "v_dot2_f32_f16", "v_dot2_i32_i16", "v_dot2_u32_u16",
+        "v_dot4_i32_i8", "v_dot4_u32_u8", "v_dot8_i32_i4", "v_dot8_u32_u4",
+    ):
+        assert is_opcode_recognized(op), op
+        assert is_instruction_supported(f"{op} v1, v2, v3, v4"), op
     for line in (
         "s_clause 63",
         "s_setprio 3",

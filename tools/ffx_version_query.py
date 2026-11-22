@@ -26,6 +26,7 @@ STRING_OPS = {
 }
 
 INTEGER_HEADER = """#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <intrin.h>
@@ -79,6 +80,89 @@ extern "C" __declspec(dllimport) void __stdcall RaiseException(unsigned long, un
     // Windows distinguishes a zero divisor from a quotient that does not fit.
     RaiseException(zero_divisor ? 0xc0000094ul : 0xc0000095ul, 1, 0, nullptr);
     __assume(0);
+}
+static inline uint8_t aes_gf_mul(uint8_t a, uint8_t b) {
+    uint8_t p = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (b & 1u) p ^= a;
+        a = static_cast<uint8_t>((a << 1) ^ ((a & 0x80u) ? 0x1bu : 0u));
+        b >>= 1;
+    }
+    return p;
+}
+static inline uint8_t aes_gf_inv(uint8_t x) {
+    uint8_t r = 1, b = x;
+    for (int e = 254; e > 0; e >>= 1) {
+        if (e & 1) r = aes_gf_mul(r, b);
+        b = aes_gf_mul(b, b);
+    }
+    return x == 0 ? 0 : r;
+}
+static inline uint8_t aes_rotl8(uint8_t x, unsigned n) {
+    return static_cast<uint8_t>((x << n) | (x >> (8u - n)));
+}
+static inline uint8_t aes_sbox(uint8_t x) {
+    const uint8_t s = aes_gf_inv(x);
+    return static_cast<uint8_t>(s ^ aes_rotl8(s, 1) ^ aes_rotl8(s, 2) ^ aes_rotl8(s, 3) ^ aes_rotl8(s, 4) ^ 0x63u);
+}
+static inline uint8_t aes_inv_sbox(uint8_t x) {
+    return aes_gf_inv(static_cast<uint8_t>(aes_rotl8(x, 1) ^ aes_rotl8(x, 3) ^ aes_rotl8(x, 6) ^ 0x05u));
+}
+static inline void aes_mix_columns(uint8_t s[16], bool inv) {
+    for (size_t c = 0; c < 16; c += 4) {
+        const uint8_t a0 = s[c], a1 = s[c+1], a2 = s[c+2], a3 = s[c+3];
+        if (!inv) {
+            s[c]   = static_cast<uint8_t>(aes_gf_mul(a0, 2) ^ aes_gf_mul(a1, 3) ^ a2 ^ a3);
+            s[c+1] = static_cast<uint8_t>(a0 ^ aes_gf_mul(a1, 2) ^ aes_gf_mul(a2, 3) ^ a3);
+            s[c+2] = static_cast<uint8_t>(a0 ^ a1 ^ aes_gf_mul(a2, 2) ^ aes_gf_mul(a3, 3));
+            s[c+3] = static_cast<uint8_t>(aes_gf_mul(a0, 3) ^ a1 ^ a2 ^ aes_gf_mul(a3, 2));
+        } else {
+            s[c]   = static_cast<uint8_t>(aes_gf_mul(a0, 14) ^ aes_gf_mul(a1, 11) ^ aes_gf_mul(a2, 13) ^ aes_gf_mul(a3, 9));
+            s[c+1] = static_cast<uint8_t>(aes_gf_mul(a0, 9)  ^ aes_gf_mul(a1, 14) ^ aes_gf_mul(a2, 11) ^ aes_gf_mul(a3, 13));
+            s[c+2] = static_cast<uint8_t>(aes_gf_mul(a0, 13) ^ aes_gf_mul(a1, 9)  ^ aes_gf_mul(a2, 14) ^ aes_gf_mul(a3, 11));
+            s[c+3] = static_cast<uint8_t>(aes_gf_mul(a0, 11) ^ aes_gf_mul(a1, 13) ^ aes_gf_mul(a2, 9)  ^ aes_gf_mul(a3, 14));
+        }
+    }
+}
+static inline void aes_round(uint8_t out[16], const uint8_t state[16], const uint8_t key[16], bool dec, bool last) {
+    static constexpr uint8_t sr[16]  = {0,5,10,15, 4,9,14,3, 8,13,2,7, 12,1,6,11};
+    static constexpr uint8_t isr[16] = {0,13,10,7, 4,1,14,11, 8,5,2,15, 12,9,6,3};
+    for (size_t i = 0; i < 16; ++i) out[i] = dec ? aes_inv_sbox(state[isr[i]]) : aes_sbox(state[sr[i]]);
+    if (!last) aes_mix_columns(out, dec);
+    for (size_t i = 0; i < 16; ++i) out[i] ^= key[i];
+}
+static inline void aes_keygen(uint8_t out[16], const uint8_t src[16], uint8_t rcon) {
+    auto subw = [](const uint8_t p[4]) -> uint32_t {
+        return uint32_t(aes_sbox(p[0])) | (uint32_t(aes_sbox(p[1])) << 8)
+             | (uint32_t(aes_sbox(p[2])) << 16) | (uint32_t(aes_sbox(p[3])) << 24);
+    };
+    const uint32_t w1 = subw(src + 4), w3 = subw(src + 12);
+    const uint32_t r[4] = {w1, ((w1 >> 8) | (w1 << 24)) ^ rcon, w3, ((w3 >> 8) | (w3 << 24)) ^ rcon};
+    memcpy(out, r, 16);
+}
+static inline void pclmul_x86(uint8_t out[16], const uint8_t lhs[16], const uint8_t rhs[16], uint8_t imm) {
+    uint64_t a, b, lo = 0, hi = 0;
+    memcpy(&a, lhs + ((imm & 0x01u) ? 8 : 0), 8);
+    memcpy(&b, rhs + ((imm & 0x10u) ? 8 : 0), 8);
+    for (unsigned k = 0; k < 64u; ++k) {
+        if ((b >> k) & 1ull) { lo ^= (a << k); if (k > 0u) hi ^= (a >> (64u - k)); }
+    }
+    memcpy(out, &lo, 8); memcpy(out + 8, &hi, 8);
+}
+template<class F, class U> static F quiet_nan(F x) {
+    U bits; memcpy(&bits, &x, sizeof bits);
+    bits |= (sizeof(U) == 4) ? static_cast<U>(0x00400000u) : static_cast<U>(0x0008000000000000ull);
+    memcpy(&x, &bits, sizeof bits);
+    return x;
+}
+template<class F, class U> static F fma_x86(F s0, F s1, F s2, int order, bool neg_p, bool neg_c) {
+    if (std::isnan(s0)) return quiet_nan<F, U>(s0);
+    if (std::isnan(s1)) return quiet_nan<F, U>(s1);
+    if (std::isnan(s2)) return quiet_nan<F, U>(s2);
+    const F a = order == 132 ? s0 : s1;
+    const F b = order == 213 ? s0 : s2;
+    const F c = order == 231 ? s0 : (order == 132 ? s1 : s2);
+    return std::fma(neg_p ? -a : a, b, neg_c ? -c : c);
 }
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
@@ -147,6 +231,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                        or (i.mnemonic == M.VPADDD and i.op2_kind != K.MEMORY) for i in body)
     if has_xmm_math:
         lines.append("__m128i xmm0{}, xmm1{}, xmm2{};")
+    sse2_int_ops = {
+        M.PADDB, M.PADDW, M.PADDD, M.PADDQ, M.PSUBB, M.PSUBW, M.PSUBD, M.PSUBQ,
+        M.PAND, M.PANDN, M.POR, M.PXOR,
+        M.PCMPEQB, M.PCMPEQW, M.PCMPEQD, M.PCMPGTB, M.PCMPGTW, M.PCMPGTD,
+    }
     # Unaligned YMM copies and VEX zeroing in the descriptor builder need
     # only byte storage on the desktop host.
     wide = {R.YMM0: "wide0", R.YMM1: "wide1", R.YMM2: "wide2"}
@@ -161,10 +250,28 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
     }
     sse41_ops = (M.PMINSB, M.PMAXSB, M.PMINUW, M.PMAXUW, M.PMINSD, M.PMAXSD,
                  M.PMINUD, M.PMAXUD, M.PMULLD, M.PMULDQ, M.PCMPEQQ, M.PACKUSDW, M.PBLENDW, M.PBLENDVB)
-    has_wide = any(i.mnemonic in (M.VMOVUPS, M.MOVDQU, *avx2_wide_ops, *sse41_ops) or i.mnemonic in sha_ops or i.mnemonic in pmov_ext for i in body)
+    sse2_sat_mul_ops = {
+        M.PADDSB, M.PADDSW, M.PADDUSB, M.PADDUSW, M.PSUBSB, M.PSUBSW, M.PSUBUSB, M.PSUBUSW,
+        M.PMULHW, M.PMULHUW, M.PMULLW, M.PMADDWD, M.PMULUDQ,
+        M.PMINUB, M.PMAXUB, M.PMINSW, M.PMAXSW, M.PAVGB, M.PAVGW, M.PSADBW,
+    }
+    crypto_legacy_ops = {M.AESENC, M.AESENCLAST, M.AESDEC, M.AESDECLAST, M.AESIMC, M.AESKEYGENASSIST, M.PCLMULQDQ}
+    crypto_vex_ops = {M.VAESENC, M.VAESENCLAST, M.VAESDEC, M.VAESDECLAST, M.VAESIMC, M.VAESKEYGENASSIST, M.VPCLMULQDQ}
+    fma_scalar = {
+        getattr(M, f"VF{k.upper()}{o}{s.upper()}"): (k, o, s == "sd")
+        for k in ("madd", "msub", "nmadd", "nmsub") for o in ("132", "213", "231") for s in ("ss", "sd")
+    }
+    has_wide = any(i.mnemonic in (M.VMOVUPS, M.MOVDQU, *avx2_wide_ops, *sse41_ops) or i.mnemonic in sha_ops or i.mnemonic in pmov_ext or i.mnemonic in sse2_sat_mul_ops or i.mnemonic in crypto_legacy_ops or i.mnemonic in crypto_vex_ops or i.mnemonic in fma_scalar for i in body)
+    sse41_42_misc_ops = {
+        M.PEXTRB, M.PEXTRW, M.PEXTRD, M.PEXTRQ,
+        M.PINSRB, M.PINSRW, M.PINSRD, M.PINSRQ,
+        M.PMADDUBSW, M.PMULHRSW, M.PHMINPOSUW, M.PTEST, M.MPSADBW, M.PCMPGTQ,
+    }
+    has_wide |= any(i.mnemonic in sse41_42_misc_ops for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
+    has_wide |= any(i.mnemonic in sse2_int_ops for i in body)
     if has_wide:
         if has_xmm_math:
             raise ValueError("mixed vector arithmetic and wide descriptor copies are unsupported")
@@ -743,6 +850,224 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             stmt = (f"{{ {src_init} for (size_t k = 0; k < {lanes}; ++k) {{ "
                     f"const {dst_t} v = static_cast<{dst_t}>(load<{src_t}>(reinterpret_cast<word>(in1.data() + k * {src_sz}))); "
                     f"memcpy({dst}.data() + k * {dst_sz}, &v, {dst_sz}); }} }}")
+        elif op in sse2_sat_mul_ops and i.encoding == EncodingKind.LEGACY and i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and has_wide:
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                src_init = f"std::array<uint8_t,16> rhs; memcpy(rhs.data(), {wide_xmm[i.op1_register]}.data(), 16);"
+            elif i.op1_kind == K.MEMORY:
+                src_init = f"std::array<uint8_t,16> rhs; memcpy(rhs.data(), reinterpret_cast<const void*>({address()}), 16);"
+            else:
+                raise ValueError(f"unsupported SSE2 integer source at {i.ip:#x}: {i}")
+            if op in (M.PADDSB, M.PSUBSB, M.PADDSW, M.PSUBSW):
+                lane_size = 1 if op in (M.PADDSB, M.PSUBSB) else 2
+                stype, lo, hi = ("int8_t", -128, 127) if lane_size == 1 else ("int16_t", -32768, 32767)
+                sign = "+" if op in (M.PADDSB, M.PADDSW) else "-"
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{stype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const int s = int(a) {sign} int(b); "
+                        f"const {stype} v = static_cast<{stype}>(s < {lo} ? {lo} : (s > {hi} ? {hi} : s)); "
+                        f"memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
+            elif op in (M.PADDUSB, M.PADDUSW):
+                lane_size = 1 if op == M.PADDUSB else 2
+                utype, hi = ("uint8_t", 255) if lane_size == 1 else ("uint16_t", 65535)
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{utype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const unsigned s = unsigned(a) + unsigned(b); "
+                        f"const {utype} v = static_cast<{utype}>(s > {hi}u ? {hi}u : s); "
+                        f"memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
+            elif op in (M.PSUBUSB, M.PSUBUSW):
+                lane_size = 1 if op == M.PSUBUSB else 2
+                utype = "uint8_t" if lane_size == 1 else "uint16_t"
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{utype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const {utype} v = a > b ? static_cast<{utype}>(a - b) : {utype}(0); "
+                        f"memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
+            elif op in (M.PMULHW, M.PMULHUW, M.PMULLW):
+                itype = "int16_t" if op == M.PMULHW else "uint16_t"
+                prod = ("static_cast<uint32_t>(int32_t(a) * int32_t(b)) >> 16" if op == M.PMULHW
+                        else ("(uint32_t(a) * uint32_t(b)) >> 16" if op == M.PMULHUW
+                              else "uint32_t(a) * uint32_t(b)"))
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+=2) {{ "
+                        f"{itype} a, b; memcpy(&a, {dst}.data()+n, 2); memcpy(&b, rhs.data()+n, 2); "
+                        f"const uint16_t v = static_cast<uint16_t>({prod}); memcpy({dst}.data()+n, &v, 2); }} }}")
+            elif op == M.PMADDWD:
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+=4) {{ "
+                        f"int16_t a0, a1, b0, b1; memcpy(&a0, {dst}.data()+n, 2); memcpy(&a1, {dst}.data()+n+2, 2); "
+                        f"memcpy(&b0, rhs.data()+n, 2); memcpy(&b1, rhs.data()+n+2, 2); "
+                        f"const uint32_t v = static_cast<uint32_t>(int32_t(a0) * int32_t(b0)) "
+                        f"+ static_cast<uint32_t>(int32_t(a1) * int32_t(b1)); "
+                        f"memcpy({dst}.data()+n, &v, 4); }} }}")
+            elif op == M.PMULUDQ:
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+=8) {{ "
+                        f"uint32_t a, b; memcpy(&a, {dst}.data()+n, 4); memcpy(&b, rhs.data()+n, 4); "
+                        f"const uint64_t v = uint64_t(a) * uint64_t(b); memcpy({dst}.data()+n, &v, 8); }} }}")
+            elif op in (M.PMINUB, M.PMAXUB, M.PMINSW, M.PMAXSW):
+                lane_size = 1 if op in (M.PMINUB, M.PMAXUB) else 2
+                ltype = "uint8_t" if lane_size == 1 else "int16_t"
+                cmp_op = "<" if op in (M.PMINUB, M.PMINSW) else ">"
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{ltype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const {ltype} v = a {cmp_op} b ? a : b; memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
+            elif op in (M.PAVGB, M.PAVGW):
+                lane_size = 1 if op == M.PAVGB else 2
+                utype = "uint8_t" if lane_size == 1 else "uint16_t"
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{utype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const {utype} v = static_cast<{utype}>((unsigned(a) + unsigned(b) + 1u) >> 1); "
+                        f"memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
+            else:  # M.PSADBW
+                stmt = (f"{{ {src_init} for (size_t q=0; q<16; q+=8) {{ uint64_t s = 0; "
+                        f"for (size_t k=0; k<8; ++k) {{ const int d = int({dst}[q+k]) - int(rhs[q+k]); "
+                        f"s += static_cast<uint64_t>(d < 0 ? -d : d); }} memcpy({dst}.data()+q, &s, 8); }} }}")
+        elif ((op in crypto_legacy_ops and i.encoding == EncodingKind.LEGACY)
+              or (op in crypto_vex_ops and i.encoding == EncodingKind.VEX)) and has_wide:
+            if i.op0_kind != K.REGISTER or i.op0_register not in wide_xmm:
+                raise ValueError(f"unsupported crypto destination at {i.ip:#x}: {i}")
+            dst = wide_xmm[i.op0_register]
+            is_vex = op in crypto_vex_ops
+            zero_hi = f" memset({dst}.data()+16, 0, 16);" if is_vex else ""
+            if op in (M.AESIMC, M.VAESIMC, M.AESKEYGENASSIST, M.VAESKEYGENASSIST):
+                if i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                    s_init = f"uint8_t s[16]; memcpy(s, {wide_xmm[i.op1_register]}.data(), 16);"
+                elif i.op1_kind == K.MEMORY:
+                    s_init = f"uint8_t s[16]; memcpy(s, reinterpret_cast<const void*>({address()}), 16);"
+                else:
+                    raise ValueError(f"unsupported crypto source at {i.ip:#x}: {i}")
+                if op in (M.AESIMC, M.VAESIMC):
+                    stmt = f"{{ {s_init} aes_mix_columns(s, true); memcpy({dst}.data(), s, 16);{zero_hi} }}"
+                else:
+                    rcon = i.immediate(2) & 0xff
+                    stmt = f"{{ {s_init} uint8_t o[16]; aes_keygen(o, s, {rcon}u); memcpy({dst}.data(), o, 16);{zero_hi} }}"
+            else:
+                if is_vex and (i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm):
+                    raise ValueError(f"unsupported crypto source at {i.ip:#x}: {i}")
+                src1 = wide_xmm[i.op1_register] if is_vex else dst
+                src2_idx = 2 if is_vex else 1
+                if i.op_kind(src2_idx) == K.REGISTER and i.op_register(src2_idx) in wide_xmm:
+                    s2_init = f"uint8_t s2[16]; memcpy(s2, {wide_xmm[i.op_register(src2_idx)]}.data(), 16);"
+                elif i.op_kind(src2_idx) == K.MEMORY:
+                    s2_init = f"uint8_t s2[16]; memcpy(s2, reinterpret_cast<const void*>({address()}), 16);"
+                else:
+                    raise ValueError(f"unsupported crypto source2 at {i.ip:#x}: {i}")
+                if op in (M.PCLMULQDQ, M.VPCLMULQDQ):
+                    imm = i.immediate(3 if is_vex else 2) & 0xff
+                    stmt = (f"{{ uint8_t s1[16], o[16]; memcpy(s1, {src1}.data(), 16); {s2_init} "
+                            f"pclmul_x86(o, s1, s2, {imm}u); memcpy({dst}.data(), o, 16);{zero_hi} }}")
+                else:
+                    dec = "true" if op in (M.AESDEC, M.AESDECLAST, M.VAESDEC, M.VAESDECLAST) else "false"
+                    last = "true" if op in (M.AESENCLAST, M.AESDECLAST, M.VAESENCLAST, M.VAESDECLAST) else "false"
+                    stmt = (f"{{ uint8_t s1[16], o[16]; memcpy(s1, {src1}.data(), 16); {s2_init} "
+                            f"aes_round(o, s1, s2, {dec}, {last}); memcpy({dst}.data(), o, 16);{zero_hi} }}")
+        elif has_wide and i.encoding == EncodingKind.VEX and op in fma_scalar:
+            if (i.op0_kind != K.REGISTER or i.op0_register not in wide_xmm
+                    or i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm
+                    or (i.op2_kind != K.MEMORY and
+                        (i.op2_kind != K.REGISTER or i.op2_register not in wide_xmm))):
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+            kind, order, is_f64 = fma_scalar[op]
+            ftype, utype, sz = ("double", "uint64_t", 8) if is_f64 else ("float", "uint32_t", 4)
+            dst, src1 = wide_xmm[i.op0_register], wide_xmm[i.op1_register]
+            s0 = f"load<{ftype}>(reinterpret_cast<word>({dst}.data()))"
+            s1 = f"load<{ftype}>(reinterpret_cast<word>({src1}.data()))"
+            s2 = (f"load<{ftype}>({address()})" if i.op2_kind == K.MEMORY
+                  else f"load<{ftype}>(reinterpret_cast<word>({wide_xmm[i.op2_register]}.data()))")
+            neg_p = "true" if kind in ("nmadd", "nmsub") else "false"
+            neg_c = "true" if kind in ("msub", "nmsub") else "false"
+            stmt = (f"{{ const {ftype} r = fma_x86<{ftype}, {utype}>({s0}, {s1}, {s2}, {order}, {neg_p}, {neg_c}); "
+                    f"auto keep = {dst}; {dst} = {{}}; memcpy({dst}.data(), keep.data(), 16); memcpy({dst}.data(), &r, {sz}); }}")
+        elif op in sse2_int_ops and i.encoding == EncodingKind.LEGACY and i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and has_wide:
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                src_init = f"std::array<uint8_t,16> rhs; memcpy(rhs.data(), {wide_xmm[i.op1_register]}.data(), 16);"
+            else:
+                raise ValueError(f"unsupported SSE2 integer source at {i.ip:#x}: {i}")
+            if op in (M.PADDB, M.PADDW, M.PADDD, M.PADDQ, M.PSUBB, M.PSUBW, M.PSUBD, M.PSUBQ):
+                lane_size = {M.PADDB: 1, M.PSUBB: 1, M.PADDW: 2, M.PSUBW: 2,
+                             M.PADDD: 4, M.PSUBD: 4, M.PADDQ: 8, M.PSUBQ: 8}[op]
+                utype = UINT[lane_size]
+                sign = "+" if op in (M.PADDB, M.PADDW, M.PADDD, M.PADDQ) else "-"
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{utype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const {utype} v = static_cast<{utype}>(a {sign} b); memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
+            elif op in (M.PAND, M.PANDN, M.POR, M.PXOR):
+                expr = {M.PAND: "a & b", M.PANDN: "(~a) & b", M.POR: "a | b", M.PXOR: "a ^ b"}[op]
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; ++n) {{ "
+                        f"const uint8_t a = {dst}[n], b = rhs[n]; {dst}[n] = static_cast<uint8_t>({expr}); }} }}")
+            elif op in (M.PCMPEQB, M.PCMPEQW, M.PCMPEQD):
+                lane_size = {M.PCMPEQB: 1, M.PCMPEQW: 2, M.PCMPEQD: 4}[op]
+                utype = UINT[lane_size]
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{utype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const {utype} v = a == b ? static_cast<{utype}>(~{utype}(0)) : {utype}(0); "
+                        f"memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
+            else:  # M.PCMPGTB, M.PCMPGTW, M.PCMPGTD
+                lane_size = {M.PCMPGTB: 1, M.PCMPGTW: 2, M.PCMPGTD: 4}[op]
+                stype = {1: "int8_t", 2: "int16_t", 4: "int32_t"}[lane_size]
+                utype = UINT[lane_size]
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+={lane_size}) {{ "
+                        f"{stype} a, b; memcpy(&a, {dst}.data()+n, {lane_size}); memcpy(&b, rhs.data()+n, {lane_size}); "
+                        f"const {utype} v = a > b ? static_cast<{utype}>(~{utype}(0)) : {utype}(0); "
+                        f"memcpy({dst}.data()+n, &v, {lane_size}); }} }}")
+        elif op == M.CRC32 and i.op0_kind == K.REGISTER and RegisterExt.size(i.op0_register) in (4, 8):
+            src_size = MemorySizeExt.size(i.memory_size) if i.op1_kind == K.MEMORY else RegisterExt.size(i.op1_register)
+            stmt = (f"{{ uint32_t crc = static_cast<uint32_t>({operand(0)}); uint64_t data = {operand(1)}; "
+                    f"for (size_t k=0; k<{src_size}; ++k) {{ crc ^= static_cast<uint8_t>(data >> (8u * k)); "
+                    f"for (int b=0; b<8; ++b) crc = (crc & 1u) ? ((crc >> 1) ^ 0x82f63b78u) : (crc >> 1); }} "
+                    f"{write('crc')} }}")
+        elif op == M.MOVNTDQA:
+            raise ValueError(f"unsupported MOVNTDQA memory contract at {i.ip:#x}: {i}")
+        elif op in (M.PEXTRB, M.PEXTRW, M.PEXTRD, M.PEXTRQ) and i.encoding == EncodingKind.LEGACY and has_wide and i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+            lane_size = {M.PEXTRB: 1, M.PEXTRW: 2, M.PEXTRD: 4, M.PEXTRQ: 8}[op]
+            lane = i.immediate(2) & ((16 // lane_size) - 1)
+            utype = UINT[lane_size]
+            src = wide_xmm[i.op1_register]
+            stmt = f"{{ {utype} v; memcpy(&v, {src}.data()+{lane * lane_size}, {lane_size}); {write('v')} }}"
+        elif op in (M.PINSRB, M.PINSRW, M.PINSRD, M.PINSRQ) and i.encoding == EncodingKind.LEGACY and has_wide and i.op0_kind == K.REGISTER and i.op0_register in wide_xmm:
+            lane_size = {M.PINSRB: 1, M.PINSRW: 2, M.PINSRD: 4, M.PINSRQ: 8}[op]
+            lane = i.immediate(2) & ((16 // lane_size) - 1)
+            utype = UINT[lane_size]
+            dst = wide_xmm[i.op0_register]
+            stmt = f"{{ const {utype} v = static_cast<{utype}>({operand(1)}); memcpy({dst}.data()+{lane * lane_size}, &v, {lane_size}); }}"
+        elif (op in (M.PMADDUBSW, M.PMULHRSW, M.PHMINPOSUW, M.PTEST, M.MPSADBW, M.PCMPGTQ)
+              and i.encoding == EncodingKind.LEGACY and i.op0_kind == K.REGISTER and i.op0_register in wide_xmm and has_wide):
+            dst = wide_xmm[i.op0_register]
+            if i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
+                src_init = f"std::array<uint8_t,16> rhs; memcpy(rhs.data(), {wide_xmm[i.op1_register]}.data(), 16);"
+            else:
+                raise ValueError(f"unsupported SSE4.1/4.2 source at {i.ip:#x}: {i}")
+            if op == M.PMADDUBSW:
+                stmt = (f"{{ {src_init} for (size_t k=0; k<8; ++k) {{ "
+                        f"const int s = int({dst}[2*k]) * int(static_cast<int8_t>(rhs[2*k])) "
+                        f"+ int({dst}[2*k+1]) * int(static_cast<int8_t>(rhs[2*k+1])); "
+                        f"const int16_t v = static_cast<int16_t>(s < -32768 ? -32768 : (s > 32767 ? 32767 : s)); "
+                        f"memcpy({dst}.data()+2*k, &v, 2); }} }}")
+            elif op == M.PMULHRSW:
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+=2) {{ "
+                        f"int16_t a, b; memcpy(&a, {dst}.data()+n, 2); memcpy(&b, rhs.data()+n, 2); "
+                        f"const int32_t t = ((int32_t(a) * int32_t(b)) >> 14) + 1; "
+                        f"const int16_t v = static_cast<int16_t>(t >> 1); memcpy({dst}.data()+n, &v, 2); }} }}")
+            elif op == M.PHMINPOSUW:
+                stmt = (f"{{ {src_init} uint16_t best = 0xffffu, idx = 0u; "
+                        f"for (uint16_t k=0; k<8; ++k) {{ uint16_t v; memcpy(&v, rhs.data()+2*k, 2); "
+                        f"if (k == 0 || v < best) {{ best = v; idx = k; }} }} "
+                        f"memset({dst}.data(), 0, 16); memcpy({dst}.data(), &best, 2); memcpy({dst}.data()+2, &idx, 2); }}")
+            elif op == M.PTEST:
+                stmt = (f"{{ {src_init} uint8_t z = 0, c = 0; "
+                        f"for (size_t n=0; n<16; ++n) {{ z |= ({dst}[n] & rhs[n]); c |= (static_cast<uint8_t>(~{dst}[n]) & rhs[n]); }} "
+                        f"zero = z == 0; carry = c == 0; overflow = false;"
+                        + (" parity = false;" if parity else "") + " }")
+            elif op == M.MPSADBW:
+                imm = i.immediate(2)
+                src_off = (imm & 3) * 4
+                dst_off = ((imm >> 2) & 1) * 4
+                stmt = (f"{{ std::array<uint8_t,16> lhs; memcpy(lhs.data(), {dst}.data(), 16); {src_init} "
+                        f"for (size_t j=0; j<8; ++j) {{ uint16_t s = 0; "
+                        f"for (size_t k=0; k<4; ++k) {{ const int d = int(lhs[{dst_off}+j+k]) - int(rhs[{src_off}+k]); "
+                        f"s += static_cast<uint16_t>(d < 0 ? -d : d); }} memcpy({dst}.data()+2*j, &s, 2); }} }}")
+            else:  # M.PCMPGTQ
+                stmt = (f"{{ {src_init} for (size_t n=0; n<16; n+=8) {{ "
+                        f"int64_t a, b; memcpy(&a, {dst}.data()+n, 8); memcpy(&b, rhs.data()+n, 8); "
+                        f"const uint64_t v = a > b ? ~0ull : 0ull; memcpy({dst}.data()+n, &v, 8); }} }}")
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = load<std::array<uint8_t,32>>({address()});"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:

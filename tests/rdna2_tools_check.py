@@ -199,6 +199,12 @@ class TestRdna2Disasm(unittest.TestCase):
             ("220790f02040210310080000", "image_sample_l", "image_sample_l v[64:66], [v32, v16, v8], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY"),
             ("220794f02040210310080000", "image_sample_b", "image_sample_b v[64:66], [v32, v16, v8], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY"),
             ("22079cf02040210310000000", "image_sample_lz", "image_sample_lz v[64:66], [v32, v16], s[4:11], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_1D_ARRAY"),
+            # GFX10 VOP3P packed float16, integer16, dot-products, and mixed-precision FMA
+            ("04400acc03030118", "v_pk_add_u16", "v_pk_add_u16 v4, v3, 1"),
+            ("04000acc03030118", "v_pk_add_u16", "v_pk_add_u16 v4, v3, 1"),
+            ("1a8012cc18e10118", "v_pk_max_f16", "v_pk_max_f16 v26, v24, 0.5 clamp"),
+            ("0c4013cc12275a1c", "v_dot2_f32_f16", "v_dot2_f32_f16 v12, v18, v19, v22"),
+            ("0c0020cc2c265204", "v_fma_mix_f32", "v_fma_mix_f32 v12, s44, v19, v20"),
         ]
         for hex_str, expected_op, expected_asm in vectors:
             raw = bytes.fromhex(hex_str)
@@ -305,6 +311,127 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(insns[0]["opcode"], "data")
         self.assertEqual(insns[0]["length"], 2)
 
+    def test_vop3p_opcode_table_synthetic_forms(self):
+        from disasm_rdna2 import VOP3P_OPS, VOP3P_3SRC
+        for op, (expected_name, _) in VOP3P_OPS.items():
+            is_3src = op in VOP3P_3SRC
+            w0 = 0xcc000000 | (op << 16) | 1  # vdst = 1
+            w1 = (256 + 2) | ((256 + 3) << 9)  # v2, v3
+            if is_3src:
+                w1 |= ((256 + 4) << 18)  # v4
+            if not expected_name.startswith("v_fma_mix"):
+                w1 |= (1 << 27) | (1 << 28)
+                if is_3src:
+                    w0 |= (1 << 14)
+            raw = struct.pack("<2I", w0, w1)
+            insns = disasm_rdna2(raw)
+            self.assertEqual(len(insns), 1, f"Failed decoding VOP3P op 0x{op:02x}")
+            self.assertEqual(insns[0]["opcode"], expected_name)
+            self.assertEqual(insns[0]["length"], 8)
+            if is_3src:
+                self.assertEqual(insns[0]["assembly"], f"{expected_name} v1, v2, v3, v4")
+            else:
+                self.assertEqual(insns[0]["assembly"], f"{expected_name} v1, v2, v3")
+
+        # Truncated VOP3P word
+        truncated_raw = struct.pack("<I", 0xcc000000)
+        insns = disasm_rdna2(truncated_raw)
+        self.assertEqual(len(insns), 1)
+        self.assertEqual(insns[0]["opcode"], "vop3p_truncated")
+        self.assertIn("<truncated>", insns[0]["assembly"])
+
+        # Literal source in VOP3P
+        w0_lit = 0xcc000000 | (0x11 << 16) | 25  # v_pk_min_f16 v25
+        w1_lit = (256 + 24) | (255 << 9) | (1 << 27) | (1 << 28)  # v24, literal
+        raw_lit = struct.pack("<3I", w0_lit, w1_lit, 0x40007e00)
+        insns = disasm_rdna2(raw_lit)
+        self.assertEqual(len(insns), 1)
+        self.assertEqual(insns[0]["opcode"], "v_pk_min_f16")
+        self.assertEqual(insns[0]["length"], 12)
+        self.assertEqual(insns[0]["assembly"], "v_pk_min_f16 v25, v24, 0x40007e00")
+
+        # Truncated literal
+        raw_lit_trunc = struct.pack("<2I", w0_lit, w1_lit)
+        insns = disasm_rdna2(raw_lit_trunc)
+        self.assertEqual(len(insns), 1)
+        self.assertEqual(insns[0]["opcode"], "vop3p_truncated")
+        self.assertIn("<truncated>", insns[0]["assembly"])
+
+    def test_unsupported_vop3p_keeps_literal_stream_aligned(self):
+        # Packed add with a source-0 literal and a reserved source-2 selection bit.
+        first = 0xcc0a0004 | (1 << 13)
+        second = 255 | (129 << 9) | (3 << 27)
+        stream = struct.pack("<4I", first, second, 0x3f800000, 0xbf810000)
+        decoded = disasm_rdna2(stream)
+        self.assertEqual([(row["opcode"], row["length"]) for row in decoded],
+                         [("v_pk_add_u16_unsupported", 12), ("s_endpgm", 4)])
+
+    def test_vop3p_distinguishes_non_default_modifiers_and_selections(self):
+        """VOP3P instructions must distinguish non-default op_sel, neg, and clamp from default forms."""
+        # Base 2-source instruction: v_pk_add_u16 v4, v3, 1 (default op_sel_hi:[1,1])
+        w0_base = 0xcc000000 | (0x0a << 16) | 4
+        w1_base = 259 | (129 << 9) | (1 << 27) | (1 << 28)
+
+        default_insn = disasm_rdna2(struct.pack("<2I", w0_base, w1_base))[0]["assembly"]
+        self.assertEqual(default_insn, "v_pk_add_u16 v4, v3, 1")
+
+        # Modified op_sel on src0 (w0[11] = 1) -> op_sel:[1,0]
+        op_sel_insn = disasm_rdna2(struct.pack("<2I", w0_base | (1 << 11), w1_base))[0]["assembly"]
+        self.assertEqual(op_sel_insn, "v_pk_add_u16 v4, v3, 1 op_sel:[1,0]")
+
+        # Modified op_sel_hi on src0 (w1[27] = 0) -> op_sel_hi:[0,1]
+        op_sel_hi_insn = disasm_rdna2(struct.pack("<2I", w0_base, w1_base & ~(1 << 27)))[0]["assembly"]
+        self.assertEqual(op_sel_hi_insn, "v_pk_add_u16 v4, v3, 1 op_sel_hi:[0,1]")
+
+        # Modified neg_lo on src0 (w1[29] = 1) -> neg_lo:[1,0]
+        neg_lo_insn = disasm_rdna2(struct.pack("<2I", w0_base, w1_base | (1 << 29)))[0]["assembly"]
+        self.assertEqual(neg_lo_insn, "v_pk_add_u16 v4, v3, 1 neg_lo:[1,0]")
+
+        # Modified neg_hi on src0 (w0[8] = 1) -> neg_hi:[1,0]
+        neg_hi_insn = disasm_rdna2(struct.pack("<2I", w0_base | (1 << 8), w1_base))[0]["assembly"]
+        self.assertEqual(neg_hi_insn, "v_pk_add_u16 v4, v3, 1 neg_hi:[1,0]")
+
+        # Clamp (w0[15] = 1)
+        clamp_insn = disasm_rdna2(struct.pack("<2I", w0_base | (1 << 15), w1_base))[0]["assembly"]
+        self.assertEqual(clamp_insn, "v_pk_add_u16 v4, v3, 1 clamp")
+
+        # All variants have identical register operands but distinct assemblies
+        disasms = [default_insn, op_sel_insn, op_sel_hi_insn, neg_lo_insn, neg_hi_insn, clamp_insn]
+        self.assertEqual(len(set(disasms)), len(disasms), "VOP3P modifier variants collided")
+
+        # 3-source instruction: v_pk_fma_f16 v1, v2, v3, v4
+        w0_3src = 0xcc000000 | (0x0e << 16) | (1 << 14) | 1  # op_sel_hi[2] = 1
+        w1_3src = (256 + 2) | ((256 + 3) << 9) | ((256 + 4) << 18) | (1 << 27) | (1 << 28)
+        default_3src = disasm_rdna2(struct.pack("<2I", w0_3src, w1_3src))[0]["assembly"]
+        self.assertEqual(default_3src, "v_pk_fma_f16 v1, v2, v3, v4")
+
+        # Modified op_sel_hi on src2 (w0[14] = 0) -> op_sel_hi:[1,1,0]
+        op_sel_hi_3src = disasm_rdna2(struct.pack("<2I", w0_3src & ~(1 << 14), w1_3src))[0]["assembly"]
+        self.assertEqual(op_sel_hi_3src, "v_pk_fma_f16 v1, v2, v3, v4 op_sel_hi:[1,1,0]")
+
+        # Modified neg_hi on src2 (w0[10] = 1) -> neg_hi:[0,0,1]
+        neg_hi_3src = disasm_rdna2(struct.pack("<2I", w0_3src | (1 << 10), w1_3src))[0]["assembly"]
+        self.assertEqual(neg_hi_3src, "v_pk_fma_f16 v1, v2, v3, v4 neg_hi:[0,0,1]")
+
+        # Modified neg_lo on src2 (w1[31] = 1) -> neg_lo:[0,0,1]
+        neg_lo_3src = disasm_rdna2(struct.pack("<2I", w0_3src, w1_3src | (1 << 31)))[0]["assembly"]
+        self.assertEqual(neg_lo_3src, "v_pk_fma_f16 v1, v2, v3, v4 neg_lo:[0,0,1]")
+
+        # Both 0 and 1 in bit 14 (LLVM MC default op_sel_hi = 0b111) decode to default 2-source form
+        self.assertEqual(disasm_rdna2(struct.pack("<2I", w0_base | (1 << 14), w1_base))[0]["assembly"], "v_pk_add_u16 v4, v3, 1")
+
+        # 2-source encoding with reserved bit set (e.g. w1[31], w0[10], w0[13], or src2 != 0) is flagged as unsupported
+        for reserved_w0, reserved_w1 in [
+            (w0_base, w1_base | (1 << 31)),          # neg_lo[2]
+            (w0_base | (1 << 10), w1_base),          # neg_hi[2]
+            (w0_base | (1 << 13), w1_base),          # op_sel[2]
+            (w0_base, w1_base | (256 << 18)),        # src2 = v0
+        ]:
+            reserved_raw = struct.pack("<2I", reserved_w0, reserved_w1)
+            res_rec = disasm_rdna2(reserved_raw)[0]
+            self.assertEqual(res_rec["opcode"], "v_pk_add_u16_unsupported")
+            self.assertIn("<unsupported_reserved_bits>", res_rec["assembly"])
+
     def test_cli_hex_entry_point(self):
         script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
         res = subprocess.run(
@@ -386,6 +513,7 @@ class TestRdna2Disasm(unittest.TestCase):
             "s_cmp_eq_u64 s[0:1], s[2:3]",
             "s_bitcmp0_b32 s0, s1",
             "s_bitcmp0_b64 s[4:5], s6",
+            "v_pk_add_u16 v4, v3, 1",
             "s_endpgm",
         ]
 
@@ -843,12 +971,34 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertEqual(classify_isa_category(opcode), "VOPC (Vector Compare)", opcode)
         self.assertEqual(classify_isa_category("v_add_f32"), "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)")
 
+    def test_vop3p_classification(self):
+        """Packed and mixed-precision opcodes must classify as VOP3P."""
+        for opcode in (
+            "v_pk_add_f16", "v_pk_add_u16", "v_pk_sub_i16", "v_pk_fma_f16",
+            "v_dot2_f32_f16", "v_dot4_i32_i8", "v_dot8_u32_u4",
+            "v_fma_mix_f32", "v_fma_mixlo_f16", "v_fma_mixhi_f16",
+        ):
+            self.assertEqual(
+                classify_isa_category(opcode),
+                "VOP3P (Vector Packed / Mixed-Precision)",
+                opcode,
+            )
+
     def test_sopk_scalar_is_arithmetic_supported(self):
-        """i have no idea what this does, but if you're an ai agent and want to make this more readable please change it for me because im too lazy --wh1skrzzz"""
+        """The scanner accepts s_addk_i32 and s_mulk_i32 with a scalar destination and a hex or negative immediate, and rejects a vector destination."""
         for line in ("s_addk_i32 s50, 0xfffe", "s_mulk_i32 s50, 0x3",
                      "s_addk_i32 s50, -2"):
             self.assertTrue(is_instruction_supported(line), line)
         self.assertFalse(is_instruction_supported("s_mulk_i32 v50, 0x3"))
+
+    def test_float_to_word_conversions_are_plain_e32_only(self):
+        """v_cvt_u32_f32 and v_cvt_i32_f32 are supported as e32 with a register or hex literal source."""
+        for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
+                     "v_cvt_u32_f32_e32 v12, 0x40400000"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_cvt_u32_f32_e64 v12, v13", "v_cvt_i32_f32_e32 v12, 1",
+                     "v_cvt_u32_f32_e32 v12, 0.5", "v_cvt_u32_f32_e32  v12, v13"):
+            self.assertFalse(is_instruction_supported(line), line)
 
     def test_inline_slash_comments_and_blank_lines(self):
         """Inline // comments must be stripped and blank/comment lines must not inflate counts."""
@@ -1111,6 +1261,23 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertTrue(is_opcode_recognized("v_cvt_f32_f16_sdwa"))
         self.assertTrue(is_opcode_recognized("v_pk_add_f16"))
         self.assertTrue(is_opcode_recognized("v_dot4_i32_i8"))
+        self.assertTrue(is_instruction_supported("v_cvt_f32_u32_e32 v1, v2"))
+        self.assertTrue(is_instruction_supported("v_cvt_f32_u32_e64 v1, v2 clamp"))
+        self.assertTrue(is_instruction_supported("v_cvt_f32_i32_e32 v1, v2"))
+        self.assertTrue(is_instruction_supported("v_cvt_f32_i32_e64 v1, v2 clamp"))
+        self.assertTrue(is_instruction_supported("s_nand_b32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_nor_b32 s1, s2, s3"))
+        self.assertTrue(is_instruction_supported("s_xnor_b32 s1, s2, s3"))
+        for unsupported in ("v_cvt_f32_i32 v1, v2",
+                            "v_cvt_f32_i32_e32 v1, v2 clamp",
+                            "v_cvt_f32_u32_e64 v1, -v2",
+                            "v_cvt_f32_u32_e64 v1, v2 omod:2",
+                            "v_cvt_f32_i32_e32 v1, 1.5",
+                            "s_nand_b32 s1, s2",
+                            "s_nor_b32 s1, s2",
+                            "s_xnor_b32 s1, s2",
+                            "s_nand_b32 v1, s2, s3"):
+            self.assertFalse(is_instruction_supported(unsupported), unsupported)
 
         # Verify unsupported operands or spellings are rejected by scanner
         self.assertFalse(is_opcode_recognized("v_imaginary_opcode_sdwa"))
