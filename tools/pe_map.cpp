@@ -99,6 +99,23 @@ bool executable(const IMAGE_NT_HEADERS64* nt, std::uint64_t rva) {
     return false;
 }
 
+// True if [rva, rva + size) lies inside a section mapped as writable. The Windows loader
+// writes the TLS index to AddressOfIndex, so that slot must be writable: measured on
+// Windows 11, an index in the headers, .text, .rdata or .tlscb fails with ERROR_NOACCESS
+// while another DWORD in writable .data loads. The check is by section characteristics,
+// like executable() above, so it holds both after mapping and on release.
+bool writable_section(const IMAGE_NT_HEADERS64* nt, std::uint64_t rva, std::uint64_t size) {
+    const auto* sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        const auto& s = sections[i];
+        const DWORD span = s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData;
+        if ((s.Characteristics & IMAGE_SCN_MEM_WRITE) && rva >= s.VirtualAddress
+            && size <= span && rva - s.VirtualAddress <= span - size)
+            return true;
+    }
+    return false;
+}
+
 // True if every page of [address, address + size) is committed and currently allows reads.
 // Image bounds alone do not make bytes readable: section protections apply, and the image may
 // change them at run time, so the live protection is queried at each read, including on release.
@@ -161,9 +178,15 @@ const char* tls_callbacks(const Image& image, const IMAGE_NT_HEADERS64* nt, std:
     // Sections are already protected here, both after mapping and on release.
     if (!readable(tls, sizeof(IMAGE_TLS_DIRECTORY64))) return "TLS directory not readable";
     // Each value is read once after its check, so the validated value is the one used.
+    // The loader assigns the TLS index even for an empty template, so the slot must be
+    // validated whenever the directory is present, independent of the callback list.
+    const auto base = reinterpret_cast<std::uint64_t>(image.base);
+    const std::uint64_t index = tls->AddressOfIndex;
+    if (index < base || index - base >= image.size || !image.at<DWORD>(index - base))
+        return "TLS index outside image";
+    if (!writable_section(nt, index - base, sizeof(DWORD))) return "TLS index outside writable section";
     const std::uint64_t list = tls->AddressOfCallBacks;
     if (!list) return nullptr;
-    const auto base = reinterpret_cast<std::uint64_t>(image.base);
     for (std::uint64_t i = 0; i <= MAX_TLS_CALLBACKS; ++i) {
         const std::uint64_t va = list + 8 * i;
         const auto* slot = va >= base ? image.at<std::uint64_t>(va - base) : nullptr;
