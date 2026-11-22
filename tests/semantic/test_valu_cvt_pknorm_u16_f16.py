@@ -985,5 +985,142 @@ class TestValuCvtPknormU16F16SIMDDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
+# ==============================================================================
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestValuCvtPknormU16F16RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing hazards and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        """Verify dst == src0 reads original src0 before destination overwrite."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, POS_ONE_F16)   # src0 initial: +1.0
+        state.set_vgpr(1, POS_ZERO_F16)  # src1: 0.0
+
+        instr = VCvtPknormU16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0x0000FFFF)
+        self.assertEqual(state.get_vgpr(0), 0x0000FFFF)
+        self.assertEqual(state.get_vgpr(1), POS_ZERO_F16)  # src1 untouched
+
+    def test_dst_alias_src1(self) -> None:
+        """Verify dst == src1 reads original src1 before destination overwrite."""
+        state = ScalarMachineState()
+        state.set_vgpr(1, POS_ONE_F16)   # src0: +1.0
+        state.set_vgpr(0, POS_ZERO_F16)  # src1 initial: 0.0
+
+        instr = VCvtPknormU16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0x0000FFFF)
+        self.assertEqual(state.get_vgpr(0), 0x0000FFFF)
+        self.assertEqual(state.get_vgpr(1), POS_ONE_F16)  # src0 untouched
+
+    def test_full_self_aliasing(self) -> None:
+        """Verify dst == src0 == src1 correctly converts and duplicates channels."""
+        state = ScalarMachineState()
+        state.set_vgpr(7, POS_HALF_F16)  # +0.5f16
+
+        instr = VCvtPknormU16F16Instruction(
+            dst=Reg(7, RegType.VGPR),
+            src0=VOP3Operand(Reg(7, RegType.VGPR)),
+            src1=VOP3Operand(Reg(7, RegType.VGPR)),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        # Both channels convert +0.5 -> 0x8000
+        self.assertEqual(res, 0x80008000)
+        self.assertEqual(state.get_vgpr(7), 0x80008000)
+
+    def test_src0_alias_src1_distinct_dst(self) -> None:
+        """Verify src0 == src1 with distinct dst preserves source register."""
+        state = ScalarMachineState()
+        state.set_vgpr(1, POS_ONE_F16)
+
+        instr = VCvtPknormU16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(state.get_vgpr(0), 0xFFFFFFFF)
+        self.assertEqual(state.get_vgpr(1), POS_ONE_F16)  # Source untouched
+
+    def test_aliased_operand_with_op_sel(self) -> None:
+        """Verify reading both halves of a single packed register with op_sel."""
+        state = ScalarMachineState()
+        # reg 5 contains: low = 1.0 (0x3C00), high = 0.5 (0x3800) -> 0x38003C00
+        state.set_vgpr(5, (POS_HALF_F16 << 16) | POS_ONE_F16)
+
+        # src0 takes low half (1.0), src1 takes high half (0.5), overwriting reg 5
+        instr = VCvtPknormU16F16Instruction(
+            dst=Reg(5, RegType.VGPR),
+            src0=VOP3Operand(Reg(5, RegType.VGPR)),
+            src1=VOP3Operand(Reg(5, RegType.VGPR)),
+            op_sel=(0, 1),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        # ch0 = 1.0 -> 0xFFFF, ch1 = 0.5 -> 0x8000
+        self.assertEqual(res, 0x8000FFFF)
+        self.assertEqual(state.get_vgpr(5), 0x8000FFFF)
+
+    def test_aliased_operand_with_modifiers(self) -> None:
+        """Verify self-aliased register with asymmetric channel modifiers."""
+        state = ScalarMachineState()
+        state.set_vgpr(2, NEG_ONE_F16)  # -1.0f16
+
+        # src0: abs(-1.0) = +1.0 -> 0xFFFF
+        # src1: plain -1.0 -> clamps to 0x0000
+        instr = VCvtPknormU16F16Instruction(
+            dst=Reg(2, RegType.VGPR),
+            src0=VOP3Operand(Reg(2, RegType.VGPR), abs_mod=True),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+        )
+
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 0x0000FFFF)
+        self.assertEqual(state.get_vgpr(2), 0x0000FFFF)
+
+    def test_simd_aliasing_with_inactive_lanes(self) -> None:
+        """Verify SIMD self-aliasing correctly preserves inactive lanes."""
+        state = SIMDState(num_lanes=32, exec_mask=0x0000FFFF)  # Low 16 lanes active
+        initial_val = POS_ONE_F16
+
+        for lane in range(32):
+            state.set_vgpr(lane, 0, initial_val)
+
+        instr = VCvtPknormU16F16Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+
+        results = self.simd_interp.step(instr, state)
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(results[lane], 0xFFFFFFFF)
+                self.assertEqual(state.get_vgpr(lane, 0), 0xFFFFFFFF)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 0), initial_val)
+
+
 if __name__ == "__main__":
     unittest.main()
