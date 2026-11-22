@@ -4,7 +4,8 @@
 of the shader's LDS array. With a 64 KiB LDS that made modules over the 64 KiB device limit, which `spirv-val` accepts
 and RADV dies on (#1721: 16,385 uints = 65,540 B). The translator now counts both against
 `rdna2spirv.MAX_SHARED_BYTES` (`--max-shared-memory`, default 65536, the hard cap): the LDS array, a power of two at
-least the program's need, shrinks to the RSRC2 allocation when that still fits; otherwise the shader is refused
+least the program's need, shrinks to the RSRC2 allocation when that still fits. A full 64 KiB guest allocation
+can also stage wave exchange in LDS between rounds (SHADER-638). Modules over the cap are refused
 (`Unsupported`, with the byte counts). The device's own limit (32768 on the AMD Windows and Intel drivers) is the
 runtime's check, against `lds_bytes`, which must be the whole total.
 
@@ -127,15 +128,12 @@ class SharedMemoryLimitTests(unittest.TestCase):
         self.assertEqual(wg, {"%lds": 32768, "%x_buf": X_BUF})
         self.assertLessEqual(sum(wg.values()), rdna2spirv.MAX_SHARED_BYTES)
 
-    def test_full_64k_lds_is_refused(self):
-        # #1721: 64 KiB of LDS leaves no room for the exchange, and the program needs all of it
-        with self.assertRaises(rdna2spirv.Unsupported) as cm:
-            translate(128)
-        msg = str(cm.exception)
-        self.assertIn(f"{65536 + X_BUF} B", msg)
-        self.assertIn("LDS 65536 B", msg)
-        self.assertIn(f"wave64 exchange {X_BUF} B", msg)
-        self.assertIn("65536 B", msg)
+    def test_full_64k_lds_borrows_only_at_a_sufficient_cap(self):
+        self.assertEqual(workgroup_bytes(translate(128)), {"%lds": 65536})
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate(128, limit=65532)
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate(129)
 
     def test_rounded_up_lds_shrinks_to_the_allocation(self):
         # LDS_SIZE 100 units = 51,200 B rounds up to a 64 KiB array, over the cap with the exchange; the allocation
@@ -159,7 +157,7 @@ class SharedMemoryLimitTests(unittest.TestCase):
     def test_metadata_lds_bytes_is_every_workgroup_byte(self):
         # index.json's lds_bytes is what the runtime compares with the device's maxComputeSharedMemorySize (32768 on
         # some drivers): it has to be the module's whole Workgroup total, the emulation's %x_buf included
-        for units, emulate in ((64, True), (100, True), (128, False), (64, False)):
+        for units, emulate in ((64, True), (100, True), (128, False), (128, True), (64, False)):
             with self.subTest(units=units, emulate=emulate):
                 prev = rdna2spirv.WAVE64_EMULATE
                 spv = translate(units, emulate=emulate)

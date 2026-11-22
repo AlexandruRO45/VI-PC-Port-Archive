@@ -720,7 +720,7 @@ def _translate_cs(name, items, threads=64, lds_bytes=0, emulate=False, size_xyz=
     lines = _resolve_labels(items)
     sx, sy, sz = size_xyz if size_xyz is not None else (threads, 1, 1)
     lds_blocks = (lds_bytes + 511) // 512
-    rsrc2 = 0x8090 | ((lds_blocks & 0x1FF) << 15)
+    rsrc2 = 0x90 | ((max(1, lds_blocks) & 0x1FF) << 15)
     with tempfile.TemporaryDirectory() as tmp:
         os.mkdir(os.path.join(tmp, "disasm"))
         os.mkdir(os.path.join(tmp, "fssm"))

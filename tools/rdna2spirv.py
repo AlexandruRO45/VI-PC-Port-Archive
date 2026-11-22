@@ -290,6 +290,7 @@ class Gen:
         self.x_seg = 0             # emulate: number of the next continuation segment (past the block numbers)
         self.x_marks = []          # emulate: (index into body, segment) where a segment of the current block ends
         self.x_segs = {}           # emulate: continuation segment -> its SPIR-V lines
+        self.borrow_lds = False    # SHADER-638: stage the exchange while guest LDS is quiescent
         self.x_spills = []         # emulate: (Function variable, pointer type) carrying a value across a round
         self.x_ptr_types = {}      # emulate: value type -> Function pointer type declared for spills
         self.x_dirty = set()       # emulate: (memory kind "lds"/"mem", "r"/"w") accessed since the last round
@@ -3644,6 +3645,8 @@ class Gen:
 
     def x_buf_bytes(self):
         """Workgroup bytes of %x_buf: the wave64 exchange (emulate) or the barrier-round counts (bar_rounds)."""
+        if self.borrow_lds:
+            return 0
         return 4 * (self.x_sizes()[3] + 1) if self.emulate else 12 if self.bar_rounds else 0
 
     def fit_shared_memory(self):
@@ -3694,6 +3697,27 @@ class Gen:
         the wave's two mask words. Returns (read, (lo, hi)): read(lane) loads `data` of a lane (0-63) of this wave,
         and (lo, hi) is the OR over all 64 lanes. Both are only valid in the code emitted after this call, which
         runs one round later."""
+        if self.borrow_lds:
+            if data is not None:
+                self.emit(f"OpStore %xb_data {data}")
+            if bits is not None:
+                for name, bit in zip(("lo", "hi"), bits):
+                    if bit is not None:
+                        self.emit(f"OpStore %xb_{name} {bit}")
+            self.x_split()
+
+            def captured(lane):
+                ptr, value = self.tmp(), self.tmp()
+                self.emit(f"{ptr} = OpAccessChain %_ptr_Function_uint %xb_wave {lane}")
+                self.emit(f"{value} = OpLoad %uint {ptr}")
+                return value
+
+            masks = None
+            if bits is not None:
+                masks = self.tmp(), self.tmp()
+                for name, value in zip(("lo", "hi"), masks):
+                    self.emit(f"{value} = OpLoad %uint %xb_{name}_in")
+            return captured, masks
         it = self.tmp()
         self.emit(f"{it} = OpLoad %uint %x_it")
         if data is not None:
@@ -11002,6 +11026,10 @@ def assemble(gen):
         for v in (0, 1, 2, 3, 6, 31, 63, 0x948, x_mask, x_sched, x_sink, x_sink + 1, x_zero - 1, x_threads,
                   x_waves, sx, sx * sy, 0xFFFFFFC0):
             gen.cu(v)
+        if gen.borrow_lds:
+            # Register its constants before emitting the type/constant section.
+            gen.cu(64)  # length of the private wave snapshot
+            borrowed_tail = borrowed_round_tail(gen)
         x_missing = gen.x_lanes - x_threads          # lanes of a partial last wave that don't exist
         for k in range(-(-max(x_zero, x_missing) // x_threads)):
             gen.cu(k * x_threads)
@@ -11019,7 +11047,7 @@ def assemble(gen):
          [("%ms_out_vtx" if ms_blk else "%ms_out_pos"), "%ms_prim_idx", "%ms_cull"] +
          [f"%ms_out_param{n}" for n in sorted(gen.ms_params)] +
          [f"%ms_out_f16h{n}_{h}" for n in ms_halves for h in (0, 1)])) if ms else []) + (
-        ["%x_buf"] if gen.emulate or gen.bar_rounds else []) + (
+        ["%x_buf"] if (gen.emulate and not gen.borrow_lds) or gen.bar_rounds else []) + (
         ([("%gs_in_pos" if sv == 1 else f"%gs_in{r}") for r, sv in gen.gs["in"]] +
          [("%gs_out_pos" if sv == 1 else f"%gs_out{r}") for r, sv in gen.gs["out"]]) if gsx else []) +         (["%fmt_uint_mask", "%fmt_sint_mask"] if gen.uses_store_views or gen.uses_int_fetch else []) + \
         [f"%stv{c}_{d}" for d in sorted(gen.uses_store_views) for c in range(3)] + \
@@ -11431,7 +11459,10 @@ def assemble(gen):
             types += [f"%lds_arr = OpTypeArray %uint {gen.cu(gen.lds_dwords)}",
                       "%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr", "%_ptr_WG_uint = OpTypePointer Workgroup %uint"]
             gvars += ["%lds = OpVariable %_ptr_WG_lds Workgroup"]
-    if gen.emulate:
+    if gen.borrow_lds:
+        types += [f"%xb_arr = OpTypeArray %uint {gen.cu(64)}",
+                  "%xb_arr_ptr = OpTypePointer Function %xb_arr"]
+    elif gen.emulate:
         types += [f"%x_arr = OpTypeArray %uint {gen.cu(x_sink + 1)}",
                   "%_ptr_WG_x_arr = OpTypePointer Workgroup %x_arr", "%_ptr_WG_uint_x = OpTypePointer Workgroup %uint"]
         gvars += ["%x_buf = OpVariable %_ptr_WG_x_arr Workgroup"]
@@ -11537,6 +11568,10 @@ def assemble(gen):
     if gen.vm_latch:
         fn += ["%vm_mask = OpVariable %_ptr_Function_bool Function %true",
                "%vm_set = OpVariable %_ptr_Function_bool Function %false"]
+    if gen.borrow_lds:
+        fn.append("%xb_wave = OpVariable %xb_arr_ptr Function")
+        for name in ("data", "lo", "hi", "lo_in", "hi_in"):
+            fn.append(f"%xb_{name} = OpVariable %_ptr_Function_uint Function")
     if gen.emulate:
         fn += ["%x_it = OpVariable %_ptr_Function_uint Function %c0",
                "%x_bar = OpVariable %_ptr_Function_bool Function %false",
@@ -11709,7 +11744,7 @@ def assemble(gen):
             body.append(f"%blk{i} = OpLabel")
             body += blines
             body.append("OpBranch %sw_merge")
-        body += x_scheduler_tail(gen)
+        body += x_scheduler_tail(gen, borrowed_tail if gen.borrow_lds else None)
     elif gen.bar_rounds:
         lines = bar_scheduler(gen)
         body = []
@@ -12908,8 +12943,17 @@ def translate(path):
     # Successors ahead of emission, for node splitting and lane-mask analysis (the loop below works them out
     # again as it goes, and the two are compared at the end).
     raw_edges = []
+    full_lds = (g.cs and g.emulate and g.lds_declared == 16384
+                and 65536 <= MAX_SHARED_BYTES < 65536 + g.x_buf_bytes())
     for n, blk in enumerate(blocks):
-        last = next((i for i in blk if base_op(i["op"]) == "s_endpgm" or base_op(i["op"]) in BRANCHES), None)
+        last = None
+        for ins in blk:
+            op = base_op(ins["op"])
+            if op == "s_endpgm" or op in BRANCHES:
+                last = ins
+                break
+            if full_lds and op.startswith("ds_") and op not in ("ds_swizzle_b32", "ds_bpermute_b32", "ds_permute_b32"):
+                g.borrow_lds = True
         fall = [n + 1] if n + 1 < len(blocks) else []
         if last is None:
             raw_edges.append(fall)
@@ -13119,7 +13163,6 @@ def x_scheduler(gen, threads):
     itself to the round's counts (not done; neither done nor waiting); after the barrier everyone reads the same
     counts: no lane left ends the loop, and no lane left that isn't waiting releases the s_barrier."""
     c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
-    x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
     sx, sy, _ = (gen.cs or gen.ms)["size"]
     L = ["%pc = OpVariable %_ptr_Function_uint Function %c0",
          "%done = OpVariable %_ptr_Function_bool Function %false"]
@@ -13133,8 +13176,31 @@ def x_scheduler(gen, threads):
               "%x_lxy = OpIAdd %uint %x_lx %x_ly2", "%x_li = OpIAdd %uint %x_lxy %x_lz2"]
     L += [f"%x_lane = OpBitwiseAnd %uint %x_li {c(63)}", f"%x_wave = OpShiftRightLogical %uint %x_li {c(6)}",
           f"%x_wbase = OpBitwiseAnd %uint %x_li {c(0xFFFFFFC0)}"]
-    # Workgroup memory starts undefined: zero the mask and schedule words, every invocation a share of them.
+    if gen.borrow_lds:
+        L += ["OpBranch %loop_head", "%loop_head = OpLabel", "OpLoopMerge %loop_exit %loop_cont None",
+              "OpBranch %x_round", "%x_round = OpLabel"]
+        L += [f"OpStore %xb_{name} {c(0)}" for name in ("data", "lo", "hi")]
+    else:
+        L += x_round_setup(gen, threads)
+    L += ["%x_d = OpLoad %bool %done", "%x_b = OpLoad %bool %x_bar", "%x_nd = OpLogicalNot %bool %x_d",
+          "%x_nb = OpLogicalNot %bool %x_b", "%x_run = OpLogicalAnd %bool %x_nd %x_nb",
+          "OpSelectionMerge %x_ran None", "OpBranchConditional %x_run %dispatch %x_ran",
+          # A segment that only reads a vote and picks the next block sets %x_chain: that block runs in the same
+          # round (its code before the vote was in an earlier one, and it starts a fresh segment).
+          "%dispatch = OpLabel", "OpBranch %x_ch_head", "%x_ch_head = OpLabel",
+          "OpLoopMerge %x_ch_merge %x_ch_cont None", "OpBranch %x_ch_body", "%x_ch_body = OpLabel",
+          "%pcv = OpLoad %uint %pc", "OpSelectionMerge %sw_merge None",
+          "OpSwitch %pcv %sw_default " + " ".join(f"{i} %blk{i}" for i in
+                                                  sorted(list(range(len(gen.blocks))) + list(gen.x_segs)))]
+    return L
+
+
+def x_round_setup(gen, threads):
+    """Initialize the separate exchange array and prepare its next round slot."""
+    c = gen.cu
+    x_waves, x_mask, x_sched, x_sink = gen.x_sizes()
     zero = x_sink - x_mask
+    L = []
     for k in range(-(-zero // threads)):
         L += [f"%x_z{k} = OpIAdd %uint %x_li {c(k * threads)}",
               f"%x_zm{k} = OpExtInst %uint %glsl UMin %x_z{k} {c(zero - 1)}",
@@ -13168,48 +13234,87 @@ def x_scheduler(gen, threads):
           f"%x_q2 = OpIAdd %uint %x_q1 {c(1)}", f"%x_ql = OpIEqual %bool %x_li {c(0)}",
           f"%x_q3 = OpSelect %uint %x_ql %x_q1 {c(x_sink)}", f"%x_q4 = OpSelect %uint %x_ql %x_q2 {c(x_sink)}",
           "%x_qp3 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_q3", f"OpStore %x_qp3 {c(0)}",
-          "%x_qp4 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_q4", f"OpStore %x_qp4 {c(0)}",
-          "%x_d = OpLoad %bool %done", "%x_b = OpLoad %bool %x_bar", "%x_nd = OpLogicalNot %bool %x_d",
-          "%x_nb = OpLogicalNot %bool %x_b", "%x_run = OpLogicalAnd %bool %x_nd %x_nb",
-          "OpSelectionMerge %x_ran None", "OpBranchConditional %x_run %dispatch %x_ran",
-          # A segment that only reads a vote and picks the next block sets %x_chain: that block runs in the same
-          # round (its code before the vote was in an earlier one, and it starts a fresh segment).
-          "%dispatch = OpLabel", "OpBranch %x_ch_head", "%x_ch_head = OpLabel",
-          "OpLoopMerge %x_ch_merge %x_ch_cont None", "OpBranch %x_ch_body", "%x_ch_body = OpLabel",
-          "%pcv = OpLoad %uint %pc", "OpSelectionMerge %sw_merge None",
-          "OpSwitch %pcv %sw_default " + " ".join(f"{i} %blk{i}" for i in
-                                                  sorted(list(range(len(gen.blocks))) + list(gen.x_segs)))]
+          "%x_qp4 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_q4", f"OpStore %x_qp4 {c(0)}"]
     return L
 
 
-def x_scheduler_tail(gen):
+def x_scheduler_tail(gen, borrowed_tail):
     """Emulated wave64: the end of a round, after the switch (see x_scheduler)."""
     c = lambda v: gen.consts[v & 0xFFFFFFFF]                                          # noqa: E731
     _, _, x_sched, _ = gen.x_sizes()
-    return ["%sw_default = OpLabel", "OpStore %done %true", "OpBranch %sw_merge",
-            "%sw_merge = OpLabel", "OpBranch %x_ch_cont", "%x_ch_cont = OpLabel",
-            "%x_chv = OpLoad %bool %x_chain", "OpStore %x_chain %false",
-            "OpBranchConditional %x_chv %x_ch_head %x_ch_merge", "%x_ch_merge = OpLabel",
-            "OpBranch %x_ran", "%x_ran = OpLabel",
-            "%x_d2 = OpLoad %bool %done", "%x_b2 = OpLoad %bool %x_bar",
-            "%x_nd2 = OpLogicalNot %bool %x_d2", "%x_nb2 = OpLogicalNot %bool %x_b2",
-            "%x_w = OpLogicalAnd %bool %x_nd2 %x_nb2",
-            f"%x_c0 = OpSelect %uint %x_nd2 {c(1)} {c(0)}", f"%x_c1 = OpSelect %uint %x_w {c(1)} {c(0)}",
-            f"%x_s0 = OpIMul %uint %x_s {c(2)}", f"%x_s1 = OpIAdd %uint %x_s0 {c(x_sched)}",
-            f"%x_s2 = OpIAdd %uint %x_s1 {c(1)}",
-            "%x_p0 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_s1",
-            "%x_p1 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_s2",
-            f"%x_a0 = OpAtomicIAdd %uint %x_p0 {c(2)} {c(0)} %x_c0",
-            f"%x_a1 = OpAtomicIAdd %uint %x_p1 {c(2)} {c(0)} %x_c1",
-            "OpBranch %loop_cont", "%loop_cont = OpLabel",
-            # Workgroup, acquire-release, workgroup + uniform + image memory: also orders the stores a round made.
-            f"OpControlBarrier {c(2)} {c(2)} {c(0x948)}",
-            "%x_r0 = OpLoad %uint %x_p0", "%x_r1 = OpLoad %uint %x_p1",
-            f"%x_rel = OpIEqual %bool %x_r1 {c(0)}", "%x_b3 = OpLoad %bool %x_bar",
-            "%x_nrel = OpLogicalNot %bool %x_rel", "%x_b4 = OpLogicalAnd %bool %x_b3 %x_nrel",
-            "OpStore %x_bar %x_b4", f"%x_it1 = OpIAdd %uint %x_itv {c(1)}", "OpStore %x_it %x_it1",
-            f"%x_fin = OpIEqual %bool %x_r0 {c(0)}", "OpBranchConditional %x_fin %loop_exit %loop_head",
-            "%loop_exit = OpLabel"]
+    lines = ["%sw_default = OpLabel", "OpStore %done %true", "OpBranch %sw_merge",
+             "%sw_merge = OpLabel", "OpBranch %x_ch_cont", "%x_ch_cont = OpLabel",
+             "%x_chv = OpLoad %bool %x_chain", "OpStore %x_chain %false",
+             "OpBranchConditional %x_chv %x_ch_head %x_ch_merge", "%x_ch_merge = OpLabel",
+             "OpBranch %x_ran", "%x_ran = OpLabel",
+             "%x_d2 = OpLoad %bool %done", "%x_b2 = OpLoad %bool %x_bar",
+             "%x_nd2 = OpLogicalNot %bool %x_d2", "%x_nb2 = OpLogicalNot %bool %x_b2",
+             "%x_w = OpLogicalAnd %bool %x_nd2 %x_nb2",
+             f"%x_c0 = OpSelect %uint %x_nd2 {c(1)} {c(0)}", f"%x_c1 = OpSelect %uint %x_w {c(1)} {c(0)}"]
+    if gen.borrow_lds:
+        lines += borrowed_tail
+    else:
+        lines += [f"%x_s0 = OpIMul %uint %x_s {c(2)}", f"%x_s1 = OpIAdd %uint %x_s0 {c(x_sched)}",
+                  f"%x_s2 = OpIAdd %uint %x_s1 {c(1)}",
+                  "%x_p0 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_s1",
+                  "%x_p1 = OpAccessChain %_ptr_WG_uint_x %x_buf %x_s2",
+                  f"%x_a0 = OpAtomicIAdd %uint %x_p0 {c(2)} {c(0)} %x_c0",
+                  f"%x_a1 = OpAtomicIAdd %uint %x_p1 {c(2)} {c(0)} %x_c1",
+                  "OpBranch %loop_cont", "%loop_cont = OpLabel",
+                  # Workgroup, acquire-release, workgroup + uniform + image memory: also orders the stores a round made.
+                  f"OpControlBarrier {c(2)} {c(2)} {c(0x948)}",
+                  "%x_r0 = OpLoad %uint %x_p0", "%x_r1 = OpLoad %uint %x_p1"]
+    lines += [f"%x_rel = OpIEqual %bool %x_r1 {c(0)}", "%x_b3 = OpLoad %bool %x_bar",
+             "%x_nrel = OpLogicalNot %bool %x_rel", "%x_b4 = OpLogicalAnd %bool %x_b3 %x_nrel",
+             "OpStore %x_bar %x_b4"]
+    if not gen.borrow_lds:
+        lines += [f"%x_it1 = OpIAdd %uint %x_itv {c(1)}", "OpStore %x_it %x_it1"]
+    return lines + [f"%x_fin = OpIEqual %bool %x_r0 {c(0)}", "OpBranchConditional %x_fin %loop_exit %loop_head",
+             "%loop_exit = OpLabel"]
+
+
+def borrowed_round_tail(gen):
+    """Every invocation, even when done or waiting, participates in every phase.
+    One owner saves, clears and restores each word. Data slots for unlaunched
+    lanes stay zero. Capture the entire wave before restoring guest memory:
+    readfirstlane and scatter cannot select a source until other results exist.
+    """
+    c = gen.cu
+    sx, sy, sz = gen.cs["size"]
+    threads = sx * sy * sz
+    lanes = gen.x_lanes
+    count = lanes + 2 * (lanes // 64)
+    barrier = f"OpControlBarrier {c(2)} {c(2)} {c(0x948)}"
+    lines = ["OpBranch %loop_cont", "%loop_cont = OpLabel", barrier]
+    # Round up to whole stripes. With at most 1024 invocations the entire
+    # borrowed window fits well inside the 16384-dword guest allocation.
+    stripes = range(0, count + 2, threads)
+    for offset in stripes:
+        lines += [f"%xb_i{offset} = OpIAdd %uint %x_li {c(offset)}",
+                  f"%xb_p{offset} = OpAccessChain %_ptr_WG_uint %lds %xb_i{offset}",
+                  f"%xb_save{offset} = OpLoad %uint %xb_p{offset}", f"OpStore %xb_p{offset} {c(0)}"]
+    lines += [barrier, "%xb_out = OpLoad %uint %xb_data", "OpStore %xb_p0 %xb_out",
+              f"%xb_pair = OpIMul %uint %x_wave {c(2)}",
+              f"%xb_ml = OpIAdd %uint %xb_pair {c(lanes)}", f"%xb_mh = OpIAdd %uint %xb_ml {c(1)}"]
+    for name, index in (("lo", "%xb_ml"), ("hi", "%xb_mh")):
+        lines += [f"%xb_{name}p = OpAccessChain %_ptr_WG_uint %lds {index}",
+                  f"%xb_{name}v = OpLoad %uint %xb_{name}",
+                  f"%xb_{name}a = OpAtomicOr %uint %xb_{name}p {c(2)} {c(0)} %xb_{name}v"]
+    for k in range(2):
+        lines += [f"%xb_cp{k} = OpAccessChain %_ptr_WG_uint %lds {c(count + k)}",
+                  f"%xb_ca{k} = OpAtomicIAdd %uint %xb_cp{k} {c(2)} {c(0)} %x_c{k}"]
+    lines.append(barrier)
+    for lane in range(64):
+        lines += [f"%xb_src{lane} = OpIAdd %uint %x_wbase {c(lane)}",
+                  f"%xb_sp{lane} = OpAccessChain %_ptr_WG_uint %lds %xb_src{lane}",
+                  f"%xb_v{lane} = OpLoad %uint %xb_sp{lane}",
+                  f"%xb_dst{lane} = OpAccessChain %_ptr_Function_uint %xb_wave {c(lane)}",
+                  f"OpStore %xb_dst{lane} %xb_v{lane}"]
+    for name in ("lo", "hi"):
+        lines += [f"%xb_{name}r = OpLoad %uint %xb_{name}p", f"OpStore %xb_{name}_in %xb_{name}r"]
+    lines += ["%x_r0 = OpLoad %uint %xb_cp0", "%x_r1 = OpLoad %uint %xb_cp1", barrier]
+    lines += [f"OpStore %xb_p{off} %xb_save{off}" for off in stripes]
+    return lines + [barrier]
 
 
 def bar_scheduler(gen):
