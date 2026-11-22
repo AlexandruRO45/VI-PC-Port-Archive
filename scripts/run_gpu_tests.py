@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -310,6 +311,30 @@ def dump_words(msg: str) -> list[int] | None:
     return [int(x) for x in m.group(1).split()] if m else None
 
 
+def exit_status(rc: int) -> str:
+    """A subprocess return code as a reader needs it: a signal by name (POSIX, negative), a Windows exception status in
+    hex, else the plain exit code."""
+    if rc < 0:
+        try:
+            return f"killed by {signal.Signals(-rc).name}"
+        except ValueError:
+            return f"killed by signal {-rc}"
+    if rc > 255:
+        return f"exit status {rc:#x}"
+    return f"exit status {rc}"
+
+
+def failed_run(rc: int, msg: str, what: str = "vk_compute_test") -> str:
+    """Why a run produced no judgeable result (TEST-388): a launch that failed (non-zero status) or a clean exit that
+    printed no result line. msg is stdout + stderr, which always ends with the device line, so a bare "device: ..."
+    says nothing; the status goes first and the last output lines follow, which is where the program says why."""
+    lines = [ln.strip() for ln in msg.splitlines() if ln.strip()]
+    tail = " | ".join(lines[-3:]) if lines else "no output"
+    if rc != 0:
+        return f"{what} failed to run to a result: {exit_status(rc)}; last output: {tail}"
+    return f"{what} exited 0 but printed no valid result line (eight decimal words); last output: {tail}"
+
+
 def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: bool, emulated: bool,
                   hexwords: bool = False) -> tuple[bool | None, str]:
     """Judge one vk_compute_test "dump" run: (True, words), (False, why), or (None, why) when the device can't run it.
@@ -323,7 +348,7 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
         return False, "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
     words = dump_words(msg)
     if rc != 0 or words is None:
-        return False, msg
+        return False, failed_run(rc, msg)
     vals = words[:len(want)]
     return vals == want, " ".join((hex if hexwords else str)(x) for x in vals)
 
@@ -860,7 +885,7 @@ def run_suite(a, work: str) -> int:
             words = dump_words(msg)
             vals = words[:len(USER_SGPRS_WORDS)] if words else []
             results.append((name, rc == 0 and vals == USER_SGPRS_WORDS,
-                            " ".join(hex(x) for x in vals) if vals else msg))
+                            " ".join(hex(x) for x in vals) if vals else failed_run(rc, msg)))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
             wrong = []
@@ -869,7 +894,7 @@ def run_suite(a, work: str) -> int:
                                   env=dict(cs_env or os.environ, VKC_SGPRS=f"{bits:#010x}"))
                 words = dump_words(msg)
                 if rc != 0 or not words or words[:2] != [unsigned, signed]:
-                    got = " ".join(hex(x) for x in words[:2]) if words else msg.splitlines()[-1] if msg else "no output"
+                    got = " ".join(hex(x) for x in words[:2]) if words and rc == 0 else failed_run(rc, msg)
                     wrong.append(f"{bits:#010x} gave {got}, want {unsigned:#x} {signed:#x}")
             n = len(CVT_F32_SAT_CASES)
             results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong

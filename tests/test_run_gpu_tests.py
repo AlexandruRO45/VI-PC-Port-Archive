@@ -347,5 +347,53 @@ class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
                 self.assertEqual(check.pixel_test("unused", tmp, self.NAME), f"missing {self.NAME}.spv")
 
 
+class FailedRunReport(unittest.TestCase):
+    """TEST-388: a run with no judgeable result says why (exit status, or a clean exit with no result line) instead of
+    only vk_compute_test's device line."""
+
+    DEVICE = "device: NVIDIA GeForce RTX 5080 (subgroup 32..32)"
+
+    def test_launch_failure_names_the_status_and_keeps_the_last_output(self):
+        ok, why = judge(1, "vk_compute_test: vkCreateComputePipelines failed (-3)\n" + self.DEVICE)
+        self.assertFalse(ok)
+        self.assertIn("exit status 1", why)
+        self.assertIn("vkCreateComputePipelines failed", why)
+        self.assertIn("device: NVIDIA", why)
+
+    def test_a_crash_is_named_by_signal(self):
+        ok, why = judge(-11, self.DEVICE)
+        self.assertFalse(ok)
+        self.assertIn("killed by SIGSEGV", why)
+
+    def test_a_windows_exception_status_is_hex(self):
+        ok, why = judge(0xC0000005, self.DEVICE)
+        self.assertFalse(ok)
+        self.assertIn("exit status 0xc0000005", why)
+
+    def test_a_clean_exit_without_a_result_line_is_not_a_launch_failure(self):
+        ok, why = judge(0, self.DEVICE)
+        self.assertFalse(ok)
+        self.assertIn("exited 0 but printed no valid result line", why)
+        self.assertNotIn("exit status", why)
+
+    def test_a_malformed_result_line_is_reported_as_no_result(self):
+        ok, why = judge(0, "out[0..7] = 55 48 BAD 0 0 0 0 0\n" + self.DEVICE)
+        self.assertFalse(ok)
+        self.assertIn("no valid result line", why)
+
+    def test_wrong_words_stay_a_value_mismatch(self):
+        ok, why = judge(0, dump([55, 49]) + self.DEVICE)
+        self.assertFalse(ok)
+        self.assertEqual(why, "55 49")
+
+    def test_right_words_pass(self):
+        self.assertEqual(judge(0, dump(WANT) + self.DEVICE), (True, "55 48"))
+
+    def test_empty_output_says_so(self):
+        ok, why = judge(1, "")
+        self.assertFalse(ok)
+        self.assertIn("no output", why)
+
+
 if __name__ == "__main__":
     unittest.main()
