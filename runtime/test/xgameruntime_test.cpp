@@ -131,16 +131,19 @@ void check_run_time_load() {
     using LoadW = HMODULE(WINAPI*)(LPCWSTR);
     using LoadExA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
     using GetModW = HMODULE(WINAPI*)(LPCWSTR);
+    using GetModExW = BOOL(WINAPI*)(DWORD, LPCWSTR, HMODULE*);
     using GetProc = FARPROC(WINAPI*)(HMODULE, LPCSTR);
     using Free = BOOL(WINAPI*)(HMODULE);
     const char* set = "api-ms-win-core-libraryloader-l1-2-0.dll";
     auto load_w = reinterpret_cast<LoadW>(rt::shims::find(set, "LoadLibraryW"));
     auto load_ex_a = reinterpret_cast<LoadExA>(rt::shims::find("kernel32.dll", "LoadLibraryExA"));
     auto get_mod_w = reinterpret_cast<GetModW>(rt::shims::find(set, "GetModuleHandleW"));
+    auto get_mod_ex_w = reinterpret_cast<GetModExW>(rt::shims::find(set, "GetModuleHandleExW"));
     auto get_proc = reinterpret_cast<GetProc>(rt::shims::find(set, "GetProcAddress"));
     auto free_lib = reinterpret_cast<Free>(rt::shims::find(set, "FreeLibrary"));
-    check(load_w && load_ex_a && get_mod_w && get_proc && free_lib, "the loader functions are registered");
-    if (!(load_w && load_ex_a && get_mod_w && get_proc && free_lib)) return;
+    check(load_w && load_ex_a && get_mod_w && get_mod_ex_w && get_proc && free_lib,
+          "the loader functions are registered");
+    if (!(load_w && load_ex_a && get_mod_w && get_mod_ex_w && get_proc && free_lib)) return;
 
     check(rt::shims::owns_dll("xgameruntime.dll") && !rt::shims::owns_dll("kernel32.dll") &&
               !rt::shims::owns_dll(set) && !rt::shims::owns_dll("nosuch.dll"),
@@ -151,6 +154,9 @@ void check_run_time_load() {
     check(load_w(L"XGameRuntime") == rt_mod && load_ex_a("C:\\Some\\Dir\\XGAMERUNTIME.DLL", nullptr, 0) == rt_mod &&
               get_mod_w(L"xgameruntime.dll") == rt_mod,
           "the same module for a bare name, a full path in any case, LoadLibraryExA and GetModuleHandleW");
+    HMODULE ex = nullptr;
+    check(get_mod_ex_w(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"XGameRuntime", &ex) && ex == rt_mod,
+          "GetModuleHandleExW gives the same module");
 
     const char* entry_points[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2",
                                   "UninitializeApiImpl", "QueryApiImpl"};

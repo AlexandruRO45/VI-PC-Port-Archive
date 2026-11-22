@@ -4,8 +4,11 @@
 // tiny_last_pid to prove the IAT entry really points at the host function. The string literal below gives the image
 // a .rdata section, and tiny_text_ptr is initialised with its address so the image also contains a DIR64 base
 // relocation that the test can verify after forcing a relocated mapping. tiny_fault_caught gives it a .pdata entry
-// with an exception handler, for the unwind-registration test.
+// with an exception handler, for the unwind-registration test. tiny_forwarded is a forwarder export, for the test
+// that GetProcAddress on a mapped module follows it.
 #include <windows.h>
+
+#pragma comment(linker, "/export:tiny_forwarded=kernel32.GetCurrentProcessId")
 
 namespace {
 

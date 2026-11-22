@@ -8,8 +8,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -344,10 +346,56 @@ bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t
     }
     return false;
 }
+
+// The library-loader shims' questions (shims::ModuleQuery): a module by file name or full path, by image base, or the
+// main executable. Module::path is already a full path (map_image); names compare as Windows compares them, by
+// ordinal without case. Like lookup_in_loader it reads the module list without a lock: load() fills it before image
+// code runs, and ~Loader unregisters (under the registry's lock) before it frees a module.
+bool find_in_loader(void* ctx, const shims::ModuleQuery& query, uint64_t& base, std::wstring* path) {
+    const auto* loader = static_cast<const Loader*>(ctx);
+    const Module* found = (query.name || query.base) ? nullptr : loader->main_module();
+    if (query.name) {
+        const bool full_path = std::wcschr(query.name, L'\\') != nullptr;
+        for (const Module* m : loader->modules()) {
+            const std::wstring& p = m->path.native();
+            const size_t slash = full_path ? std::wstring::npos : p.find_last_of(L"\\/");
+            const wchar_t* candidate = p.c_str() + (slash == std::wstring::npos ? 0 : slash + 1);
+            if (m->base && CompareStringOrdinal(candidate, -1, query.name, -1, TRUE) == CSTR_EQUAL) {
+                found = m;
+                break;
+            }
+        }
+    } else if (query.base) {
+        for (const Module* m : loader->modules())
+            if (m->base && reinterpret_cast<uint64_t>(m->base) == query.base) {
+                found = m;
+                break;
+            }
+    }
+    if (!found || !found->base) return false;
+    base = reinterpret_cast<uint64_t>(found->base);
+    if (path) *path = found->path.native();
+    return true;
+}
+
+// GetProcAddress on one of the modules (shims::ModuleProc). Asked outside the registry's lock (mapped_proc_address),
+// so a forwarder may load a host DLL; the module list is only read, as in find_in_loader.
+void* proc_in_loader(void* ctx, uint64_t base, const std::string& name) {
+    auto* loader = static_cast<Loader*>(ctx);
+    for (const Module* m : loader->modules())
+        if (m->base && reinterpret_cast<uint64_t>(m->base) == base) return loader->export_address(*m, name);
+    return nullptr;
+}
 }  // namespace
 
 Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
-    shims::add_module_lookup(this, &lookup_in_loader);
+    shims::add_module_lookup(this, &lookup_in_loader, &find_in_loader, &proc_in_loader);
+}
+
+void Loader::set_main_module(Module& m) {
+    if (std::find(order_.begin(), order_.end(), &m) == order_.end())
+        throw std::runtime_error(m.name + ": not a module of this loader, so it can't be its main module");
+    main_ = &m;
 }
 
 Loader::~Loader() {
@@ -499,7 +547,10 @@ Module& Loader::map_image(const std::filesystem::path& path) {
 
     auto* m = new Module;
     m->name = name;
-    m->path = path;
+    // The full path, as the Windows loader records it for GetModuleFileName: resolved against the current folder now.
+    std::error_code ec;
+    m->path = std::filesystem::absolute(path, ec);
+    if (ec || m->path.empty()) m->path = path;
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
@@ -679,8 +730,9 @@ void Loader::parse_exports(Module& m) {
 
 // Follows a forwarder string to the module and export it names. Bundled modules are searched first, with or without
 // the extension, because a forwarder may point at another mapped module; system DLLs go through LoadLibraryEx, whose
-// own GetProcAddress already follows its forwarders. Errors are "not found": the caller decides what to bind.
-void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int depth) {
+// own GetProcAddress already follows its forwarders. Errors are "not found": the caller decides what to bind. Without
+// `map_bundled` (GetProcAddress while image code runs, export_address) a bundled module counts only if already mapped.
+void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int depth, bool map_bundled) {
     if (depth >= 8) return nullptr;  // a longer chain is a loop between modules, not a re-export
     auto dot = spec.rfind('.');
     if (dot == std::string::npos || dot == 0 || dot + 1 >= spec.size()) return nullptr;
@@ -709,13 +761,16 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     for (const auto& candidate : candidates) {
         std::error_code ec;
         if (prefer_host_copy(lower(module)) || !std::filesystem::exists(candidate, ec)) continue;
-        Module& dep = load(candidate);
-        if (auto it = dep.exports.find(symbol); it != dep.exports.end()) {
+        Module* dep = nullptr;
+        if (map_bundled) dep = &load(candidate);
+        else if (auto it = by_name_.find(lower(candidate.filename().string())); it != by_name_.end()) dep = it->second;
+        if (!dep) return nullptr;  // bundled but not mapped, and not to be mapped now
+        if (auto it = dep->exports.find(symbol); it != dep->exports.end()) {
             binding = Binding::Module;
             return it->second;
         }
-        if (auto it = dep.forwarders.find(symbol); it != dep.forwarders.end())
-            return resolve_forwarder(it->second, binding, depth + 1);
+        if (auto it = dep->forwarders.find(symbol); it != dep->forwarders.end())
+            return resolve_forwarder(it->second, binding, depth + 1, map_bundled);
         return nullptr;  // the bundled module exists and does not export it; don't look for a host namesake
     }
 
@@ -727,6 +782,23 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     if (prefer_host_copy(shim_key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
     binding = Binding::Host;
     return reinterpret_cast<void*>(p);
+}
+
+void* Loader::export_address(const Module& m, const std::string& name) {
+    if (auto it = m.exports.find(name); it != m.exports.end()) return it->second;
+    const auto it = m.forwarders.find(name);
+    if (it == m.forwarders.end()) return nullptr;
+    Binding binding = Binding::Unimplemented;
+    void* p = resolve_forwarder(it->second, binding, 0, false);
+    if (!p) {
+        static auto* mutex = new std::mutex;  // immortal: a DLL_PROCESS_DETACH can still ask
+        static auto* seen = new std::set<std::string>;
+        std::lock_guard lock(*mutex);
+        if (seen->insert(m.name + "!" + name).second)
+            std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): forwarder %s not resolved\n", m.name.c_str(),
+                         name.c_str(), it->second.c_str());
+    }
+    return p;
 }
 
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {

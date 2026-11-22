@@ -12,7 +12,9 @@
 //   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [-- game arguments...]
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
-//       (shims/process.cpp). gta6rt prints the binding report first and returns the game's exit code.
+//       (shims/process.cpp). To mapped code the EXE is the process's own image: GetModuleHandle(NULL) and
+//       GetModuleFileName(NULL) name it, not gta6rt.exe (shims/library_loader.cpp). gta6rt prints the binding report
+//       first and returns the game's exit code.
 //
 // --game-dir is also where a title's GAME: paths read from; anything it writes or deletes goes to the overlay
 // (--overlay, default <game-dir>/overlay) so the package is never modified (shims/file_system.cpp).
@@ -81,6 +83,8 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        // Before initialise(): a DllMain may already ask for the process's executable.
+        if (run) loader.set_main_module(main_module);
         if (init || run) {
             loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
             std::printf("%zu module(s) initialised\n", loader.modules().size());

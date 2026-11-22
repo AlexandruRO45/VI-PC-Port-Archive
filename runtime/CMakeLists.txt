@@ -345,7 +345,8 @@ if(BUILD_TESTING)
 
     # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The xmem and d3d12_xs tables
     # are linked too so the optional LEONIDA_GAME_DIR run classifies the shipped modules' imports exactly like
-    # gta6rt does (no d3d12.lib is needed: d3d12_xs resolves its host entry points at run time).
+    # gta6rt does (no d3d12.lib is needed: d3d12_xs resolves its host entry points at run time). The library-loader
+    # table is what test_module_identity asks about the mapped fixtures.
     add_executable(pe_loader_test
       test/pe_loader_test.cpp
       src/pe_loader.cpp
@@ -353,6 +354,7 @@ if(BUILD_TESTING)
       shims/xmem.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
+      shims/library_loader.cpp
     )
     target_include_directories(pe_loader_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src

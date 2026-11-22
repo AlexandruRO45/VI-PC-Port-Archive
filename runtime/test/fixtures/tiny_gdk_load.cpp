@@ -31,10 +31,15 @@ int fail(const char* stage, unsigned long value) {
 int main() {
     HMODULE runtime = LoadLibraryW(L"xgameruntime.dll");
     if (!runtime) return fail("LoadLibraryW(xgameruntime.dll)", GetLastError());
-    // The loader shim hands out a pseudo-handle for a module it owns: not an image the host loaded.
-    HMODULE host_view = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"xgameruntime.dll", &host_view) && host_view == runtime)
-        return fail("xgameruntime.dll came from the host loader, not the shims", 0);
+    // The loader shim hands out a pseudo-handle for a module it owns, in the runtime's heap: not an image the host
+    // loaded. GetModuleHandleExW is bound to the shims as well, so it must name the same module.
+    MEMORY_BASIC_INFORMATION where{};
+    if (!VirtualQuery(runtime, &where, sizeof where) || where.Type == MEM_IMAGE)
+        return fail("xgameruntime.dll came from the host loader, not the shims", where.Type);
+    HMODULE again = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"xgameruntime.dll", &again) ||
+        again != runtime)
+        return fail("GetModuleHandleExW(xgameruntime.dll) is the pseudo-handle LoadLibraryW gave", GetLastError());
 
     const char* names[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2", "UninitializeApiImpl",
                            "QueryApiImpl"};

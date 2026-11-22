@@ -3,7 +3,8 @@
 // The fixtures are an ordinary DLL (tiny_dll) and an EXE that imports it (tiny_exe). The test maps both through the
 // public Loader API and checks the mapped headers, exports (by name and ordinal), import binding, recursive module
 // loading/dedupe, section protections and forced base relocation. Negative inputs must throw std::runtime_error
-// without leaving a module behind. The fixtures are passed as argv[1] and argv[2] by CTest.
+// without leaving a module behind. It also asks the library-loader shims about the mapped modules (GetModuleHandle*,
+// GetModuleHandleEx*, GetModuleFileName*, GetProcAddress). The fixtures are passed as argv[1] and argv[2] by CTest.
 //
 // An optional final section reads LEONIDA_GAME_DIR and maps the 16 DLLs a retail package ships, without executing
 // any of them or copying any file. It skips when the variable is unset; see test_optional_package.
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -21,6 +23,7 @@
 #include <vector>
 
 #include "pe_loader.h"
+#include "shims.h"
 
 namespace {
 
@@ -513,6 +516,224 @@ void test_unwind(const fs::path& dll) {
           "an access violation inside the mapped image is caught by the image's own handler");
 }
 
+bool same_path(const std::wstring& a, const std::wstring& b) {
+    return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+// GetModuleHandle*, GetModuleHandleEx*, GetModuleFileName* and FreeLibrary as a mapped image's imports reach them
+// (rt::shims::find, under the names the package's DLLs import them by): the Loader's modules by name, path, address
+// and handle, NULL as its main module once it has one, and Windows' answers whenever no live Loader has the module.
+void test_module_identity(const fs::path& exe, const fs::path& dll) {
+    std::printf("\n-- module identity through the library-loader shims --\n");
+    using GetModW = HMODULE(WINAPI*)(LPCWSTR);
+    using GetModA = HMODULE(WINAPI*)(LPCSTR);
+    using GetModExW = BOOL(WINAPI*)(DWORD, LPCWSTR, HMODULE*);
+    using GetModExA = BOOL(WINAPI*)(DWORD, LPCSTR, HMODULE*);
+    using FileNameW = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
+    using FileNameA = DWORD(WINAPI*)(HMODULE, LPSTR, DWORD);
+    using Free = BOOL(WINAPI*)(HMODULE);
+    const char* set = "api-ms-win-core-libraryloader-l1-2-0.dll";
+    const auto get_w = reinterpret_cast<GetModW>(rt::shims::find(set, "GetModuleHandleW"));
+    const auto get_a = reinterpret_cast<GetModA>(rt::shims::find("kernel32.dll", "GetModuleHandleA"));
+    const auto get_ex_w = reinterpret_cast<GetModExW>(rt::shims::find(set, "GetModuleHandleExW"));
+    const auto get_ex_a = reinterpret_cast<GetModExA>(rt::shims::find("kernel32.dll", "GetModuleHandleExA"));
+    const auto name_w = reinterpret_cast<FileNameW>(rt::shims::find(set, "GetModuleFileNameW"));
+    const auto name_a = reinterpret_cast<FileNameA>(rt::shims::find("kernelbase.dll", "GetModuleFileNameA"));
+    const auto free_lib = reinterpret_cast<Free>(rt::shims::find(set, "FreeLibrary"));
+    const bool all = get_w && get_a && get_ex_w && get_ex_a && name_w && name_a && free_lib;
+    check(all, "GetModuleHandle*, GetModuleHandleEx*, GetModuleFileName* and FreeLibrary are registered shims");
+    if (!all) return;
+    constexpr DWORD kFromAddress =
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+
+    const HMODULE host_exe = GetModuleHandleW(nullptr);
+    wchar_t host_path[1024] = {};
+    GetModuleFileNameW(nullptr, host_path, 1024);
+    wchar_t buf[1024] = {};
+    check(get_w(nullptr) == host_exe && name_w(nullptr, buf, 1024) && std::wcscmp(buf, host_path) == 0,
+          "no live Loader: GetModuleHandleW(NULL) and GetModuleFileNameW(NULL) are Windows' answers");
+
+    std::error_code ec;
+    const std::wstring dll_path = fs::absolute(dll, ec).wstring(), exe_path = fs::absolute(exe, ec).wstring();
+    {
+        rt::Loader loader(exe.parent_path());
+        rt::Module& main_module = loader.load(exe);
+        rt::Module* tiny = nullptr;
+        for (auto* m : loader.modules())
+            if (rt::lower(m->name) == "tiny_dll.dll") tiny = m;
+        check(tiny != nullptr, "tiny_exe.exe mapped tiny_dll.dll");
+        if (!tiny) return;
+        const auto exe_h = reinterpret_cast<HMODULE>(main_module.base);
+        const auto dll_h = reinterpret_cast<HMODULE>(tiny->base);
+        HMODULE h = nullptr;
+        check(get_w(nullptr) == host_exe && get_ex_w(0, nullptr, &h) && h == host_exe,
+              "a Loader without a main module: NULL is still Windows' answer");
+
+        // By name, with GetModuleHandle's rules.
+        check(get_w(L"tiny_dll.dll") == dll_h && get_w(L"TINY_DLL") == dll_h && get_a("Tiny_Dll.DLL") == dll_h &&
+                  get_w(L"tiny_exe.exe") == exe_h,
+              "GetModuleHandleW/A find mapped modules by file name, in any case, \".dll\" added when there's none");
+        SetLastError(ERROR_SUCCESS);
+        check(get_w(L"tiny_dll.") == nullptr && GetLastError() == ERROR_MOD_NOT_FOUND &&
+                  get_w(L"tiny_dll.dll.") == dll_h,
+              "a trailing '.' means no extension: \"tiny_dll.\" names nothing, \"tiny_dll.dll.\" names the DLL");
+        std::wstring slashed = dll_path;
+        for (auto& c : slashed)
+            if (c == L'\\') c = L'/';
+        const std::wstring no_extension = dll_path.substr(0, dll_path.size() - 4);  // drops ".dll"
+        check(get_w(dll_path.c_str()) == dll_h && get_w(slashed.c_str()) == dll_h &&
+                  get_w(no_extension.c_str()) == dll_h,
+              "... and by full path, with '/' as well as '\\', the extension added there too");
+        wchar_t old_dir[1024] = {};
+        GetCurrentDirectoryW(1024, old_dir);
+        SetCurrentDirectoryW(fs::path(dll_path).parent_path().c_str());
+        const HMODULE relative = get_w(L".\\tiny_dll.dll");
+        SetCurrentDirectoryW(old_dir);
+        check(relative == dll_h, "... and by a relative path, made full against the current folder");
+        const std::wstring elsewhere = (fs::path(dll_path).parent_path() / L"elsewhere" / L"tiny_dll.dll").wstring();
+        SetLastError(ERROR_SUCCESS);
+        check(get_w(elsewhere.c_str()) == nullptr && GetLastError() == ERROR_MOD_NOT_FOUND,
+              "a full path in another folder names no module (ERROR_MOD_NOT_FOUND), as in Windows");
+
+        // By address, with GetModuleHandleEx's flags.
+        const auto add = tiny->exports.find("tiny_add");
+        h = nullptr;
+        check(add != tiny->exports.end() && get_ex_w(kFromAddress, static_cast<LPCWSTR>(add->second), &h) && h == dll_h,
+              "GetModuleHandleExW(FROM_ADDRESS) on tiny_dll's export is tiny_dll");
+        h = nullptr;
+        check(get_ex_a(kFromAddress, reinterpret_cast<LPCSTR>(tiny->base + tiny->size - 1), &h) && h == dll_h &&
+                  get_ex_w(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(main_module.base + main_module.entry_rva), &h) && h == exe_h,
+              "... on the image's last byte (A form), and with PIN on the EXE's entry point");
+        h = reinterpret_cast<HMODULE>(1);
+        SetLastError(ERROR_SUCCESS);
+        check(!get_ex_w(kFromAddress, reinterpret_cast<LPCWSTR>(tiny->base + tiny->size), &h) && h == nullptr &&
+                  GetLastError() == ERROR_MOD_NOT_FOUND,
+              "... and the byte past the image is in no module (ERROR_MOD_NOT_FOUND)");
+        h = nullptr;
+        check(get_ex_w(0, L"tiny_dll.dll", &h) && h == dll_h && free_lib(h) && get_w(L"tiny_dll.dll") == dll_h,
+              "a counted GetModuleHandleExW, then FreeLibrary: TRUE, and the DLL stays mapped");
+        const DWORD bad_flags[] = {GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, 0x8,
+                                   0x80000000u};
+        bool refused = true;
+        for (DWORD flags : bad_flags) {
+            h = reinterpret_cast<HMODULE>(1);
+            SetLastError(ERROR_SUCCESS);
+            refused = refused && !get_ex_w(flags, L"tiny_dll.dll", &h) && h == nullptr &&
+                      GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+        SetLastError(ERROR_SUCCESS);
+        refused = refused && !get_ex_w(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, nullptr, &h) &&
+                  GetLastError() == ERROR_INVALID_PARAMETER;
+        SetLastError(ERROR_SUCCESS);
+        refused = refused && !get_ex_w(0, L"tiny_dll.dll", nullptr) && GetLastError() == ERROR_INVALID_PARAMETER;
+        check(refused, "GetModuleHandleExW refuses PIN with UNCHANGED_REFCOUNT, unknown flags, FROM_ADDRESS without "
+                       "an address and a null out pointer with ERROR_INVALID_PARAMETER, clearing the handle");
+
+        // By handle: the path the module was mapped from.
+        std::wmemset(buf, L'#', 1024);
+        SetLastError(ERROR_INVALID_FUNCTION);
+        const DWORD n = name_w(dll_h, buf, 1024);
+        check(n == dll_path.size() && same_path(buf, dll_path) && GetLastError() == ERROR_SUCCESS,
+              "GetModuleFileNameW(tiny_dll) is its full path, with the last error cleared");
+        char ansi[1024] = {}, expected[1024] = {};
+        WideCharToMultiByte(CP_ACP, 0, dll_path.c_str(), -1, expected, 1024, nullptr, nullptr);
+        check(name_a(dll_h, ansi, 1024) == std::strlen(expected) && _stricmp(ansi, expected) == 0,
+              "GetModuleFileNameA(tiny_dll) is the same path in the ANSI code page");
+        std::wmemset(buf, L'#', 1024);
+        SetLastError(ERROR_SUCCESS);
+        check(name_w(dll_h, buf, 8) == 8 && GetLastError() == ERROR_INSUFFICIENT_BUFFER && buf[7] == 0 &&
+                  std::wmemcmp(buf, dll_path.c_str(), 7) == 0 && buf[8] == L'#',
+              "GetModuleFileNameW into 8 characters: 7 and a null, 8 returned, ERROR_INSUFFICIENT_BUFFER");
+        SetLastError(ERROR_SUCCESS);
+        check(name_w(reinterpret_cast<HMODULE>(reinterpret_cast<uintptr_t>(dll_h) | 1), buf, 1024) == 0 &&
+                  GetLastError() == ERROR_MOD_NOT_FOUND,
+              "a handle that isn't an image base (a datafile handle's low bit) names no module");
+
+        // The main module.
+        loader.set_main_module(main_module);
+        h = nullptr;
+        check(get_w(nullptr) == exe_h && get_a(nullptr) == exe_h && get_ex_w(0, nullptr, &h) && h == exe_h,
+              "set_main_module: GetModuleHandleW/A(NULL) and GetModuleHandleExW(0, NULL) are the mapped EXE");
+        check(name_w(nullptr, buf, 1024) == exe_path.size() && same_path(buf, exe_path) &&
+                  name_w(exe_h, buf, 1024) == exe_path.size(),
+              "set_main_module: GetModuleFileNameW(NULL) is the mapped EXE's full path");
+        bool threw = false;
+        try {
+            rt::Loader other(exe.parent_path());
+            other.set_main_module(main_module);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        check(threw, "set_main_module refuses a module another Loader mapped");
+    }
+    SetLastError(ERROR_SUCCESS);
+    check(get_w(nullptr) == host_exe && get_w(L"tiny_dll.dll") == nullptr && GetLastError() == ERROR_MOD_NOT_FOUND &&
+              name_w(nullptr, buf, 1024) && std::wcscmp(buf, host_path) == 0,
+          "once the Loader is gone, Windows answers again");
+}
+
+// GetProcAddress, reached as a mapped image's import reaches it, on the handle GetModuleHandleW gives for a mapped
+// module: the exports by name and ordinal, a forwarder followed as for an import, Windows' errors for what the module
+// doesn't export, and NULL as the main module once a Loader has one.
+void test_proc_address(const fs::path& exe, const fs::path& dll) {
+    std::printf("\n-- GetProcAddress on mapped modules through the library-loader shims --\n");
+    using GetModW = HMODULE(WINAPI*)(LPCWSTR);
+    using GetProc = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+    const char* set = "api-ms-win-core-libraryloader-l1-2-0.dll";
+    const auto get_w = reinterpret_cast<GetModW>(rt::shims::find(set, "GetModuleHandleW"));
+    const auto get_proc = reinterpret_cast<GetProc>(rt::shims::find(set, "GetProcAddress"));
+    check(get_w && get_proc, "GetModuleHandleW and GetProcAddress are registered shims");
+    if (!get_w || !get_proc) return;
+    const auto export_of = [](const rt::Module& m, const char* name) {
+        const auto it = m.exports.find(name);
+        return it == m.exports.end() ? nullptr : it->second;
+    };
+    const auto as_ptr = [](FARPROC p) { return reinterpret_cast<void*>(p); };
+    {
+        rt::Loader loader(exe.parent_path());
+        loader.load(exe);
+        rt::Module* tiny = nullptr;
+        for (auto* m : loader.modules())
+            if (rt::lower(m->name) == "tiny_dll.dll") tiny = m;
+        check(tiny != nullptr, "tiny_exe.exe mapped tiny_dll.dll");
+        if (!tiny) return;
+        const HMODULE h = get_w(L"tiny_dll.dll");
+        SetLastError(ERROR_INVALID_FUNCTION);
+        check(h == reinterpret_cast<HMODULE>(tiny->base) && export_of(*tiny, "tiny_add") &&
+                  as_ptr(get_proc(h, "tiny_add")) == export_of(*tiny, "tiny_add") &&
+                  as_ptr(get_proc(h, "tiny_exported_value")) == export_of(*tiny, "tiny_exported_value") &&
+                  GetLastError() == ERROR_INVALID_FUNCTION,
+              "GetProcAddress(GetModuleHandleW(\"tiny_dll.dll\"), name) is the export, the last error left alone");
+        const uint32_t ordinal = export_ordinal(*tiny, "tiny_add");
+        check(ordinal != 0 && as_ptr(get_proc(h, MAKEINTRESOURCEA(ordinal))) == export_of(*tiny, "tiny_add"),
+              "... and by ordinal");
+        const FARPROC host = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetCurrentProcessId");
+        check(tiny->forwarders.count("tiny_forwarded") == 1 && host && get_proc(h, "tiny_forwarded") == host,
+              "a forwarder (tiny_forwarded, to kernel32.GetCurrentProcessId) is followed as for an import");
+        SetLastError(ERROR_SUCCESS);
+        const bool missing = !get_proc(h, "tiny_missing") && GetLastError() == ERROR_PROC_NOT_FOUND;
+        SetLastError(ERROR_SUCCESS);
+        check(missing && !get_proc(h, "TINY_ADD") && GetLastError() == ERROR_PROC_NOT_FOUND,
+              "a name the DLL doesn't export, or in another case, is NULL with ERROR_PROC_NOT_FOUND");
+        SetLastError(ERROR_SUCCESS);
+        const bool bad_ordinal = !get_proc(h, MAKEINTRESOURCEA(9999)) && GetLastError() == ERROR_INVALID_ORDINAL;
+        SetLastError(ERROR_SUCCESS);
+        check(bad_ordinal && !get_proc(h, nullptr) && GetLastError() == ERROR_INVALID_PARAMETER,
+              "an ordinal it lacks is NULL with ERROR_INVALID_ORDINAL, a null name NULL with ERROR_INVALID_PARAMETER");
+    }
+    {
+        rt::Loader loader(dll.parent_path());
+        rt::Module& tiny = loader.load(dll);
+        const bool before = !get_proc(nullptr, "tiny_add");  // Windows: this test's EXE exports nothing
+        loader.set_main_module(tiny);
+        check(before && export_of(tiny, "tiny_add") &&
+                  as_ptr(get_proc(nullptr, "tiny_add")) == export_of(tiny, "tiny_add"),
+              "GetProcAddress(NULL, name) is Windows' answer until a Loader has a main module (here tiny_dll.dll), "
+              "then that module's export");
+    }
+}
+
 // True when the code at rva (or, through up to 4 `jmp rel32` thunks, the code they lead to) has an unwind entry.
 // A jump thunk touches no stack, so it legitimately has none: libHttpClient.GDK.dll's entry point is one.
 bool unwind_covers(const rt::Module& m, uint32_t rva) {
@@ -689,6 +910,8 @@ int main(int argc, char** argv) {
         test_forced_relocation(dll);
         test_rejections(dll, temp.path);
         test_unwind(dll);
+        test_module_identity(exe, dll);
+        test_proc_address(exe, dll);
         test_optional_package();
         test_optional_package_unwind();
     } catch (const std::exception& e) {

@@ -238,7 +238,9 @@ the files in place and never copy or commit game data.
 ## Current limits
 
 `gta6rt --run <exe> [-- args]` runs an executable's entry point inside the runtime (`shims/process.cpp` gives it its
-own command line and turns its `exit` into the end of the run); CTest's `run_tiny_game` does that with a stand-in game.
+own command line and turns its `exit` into the end of the run, and `shims/library_loader.cpp` makes it the process's
+own image: `GetModuleHandle(NULL)` and `GetModuleFileName(NULL)` name it, not `gta6rt.exe`); CTest's `run_tiny_game`
+does that with a stand-in game.
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
 shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The

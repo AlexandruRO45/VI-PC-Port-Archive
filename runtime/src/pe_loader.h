@@ -5,6 +5,7 @@
 // ~Loader() delivers process detach before unmapping initialised modules. The TLS slot and template are set up by load().
 // gta6rt_tls_host.dll must sit next to the executable; the loader reuses the module TLS index the OS assigns it.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -26,7 +27,7 @@ struct ImportRecord {
 
 struct Module {
     std::string name;
-    std::filesystem::path path;
+    std::filesystem::path path;  // full path: what GetModuleFileName reports for the module (shims/library_loader.cpp)
     uint8_t* base = nullptr;
     uint64_t preferred_base = 0;
     uint32_t size = 0;
@@ -62,7 +63,8 @@ struct Module {
 class Loader {
 public:
     // Also registers the module list with the shim registry, so an unimplemented import called under
-    // LEONIDA_UNIMPLEMENTED=stop can name the module and RVA of its caller.
+    // LEONIDA_UNIMPLEMENTED=stop can name the module and RVA of its caller, and mapped code's GetModuleHandle*,
+    // GetModuleHandleEx* and GetModuleFileName* can answer for these modules (shims/library_loader.cpp).
     explicit Loader(std::filesystem::path game_dir);
     Loader(const Loader&) = delete;
     Loader& operator=(const Loader&) = delete;
@@ -80,6 +82,17 @@ public:
     // The order initialise() runs modules in: each module after every module it imports (a cycle is broken at the
     // module that closed it). modules() is mapping order, which puts an importer before its imports.
     const std::vector<Module*>& initialisation_order() const { return init_order_; }
+
+    // The module that stands in for the process's executable: mapped code's GetModuleHandle(NULL), GetModuleHandleEx
+    // with no name and GetModuleFileName(NULL) answer it instead of gta6rt.exe. `gta6rt --run` sets the EXE it runs,
+    // before initialise(); without one those calls get Windows' answer. Throws if `m` isn't one of this Loader's.
+    void set_main_module(Module& m);
+    Module* main_module() const { return main_.load(); }
+
+    // What GetProcAddress gives for `name` ("#N" for an ordinal) in `m` (shims/library_loader.cpp): the export, or its
+    // forwarder followed as for an import, except that a bundled module that isn't mapped yet is not mapped now (image
+    // code is running, and it would never be initialised). Null if neither resolves.
+    void* export_address(const Module& m, const std::string& name);
 
     // Runs each loaded module's TLS callbacks and then its DllMain(DLL_PROCESS_ATTACH), dependencies first.
     // Only DLLs get DllMain called: an EXE's entry point is the caller's to run. Throws on a corrupt TLS
@@ -110,7 +123,7 @@ private:
     void initialize_tls(Module& m);
     void bind_imports(Module& m);
     void* resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal);
-    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
+    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth, bool map_bundled = true);
     void parse_exports(Module& m);
     void protect_sections(Module& m);
     void register_unwind(Module& m);
@@ -119,6 +132,7 @@ private:
     std::map<std::string, Module*> by_name_;  // lower-case file name
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
+    std::atomic<Module*> main_{nullptr};  // read by the shims on any thread
 };
 
 std::string lower(std::string s);

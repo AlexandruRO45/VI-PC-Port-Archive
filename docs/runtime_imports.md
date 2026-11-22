@@ -41,20 +41,20 @@ All 16 DLLs in the package map at their preferred base `0x180000000` with no rel
 | `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 3 | 54 | 0 | 0 |
 | `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 5 | 81 | 0 | 0 |
 | `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 4 | 18 | 0 | 0 |
-| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 7 | 191 | 0 | 0 |
-| `XCurl.dll` | 188,416 | `0x17b0` | 7 | 133 | 0 | 0 |
+| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 11 | 187 | 0 | 0 |
+| `XCurl.dll` | 188,416 | `0x17b0` | 9 | 131 | 0 | 0 |
 | `concrt140.dll` | 303,104 | `0x29160` | 1 | 102 | 0 | 0 |
-| `msvcp140.dll` | 577,536 | `0x525a0` | 5 | 182 | 0 | 0 |
+| `msvcp140.dll` | 577,536 | `0x525a0` | 10 | 177 | 0 | 0 |
 | `msvcp140_1.dll` | 36,864 | `0x15c0` | 1 | 32 | 0 | 0 |
 | `msvcp140_2.dll` | 192,512 | `0x1efa0` | 1 | 95 | 0 | 0 |
 | `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 3 | 61 | 0 | 0 |
 | `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 1 | 23 | 0 | 0 |
 | `vccorlib140.dll` | 344,064 | `0x27e50` | 6 | 108 | 0 | 0 |
-| `vcomp140.dll` | 86,016 | `0x6580` | 3 | 75 | 0 | 0 |
-| `vcruntime140.dll` | 110,592 | `0xf890` | 3 | 38 | 0 | 0 |
+| `vcomp140.dll` | 86,016 | `0x6580` | 7 | 71 | 0 | 0 |
+| `vcruntime140.dll` | 110,592 | `0xf890` | 4 | 37 | 0 | 0 |
 | `vcruntime140_1.dll` | 49,152 | `0x3e90` | 1 | 33 | 0 | 0 |
 
-Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. That is why every image above has a few more shim and fewer host imports than before; the Xbox-specific imports below are unchanged.
+Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's `LoadLibrary*`, `GetModuleHandle*`, `GetModuleHandleEx*`, `GetModuleFileName*`, `GetProcAddress` and `FreeLibrary` imports count as shim, through `kernel32`, `kernelbase` or the `api-ms-win-core-libraryloader-*` set it names. So do the file imports the [console-path shims](#console-paths-and-the-write-overlay) answer and the UCRT start-up and exit imports of `runtime/shims/process.cpp`. That is why the images above have more shim and fewer host imports than their Xbox-specific imports account for; those, below, are unchanged.
 
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
@@ -133,10 +133,11 @@ thunks `LoadLibraryW` the runtime and `GetProcAddress` those five names at run t
 mostly correspond one to one to the `xgameruntime.lib` functions. The executable is very likely linked the same way.
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
-shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`) with a
-pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
-with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
+shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*`, `GetModuleHandle*` and `GetModuleHandleEx*`
+for a module the shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`,
+`gameinput.dll`) with a pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry
+doesn't serve is `NULL` with `ERROR_PROC_NOT_FOUND` and is logged once. The images the loader mapped are answered too
+([below](#mapped-modules-and-the-processs-executable)); every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
 version and mode once. `QueryApiImpl` logs each class and interface id it is asked for and returns `0x80070032`, the
@@ -160,6 +161,35 @@ So `XCurl.dll` needs threading, error reporting and networking from the runtime,
 What this does not cover: a title that `LoadLibrary`s one of the package's bundled DLLs (`Bink2Scarlett.dll`,
 `XboxBvhBuilder.dll`, the FidelityFX DLLs) still gets the host loader, which loads the Xbox build without the
 registry's bindings for its own console imports (`xmem.dll`, `d3d12_xs.dll`).
+
+## Mapped modules and the process's executable
+
+Windows doesn't know the images `gta6rt` maps: they are `VirtualAlloc`'d, not loaded by its loader. Asked about one by
+name, handle or address it fails, and asked about the process's executable it names `gta6rt.exe`, whose folder a title
+would take for its install folder. So `runtime/shims/library_loader.cpp` answers for them, under the same DLL names as
+the other loader functions, the way Windows 11 answers for a module it loaded (measured by calling its functions on
+host modules):
+
+- `GetModuleHandle*` and `GetModuleHandleEx*` find a mapped module by file name in any case, `.dll` added when the name
+  has no extension (a trailing `.` means none). A name with a path, `\` or `/`, is made full against the current folder
+  and compared with the full path the module was mapped from. `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS` finds the mapped
+  module holding the address. The arguments are checked first, as Windows does: an unknown flag, `PIN` with
+  `UNCHANGED_REFCOUNT`, `FROM_ADDRESS` without an address, or no out pointer fail with `ERROR_INVALID_PARAMETER`.
+- `GetModuleFileName*` of a mapped module is that full path. A buffer too small gets `size - 1` characters and a null,
+  `size` is returned and the last error is `ERROR_INSUFFICIENT_BUFFER`; a whole answer sets `ERROR_SUCCESS`.
+- `GetProcAddress` on a mapped module answers from its export table, by name (with case) or ordinal, and follows a
+  forwarder as the loader does for an import, except that a bundled module not mapped yet is not mapped then. What the
+  module doesn't export is `NULL` with `ERROR_PROC_NOT_FOUND` for a name, `ERROR_INVALID_ORDINAL` for an ordinal and
+  `ERROR_INVALID_PARAMETER` for a null name.
+- `NULL` (`GetModuleHandle`, `GetModuleHandleEx` without a name, `GetModuleFileName`, `GetProcAddress`) is the EXE
+  `gta6rt --run` runs. Without `--run` it stays Windows' answer, `gta6rt.exe`.
+- A mapped module stays mapped until the loader is destroyed, so `GetModuleHandleEx`'s reference count and `PIN` need no
+  bookkeeping, and `FreeLibrary` on a mapped module succeeds and leaves it mapped.
+- The A forms read a name in the file APIs' code page (`SetFileApisToOEM` switches it); `GetModuleFileNameA` writes the
+  ANSI code page either way.
+
+`pe_loader_test` checks this on its fixture DLL and EXE, and `run_tiny_game` from inside the stand-in game.
+`LoadLibrary*` of a mapped module's name still goes to Windows, which doesn't know the module.
 
 ## What this proves and what it does not
 
