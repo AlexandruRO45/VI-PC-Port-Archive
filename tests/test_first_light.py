@@ -16,7 +16,11 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -26,6 +30,28 @@ import first_light as fl
 CLEAR = fl.CLEAR
 check_image = fl.check_image
 write_ppm = fl.write_ppm
+
+
+class FirstLightMeshReplayTest(unittest.TestCase):
+    def test_replay_uses_manifest_mesh_and_vertex_layout(self):
+        manifest = {
+            "width": 1,
+            "height": 1,
+            "files": {"mesh": "prop.bin"},
+            "vertex_layout": "0:3f,1:3f,2:4f,3:2f",
+        }
+
+        def draw(command, *, check, env):
+            self.assertTrue(check)
+            self.assertEqual(env["VKH_DRAW_MESH"], os.path.join(out_dir, "prop.bin"))
+            self.assertEqual(env["VKH_VERTEX_LAYOUT"], manifest["vertex_layout"])
+            Path(command[3]).write_bytes(struct.pack("<4f", 0, 0, 0, 1))
+
+        with tempfile.TemporaryDirectory() as out_dir:
+            with mock.patch.object(fl, "find_harness", return_value="vk_harness"):
+                with mock.patch.object(fl.subprocess, "run", side_effect=draw):
+                    result = fl.run_draw(SimpleNamespace(harness=None), manifest, out_dir)
+        self.assertEqual(result["covered"], 1)
 
 
 def harness() -> str | None:

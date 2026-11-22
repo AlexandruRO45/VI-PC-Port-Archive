@@ -79,6 +79,13 @@ creates a vertex and an index buffer, and draws it with `vkCmdDrawIndexed`. The 
 and only float attributes. The first-light pair above uses no other harness option: the VS reads no user SGPRs and
 the PS has no bindings.
 
+When replaying a prepared draw with `first_light.py --check --out <directory>`, the manifest's
+`files.mesh` selects the packed mesh and `vertex_layout` selects the harness attributes in
+packed order. For example, `0:3f,1:3f,2:4f,3:2f` can describe position, normal, colour
+and UV when those four locations match the vertex shader. Older manifests default to
+`mesh.bin` and `0:3f,1:2f`. The coverage and pixel probes in the manifest must describe the
+prepared draw.
+
 ## 5. Through the D3D12 layer
 
 `runtime/test/d3d12_first_light_test.cpp` (ctest `d3d12_first_light`) draws the same model and pair through the

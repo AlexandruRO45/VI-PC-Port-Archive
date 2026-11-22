@@ -341,8 +341,8 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         )  # a harness that exits 0 without writing must not pass on a stale file
     env = dict(
         os.environ,
-        VKH_DRAW_MESH=os.path.join(out_dir, "mesh.bin"),
-        VKH_VERTEX_LAYOUT="0:3f,1:2f",
+        VKH_DRAW_MESH=os.path.join(out_dir, manifest.get("files", {}).get("mesh", "mesh.bin")),
+        VKH_VERTEX_LAYOUT=manifest.get("vertex_layout", "0:3f,1:2f"),
     )
     cmd = [
         harness,
@@ -500,6 +500,7 @@ def main(argv=None) -> int:
             "verified": True,
         },
         "vertex_count": len(vertices),
+        "vertex_layout": "0:3f,1:2f",
         "index_count": len(indices),
         "triangle_count": len(indices) // 3,
         "obj_sha256": obj_sha256,
