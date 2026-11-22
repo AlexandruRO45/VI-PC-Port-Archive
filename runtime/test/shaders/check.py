@@ -81,14 +81,14 @@ CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed001
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst")
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_ds_subword_write", "cs_w32_ds_subword_read", "cs_w32_ds_wide")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_exec_const",
-                     "cs_w32_mask_imm", "cs_lds_b64_cmpst")
+                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_w32_ds_subword_write", "cs_w32_ds_subword_read", "cs_w32_ds_wide")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
           ("cs_dpp_mask", [1, 0, 3, 2, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee, 0xeeeeeeee]),
@@ -119,6 +119,10 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # ds_cmpst_b32 and the b64 2-address forms (cs_lds_b64_cmpst.asm header)
             ("cs_lds_b64_cmpst", [0x11110001, 0x22220002, 0x33330003, 0x44440004,
                                   0xCCCC000C, 0x44440004, 0xBBBB000B, 0x3579BADC]),
+            # LDS sub-dword writes and reads, mskor, add_rtn, b96/b128 (the three cs_w32_ds_* headers)
+            ("cs_w32_ds_subword_write", [0x44434241, 0x605F5E5D, 0xEEEEEEEE, 0xFF81FF80, 0xFF9FFF9E, 0xEEEE22EE, 0x556622EE, 0xEEEE9ABC]),
+            ("cs_w32_ds_subword_read", [0x000000F2, 0xFFFFFFF2, 0x00008081, 0xFFFF8081, 0xAAAA8001, 0x7FFEBBBB, 0x58C57884, 0xFFFFFFE0]),
+            ("cs_w32_ds_wide", [0x01020304, 0x05060708, 0x090A0B0C, 0x0D0E0F10, 0x11111111, 0x22222222, 0x33333333, 0x11110003]),
             # constant EXEC: each lane takes its own bit (Intel got 16-bit constants wrong for lanes 16-31)
             ("cs_exec_const", [16, 8, 2, 16, 0, 16]),
             # a constant lane mask (saveexec, wrexec, s_and/s_not/s_mov_b64 into EXEC or VCC) gives lane L its bit L,
