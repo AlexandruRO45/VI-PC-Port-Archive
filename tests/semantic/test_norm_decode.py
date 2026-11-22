@@ -53,11 +53,12 @@ def norm_bits_on_interp(m: int, n: int) -> int:
     gen = rdna2spirv.Gen("ps")
     res = gen.norm_bits(gen.cu(m), n)
     consts = "".join(f"{name} = OpConstant %uint {v}\n" for v, name in gen.consts.items())
-    consts += "".join(f"{name} = OpConstant %ulong {v}\n" for v, name in gen.lconsts.items())
-    text = ("OpCapability Shader\nOpCapability Int64\n%glsl = OpExtInstImport \"GLSL.std.450\"\n"
+    if gen.lconsts or any("%ulong" in line for line in gen.body):
+        raise AssertionError("normalized decode requires Int64")
+    text = ("OpCapability Shader\n%glsl = OpExtInstImport \"GLSL.std.450\"\n"
             "OpMemoryModel Logical GLSL450\nOpEntryPoint Fragment %main \"main\" %out\n"
             "%void = OpTypeVoid\n%fn = OpTypeFunction %void\n%bool = OpTypeBool\n%uint = OpTypeInt 32 0\n"
-            "%int = OpTypeInt 32 1\n%ulong = OpTypeInt 64 0\n%_ptr_Output_uint = OpTypePointer Output %uint\n"
+            "%int = OpTypeInt 32 1\n%_ptr_Output_uint = OpTypePointer Output %uint\n"
             "%out = OpVariable %_ptr_Output_uint Output\n" + consts
             + "%main = OpFunction %void None %fn\n%entry = OpLabel\n"
             + "".join(line.strip() + "\n" for line in gen.body)
@@ -96,6 +97,12 @@ class NormBitsExact(unittest.TestCase):
             off = [m for m in range(1, d) if recip_mul(m, n) != f32_rne(Fraction(m, d))][:64]
             self.check(n, edge + off + [rng.randrange(d + 1) for _ in range(96)])
 
+    def test_each_leading_bit_at_every_width(self):
+        for n in range(1, 17):
+            limit = (1 << n) - 1
+            self.check(n, sorted({m for bit in range(n + 1) for offset in (-1, 0, 1)
+                                  if 0 <= (m := (1 << bit) + offset) <= limit}))
+
     def test_reciprocal_multiply_really_differs(self):
         # negative control: the values above include inputs the old decode got wrong (126 of 256 for 8 bits)
         self.assertEqual(sum(recip_mul(m, 8) != f32_rne(Fraction(m, 255)) for m in range(256)), 126)
@@ -117,6 +124,15 @@ class DecodeThroughBufferLoad(unittest.TestCase):
                             mods=" format:[BUF_FMT_8_8_8_8_SNORM]")
         self.assertEqual(words, (f32_rne(Fraction(3, 127)), 0x3F800000,
                                  f32_rne(Fraction(-1, 127)), 0xBF800000))
+
+    def test_snorm_sign_and_saturation_boundaries(self):
+        for width, fmt in ((8, 2), (16, 8)):
+            maximum = (1 << (width - 1)) - 1
+            for value in (-maximum - 1, -maximum, -maximum + 1, -1, 0, 1, maximum - 1, maximum):
+                with self.subTest(width=width, value=value):
+                    raw = value & ((1 << width) - 1)
+                    expected = f32_rne(Fraction(max(-maximum, value), maximum))
+                    self.assertEqual(load_format(fmt, 0, 1, memory={BASE: raw})[0], expected)
 
     def test_added_snorm_formats(self):
         mem = {BASE: 0x8001FF81}

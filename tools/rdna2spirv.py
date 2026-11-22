@@ -1732,42 +1732,38 @@ class Gen:
         return words
 
     def norm_bits(self, m, n):
-        """f32 bits of m / (2^n - 1), correctly rounded, for an n-bit unsigned id m (1 <= n <= 16), integer ops only.
+        """Correctly rounded f32 bits of the unsigned n-bit fraction m / (2**n - 1), for 1 <= n <= 16."""
+        nonzero, msb_i, msb, shift, word = (self.tmp() for _ in range(5))
+        # Give zero a defined shift too. Setting bit zero preserves every nonzero input's leading bit.
+        self.emit(f"{nonzero} = OpBitwiseOr %uint {m} {self.cu(1)}")
+        self.emit(f"{msb_i} = OpExtInst %int %glsl FindUMsb {nonzero}")
+        self.emit(f"{msb} = OpBitcast %uint {msb_i}")
+        self.emit(f"{shift} = OpISub %uint {self.cu(31)} {msb}")
+        self.emit(f"{word} = OpShiftLeftLogical %uint {m} {shift}")
 
-        In binary, m / (2^n - 1) is m's n bits repeated forever. T = m * sum(2^(64 - n(k+1))) holds the first 64 of
-        them (the partial block at the bottom is dropped, below every bit used here). For 0 < m < 2^n - 1 the top 1 of
-        T is in its high dword (T >= 2^(64-n)), so p = FindUMsb(T >> 32) is 16..31 and the value is in [2^(p-32),
-        2^(p-31)). The mantissa is T >> (p + 9) (24 bits with the hidden one) and the round bit the one below it. The
-        repeating tail is never all zero, so a tie can't happen: round to nearest is "add the round bit". A carry
-        out of the mantissa moves into the exponent through the plain add. 0 and 2^n - 1 are exact (0 and 1.0)."""
-        rep = sum(1 << (64 - n * (k + 1)) for k in range(64 // n))
-        m64, t, h64, hi, pi, p, s, s64, q64, q, s1, s164, r64, rb, e, eb, b0, b1, b2, z, one, b3, b4 = \
-            (self.tmp() for _ in range(23))
-        self.emit(f"{m64} = OpUConvert %ulong {m}")
-        self.emit(f"{t} = OpIMul %ulong {m64} {self.cl(rep)}")
-        self.emit(f"{h64} = OpShiftRightLogical %ulong {t} {self.cl(32)}")
-        self.emit(f"{hi} = OpUConvert %uint {h64}")
-        self.emit(f"{pi} = OpExtInst %int %glsl FindUMsb {hi}")
-        self.emit(f"{p} = OpBitcast %uint {pi}")
-        self.emit(f"{s} = OpIAdd %uint {p} {self.cu(9)}")               # m = 0 gives p = -1: s = 8, result unused
-        self.emit(f"{s64} = OpUConvert %ulong {s}")
-        self.emit(f"{q64} = OpShiftRightLogical %ulong {t} {s64}")
-        self.emit(f"{q} = OpUConvert %uint {q64}")
-        self.emit(f"{s1} = OpISub %uint {s} {self.cu(1)}")
-        self.emit(f"{s164} = OpUConvert %ulong {s1}")
-        self.emit(f"{r64} = OpShiftRightLogical %ulong {t} {s164}")
-        self.emit(f"{rb} = OpUConvert %uint {r64}")
-        self.emit(f"{e} = OpIAdd %uint {p} {self.cu(95)}")              # biased exponent p - 32 + 127
-        self.emit(f"{eb} = OpShiftLeftLogical %uint {e} {self.cu(23)}")
-        self.emit(f"{b0} = OpISub %uint {q} {self.cu(0x800000)}")       # drop the hidden one
-        self.emit(f"{b1} = OpIAdd %uint {eb} {b0}")
-        self.emit(f"{b2} = OpBitwiseAnd %uint {rb} {self.cu(1)}")
-        self.emit(f"{b3} = OpIAdd %uint {b1} {b2}")
-        self.emit(f"{z} = OpIEqual %bool {m} {self.cu(0)}")
-        self.emit(f"{one} = OpIEqual %bool {m} {self.cu((1 << n) - 1)}")
-        self.emit(f"{b4} = OpSelect %uint {one} {self.cu(0x3F800000)} {b3}")
-        res = self.tmp()
-        self.emit(f"{res} = OpSelect %uint {z} {self.cu(0)} {b4}")
+        # The quotient repeats m's n bits forever. Double the number of copies until the
+        # top 25 bits hold the normalized significand and its round bit.
+        spacing = n
+        while spacing < 25:
+            tail, joined = self.tmp(), self.tmp()
+            self.emit(f"{tail} = OpShiftRightLogical %uint {word} {self.cu(spacing)}")
+            self.emit(f"{joined} = OpBitwiseOr %uint {word} {tail}")
+            word = joined
+            spacing *= 2
+
+        significand, guard_word, guard, exponent, base, bits, rounded, zero, res = (self.tmp() for _ in range(9))
+        self.emit(f"{significand} = OpShiftRightLogical %uint {word} {self.cu(8)}")
+        self.emit(f"{guard_word} = OpShiftRightLogical %uint {word} {self.cu(7)}")
+        self.emit(f"{guard} = OpBitwiseAnd %uint {guard_word} {self.cu(1)}")
+        # Include the hidden bit by starting the biased exponent one lower. The tail of a
+        # nonzero periodic fraction is never zero, so guard=1 always rounds up. All ones
+        # carries into the exponent to give exactly 1.0.
+        self.emit(f"{exponent} = OpIAdd %uint {msb} {self.cu(126 - n)}")
+        self.emit(f"{base} = OpShiftLeftLogical %uint {exponent} {self.cu(23)}")
+        self.emit(f"{bits} = OpIAdd %uint {base} {significand}")
+        self.emit(f"{rounded} = OpIAdd %uint {bits} {guard}")
+        self.emit(f"{zero} = OpIEqual %bool {m} {self.cu(0)}")
+        self.emit(f"{res} = OpSelect %uint {zero} {self.cu(0)} {rounded}")
         return res
 
     def tbuffer_norm_bits(self, magnitude: str, width: int) -> str:
