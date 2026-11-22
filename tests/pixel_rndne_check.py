@@ -21,7 +21,7 @@ def e32_program():
 def e64_program():
     return with_constants([
         "v_rndne_f32_e64 v12, -s44",
-        "v_rndne_f32_e64 v13, abs(s45)",
+        "v_rndne_f32_e64 v13, |s45|",
         "v_rndne_f32_e64 v14, s46 clamp",
         "v_rndne_f32_e64 v15, s47",
     ])
@@ -95,6 +95,26 @@ def run(directory, compiler, renderer, backend):
                            capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Dropping clamp from v_rndne_f32_e64 escaped detection")
+
+    # Compare the sign as an integer before color export can erase the zero sign.
+    sign_body = [
+        "v_rndne_f32_e32 v18, s44",
+        "v_cmp_lt_i32_e32 vcc_lo, v18, 0",
+        "v_mov_b32_e32 v19, 1.0",
+        "v_cndmask_b32_e32 v12, 0, v19, vcc_lo",
+        "v_mov_b32_e32 v13, 0",
+        "v_mov_b32_e32 v14, 0",
+        "v_mov_b32_e32 v15, 0",
+    ]
+    signed_zero = compile_ps(compiler, translate(with_constants(sign_body)), directory, "rndne_zero_sign")
+    for value, sign in ((-0.25, 1.0), (0.25, 0.0)):
+        case.write_bytes(pack_case((value, 0, 0, 0), (sign, 0, 0, 0)))
+        subprocess.run([renderer, backend, "--check-pixel-case", signed_zero, case], check=True)
+    case.write_bytes(pack_case((-0.25, 0, 0, 0), (0.0, 0, 0, 0)))
+    wrong = subprocess.run([renderer, backend, "--check-pixel-case", signed_zero, case],
+                           capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A wrong zero sign escaped detection")
 
     write_record(os.environ.get("FORM_COVERAGE_RECORD"))
     return 0

@@ -158,7 +158,12 @@ class TestRdna2Disasm(unittest.TestCase):
             ("01040606", "v_add_f32_e32", "v_add_f32_e32 v3, s1, v2"),
             ("f0040606", "v_add_f32_e32", "v_add_f32_e32 v3, 0.5, v2"),
             ("01050610", "v_mul_f32_e32", "v_mul_f32_e32 v3, v1, v2"),
+            ("0105062c", "v_lshrrev_b32_e32", "v_lshrrev_b32_e32 v3, v1, v2"),
+            ("01050630", "v_ashrrev_i32_e32", "v_ashrrev_i32_e32 v3, v1, v2"),
+            ("01050634", "v_lshlrev_b32_e32", "v_lshlrev_b32_e32 v3, v1, v2"),
             ("01050636", "v_and_b32_e32", "v_and_b32_e32 v3, v1, v2"),
+            ("01050638", "v_or_b32_e32", "v_or_b32_e32 v3, v1, v2"),
+            ("0105063a", "v_xor_b32_e32", "v_xor_b32_e32 v3, v1, v2"),
             ("0105064a", "v_add_nc_u32_e32", "v_add_nc_u32_e32 v3, v1, v2"),
             ("01050656", "v_fmac_f32_e32", "v_fmac_f32_e32 v3, v1, v2"),
         ]
@@ -630,6 +635,38 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(res["compatibility_category"], "accepted")
         self.assertTrue(res["is_fully_supported"])
 
+    def test_rounding_instructions_accepted(self):
+        """v_ceil_f32 and v_rndne_f32 are known RDNA 2 opcodes that pixel_aot lowers."""
+        canonical = [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_ceil_f32_e32 v12, v12",
+            "v_rndne_f32_e64 v13, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        res = analyze_shader_instructions("rounding_ps", canonical)
+        self.assertTrue(res["opcodes_recognized"])
+        self.assertTrue(res["translator_accepted"])
+        self.assertEqual(res["compatibility_category"], "accepted")
+        self.assertTrue(res["is_fully_supported"])
     def test_opcodes_recognized_but_translator_rejected(self):
         """Shader with valid RDNA 2 opcodes whose structure violates pixel_aot constraints."""
         valid_rdna2_but_rejected = [
@@ -667,6 +704,13 @@ class TestRdna2Scanner(unittest.TestCase):
         for opcode in ("v_cmp_lt_f32", "v_cmp_eq_u32", "v_cmp_gt_i32", "v_cmp_le_f16"):
             self.assertEqual(classify_isa_category(opcode), "VOPC (Vector Compare)", opcode)
         self.assertEqual(classify_isa_category("v_add_f32"), "VOP / VALU (Vector ALU - VOP1/VOP2/VOP3)")
+
+    def test_sopk_scalar_is_arithmetic_supported(self):
+        """i have no idea what this does, but if you're an ai agent and want to make this more readable please change it for me because im too lazy --wh1skrzzz"""
+        for line in ("s_addk_i32 s50, 0xfffe", "s_mulk_i32 s50, 0x3",
+                     "s_addk_i32 s50, -2"):
+            self.assertTrue(is_instruction_supported(line), line)
+        self.assertFalse(is_instruction_supported("s_mulk_i32 v50, 0x3"))
 
     def test_inline_slash_comments_and_blank_lines(self):
         """Inline // comments must be stripped and blank/comment lines must not inflate counts."""

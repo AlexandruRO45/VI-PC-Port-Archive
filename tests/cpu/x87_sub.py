@@ -59,13 +59,13 @@ CONTROLS = {
     # The difference rounds in the binary64 exponent range, as host double arithmetic would.
     "double": (base.ARITH, "x87_arith{53, 1023, 0x7fe}"),
     # The subtrahend is negated before the NaN rules, so a NaN subtrahend comes back with its sign flipped.
-    "nansign": (re.compile(r"(x87_sub\(X87Value a, X87Value b\) \{\s+X87Value out;\s+)"
+    "nansign": (re.compile(r"(x87_sub\(X87Value a, X87Value b, uint16_t cw\) \{\s+X87Value out;\s+)"
                            r"if \(x87_special_operands\(a, b, &out\)\) return out;"), r"\1"),
     # FSUBR subtracts in the FSUB order.
-    "reverse": (re.compile(r"x87_subr\(X87Value a, X87Value b\) \{ return x87_sub\(b, a\); \}"),
-                "x87_subr(X87Value a, X87Value b) { return x87_sub(a, b); }"),
+    "reverse": (re.compile(r"x87_subr\(X87Value a, X87Value b, uint16_t cw\) \{ return x87_sub\(b, a, cw\); \}"),
+                "x87_subr(X87Value a, X87Value b, uint16_t cw) { return x87_sub(a, b, cw); }"),
     # An exact zero difference of nonzero values is -0.
-    "cancel": (re.compile(r"return \{0, 0\};  // x \+ \(-x\)"), "return {0, 0x8000};  // x + (-x)"),
+    "cancel": (re.compile(r"return \{0, zero_sign\};  // x \+ \(-x\)"), "return {0, 0x8000};  // x + (-x)"),
     # Bits shifted out when aligning the smaller operand are dropped instead of kept as a sticky bit.
     "nosticky": (re.compile(r"lo \|= sticky;|lo = \(hi \| lo\) != 0;"),
                  lambda m: ";" if m.group(0).startswith("lo |=") else "lo = 0;"),
