@@ -1256,5 +1256,114 @@ class TestBufferAtomicFmaxConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, canary)
 
 
+class TestBufferAtomicFmaxBoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, address wrapping, subnormals, and IEEE 754 NaN handling."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(4096)
+
+    def test_last_valid_dword_boundary(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Last valid 4-byte dword starts at offset 96 (96 + 4 = 100)
+        self.mem.write_u32(96, f32_to_bits(42.0))
+        ret, in_bounds = ref_buffer_atomic_fmax(self.mem, desc, soffset=0, vaddr=96, comp_val=f32_to_bits(50.0), glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(bits_to_f32(ret), 42.0)
+        self.assertEqual(bits_to_f32(self.mem.read_u32(96)), 50.0)
+
+        # Offsets 97, 98, 99 all exceed num_records (97 + 4 = 101 > 100)
+        for oob_off in (97, 98, 99, 100):
+            ret, in_bounds = ref_buffer_atomic_fmax(self.mem, desc, soffset=0, vaddr=oob_off, comp_val=f32_to_bits(100.0), glc=True)
+            self.assertFalse(in_bounds)
+            self.assertEqual(ret, 0)
+
+    def test_zero_capacity_buffer(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=0)
+        ret, in_bounds = ref_buffer_atomic_fmax(self.mem, desc, soffset=0, vaddr=0, comp_val=f32_to_bits(1.0), glc=True)
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+
+    def test_subnormals_vs_zeros(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # Smallest positive subnormal: 0x00000001 > +0.0 > -0.0
+        subnormal_pos = 0x00000001
+        self.mem.write_u32(0, POS_ZERO_F32)
+        ret, in_bounds = ref_buffer_atomic_fmax(self.mem, desc, soffset=0, vaddr=0, comp_val=subnormal_pos, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, POS_ZERO_F32)
+        self.assertEqual(self.mem.read_u32(0), subnormal_pos)
+
+        # -0.0 vs subnormal_pos -> subnormal_pos wins
+        self.mem.write_u32(4, NEG_ZERO_F32)
+        ret2, in_bounds2 = ref_buffer_atomic_fmax(self.mem, desc, soffset=0, vaddr=4, comp_val=subnormal_pos, glc=True)
+        self.assertTrue(in_bounds2)
+        self.assertEqual(ret2, NEG_ZERO_F32)
+        self.assertEqual(self.mem.read_u32(4), subnormal_pos)
+
+        # Negative subnormal (0x80000001) vs -0.0 -> -0.0 > -subnormal
+        subnormal_neg = 0x80000001
+        self.mem.write_u32(8, subnormal_neg)
+        ret3, in_bounds3 = ref_buffer_atomic_fmax(self.mem, desc, soffset=0, vaddr=8, comp_val=NEG_ZERO_F32, glc=True)
+        self.assertTrue(in_bounds3)
+        self.assertEqual(ret3, subnormal_neg)
+        self.assertEqual(self.mem.read_u32(8), NEG_ZERO_F32)
+
+    def test_infinities_vs_finite_extremes(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        flt_max = 0x7F7FFFFF  # ~3.4028235e+38
+        self.mem.write_u32(0, flt_max)
+        ret, in_bounds = ref_buffer_atomic_fmax(self.mem, desc, soffset=0, vaddr=0, comp_val=POS_INF_F32, glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, flt_max)
+        self.assertEqual(self.mem.read_u32(0), POS_INF_F32)
+
+        # -FLT_MAX vs -inf -> -FLT_MAX is greater
+        neg_flt_max = 0xFF7FFFFF
+        self.mem.write_u32(4, NEG_INF_F32)
+        ret2, in_bounds2 = ref_buffer_atomic_fmax(self.mem, desc, soffset=0, vaddr=4, comp_val=neg_flt_max, glc=True)
+        self.assertTrue(in_bounds2)
+        self.assertEqual(ret2, NEG_INF_F32)
+        self.assertEqual(self.mem.read_u32(4), neg_flt_max)
+
+    def test_nan_suppression_and_quiet_nan_production(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # Signaling NaN suppressed against finite number
+        self.mem.write_u32(0, SNAN_F32)
+        ret, in_bounds = ref_buffer_atomic_fmax(self.mem, desc, soffset=0, vaddr=0, comp_val=f32_to_bits(1.0), glc=True)
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, SNAN_F32)
+        self.assertEqual(bits_to_f32(self.mem.read_u32(0)), 1.0)
+
+        # Dual NaN produces canonical quiet NaN
+        other_snan = 0x7F800005
+        self.mem.write_u32(4, SNAN_F32)
+        ret2, in_bounds2 = ref_buffer_atomic_fmax(self.mem, desc, soffset=0, vaddr=4, comp_val=other_snan, glc=True)
+        self.assertTrue(in_bounds2)
+        self.assertEqual(ret2, SNAN_F32)
+        self.assertEqual(self.mem.read_u32(4), QNAN_F32)
+
+    def test_signed_zero_matrix(self) -> None:
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=256)
+        # max(+0.0, +0.0) -> +0.0
+        self.mem.write_u32(0, POS_ZERO_F32)
+        ref_buffer_atomic_fmax(self.mem, desc, 0, 0, POS_ZERO_F32)
+        self.assertEqual(self.mem.read_u32(0), POS_ZERO_F32)
+
+        # max(-0.0, +0.0) -> +0.0
+        self.mem.write_u32(4, NEG_ZERO_F32)
+        ref_buffer_atomic_fmax(self.mem, desc, 0, 4, POS_ZERO_F32)
+        self.assertEqual(self.mem.read_u32(4), POS_ZERO_F32)
+
+        # max(+0.0, -0.0) -> +0.0
+        self.mem.write_u32(8, POS_ZERO_F32)
+        ref_buffer_atomic_fmax(self.mem, desc, 0, 8, NEG_ZERO_F32)
+        self.assertEqual(self.mem.read_u32(8), POS_ZERO_F32)
+
+        # max(-0.0, -0.0) -> -0.0
+        self.mem.write_u32(12, NEG_ZERO_F32)
+        ref_buffer_atomic_fmax(self.mem, desc, 0, 12, NEG_ZERO_F32)
+        self.assertEqual(self.mem.read_u32(12), NEG_ZERO_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
