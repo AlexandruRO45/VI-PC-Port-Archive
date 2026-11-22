@@ -1105,5 +1105,218 @@ class TestVSadHiU8IEEE754BitPatterns(unittest.TestCase):
         self.assertEqual(ref_sad_hi_u8(subnormal_max, 0, 0), 637 << 16)
 
 
+# ==============================================================================
+# Unit Tests: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestVSadHiU8NegativeControls(unittest.TestCase):
+    """Test suite verifying negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_destination_not_vgpr(self) -> None:
+        """Destination operand must strictly be a VGPR."""
+        with self.assertRaises(TypeError):
+            VSadHiU8Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+            )
+        with self.assertRaises(TypeError):
+            VSadHiU8Instruction(
+                dst=Operand.literal(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+            )
+
+    def test_syntax_rejection_invalid_vgpr_index(self) -> None:
+        """VGPR indices must be strictly within [0, 255]."""
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+
+    def test_syntax_rejection_invalid_sgpr_index(self) -> None:
+        """SGPR indices must be strictly within [0, 105]."""
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_syntax_rejection_invalid_literal_value(self) -> None:
+        """Literal constants must be unsigned 32-bit integers."""
+        with self.assertRaises(ValueError):
+            Operand.literal(-1)
+        with self.assertRaises(ValueError):
+            Operand.literal(0x1_0000_0000)
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        """SIMDState lane count must be either 32 (Wave32) or 64 (Wave64)."""
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        """Single-bit corruptions of the expected result are deterministically caught."""
+        s0 = 0xFFFFFFFF
+        s1 = 0x00000000
+        s2 = 0x00000000
+        correct = ref_sad_hi_u8(s0, s1, s2)
+        self.assertEqual(correct, 0x03FC_0000)
+
+        # Flip bit 16
+        corrupted = correct ^ (1 << 16)
+        self.assertNotEqual(correct, corrupted)
+
+    def test_mutation_omitted_shift_detected(self) -> None:
+        """Mutant: Omits `<< 16` shift (computing v_sad_u8 instead of v_sad_hi_u8)."""
+        def mutant_sad(s0: int, s1: int, s2: int) -> int:
+            # Bug: forgot << 16
+            return (ref_sad_u8_sum(s0, s1) + u32(s2)) & MASK32
+
+        s0 = pack_bytes_u32(10, 0, 0, 0)
+        s1 = 0
+        s2 = 0
+
+        oracle_res = ref_sad_hi_u8(s0, s1, s2)
+        mutant_res = mutant_sad(s0, s1, s2)
+
+        # Oracle shifts 10 by 16: 0x000A0000; mutant returns 10
+        self.assertEqual(oracle_res, 0x000A_0000)
+        self.assertEqual(mutant_res, 10)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_signed_byte_difference_detected(self) -> None:
+        """Mutant: Treats packed bytes as signed two's complement integers."""
+        def mutant_sad_hi(s0: int, s1: int, s2: int) -> int:
+            def to_s8(x: int) -> int:
+                b = x & 0xFF
+                return b - 256 if (b & 0x80) else b
+            b0_0, b0_1, b0_2, b0_3 = unpack_bytes_u32(s0)
+            b1_0, b1_1, b1_2, b1_3 = unpack_bytes_u32(s1)
+            # Bug: signed absolute difference
+            diff = (
+                abs(to_s8(b0_0) - to_s8(b1_0))
+                + abs(to_s8(b0_1) - to_s8(b1_1))
+                + abs(to_s8(b0_2) - to_s8(b1_2))
+                + abs(to_s8(b0_3) - to_s8(b1_3))
+            )
+            return ((diff << 16) + u32(s2)) & MASK32
+
+        s0 = pack_bytes_u32(0xFF, 0, 0, 0)  # 255 unsigned, -1 signed
+        s1 = 0
+        s2 = 0
+
+        oracle_res = ref_sad_hi_u8(s0, s1, s2)
+        mutant_res = mutant_sad_hi(s0, s1, s2)
+
+        # Unsigned diff: 255 << 16 = 0x00FF0000
+        self.assertEqual(oracle_res, 0x00FF_0000)
+        # Signed diff: |-1 - 0| = 1 << 16 = 0x00010000
+        self.assertEqual(mutant_res, 0x0001_0000)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_signed_whole_dword_diff_detected(self) -> None:
+        """Mutant: Computes whole 32-bit difference instead of 4 packed byte differences."""
+        def mutant_sad_hi(s0: int, s1: int, s2: int) -> int:
+            # Bug: whole dword diff instead of 4 byte lanes
+            diff = abs(u32(s0) - u32(s1))
+            return ((diff << 16) + u32(s2)) & MASK32
+
+        s0 = 0x0102_0304
+        s1 = 0x0000_0000
+        s2 = 0
+
+        oracle_res = ref_sad_hi_u8(s0, s1, s2)
+        mutant_res = mutant_sad_hi(s0, s1, s2)
+
+        # Oracle sum = 1 + 2 + 3 + 4 = 10 -> 0x000A0000
+        self.assertEqual(oracle_res, 0x000A_0000)
+        # Mutant: 0x01020304 << 16 != 0x000A0000
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_omitted_accumulator_detected(self) -> None:
+        """Mutant: Forgets to add accumulator src2."""
+        def mutant_sad_hi(s0: int, s1: int, s2: int) -> int:
+            # Bug: ignores s2
+            return (ref_sad_u8_sum(s0, s1) << 16) & MASK32
+
+        s0 = 0
+        s1 = 0
+        s2 = 0x1234_5678
+
+        oracle_res = ref_sad_hi_u8(s0, s1, s2)
+        mutant_res = mutant_sad_hi(s0, s1, s2)
+
+        self.assertEqual(oracle_res, s2)
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_incorrect_shift_amount_detected(self) -> None:
+        """Mutant: Shifts by 8 or 24 instead of 16."""
+        def mutant_sad_hi_shift8(s0: int, s1: int, s2: int) -> int:
+            return ((ref_sad_u8_sum(s0, s1) << 8) + u32(s2)) & MASK32
+
+        s0 = pack_bytes_u32(1, 0, 0, 0)
+        s1 = 0
+        s2 = 0
+
+        oracle_res = ref_sad_hi_u8(s0, s1, s2)
+        mutant_res = mutant_sad_hi_shift8(s0, s1, s2)
+
+        # Oracle: 1 << 16 = 0x00010000; Mutant: 1 << 8 = 0x00000100
+        self.assertEqual(oracle_res, 0x0001_0000)
+        self.assertEqual(mutant_res, 0x0000_0100)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_simd_ignore_exec_mask_detected(self) -> None:
+        """Mutant: SIMD interpreter writes inactive lanes ignoring EXEC mask."""
+        sentinel = 0xCAFEBABE
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)
+        for lane in range(32):
+            state.vgprs[lane][0] = sentinel
+
+        class BrokenSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VSadHiU8Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    # Bug: no is_lane_active check
+                    res = ref_sad_hi_u8(0xFFFFFFFF, 0, 0)
+                    state.write_lane(instr.dst, lane, res)
+                    results.append(res)
+                return results
+
+        broken = BrokenSIMDInterpreter()
+        instr = VSadHiU8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.literal(0xFFFFFFFF),
+            src1=Operand.literal(0),
+            src2=Operand.literal(0),
+        )
+        broken.step(instr, state)
+
+        # Verify that broken interpreter corrupted all 32 lanes
+        corrupted = [lane for lane in range(32) if state.vgprs[lane][0] != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+    def test_mutation_unmasked_overflow_detected(self) -> None:
+        """Mutant: Fails to wrap result to 32 bits upon overflow."""
+        def mutant_sad_hi_unmasked(s0: int, s1: int, s2: int) -> int:
+            # Bug: no 32-bit truncation
+            return (ref_sad_u8_sum(s0, s1) << 16) + (s2 & MASK32)
+
+        s0 = 0xFFFFFFFF
+        s1 = 0x00000000
+        s2 = 0xFFFF_0000
+
+        oracle_res = ref_sad_hi_u8(s0, s1, s2)
+        mutant_res = mutant_sad_hi_unmasked(s0, s1, s2)
+
+        self.assertEqual(oracle_res, 0x03FB_0000)
+        self.assertEqual(mutant_res, 0x1_03FB_0000)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+
 if __name__ == "__main__":
     unittest.main()
