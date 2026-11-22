@@ -32,9 +32,11 @@ Python 3.9+ compatible (from __future__ import annotations).
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 import struct
 import unittest
+from enum import Enum, auto
 from fractions import Fraction
 from typing import Any, List, Optional, Tuple, Union
 
@@ -259,6 +261,164 @@ class TestValuCvtNormU16F16Oracle(unittest.TestCase):
         self.assertEqual(ref_cvt_norm_u16_f16(MIN_SUBNORMAL_F16), UNORM16_MIN)
         # Largest subnormal ~6.0975e-5 * 65535 ~= 3.996 rounds to 4
         self.assertEqual(ref_cvt_norm_u16_f16(MAX_SUBNORMAL_F16), 4)
+
+
+# ---------------------------------------------------------------------------
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class Opcode(Enum):
+    V_CVT_NORM_U16_F16 = "v_cvt_norm_u16_f16"
+
+
+class Encoding(Enum):
+    VOP1 = "vop1"
+    VOP3 = "vop3"
+
+
+class RegKind(Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+
+
+class SubWord(Enum):
+    FULL = "full"
+    LO = "lo"
+    HI = "hi"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """Typed architectural register descriptor with optional 16-bit sub-dword indexing."""
+    kind: RegKind
+    index: int
+    subword: SubWord = SubWord.FULL
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index > 255:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+
+    def name(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        base = f"{prefix}{self.index}"
+        if self.subword == SubWord.LO:
+            return f"{base}.l"
+        elif self.subword == SubWord.HI:
+            return f"{base}.h"
+        return base
+
+
+@dataclasses.dataclass(frozen=True)
+class Immediate:
+    """Immediate floating-point or integer constant operand."""
+    value: Union[int, float]
+    is_f16: bool = True
+
+    def bits16(self) -> int:
+        if isinstance(self.value, float):
+            return f16_to_bits(self.value)
+        return int(self.value) & MASK16
+
+
+@dataclasses.dataclass(frozen=True)
+class Instruction:
+    """Symbolic AST representation of a VALU conversion instruction."""
+    opcode: Opcode
+    dst: Register
+    src0: Union[Register, Immediate]
+    abs_src0: bool = False
+    neg_src0: bool = False
+    clamp: bool = False
+    encoding: Encoding = Encoding.VOP1
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != RegKind.VGPR:
+            raise ValueError("VALU destination must be a VGPR")
+        if self.encoding == Encoding.VOP1 and (self.abs_src0 or self.neg_src0 or self.clamp):
+            raise ValueError("VOP1 encoding does not support modifiers or clamp")
+
+    def asm(self) -> str:
+        suffix = "_e64" if self.encoding == Encoding.VOP3 else "_e32"
+        s0_str = self.src0.name() if isinstance(self.src0, Register) else f"{self.src0.bits16():#06x}"
+        if self.abs_src0:
+            s0_str = f"|{s0_str}|"
+        if self.neg_src0:
+            s0_str = f"-{s0_str}"
+        clamp_str = " clamp" if self.clamp else ""
+        return f"{self.opcode.value}{suffix} {self.dst.name()}, {s0_str}{clamp_str}"
+
+
+class TestValuCvtNormU16F16AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_opcode_and_encoding_enums(self) -> None:
+        self.assertEqual(Opcode.V_CVT_NORM_U16_F16.value, "v_cvt_norm_u16_f16")
+        self.assertEqual(Encoding.VOP1.value, "vop1")
+        self.assertEqual(Encoding.VOP3.value, "vop3")
+
+    def test_register_descriptors(self) -> None:
+        v0 = Register(RegKind.VGPR, 0)
+        v0_l = Register(RegKind.VGPR, 0, SubWord.LO)
+        v0_h = Register(RegKind.VGPR, 0, SubWord.HI)
+        s5 = Register(RegKind.SGPR, 5)
+
+        self.assertEqual(v0.name(), "v0")
+        self.assertEqual(v0_l.name(), "v0.l")
+        self.assertEqual(v0_h.name(), "v0.h")
+        self.assertEqual(s5.name(), "s5")
+
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, -1)
+
+    def test_immediate_wrapping(self) -> None:
+        imm_f = Immediate(1.0)
+        self.assertEqual(imm_f.bits16(), ONE_F16)
+
+        imm_raw = Immediate(0x3800)
+        self.assertEqual(imm_raw.bits16(), HALF_F16)
+
+    def test_instruction_construction_and_asm(self) -> None:
+        # VOP1 default
+        inst_vop1 = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Register(RegKind.VGPR, 1, SubWord.LO),
+            encoding=Encoding.VOP1,
+        )
+        self.assertEqual(inst_vop1.asm(), "v_cvt_norm_u16_f16_e32 v0.l, v1.l")
+
+        # VOP3 with modifiers and clamp
+        inst_vop3 = Instruction(
+            opcode=Opcode.V_CVT_NORM_U16_F16,
+            dst=Register(RegKind.VGPR, 0, SubWord.LO),
+            src0=Register(RegKind.VGPR, 1, SubWord.LO),
+            abs_src0=True,
+            neg_src0=True,
+            clamp=True,
+            encoding=Encoding.VOP3,
+        )
+        self.assertEqual(inst_vop3.asm(), "v_cvt_norm_u16_f16_e64 v0.l, -|v1.l| clamp")
+
+    def test_instruction_validation(self) -> None:
+        # Reject SGPR as VALU destination
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_NORM_U16_F16,
+                dst=Register(RegKind.SGPR, 0),
+                src0=Register(RegKind.VGPR, 1),
+            )
+
+        # Reject modifiers on VOP1
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_CVT_NORM_U16_F16,
+                dst=Register(RegKind.VGPR, 0),
+                src0=Register(RegKind.VGPR, 1),
+                abs_src0=True,
+                encoding=Encoding.VOP1,
+            )
 
 
 if __name__ == "__main__":
