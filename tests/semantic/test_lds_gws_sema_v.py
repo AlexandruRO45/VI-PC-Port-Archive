@@ -695,5 +695,96 @@ class TestGWSSemaVConditionCodes(unittest.TestCase):
         self.assertEqual(vcc_mask, exec_mask)
 
 
+class TestGWSSemaVIEEE754(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling for ds_gws_sema_v."""
+
+    def test_snan_payload_preservation_without_quietening(self) -> None:
+        # Signaling NaN with explicit non-zero payload: 0x7F800001
+        snan_bits = 0x7F80_0001
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(7, snan_bits)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(7, RegKind.VGPR), offset=0)
+        interp.step(instr)
+
+        result_bits = interp.rf.get_vgpr(7)
+        self.assertEqual(result_bits, snan_bits)
+        # Verify MSB of mantissa is NOT forced to 1 (not quietened)
+        self.assertEqual(result_bits & 0x0040_0000, 0)
+
+    def test_qnan_payload_preservation(self) -> None:
+        # Quiet NaN with payload 0x7FC01234
+        qnan_bits = 0x7FC0_1234
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(8, qnan_bits)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(8, RegKind.VGPR), offset=1)
+        interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(8), qnan_bits)
+
+    def test_signed_zeros_distinction_and_preservation(self) -> None:
+        # +0.0 (0x00000000) vs -0.0 (0x80000000)
+        pos_zero = 0x0000_0000
+        neg_zero = 0x8000_0000
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(1, pos_zero)
+        interp.rf.set_vgpr(2, neg_zero)
+
+        instr1 = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(1, RegKind.VGPR), offset=0)
+        instr2 = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(2, RegKind.VGPR), offset=0)
+        interp.step(instr1)
+        interp.step(instr2)
+
+        self.assertEqual(interp.rf.get_vgpr(1), pos_zero)
+        self.assertEqual(interp.rf.get_vgpr(2), neg_zero)
+        # Sign bit on -0.0 must be preserved
+        self.assertEqual(interp.rf.get_vgpr(2) & 0x8000_0000, 0x8000_0000)
+
+    def test_subnormals_preservation_without_flush_to_zero(self) -> None:
+        # Smallest positive subnormal: 0x00000001
+        subnormal_min = 0x0000_0001
+        # Largest positive subnormal: 0x007FFFFF
+        subnormal_max = 0x007F_FFFF
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(3, subnormal_min)
+        interp.rf.set_vgpr(4, subnormal_max)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(3, RegKind.VGPR), offset=0)
+        interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(3), subnormal_min)
+        self.assertEqual(interp.rf.get_vgpr(4), subnormal_max)
+        self.assertNotEqual(interp.rf.get_vgpr(3), 0)
+
+    def test_infinities_preservation(self) -> None:
+        pos_inf = 0x7F80_0000
+        neg_inf = 0xFF80_0000
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(5, pos_inf)
+        interp.rf.set_vgpr(6, neg_inf)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(5, RegKind.VGPR), offset=0)
+        interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(5), pos_inf)
+        self.assertEqual(interp.rf.get_vgpr(6), neg_inf)
+
+    def test_normal_extremes_and_packed_f16(self) -> None:
+        flt_max = 0x7F7F_FFFF
+        flt_min = 0x0080_0000
+        # Packed dual half-precision floats: +inf, +inf -> 0x7C007C00
+        packed_f16 = 0x7C00_7C00
+        interp = ScalarInterpreter()
+        interp.rf.set_vgpr(10, flt_max)
+        interp.rf.set_vgpr(11, flt_min)
+        interp.rf.set_vgpr(12, packed_f16)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_V, vdata=Register(10, RegKind.VGPR), offset=0)
+        interp.step(instr)
+
+        self.assertEqual(interp.rf.get_vgpr(10), flt_max)
+        self.assertEqual(interp.rf.get_vgpr(11), flt_min)
+        self.assertEqual(interp.rf.get_vgpr(12), packed_f16)
+
+
 if __name__ == "__main__":
     unittest.main()
