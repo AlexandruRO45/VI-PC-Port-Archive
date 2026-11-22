@@ -292,6 +292,7 @@ class ScalarInterpreter:
         Returns:
             (old_mem_val, new_mem_val, modified)
         """
+        # Hardware latches source operands before writeback
         vaddr = state.get_vgpr(instr.addr.index)
         vdata = self.resolve_operand(instr.data, state)
 
@@ -814,6 +815,159 @@ class TestLdsMaxRtnU32SIMD(unittest.TestCase):
 
         # Final memory must be 50
         self.assertEqual(state.lds.read_dword(target_addr), 50)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestLdsMaxRtnU32Aliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and operand preservation."""
+
+    def test_alias_dst_equals_addr(self) -> None:
+        """vdst == vaddr: v0 is both destination and address register."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x200
+        state.lds.write_dword(addr, 1234)
+        state.set_vgpr(0, addr)  # v0 = addr
+        state.set_vgpr(1, 5678)  # v1 = data
+
+        # ds_max_rtn_u32 v0, v0, v1
+        inst = DSMaxRtnU32Instruction(
+            opcode=Opcode.DS_MAX_RTN_U32,
+            dst=VGPR(0),
+            addr=VGPR(0),
+            data=VGPR(1),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, 1234)
+        self.assertEqual(new_val, 5678)
+        self.assertTrue(mod)
+        # v0 receives old value 1234
+        self.assertEqual(state.get_vgpr(0), 1234)
+        # Memory at 0x200 updated to 5678
+        self.assertEqual(state.lds.read_dword(addr), 5678)
+
+    def test_alias_dst_equals_data(self) -> None:
+        """vdst == vdata: v1 is both destination and data register."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr = 0x300
+        state.lds.write_dword(addr, 200)
+        state.set_vgpr(0, addr)  # v0 = addr
+        state.set_vgpr(1, 400)   # v1 = data
+
+        # ds_max_rtn_u32 v1, v0, v1
+        inst = DSMaxRtnU32Instruction(
+            opcode=Opcode.DS_MAX_RTN_U32,
+            dst=VGPR(1),
+            addr=VGPR(0),
+            data=VGPR(1),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, 200)
+        self.assertEqual(new_val, 400)
+        self.assertTrue(mod)
+        # v1 receives old value 200
+        self.assertEqual(state.get_vgpr(1), 200)
+        # Memory updated to max(200, 400) = 400
+        self.assertEqual(state.lds.read_dword(addr), 400)
+
+    def test_alias_addr_equals_data(self) -> None:
+        """vaddr == vdata: v0 is both address and data."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        # Let addr and data be 0x100 (256)
+        state.lds.write_dword(0x100, 100)
+        state.set_vgpr(0, 0x100)
+
+        # ds_max_rtn_u32 v2, v0, v0
+        inst = DSMaxRtnU32Instruction(
+            opcode=Opcode.DS_MAX_RTN_U32,
+            dst=VGPR(2),
+            addr=VGPR(0),
+            data=VGPR(0),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, 100)
+        self.assertEqual(new_val, 256)
+        self.assertTrue(mod)
+        self.assertEqual(state.get_vgpr(2), 100)
+        # v0 remains preserved as 0x100
+        self.assertEqual(state.get_vgpr(0), 0x100)
+        self.assertEqual(state.lds.read_dword(0x100), 256)
+
+    def test_alias_tri_dst_addr_data(self) -> None:
+        """vdst == vaddr == vdata: v0 is dst, addr, and data."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        addr_val = 0x80  # 128
+        state.lds.write_dword(addr_val, 50)
+        state.set_vgpr(0, addr_val)
+
+        # ds_max_rtn_u32 v0, v0, v0
+        inst = DSMaxRtnU32Instruction(
+            opcode=Opcode.DS_MAX_RTN_U32,
+            dst=VGPR(0),
+            addr=VGPR(0),
+            data=VGPR(0),
+        )
+
+        old_val, new_val, mod = interp.step(inst, state)
+        self.assertEqual(old_val, 50)
+        self.assertEqual(new_val, 128)
+        self.assertTrue(mod)
+        # v0 overwritten with old_val (50)
+        self.assertEqual(state.get_vgpr(0), 50)
+        # Memory at 128 updated to 128
+        self.assertEqual(state.lds.read_dword(addr_val), 128)
+
+    def test_simd_multi_lane_aliasing(self) -> None:
+        """SIMD wave with mixed aliased operands across lanes."""
+        state = SIMDState(num_lanes=32, exec_mask=0x7)  # lanes 0, 1, 2
+        interp = SIMDInterpreter()
+
+        # Lane 0: vdst == vaddr
+        state.lds.write_dword(0x10, 10)
+        state.set_vgpr(0, 0, 0x10)  # v0: addr
+        state.set_vgpr(0, 1, 30)    # v1: data
+
+        # Lane 1: vdst == vaddr
+        state.lds.write_dword(0x20, 40)
+        state.set_vgpr(1, 0, 0x20)  # v0: addr
+        state.set_vgpr(1, 1, 25)    # v1: data (less than 40)
+
+        # Lane 2: vdst == vaddr
+        state.lds.write_dword(0x30, 100)
+        state.set_vgpr(2, 0, 0x30)
+        state.set_vgpr(2, 1, 200)
+
+        inst = DSMaxRtnU32Instruction(Opcode.DS_MAX_RTN_U32, VGPR(0), VGPR(0), VGPR(1))
+        results = interp.step(inst, state)
+
+        self.assertEqual(len(results), 3)
+        # Lane 0
+        self.assertEqual(results[0], (0, 10, 30))
+        self.assertEqual(state.get_vgpr(0, 0), 10)
+        self.assertEqual(state.lds.read_dword(0x10), 30)
+
+        # Lane 1
+        self.assertEqual(results[1], (1, 40, 40))
+        self.assertEqual(state.get_vgpr(1, 0), 40)
+        self.assertEqual(state.lds.read_dword(0x20), 40)
+
+        # Lane 2
+        self.assertEqual(results[2], (2, 100, 200))
+        self.assertEqual(state.get_vgpr(2, 0), 100)
+        self.assertEqual(state.lds.read_dword(0x30), 200)
 
 
 if __name__ == "__main__":
