@@ -171,10 +171,31 @@ def main(argv=None) -> int:
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
     a = ap.parse_args(argv)
+    tools_dir = os.path.dirname(os.path.abspath(__file__))
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    from report_paths import same_report_path  # noqa: E402
+
+    if os.path.exists(a.out) and not os.path.isdir(a.out):
+        print(f"ERROR: --out {a.out} is not a directory", file=sys.stderr)
+        return 2
+    for path in a.files:
+        if same_report_path(path, a.out):
+            print(f"ERROR: --out {a.out} collides with input {path}", file=sys.stderr)
+            return 2
+        if not os.path.exists(path):
+            print(f"ERROR: {path} does not exist", file=sys.stderr)
+            return 2
+        if os.path.isdir(path):
+            print(f"ERROR: {path} is a directory, not a file", file=sys.stderr)
+            return 2
+        if not os.path.isfile(path):
+            print(f"ERROR: {path} is not a file", file=sys.stderr)
+            return 2
+
     os.makedirs(os.path.join(a.out, "fspx"), exist_ok=True)
     disasm = None
     if a.disasm:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import shader_disasm  # noqa: E402  (resolves LLVM_MC at import)
         disasm = shader_disasm
         os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
@@ -220,7 +241,11 @@ def main(argv=None) -> int:
             if "wave32" in meta:
                 entry["wave32"] = meta["wave32"]
             if container:
-                with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
+                out_dxbc = os.path.join(a.out, name + ".dxbc")
+                if any(same_report_path(out_dxbc, p) for p in a.files):
+                    print(f"ERROR: {out_dxbc} would overwrite input file", file=sys.stderr)
+                    return 2
+                with open(out_dxbc, "wb") as f:
                     f.write(container)
             with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
                 f.write(blob[6])
