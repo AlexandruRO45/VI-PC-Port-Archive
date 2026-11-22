@@ -873,6 +873,97 @@ class TestValuLshlAddU32IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(neg_inf, NEG_INF_F32)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuLshlAddU32NegativeControls(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_lshl_add_u32."""
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3Operand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VLshlAddU32Instruction(dst=dst_sgpr, src0=src, src1=src, src2=src)
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_operand_order_reversal(self) -> None:
+        # (s0 << s1) + s2 vs (s0 << s2) + s1
+        s0, s1, s2 = 10, 2, 50
+        correct = oracle_v_lshl_add_u32(s0, s1, s2)
+        swapped = oracle_v_lshl_add_u32(s0, s2, s1)
+        self.assertNotEqual(correct, swapped)
+
+    def test_negative_control_add_then_shift_order(self) -> None:
+        # (s0 << s1) + s2 vs (s0 + s2) << s1
+        s0, s1, s2 = 4, 3, 10
+        correct = oracle_v_lshl_add_u32(s0, s1, s2)  # (4 << 3) + 10 = 32 + 10 = 42
+        wrong_order = ((s0 + s2) << s1) & MASK32     # (4 + 10) << 3 = 14 * 8 = 112
+        self.assertNotEqual(correct, wrong_order)
+
+    def test_negative_control_unmasked_shift_count(self) -> None:
+        s0 = 1
+        s1 = 33  # & 0x1F gives 1
+        correct = oracle_v_lshl_add_u32(s0, s1, 0)
+        unmasked = (s0 << s1) & MASK32  # 1 << 33 = 0x200000000 -> 0 when masked to 32 bits
+        self.assertEqual(correct, 2)
+        self.assertEqual(unmasked, 0)
+        self.assertNotEqual(correct, unmasked)
+
+    def test_negative_control_missing_modulo_truncation(self) -> None:
+        s0 = 0x80000000
+        s1 = 1
+        s2 = 0x80000000
+        correct = oracle_v_lshl_add_u32(s0, s1, s2)
+        # Without modulo 32-bit truncation:
+        untruncated = (s0 << s1) + s2
+        self.assertEqual(correct, 0x80000000)
+        self.assertNotEqual(correct, untruncated)
+
+    def test_mutation_bitwise_or_instead_of_addition(self) -> None:
+        """Mutant: Use bitwise OR instead of addition."""
+        def mutant_lshl_or(s0: int, s1: int, s2: int) -> int:
+            return ((s0 << (s1 & 0x1F)) | s2) & MASK32
+
+        # When shifted and s2 have overlapping set bits:
+        s0, s1, s2 = 1, 2, 4  # (1 << 2) = 4, 4 + 4 = 8, but 4 | 4 = 4
+        correct = oracle_v_lshl_add_u32(s0, s1, s2)
+        mutant = mutant_lshl_or(s0, s1, s2)
+        self.assertEqual(correct, 8)
+        self.assertEqual(mutant, 4)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_shift_right_instead_of_left(self) -> None:
+        """Mutant: Use logical shift right (lshr) instead of shift left."""
+        def mutant_lshr_add(s0: int, s1: int, s2: int) -> int:
+            return ((s0 >> (s1 & 0x1F)) + s2) & MASK32
+
+        s0, s1, s2 = 16, 2, 0
+        correct = oracle_v_lshl_add_u32(s0, s1, s2)
+        mutant = mutant_lshr_add(s0, s1, s2)
+        self.assertEqual(correct, 64)
+        self.assertEqual(mutant, 4)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_off_by_one_shift(self) -> None:
+        """Mutant: Shift by (s1 & 0x1F) + 1."""
+        def mutant_off_by_one(s0: int, s1: int, s2: int) -> int:
+            return ((s0 << ((s1 & 0x1F) + 1)) + s2) & MASK32
+
+        s0, s1, s2 = 5, 2, 0
+        correct = oracle_v_lshl_add_u32(s0, s1, s2)
+        mutant = mutant_off_by_one(s0, s1, s2)
+        self.assertEqual(correct, 20)
+        self.assertEqual(mutant, 40)
+        self.assertNotEqual(correct, mutant)
+
+
+
 
 
 
