@@ -62,21 +62,6 @@ SENTINEL = 0x5A5A5A5A
 # Live translator divergences confirmed on AMD Radeon 680M (gfx1035, RDNA2, wave32 & wave64).
 # Each entry maps case.name -> (tag, expected_hw_words, reason).
 KNOWN_DIVERGENCES = {
-    "v_add_co_u32_clamp": (
-        "co_clamp_ignored",
-        [0xFFFFFFFF, 0x00000001, 0x00000000, 0x00000001],
-        "translator ignores VOP3 clamp on v_add_co_u32 / v_sub_co_u32",
-    ),
-    "v_subrev_co_u32_clamp": (
-        "co_clamp_ignored",
-        [0x00000000, 0x00000001, 0x00000000, 0x00000001],
-        "translator ignores VOP3 clamp on v_subrev_co_u32 / v_subrev_co_ci_u32",
-    ),
-    "v_add_co_ci_u32_clamp": (
-        "co_clamp_ignored",
-        [0xFFFFFFFF, 0x00000001, 0x00000000, 0x00000001],
-        "translator ignores VOP3 clamp on v_add_co_ci_u32 / v_sub_co_ci_u32",
-    ),
     "v_cvt_rpi_precision": (
         "cvt_rpi_exact_half",
         [0x00000000, 0x00800001, 0x00FFFFFF, 0x00000000],
