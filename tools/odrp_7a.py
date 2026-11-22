@@ -40,6 +40,11 @@ import sys
 import time
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import gap_split  # noqa: E402
+
 SIGNATURE = b"0DRP"
 VERSION = 0x7A
 PSIN_MAGIC = b"PSIN"
@@ -818,10 +823,6 @@ class _StreamConsumer:
         return self.rows
 
 
-def _gap_bytes(gap):
-    return (len(gap), 0) if gap.count(0) == len(gap) else (0, len(gap))
-
-
 def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
     """Walk an RPF9 archive data area inside `[start, start + limit)`. No TOC is touched."""
     t0 = time.time()
@@ -858,7 +859,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                         pos = s + 1
                         continue
                     consumer._flush_pending()
-                    z, u = _gap_bytes(m[last:s])
+                    z, u = gap_split(m, last, s)
                     zero += z
                     unread += u
                     stream_count += 1
@@ -926,7 +927,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     pos = s + 1
                     continue
                 used = p - s - len(d.unused_data)
-                z, u = _gap_bytes(m[last:s])
+                z, u = gap_split(m, last, s)
                 zero += z
                 unread += u
                 if keep_full or not decided:
@@ -945,7 +946,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                 inflated_bytes += total
                 last = pos = s + used
 
-            z, u = _gap_bytes(m[last:end])
+            z, u = gap_split(m, last, end)
             zero += z
             unread += u
 

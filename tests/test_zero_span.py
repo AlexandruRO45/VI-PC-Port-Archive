@@ -33,6 +33,8 @@ SCANNERS = {
     "anim_index": ["{arc}", "{out}/anim.json", "--quiet"],
     "restofworld_index": ["{arc}", "{out}/row.json", "--quiet"],
     "story_index": ["{arc}", "{out}/story.json", "--quiet"],
+    "odrp_7a": ["{arc}", "{out}/odrp.json", "--quiet"],
+    "restofworld_model_join": ["{arc}", "{out}/join.json", "--quiet"],
 }
 
 # Runs a tool as __main__ under tracemalloc and prints its exit code and heap peak as JSON on the last line.

@@ -46,6 +46,11 @@ import sys
 import time
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from zero_span import all_zero  # noqa: E402
+
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
 SYS_BASE = 0x50000000
 GFX_BASE = 0x60000000
@@ -945,15 +950,14 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     if not (64 <= blen <= end - s and 16 <= w <= 8192 and 16 <= h <= 8192):
                         pos = s + 1
                         continue
-                    gap = m[last:s]
                     streams.append({
                         "stream_index": len(streams),
                         "offset": s,
                         "stored": blen,
                         "size": blen,
                         "kind": "bink2",
-                        "gap_len": len(gap),
-                        "gap_zero": gap.count(0) == len(gap),
+                        "gap_len": s - last,
+                        "gap_zero": all_zero(m, last, s),
                         "align4k_plus16": (s & 0xFFF) == 0x10,
                         "pre16_zero": s >= 16 and m[s - 16:s] == b"\x00" * 16,
                         "zero_prefix": False,
@@ -975,15 +979,14 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                         skipped += 1
                     pos = s + 1
                     continue
-                gap = m[last:s]
                 meta = {
                     "stream_index": len(streams),
                     "offset": s,
                     "stored": used,
                     "size": len(data),
                     "kind": "zlib",
-                    "gap_len": len(gap),
-                    "gap_zero": gap.count(0) == len(gap),
+                    "gap_len": s - last,
+                    "gap_zero": all_zero(m, last, s),
                     "align4k_plus16": (s & 0xFFF) == 0x10,
                     "pre16_zero": s >= 16 and m[s - 16:s] == b"\x00" * 16,
                     "zero_prefix": data[:8] == b"\x00" * 8,
