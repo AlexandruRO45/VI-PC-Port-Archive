@@ -7,9 +7,9 @@ The profile accepts:
 - the constant loads FLD1, FLDZ, FLDPI, FLDL2T, FLDL2E, FLDLG2 and FLDLN2;
 - FILD, FISTP and FISTTP with an m16, m32 or m64 integer operand, and FIST with m16 or m32;
 - FCOMI, FCOMIP, FUCOMI and FUCOMIP ST(0), ST(i), which set ZF and CF and clear OF for the integer
-  lowering (PF is not modelled, so a JP or JNP after them is rejected, and so is every other reader of PF);
-- FCMOVB, FCMOVE, FCMOVBE, FCMOVNB, FCMOVNE and FCMOVNBE ST(0), ST(i), which read ZF and CF (FCMOVU
-  and FCMOVNU read PF and stay outside the profile);
+  lowering, and PF in a function with a JP, JNP, FCMOVU or FCMOVNU;
+- FCMOVB, FCMOVE, FCMOVBE, FCMOVNB, FCMOVNE, FCMOVNBE, FCMOVU and FCMOVNU ST(0), ST(i), which read ZF,
+  CF and PF;
 - FCOM and FCOMP with ST(i) or an m32 or m64 operand, FCOMPP, FUCOM and FUCOMP ST(i) and FUCOMPP, which
   set C0, C2 and C3 of the status word, and FNSTSW AX, which copies the status word to AX (see below);
 - FADD, FSUB, FSUBR, FMUL, FDIV and FDIVR with an m32 or m64 operand, with ST(0), ST(i) and with
@@ -32,8 +32,9 @@ source must include before the lowered functions (X87_HEADER).
 Flags and the status word. In a function with an FCMOV, FNSTSW, SAHF, JP or JNP, each status flag that
 any instruction reads must be defined on every path from the entry: the caller's flags are not an input
 of the lowered function, a call leaves them undefined, and ADC, SBB, RCL, RCR and CMC carry an undefined
-CF on into the flags and registers they write. The integer lowering models PF only after SAHF and an
-8-bit TEST or AND, so a reader of PF that another instruction may have written last is rejected. SAHF,
+CF on into the flags and registers they write. The integer lowering models PF only after SAHF, the FCOMI
+family and an 8-bit TEST or AND, so a reader of PF that another instruction may have written last is
+rejected. SAHF,
 JP and JNP are accepted only in such a function. C0, C2 and C3 are known after a comparison into the
 status word and unknown at the entry. FCOMI, FCOMIP, FUCOMI and FUCOMIP leave them as they were, and
 every other x87 instruction leaves them undefined, as the SDM states, including WAIT (so FSTSW AX, which
@@ -68,7 +69,7 @@ IARITHMETIC = {M.FIADD: "x87_add", M.FISUB: "x87_sub", M.FISUBR: "x87_subr", M.F
                M.FIDIV: "x87_div", M.FIDIVR: "x87_divr"}
 # Conditional register moves and the C++ condition each reads from the integer lowering's flags.
 FCMOV = {M.FCMOVB: "carry", M.FCMOVE: "zero", M.FCMOVBE: "carry || zero", M.FCMOVNB: "!carry",
-         M.FCMOVNE: "!zero", M.FCMOVNBE: "!carry && !zero"}
+         M.FCMOVNE: "!zero", M.FCMOVNBE: "!carry && !zero", M.FCMOVU: "parity", M.FCMOVNU: "!parity"}
 X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FRNDINT, M.FLD1, M.FLDZ, M.FLDPI, M.FLDL2T, M.FLDL2E,
                      M.FLDLG2, M.FLDLN2, M.FILD, M.FIST, M.FISTP, M.FISTTP, M.FXTRACT, M.FSCALE, *FCMOV, M.FCOMI,
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
@@ -376,8 +377,9 @@ _INFO = InstructionInfoFactory()
 
 
 def assigns_parity(i):
-    """Whether the integer lowering sets PF for i: SAHF, and TEST and AND with an 8-bit destination."""
-    if i.mnemonic == M.SAHF:
+    """Whether the integer lowering sets PF for i: SAHF, the FCOMI family, and TEST and AND with an 8-bit
+    destination."""
+    if i.mnemonic == M.SAHF or i.mnemonic in COMPARES:
         return True
     if i.mnemonic not in (M.TEST, M.AND):
         return False
@@ -511,8 +513,8 @@ def check_flags(body, exits):
             raise ValueError(f"{i} at {i.ip:#x} reads {names}, which no instruction defines on every path from "
                              "the entry")
         if i.rflags_read & F.PF and not s.parity:
-            raise ValueError(f"{i} at {i.ip:#x} reads PF, which the integer lowering models only after SAHF "
-                             "and an 8-bit TEST or AND")
+            raise ValueError(f"{i} at {i.ip:#x} reads PF, which the integer lowering models only after SAHF, "
+                             "FCOMI, FCOMIP, FUCOMI, FUCOMIP and an 8-bit TEST or AND")
         unknown = 0xFFFF & ~s.ax
         if not unknown:
             continue
@@ -531,9 +533,10 @@ def check_flags(body, exits):
                                  f"{i.ip:#x} -> {target:#x}")
 
 
-def statement(i, depth, address, checked=None):
+def statement(i, depth, address, checked=None, parity=False):
     """C++ for one profile instruction at a known stack depth; address() gives the memory operand. checked
-    is the Checked entry's error channel, or None for the fixed control word."""
+    is the Checked entry's error channel, or None for the fixed control word. parity is whether the function
+    declares the integer lowering's PF, which the FCOMI family then sets."""
     op = i.mnemonic
     _effect(i, depth, checked)
     top = depth - 1  # ST(k) is x87_slot[top - k]
@@ -574,9 +577,10 @@ def statement(i, depth, address, checked=None):
                 "x87_sw = static_cast<uint16_t>(r == 0 ? 0x0100 : r == 1 ? 0x4000 : r == 3 ? 0x4500 : 0); }  "
                 f"// {name}")
     if op in COMPARES:  # ZF and CF: 1 and 0 for equal, 0 and 1 for less, 0 and 0 for greater, 1 and 1 unordered
-        k = top - (i.op1_register - R.ST0)  # OF is always cleared
+        k = top - (i.op1_register - R.ST0)  # OF is always cleared, and PF is 1 only for unordered
         return (f"{{ const int r = x87_compare(x87_slot[{top}], x87_slot[{k}]); "
-                f"zero = r == 1 || r == 3; carry = r == 0 || r == 3; overflow = false; }}")
+                f"{'parity = r == 3; ' if parity else ''}zero = r == 1 || r == 3; carry = r == 0 || r == 3; "
+                "overflow = false; }")
     if op in (M.FILD, M.FIST, M.FISTP, M.FISTTP):
         signed, unsigned, bits = INTEGERS[i.memory_size]
         if op == M.FILD:
