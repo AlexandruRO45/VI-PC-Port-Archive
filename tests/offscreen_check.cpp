@@ -362,6 +362,8 @@ int main(int argc, char** argv)
     const std::string_view operation = argv[2];
     if (operation == "--check-pixel-batch") {
         if (argc < 5) return 2;
+    } else if (operation == "--compute-to-pixel") {
+        if (argc != 6 && argc != 7) return 2;
     } else if (operation == "--check-pixel-quad-lod") {
         if (argc != 4) return 2;
     } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
@@ -482,6 +484,8 @@ int main(int argc, char** argv)
             check_sampled_coverage(device.Get(), argv[3], argv[4]);
         } else if (argc == 5 && operation == "--check-pixel-case") {
             check_translated_pixel(device.Get(), argv[3], false, argv[4]);
+        } else if (operation == "--compute-to-pixel") {
+            check_compute_to_pixel(device.Get(), argv[3], argv[4], argv[5], argc == 7 ? argv[6] : nullptr);
         } else if (argc == 5 && (operation == "--check-pixel-attribute" || operation == "--check-pixel-attribute-rg")) {
             check_attribute_pixel(device.Get(), argv[3], argv[4], operation == "--check-pixel-attribute-rg");
         } else if (argc == 5 && operation == "--check-pixel-case-rg") {

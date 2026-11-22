@@ -808,7 +808,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_float_${variant} scalar_float)
         cpu_translation(cpu_float_${variant} cpu_sse_aot
-            "blend_ss=f:ffqf,blend_sd=d:ddqd,convert=q:fdq,from_int=d:qq,classify_ss=q:ff,classify_sd=q:dq,round_trip=f:f,zero_xorps=d:d,zero_pxor=d:d,zero_xorpd=d:d")
+            "blend_ss=f:ffqf,blend_sd=d:ddqd,convert=q:fdq,from_int=d:qq,classify_ss=q:ff,classify_sd=q:dq,round_trip=f:f,zero_xorps=d:d,zero_pxor=d:d,zero_xorpd=d:d,probe_ss=q:qff")
         add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cpu_float_${variant}_lifted.cpp" APPEND
             DEPENDS tools/cpu_switch_aot.py)
     endforeach()
@@ -1630,6 +1630,26 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_status COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_status.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_status>"
         "$<TARGET_FILE:cpu_x87_status_lifted>" ${x87_status_control_files})
+    cpu_asm_fixture(cpu_x87_parity x87_parity)
+    # The lifted DLL and five mutated controls that the check requires to mismatch.
+    set(x87_parity_control_files "")
+    foreach(variant IN ITEMS lifted pfnever pfequal pfkeep uinvert nuinvert)
+        set(x87_parity_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_parity_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_parity_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_parity.py"
+                emit "$<TARGET_FILE:cpu_x87_parity>" "${x87_parity_fixture}" ${variant}
+            DEPENDS cpu_x87_parity tests/cpu/x87_parity.py tests/cpu/x87_status.py tests/cpu/x87_compare.py
+                tests/cpu/x87_moves.py tests/cpu/x87_div.py tests/cpu/x87_mul.py tests/cpu/x87_sub.py
+                tests/cpu/x87_add.py tools/ffx_version_query.py tools/x87_lower.py tools/x87_soft.h
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_parity_${variant} SHARED "${x87_parity_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_parity_control_files "$<TARGET_FILE:cpu_x87_parity_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_parity COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_parity.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_parity>"
+        "$<TARGET_FILE:cpu_x87_parity_lifted>" ${x87_parity_control_files})
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
@@ -2165,6 +2185,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_${adapter} PROPERTIES TIMEOUT 45)
+        add_test(NAME compute_to_pixel_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_to_pixel_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_to_pixel_${adapter} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
         add_test(NAME cpu_native_frame_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/cpu/native_frame_check.py" "$<TARGET_FILE:cpu_frame_guest>"
             "$<TARGET_FILE:cpu_tls_sink>" "$<TARGET_FILE:cpu_frame_host>" "$<TARGET_FILE:pe_map>"

@@ -114,11 +114,13 @@ It may be reached by call or jmp QWORD PTR [rip+slot], or by a direct CALL or
 JMP of an import thunk: the six bytes FF 25 disp32 at a target outside every
 unwind interval and bound range, read as a call or tail jump through their
 slot. A call or thunk counts only when its slot is one of the ordinary import
-directory; the slot must be eight bytes of one readable section. The
-translation calls the bound import and does not read the slot, which the loader
-fills before the image's code runs: the original's read cannot fault while that
-code runs, and a later change of the slot, such as a hook, is not followed. A
-call becomes "rax = import(...);" under the rules of a direct call above: RSP 8
+directory; the slot must be eight bytes of one section marked readable.
+Those checks establish the slot identity and expected initial mapping. During
+execution of the original and its translation, the caller must keep the image
+and bound target valid and ensure the slot stays readable and contains that
+target. The translation directly calls the binding. Delay-loaded imports,
+rebinding and page protection changes are outside this contract. A call becomes
+"rax = import(...);" under the rules of a direct call above: RSP 8
 mod 16, the home space below the return address, and each register of the
 binding's argument count (RCX, RDX, R8, then R9) fully defined. After it RAX
 holds the binding's number of guaranteed low bytes, none for 0, and the other
@@ -534,7 +536,8 @@ class Function:
             elif flow == FlowControl.CONDITIONAL_BRANCH and ins.is_jcc_short_or_near:
                 targets = [ins.near_branch_target, ins.next_ip]
             elif (flow == FlowControl.UNCONDITIONAL_BRANCH and ins.is_jmp_short_or_near
-                  and not self.owns(ins.near_branch_target) and self.thunk_slot(ins) in self.entries.import_slots):
+                  and self.entries.import_slots and not self.owns(ins.near_branch_target)
+                  and self.thunk_slot(ins) in self.entries.import_slots):
                 # A jump to an import thunk is a tail jump through the thunk's slot.
                 slot = self.thunk_slot(ins)
                 self.host_calls[ip] = self.bound_import(
@@ -554,7 +557,7 @@ class Function:
                 self.tails[ip] = slot
                 targets = []
             elif flow == FlowControl.CALL and ins.is_call_near:
-                slot = self.thunk_slot(ins)
+                slot = self.thunk_slot(ins) if imports or self.entries.import_slots else None
                 if slot is not None and imports and slot in imports:
                     self.host_calls[ip] = imports[slot]
                     self.calls[ip] = slot
@@ -1867,7 +1870,8 @@ if __name__ == "__main__":
                         help="trusted [start, end) ranges of functions without unwind data, bound to this image's sha256")
     parser.add_argument("--bind", nargs=2, metavar=("PROVIDER_DLL", "SYMBOL"),
                         help="provider and export name or #ordinal of the import that calls and tail jumps "
-                             "through the import address table reach")
+                             "through the import address table reach. The image and target must stay valid and "
+                             "the original slot must stay readable and contain that target throughout execution")
     parser.add_argument("--link-name", help="local import-library symbol for an ordinal binding")
     parser.add_argument("--import-arguments", type=int, choices=ARGUMENT_COUNTS,
                         help="integer arguments the bound import takes; stated by the binding, not derived from "

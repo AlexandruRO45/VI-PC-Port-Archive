@@ -256,6 +256,200 @@ VOP1_OPS = {
     0x38: ("v_bfrev_b32_e32", "Vector bit-reverse"),
 }
 
+VOPC_OPS = {
+    0x00: ("v_cmp_f_f32_e32", "Vector compare v_cmp_f_f32"),
+    0x01: ("v_cmp_lt_f32_e32", "Vector compare v_cmp_lt_f32"),
+    0x02: ("v_cmp_eq_f32_e32", "Vector compare v_cmp_eq_f32"),
+    0x03: ("v_cmp_le_f32_e32", "Vector compare v_cmp_le_f32"),
+    0x04: ("v_cmp_gt_f32_e32", "Vector compare v_cmp_gt_f32"),
+    0x05: ("v_cmp_lg_f32_e32", "Vector compare v_cmp_lg_f32"),
+    0x06: ("v_cmp_ge_f32_e32", "Vector compare v_cmp_ge_f32"),
+    0x07: ("v_cmp_o_f32_e32", "Vector compare v_cmp_o_f32"),
+    0x08: ("v_cmp_u_f32_e32", "Vector compare v_cmp_u_f32"),
+    0x09: ("v_cmp_nge_f32_e32", "Vector compare v_cmp_nge_f32"),
+    0x0a: ("v_cmp_nlg_f32_e32", "Vector compare v_cmp_nlg_f32"),
+    0x0b: ("v_cmp_ngt_f32_e32", "Vector compare v_cmp_ngt_f32"),
+    0x0c: ("v_cmp_nle_f32_e32", "Vector compare v_cmp_nle_f32"),
+    0x0d: ("v_cmp_neq_f32_e32", "Vector compare v_cmp_neq_f32"),
+    0x0e: ("v_cmp_nlt_f32_e32", "Vector compare v_cmp_nlt_f32"),
+    0x0f: ("v_cmp_tru_f32_e32", "Vector compare v_cmp_tru_f32"),
+    0x10: ("v_cmpx_f_f32_e32", "Vector compare v_cmpx_f_f32"),
+    0x11: ("v_cmpx_lt_f32_e32", "Vector compare v_cmpx_lt_f32"),
+    0x12: ("v_cmpx_eq_f32_e32", "Vector compare v_cmpx_eq_f32"),
+    0x13: ("v_cmpx_le_f32_e32", "Vector compare v_cmpx_le_f32"),
+    0x14: ("v_cmpx_gt_f32_e32", "Vector compare v_cmpx_gt_f32"),
+    0x15: ("v_cmpx_lg_f32_e32", "Vector compare v_cmpx_lg_f32"),
+    0x16: ("v_cmpx_ge_f32_e32", "Vector compare v_cmpx_ge_f32"),
+    0x17: ("v_cmpx_o_f32_e32", "Vector compare v_cmpx_o_f32"),
+    0x18: ("v_cmpx_u_f32_e32", "Vector compare v_cmpx_u_f32"),
+    0x19: ("v_cmpx_nge_f32_e32", "Vector compare v_cmpx_nge_f32"),
+    0x1a: ("v_cmpx_nlg_f32_e32", "Vector compare v_cmpx_nlg_f32"),
+    0x1b: ("v_cmpx_ngt_f32_e32", "Vector compare v_cmpx_ngt_f32"),
+    0x1c: ("v_cmpx_nle_f32_e32", "Vector compare v_cmpx_nle_f32"),
+    0x1d: ("v_cmpx_neq_f32_e32", "Vector compare v_cmpx_neq_f32"),
+    0x1e: ("v_cmpx_nlt_f32_e32", "Vector compare v_cmpx_nlt_f32"),
+    0x1f: ("v_cmpx_tru_f32_e32", "Vector compare v_cmpx_tru_f32"),
+    0x20: ("v_cmp_f_f64_e32", "Vector compare v_cmp_f_f64"),
+    0x21: ("v_cmp_lt_f64_e32", "Vector compare v_cmp_lt_f64"),
+    0x22: ("v_cmp_eq_f64_e32", "Vector compare v_cmp_eq_f64"),
+    0x23: ("v_cmp_le_f64_e32", "Vector compare v_cmp_le_f64"),
+    0x24: ("v_cmp_gt_f64_e32", "Vector compare v_cmp_gt_f64"),
+    0x25: ("v_cmp_lg_f64_e32", "Vector compare v_cmp_lg_f64"),
+    0x26: ("v_cmp_ge_f64_e32", "Vector compare v_cmp_ge_f64"),
+    0x27: ("v_cmp_o_f64_e32", "Vector compare v_cmp_o_f64"),
+    0x28: ("v_cmp_u_f64_e32", "Vector compare v_cmp_u_f64"),
+    0x29: ("v_cmp_nge_f64_e32", "Vector compare v_cmp_nge_f64"),
+    0x2a: ("v_cmp_nlg_f64_e32", "Vector compare v_cmp_nlg_f64"),
+    0x2b: ("v_cmp_ngt_f64_e32", "Vector compare v_cmp_ngt_f64"),
+    0x2c: ("v_cmp_nle_f64_e32", "Vector compare v_cmp_nle_f64"),
+    0x2d: ("v_cmp_neq_f64_e32", "Vector compare v_cmp_neq_f64"),
+    0x2e: ("v_cmp_nlt_f64_e32", "Vector compare v_cmp_nlt_f64"),
+    0x2f: ("v_cmp_tru_f64_e32", "Vector compare v_cmp_tru_f64"),
+    0x30: ("v_cmpx_f_f64_e32", "Vector compare v_cmpx_f_f64"),
+    0x31: ("v_cmpx_lt_f64_e32", "Vector compare v_cmpx_lt_f64"),
+    0x32: ("v_cmpx_eq_f64_e32", "Vector compare v_cmpx_eq_f64"),
+    0x33: ("v_cmpx_le_f64_e32", "Vector compare v_cmpx_le_f64"),
+    0x34: ("v_cmpx_gt_f64_e32", "Vector compare v_cmpx_gt_f64"),
+    0x35: ("v_cmpx_lg_f64_e32", "Vector compare v_cmpx_lg_f64"),
+    0x36: ("v_cmpx_ge_f64_e32", "Vector compare v_cmpx_ge_f64"),
+    0x37: ("v_cmpx_o_f64_e32", "Vector compare v_cmpx_o_f64"),
+    0x38: ("v_cmpx_u_f64_e32", "Vector compare v_cmpx_u_f64"),
+    0x39: ("v_cmpx_nge_f64_e32", "Vector compare v_cmpx_nge_f64"),
+    0x3a: ("v_cmpx_nlg_f64_e32", "Vector compare v_cmpx_nlg_f64"),
+    0x3b: ("v_cmpx_ngt_f64_e32", "Vector compare v_cmpx_ngt_f64"),
+    0x3c: ("v_cmpx_nle_f64_e32", "Vector compare v_cmpx_nle_f64"),
+    0x3d: ("v_cmpx_neq_f64_e32", "Vector compare v_cmpx_neq_f64"),
+    0x3e: ("v_cmpx_nlt_f64_e32", "Vector compare v_cmpx_nlt_f64"),
+    0x3f: ("v_cmpx_tru_f64_e32", "Vector compare v_cmpx_tru_f64"),
+    0x80: ("v_cmp_f_i32_e32", "Vector compare v_cmp_f_i32"),
+    0x81: ("v_cmp_lt_i32_e32", "Vector compare v_cmp_lt_i32"),
+    0x82: ("v_cmp_eq_i32_e32", "Vector compare v_cmp_eq_i32"),
+    0x83: ("v_cmp_le_i32_e32", "Vector compare v_cmp_le_i32"),
+    0x84: ("v_cmp_gt_i32_e32", "Vector compare v_cmp_gt_i32"),
+    0x85: ("v_cmp_ne_i32_e32", "Vector compare v_cmp_ne_i32"),
+    0x86: ("v_cmp_ge_i32_e32", "Vector compare v_cmp_ge_i32"),
+    0x87: ("v_cmp_t_i32_e32", "Vector compare v_cmp_t_i32"),
+    0x88: ("v_cmp_class_f32_e32", "Vector compare v_cmp_class_f32"),
+    0x89: ("v_cmp_lt_i16_e32", "Vector compare v_cmp_lt_i16"),
+    0x8a: ("v_cmp_eq_i16_e32", "Vector compare v_cmp_eq_i16"),
+    0x8b: ("v_cmp_le_i16_e32", "Vector compare v_cmp_le_i16"),
+    0x8c: ("v_cmp_gt_i16_e32", "Vector compare v_cmp_gt_i16"),
+    0x8d: ("v_cmp_ne_i16_e32", "Vector compare v_cmp_ne_i16"),
+    0x8e: ("v_cmp_ge_i16_e32", "Vector compare v_cmp_ge_i16"),
+    0x8f: ("v_cmp_class_f16_e32", "Vector compare v_cmp_class_f16"),
+    0x90: ("v_cmpx_f_i32_e32", "Vector compare v_cmpx_f_i32"),
+    0x91: ("v_cmpx_lt_i32_e32", "Vector compare v_cmpx_lt_i32"),
+    0x92: ("v_cmpx_eq_i32_e32", "Vector compare v_cmpx_eq_i32"),
+    0x93: ("v_cmpx_le_i32_e32", "Vector compare v_cmpx_le_i32"),
+    0x94: ("v_cmpx_gt_i32_e32", "Vector compare v_cmpx_gt_i32"),
+    0x95: ("v_cmpx_ne_i32_e32", "Vector compare v_cmpx_ne_i32"),
+    0x96: ("v_cmpx_ge_i32_e32", "Vector compare v_cmpx_ge_i32"),
+    0x97: ("v_cmpx_t_i32_e32", "Vector compare v_cmpx_t_i32"),
+    0x98: ("v_cmpx_class_f32_e32", "Vector compare v_cmpx_class_f32"),
+    0x99: ("v_cmpx_lt_i16_e32", "Vector compare v_cmpx_lt_i16"),
+    0x9a: ("v_cmpx_eq_i16_e32", "Vector compare v_cmpx_eq_i16"),
+    0x9b: ("v_cmpx_le_i16_e32", "Vector compare v_cmpx_le_i16"),
+    0x9c: ("v_cmpx_gt_i16_e32", "Vector compare v_cmpx_gt_i16"),
+    0x9d: ("v_cmpx_ne_i16_e32", "Vector compare v_cmpx_ne_i16"),
+    0x9e: ("v_cmpx_ge_i16_e32", "Vector compare v_cmpx_ge_i16"),
+    0x9f: ("v_cmpx_class_f16_e32", "Vector compare v_cmpx_class_f16"),
+    0xa0: ("v_cmp_f_i64_e32", "Vector compare v_cmp_f_i64"),
+    0xa1: ("v_cmp_lt_i64_e32", "Vector compare v_cmp_lt_i64"),
+    0xa2: ("v_cmp_eq_i64_e32", "Vector compare v_cmp_eq_i64"),
+    0xa3: ("v_cmp_le_i64_e32", "Vector compare v_cmp_le_i64"),
+    0xa4: ("v_cmp_gt_i64_e32", "Vector compare v_cmp_gt_i64"),
+    0xa5: ("v_cmp_ne_i64_e32", "Vector compare v_cmp_ne_i64"),
+    0xa6: ("v_cmp_ge_i64_e32", "Vector compare v_cmp_ge_i64"),
+    0xa7: ("v_cmp_t_i64_e32", "Vector compare v_cmp_t_i64"),
+    0xa8: ("v_cmp_class_f64_e32", "Vector compare v_cmp_class_f64"),
+    0xa9: ("v_cmp_lt_u16_e32", "Vector compare v_cmp_lt_u16"),
+    0xaa: ("v_cmp_eq_u16_e32", "Vector compare v_cmp_eq_u16"),
+    0xab: ("v_cmp_le_u16_e32", "Vector compare v_cmp_le_u16"),
+    0xac: ("v_cmp_gt_u16_e32", "Vector compare v_cmp_gt_u16"),
+    0xad: ("v_cmp_ne_u16_e32", "Vector compare v_cmp_ne_u16"),
+    0xae: ("v_cmp_ge_u16_e32", "Vector compare v_cmp_ge_u16"),
+    0xb0: ("v_cmpx_f_i64_e32", "Vector compare v_cmpx_f_i64"),
+    0xb1: ("v_cmpx_lt_i64_e32", "Vector compare v_cmpx_lt_i64"),
+    0xb2: ("v_cmpx_eq_i64_e32", "Vector compare v_cmpx_eq_i64"),
+    0xb3: ("v_cmpx_le_i64_e32", "Vector compare v_cmpx_le_i64"),
+    0xb4: ("v_cmpx_gt_i64_e32", "Vector compare v_cmpx_gt_i64"),
+    0xb5: ("v_cmpx_ne_i64_e32", "Vector compare v_cmpx_ne_i64"),
+    0xb6: ("v_cmpx_ge_i64_e32", "Vector compare v_cmpx_ge_i64"),
+    0xb7: ("v_cmpx_t_i64_e32", "Vector compare v_cmpx_t_i64"),
+    0xb8: ("v_cmpx_class_f64_e32", "Vector compare v_cmpx_class_f64"),
+    0xb9: ("v_cmpx_lt_u16_e32", "Vector compare v_cmpx_lt_u16"),
+    0xba: ("v_cmpx_eq_u16_e32", "Vector compare v_cmpx_eq_u16"),
+    0xbb: ("v_cmpx_le_u16_e32", "Vector compare v_cmpx_le_u16"),
+    0xbc: ("v_cmpx_gt_u16_e32", "Vector compare v_cmpx_gt_u16"),
+    0xbd: ("v_cmpx_ne_u16_e32", "Vector compare v_cmpx_ne_u16"),
+    0xbe: ("v_cmpx_ge_u16_e32", "Vector compare v_cmpx_ge_u16"),
+    0xc0: ("v_cmp_f_u32_e32", "Vector compare v_cmp_f_u32"),
+    0xc1: ("v_cmp_lt_u32_e32", "Vector compare v_cmp_lt_u32"),
+    0xc2: ("v_cmp_eq_u32_e32", "Vector compare v_cmp_eq_u32"),
+    0xc3: ("v_cmp_le_u32_e32", "Vector compare v_cmp_le_u32"),
+    0xc4: ("v_cmp_gt_u32_e32", "Vector compare v_cmp_gt_u32"),
+    0xc5: ("v_cmp_ne_u32_e32", "Vector compare v_cmp_ne_u32"),
+    0xc6: ("v_cmp_ge_u32_e32", "Vector compare v_cmp_ge_u32"),
+    0xc7: ("v_cmp_t_u32_e32", "Vector compare v_cmp_t_u32"),
+    0xc8: ("v_cmp_f_f16_e32", "Vector compare v_cmp_f_f16"),
+    0xc9: ("v_cmp_lt_f16_e32", "Vector compare v_cmp_lt_f16"),
+    0xca: ("v_cmp_eq_f16_e32", "Vector compare v_cmp_eq_f16"),
+    0xcb: ("v_cmp_le_f16_e32", "Vector compare v_cmp_le_f16"),
+    0xcc: ("v_cmp_gt_f16_e32", "Vector compare v_cmp_gt_f16"),
+    0xcd: ("v_cmp_lg_f16_e32", "Vector compare v_cmp_lg_f16"),
+    0xce: ("v_cmp_ge_f16_e32", "Vector compare v_cmp_ge_f16"),
+    0xcf: ("v_cmp_o_f16_e32", "Vector compare v_cmp_o_f16"),
+    0xd0: ("v_cmpx_f_u32_e32", "Vector compare v_cmpx_f_u32"),
+    0xd1: ("v_cmpx_lt_u32_e32", "Vector compare v_cmpx_lt_u32"),
+    0xd2: ("v_cmpx_eq_u32_e32", "Vector compare v_cmpx_eq_u32"),
+    0xd3: ("v_cmpx_le_u32_e32", "Vector compare v_cmpx_le_u32"),
+    0xd4: ("v_cmpx_gt_u32_e32", "Vector compare v_cmpx_gt_u32"),
+    0xd5: ("v_cmpx_ne_u32_e32", "Vector compare v_cmpx_ne_u32"),
+    0xd6: ("v_cmpx_ge_u32_e32", "Vector compare v_cmpx_ge_u32"),
+    0xd7: ("v_cmpx_t_u32_e32", "Vector compare v_cmpx_t_u32"),
+    0xd8: ("v_cmpx_f_f16_e32", "Vector compare v_cmpx_f_f16"),
+    0xd9: ("v_cmpx_lt_f16_e32", "Vector compare v_cmpx_lt_f16"),
+    0xda: ("v_cmpx_eq_f16_e32", "Vector compare v_cmpx_eq_f16"),
+    0xdb: ("v_cmpx_le_f16_e32", "Vector compare v_cmpx_le_f16"),
+    0xdc: ("v_cmpx_gt_f16_e32", "Vector compare v_cmpx_gt_f16"),
+    0xdd: ("v_cmpx_lg_f16_e32", "Vector compare v_cmpx_lg_f16"),
+    0xde: ("v_cmpx_ge_f16_e32", "Vector compare v_cmpx_ge_f16"),
+    0xdf: ("v_cmpx_o_f16_e32", "Vector compare v_cmpx_o_f16"),
+    0xe0: ("v_cmp_f_u64_e32", "Vector compare v_cmp_f_u64"),
+    0xe1: ("v_cmp_lt_u64_e32", "Vector compare v_cmp_lt_u64"),
+    0xe2: ("v_cmp_eq_u64_e32", "Vector compare v_cmp_eq_u64"),
+    0xe3: ("v_cmp_le_u64_e32", "Vector compare v_cmp_le_u64"),
+    0xe4: ("v_cmp_gt_u64_e32", "Vector compare v_cmp_gt_u64"),
+    0xe5: ("v_cmp_ne_u64_e32", "Vector compare v_cmp_ne_u64"),
+    0xe6: ("v_cmp_ge_u64_e32", "Vector compare v_cmp_ge_u64"),
+    0xe7: ("v_cmp_t_u64_e32", "Vector compare v_cmp_t_u64"),
+    0xe8: ("v_cmp_u_f16_e32", "Vector compare v_cmp_u_f16"),
+    0xe9: ("v_cmp_nge_f16_e32", "Vector compare v_cmp_nge_f16"),
+    0xea: ("v_cmp_nlg_f16_e32", "Vector compare v_cmp_nlg_f16"),
+    0xeb: ("v_cmp_ngt_f16_e32", "Vector compare v_cmp_ngt_f16"),
+    0xec: ("v_cmp_nle_f16_e32", "Vector compare v_cmp_nle_f16"),
+    0xed: ("v_cmp_neq_f16_e32", "Vector compare v_cmp_neq_f16"),
+    0xee: ("v_cmp_nlt_f16_e32", "Vector compare v_cmp_nlt_f16"),
+    0xef: ("v_cmp_tru_f16_e32", "Vector compare v_cmp_tru_f16"),
+    0xf0: ("v_cmpx_f_u64_e32", "Vector compare v_cmpx_f_u64"),
+    0xf1: ("v_cmpx_lt_u64_e32", "Vector compare v_cmpx_lt_u64"),
+    0xf2: ("v_cmpx_eq_u64_e32", "Vector compare v_cmpx_eq_u64"),
+    0xf3: ("v_cmpx_le_u64_e32", "Vector compare v_cmpx_le_u64"),
+    0xf4: ("v_cmpx_gt_u64_e32", "Vector compare v_cmpx_gt_u64"),
+    0xf5: ("v_cmpx_ne_u64_e32", "Vector compare v_cmpx_ne_u64"),
+    0xf6: ("v_cmpx_ge_u64_e32", "Vector compare v_cmpx_ge_u64"),
+    0xf7: ("v_cmpx_t_u64_e32", "Vector compare v_cmpx_t_u64"),
+    0xf8: ("v_cmpx_u_f16_e32", "Vector compare v_cmpx_u_f16"),
+    0xf9: ("v_cmpx_nge_f16_e32", "Vector compare v_cmpx_nge_f16"),
+    0xfa: ("v_cmpx_nlg_f16_e32", "Vector compare v_cmpx_nlg_f16"),
+    0xfb: ("v_cmpx_ngt_f16_e32", "Vector compare v_cmpx_ngt_f16"),
+    0xfc: ("v_cmpx_nle_f16_e32", "Vector compare v_cmpx_nle_f16"),
+    0xfd: ("v_cmpx_neq_f16_e32", "Vector compare v_cmpx_neq_f16"),
+    0xfe: ("v_cmpx_nlt_f16_e32", "Vector compare v_cmpx_nlt_f16"),
+    0xff: ("v_cmpx_tru_f16_e32", "Vector compare v_cmpx_tru_f16"),
+}
+
+
 VOP2_OPS = {
     0x01: ("v_cndmask_b32_e32", "Vector conditional mask select"),
     0x03: ("v_add_f32_e32", "Vector add float32"),
@@ -462,7 +656,46 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             asm = f"{op_name} v{vdst}, {src0_str}"
         return (length, op_name, asm, comment)
 
-    # 6. VOP2: [31] == 0
+    # 6. VOPC: [31:25] == 0b0111110 (0x7c000000)
+    if (w0 & 0xfe000000) == 0x7c000000:
+        op = (w0 >> 17) & 0xff
+        vsrc1 = (w0 >> 9) & 0xff
+        src0 = w0 & 0x1ff
+        op_info = VOPC_OPS.get(op, (f"v_vopc_{op:02x}", "Unknown VOPC"))
+        op_name, comment = op_info
+        length = 4
+        literal = None
+        if src0 in (249, 255):
+            extension = "SDWA" if src0 == 249 else "literal"
+            if offset + 8 > len(data):
+                return (4, "vopc_truncated", f"{op_name} <truncated>", f"Incomplete VOPC {extension}")
+            if src0 == 249:
+                return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "VOPC SDWA is not decoded")
+            literal, = struct.unpack_from("<I", data, offset + 4)
+            length = 8
+        wide0 = op_name.endswith(("_f64_e32", "_i64_e32", "_u64_e32"))
+        wide1 = wide0 and "_class_" not in op_name
+        if literal is not None:
+            src0_str = f"0x{literal:x}"
+        elif wide0:
+            if src0 >= 256:
+                vreg = src0 - 256
+                src0_str = f"v[{vreg}:{vreg + 1}]" if vreg < 255 else "<invalid VGPR pair>"
+            else:
+                src0_str = decode_s_reg64(src0)
+        else:
+            src0_str = decode_v_reg(src0)
+        if wide1:
+            src1_str = f"v[{vsrc1}:{vsrc1 + 1}]" if vsrc1 < 255 else "<invalid VGPR pair>"
+        else:
+            src1_str = f"v{vsrc1}"
+        if op_name.startswith("v_cmpx_"):
+            asm = f"{op_name} {src0_str}, {src1_str}"
+        else:
+            asm = f"{op_name} vcc_lo, {src0_str}, {src1_str}"
+        return (length, op_name, asm, comment)
+
+    # 7. VOP2: [31] == 0
     if (w0 & 0x80000000) == 0:
         op = (w0 >> 25) & 0x3f
         vdst = (w0 >> 17) & 0xff
@@ -489,7 +722,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             asm = f"{op_name} v{vdst}, {src0_str}, v{vsrc1}"
         return (length, op_name, asm, comment)
 
-    # 7. VINTRP: [31:26] == 0b110010 (0xc8000000)
+    # 8. VINTRP: [31:26] == 0b110010 (0xc8000000)
     if (w0 & 0xfc000000) == 0xc8000000:
         vdst = (w0 >> 18) & 0xff
         op = (w0 >> 16) & 0x3
@@ -502,7 +735,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         comment = f"Parameter interpolation stage {op+1} for attribute {attr}.{chan}"
         return (4, op_name, asm, comment)
 
-    # 8. EXP: 64-bit [31:26] == 0b111110 (0xf8000000)
+    # 9. EXP: 64-bit [31:26] == 0b111110 (0xf8000000)
     if (w0 & 0xfc000000) == 0xf8000000:
         if offset + 8 > len(data):
             return (4, "exp_truncated", "exp <truncated>", "Incomplete 64-bit export instruction")
@@ -536,7 +769,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         comment = f"Export output pixels/attributes to {target_name.upper()}"
         return (8, "exp", asm, comment)
 
-    # 9. SMEM: 64-bit [31:26] == 0b111101 (0xf4000000)
+    # 10. SMEM: 64-bit [31:26] == 0b111101 (0xf4000000)
     if (w0 & 0xfc000000) == 0xf4000000:
         if offset + 8 > len(data):
             return (4, "smem_truncated", "smem <truncated>", "Incomplete 64-bit SMEM instruction")
@@ -569,7 +802,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         comment = "Scalar memory load from constant buffer/resource descriptor"
         return (8, op_name, asm, comment)
 
-    # 10. MIMG: 64-bit + optional NSA dwords [31:26] == 0b111100 (0xf0000000)
+    # 11. MIMG: 64-bit + optional NSA dwords [31:26] == 0b111100 (0xf0000000)
     if (w0 & 0xfc000000) == 0xf0000000:
         nsize = (w0 >> 1) & 0x3
         length = 8 + 4 * nsize
@@ -622,7 +855,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         comment = "Image memory load/store/sample operation"
         return (length, op_name, asm, comment)
 
-    # 11. VOP3P: 64-bit [31:23] == 0b110011000 (0xcc000000)
+    # 12. VOP3P: 64-bit [31:23] == 0b110011000 (0xcc000000)
     if (w0 & 0xff800000) == 0xcc000000:
         if offset + 8 > len(data):
             return (4, "vop3p_truncated", "vop3p <truncated>", "Incomplete 64-bit VOP3P instruction")
