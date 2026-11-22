@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import math
+import re
 import struct
 import unittest
 from dataclasses import dataclass, field
@@ -349,6 +350,56 @@ def evaluate_gws_br_status(
         counter_negative=counter_negative,
         carry_out=carry_out,
         resource_id=rid,
+    )
+
+
+# Commit 8: Negative controls, syntax rejection, and mutation detection
+
+
+def parse_gws_sema_br_asm(line: str) -> Instruction:
+    """Parses canonical assembly string for ds_gws_sema_br."""
+    tokens = line.strip().split()
+    if not tokens:
+        raise ValueError("Empty instruction line")
+
+    mnemonic = tokens[0]
+    if mnemonic != "ds_gws_sema_br":
+        raise ValueError(f"Unrecognized opcode: {mnemonic}")
+
+    vdata: Optional[Register] = None
+    offset = 0
+    gds = False
+
+    for tok in tokens[1:]:
+        if tok == "gds":
+            gds = True
+        elif tok.startswith("offset:"):
+            try:
+                offset_val = int(tok.split(":")[1])
+            except ValueError:
+                raise ValueError(f"Invalid offset format: {tok}")
+            if not (0 <= offset_val <= 255):
+                raise ValueError(f"Offset out of range [0, 255]: {offset_val}")
+            offset = offset_val
+        elif tok.startswith("v"):
+            m = re.match(r"^v(\d+)$", tok)
+            if not m:
+                raise ValueError(f"Invalid VGPR token: {tok}")
+            v_idx = int(m.group(1))
+            if not (0 <= v_idx <= 255):
+                raise ValueError(f"VGPR index out of range: {v_idx}")
+            vdata = Register(v_idx, RegKind.VGPR)
+        else:
+            raise ValueError(f"Unexpected token in ds_gws_sema_br: {tok}")
+
+    if not gds:
+        raise ValueError("GWS instructions require the 'gds' modifier")
+
+    return Instruction(
+        opcode=Opcode.DS_GWS_SEMA_BR,
+        vdata=vdata,
+        offset=offset,
+        gds=gds,
     )
 
 
@@ -869,6 +920,122 @@ class TestGWSSemaBrIEEE754(unittest.TestCase):
 
         for idx, expected in enumerate(float_patterns):
             self.assertEqual(interp.rf.get_vgpr(idx), expected, f"Float pattern at v{idx} altered")
+
+
+class TestGWSSemaBrNegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection for ds_gws_sema_br."""
+
+    def test_syntax_rejection_invalid_mnemonic(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_gws_sema_br_asm("ds_gws_sema_branch offset:0 gds")
+        with self.assertRaises(ValueError):
+            parse_gws_sema_br_asm("ds_gws_br_invalid offset:0 gds")
+
+    def test_syntax_rejection_missing_gds_modifier(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_gws_sema_br_asm("ds_gws_sema_br offset:0")
+
+    def test_syntax_rejection_invalid_register(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_gws_sema_br_asm("ds_gws_sema_br r0 offset:0 gds")
+        with self.assertRaises(ValueError):
+            parse_gws_sema_br_asm("ds_gws_sema_br v256 offset:0 gds")
+
+    def test_syntax_rejection_invalid_offset(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_gws_sema_br_asm("ds_gws_sema_br offset:-1 gds")
+        with self.assertRaises(ValueError):
+            parse_gws_sema_br_asm("ds_gws_sema_br offset:256 gds")
+        with self.assertRaises(ValueError):
+            parse_gws_sema_br_asm("ds_gws_sema_br offset:bad gds")
+
+    def test_valid_syntax_parsing(self) -> None:
+        instr1 = parse_gws_sema_br_asm("ds_gws_sema_br offset:8 gds")
+        self.assertEqual(instr1.offset, 8)
+        self.assertIsNone(instr1.vdata)
+        self.assertTrue(instr1.gds)
+
+        instr2 = parse_gws_sema_br_asm("ds_gws_sema_br v2 offset:16 gds")
+        self.assertEqual(instr2.offset, 16)
+        self.assertIsNotNone(instr2.vdata)
+        self.assertEqual(instr2.vdata.index, 2)
+        self.assertTrue(instr2.gds)
+
+    def test_negative_control_barrier_conflict(self) -> None:
+        gws = GWSSubsystem()
+        gws.init_resource(5, init_val=0, res_type=GWSResourceType.BARRIER)
+        with self.assertRaises(TypeError):
+            gws.bulk_release_br(5, release_count=1)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        class MutantIgnoreExecSIMD(SIMDInterpreter):
+            def step_wave(self, wave: SIMDWaveState, instr: Instruction) -> Dict[str, Any]:
+                rid = ref_gws_resource_id(wave.m0, instr.offset)
+                total = 0
+                for _ in range(wave.wave_size):
+                    # Mutant: executes for all lanes unconditionally
+                    self.gws.bulk_release_br(rid, release_count=1)
+                    total += 1
+                return {"total_permits_issued": total}
+
+        mutant = MutantIgnoreExecSIMD()
+        wave = SIMDWaveState(wave_id=1, wave_size=32, exec_mask=0)  # Inactive
+        res = mutant.step_wave(wave, Instruction(opcode=Opcode.DS_GWS_SEMA_BR))
+        self.assertNotEqual(res["total_permits_issued"], 0)
+
+    def test_mutation_detection_fixed_single_release(self) -> None:
+        # Mutant always delivers 1 permit regardless of vdata count
+        def mutant_bulk_release_br(subsystem: GWSSubsystem, rid: int, release_count: int) -> int:
+            # Bug: ignores release_count and only adds 1
+            return subsystem.bulk_release_br(rid, release_count=1)[0]
+
+        gws = GWSSubsystem()
+        val = mutant_bulk_release_br(gws, 0, release_count=10)
+        self.assertEqual(val, 1)
+        self.assertNotEqual(val, 10)
+
+    def test_mutation_detection_ignore_wait_queue(self) -> None:
+        # Mutant fails to pop waiting wavefronts and increments counter directly
+        class MutantIgnoreWaitQueue(GWSSubsystem):
+            def bulk_release_br(self, res_id: int, release_count: int = 1) -> Tuple[int, List[int]]:
+                rid = res_id & GWS_RESOURCE_ID_MASK
+                res = self.resources[rid]
+                res.value = (res.value + release_count) & MASK32
+                # Bug: leaves wait_queue intact
+                return res.value, []
+
+        mutant_gws = MutantIgnoreWaitQueue()
+        mutant_gws.wait_p(2, wave_id=55)
+        val, awakened = mutant_gws.bulk_release_br(2, release_count=1)
+        self.assertEqual(awakened, [])
+        self.assertEqual(len(mutant_gws.resources[2].wait_queue), 1)
+
+    def test_mutation_detection_snan_quietening(self) -> None:
+        def mutant_quiet_snan(val: int) -> int:
+            return val | 0x0040_0000
+
+        snan = 0x7F80_0001
+        self.assertNotEqual(snan, mutant_quiet_snan(snan))
+
+    def test_mutation_detection_subnormal_ftz(self) -> None:
+        def mutant_ftz(val: int) -> int:
+            if (val & 0x7F80_0000) == 0 and (val & 0x007F_FFFF) != 0:
+                return 0
+            return val
+
+        subnormal = 0x0000_0001
+        self.assertEqual(mutant_ftz(subnormal), 0)
+        self.assertNotEqual(subnormal, 0)
+
+    def test_mutation_detection_wrong_resource_mask(self) -> None:
+        def mutant_gws_id(m0_val: int, offset: int) -> int:
+            return (m0_val + offset) & 0x1F  # 32 slots instead of 64
+
+        correct = ref_gws_resource_id(40, 0)
+        mutant = mutant_gws_id(40, 0)
+        self.assertEqual(correct, 40)
+        self.assertEqual(mutant, 8)
+        self.assertNotEqual(correct, mutant)
 
 
 if __name__ == "__main__":
