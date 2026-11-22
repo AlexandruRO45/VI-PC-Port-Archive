@@ -1132,5 +1132,84 @@ class TestValuCvtNormI16F16StatusFlags(unittest.TestCase):
         self.assertFalse(cc_neg.carry)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 boundary extremes, subnormals, and NaN handling
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormI16F16IEEE754Boundaries(unittest.TestCase):
+    """Comprehensive IEEE 754 boundary, subnormal, and NaN handling tests."""
+
+    def test_signed_zeros(self) -> None:
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(POS_ZERO_F16), 0)
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(NEG_ZERO_F16), 0)
+
+    def test_infinities(self) -> None:
+        # +inf clamps to +1.0 (32767 = 0x7FFF)
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(POS_INF_F16), 32767)
+        # -inf clamps to -1.0 (-32767 = 0x8001)
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(NEG_INF_F16), u16(-32767))
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(NEG_INF_F16), 0x8001)
+
+    def test_quiet_and_signaling_nans_with_payloads(self) -> None:
+        # All NaN variants (both quiet and signaling with various payloads) map to 0
+        nans = [
+            QNAN_F16,
+            SNAN_F16,
+            0x7C01, 0x7C10, 0x7D55, 0x7CFF,  # SNaNs
+            0x7E00, 0x7E01, 0x7EFF, 0x7FFF,  # QNaNs
+            0xFC01, 0xFC10, 0xFD55, 0xFCFF,  # Negative SNaNs
+            0xFE00, 0xFE01, 0xFEFF, 0xFFFF,  # Negative QNaNs
+        ]
+        for n in nans:
+            res = oracle_v_cvt_norm_i16_f16(n)
+            self.assertEqual(res, 0, f"Expected 0 for NaN {n:#06x}, got {res:#06x}")
+
+    def test_finite_extremes_and_saturation(self) -> None:
+        # Max positive finite half float (65504.0) -> clamps to 32767
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(MAX_FINITE_F16), 32767)
+        # Min negative finite half float (-65504.0) -> clamps to -32767
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(MIN_FINITE_NEG_F16), u16(-32767))
+
+        # Values just above 1.0 (0x3C01) clamp to 32767
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(0x3C01), 32767)
+        # Values just below -1.0 (0xBC01) clamp to -32767
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(0xBC01), u16(-32767))
+
+    def test_subnormal_precision_and_underflow(self) -> None:
+        # Smallest positive subnormal (2^-24) rounds to 0
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(MIN_SUBNORMAL_F16), 0)
+        # Smallest negative subnormal (-2^-24) rounds to 0
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(0x8001), 0)
+
+        # 0x0100 (2^-16) * 32767 = 0.49998... rounds to 0
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(0x0100), 0)
+        # 0x0101 * 32767 = 0.5019... rounds to 1
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(0x0101), 1)
+
+        # Largest subnormal (0x03FF) * 32767 = 1.9979... rounds to 2
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(MAX_SUBNORMAL_F16), 2)
+        # Negative largest subnormal rounds to -2
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(0x83FF), u16(-2))
+
+        # Minimum normal (0x0400 = 2^-14) * 32767 = 1.9999... rounds to 2
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(MIN_NORMAL_F16), 2)
+
+    def test_ties_to_even_half_precision(self) -> None:
+        # 0.5 * 32767 = 16383.5 -> ties to even integer 16384
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(HALF_F16), 16384)
+        # -0.5 * 32767 = -16383.5 -> ties to even integer -16384
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(NEG_HALF_F16), u16(-16384))
+
+    def test_boundary_values_near_unit(self) -> None:
+        # 0x3BFF (0.99951171875) * 32767 = 32751.00048828125 -> 32751
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(0x3BFF), 32751)
+        # 0x3C00 (1.0) -> 32767
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(ONE_F16), 32767)
+        # 0xBBFF (-0.99951171875) -> -32751
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(0xBBFF), u16(-32751))
+        # 0xBC00 (-1.0) -> -32767
+        self.assertEqual(oracle_v_cvt_norm_i16_f16(NEG_ONE_F16), u16(-32767))
+
+
 if __name__ == "__main__":
     unittest.main()
