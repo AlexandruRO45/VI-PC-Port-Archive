@@ -39,6 +39,7 @@ Architecture & Specification:
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import re
+import struct
 import unittest
 from typing import Optional, Tuple
 
@@ -1029,6 +1030,180 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         flags_aligned = evaluate_ds_inc_src2_u64_flags(1, 10, 0x100, 0x208)
         self.assertFalse(flags_aligned.unaligned_addr_a)
         self.assertFalse(flags_aligned.unaligned_addr_b)
+
+
+# ==============================================================================
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+# IEEE 754 Double-Precision Boundary Constants
+POS_ZERO_F64 = 0x0000_0000_0000_0000
+NEG_ZERO_F64 = 0x8000_0000_0000_0000
+POS_INF_F64 = 0x7FF0_0000_0000_0000
+NEG_INF_F64 = 0xFFF0_0000_0000_0000
+QNAN_F64 = 0x7FF8_0000_0000_0000
+SNAN_F64 = 0x7FF0_0000_0000_0001
+MIN_NORMAL_F64 = 0x0010_0000_0000_0000
+MIN_SUBNORMAL_F64 = 0x0000_0000_0000_0001
+MAX_SUBNORMAL_F64 = 0x000F_FFFF_FFFF_FFFF
+MAX_NORMAL_F64 = 0x7FEF_FFFF_FFFF_FFFF
+ONE_F64 = 0x3FF0_0000_0000_0000
+
+
+def bits_to_f64(bits: int) -> float:
+    """Interpret 64-bit unsigned integer as IEEE 754 double-precision float."""
+    return struct.unpack("<d", struct.pack("<Q", bits & MASK64))[0]
+
+
+def f64_to_bits(val: float) -> int:
+    """Pack IEEE 754 double-precision float into 64-bit unsigned integer."""
+    return struct.unpack("<Q", struct.pack("<d", val))[0]
+
+
+def is_f64_nan(bits: int) -> bool:
+    """Test if 64-bit bit pattern is an IEEE 754 double-precision NaN."""
+    return (bits & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000 and (bits & 0x000F_FFFF_FFFF_FFFF) != 0
+
+
+def is_f64_subnormal(bits: int) -> bool:
+    """Test if 64-bit bit pattern is an IEEE 754 double-precision subnormal float."""
+    return (bits & 0x7FF0_0000_0000_0000) == 0 and (bits & 0x000F_FFFF_FFFF_FFFF) != 0
+
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormal_increment_no_flush_to_zero(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        # Location A has subnormal float
+        state.lds.write_qword(10, MIN_SUBNORMAL_F64)
+        state.lds.write_qword(11, MASK64)
+        state.set_vgpr(0, 10 * 8)
+
+        self.assertTrue(is_f64_subnormal(MIN_SUBNORMAL_F64))
+
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, MIN_SUBNORMAL_F64 + 1)
+        self.assertNotEqual(new_val, 0)
+        self.assertTrue(is_f64_subnormal(new_val))
+        self.assertEqual(state.lds.read_qword(10), MIN_SUBNORMAL_F64 + 1)
+
+    def test_subnormal_to_normal_boundary_crossing(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        state.lds.write_qword(12, MAX_SUBNORMAL_F64)
+        state.lds.write_qword(13, MASK64)
+        state.set_vgpr(0, 12 * 8)
+
+        self.assertTrue(is_f64_subnormal(MAX_SUBNORMAL_F64))
+
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, MIN_NORMAL_F64)
+        self.assertFalse(is_f64_subnormal(new_val))
+        self.assertEqual(state.lds.read_qword(12), MIN_NORMAL_F64)
+
+    def test_signaling_nan_preserved_without_quietening(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        state.lds.write_qword(14, SNAN_F64)
+        state.lds.write_qword(15, MASK64)
+        state.set_vgpr(0, 14 * 8)
+
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, SNAN_F64 + 1)
+        # Quiet bit 51 is bit 0x0008_0000_0000_0000; must not be forced high
+        self.assertEqual(new_val & 0x0008_0000_0000_0000, 0)
+        self.assertTrue(is_f64_nan(new_val))
+
+    def test_quiet_nan_wrap_boundary(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        state.lds.write_qword(16, QNAN_F64)
+        state.lds.write_qword(17, QNAN_F64) # Equal to threshold -> wraps to 0
+        state.set_vgpr(0, 16 * 8)
+
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, 0)
+        self.assertEqual(state.lds.read_qword(16), 0)
+
+    def test_double_precision_infinities(self) -> None:
+        state = ScalarMachineState64(lds_capacity_qwords=512)
+        interp = ScalarInterpreter64()
+
+        # POS_INF_F64
+        state.lds.write_qword(20, POS_INF_F64)
+        state.lds.write_qword(21, MASK64)
+        state.set_vgpr(0, 20 * 8)
+
+        instr = DSIncSrc2U64Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        new_val = interp.step(instr, state)
+        self.assertEqual(new_val, POS_INF_F64 + 1)
+
+        # NEG_INF_F64
+        state.lds.write_qword(22, NEG_INF_F64)
+        state.lds.write_qword(23, NEG_INF_F64) # wrap on match
+        state.set_vgpr(0, 22 * 8)
+
+        new_val2 = interp.step(instr, state)
+        self.assertEqual(new_val2, 0)
+
+    def test_integer_64bit_boundary_extremes(self) -> None:
+        extremes = [
+            0x0000_0000_0000_0000,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFE,
+            0xFFFF_FFFF_FFFF_FFFF,
+        ]
+        for val in extremes:
+            # Check increment below limit
+            self.assertEqual(ref_ds_inc_src2_u64(val, MASK64), 0 if val == MASK64 else val + 1)
+            # Check wrap at equal limit
+            self.assertEqual(ref_ds_inc_src2_u64(val, val), 0)
 
 
 if __name__ == "__main__":
