@@ -9,9 +9,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include "../shims/shims.h"
@@ -123,6 +125,43 @@ std::array<TlsHostModule, kMaxMappedTlsModules> g_tls_hosts{};
 std::array<std::atomic<Module*>, kMaxMappedTlsModules> g_tls_slot_owners{};
 std::vector<TlsCloneRecord> g_tls_clones;
 
+// Use a new prefix so an older runtime's unconditional sweep cannot remove these clones.
+constexpr std::wstring_view kTlsClonePrefix = L"leonida_tls_clone_";
+
+uint64_t process_creation_time(HANDLE process) {
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) return 0;
+    return (uint64_t{created.dwHighDateTime} << 32) | created.dwLowDateTime;
+}
+
+bool tls_clone_is_orphan(const wchar_t* name) {
+    const std::wstring_view filename(name);
+    if (!filename.starts_with(kTlsClonePrefix) || !filename.ends_with(L".dll")) return false;
+
+    wchar_t* pid_end = nullptr;
+    const wchar_t* pid_start = name + kTlsClonePrefix.size();
+    const DWORD pid = std::wcstoul(pid_start, &pid_end, 10);
+    if (pid == 0 || *pid_end != L'_' || std::wstring_view(pid_start, pid_end) != std::to_wstring(pid)) return false;
+    auto stamp_and_slot = std::wstring_view(pid_end + 1);
+    stamp_and_slot.remove_suffix(4);  // .dll
+    const size_t separator = stamp_and_slot.find(L'_');
+    if (separator == std::wstring_view::npos) return false;
+    const auto stamp = stamp_and_slot.substr(0, separator);
+    const auto slot = stamp_and_slot.substr(separator + 1);
+    constexpr std::wstring_view digits = L"0123456789";
+    if (stamp.empty() || stamp.find_first_not_of(digits) != std::wstring_view::npos ||
+        slot.empty() || slot.find_first_not_of(digits) != std::wstring_view::npos) return false;
+
+    HANDLE owner = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!owner) return GetLastError() == ERROR_INVALID_PARAMETER;
+    const DWORD wait = WaitForSingleObject(owner, 0);
+    const uint64_t started = process_creation_time(owner);
+    CloseHandle(owner);
+    // A different creation time identifies an older process that used the same PID. If ownership is
+    // uncertain (e.g. access was denied), keep the file. A live owner may still be about to load it.
+    return wait == WAIT_OBJECT_0 || (started != 0 && std::to_wstring(started) != stamp);
+}
+
 void cleanup_tls_clones_at_exit() {
     for (const auto& rec : g_tls_clones) {
         if (rec.module) FreeLibrary(rec.module);
@@ -133,12 +172,11 @@ void cleanup_tls_clones_at_exit() {
 
 void sweep_stale_tls_clones(const std::filesystem::path& dir) {
     WIN32_FIND_DATAW fd{};
-    const std::filesystem::path pattern = dir / L"leonida_tls_host_*.dll";
+    const std::filesystem::path pattern = dir / (std::wstring(kTlsClonePrefix) + L"*.dll");
     HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-            // Fails harmlessly for clones still mapped in live processes; deletes orphaned ones from exited processes.
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 && tls_clone_is_orphan(fd.cFileName)) {
             DeleteFileW((dir / fd.cFileName).c_str());
         }
     } while (FindNextFileW(h, &fd));
@@ -205,8 +243,10 @@ TlsHostModule ensure_tls_host(size_t slot) {
         sweep_stale_tls_clones(dir);
         std::atexit(&cleanup_tls_clones_at_exit);
     }
-    const std::wstring name =
-        L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(slot) + L".dll";
+    const uint64_t started = process_creation_time(GetCurrentProcess());
+    if (started == 0) return {};
+    const std::wstring name = std::wstring(kTlsClonePrefix) + std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(started) + L"_" + std::to_wstring(slot) + L".dll";
     const std::filesystem::path clone_path = dir / name;
     if (!CopyFileW(primary.c_str(), clone_path.c_str(), FALSE)) return {};
 

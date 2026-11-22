@@ -526,6 +526,15 @@ if(BUILD_TESTING)
     add_test(NAME loader_tls
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
+    if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_test(NAME loader_tls_clone_sweep COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tls_clone_sweep.py"
+          "$<TARGET_FILE:loader_tls_test>" "$<TARGET_FILE:tiny_tls>")
+        set_tests_properties(loader_tls_clone_sweep PROPERTIES TIMEOUT 60)
+      endif()
+    endif()
 
     # DisableThreadLibraryCalls from a mapped DllMain (shims/library_loader.cpp). The fixture is built without the CRT, so
     # DllMain's only work is that one call. No game files.
