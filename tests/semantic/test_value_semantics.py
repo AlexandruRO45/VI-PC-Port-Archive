@@ -693,5 +693,51 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
-if __name__ == "__main__":
-    unittest.main()
+class Int24Clamp(unittest.TestCase):
+    """runtime/test/shaders/cs_int24_clamp.asm: VOP3 clamp on v_mul/mad_u32_u24 and v_mul/mad_i32_i24 saturates the
+    exact result (u24 to [0, 0xFFFFFFFF], i24 to the i32 range; measured on a gfx1036) instead of keeping its low 32
+    bits (EGEN-INT24-CLAMP). One wave32 group; lane 0 stores eight words, derived by hand in the .asm header."""
+
+    WANT = [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF, 0x80000000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFF2]
+    # The translation before the fix: the clamp bit ignored, so the low 32 bits of each exact value.
+    OLD = [0xFE000000, 0x00000000, 0xFE000001, 0x7F000000, 0x7FFFFFFE, 0x00000000, 0x00800000, 0xFFFFFFF2]
+
+    def test_words(self):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", "cs_int24_clamp.asm"))
+        spv = support.translate_fixture("cs_int24_clamp", fssm=bytes(header))
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        si.run_workgroup(spv, 32, 32,
+                         inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                         push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
+        got = [memory[4 * i] for i in range(8)]
+        self.assertEqual([f"{w:#010x}" for w in got], [f"{w:#010x}" for w in self.WANT])
+        self.assertNotEqual(got, self.OLD)
+
+    def test_words_follow_from_the_values(self):
+        # Plain-Python reference: exact product (+ addend) of the 24-bit fields, then saturate (clamp) or wrap.
+        def s24(v):
+            v &= 0xFFFFFF
+            return v - (1 << 24) if v >> 23 else v
+
+        def s32(v):
+            return v - (1 << 32) if v >> 31 else v
+
+        def u24(x, y, z=0, clamp=True):
+            v = (x & 0xFFFFFF) * (y & 0xFFFFFF) + z
+            return min(v, 0xFFFFFFFF) if clamp else v & 0xFFFFFFFF
+
+        def i24(x, y, z=0, clamp=True):
+            v = s24(x) * s24(y) + s32(z)
+            return (max(-2 ** 31, min(2 ** 31 - 1, v)) if clamp else v) & 0xFFFFFFFF
+
+        rows = [(u24, 0xFFFFFF, 0xFFFFFF, 0xFFFFFFFF), (u24, 1, 1, 0xFFFFFFFF), (u24, 0xFFFFFF, 0xFFFFFF, 0),
+                (i24, 0x7FFFFF, 0x7FFFFF, 0x7FFFFFFF), (i24, 0xFFFFFF, 2, 0x80000000), (i24, 0x800000, 0x800000, 0),
+                (i24, 0x800000, 0x7FFFFF, 0), (i24, 0xFFFFFD, 5, 1)]
+        self.assertEqual([fn(x, y, z) for fn, x, y, z in rows], self.WANT)
+        self.assertEqual([fn(x, y, z, clamp=False) for fn, x, y, z in rows], self.OLD)
+
+
+if __name__ == "__main__":    unittest.main()

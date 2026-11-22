@@ -5215,6 +5215,55 @@ class Gen:
                 self.emit(f"{s} = OpUMulExtended %umul {xs} {ys}")
                 self.emit(f"{r} = OpCompositeExtract %uint {s} 1")
             self.dst(a[0], r)
+        elif op in ("v_mul_u32_u24", "v_mad_u32_u24", "v_mul_i32_i24", "v_mad_i32_i24") and "clamp" in mods:
+            # VOP3 clamp saturates the exact 24 x 24-bit product (+ S2 for mad) instead of keeping its low 32 bits:
+            # u24 to [0, 0xFFFFFFFF], i24 to [0x80000000, 0x7FFFFFFF]. Measured on gfx1036 (docs/design.md,
+            # "Integer clamp"). The exact value fits in 64 bits: (lo, hi) from the extended multiply, then S2 added
+            # with its carry (and, signed, its sign word) into hi.
+            signed = "_i32_" in op
+            x, y = self.src_u(a[1]), self.src_u(a[2])
+            ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
+            xs, ys, pm, lo, hi = (self.tmp() for _ in range(5))
+            self.emit(f"{xs} = {ext} %uint {x} {self.cu(0)} {self.cu(24)}")
+            self.emit(f"{ys} = {ext} %uint {y} {self.cu(0)} {self.cu(24)}")
+            if signed:
+                self.emit(f"{pm} = OpSMulExtended %smul {self.as_int(xs)} {self.as_int(ys)}")
+                lo_i, hi_i = self.tmp(), self.tmp()
+                self.emit(f"{lo_i} = OpCompositeExtract %int {pm} 0")
+                self.emit(f"{hi_i} = OpCompositeExtract %int {pm} 1")
+                self.emit(f"{lo} = OpBitcast %uint {lo_i}")
+                self.emit(f"{hi} = OpBitcast %uint {hi_i}")
+                self.uses_smul = True
+            else:
+                self.emit(f"{pm} = OpUMulExtended %umul {xs} {ys}")
+                self.emit(f"{lo} = OpCompositeExtract %uint {pm} 0")
+                self.emit(f"{hi} = OpCompositeExtract %uint {pm} 1")
+            if op.startswith("v_mad_"):
+                z = self.src_u(a[3])
+                s, lo2, c, hi1, hi2 = (self.tmp() for _ in range(5))
+                self.emit(f"{s} = OpIAddCarry %umul {lo} {z}")
+                self.emit(f"{lo2} = OpCompositeExtract %uint {s} 0")
+                self.emit(f"{c} = OpCompositeExtract %uint {s} 1")
+                self.emit(f"{hi1} = OpIAdd %uint {hi} {c}")
+                if signed:
+                    zs = self.tmp()
+                    self.emit(f"{zs} = OpShiftRightArithmetic %uint {z} {self.cu(31)}")
+                    self.emit(f"{hi2} = OpIAdd %uint {hi1} {zs}")
+                else:
+                    hi2 = hi1
+                lo, hi = lo2, hi2
+            r = self.tmp()
+            if signed:
+                # In range when hi is the sign extension of lo; otherwise hi's sign picks the limit.
+                ls, ov, neg, lim = (self.tmp() for _ in range(4))
+                self.emit(f"{ls} = OpShiftRightArithmetic %uint {lo} {self.cu(31)}")
+                self.emit(f"{ov} = OpINotEqual %bool {hi} {ls}")
+                self.emit(f"{neg} = OpSLessThan %bool {self.as_int(hi)} {self.as_int(self.cu(0))}")
+                self.emit(f"{lim} = OpSelect %uint {neg} {self.cu(0x80000000)} {self.cu(0x7FFFFFFF)}")
+                self.emit(f"{r} = OpSelect %uint {ov} {lim} {lo}")
+            else:
+                self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(hi)} {self.cu(0xFFFFFFFF)} {lo}")
+            self.dst(a[0], r)
         elif op in ("v_mul_i32_i24", "v_mad_i32_i24"):
             # signed 24-bit operands (sign-extended from bit 23), low 32 bits of the product (+ src2 for mad)
             x, y = self.src_u(a[1]), self.src_u(a[2])
