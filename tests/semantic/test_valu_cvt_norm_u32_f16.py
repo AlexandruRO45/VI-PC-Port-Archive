@@ -1109,5 +1109,112 @@ class TestValuCvtNormU32F16IEEE754Boundaries(unittest.TestCase):
         # 0x3C00 (1.0) -> 4294967295
         self.assertEqual(oracle_v_cvt_norm_u32_f16(ONE_F16), 4294967295)
 
+
+# ---------------------------------------------------------------------------
+# Negative controls, syntax rejection, and mutation detection
+# ---------------------------------------------------------------------------
+
+class TestValuCvtNormU32F16NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_malformed_syntax(self) -> None:
+        invalid_instructions = [
+            "v_cvt_norm_u32_f16",
+            "v_cvt_norm_u32_f16 v0",
+            "v_cvt_norm_u32_f16 v0, v1, v2",
+            "v_cvt_norm_u32_f16 s0, v1",
+            "v_cvt_norm_u32_f16 v256, v0",
+            "v_cvt_norm_u32_f16 v0, s106",
+            "v_cvt_norm_u32_f16 v0, v1 unknown_mod",
+            "v_cvt_norm_u32_f16 v0.h, v1",
+            "v_cvt_norm_u32_f16 -v0, v1",
+            "v_cvt_norm_u32_f16 |v0|, v1",
+            "v_cvt_norm_u32_f16 v0, v1 op_sel:[2, 0]",
+        ]
+        for asm in invalid_instructions:
+            with self.assertRaises((ValueError, TypeError), msg=f"Should reject invalid assembly: '{asm}'"):
+                parse_vop_cvt_norm_u32_f16(asm)
+
+    def test_mutation_detection_scale_factor_4294967296(self) -> None:
+        """Mutant: use 4294967296.0 instead of 4294967295.0 for UNORM32 scale factor."""
+        def mutant_f16_to_unorm32(val_bits: int) -> int:
+            f = bits_to_f16(val_bits)
+            return u32(int(round(f * 4294967296.0)))
+
+        # For 0x3BFF (0.99951171875): correct is 4292870143, mutant is 4292870144
+        correct = oracle_v_cvt_norm_u32_f16(0x3BFF)
+        mutant = mutant_f16_to_unorm32(0x3BFF)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_truncation_instead_of_round_to_even(self) -> None:
+        """Mutant: use int() truncation towards zero instead of round-to-nearest-even."""
+        def mutant_f16_to_unorm32(val_bits: int) -> int:
+            f = bits_to_f16(val_bits)
+            return u32(int(f * UNORM32_SCALE))
+
+        # 0.5 * 4294967295 = 2147483647.5 -> correct is 2147483648, mutant is 2147483647
+        correct = oracle_v_cvt_norm_u32_f16(HALF_F16)
+        mutant = mutant_f16_to_unorm32(HALF_F16)
+        self.assertEqual(correct, 2147483648)
+        self.assertEqual(mutant, 2147483647)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_nan_to_nan_instead_of_zero(self) -> None:
+        """Mutant: preserve NaN bits instead of returning 0."""
+        def mutant_nan_to_nan(val_bits: int) -> int:
+            if is_nan_f16(val_bits):
+                return val_bits
+            return oracle_v_cvt_norm_u32_f16(val_bits)
+
+        self.assertNotEqual(mutant_nan_to_nan(QNAN_F16), oracle_v_cvt_norm_u32_f16(QNAN_F16))
+        self.assertNotEqual(mutant_nan_to_nan(SNAN_F16), oracle_v_cvt_norm_u32_f16(SNAN_F16))
+
+    def test_mutation_detection_unclamped_infinity(self) -> None:
+        """Mutant: unhandled infinity wrapping or producing 0."""
+        def mutant_unclamped_inf(val_bits: int) -> int:
+            if is_inf_f16(val_bits):
+                return 0
+            return oracle_v_cvt_norm_u32_f16(val_bits)
+
+        self.assertNotEqual(mutant_unclamped_inf(POS_INF_F16), oracle_v_cvt_norm_u32_f16(POS_INF_F16))
+
+    def test_mutation_detection_neg_abs_modifier_order(self) -> None:
+        """Mutant: apply neg first then abs (resulting in positive value)."""
+        def mutant_apply_mods(bits16: int, abs_mod: bool, neg_mod: bool) -> int:
+            val = bits16 & MASK16
+            if neg_mod:
+                val ^= SIGN_MASK_F16
+            if abs_mod:
+                val &= ~SIGN_MASK_F16
+            return val
+
+        # In RDNA2 ISA: abs first then neg: -|1.0| = -1.0 -> clamps to 0
+        correct_res = oracle_v_cvt_norm_u32_f16(ONE_F16, abs_mod=True, neg_mod=True)
+        mutant_bits = mutant_apply_mods(ONE_F16, abs_mod=True, neg_mod=True)
+        mutant_res = oracle_v_cvt_norm_u32_f16(mutant_bits)
+        self.assertEqual(correct_res, 0)
+        self.assertEqual(mutant_res, 4294967295)
+        self.assertNotEqual(correct_res, mutant_res)
+
+    def test_mutation_detection_simd_exec_mask_ignored(self) -> None:
+        """Mutant: SIMD execution ignores EXEC mask and executes inactive lanes."""
+        simd = SIMDVALUInterpreter(wave_size=32)
+        simd.exec_mask = 0x00000001  # Only lane 0 active
+        for lane in range(32):
+            simd.set_vgpr_u32(0, lane, 0x77777777)
+            simd.set_vgpr_u32(1, lane, ONE_F16)
+
+        simd.execute_asm("v_cvt_norm_u32_f16 v0, v1")
+
+        # Inactive lane 1 must remain untouched
+        self.assertEqual(simd.get_vgpr_u32(0, 1), 0x77777777)
+
+        def mutant_simd_exec(simd_inst: SIMDVALUInterpreter) -> None:
+            for lane in range(simd_inst.wave_size):
+                simd_inst.set_vgpr_u32(0, lane, 4294967295)
+
+        mutant_simd_exec(simd)
+        self.assertNotEqual(simd.get_vgpr_u32(0, 1), 0x77777777)
+
 if __name__ == "__main__":
     unittest.main()
