@@ -95,6 +95,32 @@ cmake --build --preset dev --target cpu_shim_startup pe_map
 ctest --preset dev --no-tests=error -R '^cpu_native_shim_startup$' -V
 ```
 
+The same EXE drives a compute dispatch when the test supplies a size. The
+shared x64 translator starts at the PE entry and follows the internal call
+through allocation, the null check, dispatch and release. The AOT runner
+records the input image SHA-256. All three runners call the same native
+providers. The compute provider submits the repository's HLSL on a D3D12
+compute queue, waits for a fence, then copies the GPU readback into the XMem
+allocation. The test checks both the bytes and the sequence of import calls.
+
+| Compute request | Readback (hex, in memory order) | Compute frees | Exit |
+| --- | --- | ---: | ---: |
+| 4,096 bytes | `594634123d463412e546341209463412` | 1 | 42 |
+| 8,192 bytes | `597634123d763412e576341209763412` | 1 | 42 |
+| `SIZE_MAX` | empty, allocation returned null before dispatch | 0 | 17 |
+
+The verifier checks the size, attributes (`0xa8004000`), seed and word
+count against an independent expectation. Virtual addresses may differ per
+process. Within each process the returned, 256-byte-aligned pointer must reach
+dispatch and release unchanged, and its pages must be free afterward. The
+counts above cover the compute allocation. The companion also performs its
+existing startup allocation and release in every case.
+
+```powershell
+cmake --build --preset dev --target cpu_shim_startup_lifted pe_map
+ctest --preset dev --no-tests=error -R '^cpu_shim_compute_(warp|hardware)$' -V
+```
+
 ## Source-built EXE entry to a DLL import
 
 MSVC assembles a small CRT-free [EXE entry body](../tests/cpu/exe_entry.asm) and links it with the existing `call_mix` fixture. The [translator](../tools/cpu_exe_aot.py) takes the fixture's `native_entry` export through `--entry-export`, reads its unwind-bounded instruction range, follows the relative call to `call_mix`, and resolves its IAT slot against `cpu_import_provider.dll!mix_args`. It emits both functions as C++. The translated EXE uses ordinary Windows C++ startup to enter the generated `main`. Both versions use the same native provider and the same I/O DLL.
