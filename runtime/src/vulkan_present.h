@@ -22,9 +22,8 @@
 
 #include "vulkan_backend.h"
 
-// Both extension names share the structures (the KHR one was promoted from the EXT one); headers older than the
-// promotion do not have the KHR types, and the presenter then never tears.
-#if defined(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
+// Use the original EXT spellings. They are aliases of the promoted KHR types and are available in older headers.
+#if defined(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
 #define LEONIDA_SWAPCHAIN_MAINTENANCE1 1
 #endif
 
@@ -74,9 +73,10 @@ class VulkanPresenter {
 public:
     VulkanPresenter(VulkanContext& context, PFN_vkGetInstanceProcAddr get_instance, VkInstance instance,
                     VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
-                    bool swapchain_maintenance1 = false)
+                    bool swapchain_maintenance1 = false,
+                    std::function<VkExtent2D()> extent_fn = nullptr)
         : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
-          maintenance1_(swapchain_maintenance1) {
+          maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)) {
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
@@ -224,11 +224,12 @@ public:
     }
 
     // The last presented frame as the swapchain stores it (4 bytes a texel, rows tightly packed, format() order).
-    // Waits for the frame to finish. False when nothing was presented since enable_capture().
+    // Waits for the frame to finish. False if no captured frame is available or the wait fails.
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
         if (!capture_ || !capture_ptr_ || !captured_) return false;
         const Frame& frame = frames_[(frame_index_ + frames_.size() - 1) % frames_.size()];
-        vkWaitForFences_(context_.device(), 1, &frame.done, VK_TRUE, UINT64_MAX);
+        if (vkWaitForFences_(context_.device(), 1, &frame.done, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+            return false;
         pixels.assign(capture_ptr_, capture_ptr_ + std::size_t(captured_extent_.width) * captured_extent_.height * 4);
         if (extent) *extent = captured_extent_;
         if (format) *format = captured_format_;
@@ -268,11 +269,19 @@ public:
         if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
 
         bool recorded = false;
+        std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
+        bool rollback_source = false;
+        VkImageLayout prev_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (binding) {
-            // The back buffer's layout is tracked like any other texture; this holds the context while it is read.
-            std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
+            // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_ (vulkan_backend.h).
+            // record() only touches subresource 0 (mip 0, layer 0, color) of `source`, so saving that one layout
+            // rolls back a failed submit in O(1) without copying the entire LayoutTracker map.
+            std::shared_lock resource_lock(context_.resource_mutex_);
             const ResourceBinding* current = context_.resolve(source);
             if (current && current->image && current->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
+                tracker_lock.lock();
+                rollback_source = context_.tracker_.tracked(source);
+                if (rollback_source) prev_layout = context_.tracker_.layout(source, 0);
                 record(frame.commands, *current, source, image, source_rect);
                 recorded = true;
             }
@@ -280,8 +289,15 @@ public:
             record_blank(frame.commands, image);
             recorded = true;
         }
+        const auto rollback = [&] {
+            if (rollback_source)
+                context_.tracker_.set(source, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, prev_layout);
+        };
         if (!recorded) return give_back(frame, VK_ERROR_UNKNOWN);  // released by another thread since presentable()
-        if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) return stop(reset);
+        if (const VkResult reset = vkResetFences_(device, 1, &frame.done); reset != VK_SUCCESS) {
+            rollback();
+            return stop(reset);
+        }
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo submit_info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit_info.waitSemaphoreCount = 1;
@@ -299,7 +315,7 @@ public:
         present.pImageIndices = &image;
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
         // The swapchain was created with FIFO and tear_mode_ (both come from the same recreate).
-        VkSwapchainPresentModeInfoKHR present_mode{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR};
+        VkSwapchainPresentModeInfoEXT present_mode{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT};
         const bool tearing = tear && vsync_ && tear_supported();
         if (tearing) {
             present_mode.swapchainCount = 1;
@@ -314,6 +330,10 @@ public:
         {
             std::lock_guard lock(context_.submit_mutex());
             submitted = vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
+            if (submitted != VK_SUCCESS) rollback();
+            // Commit/rollback happened before releasing tracker_mutex_ inside submit_mutex(), preserving submission
+            // order without holding tracker_mutex_ across vkQueuePresentKHR.
+            if (tracker_lock.owns_lock()) tracker_lock.unlock();
             if (submitted == VK_SUCCESS) result = vkQueuePresentKHR_(queue_, &present);
         }
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
@@ -491,9 +511,27 @@ private:
         VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         VkAccessFlags access = VK_ACCESS_TRANSFER_WRITE_BIT;
         if (capture_ && capture_buffer_) {
-            detail::image_barrier(fn, commands, target_of(image), range, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                  access, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+            // Two frames may be in flight and share `capture_buffer_`: serialize the prior frame's capture copy
+            // before overwriting it, while moving this frame's swapchain image to TRANSFER_SRC.
+            VkBufferMemoryBarrier capture_waw{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            capture_waw.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            capture_waw.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            capture_waw.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            capture_waw.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            capture_waw.buffer = capture_buffer_;
+            capture_waw.offset = 0;
+            capture_waw.size = VK_WHOLE_SIZE;
+            VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            to_src.srcAccessMask = access;
+            to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            to_src.oldLayout = layout;
+            to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_src.image = images_[image];
+            to_src.subresourceRange = range;
+            fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                nullptr, 1, &capture_waw, 1, &to_src);
             VkBufferImageCopy copy{};
             copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             copy.imageExtent = {extent_.width, extent_.height, 1};
@@ -568,7 +606,21 @@ private:
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
-        if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
+        VkExtent2D extent = caps.currentExtent;
+        // When the platform leaves the swapchain extent to the application (0xFFFFFFFF, as on Intel UHD / Win32 WSI),
+        // query the window client area or fall back to the last known extent, and clamp to the surface bounds (D3D-165).
+        if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF) {
+            if (extent_fn_) extent = extent_fn_();
+            // ponytail: if no window extent function was supplied, fall back to last extent_ or minImageExtent
+            if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF || (extent.width == 0 && extent.height == 0)) {
+                extent = extent_.width && extent_.height ? extent_ : caps.minImageExtent;
+            }
+            if (extent.width && extent.height) {
+                extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+                extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+            }
+        }
+        if (extent.width == 0 || extent.height == 0) {
             release(swapchain_);
             swapchain_ = VK_NULL_HANDLE;
             vsync_ = vsync;
@@ -632,7 +684,7 @@ private:
         if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
         info.imageFormat = chosen.format;
         info.imageColorSpace = chosen.colorSpace;
-        info.imageExtent = caps.currentExtent;
+        info.imageExtent = extent;
         info.imageArrayLayers = 1;
         info.imageUsage = usage;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -642,7 +694,7 @@ private:
         info.presentMode = mode;
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
         // A vsync swapchain that can also be presented in IMMEDIATE (or FIFO_RELAXED), switched per present.
-        VkSwapchainPresentModesCreateInfoKHR switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR};
+        VkSwapchainPresentModesCreateInfoEXT switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT};
         std::array<VkPresentModeKHR, 2> switchable_modes{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAX_ENUM_KHR};
         VkPresentModeKHR tear = VK_PRESENT_MODE_MAX_ENUM_KHR;
         if (vsync && mode == VK_PRESENT_MODE_FIFO_KHR) tear = find_tear_mode(modes, info.minImageCount, info.imageUsage, info.imageExtent);
@@ -686,7 +738,7 @@ private:
         images_ = std::move(images);
         ready_ = std::move(ready);
         format_ = chosen.format;
-        extent_ = caps.currentExtent;
+        extent_ = extent;
         if (capture_) {
             // A capture that cannot be made fails the recreation with the swapchain in place and stale_ still set.
             const bool four_bytes = format_ == VK_FORMAT_B8G8R8A8_UNORM || format_ == VK_FORMAT_R8G8B8A8_UNORM ||
@@ -710,11 +762,11 @@ private:
         // The capabilities of the surface for one present mode, and the modes it can switch to from there.
         const auto ask = [&](VkPresentModeKHR asked, VkSurfaceCapabilitiesKHR& caps,
                              std::array<VkPresentModeKHR, 16>* compatible, std::uint32_t* compatible_count) {
-            VkSurfacePresentModeKHR for_mode{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR};
+            VkSurfacePresentModeEXT for_mode{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT};
             for_mode.presentMode = asked;
             VkPhysicalDeviceSurfaceInfo2KHR surface_info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, &for_mode};
             surface_info.surface = surface_;
-            VkSurfacePresentModeCompatibilityKHR compat{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR};
+            VkSurfacePresentModeCompatibilityEXT compat{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT};
             if (compatible) {
                 compat.presentModeCount = std::uint32_t(compatible->size());
                 compat.pPresentModes = compatible->data();
@@ -785,6 +837,7 @@ private:
     bool ok_ = false;
     bool swapchain_srgb_ = false;  // the swapchain format follows the source being presented (set once it exists)
     std::function<bool()> abort_;
+    std::function<VkExtent2D()> extent_fn_;
     std::map<VkFormat, VkFormatFeatureFlags> features_;
     bool warned_srgb_ = false;
     bool capture_ = false;

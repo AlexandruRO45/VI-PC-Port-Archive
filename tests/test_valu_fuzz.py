@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 from fractions import Fraction
+from itertools import permutations
 
 import pytest
 
@@ -70,6 +71,17 @@ def test_signed_zeros():
     assert vf.f16_op("add", 0x8000, 0x8000) == (0x8000, False)    # -0 + -0 = -0
     assert vf.f16_op("sub", 0x8000, 0x0000) == (0x8000, False)    # -0 - +0 = -0
     assert vf.f16_op("max", 0x0000, 0x8000)[1]                    # +0 vs -0: not promised, so uncertain
+
+
+@pytest.mark.parametrize("operands,expected", [
+    ((0x0000, 0x8000, 0x0000), 0x0000),  # +0, -0, +0
+    ((0x8000, 0x0000, 0x8000), 0x8000),  # -0, +0, -0
+    ((0xBC00, 0x0000, 0x8000), 0x8000),  # -1 < -0 < +0
+    ((0x3C00, 0x0000, 0x8000), 0x0000),  # -0 < +0 < +1
+])
+def test_f16_med3_orders_signed_zeros(operands, expected):
+    for args in dict.fromkeys(permutations(operands)):
+        assert vf.f16_op("med3", *args) == (expected, False), args
 
 
 @pytest.mark.parametrize("a,b,c,true,double", [
@@ -384,9 +396,11 @@ def _mc():
 def _mc_accepts_f16_opsel(mc):
     """llvm-mc 21+ is needed for op_sel on 16-bit VOP3 (docs/testing.md); older builds reject the modifier.
 
-    Probe a fixed instruction rather than a generated program, so a generator bug can never turn into a skip.
+    Probe a fixed instruction rather than a generated program, so a generator bug can never turn into a skip. The
+    probe is the form llvm-mc 18 rejects (docs/testing.md): a 16-bit integer op, which GFX10 has only as op_sel VOP3.
+    An f16 VOP2 op's VOP3 form takes no op_sel on GFX10 (tools/valu_fuzz.py), so no assembler accepts that as a probe.
     """
-    probe = "v_add_f16_e64 v0, v1, v2 op_sel:[0,0,0]\n"
+    probe = "v_ashrrev_i16_e64 v0, v1, v2 op_sel:[0,0,0]\n"
     r = subprocess.run(mc + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"], input=probe,
                        capture_output=True, text=True)
     return r.returncode == 0 and "error:" not in r.stderr

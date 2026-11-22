@@ -124,6 +124,27 @@ class TestChains(unittest.TestCase):
         self.assertEqual(sorted(lang for _s, _o, lang, _t in scan.tables), ["de", "en"])
         self.assertEqual(scan.tables[0][1], 0x1000)
 
+    def test_resource_across_a_128k_first_stream(self):
+        # A resource's first stream can be any whole number of 64 KiB blocks (docs/page_directory.md): 41 data.rpf
+        # resources start with a 128 or 192 KiB stream whose descriptors end in the next stream.
+        res = make_resource(EN, pad=2 * T.BLOCK)        # tables start past the first 128 KiB
+        streams = [res[:2 * T.BLOCK], res[2 * T.BLOCK:], make_resource(DE), CONV]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.carve(tmp, streams)
+            scan = T.Scan()
+            for label, off, data in T.blobs(tmp):
+                scan.add(label, off, data)
+        self.assertEqual(sorted(lang for _s, _o, lang, _t in scan.tables), ["de", "en"])
+
+    def test_whole_block_streams_continue_and_others_end_the_chain(self):
+        for first, joined in ((T.BLOCK, True), (2 * T.BLOCK, True), (3 * T.BLOCK, True),
+                              (T.BLOCK + 16, False), (T.BLOCK - 16, False)):
+            with self.subTest(first=first):
+                rows = [{"off": 0, "size": first}, {"off": 1, "size": 100}]
+                data = {0: bytes(first), 1: b"b" * 100}
+                offsets = [o for o, _d in T._chains(rows, lambda r: data[r["off"]])]
+                self.assertEqual(offsets, [0] if joined else [0, 1])
+
     def test_short_stream_ends_the_chain(self):
         rows = [{"off": 0, "size": 100}, {"off": 1, "size": 50}]
         data = {0: b"a" * 100, 1: b"b" * 50}
@@ -155,6 +176,20 @@ class TestDialogue(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_csv_exports_explicitly_empty_strings(self) -> None:
+        strings = {"ZZ_SYNTHETIC_BLANK": "", "ZZ_SYNTHETIC_LINE": "This is the text you know"}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = write(os.path.join(tmp, "strings.bin"), make_resource(strings))
+            tables_csv = os.path.join(tmp, "tables.csv")
+            strings_csv = os.path.join(tmp, "strings.csv")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(T.main([source, "--tables", tables_csv, "--strings", strings_csv]), 0)
+            with open(tables_csv, encoding="utf-8", newline="") as f:
+                self.assertEqual([row["strings"] for row in csv.DictReader(f)], ["2"])
+            with open(strings_csv, encoding="utf-8", newline="") as f:
+                self.assertEqual({row["hash"]: row["text"] for row in csv.DictReader(f)},
+                                 {f"{T.joaat(label):08x}": text for label, text in strings.items()})
+
     def test_end_to_end(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "src")
@@ -178,10 +213,100 @@ class TestCli(unittest.TestCase):
             with open(outs["strings"], encoding="utf-8", newline="") as fh:
                 strings = list(csv.DictReader(fh))
             self.assertIn(("ZZ_MENU_TITLE", "das Menü"), {(s["label"], s["text"]) for s in strings})
+            self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")],
+                             "staging files must not be left behind")
+
+    def test_failed_later_write_leaves_earlier_reports_intact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "conv.pso"), CONV)
+            dialogue = os.path.join(tmp, "dialogue.csv")
+            old = "OLD GOOD REPORT\n"
+            with open(dialogue, "w", encoding="utf-8") as fh:
+                fh.write(old)
+            tables = os.path.join(tmp, "tables.csv")
+            os.mkdir(tables)                        # a later output that cannot be written
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(T.main([src, "--dialogue", dialogue, "--tables", tables]), 2)
+            self.assertIn("cannot write", err.getvalue())
+            with open(dialogue, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), old)
+            self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")])
+
+    @unittest.skipUnless(os.name == "nt", "Windows denies os.replace on a file held open by a reader")
+    def test_reader_holding_a_later_report_keeps_all_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "conv.pso"), CONV)
+            dialogue = os.path.join(tmp, "dialogue.csv")
+            tables = os.path.join(tmp, "tables.csv")
+            old_dialogue, old_tables = "OLD DIALOGUE\n", "OLD TABLES\n"
+            for path, text in ((dialogue, old_dialogue), (tables, old_tables)):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            with open(tables, "rb"):       # a reader keeps the second output open
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(T.main([src, "--dialogue", dialogue, "--tables", tables]), 2)
+            self.assertIn("cannot write", err.getvalue())
+            with open(dialogue, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), old_dialogue)
+            with open(tables, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), old_tables)
+            self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")],
+                             "staging and backup files must not be left behind")
+
+    def test_two_outputs_naming_one_file_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "conv.pso"), CONV)
+            out = os.path.join(tmp, "same.csv")
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as cm:
+                    T.main([src, "--dialogue", out, "--tables", out])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("distinct", err.getvalue())
+            self.assertFalse(os.path.exists(out), "no report may be written before the check")
 
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(T.main(["/nonexistent"]), 2)
+
+    def test_missing_parent_and_hardlinked_outputs_rejected_upfront(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "en.bin"), make_resource(EN))
+            missing_parent = os.path.join(tmp, "no_such_dir", "out.csv")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                T.main([src, "--tables", missing_parent])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("parent directory does not exist", err.getvalue())
+
+            first = write(os.path.join(tmp, "first.csv"), b"old\n")
+            alias = os.path.join(tmp, "alias.csv")
+            try:
+                os.link(first, alias)
+            except OSError:
+                self.skipTest("hard links unavailable")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                T.main([src, "--dialogue", first, "--tables", alias])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("distinct", err.getvalue())
+
+    def test_invalid_json_labels_is_clean_error_not_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "en.bin"), make_resource(EN))
+            bad_labels = os.path.join(tmp, "bad.json")
+            with open(bad_labels, "w", encoding="utf-8") as fh:
+                fh.write("{not valid json")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = T.main([src, "--labels", bad_labels])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot read input", err.getvalue())
 
 
 if __name__ == "__main__":

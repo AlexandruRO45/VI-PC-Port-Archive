@@ -314,7 +314,7 @@ def scan_dir(path, max_inflate=1 << 28):
                 print(f"{p}: skipped ({e})", file=sys.stderr)
                 continue
             rows += r
-            summaries.append(s)
+            summaries.extend(s)
         return rows, summaries
     for p in sorted(glob.glob(os.path.join(path, "**", "*.bin"), recursive=True)):
         size = os.path.getsize(p)
@@ -351,7 +351,7 @@ def write_outputs(rows, summaries, out, csv_path):
     if out:
         _make_parent(out)
         payload = summaries if len(summaries) > 1 else (summaries[0] if summaries else {})
-        with open(out, "w", encoding="utf-8") as f:
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": payload, "streams": rows}, f, indent=0)
     if csv_path:
         _make_parent(csv_path)
@@ -363,7 +363,7 @@ def write_outputs(rows, summaries, out, csv_path):
                 "compression_params", "dehydrated", "chunked", "bounds_min", "bounds_max",
                 "hash", "off_a0", "hi16", "lo16", "desc_word", "fragment"]
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
             w.writeheader()
             for r in rows:
                 r = dict(r)

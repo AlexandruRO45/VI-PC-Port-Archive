@@ -105,6 +105,22 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "fail")
         self.assertIn("exit 3", detail)
 
+    def test_a_disabled_test_is_skipped_without_launching(self) -> None:
+        built = self.command_for(self.exiting(0))
+        missing = self.command_for(self.artifact / "missing.exe")
+        for command in (built, missing, None):
+            with self.subTest(command=command), \
+                    mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+                status, detail = self.run_entry(ctest_entry("disabled", command, {"DISABLED": True}))
+                launch.assert_not_called()
+                self.assertEqual(status, "skip", detail)
+                self.assertIn("disabled by CTest", detail)
+
+    def test_a_false_disabled_property_still_runs_the_test(self) -> None:
+        command = self.command_for(self.exiting(0))
+        status, detail = self.run_entry(ctest_entry("enabled", command, {"DISABLED": "0"}))
+        self.assertEqual(status, "pass", detail)
+
     def test_a_test_without_a_command_fails(self):
         status, detail = self.run_entry(ctest_entry("unbuilt", None))
         self.assertEqual(status, "fail")
@@ -136,6 +152,35 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "skip")
         self.assertIn("exit 77", detail)
 
+    def test_ctest_environment_is_applied_only_to_its_child(self) -> None:
+        exe = self.program("show_environment.py",
+                           "import os\n"
+                           "for key in ('LEONIDA_HOST_ADAPTER', 'LEONIDA_WINE_TEST_INHERITED', "
+                           "'LEONIDA_WINE_TEST_VALUE', 'LEONIDA_WINE_TEST_EMPTY'):\n"
+                           "    print(repr(os.environ.get(key)))\n")
+        command = self.command_for(exe)
+        env = {"LEONIDA_HOST_ADAPTER": "inherited", "LEONIDA_WINE_TEST_INHERITED": "keep"}
+        props = {"ENVIRONMENT": ["LEONIDA_HOST_ADAPTER=warp", "LEONIDA_WINE_TEST_VALUE=path=a;b",
+                                 "LEONIDA_WINE_TEST_EMPTY="]}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("LEONIDA_WINE_TEST_VALUE", None)
+            os.environ.pop("LEONIDA_WINE_TEST_EMPTY", None)
+            status, detail = self.run_entry(ctest_entry("with_environment", command, props))
+            self.assertEqual(status, "pass", detail)
+            self.assertEqual(detail.splitlines()[1:], ["'warp'", "'keep'", "'path=a;b'", "''"])
+            status, detail = self.run_entry(ctest_entry("without_environment", command))
+            self.assertEqual(status, "pass", detail)
+            self.assertEqual(detail.splitlines()[1:], ["'inherited'", "'keep'", "None", "None"])
+
+    def test_malformed_ctest_environment_fails_before_launch(self) -> None:
+        command = self.command_for(self.exiting(0))
+        props = {"ENVIRONMENT": ["missing_equals"]}
+        with mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+            status, detail = self.run_entry(ctest_entry("bad_environment", command, props))
+        launch.assert_not_called()
+        self.assertEqual(status, "fail", detail)
+        self.assertIn("invalid CTest ENVIRONMENT", detail)
+
     def test_ctest_output_expressions_determine_the_result(self):
         usage = {"PASS_REGULAR_EXPRESSION": ["alternative", "usage: gta6rt"]}
         forbidden = {"FAIL_REGULAR_EXPRESSION": ["running ", r"module\(s\) mapped"]}
@@ -150,6 +195,20 @@ class RunTestTest(unittest.TestCase):
         ):
             with self.subTest(code=code, output=output, props=props):
                 exe = self.program("regex.py", f"import sys\nprint({output!r}, file=sys.stderr)\nsys.exit({code})\n")
+                status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
+                self.assertEqual(status, expected, detail)
+
+    def test_a_scalar_output_expression_is_matched_as_one_pattern(self):
+        required = {"PASS_REGULAR_EXPRESSION": "usage: gta6rt"}
+        forbidden = {"FAIL_REGULAR_EXPRESSION": r"module\(s\) mapped"}
+        for code, output, props, expected in (
+            (3, "unexpected output", required, "fail"),
+            (2, "usage: gta6rt", required, "pass"),
+            (0, "unexpected output", forbidden, "pass"),
+            (0, "1 module(s) mapped", forbidden, "fail"),
+        ):
+            with self.subTest(output=output, props=props):
+                exe = self.program("regex.py", f"import sys\nprint({output!r})\nsys.exit({code})\n")
                 status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
                 self.assertEqual(status, expected, detail)
 
@@ -197,6 +256,70 @@ class RunTestTest(unittest.TestCase):
                          os.path.normcase(os.path.realpath(self.artifact / "sub")))
 
 
+@unittest.skipIf(os.name == "nt", "the runner and its dosdevices links are for Linux and macOS")
+class DriveMapTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.root = base / "checkout"
+        (self.root / "runtime" / "build" / "generated").mkdir(parents=True)
+        (self.root / "runtime" / "build" / "generated" / "cs.spv").write_text("spirv", encoding="utf-8")
+        self.prefix = base / "prefix"
+        (self.prefix / "dosdevices").mkdir(parents=True)
+        self.link = self.prefix / "dosdevices" / "d:"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_the_drive_leads_to_the_checkout_and_is_removed_afterwards(self):
+        with rwt.DriveMap("D:/a/Leonida/Leonida", str(self.root), str(self.prefix)) as drive:
+            seen = self.link / "a" / "Leonida" / "Leonida" / "runtime" / "build" / "generated" / "cs.spv"
+            self.assertEqual(seen.read_text(encoding="utf-8"), "spirv")
+            self.assertIn("drive d: maps", drive.note)
+            scratch = drive.scratch
+        self.assertFalse(os.path.lexists(self.link))
+        self.assertFalse(os.path.exists(scratch))
+        self.assertTrue((self.root / "runtime" / "build" / "generated" / "cs.spv").is_file())   # links only
+
+    def test_backslashes_and_a_lower_case_drive_are_accepted(self):
+        with rwt.DriveMap("d:\\work\\leonida\\", str(self.root), str(self.prefix)):
+            self.assertTrue((self.link / "work" / "leonida" / "runtime" / "build").is_dir())
+
+    def test_a_drive_the_prefix_already_has_is_left_alone(self):
+        other = self.prefix / "elsewhere"
+        other.mkdir()
+        os.symlink(other, self.link)
+        with rwt.DriveMap("D:/a/Leonida/Leonida", str(self.root), str(self.prefix)) as drive:
+            self.assertIn("already set", drive.note)
+        self.assertEqual(os.readlink(self.link), str(other))
+
+    def test_no_prefix_or_no_drive_letter_maps_nothing(self):
+        with rwt.DriveMap("D:/a/b", str(self.root), str(self.prefix / "absent")) as drive:
+            self.assertIn("no Wine prefix", drive.note)
+        with rwt.DriveMap("/home/runner/work", str(self.root), str(self.prefix)) as drive:
+            self.assertIn("no drive letter", drive.note)
+        self.assertFalse(os.path.lexists(self.link))
+
+    def test_main_maps_the_drive_while_the_tests_run(self):
+        # The "Wine" here is the Python interpreter, so the program reads the drive through its dosdevices link, which
+        # is where Wine resolves D:/win/root/... too.
+        probe = self.root / "probe.py"
+        target = self.link / "win" / "root" / "runtime" / "build" / "generated" / "cs.spv"
+        probe.write_text(f"import sys\nsys.exit(0 if open({str(target)!r}).read() == 'spirv' else 1)\n", encoding="utf-8")
+        listing = self.root / "ctest.json"
+        listing.write_text(json.dumps({"tests": [ctest_entry("compiled_in_path", [WINDOWS_ROOT + "/probe.py"])]}),
+                           encoding="utf-8")
+        argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
+                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/")]
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"WINEPREFIX": str(self.prefix)}), mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(out):
+            code = rwt.main()
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("[PASS] compiled_in_path", out.getvalue())
+        self.assertFalse(os.path.lexists(self.link))
+
+
 class MainTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -205,6 +328,10 @@ class MainTest(unittest.TestCase):
         self.artifact.mkdir()
         for name, code in (("ok.py", 0), ("bad.py", 1)):
             (self.artifact / name).write_text(f"import sys\nsys.exit({code})\n", encoding="utf-8")
+        # main() maps the checkout's drive into $WINEPREFIX: keep it away from a real prefix (~/.wine).
+        env = mock.patch.dict(os.environ, {"WINEPREFIX": str(self.root / "no-prefix")})
+        env.start()
+        self.addCleanup(env.stop)
 
     def tearDown(self):
         self._tmp.cleanup()

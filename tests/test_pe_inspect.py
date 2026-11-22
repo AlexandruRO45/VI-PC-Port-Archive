@@ -249,6 +249,16 @@ class PeInspectTest(unittest.TestCase):
             self.assertEqual(report["exports"], ["Alpha", "#12"])
             self.assertEqual(report["export_count"], 2)
 
+    def test_named_exports_require_a_populated_address_table_slot(self) -> None:
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                data = bytearray(with_exports([0x1000, 0, FORWARDER, 0x1010],
+                                              {0: "Alpha", 1: "Empty", 2: "Forwarded", 4: "Outside"},
+                                              is64=is64))
+                # The bytes after AddressOfFunctions are not part of its declared four slots.
+                place(data, EXPORT_FUNCS + 16, struct.pack("<I", 0x1020))
+                self.assertEqual(self.exports_of(bytes(data)), ["Alpha", "Forwarded", "#13"])
+
     def test_unused_slots_in_a_table_without_names(self):
         data = with_exports([0, 0x1000, 0, 0x1010, 0], {})
         self.assertEqual(self.exports_of(data), ["#11", "#13"])
@@ -635,6 +645,34 @@ class TruncatedImageTest(unittest.TestCase):
         exports = pe_inspect.inspect(path, None)["exports"]
         self.assertLessEqual(len(exports), pe_inspect.MAX_ENTRIES + 2)
 
+
+class DeclaredOptionalHeaderSizeTest(unittest.TestCase):
+    """Reject optional headers smaller than the fields the parser reads."""
+
+    def test_declared_optional_header_too_small(self):
+        for is64 in (False, True):
+            for declared_size in (0, 2, 71):
+                with self.subTest(is64=is64, declared_size=declared_size):
+                    data = bytearray(build_image(is64=is64))
+                    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                    struct.pack_into("<H", data, pe_offset + 20, declared_size)
+
+                    with self.assertRaisesRegex(
+                        pe_inspect.PeFormatError, "truncated optional header"
+                    ):
+                        pe_inspect.PeImage(bytes(data))
+
+    def test_declared_optional_header_extends_beyond_file(self):
+        for is64 in (False, True):
+            with self.subTest(is64=is64):
+                data = bytearray(build_image(is64=is64))
+                pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                struct.pack_into("<H", data, pe_offset + 20, 0xFFFF)
+
+                with self.assertRaisesRegex(
+                    pe_inspect.PeFormatError, "truncated optional header"
+                ):
+                    pe_inspect.PeImage(bytes(data))
 
 if __name__ == "__main__":
     unittest.main()

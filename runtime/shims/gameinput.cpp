@@ -50,8 +50,9 @@ using namespace gi;
 
 namespace {
 
-constexpr uint32_t kSupportedKinds =
+constexpr uint32_t kBaseKinds =
     GameInputKindControllerAxis | GameInputKindControllerButton | GameInputKindGamepad | GameInputKindUiNavigation;
+constexpr uint32_t kSupportedKinds = kBaseKinds | GameInputKindMotion;  // everything a reading may carry
 constexpr uint32_t kAxisCount = 6;  // LX, LY, RX, RY, LT, RT
 constexpr uint32_t kButtonCount = SDL_GAMEPAD_BUTTON_COUNT;
 constexpr uint32_t kConnectedStatus = GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled;
@@ -61,6 +62,14 @@ constexpr uint64_t kBatteryRefreshUs = 1'000'000;
 constexpr int kDsEffectSize = 47;  // the DualSense effects block SDL_SendGamepadEffect forwards (SDL's DS5EffectsState_t)
 constexpr uint64_t kHistoryUs = 500'000;  // a reading stays in the history until the one after it is this old
 constexpr size_t kHistoryCap = 512;       // readings per pad, whatever the poll rate
+// Motion. SDL gives accel in m/s^2 (gravity included) and gyro in rad/s; the state the ABI defines carries signed
+// fractions of the maxima motionInfo reports, so a reading stays within -1..1 however hard the pad is shaken. The
+// maxima are this shim's choice: SDL does not expose a sensor range, and 2 g / 2000 deg/s are the ranges a
+// DualSense's accelerometer and gyro can express (VERIFY: against the game and a real pad, docs/gameinput.md).
+constexpr float kMaxAcceleration = 19.6133f;     // 2 g in m/s^2
+constexpr float kMaxAngularVelocity = 34.9066f;  // 2000 deg/s in rad/s
+constexpr float kMotionSensorRate = 250.0f;      // requested sample rate; the device clamps to what it has
+constexpr uint64_t kMotionReadingUs = 8'000;     // a motion pad streams readings at ~125 Hz so the history stays sane
 
 uint64_t now_us() {
     static const LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
@@ -97,6 +106,8 @@ rt::gameinput::Config read_config() {
     else if (!t.empty() && t != "rumble") std::fprintf(stderr, "[rt] gameinput: LEONIDA_DS_TRIGGERS=%s unknown, using rumble\n", t.c_str());
     if (const std::string g = env("LEONIDA_DS_TRIGGER_GAIN"); !g.empty())
         c.ds_trigger_gain = std::clamp(static_cast<float>(std::atof(g.c_str())), 0.0f, 4.0f);
+    if (const std::string g = env("LEONIDA_MOUSE_SENSITIVITY"); !g.empty())
+        c.mouse_sensitivity = std::clamp(static_cast<float>(std::atof(g.c_str())), 0.1f, 10.0f);
     if (const std::string f = env("LEONIDA_DS_TRIGGER_FREQ"); !f.empty())
         c.ds_trigger_frequency = static_cast<uint8_t>(std::clamp(std::atoi(f.c_str()), 1, 255));
     if (const std::string l = env("LEONIDA_DS_LIGHTBAR"); !l.empty()) {
@@ -133,6 +144,8 @@ struct Snapshot {
     float axes[kAxisCount] = {};
     bool buttons[kButtonCount] = {};
     bool guide = false;
+    GameInputMotionState motion{};  // valid only when has_motion; does not take part in operator==
+    bool has_motion = false;
     bool operator==(const Snapshot& o) const {  // field by field: the padding is not initialised
         const GameInputGamepadState &a = gamepad, &b = o.gamepad;
         return a.buttons == b.buttons && a.leftTrigger == b.leftTrigger && a.rightTrigger == b.rightTrigger &&
@@ -164,7 +177,9 @@ public:
         return r;
     }
 
-    uint32_t STDMETHODCALLTYPE GetInputKind() override { return kSupportedKinds; }
+    uint32_t STDMETHODCALLTYPE GetInputKind() override {
+        return s_.has_motion ? kSupportedKinds : kBaseKinds;  // a reading of a pad without sensors carries no motion
+    }
     uint64_t STDMETHODCALLTYPE GetSequenceNumber(uint32_t) override { return seq_; }
     uint64_t STDMETHODCALLTYPE GetTimestamp() override { return ts_; }
     void STDMETHODCALLTYPE GetDevice(IGameInputDevice** device) override;
@@ -191,7 +206,11 @@ public:
     bool STDMETHODCALLTYPE GetMouseState(void*) override { return false; }
     uint32_t STDMETHODCALLTYPE GetTouchCount() override { return 0; }
     uint32_t STDMETHODCALLTYPE GetTouchState(uint32_t, void*) override { return 0; }
-    bool STDMETHODCALLTYPE GetMotionState(void*) override { return false; }
+    bool STDMETHODCALLTYPE GetMotionState(void* state) override {
+        if (!state || !s_.has_motion) return false;
+        *static_cast<GameInputMotionState*>(state) = s_.motion;
+        return true;
+    }
     bool STDMETHODCALLTYPE GetArcadeStickState(void*) override { return false; }
     bool STDMETHODCALLTYPE GetFlightStickState(void*) override { return false; }
     bool STDMETHODCALLTYPE GetGamepadState(GameInputGamepadState* state) override {
@@ -281,6 +300,7 @@ public:
     GameInputControllerButtonInfo button_info[kButtonCount]{};
     GameInputGamepadInfo gamepad_info{};
     GameInputUiNavigationInfo ui_info{};
+    GameInputMotionInfo motion_info{};  // filled only when the pad has sensors; info.motionInfo points at it
     std::atomic<uint32_t> status{GameInputDeviceNoStatus};
     std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
     uint64_t evicted_order = 0;    // order of the newest reading dropped from history
@@ -294,9 +314,10 @@ public:
     SDL_Gamepad* pad = nullptr;
     SDL_JoystickID id = 0;
     int player = -1;
-    bool is_dualsense = false, has_rumble = false, has_trigger_rumble = false;
+    bool is_dualsense = false, has_rumble = false, has_trigger_rumble = false, has_motion = false;
     rt::gameinput::OutputState sent{};
     Snapshot last_snap{};  // what the latest reading holds
+    uint64_t last_reading_us = 0;  // for the motion cadence: readings stream at ~125 Hz on pads with sensors
     uint64_t motors_sent_at = 0, triggers_sent_at = 0, battery_at = 0;
     bool ds_sent_once = false;
 
@@ -446,7 +467,10 @@ uint16_t to_u16(float v) { return static_cast<uint16_t>(std::lround(std::clamp(v
 
 float axis(SDL_Gamepad* p, SDL_GamepadAxis a) { return std::max(-1.0f, SDL_GetGamepadAxis(p, a) / 32767.0f); }
 
-Snapshot read_pad(SDL_Gamepad* p) {
+float norm(float v, float max) { return std::clamp(v / max, -1.0f, 1.0f); }
+
+Snapshot read_pad(Device* d) {
+    SDL_Gamepad* p = d->pad;
     Snapshot s;
     auto down = [p](SDL_GamepadButton b) { return SDL_GetGamepadButton(p, b); };
     struct Map { SDL_GamepadButton sdl; uint32_t gi; };
@@ -485,6 +509,31 @@ Snapshot read_pad(SDL_Gamepad* p) {
     s.axes[5] = s.gamepad.rightTrigger;
     for (uint32_t i = 0; i < kButtonCount; ++i) s.buttons[i] = down(static_cast<SDL_GamepadButton>(i));
     s.guide = down(SDL_GAMEPAD_BUTTON_GUIDE);
+
+    // Motion, normalised against the maxima motionInfo reports (the ABI's fraction convention). Sensors were enabled
+    // when the pad was opened; a pad whose sensor read fails just reports no motion this poll. SDL answers reads
+    // with zeros before the device's first sample arrives, and gravity makes a real accelerometer never read
+    // exactly zero, so all-zero accel means "no sample yet" and the reading carries no motion at all.
+    if (d->has_motion) {
+        float accel[3], gyro[3];
+        if (SDL_GetGamepadSensorData(p, SDL_SENSOR_ACCEL, accel, 3) &&
+            SDL_GetGamepadSensorData(p, SDL_SENSOR_GYRO, gyro, 3) &&
+            (accel[0] != 0.0f || accel[1] != 0.0f || accel[2] != 0.0f)) {
+            s.has_motion = true;
+            s.motion.accelerationX = norm(accel[0], kMaxAcceleration);
+            s.motion.accelerationY = norm(accel[1], kMaxAcceleration);
+            s.motion.accelerationZ = norm(accel[2], kMaxAcceleration);
+            s.motion.angularVelocityX = norm(gyro[0], kMaxAngularVelocity);
+            s.motion.angularVelocityY = norm(gyro[1], kMaxAngularVelocity);
+            s.motion.angularVelocityZ = norm(gyro[2], kMaxAngularVelocity);
+            // SDL's gamepad API has no compass and the shim synthesises no orientation, so those stay zero and
+            // unknown rather than a made-up value.
+            s.motion.accelerometerAccuracy = GameInputMotionAccuracyHigh;
+            s.motion.gyroscopeAccuracy = GameInputMotionAccuracyHigh;
+            s.motion.magnetometerAccuracy = GameInputMotionAccuracyUnknown;
+            s.motion.orientationAccuracy = GameInputMotionAccuracyUnknown;
+        }
+    }
 
     // UI navigation derived from the gamepad (VERIFY against the console's own mapping).
     const uint32_t b = s.gamepad.buttons;
@@ -544,10 +593,19 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
     // filters on the family).
     i.deviceFamily = GameInputFamilyXboxOne;
     if (SDL_GetGamepadConnectionState(p) == SDL_JOYSTICK_CONNECTION_WIRELESS) i.capabilities |= GameInputDeviceCapabilityWireless;
-    i.supportedInput = kSupportedKinds;
+    // The per-device kind set: the reading-kind searches take the global kSupportedKinds as the outer bound and this
+    // as the per-device one, so only pads with sensors answer a motion query.
+    i.supportedInput = kBaseKinds;
     if (d->has_rumble) i.supportedRumbleMotors |= GameInputRumbleLowFrequency | GameInputRumbleHighFrequency;
     if (d->has_trigger_rumble || (d->is_dualsense && g().config.ds_triggers != rt::gameinput::DsTriggerMode::Off))
         i.supportedRumbleMotors |= GameInputRumbleLeftTrigger | GameInputRumbleRightTrigger;
+    if (d->has_motion) {
+        i.supportedInput |= GameInputKindMotion;
+        // The maxima GetMotionState's fractions divide by. The magnetometer is not available: SDL's gamepad API has
+        // no compass, and maxMagneticFieldStrength 0 says so (Microsoft's GameInputMotionInfo remarks).
+        d->motion_info = {kMaxAcceleration, kMaxAngularVelocity, 0.0f};
+        i.motionInfo = &d->motion_info;
+    }
     i.controllerAxisCount = kAxisCount;
     i.controllerButtonCount = kButtonCount;
     for (uint32_t a = 0; a < kAxisCount; ++a) {
@@ -583,6 +641,7 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
 // the title holds outlive their place here (~Reading only releases the device, which takes no lock). Under g().mu.
 Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
     std::deque<Reading*>& h = d->history;
+    d->last_reading_us = ts;
     h.push_back(new Reading(d, snap, ++d->seq, ts, ++g().last_order));
     while (h.size() > kHistoryCap || (h.size() > 1 && h[1]->GetTimestamp() + kHistoryUs < ts)) {
         d->evicted_order = h.front()->order();
@@ -637,6 +696,13 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->is_dualsense = SDL_GetGamepadType(p) == SDL_GAMEPAD_TYPE_PS5;
     d->has_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
     d->has_trigger_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
+    // Motion needs both sensors; SDL's orientation quaternion is left alone (no title asks for it, and a synthesised
+    // one would lie). Enabling at open: SDL delivers samples only for enabled sensors.
+    d->has_motion = SDL_GamepadHasSensor(p, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(p, SDL_SENSOR_ACCEL);
+    if (d->has_motion) {
+        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_GYRO, kMotionSensorRate);
+        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_ACCEL, kMotionSensorRate);
+    }
     d->sent = {};
     d->sent.is_dualsense = d->is_dualsense;
     d->sent.trigger_rumble = d->has_trigger_rumble;
@@ -662,13 +728,13 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->status = status;
     s.connected.push_back(d);
 
-    const Snapshot snap = read_pad(p);
+    const Snapshot snap = read_pad(d);
     d->last_snap = snap;
     push_reading(d, snap, ts);
     queue_event({CbType::Device, d, nullptr, ts, status, GameInputDeviceNoStatus, false, 0});
-    std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, player %d%s%s)\n", d->name.c_str(), d->info.vendorId,
-                 d->info.productId, player + 1, d->is_dualsense ? ", DualSense trigger effects" : "",
-                 d->has_trigger_rumble ? ", trigger rumble" : "");
+    std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, player %d%s%s%s)\n", d->name.c_str(),
+                 d->info.vendorId, d->info.productId, player + 1, d->is_dualsense ? ", DualSense trigger effects" : "",
+                 d->has_trigger_rumble ? ", trigger rumble" : "", d->has_motion ? ", gyro" : "");
 }
 
 void close_pad(Device* d, uint64_t ts) {
@@ -811,8 +877,76 @@ constexpr int kMouseDecayNum = 7, kMouseDecayDen = 8;
 
 bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-// shortcut: plain cursor deltas stop at the screen edge; capture or recenter the cursor if that matters in game.
+// ---- raw mouse input (its own thread) ----
+//
+// The cursor stops at the edge of the screen, so cursor deltas stop too. Raw input reports what the mouse itself
+// moved, with no edge and no pointer acceleration. A message-only window (never shown) on its own thread receives
+// WM_INPUT and adds each movement to a running total; system_cursor_pos then returns that total as an edgeless
+// "cursor", and update_keyboard_pad takes the difference between polls exactly as it did with the real cursor.
+std::atomic<long long> g_raw_x{0}, g_raw_y{0};  // total raw movement since the thread started, mouse counts
+std::atomic<bool> g_raw_ready{false};           // registration worked; system_cursor_pos uses the totals
+std::atomic<bool> g_raw_started{false};         // the thread is started once per process
+
+LRESULT CALLBACK raw_mouse_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_INPUT) {
+        RAWINPUT raw{};
+        UINT size = sizeof(raw);
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) !=
+                static_cast<UINT>(-1) &&
+            raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            // Relative movement only: absolute reports (remote desktop, some VMs, tablets) are positions, not
+            // movement, and would make the stick jump.
+            g_raw_x += raw.data.mouse.lLastX;
+            g_raw_y += raw.data.mouse.lLastY;  // +Y is down, as for the cursor
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);  // also for WM_INPUT, which lets Windows clean up the input
+}
+
+void raw_mouse_thread() {
+    const HINSTANCE inst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = raw_mouse_proc;
+    wc.hInstance = inst;
+    wc.lpszClassName = L"LeonidaRawMouse";
+    RegisterClassExW(&wc);
+    // HWND_MESSAGE: a window that is never shown and only receives messages. It must be created on the thread that
+    // runs the message loop below, because a window's messages go to the thread that created it.
+    HWND hwnd = CreateWindowExW(0, L"LeonidaRawMouse", L"", 0, 0, 0, 0, 0,
+                                HWND_MESSAGE, nullptr, inst, nullptr);
+    if (!hwnd) {
+        std::fprintf(stderr, "[rt] gameinput: no raw mouse input (window: error %lu); using the cursor position\n",
+                     GetLastError());
+        return;
+    }
+    RAWINPUTDEVICE dev{};
+    dev.usUsagePage = 0x01;  // HID generic desktop
+    dev.usUsage = 0x02;      // mouse
+    dev.dwFlags = RIDEV_INPUTSINK;  // also while this (invisible) window has no focus; focus is checked per poll
+    dev.hwndTarget = hwnd;
+    if (!RegisterRawInputDevices(&dev, 1, sizeof(dev))) {
+        std::fprintf(stderr, "[rt] gameinput: no raw mouse input (register: error %lu); using the cursor position\n",
+                     GetLastError());
+        DestroyWindow(hwnd);
+        return;
+    }
+    g_raw_ready = true;
+    std::fprintf(stderr, "[rt] gameinput: raw mouse input on (the right stick does not stop at the screen edge)\n");
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) DispatchMessageW(&m);
+}
+
+void start_raw_mouse() {
+    if (!g_raw_started.exchange(true)) std::thread(raw_mouse_thread).detach();
+}
+
 bool system_cursor_pos(int* x, int* y) {
+    if (g_raw_ready) {  // the edgeless total; it wraps only after ±2^31 counts, and the poll uses differences
+        *x = static_cast<int>(g_raw_x.load());
+        *y = static_cast<int>(g_raw_y.load());
+        return true;
+    }
     POINT p;
     if (!GetCursorPos(&p)) return false;
     *x = p.x;
@@ -847,6 +981,33 @@ void detach_keyboard_pad() {
     g_keyboard = {};
 }
 
+// Keeps the cursor inside the game window while it has focus, so a click cannot land on another window, and releases
+// it on focus loss. Only with raw input (a clipped plain cursor would stop the stick at the window edge) and only for
+// a real foreground window of this process: not KeyboardPadMode::Always over a terminal, nor a test's fake focus.
+// Re-applied every 100 ms, because Windows drops the clip on some focus and resize changes.
+bool g_clipped = false;
+uint64_t g_clip_at = 0;
+
+void clip_cursor(bool want) {
+    if (!want) {
+        if (g_clipped) ClipCursor(nullptr);
+        g_clipped = false;
+        return;
+    }
+    const uint64_t now = now_us();
+    if (g_clipped && now - g_clip_at < 100'000) return;
+    const HWND w = GetForegroundWindow();
+    RECT r;
+    if (!w || !GetClientRect(w, &r)) return;
+    POINT top_left{r.left, r.top}, bottom_right{r.right, r.bottom};
+    if (!ClientToScreen(w, &top_left) || !ClientToScreen(w, &bottom_right)) return;
+    const RECT screen{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
+    if (screen.right > screen.left && screen.bottom > screen.top && ClipCursor(&screen)) {
+        g_clipped = true;
+        g_clip_at = now;
+    }
+}
+
 bool attach_keyboard_pad() {
     SDL_VirtualJoystickDesc d;
     SDL_INIT_INTERFACE(&d);
@@ -867,17 +1028,21 @@ bool attach_keyboard_pad() {
     std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
                          "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
                          "button LT/RT)\n");
+    start_raw_mouse();
     return true;
 }
 
 // Before SDL_UpdateGamepads, so the buttons set here are in this poll's reading.
 void update_keyboard_pad() {
+    float sens;
     rt::gameinput::KeyboardPadMode mode;
     {
         std::lock_guard lock(g().mu);
         mode = g().config.keyboard_pad;
+        sens = g().config.mouse_sensitivity;
     }
     if (mode == rt::gameinput::KeyboardPadMode::Off) {
+        clip_cursor(false);
         if (g_keyboard.id) detach_keyboard_pad();
         g_keyboard.failed = false;
         return;
@@ -889,7 +1054,8 @@ void update_keyboard_pad() {
     bool aim = false, fire = false;
     // Out of focus every button, stick and trigger is released, so a key held while switching windows does not stay
     // pressed, and the cursor is read afresh on return, so moving it in another window does not swing the stick.
-    if (mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()()) {
+    const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
+    if (active) {
         const rt::gameinput::KeyDownFn key_down = g_key_down.load();
         for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
         lx = key_down('D') - key_down('A');  // opposite keys cancel
@@ -900,9 +1066,9 @@ void update_keyboard_pad() {
         int x = 0, y = 0;
         const bool have = g_cursor_pos.load()(&x, &y);
         const bool moved = have && g_keyboard.have_cursor;
-        auto step = [](int v, int pixels) {
+        auto step = [sens](int v, int pixels) {
             const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
-                                static_cast<long long>(pixels) * kMouseAxisPerPixel;
+                                std::lround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
             return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
         };
         g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
@@ -913,6 +1079,7 @@ void update_keyboard_pad() {
         g_keyboard.right_x = g_keyboard.right_y = 0;
         g_keyboard.have_cursor = false;
     }
+    clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
     const int reach = lx && ly ? kStickDiagonal : kStickFull;
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_LEFTX, static_cast<Sint16>(lx * reach));
@@ -984,11 +1151,15 @@ void poll_once() {
         connected = s.connected;
     }
     for (Device* d : connected) {
-        const Snapshot snap = read_pad(d->pad);
+        const Snapshot snap = read_pad(d);
         const bool guide_changed = d->last_snap.guide != snap.guide;
         const bool changed = !(d->last_snap == snap);
         d->last_snap = snap;
-        if (changed) {
+        // A pad with sensors streams readings at ~125 Hz even when nothing else changes, so motion the title reads
+        // between its frames is never stuck at the last button event; pads without sensors only read on change, as
+        // before. push_reading stamps last_reading_us, so the cadence follows the actual history.
+        const bool motion_tick = snap.has_motion && now - d->last_reading_us >= kMotionReadingUs;
+        if (changed || motion_tick) {
             std::lock_guard lock(s.mu);
             queue_event({CbType::Reading, d, push_reading(d, snap, now), now, 0, 0, false, 0});
         }
@@ -1120,8 +1291,23 @@ HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* de
     std::vector<Device*> scope = s.connected;
     uint64_t horizon = 0;
     if (device) {
-        if (as_device(device)->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
-        scope = {as_device(device)};
+        Device* dev = as_device(device);
+        if (dev->info.deviceFamily == GameInputFamilyAggregate) {
+            if (kind != GameInputKindUnknown && !(kind & dev->info.supportedInput))
+                return GAMEINPUT_E_READING_NOT_FOUND;
+            const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & dev->info.supportedInput) : dev->info.supportedInput;
+            scope.clear();
+            for (Device* cd : s.connected) {
+                if (effective_kind & cd->info.supportedInput) {
+                    scope.push_back(cd);
+                }
+            }
+        } else {
+            if (dev->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
+            if (kind != GameInputKindUnknown && !(kind & dev->info.supportedInput))
+                return GAMEINPUT_E_READING_NOT_FOUND;  // the device does not do this kind (motion on a plain pad)
+            scope = {dev};
+        }
     } else {
         horizon = r->device()->evicted_order;
     }
@@ -1164,8 +1350,20 @@ public:
         Reading* best = nullptr;
         if (device) {
             Device* d = as_device(device);
-            if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
-            best = d->latest();
+            if (d->info.deviceFamily == GameInputFamilyAggregate) {
+                if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
+                    return GAMEINPUT_E_READING_NOT_FOUND;
+                const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & d->info.supportedInput) : d->info.supportedInput;
+                for (Device* cd : g().connected) {
+                    if (!(effective_kind & cd->info.supportedInput)) continue;
+                    if (Reading* r = cd->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+                }
+            } else {
+                if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
+                if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
+                    return GAMEINPUT_E_READING_NOT_FOUND;  // the device does not do this kind (motion on a plain pad)
+                best = d->latest();
+            }
         } else {
             for (Device* d : g().connected)  // the most recent reading from any gamepad
                 if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
@@ -1184,6 +1382,8 @@ public:
                                                  IGameInputReading** out) override {
         return find_reading(ref, kind, device, out, false);
     }
+    // E_NOTIMPL is GameInput v0's own answer: Microsoft's reference page says the method "was never implemented in
+    // v0" and returns E_NOTIMPL, and v1 removed it. A history lookup here would give a title what no GameInput does.
     HRESULT STDMETHODCALLTYPE GetTemporalReading(uint64_t, IGameInputDevice*, IGameInputReading** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
@@ -1192,6 +1392,9 @@ public:
 
     HRESULT STDMETHODCALLTYPE RegisterReadingCallback(IGameInputDevice* device, uint32_t kind, float, void* context,
                                                       GameInputReadingCallback fn, GameInputCallbackToken* token) override {
+        if (token) *token = kInvalidCallbackToken;
+        if (!fn) return E_INVALIDARG;
+        if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
         return add({0, CbType::Reading, as_device(device), kind, 0, context, reinterpret_cast<void*>(fn), true}, token);
     }
 
@@ -1200,6 +1403,7 @@ public:
                                                      GameInputDeviceCallback fn, GameInputCallbackToken* token) override {
         if (token) *token = kInvalidCallbackToken;
         if (!fn) return E_INVALIDARG;
+        if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
         State& s = g();
         GameInputCallbackToken t;
         std::vector<Event> now;
@@ -1272,9 +1476,45 @@ public:
         *out = new Dispatcher;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE CreateAggregateDevice(uint32_t, IGameInputDevice** out) override {
-        if (out) *out = nullptr;
-        return E_NOTIMPL;
+    HRESULT STDMETHODCALLTYPE CreateAggregateDevice(uint32_t kind, IGameInputDevice** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (kind == GameInputKindUnknown) return E_INVALIDARG;
+        // Combining multiple kinds into a single call is unsupported per Microsoft GDK spec
+        if ((kind & (kind - 1)) != 0) return E_INVALIDARG;
+        constexpr uint32_t kAllowedKinds =
+            GameInputKindKeyboard | GameInputKindMouse | GameInputKindGamepad |
+            GameInputKindArcadeStick | GameInputKindFlightStick | GameInputKindRacingWheel;
+        if (!(kind & kAllowedKinds)) return E_INVALIDARG;
+
+        std::lock_guard lock(g().mu);
+        for (Device* d : g().devices) {
+            if (d->info.deviceFamily == GameInputFamilyAggregate && d->info.supportedInput == kind) {
+                d->AddRef();
+                *out = d;
+                return S_OK;
+            }
+        }
+
+        auto* agg = new Device();
+        agg->info.deviceFamily = GameInputFamilyAggregate;
+        agg->info.supportedInput = kind;
+        agg->info.capabilities = GameInputDeviceCapabilityNone;
+        agg->status = GameInputDeviceConnected;
+        agg->name = "Aggregate GameInput Device";
+        agg->display_name.data = agg->name.c_str();
+        agg->display_name.sizeInBytes = static_cast<uint32_t>(agg->name.size());
+        agg->display_name.codePointCount = static_cast<uint32_t>(agg->name.size());
+        agg->info.displayName = &agg->display_name;
+
+        std::memcpy(agg->info.deviceId.value, "LEONIDA_AGGREGATE_DEVICE_ID\0\0\0\0", 32);
+        agg->info.deviceId.value[28] = static_cast<uint8_t>(kind & 0xff);
+        agg->info.deviceId.value[29] = static_cast<uint8_t>((kind >> 8) & 0xff);
+
+        g().devices.push_back(agg);
+        agg->AddRef();
+        *out = agg;
+        return S_OK;
     }
     HRESULT STDMETHODCALLTYPE FindDeviceFromId(const AppLocalDeviceId* id, IGameInputDevice** out) override {
         if (!out) return E_POINTER;

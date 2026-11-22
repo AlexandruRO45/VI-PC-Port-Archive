@@ -92,11 +92,23 @@ swapped-buttons setting.
 WASD pushes the left stick to full deflection. Opposite keys cancel (W+S is centered on Y), and a diagonal sits on
 the round gate as a real stick reports it: about 0.707 on each axis, not 1.
 
-The right stick follows the cursor's movement (`GetCursorPos`), not its position. Each poll (2 ms with the
-background thread) the stick keeps 7/8 of its value and adds 1024 axis units (of 32767) per pixel the cursor moved
-since the last poll, clamped to full. Steady movement of 4 pixels a poll (2000 pixels a second) is full deflection;
-when the mouse stops, the stick falls back from full to exactly 0 in 67 polls (134 ms). Moving the mouse down pushes
-the stick down. The cursor is not captured, so movement stops counting when it reaches the edge of the screen.
+The right stick follows the mouse's movement, not the cursor's position. Each poll (2 ms with the background thread)
+the stick keeps 7/8 of its value and adds 1024 axis units (of 32767, times `LEONIDA_MOUSE_SENSITIVITY`) per count the mouse moved since the last poll,
+clamped to full. Steady movement of 4 counts a poll (2000 a second) is full deflection; when the mouse stops, the
+stick falls back from full to exactly 0 in 67 polls (134 ms). Moving the mouse down pushes the stick down.
+
+The movement comes from raw input (`WM_INPUT`): what the mouse itself reports, so it does not stop at the edge of the
+screen and Windows' pointer acceleration does not change it. When the keyboard pad attaches, the shim starts one
+thread with a message-only window (never shown) registered for raw mouse input (`RIDEV_INPUTSINK`), which adds each
+relative movement to a running total; the poll takes the difference of that total between polls. Absolute reports
+(remote desktop, some virtual machines, pen tablets) are ignored. If the window or the registration fails, the shim
+logs it and falls back to `GetCursorPos` deltas, which stop at the screen edge. A count is one step of the mouse's
+sensor, about a pixel at Windows' default pointer speed without acceleration, so the feel depends on the mouse's DPI.
+
+With raw input on and a window of this process in the foreground, the cursor is kept inside that window's client
+area (`ClipCursor`, re-applied every 100 ms) so that a click cannot land on another window; it is released when focus
+moves away or the keyboard pad is turned off. The cursor stays visible: hiding it has to happen on the thread that
+owns the game's window, which is the title's, not the shim's.
 
 Keys are read with `GetAsyncKeyState`, which needs no window or message loop (SDL's keyboard is part of its video
 subsystem, which this build leaves out) and works under Wine. With `LEONIDA_KEYBOARD_PAD=1` keys count only while a
@@ -136,6 +148,29 @@ uses:
 
 An effect is sent only when its bytes change, so a steady level costs one report.
 
+## Motion
+
+Pads whose SDL gamepad reports both a gyroscope and an accelerometer (a DualSense, a Switch Pro, Steam Input pads) get
+`GameInputKindMotion` in `supportedInput` and a `motionInfo` (`GameInputMotionInfo`, Microsoft's v0 layout); `IGameInputReading::GetMotionState`
+returns a `GameInputMotionState` on their readings, and `GetCurrentReading`/`GetNextReading` answer a
+`GameInputKindMotion` query for such a pad and return `GAMEINPUT_E_READING_NOT_FOUND` for a pad without sensors. The
+sensors are enabled when the pad is opened, at SDL's requested rate, and every poll reads the latest sample.
+
+- The state carries **signed fractions of the maxima `motionInfo` reports** (1.0 = full magnitude), which is the
+  convention Microsoft documents for `GameInputMotionState`. SDL delivers accel in m/s² (gravity included) and gyro
+  in rad/s, so the shim divides by the maxima. The maxima are this shim's choice — SDL does not expose a sensor
+  range — and are 2 g (19.6133 m/s²) and 2000 deg/s (34.9066 rad/s), a DualSense's accelerometer and gyro ranges
+  (VERIFY against the game and a real pad).
+- A pad at rest sits at about 0.5 on the gravity axis and 0.0 on all gyro axes. SDL answers sensor reads with zeros
+  before the device's first sample arrives; since a real accelerometer never reads exactly zero (gravity), all-zero
+  accel means "no sample yet" and the reading carries no motion at all — `GetMotionState` returns false.
+- SDL's gamepad API has no compass and the shim synthesises no orientation quaternion, so the magnetic-field and
+  orientation members are zero with `GameInputMotionAccuracyUnknown`.
+- A pad with sensors streams a reading every ~8 ms (~125 Hz) even when nothing else changes, so motion is not stuck
+  at the last button event; pads without sensors keep the old change-driven behaviour. The 8 ms window and the 512-
+  reading history cap bound the cost.
+- `gameinput_probe` prints the accel and gyro fractions when the pad has sensors (a resting pad shows ~0.5 g).
+
 ## Environment variables
 
 | variable | default | effect |
@@ -147,6 +182,7 @@ An effect is sent only when its bytes change, so a steady level costs one report
 | `LEONIDA_RUMBLE` | `1` | `0` turns all rumble and trigger output off |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
+| `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 |
 
 SDL's own hints (`SDL_JOYSTICK_*`, see SDL's `SDL_hints.h`) also apply, for example `SDL_JOYSTICK_HIDAPI_PS5=0` to
 leave a DualSense to the generic driver, or `SDL_GAMECONTROLLERCONFIG` to add a mapping for an unknown pad.
@@ -164,8 +200,8 @@ The API surface:
 
 | interface | implemented | not implemented |
 |---|---|---|
-| `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetTemporalReading`, `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
-| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons | raw report, keyboard, mouse, touch, motion, arcade/flight stick, racing wheel (all return nothing) |
+| `IGameInput` | `GetCurrentTimestamp` (µs), `GetCurrentReading`, `GetNextReading`, `GetPreviousReading`, `RegisterReadingCallback`, `RegisterDeviceCallback` (blocking and async enumeration), `RegisterGuideButtonCallback`, `RegisterKeyboardLayoutCallback` (never fires), `StopCallback`, `UnregisterCallback`, `CreateDispatcher`, `FindDeviceFromId`, `EnableOemDeviceSupport` (no-op), `SetFocusPolicy` (no-op) | `GetTemporalReading` (`E_NOTIMPL`, as in GameInput v0 itself; see below), `CreateAggregateDevice`, `FindDeviceFromObject/PlatformHandle/PlatformString` |
+| `IGameInputReading` | kind, sequence number, timestamp, device, gamepad state, UI navigation state, controller axes and buttons, motion state | raw report, keyboard, mouse, touch, arcade/flight stick, racing wheel (all return nothing) |
 | `IGameInputDevice` | device info, status, battery, `SetRumbleState` | force feedback and haptic motors (none reported), raw device I/O, power off, input synchronization (no-ops) |
 | `IGameInputDispatcher` | `Dispatch`, `OpenWaitHandle` | the quota (the queue is short) |
 
@@ -235,7 +271,11 @@ shim fills (`GameInputDeviceInfo` 320 bytes with `deviceFamily` at 96 and the in
   rumble as SDL receives them, the DualSense effect bytes in each `LEONIDA_DS_TRIGGERS` mode, the lightbar, a
   dispatcher, async and blocking enumeration, unregistering, unplugging and replugging, and three identical pads
   (an id each, `FindDeviceFromId` and device-filtered readings per pad, replugging one, two and all three, and the
-  first twin's id equal to the single-pad id). The keyboard pad is
+  first twin's id equal to the single-pad id). Motion runs on a virtual pad with sensors (`nsensors` in the
+  virtual-joystick description, fed with `SDL_SendJoystickVirtualSensorData`): the kind and `motionInfo` on a sensor
+  pad and not on a plain one, no motion before the first sample, normalisation against the `motionInfo` maxima, the
+  accuracy values, the ±1 clamp, the ~8 ms cadence, and that a motion query on a pad without sensors is
+  `GAMEINPUT_E_READING_NOT_FOUND`. The keyboard pad is
   driven through `rt::gameinput::set_keyboard_source` and `set_cursor_source` with fake keys, focus and cursor: every
   binding, two keys at once, each WASD direction, opposite keys cancelling, diagonals, the mouse moving the right
   stick, clamping and decaying to 0, the mouse-button triggers, no input out of focus, release of buttons, sticks and
@@ -252,17 +292,29 @@ These need the game executable or a test on hardware:
   built against one of those, the vtables need a second set.
 - **IIDs.** `QueryInterface` answers the v0 IIDs from the public header.
 - **Reading history.** Microsoft's [next reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getnextreading)
-  and [previous reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getpreviousreading) pages describe half a second of readings per device and failure when old readings leave the stream. The table above records the shim's HRESULT choices. Changes faster than the poll are not seen, and
-  `GetTemporalReading` is not implemented.
+  and [previous reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getpreviousreading) pages describe half a second of readings per device and failure when old readings leave the stream. The table above records the shim's HRESULT choices. Changes faster than the poll are not seen.
+  `GetTemporalReading` returns `E_NOTIMPL` with a null reading on purpose: Microsoft's
+  [reference page](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/deprecated/interfaces/igameinput/methods/igameinput_gettemporalreading)
+  says it "was never implemented in v0" and returns `E_NOTIMPL`, and v1 removed it. The v0 header (NuGet
+  `Microsoft.GameInput` 0.2303.22621.3038) declares it as `(timestamp, device, reading)`, the layout the shim has;
+  the page's five-parameter form does not match that header.
 - **UI navigation mapping** and the **controller-axis convention** (0..1 with sticks at 0.5) are this shim's choice,
   not measured from a console.
 - **Battery capacity** is reported as a fraction (remaining 0..1 of full 1), not in device units.
 - **`UnregisterCallback` timeout** is not honoured; it waits for a callback that is running.
+- **Motion normalisation maxima** (2 g accel, 2000 deg/s gyro) are this shim's choice; SDL exposes no sensor range,
+  and whether the game reads motion, and against what scale, is unknown until it runs. The accelerometer range a
+  DualSense exposes can also be wider than 2 g, so hard shakes may clamp at 1.0.
+- **Motion members the shim does not provide** (magnetic field, orientation) are zero with
+  `GameInputMotionAccuracyUnknown`; whether a title wants a synthesised quaternion there is unknown.
 - **Device family**: every pad is reported as `GameInputFamilyXboxOne`; a title that filters on family sees only
   that.
 - **Identical pads at start**: twins are numbered in the order the shim opens them. For pads already connected when
   it starts, that is SDL's enumeration order, not measured on Windows for identical pads; if it varies between runs,
   so does which pad gets which id.
+- **Raw mouse registration**: Windows keeps one raw-input target window per device type and process, so if the title
+  registers raw mouse input itself (a console title is not expected to), it replaces the shim's registration and the
+  right stick falls back to nothing. The shim does not detect that yet.
 - **Keyboard pad as a second pad**: it is one more connected gamepad, so with a controller plugged in the title sees
   two. A title that follows only the first pad it saw, or asks the player to press a button to pick the active pad,
   may ignore one of them; whether the game does either is unknown.

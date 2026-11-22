@@ -92,12 +92,14 @@ def dds_bytes(w, h, fmt, payload):
 def score_image(w, h, fmt, payload, bpe):
     a = None
     if fmt in PILLOW_OK:
-        from PIL import Image
         try:
+            from PIL import Image
+
             im = Image.open(io.BytesIO(dds_bytes(w, h, DECODE_AS.get(fmt, fmt), payload))).convert("RGB")
             a = np.asarray(im.reduce(4) if min(w, h) >= 64 else im, np.float32)
-        except NotImplementedError:
-            pass  # Pillow 13.0.0 can't decode DXGI 81 and 87 (91 as 87): score raw elements, not a tied 9e9 in export_one
+        except (ImportError, NotImplementedError, OSError):
+            # Some Pillow installations cannot decode these formats. Score the raw elements below.
+            a = None
     if a is None:
         block = FMT[fmt][1]
         we, he = (w + block - 1) // block, (h + block - 1) // block
@@ -187,12 +189,33 @@ def main():
     ap.add_argument("--limit", type=positive_int, help="export only the first N textures (N >= 1)")
     ap.add_argument("--png", action="store_true", help="also write a PNG beside each DDS dds_png.py can decode")
     a = ap.parse_args()
-    with open(a.index, encoding="utf-8") as f:
-        texs = json.load(f)
-    texs.sort(key=lambda t: (t["archive"], t["gpu"]))
+    try:
+        with open(a.index, encoding="utf-8") as f:
+            texs = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot read {a.index}: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(texs, list):
+        print(f"ERROR: cannot read {a.index}: expected a texture list, got {type(texs).__name__}", file=sys.stderr)
+        return 2
+    try:
+        texs.sort(key=lambda t: (t["archive"], t["gpu"]))
+    except KeyError as e:
+        print(f"ERROR: cannot read {a.index}: row has no {e.args[0]!r}", file=sys.stderr)
+        return 2
+    except TypeError as e:
+        print(f"ERROR: cannot read {a.index}: {e}", file=sys.stderr)
+        return 2
     if a.limit is not None:         # 0 used to read as "no limit", and a negative N dropped the last N
         texs = texs[: a.limit]
-    os.makedirs(a.out, exist_ok=True)
+    if os.path.exists(a.out) and not os.path.isdir(a.out):
+        print(f"ERROR: {a.out} is a file, not a folder", file=sys.stderr)
+        return 2
+    try:
+        os.makedirs(a.out, exist_ok=True)
+    except OSError as e:  # a report path under an existing file, or a dangling symlink
+        print(f"ERROR: cannot create {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     res, cache, pngs = Counter(), {}, Counter()
     for i, t in enumerate(texs, 1):
         try:
@@ -204,7 +227,7 @@ def main():
             pngs[t["export"]["png"]] += 1
         if i % 2000 == 0:
             print(f"[{i}/{len(texs)}] {dict(res)}", flush=True)
-    with open(os.path.join(a.out, "export_log.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(a.out, "export_log.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(texs, f)
     print(f"{len(texs)} textures: {dict(res)} -> {a.out}")
     if a.png:

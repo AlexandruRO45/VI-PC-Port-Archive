@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "../src/root_signature.h"
+#include "../src/subgroup_size.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -49,7 +50,7 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
                              std::shared_ptr<void> queue_lease = {});
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
-                            void** out, IUnknown* device = nullptr);
+                            void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
@@ -61,6 +62,8 @@ bool command_signature_info(ID3D12CommandSignature* signature, leonida::Indirect
 HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, ID3D12Fence* const* fences,
                                                const UINT64* values, UINT count,
                                                D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event);
+
+std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, const leonida::VulkanContext& context);
 
 // The Vulkan objects a D3D12 device runs on. Vulkan 1.3 with dynamicRendering, synchronization2, timelineSemaphore
 // and (when separate_depth_stencil_layouts is set) separateDepthStencilLayouts enabled.
@@ -77,6 +80,9 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // The subgroup sizes the device offers and whether subgroupSizeControl / computeFullSubgroups are enabled on it
+    // (src/subgroup_size.h). Default: nothing, so pipelines request no size.
+    leonida::SubgroupSizeCaps subgroup;
     // Enabled: runtimeDescriptorArray, the dynamic indexing of sampled- and storage-image arrays, and update after
     // bind for sampled images, storage images and storage buffers. The device then keeps the bindless set 0 of
     // the translated shaders (docs section 3.4), and texture views and samplers are put in it as they are
@@ -116,6 +122,13 @@ struct VulkanDeviceInfo {
     bool swapchain_maintenance1 = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
+    // Pixel-shader extensions translated shaders can declare, each enabled with its feature where the GPU has it:
+    // VK_KHR_fragment_shader_barycentric (BaryCoordKHR / PerVertexKHR reads), VK_EXT_fragment_shader_interlock
+    // (fragmentShaderPixelInterlock: POPS shaders run in PixelInterlockOrderedEXT) and VK_KHR_maintenance8 (texel
+    // offsets outside gathers: the index's needs_maintenance8).
+    bool fragment_shader_barycentric = false;
+    bool fragment_shader_interlock = false;
+    bool maintenance8 = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
@@ -126,12 +139,26 @@ struct VulkanDeviceInfo {
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
+    // BuildRaytracingAccelerationStructure writes the console's XDXR BVH4 records into the destination buffer
+    // (src/xdxr_build.h), the layout the game's translated traversal shaders read, instead of building a
+    // VkAccelerationStructureKHR; needs buffer_device_address and the GPU address arena. The standalone device sets it
+    // unless LEONIDA_RT_AS=khr (docs/d3d12_vulkan.md 4.8); with it set, ray_tracing is not enabled.
+    bool xdxr_acceleration_structures = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
+    // Vulkan 1.2 shaderOutputLayer / shaderOutputViewportIndex enabled on `device`: a translated vertex shader that
+    // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
+    bool shader_output_layer = false;
+    bool shader_output_viewport_index = false;
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;
+    // VK_EXT_custom_border_color (with customBorderColors and customBorderColorWithoutFormat) is enabled on
+    // `device`: samplers with custom border colours pass them through to Vulkan. Without it, custom border
+    // colours fall back to transparent black.
+    bool custom_border_color = false;
+    bool custom_border_color_without_format = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -150,6 +177,8 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 VkImage vulkan_image(ID3D12Resource* resource);
 // The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
+// What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
+const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
@@ -157,6 +186,9 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
 
 // The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
+
+// Whether the requested colour format has an integer numeric class.
+bool color_resolve_format_is_integer(DXGI_FORMAT format);
 
 // Whether both resources use the requested typed, non-integer colour format for a regional average resolve.
 bool color_resolve_format_matches(DXGI_FORMAT format, ID3D12Resource* dst, ID3D12Resource* src);
@@ -181,6 +213,9 @@ bool device_push_constants_need_fallback(ID3D12Device* device);
 // LEONIDA_UPLOAD_SYSMEM is not set (D3D-96).
 bool device_upload_in_vram(ID3D12Device* device);
 
+// True when the device can map reserved buffers onto its D3D12 heaps.
+bool device_sparse_buffer_tiles(ID3D12Device* device);
+
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
 // brought up to date at every ExecuteCommandLists.
@@ -189,6 +224,14 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
 // 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]);
+// The free indices of that set's 2D image and sampler arrays: how many more distinct 2D T#s and S#s
+// CreateShaderResourceView and CreateSampler can register before they log that the array is full. Zeros when
+// `device` has no such set. For tests.
+struct BindlessRoom {
+    std::uint32_t images_2d = 0;
+    std::uint32_t samplers = 0;
+};
+BindlessRoom bindless_room(ID3D12Device* device);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be
@@ -255,6 +298,8 @@ struct RootArgumentLayout {
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+// What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
+const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 
 // The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
 inline constexpr UINT descriptor_size = 32;
@@ -262,10 +307,20 @@ inline constexpr UINT descriptor_size = 32;
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
 
+// True when the current thread or process token has SeIncreaseBasePriorityPrivilege enabled (or the test override
+// forces it), which D3D12 requires for D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME.
+bool has_global_realtime_privilege();
+// Test override for has_global_realtime_privilege(): -1 queries the token (default), 0 forces denied, 1 forces granted.
+void set_global_realtime_privilege_override_for_test(int state);
+
 // The front/back stencil references last recorded by ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef on
 // `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is
 // not one of this module's command lists.
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
+
+// A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
+// `list` is not one of this module's command lists.
+bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands);
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);

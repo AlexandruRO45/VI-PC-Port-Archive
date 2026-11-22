@@ -333,11 +333,13 @@ def totals(pages):
     out["block_flags"] = sorted({f for p in good for f in p["block_flags"]})
     # A group's vertex span that matches a block in the same page or a neighbouring page (input order).
     near = 0
-    for i, p in enumerate(good):
+    for i, p in enumerate(pages):
+        if "error" in p:
+            continue
         pool = set(p["block_counts"])
         for j in (i - 1, i + 1):
-            if 0 <= j < len(good):
-                pool |= set(good[j]["block_counts"])
+            if 0 <= j < len(pages) and "error" not in pages[j]:
+                pool.update(pages[j]["block_counts"])
         near += sum(1 for s in p["group_spans"] if s in pool)
     out["groups_matching_block_near"] = near
     return out
@@ -487,7 +489,7 @@ def main(argv=None):
             report = json.dumps({"bindings": rows}, indent=2)
             if args.json:
                 try:
-                    with open(args.json, "w", encoding="utf-8") as out:
+                    with open(args.json, "w", encoding="utf-8", newline="\n") as out:
                         out.write(report + "\n")
                 except OSError as exc:
                     print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
@@ -514,7 +516,7 @@ def main(argv=None):
         print(json.dumps(total, indent=1))
     if args.json:
         try:
-            with open(args.json, "w", encoding="utf-8") as fh:
+            with open(args.json, "w", encoding="utf-8", newline="\n") as fh:
                 json.dump({"totals": total, "pages": pages}, fh, indent=1)
         except OSError as exc:
             print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)

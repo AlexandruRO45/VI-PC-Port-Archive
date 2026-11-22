@@ -163,6 +163,24 @@ class TestConversations(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_sources_with_same_basename_keep_separate_summaries_and_streams(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = []
+            for parent, count in (("first", 1), ("second", 2)):
+                folder = os.path.join(tmp, parent, "banks")
+                os.makedirs(folder)
+                sources.append(folder)
+                write(os.path.join(folder, "one.awc"), make_bank(["zz_rootau_abcd_01"], extra_ids=range(count - 1)))
+            words = write(os.path.join(tmp, "words.txt"), "zz_rootau_abcd_01\n")
+            out = os.path.join(tmp, "names.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(A.main([*sources, "--words", words, "--out", out]), 0)
+            with open(out, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertEqual({k: v["streams"] for k, v in doc["summary"].items()},
+                             {"first/banks": 1, "second/banks": 2})
+            self.assertEqual([row["source"] for row in doc["streams"]], ["first/banks", "second/banks"])
+
     def test_end_to_end(self):
         with tempfile.TemporaryDirectory() as tmp:
             banks = os.path.join(tmp, "banks")
@@ -187,6 +205,21 @@ class TestCli(unittest.TestCase):
                 self.assertEqual(A.main([banks, "--conversations", conv, "--out", json_out]), 0)
             with open(json_out, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["summary"]["banks"]["streams"], 3)
+
+    def test_rejects_output_aliasing_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = write(os.path.join(tmp, "one.awc"), make_bank(["zz_rootau_abcd_01"]))
+            original = b"ZZ_ROOTAU_ABCD\x00ZZ_A\x00"
+            conv = write(os.path.join(tmp, "c.pso"), original)
+            alias = os.path.join(tmp, ".", "c.pso")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    A.main([bank, "--conversations", conv, "--out", alias])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("--out must not overwrite an input", err.getvalue())
+            with open(conv, "rb") as f:
+                self.assertEqual(f.read(), original)
 
     def test_hashdict_json_words(self):
         with tempfile.TemporaryDirectory() as tmp:

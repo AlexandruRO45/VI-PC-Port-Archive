@@ -19,6 +19,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.dont_write_bytecode = True
@@ -252,6 +253,34 @@ class LoadOnlyShaders(unittest.TestCase):
                 self.assertEqual(hi_masks, 3 if expect_preserve else 0)
 
 
+class LodQueryCoordinates(unittest.TestCase):
+    def test_a16_queries_with_status_are_unsupported(self) -> None:
+        for status, dest in (("tfe", "v[6:7]"), ("lwe", "v6")):
+            with self.subTest(status=status), self.assertRaises(rdna2spirv.Unsupported):
+                translate([f"image_get_lod {dest}, v10, s[8:15], s[16:19] "
+                           f"dmask:0x1 dim:SQ_RSRC_IMG_2D a16 {status}"])
+
+    def test_a16_queries_unpack_uv_and_keep_f32_results(self) -> None:
+        fixture = Path(ROOT) / "tests/semantic/fixtures/get_lod_a16.asm"
+        lines = [line for line in fixture.read_text(encoding="utf-8").splitlines()
+                 if line and not line.startswith(";")]
+        module = Module(translate(lines))
+        queries = [(rid, args) for rid, op, args in module.order if op == "OpImageQueryLod"]
+        self.assertEqual(len(queries), 2)
+        for (rid, (ty, image, coord)), (register, image_type, components) in zip(
+                queries, [(10, "%simg2d", [0, 1]), (12, "%simg2da", [1])]):
+            self.assertEqual(ty, "%v2float")
+            self.assertEqual(module.defs[image][1][0], image_type)
+            op, unpack = module.defs[coord]
+            self.assertEqual((op, unpack[:3]), ("OpExtInst", ["%v2float", "%glsl", "UnpackHalf2x16"]))
+            op, load = module.defs[unpack[3]]
+            self.assertEqual(op, "OpLoad")
+            op, ptr = module.defs[load[1]]
+            self.assertEqual((op, ptr[1], module.value(ptr[2], 0, 0)), ("OpAccessChain", "%vgpr", register))
+            self.assertEqual([int(args[2]) for _, op, args in module.order
+                              if op == "OpCompositeExtract" and args[:2] == ["%float", rid]], components)
+
+
 class TypedGatherShaders(unittest.TestCase):
     def test_2d_sample_lz_uses_matching_typed_view_at_level_zero(self):
         for dst, modifier in (("v[0:3]", ""), ("v[0:1]", " d16")):
@@ -287,6 +316,20 @@ class TypedGatherShaders(unittest.TestCase):
                         self.assertEqual([a[2] for a in taps], ["1"])
                 self.assertEqual(footprints[0], footprints[1])
                 self.assertEqual(footprints[0], footprints[2])
+
+    def test_implicit_2d_sample_takes_gradients_before_typed_dispatch(self):
+        m = Module(translate(["image_sample v[0:1], v[4:5], s[0:7], s[8:11] "
+                              "dmask:0xf dim:SQ_RSRC_IMG_2D d16"]))
+        samples = [args for _, op, args in m.order if op == "OpImageSampleExplicitLod"]
+        self.assertEqual({args[0] for args in samples}, {"%v4float", "%v4uint_st", "%v4int_st"})
+        dispatch = re.search(r"OpBranchConditional %\w+ %\w+_s %\w+_rest", m.text)
+        self.assertIsNotNone(dispatch)
+        for _, _, coords, mode, dx, dy in samples:
+            self.assertEqual(mode, "Grad")
+            self.assertEqual(m.defs[dx], ("OpDPdx", ["%v2float", coords]))
+            self.assertEqual(m.defs[dy], ("OpDPdy", ["%v2float", coords]))
+            # The gradients must exist before the image-class selection can diverge.
+            self.assertLess(m.text.index(f"{dy} = OpDPdy"), dispatch.start())
 
     def test_2d_gather_picks_the_sampled_type_and_selected_component(self):
         for dst, modifier in (("v[0:3]", ""), ("v[0:1]", " d16")):
