@@ -228,7 +228,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
         with patch.object(sys, "argv", ["make_game.py", "--game", self.game_dir,
                                         "--out", self.out_dir, "--work", self.work_dir,
                                         "--stages", "pipelines,runtime,assets,shaders"]):
-            with patch("make_game.below_normal"):
+            with patch("make_game.below_normal"), patch("make_game.wave64_settings", return_value=(False, True)):
                 with patch("make_game.check", return_value={"expected_exe": "Leonida.exe"}):
                     with patch("make_game.preflight"):
                         with patch("make_game.log"):
