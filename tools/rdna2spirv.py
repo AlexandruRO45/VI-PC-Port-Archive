@@ -2190,7 +2190,8 @@ class Gen:
         addr = V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex * V#.stride : 0), byte exact.
         Each dword is loaded only when it is in range per the V#'s OOB_SELECT (buffer_address; docs/design.md, Buffer
         bounds checking): for modes 0 and 3 dword i ends inside the stride / num_records, else it is 0 and memory is
-        not read; modes 1 and 2 check the index / num_records once. Inactive lanes don't load."""
+        not read; modes 1 and 2 check the index / num_records once. An INVALID V# format zeroes all active results
+        without reading memory. Inactive lanes don't load."""
         if any(m in mods for m in ("lds", "tfe")) or "format" in op:
             raise Unsupported(op + " form")
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
@@ -2221,7 +2222,7 @@ class Gen:
                 out.append(v)
             return out
 
-        if raw_parts is None:               # literal mode 1/2: one check for the whole load
+        if raw_parts is None:               # literal mode 1/2 or INVALID: one check for the whole load
             cond = self.tmp()
             self.emit(f"{cond} = OpLogicalAnd %bool {act} {in_b}")
             phis = guarded(cond, range(n))
@@ -3601,7 +3602,10 @@ class Gen:
             - Indexed swizzle (`SWIZZLE_ENABLE=1, idxen=1`): multi-dword raw, typed, and `_x2` atomic accesses step
               linearly by `+4` bytes (`step = None`), and typed formats > 4 bytes execute normally.
         A literal V# word1/word3 (`sgpr_imm`) folds each bit; a run-time one selects dynamically. elem="fmt" checks the
-        whole element's format size; parts=True adds a 4th element `k -> in-range bool id` for per-dword checks."""
+        whole element's format size. parts=True is for raw MUBUF loads and stores: FORMAT=0 (INVALID, word3 bits
+        [18:12]) suppresses every dword before any memory access, and the 4th element is a function k -> in-range
+        bool id for dword k (modes 0 and 3, and a run-time V#), or None when every dword shares in_bounds (literal
+        mode 1/2, or literal FORMAT=0, whose whole access is out of range)."""
         vaddr, rsrc = a[1], a[2]
         soff = a[3] if len(a) > 3 else {"k": "imm", "v": 0}
         if (rsrc["k"] == "sgpr" and rsrc.get("n") == 4):
@@ -3758,6 +3762,15 @@ class Gen:
         self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{o64} = OpUConvert %ulong {total}")
         self.emit(f"{addr} = OpIAdd %ulong {base} {o64}")
+        format_ok = None
+        if parts:
+            # Raw opcodes supply the data layout and use identity selectors. The descriptor still gates access.
+            if lit3 is None:
+                fmt, format_ok = self.tmp(), self.tmp()
+                self.emit(f"{fmt} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
+                self.emit(f"{format_ok} = OpINotEqual %bool {fmt} {self.cu(0)}")
+            elif (lit3 >> 12 & 0x7F) == 0:
+                return addr, d3, "%false", None, step
         mode = None if lit3 is None else lit3 >> 28 & 3
         mode0_rule = mode in (None, 0) or (mode == 3 and sw3 is not False)
         need_raw = mode in (None, 3) and sw3 is not True
@@ -3876,7 +3889,12 @@ class Gen:
 
         def check(k):
             """in-range bool of dword k of the access (k = 0: the first dword)."""
-            return check_end(4 * k + 4)
+            in_b = check_end(4 * k + 4)
+            if format_ok is None:
+                return in_b
+            ok = self.tmp()
+            self.emit(f"{ok} = OpLogicalAnd %bool {format_ok} {in_b}")
+            return ok
 
         if isinstance(elem, int):
             in_b = check_end(elem)
