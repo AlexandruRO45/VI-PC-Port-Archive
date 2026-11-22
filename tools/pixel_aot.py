@@ -107,8 +107,8 @@ def _check_two_exits(code, llvm):
                                  "s_add", "s_sub", "s_mul", "s_min_", "s_max_", "s_cselect", "s_bfe",
                                  "s_bfm", "s_brev", "s_ff", "s_bcnt", "s_wqm", "s_quadmask"))
                   or op in ("s_nop", "s_inst_prefetch", "s_waitcnt", "s_clause", "s_delay_alu",
-                            "s_setprio", "s_sleep", "s_movk_i32", "s_mulk_i32", "s_flbit_i32_b32",
-                            "s_setreg_imm32_b32")):
+                            "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
+                            "s_flbit_i32_b32", "s_setreg_imm32_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
     # A direct branch may skip alignment NOPs. Keep them in the original span.
@@ -707,6 +707,19 @@ def scalar_u32(token, scalar, pending):
         bits, = struct.unpack("<I", struct.pack("<f", float(token)))
         return f"{bits}u"
     raise ValueError(f"Unsupported 32-bit scalar operand {token}")
+
+
+def sopk_imm16(token, *, signed=True):
+    """Parse a 16-bit SOPK immediate as a sign-extended or zero-extended 32-bit word."""
+    word = int(token, 16) if token.startswith("0x") else int(token)
+    if signed:
+        if not -0x8000 <= word <= 0xffff:
+            raise ValueError("Invalid sopk immediate")
+        value = word - 0x10000 if word >= 0 and word & 0x8000 else word
+        return value & 0xffffffff
+    if not 0 <= word <= 0xffff:
+        raise ValueError("Invalid sopk immediate")
+    return word
 
 
 def scalar_u64(token, scalar, pending, *, signed=False):
@@ -1473,14 +1486,27 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             values = [scalar_u32(t, scalar, pending) for t in tokens]
             lines.append(f"    uint salu{i} = {scc} ? {values[0]} : {values[1]};")
             scalar[dst] = ("uint", f"salu{i}")
+        elif m := match(r"(s_cmpk_(?:eq|lg|gt|ge|lt|le)_(?:i32|u32)) (s\d+), (-?\d+|0x[0-9a-f]+)"):
+            op, dst, imm = m.groups()
+            operand = scalar_u32(dst, scalar, pending)
+            signed = op.endswith("_i32")
+            op_sym = {"eq": "==", "lg": "!=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}[op.split("_")[2]]
+            val = sopk_imm16(imm, signed=signed)
+            cond = f"(asint({operand}) {op_sym} asint({val}u))" if signed else f"({operand} {op_sym} {val}u)"
+            lines.append(f"    bool scc{i} = {cond};")
+            scc = f"scc{i}"
+        elif m := match(r"s_cmovk_i32 (s\d+), (-?\d+|0x[0-9a-f]+)"):
+            dst, imm = m.groups()
+            if scc is None:
+                raise ValueError("Select condition is not a tracked scalar result")
+            prev = scalar_u32(dst, scalar, pending)
+            val = sopk_imm16(imm, signed=True)
+            scalar[dst] = ("uint", f"salu{i}")
+            lines.append(f"    uint salu{i} = {scc} ? {val}u : {prev};")
         elif m := match(r"(s_addk_i32|s_mulk_i32) (s\d+), (-?\d+|0x[0-9a-f]+)"):
             op, dst, imm = m.groups()
             operand = scalar_u32(dst, scalar, pending)
-            word = int(imm, 16) if imm.startswith("0x") else int(imm)
-            if not -0x8000 <= word <= 0xffff:
-                raise ValueError("Invalid sopk immediate")
-            signed = word - 0x10000 if word >= 0 and word & 0x8000 else word
-            addend = signed & 0xffffffff
+            addend = sopk_imm16(imm, signed=True)
             operation = "+" if op == "s_addk_i32" else "*"
             scalar[dst] = ("uint", f"alu{i}")
             lines.append(f"    uint alu{i} = ({operand} {operation} {addend}u);")

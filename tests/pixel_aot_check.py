@@ -533,6 +533,58 @@ def sopk_scalar() -> list[str]:
     ])
 
 
+SOPK_CMPK_OPS = ("eq", "lg", "gt", "ge", "lt", "le")
+SOPK_CMPK_WORDS = (
+    (0xffff7fff, 0x00007fff, 0x13579bdf, 0xffffffff),
+    (0xffff8000, 0x00008000, 0x13579bdf, 0x0000ffff),
+    (0x00008000, 0xffff8000, 0x2468ace0, 0xffffffff),
+    (0xffff8001, 0x00008001, 0x2468ace0, 0),
+)
+
+
+def sopk_cmpk_cmovk() -> list[str]:
+    body = ["s_mov_b32 s52, 0", "s_mov_b32 s53, 0"]
+    for bit, op in enumerate(SOPK_CMPK_OPS):
+        flag = 1 << bit
+        body += [
+            f"s_cmpk_{op}_i32 s44, 0x8000",
+            f"s_cselect_b32 s63, {flag}, 0",
+            "s_or_b32 s52, s52, s63",
+            f"s_cmpk_{op}_u32 s45, 0x8000",
+            f"s_cselect_b32 s63, {flag}, 0",
+            "s_or_b32 s53, s53, s63",
+        ]
+    body += [
+        "s_mov_b32 s50, s46",
+        "s_mov_b32 s51, s46",
+        "s_cmpk_eq_i32 s47, 0xffff",
+        "s_cmovk_i32 s50, 0xfffe",
+        "s_cmovk_i32 s51, 0x7fff",
+        "v_mov_b32_e32 v12, s52",
+        "v_mov_b32_e32 v13, s53",
+        "v_mov_b32_e32 v14, s50",
+        "v_mov_b32_e32 v15, s51",
+    ]
+    return uncompressed_export(body)
+
+
+def sopk_cmpk_cmovk_reference(words):
+    s44, s45, s46, s47 = words
+    signed44 = s44 - (1 << 32) if s44 >> 31 else s44
+    preds = {
+        "eq": lambda a, b: a == b,
+        "lg": lambda a, b: a != b,
+        "gt": lambda a, b: a > b,
+        "ge": lambda a, b: a >= b,
+        "lt": lambda a, b: a < b,
+        "le": lambda a, b: a <= b,
+    }
+    mask_i32 = sum((1 << bit) for bit, op in enumerate(SOPK_CMPK_OPS) if preds[op](signed44, -0x8000))
+    mask_u32 = sum((1 << bit) for bit, op in enumerate(SOPK_CMPK_OPS) if preds[op](s45, 0x8000))
+    take = s47 == 0xffffffff
+    return (mask_i32, mask_u32, 0xfffffffe if take else s46, 0x00007fff if take else s46)
+
+
 def rounding():
     """Round scaled samples up and to nearest even, and a constant tie through the VOP3 encoding."""
     return with_constants([
@@ -2276,14 +2328,15 @@ def check_scalar_controls():
                 "s_add_u32 s62, s90, s45", "s_add_u32 s62, vcc_lo, s45", "s_add_u32 s62, exec_lo, s45",
                 "s_add_u32 s62, v12, s45", "s_add_u32 m0, s44, s45", "s_add_u32 vcc_lo, s44, s45",
                 "s_add_u32 s62, s44, |s45|",
-                "s_cmp_eq_u64 s[44:46], s[46:47]", "s_bitcmp1_b32 v12, s45", "s_cmpk_eq_u32 s44, 0x10",
+                "s_cmp_eq_u64 s[44:46], s[46:47]", "s_bitcmp1_b32 v12, s45",
+                "s_cmpk_eq_u32 s44, 0x10000", "s_cmpk_eq_u32 s44, -1", "s_cmpk_eq_f32 s44, 0x10",
                 "s_cmp_lt_i32 s44", "s_cmp_lt_f32 s44, s45"):
         changed = [line.replace(first, new) for line in program]
         assert changed != program, new
         must_reject(translate, changed)
     flag = program.index(first) + 1
-    for new in ("s_cselect_b64 s[62:63], s44, s45", "s_cmovk_i32 s63, 0x1", "s_cselect_b32 s63, s28, 0",
-                "s_cselect_b32 vcc_lo, 1, 0"):
+    for new in ("s_cselect_b64 s[62:63], s44, s45", "s_cmovk_i32 s63, 0x10000", "s_cmovk_i32 vcc_lo, 0x1",
+                "s_cselect_b32 s63, s28, 0", "s_cselect_b32 vcc_lo, 1, 0"):
         must_reject(translate, program[:flag] + [new] + program[flag + 1:])
     # Before lgkmcnt(0) the constant words are still loading: neither read nor overwrite them.
     load = program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc") + 1
@@ -3770,6 +3823,44 @@ def check_controls(directory):
 
     wait = program.index("s_waitcnt lgkmcnt(0)", program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
     must_reject(translate, program[:wait] + ["s_mulk_i32 s44, 0x3"] + program[wait:])
+
+    cmpk_program = sopk_cmpk_cmovk()
+    cmpk_source = translate_int(cmpk_program)
+    for expected in ("(asint(asuint(params[0].w)) < asint(4294934528u))",
+                     "(asuint(params[1].x) < 32768u)",
+                     "? 4294967294u : ",
+                     "? 32767u : "):
+        assert expected in cmpk_source, expected
+    refs = [sopk_cmpk_cmovk_reference(words) for words in SOPK_CMPK_WORDS]
+    for bit in range(len(SOPK_CMPK_OPS)):
+        assert any(r[0] & (1 << bit) for r in refs) and any(not (r[0] & (1 << bit)) for r in refs)
+        assert any(r[1] & (1 << bit) for r in refs) and any(not (r[1] & (1 << bit)) for r in refs)
+    assert any(r[2] == 0xfffffffe for r in refs) and any(r[2] == 0x13579bdf for r in refs)
+    base = assembly(False)
+    wqm = base.index("s_wqm_b64 exec, exec")
+    andexec = base.index("s_and_b64 exec, exec, s[50:51]")
+    must_reject(translate, base[:andexec] + ["s_mov_b32 s50, 0", "s_cmovk_i32 s50, 1"] + base[andexec:])
+    must_reject(translate, base[:andexec] + ["s_cmp_eq_u32 1, 1"] + base[andexec:andexec + 1]
+                + ["s_mov_b32 s50, 0", "s_cmovk_i32 s50, 1"] + base[andexec + 1:])
+    must_reject(translate, base[:wqm] + ["s_cmp_eq_u32 1, 1"] + base[wqm:wqm + 1]
+                + ["s_mov_b32 s50, 0", "s_cmovk_i32 s50, 1"] + base[wqm + 1:])
+    must_reject(translate_int, [line.replace("s_mov_b32 s50, s46", "s_nop 0") for line in cmpk_program])
+    cmpk_wait = cmpk_program.index("s_waitcnt lgkmcnt(0)", cmpk_program.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    for bad in ("s_cmpk_eq_i32 s44, 0x0", "s_cmovk_i32 s44, 0x1"):
+        must_reject(translate_int, cmpk_program[:cmpk_wait] + ["s_cmp_eq_u32 1, 1", bad] + cmpk_program[cmpk_wait:])
+    for old, new in (("s_cmpk_eq_i32 s44, 0x8000", "s_cmpk_eq_i32 s44, 0x10000"),
+                     ("s_cmpk_eq_i32 s44, 0x8000", "s_cmpk_eq_i32 s44, -32769"),
+                     ("s_cmpk_eq_u32 s45, 0x8000", "s_cmpk_eq_u32 s45, 0x10000"),
+                     ("s_cmpk_eq_u32 s45, 0x8000", "s_cmpk_eq_u32 s45, -1"),
+                     ("s_cmpk_eq_i32 s44, 0x8000", "s_cmpk_eq_i32 s106, 0x0"),
+                     ("s_cmpk_eq_i32 s44, 0x8000", "s_cmpk_eq_i32 v12, 0x0"),
+                     ("s_cmovk_i32 s50, 0xfffe", "s_cmovk_i32 s50, 0x10000"),
+                     ("s_cmovk_i32 s50, 0xfffe", "s_cmovk_i32 s50, -32769"),
+                     ("s_cmovk_i32 s50, 0xfffe", "s_cmovk_i32 s106, 0x1"),
+                     ("s_cmovk_i32 s50, 0xfffe", "s_cmovk_i32 v12, 0x1")):
+        changed = [line.replace(old, new) for line in cmpk_program]
+        assert changed != cmpk_program, new
+        must_reject(translate_int, changed)
     source = translate(rounding())
     for expected in ("= ceil(alu", "= round(alu", "= round(params[1].x);", "= ceil((-params[1].y));"):
         assert expected in source, expected
@@ -4221,7 +4312,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (truncate_values(), translate), (affine_coordinates(), translate), (ceiling(), translate),
-                (scalar64(), translate), (sopk_scalar(), translate)]
+                (scalar64(), translate), (sopk_scalar(), translate), (sopk_cmpk_cmovk(), translate_int)]
     fixtures.append((rgb_sample(), translate))
     fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
@@ -5239,6 +5330,41 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
     return check_blend_and_scalar_draws(directory, compiler, renderer, backend)
 
 
+def check_sopk_cmpk_cmovk_draw(directory, compiler, renderer, backend):
+    source = directory / "sopk_cmpk_cmovk.hlsl"
+    shader = directory / "sopk_cmpk_cmovk.cso"
+    case = directory / "sopk_cmpk_cmovk.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    program = sopk_cmpk_cmovk()
+
+    def write_words(words, expected):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        for word in expected:
+            assert struct.unpack("<I", struct.pack("<f", as_float(word)))[0] == word, hex(word)
+        write_case(case, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    for words in SOPK_CMPK_WORDS:
+        write_words(words, sopk_cmpk_cmovk_reference(words))
+        subprocess.run(draw, check=True)
+
+    words = SOPK_CMPK_WORDS[0]
+    write_words(words, sopk_cmpk_cmovk_reference(words))
+    for old, new, label in (
+        ("s_cmpk_lt_i32 s44, 0x8000", "s_cmpk_lt_u32 s44, 0x8000", "signed sopk comparison"),
+        ("s_cmovk_i32 s50, 0xfffe", "s_cmovk_i32 s50, 0x7fff", "sopk conditional move"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate_int(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutating {label} escaped detection")
+
+
 def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     source = directory / "fixture.hlsl"
     shader = directory / "fixture.cso"
@@ -5272,6 +5398,8 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
 
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Changing the sopk multiply escaped detection")
+
+    check_sopk_cmpk_cmovk_draw(directory, compiler, renderer, backend)
 
     source.write_text(translate(rounding()), encoding="ascii")
     compile_shader(compiler, source, shader)
