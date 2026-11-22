@@ -4624,6 +4624,92 @@ class Gen:
             self.dst(a[0], r)
         elif op == "ds_swizzle_b32":
             self.swizzle(a, mods, ins)
+        elif op in ("v_mul_f64", "v_fma_f64", "v_min_f64", "v_max_f64", "v_ldexp_f64", "v_floor_f64", "v_ceil_f64",
+                    "v_trunc_f64", "v_rndne_f64", "v_fract_f64", "v_cvt_f64_f32", "v_cvt_f64_i32", "v_cvt_f64_u32",
+                    "v_cvt_i32_f64", "v_cvt_u32_f64"):
+            if self.round_mode:
+                raise Unsupported(op + " under a MODE rounding")
+            self.uses_f64 = True
+
+            def rd64(sv):
+                if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
+                    lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+                elif sv["k"] in ("imm", "fimm"):
+                    bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0] if sv["k"] == "fimm"
+                            else sv["v"] & 0xFFFFFFFFFFFFFFFF)
+                    lo, hi = self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
+                else:
+                    raise Unsupported(op + " operand")
+                v2, d = self.tmp(), self.tmp()
+                self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {lo} {hi}")
+                self.emit(f"{d} = OpBitcast %double {v2}")
+                if sv.get("abs"):
+                    t = self.tmp()
+                    self.emit(f"{t} = OpExtInst %double %glsl FAbs {d}")
+                    d = t
+                if sv.get("neg"):
+                    t = self.tmp()
+                    self.emit(f"{t} = OpFNegate %double {d}")
+                    d = t
+                return d
+
+            def wr64(d):
+                if a[0]["k"] != "vgpr":
+                    raise Unsupported(op + " destination")
+                v2, lo, hi = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{v2} = OpBitcast %v2uint_d {d}")
+                self.emit(f"{lo} = OpCompositeExtract %uint {v2} 0")
+                self.emit(f"{hi} = OpCompositeExtract %uint {v2} 1")
+                self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, lo)
+                self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, hi)
+
+            if op in ("v_cvt_i32_f64", "v_cvt_u32_f64"):
+                if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+                    raise Unsupported(op + " output modifier")
+                x = rd64(a[1])
+                signed = op == "v_cvt_i32_f64"
+                nan, z, tr, cl, cv, r = (self.tmp() for _ in range(6))
+                self.emit(f"{nan} = OpIsNan %bool {x}")
+                self.emit(f"{z} = OpSelect %double {nan} {self.dconst(0.0)} {x}")
+                self.emit(f"{tr} = OpExtInst %double %glsl Trunc {z}")
+                lo_b, hi_b = (-2147483648.0, 2147483647.0) if signed else (0.0, 4294967295.0)
+                self.emit(f"{cl} = OpExtInst %double %glsl FClamp {tr} {self.dconst(lo_b)} {self.dconst(hi_b)}")
+                if signed:
+                    self.emit(f"{cv} = OpConvertFToS %int {cl}")
+                    self.emit(f"{r} = OpBitcast %uint {cv}")
+                else:
+                    self.emit(f"{r} = OpConvertFToU %uint {cl}")
+                self.dst(a[0], r)
+                return
+            if op in ("v_cvt_f64_f32", "v_cvt_f64_i32", "v_cvt_f64_u32"):
+                r = self.tmp()
+                if op == "v_cvt_f64_f32":
+                    self.emit(f"{r} = OpFConvert %double {self.src_f(a[1])}")
+                elif op == "v_cvt_f64_i32":
+                    self.emit(f"{r} = OpConvertSToF %double {self.as_int(self.src_u(a[1]))}")
+                else:
+                    self.emit(f"{r} = OpConvertUToF %double {self.src_u(a[1])}")
+                wr64(self.clamp_mods_f64(r, mods))
+                return
+            r = self.tmp()
+            if op == "v_mul_f64":
+                self.emit(f"{r} = OpFMul %double {rd64(a[1])} {rd64(a[2])}")
+            elif op == "v_fma_f64":
+                self.emit(f"{r} = OpExtInst %double %glsl Fma {rd64(a[1])} {rd64(a[2])} {rd64(a[3])}")
+            elif op in ("v_min_f64", "v_max_f64"):
+                self.emit(f"{r} = OpExtInst %double %glsl {'NMin' if op == 'v_min_f64' else 'NMax'} {rd64(a[1])} "
+                          f"{rd64(a[2])}")
+            elif op == "v_ldexp_f64":
+                self.emit(f"{r} = OpExtInst %double %glsl Ldexp {rd64(a[1])} {self.as_int(self.src_u(a[2]))}")
+            elif op == "v_fract_f64":
+                fr, one = self.tmp(), self.tmp()
+                self.emit(f"{fr} = OpExtInst %double %glsl Fract {rd64(a[1])}")
+                self.emit(f"{one} = OpFOrdEqual %bool {fr} {self.dconst(1.0)}")
+                self.emit(f"{r} = OpSelect %double {one} {self.dconst(struct.unpack('<d', struct.pack('<Q', 0x3FEFFFFFFFFFFFFF))[0])} {fr}")
+            else:
+                fn = {"v_floor_f64": "Floor", "v_ceil_f64": "Ceil", "v_trunc_f64": "Trunc", "v_rndne_f64": "RoundEven"}[op]
+                self.emit(f"{r} = OpExtInst %double %glsl {fn} {rd64(a[1])}")
+            wr64(self.clamp_mods_f64(r, mods))
         elif op in ("v_add_f64", "v_cvt_f32_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
