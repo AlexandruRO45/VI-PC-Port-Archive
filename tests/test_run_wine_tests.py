@@ -230,6 +230,30 @@ class RunTestTest(unittest.TestCase):
         self.assertEqual(status, "fail")
         self.assertIn("timed out after 0.2 s", detail)
 
+    def test_ctest_timeout_fails_a_late_expected_failure(self):
+        slow = self.program("late.py", "import sys, time\ntime.sleep(0.4)\nsys.exit(2)\n")
+        entry = ctest_entry("late", self.command_for(slow), {"TIMEOUT": 0.05, "WILL_FAIL": True})
+        status, detail = self.run_entry(entry)
+        self.assertEqual(status, "fail", detail)
+        self.assertIn("timed out after 0.05 s", detail)
+
+    def test_ctest_timeout_keeps_the_runner_limit(self):
+        command = self.command_for(self.exiting(0))
+        for limit in (0, self.args.timeout * 2):
+            with self.subTest(limit=limit), mock.patch.object(rwt.subprocess, "run", wraps=rwt.subprocess.run) as launch:
+                status, detail = self.run_entry(ctest_entry("bounded", command, {"TIMEOUT": limit}))
+                self.assertEqual(status, "pass", detail)
+                self.assertEqual(launch.call_args.kwargs["timeout"], self.args.timeout)
+
+    def test_invalid_ctest_timeout_fails_before_launch(self):
+        command = self.command_for(self.exiting(0))
+        for limit in (-1, None, "bad", float("inf"), float("nan"), True):
+            with self.subTest(limit=limit), mock.patch.object(rwt.subprocess, "run") as launch:
+                status, detail = self.run_entry(ctest_entry("invalid", command, {"TIMEOUT": limit}))
+                launch.assert_not_called()
+                self.assertEqual(status, "fail", detail)
+                self.assertIn("invalid CTest TIMEOUT", detail)
+
     def test_an_unstartable_wine_fails_the_test_instead_of_aborting_the_run(self):
         status, detail = rwt.run_test(ctest_entry("ok", self.command_for(self.exiting(0))), self.args,
                                       ["definitely-not-a-real-wine-xyz"])
