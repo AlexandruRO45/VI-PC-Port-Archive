@@ -18,6 +18,12 @@ fragments, while world fragments do have them; see
 Source resource: `ambient_femalebody_upper_nohead.#ft` in `packs.rpf`, stream offset
 `0x45449F70` (stored 17,434 bytes, inflated 42,384 bytes).
 
+That is the name-table stream, not the fragment offset `tools/anim_glb.py` takes for
+`--skeleton`. In this package `0x45449F70` is a bare skeleton page and the tool refuses it with
+`page directory: not a system pointer`; the `ambient_femalebody_head.#ft` fragment at
+`0x45417010` resolves to the drawable/system page the exporter needs. Pass the fragment offset
+your own reader reports.
+
 | Range | Contents |
 |---|---|
 | `0x0008..0x7FF8` | 4,095-slot hash table, 8 bytes per slot: `u32 joaat32(name)`, `u32 boneIndex` |
@@ -226,6 +232,11 @@ python -I tools/anim_glb.py <package>\packs.rpf --coverage --skeleton <fragment 
     --anim <package>\anim.rpf --jobs 8 --report <work>\coverage.json
 ```
 
+`--clip` matches the full clip label or the dictionary hash. When the hash is the leaf-name hash,
+one value selects every path with that leaf: in dictionary `0xfc91b010`, `0xe61dc582` is
+`joaat32("move")` and selects all six `/move` clips. Pass the full label (for example
+`gameplay@locomotion@female_generic@normal@standing@walk@slope@up/move`) to export one clip.
+
 Offsets are zlib stream offsets (as `tools/skin_streams.py` and `rpf9dump` report them). The
 output is a standard glTF 2.0 file; Blender and the three.js editor play its animations. What
 it does and why:
@@ -433,8 +444,9 @@ table, not a unique `mandy` drawable.
 Steps 1-4 were measured with local tools that are not part of this repository; a reader can
 reproduce them with a standard zlib/RPF9 reader:
 
-1. Inflate the `.#ft` stream at `0x45449F70`; parse the 4,095-slot hash table and the
-   NUL-separated names; verify `joaat32` lowercased.
+1. Inflate the `.#ft` name-table stream at `0x45449F70`; parse the 4,095-slot hash table and the
+   NUL-separated names; verify `joaat32` lowercased. This is not the `anim_glb.py --skeleton`
+   offset; see the note at the top of this page.
 2. Inflate the following 131,072-byte graphics page at `0x4544F010`; parse the records at
    `0x110 + 0x50*i`: rotation at +0x00, translation at +0x10, hash at +0x1C, parent at +0x46
    (see the correction above). `tools/anim_glb.py` reads the same records through the
