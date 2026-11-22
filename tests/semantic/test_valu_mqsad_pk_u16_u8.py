@@ -1023,5 +1023,222 @@ class TestValuMqsadPkU16U8IEEE754BitPatterns(unittest.TestCase):
         self.assertEqual(w0, 0)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuMqsadPkU16U8NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_dst_cannot_be_sgpr(self) -> None:
+        with self.assertRaises(TypeError):
+            VMqsadPkU16U8Instruction(
+                dst=Operand.sgpr(0, count=2),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(4, count=1),
+                src2=Operand.vgpr(6, count=2),
+            )
+
+    def test_syntax_rejection_dst_count_must_be_two(self) -> None:
+        with self.assertRaises(ValueError):
+            VMqsadPkU16U8Instruction(
+                dst=Operand.vgpr(0, count=1),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(4, count=1),
+                src2=Operand.vgpr(6, count=2),
+            )
+
+    def test_syntax_rejection_src_operand_sizes(self) -> None:
+        # src0 count must be 2
+        with self.assertRaises(ValueError):
+            VMqsadPkU16U8Instruction(
+                dst=Operand.vgpr(0, count=2),
+                src0=Operand.vgpr(2, count=1),
+                src1=Operand.vgpr(4, count=1),
+                src2=Operand.vgpr(6, count=2),
+            )
+        # src1 count must be 1
+        with self.assertRaises(ValueError):
+            VMqsadPkU16U8Instruction(
+                dst=Operand.vgpr(0, count=2),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(4, count=2),
+                src2=Operand.vgpr(6, count=2),
+            )
+        # src2 count must be 2
+        with self.assertRaises(ValueError):
+            VMqsadPkU16U8Instruction(
+                dst=Operand.vgpr(0, count=2),
+                src0=Operand.vgpr(2, count=2),
+                src1=Operand.vgpr(4, count=1),
+                src2=Operand.vgpr(6, count=1),
+            )
+
+    def test_syntax_rejection_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_syntax_rejection_lane_bounds(self) -> None:
+        wave = SIMDWaveState(wave_size=32)
+        with self.assertRaises(IndexError):
+            wave.is_lane_active(32)
+        with self.assertRaises(IndexError):
+            wave.is_lane_active(-1)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        s0 = 0x01020304_05060708
+        s1 = 0x11223344
+        s2 = pack_u16_to_u64(10, 20, 30, 40)
+        correct = ref_mqsad_pk_u16_u8_u64(s0, s1, s2)
+        # Flip bit 0 in lane 0
+        corrupted = correct ^ 1
+        self.assertNotEqual(correct, corrupted)
+        # Flip bit 16 in lane 1
+        corrupted16 = correct ^ (1 << 16)
+        self.assertNotEqual(correct, corrupted16)
+
+    def test_mutation_detection_signed_difference_bug(self) -> None:
+        """Mutant casts bytes to signed 8-bit integers before difference."""
+        def to_s8(x: int) -> int:
+            x &= MASK8
+            return x - 256 if (x & 0x80) else x
+
+        def mutant_msad(win32: int, s1_32: int, acc16: int) -> int:
+            acc = acc16 & MASK16
+            for k in range(4):
+                b0 = extract_byte(win32, k)
+                b1 = extract_byte(s1_32, k)
+                if b1 != 0:
+                    # Bug: signed subtraction
+                    acc += abs(to_s8(b0) - to_s8(b1))
+            return acc & MASK16
+
+        # S0 byte 0 is 0, S1 byte 0 is 255 (0xFF)
+        s0_win = 0
+        s1_query = 0xFF
+        correct = ref_msad_u8(s0_win, s1_query, 0)
+        mutant = mutant_msad(s0_win, s1_query, 0)
+        # Correct unsigned: |0 - 255| = 255
+        # Mutant signed: |0 - (-1)| = 1
+        self.assertEqual(correct, 255)
+        self.assertEqual(mutant, 1)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_unmasked_quad_sad_bug(self) -> None:
+        """Mutant forgets to check if query byte == 0 and accumulates all bytes."""
+        def mutant_unmasked_msad(win32: int, s1_32: int, acc16: int) -> int:
+            acc = acc16 & MASK16
+            for k in range(4):
+                b0 = extract_byte(win32, k)
+                b1 = extract_byte(s1_32, k)
+                # Bug: no check if b1 != 0
+                acc += ref_abs_diff_u8(b0, b1)
+            return acc & MASK16
+
+        # S1 has all zeros (all masked)
+        s0_win = 0x5555_5555
+        s1_query = 0x0000_0000
+        correct = ref_msad_u8(s0_win, s1_query, 0)
+        mutant = mutant_unmasked_msad(s0_win, s1_query, 0)
+        self.assertEqual(correct, 0)
+        self.assertEqual(mutant, 4 * 0x55)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_inverted_mask_condition(self) -> None:
+        """Mutant checks b1 == 0 instead of b1 != 0."""
+        def mutant_inverted_msad(win32: int, s1_32: int, acc16: int) -> int:
+            acc = acc16 & MASK16
+            for k in range(4):
+                b0 = extract_byte(win32, k)
+                b1 = extract_byte(s1_32, k)
+                # Bug: inverted condition
+                if b1 == 0:
+                    acc += ref_abs_diff_u8(b0, b1)
+            return acc & MASK16
+
+        s0_win = 0x1010_1010
+        s1_query = 0x1000_1000  # bytes 0, 2 are 0x00; bytes 1, 3 are 0x10
+        correct = ref_msad_u8(s0_win, s1_query, 0)
+        mutant = mutant_inverted_msad(s0_win, s1_query, 0)
+        # Correct: checks bytes 1 and 3 (|0x10 - 0x10| = 0) -> 0
+        # Mutant: checks bytes 0 and 2 (|0x10 - 0x00| = 16) -> 32
+        self.assertEqual(correct, 0)
+        self.assertEqual(mutant, 32)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_window_stride_bug(self) -> None:
+        """Mutant slides windows by 4 bytes (dword stride) instead of 1 byte."""
+        def mutant_mqsad(s0_64: int, s1_32: int, s2_64: int) -> Tuple[int, int, int, int]:
+            # Bug: stride by 32 bits (4 bytes) instead of 8 bits (1 byte)
+            win0 = (s0_64 >> 0) & MASK32
+            win1 = (s0_64 >> 32) & MASK32
+            win2 = 0
+            win3 = 0
+            return (
+                ref_msad_u8(win0, s1_32, extract_u16(s2_64, 0)),
+                ref_msad_u8(win1, s1_32, extract_u16(s2_64, 1)),
+                0,
+                0,
+            )
+
+        # S0 reference has distinct bytes 1..8
+        s0 = sum((i + 1) << (8 * i) for i in range(8))
+        s1 = 2 | (3 << 8) | (4 << 16) | (5 << 24)
+        correct = ref_mqsad_pk_u16_u8(s0, s1, 0)
+        mutant = mutant_mqsad(s0, s1, 0)
+        self.assertEqual(correct[1], 0)  # window 1 exact match
+        self.assertNotEqual(correct[1], mutant[1])
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_omitted_accumulator_bug(self) -> None:
+        """Mutant forgets to add initial accumulator src2."""
+        def mutant_mqsad(s0_64: int, s1_32: int, s2_64: int) -> int:
+            # Bug: passes 0 for accumulator
+            w0, w1, w2, w3 = ref_mqsad_pk_u16_u8(s0_64, s1_32, 0)
+            return pack_u16_to_u64(w0, w1, w2, w3)
+
+        s2 = pack_u16_to_u64(100, 200, 300, 400)
+        correct = ref_mqsad_pk_u16_u8_u64(0, 0, s2)
+        mutant = mutant_mqsad(0, 0, s2)
+        self.assertEqual(correct, s2)
+        self.assertEqual(mutant, 0)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_exec_mask_bypass(self) -> None:
+        """Mutant SIMD interpreter writes to inactive lanes ignoring EXEC mask."""
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VMqsadPkU16U8Instruction, state: SIMDWaveState) -> List[int | None]:
+                results: List[int | None] = []
+                for lane in range(state.wave_size):
+                    # Bug: no check for is_lane_active
+                    s0 = state.read_lane_operand_64(instr.src0, lane)
+                    s1 = state.read_lane_operand_32(instr.src1, lane)
+                    s2 = state.read_lane_operand_64(instr.src2, lane)
+                    res = ref_mqsad_pk_u16_u8_u64(s0, s1, s2)
+                    state.write_lane_vgpr_64(instr.dst.index, lane, res)
+                    results.append(res)
+                return results
+
+        sentinel = 0xFEED_FACE_CAFE_BEEF
+        state = SIMDWaveState(wave_size=32, exec_mask=0x0000_0000)  # All inactive
+        for lane in range(32):
+            state.write_lane_vgpr_64(0, lane, sentinel)
+
+        buggy = BuggySIMDInterpreter()
+        instr = VMqsadPkU16U8Instruction(
+            dst=Operand.vgpr(0, count=2),
+            src0=Operand.vgpr(2, count=2),
+            src1=Operand.literal(0x11223344),
+            src2=Operand.literal(0, count=2),
+        )
+        buggy.step(instr, state)
+
+        # Corrupted lanes count must be 32 in mutant
+        corrupted = [lane for lane in range(32) if state.read_lane_operand_64(Operand.vgpr(0, count=2), lane) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
