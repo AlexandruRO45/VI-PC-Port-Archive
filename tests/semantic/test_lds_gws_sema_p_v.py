@@ -1058,5 +1058,118 @@ class TestIEEE754BoundaryExtremesAndNaNHandling(unittest.TestCase):
             self.assertEqual(state.get_lane_vgpr(lane, 0), self.F32_CUSTOM_NAN_PAYLOAD)
 
 
+class TestNegativeControlsSyntaxRejectionAndMutations(unittest.TestCase):
+    """Phase 8: Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_negative_and_out_of_bounds_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.SGPR)
+
+        with self.assertRaises(ValueError):
+            RegisterOperand(106, RegType.SGPR)
+
+    def test_syntax_rejection_sgpr_as_vdata0(self) -> None:
+        s0 = RegisterOperand(0, RegType.SGPR)
+        with self.assertRaises(ValueError):
+            DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_P, vdata0=s0, offset=0, gds=True)
+
+    def test_syntax_rejection_invalid_offset_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_P, offset=-1, gds=True)
+
+        with self.assertRaises(ValueError):
+            DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_P, offset=0x10000, gds=True)
+
+    def test_syntax_rejection_missing_mandatory_gds(self) -> None:
+        with self.assertRaises(ValueError):
+            DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_P, offset=0, gds=False)
+
+    def test_invalid_simd_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=48)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_invalid_gws_memory_size(self) -> None:
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=0)
+
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=-1)
+
+        with self.assertRaises(ValueError):
+            GWSMemory(num_resources=48)
+
+    def test_mutation_detection_sema_p_underflow_when_zero(self) -> None:
+        # Reference: counter=0 -> acq=False, counter remains 0
+        acq_ref, cnt_ref = ref_ds_gws_sema_p(0)
+        self.assertFalse(acq_ref)
+        self.assertEqual(cnt_ref, 0)
+
+        # Buggy mutant decrements without checking > 0, producing 0xFFFFFFFF
+        mutant_cnt = u32(0 - 1)
+        self.assertNotEqual(mutant_cnt, cnt_ref)
+        self.assertEqual(mutant_cnt, 0xFFFFFFFF)
+
+    def test_mutation_detection_sema_v_decrement_instead_of_increment(self) -> None:
+        ref_cnt = ref_ds_gws_sema_v(5)
+        self.assertEqual(ref_cnt, 6)
+
+        mutant_cnt = u32(5 - 1)
+        self.assertNotEqual(mutant_cnt, ref_cnt)
+
+    def test_mutation_detection_exec_zero_bypass(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0)
+        interp = SIMDInterpreter()
+
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=8)
+        res = interp.execute(instr_v, state)
+
+        self.assertIsNone(res)
+        self.assertEqual(state.gws.read_counter(8), 0)
+
+        mutant_executed_cnt = 1
+        self.assertNotEqual(mutant_executed_cnt, state.gws.read_counter(8))
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        target_offset = 35
+        instr_v = DSGWSSemaphoreInstruction(opcode=DSOpcode.DS_GWS_SEMA_V, offset=target_offset)
+
+        rid, cnt, _ = interp.execute(instr_v, state)
+        self.assertEqual(rid, target_offset)
+        self.assertEqual(state.gws.read_counter(target_offset), 1)
+        self.assertEqual(state.gws.read_counter(0), 0)
+
+        mutant_rid = 0
+        self.assertNotEqual(mutant_rid, rid)
+
+    def test_mutation_detection_fifo_wake_order(self) -> None:
+        gws = GWSMemory()
+        # Waves 101 and 102 queue up on resource 0
+        gws.sema_p(offset=0, wave_id=101)
+        gws.sema_p(offset=0, wave_id=102)
+
+        # Release must wake wave 101 first (FIFO)
+        _, _, woken1 = gws.sema_v(offset=0)
+        self.assertEqual(woken1, 101)
+
+        # Flawed LIFO mutant would have woken wave 102
+        mutant_lifo_woken = 102
+        self.assertNotEqual(mutant_lifo_woken, woken1)
+
+
 if __name__ == "__main__":
     unittest.main()
