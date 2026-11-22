@@ -392,6 +392,16 @@ INTEGER = {
     "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
     "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
     "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
+    "mul_u32_u24": (2, "mul24_u32({0}, {1})"),
+    "mul_i32_i24": (2, "mul24_i32({0}, {1})"),
+    "mul_hi_u32_u24": (2, "mul24_hi_u32({0}, {1})"),
+    "mul_hi_i32_i24": (2, "mul24_hi_i32({0}, {1})"),
+}
+MUL24_HELPERS = {
+    "mul_u32_u24": ("mul24_u32",),
+    "mul_i32_i24": ("mul24_i32",),
+    "mul_hi_u32_u24": ("mul24_hi_u32",),
+    "mul_hi_i32_i24": ("mul24_hi_u32", "mul24_hi_i32"),
 }
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
@@ -614,6 +624,46 @@ SALU_HELPERS = {
         "    }\n"
         "    uint2 s = dot_u64_add(uint2(c, 0u), sum);\n"
         "    return sat ? dot_u64_sat(s) : s.x;\n"
+        "}"
+    ),
+    "mul24_u32": (
+        "uint mul24_u32(uint a, uint b) {\n"
+        "    return (a & 0xffffffu) * (b & 0xffffffu);\n"
+        "}"
+    ),
+    "mul24_i32": (
+        "uint mul24_i32(uint a, uint b) {\n"
+        "    int sa = asint(a << 8u) >> 8;\n"
+        "    int sb = asint(b << 8u) >> 8;\n"
+        "    return asuint(sa) * asuint(sb);\n"
+        "}"
+    ),
+    "mul24_hi_u32": (
+        "uint mul24_hi_u32(uint a, uint b) {\n"
+        "    uint ua = a & 0xffffffu;\n"
+        "    uint ub = b & 0xffffffu;\n"
+        "    uint al = ua & 0xfffu;\n"
+        "    uint ah = ua >> 12u;\n"
+        "    uint bl = ub & 0xfffu;\n"
+        "    uint bh = ub >> 12u;\n"
+        "    uint p0 = al * bl;\n"
+        "    uint p1 = al * bh + ah * bl;\n"
+        "    uint p2 = ah * bh;\n"
+        "    uint mid = (p0 >> 12u) + p1;\n"
+        "    return (p2 + (mid >> 12u)) >> 8u;\n"
+        "}"
+    ),
+    "mul24_hi_i32": (
+        "uint mul24_hi_i32(uint a, uint b) {\n"
+        "    int sa = asint(a << 8u) >> 8;\n"
+        "    int sb = asint(b << 8u) >> 8;\n"
+        "    bool neg = (sa < 0) != (sb < 0);\n"
+        "    uint ua = (uint)(sa < 0 ? -sa : sa);\n"
+        "    uint ub = (uint)(sb < 0 ? -sb : sb);\n"
+        "    uint lo = ua * ub;\n"
+        "    uint hi = mul24_hi_u32(ua, ub);\n"
+        "    if (neg && (lo != 0u || hi != 0u)) return ~hi + (lo == 0u ? 1u : 0u);\n"
+        "    return hi;\n"
         "}"
     ),
 }
@@ -1690,9 +1740,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             op, dst, sources = m.groups()
             tokens = sources.split(", ")
             arity, template = INTEGER[op]
-            if mask != "entry" or dst in sample_dest or len(tokens) != arity:
+            if mask != "entry" or int(dst[1:]) > 255 or dst in sample_dest or len(tokens) != arity:
                 raise ValueError("Invalid integer operation")
             args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
+            if op in MUL24_HELPERS:
+                helpers.update(MUL24_HELPERS[op])
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
