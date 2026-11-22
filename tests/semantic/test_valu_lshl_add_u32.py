@@ -656,6 +656,128 @@ class TestValuLshlAddU32RegisterAliasing(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 1), 10)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class LshlAddStatusFlags:
+    """Architectural condition codes and status flags for v_lshl_add_u32."""
+    zero: bool
+    sign: bool
+    shift_truncated: bool
+    carry_out: bool
+    shift_overflow: bool
+    parity: bool
+    vcc_modified: bool = False
+
+
+def evaluate_lshl_add_flags(
+    res32: int,
+    s0: int,
+    s1: int,
+    s2: int,
+) -> LshlAddStatusFlags:
+    """Evaluate condition codes, addition carry-out, and shift overflow."""
+    res = res32 & MASK32
+    shift = s1 & SHIFT_MASK
+    shifted_full = (s0 & MASK32) << shift
+    shifted32 = shifted_full & MASK32
+    add_full = shifted32 + (s2 & MASK32)
+
+    bits_set = bin(res).count("1")
+
+    return LshlAddStatusFlags(
+        zero=(res == 0),
+        sign=bool(res & 0x8000_0000),
+        shift_truncated=(s1 > SHIFT_MASK),
+        carry_out=(add_full > MASK32),
+        shift_overflow=(shifted_full > MASK32),
+        parity=(bits_set % 2) == 0,
+        vcc_modified=False,
+    )
+
+
+def compute_u32_add_carry(a: int, b: int) -> Tuple[int, int]:
+    """Compute 32-bit unsigned addition sum and carry out."""
+    total = (a & MASK32) + (b & MASK32)
+    return total & MASK32, (total >> 32) & 1
+
+
+class TestValuLshlAddU32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_zero_flag(self) -> None:
+        res = oracle_v_lshl_add_u32(0, 5, 0)
+        flags = evaluate_lshl_add_flags(res, 0, 5, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.sign)
+        self.assertTrue(flags.parity)
+
+        # Zero via overflow: (0x80000000 << 1) + 0 == 0
+        res2 = oracle_v_lshl_add_u32(0x80000000, 1, 0)
+        flags2 = evaluate_lshl_add_flags(res2, 0x80000000, 1, 0)
+        self.assertTrue(flags2.zero)
+        self.assertTrue(flags2.shift_overflow)
+        self.assertFalse(flags2.carry_out)
+
+    def test_condition_codes_sign_flag(self) -> None:
+        res = oracle_v_lshl_add_u32(1, 31, 0)
+        flags = evaluate_lshl_add_flags(res, 1, 31, 0)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.sign)
+        self.assertFalse(flags.carry_out)
+
+    def test_condition_codes_parity(self) -> None:
+        # 0 bits -> even (True)
+        self.assertTrue(evaluate_lshl_add_flags(0, 0, 0, 0).parity)
+        # 1 bit -> odd (False)
+        self.assertFalse(evaluate_lshl_add_flags(1, 0, 0, 1).parity)
+        # 2 bits -> even (True)
+        self.assertTrue(evaluate_lshl_add_flags(3, 0, 0, 3).parity)
+
+    def test_carry_out_and_shift_overflow_flags(self) -> None:
+        # Addition carry out: 0xFFFFFFFF + 1 => overflow
+        res = oracle_v_lshl_add_u32(0xFFFFFFFF, 0, 1)
+        flags = evaluate_lshl_add_flags(res, 0xFFFFFFFF, 0, 1)
+        self.assertTrue(flags.carry_out)
+        self.assertFalse(flags.shift_overflow)
+
+        # Shift overflow + addition carry: (0x80000000 << 1) + 0xFFFFFFFF
+        res2 = oracle_v_lshl_add_u32(0x80000000, 1, 0xFFFFFFFF)
+        flags2 = evaluate_lshl_add_flags(res2, 0x80000000, 1, 0xFFFFFFFF)
+        self.assertTrue(flags2.shift_overflow)
+        self.assertFalse(flags2.carry_out)
+
+    def test_shift_truncation_detection(self) -> None:
+        # S1 = 35 => truncated to 3
+        res = oracle_v_lshl_add_u32(2, 35, 1)
+        flags = evaluate_lshl_add_flags(res, 2, 35, 1)
+        self.assertTrue(flags.shift_truncated)
+        self.assertEqual(res, (2 << 3) + 1)
+
+    def test_vcc_isolation(self) -> None:
+        interp = ScalarVALUInterpreter()
+        canary_vcc = 0xFEEDFACECAFEBEEF
+        state = ScalarMachineState(vcc=canary_vcc)
+
+        instr = VLshlAddU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Literal32(0xFFFFFFFF)),
+            src1=VOP3Operand(Literal32(1)),
+            src2=VOP3Operand(Literal32(0xFFFFFFFF)),
+        )
+        interp.step(instr, state)
+        # VCC must remain unchanged
+        self.assertEqual(state.vcc, canary_vcc)
+
+        simd = SIMDInterpreter()
+        simd_state = SIMDState(num_lanes=64, vcc=canary_vcc)
+        simd.step(instr, simd_state)
+        self.assertEqual(simd_state.vcc, canary_vcc)
+
+
+
 
 
 
