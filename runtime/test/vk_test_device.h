@@ -255,6 +255,7 @@ public:
         VkPhysicalDeviceFeatures enable{};
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
         bc = features.features.textureCompressionBC == VK_TRUE;
+        enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;

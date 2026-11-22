@@ -2697,6 +2697,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     queue_info.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures enable{};
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
+    enable.shaderInt64 = chosen_features.shaderInt64;  // translated shaders declare Int64 (index features)
     enable.shaderSampledImageArrayDynamicIndexing = info.bindless;
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;
     enable.samplerAnisotropy = info.sampler_anisotropy;
