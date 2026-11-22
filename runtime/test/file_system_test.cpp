@@ -388,11 +388,11 @@ void run_checks(const std::filesystem::path& root) {
 
     // Names with non-ASCII letters keep the file system's case rule: deleting U+00E9 hides the package's U+00C9.
     {
-        write_path(package / "names" / L"Éclair.txt", "package");
+        write_path(package / "names" / L"Ã‰clair.txt", "package");
         write_path(package / "names" / "plain.txt", "package");
-        check(delete_w(L"GAME:\\names\\éclair.txt") != FALSE, "DeleteFileW takes a name that differs in a non-ASCII case");
+        check(delete_w(L"GAME:\\names\\Ã©clair.txt") != FALSE, "DeleteFileW takes a name that differs in a non-ASCII case");
         const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\names\\*");
-        check(std::find(names.begin(), names.end(), std::wstring(L"Éclair.txt")) == names.end() &&
+        check(std::find(names.begin(), names.end(), std::wstring(L"Ã‰clair.txt")) == names.end() &&
                   contains(names, L"plain.txt"),
               "and the listing hides it, as the file system's compare does");
     }
@@ -400,12 +400,12 @@ void run_checks(const std::filesystem::path& root) {
     // Duplicates are decided by _wcsicmp (same_name) in the title's locale, not by a lower-cased key: under .UTF-8,
     // _wcslwr_s folds U+00C9 and U+00E9 while _wcsicmp keeps them apart.
     {
-        write_path(overlay / "loc" / L"Éclair.txt", "overlay");
-        write_path(package / "loc" / L"éclair.txt", "package");
+        write_path(overlay / "loc" / L"Ã‰clair.txt", "overlay");
+        write_path(package / "loc" / L"Ã©clair.txt", "package");
         const char* old = std::setlocale(LC_CTYPE, nullptr);
         const std::string saved = old ? old : "C";
         if (std::setlocale(LC_CTYPE, ".UTF-8")) {
-            const int expected = _wcsicmp(L"Éclair.txt", L"éclair.txt") == 0 ? 1 : 2;
+            const int expected = _wcsicmp(L"Ã‰clair.txt", L"Ã©clair.txt") == 0 ? 1 : 2;
             const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\loc\\*");
             int files = 0;
             for (const auto& n : names)
@@ -1385,6 +1385,67 @@ void run_checks(const std::filesystem::path& root) {
         SetLastError(0);
         check(move_w(L"GAME:\\moves", L"GAME:\\MOVES") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a case rename of a package folder is refused like any other move of one");
+    }
+
+    // FILE_FLAG_DELETE_ON_CLOSE deletes the file even when the open asks for read access only: the host adds DELETE to
+    // such an open. On a package file it is a delete like DeleteFile's, so the package keeps the file.
+    {
+        constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        write_path(package / "data" / "once.txt", "package");
+        HANDLE h = create_w(L"GAME:\\data\\once.txt", GENERIC_READ, kShareAll, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package",
+              "a read-only delete-on-close open of a package file reads its bytes");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(read_path(package / "data" / "once.txt") == "package",
+              "closing a delete-on-close handle leaves the package file in place");
+        check(attributes_w(L"GAME:\\data\\once.txt") == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "the name is gone for the title after the delete-on-close handle is closed");
+        check(!contains(list(first_w, next_w, find_close, L"GAME:\\data\\*"), L"once.txt"),
+              "a listing does not show a file deleted on close");
+        check(!std::filesystem::exists(overlay / "data" / "once.txt"), "no overlay copy is left behind");
+
+        // The same through CreateFile2, which carries the flag in its extended parameters.
+        const auto create2 = resolve<CreateFile2Fn>("kernel32.dll", "CreateFile2");
+        write_path(package / "data" / "once2.txt", "package");
+        CREATEFILE2_EXTENDED_PARAMETERS ext{};
+        ext.dwSize = sizeof(ext);
+        ext.dwFileFlags = FILE_FLAG_DELETE_ON_CLOSE;
+        h = create2 ? create2(L"GAME:\\data\\once2.txt", GENERIC_READ, kShareAll, OPEN_EXISTING, &ext)
+                    : INVALID_HANDLE_VALUE;
+        check(h != INVALID_HANDLE_VALUE, "CreateFile2 opens a package file with delete-on-close");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(read_path(package / "data" / "once2.txt") == "package",
+              "CreateFile2 with delete-on-close leaves the package file in place");
+        check(attributes_w(L"GAME:\\data\\once2.txt") == INVALID_FILE_ATTRIBUTES,
+              "the name is gone for the title after CreateFile2's delete-on-close handle is closed");
+
+        // A file the title made itself is simply deleted, and a host path is passed through with its flag.
+        write_path(overlay / "save" / "temp.bin", "temp");
+        h = create_w(L"GAME:\\save\\temp.bin", GENERIC_READ, kShareAll, nullptr, OPEN_EXISTING,
+                     FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "a delete-on-close open of an overlay file succeeds");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(attributes_w(L"GAME:\\save\\temp.bin") == INVALID_FILE_ATTRIBUTES,
+              "an overlay file is deleted when its delete-on-close handle is closed");
+        check(!std::filesystem::exists(overlay / ".gta6rt-deleted" / "save" / "temp.bin"),
+              "a file only the overlay has needs no deletion marker");
+        const std::filesystem::path host_once = root / "host_once.txt";
+        write_path(host_once, "host");
+        h = create_w(host_once.c_str(), GENERIC_READ, kShareAll, nullptr, OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE,
+                     nullptr);
+        check(h != INVALID_HANDLE_VALUE, "a delete-on-close open of a host path succeeds");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(!std::filesystem::exists(host_once), "a host file is deleted on close, as the host does");
+
+        // An open that fails deletes nothing.
+        h = create_w(L"GAME:\\data\\absent.txt", GENERIC_READ, kShareAll, nullptr, OPEN_EXISTING,
+                     FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "a delete-on-close open of a missing name fails with ERROR_FILE_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(!std::filesystem::exists(overlay / ".gta6rt-deleted" / "data" / "absent.txt"),
+              "a failed delete-on-close open leaves no deletion marker");
     }
 }
 

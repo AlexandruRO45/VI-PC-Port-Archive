@@ -13,6 +13,8 @@
 //     <overlay>\\.gta6rt-deleted, and reads and listings treat the name as gone. The marker is never removed and a
 //     deleted name is never copied up: a re-created file is its overlay copy, which reads and listings already
 //     prefer, while an open of a deleted name that fails leaves the name deleted;
+//   - FILE_FLAG_DELETE_ON_CLOSE is a delete whatever access the open asks for: the open uses the overlay copy and a
+//     package name gets its marker once the open has succeeded;
 //   - reads prefer the overlay copy and then the package;
 //   - FindFirstFile merges the two folders, the overlay winning on a name, and hides deleted names and the marker
 //     folder;
@@ -436,23 +438,41 @@ Target write_target(const std::wstring& path, bool copy_up) {
     return t;
 }
 
-// MAXIMUM_ALLOWED names no right and grants every one the file allows, write included, so it is a write-open: opened
-// as a read it handed out a handle to the package file itself, and a WriteFile through it changed the package.
-bool writes(DWORD access, DWORD disposition) {
-    constexpr DWORD kWriteAccess = GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED | FILE_WRITE_DATA | FILE_APPEND_DATA |
-                                   FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
-    if ((access & kWriteAccess) != 0) return true;
+// FILE_FLAG_DELETE_ON_CLOSE makes any open a delete: the host adds DELETE to the access it was asked for, so a
+// read-only open with the flag removes the file when its last handle is closed.
+// MAXIMUM_ALLOWED can grant write access, so it also requires the overlay.
+bool writes(DWORD access, DWORD disposition, DWORD flags) {
+    constexpr DWORD kWriteAccess = GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
+                                   FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
+    if ((access & kWriteAccess) != 0 || (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) return true;
     return disposition == CREATE_NEW || disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS ||
            disposition == TRUNCATE_EXISTING;
 }
 
-Target open_target(const std::wstring& path, DWORD access, DWORD disposition) {
-    if (!writes(access, disposition)) return read_target(path);
+Target open_target(const std::wstring& path, DWORD access, DWORD disposition, DWORD flags) {
+    if (!writes(access, disposition, flags)) return read_target(path);
     // OPEN_ALWAYS and TRUNCATE_EXISTING read what is already there, and a write-open must not lose a package file's
     // bytes; CREATE_ALWAYS and CREATE_NEW replace it.
     const bool keeps_contents =
         disposition == OPEN_EXISTING || disposition == OPEN_ALWAYS || disposition == TRUNCATE_EXISTING;
     return write_target(path, keeps_contents);
+}
+
+// A delete-on-close open that succeeded is on the overlay copy, which the host removes at the last close. A name the
+// package has gets the marker DeleteFile leaves, so the package file does not come back into view then; until the
+// close, reads still find the overlay copy. A marker that cannot be written is not reported: the open succeeded and
+// the delete it carries cannot be taken back, so the package file is what the title sees again after the close.
+void mark_deleted_on_close(const std::wstring& path) {
+    std::vector<std::wstring> parts;
+    if (parse_console(path, parts) != Parsed::Console || parts.empty()) return;
+    const Roots r = roots();
+    if (r.game.empty() || r.overlay.empty() || deleted(r.overlay, parts)) return;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(join(r.game, parts), ec)) return;
+    const DWORD last_error = GetLastError();  // CreateFile's ERROR_ALREADY_EXISTS or 0, which the title may read
+    DWORD error = 0;
+    write_marker(marker(r.overlay, parts), error);
+    SetLastError(last_error);
 }
 
 // ---- FindFirstFile: the overlay and the package merged into one listing
@@ -571,7 +591,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         return deleted(r.overlay, entry_parts);
     };
     // Names already listed, ordered by _wcsicmp itself, so two names are one entry exactly when same_name says so, in
-    // whatever locale the title set (a lower-cased key is not: under .UTF-8 _wcslwr_s folds É and é, _wcsicmp not).
+    // whatever locale the title set (a lower-cased key is not: under .UTF-8 _wcslwr_s folds Ã‰ and Ã©, _wcsicmp not).
     struct NoCase {
         bool operator()(const std::wstring& a, const std::wstring& b) const { return _wcsicmp(a.c_str(), b.c_str()) < 0; }
     };
@@ -660,7 +680,7 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    const Target t = open_target(name, access, disposition);
+    const Target t = open_target(name, access, disposition, flags);
     if (t.error) {
         note_open_failure("CreateFileW", name, t.error, _ReturnAddress());
         SetLastError(t.error);
@@ -672,6 +692,7 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         note_open_failure("CreateFileW", name, error, _ReturnAddress());
         SetLastError(error);
     }
+    if (h != INVALID_HANDLE_VALUE && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) mark_deleted_on_close(name);
     return h;
 }
 
@@ -691,7 +712,8 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    const Target t = open_target(name, access, disposition);
+    const DWORD flags = params ? params->dwFileFlags : 0;
+    const Target t = open_target(name, access, disposition, flags);
     if (t.error) {
         note_open_failure("CreateFile2", name, t.error, _ReturnAddress());
         SetLastError(t.error);
@@ -703,6 +725,7 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         note_open_failure("CreateFile2", name, error, _ReturnAddress());
         SetLastError(error);
     }
+    if (h != INVALID_HANDLE_VALUE && (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0) mark_deleted_on_close(name);
     return h;
 }
 
