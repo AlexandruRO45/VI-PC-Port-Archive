@@ -57,6 +57,11 @@ SDST = 8            # s[8:15]: scalar load results
 VADDR = 2           # v[2:3]: index / offset (v2 alone when only one is used)
 VDATA = 4           # v[4:7]: buffer load / store data
 EXPORT = (8, 9, 10, 11)
+# exp writes float channels, and a float round trip may quiet a word with a signalling-NaN pattern (bit 22 set):
+# Python before 3.14 does in struct's float packing, so the interpreter's export changes such a word, and a GPU
+# export may too. The four words therefore leave as eight 16-bit halves ORed into 0x40000000 (always a normal
+# float) in v12..v19, through mrt0 and mrt1, and are put back together before the comparison.
+HALVES = tuple(range(12, 20))
 REGION = 0x1000     # bytes of seeded memory per buffer
 WORDS = REGION // 4
 
@@ -446,8 +451,21 @@ def generate_program(rng, n_ops, families=None):
 
 def _listing(lines):
     body = [line for line in lines if not line.startswith(";")]
+    for i, r in enumerate(EXPORT):
+        lo, hi = HALVES[2 * i], HALVES[2 * i + 1]
+        body += [f"v_and_b32 v{lo}, 0xffff, v{r}", f"v_lshrrev_b32 v{hi}, 16, v{r}",
+                 f"v_or_b32 v{lo}, 0x40000000, v{lo}", f"v_or_b32 v{hi}, 0x40000000, v{hi}"]
     return ("; mem_diff case  code 0x0..0x1000\n" + "".join("\t" + line + "\n" for line in body)
-            + f"\texp mrt0 {', '.join('v%d' % r for r in EXPORT)} done vm\n\ts_endpgm\n")
+            + f"\texp mrt0 {', '.join('v%d' % r for r in HALVES[:4])} vm\n"
+            + f"\texp mrt1 {', '.join('v%d' % r for r in HALVES[4:])} done vm\n\ts_endpgm\n")
+
+
+def _exported_words(out):
+    """The four exported words, reassembled from the halves; None if the export is missing or malformed."""
+    halves = list(out.get("%out_mrt0", ())) + list(out.get("%out_mrt1", ()))
+    if len(halves) != 8 or any(not isinstance(h, int) or h >> 16 != 0x4000 for h in halves):
+        return None
+    return [(halves[2 * i] & 0xFFFF) | (halves[2 * i + 1] & 0xFFFF) << 16 for i in range(4)]
 
 
 def run_one(name, prog):
@@ -475,7 +493,9 @@ def run_one(name, prog):
         out = run_fragment(spvasm, memory=memory)
     except Exception as e:  # noqa: BLE001 - the interpreter is half of the comparison
         return "skip", f"mini_interp unsupported: {type(e).__name__}: {e}"
-    got = list(out.get("%out_mrt0", ()))
+    got = _exported_words(out)
+    if got is None:
+        return "mismatch", "export: the eight 16-bit halves did not come back"
     if got != want:
         i = next(k for k in range(4) if k >= len(got) or got[k] != want[k])
         g = f"{got[i]:#010x}" if i < len(got) else "missing"
