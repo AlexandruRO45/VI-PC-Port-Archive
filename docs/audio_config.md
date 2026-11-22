@@ -69,7 +69,7 @@ On the measured package:
 
 It does **not** give per-track start offsets. Id order is not mix order, and the schedule-like
 structures in the config carry constant template fields, not cue times. A continuous radio mix must
-be matched in the audio (`docs/music.md` if present, or the local radio-timing tools).
+be matched in the audio itself.
 
 ## Tool
 

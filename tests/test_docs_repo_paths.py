@@ -3,10 +3,10 @@
     python -I tests/test_docs_repo_paths.py
 
 `tests/test_docs_links.py` checks Markdown links; this checks the other way the docs point at code, a backticked
-`tools/...`, `runtime/...`, `tests/...` or `scripts/...` path. A rename, or a page written against an unmerged pull
-request, leaves such a path pointing at nothing (docs/saves.md described #279's `xgameruntime_services.cpp` as the
-runtime's save store while #279 was still open). Reads tracked files only (`git ls-files`, with a directory walk when
-git is not available); no game files.
+`tools/...`, `runtime/...`, `tests/...`, `scripts/...`, `docs/...`, `viewer/...` or `game/...` path. A rename, or
+a page written against an unmerged pull request, leaves such a path pointing at nothing (docs/saves.md described
+#279's `xgameruntime_services.cpp` as the runtime's save store while #279 was still open). Reads tracked files only
+(`git ls-files`, with a directory walk when git is not available); no game files.
 """
 import os
 import re
@@ -14,7 +14,8 @@ import subprocess
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PATH = re.compile(r"`((?:tools|runtime|tests|scripts)/[A-Za-z0-9_./\-]+)`")
+# third_party/ is left out: its files belong to submodules, which `git ls-files` doesn't list.
+PATH = re.compile(r"`((?:tools|runtime|tests|scripts|docs|viewer|game)/[A-Za-z0-9_./\-]+)`")
 # Pages that quote another project's tree (SCARAB, americas-recomp): their paths are not this repository's.
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 # Build output, not tracked.
@@ -61,6 +62,12 @@ class DocsRepoPaths(unittest.TestCase):
         pages = {"docs/a.md": "Run `tools/real.py`, then `tools/gone.py`.\n```\n`tools/in_fence.py`\n```\n"
                               "`runtime/build/x.exe` and `tests/` and [`tools/x.py`](https://example.org/tools/x.py)"}
         self.assertEqual(missing_paths(pages, ["tools/real.py", "tests/t.py"]), [("docs/a.md:1", "tools/gone.py")])
+
+    def test_checker_covers_docs_viewer_and_game_paths(self):
+        pages = {"docs/a.md": "See `docs/real.md`, `docs/gone.md`, `viewer/gone.html` and `game/gone.json`."}
+        self.assertEqual(missing_paths(pages, ["docs/real.md"]),
+                         [("docs/a.md:1", "docs/gone.md"), ("docs/a.md:1", "viewer/gone.html"),
+                          ("docs/a.md:1", "game/gone.json")])
 
     def test_docs_name_existing_paths(self):
         files = tracked_files()
