@@ -848,5 +848,220 @@ class TestDivScaleF64SymbolicAST(unittest.TestCase):
         self.assertTrue(inst.clamp)
 
 
+class ScalarRegisterFile:
+    """Register file for a single scalar lane with 256 VGPRs and 106 SGPRs."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 108  # 106 general SGPRs + VCC_LO (106) and VCC_HI (107)
+
+    def read_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx]
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def read_vgpr_pair_u64(self, idx: int) -> int:
+        return dwords_to_u64(self.vgprs[idx], self.vgprs[idx + 1])
+
+    def write_vgpr_pair_u64(self, idx: int, val: int) -> None:
+        lo, hi = u64_to_dwords(val)
+        self.vgprs[idx] = lo
+        self.vgprs[idx + 1] = hi
+
+    def read_vgpr_pair_f64(self, idx: int) -> float:
+        return u64_to_f64(self.read_vgpr_pair_u64(idx))
+
+    def write_vgpr_pair_f64(self, idx: int, val: float) -> None:
+        self.write_vgpr_pair_u64(idx, f64_to_u64(val))
+
+    def read_sgpr_pair_u64(self, idx: int) -> int:
+        return dwords_to_u64(self.sgprs[idx], self.sgprs[idx + 1])
+
+    def write_sgpr_pair_u64(self, idx: int, val: int) -> None:
+        lo, hi = u64_to_dwords(val)
+        self.sgprs[idx] = lo
+        self.sgprs[idx + 1] = hi
+
+    def read_sgpr_pair_f64(self, idx: int) -> float:
+        return u64_to_f64(self.read_sgpr_pair_u64(idx))
+
+    def write_sgpr_pair_f64(self, idx: int, val: float) -> None:
+        self.write_sgpr_pair_u64(idx, f64_to_u64(val))
+
+    @property
+    def vcc_lo(self) -> int:
+        return self.sgprs[106]
+
+    @vcc_lo.setter
+    def vcc_lo(self, val: int) -> None:
+        self.sgprs[106] = val & MASK32
+
+    @property
+    def vcc_hi(self) -> int:
+        return self.sgprs[107]
+
+    @vcc_hi.setter
+    def vcc_hi(self, val: int) -> None:
+        self.sgprs[107] = val & MASK32
+
+    @property
+    def vcc(self) -> int:
+        return dwords_to_u64(self.vcc_lo, self.vcc_hi)
+
+    @vcc.setter
+    def vcc(self, val: int) -> None:
+        self.vcc_lo, self.vcc_hi = u64_to_dwords(val)
+
+
+class DivScaleF64ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_div_scale_f64."""
+
+    def __init__(self, reg_file: ScalarRegisterFile | None = None) -> None:
+        self.reg_file = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def resolve_source_u64(self, src: ASTOperand) -> int:
+        if src.kind == OperandKind.VGPR_PAIR:
+            val_u64 = self.reg_file.read_vgpr_pair_u64(src.index)
+        elif src.kind == OperandKind.SGPR_PAIR:
+            val_u64 = self.reg_file.read_sgpr_pair_u64(src.index)
+        elif src.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST):
+            val_u64 = f64_to_u64(float(src.value)) if src.value is not None else 0
+        else:
+            raise ValueError(f"Unsupported operand kind: {src.kind}")
+
+        return apply_src_mods_u64(val_u64, neg=src.neg, abs_=src.abs_)
+
+    def step(self, inst: ASTInstruction) -> tuple[int, int]:
+        inst.validate()
+        u0 = self.resolve_source_u64(inst.src0)
+        u1 = self.resolve_source_u64(inst.src1)
+        u2 = self.resolve_source_u64(inst.src2)
+
+        d_u64, vcc_bit = ref_div_scale_f64_u64(
+            u0,
+            u1,
+            u2,
+            clamp=inst.clamp,
+            omod=inst.omod.value,
+        )
+
+        self.reg_file.write_vgpr_pair_u64(inst.dst.index, d_u64)
+
+        if inst.sdst.kind == OperandKind.VCC:
+            self.reg_file.vcc = vcc_bit
+        elif inst.sdst.kind == OperandKind.SGPR_PAIR:
+            self.reg_file.write_sgpr_pair_u64(inst.sdst.index, vcc_bit)
+        elif inst.sdst.kind == OperandKind.SGPR_SINGLE:
+            self.reg_file.write_sgpr(inst.sdst.index, vcc_bit)
+
+        return d_u64, vcc_bit
+
+
+class TestDivScaleF64ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def test_interpreter_basic_scaling(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF64ScalarInterpreter(rf)
+
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+
+        # Set v[2:3] = one5, v[4:5] = big
+        rf.write_vgpr_pair_u64(2, one5)
+        rf.write_vgpr_pair_u64(4, big)
+
+        # v_div_scale_f64 v[0:1], vcc, v[2:3], v[2:3], v[4:5]
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(4),
+        )
+
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 1)
+        self.assertEqual(rf.vcc, 1)
+        self.assertEqual(rf.read_vgpr_pair_u64(0), d_res)
+
+        # Expected word components from case 1
+        self.assertEqual(rf.read_vgpr(0), 0x00000005)
+        self.assertEqual(rf.read_vgpr(1), 0x47F00000)
+
+    def test_interpreter_source_modifiers_neg(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF64ScalarInterpreter(rf)
+
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+        rf.write_vgpr_pair_u64(2, one5)
+        rf.write_vgpr_pair_u64(4, big)
+
+        # neg on src0 only makes s0 != s1, unscaled result
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(2, neg=True),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(4),
+        )
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 1)
+        self.assertEqual(d_res, one5 ^ (1 << 63))
+
+    def test_interpreter_sdst_sgpr(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF64ScalarInterpreter(rf)
+
+        one5 = 0x3FF0000000000005
+        big = 0x71F0000000000000
+        rf.write_vgpr_pair_u64(2, one5)
+        rf.write_vgpr_pair_u64(4, big)
+
+        # Write scale bit to SGPR pair s[10:11]
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.sdst_sgpr(10),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(4),
+        )
+        interp.step(inst)
+        self.assertEqual(rf.read_sgpr_pair_u64(10), 1)
+
+    def test_interpreter_clamp_modifier(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF64ScalarInterpreter(rf)
+
+        # Set v[2:3] = 2.0, v[4:5] = 1.0, v[6:7] = 1.0
+        rf.write_vgpr_pair_u64(2, F64_TWO)
+        rf.write_vgpr_pair_u64(4, F64_ONE)
+        rf.write_vgpr_pair_u64(6, F64_ONE)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F64,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(2),
+            src1=ASTOperand.vgpr(4),
+            src2=ASTOperand.vgpr(6),
+            clamp=True,
+        )
+        d_res, _ = interp.step(inst)
+        self.assertEqual(d_res, F64_ONE)
+        self.assertEqual(rf.read_vgpr_pair_u64(0), F64_ONE)
+
+
 if __name__ == "__main__":
     unittest.main()
