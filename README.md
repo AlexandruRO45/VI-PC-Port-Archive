@@ -1,5 +1,5 @@
 # Instruction coverage
 
-[Source commit `b03f754`](https://github.com/R0Y00/Xbox2Windows/commit/b03f7545637c6af922c1bcc75d2b1c5852847d16) · [Windows CI run 45047081305](https://github.com/R0Y00/Xbox2Windows/actions/runs/45047081305/attempts/1)
+[Source commit `2bb9ee0`](https://github.com/R0Y00/Xbox2Windows/commit/2bb9ee0f74bfa8b81abd19bf248880a8eef01053) · [Windows CI run 45050761069](https://github.com/R0Y00/Xbox2Windows/actions/runs/45050761069/attempts/1)
 
 ![Instruction coverage for the measured Windows run](dashboard.svg)
