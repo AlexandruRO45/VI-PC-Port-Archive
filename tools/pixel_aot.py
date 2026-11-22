@@ -1099,8 +1099,9 @@ def sdwa_dest(result, sel, unused, old):
 SDWA_ALU = ("add", "sub", "subrev", "mul", "mul_legacy", "max", "min", "floor", "ceil", "fract", "trunc")
 
 
-def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
-    """Track descriptor provenance, interpolation and packed exports through register writes."""
+def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
+          second_texture_offset=None, integer_export=False):
+    """Track descriptor provenance, interpolation and packed or uncompressed exports."""
     if texture_sgpr == interp_sgpr or not 0 <= texture_sgpr <= 105 or not 0 <= interp_sgpr <= 105:
         raise ValueError("Invalid scalar inputs")
     if sampler is not None and (len(sampler) != 4 or any(not 0 <= word <= 0xffffffff for word in sampler)):
@@ -1135,7 +1136,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     exported = False
     ended = False
     entry_line = len(lines)
-    lines.append("float4 main(float2 uv : TEXCOORD0) : SV_Target0 {")
+    result_type = "uint4" if integer_export else "float4"
+    lines.append(f"{result_type} main(float2 uv : TEXCOORD0) : SV_Target0 {{")
     attribute_input = False
     for i, line in enumerate(instructions):
         def match(pattern):
@@ -1857,6 +1859,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Unsupported pack operand")
             vector[dst] = pair
         elif m := match(r"exp mrt0,? (v\d+), \1, (v\d+|off), \2 done compr vm"):
+            if integer_export:
+                raise ValueError("Integer export requires the uncompressed export form")
             pairs = [vector[v] for v in m.groups() if v != "off"]
             if mask != "entry" or exported or not all(isinstance(p, tuple) and len(p)==2 and
                     all(v.startswith(("sample", "alu")) for v in p) for p in pairs):
@@ -1865,6 +1869,19 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             input_type = "float4" if attribute_input else "float2"
             lines[entry_line] = f"float{len(args)} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
             lines.append(f"    return float{len(args)}({', '.join(args)});")
+            exported = True
+        elif m := match(r"exp mrt0,? (v\d+), (v\d+), (v\d+), (v\d+) done vm"):
+            # Four distinct, ready registers of computed or sampled values.
+            export_regs = m.groups()
+            values = [vector.get(reg) for reg in export_regs]
+            if (mask != "entry" or exported or len(set(export_regs)) != 4
+                    or any(reg in sample_dest for reg in export_regs)
+                    or not all(isinstance(v, str) and v.startswith(("sample", "alu")) for v in values)):
+                raise ValueError("Unsupported export")
+            args = [f"asuint({v})" for v in values] if integer_export else values
+            input_type = "float4" if attribute_input else "float2"
+            lines[entry_line] = f"{result_type} main({input_type} uv : TEXCOORD0) : SV_Target0 {{"
+            lines.append(f"    return {result_type}({', '.join(args)});")
             exported = True
         elif line == "s_endpgm" and exported:
             ended = True

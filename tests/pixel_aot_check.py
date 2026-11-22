@@ -47,6 +47,12 @@ def write_record(path):
 
 RAMP = (0, 16, 37, 64, 101, 153, 219, 254)
 
+# CPU references use plain Python floats, which keep binary32 subnormals: the fixtures assume the
+# compiled desktop shader preserves them, and DXC runs with a matching -denorm flag. The Scarlett
+# pipeline's FLOAT_MODE is unmeasured, so this records the harness's assumption rather than a claim
+# about the console; binary16 and binary64 denormal behavior is established separately, not here.
+F32_DENORM_MODE = "preserve"
+
 
 def assembly(swap):
     red, blue = ("v14", "v12") if swap else ("v12", "v14")
@@ -172,12 +178,60 @@ def envelope(code: bytes, name: bytes = b"fixture", *, private_data: bytes | Non
     return shader_record(blob, name)
 
 
-def must_reject(function, *args):
+def must_reject(function, *args, **kwargs):
     try:
-        function(*args)
+        function(*args, **kwargs)
     except (ValueError, KeyError):
         return
     raise AssertionError(f"{function.__name__} accepted invalid input")
+
+
+def compile_shader(compiler, source, shader, *, listing=None, mode=F32_DENORM_MODE, ieee=True):
+    """Run DXC on one translated shader under an explicit binary32 denormal mode."""
+    # DXC accepts -denorm only at shader model 6.2 and above; ps_6_2 is the minimum target.
+    command = [compiler, *(["-Gis"] if ieee else []), "-denorm", mode,
+               "-T", "ps_6_2", "-E", "main", "-Fo", shader]
+    if listing is not None:
+        command += ["-Fc", listing]
+    command.append(source)
+    subprocess.run(command, check=True)
+
+
+def flush_ftz(value):
+    """Flush one binary32 subnormal input or result to signed zero, as -denorm ftz would."""
+    bits, = struct.unpack("<I", struct.pack("<f", value))
+    if bits & 0x7f800000 == 0 and bits & 0x007fffff:
+        return struct.unpack("<f", struct.pack("<I", bits & 0x80000000))[0]
+    return value
+
+
+def write_case(path, constants, pixels, *, nan_mask=None, integer_rt=False):
+    """Write a renderer case: 256 constant bytes, then 64 expected float4 rows in row-major order.
+
+    A single float4 broadcasts to every texel. The optional trailer appends one flags byte, whose
+    bit 0 selects the lossless R32G32B32A32_UINT readback target. Floating-point cases may instead
+    append a zero flags byte and 64 mask bytes for per-channel NaN-class checks. Cases written without
+    integer_rt or nan_mask keep the original 1280-byte format exactly.
+    """
+    rows = [pixels] * 64 if len(pixels) == 4 and not isinstance(pixels[0], (list, tuple)) else list(pixels)
+    if len(rows) != 64 or any(len(row) != 4 for row in rows):
+        raise ValueError("A case needs 64 float4 expectations")
+    data = bytearray(bytes(constants))
+    for row in rows:
+        data += struct.pack("<4f", *row)
+    if integer_rt:
+        if nan_mask is not None:
+            raise ValueError("NaN-class masks require a floating-point render target")
+        data.append(1)
+    elif nan_mask is not None:
+        if isinstance(nan_mask, int):
+            nan_mask = bytes([nan_mask]) * 64
+        elif len(nan_mask) != 64:
+            raise ValueError("The NaN-class mask needs exactly 64 texel bytes")
+        data.append(0)
+        data += nan_mask
+    Path(path).write_bytes(data)
+    return Path(path)
 
 
 def check_container_selector(directory: Path, code: bytes, library: str | None = None) -> None:
@@ -293,19 +347,27 @@ def check_movk_draw(directory, compiler, renderer, backend):
     assert [float((words[0] >> 24) & 0xff), float((words[0] >> 8) & 0xff),
             float((words[1] >> 8) & 0xff), float((words[1] >> 24) & 0xff)] == MOVK_EXPECTED
     source.write_text(translate(with_constants(MOVK_BODY)), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     constants = bytes(256)
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    case.write_bytes(constants + struct.pack("<4f", *MOVK_EXPECTED) * 64)
+    write_case(case, constants, tuple(MOVK_EXPECTED))
     subprocess.run(draw, check=True)
     # Zero extension clears byte 3 of 0x8000; sign-extending 0x7fff as negative sets byte 3.
     for channel, value in ((0, 0.0), (3, 255.0)):
         wrong = list(MOVK_EXPECTED)
         wrong[channel] = value
-        case.write_bytes(constants + struct.pack("<4f", *wrong) * 64)
+        write_case(case, constants, tuple(wrong))
         result = subprocess.run(draw, capture_output=True, text=True)
         if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
             raise AssertionError(f"A wrong s_movk_i32 extension escaped detection in channel {channel}")
+
+
+def uncompressed_export(body):
+    """Run body on the sample, then export v12 to v15 as four uncompressed binary32 channels."""
+    program = with_constants(body)
+    pos = program.index("v_cvt_pkrtz_f16_f32_e32 v16, v12, v13")
+    program[pos:] = ["exp mrt0 v12, v13, v14, v15 done vm", "s_endpgm"]
+    return program
 
 
 def with_scalar_constant_reads() -> list[str]:
@@ -684,7 +746,7 @@ def check_class_draw(directory, compiler, renderer, backend):
     shader = directory / "class.cso"
     case = directory / "class.case"
     source.write_text(translate(with_constants(CLASS_BODY)), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     constants = bytearray(256)
     struct.pack_into("<4I", constants, 12, *CLASS_BITS)
     expected = [1.0, 1.0, 0.0, 1.0]
@@ -738,7 +800,7 @@ def check_reciprocal_draw(directory, compiler, renderer, backend):
             # 1 / abs(-16) is 1/16, while its reciprocal square root is 1/4.
             body[2] = body[2].replace("v_rsq", "v_rcp")
         source.write_text(translate(with_constants(body)), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         if mutation:
             wrong = subprocess.run(draw, capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
@@ -789,7 +851,7 @@ def check_e64_draws(directory, compiler, renderer, backend):
     assert [-x * abs(y) + z, 0.0, 0.0, 0.0] == E64_ARITH[1][1]
     for body, expected, wrongs in E64_ARITH:
         source.write_text(translate(with_constants(body)), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         constants = bytearray(256)
         struct.pack_into("<4f", constants, 12, *E64_ARITH_INPUTS)
         cases = []
@@ -804,7 +866,7 @@ def check_e64_draws(directory, compiler, renderer, backend):
     negated = {0: 2, 1: 1, 2: 0, 3: 3}
     for first in range(0, 16, 4):
         source.write_text(translate(predicate_group_e64(first)), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         cases = []
         for left, right, relation in inputs:
             constants = bytearray(256)
@@ -845,7 +907,7 @@ def check_bitwise_draw(directory, compiler, renderer, backend):
         if logical:
             program = [line.replace("v_ashrrev_i32", "v_lshrrev_b32") for line in program]
         source.write_text(translate(program), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         for left, right, a, b in ((36, 33, 0x40d10000, 0xc0250000), (35, 37, 0x3e270000, 0xbf620000)):
             words = (((a << (left % 32)) & 0xffffffff) >> (right % 32),
                      (b - 2**32) >> 20, ~a ^ b, (a & 0x00700000) | (b & ~0x00700000))
@@ -867,17 +929,17 @@ def check_fract_draw(directory, compiler, renderer, backend):
     shader = directory / "fract.cso"
     case = directory / "fract.case"
     source.write_text(translate(fract_values()), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     constants = bytearray(256)
     struct.pack_into("<4f", constants, 12, *FRACT_INPUTS)
     a, b, c, d = FRACT_INPUTS
     expected = [min(single(x - math.floor(x)), FRACT_CLAMP) for x in (a, abs(b), -abs(c), d)]
     assert expected[0] == FRACT_CLAMP and single(FRACT_INPUTS[0] - math.floor(FRACT_INPUTS[0])) == 1.0
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    case.write_bytes(constants + struct.pack("<4f", *map(half_rtz, expected)) * 64)
+    write_case(case, constants, tuple(map(half_rtz, expected)))
     subprocess.run(draw, check=True)
     # An unclamped fract exports 1.0 for the first input; the renderer must tell it from the clamp.
-    case.write_bytes(constants + struct.pack("<4f", 1.0, *map(half_rtz, expected[1:])) * 64)
+    write_case(case, constants, (1.0, *map(half_rtz, expected[1:])))
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("An unclamped fract result escaped detection")
@@ -903,7 +965,7 @@ def check_mad_draw(directory, compiler, renderer, backend):
     shader = directory / "mad.cso"
     case = directory / "mad.case"
     source.write_text(translate(with_constants(MAD_BODY)), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     constants = bytearray(256)
     struct.pack_into("<4f", constants, 12, *MAD_INPUTS)
     a, c, tiny, large = MAD_INPUTS
@@ -936,8 +998,7 @@ def check_predicate_draws(directory, compiler, renderer, backend):
                                    "v_cndmask_b32_e32 v12, 0, 1.0, vcc_lo"])
         source.write_text(translate(isolated), encoding="ascii")
         listing = directory / f"{op}.ll"
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main",
-                        "-Fc", listing, "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader, listing=listing)
         dxil = listing.read_text(encoding="utf-8")
         if not any(text in dxil for text in ("@dx.op.isSpecialFloat.f32(i32 8,", "fcmp uno ", "fcmp ueq ")):
             raise AssertionError(f"{op.upper()} lacks an explicit unordered comparison in DXIL")
@@ -945,12 +1006,12 @@ def check_predicate_draws(directory, compiler, renderer, backend):
               (math.nan, 1, 3), (1, math.nan, 3))
     for first in range(0, 16, 4):
         source.write_text(translate(predicate_group(first)), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         for left, right, relation in inputs:
             constants = bytearray(256)
             struct.pack_into("<4f", constants, 12, left, right, 0, 1)
-            pixel = struct.pack("<4f", *((op >> relation) & 1 for op in range(first, first + 4)))
-            case.write_bytes(constants + pixel * 64)
+            pixel = tuple((op >> relation) & 1 for op in range(first, first + 4))
+            write_case(case, constants, pixel)
             try:
                 subprocess.run(draw, check=True)
             except subprocess.CalledProcessError as error:
@@ -963,7 +1024,7 @@ def check_predicate_draws(directory, compiler, renderer, backend):
                 raise
     # Keep the unordered oracle and change only the NaN operand to equal.
     struct.pack_into("<f", constants, 16, 1.0)
-    case.write_bytes(constants + pixel * 64)
+    write_case(case, constants, pixel)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Replacing NaN with a finite equal operand escaped detection")
@@ -995,7 +1056,7 @@ def check_int_predicate_draws(directory, compiler, renderer, backend):
         for encoding in ("e32", "e64"):
             for first in (0, 4):
                 source.write_text(translate(int_predicate_group(kind, encoding, first)), encoding="ascii")
-                subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+                compile_shader(compiler, source, shader)
                 for left_u, right_u in pairs:
                     rel = relation(left_u, right_u, kind)
                     constants = bytearray(256)
@@ -1006,7 +1067,7 @@ def check_int_predicate_draws(directory, compiler, renderer, backend):
 
     # Negative control: signed shader evaluated against the unsigned oracle on (0x80000000, 0x00000000).
     source.write_text(translate(int_predicate_group("i32", "e32", 0)), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     constants = bytearray(256)
     struct.pack_into("<IIff", constants, 12, 0x80000000, 0x00000000, 0.0, 1.0)
     unsigned_rel = relation(0x80000000, 0x00000000, "u32")
@@ -1035,7 +1096,7 @@ def check_int16_predicate_draws(directory, compiler, renderer, backend):
 
     def build(program):
         source.write_text(translate(program), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
 
     def write_case(left, right, expected):
         constants = bytearray(256)
@@ -1083,7 +1144,7 @@ def check_sdwa_predicate_draws(directory, compiler, renderer, backend):
     inputs = ((-1, 1, 0), (-0.0, 0.0, 1), (1, -1, 2), (math.nan, 1, 3), (1, math.nan, 3))
     for first in range(0, 16, 4):
         source.write_text(translate(predicate_group(first, sdwa=True)), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         for left, right, relation in inputs:
             constants = bytearray(256)
             struct.pack_into("<4f", constants, 12, left, right, 0, 1)
@@ -1125,7 +1186,7 @@ def check_half_draw(directory, compiler, renderer, backend):
     shader = directory / "half.cso"
     case = directory / "half.case"
     source.write_text(translate(with_constants(HALF_BODY)), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     constants = bytearray(256)
     struct.pack_into("<4I", constants, 12, *HALF_WORDS)
     first, second, third, fourth = map(half_value, HALF_WORDS)
@@ -1136,12 +1197,12 @@ def check_half_draw(directory, compiler, renderer, backend):
     for x in (*expected, *wrong):
         assert half_rtz(x) == x, x
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+    write_case(case, constants, tuple(expected))
     subprocess.run(draw, check=True)
     for k in range(4):
         wrong_values = list(expected)
         wrong_values[k] = wrong[k]
-        case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
+        write_case(case, constants, tuple(wrong_values))
         result = subprocess.run(draw, capture_output=True, text=True)
         if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
             raise AssertionError(f"A wrong half conversion escaped detection in channel {k}")
@@ -1157,7 +1218,7 @@ def check_half_draw(directory, compiler, renderer, backend):
         *HALF_BODY[3:],
     ]
     source.write_text(translate(with_constants(body)), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     scalars = [half_value(0x3c00), half_value(0xf000 // 4), half_value((2**16 - 1) & 0x3c00), fourth * 2.0 ** 24]
     assert scalars == [1.0, 1.0, 1.0, 1.0]
     case.write_bytes(constants + struct.pack("<4f", *scalars) * 64)
@@ -1243,8 +1304,7 @@ def check_vop3p_draw(directory, compiler, renderer, backend):
     case = directory / "vop3p.case"
     program = with_constants(VOP3P_BODY)
     source.write_text(translate(program), encoding="ascii")
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     for words in VOP3P_SETS:
         expected = vop3p_reference(words)
@@ -1278,7 +1338,7 @@ def check_vop3p_draw(directory, compiler, renderer, backend):
         mutated = [line.replace(old, new) for line in program]
         assert mutated != program, label
         source.write_text(translate(mutated), encoding="ascii")
-        subprocess.run(compile_shader, check=True)
+        compile_shader(compiler, source, shader)
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
@@ -1326,7 +1386,7 @@ def check_narrow_draw(directory, compiler, renderer, backend):
     shader = directory / "narrow.cso"
     case = directory / "narrow.case"
     source.write_text(translate(with_constants(NARROW_BODY)), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     for inputs, wrongs in NARROW_SETS:
         words = [struct.unpack("<I", struct.pack("<f", x))[0] for x in inputs]
@@ -1388,6 +1448,7 @@ def arithmetic_case(directory, *constants):
     case = bytearray(256)
     struct.pack_into("<4f", case, 32, scale, bias, pivot, offset)
     ramp = (0, 16, 37, 64, 101, 153, 219, 254)
+    pixels = []
     for y in ramp:
         for x in ramp:
             r, g, b = (struct.unpack("<f", struct.pack("<f", c / 255))[0] for c in (x, y, 128))
@@ -1395,30 +1456,28 @@ def arithmetic_case(directory, *constants):
             red = min(1, max(0, exact(scaled + bias)))
             green = min(1, max(0, exact(exact(exact(pivot - g) * -2.0) - offset)))
             color = (red, green, exact(-0.5 + b), exact(0.25 * scaled))
-            case.extend(struct.pack("<4f", *map(half_rtz, color)))
-    path = directory / "arithmetic.case"
-    path.write_bytes(case)
-    return path
+            pixels.append(tuple(map(half_rtz, color)))
+    return write_case(directory / "arithmetic.case", case, pixels)
 
 
 def curve_case(directory, gain):
     gamma, floor, mix = 2.0, .125, .25
     case = bytearray(256)
     struct.pack_into("<4f", case, 12, gamma, gain, floor, mix)
+    pixels = []
     for y in RAMP:
         for x in RAMP:
             g = y / 255
             r = gain * math.sqrt(max(floor, x / 255)) - (1 - g) + mix * g
-            case.extend(struct.pack("<4f", half_rtz(min(1, max(0, r))), half_rtz(g), half_rtz(128/255), 1))
-    path = directory / "curve.case"
-    path.write_bytes(case)
-    return path
+            pixels.append((half_rtz(min(1, max(0, r))), half_rtz(g), half_rtz(128/255), 1))
+    return write_case(directory / "curve.case", case, pixels)
 
 
 def shaping_case(directory, gain):
     scale, floor, mix = 2.0, .125, .25
     case = bytearray(256)
     struct.pack_into("<4f", case, 12, scale, gain, floor, mix)
+    pixels = []
     for y in RAMP:
         for x in RAMP:
             g = y / 255
@@ -1427,10 +1486,8 @@ def shaping_case(directory, gain):
                  + 1.0 / math.sqrt(scale + g)
                  + mix * (scaled - math.floor(scaled))
                  - math.floor(scaled))
-            case.extend(struct.pack("<4f", half_rtz(min(1, max(0, r))), half_rtz(g), half_rtz(128/255), 1))
-    path = directory / "shaping.case"
-    path.write_bytes(case)
-    return path
+            pixels.append((half_rtz(min(1, max(0, r))), half_rtz(g), half_rtz(128/255), 1))
+    return write_case(directory / "shaping.case", case, pixels)
 
 
 def truncate_case(directory: Path, bias: float, green: float, blue: float, alpha: float) -> Path:
@@ -1440,13 +1497,11 @@ def truncate_case(directory: Path, bias: float, green: float, blue: float, alpha
     green = math.modf(green)[1]
     blue = math.modf(-abs(blue))[1]
     alpha = max(0.0, min(1.0, math.modf(alpha)[1]))
+    pixels = []
     for _ in RAMP:
         for x in RAMP:
-            red = math.modf(bias + x / 255)[1]
-            case.extend(struct.pack("<4f", red, green, blue, alpha))
-    path = directory / "truncate.case"
-    path.write_bytes(case)
-    return path
+            pixels.append((math.modf(bias + x / 255)[1], green, blue, alpha))
+    return write_case(directory / "truncate.case", case, pixels)
 
 
 def sopk_case(directory, red: float, green: float) -> Path:
@@ -1490,13 +1545,12 @@ def rounding_case(directory, scale, tie, bias):
 
 def absolute_case(directory):
     case = bytearray(256)
+    pixels = []
     for y in RAMP:
         for x in RAMP:
             red = abs(0.5 - x / 255)
-            case.extend(struct.pack("<4f", half_rtz(red), half_rtz(y / 255), half_rtz(128 / 255), 1))
-    path = directory / "absolute.case"
-    path.write_bytes(case)
-    return path
+            pixels.append((half_rtz(red), half_rtz(y / 255), half_rtz(128 / 255), 1))
+    return write_case(directory / "absolute.case", case, pixels)
 
 
 def single(x):
@@ -1508,15 +1562,14 @@ def select_case(directory, fold, limit, capped, unequal):
     case = bytearray(256)
     struct.pack_into("<4f", case, 12, fold, limit, capped, unequal)
     ramp = (0, 16, 37, 64, 101, 153, 219, 254)
+    pixels = []
     for y in ramp:
         for x in ramp:
             r, g = single(x / 255), single(y / 255)
             color = (single(1 - r) if fold < r else r, capped if g >= limit else g,
                      0.0 if r < g else 1.0, 1.0 if r == g else unequal)
-            case.extend(struct.pack("<4f", *map(half_rtz, color)))
-    path = directory / "select.case"
-    path.write_bytes(case)
-    return path
+            pixels.append(tuple(map(half_rtz, color)))
+    return write_case(directory / "select.case", case, pixels)
 
 
 # v_cube{id,sc,tc,ma}_f32 follow LLVM's ConstantFoldAMDGCNCubeIntrinsic. The direction sets cover all
@@ -1555,7 +1608,7 @@ def check_cube_draw(directory, compiler, renderer, backend):
     shader = directory / "cube.cso"
     case = directory / "cube.case"
     source.write_text(translate(with_constants(CUBE_BODY)), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     faces = set()
     for direction, (channel, wrong_value) in CUBE_SETS:
         constants = bytearray(256)
@@ -1564,11 +1617,11 @@ def check_cube_draw(directory, compiler, renderer, backend):
         faces.add(expected[0])
         assert all(half_rtz(x) == x for x in (*expected, wrong_value)) and wrong_value != expected[channel]
         draw = [renderer, backend, "--check-pixel-case", shader, case]
-        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        write_case(case, constants, tuple(expected))
         subprocess.run(draw, check=True)
         wrong_values = list(expected)
         wrong_values[channel] = wrong_value
-        case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
+        write_case(case, constants, tuple(wrong_values))
         result = subprocess.run(draw, capture_output=True, text=True)
         if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
             raise AssertionError(f"A wrong cube result escaped detection for {direction}")
@@ -1884,9 +1937,7 @@ def scalar64_case(directory, values):
     struct.pack_into("<12I", constants, 16, *values)
     words = struct.unpack("<64I", constants)
     color, _ = scalar64_reference(scalar64(), words)
-    path = directory / "scalar64.case"
-    path.write_bytes(constants + struct.pack("<4f", *color) * 64)
-    return path
+    return write_case(directory / "scalar64.case", constants, tuple(color))
 # Scalar ALU producers in the scalar() fixture. Each SCC result sets its own bit of s60 through
 # s_cselect_b32; each result value is mixed into the hash in s61. a to d are constant words 3 to 6.
 SCALAR_STEPS = (
@@ -1953,7 +2004,7 @@ def check_sext_draw(directory, compiler, renderer, backend):
     shader = directory / "sext.cso"
     case = directory / "sext.case"
     source.write_text(translate(sext_values()), encoding="ascii")
-    subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader, ieee=False)
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     for index, word in enumerate((0xabcd807f, 0xabcd7f80, 0xabcd0000, 0x1234ffff)):
         flag = index % 2
@@ -2181,7 +2232,7 @@ def check_sdwa_draw(directory, compiler, renderer, backend):
         source = directory / f"{name}.hlsl"
         shader = directory / f"{name}.cso"
         source.write_text(translate(with_constants(body)), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
     case = directory / "sdwa.case"
     for body, words, expected, wrongs in SDWA_SETS:
         assert sdwa_reference(body, words) == expected, (words, expected)
@@ -2273,7 +2324,7 @@ def check_sdwa_arith_draws(directory, compiler, renderer, backend):
         source = directory / f"sdwa_arith{index}.hlsl"
         shader = directory / f"sdwa_arith{index}.cso"
         source.write_text(translate(with_constants(body)), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         words = [v if isinstance(v, int) else struct.unpack("<I", struct.pack("<f", v))[0] for v in inputs]
         constants = bytearray(256)
         struct.pack_into("<4I", constants, 12, *words)
@@ -2397,7 +2448,7 @@ def check_literal_fma_draw(directory, compiler, renderer, backend):
     shader = directory / "literal_fma.cso"
     case = directory / "literal_fma.case"
     source.write_text(translate(with_constants(LITERAL_FMA_BODY)), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     constants = bytearray(256)
     struct.pack_into("<4f", constants, 12, *LITERAL_FMA_INPUTS)
     a, b, c, d = LITERAL_FMA_INPUTS
@@ -2407,13 +2458,13 @@ def check_literal_fma_draw(directory, compiler, renderer, backend):
         assert single(x) == x == half_rtz(x), x
     assert all(x != y for x, y in zip(expected, swapped))
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+    write_case(case, constants, tuple(expected))
     subprocess.run(draw, check=True)
     # Treating the literal as S1, or S1 as the literal, must change the exported color.
     for k in range(4):
         wrong_values = list(expected)
         wrong_values[k] = swapped[k]
-        case.write_bytes(constants + struct.pack("<4f", *wrong_values) * 64)
+        write_case(case, constants, tuple(wrong_values))
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Swapped literal multiply-add operands escaped detection in channel {k}")
@@ -2618,10 +2669,9 @@ def check_fma_mix_draw(directory, compiler, renderer, backend):
     source = directory / "fma_mix.hlsl"
     shader = directory / "fma_mix.cso"
     case = directory / "fma_mix.case"
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     for a_bits, b_bits, c_val, d_val in FMA_MIX_SETS:
         constants = bytearray(256)
         struct.pack_into("<2I2f", constants, 12, a_bits, b_bits, c_val, d_val)
@@ -2645,7 +2695,7 @@ def check_fma_mix_draw(directory, compiler, renderer, backend):
         mutated = [line.replace(old, new) for line in program]
         assert mutated != program, label
         source.write_text(translate(mutated), encoding="ascii")
-        subprocess.run(compile_shader, check=True)
+        compile_shader(compiler, source, shader)
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
@@ -2774,10 +2824,9 @@ def check_dot_draw(directory, compiler, renderer, backend):
     source = directory / "dot.hlsl"
     shader = directory / "dot.cso"
     case = directory / "dot.case"
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     for values in DOT_SETS:
         constants = bytearray(256)
         struct.pack_into("<4I", constants, 12, *values)
@@ -2799,7 +2848,7 @@ def check_dot_draw(directory, compiler, renderer, backend):
         mutated = [line.replace(old, new) for line in program]
         assert mutated != program, label
         source.write_text(translate(mutated), encoding="ascii")
-        subprocess.run(compile_shader, check=True)
+        compile_shader(compiler, source, shader)
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
@@ -2901,10 +2950,9 @@ def check_pk_int16_draw(directory, compiler, renderer, backend):
     source = directory / "pk_int16.hlsl"
     shader = directory / "pk_int16.cso"
     case = directory / "pk_int16.case"
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     for values in PK_INT16_SETS:
         constants = bytearray(256)
         struct.pack_into("<4I", constants, 12, *values)
@@ -2926,7 +2974,7 @@ def check_pk_int16_draw(directory, compiler, renderer, backend):
         mutated = [line.replace(old, new) for line in program]
         assert mutated != program, label
         source.write_text(translate(mutated), encoding="ascii")
-        subprocess.run(compile_shader, check=True)
+        compile_shader(compiler, source, shader)
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
@@ -3088,6 +3136,26 @@ def check_controls(directory):
         assert modern != program
         assert translate(modern) == translate(program)
         must_reject(translate, [line.replace("exp mrt0 ", "exp mrt0,, ") for line in program])
+
+    # Uncompressed binary32 exports need four distinct computed or sampled registers; an integer
+    # export refuses the compressed form and nothing may follow the export.
+    program = uncompressed_export(["v_mov_b32_e32 v12, s44", "v_mov_b32_e32 v13, s45",
+                                   "v_mov_b32_e32 v14, s46", "v_mov_b32_e32 v15, s47"])
+    modern = [line.replace("exp mrt0 ", "exp mrt0, ") for line in program]
+    assert translate(modern) == translate(program)
+    source = translate(program)
+    assert "return float4(alu" in source and "export16(" not in source.split("float4 main", 1)[1]
+    integral = lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True)
+    assert "uint4 main" in integral and "return uint4(asuint(" in integral
+    must_reject(lower, with_constants([]), 20, 24, [1, 2, 3, 4],
+                constant_descriptor=64, integer_export=True)
+    export = program.index("exp mrt0 v12, v13, v14, v15 done vm")
+    must_reject(translate, program[:export] + ["exp mrt0 v12, v12, v13, v14 done vm"] + program[export+1:])
+    must_reject(translate, program[:export] + ["exp mrt0 v12, v13, v14, v255 done vm"] + program[export+1:])
+    sampled = assembly(False)
+    sample_wait = sampled.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, sampled[:sample_wait] + ["exp mrt0 v12, v13, v14, v15 done vm", "s_endpgm"])
+    must_reject(translate, program[:export+1] + ["v_mov_b32_e32 v20, 1.0"] + program[export+1:])
 
     # The literal of v_fmaak_f32 is its last operand and that of v_fmamk_f32 its second; a register there is refused.
     body = translate(with_constants(LITERAL_FMA_BODY)).split("float4 main", 1)[1]
@@ -3675,23 +3743,22 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
     shader = directory / "ceiling.cso"
     case = directory / "ceiling.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
     source.write_text(translate(instructions), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     for a, b, c, d in ((-1.75, 1.75, -1.75, -1.75), (-2.0, 2.0, 0.0, 0.0),
                        (-0.75, 0.75, -0.75, -0.75), (2.25, -2.75, 2.25, 2.25)):
         constants = bytearray(256)
         struct.pack_into("<4f", constants, 12, a, b, c, d)
         # Python's integer results lose the sign of zero. The readback compares float bits.
-        expected = struct.pack("<4f", math.copysign(math.ceil(a), a),
-                               math.copysign(math.ceil(-abs(b)), -1), math.ceil(abs(c)),
-                               min(math.ceil(abs(d)), 1))
-        case.write_bytes(constants + expected * 64)
+        expected = (math.copysign(math.ceil(a), a),
+                    math.copysign(math.ceil(-abs(b)), -1), math.ceil(abs(c)),
+                    min(math.ceil(abs(d)), 1))
+        write_case(case, constants, expected)
         subprocess.run(draw, check=True)
 
     floor = [line.replace("v_ceil_f32_e32", "v_floor_f32_e32") for line in instructions]
     source.write_text(translate(floor), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Replacing ceiling with floor escaped detection")
@@ -3708,16 +3775,116 @@ def check_affine_lod_draw(directory: Path, compiler: str, renderer: str, backend
                      " * float2(params[0].z * 0.5f, 1.0f))")
     hlsl = directory / "quad_lod.hlsl"
     shader = directory / "quad_lod.cso"
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, hlsl]
     draw = [renderer, backend, "--check-pixel-quad-lod", shader]
     hlsl.write_text(source, encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, hlsl, shader)
     subprocess.run(draw, check=True)
     hlsl.write_text(source.replace(coordinate, poor_gradient), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, hlsl, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("The draw accepted a missing helper-lane gradient")
+# v_min_f32/v_max_f32 on the least binary32 subnormal keep it under -denorm preserve and flush it
+# to zero under -denorm ftz; v_mul_f32 by 1.0 folds to a move, so that channel exports identical
+# bits under both modes and cannot detect the mode by itself.
+DENORM_BODY = [
+    "v_min_f32_e32 v12, s44, s45",
+    "v_max_f32_e32 v13, s44, s46",
+    "v_mul_f32_e32 v14, s44, 1.0",
+]
+LEAST_SUBNORMAL = struct.unpack("<f", struct.pack("<I", 1))[0]
+
+
+def check_denorm_mode_draw(directory, compiler, renderer, backend):
+    """Draw one program under both -denorm modes with mode-matched references."""
+    source = directory / "denorm_mode.hlsl"
+    shader = directory / "denorm_mode.cso"
+    case = directory / "denorm_mode.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, LEAST_SUBNORMAL, 1.0, -1.0, 0.0)
+    source.write_text(translate(uncompressed_export(DENORM_BODY)), encoding="ascii")
+    passthrough = 1.0  # the untouched sample alpha
+    preserve = (LEAST_SUBNORMAL, LEAST_SUBNORMAL, LEAST_SUBNORMAL, passthrough)
+    ftz = (flush_ftz(LEAST_SUBNORMAL), flush_ftz(LEAST_SUBNORMAL), LEAST_SUBNORMAL, passthrough)
+    write_case(case, constants, preserve)
+    compile_shader(compiler, source, shader)
+    subprocess.run(draw, check=True)
+    # The folding channel expects the same raw subnormal under ftz, so this run passing proves the
+    # folded move exports identical bits in both modes; the min and max channels expect the flush.
+    write_case(case, constants, ftz)
+    compile_shader(compiler, source, shader, mode="ftz")
+    subprocess.run(draw, check=True)
+    # The min and max channels differ between the modes, so the preserve build must fail the ftz
+    # reference still on disk.
+    compile_shader(compiler, source, shader)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A preserve-mode export matched the ftz reference")
+
+
+def check_nan_class_draw(directory, compiler, renderer, backend):
+    """Check v_add_f32 NaN results by class on masked channels; finite channels stay strict."""
+    source = directory / "nan_class.hlsl"
+    shader = directory / "nan_class.cso"
+    case = directory / "nan_class.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    words = (0x7fc00000, 0x7f800001, 0xffc00003, 0x3f800000)
+    values = [struct.unpack("<f", struct.pack("<I", word))[0] for word in words]
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *words)
+    program = uncompressed_export([
+        "v_add_f32_e32 v12, s44, s47",
+        "v_add_f32_e32 v13, s45, s46",
+        "v_add_f32_e32 v14, s45, s45",
+    ])
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    write_case(case, constants, (*values[:3], 1.0), nan_mask=0b0111)
+    subprocess.run(draw, check=True)
+    # A masked channel whose shader output is finite must fail on every backend.
+    finite = [line.replace("v12, s44, s47", "v12, s47, s47") for line in program]
+    source.write_text(translate(finite), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A finite export satisfied a NaN-class channel")
+    # A strict finite channel against a NaN export must also fail on every backend.
+    nan_alpha = program[:-2] + ["v_add_f32_e32 v15, s45, s46"] + program[-2:]
+    source.write_text(translate(nan_alpha), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A NaN export satisfied the strict finite channel")
+
+
+def check_integer_readback_draw(directory, compiler, renderer, backend):
+    """Round-trip v_mov_b32 bit copies bit-for-bit through the integer readback target."""
+    source = directory / "integer_readback.hlsl"
+    shader = directory / "integer_readback.cso"
+    case = directory / "integer_readback.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    words = (0x7fc00001, 0xffc00003, 0x00000001, 0x80000000)
+    constants = bytearray(256)
+    struct.pack_into("<I", constants, 12, words[0])
+    program = uncompressed_export([
+        "v_mov_b32_e32 v12, s44",
+        f"v_mov_b32_e32 v13, {words[1]:#x}",
+        f"v_mov_b32_e32 v14, {words[2]:#x}",
+        f"v_mov_b32_e32 v15, {words[3]:#x}",
+    ])
+    source.write_text(lower(program, 20, 24, [1, 2, 3, 4], constant_descriptor=64,
+                            integer_export=True), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    expected = tuple(struct.unpack("<f", struct.pack("<I", word))[0] for word in words)
+    write_case(case, constants, expected, integer_rt=True)
+    subprocess.run(draw, check=True)
+    corrupted = list(expected)
+    corrupted[2] = struct.unpack("<f", struct.pack("<I", words[2] ^ 3))[0]
+    write_case(case, constants, corrupted, integer_rt=True)
+    wrong = subprocess.run(draw, capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A corrupted expected word escaped the integer readback")
 
 
 def check_int_minmax_draws(directory, compiler, renderer, backend):
@@ -3725,7 +3892,6 @@ def check_int_minmax_draws(directory, compiler, renderer, backend):
     shader = directory / "int_minmax.cso"
     case = directory / "int_minmax.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
 
     def order_key(value, signed):
         return struct.unpack("<i" if signed else "<I", struct.pack("<f", value))[0]
@@ -3746,7 +3912,7 @@ def check_int_minmax_draws(directory, compiler, renderer, backend):
     # Exact binary16 floats whose 32-bit patterns reverse order across signed, unsigned, and float.
     for encoding in ("e32", "e64"):
         source.write_text(translate(int_minmax_pair(encoding)), encoding="ascii")
-        subprocess.run(compile_shader, check=True)
+        compile_shader(compiler, source, shader)
         for a, b in ((-2.0, 1.0), (-2.0, -1.0)):
             constants = bytearray(256)
             struct.pack_into("<4f", constants, 12, a, b, 0.0, 0.0)
@@ -3755,7 +3921,7 @@ def check_int_minmax_draws(directory, compiler, renderer, backend):
 
     swapped = [line.replace("v_min_i32_e32", "v_min_u32_e32") for line in int_minmax_pair("e32")]
     source.write_text(translate(swapped), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     constants = bytearray(256)
     struct.pack_into("<4f", constants, 12, -2.0, 1.0, 0.0, 0.0)
     case.write_bytes(constants + struct.pack("<4f", *pick_pair(-2.0, 1.0)) * 64)
@@ -3765,7 +3931,7 @@ def check_int_minmax_draws(directory, compiler, renderer, backend):
 
     for kind in ("i32", "u32"):
         source.write_text(translate(int_minmax_triple(kind)), encoding="ascii")
-        subprocess.run(compile_shader, check=True)
+        compile_shader(compiler, source, shader)
         for a, b, c in ((-2.0, -1.0, 1.0), (0.5, -0.5, 4.0)):
             constants = bytearray(256)
             struct.pack_into("<4f", constants, 12, a, b, c, 0.0)
@@ -3774,7 +3940,7 @@ def check_int_minmax_draws(directory, compiler, renderer, backend):
 
     wrong_med = [line.replace("v_med3_i32", "v_med3_u32") for line in int_minmax_triple("i32")]
     source.write_text(translate(wrong_med), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     constants = bytearray(256)
     struct.pack_into("<4f", constants, 12, -2.0, -1.0, 1.0, 0.0)
     case.write_bytes(constants + struct.pack("<4f", *pick_triple(-2.0, -1.0, 1.0, True)) * 64)
@@ -3787,10 +3953,9 @@ def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
     shader = directory / "frexp_ldexp.cso"
     case = directory / "frexp_ldexp.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
 
     source.write_text(translate(frexp_mant_values()), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     for a, b, c, d in ((3.0, 6.0, -0.25, -3.0), (-0.0, 0.0, 0.75, 12.0)):
         constants = bytearray(256)
         struct.pack_into("<4f", constants, 12, a, b, c, d)
@@ -3805,7 +3970,7 @@ def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
 
     wrong_frexp = [line.replace("v_frexp_mant_f32_e32", "v_mov_b32_e32") for line in frexp_mant_values()]
     source.write_text(translate(wrong_frexp), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     constants = bytearray(256)
     struct.pack_into("<4f", constants, 12, 3.0, 6.0, -0.25, -3.0)
     case.write_bytes(constants + struct.pack("<4f", 0.75, -0.75, 0.5, 0.0) * 64)
@@ -3814,7 +3979,7 @@ def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
         raise AssertionError("Replacing v_frexp_mant_f32 with v_mov_b32 escaped detection")
 
     source.write_text(translate(ldexp_values()), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     for a, exp_i, c, d in ((0.75, 3, 6.0, 0.25), (-0.0, 10, -2.0, -0.5), (1.5, -2, 0.5, 0.0625)):
         constants = bytearray(256)
         struct.pack_into("<fiff", constants, 12, a, exp_i, c, d)
@@ -3829,7 +3994,7 @@ def check_frexp_ldexp_draws(directory, compiler, renderer, backend):
 
     wrong_ldexp = [line.replace("v_ldexp_f32 v14, s46, -2", "v_ldexp_f32 v14, s46, 2") for line in ldexp_values()]
     source.write_text(translate(wrong_ldexp), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     constants = bytearray(256)
     struct.pack_into("<fiff", constants, 12, 0.75, 3, 6.0, 0.25)
     case.write_bytes(constants + struct.pack("<4f", 6.0, -3.0, 1.5, 1.0) * 64)
@@ -3842,7 +4007,7 @@ def check_three_way_draw(directory, compiler, renderer, backend):
     source = directory / "three_way.hlsl"
     shader = directory / "three_way.cso"
     source.write_text(translate(three_way()), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     for constants in ((.25, .75, .375, .5), (.625, .125, -.3125, .5)):
         case = three_way_case(directory, *constants)
         draw = [renderer, backend, "--check-pixel-case", shader, case]
@@ -3851,13 +4016,13 @@ def check_three_way_draw(directory, compiler, renderer, backend):
             return result.returncode
     without_abs = [line.replace("|s46|", "s46") for line in three_way()]
     source.write_text(translate(without_abs), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("The renderer failed to detect the missing min3 absolute value")
     source.write_text(translate([line.replace("v_med3_f32 v12", "v_min3_f32 v12") for line in three_way()]),
                       encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("A minimum replaced the median without a mismatch")
@@ -3868,7 +4033,7 @@ def check_buffer_color_draw(directory, compiler, renderer, backend):
     source, shader, case = (directory / name for name in ("buffer.hlsl", "buffer.cso", "buffer.case"))
     for rg in (False, True):
         source.write_text(translate_buffer_color(buffer_color(rg)), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         draw = [renderer, backend, "--check-pixel-case-rg" if rg else "--check-pixel-case", shader, case]
         for red, green in ((0.25, 0.75), (-0.5, 0.125)):
             constants = bytearray(256)
@@ -3890,9 +4055,8 @@ def check_unpack_byte_draws(directory, compiler, renderer, backend):
     shader = directory / "ubyte.cso"
     case = directory / "ubyte.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
     source.write_text(translate(instructions), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     # Every word is a normal binary32 value, so its bits survive the constant buffer, and
     # all four bytes of each word differ, so reading the wrong byte changes the result.
     for words in ((0x40ff8001, 0x3e7f02c3, 0x41a5005a, 0x00102030 | 0x3f000000),
@@ -3906,7 +4070,7 @@ def check_unpack_byte_draws(directory, compiler, renderer, backend):
 
     wrong = [line.replace("ubyte1", "ubyte0") for line in instructions]
     source.write_text(translate(wrong), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     result = subprocess.run(draw, capture_output=True, text=True)
     if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
         raise AssertionError("Reading the wrong byte escaped detection")
@@ -3916,9 +4080,8 @@ def check_reciprocal_iflag_draws(directory, compiler, renderer, backend):
     shader = directory / "rcp_iflag.cso"
     case = directory / "rcp_iflag.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
     source.write_text(translate(instructions), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     inf = math.inf
     # Powers of two have exact reciprocals, so no rounding difference can hide a fault.
     # A zero operand gives an infinity of its sign, and clamp turns +inf into 1.
@@ -3932,7 +4095,7 @@ def check_reciprocal_iflag_draws(directory, compiler, renderer, backend):
 
     wrong = [line.replace("v_rcp_iflag_f32", "v_sqrt_f32") for line in instructions]
     source.write_text(translate(wrong), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     result = subprocess.run(draw, capture_output=True, text=True)
     if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
         raise AssertionError("Replacing the reciprocal with a square root escaped detection")
@@ -3942,9 +4105,8 @@ def check_offset_nibble_draws(directory, compiler, renderer, backend):
     shader = directory / "cvt_off.cso"
     case = directory / "cvt_off.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
     source.write_text(translate(instructions), encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
 
     def offset(nibble):
         return (nibble - 16 if nibble & 8 else nibble) / 16
@@ -3968,7 +4130,7 @@ def check_offset_nibble_draws(directory, compiler, renderer, backend):
     # Reading the nibble as unsigned changes every result with bit 3 set.
     unsigned = translate(instructions).replace("asint(", "(")
     source.write_text(unsigned, encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     words = [high | 0x8, high | 0x9, high | 0xf, high | 0xc]
     constants = bytearray(256)
     struct.pack_into("<4I", constants, 12, *words)
@@ -3981,7 +4143,6 @@ def check_trig_draws(directory, compiler, renderer, backend):
     shader = directory / "trig.cso"
     case = directory / "trig.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
-    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
     instructions = with_constants(TRIG_BODY)
     hlsl = translate(instructions)
 
@@ -3991,14 +4152,14 @@ def check_trig_draws(directory, compiler, renderer, backend):
         case.write_bytes(constants + struct.pack("<4f", *trig_reference(inputs)) * 64)
 
     source.write_text(hlsl, encoding="ascii")
-    subprocess.run(compile_shader, check=True)
+    compile_shader(compiler, source, shader)
     for inputs in TRIG_CASES:
         write_case(inputs)
         subprocess.run(draw, check=True)
 
     def mismatches(text):
         source.write_text(text, encoding="ascii")
-        subprocess.run(compile_shader, check=True)
+        compile_shader(compiler, source, shader)
         detected = []
         for inputs in TRIG_CASES:
             write_case(inputs)
@@ -4030,7 +4191,7 @@ def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend
     shader = directory / "rgb-sample.cso"
     case = directory / "rgb-sample.case"
     hlsl.write_text(translate(rgb_sample()), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, hlsl], check=True)
+    compile_shader(compiler, hlsl, shader)
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     for alpha in (0.5, 1.0):
         colors = (struct.pack("<4f", half_rtz(red / 255), half_rtz(green / 255), half_rtz(128 / 255), alpha)
@@ -4049,7 +4210,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"
         source.write_text(translate(assembly(swap)), encoding="ascii")
-        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader, ieee=False)
         draw = [renderer, backend, "--check-pixel", shader]
         result = subprocess.run([*draw, "bgra" if swap else "rgba"])
         if result.returncode:
@@ -4069,37 +4230,37 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
     for exp_shader_inst in ("s_waitcnt_expcnt null, 0x3", "s_waitcnt expcnt(0)"):
         exp_program = [exp_shader_inst] + assembly(False)[:-1] + [exp_shader_inst, "s_endpgm"]
         source.write_text(translate(exp_program), encoding="ascii")
-        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader, ieee=False)
         subprocess.run([renderer, backend, "--check-pixel", shader, "rgba"], check=True)
     check_rgb_sample_draw(directory, compiler, renderer, backend)
     check_trig_draws(directory, compiler, renderer, backend)
     program = arithmetic()
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     for constants in ((4.0, -.0625, .125, -.015625), (2.0, -.03125, .0625, -.0078125)):
         draw = [renderer, backend, "--check-pixel-case", shader, arithmetic_case(directory, *constants)]
         subprocess.run(draw, check=True)
     swapped = [line.replace("v_subrev_f32", "v_sub_f32") for line in program]
     source.write_text(translate(swapped), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapped subtraction operands escaped detection")
 
     program = with_scalar_constant_reads()
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     case = directory / "scalar-constants.case"
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     for red, green, blue in ((.25, -.5, .75), (-.125, .625, .875)):
         constants = bytearray(256)
         for offset, value in ((0, red), (8, green), (252, blue)):
             struct.pack_into("<f", constants, offset, value)
-        case.write_bytes(constants + struct.pack("<4f", red, green, blue, 1) * 64)
+        write_case(case, constants, (red, green, blue, 1))
         subprocess.run(draw, check=True)
     wrong_word = [line.replace("s62, s[44:47], 0x8", "s62, s[44:47], 0x4") for line in program]
     source.write_text(translate(wrong_word), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Reading the neighboring constant word escaped detection")
@@ -4107,7 +4268,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
     check_affine_lod_draw(directory, compiler, renderer, backend)
     program = with_scalar_pair_reads()
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     for constants in ((2.0, -.0625, 1.0, .5, .25, .5), (.5, -.03125, .75, 2.0, .125, .25)):
         case = scalar_pair_case(directory, *constants)
         draw = [renderer, backend, "--check-pixel-case", shader, case]
@@ -4124,16 +4285,24 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
     case.write_bytes(reference)
     shifted = [line.replace("s[62:63], s[44:47], 0x14", "s[62:63], s[44:47], 0x10") for line in program]
     source.write_text(translate(shifted), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Reading the pair one word early escaped detection")
 
-    for program_fn, case_fn in ((curve, curve_case), (shaping, shaping_case)):
+    # The NVIDIA driver (32.0.16.2124, RTX 5060 Ti) refuses PSO creation for the curve program
+    # under -denorm preserve (E_OUTOFMEMORY). Its rows contain no binary32 subnormals, so the
+    # mode cannot change the exported bits; record this fixture's mode as any, not the assumption,
+    # and assert that mode independence on every expected word instead of arguing it.
+    for program_fn, case_fn, mode in ((curve, curve_case, "any"),
+                                      (shaping, shaping_case, F32_DENORM_MODE)):
         source.write_text(translate(program_fn()), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader, mode=mode)
         for gain in (.75, 1.125):
             case = case_fn(directory, gain)
+            if mode != F32_DENORM_MODE:
+                words = struct.unpack("<256f", case.read_bytes()[256:1280])
+                assert all(flush_ftz(word) == word for word in words), program_fn.__name__
             draw = [renderer, backend, "--check-pixel-case", shader, case]
             subprocess.run(draw, check=True)
         corrupted = bytearray(case.read_bytes())
@@ -4154,21 +4323,21 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     shader = directory / "fixture.cso"
     program = truncate_values()
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     for constants in ((1.75, -1.75, -2.75, 2.75), (-1.75, 2.75, 3.75, -1.75)):
         case = truncate_case(directory, *constants)
         draw = [renderer, backend, "--check-pixel-case", shader, case]
         subprocess.run(draw, check=True)
     rounded_down = [line.replace("v_trunc_f32", "v_floor_f32") for line in program]
     source.write_text(translate(rounded_down), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Rounding toward negative infinity escaped detection")
 
     program = sopk_scalar()
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     for red, green in ((0.5, 0.25), (0.125, 1.0)):
         case = sopk_case(directory, red, green)
         subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
@@ -4177,14 +4346,14 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     changed = [line.replace("s_mulk_i32 s50, 0x3", "s_mulk_i32 s50, 0x5") for line in program]
     source.write_text(translate(changed), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
 
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Changing the sopk multiply escaped detection")
 
     source.write_text(translate(rounding()), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     # Ties go to even (2.5 to 2, -3.5 to -4), unlike rounding half away from zero or half up.
     for constants in ((4.0, 2.5, 1.25), (8.0, -3.5, -0.75)):
         draw = [renderer, backend, "--check-pixel-case", shader, rounding_case(directory, *constants)]
@@ -4192,13 +4361,13 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     for old, new, failure in (("v_rndne_f32_e32", "v_floor_f32_e32", "Flooring instead of rounding"),
                               ("v_ceil_f32_e32", "v_floor_f32_e32", "Flooring instead of ceiling")):
         source.write_text(translate([line.replace(old, new) for line in rounding()]), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"{failure} escaped detection")
     # Rounding half up gives -3 for the -3.5 tie, so the same draw must catch it.
     source.write_text(translate(rounding()).replace("round(", "floor(0.5f + "), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Rounding ties up instead of to even escaped detection")
@@ -4207,12 +4376,12 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     case = absolute_case(directory)
     draw = [renderer, backend, "--check-pixel-case", shader, case]
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader, ieee=False)
     subprocess.run(draw, check=True)
 
     without_abs = [line.replace("|v12|", "v12") for line in program]
     source.write_text(translate(without_abs), encoding="ascii")
-    subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader, ieee=False)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("The renderer failed to detect the missing absolute value")
@@ -4221,7 +4390,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_reciprocal_iflag_draws(directory, compiler, renderer, backend)
     check_offset_nibble_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):
         case = select_case(directory, *constants)
         draw = [renderer, backend, "--check-pixel-case", shader, case]
@@ -4238,9 +4407,9 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     struct.pack_into("<4f", constants, 12, *values)
     program = with_constants([f"v_sub_f32_e64 v{12 + i}, s{44 + i}, 0" for i in range(4)])
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     case = directory / "signed-export.case"
-    case.write_bytes(constants + struct.pack("<4f", *map(half_rtz, values)) * 64)
+    write_case(case, constants, tuple(map(half_rtz, values)))
     subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
     check_class_draw(directory, compiler, renderer, backend)
     check_predicate_draws(directory, compiler, renderer, backend)
@@ -4259,13 +4428,13 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
     draw = [renderer, backend, "--dual-pixel", shader, capture]
     for case in DUAL_CASES:
         source.write_text(translate_dual(dual_program(case)), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         subprocess.run(draw, check=True)
     wrong = subprocess.run([renderer, backend, "--dual-pixel-swapped", shader, capture], capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapped texture bindings escaped detection")
     source.write_text(translate_dual(dual_program(swap_weights=True)), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Swapped blend weights escaped detection")
@@ -4280,7 +4449,7 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
 
     program = scalar64()
     source.write_text(translate(program), encoding="ascii")
-    subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader)
     for values in SCALAR64_SETS:
         case = scalar64_case(directory, values)
         draw = [renderer, backend, "--check-pixel-case", shader, case]
@@ -4309,20 +4478,20 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
         mutated = [line.replace(old, new) for line in program]
         assert mutated != program, label
         source.write_text(translate(mutated), encoding="ascii")
-        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader)
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
     check_mad_draw(directory, compiler, renderer, backend)
     source.write_text(translate(scalar()), encoding="ascii")
-    subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+    compile_shader(compiler, source, shader, ieee=False)
     for words in SCALAR_WORDS:
         case = scalar_case(directory, words)
         subprocess.run([renderer, backend, "--check-pixel-case", shader, case], check=True)
     for old, new in SCALAR_MUTATIONS:
         case = scalar_case(directory, scalar_detecting_words(old, new))
         source.write_text(translate([line.replace(old, new) for line in scalar()]), encoding="ascii")
-        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        compile_shader(compiler, source, shader, ieee=False)
         wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, case], capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Replacing {old} with {new} escaped detection")
@@ -4338,6 +4507,9 @@ def check_e64_render(directory, compiler, renderer, backend):
         if error.returncode == 77:
             return 77
         raise
+    check_denorm_mode_draw(directory, compiler, renderer, backend)
+    check_nan_class_draw(directory, compiler, renderer, backend)
+    check_integer_readback_draw(directory, compiler, renderer, backend)
     return 0
 
 

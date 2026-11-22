@@ -153,7 +153,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
         getattr(M, f"PMOV{k.upper()}{p.upper()}"): (k == "sx", {"b": 1, "w": 2, "d": 4}[p[0]], {"w": 2, "d": 4, "q": 8}[p[1]])
         for k in ("sx", "zx") for p in ("bw", "bd", "bq", "wd", "wq", "dq")
     }
-    has_wide = any(i.mnemonic in (M.VMOVUPS, M.MOVDQU, *avx2_wide_ops) or i.mnemonic in sha_ops or i.mnemonic in pmov_ext for i in body)
+    sse41_ops = (M.PMINSB, M.PMAXSB, M.PMINUW, M.PMAXUW, M.PMINSD, M.PMAXSD,
+                 M.PMINUD, M.PMAXUD, M.PMULLD, M.PMULDQ, M.PCMPEQQ, M.PACKUSDW, M.PBLENDW, M.PBLENDVB)
+    has_wide = any(i.mnemonic in (M.VMOVUPS, M.MOVDQU, *avx2_wide_ops, *sse41_ops) or i.mnemonic in sha_ops or i.mnemonic in pmov_ext for i in body)
     if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
@@ -658,6 +660,54 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
                     f"for (size_t n = 0; n < {vec_size}; n += {elem_size}) {{ "
                     f"const {w} a = load<{w}>(reinterpret_cast<word>(in1.data() + n)), c = {cnt_expr}; "
                     f"const {w} v = {op_expr}; memcpy({dst}.data() + n, &v, {elem_size}); }} }}")
+        elif has_wide and i.encoding == EncodingKind.LEGACY and i.op0_register in wide_xmm and op in (
+                M.PMINSB, M.PMAXSB, M.PMINUW, M.PMAXUW, M.PMINSD, M.PMAXSD, M.PMINUD, M.PMAXUD,
+                M.PMULLD, M.PMULDQ, M.PCMPEQQ, M.PACKUSDW, M.PBLENDW, M.PBLENDVB):
+            if i.op1_kind != K.MEMORY and (i.op1_kind != K.REGISTER or i.op1_register not in wide_xmm):
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+            dst = wide_xmm[i.op0_register]
+            s2_init = (f"const auto in2 = load<std::array<uint8_t,16>>({address()});" if i.op1_kind == K.MEMORY
+                       else f"const auto in2 = load<std::array<uint8_t,16>>(reinterpret_cast<word>({wide_xmm[i.op1_register]}.data()));")
+            minmax = {
+                M.PMINSB: ("int8_t", 1, "<"), M.PMAXSB: ("int8_t", 1, ">"),
+                M.PMINUW: ("uint16_t", 2, "<"), M.PMAXUW: ("uint16_t", 2, ">"),
+                M.PMINSD: ("int32_t", 4, "<"), M.PMAXSD: ("int32_t", 4, ">"),
+                M.PMINUD: ("uint32_t", 4, "<"), M.PMAXUD: ("uint32_t", 4, ">"),
+            }
+            if op in minmax:
+                ct, sz, cmp_op = minmax[op]
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t n = 0; n < 16; n += {sz}) {{ "
+                        f"const {ct} a = load<{ct}>(reinterpret_cast<word>(in1.data() + n)), "
+                        f"b = load<{ct}>(reinterpret_cast<word>(in2.data() + n)); "
+                        f"const {ct} v = (a {cmp_op} b) ? a : b; memcpy({dst}.data() + n, &v, {sz}); }} }}")
+            elif op == M.PMULLD:
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t n = 0; n < 16; n += 4) {{ "
+                        f"const uint32_t v = load<uint32_t>(reinterpret_cast<word>(in1.data() + n)) * "
+                        f"load<uint32_t>(reinterpret_cast<word>(in2.data() + n)); memcpy({dst}.data() + n, &v, 4); }} }}")
+            elif op == M.PMULDQ:
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t n = 0; n < 16; n += 8) {{ "
+                        f"const int64_t v = static_cast<int64_t>(load<int32_t>(reinterpret_cast<word>(in1.data() + n))) * "
+                        f"static_cast<int64_t>(load<int32_t>(reinterpret_cast<word>(in2.data() + n))); "
+                        f"memcpy({dst}.data() + n, &v, 8); }} }}")
+            elif op == M.PCMPEQQ:
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t n = 0; n < 16; n += 8) {{ "
+                        f"const uint64_t v = load<uint64_t>(reinterpret_cast<word>(in1.data() + n)) == "
+                        f"load<uint64_t>(reinterpret_cast<word>(in2.data() + n)) ? ~0ull : 0ull; "
+                        f"memcpy({dst}.data() + n, &v, 8); }} }}")
+            elif op == M.PACKUSDW:
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t k = 0; k < 8; ++k) {{ "
+                        f"const uint8_t* src = k < 4 ? in1.data() : in2.data(); "
+                        f"const int32_t s = load<int32_t>(reinterpret_cast<word>(src + (k % 4) * 4)); "
+                        f"const uint16_t v = s < 0 ? 0u : (s > 65535 ? 65535u : static_cast<uint16_t>(s)); "
+                        f"memcpy({dst}.data() + k * 2, &v, 2); }} }}")
+            elif op == M.PBLENDW:
+                imm = i.immediate(2)
+                stmt = (f"{{ const auto in1 = {dst}; {s2_init} for (size_t k = 0; k < 8; ++k) {{ "
+                        f"const uint8_t* src = (({imm}u >> k) & 1u) ? in2.data() : in1.data(); "
+                        f"memcpy({dst}.data() + k * 2, src + k * 2, 2); }} }}")
+            else:  # M.PBLENDVB (implicit XMM0 mask)
+                stmt = (f"{{ const auto in1 = {dst}, m = wide0; {s2_init} for (size_t n = 0; n < 16; ++n) {{ "
+                        f"{dst}[n] = (m[n] & 0x80u) ? in2[n] : in1[n]; }} }}")
         elif has_wide and i.encoding == EncodingKind.LEGACY and i.op0_register in wide_xmm and op in pmov_ext:
             signed, src_sz, dst_sz = pmov_ext[op]
             lanes = 16 // dst_sz
@@ -666,8 +716,10 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False):
             dst = wide_xmm[i.op0_register]
             if i.op1_kind == K.MEMORY:
                 src_init = f"const auto in1 = load<std::array<uint8_t,{lanes * src_sz}>>({address()});"
-            else:
+            elif i.op1_kind == K.REGISTER and i.op1_register in wide_xmm:
                 src_init = f"const auto in1 = {wide_xmm[i.op1_register]};"
+            else:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
             stmt = (f"{{ {src_init} for (size_t k = 0; k < {lanes}; ++k) {{ "
                     f"const {dst_t} v = static_cast<{dst_t}>(load<{src_t}>(reinterpret_cast<word>(in1.data() + k * {src_sz}))); "
                     f"memcpy({dst}.data() + k * {dst_sz}, &v, {dst_sz}); }} }}")
