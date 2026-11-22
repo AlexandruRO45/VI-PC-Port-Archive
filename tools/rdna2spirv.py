@@ -123,7 +123,7 @@ USER_SGPRS = 32
 # s_code_end pads the end of a code object; s_version records the ISA version. None of them has a register, memory,
 # SCC or EXEC effect. (Data-cache invalidations such as buffer_gl0_inv are about cross-wave coherence and are not
 # here.) ds_nop is the DS unit's no-operation (no address, data or result). v_clrexcp clears the exception bits of
-# TRAPSTS, which nothing translated reads (s_getreg_b32 is unsupported and there are no traps).
+# TRAPSTS, which nothing translated reads (s_getreg_b32 reads only MODE.FP_ROUND and there are no traps).
 # s_atc_probe / s_atc_probe_buffer probe (prefetch) an address in the address translation cache: no data comes back
 # and nothing is written (RDNA2 ISA, SMEM).
 NOOPS = {"s_sleep", "v_nop", "v_pipeflush", "s_nop", "s_inst_prefetch", "s_endpgm", "s_setprio", "s_clause",
@@ -740,6 +740,34 @@ class Gen:
         if new in (1, 2):
             raise Unsupported("MODE.FP_ROUND[3:2] directed rounding (+inf/-inf)")
         self.emit(f"OpStore %mode_r16 {self.cu(new)}")
+
+    def mode_read(self, a):
+        """s_getreg_b32 D, hwreg(HW_REG_MODE[, offset, size]): D = (MODE >> offset) & ((1 << size) - 1), right-justified,
+        SCC not written (measured on gfx1036, hunt6/hw_getreg.py). Only FP_ROUND (MODE[3:0]) has a value the translator
+        can stand behind: the f32 rounding [1:0] is always nearest even here (0), and the f16/f64 rounding [3:2] is
+        %mode_r16 (0 nearest even at the start, 3 after an s_setreg toward zero). Every other MODE bit (denormal modes,
+        DX10_CLAMP, IEEE, exceptions ...) is set by the game's shader descriptor, which the translator does not see,
+        and every other hardware register (HW_ID, STATUS, TRAPSTS, GPR_ALLOC ...) describes the wave on the console: a
+        read of either is refused, so no guessed value reaches the shader."""
+        t = a[1].get("t", "") if len(a) > 1 and a[1]["k"] == "special" else ""
+        m = re.match(r"hwreg\((\w+)(?:,\s*(\d+),\s*(\d+))?\)", t)
+        if not m or a[0]["k"] != "sgpr":
+            raise Unsupported("s_getreg_b32 operands")
+        if m.group(1) != "HW_REG_MODE":
+            raise Unsupported(f"s_getreg_b32 of {m.group(1)} (only MODE.FP_ROUND is modelled)")
+        off, size = (int(m.group(2)), int(m.group(3))) if m.group(2) else (0, 32)
+        if off + size > 4:
+            raise Unsupported(f"s_getreg_b32 of MODE bits {off}..{off + size - 1} (only FP_ROUND[3:0] is modelled)")
+        if self.round_mode:
+            r16 = self.tmp()
+            self.emit(f"{r16} = OpLoad %uint %mode_r16")
+            mode, sh, val = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{mode} = OpShiftLeftLogical %uint {r16} {self.cu(2)}")
+            self.emit(f"{sh} = OpShiftRightLogical %uint {mode} {self.cu(off)}")
+            self.emit(f"{val} = OpBitwiseAnd %uint {sh} {self.cu((1 << size) - 1)}")
+        else:
+            val = self.cu(0)          # no MODE write in the program: FP_ROUND stays 0 (nearest even)
+        self.dst(a[0], val)
 
     def emit_ne0(self, v):
         r = self.tmp()
@@ -4487,6 +4515,9 @@ class Gen:
             return
         if op in ("s_setreg_imm32_b32", "s_setreg_b32"):
             self.mode_write(op, a)
+            return
+        if op == "s_getreg_b32":
+            self.mode_read(a)
             return
         if op in ("s_denorm_mode", "s_round_mode"):
             raise Unsupported(op + " (not in the corpus; MODE is modelled through s_setreg only)")

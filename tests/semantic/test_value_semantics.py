@@ -731,5 +731,33 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
+
+class GetregMode(LaneMaskConstants):
+    """runtime/test/shaders/cs_w32_getreg_mode.asm: s_getreg_b32 of MODE.FP_ROUND (MODE[3:0]), right-justified
+    (offset, size) fields, with FP_ROUND[3:2] following s_setreg_imm32_b32 and SCC untouched. The words are the GPU
+    check's and match what RDNA2 gfx1036 returned for the same reads. Before, s_getreg_b32 raised Unsupported."""
+
+    WANT = {"cs_w32_getreg_mode": (32, [0, 0, 3, 12, 1, 6, 0, 5])}
+    OLD = {"cs_w32_getreg_mode": None}
+
+    def test_words_follow_from_the_masks(self):
+        # Plain-Python reference: MODE[1:0] = 0 (f32 nearest even), MODE[3:2] = the f16/f64 rounding last set.
+        def field(r16, off, size):
+            return ((r16 << 2) >> off) & ((1 << size) - 1)
+        want = [field(0, 0, 4), field(0, 2, 2), field(3, 2, 2), field(3, 0, 4), field(3, 3, 1), field(3, 1, 3),
+                field(0, 2, 2), 5]
+        self.assertEqual(want, self.WANT["cs_w32_getreg_mode"][1])
+
+    def test_unmodelled_fields_are_refused(self):
+        import rdna2spirv
+        for line, msg in (("s_getreg_b32 s4, hwreg(HW_REG_MODE)", r"MODE bits 0\.\.31"),
+                          ("s_getreg_b32 s4, hwreg(HW_REG_MODE, 4, 4)", r"MODE bits 4\.\.7"),
+                          ("s_getreg_b32 s4, hwreg(HW_REG_MODE, 3, 2)", r"MODE bits 3\.\.4"),
+                          ("s_getreg_b32 s4, hwreg(HW_REG_HW_ID)", "of HW_REG_HW_ID")):
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(rdna2spirv.Unsupported, msg):
+                    support.translate_lines("ps_getreg", [line, "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"])
+
+
 if __name__ == "__main__":
     unittest.main()
