@@ -781,5 +781,130 @@ class TestIEEE754BitPatternHandling(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(4), 0)
 
 
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_and_parameter_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            RegisterOperand(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            RegisterOperand(256, RegType.VGPR)
+
+        v0 = RegisterOperand(0, RegType.VGPR)
+        s0 = RegisterOperand(0, RegType.SGPR)
+        with self.assertRaises(TypeError):
+            DSSubRtnInstruction(dst=s0, addr=v0, data=v0)
+        with self.assertRaises(TypeError):
+            DSSubRtnInstruction(dst=v0, addr=s0, data=v0)
+        with self.assertRaises(TypeError):
+            DSSubRtnInstruction(dst=v0, addr=v0, data=s0)
+
+        with self.assertRaises(ValueError):
+            DSSubRtnInstruction(dst=v0, addr=v0, data=v0, offset=-1)
+        with self.assertRaises(ValueError):
+            DSSubRtnInstruction(dst=v0, addr=v0, data=v0, offset=65536)
+
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=-16)
+        with self.assertRaises(ValueError):
+            LDSMemory(size_dwords=100)
+
+    def test_mutation_addition_instead_of_subtraction(self) -> None:
+        def mutant_oracle(mem: LDSMemory, vaddr: int, vdata: int, offset: int = 0) -> int:
+            idx = (u32(vaddr + offset) >> 2) & (mem.size_dwords - 1)
+            old_val = mem.read_dword(idx)
+            mem.write_dword(idx, u32(old_val + vdata))
+            return old_val
+
+        mem_correct = LDSMemory(256)
+        mem_mutant = LDSMemory(256)
+        mem_correct.write_dword(5, 50)
+        mem_mutant.write_dword(5, 50)
+
+        ref_ds_sub_rtn_u32(mem_correct, 20, 10)
+        mutant_oracle(mem_mutant, 20, 10)
+
+        self.assertEqual(mem_correct.read_dword(5), 40)
+        self.assertEqual(mem_mutant.read_dword(5), 60)
+        self.assertNotEqual(mem_correct.read_dword(5), mem_mutant.read_dword(5))
+
+    def test_mutation_missing_destination_return_writeback(self) -> None:
+        class MutantInterpreter(ScalarInterpreter):
+            def execute(self, instr: DSSubRtnInstruction, state: ScalarMachineState) -> int:
+                vaddr = state.get_vgpr(instr.addr.index)
+                vdata = state.get_vgpr(instr.data.index)
+                old_val = ref_ds_sub_rtn_u32(state.lds, vaddr=vaddr, vdata=vdata, offset=instr.offset)
+                idx = (u32(vaddr + instr.offset) >> 2) & (state.lds.size_dwords - 1)
+                new_val = state.lds.read_dword(idx)
+                state.set_vgpr(instr.dst.index, new_val)
+                return old_val
+
+        state = ScalarMachineState(256)
+        state.lds.write_dword(2, 100)
+        state.set_vgpr(1, 8)
+        state.set_vgpr(2, 30)
+
+        instr = DSSubRtnInstruction(dst=RegisterOperand(0), addr=RegisterOperand(1), data=RegisterOperand(2))
+        MutantInterpreter().execute(instr, state)
+
+        self.assertNotEqual(state.get_vgpr(0), 100)
+        self.assertEqual(state.get_vgpr(0), 70)
+
+    def test_mutation_inactive_lane_leakage(self) -> None:
+        class LeakySIMDInterpreter(SIMDInterpreter):
+            def execute(self, instr: DSSubRtnInstruction, state: SIMDState) -> list[tuple[int, int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    vaddr = state.get_vgpr(lane, instr.addr.index)
+                    vdata = state.get_vgpr(lane, instr.data.index)
+                    old_val = ref_ds_sub_rtn_u32(state.lds, vaddr=vaddr, vdata=vdata, offset=instr.offset)
+                    state.set_vgpr(lane, instr.dst.index, old_val)
+                    results.append((lane, old_val))
+                return results
+
+        state = SIMDState(num_lanes=32, exec_mask=0x1, lds_dwords=256)
+        state.lds.write_dword(1, 500)
+        state.set_vgpr(1, 1, 4)
+        state.set_vgpr(1, 2, 50)
+        state.set_vgpr(1, 0, 0xCAFEBABE)
+
+        instr = DSSubRtnInstruction(dst=RegisterOperand(0), addr=RegisterOperand(1), data=RegisterOperand(2))
+        LeakySIMDInterpreter().execute(instr, state)
+
+        self.assertNotEqual(state.get_vgpr(1, 0), 0xCAFEBABE)
+
+    def test_mutation_dropped_immediate_offset(self) -> None:
+        def buggy_address(vaddr: int, offset: int = 0) -> int:
+            return u32(vaddr)
+
+        vaddr = 32
+        offset = 16
+        correct = u32(vaddr + offset)
+        buggy = buggy_address(vaddr, offset)
+        self.assertEqual(correct, 48)
+        self.assertEqual(buggy, 32)
+        self.assertNotEqual(correct, buggy)
+
+    def test_mutation_premature_writeback_when_aliased(self) -> None:
+        class PrematureWritebackInterpreter(ScalarInterpreter):
+            def execute(self, instr: DSSubRtnInstruction, state: ScalarMachineState) -> int:
+                state.set_vgpr(instr.dst.index, 0x1234)
+                vaddr = state.get_vgpr(instr.addr.index)
+                vdata = state.get_vgpr(instr.data.index)
+                return ref_ds_sub_rtn_u32(state.lds, vaddr=vaddr, vdata=vdata, offset=instr.offset)
+
+        state = ScalarMachineState(256)
+        state.lds.write_dword(4, 200)
+        state.set_vgpr(0, 16)
+        state.set_vgpr(1, 25)
+
+        instr = DSSubRtnInstruction(dst=RegisterOperand(0), addr=RegisterOperand(0), data=RegisterOperand(1))
+        PrematureWritebackInterpreter().execute(instr, state)
+
+        self.assertEqual(state.lds.read_dword(4), 200)
+
+
 if __name__ == '__main__':
     unittest.main()
