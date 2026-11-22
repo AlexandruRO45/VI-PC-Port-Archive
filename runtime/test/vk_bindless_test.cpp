@@ -23,6 +23,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "spirv_capability.h"
 #include "../src/vulkan_bindless.h"
 
 #include <algorithm>
@@ -183,13 +184,19 @@ int main(int argc, char** argv) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(d, &p);
         if (p.apiVersion < VK_API_VERSION_1_2) continue;
+        // LEONIDA_VK_DEVICE, as pick_device applies it: without this a run meant for one GPU took the best-ranked
+        // one instead (TEST-469).
+        if (!leonida::vulkan_device_wanted(p.deviceName)) continue;
         if (const int rank = leonida::vk_test::device_rank(p.deviceType, p.vendorID); rank > best_rank) {
             pd = d;
             best_rank = rank;
         }
     }
     if (!pd) {
-        std::printf("unsupported: no Vulkan 1.2 device\n");
+        if (const std::string filter = leonida::vulkan_device_filter(); !filter.empty())
+            std::printf("unsupported: LEONIDA_VK_DEVICE=%s matches no Vulkan 1.2 device\n", filter.c_str());
+        else
+            std::printf("unsupported: no Vulkan 1.2 device\n");
         return unsupported;
     }
     VkPhysicalDeviceVulkan12Properties props12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
@@ -209,16 +216,19 @@ int main(int argc, char** argv) {
         return unsupported;
     }
 
-    // The features ps_tex's metadata names (bufferDeviceAddress, runtimeDescriptorArray, shaderInt64), dynamic
-    // indexing of the image array, and whichever descriptor-indexing flags the set can use.
+    // The features ps_tex's metadata names (bufferDeviceAddress, runtimeDescriptorArray), dynamic indexing of the
+    // image array, and whichever descriptor-indexing flags the set can use. shaderInt64 only when a stage has 64-bit
+    // integers: SHADER-423's address pairs need none (TEST-468).
     VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &have11};
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have12};
     vkGetPhysicalDeviceFeatures2(pd, &have);
-    if (!have12.bufferDeviceAddress || !have12.runtimeDescriptorArray || !have.features.shaderInt64 ||
+    const bool int64 = leonida::vk_test::needs_shader_int64(read_spv(argv[1])) ||
+                       leonida::vk_test::needs_shader_int64(read_spv(argv[2]));
+    if (!have12.bufferDeviceAddress || !have12.runtimeDescriptorArray || (int64 && !have.features.shaderInt64) ||
         !have.features.shaderSampledImageArrayDynamicIndexing) {
-        std::printf("unsupported: the device lacks bufferDeviceAddress, runtimeDescriptorArray, shaderInt64 or "
-                    "shaderSampledImageArrayDynamicIndexing\n");
+        std::printf("unsupported: the device lacks bufferDeviceAddress, runtimeDescriptorArray, %s"
+                    "shaderSampledImageArrayDynamicIndexing\n", int64 ? "shaderInt64 (a stage declares Int64) or " : "");
         return unsupported;
     }
     BindlessFeatures device_flags;
@@ -238,7 +248,7 @@ int main(int argc, char** argv) {
     enable12.descriptorBindingStorageBufferUpdateAfterBind = device_flags.update_after_bind;
     enable12.descriptorBindingPartiallyBound = device_flags.partially_bound;
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &enable12};
-    enable.features.shaderInt64 = VK_TRUE;
+    enable.features.shaderInt64 = int64 ? VK_TRUE : VK_FALSE;
     enable.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
     const std::vector<std::uint32_t> shader_code[] = {read_spv(argv[1]), read_spv(argv[2])};
     bool dynamic_storage = false;

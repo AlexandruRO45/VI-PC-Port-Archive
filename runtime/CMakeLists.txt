@@ -1232,6 +1232,11 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_device_pick COMMAND vk_device_pick_test)
   endif()
+  # CPU-only: which SPIR-V capabilities make the standalone GPU tools ask for shaderInt64 (TEST-468). No GPU needed.
+  add_executable(spirv_capability_test test/spirv_capability_test.cpp)
+  if(BUILD_TESTING)
+    add_test(NAME spirv_capability COMMAND spirv_capability_test)
+  endif()
   # Committed BC* texture zero-initialization via vk.zero_buffer or vk.copy_scratch (D3D-220).
   add_executable(vk_bc_zero_init_test test/vk_bc_zero_init_test.cpp)
   target_link_libraries(vk_bc_zero_init_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})

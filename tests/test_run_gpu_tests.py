@@ -169,6 +169,42 @@ class BindlessTestOnASmallPushConstantDevice(unittest.TestCase):
         self.assertNotIn("skipped", out)
 
 
+class StoreHelperUnsupported(unittest.TestCase):
+    """vk_store_test exits 77 when the device lacks a feature (TEST-469): a SKIP that quotes why, not a FAIL."""
+
+    def run_store(self, shader, rc, msg):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=f"{shader}.asm", build=tmp, llvm_mc="unused")
+
+            def run(cmd, env=None, gpu=True):
+                if Path(cmd[0]).stem == "vk_store_test":
+                    return rc, msg
+                (Path(tmp) / "spirv" / f"{shader}.spv").touch()   # rdna2spirv.py "translating" the shader
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=run),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                suite_rc = rgt.run_suite(args, tmp)
+            return suite_rc, output.getvalue()
+
+    def test_unsupported_is_a_skip_with_its_reason(self):
+        for shader in ("cs_imgstore", "cs_imgload", "cs_imgload_d16"):
+            with self.subTest(shader=shader):
+                rc, out = self.run_store(shader, 77, "unsupported: shaderStorageImageWriteWithoutFormat=0\ndevice: X")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("SKIP (unsupported: shaderStorageImageWriteWithoutFormat=0)", out)
+                self.assertIn("0/1 passed, 1 skipped", out)
+
+    def test_other_failures_still_fail(self):
+        rc, out = self.run_store("cs_imgstore", 1, "device: X\nFAILED: texel 3 is 0x0")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAILED: texel 3 is 0x0", out)
+        self.assertNotIn("skipped", out)
+
+
 class FilterWithoutRunnableCases(unittest.TestCase):
     """A filter selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
 

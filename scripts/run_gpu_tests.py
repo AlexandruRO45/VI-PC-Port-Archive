@@ -255,6 +255,14 @@ def verdict_line(rc: int, msg: str) -> str:
     return failure(rc, msg, 1) if rc else msg.splitlines()[-1] if msg else ""
 
 
+def helper_result(rc: int, msg: str) -> tuple[bool | None, str]:
+    """(ok, detail) for a helper that judges its own output (vk_store_test): 77 is a SKIP that names the missing
+    feature, not a failure (TEST-469); otherwise the exit code decides and verdict_line gives the detail."""
+    if rc == UNSUPPORTED:
+        return None, unsupported_skip(msg)
+    return rc == 0, verdict_line(rc, msg)
+
+
 def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
             cwd: str | None = None) -> tuple[int, str]:
     # A hung GPU test program fails its test instead of stalling the suite (check.py, LEONIDA_GPU_TEST_TIMEOUT).
@@ -1170,10 +1178,10 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name, *helper_result(rc, msg)))
         elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load" if name == "cs_imgload" else "load-d16"])
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name, *helper_result(rc, msg)))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
