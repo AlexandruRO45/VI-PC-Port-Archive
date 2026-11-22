@@ -1587,6 +1587,26 @@ Not covered: RIP-relative constants, packed operations, `SQRT`, `MIN` and `MAX`,
 
 On Linux, `llvm-ml` assembled the fixture and `lld-link` linked it. The original machine code ran in-process through a Windows-ABI trampoline that loads each slot into both its integer and its XMM register. It matched the lifted C++ built with clang at `-O0`, `-O2` and `-O3` on every call, for both builds, and all rejection controls passed. The generated sources compile without warnings under clang-cl `/W4 /WX`. A Windows run of `cpu_aot_scalar_float` with ML64 and MSVC has not been recorded yet.
 
+## Passing compute output directly to a pixel shader
+
+`compute_to_pixel` translates a fixed `buffer_store_dwordx4` compute producer
+and the scalar-buffer pixel color fixture. The producer dispatch writes four
+words at byte offset 16 of a 256-byte default-heap buffer. The runner
+transitions that resource from unordered access to constant-buffer state
+and waits for the dispatch fence before binding its GPU address to the
+pixel shader. Only the final RGBA32F render target is read back.
+
+Two producer variants write different exactly representable colors. The
+pixel shader is shared, and the CPU comparison checks every channel in
+the 64×64 target for each palette. The stale-binding control dispatches
+both producers and binds the earlier buffer while keeping the later
+reference. The first pixel must differ.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_to_pixel_(warp|hardware)$' -V
+```
+
 ## Offline pixel shader recompilation
 
 #The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.

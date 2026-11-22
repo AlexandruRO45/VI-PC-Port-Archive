@@ -68,10 +68,15 @@ struct Extent {
 };
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
-                   Extent base, UINT firstResident, const std::vector<MipDraw>& draws, const char* capture)
+                   Extent base, UINT firstResident, const std::vector<MipDraw>& draws, const char* capture,
+                   ID3D12Resource* gpuConstants = nullptr)
 {
     const auto& input = levels.front();
-    auto cb = upload(device, input.constants);
+    ComPtr<ID3D12Resource> uploadedConstants;
+    if (!gpuConstants) {
+        uploadedConstants = upload(device, input.constants);
+        gpuConstants = uploadedConstants.Get();
+    }
     std::ifstream file(path, std::ios::binary);
     std::vector<char> ps{std::istreambuf_iterator<char>(file), {}};
     if (ps.empty() || file.bad()) throw std::runtime_error("Cannot read compiled pixel shader");
@@ -194,7 +199,7 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
         list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootSignature(root.Get());
         list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
-        list->SetGraphicsRootConstantBufferView(1, cb->GetGPUVirtualAddress());
+        list->SetGraphicsRootConstantBufferView(1, gpuConstants->GetGPUVirtualAddress());
         // WARP and hardware can use either the rounded SRV extent or the
         // unrounded base extent for implicit LOD. Their geometric mean is
         // within half a mip of both, since rounding discards less than one texel.
@@ -355,15 +360,54 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
 }
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
-                   UINT firstResident, UINT sampledLevel, const char* capture)
+                   UINT firstResident, UINT sampledLevel, const char* capture,
+                   ID3D12Resource* gpuConstants = nullptr)
 {
     const auto& top = levels.front();
     draw_verified(device, path, levels, {top.width << firstResident, top.height << firstResident},
-                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture);
+                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture, gpuConstants);
+}
+
+ComPtr<ID3D12Resource> produce_pixel_constants(ID3D12Device* device, const char* path)
+{
+    std::ifstream file(path, std::ios::binary);
+    const std::vector<char> shader{std::istreambuf_iterator<char>(file), {}};
+    if (shader.empty() || file.bad()) throw std::runtime_error("Cannot read compiled compute producer");
+
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    signature.NumParameters = 1;
+    signature.pParameters = &parameter;
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+          "Serialize compute producer root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "Compute producer root");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = root.Get();
+    desc.CS = {shader.data(), shader.size()};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline)), "Compute producer pipeline");
+
+    auto constants = make_buffer(device, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+                                 D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+    commands.list->SetComputeRootSignature(root.Get());
+    commands.list->SetComputeRootUnorderedAccessView(0, constants->GetGPUVirtualAddress());
+    commands.list->Dispatch(1, 1, 1);
+    transition(commands.list.Get(), constants.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    commands.submit_and_wait(device);
+    return constants;
 }
 }
 
-void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference, UINT8 writeMask)
+static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference,
+                        UINT8 writeMask, ID3D12Resource* gpuConstants)
 {
     PixelInput input{8, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM};
     input.writeMask = writeMask;
@@ -400,7 +444,21 @@ void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB,
     }
     std::vector<PixelInput> levels;
     levels.push_back(std::move(input));
-    draw_verified(device, path, levels, 0, 0, nullptr);
+    draw_verified(device, path, levels, 0, 0, nullptr, gpuConstants);
+}
+
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference, UINT8 writeMask)
+{
+    check_pixel(device, path, swapRB, reference, writeMask, nullptr);
+}
+
+void check_compute_to_pixel(ID3D12Device* device, const char* compute, const char* pixel,
+                            const char* reference, const char* previous)
+{
+    auto stale = previous ? produce_pixel_constants(device, previous) : ComPtr<ID3D12Resource>{};
+    auto current = produce_pixel_constants(device, compute);
+    check_pixel(device, pixel, false, reference, D3D12_COLOR_WRITE_ENABLE_ALL,
+                stale ? stale.Get() : current.Get());
 }
 
 void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
