@@ -576,8 +576,105 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
             self.assertEqual(state.get_vgpr(lane, 0), expected)
 
 
+
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+        self.simd_interp = SIMDInterpreter()
+
+    def test_dst_alias_src0(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, 25)
+        state.set_vgpr(1, 15)
+        # v0 = (v0 + v1) << 2 = (25 + 15) << 2 = 160
+        instr = VAddLshlU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Literal32(2)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 160)
+        self.assertEqual(state.get_vgpr(0), 160)
+        # v1 must be preserved intact
+        self.assertEqual(state.get_vgpr(1), 15)
+
+    def test_dst_alias_src1(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, 30)
+        state.set_vgpr(1, 70)
+        # v0 = (v1 + v0) << 1 = (70 + 30) << 1 = 200
+        instr = VAddLshlU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            src2=VOP3Operand(Literal32(1)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 200)
+        self.assertEqual(state.get_vgpr(0), 200)
+        self.assertEqual(state.get_vgpr(1), 70)
+
+    def test_dst_alias_src2(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, 3)   # shift count in v0
+        state.set_vgpr(1, 10)
+        state.set_vgpr(2, 20)
+        # v0 = (v1 + v2) << v0 = (10 + 20) << 3 = 240
+        instr = VAddLshlU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(1, RegType.VGPR)),
+            src1=VOP3Operand(Reg(2, RegType.VGPR)),
+            src2=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 240)
+        self.assertEqual(state.get_vgpr(0), 240)
+        self.assertEqual(state.get_vgpr(1), 10)
+        self.assertEqual(state.get_vgpr(2), 20)
+
+    def test_dst_alias_all_three_sources(self) -> None:
+        state = ScalarMachineState()
+        state.set_vgpr(0, 2)
+        # v0 = (v0 + v0) << v0 = (2 + 2) << 2 = 16
+        instr = VAddLshlU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(0, RegType.VGPR)),
+            src2=VOP3Operand(Reg(0, RegType.VGPR)),
+        )
+        res = self.scalar_interp.step(instr, state)
+        self.assertEqual(res, 16)
+        self.assertEqual(state.get_vgpr(0), 16)
+
+    def test_simd_multi_lane_aliased_accumulation(self) -> None:
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.set_vgpr(lane, 0, lane + 1)
+            state.set_vgpr(lane, 1, lane + 1)
+
+        # In-place lane accumulation: v0 = (v0 + v1) << 1
+        instr = VAddLshlU32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Reg(0, RegType.VGPR)),
+            src1=VOP3Operand(Reg(1, RegType.VGPR)),
+            src2=VOP3Operand(Literal32(1)),
+        )
+        self.simd_interp.step(instr, state)
+        for lane in range(32):
+            expected = (((lane + 1) * 2) << 1) & MASK32
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
