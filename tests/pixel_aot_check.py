@@ -1076,6 +1076,196 @@ def check_scheduling_hints():
     must_reject(translate, plain[:-1] + ["s_setprio 0", plain[-1]])
 
 
+# Quad-local DPP16 and DPP8 integer/bitwise/shift/bit-scan fixture covering 23 VOP1/VOP2 DPP forms.
+# Derives integer quad lane ID {0, 1, 2, 3} from interpolated uv.x/uv.y (v8/v9), verifies quad
+# swizzles across lanes, folds all 23 ops into a 32-bit accumulator, and exports all 4 bytes as
+# exact [0, 255] integers.
+DPP_INT32_BODY = [
+    "v_mov_b32_e32 v17, 0",
+    "v_or_b32_dpp v18, v8, v17 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_or_b32_dpp v19, v9, v17 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf",
+    "v_or_b32_dpp v20, v8, v17 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_or_b32_dpp v21, v9, v17 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_f32_e32 v18, v20, v18",
+    "v_sub_f32_e32 v19, v21, v19",
+    "v_mul_f32_e32 v18, 0x42800000, v18",
+    "v_mul_f32_e32 v19, 0x43000000, v19",
+    "v_add_f32_e32 v20, v18, v19",
+    "v_add_f32_e32 v20, 0x4b000000, v20",
+    "v_mov_b32_e32 v17, 3",
+    "v_and_b32_dpp v20, v20, v17 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_sub_nc_u32_dpp v21, v20, v20 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_mul_i32_i24_dpp v21, v21, v21 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_subrev_nc_u32_dpp v22, v20, v20 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_mul_i32_i24_dpp v22, v22, v22 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v23, v20, v20 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_sub_nc_u32_dpp v24, v20, v20 dpp8:[1,2,3,0,5,6,7,4]",
+    "v_and_b32_dpp v24, v24, v17 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v25, s44",
+    "v_mov_b32_e32 v26, s45",
+    "v_mov_b32_e32 v27, s46",
+    "v_mov_b32_e32 v28, s47",
+    "v_min_i32_dpp v29, v25, v26 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_max_i32_dpp v30, v25, v26 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_min_u32_dpp v31, v25, v26 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_max_u32_dpp v32, v25, v26 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_mul_u32_u24_dpp v33, v25, v26 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_mul_hi_u32_u24_dpp v34, v25, v26 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_mul_hi_i32_i24_dpp v35, v25, v26 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v36, v29, v30 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_xnor_b32_dpp v37, v31, v32 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_not_b32_dpp v38, v27 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+    "v_lshlrev_b32_dpp v39, v28, v25 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_lshrrev_b32_dpp v40, v28, v26 dpp8:[1,0,3,2,5,4,7,6]",
+    "v_ashrrev_i32_dpp v41, v28, v25 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_bfrev_b32_dpp v42, v27 dpp8:[3,2,1,0,7,6,5,4]",
+    "v_ffbl_b32_dpp v43, v27 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    "v_ffbh_u32_dpp v44, v27 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+    "v_ffbh_i32_dpp v45, v25 dpp8:[2,3,0,1,6,7,4,5]",
+    "v_add_nc_u32_dpp v30, v21, v22 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v23 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v24 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v33 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v34 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v35 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v36 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v37 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v38 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v39 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v40 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v41 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v42 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v43 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_add_nc_u32_dpp v30, v30, v44 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_xor_b32_dpp v30, v30, v45 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_mov_b32_e32 v46, 0xff",
+    "v_mov_b32_e32 v47, 8",
+    "v_mov_b32_e32 v48, 16",
+    "v_mov_b32_e32 v49, 24",
+    "v_and_b32_dpp v50, v30, v46 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_lshrrev_b32_dpp v51, v47, v30 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_and_b32_dpp v51, v51, v46 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_lshrrev_b32_dpp v52, v48, v30 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_and_b32_dpp v52, v52, v46 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_lshrrev_b32_dpp v53, v49, v30 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+    "v_cvt_f32_f16_e32 v12, v50",
+    "v_mul_f32_e32 v12, 0x4b800000, v12",
+    "v_cvt_f32_f16_e32 v13, v51",
+    "v_mul_f32_e32 v13, 0x4b800000, v13",
+    "v_cvt_f32_f16_e32 v14, v52",
+    "v_mul_f32_e32 v14, 0x4b800000, v14",
+    "v_cvt_f32_f16_e32 v15, v53",
+    "v_mul_f32_e32 v15, 0x4b800000, v15",
+]
+
+DPP_INT32_SETS = (
+    # Set 1: negative i24/i32 in s44, positive in s45, mixed bits in s46, shift >= 32 (37 -> 5).
+    (0xff801234, 0x007f5678, 0x00108040, 37),
+    # Set 2: extreme i24 (-2^23 * 2^23-1), zero input for ffbl/ffbh (-1), all-ones sign for ffbh_i32.
+    (0xffffffff, 0x007fffff, 0x00000000, 13),
+    # Set 3: negative * negative i24 (-2^23 * -2^23 -> +0x4000 high), MSB=1 for ffbh_u32=0.
+    (0x00800000, 0x00800000, 0x80000001, 31),
+)
+
+
+def dpp_int32_reference(a, b, c, shift):
+    m32 = 0xffffffff
+
+    def i32(x):
+        x &= m32
+        return x - 0x100000000 if x & 0x80000000 else x
+
+    def i24(x):
+        x &= 0xffffff
+        return x - 0x1000000 if x & 0x800000 else x
+
+    def ffbl(x):
+        x &= m32
+        return m32 if x == 0 else (x & -x).bit_length() - 1
+
+    def ffbh_u(x):
+        x &= m32
+        return m32 if x == 0 else 32 - x.bit_length()
+
+    def ffbh_i(x):
+        x &= m32
+        m = (~x & m32) if (x & 0x80000000) else x
+        return m32 if m == 0 else 32 - m.bit_length()
+
+    s = shift & 31
+    v21, v22, v23, v24 = 1, 4, 3, 1
+    v29 = min(i32(a), i32(b)) & m32
+    v30_max = max(i32(a), i32(b)) & m32
+    v31 = min(a & m32, b & m32)
+    v32 = max(a & m32, b & m32)
+    v33 = ((a & 0xffffff) * (b & 0xffffff)) & m32
+    v34 = (((a & 0xffffff) * (b & 0xffffff)) >> 32) & m32
+    v35 = ((i24(a) * i24(b)) >> 32) & m32
+    v36 = (v29 ^ v30_max) & m32
+    v37 = (~(v31 ^ v32)) & m32
+    v38 = (~c) & m32
+    v39 = ((a & m32) << s) & m32
+    v40 = (b & m32) >> s
+    v41 = (i32(a) >> s) & m32
+    v42 = int(f"{c & m32:032b}"[::-1], 2)
+    v43 = ffbl(c)
+    v44 = ffbh_u(c)
+    v45 = ffbh_i(a)
+
+    acc = (v21 + v22 + v23 + v24) & m32
+    acc = (acc ^ v33) & m32
+    acc = (acc + v34) & m32
+    acc = (acc ^ v35) & m32
+    acc = (acc + v36) & m32
+    acc = (acc ^ v37) & m32
+    acc = (acc + v38) & m32
+    acc = (acc ^ v39) & m32
+    acc = (acc + v40) & m32
+    acc = (acc ^ v41) & m32
+    acc = (acc + v42) & m32
+    acc = (acc ^ v43) & m32
+    acc = (acc + v44) & m32
+    acc = (acc ^ v45) & m32
+    return tuple(float((acc >> (8 * k)) & 0xff) for k in range(4))
+
+
+def check_dpp_int32_draw(directory, compiler, renderer, backend):
+    program = with_constants(DPP_INT32_BODY)
+    source = directory / "dpp_int32.hlsl"
+    shader = directory / "dpp_int32.cso"
+    case = directory / "dpp_int32.case"
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for values in DPP_INT32_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = dpp_int32_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    for set_idx, old, new, label in (
+        (0, "v_sub_nc_u32_dpp v21, v20, v20 quad_perm:[1,0,3,2]",
+         "v_sub_nc_u32_dpp v21, v20, v20 quad_perm:[2,3,0,1]", "AcrossX vs AcrossY"),
+        (0, "dpp8:[1,2,3,0,5,6,7,4]", "dpp8:[3,0,1,2,7,4,5,6]", "cyclic dpp8 rotation"),
+        (0, "v_ashrrev_i32_dpp v41, v28, v25", "v_lshrrev_b32_dpp v41, v28, v25", "ashrrev vs lshrrev"),
+        (0, "v_mul_hi_i32_i24_dpp v35", "v_mul_hi_u32_u24_dpp v35", "mul_hi signed vs unsigned"),
+        (0, "v_ffbh_i32_dpp v45, v25", "v_ffbh_u32_dpp v45, v25", "ffbh signed vs unsigned"),
+    ):
+        values = DPP_INT32_SETS[set_idx]
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = dpp_int32_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
 def check_controls(directory):
     check_scheduling_hints()
     check_constant_descriptor_bounds()
@@ -1307,6 +1497,34 @@ def check_controls(directory):
     cnd_pos = sel.index("v_cndmask_b32_e64 v13, v13, s46, s[52:53]")
     must_reject(translate, sel[:cnd_pos] + ["s_not_b64 s[52:53], 0"] + sel[cnd_pos:])
 
+    # Quad-local integer/bitwise/shift/bit-scan DPP16 and DPP8 controls.
+    dpp_int = with_constants(DPP_INT32_BODY)
+    source = translate(dpp_int)
+    for expected in ("uint dpp_ffbh_u32(", "uint dpp_ffbh_i32(", "uint dpp_mul_hi_u24(", "uint dpp_mul_hi_i24(",
+                     "QuadReadAcrossX(", "QuadReadAcrossY(", "QuadReadAcrossDiagonal(", "QuadReadLaneAt("):
+        assert expected in source, expected
+    assert "uint dpp_mul_hi_i24(" not in translate(assembly(False))
+    for bad in (
+        "v_add_nc_u32_dpp v22, v18, v19 dpp8:[4,5,6,7,0,1,2,3]",  # cross-quad DPP8
+        "v_add_nc_u32_dpp v22, v18, v19 dpp8:[1,0,3,2,4,5,6,7]",
+        "v_add_nc_u32_dpp v22, v18, v19 row_shr:1 row_mask:0xf bank_mask:0xf",
+        "v_add_nc_u32_dpp v22, v18, v19 quad_perm:[1,0,3,2] row_mask:0xe bank_mask:0xf",
+        "v_add_nc_u32_dpp v22, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0x7",
+        "v_add_nc_u32_dpp v22, -v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_and_b32_dpp v22, |v18|, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_nc_u32_dpp v22, s44, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_nc_u32_dpp v22, 1, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_not_b32_dpp v22, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_nc_u32_dpp v256, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_add_f32_dpp v22, v18, v19 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+    ):
+        must_reject(translate, with_constants(["v_mov_b32_e32 v18, s44", "v_mov_b32_e32 v19, s45", bad]))
+    wait_vm = dpp_int.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, dpp_int[:wait_vm] + ["v_not_b32_dpp v12, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + dpp_int[wait_vm:])
+    must_reject(translate, dpp_int[:wait_vm] + ["v_not_b32_dpp v22, v12 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + dpp_int[wait_vm:])
+    wqm_idx = dpp_int.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, dpp_int[:wqm_idx] + ["v_not_b32_dpp v22, v8 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"] + dpp_int[wqm_idx:])
+
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
@@ -1320,6 +1538,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
+    fixtures.append((with_constants(DPP_INT32_BODY), translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -1368,6 +1587,7 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
+    check_dpp_int32_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"

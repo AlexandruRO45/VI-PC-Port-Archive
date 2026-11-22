@@ -252,6 +252,71 @@ SALU_HELPERS = {
         "    return asuint(asint(src) >> off);\n"
         "}"
     ),
+    "dpp_ffbh_u32": (
+        "uint dpp_ffbh_u32(uint x) {\n"
+        "    return x == 0u ? 0xffffffffu : (31u - firstbithigh(x));\n"
+        "}"
+    ),
+    "dpp_ffbh_i32": (
+        "uint dpp_ffbh_i32(uint x) {\n"
+        "    uint m = asint(x) < 0 ? ~x : x;\n"
+        "    return m == 0u ? 0xffffffffu : (31u - firstbithigh(m));\n"
+        "}"
+    ),
+    "dpp_mul_hi_u24": (
+        "uint dpp_mul_hi_u24(uint a, uint b) {\n"
+        "    a &= 0xffffffu;\n"
+        "    b &= 0xffffffu;\n"
+        "    uint a0 = a & 0xfffu, a1 = a >> 12;\n"
+        "    uint b0 = b & 0xfffu, b1 = b >> 12;\n"
+        "    uint p0 = a0 * b0;\n"
+        "    uint mid = a0 * b1 + a1 * b0 + (p0 >> 12);\n"
+        "    uint p2 = a1 * b1 + (mid >> 12);\n"
+        "    return p2 >> 8;\n"
+        "}"
+    ),
+    "dpp_mul_hi_i24": (
+        "uint dpp_mul_hi_i24(uint a, uint b) {\n"
+        "    int sa = asint(a << 8) >> 8;\n"
+        "    int sb = asint(b << 8) >> 8;\n"
+        "    uint ma = asuint(sa < 0 ? -sa : sa);\n"
+        "    uint mb = asuint(sb < 0 ? -sb : sb);\n"
+        "    uint a0 = ma & 0xfffu, a1 = ma >> 12;\n"
+        "    uint b0 = mb & 0xfffu, b1 = mb >> 12;\n"
+        "    uint p0 = a0 * b0;\n"
+        "    uint mid = a0 * b1 + a1 * b0 + (p0 >> 12);\n"
+        "    uint p2 = a1 * b1 + (mid >> 12);\n"
+        "    uint mag_lo = (p0 & 0xfffu) | ((mid & 0xfffu) << 12) | ((p2 & 0xffu) << 24);\n"
+        "    uint mag_hi = p2 >> 8;\n"
+        "    if ((sa < 0) != (sb < 0)) return ~mag_hi + (mag_lo == 0u ? 1u : 0u);\n"
+        "    return mag_hi;\n"
+        "}"
+    ),
+}
+DPP_INT32 = {
+    "not_b32": (1, "(~{0})", None),
+    "bfrev_b32": (1, "reversebits({0})", None),
+    "ffbl_b32": (1, "firstbitlow({0})", None),
+    "ffbh_u32": (1, "dpp_ffbh_u32({0})", "dpp_ffbh_u32"),
+    "ffbh_i32": (1, "dpp_ffbh_i32({0})", "dpp_ffbh_i32"),
+    "add_nc_u32": (2, "({0} + {1})", None),
+    "sub_nc_u32": (2, "({0} - {1})", None),
+    "subrev_nc_u32": (2, "({1} - {0})", None),
+    "min_i32": (2, "asuint(min(asint({0}), asint({1})))", None),
+    "max_i32": (2, "asuint(max(asint({0}), asint({1})))", None),
+    "min_u32": (2, "min({0}, {1})", None),
+    "max_u32": (2, "max({0}, {1})", None),
+    "mul_u32_u24": (2, "(({0} & 0xffffffu) * ({1} & 0xffffffu))", None),
+    "mul_hi_u32_u24": (2, "dpp_mul_hi_u24({0}, {1})", "dpp_mul_hi_u24"),
+    "mul_i32_i24": (2, "(asuint(asint({0} << 8) >> 8) * asuint(asint({1} << 8) >> 8))", None),
+    "mul_hi_i32_i24": (2, "dpp_mul_hi_i24({0}, {1})", "dpp_mul_hi_i24"),
+    "and_b32": (2, "({0} & {1})", None),
+    "or_b32": (2, "({0} | {1})", None),
+    "xor_b32": (2, "({0} ^ {1})", None),
+    "xnor_b32": (2, "(~({0} ^ {1}))", None),
+    "lshlrev_b32": (2, "({1} << ({0} & 31u))", None),
+    "lshrrev_b32": (2, "({1} >> ({0} & 31u))", None),
+    "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))", None),
 }
 
 
@@ -350,6 +415,81 @@ def fp_operand(token, scalar, vector, pending, sample_pending):
     if re.fullmatch(r"\d+\.\d+", token):
         return token + "f"
     raise ValueError(f"Unsupported arithmetic operand {token}")
+
+
+def dpp_int_vgpr(token, vector, sample_pending):
+    """Parse one integer/bitwise DPP VGPR operand (no FP source modifiers)."""
+    m = re.fullmatch(r"v(\d+)", token)
+    if not m or not 0 <= int(m.group(1)) <= 255:
+        raise ValueError(f"DPP operand must be a VGPR, got {token}")
+    value = vector[token]
+    if not isinstance(value, str) or not value.startswith(("sample", "alu", "uv.")):
+        raise ValueError(f"Expected a numeric VGPR in DPP, got {token}")
+    if sample_pending and value.startswith("sample"):
+        raise ValueError("Sample used before vmcnt wait")
+    return value
+
+
+def parse_dpp(rest, operand_count):
+    """Parse operands and quad-local DPP16 (quad_perm) or DPP8 (dpp8) modifiers."""
+    parts_ = rest.split(", ")
+    if len(parts_) != operand_count:
+        raise ValueError("Invalid DPP operand count")
+    last_op, _, mod_text = parts_[-1].partition(" ")
+    operands = [*parts_[:-1], last_op]
+    mods = mod_text.split()
+    if not mods:
+        raise ValueError("Missing DPP control modifiers")
+    if m := re.fullmatch(r"dpp8:\[([0-7](?:,[0-7]){7})\]", mods[0]):
+        perm8 = [int(b) for b in m.group(1).split(",")]
+        seen_fi = False
+        for mod in mods[1:]:
+            if re.fullmatch(r"fi:[01]", mod) and not seen_fi:
+                seen_fi = True
+            else:
+                raise ValueError(f"Unsupported DPP8 modifier {mod}")
+        if not all(p < 4 for p in perm8[:4]) or perm8[4:] != [p + 4 for p in perm8[:4]]:
+            raise ValueError(f"Cross-quad DPP8 permutation is unsupported: {mods[0]}")
+        return operands, perm8[:4]
+    if m := re.fullmatch(r"quad_perm:\[([0-3],[0-3],[0-3],[0-3])\]", mods[0]):
+        perm4 = [int(b) for b in m.group(1).split(",")]
+        seen = set()
+        for mod in mods[1:]:
+            if mod in ("row_mask:0xf", "bank_mask:0xf") or re.fullmatch(r"(bound_ctrl|fi):[01]", mod):
+                key = mod.split(":", 1)[0]
+                if key in seen:
+                    raise ValueError(f"Duplicate DPP16 modifier {mod}")
+                seen.add(key)
+            else:
+                raise ValueError(f"Unsupported DPP16 modifier {mod}")
+        return operands, perm4
+    raise ValueError(f"Unsupported DPP control {mods[0]}")
+
+
+def emit_quad_swizzle_u32(lines, idx, base_expr, perm):
+    """Swizzle a 32-bit value across a 2x2 quad as uint bits."""
+    bits = f"asuint({base_expr})"
+    if perm == [0, 1, 2, 3]:
+        return bits
+    if perm == [1, 0, 3, 2]:
+        return f"QuadReadAcrossX({bits})"
+    if perm == [2, 3, 0, 1]:
+        return f"QuadReadAcrossY({bits})"
+    if perm == [3, 2, 1, 0]:
+        return f"QuadReadAcrossDiagonal({bits})"
+    if len(set(perm)) == 1:
+        return f"QuadReadLaneAt({bits}, {perm[0]})"
+    lines.append(f"    uint dpp{idx}_in = {bits};")
+    lines.append(f"    uint dpp{idx}_q = WaveGetLaneIndex() & 3u;")
+    lane_vars = {}
+    for lane in sorted(set(perm)):
+        lv = f"dpp{idx}_l{lane}"
+        lines.append(f"    uint {lv} = QuadReadLaneAt(dpp{idx}_in, {lane});")
+        lane_vars[lane] = lv
+    l0, l1, l2, l3 = (lane_vars[p] for p in perm)
+    svar = f"dpp{idx}_s"
+    lines.append(f"    uint {svar} = (dpp{idx}_q == 0u ? {l0} : (dpp{idx}_q == 1u ? {l1} : (dpp{idx}_q == 2u ? {l2} : {l3})));")
+    return svar
 
 
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *, second_texture_offset=None):
@@ -647,6 +787,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_({'|'.join(DPP_INT32)})_dpp (v\d+), (.+)"):
+            op, dst, rest = m.groups()
+            arity, template, helper = DPP_INT32[op]
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid integer DPP operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm = parse_dpp(rest, arity)
+            src0_val = dpp_int_vgpr(tokens[0], vector, sample_pending)
+            s0_u32 = emit_quad_swizzle_u32(lines, i, src0_val, perm)
+            args = [s0_u32]
+            if arity == 2:
+                src1_val = dpp_int_vgpr(tokens[1], vector, sample_pending)
+                args.append(f"asuint({src1_val})")
+            if helper is not None:
+                helpers.add(helper)
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(r"v_cvt_pkrtz_f16_f32_e32 (v\d+), (v\d+), (v\d+)"):
             dst, lo, hi = m.groups()
             pair = (vector[lo], vector[hi])
