@@ -404,3 +404,95 @@ class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
         expr = DualSourceAddExpr(a, b)
         env = {"A": 1000, "B": 2000}
         self.assertEqual(expr.evaluate(env), 3000)
+
+
+# ============================================================================
+# Section 3: Deterministic Scalar Instruction Interpreter
+# ============================================================================
+
+class ScalarMachineState:
+    """Register and memory state for scalar single-thread RDNA2 execution."""
+
+    def __init__(self, lds_capacity_qwords: int = DEFAULT_LDS_QWORDS) -> None:
+        self.vgprs: List[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSModel = LDSModel(capacity_qwords=lds_capacity_qwords)
+
+    def get_vgpr(self, idx: int) -> int:
+        if not (0 <= idx < DEFAULT_NUM_VGPRS):
+            raise IndexError(f"VGPR index out of range: {idx}")
+        return self.vgprs[idx]
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx < DEFAULT_NUM_VGPRS):
+            raise IndexError(f"VGPR index out of range: {idx}")
+        self.vgprs[idx] = u32(val)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_add_src2_u64."""
+
+    def step(
+        self,
+        instr: DSAddSrc2U64Instruction,
+        state: ScalarMachineState,
+    ) -> int:
+        """Execute a single ds_add_src2_u64 instruction deterministically.
+
+        Non-returning: VGPR registers are strictly untouched.
+        Returns the updated value at location A.
+        """
+        vaddr = state.get_vgpr(instr.vaddr.index)
+        return state.lds.atomic_add_src2_u64(vaddr, instr.offset0, instr.offset1)
+
+    def execute_sequence(
+        self,
+        instructions: List[DSAddSrc2U64Instruction],
+        state: ScalarMachineState,
+    ) -> List[int]:
+        """Execute an ordered sequence of instructions."""
+        return [self.step(instr, state) for instr in instructions]
+
+
+class TestDeterministicScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_basic_execution(self) -> None:
+        base = 0x400
+        self.state.set_vgpr(5, base)
+
+        # A at offset0=1 -> 0x408, B at offset1=2 -> 0x410
+        self.state.lds.write_qword_at_byte_addr(0x408, 0x1000)
+        self.state.lds.write_qword_at_byte_addr(0x410, 0x2000)
+
+        instr = DSAddSrc2U64Instruction(vaddr=VGPR(5), offset0=1, offset1=2)
+        res = self.interp.step(instr, self.state)
+
+        self.assertEqual(res, 0x3000)
+        self.assertEqual(self.state.lds.read_qword_at_byte_addr(0x408), 0x3000)
+        self.assertEqual(self.state.lds.read_qword_at_byte_addr(0x410), 0x2000)
+        # Verify vaddr VGPR was preserved untouched
+        self.assertEqual(self.state.get_vgpr(5), base)
+
+    def test_scalar_deterministic_instruction_sequence(self) -> None:
+        base = 0x500
+        self.state.set_vgpr(1, base)
+
+        # Acc at offset 0 (0x500), Step at offset 1 (0x508)
+        self.state.lds.write_qword_at_byte_addr(0x500, 10)
+        self.state.lds.write_qword_at_byte_addr(0x508, 5)
+
+        seq = [
+            DSAddSrc2U64Instruction(vaddr=VGPR(1), offset0=0, offset1=1),
+            DSAddSrc2U64Instruction(vaddr=VGPR(1), offset0=0, offset1=1),
+            DSAddSrc2U64Instruction(vaddr=VGPR(1), offset0=0, offset1=1),
+        ]
+        results = self.interp.execute_sequence(seq, self.state)
+
+        self.assertEqual(results, [15, 20, 25])
+        self.assertEqual(self.state.lds.read_qword_at_byte_addr(0x500), 25)
+        self.assertEqual(self.state.lds.read_qword_at_byte_addr(0x508), 5)
