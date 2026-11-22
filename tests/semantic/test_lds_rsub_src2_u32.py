@@ -809,5 +809,70 @@ class TestLdsRsubSrc2BoundaryExtremes(unittest.TestCase):
         res = oracle_ds_rsub_src2_u32(val_a=subnormal_bits, val_b=0x00000005)
         self.assertEqual(res, 4)
 
+
+class TestLdsRsubSrc2NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 255, count=2)
+
+    def test_invalid_instruction_parameters(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_RSUB_SRC2_U32,
+                vaddr=Register(RegKind.SGPR, 0),
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.DS_RSUB_SRC2_U32,
+                vaddr=Register(RegKind.VGPR, 0, count=2),
+            )
+        with self.assertRaises(ValueError):
+            DSSrc2Offset(offset0=-1, offset1=0)
+        with self.assertRaises(ValueError):
+            DSSrc2Offset(offset0=0, offset1=256)
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDLDSWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDLDSWavefrontInterpreter(wave_size=128)
+
+    def test_invalid_lds_capacity(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=0)
+        with self.assertRaises(ValueError):
+            LDSModel(capacity_dwords=100)
+
+    def test_mutation_detection_forward_subtraction(self) -> None:
+        val_a, val_b = 30, 100
+        correct = oracle_ds_rsub_src2_u32(val_a, val_b)
+        mutant = (val_a - val_b) & MASK32
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_addition(self) -> None:
+        val_a, val_b = 30, 100
+        correct = oracle_ds_rsub_src2_u32(val_a, val_b)
+        mutant = (val_b + val_a) & MASK32
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_ignored_exec_mask(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter(wave_size=32, capacity_dwords=1024)
+        simd.set_exec_mask(0)
+        simd.lds.write_dword(0, 50)
+        simd.lds.write_dword(4, 100)
+        inst = Instruction(
+            opcode=Opcode.DS_RSUB_SRC2_U32,
+            vaddr=Register(RegKind.VGPR, 0),
+            offset=DSSrc2Offset(offset0=0, offset1=1),
+        )
+        simd.step(inst)
+        self.assertEqual(simd.lds.read_dword(0), 50)
+
 if __name__ == "__main__":
     unittest.main()
