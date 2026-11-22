@@ -155,6 +155,97 @@ class LDSMemory:
 
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    DS_CMPST_F64 = "ds_cmpst_f64"
+    DS_CMPST_RTN_F64 = "ds_cmpst_rtn_f64"
+
+
+class RegType(Enum):
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegSingle:
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(f"Register index out of bounds: {self.reg_type.value}[{self.index}]")
+
+    def __str__(self) -> str:
+        return f"{self.reg_type.value}[{self.index}]"
+
+
+@dataclass(frozen=True)
+class RegPair:
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = (DEFAULT_NUM_VGPRS - 1) if self.reg_type == RegType.VGPR else (DEFAULT_NUM_SGPRS - 1)
+        if not (0 <= self.index < max_limit):
+            raise ValueError(f"Register pair base index out of bounds: {self.reg_type.value}[{self.index}:{self.index + 1}]")
+
+    def __str__(self) -> str:
+        return f"{self.reg_type.value}[{self.index}:{self.index + 1}]"
+
+
+@dataclass(frozen=True)
+class ImmediateF64:
+    val: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "val", u64(self.val))
+
+    def __str__(self) -> str:
+        return f"0x{self.val:X}"
+
+
+Operand64 = Union[RegPair, ImmediateF64]
+
+
+@dataclass(frozen=True)
+class DSCmpstF64Instruction:
+    """Symbolic AST node for ds_cmpst_f64 / ds_cmpst_rtn_f64 instruction."""
+    vaddr: RegSingle
+    vdata0: Operand64  # Double compare value
+    vdata1: Operand64  # Double new value
+    vdst: Optional[RegPair] = None  # None for ds_cmpst_f64, present for ds_cmpst_rtn_f64
+    offset: int = 0
+    gds: bool = False
+
+    @property
+    def opcode(self) -> DSOpcode:
+        return DSOpcode.DS_CMPST_RTN_F64 if self.vdst is not None else DSOpcode.DS_CMPST_F64
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.vaddr, RegSingle) or self.vaddr.reg_type != RegType.VGPR:
+            raise ValueError(f"vaddr must be a VGPR RegSingle, got {self.vaddr}")
+        if self.vdst is not None and (not isinstance(self.vdst, RegPair) or self.vdst.reg_type != RegType.VGPR):
+            raise ValueError(f"vdst must be a VGPR RegPair, got {self.vdst}")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"offset out of bounds: {self.offset}")
+
+    def disassemble(self) -> str:
+        parts = [self.opcode.value]
+        if self.vdst is not None:
+            parts.append(str(self.vdst))
+        parts.extend([str(self.vaddr), str(self.vdata0), str(self.vdata1)])
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return f"{parts[0]} {', '.join(parts[1:])}"
+
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -199,6 +290,41 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(old, val)
         self.assertEqual(mem, new_val)
         self.assertEqual(lds.read_qword(addr), new_val)
+
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_non_returning_ast(self) -> None:
+        vaddr = RegSingle(1)
+        vdata0 = RegPair(2)
+        vdata1 = RegPair(4)
+        instr = DSCmpstF64Instruction(vaddr=vaddr, vdata0=vdata0, vdata1=vdata1, offset=16)
+
+        self.assertEqual(instr.opcode, DSOpcode.DS_CMPST_F64)
+        self.assertIsNone(instr.vdst)
+        self.assertEqual(instr.disassemble(), "ds_cmpst_f64 v[1], v[2:3], v[4:5], offset:16")
+
+    def test_returning_ast(self) -> None:
+        vdst = RegPair(0)
+        vaddr = RegSingle(2)
+        vdata0 = ImmediateF64(f64_to_bits(1.0))
+        vdata1 = ImmediateF64(f64_to_bits(2.0))
+        instr = DSCmpstF64Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, vdata1=vdata1)
+
+        self.assertEqual(instr.opcode, DSOpcode.DS_CMPST_RTN_F64)
+        self.assertEqual(instr.disassemble(), "ds_cmpst_rtn_f64 v[0:1], v[2], 0x3FF0000000000000, 0x4000000000000000")
+
+    def test_ast_validation_errors(self) -> None:
+        v0 = RegPair(0)
+        v1 = RegSingle(1)
+        s0 = RegSingle(0, RegType.SGPR)
+
+        with self.assertRaises(ValueError):
+            DSCmpstF64Instruction(vaddr=s0, vdata0=v0, vdata1=v0)
+        with self.assertRaises(ValueError):
+            DSCmpstF64Instruction(vaddr=v1, vdata0=v0, vdata1=v0, offset=-1)
 
 
 
