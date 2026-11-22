@@ -408,6 +408,116 @@ class ScalarGWSInterpreter:
             return False, val, False
 
 
+# ============================================================================
+# Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking
+# ============================================================================
+
+
+@dataclass
+class SIMDWaveState:
+    """Models an AMD RDNA2 wavefront (Wave32 or Wave64) executing in SIMD."""
+    wave_id: int = 0
+    wave_size: int = 32
+    exec_mask: int = 0xFFFF_FFFF
+    m0: int = 0
+    sgprs: Dict[int, int] = field(default_factory=dict)
+    lane_vgprs: List[Dict[int, int]] = field(default_factory=list)
+    status: ThreadExecutionStatus = ThreadExecutionStatus.RUNNING
+    scc: int = 0
+    branch_target: Optional[int] = None
+    gws: GWSSubsystem = field(default_factory=GWSSubsystem)
+
+    def __post_init__(self) -> None:
+        if self.wave_size not in (32, 64):
+            raise ValueError(f"Unsupported wave_size {self.wave_size}; must be 32 or 64")
+        if self.wave_size == 32:
+            self.exec_mask &= MASK32
+        else:
+            self.exec_mask &= MASK64
+        if not self.lane_vgprs:
+            self.lane_vgprs = [dict() for _ in range(self.wave_size)]
+        elif len(self.lane_vgprs) != self.wave_size:
+            raise ValueError(f"lane_vgprs length {len(self.lane_vgprs)} != wave_size {self.wave_size}")
+
+    def get_vgpr(self, lane: int, idx: int) -> int:
+        if not (0 <= lane < self.wave_size):
+            raise ValueError(f"Lane {lane} out of bounds for Wave{self.wave_size}")
+        if not (0 <= idx <= 255):
+            raise ValueError(f"VGPR index {idx} out of bounds")
+        return self.lane_vgprs[lane].get(idx, 0)
+
+    def set_vgpr(self, lane: int, idx: int, val: int) -> None:
+        if not (0 <= lane < self.wave_size):
+            raise ValueError(f"Lane {lane} out of bounds for Wave{self.wave_size}")
+        if not (0 <= idx <= 255):
+            raise ValueError(f"VGPR index {idx} out of bounds")
+        self.lane_vgprs[lane][idx] = val & MASK32
+
+    def get_sgpr(self, idx: int) -> int:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"SGPR index {idx} out of bounds")
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"SGPR index {idx} out of bounds")
+        self.sgprs[idx] = val & MASK32
+
+    def first_active_lane(self) -> Optional[int]:
+        """Returns the index of the first active lane in the execution mask."""
+        mask = self.exec_mask & ((1 << self.wave_size) - 1)
+        if mask == 0:
+            return None
+        return (mask & -mask).bit_length() - 1
+
+
+class SIMDGWSInterpreter:
+    """SIMD wavefront instruction interpreter with 32/64-bit EXEC divergence."""
+
+    def execute(
+        self,
+        wave: SIMDWaveState,
+        inst: Instruction,
+        branch_pc: Optional[int] = None,
+    ) -> Tuple[bool, int, bool]:
+        """Execute a GWS branch probe on a full wavefront under EXEC mask.
+
+        Returns:
+            Tuple[bool, int, bool]: (probe_success, new_counter_val, branch_taken)
+        """
+        if wave.status == ThreadExecutionStatus.BLOCKED:
+            raise RuntimeError(f"Cannot execute instruction on suspended wavefront {wave.wave_id}")
+
+        if inst.opcode != Opcode.DS_GWS_SEMA_BR_P:
+            raise ValueError(f"Unsupported opcode in SIMDGWSInterpreter: {inst.opcode}")
+
+        active_lane = wave.first_active_lane()
+        if active_lane is None:
+            # EXEC == 0: whole-wave instruction is suppressed
+            rid = ref_gws_resource_id(wave.m0, inst.offset)
+            return False, wave.gws.resources[rid].value, False
+
+        rid = ref_gws_resource_id(wave.m0, inst.offset)
+
+        # Source permits from first active lane's VGPR if vdata is present
+        permits = 1
+        if inst.vdata is not None:
+            permits = max(1, wave.get_vgpr(active_lane, inst.vdata.index))
+
+        success, val, branch_taken = wave.gws.probe_p(rid, permits=permits)
+
+        if success:
+            wave.scc = 1
+            wave.branch_target = branch_pc
+            wave.status = ThreadExecutionStatus.RUNNING
+            return True, val, True
+        else:
+            wave.scc = 0
+            wave.branch_target = None
+            wave.status = ThreadExecutionStatus.RUNNING
+            return False, val, False
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br_p."""
 
@@ -692,6 +802,103 @@ class TestDeterministicScalarInterpreter(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(val, 3)
         self.assertEqual(self.gws.resources[15].value, 3)
+
+
+class TestSIMDMultiLaneDivergenceAndExecMasking(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking for ds_gws_sema_br_p."""
+
+    def setUp(self) -> None:
+        self.gws = GWSSubsystem()
+        self.interp = SIMDGWSInterpreter()
+
+    def test_wave32_full_exec_single_probe(self) -> None:
+        rid = 2
+        self.gws.init_resource(rid, init_val=10)
+        wave = SIMDWaveState(wave_id=1, wave_size=32, exec_mask=0xFFFF_FFFF, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(wave, inst, branch_pc=0x4000)
+        self.assertTrue(success)
+        # Whole-wave atomic operation decrements by exactly 1, not 32!
+        self.assertEqual(val, 9)
+        self.assertTrue(branch)
+        self.assertEqual(wave.scc, 1)
+        self.assertEqual(wave.branch_target, 0x4000)
+        self.assertEqual(wave.status, ThreadExecutionStatus.RUNNING)
+
+    def test_wave32_divergent_mask_single_lane(self) -> None:
+        rid = 3
+        self.gws.init_resource(rid, init_val=5)
+        # Only lane 14 active
+        wave = SIMDWaveState(wave_id=2, wave_size=32, exec_mask=(1 << 14), m0=rid, gws=self.gws)
+        self.assertEqual(wave.first_active_lane(), 14)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(wave, inst)
+        self.assertTrue(success)
+        self.assertEqual(val, 4)
+
+    def test_wave32_divergent_vdata_permits(self) -> None:
+        rid = 4
+        self.gws.init_resource(rid, init_val=20)
+        # Active lanes: 4 and 8. First active lane is 4!
+        wave = SIMDWaveState(wave_id=3, wave_size=32, exec_mask=(1 << 4) | (1 << 8), m0=rid, gws=self.gws)
+        wave.set_vgpr(4, 2, 7)   # Lane 4 requests 7 permits
+        wave.set_vgpr(8, 2, 100) # Lane 8 requests 100 permits (should be ignored!)
+
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True, vdata=Register(2, RegKind.VGPR))
+        success, val, branch = self.interp.execute(wave, inst)
+        self.assertTrue(success)
+        # Must decrement by lane 4's request (7 permits: 20 - 7 = 13)
+        self.assertEqual(val, 13)
+
+    def test_wave32_exec_zero_suppression(self) -> None:
+        rid = 5
+        self.gws.init_resource(rid, init_val=8)
+        wave = SIMDWaveState(wave_id=4, wave_size=32, exec_mask=0, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(wave, inst)
+        self.assertFalse(success)
+        self.assertEqual(val, 8)
+        self.assertFalse(branch)
+        self.assertEqual(self.gws.resources[rid].value, 8)
+        self.assertEqual(wave.status, ThreadExecutionStatus.RUNNING)
+
+    def test_wave64_full_exec_single_probe(self) -> None:
+        rid = 6
+        self.gws.init_resource(rid, init_val=15)
+        wave = SIMDWaveState(wave_id=10, wave_size=64, exec_mask=0xFFFF_FFFF_FFFF_FFFF, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(wave, inst)
+        self.assertTrue(success)
+        self.assertEqual(val, 14)
+
+    def test_wave64_upper_lanes_divergence(self) -> None:
+        rid = 7
+        self.gws.init_resource(rid, init_val=6)
+        wave = SIMDWaveState(wave_id=11, wave_size=64, exec_mask=0xFFFF_0000_0000_0000, m0=rid, gws=self.gws)
+        self.assertEqual(wave.first_active_lane(), 48)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(wave, inst)
+        self.assertTrue(success)
+        self.assertEqual(val, 5)
+
+    def test_wave_never_blocks_when_zero(self) -> None:
+        rid = 8
+        self.gws.init_resource(rid, init_val=0)
+        wave = SIMDWaveState(wave_id=20, wave_size=32, exec_mask=0xFFFF_FFFF, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_P, offset=0, gds=True)
+
+        success, val, branch = self.interp.execute(wave, inst)
+        self.assertFalse(success)
+        self.assertEqual(val, 0)
+        self.assertFalse(branch)
+        self.assertEqual(wave.scc, 0)
+        self.assertEqual(wave.status, ThreadExecutionStatus.RUNNING)
+        self.assertEqual(len(self.gws.resources[rid].wait_queue), 0)
 
 
 if __name__ == "__main__":
