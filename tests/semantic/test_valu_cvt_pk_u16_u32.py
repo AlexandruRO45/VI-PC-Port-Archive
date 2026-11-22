@@ -43,10 +43,13 @@ Standard library Python only; zero third-party dependencies; zero game data.
 Python 3.9+ compatible (from __future__ import annotations).
 """
 
+import abc
+from dataclasses import dataclass
+import enum
 import math
 import struct
 import unittest
-from typing import Tuple
+from typing import Dict, Optional, Tuple, Union
 
 # ==============================================================================
 # Architectural Constants
@@ -106,6 +109,177 @@ def ref_cvt_pk_u16_u32(src0: int, src1: int) -> int:
 def ref_cvt_pk_u16_u32_decomposed(src0: int, src1: int) -> Tuple[int, int]:
     """Decomposed architectural reference returning (lo_u16, hi_u16)."""
     return u16_sat(src0), u16_sat(src1)
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegKind(enum.Enum):
+    """Architecture register files in RDNA2 VALU."""
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+
+
+@dataclass(frozen=True)
+class Register:
+    """Typed architectural register."""
+    kind: RegKind
+    index: int
+
+    def __post_init__(self) -> None:
+        if self.index < 0:
+            raise ValueError(f"Negative register index: {self.index}")
+        if self.kind == RegKind.VGPR and self.index >= 256:
+            raise ValueError(f"VGPR index out of range [0, 255]: {self.index}")
+        if self.kind == RegKind.SGPR and self.index >= 106:
+            raise ValueError(f"SGPR index out of range [0, 105]: {self.index}")
+
+    def __str__(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+@dataclass(frozen=True)
+class Immediate:
+    """32-bit unsigned immediate / literal constant."""
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", self.value & MASK32)
+
+    def __str__(self) -> str:
+        return f"0x{self.value:08X}"
+
+
+Operand = Union[Register, Immediate]
+
+
+class Opcode(enum.Enum):
+    """Instruction opcodes."""
+    V_CVT_PK_U16_U32 = "v_cvt_pk_u16_u32"
+    V_MOV_B32 = "v_mov_b32"
+
+
+@dataclass(frozen=True)
+class Instruction:
+    """Assembly instruction model."""
+    opcode: Opcode
+    dst: Register
+    src0: Operand
+    src1: Optional[Operand] = None
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != RegKind.VGPR:
+            raise TypeError(f"VALU instruction destination must be a VGPR, got {self.dst}")
+        if self.opcode == Opcode.V_CVT_PK_U16_U32 and self.src1 is None:
+            raise ValueError("v_cvt_pk_u16_u32 requires two source operands")
+
+    def __str__(self) -> str:
+        if self.src1 is not None:
+            return f"{self.opcode.value} {self.dst}, {self.src0}, {self.src1}"
+        return f"{self.opcode.value} {self.dst}, {self.src0}"
+
+
+class ASTNode(abc.ABC):
+    """Abstract base class for symbolic AST expression trees."""
+
+    @abc.abstractmethod
+    def eval(self, env: Dict[Register, int]) -> int:
+        """Evaluate the expression tree against register environment."""
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class LiteralNode(ASTNode):
+    """Constant literal AST node."""
+    val: int
+
+    def eval(self, env: Dict[Register, int]) -> int:
+        return self.val & MASK32
+
+    def __str__(self) -> str:
+        return f"0x{self.val:08X}"
+
+
+@dataclass(frozen=True)
+class RegReadNode(ASTNode):
+    """Register read AST node."""
+    reg: Register
+
+    def eval(self, env: Dict[Register, int]) -> int:
+        return env.get(self.reg, 0) & MASK32
+
+    def __str__(self) -> str:
+        return str(self.reg)
+
+
+@dataclass(frozen=True)
+class SatU16Node(ASTNode):
+    """Symbolic unsigned 16-bit saturation node: min(expr, 0xFFFF)."""
+    expr: ASTNode
+
+    def eval(self, env: Dict[Register, int]) -> int:
+        return u16_sat(self.expr.eval(env))
+
+    def __str__(self) -> str:
+        return f"sat_u16({self.expr})"
+
+
+@dataclass(frozen=True)
+class PackU16Node(ASTNode):
+    """Symbolic 16-bit packing node: (hi << 16) | lo."""
+    lo: ASTNode
+    hi: ASTNode
+
+    def eval(self, env: Dict[Register, int]) -> int:
+        return pack_u16(self.lo.eval(env), self.hi.eval(env))
+
+    def __str__(self) -> str:
+        return f"pack_u16({self.lo}, {self.hi})"
+
+
+@dataclass(frozen=True)
+class CvtPkU16U32Node(ASTNode):
+    """High-level typed AST node for v_cvt_pk_u16_u32."""
+    src0: ASTNode
+    src1: ASTNode
+
+    def to_lowered_ast(self) -> ASTNode:
+        """Decompose into primitive saturation and packing AST nodes."""
+        return PackU16Node(lo=SatU16Node(self.src0), hi=SatU16Node(self.src1))
+
+    def eval(self, env: Dict[Register, int]) -> int:
+        return ref_cvt_pk_u16_u32(self.src0.eval(env), self.src1.eval(env))
+
+    def __str__(self) -> str:
+        return f"v_cvt_pk_u16_u32({self.src0}, {self.src1})"
+
+
+def simplify_ast(node: ASTNode) -> ASTNode:
+    """Constant fold AST nodes where all inputs are literals."""
+    if isinstance(node, LiteralNode):
+        return node
+    if isinstance(node, RegReadNode):
+        return node
+    if isinstance(node, SatU16Node):
+        simplified_child = simplify_ast(node.expr)
+        if isinstance(simplified_child, LiteralNode):
+            return LiteralNode(u16_sat(simplified_child.val))
+        return SatU16Node(simplified_child)
+    if isinstance(node, PackU16Node):
+        s_lo = simplify_ast(node.lo)
+        s_hi = simplify_ast(node.hi)
+        if isinstance(s_lo, LiteralNode) and isinstance(s_hi, LiteralNode):
+            return LiteralNode(pack_u16(s_lo.val, s_hi.val))
+        return PackU16Node(s_lo, s_hi)
+    if isinstance(node, CvtPkU16U32Node):
+        s0 = simplify_ast(node.src0)
+        s1 = simplify_ast(node.src1)
+        if isinstance(s0, LiteralNode) and isinstance(s1, LiteralNode):
+            return LiteralNode(ref_cvt_pk_u16_u32(s0.val, s1.val))
+        return CvtPkU16U32Node(s0, s1)
+    return node
 
 
 # ==============================================================================
@@ -188,6 +362,69 @@ class TestValuCvtPkU16U32Oracle(unittest.TestCase):
                 self.assertEqual(sat, val)
             else:
                 self.assertEqual(sat, 0xFFFF)
+
+
+# ==============================================================================
+# Unit Tests: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class TestValuCvtPkU16U32AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_instruction_creation_and_string_representation(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.SGPR, 2),
+        )
+        self.assertEqual(inst.opcode, Opcode.V_CVT_PK_U16_U32)
+        self.assertEqual(str(inst), "v_cvt_pk_u16_u32 v0, v1, s2")
+
+    def test_instruction_with_immediate_operand(self) -> None:
+        inst = Instruction(
+            opcode=Opcode.V_CVT_PK_U16_U32,
+            dst=Register(RegKind.VGPR, 5),
+            src0=Immediate(0x1234),
+            src1=Immediate(0x5678),
+        )
+        self.assertEqual(str(inst), "v_cvt_pk_u16_u32 v5, 0x00001234, 0x00005678")
+
+    def test_ast_evaluation_matches_oracle(self) -> None:
+        env: Dict[Register, int] = {
+            Register(RegKind.VGPR, 1): 0x0000_1000,
+            Register(RegKind.VGPR, 2): 0x0002_0000,
+        }
+        node = CvtPkU16U32Node(
+            src0=RegReadNode(Register(RegKind.VGPR, 1)),
+            src1=RegReadNode(Register(RegKind.VGPR, 2)),
+        )
+        eval_result = node.eval(env)
+        oracle_result = ref_cvt_pk_u16_u32(0x0000_1000, 0x0002_0000)
+        self.assertEqual(eval_result, oracle_result)
+        self.assertEqual(eval_result, 0xFFFF_1000)
+
+    def test_ast_lowered_matches_high_level(self) -> None:
+        env: Dict[Register, int] = {
+            Register(RegKind.VGPR, 0): 0x0000_0005,
+            Register(RegKind.SGPR, 0): 0x0000_000A,
+        }
+        high_level = CvtPkU16U32Node(
+            src0=RegReadNode(Register(RegKind.VGPR, 0)),
+            src1=RegReadNode(Register(RegKind.SGPR, 0)),
+        )
+        lowered = high_level.to_lowered_ast()
+        self.assertEqual(high_level.eval(env), lowered.eval(env))
+        self.assertEqual(lowered.eval(env), (0x000A << 16) | 0x0005)
+
+    def test_ast_simplification_constant_folding(self) -> None:
+        unfolded = CvtPkU16U32Node(
+            src0=LiteralNode(0x1234),
+            src1=LiteralNode(0x80000),
+        )
+        simplified = simplify_ast(unfolded)
+        self.assertIsInstance(simplified, LiteralNode)
+        self.assertEqual(simplified.eval({}), 0xFFFF_1234)
 
 
 if __name__ == "__main__":
