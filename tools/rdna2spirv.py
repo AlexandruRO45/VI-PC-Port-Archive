@@ -11309,6 +11309,120 @@ def _shard_arg(text):
     return si, sn
 
 
+_PART_RE = re.compile(r"^index\.part(0|[1-9]\d*)\.json$")
+_PART_META_RE = re.compile(r"^index\.part(0|[1-9]\d*)\.meta\.json$")
+
+
+def merge_shards(out_dir, expected_shards=None):
+    """Merge a complete set of index.part<k>.json files in `out_dir` into index.json.
+
+    Refuses incomplete or conflicting shard sets without writing index.json, and removes the merged
+    part and companion metadata files only after index.json is in place.
+    """
+    if not os.path.isdir(out_dir):
+        print(f"ERROR: --out directory does not exist: {out_dir}", file=sys.stderr)
+        return 1
+    parts, metas = {}, {}
+    with os.scandir(out_dir) as entries:
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            m = _PART_RE.match(entry.name)
+            if m:
+                parts[int(m.group(1))] = entry.path
+                continue
+            m = _PART_META_RE.match(entry.name)
+            if m:
+                metas[int(m.group(1))] = entry.path
+    if not parts:
+        print(f"ERROR: no index.part<N>.json files found in {out_dir}", file=sys.stderr)
+        return 1
+    sources = []
+    if expected_shards is not None:
+        sources.append(("--shards", expected_shards))
+    plan_path = os.path.join(out_dir, "shards.json")
+    if os.path.isfile(plan_path):
+        try:
+            with open(plan_path, encoding="utf-8") as f:
+                plan = _json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot read {plan_path}: {e}", file=sys.stderr)
+            return 1
+        jobs = plan.get("jobs") if isinstance(plan, dict) else None
+        if not (isinstance(jobs, int) and not isinstance(jobs, bool) and jobs >= 1):
+            print(f"ERROR: invalid jobs count in {plan_path}", file=sys.stderr)
+            return 1
+        sources.append(("shards.json", jobs))
+    meta_totals = {}
+    for idx in sorted(metas):
+        mpath = metas[idx]
+        try:
+            with open(mpath, encoding="utf-8") as f:
+                mdata = _json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot read {mpath}: {e}", file=sys.stderr)
+            return 1
+        m_shard = mdata.get("shard") if isinstance(mdata, dict) else None
+        m_total = mdata.get("shards") if isinstance(mdata, dict) else None
+        if not (isinstance(m_shard, int) and not isinstance(m_shard, bool) and m_shard == idx
+                and isinstance(m_total, int) and not isinstance(m_total, bool) and m_total >= 1
+                and 0 <= idx < m_total):
+            print(f"ERROR: invalid shard metadata in {mpath}", file=sys.stderr)
+            return 1
+        meta_totals[idx] = m_total
+    distinct_meta = sorted(set(meta_totals.values()))
+    if len(distinct_meta) > 1:
+        detail = ", ".join(f"part {idx}: {n}" for idx, n in sorted(meta_totals.items()))
+        print(f"ERROR: conflicting shard totals across parts in {out_dir} ({detail})", file=sys.stderr)
+        return 1
+    if distinct_meta:
+        sources.append(("shard metadata", distinct_meta[0]))
+    if len({n for _, n in sources}) > 1:
+        detail = ", ".join(f"{name}={n}" for name, n in sources)
+        print(f"ERROR: conflicting shard counts in {out_dir} ({detail})", file=sys.stderr)
+        return 1
+    total = sources[0][1] if sources else (max(parts) + 1)
+    expected = set(range(total))
+    present = set(parts)
+    missing = sorted(expected - present)
+    extra = sorted(present - expected)
+    if missing or extra:
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(str(i) for i in missing))
+        if extra:
+            detail.append("unexpected " + ", ".join(str(i) for i in extra))
+        print(f"ERROR: incomplete shard set in {out_dir}: expected {total} shards (0..{total - 1}); "
+              + "; ".join(detail), file=sys.stderr)
+        return 1
+    merged = {}
+    for idx in range(total):
+        part_path = parts[idx]
+        try:
+            with open(part_path, encoding="utf-8") as f:
+                data = _json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot read {part_path}: {e}", file=sys.stderr)
+            return 1
+        if not isinstance(data, dict):
+            print(f"ERROR: invalid shard part {part_path}: expected JSON object", file=sys.stderr)
+            return 1
+        merged.update(data)
+    # The stubs go first: index.json is what tells make_game.py the translation finished.
+    import spirv_stubs
+    spirv_stubs.generate_for_index(out_dir, merged)
+    write_index(os.path.join(out_dir, "index.json"), merged)
+    for idx in range(total):
+        for path in (parts[idx], metas.get(idx)):
+            if path:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+    print(f"merged {len(merged)} entries")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -11320,6 +11434,8 @@ def main():
     ap.add_argument("--no-asm", action="store_true",
                     help="delete each .spvasm once its .spv is written (the text is ~2.7x the binary: 35 GB for the corpus)")
     ap.add_argument("--merge", action="store_true", help="merge index.part*.json in --out into index.json and exit")
+    ap.add_argument("--shards", type=_limit_arg, default=None,
+                    help="expected shard count for --merge (optional; checked against shard metadata and shards.json)")
     ap.add_argument("--fssm-dir", default=None,
                     help="optional dir with <name>.fssm sidecars: records fssm_sha256 per shader in the index")
     ap.add_argument("--dispatch-loop", action="store_true",
@@ -11352,6 +11468,10 @@ def main():
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
     a = ap.parse_args()
+    if a.merge and a.shard is not None:
+        ap.error("--merge cannot be combined with --shard")
+    if a.shards is not None and not a.merge:
+        ap.error("--shards requires --merge")
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
@@ -11362,17 +11482,7 @@ def main():
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
     if a.merge:
-        import glob as _gl, json as _js
-        merged = {}
-        for part in sorted(_gl.glob(os.path.join(a.out, "index.part*.json"))):
-            with open(part, encoding="utf-8") as f:
-                merged.update(_js.load(f))
-        # The stubs go first: index.json is what tells make_game.py the translation finished.
-        import spirv_stubs
-        spirv_stubs.generate_for_index(a.out, merged)
-        write_index(os.path.join(a.out, "index.json"), merged)
-        print(f"merged {len(merged)} entries")
-        return 0
+        return merge_shards(a.out, expected_shards=a.shards)
     if os.path.isfile(a.src) and a.src.endswith(".s"):
         files = [a.src]
     elif os.path.isdir(a.src):
@@ -11381,11 +11491,11 @@ def main():
     else:
         ap.error(f"{a.src} is not a .s file or a folder of .s files")
     files = files[: a.limit] if a.limit is not None else files
-    shard = None
+    shard = shard_total = None
     if a.shard:
         si, sn = a.shard
         files = files[si::sn]
-        shard = si
+        shard, shard_total = si, sn
     os.makedirs(a.out, exist_ok=True)
     why, ok, valid = Counter(), 0, 0
     meta = {}
@@ -11427,6 +11537,10 @@ def main():
         for name in invalid:
             old.pop(name, None)
     old.update(meta)
+    if shard is not None:
+        # Companion metadata goes down before index.part<i>.json so the part file remains the last
+        # write (make_game.py treats index.part<i>.json on disk as proof the shard finished).
+        write_index(os.path.join(a.out, f"index.part{shard}.meta.json"), {"shard": shard, "shards": shard_total})
     write_index(idx_path, old)
     if shard is None:
         import spirv_stubs
