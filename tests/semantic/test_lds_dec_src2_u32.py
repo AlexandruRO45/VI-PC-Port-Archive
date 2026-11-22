@@ -784,6 +784,114 @@ class TestSIMDMultiLaneAndExecMasking(unittest.TestCase):
         self.assertEqual(state.lds.read_dword(d_a), 1)
 
 
+# ==============================================================================
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestRegisterAliasingAndPreservation(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_self_referencing_identical_offsets(self) -> None:
+        state = ScalarMachineState32(lds_capacity_dwords=512)
+        interp = ScalarInterpreter32()
+
+        state.lds.write_dword(10, 3)
+        state.set_vgpr(0, 0)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=10,
+                offset1=10,
+            )
+        )
+
+        # Step 1: 3 -> 2
+        self.assertEqual(interp.step(instr, state), 2)
+        self.assertEqual(state.lds.read_dword(10), 2)
+
+        # Step 2: 2 -> 1
+        self.assertEqual(interp.step(instr, state), 1)
+        self.assertEqual(state.lds.read_dword(10), 1)
+
+        # Step 3: 1 -> 0
+        self.assertEqual(interp.step(instr, state), 0)
+        self.assertEqual(state.lds.read_dword(10), 0)
+
+        # Step 4: 0 -> wrap to b (b=0) -> 0
+        self.assertEqual(interp.step(instr, state), 0)
+        self.assertEqual(state.lds.read_dword(10), 0)
+
+        # Register v0 preserved
+        self.assertEqual(state.get_vgpr(0), 0)
+
+    def test_secondary_location_b_preserved_when_distinct(self) -> None:
+        state = ScalarMachineState32(lds_capacity_dwords=512)
+        interp = ScalarInterpreter32()
+
+        state.lds.write_dword(20, 2)
+        state.lds.write_dword(21, 5)
+        state.set_vgpr(1, 0)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(1, RegType.VGPR),
+                offset0=20,
+                offset1=21,
+            )
+        )
+
+        for expected in [1, 0, 5, 4]:
+            res = interp.step(instr, state)
+            self.assertEqual(res, expected)
+            self.assertEqual(state.lds.read_dword(20), expected)
+            self.assertEqual(state.lds.read_dword(21), 5)
+
+    def test_vaddr_register_preservation_under_scalar_step(self) -> None:
+        state = ScalarMachineState32(lds_capacity_dwords=512)
+        interp = ScalarInterpreter32()
+
+        state.set_vgpr(5, 0x200)
+        state.lds.write_dword(0x200 >> 2, 100)
+        state.lds.write_dword((0x200 >> 2) + 1, 200)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(5, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        interp.step(instr, state)
+        self.assertEqual(state.get_vgpr(5), 0x200)
+
+    def test_simd_register_preservation_across_all_divergent_lanes(self) -> None:
+        even_mask = 0x5555555555555555
+        state = SIMDState32(num_lanes=64, exec_mask=even_mask, lds_capacity_dwords=512)
+        interp = SIMDInterpreter32()
+
+        sentinels = [1000 + lane for lane in range(64)]
+        for lane in range(64):
+            state.set_lane_vgpr(lane, 0, sentinels[lane])
+            d_a = (sentinels[lane] >> 2) & 511
+            state.lds.write_dword(d_a, 10)
+            state.lds.write_dword((d_a + 1) & 511, 20)
+
+        instr = DSDecSrc2U32Instruction(
+            addr=LDSAddressExpression(
+                base_reg=RegisterOperand(0, RegType.VGPR),
+                offset0=0,
+                offset1=1,
+            )
+        )
+
+        interp.execute(instr, state)
+
+        for lane in range(64):
+            self.assertEqual(state.get_lane_vgpr(lane, 0), sentinels[lane])
+
+
 
 if __name__ == "__main__":
     unittest.main()
