@@ -63,7 +63,9 @@ NAMES = {CNT: "lane-count", RNK: "lane-rank", FF1: "first-lane", BASE: "allocati
          ACT_RFL: "cross-lane"}
 REASONS = sorted(set(NAMES.values()) | {"tainted-branch", "unsafe-vote-branch", "mask-half", "elected-side-effect",
                                         "tainted-exec", "mask-compare", "unmodelled-op", "unsafe-execz-branch",
-                                        "analysis-error"})
+                                         "scalar-side-effect", "analysis-error"})
+
+SCALAR_SIDE_EFFECTS = ("s_store_", "s_buffer_store_", "s_atomic_", "s_buffer_atomic_")
 
 BRANCHES = {"s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz",
             "s_cbranch_execz", "s_cbranch_execnz"}
@@ -1320,8 +1322,13 @@ class Analysis:
             return
         # On hardware nobody runs the other side when some lane votes yes; a half whose lanes all vote no does. So
         # that side must be no code of its own: the join, which the run side reaches again.
-        ok = run is not None and self.narrows(run, reg) and skip is not None \
-            and self.reaches(run, self.past_jumps(skip), n)
+        join = self.past_jumps(skip) if skip is not None else None
+        ok = run is not None and join is not None and self.narrows(run, reg) and self.reaches(run, join, n)
+        if ok and ev is not None:
+            effect = self.run_side_scalar_effect(run, join)
+            if effect is not None:
+                ev["viol"].append(("scalar-side-effect", effect.get("pc"), base_op(effect["op"])))
+                return
         # The early exit of a pixel kill: the side a half takes when its mask is empty only empties EXEC (from that
         # mask or 0), may export with that EXEC and ends, so it writes nothing; the run side narrows EXEC into the
         # mask's whole quads and never widens it again, so in the wave the lanes of that half stay off to the end.
@@ -1483,6 +1490,23 @@ class Analysis:
         elif dests and _mask64(dests[0]) and combine(op, srcs):
             new_sub.add(tuple(_regs(dests[0])))
         return inside, frozenset(new_sub)
+
+    def run_side_scalar_effect(self, run, join):
+        """Find a per-wave effect in the run side before it rejoins the skip side."""
+        seen, work = set(), [run]
+        while work:
+            b = work.pop()
+            if b == join or b in seen:
+                continue
+            seen.add(b)
+            for ins in self.blocks[b]:
+                op = base_op(ins["op"])
+                # Unlike a lane-masked operation, a scalar effect can run twice when both halves vote yes.
+                # In GS the translator treats sendmsg as stage output (emit/cut/done).
+                if op.startswith(SCALAR_SIDE_EFFECTS) or (op == "s_sendmsg" and self.stage != "gs"):
+                    return ins
+            work.extend(self.succ[b])
+        return None
 
     def past_jumps(self, blk):
         """`blk`, or where it leads when it holds nothing but jumps and waits (the layout of a vccnz skip)."""

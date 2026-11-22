@@ -27,6 +27,7 @@ import support  # noqa: E402,F401  (sets the tools path)
 from support import translate_lines, translate_listing  # noqa: E402
 import rdna2spirv  # noqa: E402
 import spirv_wave_interp as wi  # noqa: E402
+import wave64_halves  # noqa: E402
 
 LITERAL_OPS = ("exp", "buffer_", "global_", "ds_", "image_")
 VOP3_ONLY = ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "v_readlane_b32", "v_writelane_b32", "v_lshl_add_u32",
@@ -1316,6 +1317,53 @@ class PixelShaders(unittest.TestCase):
                     slots32 = {mem32[0x100 + 4 * k] for k in range(16)}
                     self.assertEqual(len(slots64), 16)
                     self.assertEqual(slots64, slots32)
+
+
+class ScalarSideEffect(unittest.TestCase):
+    """SHADER-742: analyze hand-built blocks because the shader translator does not lower these scalar writes."""
+
+    @staticmethod
+    def analyse(effect=None, *, at_join=False, stage="ps"):
+        vcc = {"k": "special", "t": "vcc"}
+        saved = {"k": "sgpr", "r": 16, "n": 2}
+        blocks = [
+            [{"op": "s_cbranch_vccnz", "args": [], "pc": 0}],
+            [{"op": "s_and_saveexec_b64", "args": [saved, vcc], "pc": 4},
+             {"op": "s_branch", "args": [], "pc": 16}],
+            [{"op": "s_branch", "args": [], "pc": 20}],
+            [{"op": "s_endpgm", "args": [], "pc": 32}],
+        ]
+        if effect is not None:
+            target, pc = (3, 24) if at_join else (1, 8)
+            op, args = effect
+            blocks[target].insert(-1, {"op": op, "args": args, "pc": pc})
+        return wave64_halves.analyse(blocks, [[1, 2], [3], [3], []], {}, stage)
+
+    STORE = ("s_store_dword", [{"k": "sgpr", "r": 0}, {"k": "sgpr", "r": 2, "n": 2}, {"k": "imm", "v": 0}])
+
+    def test_plain_skip_is_tier_a(self):
+        self.assertEqual(self.analyse()["tier"], "A")
+
+    def test_scalar_effects_in_the_run_side_are_tier_c(self):
+        data, _, offset = self.STORE[1]
+        descriptor = {"k": "sgpr", "r": 4, "n": 4}
+        effects = (self.STORE, ("s_buffer_store_dword", [data, descriptor, offset]),
+                   ("s_atomic_add", self.STORE[1]), ("s_buffer_atomic_add", [data, descriptor, offset]),
+                   ("s_sendmsg", [{"k": "special", "t": "MSG_INTERRUPT"}]))
+        for effect in effects:
+            with self.subTest(op=effect[0]):
+                result = self.analyse(effect)
+                self.assertEqual(result["tier"], "C")
+                self.assertEqual(result["sites"], [("scalar-side-effect", 8, effect[0])])
+
+    def test_scalar_store_in_the_join_is_not_part_of_the_voted_region(self):
+        result = self.analyse(self.STORE, at_join=True)
+        # This pins the branch check's boundary, not the safety of unconditional scalar stores.
+        self.assertNotIn("scalar-side-effect", result["reasons"])
+
+    def test_gs_sendmsg_is_tier_a(self):
+        result = self.analyse(("s_sendmsg", [{"k": "special", "t": "MSG_GS, GS_OP_EMIT, 0"}]), stage="gs")
+        self.assertEqual((result["tier"], result["reasons"]), ("A", []))
 
 
 if __name__ == "__main__":
