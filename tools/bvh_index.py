@@ -347,6 +347,18 @@ def _make_parent(path):
         os.makedirs(parent, exist_ok=True)
 
 
+def parent_problem(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    while parent and not os.path.exists(parent):
+        nxt = os.path.dirname(parent)
+        if nxt == parent:
+            break
+        parent = nxt
+    if parent and not os.path.isdir(parent):
+        return f"{parent} is not a folder"
+    return None
+
+
 def write_outputs(rows, summaries, out, csv_path):
     if out:
         _make_parent(out)
@@ -464,6 +476,10 @@ def main(argv=None):
                             continue
                         if same_output_path(os.path.join(root, name), path):
                             ap.error(f"{flag} would overwrite an input file: {path}")
+    for flag, path in (("--out", a.out), ("--csv", a.csv)):
+        problem = path and parent_problem(path)
+        if problem:
+            ap.error(f"{flag}: {problem}")
     if os.path.isdir(a.target) and (a.start is not None or a.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     below_normal()
@@ -477,7 +493,11 @@ def main(argv=None):
             return 2
     for s in summaries:
         print(json.dumps(s, indent=1))
-    write_outputs(rows, summaries, a.out, a.csv)
+    try:
+        write_outputs(rows, summaries, a.out, a.csv)
+    except OSError as e:
+        print(f"cannot write the report: {e}", file=sys.stderr)
+        return 2
     if not rows:
         print("no zlib streams found", file=sys.stderr)
     return 0

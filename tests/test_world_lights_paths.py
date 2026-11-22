@@ -404,6 +404,19 @@ class ScanTest(unittest.TestCase):
         self.assertIn("--out and --lights-out must use different paths", err.getvalue())
         self.assertEqual(set(os.listdir(self.tmp.name)), original_files)
 
+    def test_bad_entities_keep_the_old_lights_report(self):
+        lights = os.path.join(self.tmp.name, "lights.jsonl")
+        with open(lights, "w", encoding="utf-8") as f:
+            f.write("old\n")
+        bad = os.path.join(self.tmp.name, "bad.jsonl")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("{not json\n")
+        with self.assertRaises(ValueError):
+            T.summarize(T.scan(self.rpf, lights_out=True), bad, lights)
+        with open(lights, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old\n")
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["bad.jsonl", "entities.jsonl", "levels.rpf", "lights.jsonl"])
+
     def test_cli_writes_summary_and_placed_lights(self):
         out = os.path.join(self.tmp.name, "summary.json")
         lights = os.path.join(self.tmp.name, "lights.jsonl")

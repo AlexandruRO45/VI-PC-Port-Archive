@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -224,6 +225,24 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("--out and --csv must use different paths", err.getvalue())
         self.assertFalse(os.path.exists(out))
+
+    def test_cli_refuses_an_out_parent_that_is_a_file_before_the_scan(self):
+        blocker = os.path.join(self.dir, "blocker")
+        with open(blocker, "w", encoding="utf-8"):
+            pass
+        err = io.StringIO()
+        with mock.patch.object(bvh_index, "scan_dir", side_effect=AssertionError("scan started")), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            bvh_index.main([self.dir, "--out", os.path.join(blocker, "sub", "index.json")])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("is not a folder", err.getvalue())
+
+    def test_cli_write_error_exits_2(self):
+        err = io.StringIO()
+        with mock.patch.object(bvh_index, "write_outputs", side_effect=PermissionError("denied")), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bvh_index.main([self.dir, "--out", os.path.join(self.dir, "i.json")]), 2)
+        self.assertIn("cannot write the report", err.getvalue())
 
     def test_directory_of_payloads(self):
         for name, payload in (("a.bin", bvh_payload(4)), ("b.bin", instance_payload()), ("c.bin", b"z" * 80)):

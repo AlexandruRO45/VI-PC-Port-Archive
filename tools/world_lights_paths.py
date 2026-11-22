@@ -671,10 +671,13 @@ def summarize(total, entities=None, lights_out=None):
                                                   if len(sets) > 1 and any(len(s) != len(sets[0]) for s in sets)),
     }
     placed = collections.Counter()
-    out = None
+    out = tmp = None
+    ok = False
     try:
         if lights_out:
-            out = open(lights_out, "w", encoding="utf-8", newline="\n")
+            fd, tmp = tempfile.mkstemp(prefix=".lights_", suffix=".tmp",
+                                       dir=os.path.dirname(os.path.abspath(lights_out)))
+            out = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
             for row in total["world_lights"]:
                 out.write(json.dumps(row, separators=(",", ":")) + "\n")
         placed["entity_lights_in_maps"] = len(total["world_lights"]) if lights_out else lights.get("lights_entity_in_map_placed", 0)
@@ -700,9 +703,15 @@ def summarize(total, entities=None, lights_out=None):
                                          e.get("scale_xy"), e.get("scale_z"))
                             out.write(json.dumps(_light_row(p, d, L, "archetype", a),
                                                  separators=(",", ":")) + "\n")
+        ok = True
     finally:
         if out is not None:
             out.close()
+        if tmp is not None:
+            if ok:
+                os.replace(tmp, lights_out)
+            else:
+                os.unlink(tmp)
     summary["placement"] = dict(placed)
     nodes = [n for part in total["nodes"] for n in part]
     links = [l for part in total["links"] for l in part]
