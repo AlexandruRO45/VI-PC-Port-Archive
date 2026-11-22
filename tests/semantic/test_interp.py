@@ -27,6 +27,10 @@ OpEntryPoint Fragment %main "main" %out
 %cF0 = OpConstant %uint 4294967280
 %cFF = OpConstant %uint 4294967295
 %cInf = OpConstant %uint 2139095040
+%cSnanNeg = OpConstant %uint 4288913557
+%cSnanPos = OpConstant %uint 2139095041
+%cSnanMax = OpConstant %uint 2143289343
+%cQnan = OpConstant %uint 2143458804
 %c80 = OpConstant %uint 128
 %ch = OpConstant %uint 1073757184
 %f1 = OpConstant %float 1
@@ -77,6 +81,34 @@ class InterpreterTests(unittest.TestCase):
         self.assertEqual(run_word("%u = OpExtInst %v2float %glsl UnpackHalf2x16 %ch\n"          # %ch = 0x40003c00
                                   "%x = OpCompositeExtract %float %u 1\n"
                                   "%res = OpBitcast %uint %x\n"), 0x40000000)                   # 2.0f
+
+    def test_bitcast_keeps_signalling_nan_patterns(self):
+        # SPIR-V: OpBitcast is bit-exact. A 32-bit word in 0x7f800001..0x7fbfffff or 0xff800001..0xffbfffff is a
+        # signalling NaN; going through a Python float used to set bit 22 (#509).
+        for constant, word in (("%cSnanNeg", 0xFFA3A095), ("%cSnanPos", 0x7F800001), ("%cSnanMax", 0x7FBFFFFF),
+                               ("%cQnan", 0x7FC295F4), ("%cInf", 0x7F800000), ("%cFF", 0xFFFFFFFF)):
+            with self.subTest(word=hex(word)):
+                body = f"%f = OpBitcast %float {constant}\n%res = OpBitcast %uint %f\n"
+                self.assertEqual(run_word(body), word)
+                body = f"%f = OpBitcast %float {constant}\n%g = OpCopyObject %float %f\n%res = OpBitcast %uint %g\n"
+                self.assertEqual(run_word(body), word)
+                body = (f"%f = OpBitcast %float {constant}\n%g = OpSelect %float %t %f %f1\n"
+                        "%res = OpBitcast %uint %g\n")
+                self.assertEqual(run_word(body), word)
+
+    def test_float_output_keeps_signalling_nan_patterns(self):
+        header = HEADER.replace("%_ptr_Output_uint = OpTypePointer Output %uint\n%out = OpVariable %_ptr_Output_uint Output",
+                                "%_ptr_Output_float = OpTypePointer Output %float\n%out = OpVariable %_ptr_Output_float Output")
+        self.assertNotEqual(header, HEADER)
+        for constant, word in (("%cSnanNeg", 0xFFA3A095), ("%cSnanPos", 0x7F800001), ("%cSnanMax", 0x7FBFFFFF)):
+            with self.subTest(word=hex(word)):
+                body = f"%res = OpBitcast %float {constant}\nOpStore %out %res\n"
+                self.assertEqual(si.run_fragment(header + body + FOOTER)["%out"][0], word)
+
+    def test_arithmetic_still_quiets_a_signalling_nan(self):
+        # IEEE 754: an operation on a signalling NaN returns the quiet NaN with the same sign and payload.
+        body = "%f = OpBitcast %float %cSnanNeg\n%g = OpFAdd %float %f %f1\n%res = OpBitcast %uint %g\n"
+        self.assertEqual(run_word(body), 0xFFE3A095)
 
     def test_fma_select_bitcast(self):
         self.assertEqual(run_word("%x = OpExtInst %float %glsl Fma %f2 %f3 %f1\n%res = OpBitcast %uint %x\n"),

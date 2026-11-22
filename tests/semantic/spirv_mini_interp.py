@@ -77,7 +77,25 @@ def f32(x):
         return float("inf") if x > 0 else float("-inf")
 
 
+class SignallingNaN(float):
+    """A binary32 signalling NaN that keeps its 32-bit pattern.
+
+    Python quiets a signalling NaN (sets bit 22) whenever a float goes through struct '<f' or a double, so a plain
+    float would change a word that OpBitcast, OpCopyObject, OpSelect and the exported outputs must carry unchanged.
+    The value is the quiet NaN Python makes of the pattern, so arithmetic on it behaves as before (a quiet NaN of the
+    same sign and payload, as on hardware); only f32_bits returns the original pattern.
+    """
+
+    def __new__(cls, pattern):
+        quiet = struct.unpack("<f", struct.pack("<I", pattern))[0]
+        value = super().__new__(cls, quiet)
+        value.pattern = pattern
+        return value
+
+
 def f32_bits(x):
+    if isinstance(x, SignallingNaN):
+        return x.pattern
     try:
         return struct.unpack("<I", struct.pack("<f", x))[0]
     except OverflowError:
@@ -85,7 +103,10 @@ def f32_bits(x):
 
 
 def bits_f32(b):
-    return struct.unpack("<f", struct.pack("<I", b & MASK))[0]
+    b &= MASK
+    if (b & 0x7F800000) == 0x7F800000 and (b & 0x007FFFFF) and not (b & 0x00400000):
+        return SignallingNaN(b)
+    return struct.unpack("<f", struct.pack("<I", b))[0]
 
 
 def half_to_float(h):
