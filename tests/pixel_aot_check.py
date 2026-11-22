@@ -1076,6 +1076,125 @@ def check_scheduling_hints():
     must_reject(translate, plain[:-1] + ["s_setprio 0", plain[-1]])
 
 
+def pack_f16_pair(lo, hi):
+    lo_b = struct.unpack("<H", struct.pack("<e", lo))[0]
+    hi_b = struct.unpack("<H", struct.pack("<e", hi))[0]
+    return lo_b | (hi_b << 16)
+
+
+# VOP3P dot-product fixture covering all 7 RDNA 2 (gfx1030) dot-product forms:
+# v_dot2_f32_f16 (op_sel, op_sel_hi, neg_lo, neg_hi, clamp), v_dot2_{i,u}32_{i,u}16,
+# v_dot4_{i,u}32_{i,u}8, and v_dot8_{i,u}32_{i,u}4 (wrapping and saturating clamp).
+DOT_BODY = [
+    "v_mov_b32_e32 v18, s44",
+    "v_mov_b32_e32 v19, s45",
+    "v_mov_b32_e32 v20, s46",
+    "v_mov_b32_e32 v21, s47",
+    "v_dot2_f32_f16 v22, v18, 0x40003800, 0.5 op_sel:[1,0,0] op_sel_hi:[0,1,1] neg_lo:[1,0,1] neg_hi:[0,1,0]",
+    "v_dot2_f32_f16 v12, v18, 0x3c003800, v22 clamp",
+    "v_dot2_i32_i16 v23, v19, v20, v21 op_sel:[0,1,0] op_sel_hi:[1,0,1] clamp",
+    "v_dot2_u32_u16 v24, v19, v20, v21 clamp",
+    "v_dot4_i32_i8 v25, v19, v20, v21 clamp",
+    "v_dot4_u32_u8 v26, v19, v20, v21",
+    "v_dot8_i32_i4 v27, v19, v20, v21",
+    "v_dot8_u32_u4 v28, v19, v20, v21 clamp",
+    "v_dot8_u32_u4 v29, v23, 0x12341234, 0",
+    "v_dot8_u32_u4 v29, v24, 0x43214321, v29",
+    "v_cvt_f32_f16_e32 v13, v29",
+    "v_mul_f32_e32 v13, 0x4b800000, v13",
+    "v_dot8_u32_u4 v30, v25, 0x12341234, 0",
+    "v_dot8_u32_u4 v30, v26, 0x43214321, v30",
+    "v_cvt_f32_f16_e32 v14, v30",
+    "v_mul_f32_e32 v14, 0x4b800000, v14",
+    "v_dot8_u32_u4 v31, v27, 0x12341234, 0",
+    "v_dot8_u32_u4 v31, v28, 0x43214321, v31",
+    "v_cvt_f32_f16_e32 v15, v31",
+    "v_mul_f32_e32 v15, 0x4b800000, v15",
+]
+
+DOT_SETS = (
+    # Set 1: mixed signs, interior v_dot2_f32_f16 value, non-overflowing signed & unsigned integer dots.
+    (pack_f16_pair(-0.5, 1.0), 0xfffc0005, 0x0003fffe, 0x00000010),
+    # Set 2: positive signed saturation (INT32_MAX) and unsigned saturation (UINT32_MAX).
+    (pack_f16_pair(2.0, 2.0), 0x7fff7fff, 0x7fff7fff, 0x7ffffff0),
+    # Set 3: negative signed saturation (INT32_MIN) and high-end clamp on v_dot2_f32_f16.
+    (pack_f16_pair(-2.0, 2.0), 0x8000ffff, 0x7fff7fff, 0x80000010),
+    # Set 4: v_dot8_u32_u4 unsigned saturation (UINT32_MAX) vs unwrapped v_dot4_u32_u8 wraparound.
+    (pack_f16_pair(0.5, -1.0), 0xffffffff, 0xffffffff, 0xfffffe00),
+)
+
+
+def dot_reference(f16_bits, x, y, acc):
+    def sext(val, bits):
+        mask = (1 << bits) - 1
+        v = val & mask
+        return v - (1 << bits) if v & (1 << (bits - 1)) else v
+
+    def sat_i32(v):
+        return max(-0x80000000, min(0x7fffffff, v)) & 0xffffffff
+
+    def sat_u32(v):
+        return min(0xffffffff, v) & 0xffffffff
+
+    def nibble_dot(a, b):
+        return sum(((a >> (4 * k)) & 0xf) * ((b >> (4 * k)) & 0xf) for k in range(8))
+
+    a_lo = struct.unpack("<e", struct.pack("<H", f16_bits & 0xffff))[0]
+    a_hi = struct.unpack("<e", struct.pack("<H", (f16_bits >> 16) & 0xffff))[0]
+    v22 = single((-a_hi) * 0.5 + a_lo * (-2.0) + (-0.5))
+    v12 = min(max(single(a_lo * 0.5 + a_hi * 1.0 + v22), 0.0), 1.0)
+
+    acc_s = sext(acc, 32)
+    v23 = sat_i32(sext(x, 16) * sext(y >> 16, 16) + sext(x >> 16, 16) * sext(y, 16) + acc_s)
+    v24 = sat_u32((x & 0xffff) * (y & 0xffff) + ((x >> 16) & 0xffff) * ((y >> 16) & 0xffff) + acc)
+    v25 = sat_i32(sum(sext(x >> (8 * k), 8) * sext(y >> (8 * k), 8) for k in range(4)) + acc_s)
+    v26 = (sum(((x >> (8 * k)) & 0xff) * ((y >> (8 * k)) & 0xff) for k in range(4)) + acc) & 0xffffffff
+    v27 = (sum(sext(x >> (4 * k), 4) * sext(y >> (4 * k), 4) for k in range(8)) + acc_s) & 0xffffffff
+    v28 = sat_u32(nibble_dot(x, y) + acc)
+
+    c1 = nibble_dot(v23, 0x12341234) + nibble_dot(v24, 0x43214321)
+    c2 = nibble_dot(v25, 0x12341234) + nibble_dot(v26, 0x43214321)
+    c3 = nibble_dot(v27, 0x12341234) + nibble_dot(v28, 0x43214321)
+    assert c1 < 1024 and c2 < 1024 and c3 < 1024, (c1, c2, c3)
+    return (half_rtz(v12), float(c1), float(c2), float(c3))
+
+
+def check_dot_draw(directory, compiler, renderer, backend):
+    program = with_constants(DOT_BODY)
+    source = directory / "dot.hlsl"
+    shader = directory / "dot.cso"
+    case = directory / "dot.case"
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    for values in DOT_SETS:
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = dot_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    for set_idx, old, new, label in (
+        (0, "neg_lo:[1,0,1]", "neg_lo:[0,0,1]", "dot2_f32_f16 neg_lo"),
+        (0, "v_dot2_i32_i16 v23", "v_dot2_u32_u16 v23", "dot2 signed vs unsigned"),
+        (1, "v_dot4_i32_i8 v25, v19, v20, v21 clamp", "v_dot4_i32_i8 v25, v19, v20, v21", "dot4_i32_i8 clamp"),
+        (0, "v_dot8_i32_i4 v27", "v_dot8_u32_u4 v27", "dot8 signed vs unsigned"),
+        (3, "v_dot8_u32_u4 v28, v19, v20, v21 clamp", "v_dot8_u32_u4 v28, v19, v20, v21", "dot8_u32_u4 clamp"),
+    ):
+        values = DOT_SETS[set_idx]
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *values)
+        expected = dot_reference(*values)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Mutation of {label} escaped detection")
+
+
 def check_controls(directory):
     check_scheduling_hints()
     check_constant_descriptor_bounds()
@@ -1307,6 +1426,44 @@ def check_controls(directory):
     cnd_pos = sel.index("v_cndmask_b32_e64 v13, v13, s46, s[52:53]")
     must_reject(translate, sel[:cnd_pos] + ["s_not_b64 s[52:53], 0"] + sel[cnd_pos:])
 
+    # VOP3P dot-product controls.
+    dot = with_constants(DOT_BODY)
+    source = translate(dot)
+    for expected in ("uint v_dot2_i32_i16(", "uint v_dot2_u32_u16(", "uint v_dot4_i32_i8(",
+                     "uint v_dot4_u32_u8(", "uint v_dot8_i32_i4(", "uint v_dot8_u32_u4("):
+        assert expected in source, expected
+    assert "uint v_dot2_i32_i16(" not in translate(assembly(False))
+    # Verify f16 inline constant 0.5 zero-extends to 0x00003800 on RDNA 2.
+    inline_dot = translate(with_constants(["v_dot2_f32_f16 v12, 0.5, 1.0, 2.0"]))
+    assert "14336u" in inline_dot and "15360u" in inline_dot and "(2.0f)" in inline_dot, inline_dot
+    for bad in (
+        "v_dot2_f32_f16 v22, v19, v20, v21 op_sel:[0,0,1]",
+        "v_dot2_f32_f16 v22, v19, v20, v21 op_sel_hi:[1,1,0]",
+        "v_dot2_f32_f16 v22, v19, v20, v21 neg_hi:[0,0,1]",
+        "v_dot2_f32_f16 v22, -v19, v20, v21",
+        "v_dot2_f32_f16 v22, |v19|, v20, v21",
+        "v_dot2_f32_f16 v22, v19, v20, v21 clamp clamp",
+        "v_dot2_f32_f16 v22, v19, v20",
+        "v_dot2_i32_i16 v22, v19, v20, v21 neg_lo:[1,0,0]",
+        "v_dot2_i32_i16 v22, 0.5, v20, v21",
+        "v_dot4_i32_i8 v22, v19, v20, v21 op_sel:[1,0,0]",
+        "v_dot8_u32_u4 v22, v19, v20, v21 op_sel_hi:[0,1,1]",
+        "v_dot4_u32_u8 v22, v19, v20, 65",
+        "v_dot8_i32_i4 v256, v19, v20, v21",
+        "v_dot2_u32_u16 v22, s28, v20, v21",
+        "v_pk_add_f16 v22, v19, v20",
+        "v_fma_mix_f32 v22, v19, v20, v21",
+    ):
+        must_reject(translate, with_constants(["v_mov_b32_e32 v19, s45", "v_mov_b32_e32 v20, s46",
+                                               "v_mov_b32_e32 v21, s47", bad]))
+    wait_vm = dot.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, dot[:wait_vm] + ["v_dot4_u32_u8 v12, s45, s46, 0"] + dot[wait_vm:])
+    must_reject(translate, dot[:wait_vm] + ["v_dot4_u32_u8 v22, v12, s46, 0"] + dot[wait_vm:])
+    wqm_idx = dot.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, dot[:wqm_idx] + ["v_dot4_u32_u8 v22, 1, 1, 0"] + dot[wqm_idx:])
+    lgkm_idx = dot.index("s_waitcnt lgkmcnt(0)", dot.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    must_reject(translate, dot[:lgkm_idx] + ["v_dot4_u32_u8 v22, s45, 1, 0"] + dot[lgkm_idx:])
+
 
 def check_binary(directory, assembler, objcopy, library):
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
@@ -1320,19 +1477,22 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
     fixtures.append((scheduling_hints(), translate))
-    for index, (instructions, lower_fixture) in enumerate(fixtures):
+    fixtures.append((with_constants(DOT_BODY), translate, "gfx1030"))
+    for index, entry in enumerate(fixtures):
+        instructions, lower_fixture = entry[:2]
+        cpu = entry[2] if len(entry) > 2 else "gfx1013"
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
         binary = directory / "fixture.bin"
         source.write_text("\n".join(instructions) + "\n", encoding="ascii")
-        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013",
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", f"-mcpu={cpu}",
                         "-filetype=obj", source, "-o", obj], check=True)
         subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
         archive = directory / "fixture.rpf"
         archive.write_bytes(envelope(binary.read_bytes()))
         _, native = native_program(archive, "fixture")
         assert native == binary.read_bytes()
-        assert lower_fixture(disassemble(native, library)) == lower_fixture(instructions)
+        assert lower_fixture(disassemble(native, library, cpu=cpu.encode())) == lower_fixture(instructions)
         if index == 0:
             check_container_selector(directory, native, library)
 
@@ -1368,6 +1528,7 @@ def check_ceiling_draws(directory, compiler, renderer, backend):
 def check_render(directory, compiler, renderer, backend):
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
+    check_dot_draw(directory, compiler, renderer, backend)
     for swap in (False, True):
         source = directory / "fixture.hlsl"
         shader = directory / "fixture.cso"
