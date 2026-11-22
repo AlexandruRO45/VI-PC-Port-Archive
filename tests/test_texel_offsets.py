@@ -131,3 +131,54 @@ def test_fallback_needs_no_maintenance8(asm, op, n, tmp_path, fallback):
                 ["spirv-val", "--target-env", "vulkan1.2", str(out)]):
         r = subprocess.run(cmd, capture_output=True, text=True)
         assert r.returncode == 0, r.stdout + r.stderr
+
+
+# ---- SHADER-491: clamp explicit forms and _b_o bias to S# word 1 [MIN_LOD, MAX_LOD] ----
+
+def test_fallback_explicit_min_lod_literal(tmp_path, fallback):
+    # S# word 1 (s17) has MIN_LOD = 1.0 (0x100 = 256 in 4.8 fixed point), MAX_LOD = 4.0 (0x400 << 12 = 0x400000)
+    s_smp = "\ns_mov_b32 s17, 0x00400100"
+    asm = f"image_sample_lz_o v[4:5], v[10:12], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D"
+    spv = translate_listing(tmp_path, PROLOGUE + s_smp + "\n" + asm)
+    # MIN_LOD 1.0 is used as level_f (1.0), then floored and clamped
+    assert "OpConstant %float 1" in spv
+    assert "OpImageQuerySizeLod %v2int" in spv
+
+
+def test_fallback_explicit_max_lod_literal(tmp_path, fallback):
+    # S# word 1 (s17) has MIN_LOD = 0.0, MAX_LOD = 2.0 (0x200 << 12 = 0x200000)
+    s_smp = "\ns_mov_b32 s17, 0x00200000\nv_mov_b32 v13, 0x40a00000"  # v13 = LOD 5.0f
+    asm = f"image_sample_l_o v[4:5], v[10:13], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D"
+    spv = translate_listing(tmp_path, PROLOGUE + s_smp + "\n" + asm)
+    # FClamp with limits [0.0, 2.0] (2.0f is bits 0x40000000)
+    assert "FClamp" in spv
+    assert "%c40000000" in spv
+
+
+def test_fallback_explicit_zero_min_lod_emits_level_zero(tmp_path, fallback):
+    # S# word 1 (s17) has MIN_LOD = 0.0, MAX_LOD = 15.0
+    s_smp = "\ns_mov_b32 s17, 0x00f00000"
+    asm = f"image_sample_lz_o v[4:5], v[10:12], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D"
+    spv = translate_listing(tmp_path, PROLOGUE + s_smp + "\n" + asm)
+    # Level 0 directly used, no FClamp emitted
+    assert "FClamp" not in spv
+
+
+def test_fallback_runtime_smp_word1_clamps(tmp_path, fallback):
+    # Runtime S# (no literal for s17)
+    asm = f"image_sample_l_o v[4:5], v[10:13], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D"
+    spv = translate_listing(tmp_path, PROLOGUE + "\n" + asm)
+    # BitFieldUExtract of word 1 bits 0 and 12, then FMax / FMin
+    assert "OpBitFieldUExtract" in spv
+    assert "FMax" in spv and "FMin" in spv
+
+
+def test_fallback_bias_clamps(tmp_path, fallback):
+    # image_sample_b_o with runtime sampler
+    asm = f"image_sample_b_o v[4:5], v[10:12], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D a16"
+    spv = translate_listing(tmp_path, PROLOGUE + "\n" + asm)
+    # Bias is added and clamped with FMax / FMin
+    assert "OpFAdd %float" in spv
+    assert "OpBitFieldUExtract" in spv
+    assert "FMax" in spv and "FMin" in spv
+

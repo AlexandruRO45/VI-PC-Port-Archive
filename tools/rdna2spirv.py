@@ -8611,8 +8611,10 @@ class Gen:
             implicit = kind in ("", "_b") and self.stage == "ps"
             grads_fb = None
             if off is not None and TEXEL_OFFSET_FALLBACK:
+                smp_w1 = a[3]["r"] + 1 if len(a) > 3 and a[3].get("k") == "sgpr" else None
                 uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit,
-                                                      f[ncoord] if kind == "_l" and len(f) > ncoord else None, bias)
+                                                      f[ncoord] if kind == "_l" and len(f) > ncoord else None, bias,
+                                                      smp_word1=smp_w1)
                 off = None
 
             def opnd(mask, args):
@@ -9205,12 +9207,13 @@ class Gen:
         self.emit(f"{r} = OpFAdd %float {s} {m2}")
         return r
 
-    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias):
+    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, smp_word1=None):
         """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
 
         The level is 0 for _lz / _c_lz (and for implicit samples outside the PS, which sample LOD 0), the given LOD
         for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), floored and clamped to the image's
-        levels. Texel offsets apply before wrapping and clamping, and an integer offset commutes with them, so the
+        levels. The LOD is clamped to S# word 1's [MIN_LOD, MAX_LOD] for explicit forms and for _b's bias.
+        Texel offsets apply before wrapping and clamping, and an integer offset commutes with them, so the
         shift is exact for any address mode at that level. Only a trilinear blend of two levels differs: the
         coarser level moves by offset / 2 of its texels instead of offset. Implicit samples become Grad samples with
         the derivatives of the original coordinate (scaled by 2^bias for _b): the LOD and anisotropy are those of the
@@ -9230,6 +9233,8 @@ class Gen:
         level_f = None
         if kind == "_l":
             level_f = lod if lod is not None else "%f0"
+            if smp_word1 is not None:
+                level_f = self.clamp_gather_lod(level_f, smp_word1)
         elif implicit:
             q, qx = self.tmp(), self.tmp()
             self.emit(f"{q} = OpImageQueryLod %v2float {si} {uvs}")
@@ -9238,7 +9243,21 @@ class Gen:
             if kind == "_b" and bias is not None:
                 qb = self.tmp()
                 self.emit(f"{qb} = OpFAdd %float {qx} {bias}")
-                level_f = qb
+                if smp_word1 is not None:
+                    level_f = self.clamp_gather_lod(qb, smp_word1)
+                else:
+                    level_f = qb
+        elif kind in ("_lz", "_c_lz") or not implicit:
+            if smp_word1 is not None:
+                literal = self.sgpr_imm.get(smp_word1)
+                if literal is not None:
+                    min_lod = ((literal >> 0) & 0xfff) / 256.0
+                    max_lod = ((literal >> 12) & 0xfff) / 256.0
+                    if min_lod > 0.0:
+                        clamped_val = min(max(0.0, min_lod), max_lod)
+                        level_f = self.fconst(clamped_val)
+                else:
+                    level_f = self.clamp_gather_lod("%f0", smp_word1)
         if level_f is None:
             level = ci(0)
         else:
