@@ -378,5 +378,234 @@ class TestLDSMemoryAndOracle64(unittest.TestCase):
         self.assertEqual(mem.read_qword(0x50), TWO_F64)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(enum.Enum):
+    """Data Share (DS) atomic opcodes."""
+    DS_MAX_RTN_F64 = "ds_max_rtn_f64"
+
+
+class RegType(enum.Enum):
+    """Register file classes."""
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class RegisterOperand:
+    """Typed symbolic register operand representation (scalar or paired registers)."""
+    index: int
+    count: int = 1
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index and self.index + self.count <= limit):
+            raise ValueError(f"Register span out of range: {self.reg_type.value}{self.index} count={self.count}")
+        if self.count <= 0:
+            raise ValueError(f"Count must be positive, got {self.count}")
+
+    @property
+    def name(self) -> str:
+        if self.count == 1:
+            return f"{self.reg_type.value}{self.index}"
+        return f"{self.reg_type.value}[{self.index}:{self.index + self.count - 1}]"
+
+
+@dataclasses.dataclass(frozen=True)
+class Immediate64:
+    """64-bit immediate value representing double bit pattern."""
+    value: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", u64(self.value))
+
+    @property
+    def name(self) -> str:
+        return hex(self.value)
+
+
+@dataclasses.dataclass(frozen=True)
+class OffsetImmediate:
+    """16-bit immediate byte offset descriptor."""
+    offset: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"Offset out of 16-bit range: {self.offset}")
+
+
+@dataclasses.dataclass(frozen=True)
+class DSMaxRtnF64Instruction:
+    """Symbolic AST node representing a ds_max_rtn_f64 instruction."""
+    vdst: RegisterOperand
+    vaddr: RegisterOperand
+    vdata0: Union[RegisterOperand, Immediate64]
+    offset: int = 0
+    gds: bool = False
+    opcode: DSOpcode = DSOpcode.DS_MAX_RTN_F64
+
+    def __post_init__(self) -> None:
+        if self.vdst.reg_type != RegType.VGPR:
+            raise ValueError(f"vdst must be VGPR, got {self.vdst.reg_type.value}")
+        if self.vdst.count != 2:
+            raise ValueError(f"vdst must be a 64-bit paired register (count=2), got {self.vdst.count}")
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise ValueError(f"vaddr must be VGPR, got {self.vaddr.reg_type.value}")
+        if self.vaddr.count != 1:
+            raise ValueError(f"vaddr must be a 32-bit register (count=1), got {self.vaddr.count}")
+        if isinstance(self.vdata0, RegisterOperand):
+            if self.vdata0.reg_type != RegType.VGPR:
+                raise ValueError(f"vdata0 register must be VGPR, got {self.vdata0.reg_type.value}")
+            if self.vdata0.count != 2:
+                raise ValueError(f"vdata0 register must be a 64-bit paired register (count=2), got {self.vdata0.count}")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"offset out of 16-bit range: {self.offset}")
+
+    def disasm(self) -> str:
+        vdata_str = self.vdata0.name
+        parts = [f"{self.opcode.value} {self.vdst.name}, {self.vaddr.name}, {vdata_str}"]
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+    @classmethod
+    def parse(cls, line: str) -> DSMaxRtnF64Instruction:
+        import re
+        raw = line.split("//")[0].split(";")[0].strip()
+        if not raw:
+            raise ValueError("Empty instruction line")
+        tokens = raw.replace(",", " ").split()
+        if not tokens:
+            raise ValueError("No tokens found")
+        mnemonic = tokens[0].lower()
+        if mnemonic != DSOpcode.DS_MAX_RTN_F64.value:
+            raise ValueError(f"Unknown opcode: {mnemonic}")
+
+        if len(tokens) < 4:
+            raise ValueError(f"Insufficient operands for {mnemonic}")
+
+        def parse_reg(tok: str, expected_count: int) -> RegisterOperand:
+            m_range = re.match(r"^([vs])\[(\d+):(\d+)\]$", tok.lower())
+            if m_range:
+                rtype = RegType.VGPR if m_range.group(1) == "v" else RegType.SGPR
+                start = int(m_range.group(2))
+                end = int(m_range.group(3))
+                cnt = end - start + 1
+                return RegisterOperand(start, cnt, rtype)
+
+            m_single = re.match(r"^([vs])\[?(\d+)\]?$", tok.lower())
+            if m_single:
+                rtype = RegType.VGPR if m_single.group(1) == "v" else RegType.SGPR
+                start = int(m_single.group(2))
+                return RegisterOperand(start, expected_count, rtype)
+
+            raise ValueError(f"Invalid register operand: {tok}")
+
+        vdst = parse_reg(tokens[1], expected_count=2)
+        vaddr = parse_reg(tokens[2], expected_count=1)
+        vdata_tok = tokens[3]
+        if vdata_tok.lower().startswith("v") or vdata_tok.lower().startswith("s"):
+            vdata0: Union[RegisterOperand, Immediate64] = parse_reg(vdata_tok, expected_count=2)
+        else:
+            vdata0 = Immediate64(int(vdata_tok, 0))
+
+        offset = 0
+        gds = False
+        for opt in tokens[4:]:
+            opt_l = opt.lower()
+            if opt_l == "gds":
+                gds = True
+            elif opt_l.startswith("offset:"):
+                offset = int(opt_l.split(":", 1)[1], 0)
+            else:
+                raise ValueError(f"Unexpected token in instruction: {opt}")
+
+        return cls(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=offset, gds=gds)
+
+
+class TestDSMaxRtnF64AST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_instantiation_and_disasm(self) -> None:
+        v0_1 = RegisterOperand(0, count=2, reg_type=RegType.VGPR)
+        v2 = RegisterOperand(2, count=1, reg_type=RegType.VGPR)
+        v4_5 = RegisterOperand(4, count=2, reg_type=RegType.VGPR)
+
+        inst_simple = DSMaxRtnF64Instruction(vdst=v0_1, vaddr=v2, vdata0=v4_5)
+        self.assertEqual(inst_simple.disasm(), "ds_max_rtn_f64 v[0:1], v2, v[4:5]")
+        self.assertEqual(inst_simple.offset, 0)
+        self.assertFalse(inst_simple.gds)
+
+        inst_opts = DSMaxRtnF64Instruction(vdst=v0_1, vaddr=v2, vdata0=v4_5, offset=64, gds=True)
+        self.assertEqual(inst_opts.disasm(), "ds_max_rtn_f64 v[0:1], v2, v[4:5] offset:64 gds")
+
+        inst_imm = DSMaxRtnF64Instruction(vdst=v0_1, vaddr=v2, vdata0=Immediate64(ONE_F64), offset=16)
+        self.assertEqual(inst_imm.disasm(), f"ds_max_rtn_f64 v[0:1], v2, {hex(ONE_F64)} offset:16")
+
+    def test_ast_parse_canonical(self) -> None:
+        inst1 = DSMaxRtnF64Instruction.parse("ds_max_rtn_f64 v[0:1], v2, v[4:5]")
+        self.assertEqual(inst1.vdst, RegisterOperand(0, count=2, reg_type=RegType.VGPR))
+        self.assertEqual(inst1.vaddr, RegisterOperand(2, count=1, reg_type=RegType.VGPR))
+        self.assertEqual(inst1.vdata0, RegisterOperand(4, count=2, reg_type=RegType.VGPR))
+        self.assertEqual(inst1.offset, 0)
+        self.assertFalse(inst1.gds)
+
+        inst2 = DSMaxRtnF64Instruction.parse("ds_max_rtn_f64 v[6:7], v8, v[10:11] offset:128 gds")
+        self.assertEqual(inst2.vdst, RegisterOperand(6, count=2, reg_type=RegType.VGPR))
+        self.assertEqual(inst2.vaddr, RegisterOperand(8, count=1, reg_type=RegType.VGPR))
+        self.assertEqual(inst2.vdata0, RegisterOperand(10, count=2, reg_type=RegType.VGPR))
+        self.assertEqual(inst2.offset, 128)
+        self.assertTrue(inst2.gds)
+
+        inst3 = DSMaxRtnF64Instruction.parse("ds_max_rtn_f64 v[0:1], v2, 0x3ff0000000000000 offset:0x20")
+        self.assertEqual(inst3.vdata0, Immediate64(ONE_F64))
+        self.assertEqual(inst3.offset, 32)
+
+    def test_ast_validation_errors(self) -> None:
+        v0_1 = RegisterOperand(0, count=2, reg_type=RegType.VGPR)
+        v2 = RegisterOperand(2, count=1, reg_type=RegType.VGPR)
+        v4_5 = RegisterOperand(4, count=2, reg_type=RegType.VGPR)
+        s0_1 = RegisterOperand(0, count=2, reg_type=RegType.SGPR)
+        s2 = RegisterOperand(2, count=1, reg_type=RegType.SGPR)
+        v_single = RegisterOperand(0, count=1, reg_type=RegType.VGPR)
+
+        # vdst cannot be SGPR
+        with self.assertRaises(ValueError):
+            DSMaxRtnF64Instruction(vdst=s0_1, vaddr=v2, vdata0=v4_5)
+
+        # vdst count must be 2
+        with self.assertRaises(ValueError):
+            DSMaxRtnF64Instruction(vdst=v_single, vaddr=v2, vdata0=v4_5)
+
+        # vaddr cannot be SGPR
+        with self.assertRaises(ValueError):
+            DSMaxRtnF64Instruction(vdst=v0_1, vaddr=s2, vdata0=v4_5)
+
+        # vaddr count must be 1
+        with self.assertRaises(ValueError):
+            DSMaxRtnF64Instruction(vdst=v0_1, vaddr=v0_1, vdata0=v4_5)
+
+        # vdata0 cannot be SGPR
+        with self.assertRaises(ValueError):
+            DSMaxRtnF64Instruction(vdst=v0_1, vaddr=v2, vdata0=s0_1)
+
+        # Negative offset
+        with self.assertRaises(ValueError):
+            DSMaxRtnF64Instruction(vdst=v0_1, vaddr=v2, vdata0=v4_5, offset=-1)
+
+        # Offset exceeding 16 bits
+        with self.assertRaises(ValueError):
+            DSMaxRtnF64Instruction(vdst=v0_1, vaddr=v2, vdata0=v4_5, offset=65536)
+
+        # Register span out of bounds
+        with self.assertRaises(ValueError):
+            RegisterOperand(255, count=2, reg_type=RegType.VGPR)
+
+
 if __name__ == "__main__":
     unittest.main()
