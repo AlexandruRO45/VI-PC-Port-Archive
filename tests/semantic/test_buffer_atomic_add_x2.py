@@ -1204,5 +1204,194 @@ class TestBufferAtomicAddX2BoundaryExtremes(unittest.TestCase):
         self.assertEqual(self.mem.read_u64(24), 0x0000000000000002)
 
 
+class TestBufferAtomicAddX2NegativeControls(unittest.TestCase):
+    """Negative controls and syntax rejection tests for buffer_atomic_add_x2."""
+
+    def test_invalid_vdata_count(self) -> None:
+        # vdata must be a 64-bit pair (count=2)
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_ADD_X2,
+                vdata=Register(RegKind.VGPR, 0, count=1),
+                vaddr=Register(RegKind.VGPR, 2),
+                srsrc=Register(RegKind.SGPR, 0, count=4),
+                soffset=0,
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_ADD_X2,
+                vdata=Register(RegKind.VGPR, 0, count=4),
+                vaddr=Register(RegKind.VGPR, 2),
+                srsrc=Register(RegKind.SGPR, 0, count=4),
+                soffset=0,
+            )
+
+    def test_invalid_vdata_kind(self) -> None:
+        # vdata cannot be SGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_ADD_X2,
+                vdata=Register(RegKind.SGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2),
+                srsrc=Register(RegKind.SGPR, 0, count=4),
+                soffset=0,
+            )
+
+    def test_invalid_vaddr_kind(self) -> None:
+        # vaddr must be VGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_ADD_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.SGPR, 2),
+                srsrc=Register(RegKind.SGPR, 0, count=4),
+                soffset=0,
+            )
+
+    def test_invalid_srsrc_count_and_kind(self) -> None:
+        # srsrc must be SGPR with count=4
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_ADD_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2),
+                srsrc=Register(RegKind.SGPR, 0, count=2),
+                soffset=0,
+            )
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_ADD_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2),
+                srsrc=Register(RegKind.VGPR, 0, count=4),
+                soffset=0,
+            )
+
+    def test_invalid_soffset_kind(self) -> None:
+        # soffset register must be SGPR
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.BUFFER_ATOMIC_ADD_X2,
+                vdata=Register(RegKind.VGPR, 0, count=2),
+                vaddr=Register(RegKind.VGPR, 2),
+                srsrc=Register(RegKind.SGPR, 0, count=4),
+                soffset=Register(RegKind.VGPR, 4),
+            )
+
+    def test_invalid_instruction_offset(self) -> None:
+        # offset must be in [0, 4095]
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=-1)
+        with self.assertRaises(ValueError):
+            BufferAtomicModifiers(offset=4096)
+
+    def test_invalid_wave_size(self) -> None:
+        # Wave size must be 32 or 64
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDBufferWavefrontInterpreter(wave_size=128)
+
+    def test_register_bounds_scalar_interpreter(self) -> None:
+        interp = ScalarBufferInterpreter()
+        with self.assertRaises(IndexError):
+            interp.read_reg_u32(RegKind.VGPR, -1)
+        with self.assertRaises(IndexError):
+            interp.read_reg_u32(RegKind.VGPR, 256)
+        with self.assertRaises(IndexError):
+            interp.read_reg_u32(RegKind.SGPR, 106)
+        with self.assertRaises(IndexError):
+            interp.write_reg_u32(RegKind.VGPR, 256, 123)
+        with self.assertRaises(IndexError):
+            interp.write_reg_u32(RegKind.SGPR, -1, 123)
+
+    def test_buffer_memory_out_of_bounds_bounds_check(self) -> None:
+        mem = BufferMemory(16)
+        # Reads beyond physical memory bounds return 0 safely
+        self.assertEqual(mem.read_u64(10), 0)
+        self.assertEqual(mem.read_u64(-1), 0)
+        # Writes beyond physical memory bounds are safely ignored without memory corruption
+        mem.write_u64(12, 0x1234)
+        self.assertEqual(mem.read_u64(12), 0)
+
+
+class TestBufferAtomicAddX2MutationDetection(unittest.TestCase):
+    """Tests ensuring mutation kill for common semantic implementation errors."""
+
+    def setUp(self) -> None:
+        self.mem = BufferMemory(1024)
+
+    def test_mutant_4byte_bounds_check_killed(self) -> None:
+        # A 4-byte check would allow access at num_records - 4.
+        # But an 8-byte atomic requires 8 full bytes in range.
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        # Offset 96: 96 + 8 = 104 > 100 (OOB for 64-bit atomic).
+        ret, in_bounds = ref_buffer_atomic_add_x2(
+            self.mem, desc, soffset=0, vaddr=96, add_val=0x1122334455667788, glc=True
+        )
+        self.assertFalse(in_bounds)
+        self.assertEqual(ret, 0)
+        # Ensure memory at 96 remains 0
+        self.assertEqual(self.mem.read_u64(96), 0)
+
+    def test_mutant_glc_post_op_return_killed(self) -> None:
+        # A mutant returning post-op value instead of pre-op value must be rejected.
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        self.mem.write_u64(0, 100)
+        ret, in_bounds = ref_buffer_atomic_add_x2(
+            self.mem, desc, soffset=0, vaddr=0, add_val=50, glc=True
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(ret, 100)
+        self.assertNotEqual(ret, 150)
+        self.assertEqual(self.mem.read_u64(0), 150)
+
+    def test_mutant_subtraction_killed(self) -> None:
+        # A mutant computing subtraction instead of addition must be rejected.
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=100)
+        self.mem.write_u64(0, 100)
+        ret, in_bounds = ref_buffer_atomic_add_x2(
+            self.mem, desc, soffset=0, vaddr=0, add_val=50, glc=False
+        )
+        self.assertTrue(in_bounds)
+        self.assertEqual(self.mem.read_u64(0), 150)
+        self.assertNotEqual(self.mem.read_u64(0), 50)
+
+    def test_mutant_inactive_lane_leak_killed(self) -> None:
+        # A mutant executing on inactive lanes must be rejected.
+        simd = SIMDBufferWavefrontInterpreter(wave_size=32, mem_size=4096)
+        desc = BufferResourceDescriptor(base_address=0, stride=0, num_records=4096)
+        simd.set_buffer_descriptor(0, desc)
+        # Initialize memory at lane 0 and lane 1 locations
+        simd.mem.write_u64(0, 100)
+        simd.mem.write_u64(8, 200)
+
+        # Enable only lane 0; lane 1 is inactive
+        simd.set_exec_mask(0x1)
+
+        simd.write_lane_reg_u32(0, RegKind.VGPR, 2, 0)   # vaddr lane 0 = 0
+        simd.write_lane_reg_u64(0, 0, 10)                # vdata lane 0 = 10
+        simd.write_lane_reg_u32(1, RegKind.VGPR, 2, 8)   # vaddr lane 1 = 8
+        simd.write_lane_reg_u64(1, 0, 20)                # vdata lane 1 = 20
+
+        inst = Instruction(
+            opcode=Opcode.BUFFER_ATOMIC_ADD_X2,
+            vdata=Register(RegKind.VGPR, 0, count=2),
+            vaddr=Register(RegKind.VGPR, 2),
+            srsrc=Register(RegKind.SGPR, 0, count=4),
+            soffset=0,
+            mods=BufferAtomicModifiers(glc=True),
+        )
+        simd.step(inst)
+
+        # Lane 0 was active: 100 + 10 = 110, returned pre-op 100
+        self.assertEqual(simd.mem.read_u64(0), 110)
+        self.assertEqual(simd.read_lane_reg_u64(0, 0), 100)
+
+        # Lane 1 was inactive: memory must remain 200, vdata must remain 20
+        self.assertEqual(simd.mem.read_u64(8), 200)
+        self.assertEqual(simd.read_lane_reg_u64(1, 0), 20)
+
+
 if __name__ == "__main__":
     unittest.main()
