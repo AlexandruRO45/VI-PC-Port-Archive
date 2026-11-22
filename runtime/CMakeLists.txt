@@ -5,10 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # The sources are UTF-8 (comments use →, ×, …). Without /utf-8, MSVC reads them in the system code page and reports
-# C4819 (936, 1252, ...) or misreads a literal. Set it for every target here, so a new target can't miss it; the
-# per-target /utf-8 flags below are now redundant but harmless.
+# C4819 (on DBCS code pages such as 936) or misreads a literal. Set it here for every target, so a new one can't miss
+# it; the per-target /utf-8 flags below are now redundant but harmless. C and C++ only: ml64 rejects it (A4018).
 if(MSVC)
-  add_compile_options(/utf-8)
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
 endif()
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)

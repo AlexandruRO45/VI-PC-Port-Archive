@@ -1,9 +1,10 @@
 """MSVC must read every runtime source as UTF-8 (BUILD-1005).
 
 Without ``/utf-8``, MSVC reads a source in the system code page and reports C4819 for any character the code page
-can't hold (``→`` in ``runtime/src/vulkan_replay.h`` on 936 and 1252), or misreads a literal. The flag used to be
-added per target, and the standalone Vulkan and replay test targets didn't have it. It is now set once, before the
-first target, so a new target can't miss it.
+can't hold (``→`` in ``runtime/src/vulkan_replay.h`` on DBCS code pages such as 936), or misreads a literal. The
+flag used to be added per target, and the standalone Vulkan and replay test targets didn't have it. It is now set
+once, before the first target, so a new target can't miss it. It is limited to C and C++: ml64 warns A4018 on an
+unknown /utf-8.
 """
 import os
 import re
@@ -13,7 +14,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CMAKE = Path(os.environ.get("LEONIDA_RUNTIME_CMAKE", str(ROOT / "runtime" / "CMakeLists.txt")))
 
-GLOBAL_UTF8 = re.compile(r"^if\(MSVC\)\s*\n\s*add_compile_options\(/utf-8\)\s*\nendif\(\)", re.M)
+GLOBAL_UTF8 = re.compile(r"^if\(MSVC\)\s*\n"
+                         r"\s*add_compile_options\(\$<\$<COMPILE_LANGUAGE:C,CXX>:/utf-8>\)\s*\n"
+                         r"endif\(\)", re.M)
 FIRST_TARGET = re.compile(r"^\s*add_(executable|library)\(", re.M)
 
 
