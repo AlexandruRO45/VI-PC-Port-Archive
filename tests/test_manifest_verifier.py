@@ -134,6 +134,52 @@ class TestManifestVerifier(unittest.TestCase):
         with self.assertRaises(mv.ManifestError):
             mv.load_manifest(invalid_entries)
 
+    def test_wrapped_manifest_metadata_names_are_verified(self) -> None:
+        names = ("created", "title", "version", "note")
+        payloads = {name: f"synthetic-{name}".encode("utf-8") for name in names}
+        for name, data in payloads.items():
+            with open(os.path.join(self.game_dir, name), "wb") as f:
+                f.write(data)
+
+        path = os.path.join(self.root, "reserved_names.json")
+        self.write_manifest(path, payloads)  # also includes top-level "created" metadata
+        entries = mv.load_manifest(path)
+        self.assertEqual(set(entries), set(names))
+
+        clean = mv.verify_manifest(self.game_dir, path, jobs=2)
+        self.assertTrue(clean.passed)
+        self.assertEqual(clean.total_manifest_files, len(names))
+        self.assertEqual(set(clean.matched), set(names))
+
+        # The verifier must detect both a missing name and same-size tampering.
+        os.remove(os.path.join(self.game_dir, "created"))
+        with open(os.path.join(self.game_dir, "version"), "wb") as f:
+            f.write(b"X" * len(payloads["version"]))
+        changed = mv.verify_manifest(self.game_dir, path)
+        self.assertFalse(changed.passed)
+        self.assertEqual(changed.missing, ["created"])
+        self.assertEqual(changed.hash_mismatch, ["version"])
+        self.assertEqual(changed.problem_count, 2)
+
+    def test_flat_manifest_still_ignores_metadata_fields(self) -> None:
+        path = os.path.join(self.root, "legacy_flat.json")
+        doc = {"created": "2026-11-22", "title": "synthetic",
+               "version": 1, "note": "metadata",
+               "alpha.bin": {"size": len(self.payloads["alpha.bin"]),
+                             "sha256": hashlib.sha256(self.payloads["alpha.bin"]).hexdigest()}}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        entries = mv.load_manifest(path)
+        self.assertEqual(set(entries), {"alpha.bin"})
+        self.assertTrue(mv.verify_manifest(self.game_dir, path).passed)
+
+    def test_wrapped_metadata_name_requires_valid_digest(self) -> None:
+        path = os.path.join(self.root, "bad_reserved_name.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"files": {"created": {"size": 1}}}, f)
+        with self.assertRaises(mv.ManifestError):
+            mv.load_manifest(path)
+
     def test_verify_target_dir_missing(self) -> None:
         with self.assertRaises(mv.ManifestError):
             mv.verify_manifest(os.path.join(self.root, "missing_dir"), self.manifest_path)
