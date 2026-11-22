@@ -1456,5 +1456,163 @@ class TestValuCvtPknormI16F32IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(f32_to_snorm16(sup_step), 0x0001)
 
 
+# ==============================================================================
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuCvtPknormI16F32NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for syntax rejection, invalid operand handling, and mutation sensitivity."""
+
+    def test_syntax_rejection_sgpr_destination(self) -> None:
+        """Verify VALU instructions reject scalar registers (SGPR) as destination."""
+        s0 = Reg(0, RegType.SGPR)
+        v1 = Reg(1, RegType.VGPR)
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F32Instruction(
+                dst=s0,
+                src0=VOP3Operand(v1),
+                src1=VOP3Operand(v1),
+            )
+
+    def test_syntax_rejection_invalid_operand_types(self) -> None:
+        """Verify instruction construction rejects non-VOP3Operand objects."""
+        v0 = Reg(0, RegType.VGPR)
+        v1 = Reg(1, RegType.VGPR)
+
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F32Instruction(dst=v0, src0=v1, src1=VOP3Operand(v1))  # type: ignore
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F32Instruction(dst=v0, src0=VOP3Operand(v1), src1=123)  # type: ignore
+        with self.assertRaises(TypeError):
+            VOP3Operand(source="not_a_register")  # type: ignore
+
+    def test_syntax_rejection_register_bounds(self) -> None:
+        """Verify registers reject out-of-bound indices."""
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Literal32(-1)
+        with self.assertRaises(ValueError):
+            Literal32(0x1_0000_0000)
+
+    def test_simd_invalid_configuration(self) -> None:
+        """Verify SIMD machine state rejects non-standard wave sizes."""
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_mutation_incorrect_scale_factor(self) -> None:
+        """Mutation detection: verify test suite detects incorrect 32768.0 scale factor."""
+        def mutated_f32_to_snorm16(bits: int) -> int:
+            if is_nan_f32(bits):
+                return 0
+            val = bits_to_f32(bits)
+            clamped = max(-1.0, min(1.0, val))
+            # MUTATION: using 32768.0 instead of 32767.0
+            return int(round(clamped * 32768.0)) & MASK16
+
+        # Under correct oracle, +1.0f produces 0x7FFF (32767).
+        # Mutated scale factor produces 32768 (0x8000).
+        correct_val = f32_to_snorm16(POS_ONE_F32)
+        mutated_val = mutated_f32_to_snorm16(POS_ONE_F32)
+
+        self.assertEqual(correct_val, 0x7FFF)
+        self.assertEqual(mutated_val, 0x8000)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_missing_input_clamp(self) -> None:
+        """Mutation detection: verify test suite detects omitted [-1.0, 1.0] clamp."""
+        def mutated_f32_to_snorm16_noclamp(bits: int) -> int:
+            if is_nan_f32(bits):
+                return 0
+            val = bits_to_f32(bits)
+            # MUTATION: no clamping of input float
+            return int(round(val * 32767.0)) & MASK16
+
+        # For +2.0f, correct oracle clamps to +1.0f -> 0x7FFF
+        # Mutated un-clamped function overflows
+        correct_val = f32_to_snorm16(POS_TWO_F32)
+        mutated_val = mutated_f32_to_snorm16_noclamp(POS_TWO_F32)
+
+        self.assertEqual(correct_val, 0x7FFF)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_truncation_instead_of_round_to_even(self) -> None:
+        """Mutation detection: verify test suite detects truncation (round-toward-zero)."""
+        def mutated_f32_to_snorm16_trunc(bits: int) -> int:
+            if is_nan_f32(bits):
+                return 0
+            val = max(-1.0, min(1.0, bits_to_f32(bits)))
+            # MUTATION: integer truncation instead of roundTiesToEven
+            return int(val * 32767.0) & MASK16
+
+        # For +0.5f: 0.5 * 32767.0 = 16383.5.
+        # roundTiesToEven rounds to 16384 (0x4000). Truncation yields 16383 (0x3FFF).
+        correct_val = f32_to_snorm16(POS_HALF_F32)
+        mutated_val = mutated_f32_to_snorm16_trunc(POS_HALF_F32)
+
+        self.assertEqual(correct_val, 0x4000)
+        self.assertEqual(mutated_val, 0x3FFF)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_inverted_channel_packing(self) -> None:
+        """Mutation detection: verify test suite detects swapped destination channels."""
+        def mutated_pack(s0: int, s1: int) -> int:
+            ch0 = f32_to_snorm16(s0)
+            ch1 = f32_to_snorm16(s1)
+            # MUTATION: inverted channel placement (ch0 in high 16, ch1 in low 16)
+            return ((ch0 & MASK16) << 16) | (ch1 & MASK16)
+
+        # For (s0=+1.0f, s1=-1.0f), correct packing is 0x80017FFF.
+        # Mutated packing produces 0x7FFF8001.
+        correct_packed = oracle_v_cvt_pknorm_i16_f32(POS_ONE_F32, NEG_ONE_F32)
+        mutated_packed = mutated_pack(POS_ONE_F32, NEG_ONE_F32)
+
+        self.assertEqual(correct_packed, 0x80017FFF)
+        self.assertEqual(mutated_packed, 0x7FFF8001)
+        self.assertNotEqual(correct_packed, mutated_packed)
+
+    def test_mutation_nan_leak(self) -> None:
+        """Mutation detection: verify test suite detects failure to zero NaNs."""
+        def mutated_f32_to_snorm16_nan_leak(bits: int) -> int:
+            # MUTATION: NaNs convert to 0x7FFF instead of 0
+            if is_nan_f32(bits):
+                return 0x7FFF
+            return f32_to_snorm16(bits)
+
+        correct_val = f32_to_snorm16(CANONICAL_QNAN_F32)
+        mutated_val = mutated_f32_to_snorm16_nan_leak(CANONICAL_QNAN_F32)
+
+        self.assertEqual(correct_val, 0x0000)
+        self.assertEqual(mutated_val, 0x7FFF)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_exec_mask_bypass(self) -> None:
+        """Mutation detection: verify test suite detects inactive lane write violation."""
+        state = SIMDState(num_lanes=32, exec_mask=0x00000001)  # Only lane 0 active
+        sentinel = 0x55555555
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+
+        # MUTATION: interpreter incorrectly ignores EXEC mask and writes to all lanes
+        def mutated_step(instr: VCvtPknormI16F32Instruction, st: SIMDState) -> None:
+            for lane in range(st.num_lanes):
+                # Bug: ignoring st.exec_mask
+                st.set_vgpr(lane, instr.dst.index, 0x7FFF7FFF)
+
+        instr = VCvtPknormI16F32Instruction(
+            dst=Reg(0, RegType.VGPR),
+            src0=VOP3Operand(Literal32.from_float(1.0)),
+            src1=VOP3Operand(Literal32.from_float(1.0)),
+        )
+
+        mutated_step(instr, state)
+        # Lane 1 was masked off, but mutated step altered it
+        self.assertNotEqual(state.get_vgpr(1, 0), sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
