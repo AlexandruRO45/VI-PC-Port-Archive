@@ -1103,5 +1103,74 @@ class TestValuMqsadU32U8StatusFlags(unittest.TestCase):
         self.assertFalse(status.zero)
 
 
+class TestValuMqsadU32U8IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit pattern boundaries, subnormals, and NaNs as raw integer bytes."""
+
+    def test_float_signed_zeros_distinction(self) -> None:
+        # +0.0 is 0x00000000, -0.0 is 0x80000000
+        # Byte 3 of -0.0 is 0x80 (128), byte 3 of +0.0 is 0x00.
+        # Mask with -0.0 vs win with +0.0:
+        # Bytes 0..2 of -0.0 are 0x00 (masked out, skipped!)
+        # Byte 3 of -0.0 is 0x80 (active!), diff = |0x00 - 0x80| = 128
+        sad = ref_masked_byte_sad_u32(0x00000000, 0x80000000)
+        self.assertEqual(sad, 128)
+
+        # Conversely, if -0.0 is in win and mask is +0.0:
+        # All bytes of mask are 0, so SAD is 0 (all skipped)
+        self.assertEqual(ref_masked_byte_sad_u32(0x80000000, 0x00000000), 0)
+
+    def test_subnormal_floats_no_flush_to_zero(self) -> None:
+        # Subnormal float32: 0x00000001 (smallest positive subnormal)
+        # and 0x00000002.
+        # If flushed to zero, difference would be 0.
+        # Real hardware: byte 0 is 1 and 2, difference is |1 - 2| = 1.
+        sad = ref_masked_byte_sad_u32(0x00000001, 0x00000002)
+        self.assertEqual(sad, 1)
+
+        # Larger subnormal with byte 1 active: 0x00000100
+        sad2 = ref_masked_byte_sad_u32(0x00000000, 0x00000100)
+        self.assertEqual(sad2, 1)
+
+    def test_quiet_and_signaling_nan_payloads(self) -> None:
+        # qNaN: 0x7FC00000, sNaN: 0x7F800001
+        # Bytes of qNaN: [0x00, 0x00, 0xC0, 0x7F]
+        # Bytes of sNaN: [0x01, 0x00, 0x80, 0x7F]
+        # Diff against each other:
+        # Byte 0: |0x00 - 0x01| = 1 (active since sNaN byte 0 != 0)
+        # Byte 1: 0 (sNaN byte 1 == 0, skipped)
+        # Byte 2: |0xC0 - 0x80| = 192 - 128 = 64 (active)
+        # Byte 3: |0x7F - 0x7F| = 0 (active)
+        # Total SAD = 1 + 64 + 0 = 65
+        sad = ref_masked_byte_sad_u32(0x7FC00000, 0x7F800001)
+        self.assertEqual(sad, 65)
+
+    def test_float_infinities(self) -> None:
+        # +inf: 0x7F800000, -inf: 0xFF800000
+        # Byte 3 of +inf is 0x7F (127), byte 3 of -inf is 0xFF (255)
+        # Byte 2 of both is 0x80 (128)
+        # Bytes 0 and 1 of both are 0x00
+        # Mask = -inf:
+        # Byte 0: skipped (mask byte is 0)
+        # Byte 1: skipped (mask byte is 0)
+        # Byte 2: |0x80 - 0x80| = 0
+        # Byte 3: |0x7F - 0xFF| = 128
+        sad = ref_masked_byte_sad_u32(0x7F800000, 0xFF800000)
+        self.assertEqual(sad, 128)
+
+    def test_byte_extremes_boundary_matrix(self) -> None:
+        # Test boundary byte values: 0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF
+        extremes = [0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF]
+        for b0 in extremes:
+            for b1 in extremes:
+                win = b0 | (b0 << 8) | (b0 << 16) | (b0 << 24)
+                mask = b1 | (b1 << 8) | (b1 << 16) | (b1 << 24)
+                sad = ref_masked_byte_sad_u32(win, mask)
+                if b1 == 0:
+                    expected = 0
+                else:
+                    expected = 4 * abs(b0 - b1)
+                self.assertEqual(sad, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
