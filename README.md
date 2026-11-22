@@ -70,7 +70,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | Indexed mesh draw on WARP | `ctest --preset dev --no-tests=error -R '^mesh_indexed_draw_warp$' -V` |
 | Compute shader buffer writes on WARP | `ctest --preset dev --no-tests=error -R '^compute_store_aot_warp$' -V` |
 
-The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#repeated-memory-copies-and-fills-in-the-control-flow-cpu-lifter). REP MOVS and REP STOS copy and fill 1-, 2-, 4- and 8-byte elements.
+The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#direction-aware-repeated-memory-transfers-in-the-control-flow-cpu-lifter). REP MOVS and REP STOS copy and fill 1-, 2-, 4- and 8-byte elements in either direction.
 
 ### Tests by area
 
