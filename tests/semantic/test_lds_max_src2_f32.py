@@ -428,5 +428,119 @@ class TestSymbolicAST(unittest.TestCase):
         self.assertEqual(list(prog), [i1, i2])
 
 
+# ==============================================================================
+# Deterministic Scalar Interpreter & Machine State
+# ==============================================================================
+
+class ScalarMachineState:
+    """Architectural register and memory state for a single scalar GPU thread."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.vgprs: List[int] = [0] * DEFAULT_NUM_VGPRS
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+        self.instruction_count: int = 0
+        self.cycle_count: int = 0
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx] & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for DS src2 opcodes."""
+
+    def execute(self, instr: DSSrc2Instruction, state: ScalarMachineState) -> int:
+        base_addr = state.get_vgpr(instr.addr.base_reg.index)
+        _, _, idx_a, idx_b = calc_lds_src2_addresses(
+            vaddr=base_addr,
+            offset0=instr.addr.offset0,
+            offset1=instr.addr.offset1,
+            lds_dwords=state.lds.size_dwords,
+        )
+
+        val_a = state.lds.read_dword(idx_a)
+        val_b = state.lds.read_dword(idx_b)
+
+        if instr.opcode == DSOpcode.DS_MAX_SRC2_F32:
+            new_a = oracle_max_f32(val_a, val_b)
+        else:
+            raise NotImplementedError(f"Unsupported opcode: {instr.opcode}")
+
+        # In-place atomic update to LDS location A
+        state.lds.write_dword(idx_a, new_a)
+        state.instruction_count += 1
+        state.cycle_count += 4
+        return new_a
+
+    def run_program(self, prog: Program, state: ScalarMachineState) -> int:
+        count = 0
+        for instr in prog:
+            self.execute(instr, state)
+            count += 1
+        return count
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_DWORDS)
+        self.state = ScalarMachineState(lds=self.lds)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_execution_basic(self) -> None:
+        # Location A = dword 10 (1.0f), Location B = dword 20 (2.0f)
+        self.lds.write_dword(10, ONE_F32)
+        self.lds.write_dword(20, TWO_F32)
+        self.state.set_vgpr(1, 40)  # base = 40 (dword 10)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_MAX_SRC2_F32,
+            addr=LDSAddressExpression(base_reg=vgpr(1), offset0=0, offset1=10),
+        )
+        new_a = self.interp.execute(instr, self.state)
+        self.assertEqual(new_a, TWO_F32)
+        self.assertEqual(self.lds.read_dword(10), TWO_F32)
+        self.assertEqual(self.lds.read_dword(20), TWO_F32)
+        # Base register must not be modified
+        self.assertEqual(self.state.get_vgpr(1), 40)
+
+    def test_scalar_execution_same_location(self) -> None:
+        # offset0 == offset1: A and B are the same location
+        self.lds.write_dword(15, TEN_F32)
+        self.state.set_vgpr(2, 15 * 4)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_MAX_SRC2_F32,
+            addr=LDSAddressExpression(base_reg=vgpr(2), offset0=0, offset1=0),
+        )
+        new_a = self.interp.execute(instr, self.state)
+        self.assertEqual(new_a, TEN_F32)
+        self.assertEqual(self.lds.read_dword(15), TEN_F32)
+
+    def test_scalar_program_execution(self) -> None:
+        prog = Program()
+        self.state.set_vgpr(0, 0)
+        # Initialize 3 pairs: (0, 1), (2, 3), (4, 5)
+        pairs = [(ONE_F32, TWO_F32), (NEG_TEN_F32, NEG_ONE_F32), (HALF_F32, ONE_F32)]
+        for i, (va, vb) in enumerate(pairs):
+            idx_a = i * 2
+            idx_b = i * 2 + 1
+            self.lds.write_dword(idx_a, va)
+            self.lds.write_dword(idx_b, vb)
+            prog.add(DSSrc2Instruction(
+                opcode=DSOpcode.DS_MAX_SRC2_F32,
+                addr=LDSAddressExpression(base_reg=vgpr(0), offset0=idx_a, offset1=idx_b),
+            ))
+
+        executed = self.interp.run_program(prog, self.state)
+        self.assertEqual(executed, 3)
+        self.assertEqual(self.lds.read_dword(0), TWO_F32)
+        self.assertEqual(self.lds.read_dword(2), NEG_ONE_F32)
+        self.assertEqual(self.lds.read_dword(4), ONE_F32)
+
+
 if __name__ == "__main__":
     unittest.main()
