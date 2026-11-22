@@ -290,11 +290,25 @@ class ClosestHit(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<6f", tlas, root + 16),
                          (0.0, 0.0, 0.0, 16777216.0, 1.0, 0.0))
         self.assertEqual(struct.unpack_from("<4f", tlas, instance_offset + 64),
-                         (2.0 ** -24, 0.0, 0.0, 1.0))
+                         (1.0, 0.0, 0.0, 2.0 ** -24))
         tlas_va = mem.place(0x200000, tlas)
         hit = X.trace(mem, tlas_va, (0.25, 0.25, -1.0), (0.0, 0.0, 1.0))
         self.assertIsNotNone(hit)
         self.assertEqual(hit["primitive"], 0)
+
+    def test_world_to_object_is_translation_then_rows(self):
+        # XboxBvhBuilder.dll's LoadInstances stores the world-to-object matrix as its translation (+64, +68, +72)
+        # followed by the 3x3 row by row (+76, +88, +100), and the game's RT shaders read it that way; +0 keeps the
+        # D3D12 3x4 as given. The inverse of a rotation about z by 90 degrees and a shift (1, 2, 3) is the
+        # rotation by -90 degrees and the shift R^T * -(1, 2, 3) = (-2, 1, -3).
+        data, info = X.build_blas([TRI])
+        inst = X.Instance([[0, -1, 0, 1], [1, 0, 0, 2], [0, 0, 1, 3]], 0x12300, info["root"], info["bounds"])
+        tlas, _ = X.build_tlas([inst])
+        off = X.ptr_offset(struct.unpack_from("<4I", tlas, X.ptr_offset(struct.unpack_from("<I", tlas, 48)[0]))[0])
+        self.assertEqual(struct.unpack_from("<12f", tlas, off), (0.0, -1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 2.0,
+                                                                 0.0, 0.0, 1.0, 3.0))
+        self.assertEqual(struct.unpack_from("<12f", tlas, off + 64), (-2.0, 1.0, -3.0, 0.0, 1.0, 0.0, -1.0, 0.0,
+                                                                      0.0, 0.0, 0.0, 1.0))
 
     def test_instance_record(self):
         data, info = X.build_blas([TRI])
@@ -307,9 +321,91 @@ class ClosestHit(unittest.TestCase):
         self.assertEqual(contrib, 0x03000007)
         self.assertEqual(internal, info["root"] | X.INST_IDENTITY_ROTATION)
         self.assertEqual(blas, 0x123)
-        self.assertEqual(struct.unpack_from("<4f", tlas, off + 64), (1.0, 0.0, 0.0, -5.0))
+        self.assertEqual(struct.unpack_from("<4f", tlas, off + 64), (-5.0, 0.0, 0.0, 1.0))
         with self.assertRaises(ValueError):
             X.build_tlas([X.Instance(inst.transform, 0x12340, info["root"], info["bounds"])])
+
+
+class LeafFrame(unittest.TestCase):
+    """Console BLAS keep their leaves in the frame of `compressionParams` (docs/bvh.md §4a); a TLAS over one has to
+    fold that frame into the instance's world-to-object matrix, as the console's LoadInstances does (D3D-412)."""
+
+    SCALE8 = 0x80828282              # bit 31: scale 2^(0x82 - 127) = 8 on every axis
+    SHIFTED = 0xC0848281             # bits 31 and 30: scales 4, 8, 32 and the sceneBounds centre where it does not
+    ROTATED = 0x95838180             # straddle zero; bits 24-29 = 0x15: rotation index 21, scales 2, 4, 16
+
+    def mesh(self):
+        # every coordinate of the scene is positive on x and z, so the translation applies there; y straddles zero
+        return [[[x + 2.0, y - 0.5, 3.0 + 0.25 * x], [x + 2.5, y - 0.5, 3.0], [x + 2.0, y, 3.5]]
+                for x in range(3) for y in range(3)]
+
+    def first_record(self, tlas):
+        return X.ptr_offset(struct.unpack_from("<I", tlas, X.ptr_offset(struct.unpack_from("<I", tlas, 48)[0]))[0])
+
+    def test_a_leaf_frame_blas_keeps_object_bounds_and_stores_leaves_in_the_frame(self):
+        tris = self.mesh()
+        plain, pinfo = X.build_blas(tris)
+        data, info = X.build_blas(tris, compression=self.SHIFTED)
+        self.assertEqual(struct.unpack_from("<I", data, 60)[0], self.SHIFTED)
+        self.assertEqual(struct.unpack_from("<6f", data, 16), struct.unpack_from("<6f", plain, 16))
+        frame = X.leaf_frame(self.SHIFTED, pinfo["bounds"])
+        stored = struct.unpack_from("<3f", data, info["elements"])
+        self.assertEqual(stored, tuple(X.to_leaf_frame(frame, tris[0][0])))
+        self.assertNotEqual(stored, tuple(tris[0][0]))
+        self.assertEqual(X.validate(data, expect_bottom=True), [])
+
+    def test_a_tlas_over_leaf_frame_blas_matches_brute_force(self):
+        rng = random.Random(412)
+        tris = self.mesh()
+        c, s = math.cos(0.6), math.sin(0.6)
+        for word in (self.SCALE8, self.SHIFTED, self.ROTATED):
+            with self.subTest(compression=hex(word)):
+                blas, info = X.build_blas(tris, compression=word)
+                mem = X.Memory()
+                va = mem.place(0x100000, blas)
+                xforms = [[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]],
+                          [[c, -s, 0, -4], [s, c, 0, 1], [0, 0, 1.5, -2]]]
+                insts = [X.Instance(m, va, info["root"], info["bounds"], instance_id=k, compression=word)
+                         for k, m in enumerate(xforms)]
+                tlas, _ = X.build_tlas(insts)
+                va_t = mem.place(0x200000, tlas)
+                scene = [(m, 0xFF, tris) for m in xforms]
+                hits = 0
+                for _ in range(300):
+                    # aim at a point inside a random instance's triangle, so most rays hit something
+                    m, tri = rng.choice(xforms), rng.choice(tris)
+                    w = [rng.random() for _ in range(3)]
+                    p = [sum(w[k] * tri[k][c] for k in range(3)) / sum(w) for c in range(3)]
+                    target = [sum(m[r][c] * p[c] for c in range(3)) + m[r][3] for r in range(3)]
+                    o = [rng.uniform(-10.0, 10.0) for _ in range(3)]
+                    d = [target[c] - o[c] for c in range(3)]
+                    a = X.trace(mem, va_t, o, d)
+                    b = X.brute_force(scene, o, d)
+                    self.assertEqual(a is None, b is None)
+                    if a is not None:
+                        hits += 1
+                        self.assertEqual((a["instance"], a["primitive"]), (b["instance"], b["primitive"]))
+                        self.assertTrue(math.isclose(a["t"], b["t"], rel_tol=1e-4))
+                self.assertGreater(hits, 200)
+
+    def test_the_instance_record_carries_the_frame_and_its_flag(self):
+        blas, info = X.build_blas([TRI], compression=self.SCALE8)
+        inst = X.Instance([[1, 0, 0, 5], [0, 1, 0, 0], [0, 0, 1, 0]], 0x12300, info["root"], info["bounds"],
+                          compression=self.SCALE8)
+        tlas, _ = X.build_tlas([inst])
+        off = self.first_record(tlas)
+        self.assertEqual(struct.unpack_from("<I", tlas, off + 56)[0], info["root"] | X.INST_SCALED_LOCAL_SPACE)
+        self.assertEqual(struct.unpack_from("<4f", tlas, off + 64), (-40.0, 0.0, 0.0, 8.0))
+        self.assertEqual(struct.unpack_from("<4f", tlas, off), (1.0, 0.0, 0.0, 5.0))   # the application's transform
+
+    def test_a_word_without_frame_bits_keeps_the_plain_inverse(self):
+        blas, info = X.build_blas([TRI], compression=0x007F7F7F)
+        inst = X.Instance([[1, 0, 0, 5], [0, 1, 0, 0], [0, 0, 1, 0]], 0x12300, info["root"], info["bounds"],
+                          compression=0x007F7F7F)
+        tlas, _ = X.build_tlas([inst])
+        off = self.first_record(tlas)
+        self.assertEqual(struct.unpack_from("<I", tlas, off + 56)[0], info["root"] | X.INST_IDENTITY_ROTATION)
+        self.assertEqual(struct.unpack_from("<4f", tlas, off + 64), (-5.0, 0.0, 0.0, 1.0))
 
 
 class Validate(unittest.TestCase):

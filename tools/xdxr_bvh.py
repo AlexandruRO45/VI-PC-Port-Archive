@@ -90,6 +90,67 @@ def ptr_type(p):
     return p & 7
 
 
+# ---- the leaf frame (compressionParams, docs/bvh.md 4a) ----
+# A console BLAS stores its leaves and nodes as (R * v - t) * s, with s, t and R taken from the header word
+# compressionParams (+60): bit 31 turns on a per-axis scale 2^(e - 127), e the bytes 0, 1 and 2; bit 30 a translation,
+# the sceneBounds centre on each axis whose bounds do not straddle zero; bits 24-29 one of 64 rotations. sceneBounds
+# stay in object space. The console's LoadInstances folds that frame into an instance's world-to-object matrix when
+# any of bits 24-31 is set, and marks the record with INST_SCALED_LOCAL_SPACE (D3D-412).
+def _rotation(index):
+    """Rotation index -> 3x3 matrix Rz * Ry * Rx, each angle a multiple of pi/8, products rounded to float32."""
+    c = (1.0, math.cos(math.pi / 8), math.cos(math.pi / 4), math.cos(3 * math.pi / 8), 0.0)
+    ix, iy, iz = index & 3, (index >> 2) & 3, (index >> 4) & 3
+    cx, sx, cy, sy, cz, sz = (f32(c[ix]), f32(c[4 - ix]), f32(c[iy]), f32(c[4 - iy]), f32(c[iz]), f32(c[4 - iz]))
+    rx = ((1.0, 0.0, 0.0), (0.0, cx, sx), (0.0, -sx, cx))
+    ry = ((cy, 0.0, -sy), (0.0, 1.0, 0.0), (sy, 0.0, cy))
+    rz = ((cz, sz, 0.0), (-sz, cz, 0.0), (0.0, 0.0, 1.0))
+
+    def mul(a, b):
+        out = []
+        for r in range(3):
+            row = []
+            for col in range(3):
+                acc = 0.0
+                for k in range(3):
+                    acc = f32(acc + f32(a[r][k] * b[k][col]))
+                row.append(acc)
+            out.append(row)
+        return out
+
+    return mul(rz, mul(ry, rx))
+
+
+def leaf_frame(word, bounds):
+    """(R, t, s) of a compressionParams ``word`` for a BLAS whose object-space sceneBounds are ``bounds``, or None when
+    bits 24-31 are clear (LoadInstances applies no frame then)."""
+    if word <= 0xFFFFFF:
+        return None
+    lo, hi = bounds
+    t = [0.0, 0.0, 0.0]
+    if word >> 30 & 1:
+        for a in range(3):
+            if lo[a] > 0.0 or hi[a] < 0.0:
+                t[a] = f32(f32(lo[a] + hi[a]) * 0.5)
+    s = [1.0, 1.0, 1.0]
+    if word >> 31 & 1:
+        s = [struct.unpack("<f", struct.pack("<I", ((word >> (8 * a)) & 0xFF) << 23))[0] for a in range(3)]
+    return _rotation((word >> 24) & 0x3F), t, s
+
+
+def to_leaf_frame(frame, v):
+    """An object-space point in the leaf frame, (R * v - t) * s in float32."""
+    if frame is None:
+        return tuple(f32(c) for c in v)
+    r, t, s = frame
+    out = []
+    for row in range(3):
+        acc = f32(r[row][0] * v[0])
+        acc = f32(r[row][1] * v[1] + acc)
+        acc = f32(r[row][2] * v[2] + acc)
+        out.append(f32(f32(acc - t[row]) * s[row]))
+    return tuple(out)
+
+
 # ---- half-float bounds (Node16) ----
 def _half_bits(x):
     return struct.unpack("<H", struct.pack("<e", x))[0]
@@ -269,10 +330,10 @@ def _write_parents(buf, parents_off, elements_off, end, parent_of, root_ptr):
         struct.pack_into("<I", buf, parents_off + 4 * u, parent)
 
 
-def _write_header(buf, flags, end, n_elements, bounds, nodes_off, root, elements_off, parents_off):
+def _write_header(buf, flags, end, n_elements, bounds, nodes_off, root, elements_off, parents_off, compression=0):
     lo, hi = bounds
     struct.pack_into("<4I6fIiIIII", buf, 0, flags, end // UNIT - 1, 0, n_elements, *lo, *hi,
-                     nodes_off, 0, root, elements_off, parents_off, 0)
+                     nodes_off, 0, root, elements_off, parents_off, compression)
 
 
 def _remap_for(tri, order):
@@ -320,14 +381,19 @@ def _pair_triangles(tris):
     return leaves
 
 
-def build_blas(triangles, geometry_index=0, flags=0, box16=False, pair=False, opaque=True):
+def build_blas(triangles, geometry_index=0, flags=0, box16=False, pair=False, opaque=True, compression=0):
     """Bottom-level BVH4 from triangles (each three xyz points). Returns (bytes, info). Primitive indices are the
     triangles' positions in the list; ``flags`` is the geometry's D3D12_RAYTRACING_GEOMETRY_FLAGS (bit 0 opaque).
     With ``pair`` two triangles that share an edge go into one leaf as TRI0 and TRI1 (ASSUMPTION: greedy pairing;
-    the console builder's packing is not public)."""
+    the console builder's packing is not public). A ``compression`` word with any of bits 24-31 set builds the BLAS
+    in that leaf frame, as console BLAS are: leaves and nodes in the frame, sceneBounds in object space."""
     tris = [[[f32(c) for c in p] for p in t] for t in triangles]
     if not tris:
         raise ValueError("a BLAS needs at least one triangle")
+    scene_bounds = _bounds([p for t in tris for p in t])
+    frame = leaf_frame(compression, scene_bounds)
+    if frame is not None:
+        tris = [[list(to_leaf_frame(frame, p)) for p in t] for t in tris]
     gflags = (flags | (1 if opaque else 0)) & 0xFF
     if pair:
         leaves = _pair_triangles(tris)
@@ -362,10 +428,12 @@ def build_blas(triangles, geometry_index=0, flags=0, box16=False, pair=False, op
     _write_nodes(buf, inner, node_offsets, child_ptr, child_box, box16, parent_of)
     root_ptr = ptr(node_offsets[id(root)], kind)
     _write_parents(buf, parents_off, elements_off, end, parent_of, root_ptr)
-    _write_header(buf, FLAG_BOTTOM_LEVEL | VERSION_2403, end, len(refs), root.box, nodes_off, root_ptr,
-                  elements_off, parents_off)
+    bounds = scene_bounds if frame is not None else root.box
+    _write_header(buf, FLAG_BOTTOM_LEVEL | VERSION_2403, end, len(refs), bounds, nodes_off, root_ptr,
+                  elements_off, parents_off, compression)
     info = {"size": end, "root": root_ptr, "leaves": len(leaves), "triangles": len(refs), "nodes": len(inner),
-            "bounds": root.box, "elements": elements_off, "parents": parents_off, "node_offset": nodes_off}
+            "bounds": bounds, "elements": elements_off, "parents": parents_off, "node_offset": nodes_off,
+            "compression": compression}
     return bytes(buf), info
 
 
@@ -373,7 +441,7 @@ class Instance:
     """One D3D12_RAYTRACING_INSTANCE_DESC plus what the encoder needs from its BLAS."""
 
     def __init__(self, transform, blas_va, blas_root, blas_bounds, instance_id=0, mask=0xFF, contribution=0,
-                 flags=0):
+                 flags=0, compression=0):
         # Derive the inverse and bounds from the float32 matrix stored in the instance record.
         self.transform = [[f32(x) for x in row] for row in transform]
         self.blas_va = blas_va
@@ -383,6 +451,7 @@ class Instance:
         self.mask = mask
         self.contribution = contribution
         self.flags = flags
+        self.compression = compression     # the BLAS's compressionParams (+60), as LoadInstances reads it
 
 
 def _world_box(inst):
@@ -390,6 +459,29 @@ def _world_box(inst):
     corners = [[(lo, hi)[(i >> c) & 1][c] for c in range(3)] for i in range(8)]
     pts = [_transform_point(inst.transform, p) for p in corners]
     return _bounds(pts)
+
+
+def _pack_world_to_object(m):
+    """The 12 floats at instance +64: the translation, then the 3x3 row by row. That is the order
+    XboxBvhBuilder.dll's LoadInstances stores and the game's RT shaders read (+64 translation, rows at +76, +88,
+    +100); +0 keeps the D3D12 3x4 row-major."""
+    return [m[0][3], m[1][3], m[2][3]] + [m[r][c] for r in range(3) for c in range(3)]
+
+
+def _unpack_world_to_object(w):
+    """Instance +64 back into a 3x4 (rows of rotation | translation)."""
+    return [[w[3 + 3 * r], w[4 + 3 * r], w[5 + 3 * r], w[r]] for r in range(3)]
+
+
+def _fold_leaf_frame(frame, inv):
+    """World-to-object 3x4 ``inv`` followed by the BLAS's leaf frame: (R * inv - t) * s, row by row."""
+    r, t, s = frame
+    out = []
+    for row in range(3):
+        lin = [sum(r[row][k] * inv[k][c] for k in range(3)) for c in range(4)]
+        lin[3] -= t[row]
+        out.append([f32(x * s[row]) for x in lin])
+    return out
 
 
 def build_tlas(instances, box16=False):
@@ -411,12 +503,19 @@ def build_tlas(instances, box16=False):
         off = elements_off + h * INSTANCE_SIZE
         inv = invert_affine(inst.transform)
         identity_rot = all(inst.transform[r][c] == (1.0 if r == c else 0.0) for r in range(3) for c in range(3))
+        frame = leaf_frame(inst.compression, inst.blas_bounds)
+        if frame is not None:
+            inv = _fold_leaf_frame(frame, inv)
+            # LoadInstances keeps the identity flag only without a scale (bit 31) and with rotation index 0
+            identity_rot = identity_rot and not inst.compression >> 31 & 1 and not (inst.compression >> 24) & 0x3F
         internal = (inst.blas_root & ~INST_FLAGS_MASK) | (INST_IDENTITY_ROTATION if identity_rot else 0)
+        if frame is not None:
+            internal |= INST_SCALED_LOCAL_SPACE
         struct.pack_into("<12f", buf, off, *[x for row in inst.transform for x in row])
         struct.pack_into("<4I", buf, off + 48, (inst.instance_id & 0xFFFFFF) | (inst.mask & 0xFF) << 24,
                          (inst.contribution & 0xFFFFFF) | (inst.flags & 0xFF) << 24, internal,
                          inst.blas_va >> 8)
-        struct.pack_into("<12f", buf, off + 64, *[x for row in inv for x in row])
+        struct.pack_into("<12f", buf, off + 64, *_pack_world_to_object(inv))
         struct.pack_into("<4I", buf, off + 112, h, INVALID, 0, 0)
         inst_ptrs[h] = ptr(off, INSTANCE)
     node_offsets = {id(n): nodes_off + i * node_size for i, n in enumerate(inner)}
@@ -611,8 +710,7 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0, stats=None):
             id_mask, _, internal, blas = mem.u32(rec + 48, 4)
             if not (id_mask >> 24) & mask or blas == 0:         # masked out, or an instance with no BLAS
                 continue
-            w2o = mem.f32(rec + 64, 12)
-            m = [list(w2o[0:4]), list(w2o[4:8]), list(w2o[8:12])]
+            m = _unpack_world_to_object(mem.f32(rec + 64, 12))
             lo, ld = _transform_point(m, org), _transform_dir(m, d)
             blas_va = (blas << 8) + bias
             root = internal & ~INST_FLAGS_MASK
@@ -933,7 +1031,10 @@ def check_build(directory, rays=300, seed=1):
             for inst in desc["instances"]:
                 m = inst["transform"]
                 rows = [m[0:4], m[4:8], m[8:12]]
-                src = blas[inst["blas"]]["triangles"] if inst["blas"] >= 0 else []
+                # a leaf-frame BLAS lists its triangles twice: in the frame, as its own build saw them, and in object
+                # space, for the instances that place it (D3D-412)
+                src = (blas[inst["blas"]].get("object_triangles", blas[inst["blas"]]["triangles"])
+                       if inst["blas"] >= 0 else [])
                 scene.append((rows, inst["mask"], [t[:3] for t in src]))
                 inst_ids.append([(t[3], t[4]) for t in src])      # list position -> (geometry, primitive)
         stats = {"steps": 0}
@@ -959,10 +1060,12 @@ def check_build(directory, rays=300, seed=1):
                 same = same and all(math.isclose(g, w, rel_tol=1e-5, abs_tol=1e-6)
                                     for g, w in zip(got["bary"], want["bary"]))
             else:
-                # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t
+                # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t. That
+                # rounding is absolute (a few ulp of the scene's coordinates), so a hit at a tiny t needs a floor too:
+                # one ray of the TLAS case hit the same triangle at t = 1.62e-4, 2e-8 apart
                 want_id = inst_ids[want["instance"]][want["primitive"]]
                 same = (got["instance"], (got["geometry"], got["primitive"])) == (want["instance"], want_id)
-                same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
+                same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4, abs_tol=1e-6)
             bad += not same
         paired = f", {pairs} TRI1" if pairs else ""
         print(f"{n}: {len(data)} bytes{paired}, {len(errs)} validation errors, {bad}/{case_rays} rays differ "

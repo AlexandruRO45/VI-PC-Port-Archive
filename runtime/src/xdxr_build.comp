@@ -86,7 +86,7 @@ const uint LEAF = 0x80000000u;              // a binary child that is a sorted e
 const uint REMAP_IDENTITY = 0x09u;
 const uint FLAG_TLAS = 1u, FLAG_BOX16 = 2u, FLAG_PAIR = 4u;  // pc.flags; xdxr_build.h XdxrBuilder flag_*
 const uint FLAG_BOTTOM_LEVEL = 0x80000000u, VERSION_2403 = 6u, INST_IDENTITY_ROTATION = 0x80000000u,
-           INST_FLAGS_MASK = 0xc0000000u;
+           INST_SCALED_LOCAL_SPACE = 0x40000000u, INST_FLAGS_MASK = 0xc0000000u;
 
 layout(push_constant) uniform Push {
     uvec2 dst;            // the acceleration structure (header at byte 0)
@@ -273,6 +273,21 @@ void build_triangle(uint t) {
 }
 
 // ---- MODE_INSTANCES ----
+// A console BLAS keeps its leaves and nodes in the frame of its compressionParams (+60, docs/bvh.md 4a):
+// (R * v - t) * s, with a per-axis scale 2^(e - 127) (bit 31, e = bytes 0-2), the sceneBounds centre on each axis
+// whose bounds do not straddle zero (bit 30) and one of 64 rotations Rz * Ry * Rx in steps of pi/8 (bits 24-29).
+// The console's LoadInstances folds that frame into the world-to-object matrix whenever any of bits 24-31 is set and
+// marks the record with INST_SCALED_LOCAL_SPACE (D3D-412); tools/xdxr_bvh.py build_tlas is the reference.
+mat3 leaf_rotation(uint index) {                         // rows: r[row][col] = result[col][row] in GLSL's columns
+    const float c[5] = float[5](1.0, 0.9238795, 0.70710677, 0.38268343, 0.0);
+    uint ix = index & 3u, iy = (index >> 2u) & 3u, iz = (index >> 4u) & 3u;
+    float cx = c[ix], sx = c[4u - ix], cy = c[iy], sy = c[4u - iy], cz = c[iz], sz = c[4u - iz];
+    mat3 rx = transpose(mat3(1.0, 0.0, 0.0, 0.0, cx, sx, 0.0, -sx, cx));     // written row by row
+    mat3 ry = transpose(mat3(cy, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cy));
+    mat3 rz = transpose(mat3(cz, sz, 0.0, -sz, cz, 0.0, 0.0, 0.0, 1.0));
+    return rz * (ry * rx);
+}
+
 void build_instance(uint i) {
     uint d = 64u * i;
     float m[12];
@@ -284,12 +299,14 @@ void build_instance(uint i) {
     store(pc.dst, o + 48u, id_mask);
     store(pc.dst, o + 52u, contrib);
     vec3 lo = vec3(uintBitsToFloat(0x7f800000u)), hi = -lo;
-    uint root = INVALID;
+    uint root = INVALID, compression = 0u;
+    vec3 blo = vec3(0.0), bhi = vec3(0.0);
     if (!is_null(blas_va)) {
         uvec2 blas = add64(blas_va, pc.bias);
         root = load(blas, 48u);
-        vec3 blo = vec3(uintBitsToFloat(load(blas, 16u)), uintBitsToFloat(load(blas, 20u)), uintBitsToFloat(load(blas, 24u)));
-        vec3 bhi = vec3(uintBitsToFloat(load(blas, 28u)), uintBitsToFloat(load(blas, 32u)), uintBitsToFloat(load(blas, 36u)));
+        compression = load(blas, 60u);
+        blo = vec3(uintBitsToFloat(load(blas, 16u)), uintBitsToFloat(load(blas, 20u)), uintBitsToFloat(load(blas, 24u)));
+        bhi = vec3(uintBitsToFloat(load(blas, 28u)), uintBitsToFloat(load(blas, 32u)), uintBitsToFloat(load(blas, 36u)));
         if (!box_empty(blo, bhi) && (id_mask >> 24) != 0u) {     // mask 0: never hit, no box
             for (uint c = 0u; c < 8u; ++c) {
                 vec3 p = vec3((c & 1u) != 0u ? bhi.x : blo.x, (c & 2u) != 0u ? bhi.y : blo.y, (c & 4u) != 0u ? bhi.z : blo.z);
@@ -302,7 +319,11 @@ void build_instance(uint i) {
     }
     bool identity = m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[4] == 0.0 && m[5] == 1.0 && m[6] == 0.0 &&
                     m[8] == 0.0 && m[9] == 0.0 && m[10] == 1.0;
-    store(pc.dst, o + 56u, (root & ~INST_FLAGS_MASK) | (identity ? INST_IDENTITY_ROTATION : 0u));
+    bool framed = compression > 0xffffffu;
+    // LoadInstances keeps the identity flag only without a scale (bit 31) and with rotation index 0
+    if (framed && ((compression >> 31u) != 0u || ((compression >> 24u) & 0x3fu) != 0u)) identity = false;
+    store(pc.dst, o + 56u, (root & ~INST_FLAGS_MASK) | (identity ? INST_IDENTITY_ROTATION : 0u) |
+                           (framed ? INST_SCALED_LOCAL_SPACE : 0u));
     // The record holds the BLAS address in 256-byte units: the application's address, as the game wrote it.
     store(pc.dst, o + 60u, (blas_va.x >> 8) | (blas_va.y << 24));
     // world-to-object: the inverse of the affine transform
@@ -311,11 +332,31 @@ void build_instance(uint i) {
     mat3 inv = det != 0.0 ? inverse(a) : mat3(0.0);
     vec3 t = vec3(m[3], m[7], m[11]);
     vec3 it = -(inv * t);
+    if (framed) {                                         // then the leaf frame: (R * inv - t) * s, row by row
+        mat3 r = leaf_rotation((compression >> 24u) & 0x3fu);
+        vec3 shift = vec3(0.0), scale = vec3(1.0);
+        if ((compression & 0x40000000u) != 0u)
+            for (uint axis = 0u; axis < 3u; ++axis)
+                if (blo[axis] > 0.0 || bhi[axis] < 0.0) shift[axis] = (blo[axis] + bhi[axis]) * 0.5;
+        if ((compression & 0x80000000u) != 0u)
+            scale = vec3(uintBitsToFloat((compression & 0xffu) << 23u), uintBitsToFloat(((compression >> 8u) & 0xffu) << 23u),
+                         uintBitsToFloat(((compression >> 16u) & 0xffu) << 23u));
+        inv = r * inv;
+        it = r * it - shift;
+        for (uint row = 0u; row < 3u; ++row) {
+            inv[0][row] *= scale[row];
+            inv[1][row] *= scale[row];
+            inv[2][row] *= scale[row];
+            it[row] *= scale[row];
+        }
+    }
+    // +64: the translation, then the 3x3 row by row at +76, +88, +100, as the console's LoadInstances stores it and
+    // the game's RT shaders read it (tools/xdxr_bvh.py _pack_world_to_object)
     for (uint row = 0u; row < 3u; ++row) {
-        storef(pc.dst, o + 64u + 16u * row, inv[0][row]);
-        storef(pc.dst, o + 68u + 16u * row, inv[1][row]);
-        storef(pc.dst, o + 72u + 16u * row, inv[2][row]);
-        storef(pc.dst, o + 76u + 16u * row, it[row]);
+        storef(pc.dst, o + 64u + 4u * row, it[row]);
+        storef(pc.dst, o + 76u + 12u * row, inv[0][row]);
+        storef(pc.dst, o + 80u + 12u * row, inv[1][row]);
+        storef(pc.dst, o + 84u + 12u * row, inv[2][row]);
     }
     store(pc.dst, o + 112u, i);
     store(pc.dst, o + 116u, INVALID);          // parent node: MODE_PROPAGATE fills it

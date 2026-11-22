@@ -494,7 +494,12 @@ structure, 2 to 21,814 leaves). The other two were identified later (below) and 
 * *Leaf frame.* Leaf vertices are `(R * v - t) * s`, from `compressionParams`: bit 31 enables a per-axis scale
   `2^(e - 127)` with `e` the bytes 0, 1 and 2; bit 30 enables a translation per axis, the centre of `sceneBounds`
   where the bounds do not straddle zero; bits 24-29 select one of 64 rotations, `Rz * Ry * Rx` in steps of pi/8
-  about each axis (index 0, the identity, on every sample).
+  about each axis (index 0, the identity, on every sample). A traversal never reads this word: the console's
+  `LoadInstances` folds the frame into each instance's world-to-object matrix, `(R * M^-1 - t) * s`, and sets
+  `INST_SCALED_LOCAL_SPACE` (bit 30 of the root-pointer word) whenever any of bits 24-31 is set. Every BLAS of the
+  `shared_minigame000_bvh4` (1,237) and `core_bvh4` (271,627) packs has bit 31 set, 105 and 28,410 of them bit 30,
+  and none uses a rotation. Both Leonida builders do the same
+  (`tools/xdxr_bvh.py` `build_tlas`, `runtime/src/xdxr_build.comp`; D3D-412).
 
 **The packing holds on every stream (structure only).** The byte-exact match above covers 8 samples.
 `tools/bvh_packing_check.py` reads every stream with the same packing, without geometry (§7). It checks that the
@@ -948,7 +953,7 @@ What it writes, and where each part comes from (line numbers in the public `.hls
 | Leaf | vertex slots 0–3, then `GeometryIndexAndFlags` (index << 8 \| flags), `BasePrimitiveIndex` (TRI0), `PrimitiveIndex2` (TRI1), one remap byte per triangle node type | `Leaf` L2342, `XDXR_Runtime_Callback_GetPrimitiveIndex` |
 | TRI0 / TRI1 | TRI0 reads slots (0, 1, 2), TRI1 reads (1, 3, 2); TRI2/TRI3 read slot 4, which overlaps the metadata, and are not emitted | `Read3Verts`, `XdxrGetVertexIndicesForNodeType` |
 | Barycentric remap | byte `8 * type` of leaf `+60`: bits [1:0] pick which edge function is the first barycentric (0 U, 1 V, 2 W), [3:2] the second; U weighs the first vertex read | `TestXboxBvh4Leaf` |
-| INSTANCE | 128 bytes: object-to-world 3×4, ID \| mask << 24, contribution \| flags << 24, BLAS root pointer with bit 31 = identity rotation, BLAS address >> 8, world-to-object 3×4, instance index, parent | `Instance` L2436, `XDXR_INSTANCE_INTERNAL_FLAGS_*` |
+| INSTANCE | 128 bytes: object-to-world 3×4, ID \| mask << 24, contribution \| flags << 24, BLAS root pointer with bit 31 = identity rotation and bit 30 = scaled local space, BLAS address >> 8, world-to-object (+64: its translation, then the 3×3 row by row at +76, +88 and +100, unlike the row-major object-to-world at +0), instance index, parent. When the BLAS's `compressionParams` has any of bits 24-31 set, the world-to-object 3×4 is followed by the BLAS's leaf frame (§4a) and bit 30 is set; bit 31 then needs a clear scale bit and rotation index 0 | `Instance` L2436, `XDXR_INSTANCE_INTERNAL_FLAGS_*`; the leaf frame and the +64 order from `XboxBvhBuilder.dll`'s `LoadInstances` and the game's RT shaders (D3D-412) |
 | Parent table | one dword per 64-byte unit from `offsetToElements` on; the entry for unit `u` is at dword `u - offsetToElements/64 + offsetToParents/4` | `XboxBvh4Node_GetParentTableOffset` |
 
 **ASSUMPTION:** the region order (header, parent table, elements, nodes), the median-split build and the greedy

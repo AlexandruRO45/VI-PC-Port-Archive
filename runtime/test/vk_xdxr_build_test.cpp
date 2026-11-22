@@ -12,6 +12,8 @@
 // including coordinates past the half range and below its smallest normal, and a refit; TRI1 pairing (blas_paired_*:
 // sibling triangles that share an edge in one leaf), on grids, BOX16, a transform, inactive triangles, triangles that
 // share an edge in the same direction or across geometries (never paired), and the radix-sort path.
+// Two BLAS in a console leaf frame (compressionParams: scale and translation, then scale and a rotation) and a TLAS
+// over them, whose world-to-object matrices must fold that frame in (D3D-412).
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
 // `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
 // one submission each, after one warm-up; result and scratch in device-local memory), then in-place updates
@@ -132,6 +134,43 @@ struct Built {
     std::vector<Tri> tris;
 };
 
+// The console leaf frame (docs/bvh.md 4a, tools/xdxr_bvh.py leaf_frame): rotation index -> Rz * Ry * Rx in steps of
+// pi/8, products rounded to float; then (R * v - t) * s from a compressionParams word and object-space bounds.
+void leaf_rotation(std::uint32_t index, float r[3][3]) {
+    const float c[5] = {1.0f, 0.9238795f, 0.70710677f, 0.38268343f, 0.0f};
+    const std::uint32_t ix = index & 3, iy = (index >> 2) & 3, iz = (index >> 4) & 3;
+    const float cx = c[ix], sx = c[4 - ix], cy = c[iy], sy = c[4 - iy], cz = c[iz], sz = c[4 - iz];
+    const float rx[3][3] = {{1, 0, 0}, {0, cx, sx}, {0, -sx, cx}};
+    const float ry[3][3] = {{cy, 0, -sy}, {0, 1, 0}, {sy, 0, cy}};
+    const float rz[3][3] = {{cz, sz, 0}, {-sz, cz, 0}, {0, 0, 1}};
+    auto mul = [](const float a[3][3], const float b[3][3], float out[3][3]) {
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) {
+                volatile float acc = 0.0f;   // float32 at every step, as the reference rounds it
+                for (int k = 0; k < 3; ++k) { volatile float p = a[i][k] * b[k][j]; acc = acc + p; }
+                out[i][j] = acc;
+            }
+    };
+    float ryx[3][3];
+    mul(ry, rx, ryx);
+    mul(rz, ryx, r);
+}
+
+void to_leaf_frame(std::uint32_t word, const float lo[3], const float hi[3], const float v[3], float out[3]) {
+    float r[3][3];
+    leaf_rotation((word >> 24) & 0x3f, r);
+    for (int a = 0; a < 3; ++a) {
+        float t = 0.0f, s = 1.0f;
+        if (((word >> 30) & 1) && (lo[a] > 0.0f || hi[a] < 0.0f)) t = (lo[a] + hi[a]) * 0.5f;
+        if ((word >> 31) & 1) { const std::uint32_t bits = ((word >> (8 * a)) & 0xff) << 23; std::memcpy(&s, &bits, 4); }
+        volatile float acc = r[a][0] * v[0];
+        acc = r[a][1] * v[1] + acc;
+        acc = r[a][2] * v[2] + acc;
+        volatile float shifted = acc - t;
+        out[a] = shifted * s;
+    }
+}
+
 // With `moved` (the same geometries with new vertex positions) the BLAS is then updated: refitted in place, or with
 // `into_other` into a second buffer, in which case the untouched source is written too, as <name>_source.
 // `box16`: BOX16 inner nodes. `pair`: TRI1 pairing; the case's JSON then asks check-build for at least one TRI1
@@ -139,7 +178,9 @@ struct Built {
 int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir, const std::string& name,
                const std::vector<Geometry>& geometries, Built& built, unsigned rays = 0,
                const std::vector<Geometry>* moved = nullptr, bool into_other = false, bool box16 = false,
-               bool pair = false, bool expect_no_pairs = false) {
+               bool pair = false, bool expect_no_pairs = false, std::uint32_t compression = 0,
+               const std::vector<Tri>* object_tris = nullptr, const float* scene_lo = nullptr,
+               const float* scene_hi = nullptr) {
     std::vector<Buffer> keep, vertex_buffers;
     std::vector<XdxrTriangles> descs;
     std::uint32_t total = 0;
@@ -201,12 +242,20 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
                                                  : "") +
                                  (box16 ? ", \"box16\": true" : ", \"box16\": false") +
                                  (name == "blas_paired_rotations" ? ", \"all_rotations\": true" : "") +
-                                 ", \"triangles\": " + tris_json(tris) + "}\n";
+                                 ", \"triangles\": " + tris_json(tris) +
+                                 (object_tris ? ", \"object_triangles\": " + tris_json(*object_tris) : std::string()) + "}\n";
         const std::size_t size = header_size(bytes);
         if (size > layout.size) return false;
         return write_file(dir + "/" + case_name + ".bin", bytes, size) &&
                write_file(dir + "/" + case_name + ".json", json.data(), json.size());
     };
+    if (compression) {
+        // a console BLAS: leaves and nodes in the leaf frame, sceneBounds in object space, the word at +60
+        char* header = static_cast<char*>(dst.map) + (base - dst.address);
+        std::memcpy(header + 16, scene_lo, 12);
+        std::memcpy(header + 28, scene_hi, 12);
+        std::memcpy(header + 60, &compression, 4);
+    }
     if (!moved) {
         EXPECT(dump(name, dst, base, built.tris));
         std::printf("%s: %u triangles, %u bytes, %u nodes\n", name.c_str(), total, layout.size, layout.nodes);
@@ -608,6 +657,76 @@ int main(int argc, char** argv) {
         EXPECT(write_file(dir + "/tlas_refit_clone.json", json3.data(), json3.size()));
         std::printf("copies: blas_clone, blas_compacted (%llu bytes), tlas_refit_clone\n",
                     static_cast<unsigned long long>(compacted));
+    }
+
+    // Console leaf frames (D3D-412). Each BLAS is built from triangles already mapped into the frame, then given its
+    // object-space sceneBounds and compressionParams, as console BLAS are. The scene lies at positive x and z, so
+    // bit 30 translates those axes; y straddles zero and keeps no translation.
+    Built framed, framed_rotated;
+    auto frame_case = [&](const char* name, std::uint32_t word, Built& out) -> int {
+        Geometry g = grid(6, 3, false);
+        for (std::size_t v = 0; v + 2 < g.vertex_data.size(); v += 3) {
+            g.vertex_data[v] += 5.0f;
+            g.vertex_data[v + 2] += 3.0f;
+        }
+        std::vector<Tri> object;
+        expand(g, 0, object);
+        float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+        for (const Tri& tri : object)
+            for (int k = 0; k < 3; ++k)
+                for (int a = 0; a < 3; ++a) { lo[a] = std::min(lo[a], tri.v[k][a]); hi[a] = std::max(hi[a], tri.v[k][a]); }
+        for (std::size_t v = 0; v + 2 < g.vertex_data.size(); v += 3) {
+            const float p[3] = {g.vertex_data[v], g.vertex_data[v + 1], g.vertex_data[v + 2]};
+            to_leaf_frame(word, lo, hi, p, &g.vertex_data[v]);
+        }
+        return build_blas(gpu, builder, dir, name, {g}, out, 0, nullptr, false, false, false, false, word, &object, lo, hi);
+    };
+    if (frame_case("blas_leaf_frame", 0xC0848281u, framed)) return 1;               // scales 2^2, 2^3, 2^5; translation
+    if (frame_case("blas_leaf_frame_rotated", 0x95807F80u, framed_rotated)) return 1;  // rotation 21; scales 2, 1, 2
+    {
+        const std::uint64_t fbias = (std::min(framed.address, framed_rotated.address) - 0x10000) & ~std::uint64_t(0xffff);
+        auto fva = [&](std::uint64_t device) { return device - fbias; };
+        const Inst finsts[] = {
+            {{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, 0xff000000u | 20, 0, fva(framed.address), 0},
+            {{c, -s, 0, -12, s, c, 0, 1, 0, 0, 1.5f, -2}, 0xff000000u | 21, 0, fva(framed.address), 0},
+            {{c, 0, s, -6, 0, 1, 0, 7, -s, 0, c, -4}, 0xff000000u | 22, 0, fva(framed_rotated.address), 1},
+        };
+        const std::uint32_t fcount = sizeof finsts / sizeof finsts[0];
+        for (const Inst& i : finsts) EXPECT(i.blas < (std::uint64_t(1) << 40));
+        Buffer fdescs = make(gpu, 64 * fcount);
+        EXPECT(fdescs.buffer);
+        for (std::uint32_t i = 0; i < fcount; ++i) {
+            auto* d = static_cast<char*>(fdescs.map) + 64 * i;
+            std::memcpy(d, finsts[i].m, 48);
+            std::memcpy(d + 48, &finsts[i].id_mask, 4);
+            std::memcpy(d + 52, &finsts[i].contrib, 4);
+            std::memcpy(d + 56, &finsts[i].blas, 8);
+        }
+        XdxrLayout flayout;
+        EXPECT(flayout.compute(fcount, true));
+        Buffer fdst = make(gpu, flayout.size + 256), fscratch = make(gpu, std::size_t(flayout.scratch));
+        EXPECT(fdst.buffer && fscratch.buffer);
+        const std::uint64_t fbase = (fdst.address + 255) & ~std::uint64_t(255);
+        EXPECT(gpu.run([&](VkCommandBuffer cb) {
+            const bool ok = builder.record_tlas(cb, flayout, fdescs.address, fbase, fscratch.address, fbias);
+            barrier_to_host(gpu, cb);
+            return ok;
+        }));
+        EXPECT(write_file(dir + "/tlas_leaf_frame.bin", static_cast<const char*>(fdst.map) + (fbase - fdst.address),
+                          flayout.size));
+        std::string fjson = "{\"kind\": \"tlas\", \"address\": " + std::to_string(fbase) + ", \"bias\": " +
+                            std::to_string(fbias) + ", \"blas\": [\"blas_leaf_frame\", \"blas_leaf_frame_rotated\"], " +
+                            "\"instances\": [";
+        for (std::uint32_t i = 0; i < fcount; ++i) {
+            fjson += i ? ", {" : "{";
+            fjson += "\"transform\": [";
+            for (int k = 0; k < 12; ++k) fjson += (k ? ", " : "") + num(finsts[i].m[k]);
+            fjson += "], \"mask\": " + std::to_string(finsts[i].id_mask >> 24) + ", \"blas\": " +
+                     std::to_string(finsts[i].which) + "}";
+        }
+        fjson += "]}\n";
+        EXPECT(write_file(dir + "/tlas_leaf_frame.json", fjson.data(), fjson.size()));
+        std::printf("tlas_leaf_frame: %u instances over two leaf-frame BLAS, %u bytes\n", fcount, flayout.size);
     }
     std::printf("tlas: %u instances, %u bytes\nvk_xdxr_build_test: built every case\n", count, layout.size);
     return 0;
