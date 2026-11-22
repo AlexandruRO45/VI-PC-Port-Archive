@@ -164,6 +164,7 @@ def rewrite(text):
               f"%gsc_n = OpVariable %gsc_ptr_pv_u Private {k(0)}"]
     out_vars = {v: f"%gsc_out{i}" for i, v in enumerate(outs)}
     types += [f"{nv} = OpVariable %gsc_ptr_pv_v4 Private" for nv in out_vars.values()]
+    output_pointer_types = dict.fromkeys(out_vars, "%gsc_ptr_pv_v4")
     in_slot = {v: i for i, v in enumerate(ins)}
     lowered_input_pointers = {}
     gone = set(ins) | set(outs) | {v for v, b in builtins.items() if b in ("PrimitiveId", "InvocationId")}
@@ -262,17 +263,20 @@ def rewrite(text):
                 else:
                     out.append(f"{result} = {chain} {ptr} {base}{indices or ''}")
                 continue
-            if base in out_vars and indices is not None:
+            if base in output_pointer_types:
                 ptr = "%gsc_ptr_pv_f" if result_type in float_ptrs else "%gsc_ptr_pv_v4"
-                out.append(f"{result} = OpAccessChain {ptr} {out_vars[base]}{indices}")
+                output_pointer_types[result] = ptr
+                out.append(f"{result} = OpAccessChain {ptr} {out_vars.get(base, base)}{indices or ''}")
                 continue
         m = re.match(r"(%\w+) = OpCopyObject %\w+ (%\w+)$", s)
-        if m and m.group(2) in lowered_input_pointers:
+        if m:
             result, source = m.groups()
-            ptr = lowered_input_pointers[source]
-            lowered_input_pointers[result] = ptr
-            out.append(f"{result} = OpCopyObject {ptr} {source}")
-            continue
+            pointer_types = output_pointer_types if source in output_pointer_types else lowered_input_pointers
+            if source in pointer_types:
+                ptr = pointer_types[source]
+                pointer_types[result] = ptr
+                out.append(f"{result} = OpCopyObject {ptr} {out_vars.get(source, source)}")
+                continue
         m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):
             val = "%gsc_prim" if builtins[m.group(3)] == "PrimitiveId" else k(0)

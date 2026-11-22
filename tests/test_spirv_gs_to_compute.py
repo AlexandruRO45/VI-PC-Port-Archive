@@ -195,6 +195,49 @@ def validate_vulkan12(module: Path, assembly: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+@pytest.mark.parametrize(("alias_op", "component"), [
+    ("OpAccessChain", False),
+    ("OpInBoundsAccessChain", False),
+    ("OpCopyObject", False),
+    ("OpInBoundsAccessChain", True),
+    ("OpCopyObject", True),
+])
+def test_lowers_aliases_of_geometry_output_pointers(tmp_path, alias_op, component):
+    if component:
+        body = (
+            "OpStore %out_pos %v\n"
+            "%out_x = OpAccessChain %ptr_out_float %out_pos %u0\n"
+            f"%out_alias = {alias_op} %ptr_out_float %out_x\n"
+            "%y = OpCompositeExtract %float %v 1\n"
+            "OpStore %out_alias %y"
+        )
+        alias_type, alias_base = "%gsc_ptr_pv_f", "%out_x"
+    else:
+        body = (
+            f"%out_alias = {alias_op} %ptr_out_v4 %out_pos\n"
+            "OpStore %out_alias %v\n"
+            "%out_x = OpAccessChain %ptr_out_float %out_alias %u0\n"
+            "%y = OpCompositeExtract %float %v 1\n"
+            "OpStore %out_x %y"
+        )
+        alias_type, alias_base = "%gsc_ptr_pv_v4", "%gsc_out0"
+    geometry = PHI_GS.replace(
+        "%out_pos = OpVariable %ptr_out_v4 Output",
+        "%ptr_out_float = OpTypePointer Output %float\n%out_pos = OpVariable %ptr_out_v4 Output",
+    ).replace("OpStore %out_pos %v", body)
+
+    validate_vulkan12(tmp_path / "geometry.spv", geometry)
+    lowered, layout = gsc.rewrite(geometry)
+    validate_vulkan12(tmp_path / "compute.spv", lowered)
+    defs, _ = gsc.parse(lowered)
+    expected_op = "OpCopyObject" if alias_op == "OpCopyObject" else "OpAccessChain"
+    assert defs["%out_alias"] == (expected_op, [alias_type, alias_base])
+    component_base = "%gsc_out0" if component else "%out_alias"
+    assert defs["%out_x"] == ("OpAccessChain", ["%gsc_ptr_pv_f", component_base, "%u0"])
+    assert layout["outputs"] == ["position"]
+
+
 def geometry_input_alias(array_chain: str) -> str:
     return PHI_GS.replace(
         '"main" %in_pos %out_pos', '"main" %in_pos %in_color %out_pos',
