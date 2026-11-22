@@ -36,6 +36,8 @@ RDNA2 VALU Specification Rules:
 Standard library Python only (python -I, struct, math, unittest). Zero game data.
 """
 
+import dataclasses
+import enum
 import math
 import struct
 import unittest
@@ -284,6 +286,176 @@ class TestValuCvtPknormU16F64Oracle(unittest.TestCase):
         # abs then neg (-|x|): forces negative -> clamps to 0
         res_both = oracle_v_cvt_pknorm_u16_f64(QUARTER_F64, POS_ZERO_F64, abs0=True, neg0=True)
         self.assertEqual(extract_u16(res_both, high_half=False), 0)
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+
+
+@dataclasses.dataclass(frozen=True)
+class Reg:
+    """Represents an architectural register or 64-bit aligned register pair."""
+    index: int
+    reg_type: RegType
+    is_double: bool = False
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.index <= 255):
+            raise ValueError(f"Register index {self.index} out of range [0, 255]")
+        if self.is_double and self.index > 254:
+            raise ValueError(f"64-bit register pair base index {self.index} exceeds 254")
+
+    @property
+    def name(self) -> str:
+        prefix = "v" if self.reg_type == RegType.VGPR else "s"
+        if self.is_double:
+            return f"{prefix}[{self.index}:{self.index + 1}]"
+        return f"{prefix}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Literal64:
+    """Represents an immediate 64-bit float or integer constant."""
+    bits: int
+
+    @classmethod
+    def from_f64(cls, val: float) -> Literal64:
+        return cls(f64_to_bits(val))
+
+    @property
+    def name(self) -> str:
+        return f"0x{self.bits & MASK64:016X}"
+
+
+@dataclasses.dataclass(frozen=True)
+class VOP3Operand64:
+    """Typed operand for 64-bit source with optional modifiers (abs, neg)."""
+    source: Reg | Literal64
+    abs_mod: bool = False
+    neg_mod: bool = False
+
+    def disassemble(self) -> str:
+        s = self.source.name
+        if self.abs_mod:
+            s = f"|{s}|"
+        if self.neg_mod:
+            s = f"-{s}"
+        return s
+
+
+class Opcode(enum.Enum):
+    V_CVT_PKNORM_U16_F64 = "v_cvt_pknorm_u16_f64"
+
+
+@dataclasses.dataclass(frozen=True)
+class VCvtPknormU16F64Instruction:
+    """Symbolic AST node for RDNA2 v_cvt_pknorm_u16_f64."""
+    dst: Reg
+    src0: VOP3Operand64
+    src1: VOP3Operand64
+    clamp: bool = False
+    opcode: Opcode = Opcode.V_CVT_PKNORM_U16_F64
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination of VALU instruction must be VGPR, got {self.dst.reg_type}")
+        if self.dst.is_double:
+            raise TypeError("Destination of v_cvt_pknorm_u16_f64 must be single 32-bit VGPR")
+        if self.clamp:
+            raise ValueError("v_cvt_pknorm_u16_f64 destination cannot have clamp modifier")
+
+    def disassemble(self) -> str:
+        return f"{self.opcode.value} {self.dst.name}, {self.src0.disassemble()}, {self.src1.disassemble()}"
+
+
+@dataclasses.dataclass
+class Program:
+    """Represents an ordered sequence of instructions."""
+    instructions: list[VCvtPknormU16F64Instruction] = dataclasses.field(default_factory=list)
+
+    def append(self, instr: VCvtPknormU16F64Instruction) -> None:
+        self.instructions.append(instr)
+
+    def disassemble(self) -> str:
+        return "\n".join(instr.disassemble() for instr in self.instructions)
+
+
+class TestValuCvtPknormU16F64AST(unittest.TestCase):
+    """Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_register_creation_and_naming(self) -> None:
+        v0 = Reg(0, RegType.VGPR)
+        v_pair = Reg(2, RegType.VGPR, is_double=True)
+        s_pair = Reg(4, RegType.SGPR, is_double=True)
+        self.assertEqual(v0.name, "v0")
+        self.assertEqual(v_pair.name, "v[2:3]")
+        self.assertEqual(s_pair.name, "s[4:5]")
+
+    def test_register_out_of_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(255, RegType.VGPR, is_double=True)
+
+    def test_literal_operand(self) -> None:
+        lit = Literal64(0x3FF0000000000000)
+        self.assertEqual(lit.name, "0x3FF0000000000000")
+        lit_f64 = Literal64.from_f64(1.0)
+        self.assertEqual(lit_f64.bits, POS_ONE_F64)
+
+    def test_operand_modifiers_disassembly(self) -> None:
+        v_pair = Reg(2, RegType.VGPR, is_double=True)
+        op_plain = VOP3Operand64(v_pair)
+        self.assertEqual(op_plain.disassemble(), "v[2:3]")
+
+        op_abs = VOP3Operand64(v_pair, abs_mod=True)
+        self.assertEqual(op_abs.disassemble(), "|v[2:3]|")
+
+        op_neg = VOP3Operand64(v_pair, neg_mod=True)
+        self.assertEqual(op_neg.disassemble(), "-v[2:3]")
+
+        op_both = VOP3Operand64(v_pair, abs_mod=True, neg_mod=True)
+        self.assertEqual(op_both.disassemble(), "-|v[2:3]|")
+
+    def test_instruction_disassembly(self) -> None:
+        dst = Reg(0, RegType.VGPR)
+        src0 = VOP3Operand64(Reg(2, RegType.VGPR, is_double=True))
+        src1 = VOP3Operand64(Reg(4, RegType.VGPR, is_double=True), neg_mod=True)
+
+        instr = VCvtPknormU16F64Instruction(dst=dst, src0=src0, src1=src1)
+        self.assertEqual(instr.disassemble(), "v_cvt_pknorm_u16_f64 v0, v[2:3], -v[4:5]")
+
+    def test_instruction_validation(self) -> None:
+        # Destination must be VGPR
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3Operand64(Reg(2, RegType.VGPR, is_double=True))
+        with self.assertRaises(TypeError):
+            VCvtPknormU16F64Instruction(dst=dst_sgpr, src0=src, src1=src)
+
+        # Destination cannot be double VGPR
+        dst_double = Reg(0, RegType.VGPR, is_double=True)
+        with self.assertRaises(TypeError):
+            VCvtPknormU16F64Instruction(dst=dst_double, src0=src, src1=src)
+
+        # Destination clamp modifier rejected
+        with self.assertRaises(ValueError):
+            VCvtPknormU16F64Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, clamp=True)
+
+    def test_program_container(self) -> None:
+        prog = Program()
+        v0 = Reg(0, RegType.VGPR)
+        v2 = Reg(2, RegType.VGPR, is_double=True)
+        v4 = Reg(4, RegType.VGPR, is_double=True)
+        prog.append(VCvtPknormU16F64Instruction(v0, VOP3Operand64(v2), VOP3Operand64(v4)))
+        expected = "v_cvt_pknorm_u16_f64 v0, v[2:3], v[4:5]"
+        self.assertEqual(prog.disassemble(), expected)
 
 
 if __name__ == "__main__":
