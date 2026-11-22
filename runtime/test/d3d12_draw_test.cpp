@@ -65,6 +65,7 @@ int main() {
 
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256);
+    bool depth_clamp_checked = false;  // the depth-clip pass ran (the GPU has the depthClamp feature)
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -74,6 +75,7 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;
+        info.depth_clamp = d.depth_clamp;
         info.shader_dir = library.string();
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
@@ -239,6 +241,69 @@ int main() {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
 
+        // DepthClipEnable: a red quad at z = 2, beyond the far plane, drawn twice with a three-component POSITION.
+        // With depth clipping on (the default) it is clipped away, so the top-left quadrant stays blue; with it off
+        // the depth is clamped instead and the quad is drawn (the bottom-right quadrant turns red).
+        struct DeepVertex {
+            float x, y, z;
+            std::uint8_t r, g, b, a;
+        };
+        const DeepVertex deep[4] = {{-1, 1, 2, 255, 0, 0, 255}, {0, 1, 2, 255, 0, 0, 255}, {-1, 0, 2, 255, 0, 0, 255},
+                                    {0, 0, 2, 255, 0, 0, 255}};
+        std::memcpy(up + 1024, deep, sizeof(deep));
+        const D3D12_INPUT_ELEMENT_DESC deep_elements[2] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT,
+             D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+        pso_desc.InputLayout = {deep_elements, 2};
+        Ref<ID3D12PipelineState> clipped, clamped;
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&clipped.p))));
+        pso_desc.RasterizerState.DepthClipEnable = FALSE;
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&clamped.p))));
+        pso_desc.RasterizerState.DepthClipEnable = TRUE;
+        if (d.depth_clamp && clipped.p && clamped.p) {
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, clipped.p)));
+            D3D12_RESOURCE_BARRIER to_target = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &to_target);
+            list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+            list->SetGraphicsRootSignature(root.p);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            const D3D12_VERTEX_BUFFER_VIEW deep_vbv{upload_va + 1024, sizeof(deep), sizeof(DeepVertex)};
+            list->IASetVertexBuffers(0, 1, &deep_vbv);
+            list->IASetIndexBuffer(&ibv);
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 512);  // the red tint
+            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+            list->DrawIndexedInstanced(6, 1, 0, 0, 0);  // clipped: top-left stays blue
+            list->SetPipelineState(clamped.p);
+            list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
+            list->DrawIndexedInstanced(6, 1, 0, 0, 0);  // clamped: bottom-right turns red
+            list->ResourceBarrier(1, &to_copy);
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+            unsigned clip_mismatches = 0;
+            const auto* clip_pixels = static_cast<const std::uint8_t*>(mapped);
+            for (UINT row = 0; row < size; ++row)
+                for (UINT col = 0; col < size; ++col) {
+                    const bool drawn = row >= size / 2 && col >= size / 2;
+                    const std::array<std::uint8_t, 4> want = drawn ? std::array<std::uint8_t, 4>{255, 0, 0, 255}
+                                                                   : std::array<std::uint8_t, 4>{0, 0, 255, 255};
+                    const std::uint8_t* got = clip_pixels + row * 256 + col * 4;
+                    if (std::equal(want.begin(), want.end(), got)) continue;
+                    if (clip_mismatches++ < 4)
+                        std::fprintf(stderr, "depth-clip pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col,
+                                     row, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                }
+            EXPECT(!clip_mismatches);
+            depth_clamp_checked = true;
+        }
+
         // A draw without a topology is invalid; Close reports it.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
         list->SetGraphicsRootSignature(root.p);
@@ -247,6 +312,8 @@ int main() {
 
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
         pso.reset();
+        clipped.reset();
+        clamped.reset();
         root.reset();
         rtv_heap.reset();
         list.reset();
@@ -277,7 +344,7 @@ int main() {
         return 1;
     }
     std::printf("M1: two indexed draws and a culled triangle matched all %u pixels: input layout by semantic, root "
-                "constants and a root CBV per draw, vertex buffer in the arena, index buffer in an upload heap\n",
-                size * size);
+                "constants and a root CBV per draw, vertex buffer in the arena, index buffer in an upload heap%s\n",
+                size * size, depth_clamp_checked ? "; DepthClipEnable on and off matched too" : "");
     return 0;
 }

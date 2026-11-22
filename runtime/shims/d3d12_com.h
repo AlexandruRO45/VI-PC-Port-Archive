@@ -52,6 +52,9 @@ struct VulkanDeviceInfo {
     // bufferDeviceAddress enabled: buffers and shader-visible heaps then live in the GPU address arena and have
     // console VAs (docs section 3.3); without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
     bool buffer_device_address = false;
+    // The depthClamp feature is enabled on `device`: a PSO with DepthClipEnable = FALSE clamps depth instead of clipping
+    // against the near and far planes, as D3D12 does. Without it such PSOs still clip (logged).
+    bool depth_clamp = false;
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;

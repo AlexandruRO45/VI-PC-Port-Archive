@@ -774,7 +774,14 @@ public:
         raster.depthBiasClamp = r.DepthBiasClamp;
         raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
         raster.lineWidth = 1.0f;
-        if (!r.DepthClipEnable) log_once("DepthClipEnable = FALSE is not modelled (depth clamp); flag", 0);
+        // DepthClipEnable = FALSE: no clipping against the near and far planes; depth is clamped to the viewport's
+        // range instead. That is Vulkan's depth clamp (shadow maps use it to keep casters in front of the near plane).
+        if (!r.DepthClipEnable) {
+            if (device_.info.depth_clamp)
+                raster.depthClampEnable = VK_TRUE;
+            else
+                log_once("DepthClipEnable = FALSE without the depthClamp feature: geometry is still clipped; flag", 0);
+        }
 
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -1691,6 +1698,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.separate_depth_stencil_layouts = true;
     VkPhysicalDeviceProperties chosen{};
     bool chosen_bc = false;
+    bool chosen_depth_clamp = false;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
@@ -1714,6 +1722,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 info.queue_family = i;
                 chosen = props;
                 chosen_bc = bc;
+                chosen_depth_clamp = features.features.depthClamp == VK_TRUE;
             }
             break;
         }
@@ -1737,6 +1746,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     queue_info.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures enable{};
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
+    enable.depthClamp = chosen_depth_clamp ? VK_TRUE : VK_FALSE;    // DepthClipEnable = FALSE
+    info.depth_clamp = chosen_depth_clamp;
     if (!chosen_bc) std::fprintf(stderr, "[rt] d3d12: the GPU has no BC texture support\n");
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = 1;

@@ -17,6 +17,7 @@ layout(push_constant) uniform UserData {
 
 void main() {
     const vec2 offset = vec2(uintBitsToFloat(pc.s[0]), uintBitsToFloat(pc.s[1]));
-    gl_Position = vec4(position.xy + offset, 0.0, 1.0);
+    // z from the input: 0 for a two-component POSITION (the M1 draws), set by the depth-clip draws.
+    gl_Position = vec4(position.xy + offset, position.z, 1.0);
     out_color = color;
 }
