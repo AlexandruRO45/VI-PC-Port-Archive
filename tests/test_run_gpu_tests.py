@@ -303,5 +303,18 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertIsNone(rgt.narrow_subgroup_skip(out))
 
 
+class DevicePerVertexTest(unittest.TestCase):
+    def answer(self, stdout):
+        with patch.object(rgt, "_PER_VERTEX", []), \
+             patch.object(rgt.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
+            return rgt._device_per_vertex()
+
+    def test_driver_log_after_the_json_is_ignored(self):   # MoltenVK prints [MVK-...] lines at exit
+        self.assertIs(self.answer('{"per_vertex_inputs": false}\n[MVK-BUILD-ERROR] log line\n'), False)
+
+    def test_no_json_line_is_unknown(self):
+        self.assertIsNone(self.answer("[mvk-info] only logs\n"))
+
+
 if __name__ == "__main__":
     unittest.main()

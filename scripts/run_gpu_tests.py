@@ -278,7 +278,9 @@ def _device_per_vertex():
         try:
             r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
                                capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
+            # The driver may log to stdout after the JSON (MoltenVK prints [MVK-...] lines at exit).
+            line = next((ln for ln in reversed(r.stdout.splitlines()) if ln.lstrip().startswith("{")), "")
+            answer = json.loads(line).get("per_vertex_inputs")
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass
         _PER_VERTEX.append(answer)
@@ -754,6 +756,9 @@ def run_suite(a, work: str) -> int:
         name = os.path.splitext(fname)[0]
         spv = os.path.join(spirv_dir, f"{name}.spv")
         if not os.path.isfile(spv):
+            if name == "ps_ij_computed" and (bary_fallback() or f16_interp_fallback()):   # translator refuses it
+                results.append((name, None, "SKIP (computed I/J pairs need PerVertexKHR inputs, off under this fallback)"))
+                continue
             results.append((name, False, "missing .spv (translation failed)"))
             continue
         sg = index.get(name, {}).get("subgroup_size")
