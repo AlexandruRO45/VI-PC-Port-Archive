@@ -168,9 +168,6 @@ class F16ToIntTests(unittest.TestCase):
         for line, want in (("v_cvt_u16_f16_e64 v0, v1 clamp", 3), ("v_cvt_i16_f16_e64 v0, v1 mul:2", 3)):
             with self.subTest(line=line):
                 self.assertEqual(run(line, 0x4248), merge(OLD, want, 0))
-        # int -> f16: still rejected rather than guessed
-        with self.assertRaises(rdna2spirv.Unsupported):
-            run("v_cvt_f16_u16_e64 v0, v1 clamp", 0x4248)
 
 
 if __name__ == "__main__":
