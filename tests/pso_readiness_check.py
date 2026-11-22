@@ -12,7 +12,25 @@ from pixel_aot_check import assembly
 from pso_readiness import report
 
 
+def with_rounding(instructions):
+    """Insert the rounding forms and a multiply that pixel_aot lowers before the pack."""
+    index = next(i for i, line in enumerate(instructions) if line.startswith("v_cvt_pkrtz"))
+    extra = ["v_floor_f32_e32 v12, v12", "v_fract_f32_e32 v13, v13", "v_trunc_f32_e32 v15, v15",
+             "v_add_f32_e32 v12, v12, v13", "v_mul_f32_e32 v15, v15, v12"]
+    return instructions[:index] + extra + instructions[index:]
+
+
+def check_scanner_tracks_pixel_aot():
+    import pixel_aot
+    from scan_unsupported_shaders import is_instruction_supported, is_opcode_recognized
+    for name in pixel_aot.ALU:
+        opcode = f"v_{name}_f32"
+        assert is_opcode_recognized(opcode) and is_opcode_recognized(opcode + "_e32"), opcode
+        assert is_instruction_supported(f"{opcode}_e32 v1, v2, v3"), opcode
+
+
 def check():
+    check_scanner_tracks_pixel_aot()
     code = b"synthetic native bytes"
     digest = hashlib.sha256(code).hexdigest()
     pixel = {"stage": "pixel", "sha256": digest}
@@ -47,16 +65,25 @@ def check():
         assert untested["shaders"]["pixel"]["archive_records"] == 2
         # Temporary paths can contain a directory alias on Windows CI.
         unnormalized_root = root / ".." / root.name
-        for instructions, status, blocker in (
-                (assembly(False), "needs_pso_validation", None),
-                (["s_endpgm"], "blocked", "pixel_lowering_rejected"),
-                (["unknown_instruction"], "blocked", "unsupported_opcodes")):
-            with patch("pixel_aot.disassemble", return_value=instructions) as scan:
+        for instructions, status, blocker, detail in (
+                (assembly(False), "needs_pso_validation", None, None),
+                (with_rounding(assembly(False)), "needs_pso_validation", None, None),
+                ([], "blocked", "disassembly_failed", "empty instruction stream"),
+                (ValueError("Unknown instruction at byte 0"), "blocked", "disassembly_failed",
+                 "Unknown instruction at byte 0"),
+                (["s_endpgm"], "blocked", "pixel_lowering_rejected", None),
+                (["unknown_instruction"], "blocked", "unsupported_opcodes", "unknown_instruction")):
+            patch_args = {"side_effect": instructions} if isinstance(instructions, Exception) else {"return_value": instructions}
+            with patch("pixel_aot.disassemble", **patch_args) as scan:
                 rows = report(manifest, pipelines, unnormalized_root, "test-llvm")["pipelines"]
                 assert rows[0]["first_blocker"] == {"reason": "missing_root_signature"}
+                assert rows[2]["status"] == "needs_evidence" and rows[2]["first_blocker"] is None
                 assert rows[-1]["status"] == status, rows[-1]
                 if blocker:
                     assert rows[-1]["first_blocker"]["reason"] == blocker
+                    assert rows[-1]["first_blocker"]["stage"] == "pixel"
+                    if detail is not None:
+                        assert rows[-1]["first_blocker"]["detail"] == detail
                 else:
                     assert rows[-1]["first_blocker"] is None
                 scan.assert_called_once_with(code, "test-llvm")

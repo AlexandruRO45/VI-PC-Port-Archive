@@ -51,6 +51,32 @@ std::uint64_t Table::translate(std::uint64_t title_address, std::uint64_t bytes)
     return range.gpu_begin + (title_address - range.title_begin);
 }
 
+bool shader_ranges(const std::vector<Range>& ranges, std::vector<ShaderRange>& packed)
+{
+    packed.clear();
+    std::vector<ShaderRange> result;
+    try {
+        result.reserve(ranges.size());
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    constexpr std::uint64_t view_limit = 1ull << 32;
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const Range& range = ranges[i];
+        if (range.title_end <= range.title_begin || range.title_end - range.title_begin >= view_limit ||
+            (range.title_begin & 3) != 0 ||
+            (i > 0 && ranges[i - 1].title_end > range.title_begin)) {
+            return false;
+        }
+        result.push_back({static_cast<std::uint32_t>(range.title_begin),
+                          static_cast<std::uint32_t>(range.title_begin >> 32),
+                          static_cast<std::uint32_t>(range.title_end),
+                          static_cast<std::uint32_t>(range.title_end >> 32), static_cast<std::uint32_t>(i), 0});
+    }
+    packed.swap(result);
+    return true;
+}
+
 std::vector<Range> Table::ranges() const
 {
     std::lock_guard<std::mutex> guard(lock_);
