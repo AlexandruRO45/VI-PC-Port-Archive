@@ -7241,9 +7241,10 @@ class Gen:
                 # "Integer clamp"). The operands are zero-extended, so a result past 0xFFFF is an overflow (add) or a
                 # borrow (sub). Other 16-bit ops: rejected rather than guessed.
                 if op in ("v_add_i16", "v_sub_i16"):
-                    sat = self.tmp()
-                    self.emit(f"{sat} = OpExtInst %uint %glsl SClamp {r} {self.cu(0xFFFF8000)} {self.cu(0x7FFF)}")
-                    r = sat
+                    sat, sat_u = self.tmp(), self.tmp()
+                    self.emit(f"{sat} = OpExtInst %int %glsl SClamp {ri} {self.as_int(self.cu(0xFFFF8000))} {self.as_int(self.cu(0x7FFF))}")
+                    self.emit(f"{sat_u} = OpBitcast %uint {sat}")
+                    r = sat_u
                 elif op not in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
                     raise Unsupported(op + " clamp")
                 if op in ("v_add_u16", "v_sub_u16", "v_subrev_u16"):
@@ -7253,16 +7254,10 @@ class Gen:
                     r = sat
             lo = self.tmp()
             self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
-            if e64 and sb[2]:
-                # op_sel destination bit: the result goes to the high half, the low half is kept.
-                old, keep, sh16, v = (self.tmp() for _ in range(4))
-                self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
-                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
-                self.emit(f"{sh16} = OpShiftLeftLogical %uint {lo} {self.cu(16)}")
-                self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
-                self.dst(a[0], v)
+            if e64:
+                self.write_half16(a[0], lo, sb[2])
             else:
-                self.write_lo16(a[0], lo, preserve_high=e64)
+                self.write_lo16(a[0], lo, preserve_high=False)
         elif op in ("v_mad_u16", "v_mad_i16"):
             # D.u16 = S0.u16 * S1.u16 + S2.u16 on the low halves (op_sel picks high halves: bits 0..2 the sources, bit 3 the
             # destination); VOP3-only, so the high half of the destination is kept (RDNA2 ISA; Mesa ACO can_use_opsel).
