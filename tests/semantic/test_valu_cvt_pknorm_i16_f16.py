@@ -1240,5 +1240,212 @@ class TestValuCvtPknormI16F16IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(res_abs_z, 0x00000000)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuCvtPknormI16F16NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_register_bounds(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg(512, RegType.SGPR)
+
+    def test_syntax_rejection_destination_must_be_vgpr(self) -> None:
+        dst_sgpr = Reg(0, RegType.SGPR)
+        src = VOP3POperand(Reg(1, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F16Instruction(dst=dst_sgpr, src0=src, src1=src)
+
+    def test_syntax_rejection_clamp_modifier_rejected(self) -> None:
+        dst = Reg(0, RegType.VGPR)
+        src = VOP3POperand(Reg(1, RegType.VGPR))
+        with self.assertRaises(ValueError):
+            VCvtPknormI16F16Instruction(dst=dst, src0=src, src1=src, clamp=True)
+
+    def test_syntax_rejection_invalid_op_sel(self) -> None:
+        src = VOP3POperand(Reg(1, RegType.VGPR))
+        with self.assertRaises(ValueError):
+            VCvtPknormI16F16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(2, 0))
+        with self.assertRaises(ValueError):
+            VCvtPknormI16F16Instruction(dst=Reg(0, RegType.VGPR), src0=src, src1=src, op_sel=(0, -1))
+
+    def test_syntax_rejection_invalid_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_negative_control_operand_order_reversal(self) -> None:
+        s0, s1 = POS_ONE_F16, HALF_F16
+        correct = oracle_v_cvt_pknorm_i16_f16(s0, s1)
+        reversed_order = oracle_v_cvt_pknorm_i16_f16(s1, s0)
+        self.assertEqual(correct, (0x4000 << 16) | 0x7FFF)
+        self.assertEqual(reversed_order, (0x7FFF << 16) | 0x4000)
+        self.assertNotEqual(correct, reversed_order)
+
+    def test_negative_control_inverted_op_sel(self) -> None:
+        s0 = (HALF_F16 << 16) | POS_ONE_F16
+        s1 = (NEG_HALF_F16 << 16) | NEG_ONE_F16
+        correct = oracle_v_cvt_pknorm_i16_f16(s0, s1, op_sel=(0, 0))
+        inverted = oracle_v_cvt_pknorm_i16_f16(s0, s1, op_sel=(1, 1))
+        self.assertNotEqual(correct, inverted)
+
+    def test_negative_control_missing_high_half_shift(self) -> None:
+        s0, s1 = POS_ONE_F16, HALF_F16
+        correct = oracle_v_cvt_pknorm_i16_f16(s0, s1)
+        lo = oracle_cvt_snorm16_f16(s0)
+        hi = oracle_cvt_snorm16_f16(s1)
+        buggy_unshifted = (lo & MASK16) | (hi & MASK16)
+        self.assertNotEqual(correct, buggy_unshifted)
+
+    def test_negative_control_off_by_one_shift(self) -> None:
+        s0, s1 = POS_ONE_F16, HALF_F16
+        correct = oracle_v_cvt_pknorm_i16_f16(s0, s1)
+        lo = oracle_cvt_snorm16_f16(s0)
+        hi = oracle_cvt_snorm16_f16(s1)
+        shift_15 = (lo & MASK16) | ((hi & MASK16) << 15)
+        shift_17 = (lo & MASK16) | (((hi & MASK16) << 17) & MASK32)
+        self.assertNotEqual(correct, shift_15)
+        self.assertNotEqual(correct, shift_17)
+
+    def test_negative_control_missing_mask_truncation(self) -> None:
+        dirty_s0 = 0x10001
+        dirty_s1 = 0x0002
+        correct = pack_u16_to_u32(dirty_s0, dirty_s1)
+        buggy_leaking = (dirty_s0 | (dirty_s1 << 16)) & MASK32
+        self.assertEqual(correct, 0x00020001)
+        self.assertEqual(buggy_leaking, 0x00030001)
+        self.assertNotEqual(correct, buggy_leaking)
+
+    def test_negative_control_wrong_modifier_bit(self) -> None:
+        val = POS_ONE_F16
+        correct_neg = apply_f16_modifiers(val, neg_mod=True)
+        # Inverting bit 14 instead of sign bit 15
+        wrong_bit = val ^ (1 << 14)
+        self.assertEqual(correct_neg, NEG_ONE_F16)
+        self.assertNotEqual(correct_neg, wrong_bit)
+
+    def test_negative_control_modifier_order(self) -> None:
+        # In RDNA2 ISA: abs first, then neg (-|x| forces sign bit to 1)
+        val = POS_ONE_F16
+        correct = apply_f16_modifiers(val, abs_mod=True, neg_mod=True)
+        # If neg first then abs:
+        buggy_neg_then_abs = (val ^ SIGN16) & ABS16
+        self.assertEqual(correct, NEG_ONE_F16)
+        self.assertEqual(buggy_neg_then_abs, POS_ONE_F16)
+        self.assertNotEqual(correct, buggy_neg_then_abs)
+
+    def test_mutation_unorm_scale_65535(self) -> None:
+        """Mutant: Using unorm scale 65535.0 instead of snorm 32767.0."""
+        def mutant_cvt(bits: int) -> int:
+            val = bits_to_f16(bits)
+            return round(val * 65535.0) & MASK16
+
+        correct = oracle_cvt_snorm16_f16(POS_ONE_F16)
+        mutant = mutant_cvt(POS_ONE_F16)
+        self.assertEqual(correct, 32767)
+        self.assertEqual(mutant, 65535)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_snorm_scale_32768(self) -> None:
+        """Mutant: Using scale 32768.0 instead of 32767.0."""
+        def mutant_cvt(bits: int) -> int:
+            val = bits_to_f16(bits)
+            return round(val * 32768.0) & MASK16
+
+        # At 0.5f: 0.5 * 32768 = 16384, but at 1.0f: 32768 vs 32767
+        correct = oracle_cvt_snorm16_f16(POS_ONE_F16)
+        mutant = mutant_cvt(POS_ONE_F16)
+        self.assertEqual(correct, 32767)
+        self.assertEqual(mutant, 32768)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_truncation_rounding(self) -> None:
+        """Mutant: Using math.floor/truncation instead of round-half-even."""
+        def mutant_cvt(bits: int) -> int:
+            val = bits_to_f16(bits)
+            return int(val * 32767.0) & MASK16
+
+        # At 0.5f: 0.5 * 32767.0 = 16383.5 -> round gives 16384, int() truncates to 16383
+        correct = oracle_cvt_snorm16_f16(HALF_F16)
+        mutant = mutant_cvt(HALF_F16)
+        self.assertEqual(correct, 16384)
+        self.assertEqual(mutant, 16383)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_nan_non_zero(self) -> None:
+        """Mutant: Returning 0x7FFF on NaN input instead of 0."""
+        def mutant_cvt(bits: int) -> int:
+            if is_nan16(bits):
+                return 0x7FFF
+            return oracle_cvt_snorm16_f16(bits)
+
+        correct = oracle_cvt_snorm16_f16(POS_QNAN_F16)
+        mutant = mutant_cvt(POS_QNAN_F16)
+        self.assertEqual(correct, 0)
+        self.assertEqual(mutant, 0x7FFF)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_clamp_to_min_32768_instead_of_32767(self) -> None:
+        """Mutant: Clamping negative values to -32768 (0x8000) instead of -32767 (0x8001)."""
+        def mutant_cvt(bits: int) -> int:
+            val = bits_to_f16(bits)
+            if val <= -1.0:
+                return 0x8000  # -32768
+            return oracle_cvt_snorm16_f16(bits)
+
+        correct = oracle_cvt_snorm16_f16(NEG_TWO_F16)
+        mutant = mutant_cvt(NEG_TWO_F16)
+        self.assertEqual(correct, 0x8001)
+        self.assertEqual(mutant, 0x8000)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_ignore_abs_modifier(self) -> None:
+        """Mutant: Neglecting abs modifier."""
+        def mutant_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & MASK16
+            if neg_mod:
+                res ^= SIGN16
+            return res
+
+        val = NEG_ONE_F16
+        correct = apply_f16_modifiers(val, abs_mod=True, neg_mod=False)
+        mutant = mutant_mod(val, abs_mod=True, neg_mod=False)
+        self.assertEqual(correct, POS_ONE_F16)
+        self.assertEqual(mutant, NEG_ONE_F16)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_ignore_neg_modifier(self) -> None:
+        """Mutant: Neglecting neg modifier."""
+        def mutant_mod(bits: int, abs_mod: bool, neg_mod: bool) -> int:
+            res = bits & MASK16
+            if abs_mod:
+                res &= ABS16
+            return res
+
+        val = POS_ONE_F16
+        correct = apply_f16_modifiers(val, abs_mod=False, neg_mod=True)
+        mutant = mutant_mod(val, abs_mod=False, neg_mod=True)
+        self.assertEqual(correct, NEG_ONE_F16)
+        self.assertEqual(mutant, POS_ONE_F16)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_pack_addition_instead_of_or(self) -> None:
+        """Mutant: Channel packing using addition instead of bitwise OR."""
+        def mutant_pack(lo: int, hi: int) -> int:
+            return ((hi << 16) + lo) & MASK32
+
+        lo, hi = 0x4000, 0x4000
+        self.assertEqual(pack_u16_to_u32(lo, hi), mutant_pack(lo, hi))
+
+        dirty_lo, dirty_hi = 0x14000, 0x4000
+        self.assertNotEqual(pack_u16_to_u32(dirty_lo, dirty_hi), mutant_pack(dirty_lo, dirty_hi))
+
+
 if __name__ == "__main__":
     unittest.main()
