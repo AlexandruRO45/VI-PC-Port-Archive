@@ -491,6 +491,170 @@ class TestPermB16SymbolicAST(unittest.TestCase):
         self.assertIn("0x302", sym_str)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarRegisterFile:
+    """Architectural register file for deterministic scalar simulation."""
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    scc: int = 0
+    vcc: int = 0
+    exec_mask: int = MASK32
+    status: int = 0
+    mode: int = 0
+
+    def get_vgpr(self, idx: int) -> int:
+        if not 0 <= idx <= 255:
+            raise IndexError(f"VGPR index out of range [0, 255]: {idx}")
+        return self.vgprs[idx] & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        if not 0 <= idx <= 255:
+            raise IndexError(f"VGPR index out of range [0, 255]: {idx}")
+        self.vgprs[idx] = val & MASK32
+
+    def get_sgpr(self, idx: int) -> int:
+        if not 0 <= idx <= 105:
+            raise IndexError(f"SGPR index out of range [0, 105]: {idx}")
+        return self.sgprs[idx] & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        if not 0 <= idx <= 105:
+            raise IndexError(f"SGPR index out of range [0, 105]: {idx}")
+        self.sgprs[idx] = val & MASK32
+
+    def read_operand(self, op: ASTOperand) -> int:
+        """Resolve operand to its integer value."""
+        if op.kind == OperandKind.VGPR:
+            return self.get_vgpr(op.reg_num) & MASK16
+        elif op.kind == OperandKind.SGPR:
+            return self.get_sgpr(op.reg_num) & MASK16
+        elif op.kind in (OperandKind.LITERAL_CONST, OperandKind.INLINE_CONST):
+            return op.constant_val & MASK16
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+
+class ScalarInterpreter:
+    """Deterministic instruction interpreter for single-lane scalar execution."""
+
+    def __init__(self, reg_file: Optional[ScalarRegisterFile] = None):
+        self.rf = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def execute(self, instr: ASTInstruction) -> None:
+        """Execute a single AST instruction deterministically."""
+        instr.validate()
+        if instr.opcode == Opcode.V_PERM_B16:
+            s0_val = self.rf.read_operand(instr.src0)
+            s1_val = self.rf.read_operand(instr.src1)
+            sel_val = self.rf.read_operand(instr.src2)
+
+            res = oracle_v_perm_b16(
+                src0=s0_val,
+                src1=s1_val,
+                selector=sel_val,
+            )
+            # 16-bit destination write preserving upper 16 bits or zero-extended
+            curr_val = self.rf.get_vgpr(instr.dst.reg_num)
+            new_val = (curr_val & 0xFFFF_0000) | (res & MASK16)
+            self.rf.set_vgpr(instr.dst.reg_num, new_val)
+        elif instr.opcode == Opcode.V_NOP:
+            pass
+        else:
+            raise NotImplementedError(f"Opcode not implemented: {instr.opcode}")
+
+
+# ==============================================================================
+# Unit Tests: Commit 3 (Deterministic Scalar Interpreter)
+# ==============================================================================
+
+class TestPermB16ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarInterpreter(self.rf)
+
+    def test_scalar_execute_basic_perm(self):
+        self.rf.set_vgpr(1, 0x1122)  # S0
+        self.rf.set_vgpr(2, 0x3344)  # S1
+        self.rf.set_vgpr(3, make_selector_16(SEL_SRC1_B0, SEL_SRC0_B1))  # S2
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        self.interp.execute(instr)
+        # Byte 0 gets S1[7:0] (0x44), Byte 1 gets S0[15:8] (0x11) -> 0x1144
+        self.assertEqual(self.rf.get_vgpr(0) & MASK16, 0x1144)
+
+    def test_scalar_execute_with_sgpr_sources(self):
+        self.rf.set_sgpr(0, 0xAABB)
+        self.rf.set_sgpr(1, 0xCCDD)
+        self.rf.set_vgpr(5, make_selector_16(SEL_SRC1_B1, SEL_SRC0_B0))
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(10),
+            src0=ASTOperand.sgpr(0),
+            src1=ASTOperand.sgpr(1),
+            src2=ASTOperand.vgpr(5),
+        )
+        self.interp.execute(instr)
+        # S1[15:8] is 0xCC, S0[7:0] is 0xBB -> 0xBBCC
+        self.assertEqual(self.rf.get_vgpr(10) & MASK16, 0xBBCC)
+
+    def test_scalar_execute_with_literal_selector(self):
+        self.rf.set_vgpr(1, 0x1234)
+        self.rf.set_vgpr(2, 0x5678)
+
+        # Bswap S1 via literal selector
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.literal(PermSelectorB16Word.bswap_src1().raw),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0) & MASK16, 0x7856)
+
+    def test_scalar_execute_sign_extensions(self):
+        self.rf.set_vgpr(1, 0x807F)  # S0: bit 15=1, bit 7=0
+        self.rf.set_vgpr(2, 0x7F80)  # S1: bit 15=0, bit 7=1
+        self.rf.set_vgpr(3, make_selector_16(SEL_SIGN_EXT_SRC0_B1, SEL_SIGN_EXT_SRC1_B0))
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.vgpr(3),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0) & MASK16, 0xFFFF)
+
+    def test_scalar_execute_constants(self):
+        self.rf.set_vgpr(3, make_selector_16(SEL_ZERO, 9))
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.inline_const(0),
+            src1=ASTOperand.inline_const(0),
+            src2=ASTOperand.vgpr(3),
+        )
+        self.interp.execute(instr)
+        self.assertEqual(self.rf.get_vgpr(0) & MASK16, 0xFF00)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
