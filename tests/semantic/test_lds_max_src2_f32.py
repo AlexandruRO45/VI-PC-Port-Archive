@@ -764,5 +764,138 @@ class TestRegisterAliasing(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(idx + 5), TEN_F32)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclass(frozen=True)
+class FloatConditionCodes:
+    """Architectural floating-point condition flags for result evaluation."""
+    zero: bool
+    negative: bool
+    nan: bool
+    infinity: bool
+    subnormal: bool
+
+
+@dataclass
+class LDSStatusFlags:
+    """Architectural status flags, condition tracking, and bank conflict metrics."""
+    mem_updated: bool = False
+    mem_unchanged: bool = False
+    flags: Optional[FloatConditionCodes] = None
+    bank_conflicts: int = 0
+    conflict_lanes: List[Tuple[int, int]] = field(default_factory=list)
+
+
+def evaluate_float_conditions(bits: int) -> FloatConditionCodes:
+    """Evaluate floating-point status flags from 32-bit float bit pattern."""
+    bits &= MASK32
+    nan_flag = is_f32_nan(bits)
+    return FloatConditionCodes(
+        zero=is_f32_zero(bits),
+        negative=bool(bits & SIGN_MASK) and not nan_flag,
+        nan=nan_flag,
+        infinity=is_f32_inf(bits),
+        subnormal=is_f32_subnormal(bits),
+    )
+
+
+def analyze_bank_conflicts(
+    lane_addrs: List[Tuple[int, int]],
+    capacity_dwords: int = DEFAULT_LDS_DWORDS,
+) -> Tuple[int, List[Tuple[int, int]]]:
+    """Analyze LDS memory bank conflicts across active lanes in a wave."""
+    bank_to_dwords: Dict[int, List[Tuple[int, int]]] = {}
+    for lane, dword in lane_addrs:
+        dword &= (capacity_dwords - 1)
+        bank = dword % NUM_LDS_BANKS
+        bank_to_dwords.setdefault(bank, []).append((lane, dword))
+
+    conflicts = 0
+    conflicting_pairs: List[Tuple[int, int]] = []
+    for bank, accesses in bank_to_dwords.items():
+        if len(accesses) > 1:
+            unique_dwords = set(dw for _, dw in accesses)
+            if len(unique_dwords) > 1:
+                conflicts += len(accesses) - 1
+                for i in range(len(accesses)):
+                    for j in range(i + 1, len(accesses)):
+                        if accesses[i][1] != accesses[j][1]:
+                            conflicting_pairs.append((accesses[i][0], accesses[j][0]))
+    return conflicts, conflicting_pairs
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and bank conflict metrics."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_DWORDS)
+        self.state = ScalarMachineState(lds=self.lds)
+        self.interp = ScalarInterpreter()
+
+    def test_vcc_isolation(self) -> None:
+        # VCC condition code register must be preserved across DS operations
+        vcc_canary = 0xDEADBEEFCAFEBEEF
+        self.state.vcc = vcc_canary
+        self.state.set_vgpr(0, 0x40)
+        self.lds.write_dword(0x40 >> 2, ONE_F32)
+        self.lds.write_dword((0x40 >> 2) + 1, TWO_F32)
+
+        instr = DSSrc2Instruction(
+            opcode=DSOpcode.DS_MAX_SRC2_F32,
+            addr=LDSAddressExpression(base_reg=vgpr(0), offset0=0, offset1=1),
+        )
+        self.interp.execute(instr, self.state)
+        self.assertEqual(getattr(self.state, "vcc", 0), vcc_canary)
+
+    def test_status_flags_update_and_unchanged(self) -> None:
+        # val_b > val_a -> updated
+        new_val = oracle_max_f32(ONE_F32, TWO_F32)
+        flags1 = LDSStatusFlags(
+            mem_updated=(new_val != ONE_F32),
+            mem_unchanged=(new_val == ONE_F32),
+            flags=evaluate_float_conditions(new_val),
+        )
+        self.assertTrue(flags1.mem_updated)
+        self.assertFalse(flags1.mem_unchanged)
+
+        # val_b < val_a -> unchanged
+        new_val2 = oracle_max_f32(TWO_F32, ONE_F32)
+        flags2 = LDSStatusFlags(
+            mem_updated=(new_val2 != TWO_F32),
+            mem_unchanged=(new_val2 == TWO_F32),
+            flags=evaluate_float_conditions(new_val2),
+        )
+        self.assertFalse(flags2.mem_updated)
+        self.assertTrue(flags2.mem_unchanged)
+
+    def test_float_condition_evaluation(self) -> None:
+        pos_z = evaluate_float_conditions(POS_ZERO_F32)
+        self.assertTrue(pos_z.zero)
+        self.assertFalse(pos_z.negative)
+
+        neg_val = evaluate_float_conditions(NEG_TEN_F32)
+        self.assertTrue(neg_val.negative)
+
+        inf_val = evaluate_float_conditions(POS_INF_F32)
+        self.assertTrue(inf_val.infinity)
+
+        nan_val = evaluate_float_conditions(QNAN_F32)
+        self.assertTrue(nan_val.nan)
+
+    def test_bank_conflicts_stride_1_conflict_free(self) -> None:
+        lane_addrs = [(lane, lane) for lane in range(32)]
+        conflicts, pairs = analyze_bank_conflicts(lane_addrs)
+        self.assertEqual(conflicts, 0)
+        self.assertEqual(len(pairs), 0)
+
+    def test_bank_conflicts_stride_32_maximum_conflicts(self) -> None:
+        lane_addrs = [(lane, lane * 32) for lane in range(4)]
+        conflicts, pairs = analyze_bank_conflicts(lane_addrs)
+        self.assertEqual(conflicts, 3)
+        self.assertGreater(len(pairs), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
