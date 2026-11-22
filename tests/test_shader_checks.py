@@ -356,8 +356,14 @@ class PixelDeviceLimits(unittest.TestCase):
         self.assertIn("64-wide fragment subgroup", problem)
         self.assertIn("8..8", problem)
 
+    def test_wave64_pixel_shader_skips_when_64_was_not_available(self):
+        # vk_harness's line when the device has 64 in its range but cannot require it of the fragment stage
+        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64 not available\nok 64x64\n"
+        problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
+        self.assertIsInstance(problem, check.Skip)
+
     def test_wave64_pixel_shader_is_judged_when_64_was_required(self):
-        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64 required\nok 64x64\n"
+        out = "device: fake (subgroup 32..64)\nfragment subgroup size: 64\nok 64x64\n"
         self.assertEqual(self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels()), "")
         problem = self.run_pixel("ps_w64x_readlane", 0, out, data=self.readlane_pixels((0, 0, 0, 0)))
         self.assertNotIsInstance(problem, check.Skip)
