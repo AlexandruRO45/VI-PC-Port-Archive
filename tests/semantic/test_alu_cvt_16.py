@@ -163,10 +163,14 @@ class F16ToIntTests(unittest.TestCase):
         self.assertEqual(run("v_cvt_i16_f16_e64 v0, -v1", 0x4248), merge(OLD, -3 & 0xFFFF, 0))
         self.assertEqual(run("v_cvt_i16_f16_e64 v0, |v1|", 0xC248), merge(OLD, 3, 0))
 
-    def test_output_modifiers_are_rejected(self):
-        for line in ("v_cvt_u16_f16_e64 v0, v1 clamp", "v_cvt_i16_f16_e64 v0, v1 mul:2", "v_cvt_f16_u16_e64 v0, v1 clamp"):
-            with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
-                run(line, 0x4248)
+    def test_output_modifiers(self):
+        # f16 -> int: clamp and omod leave the integer result unchanged (measured on RDNA2, cs_cvt16_int_mods.asm)
+        for line, want in (("v_cvt_u16_f16_e64 v0, v1 clamp", 3), ("v_cvt_i16_f16_e64 v0, v1 mul:2", 3)):
+            with self.subTest(line=line):
+                self.assertEqual(run(line, 0x4248), merge(OLD, want, 0))
+        # int -> f16: still rejected rather than guessed
+        with self.assertRaises(rdna2spirv.Unsupported):
+            run("v_cvt_f16_u16_e64 v0, v1 clamp", 0x4248)
 
 
 if __name__ == "__main__":
