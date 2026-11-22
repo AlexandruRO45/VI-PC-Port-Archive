@@ -1138,5 +1138,196 @@ class TestIEEE754BitPatternHandling(unittest.TestCase):
         self.assertEqual(oracle_nor_b64(pat_b, pat_b), pat_a)
 
 
+# ==============================================================================
+# Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestNegativeControlsAndMutationDetection(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection for ds_nor_rtn_b64."""
+
+    def test_syntax_rejection_invalid_opcodes_and_syntax(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_nor_b64 v[0:1], v[2:3]",
+            "ds_nand_b64 v[0:1], v2, v[3:4]",
+            "ds_nor_u64 v[0:1], v2, v[3:4]",
+            "ds_nor_rtn_b64",
+            "ds_nor_rtn_b64 v[0:1], v2",
+            "ds_nor_b64 v2",
+            "ds_nor_b64 v0, v[1:2], v[3:4]",
+            "ds_nor_rtn_b64 v[0:1], v2, v[3:4], v[5:6]",
+            "ds_nor_b64 s0, v[1:2]",
+            "ds_nor_b64 r0, v[1:2]",
+            "ds_nor_b64 v0, v[1:2] offset:70000",
+            "ds_nor_b64 v0, v[1:2] offset:-1",
+            "ds_nor_b64 v0, v[1:2] offset:invalid",
+            "ds_nor_b64 v0, v[1:2] badmod",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, IndexError)):
+                    DSNorRtnB64Instruction.parse(asm)
+
+    def test_architectural_model_negative_controls(self) -> None:
+        with self.assertRaises(ValueError):
+            LDSMemory(0)
+        with self.assertRaises(ValueError):
+            LDSMemory(-64)
+        with self.assertRaises(ValueError):
+            LDSMemory(1000)
+
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_mutation_detection_inverted_logic_or(self) -> None:
+        def mutant_or(a: int, b: int) -> int:
+            return (a | b) & MASK64
+
+        self.assertNotEqual(mutant_or(0, 0), oracle_nor_b64(0, 0))
+        self.assertNotEqual(
+            mutant_or(0x5555555555555555, 0xAAAAAAAAAAAAAAAA),
+            oracle_nor_b64(0x5555555555555555, 0xAAAAAAAAAAAAAAAA),
+        )
+
+    def test_mutation_detection_inverted_logic_nand(self) -> None:
+        def mutant_nand(a: int, b: int) -> int:
+            return (~(a & b)) & MASK64
+
+        self.assertNotEqual(
+            mutant_nand(0x00000000FFFFFFFF, 0xFFFFFFFF00000000),
+            oracle_nor_b64(0x00000000FFFFFFFF, 0xFFFFFFFF00000000),
+        )
+
+    def test_mutation_detection_destructive_aliasing(self) -> None:
+        class DestructiveMutantInterpreter(ScalarInterpreter):
+            def execute(self, state: ScalarMachineState, inst: DSNorRtnB64Instruction) -> Optional[int]:
+                if inst.opcode.is_return:
+                    assert inst.vdst is not None
+                    state.set_vgpr_pair(inst.vdst, 0xDEADBEEFCAFEBABE)
+                return super().execute(state, inst)
+
+        lds = LDSMemory(65536)
+        lds.write_qword(16, 0)
+        state = ScalarMachineState(lds=lds)
+        state.set_vgpr(RegSingle(0), 16)  # v0 holds address
+        state.set_vgpr_pair(RegPair(2), 0)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(0),
+            vdata=RegPair(2),
+        )
+        mutant = DestructiveMutantInterpreter()
+        mutant.execute(state, inst)
+
+        self.assertNotEqual(lds.read_qword(16), MASK64)
+
+    def test_mutation_detection_ignore_exec_mask(self) -> None:
+        class MutantSIMDInterpreter(SIMDInterpreter):
+            def execute(self, state: SIMDState, inst: DSNorRtnB64Instruction) -> Dict[int, Optional[int]]:
+                saved_mask = state.exec_mask
+                state.exec_mask = (1 << state.num_lanes) - 1
+                try:
+                    return super().execute(state, inst)
+                finally:
+                    state.exec_mask = saved_mask
+
+        lds = LDSMemory(65536)
+        lds.write_qword(16, 0)
+        wave = SIMDState(num_lanes=32, exec_mask=0x0, lds=lds)
+        for l in range(32):
+            wave.set_lane_vgpr(l, RegSingle(2), l * 8)
+            wave.set_lane_vgpr_pair(l, RegPair(4), 0)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_B64,
+            vaddr=RegSingle(2),
+            vdata=RegPair(4),
+        )
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+
+        self.assertEqual(lds.read_qword(16), MASK64)
+
+        lds.write_qword(16, 0)
+        SIMDInterpreter().execute(wave, inst)
+        self.assertEqual(lds.read_qword(16), 0)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetInterpreter(ScalarInterpreter):
+            def execute(self, state: ScalarMachineState, inst: DSNorRtnB64Instruction) -> Optional[int]:
+                no_off_inst = DSNorRtnB64Instruction(
+                    opcode=inst.opcode,
+                    vaddr=inst.vaddr,
+                    vdata=inst.vdata,
+                    vdst=inst.vdst,
+                    offset=OffsetImmediate(0),
+                )
+                return super().execute(state, no_off_inst)
+
+        lds = LDSMemory(65536)
+        lds.write_qword(8, 0)
+        lds.write_qword(16, 0)
+        state = ScalarMachineState(lds=lds)
+        state.set_vgpr(RegSingle(2), 8)
+        state.set_vgpr_pair(RegPair(4), 0)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_B64,
+            vaddr=RegSingle(2),
+            vdata=RegPair(4),
+            offset=OffsetImmediate(8),  # Points to qword 16
+        )
+        mutant = DroppedOffsetInterpreter()
+        mutant.execute(state, inst)
+
+        self.assertEqual(lds.read_qword(8), MASK64)
+        self.assertEqual(lds.read_qword(16), 0)
+
+    def test_mutation_detection_non_atomic_collision(self) -> None:
+        class NonAtomicSIMDInterpreter(SIMDInterpreter):
+            def execute(self, state: SIMDState, inst: DSNorRtnB64Instruction) -> Dict[int, Optional[int]]:
+                results: Dict[int, Optional[int]] = {}
+                read_vals: Dict[int, int] = {}
+                for lane in range(state.num_lanes):
+                    if state.is_lane_active(lane):
+                        vaddr_val = state.get_lane_vgpr(lane, inst.vaddr)
+                        read_vals[lane] = state.lds.read_qword(vaddr_val, inst.offset.value)
+                for lane in range(state.num_lanes):
+                    if state.is_lane_active(lane):
+                        if inst.opcode.is_return:
+                            assert inst.vdst is not None
+                            state.set_lane_vgpr_pair(lane, inst.vdst, read_vals[lane])
+                            results[lane] = read_vals[lane]
+                return results
+
+        lds = LDSMemory(65536)
+        lds.write_qword(0, 0)
+        wave = SIMDState(num_lanes=32, exec_mask=0x3, lds=lds)
+        wave.set_lane_vgpr(0, RegSingle(2), 0)
+        wave.set_lane_vgpr_pair(0, RegPair(4), 0)
+        wave.set_lane_vgpr(1, RegSingle(2), 0)
+        wave.set_lane_vgpr_pair(1, RegPair(4), 0)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata=RegPair(4),
+        )
+
+        mutant = NonAtomicSIMDInterpreter()
+        mutant_res = mutant.execute(wave, inst)
+        self.assertEqual(mutant_res[1], 0)
+
+        lds.write_qword(0, 0)
+        true_res = SIMDInterpreter().execute(wave, inst)
+        self.assertEqual(true_res[1], MASK64)
+
+
 if __name__ == "__main__":
     unittest.main()
