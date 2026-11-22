@@ -191,6 +191,8 @@ def main():
     parser.add_argument("mapper", type=Path)
     parser.add_argument("probe", type=Path, help="source-built image with no entry point and no imports")
     args = parser.parse_args()
+    # Refused images must return loader errors instead of a Bad Image dialog on interactive runners.
+    kernel.SetErrorMode(kernel.GetErrorMode() | 0x0001)  # SEM_FAILCRITICALERRORS
     mapper = Mapper(args.mapper)
 
     with TemporaryDirectory() as folder:
