@@ -436,5 +436,195 @@ class TestSymbolicASTAndInstruction(unittest.TestCase):
             DSIncRtnInstruction.parse("ds_inc_rtn_u32 v0, v1, v2 bad_modifier")
 
 
+# ==============================================================================
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarMachineState:
+    """Architectural state representation for single-thread scalar execution."""
+
+    def __init__(
+        self,
+        lds_capacity_dwords: int = LDS_SIZE_DWORDS,
+        num_vgprs: int = DEFAULT_NUM_VGPRS,
+        num_sgprs: int = DEFAULT_NUM_SGPRS,
+    ) -> None:
+        self.lds = LDSModel(capacity_dwords=lds_capacity_dwords)
+        self.num_vgprs = num_vgprs
+        self.num_sgprs = num_sgprs
+        self.vgprs: list[int] = [0] * num_vgprs
+        self.sgprs: list[int] = [0] * num_sgprs
+        self.m0: int = 0
+
+    def get_vgpr(self, index: int) -> int:
+        if not (0 <= index < self.num_vgprs):
+            raise IndexError(f"VGPR index out of range [0..{self.num_vgprs - 1}]: {index}")
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        if not (0 <= index < self.num_vgprs):
+            raise IndexError(f"VGPR index out of range [0..{self.num_vgprs - 1}]: {index}")
+        self.vgprs[index] = u32(val)
+
+    def get_sgpr(self, index: int) -> int:
+        if not (0 <= index < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range [0..{self.num_sgprs - 1}]: {index}")
+        return self.sgprs[index]
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        if not (0 <= index < self.num_sgprs):
+            raise IndexError(f"SGPR index out of range [0..{self.num_sgprs - 1}]: {index}")
+        self.sgprs[index] = u32(val)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter executing ds_inc_rtn_u32."""
+
+    def step(
+        self,
+        instr: DSIncRtnInstruction,
+        state: ScalarMachineState,
+    ) -> Tuple[int, int]:
+        """Execute one ds_inc_rtn_u32 instruction sequentially.
+
+        Returns:
+            Tuple[int, int]: (old_val, new_mem)
+        """
+        vaddr = state.get_vgpr(instr.vaddr.index)
+        wrap_limit = state.get_vgpr(instr.vdata.index)
+
+        old_val, new_mem = state.lds.atomic_inc_rtn_u32(
+            vaddr=vaddr,
+            wrap_limit=wrap_limit,
+            offset=instr.offset,
+        )
+
+        state.set_vgpr(instr.vdst.index, old_val)
+        return old_val, new_mem
+
+    def parse_and_step(
+        self,
+        asm_line: str,
+        state: ScalarMachineState,
+    ) -> Tuple[int, int]:
+        """Parse assembly text and execute one step."""
+        instr = DSIncRtnInstruction.parse(asm_line)
+        return self.step(instr, state)
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def test_single_step_execution(self) -> None:
+        state = ScalarMachineState(lds_capacity_dwords=1024)
+        interp = ScalarInterpreter()
+
+        addr = 0x200
+        state.lds.write_dword(addr, 10)
+        state.set_vgpr(1, addr)   # vaddr = 0x200
+        state.set_vgpr(2, 20)     # vdata = wrap_limit 20
+        state.set_vgpr(0, 0xDEAD) # vdst
+
+        instr = DSIncRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata=RegisterOperand(2, RegType.VGPR),
+            offset=0,
+        )
+
+        old_val, new_mem = interp.step(instr, state)
+
+        self.assertEqual(old_val, 10)
+        self.assertEqual(new_mem, 11)
+        self.assertEqual(state.get_vgpr(0), 10)
+        self.assertEqual(state.lds.read_dword(addr), 11)
+
+    def test_wrapping_cycle(self) -> None:
+        state = ScalarMachineState(lds_capacity_dwords=1024)
+        interp = ScalarInterpreter()
+
+        addr = 0x100
+        state.lds.write_dword(addr, 0)
+        state.set_vgpr(1, addr)
+        state.set_vgpr(2, 3)  # limit = 3: 0 -> 1 -> 2 -> 3 -> 0
+
+        instr = DSIncRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata=RegisterOperand(2, RegType.VGPR),
+        )
+
+        # Step 1: 0 -> 1 (old 0)
+        old, mem = interp.step(instr, state)
+        self.assertEqual((old, mem), (0, 1))
+        self.assertEqual(state.get_vgpr(0), 0)
+
+        # Step 2: 1 -> 2 (old 1)
+        old, mem = interp.step(instr, state)
+        self.assertEqual((old, mem), (1, 2))
+        self.assertEqual(state.get_vgpr(0), 1)
+
+        # Step 3: 2 -> 3 (old 2)
+        old, mem = interp.step(instr, state)
+        self.assertEqual((old, mem), (2, 3))
+        self.assertEqual(state.get_vgpr(0), 2)
+
+        # Step 4: 3 -> 0 (wrap! old 3)
+        old, mem = interp.step(instr, state)
+        self.assertEqual((old, mem), (3, 0))
+        self.assertEqual(state.get_vgpr(0), 3)
+
+        # Step 5: 0 -> 1 (old 0)
+        old, mem = interp.step(instr, state)
+        self.assertEqual((old, mem), (0, 1))
+        self.assertEqual(state.get_vgpr(0), 0)
+
+    def test_offset_immediate_stepping(self) -> None:
+        state = ScalarMachineState(lds_capacity_dwords=1024)
+        interp = ScalarInterpreter()
+
+        state.lds.write_dword(0x310, 50)
+        state.set_vgpr(1, 0x300)  # base
+        state.set_vgpr(2, 100)    # limit
+
+        instr = DSIncRtnInstruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata=RegisterOperand(2, RegType.VGPR),
+            offset=0x10,
+        )
+
+        old, mem = interp.step(instr, state)
+        self.assertEqual(old, 50)
+        self.assertEqual(mem, 51)
+        self.assertEqual(state.lds.read_dword(0x310), 51)
+
+    def test_parse_and_step_interface(self) -> None:
+        state = ScalarMachineState(lds_capacity_dwords=1024)
+        interp = ScalarInterpreter()
+
+        state.lds.write_dword(0x40, 7)
+        state.set_vgpr(1, 0x40)
+        state.set_vgpr(2, 10)
+
+        old, mem = interp.parse_and_step("ds_inc_rtn_u32 v0, v1, v2", state)
+        self.assertEqual(old, 7)
+        self.assertEqual(mem, 8)
+        self.assertEqual(state.get_vgpr(0), 7)
+
+    def test_untouched_registers_preserved(self) -> None:
+        state = ScalarMachineState(lds_capacity_dwords=1024)
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(1, 0x80)
+        state.set_vgpr(2, 10)
+        state.set_vgpr(3, 0xCAFE)
+        state.set_vgpr(4, 0xBEEF)
+
+        interp.parse_and_step("ds_inc_rtn_u32 v0, v1, v2", state)
+        self.assertEqual(state.get_vgpr(3), 0xCAFE)
+        self.assertEqual(state.get_vgpr(4), 0xBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
