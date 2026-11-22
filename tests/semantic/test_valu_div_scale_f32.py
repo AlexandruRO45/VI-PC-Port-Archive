@@ -846,5 +846,177 @@ class TestDivScaleF32SymbolicAST(unittest.TestCase):
         self.assertTrue(inst.clamp)
 
 
+class ScalarRegisterFile:
+    """Register file for a single scalar lane with 256 VGPRs and 106 SGPRs."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 108  # 106 general SGPRs + VCC_LO (106) and VCC_HI (107)
+
+    def read_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def read_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx]
+
+    def write_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def read_vgpr_f32(self, idx: int) -> float:
+        return u32_to_f32(self.vgprs[idx])
+
+    def write_vgpr_f32(self, idx: int, val: float) -> None:
+        self.vgprs[idx] = f32_to_u32(val)
+
+    def read_sgpr_f32(self, idx: int) -> float:
+        return u32_to_f32(self.sgprs[idx])
+
+    def write_sgpr_f32(self, idx: int, val: float) -> None:
+        self.sgprs[idx] = f32_to_u32(val)
+
+    @property
+    def vcc(self) -> int:
+        return self.sgprs[106]
+
+    @vcc.setter
+    def vcc(self, val: int) -> None:
+        self.sgprs[106] = val & MASK32
+
+
+class DivScaleF32ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for v_div_scale_f32."""
+
+    def __init__(self, reg_file: ScalarRegisterFile | None = None) -> None:
+        self.reg_file = reg_file if reg_file is not None else ScalarRegisterFile()
+
+    def resolve_source_u32(self, src: ASTOperand) -> int:
+        if src.kind == OperandKind.VGPR:
+            val_u32 = self.reg_file.read_vgpr(src.index)
+        elif src.kind == OperandKind.SGPR:
+            val_u32 = self.reg_file.read_sgpr(src.index)
+        elif src.kind in (OperandKind.INLINE_CONST, OperandKind.LITERAL_CONST):
+            val_u32 = f32_to_u32(float(src.value)) if src.value is not None else 0
+        else:
+            raise ValueError(f"Unsupported operand kind: {src.kind}")
+
+        return apply_src_mods_u32(val_u32, neg=src.neg, abs_=src.abs_)
+
+    def step(self, inst: ASTInstruction) -> tuple[int, int]:
+        inst.validate()
+        u0 = self.resolve_source_u32(inst.src0)
+        u1 = self.resolve_source_u32(inst.src1)
+        u2 = self.resolve_source_u32(inst.src2)
+
+        d_u32, vcc_bit = ref_div_scale_f32_u32(
+            u0,
+            u1,
+            u2,
+            clamp=inst.clamp,
+            omod=inst.omod.value,
+        )
+
+        self.reg_file.write_vgpr(inst.dst.index, d_u32)
+
+        if inst.sdst.kind == OperandKind.VCC:
+            self.reg_file.vcc = vcc_bit
+        elif inst.sdst.kind == OperandKind.SGPR:
+            self.reg_file.write_sgpr(inst.sdst.index, vcc_bit)
+
+        return d_u32, vcc_bit
+
+
+class TestDivScaleF32ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def test_interpreter_normal_execution(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF32ScalarInterpreter(rf)
+
+        # v1 = 2.0, v2 = 10.0
+        rf.write_vgpr_f32(1, 2.0)
+        rf.write_vgpr_f32(2, 10.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 0)
+        self.assertEqual(rf.vcc, 0)
+        self.assertEqual(rf.read_vgpr_f32(0), 2.0)
+
+    def test_interpreter_scale_up_small_denom(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF32ScalarInterpreter(rf)
+
+        small = 2.0 ** -100
+        rf.write_vgpr_f32(1, small)
+        rf.write_vgpr_f32(2, 1.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+        )
+
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(vcc_res, 1)
+        self.assertEqual(rf.vcc, 1)
+        self.assertAlmostEqual(rf.read_vgpr_f32(0), small * SCALE64_POS)
+
+    def test_interpreter_source_modifiers(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF32ScalarInterpreter(rf)
+
+        rf.write_vgpr_f32(1, -2.5)
+        rf.write_vgpr_f32(2, 5.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.sdst_sgpr(10),
+            src0=ASTOperand.vgpr(1, abs_=True),
+            src1=ASTOperand.vgpr(1, abs_=True),
+            src2=ASTOperand.vgpr(2),
+        )
+
+        d_res, vcc_res = interp.step(inst)
+        self.assertEqual(rf.read_vgpr_f32(0), 2.5)
+        self.assertEqual(rf.read_sgpr(10), 0)
+
+    def test_interpreter_clamp_and_omod(self):
+        rf = ScalarRegisterFile()
+        interp = DivScaleF32ScalarInterpreter(rf)
+
+        rf.write_vgpr_f32(1, 0.4)
+        rf.write_vgpr_f32(2, 1.0)
+
+        inst = ASTInstruction(
+            opcode=Opcode.V_DIV_SCALE_F32,
+            dst=ASTOperand.vgpr(0),
+            sdst=ASTOperand.vcc(),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(1),
+            src2=ASTOperand.vgpr(2),
+            omod=OMod.MUL2,
+            clamp=True,
+        )
+
+        interp.step(inst)
+        # 0.4 * 2.0 = 0.8 <= 1.0
+        self.assertAlmostEqual(rf.read_vgpr_f32(0), 0.8)
+
+
 if __name__ == "__main__":
     unittest.main()
