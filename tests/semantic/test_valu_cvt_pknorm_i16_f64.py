@@ -765,5 +765,220 @@ class TestValuCvtPknormI16F64ScalarInterpreter(unittest.TestCase):
             self.state.set_vgpr64(-1, 0)
 
 
+# ==============================================================================
+# Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Multi-lane SIMD machine state representing Wave32 or Wave64 execution."""
+    num_lanes: int
+    exec_mask: Optional[int] = None
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 256)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = (1 << self.num_lanes) - 1
+
+    def get_vgpr(self, lane: int, index: int) -> int:
+        return self.vgprs[lane][index] & MASK32
+
+    def set_vgpr(self, lane: int, index: int, val: int) -> None:
+        self.vgprs[lane][index] = val & MASK32
+
+    def get_vgpr64(self, lane: int, index: int) -> int:
+        return join_dwords(self.vgprs[lane][index], self.vgprs[lane][index + 1])
+
+    def set_vgpr64(self, lane: int, index: int, val: int) -> None:
+        lo, hi = split_dwords(val)
+        self.vgprs[lane][index] = lo
+        self.vgprs[lane][index + 1] = hi
+
+    def get_sgpr(self, index: int) -> int:
+        return self.sgprs[index] & MASK32
+
+    def set_sgpr(self, index: int, val: int) -> None:
+        self.sgprs[index] = val & MASK32
+
+    def get_sgpr64(self, index: int) -> int:
+        return join_dwords(self.sgprs[index], self.sgprs[index + 1])
+
+    def set_sgpr64(self, index: int, val: int) -> None:
+        lo, hi = split_dwords(val)
+        self.sgprs[index] = lo
+        self.sgprs[index + 1] = hi
+
+
+class SIMDInterpreter:
+    """SIMD instruction interpreter handling multi-lane divergence and EXEC masking."""
+
+    def resolve_lane_operand(self, op: VOP3Operand64, state: SIMDState, lane: int) -> int:
+        if isinstance(op.source, Reg64):
+            if op.source.reg_type == RegType.VGPR:
+                return state.get_vgpr64(lane, op.source.index)
+            elif op.source.reg_type == RegType.SGPR:
+                return state.get_sgpr64(op.source.index)
+            else:
+                raise ValueError(f"Unknown register type: {op.source.reg_type}")
+        elif isinstance(op.source, Literal64):
+            return op.source.bits & MASK64
+        else:
+            raise TypeError(f"Unsupported operand source type: {type(op.source)}")
+
+    def step(self, instr: VCvtPknormI16F64Instruction, state: SIMDState) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * state.num_lanes
+
+        s0_vals = [
+            self.resolve_lane_operand(instr.src0, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+        s1_vals = [
+            self.resolve_lane_operand(instr.src1, state, lane)
+            for lane in range(state.num_lanes)
+        ]
+
+        for lane in range(state.num_lanes):
+            if (state.exec_mask & (1 << lane)) != 0:
+                res = oracle_v_cvt_pknorm_i16_f64(
+                    src0_bits=s0_vals[lane],
+                    src1_bits=s1_vals[lane],
+                    abs0=instr.src0.abs_mod,
+                    neg0=instr.src0.neg_mod,
+                    abs1=instr.src1.abs_mod,
+                    neg1=instr.src1.neg_mod,
+                    clamp=instr.clamp,
+                )
+                state.set_vgpr(lane, instr.dst.index, res)
+                results[lane] = res
+
+        return results
+
+
+class TestValuCvtPknormI16F64SIMDDivergence(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and Wave32/Wave64 EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpreter()
+
+    def test_wave32_all_active(self) -> None:
+        """Verify full 32-lane vector computation with unique values per lane."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        for lane in range(32):
+            val0 = -1.0 + (2.0 * lane / 31.0)
+            val1 = 1.0 - (2.0 * lane / 31.0)
+            state.set_vgpr64(lane, 2, f64_to_bits(val0))
+            state.set_vgpr64(lane, 4, f64_to_bits(val1))
+
+        instr = VCvtPknormI16F64Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg64(2, RegType.VGPR)),
+            src1=VOP3Operand64(Reg64(4, RegType.VGPR)),
+        )
+
+        results = self.interp.step(instr, state)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            self.assertIsNotNone(results[lane])
+            expected = oracle_v_cvt_pknorm_i16_f64(state.get_vgpr64(lane, 2), state.get_vgpr64(lane, 4))
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+    def test_wave64_all_active(self) -> None:
+        """Verify full 64-lane vector execution in Wave64 mode."""
+        state = SIMDState(num_lanes=64, exec_mask=0xFFFFFFFFFFFFFFFF)
+        for lane in range(64):
+            val0 = math.sin(lane * 0.1)
+            val1 = math.cos(lane * 0.1)
+            state.set_vgpr64(lane, 2, f64_to_bits(val0))
+            state.set_vgpr64(lane, 4, f64_to_bits(val1))
+
+        instr = VCvtPknormI16F64Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg64(2, RegType.VGPR)),
+            src1=VOP3Operand64(Reg64(4, RegType.VGPR)),
+        )
+
+        results = self.interp.step(instr, state)
+        self.assertEqual(len(results), 64)
+        for lane in range(64):
+            expected = oracle_v_cvt_pknorm_i16_f64(state.get_vgpr64(lane, 2), state.get_vgpr64(lane, 4))
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+    def test_wave32_even_odd_divergence(self) -> None:
+        """Verify even lanes active and odd lanes masked out preserve state."""
+        even_mask = 0x55555555
+        state = SIMDState(num_lanes=32, exec_mask=even_mask)
+        sentinel = 0xDEADBEEF
+
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+            state.set_vgpr64(lane, 2, POS_ONE_F64)
+            state.set_vgpr64(lane, 4, NEG_ONE_F64)
+
+        instr = VCvtPknormI16F64Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg64(2, RegType.VGPR)),
+            src1=VOP3Operand64(Reg64(4, RegType.VGPR)),
+        )
+
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], 0x80017FFF)
+                self.assertEqual(state.get_vgpr(lane, 0), 0x80017FFF)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+    def test_exec_all_zero_mask(self) -> None:
+        """Verify EXEC=0 skips execution across all lanes entirely."""
+        state = SIMDState(num_lanes=32, exec_mask=0x0)
+        sentinel = 0x12345678
+
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+            state.set_vgpr64(lane, 2, POS_ONE_F64)
+            state.set_vgpr64(lane, 4, POS_ONE_F64)
+
+        instr = VCvtPknormI16F64Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg64(2, RegType.VGPR)),
+            src1=VOP3Operand64(Reg64(4, RegType.VGPR)),
+        )
+
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            self.assertIsNone(results[lane])
+            self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+    def test_shared_sgpr_broadcast_simd(self) -> None:
+        """Verify uniform 64-bit SGPR operand is correctly broadcast across divergent lanes."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        state.set_sgpr64(4, POS_ONE_F64)
+
+        for lane in range(32):
+            val0 = -1.0 if lane < 16 else 0.5
+            state.set_vgpr64(lane, 2, f64_to_bits(val0))
+
+        instr = VCvtPknormI16F64Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3Operand64(Reg64(2, RegType.VGPR)),
+            src1=VOP3Operand64(Reg64(4, RegType.SGPR)),
+        )
+
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            ch0_expected = 0x8001 if lane < 16 else 0x4000
+            expected = (0x7FFF << 16) | ch0_expected
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.get_vgpr(lane, 0), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
