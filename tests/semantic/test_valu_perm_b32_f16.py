@@ -574,5 +574,122 @@ class TestPermB32F16ScalarInterpreter(unittest.TestCase):
         self.interp.execute(instr)
         self.assertEqual(self.rf.get_vgpr(0), pack_halves(POS_ONE, POS_ZERO))
 
+# ==============================================================================
+# SIMD Multi-Lane Wave State and 32/64-bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDWaveState:
+    num_lanes: int = 32
+    exec_mask: Optional[int] = None
+    lane_vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def __post_init__(self):
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"Wavefront size must be 32 or 64, got {self.num_lanes}")
+        if not self.lane_vgprs:
+            self.lane_vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        if self.exec_mask is None:
+            self.exec_mask = 0xFFFF_FFFF_FFFF_FFFF if self.num_lanes == 64 else MASK32
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_lane_vgpr(self, reg: int, lane: int) -> int:
+        return self.lane_vgprs[lane][reg] & MASK32
+
+    def set_lane_vgpr(self, reg: int, lane: int, val: int) -> None:
+        self.lane_vgprs[lane][reg] = val & MASK32
+
+    def set_wave_vgpr(self, reg: int, vals: List[int]) -> None:
+        for lane in range(self.num_lanes):
+            self.set_lane_vgpr(reg, lane, vals[lane])
+
+    def get_sgpr(self, reg: int) -> int:
+        return self.sgprs[reg] & MASK32
+
+    def set_sgpr(self, reg: int, val: int) -> None:
+        self.sgprs[reg] = val & MASK32
+
+    def read_operand_for_lane(self, op: ASTOperand, lane: int) -> Tuple[int, bool, bool]:
+        if op.kind == OperandKind.VGPR:
+            val = self.get_lane_vgpr(op.reg_num, lane)
+        elif op.kind == OperandKind.SGPR:
+            val = self.get_sgpr(op.reg_num)
+        elif op.kind in (OperandKind.LITERAL_CONST, OperandKind.INLINE_CONST):
+            val = op.constant_val & MASK32
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+        return val, op.abs_mod, op.neg_mod
+
+    def execute_instruction(self, instr: ASTInstruction) -> None:
+        instr.validate()
+        for lane in range(self.num_lanes):
+            if not self.is_lane_active(lane):
+                continue
+
+            s0_val, abs0, neg0 = self.read_operand_for_lane(instr.src0, lane)
+            s1_val, abs1, neg1 = self.read_operand_for_lane(instr.src1, lane)
+            sel_val, _, _ = self.read_operand_for_lane(instr.src2, lane)
+
+            res = oracle_v_perm_b32_f16(
+                src0=s0_val,
+                src1=s1_val,
+                selector=sel_val,
+                abs0=abs0,
+                neg0=neg0,
+                abs1=abs1,
+                neg1=neg1,
+                clamp=instr.clamp,
+            )
+            self.set_lane_vgpr(instr.dst.reg_num, lane, res)
+
+
+class TestPermB32F16SIMDDivergence(unittest.TestCase):
+    def test_simd_wave32_divergent_even_odd_lanes(self):
+        wave = SIMDWaveState(num_lanes=32, exec_mask=0x5555_5555)
+        wave.set_wave_vgpr(0, [0xDEAD_BEEF] * 32)
+        wave.set_wave_vgpr(1, [pack_halves(POS_ONE, POS_TWO)] * 32)
+        wave.set_wave_vgpr(2, [pack_halves(POS_HALF, MIN_NORMAL)] * 32)
+        sel = PermSelectorWord.identity_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.literal(sel),
+        )
+        wave.execute_instruction(instr)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave.get_lane_vgpr(0, lane), pack_halves(POS_HALF, MIN_NORMAL))
+            else:
+                self.assertEqual(wave.get_lane_vgpr(0, lane), 0xDEAD_BEEF)
+
+    def test_simd_wave64_divergent_high_low_half(self):
+        wave = SIMDWaveState(num_lanes=64, exec_mask=0x0000_0000_FFFF_FFFF)
+        wave.set_wave_vgpr(0, [0xCAFE_BABE] * 64)
+        wave.set_wave_vgpr(1, [pack_halves(POS_TWO, POS_TWO)] * 64)
+        wave.set_wave_vgpr(2, [pack_halves(POS_ONE, POS_ONE)] * 64)
+        sel = PermSelectorWord.identity_src1().raw
+
+        instr = ASTInstruction(
+            opcode=Opcode.V_PERM_B32_F16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+            src2=ASTOperand.literal(sel),
+        )
+        wave.execute_instruction(instr)
+
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(wave.get_lane_vgpr(0, lane), pack_halves(POS_ONE, POS_ONE))
+            else:
+                self.assertEqual(wave.get_lane_vgpr(0, lane), 0xCAFE_BABE)
+
 if __name__ == "__main__":
     unittest.main()
