@@ -34,8 +34,10 @@ methods are still open.
   `dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release`.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
-- `python -I tests/test_<name>.py` runs one of the unit tests (standard library only; CI runs them all). To run the
-  pytest-based tests matching CI, install the test dependencies first: `pip install -r tests/requirements.txt`.
+- `python -I tests/test_<name>.py` runs one of the standard-library unit tests (CI runs them all). The
+  pytest-based ones need `pip install -r tests/requirements.txt` and `python -m pytest tests/test_<name>.py`
+  (**not** `-I`: it hides user site-packages, so `import pytest` fails); `python -m pytest tests -q` runs all of
+  them.
 - Runtime tests: `cmake -S runtime -B runtime/build -DLEONIDA_D3D12_SHIM_TESTS=ON`,
   `cmake --build runtime/build --config RelWithDebInfo`, then
   `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. On Windows, `VULKAN_SDK` can point to
