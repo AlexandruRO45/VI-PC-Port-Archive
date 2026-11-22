@@ -1119,6 +1119,98 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
         self.assertEqual(state.get_vgpr_qword(0), 0x1234_5678_9ABC_DEF0)
 
 
+# ============================================================================
+# Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ============================================================================
+
+@dataclass(frozen=True)
+class Sub64ConditionFlags:
+    """Status flags and condition codes derived from 64-bit unsigned subtraction."""
+    z: bool             # Zero flag: result == 0 (A == B)
+    n: bool             # Sign flag: bit 63 set
+    borrow_out: bool    # 64-bit borrow out: True if A < B
+    borrow_dword: bool  # 32-bit dword boundary borrow: True if (A & MASK_32) < (B & MASK_32)
+
+
+def compute_sub64_condition_flags(a_u64: int, b_u64: int) -> Sub64ConditionFlags:
+    """Compute condition flags for unsigned 64-bit subtraction (a - b)."""
+    a = u64(a_u64)
+    b = u64(b_u64)
+    res = u64(a - b)
+
+    z = (res == 0)
+    n = bool(res & 0x8000_0000_0000_0000)
+    borrow_out = (a < b)
+    borrow_dword = ((a & MASK_32) < (b & MASK_32))
+
+    return Sub64ConditionFlags(
+        z=z,
+        n=n,
+        borrow_out=borrow_out,
+        borrow_dword=borrow_dword,
+    )
+
+
+class TestConditionCodesStatusFlagsAndCarryBorrow(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow relations."""
+
+    def test_ds_instruction_hardware_flag_isolation(self) -> None:
+        """DS instructions do not modify hardware scalar condition code (SCC)."""
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.set_sgpr(0, 1)  # SCC set
+        state.lds.write_qword(0x10, 100)
+        state.set_vgpr(4, 0x10)
+        state.set_vgpr_qword(2, 25)
+
+        instr = DSSubRtnU64Instruction(
+            dst=VGPRPair(0), addr=VGPR(4), data0=VGPRPair(2)
+        )
+        interp.step(instr, state)
+
+        # SCC is preserved unchanged
+        self.assertEqual(state.get_sgpr(0), 1)
+
+    def test_zero_flag_on_equal_operands(self) -> None:
+        """A == B produces result 0 and sets Z flag."""
+        val = 0x1234_5678_9ABC_DEF0
+        flags = compute_sub64_condition_flags(val, val)
+        self.assertTrue(flags.z)
+        self.assertFalse(flags.n)
+        self.assertFalse(flags.borrow_out)
+        self.assertFalse(flags.borrow_dword)
+
+    def test_sign_flag_transitions(self) -> None:
+        """Bit 63 set in result sets N flag."""
+        # 0 - 1 produces 0xFFFF_FFFF_FFFF_FFFF (bit 63 is 1)
+        flags = compute_sub64_condition_flags(0, 1)
+        self.assertTrue(flags.n)
+        self.assertTrue(flags.borrow_out)
+        self.assertFalse(flags.z)
+
+    def test_borrow_out_detection(self) -> None:
+        """Borrow out occurs if and only if A < B in unsigned comparison."""
+        flags_borrow = compute_sub64_condition_flags(100, 200)
+        self.assertTrue(flags_borrow.borrow_out)
+
+        flags_noborrow = compute_sub64_condition_flags(200, 100)
+        self.assertFalse(flags_noborrow.borrow_out)
+
+    def test_dword_boundary_borrow(self) -> None:
+        """Borrow occurs across 32-bit dword boundary when low dword underflows."""
+        # A = 0x0000_0001_0000_0000, B = 0x0000_0000_0000_0001
+        # Low dword of A is 0, low dword of B is 1 -> borrow_dword is True
+        # But A > B in 64 bits, so borrow_out is False!
+        a = 0x0000_0001_0000_0000
+        b = 0x0000_0000_0000_0001
+        flags = compute_sub64_condition_flags(a, b)
+        self.assertTrue(flags.borrow_dword)
+        self.assertFalse(flags.borrow_out)
+        self.assertFalse(flags.z)
+
+
+
 
 
 
