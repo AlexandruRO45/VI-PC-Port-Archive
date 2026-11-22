@@ -515,6 +515,7 @@ int main(int argc, char** argv) {
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
     std::string dir = argv[1], cache_path, stats_path;
+    bool has_cache_path = false;
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
     size_t large_module_bytes = 4 * 1024 * 1024;
@@ -554,8 +555,16 @@ int main(int argc, char** argv) {
         else if (a == "--isolate-batch") {   // parsed like the other numbers (#1735); at least one per batch
             valid = number(isolate_batch);
             isolate_batch = std::max<size_t>(1, isolate_batch);
+        } else if (a.starts_with("--")) {
+            std::fprintf(stderr, "unknown option '%s'\n", a.c_str());
+            return 2;
+        } else if (has_cache_path) {
+            std::fprintf(stderr, "unexpected argument '%s' (only one cache path is allowed)\n", a.c_str());
+            return 2;
+        } else {
+            cache_path = a;
+            has_cache_path = true;
         }
-        else cache_path = a;
         if (!valid) {
             std::fprintf(stderr, "%s requires a valid value\n", a.c_str());
             return 2;

@@ -24,8 +24,21 @@ check_invalid(--slow -0.5)
 check_invalid(--stage --graphics-only)
 check_invalid(--stats)
 
+function(check_usage message)
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" ${ARGN}
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  string(FIND "${log}" "${message}" found)
+  if(NOT code STREQUAL "2" OR found EQUAL -1)
+    message(FATAL_ERROR "${ARGN}: expected '${message}', got ${code}\n${log}")
+  endif()
+endfunction()
+
+check_usage("unknown option '--jonbs'" --jonbs 2)
+check_usage("unknown option '--jonbs'" cache.bin --jonbs 2)
+check_usage("unexpected argument 'extra.bin'" cache.bin extra.bin)
+
 execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"
-                --jobs 2 --start 3 --count 0 --max-bytes 0 --large-module-bytes 0
+                cache.bin --jobs 2 --start 3 --count 0 --max-bytes 0 --large-module-bytes 0
                 --slow 0.5 --stage cs --stats report.csv
                 RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
 # The index parser names the file and where it stopped (#1847: "index.json: expected '{' at byte 0").
