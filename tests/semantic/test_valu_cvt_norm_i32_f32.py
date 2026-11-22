@@ -505,5 +505,95 @@ class TestValuCvtNormI32F32AST(unittest.TestCase):
         self.assertTrue(ast.clamp)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic scalar instruction interpreter for v_cvt_norm_i32_f32
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar instruction interpreter for RDNA2 VALU instructions."""
+
+    def __init__(self) -> None:
+        self.num_vgprs = 256
+        self.num_sgprs = 106
+        self.vgprs: list[int] = [0] * self.num_vgprs
+        self.sgprs: list[int] = [0] * self.num_sgprs
+
+    def get_vgpr_u32(self, idx: int) -> int:
+        return self.vgprs[idx & 0xFF] & MASK32
+
+    def set_vgpr_u32(self, idx: int, val: int) -> int:
+        self.vgprs[idx & 0xFF] = val & MASK32
+        return self.vgprs[idx & 0xFF]
+
+    def get_sgpr_u32(self, idx: int) -> int:
+        return self.sgprs[idx % self.num_sgprs] & MASK32
+
+    def set_sgpr_u32(self, idx: int, val: int) -> int:
+        self.sgprs[idx % self.num_sgprs] = val & MASK32
+        return self.sgprs[idx % self.num_sgprs]
+
+    def resolve_src0(self, src: Union[RegOperand, ImmediateOperand]) -> int:
+        """Fetch and apply modifiers to source operand."""
+        if isinstance(src, ImmediateOperand):
+            val = src.value & MASK32
+            abs_mod = src.abs_mod
+            neg_mod = src.neg_mod
+        elif isinstance(src, RegOperand):
+            abs_mod = src.abs_mod
+            neg_mod = src.neg_mod
+            if src.reg_type == RegType.VGPR:
+                val = self.get_vgpr_u32(src.index)
+            else:
+                val = self.get_sgpr_u32(src.index)
+        else:
+            raise TypeError(f"Unknown source operand type: {type(src)}")
+        return apply_f32_modifiers(val, abs_mod, neg_mod)
+
+    def execute(self, ast: InstructionAST) -> int:
+        ast.validate()
+        if ast.opcode == "v_cvt_norm_i32_f32":
+            src0_val = self.resolve_src0(ast.src0)
+            res = oracle_v_cvt_norm_i32_f32(src0_val)
+            return self.set_vgpr_u32(ast.dst.index, res)
+        raise NotImplementedError(f"Opcode '{ast.opcode}' not implemented in scalar interpreter")
+
+    def execute_asm(self, asm_line: str) -> int:
+        ast = parse_vop_cvt_norm_i32_f32(asm_line)
+        return self.execute(ast)
+
+
+class TestValuCvtNormI32F32ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_basic_scalar_execution(self) -> None:
+        self.interp.set_vgpr_u32(1, ONE_F32)
+        res = self.interp.execute_asm("v_cvt_norm_i32_f32 v0, v1")
+        self.assertEqual(res, 2147483647)
+        self.assertEqual(self.interp.get_vgpr_u32(0), 2147483647)
+
+    def test_scalar_negative_execution(self) -> None:
+        self.interp.set_vgpr_u32(1, NEG_ONE_F32)
+        res = self.interp.execute_asm("v_cvt_norm_i32_f32 v0, v1")
+        self.assertEqual(res, 0x80000001)
+        self.assertEqual(self.interp.get_vgpr_u32(0), 0x80000001)
+
+    def test_scalar_sgpr_source(self) -> None:
+        self.interp.set_sgpr_u32(5, HALF_F32)
+        res = self.interp.execute_asm("v_cvt_norm_i32_f32 v2, s5")
+        self.assertEqual(res, 1073741824)
+
+    def test_scalar_literal_source(self) -> None:
+        res = self.interp.execute_asm("v_cvt_norm_i32_f32 v3, 0.5")
+        self.assertEqual(res, 1073741824)
+
+    def test_scalar_modifiers_execution(self) -> None:
+        self.interp.set_vgpr_u32(1, ONE_F32)
+        res = self.interp.execute_asm("v_cvt_norm_i32_f32 v0, -v1")
+        self.assertEqual(res, 0x80000001)
+
+
 if __name__ == "__main__":
     unittest.main()
