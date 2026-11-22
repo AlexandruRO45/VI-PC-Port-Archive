@@ -12640,6 +12640,55 @@ class Gen:
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
+    def image_load_mip(self, a, mods, dim):
+        """image_load_mip vData, vAddr, T#: explicit-mip texel fetch across 1D/2D/2D_ARRAY/CUBE/3D, with optional
+        a16 packed unsigned 16-bit coordinates+mip and optional d16 packed 16-bit results. Uses the same typed
+        sampled arrays as image_load (bindings 0, 3, 5, 6; no storage-image capability)."""
+        if "glc" in mods:
+            # A coherent read of one mip: image_load_coherent reads a storage view, which has one level.
+            raise Unsupported("image_load_mip glc")
+        if "tfe" in mods or "lwe" in mods:
+            raise Unsupported("image_load_mip status")
+        mip_dims = {
+            "dim:SQ_RSRC_IMG_1D": ("img1d", "%images_1d", "_ptr_UC_img1", 1, "dim:SQ_RSRC_IMG_1D"),
+            "dim:SQ_RSRC_IMG_2D": ("img2d", "%images", "_ptr_UC_img", 2, "dim:SQ_RSRC_IMG_2D"),
+            "dim:SQ_RSRC_IMG_2D_ARRAY": ("img2da", "%images_arr", "_ptr_UC_imga", 3, "dim:SQ_RSRC_IMG_2D_ARRAY"),
+            "dim:SQ_RSRC_IMG_CUBE": ("img2da", "%images_arr", "_ptr_UC_imga", 3, "dim:SQ_RSRC_IMG_2D_ARRAY"),
+            "dim:SQ_RSRC_IMG_3D": ("img3d", "%images_3d", "_ptr_UC_img3", 3, "dim:SQ_RSRC_IMG_3D"),
+        }
+        if dim not in mip_dims:
+            raise Unsupported("image_load_mip " + dim.split("SQ_RSRC_IMG_")[-1])
+        itype, iarr, iptr, ncoord, view_dim = mip_dims[dim]
+        if dim == "dim:SQ_RSRC_IMG_1D":
+            self.uses_tex_1d = True
+        elif dim == "dim:SQ_RSRC_IMG_3D":
+            self.uses_tex_3d = True
+        elif dim in ("dim:SQ_RSRC_IMG_2D_ARRAY", "dim:SQ_RSRC_IMG_CUBE"):
+            self.uses_tex_array = True
+        vdata, addr = a[0], self.addr_regs(a[1])
+        packed = "a16" in mods
+        total = ncoord + 1  # integer coordinates + explicit mip level
+        need_regs = (total + 1) // 2 if packed else total
+        if len(addr) < need_regs:
+            raise Unsupported("image_load_mip coords")
+        idx = self.desc_lookup_sgpr(a[2], 8)
+        ip, img = self.tmp(), self.tmp()
+        self.emit(f"{ip} = OpAccessChain %{iptr} {iarr} {idx}")
+        self.emit(f"{img} = OpLoad %{itype} {ip}")
+        if packed:
+            words = [self.load_reg("vgpr", r) for r in addr[:need_regs]]
+            xs = [self.as_int(c) for c in self.unpack_image_a16_uints(words)[:total]]
+        else:
+            xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:total]]
+        if ncoord == 1:
+            iv = xs[0]
+        else:
+            iv = self.tmp()
+            self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(xs[:ncoord])}")
+        dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+        self.image_load_typed(view_dim, self.sgpr_word(a[2], 1), iv, img, idx, int(dm.split(":")[1], 0),
+                              vdata, xs[ncoord], d16="d16" in mods)
+
     def image_misc(self, op, a, mods):
         """Query sampled image dimensions, load mip texels and handle storage image operations."""
         if a and a[0]["k"] != "vgpr":      # `off`, an SGPR or a constant where the VGPR range of the data goes
@@ -12654,28 +12703,12 @@ class Gen:
         if op == "image_load_mip" and "glc" in mods:
             # A coherent read of one mip: image_load_coherent reads a storage view, which has one level.
             raise Unsupported("image_load_mip glc")
-        if op == "image_load_mip" and dim == "dim:SQ_RSRC_IMG_3D" and "a16" not in mods:
-            # x, y, z, mip from a 3D sampled image (binding 6)
-            if "d16" in mods and ("tfe" in mods or "lwe" in mods):
-                raise Unsupported("image_load_mip d16 status")
-            vdata, addr = a[0], self.addr_regs(a[1])
-            if len(addr) < 4:
-                raise Unsupported("image_load_mip coords")
-            idx = self.desc_lookup_sgpr(a[2], 8)
-            self.uses_tex_3d = True
-            ip, img, iv = self.tmp(), self.tmp(), self.tmp()
-            self.dynamic_sampled_access(ip, "%_ptr_UC_img3", "%images_3d", idx)
-            self.emit(f"{img} = OpLoad %img3d {ip}")
-            xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:4]]
-            self.emit(f"{iv} = OpCompositeConstruct %v3int {xs[0]} {xs[1]} {xs[2]}")
-            dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
-            self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, idx, int(dm.split(":")[1], 0),
-                                  vdata, xs[3], d16="d16" in mods)
+        if op == "image_load_mip":
+            self.image_load_mip(a, mods, dim)
             return
-        packed_mip = op == "image_load_mip" and "tfe" not in mods and "lwe" not in mods
         if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query))
-                or ("a16" in mods and not (is_atomic or packed_mip))
-                or ("d16" in mods and op != "image_load_mip")):
+                or ("a16" in mods and not is_atomic)
+                or "d16" in mods):
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         vdata, addr = a[0], self.addr_regs(a[1])
         idx = self.desc_lookup_sgpr(a[2], 8)
@@ -12793,29 +12826,15 @@ class Gen:
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
         self.uses_query = True
-        if op == "image_get_resinfo":
-            vals = self.resinfo_words(img, self.load_reg("vgpr", addr[0]), array_query,
-                                      self.load_reg("sgpr", a[2]["r"] + 3))
-            out = 0
-            for c in range(4):
-                if dmask >> c & 1:
-                    u = self.tmp()
-                    self.emit(f"{u} = OpBitcast %uint {vals[c]}")
-                    self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, u)
-                    out += 1
-            return
-        # image_load_mip: x, y, mip, with the same typed SRV as image_load.
-        packed = "a16" in mods
-        if len(addr) < (2 if packed else 3):
-            raise Unsupported("image_load_mip coords")
-        if packed:
-            words = [self.load_reg("vgpr", r) for r in addr[:2]]
-            xs = [self.as_int(c) for c in self.unpack_image_a16_uints(words)[:3]]
-        else:
-            xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:3]]
-        iv = self.tmp()
-        self.emit(f"{iv} = OpCompositeConstruct %v2int {xs[0]} {xs[1]}")
-        self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, idx, dmask, vdata, xs[2], d16="d16" in mods)
+        vals = self.resinfo_words(img, self.load_reg("vgpr", addr[0]), array_query,
+                                  self.load_reg("sgpr", a[2]["r"] + 3))
+        out = 0
+        for c in range(4):
+            if dmask >> c & 1:
+                u = self.tmp()
+                self.emit(f"{u} = OpBitcast %uint {vals[c]}")
+                self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, u)
+                out += 1
 
 
     def interp_pair_src(self, op, a, ins):
