@@ -1483,5 +1483,138 @@ class TestValuMadU64U32IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(res_16_16, expected_16_16)
 
 
+class TestValuMadU64U32NegativeControlsAndMutations(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_mad_u64_u32."""
+
+    def test_rejection_misaligned_64bit_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(1, size_bits=64)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(3, size_bits=64)
+
+    def test_rejection_out_of_bounds_registers(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256, size_bits=32)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106, size_bits=32)
+
+    def test_rejection_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_rejection_multiple_literals_in_vop3(self) -> None:
+        with self.assertRaises(ValueError):
+            VMadU64U32Instruction(
+                vdst=Operand.vgpr(0, size_bits=64),
+                sdst=Operand.vcc(size_bits=64),
+                src0=Operand.literal(1, size_bits=32),
+                src1=Operand.literal(2, size_bits=32),
+                src2=Operand.vgpr(2, size_bits=64),
+            )
+
+    def test_mutation_detect_32bit_truncated_product(self) -> None:
+        # Mutant: truncates product to 32 bits before 64-bit addition
+        def mutant_mad(s0: int, s1: int, s2: int) -> Tuple[int, int]:
+            prod32 = ((s0 & MASK32) * (s1 & MASK32)) & MASK32
+            full_sum = prod32 + (s2 & MASK64)
+            return full_sum & MASK64, (1 if full_sum >= MODULO_64 else 0)
+
+        s0 = 0x10000
+        s1 = 0x10000
+        s2 = 0
+        expected = ref_mad_u64_u32(s0, s1, s2)
+        mutated = mutant_mad(s0, s1, s2)
+        self.assertNotEqual(expected, mutated)
+        self.assertEqual(expected[0], 0x1_0000_0000)
+        self.assertEqual(mutated[0], 0x0)
+
+    def test_mutation_detect_signed_multiply(self) -> None:
+        # Mutant: treats src0 and src1 as signed integers instead of unsigned
+        def mutant_signed(s0: int, s1: int, s2: int) -> Tuple[int, int]:
+            prod = s32(s0) * s32(s1)
+            full_sum = prod + (s2 & MASK64)
+            return full_sum & MASK64, (1 if full_sum >= MODULO_64 else 0)
+
+        s0 = MASK32
+        s1 = MASK32
+        s2 = 0
+        expected = ref_mad_u64_u32(s0, s1, s2)
+        mutated = mutant_signed(s0, s1, s2)
+        self.assertNotEqual(expected, mutated)
+        self.assertEqual(expected[0], 0xFFFF_FFFE_0000_0001)
+        self.assertEqual(mutated[0], 1)
+
+    def test_mutation_detect_ignored_carry(self) -> None:
+        # Mutant: always returns carry = 0
+        def mutant_no_carry(s0: int, s1: int, s2: int) -> Tuple[int, int]:
+            dst, _ = ref_mad_u64_u32(s0, s1, s2)
+            return dst, 0
+
+        s0 = 2
+        s1 = 0x8000_0000
+        s2 = 0xFFFF_FFFF_0000_0000  # sum = 2^64
+        expected = ref_mad_u64_u32(s0, s1, s2)
+        mutated = mutant_no_carry(s0, s1, s2)
+        self.assertNotEqual(expected, mutated)
+        self.assertEqual(expected[1], 1)
+        self.assertEqual(mutated[1], 0)
+
+    def test_mutation_detect_dropped_src2_high_dword(self) -> None:
+        # Mutant: drops upper 32 bits of src2 accumulator
+        def mutant_drop_s2_hi(s0: int, s1: int, s2: int) -> Tuple[int, int]:
+            return ref_mad_u64_u32(s0, s1, s2 & MASK32)
+
+        s0 = 0
+        s1 = 0
+        s2 = 0xCAFE_BABE_0000_0000
+        expected = ref_mad_u64_u32(s0, s1, s2)
+        mutated = mutant_drop_s2_hi(s0, s1, s2)
+        self.assertNotEqual(expected, mutated)
+        self.assertEqual(expected[0], s2)
+        self.assertEqual(mutated[0], 0)
+
+    def test_mutation_detect_off_by_one_carry_threshold(self) -> None:
+        # Mutant: uses strict > 2^64 instead of >= 2^64 for carry
+        def mutant_strict_gt(s0: int, s1: int, s2: int) -> Tuple[int, int]:
+            prod = (s0 & MASK32) * (s1 & MASK32)
+            full_sum = prod + (s2 & MASK64)
+            carry = 1 if full_sum > MODULO_64 else 0
+            return full_sum & MASK64, carry
+
+        s0 = 2
+        s1 = 0x8000_0000
+        s2 = 0xFFFF_FFFF_0000_0000  # full_sum == 2^64 exactly
+        expected = ref_mad_u64_u32(s0, s1, s2)
+        mutated = mutant_strict_gt(s0, s1, s2)
+        self.assertNotEqual(expected, mutated)
+        self.assertEqual(expected[1], 1)
+        self.assertEqual(mutated[1], 0)
+
+    def test_mutation_detect_inactive_lane_overwritten(self) -> None:
+        # Mutant: writes to inactive SIMD lanes
+        ws = SIMDWaveState(wave_size=32, exec_mask=0x0000_0001)  # only lane 0 active
+        ws.write_vgpr64(1, 0, 0x1234_5678)  # lane 1 is inactive
+        ws.write_vgpr32(0, 2, 5)
+        ws.write_vgpr32(0, 3, 6)
+        ws.write_vgpr64(0, 4, 7)
+
+        inst = VMadU64U32Instruction(
+            vdst=Operand.vgpr(0, size_bits=64),
+            sdst=Operand.vcc(size_bits=32),
+            src0=Operand.vgpr(2, size_bits=32),
+            src1=Operand.vgpr(3, size_bits=32),
+            src2=Operand.vgpr(4, size_bits=64),
+        )
+        interp = SIMDVALUInterpreter(ws)
+        interp.execute(inst)
+
+        # Active lane updated
+        self.assertEqual(ws.read_vgpr64(0, 0), 37)
+        # Inactive lane MUST NOT be overwritten
+        self.assertEqual(ws.read_vgpr64(1, 0), 0x1234_5678)
+
+
 if __name__ == "__main__":
     unittest.main()
