@@ -204,6 +204,55 @@ class GWSExpression:
         return ref_gws_resource_id(m0_val, self.offset)
 
 
+# Commit 3: Deterministic scalar instruction interpreter
+
+
+class ScalarRegisterFile:
+    """Models a single wavefront's scalar and vector register view."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 104
+        self.m0: int = 0
+        self.exec: int = MASK32
+        self.vcc: int = 0
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx] & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx] & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for ds_gws_sema_br."""
+
+    def __init__(self, gws: Optional[GWSSubsystem] = None) -> None:
+        self.gws: GWSSubsystem = gws if gws is not None else GWSSubsystem()
+        self.rf: ScalarRegisterFile = ScalarRegisterFile()
+        self.trace: List[Tuple[str, int, List[int]]] = []
+
+    def step(self, instr: Instruction, wave_id: int = 0) -> Tuple[int, List[int]]:
+        """Execute a single ds_gws_sema_br instruction deterministically."""
+        if instr.opcode != Opcode.DS_GWS_SEMA_BR:
+            raise NotImplementedError(f"Unsupported opcode in scalar interpreter: {instr.opcode}")
+
+        rid = ref_gws_resource_id(self.rf.m0, instr.offset)
+        release_count = 1
+        if instr.vdata is not None:
+            release_count = self.rf.get_vgpr(instr.vdata.index)
+
+        new_val, awakened = self.gws.bulk_release_br(rid, release_count=release_count)
+        self.trace.append((instr.disasm(), new_val, awakened))
+        return new_val, awakened
+
+
 class TestGWSSemaBrOracleAndModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br."""
 
@@ -317,6 +366,50 @@ class TestGWSSemaBrAST(unittest.TestCase):
         expr = GWSExpression(offset=8)
         self.assertEqual(expr.evaluate(m0_val=0), 8)
         self.assertEqual(expr.evaluate(m0_val=60), 4)
+
+
+class TestGWSSemaBrScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter for ds_gws_sema_br."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_step_default_count(self) -> None:
+        self.interp.rf.m0 = 5
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, offset=3)
+        val, awakened = self.interp.step(instr)
+        self.assertEqual(val, 1)
+        self.assertEqual(awakened, [])
+        self.assertEqual(self.interp.gws.resources[8].value, 1)
+
+    def test_scalar_step_with_vdata_count(self) -> None:
+        self.interp.rf.m0 = 0
+        self.interp.rf.set_vgpr(1, 25)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(1, RegKind.VGPR), offset=7)
+        val, _ = self.interp.step(instr)
+        self.assertEqual(val, 25)
+        self.assertEqual(self.interp.gws.resources[7].value, 25)
+
+    def test_scalar_step_awakens_waiters(self) -> None:
+        rid = 10
+        self.interp.gws.wait_p(rid, wave_id=12)
+        self.interp.gws.wait_p(rid, wave_id=13)
+        self.interp.rf.m0 = 10
+        self.interp.rf.set_vgpr(0, 4)
+
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(0, RegKind.VGPR), offset=0)
+        val, awakened = self.interp.step(instr)
+        self.assertEqual(awakened, [12, 13])
+        self.assertEqual(val, 2)  # 4 permits - 2 waiters = 2 left in counter
+
+    def test_scalar_step_trace_determinism(self) -> None:
+        self.interp.rf.m0 = 1
+        self.interp.rf.set_vgpr(2, 5)
+        instr = Instruction(opcode=Opcode.DS_GWS_SEMA_BR, vdata=Register(2, RegKind.VGPR), offset=0)
+        for i in range(1, 4):
+            val, _ = self.interp.step(instr)
+            self.assertEqual(val, i * 5)
+        self.assertEqual(len(self.interp.trace), 3)
 
 
 if __name__ == "__main__":
