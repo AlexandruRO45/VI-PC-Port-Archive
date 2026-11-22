@@ -530,6 +530,41 @@ def int_predicate_group(kind, encoding, first, *, wave64=False):
     return with_constants(body)
 
 
+# 16-bit integer comparisons read only the low half of each source. L is s44, R is v18 (a copy of s45);
+# other operands are an integer inline constant or a 16-bit literal. Each (kind, encoding) pair has two
+# groups of four channels, so all six predicates appear with SGPR and VGPR operands, and the second group
+# adds inline constants at both ends of their range and a literal with bit 15 set.
+INT16_GROUPS = {
+    "e32": ((("lt", "L", "R"), ("eq", "L", "R"), ("le", "L", "R"), ("gt", "L", "R")),
+            (("ne", "L", "R"), ("ge", "L", "R"), ("lt", "-16", "R"), ("gt", "0x8000", "R"))),
+    "e64": ((("lt", "L", "R"), ("eq", "L", "R"), ("le", "L", "R"), ("gt", "L", "R")),
+            (("ne", "L", "R"), ("ge", "R", "L"), ("lt", "R", "64"), ("le", "R", "0x8000"))),
+}
+
+
+def int16_group(kind, encoding, group, *, wave64=False):
+    dst = ("vcc" if wave64 else "vcc_lo") if encoding == "e32" else ("s[52:53]" if wave64 else "s52")
+    body = ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v19, s47"]
+    names = {"L": "s44", "R": "v18"}
+    for channel, (op, a, b) in enumerate(INT16_GROUPS[encoding][group]):
+        body.extend([f"v_cmp_{op}_{kind}_{encoding} {dst}, {names.get(a, a)}, {names.get(b, b)}",
+                     f"v_cndmask_b32_{encoding} v{12 + channel}, 0, v19, {dst}"])
+    return with_constants(body)
+
+
+def int16_reference(kind, encoding, group, left, right):
+    """Expected channels of int16_group for 32-bit words left (s44) and right (s45)."""
+    def value(token):
+        word = {"L": left, "R": right}.get(token)
+        word = int(token, 0) if word is None else word
+        low = word & 0xffff
+        return low - 0x10000 if kind == "i16" and low & 0x8000 else low
+
+    tests = {"lt": lambda a, b: a < b, "eq": lambda a, b: a == b, "le": lambda a, b: a <= b,
+             "gt": lambda a, b: a > b, "ne": lambda a, b: a != b, "ge": lambda a, b: a >= b}
+    return [float(tests[op](value(a), value(b))) for op, a, b in INT16_GROUPS[encoding][group]]
+
+
 # v_cmp_class_f32 is true when the class of S0 is in the mask S1 (LLVM SIInstrFlags::ClassFlags).
 # Each channel tests one property: +inf against its own bit, a quiet NaN against both NaN bits,
 # -0 against the +0 bit and a positive denormal against its bit, so neither the sign of zero
@@ -875,6 +910,64 @@ def check_int_predicate_draws(directory, compiler, renderer, backend):
     wrong = subprocess.run(draw, capture_output=True, text=True)
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("Signed/unsigned integer comparison mismatch escaped detection")
+# Each word is a normal binary32 value, so no float move can flush or quiet it, and its upper half differs
+# from the lower one wherever a 32-bit comparison would give another answer.
+INT16_PAIRS = (
+    (0x3f808000, 0x40000000),  # 0x8000 vs 0: signed less, unsigned greater
+    (0x40000005, 0x3f800005),  # equal low halves; the whole words compare greater
+    (0xbf80ffff, 0x3f800001),  # -1 vs 1 signed, 0xffff vs 1 unsigned
+    (0x3f807fff, 0xbf808000),  # 0x7fff vs 0x8000; right equals the 0x8000 literal
+    (0x3f80fff0, 0x3f800040),  # -16 vs 64; right equals the inline constant 64
+    (0x3f800040, 0x3f80fff0),  # 64 vs -16; right equals the inline constant -16
+)
+
+
+def check_int16_predicate_draws(directory, compiler, renderer, backend):
+    source = directory / "int16_predicates.hlsl"
+    shader = directory / "int16_predicates.cso"
+    case = directory / "int16_predicates.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+
+    def build(program):
+        source.write_text(translate(program), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+
+    def write_case(left, right, expected):
+        constants = bytearray(256)
+        struct.pack_into("<IIff", constants, 12, left, right, 0.0, 1.0)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+
+    for kind in ("i16", "u16"):
+        for encoding in ("e32", "e64"):
+            for group in (0, 1):
+                build(int16_group(kind, encoding, group))
+                for left, right in INT16_PAIRS:
+                    write_case(left, right, int16_reference(kind, encoding, group, left, right))
+                    try:
+                        subprocess.run(draw, check=True)
+                    except subprocess.CalledProcessError as error:
+                        error.add_note(f"{kind} {encoding} group {group} on {backend}, words {left:#x}, {right:#x}")
+                        raise
+
+    def must_mismatch(program, left, right, expected, message):
+        build(program)
+        write_case(left, right, expected)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(message)
+
+    left, right = INT16_PAIRS[0]
+    must_mismatch(int16_group("i16", "e32", 0), left, right, int16_reference("u16", "e32", 0, left, right),
+                  "A signed 16-bit comparison matched the unsigned reference")
+    left, right = INT16_PAIRS[1]
+    swapped = [line.replace("v_cmp_eq_i16", "v_cmp_ne_i16") for line in int16_group("i16", "e64", 0)]
+    must_mismatch(swapped, left, right, int16_reference("i16", "e64", 0, left, right),
+                  "Replacing eq with ne escaped detection")
+    widened = [line.replace("_u16_", "_u32_") for line in int16_group("u16", "e32", 0)]
+    must_mismatch(widened, left, right, int16_reference("u16", "e32", 0, left, right),
+                  "A 32-bit comparison matched the 16-bit reference")
+
+
 # The SDWA comparisons with whole-dword selections repeat the 16-predicate draws, including NaN on either side.
 # For each group a reference that inverts the unordered (NaN) result must report a mismatch.
 def check_sdwa_predicate_draws(directory, compiler, renderer, backend):
@@ -2597,6 +2690,67 @@ def check_controls(directory):
     must_reject(translate, base_int[:pos] + ["v_cmp_eq_i32_e32 vcc_lo, s44, 0"] + base_int[pos:])
     pos = base_int.index("s_wqm_b64 exec, exec") + 1
     must_reject(translate, base_int[:pos] + ["v_cmp_eq_i32_e32 vcc_lo, 0, 0"] + base_int[pos:])
+    # Every 32-bit integer comparison form is lowered here too, so tools/form_coverage.py counts all of them.
+    for kind in ("i32", "u32"):
+        for encoding in ("e32", "e64"):
+            for first in (0, 4):
+                translate(int_predicate_group(kind, encoding, first))
+
+    # 16-bit integer comparisons: low-half extension, operands, wave64 spelling and rejected neighbours.
+    i16_source = translate(int16_group("i16", "e32", 1))
+    u16_source = translate(int16_group("u16", "e64", 1))
+    assert "(asint(asuint(params[0].w) << 16) >> 16) != (asint(asuint(alu20) << 16) >> 16)" in i16_source, i16_source
+    assert "(asint(4294967280u << 16) >> 16) < (asint(asuint(alu20) << 16) >> 16)" in i16_source, i16_source
+    assert "(asint(32768u << 16) >> 16) > " in i16_source, i16_source
+    assert "(asuint(alu20) & 0xffffu) >= (asuint(params[0].w) & 0xffffu)" in u16_source, u16_source
+    assert "(asuint(alu20) & 0xffffu) < (64u & 0xffffu)" in u16_source, u16_source
+    assert "(asuint(alu20) & 0xffffu) <= (32768u & 0xffffu)" in u16_source, u16_source
+    for kind in ("i16", "u16"):
+        for encoding in ("e32", "e64"):
+            for group in (0, 1):
+                assert (translate(int16_group(kind, encoding, group, wave64=True))
+                        == translate(int16_group(kind, encoding, group)))
+    for kind, signed in (("i16", True), ("u16", False)):
+        for left, right in INT16_PAIRS:
+            low = [w & 0xffff for w in (left, right)]
+            if signed:
+                low = [v - 0x10000 if v & 0x8000 else v for v in low]
+            expected = [float(low[0] < low[1]), float(low[0] == low[1]),
+                        float(low[0] <= low[1]), float(low[0] > low[1])]
+            assert int16_reference(kind, "e32", 0, left, right) == expected
+    left, right = INT16_PAIRS[0]
+    assert int16_reference("i16", "e32", 0, left, right) != int16_reference("u16", "e32", 0, left, right)
+    base16 = int16_group("i16", "e64", 0)
+    target = "v_cmp_lt_i16_e64 s52, s44, v18"
+    for bad in (
+        "v_cmp_lt_i16_e64 s52, -s44, v18",
+        "v_cmp_lt_i16_e64 s52, |s44|, v18",
+        "v_cmp_lt_i16_e64 s52, s44, v18 clamp",
+        "v_cmp_lt_i16_e64 s52, s44, v18 op_sel:[1,0,0]",
+        "v_cmp_lt_i16_e64 s52, 1.0, v18",
+        "v_cmp_lt_i16_e64 s52, 65, v18",
+        "v_cmp_lt_i16_e64 s52, -17, v18",
+        "v_cmp_lt_i16_e64 s52, 0x10000, v18",
+        "v_cmp_f_i16_e64 s52, s44, v18",
+        "v_cmp_t_u16_e64 s52, s44, v18",
+        "v_cmpx_lt_i16_e64 s52, s44, v18",
+        "v_cmpx_lt_i16_e32 s44, v18",
+        "v_cmpx_lt_i32_e32 s44, v18",
+        "v_cmp_lt_i64_e64 s52, s[44:45], v[18:19]",
+        "v_cmp_lt_u64_e32 vcc_lo, s[44:45], v[18:19]",
+        "v_cmp_class_f16_e32 vcc_lo, s44, v18",
+        "v_cmp_lt_f16_e64 s52, s44, v18",
+    ):
+        changed = [line.replace(target, bad) for line in base16]
+        assert changed != base16
+        must_reject(translate, changed)
+    pos = base16.index("s_waitcnt vmcnt(0)")
+    must_reject(translate, base16[:pos] + ["v_cmp_eq_u16_e32 vcc_lo, v12, v13"] + base16[pos:])
+    load = next(i for i, line in enumerate(base16) if line.startswith("s_buffer_load_dwordx4"))
+    pos = base16.index("s_waitcnt lgkmcnt(0)", load)
+    must_reject(translate, base16[:pos] + ["v_cmp_eq_i16_e32 vcc_lo, s44, 0"] + base16[pos:])
+    pos = base16.index("s_wqm_b64 exec, exec") + 1
+    must_reject(translate, base16[:pos] + ["v_cmp_eq_i16_e32 vcc_lo, 0, 0"] + base16[pos:])
 
     # 32-bit integer min/max/min3/max3/med3 controls and rejections.
     pair_src = translate(int_minmax_pair("e32"))
@@ -2716,6 +2870,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((predicate_group(first), translate) for first in range(0, 16, 4))
     fixtures.extend((int_predicate_group(kind, encoding, first), translate)
                     for kind in ("i32", "u32") for encoding in ("e32", "e64") for first in (0, 4))
+    fixtures.extend((int16_group(kind, encoding, group), translate)
+                    for kind in ("i16", "u16") for encoding in ("e32", "e64") for group in (0, 1))
 
     fixtures.extend((int_minmax_pair(encoding), translate) for encoding in ("e32", "e64"))
     fixtures.extend((int_minmax_triple(kind), translate) for kind in ("i32", "u32"))
@@ -3155,6 +3311,7 @@ def check_predicate_and_rounding_draws(directory, compiler, renderer, backend):
     check_class_draw(directory, compiler, renderer, backend)
     check_predicate_draws(directory, compiler, renderer, backend)
     check_int_predicate_draws(directory, compiler, renderer, backend)
+    check_int16_predicate_draws(directory, compiler, renderer, backend)
     check_sdwa_predicate_draws(directory, compiler, renderer, backend)
     check_literal_fma_draw(directory, compiler, renderer, backend)
     return 0

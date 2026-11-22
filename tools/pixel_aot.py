@@ -621,6 +621,25 @@ def int_operand(token, scalar, vector, pending, sample_dest, *, signed):
     if signed and bits.startswith("asuint(") and bits.endswith(")"):
         return f"asint({bits[7:-1]})"
     return f"asint({bits})" if signed else bits
+def int16_operand(token, scalar, vector, pending, sample_dest, *, signed):
+    """Return the low 16 bits of a 16-bit integer source as a sign- or zero-extended HLSL value.
+
+    Registers, integer inline constants (-16..64) and 16-bit literals are accepted. llvm-mc prints a
+    float inline constant on a 16-bit integer operand as its binary16 literal (1.0 as 0x3c00), so a
+    float token or a wider literal never names a valid operand here and is refused.
+    """
+    if re.fullmatch(r"-?\d+", token):
+        if not -16 <= int(token) <= 64:
+            raise ValueError(f"Unsupported 16-bit integer inline constant {token}")
+    elif re.fullmatch(r"0x[0-9a-f]{1,8}", token):
+        if int(token, 16) > 0xffff:
+            raise ValueError(f"16-bit literal out of range: {token}")
+    elif not re.fullmatch(r"[vs]\d+", token):
+        raise ValueError(f"Unsupported 16-bit integer operand {token}")
+    bits = int_operand(token, scalar, vector, pending, sample_dest, signed=False)
+    return f"(asint({bits} << 16) >> 16)" if signed else f"({bits} & 0xffffu)"
+
+
 def vop3p_f16_word(token, scalar, vector, pending, sample_dest):
     """Return a 32-bit uint HLSL expression for one packed binary16 VOP3P source operand.
 
@@ -1218,6 +1237,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
             values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
+                      for t in tokens]
+            for j, reg in enumerate(regs):
+                scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    bool cmp{i} = {INT_COMPARE[op].format(*values)};")
+        elif m := match(rf"v_cmp_(eq|ne|lt|le|gt|ge)_(i16|u16)(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
+            # Only the low 16 bits of each source take part; gfx10 has no f/t forms at this width.
+            op, kind, dst, *tokens = m.groups()
+            regs = lane_mask(dst)
+            if mask != "entry" or pending.intersection(regs):
+                raise ValueError("Invalid comparison")
+            values = [int16_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i16")
                       for t in tokens]
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
