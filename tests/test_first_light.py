@@ -242,6 +242,60 @@ class OracleTests(unittest.TestCase):
             check_image(b"", self.manifest)
 
 
+class RedrawTests(unittest.TestCase):
+    """run_draw in one output folder: success, a failed --check, then success again. A stand-in harness writes the
+    readback, so no GPU or package is needed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = self.tmp.name
+        OracleTests.setUp(self)     # the oracle's 4x4 manifest; OracleTests.image draws for it
+        self.manifest["files"] = {"mesh": "mesh.bin"}
+        Path(self.out, "manifest.json").write_text(json.dumps(self.manifest), encoding="utf-8")
+        self.images = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fake_run(self, cmd, check, env):
+        image = self.images.pop(0)
+        if image is not None:
+            Path(cmd[3]).write_bytes(image)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    def draw(self):
+        with patch.object(fl, "find_harness", return_value="vk_harness"), \
+             patch.object(fl.subprocess, "run", side_effect=self.fake_run), redirect_stdout(io.StringIO()):
+            return fl.run_draw(type("Args", (), {"harness": None})(), self.manifest, self.out)
+
+    def on_disk(self) -> dict:
+        return json.loads(Path(self.out, "manifest.json").read_text(encoding="utf-8"))
+
+    def test_a_failed_redraw_leaves_no_earlier_result(self):
+        good, bad = OracleTests.image(self), OracleTests.image(self, fill=0.5)
+        ppm = Path(self.out, "image.ppm")
+        self.images = [good, bad, None, good]
+
+        self.draw()
+        self.assertTrue(ppm.is_file())
+        self.assertEqual(self.on_disk()["result"]["covered"], 4)
+
+        with self.assertRaises(SystemExit):     # the oracle refuses the all-opaque frame
+            self.draw()
+        self.assertFalse(ppm.exists(), "the earlier preview is left as if it were this draw's")
+        self.assertNotIn("result", self.on_disk())
+        self.assertNotIn("result", self.manifest)
+
+        with self.assertRaises(SystemExit):     # a harness that exits 0 without writing
+            self.draw()
+        self.assertFalse(ppm.exists())
+        self.assertNotIn("result", self.on_disk())
+
+        self.draw()
+        self.assertTrue(ppm.is_file())
+        self.assertEqual(self.on_disk()["result"]["covered"], 4)
+
+
 class ReadObjTests(unittest.TestCase):
     """Wavefront OBJ parsing in tools/first_light.py without a GPU or game package."""
 

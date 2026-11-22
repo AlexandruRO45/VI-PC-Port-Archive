@@ -495,10 +495,14 @@ def write_ppm(path: str, pixels, width: int, height: int) -> None:
 def run_draw(args, manifest: dict, out_dir: str) -> dict:
     harness = find_harness(args.harness)
     raw = os.path.join(out_dir, "image.raw")
-    if os.path.exists(raw):
-        os.unlink(
-            raw
-        )  # a harness that exits 0 without writing must not pass on a stale file
+    ppm = os.path.join(out_dir, "image.ppm")
+    # A harness that exits 0 without writing must not pass on a stale file, and a draw that fails (the harness, or
+    # the --check oracle) must not leave the previous draw's preview and result behind as if they were this one's.
+    for stale in (raw, ppm):
+        if os.path.exists(stale):
+            os.unlink(stale)
+    if manifest.pop("result", None) is not None:
+        write_manifest(manifest, out_dir)
     env = harness_env(manifest, out_dir)
     cmd = [
         harness,
@@ -517,7 +521,6 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         result = check_image(data, manifest)
     except AssertionError as e:
         raise SystemExit(str(e)) from e
-    ppm = os.path.join(out_dir, "image.ppm")
     write_ppm(ppm, result["pixels"], manifest["width"], manifest["height"])
     print(
         f"covered {result['covered']}/{manifest['width'] * manifest['height']} "
