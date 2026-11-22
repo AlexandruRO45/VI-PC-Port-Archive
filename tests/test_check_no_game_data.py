@@ -64,8 +64,11 @@ def run(args, cwd=None):
 
 class CheckNoGameData(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.dir)
+        # TemporaryDirectory, not mkdtemp + shutil.rmtree: git writes its object files read-only, and on Windows
+        # a plain rmtree stops at the first one (WinError 5) and leaves the folder behind.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
 
     def write(self, name, data):
         path = os.path.join(self.dir, name)
