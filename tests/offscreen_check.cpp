@@ -360,7 +360,9 @@ int main(int argc, char** argv)
 {
     if (argc < 3) return 2;
     const std::string_view operation = argv[2];
-    if (operation == "--check-pixel-quad-lod") {
+    if (operation == "--check-pixel-batch") {
+        if (argc < 5) return 2;
+    } else if (operation == "--check-pixel-quad-lod") {
         if (argc != 4) return 2;
     } else if (operation == "--mesh-entry" || operation == "--mesh-indexed") {
         if (argc != 6) return 2;
@@ -416,6 +418,29 @@ int main(int argc, char** argv)
             std::puts("driver=unavailable via DXGI");
         }
         if (debug) check(device.As(&messages), "Read debug queue");
+        if (operation == "--check-pixel-batch") {
+            bool failed = false;
+            for (int i = 4; i < argc; ++i) {
+                const char* status = "pass";
+                std::fprintf(stderr, "case=%d path=%s\n", i - 4, argv[i]);
+                try {
+                    check(device->GetDeviceRemovedReason(), "Pixel batch device");
+                    check_translated_pixel(device.Get(), argv[3], false, argv[i]);
+                } catch (const PixelMismatch& e) {
+                    std::fprintf(stderr, "%s\n", e.what());
+                    status = "mismatch";
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "%s\n", e.what());
+                    status = "error";
+                }
+                if (report_debug_errors(messages.Get()) || FAILED(device->GetDeviceRemovedReason()))
+                    status = "error";
+                if (messages) messages->ClearStoredMessages();
+                std::printf("case=%d status=%s\n", i - 4, status);
+                failed |= std::string_view(status) != "pass";
+            }
+            return failed ? 1 : 0;
+        }
         if (argc == 3 && needs_cs_6_5(operation) && !supports_cs_6_5(device.Get())) return 77;
         if (argc == 3 && (operation == "--compute-root" || operation == "--compute-tables")) {
             check_compute(device.Get(), operation == "--compute-tables");

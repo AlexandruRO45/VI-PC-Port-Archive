@@ -477,8 +477,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         vm = (w0 >> 12) & 1
         vs = [(w1 >> (8 * k)) & 0xff for k in range(4)]
         if compr:
-            lo = f"v{vs[0]}" if (en & 0x3) else "off"
-            hi = f"v{vs[1]}" if (en & 0xc) else "off"
+            lo = f"v{vs[0]}" if en & 0x1 else "off"
+            hi = f"v{vs[1]}" if en & 0x4 else "off"
             regs = [lo, lo, hi, hi]
         else:
             regs = [f"v{vs[k]}" if (en & (1 << k)) else "off" for k in range(4)]
@@ -490,6 +490,10 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             flags.append("compr")
         if vm:
             flags.append("vm")
+        # The printed compressed operands use the first bit of each pair.
+        # Keep a non-paired raw mask visible so it cannot masquerade as a supported export.
+        if compr and en not in (0x0, 0x3, 0xc, 0xf):
+            flags.append(f"en:{en:#x}")
         flags_str = " ".join(flags)
         asm = f"exp {target_name} {', '.join(regs)} {flags_str}".strip()
         comment = f"Export output pixels/attributes to {target_name.upper()}"

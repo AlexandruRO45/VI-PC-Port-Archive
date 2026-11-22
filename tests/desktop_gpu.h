@@ -1,5 +1,6 @@
 #pragma once
 #include <d3d12.h>
+#include <stdexcept>
 #include <wrl/client.h>
 
 void check(HRESULT hr, const char* stage);
@@ -18,6 +19,10 @@ void check_texture_mips(ID3D12Device* device);
 void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);
 void check_sampled_coverage(ID3D12Device*, const char*, const char*);
 void check_dual_pixel(ID3D12Device*, const char*, const char*, bool);
+struct PixelMismatch : std::runtime_error {
+    PixelMismatch() : std::runtime_error("AOT color export differs from CPU reference") {}
+};
+
 void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr,
                             UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL);
 void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg);
