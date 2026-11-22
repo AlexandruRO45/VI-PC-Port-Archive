@@ -13,7 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 sys.path.insert(0, HERE)
 
-from test_global_atomics import OUT, TARGET, run, translate  # noqa: E402  (also puts tools/ on sys.path)
+from test_global_atomics import OUT, TARGET, run, structural_errors, translate  # noqa: E402  (also puts tools/ on sys.path)
 import rdna2spirv  # noqa: E402
 
 M32 = 0xFFFFFFFF
@@ -58,6 +58,11 @@ class GlobalAtomicsX2(unittest.TestCase):
             kind, m, d = rng.choice(list(MODEL)), rng.getrandbits(64), rng.getrandbits(64)
             with self.subTest(op=kind, m=hex(m), d=hex(d)):
                 self.assertEqual(atomic_x2(kind, m, d), (split(m), split(MODEL[kind](m, d))))
+
+    def test_selection_merge_directly_precedes_its_branch(self):
+        for line in ("global_atomic_xor_x2 v[6:7], v1, v[2:3], s[0:1] glc", "global_atomic_swap_x2 v1, v[2:3], s[0:1]"):
+            with self.subTest(line=line):
+                self.assertEqual(structural_errors(translate(["v_mov_b32_e32 v1, 0x2000", line])), [])
 
     def test_carrying_and_comparing_forms_rejected(self):
         for kind in ("add", "sub", "smin", "umax", "cmpswap"):
