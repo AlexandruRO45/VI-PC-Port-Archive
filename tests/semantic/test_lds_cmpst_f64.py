@@ -246,6 +246,67 @@ class DSCmpstF64Instruction:
 
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarState:
+    def __init__(self, lds_size_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: list[int] = [0] * DEFAULT_NUM_SGPRS
+        self.lds: LDSMemory = LDSMemory(size_dwords=lds_size_dwords)
+
+    def get_vgpr(self, index: int) -> int:
+        return self.vgprs[index]
+
+    def set_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = u32(val)
+
+    def get_u64_vgpr(self, base_index: int) -> int:
+        return combine_u32s_to_u64(self.get_vgpr(base_index), self.get_vgpr(base_index + 1))
+
+    def set_u64_vgpr(self, base_index: int, val64: int) -> None:
+        lo, hi = split_u64_to_u32s(val64)
+        self.set_vgpr(base_index, lo)
+        self.set_vgpr(base_index + 1, hi)
+
+    def get_reg_single(self, reg: RegSingle) -> int:
+        return self.get_vgpr(reg.index) if reg.reg_type == RegType.VGPR else self.sgprs[reg.index]
+
+    def set_reg_pair(self, reg: RegPair, val64: int) -> None:
+        if reg.reg_type == RegType.VGPR:
+            self.set_u64_vgpr(reg.index, val64)
+        else:
+            lo, hi = split_u64_to_u32s(val64)
+            self.sgprs[reg.index] = lo
+            self.sgprs[reg.index + 1] = hi
+
+    def resolve_operand64(self, op: Operand64) -> int:
+        if isinstance(op, ImmediateF64):
+            return op.val
+        return self.get_u64_vgpr(op.index) if op.reg_type == RegType.VGPR else combine_u32s_to_u64(self.sgprs[op.index], self.sgprs[op.index + 1])
+
+
+class ScalarInterpreter:
+    def execute(self, instr: DSCmpstF64Instruction, state: ScalarState) -> Tuple[int, int, bool]:
+        vaddr = state.get_reg_single(instr.vaddr)
+        cmp_val = state.resolve_operand64(instr.vdata0)
+        new_val = state.resolve_operand64(instr.vdata1)
+
+        old_val, new_mem, swapped = state.lds.atomic_cmpst_f64(
+            vaddr=vaddr,
+            cmp_val64=cmp_val,
+            new_val64=new_val,
+            offset=instr.offset,
+        )
+
+        if instr.vdst is not None:
+            state.set_reg_pair(instr.vdst, old_val)
+
+        return old_val, new_mem, swapped
+
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -325,6 +386,61 @@ class TestSymbolicAST(unittest.TestCase):
             DSCmpstF64Instruction(vaddr=s0, vdata0=v0, vdata1=v0)
         with self.assertRaises(ValueError):
             DSCmpstF64Instruction(vaddr=v1, vdata0=v0, vdata1=v0, offset=-1)
+
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState(lds_size_dwords=1024)
+        self.interp = ScalarInterpreter()
+
+    def test_scalar_non_returning_cmpst_f64(self) -> None:
+        addr = 0x40
+        val = f64_to_bits(12.5)
+        new_val = f64_to_bits(25.0)
+
+        self.state.lds.write_qword(addr, val)
+        self.state.set_vgpr(1, addr)
+        self.state.set_u64_vgpr(2, val)
+        self.state.set_u64_vgpr(4, new_val)
+
+        instr = DSCmpstF64Instruction(
+            vaddr=RegSingle(1),
+            vdata0=RegPair(2),
+            vdata1=RegPair(4),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, val)
+        self.assertEqual(new_mem, new_val)
+        self.assertEqual(self.state.lds.read_qword(addr), new_val)
+
+    def test_scalar_returning_cmpst_rtn_f64(self) -> None:
+        addr = 0x40
+        val = f64_to_bits(100.0)
+        new_val = f64_to_bits(200.0)
+
+        self.state.lds.write_qword(addr, val)
+        self.state.set_u64_vgpr(0, 0xCAFE) # vdst sentinel
+        self.state.set_vgpr(2, addr)
+        self.state.set_u64_vgpr(4, val)
+        self.state.set_u64_vgpr(6, new_val)
+
+        instr = DSCmpstF64Instruction(
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata0=RegPair(4),
+            vdata1=RegPair(6),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, self.state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, val)
+        self.assertEqual(self.state.get_u64_vgpr(0), val)
+        self.assertEqual(self.state.lds.read_qword(addr), new_val)
 
 
 
