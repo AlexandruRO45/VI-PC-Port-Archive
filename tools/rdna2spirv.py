@@ -6218,7 +6218,7 @@ class Gen:
                 word = self.tmp()
                 self.emit(f"{word} = OpCompositeExtract %uint {words} {index}")
                 self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, word)
-        elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
+        elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_mul_f64", "v_fma_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
                 if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
@@ -6264,6 +6264,19 @@ class Gen:
                         self.emit(f"{n2} = OpCompositeConstruct %v2uint_d {mlo} {mhi}")
                         self.emit(f"{rd} = OpBitcast %double {n2}")
                         r = rd
+                elif op in ("v_mul_f64", "v_fma_f64"):
+                    # One rounding of the exact x * y (+ z) to binary64, to nearest even; f64 denormals kept (MODE
+                    # default), as measured on gfx1036 (hunt6 hw_f64.py: the fused 2^-60 case, 1 + 2^-51, subnormal
+                    # products). A program that writes MODE.FP_ROUND[3:2] would need the product rounded toward zero:
+                    # refused rather than rounded to nearest (v_add_f64 has f64_add_mode for that).
+                    if self.round_mode:
+                        raise Unsupported(op + " under a MODE.FP_ROUND write (toward-zero f64 product not modelled)")
+                    x, y = f64(a[1]), f64(a[2])
+                    r = self.tmp()
+                    if op == "v_mul_f64":
+                        self.emit(f"{r} = OpFMul %double {x} {y}")
+                    else:
+                        self.emit(f"{r} = OpExtInst %double %glsl Fma {x} {y} {f64(a[3])}")
                 elif op == "v_rcp_f64":
                     x = f64(a[1])
                     r = self.tmp()
@@ -6276,8 +6289,12 @@ class Gen:
                     x = f64(a[1])
                     r = self.tmp()
                     self.emit(f"{r} = OpExtInst %double %glsl Sqrt {x}")
-                # VOP3 f64 ops carry HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type).
-                r = self.clamp_mods_f64(r, mods)
+                # VOP3 f64 ops carry HasClamp and HasOMod (LLVM VOPProfile, f64 is a modifier type). On gfx1036 the
+                # omod of v_mul_f64/v_fma_f64 (and v_add_f64) only applies with IEEE off and f64 denormals flushed;
+                # with f64 denormals kept, the MODE the translator assumes, it is ignored and clamp still applies
+                # (hunt6 hw_f64.py). v_mul_f64/v_fma_f64 follow that; v_add_f64 keeps its older omod.
+                r = self.clamp_mods_f64(r, [m for m in mods if m == "clamp"] if op in ("v_mul_f64", "v_fma_f64")
+                                        else mods)
                 v2, lo, hi = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{v2} = OpBitcast %v2uint_d {r}")
                 self.emit(f"{lo} = OpCompositeExtract %uint {v2} 0")
