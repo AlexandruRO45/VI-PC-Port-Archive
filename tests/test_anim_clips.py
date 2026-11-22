@@ -388,6 +388,8 @@ class DecodeTest(unittest.TestCase):
                              (3, [joaat32("speed")], samples, -1.5, 1.5))
             stats = anim_clips.new_stats()
             anim_clips.count_motion_blend(motion, stats)
+            self.assertEqual(stats[f"motion_layout_node_type:{parameters}:3"], 1)
+            self.assertEqual(stats[f"motion_layout_axis_one_name:{parameters}"], 1)
             self.assertEqual((stats["motion_child_times_identity"], stats["motion_child_times_warped"],
                               stats["motion_axes"], stats["motion_axis_sorted"],
                               stats["motion_axis_range_is_first_last"], stats["motion_axis_name:speed"]),

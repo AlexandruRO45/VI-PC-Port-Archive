@@ -429,7 +429,7 @@ u32; u32 count}` with `Entry {u64 key; T *value; Entry *next}`. Hashes are `joaa
 | `.motion` (`+0x20` is a pointer) | `+0x18` pointer | the dictionary root (page offset 0) |
 | | `+0x28` u32, `+0x2C` u32 | the clip hash (the low half of its `atMap` key) and `joaat32` of the dictionary name |
 | | `+0x30` atString | `pack:/<name>.motion` |
-| | `+0x58` u32 | 1 or 2; selects where the parameter node is (see `+0x120`, `+0x138`); most likely the number of blend parameters (not verified) |
+| | `+0x58` u32 | parameter-node layout selector, with 1 for the direct pointer at `+0x138` and 2 for the wrapped pointer at `+0x120` |
 | | `+0x60` array, 16-byte items | children `{u64 0; u32 clip hash; u32 dictionary hash}`: the clips it blends |
 | | `+0x70` array, 0x28-byte items | one item per child: `{f32 child duration; f32 duration in the blend; {ptr; u16 count} curve of (child time, blend time) f32 pairs; 16 zero bytes}` |
 | | `+0x120` pointer (`+0x58` = 2) | a block whose `+0x18` points at the parameter node |
@@ -561,7 +561,7 @@ A `.motion` clip has no animation of its own; it lists other clips (its children
 fields are in the object table above. Measured on all 17,247 `.motion` clips:
 
 - `+0x18` points at the dictionary root, `+0x28` is the clip's own hash (the low half of its `atMap` key) and `+0x2C`
-  is the dictionary's `joaat32(name)`. `+0x58` is 1 on 8,932 and 2 on 8,315.
+  is the dictionary's `joaat32(name)`.
 - They have 159,584 children `{clip hash, dictionary hash}`. For every child, the dictionary hash is one of the
   root's hash-only `+0x70` references (159,584 of 159,584), so those references are the dictionaries the
   `.motion` clips draw from.
@@ -577,9 +577,20 @@ fields are in the object table above. Measured on all 17,247 `.motion` clips:
   from (0, 0) to (duration, blend duration), increasing in both coordinates, so the child is time-warped. The other
   191 have two points, but 170 don't start at (0, 0) and 21 don't end at (d, d). For every child that names a
   `.clip` in anim.rpf, the first float is bit-for-bit that `.clip`'s duration (`+0x78`): 111,948 of 111,948.
-- **Parameter node.** When `+0x58` is 1 the node is at `+0x138`; when it is 2, `+0x120` points at a block whose
-  `+0x18` is the node. Every `.motion` has one, and it starts `{u64 0, u32 type, u32 0}`. By type: 3 on 10,171, 1 on
-  3,557, 4 on 2,644, 5 on 482, 6 on 295, 8 on 98. Only type 3 is decoded here.
+- **Parameter node.** A value of 1 at `+0x58` selects the direct pointer at `+0x138`. A value of 2 selects the
+  pointer at `+0x120` to a block whose `+0x18` is the node pointer. In all 17,247 clips in `anim.rpf`, only the
+  selected path led to a node header `{u64 0, u32 type, u32 0}`.
+
+  | `+0x58` | Type 1 | Type 3 | Type 4 | Type 5 | Type 6 | Type 8 | Total |
+  |---:|---:|---:|---:|---:|---:|---:|---:|
+  | 1 | 1,176 | 5,475 | 1,488 | 425 | 270 | 98 | 8,932 |
+  | 2 | 2,381 | 4,696 | 1,156 | 57 | 25 | 0 | 8,315 |
+
+  Both layouts can lead to a type-3 node with one sampled axis. The total number of blend inputs for a clip
+  remains undetermined. In `anim_clips.py` reports, the `summary.counts` keys
+  `motion_layout_node_type:<layout>:<type>` and `motion_layout_axis_one_name:<layout>` give the table counts and
+  single-name axis counts. Use `--budget 0` to collect them without decoding keyframes. The existing
+  `motion_parameters:<layout>` key counts clips by their layout selector.
 - **Type 3: one sampled axis.** It has one u32 name hash, then 1–16 `{u32 sample index, f32 value}` items and the
   axis min and max. On all 10,171 (29,123 samples), the items are sorted by value, min and max are the first and
   last values, and the sample indices are 0..n−1 in some order. They are not child indices: the sample count
@@ -604,6 +615,10 @@ dictionaries; 15 roots do not join. All 59,593 animations of those dictionaries 
 all 54,352,969 type-10 chunk boundaries close. Its 14 `.motion` clips have 75 children, and all 75 name a `.clip` of a
 dictionary in `story000.rpf`. None of its 9,188 distinct dictionary hashes is a dictionary in anim.rpf, and none is
 one of the 1,902 hashes anim.rpf refers to without having them.
+
+For all 14 `.motion` clips, only the path selected by `+0x58` led to a valid parameter-node header. The direct
+layout (1) led to six type-3 nodes. The wrapped layout (2) led to four type-1 and four type-3 nodes. All ten
+type-3 nodes had one name hash for their sampled axis.
 
 ```
 python -I tools/anim_clips.py <package>\pack\story000\story000.rpf <work>\story000-clips.json --jobs 20

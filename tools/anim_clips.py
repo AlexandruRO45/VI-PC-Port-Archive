@@ -162,14 +162,14 @@ def motion_times(s, at):
     return out
 
 
-def parameter_node(s, at, parameters):
+def parameter_node(s, at, layout):
     """The node that places a `.motion`'s children in parameter space: the pointer at +0x138 when +0x58 is 1;
     when +0x58 is 2, +0x120 points at a block whose +0x18 is the node. A node starts {u64 0, u32 type, u32 0}.
     Type 3 is one sampled axis: {array of u32 name hashes, array of (u32 sample index, f32 value) sorted by
     value, f32 min, f32 max}. Other types are not decoded. -> (type, axis or None) or None"""
-    if parameters == 1:
+    if layout == 1:
         node = s.ptr(at + 0x138)
-    elif parameters == 2:
+    elif layout == 2:
         block = s.ptr(at + 0x120)
         node = s.ptr(block + 0x18) if block is not None else None
     else:
@@ -195,7 +195,8 @@ def parse_clip(s, at):
             motion = {"kind": "motion", "name": s.string(at + 0x30), "animations": [], "children": None,
                       "parameters": None}
             try:
-                # +0x58 u32 parameter count; +0x60 array of {u64 0; u32 clip hash; u32 dictionary hash}
+                # "parameters" is the existing output key for the +0x58 layout selector.
+                # +0x60 is an array of {u64 0; u32 clip hash; u32 dictionary hash}.
                 children, n = s.array(at + 0x60)
                 if children is None:
                     motion["children"], motion["parameters"] = [], s.u32(at + 0x58)
@@ -620,13 +621,17 @@ def count_motion_blend(c, stats):
         stats["motion_node_unreadable"] += 1
         return
     kind, axis = node
+    layout = c["parameters"]
     stats[f"motion_node_type:{kind}"] += 1
+    stats[f"motion_layout_node_type:{layout}:{kind}"] += 1
     if axis is None:
         return
     values = [v for _i, v in axis["samples"]]
+    one_name = len(axis["names"]) == 1
     stats["motion_axes"] += 1
     stats["motion_axis_samples"] += len(values)
-    stats["motion_axis_one_name"] += len(axis["names"]) == 1
+    stats["motion_axis_one_name"] += one_name
+    stats[f"motion_layout_axis_one_name:{layout}"] += one_name
     stats["motion_axis_sorted"] += all(a <= b for a, b in zip(values, values[1:]))
     stats["motion_axis_range_is_first_last"] += bool(values) and (axis["min"], axis["max"]) == (values[0], values[-1])
     stats["motion_axis_indices_are_0_to_n"] += sorted(i for i, _v in axis["samples"]) == list(range(len(values)))
