@@ -147,6 +147,11 @@ struct VulkanDeviceInfo {
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
+    // The instance was created without VK_EXT_layer_settings (create_vulkan_device_standalone), so on MoltenVK its
+    // fast math is the default or MVK_CONFIG_FAST_MATH_ENABLED, and pipelines can drop the NoContraction that
+    // Metal's safe math makes redundant (src/moltenvk_no_contraction.h). A caller's instance may have set fast math
+    // through layer settings: its shaders keep every decoration.
+    bool moltenvk_settings_from_environment = false;
     // Vulkan 1.2 bufferDeviceAddress is enabled: buffers and shader-visible heaps then live in the GPU address
     // arena and have console VAs (docs section 3.3), and GetGPUVirtualAddress returns those addresses; ray tracing
     // needs it too. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.

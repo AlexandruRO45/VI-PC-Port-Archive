@@ -272,7 +272,9 @@ int main(int argc, char** argv) {
     props2.pNext = &sgProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
-    const auto safe_math = leonida::moltenvk_safe_math(driver.driverID, props.driverVersion);
+    // This instance has no VkLayerSettingsCreateInfoEXT: MoltenVK's fast math is its default or the environment's.
+    const auto safe_math =
+        leonida::moltenvk_safe_math(driver.driverID, props.driverVersion, leonida::MoltenVKSettings::environment);
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);

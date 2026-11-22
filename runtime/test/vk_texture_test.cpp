@@ -61,6 +61,7 @@ static bool declares_capability(const std::vector<uint32_t>& spv, uint32_t cap) 
 
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/moltenvk_no_contraction.h"
 
 int main(int argc, char** argv) {
     const uint32_t W = 64, H = 64, TW = 8;
@@ -423,8 +424,12 @@ int main(int argc, char** argv) {
     vkUpdateDescriptorSets(dev, 4, wr, 0, nullptr);
     // Pipeline.
     bool tail_block = false;   // a stage reads the --pc-tail-ubo block (declares set 1)
+    // This instance has no VkLayerSettingsCreateInfoEXT: MoltenVK's fast math is its default or the environment's.
+    const auto safe_math = leonida::moltenvk_safe_math(
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(gipa(inst, "vkGetPhysicalDeviceProperties2")), pd,
+        leonida::MoltenVKSettings::environment);
     auto module = [&](const char* p, VkShaderModule* m) {
-        auto code = read_spv(p);
+        auto code = leonida::drop_no_contraction(read_spv(p), safe_math);
         if (code.empty()) {
             std::fprintf(stderr, "failed to read shader module: %s\n", p);
             return VK_ERROR_INITIALIZATION_FAILED;

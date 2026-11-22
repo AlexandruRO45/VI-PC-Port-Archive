@@ -20,6 +20,7 @@
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/moltenvk_no_contraction.h"
 
 #include <cmath>
 #include <cstdio>
@@ -319,8 +320,15 @@ int main(int argc, char** argv) {
     wr[7].pImageInfo = r32ui_3d; wr[7].descriptorCount = N;
     vkUpdateDescriptorSets(dev, 8, wr, 0, nullptr);
 
+    std::vector<uint32_t> spirv(code.size() / 4);
+    std::memcpy(spirv.data(), code.data(), code.size());
+    // This instance has no VkLayerSettingsCreateInfoEXT: MoltenVK's fast math is its default or the environment's.
+    spirv = leonida::drop_no_contraction(
+        spirv, leonida::moltenvk_safe_math(
+                   reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(gipa(inst, "vkGetPhysicalDeviceProperties2")),
+                   pd, leonida::MoltenVKSettings::environment));
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
+    smi.codeSize = spirv.size() * 4; smi.pCode = spirv.data();
     VkShaderModule sm; CHECK(vkCreateShaderModule(dev, &smi, nullptr, &sm));
     // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only, 128 bytes; a module that reads the tail
     // gets it, all zero as without the flag, from a uniform block at set 1 (vk_pc_tail.h).

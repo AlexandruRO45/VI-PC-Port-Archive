@@ -43,6 +43,7 @@
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
 #include "../src/spirv_words.h"
+#include "../src/moltenvk_no_contraction.h"
 
 #include <algorithm>
 #include <atomic>
@@ -874,6 +875,10 @@ int main(int argc, char** argv) {
     sgProps.pNext = &fcProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
+    // The words MoltenVK gets from the runtime: this instance has no VkLayerSettingsCreateInfoEXT, so its fast math
+    // is the default or the environment's.
+    const auto safe_math =
+        leonida::moltenvk_safe_math(vkGetPhysicalDeviceProperties2, pd, leonida::MoltenVKSettings::environment);
 
     uint32_t en = 0;
     vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, nullptr);
@@ -1175,7 +1180,7 @@ int main(int argc, char** argv) {
             if (it != stub_cache.end()) return it->second;
         }
         std::ifstream f(dir + "/stubs/" + fname, std::ios::binary | std::ios::ate);
-        const auto code = leonida::read_spirv_words(f, f.tellg());
+        const auto code = leonida::drop_no_contraction(leonida::read_spirv_words(f, f.tellg()), safe_math);
         VkShaderModule mod = VK_NULL_HANDLE;
         if (!code.empty()) {
             VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -1318,7 +1323,7 @@ int main(int argc, char** argv) {
                 if (isolated) write_inflight();   // alone in flight: the file names exactly this module
             }
 
-            const auto code = leonida::read_spirv_words(f, file_size);
+            const auto code = leonida::drop_no_contraction(leonida::read_spirv_words(f, file_size), safe_math);
             VkShaderModule sm = VK_NULL_HANDLE;
             bool mod_ok = false;
             if (!code.empty()) {

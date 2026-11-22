@@ -21,6 +21,7 @@
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
 #include "../src/moltenvk_no_contraction.h"
+#include "../src/spirv_words.h"
 
 #include <cctype>
 #include <cmath>
@@ -169,9 +170,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "full 64-wide compute subgroups unavailable\n");
         return 77;
     }
-    std::ifstream f(argv[1], std::ios::binary);
-    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
-    const bool needs_float64 = leonida::vk_test::spirv_declares_capability(code.data(), code.size(), 10);  // Float64
+    // Empty after a failed read, or for a file under 20 bytes, not a whole number of words or without the magic.
+    std::ifstream f(argv[1], std::ios::binary | std::ios::ate);
+    const std::vector<uint32_t> spirv = leonida::read_spirv_words(f, f ? static_cast<std::streamoff>(f.tellg()) : -1);
+    if (spirv.empty()) {
+        std::fprintf(stderr, "%s: not a SPIR-V module\n", argv[1]);
+        return 1;
+    }
+    const char* const code = reinterpret_cast<const char*>(spirv.data());
+    const std::size_t code_size = spirv.size() * 4;
+    const bool needs_float64 = leonida::vk_test::spirv_declares_capability(code, code_size, 10);  // Float64
     if (needs_float64 && !f2q.features.shaderFloat64) {
         std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64\n", argv[1]);
         return 77;
@@ -261,12 +269,12 @@ int main(int argc, char** argv) {
     bai.buffer = buf;
     const uint64_t heap = vkGetBufferDeviceAddress(dev, &bai);
 
-    if (!fma.accepts(code.data(), code.size(), argv[1])) return 77;
-    std::vector<uint32_t> spirv(code.size() / 4);
-    std::memcpy(spirv.data(), code.data(), spirv.size() * 4);
-    spirv = leonida::drop_no_contraction(spirv, leonida::moltenvk_safe_math(driver.driverID, props.driverVersion));
+    if (!fma.accepts(code, code_size, argv[1])) return 77;
+    // This instance has no VkLayerSettingsCreateInfoEXT: MoltenVK's fast math is its default or the environment's.
+    const std::vector<uint32_t> module_words = leonida::drop_no_contraction(
+        spirv, leonida::moltenvk_safe_math(driver.driverID, props.driverVersion, leonida::MoltenVKSettings::environment));
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smi.codeSize = spirv.size() * 4; smi.pCode = spirv.data();
+    smi.codeSize = module_words.size() * 4; smi.pCode = module_words.data();
     VkShaderModule sm; CHECK(vkCreateShaderModule(dev, &smi, nullptr, &sm));
     // 144 push-constant bytes: s0..s31, heap base, code base. With LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py
     // --pc-tail-ubo) only s0..s31; the tail, if the module reads it, is a uniform block at set 1 (vk_pc_tail.h), one
@@ -275,7 +283,7 @@ int main(int argc, char** argv) {
     const uint32_t pc_bytes = pc_tail ? 128u : 144u;
     leonida::vk_test::PcTail tail;
     const bool tail_block = pc_tail &&
-        leonida::vk_test::spirv_declares_set(code.data(), code.size(), leonida::vk_test::pc_tail_set);
+        leonida::vk_test::spirv_declares_set(code, code_size, leonida::vk_test::pc_tail_set);
     if (tail_block && !tail.create(vkGetDeviceProcAddr, dev, mp, props.limits.minUniformBufferOffsetAlignment,
                                    VK_SHADER_STAGE_COMPUTE_BIT, 1 + origins)) {
         std::fprintf(stderr, "FAILED creating the --pc-tail-ubo block\n");

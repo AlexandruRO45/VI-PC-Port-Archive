@@ -1002,6 +1002,12 @@ if(TARGET Vulkan::Headers)
   target_link_libraries(moltenvk_no_contraction_test PRIVATE Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME moltenvk_no_contraction COMMAND moltenvk_no_contraction_test)
+    # The same modules, each checked by spirv-val before and after the rewrite.
+    find_program(LEONIDA_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    if(LEONIDA_SPIRV_VAL)
+      add_test(NAME moltenvk_no_contraction_spirv_val
+               COMMAND moltenvk_no_contraction_test --spirv-val "${LEONIDA_SPIRV_VAL}" "${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
   endif()
   if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")

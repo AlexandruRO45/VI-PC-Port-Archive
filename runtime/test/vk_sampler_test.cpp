@@ -17,6 +17,7 @@
 
 #include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/moltenvk_no_contraction.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -114,6 +115,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!pd) { std::printf("unsupported: no Vulkan 1.2 device\n"); return unsupported; }
+    // This instance has no VkLayerSettingsCreateInfoEXT: MoltenVK's fast math is its default or the environment's.
+    const auto safe_math = leonida::moltenvk_safe_math(
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(gipa(inst, "vkGetPhysicalDeviceProperties2")), pd,
+        leonida::MoltenVKSettings::environment);
     std::printf("device: %s, driver 0x%x, Vulkan %u.%u.%u\n", props.deviceName, props.driverVersion,
                 VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion),
                 VK_API_VERSION_PATCH(props.apiVersion));
@@ -362,7 +367,7 @@ int main(int argc, char** argv) {
     const std::uint32_t push_bytes = pc_tail ? 128u : 144u;
     bool tail_block = false;
     for (int stage = 0; stage < 2; ++stage) {
-        const auto code = read_spv(argv[1 + stage]);
+        const auto code = leonida::drop_no_contraction(read_spv(argv[1 + stage]), safe_math);
         if (code.empty()) {
             std::fprintf(stderr, "cannot read %s\n", argv[1 + stage]);
             return 1;

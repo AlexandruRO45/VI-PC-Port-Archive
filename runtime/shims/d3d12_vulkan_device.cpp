@@ -4083,7 +4083,10 @@ public:
                     conservative.primitiveOverestimationSize);
                 state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
                 state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
-                state_.safe_math = leonida::moltenvk_safe_math(driver.driverID, props.properties.driverVersion);
+                state_.safe_math = leonida::moltenvk_safe_math(
+                    driver.driverID, props.properties.driverVersion,
+                    info.moltenvk_settings_from_environment ? leonida::MoltenVKSettings::environment
+                                                            : leonida::MoltenVKSettings::unknown);
             }
         }
 
@@ -7660,6 +7663,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     info.instance = owned.instance;
     info.separate_depth_stencil_layouts = true;
     info.debug_utils = has_debug_utils;
+    info.moltenvk_settings_from_environment = true;  // instance_info has no VkLayerSettingsCreateInfoEXT
     VkPhysicalDeviceProperties chosen{};
     bool chosen_bc = false;
     VkPhysicalDeviceFeatures chosen_features{};
