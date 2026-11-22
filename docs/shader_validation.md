@@ -1051,6 +1051,25 @@ First results on an RTX 4090 (subgroup 32, driver 621.14):
 - **Everything else matches.** On `main`, 1,000 programs (`--seed 8 --ops 28 --no-maskdata --no-w32-hi-lanes`, 500 wave32 native and 500 wave64 emulated) give 0 mismatches. 297 of them are `hyp_only` (permlane with FI = 0 and an inactive source), and with `--permlane-fetch-inactive` all 1,000 match. Native wave64 on the 32-wide card mismatches as documented: `s_bcnt1` of EXEC counts one half, and a `v_readlane` from the other half wraps.
 - **Closed question (#374):** what hardware does for permlane with FI = 0 was measured on RDNA2 and RDNA3.5 (see above).
 
+### Wave and cross-lane ops on the CPU (`tools/wave_diff.py`)
+
+The same family as `crosslane_fuzz.py`, without a GPU or llvm-mc, so it can run wherever the translator tests run.
+The reference is `cf_ref.WaveMachine` (FUZZ-8) extended in `wave_diff.WaveRef` with the instructions it leaves out:
+`v_readlane`, `v_readfirstlane`, `v_writelane`, `ds_bpermute_b32` (per 32-lane half, an inactive source reads 0),
+`v_permlane16/x16` (FI = 0 with an inactive source leaves vD, as measured above), `s_bcnt0/1` and `s_ff0/1`
+(`_b32`/`_b64`, constants sign-extended to the operand width) and `s_not`. Each rule is written next to its instruction.
+The translated side is `spirv_mini_interp.run_workgroup`, every lane of the wave in one subgroup of the wave's size, and
+all 12 dwords every lane stores are compared (four VGPRs, two masks, VCC and the final EXEC as each lane's bit, four
+scalars). Programs are straight-line wave32 and wave64 compute under random EXEC (`v_cmpx`, saveexec, constants).
+
+By default the generator keeps lane masks and 64-bit data in separate registers and only issues `v_permlane` with every
+lane on, so a default run is a regression check. Two known gaps on `main` are opt-in: `--masks-as-data` (#210, #293) and
+`--permlane-partial` (SHADER-74, #580).
+
+Results, 2026-11-22 (`--max-ops 16`, half wave32, half wave64, nothing skipped): on `main` f847748c, 199 of 200 match
+(seed 301); the mismatch is `s_ff0_i32_b64` of a negative constant, which #1409 fixes. With #1409, 600 of 600 match
+(seeds 301 to 303).
+
 ### 32-bit float VALU on the GPU (`tools/f32_fuzz.py`, FUZZ-3)
 
 `--oracle hw` (or `translator,hw`) runs the same seeded VOP1/VOP2/VOP3 f32 programs natively on the AMD GPU and judges
