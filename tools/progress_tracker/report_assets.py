@@ -157,5 +157,3 @@ def assets(data, history):
         count = totals({'groups': domain['groups']})
         result['badge-' + domain['id'] + '.svg'] = badge(domain['id'] + ' bodies', f"{count['body']}/{count['total']}", '#238636')
     return result
-
-

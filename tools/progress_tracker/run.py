@@ -206,7 +206,7 @@ def render_report(data):
                 lines.append(f"| {md(item['interface'])} | {md(item['method'])} | {LABELS[item['state']]} | {md(item['reason'])} | "
                              f"[{md(item['path'])}:{item['line']}]({item['url']}) |")
         lines += ['', '</details>', '']
-    return '\n'.join(lines) + '\n'
+    return '\n'.join(lines).rstrip() + '\n'
 
 
 def publish(data, output, history):

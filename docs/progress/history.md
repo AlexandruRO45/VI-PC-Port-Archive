@@ -14,7 +14,7 @@ Units: methods.
 | UTC day | Bodies | Guarded | No-op | Stubs | Total | Source | Measurement |
 |---|---:|---:|---:|---:|---:|---|---|
 | 2026-11-21 | 60 | 8 | 11 | 128 | 207 | [4abd5457](https://github.com/ItsNotRexed/Leonida/commit/4abd54571b6efa02d97eda4711792fa00b455dc3) | rescanned |
-| 2026-11-22 | 74 | 14 | 12 | 107 | 207 | [366f55e4](https://github.com/ItsNotRexed/Leonida/commit/366f55e48e60a144628ef81c794f97356026f0a3) | observed |
+| 2026-11-22 | 74 | 14 | 12 | 107 | 207 | [a161e7b3](https://github.com/ItsNotRexed/Leonida/commit/a161e7b3534f500bc9356d94e590b7dff9d0e71c) | observed |
 
 ## Shader translator · declared selectors
 
@@ -23,7 +23,7 @@ Units: selectors.
 | UTC day | Bodies | Guarded | No-op | Stubs | Total | Source | Measurement |
 |---|---:|---:|---:|---:|---:|---|---|
 | 2026-11-21 | 10 | 343 | 20 | 0 | 373 | [4abd5457](https://github.com/ItsNotRexed/Leonida/commit/4abd54571b6efa02d97eda4711792fa00b455dc3) | rescanned |
-| 2026-11-22 | 10 | 372 | 19 | 0 | 401 | [366f55e4](https://github.com/ItsNotRexed/Leonida/commit/366f55e48e60a144628ef81c794f97356026f0a3) | observed |
+| 2026-11-22 | 10 | 372 | 19 | 0 | 401 | [a161e7b3](https://github.com/ItsNotRexed/Leonida/commit/a161e7b3534f500bc9356d94e590b7dff9d0e71c) | observed |
 
 ## Shader pipeline · Python definitions
 
@@ -32,7 +32,7 @@ Units: definitions.
 | UTC day | Bodies | Guarded | No-op | Stubs | Total | Source | Measurement |
 |---|---:|---:|---:|---:|---:|---|---|
 | 2026-11-21 | 171 | 61 | 0 | 0 | 232 | [4abd5457](https://github.com/ItsNotRexed/Leonida/commit/4abd54571b6efa02d97eda4711792fa00b455dc3) | rescanned |
-| 2026-11-22 | 186 | 65 | 0 | 0 | 251 | [366f55e4](https://github.com/ItsNotRexed/Leonida/commit/366f55e48e60a144628ef81c794f97356026f0a3) | observed |
+| 2026-11-22 | 186 | 65 | 0 | 0 | 251 | [a161e7b3](https://github.com/ItsNotRexed/Leonida/commit/a161e7b3534f500bc9356d94e590b7dff9d0e71c) | observed |
 
 ## Runtime · C++ definitions
 
@@ -41,7 +41,7 @@ Units: definitions.
 | UTC day | Bodies | Guarded | No-op | Stubs | Total | Source | Measurement |
 |---|---:|---:|---:|---:|---:|---|---|
 | 2026-11-21 | 301 | 5 | 4 | 8 | 318 | [4abd5457](https://github.com/ItsNotRexed/Leonida/commit/4abd54571b6efa02d97eda4711792fa00b455dc3) | rescanned |
-| 2026-11-22 | 338 | 5 | 3 | 10 | 356 | [366f55e4](https://github.com/ItsNotRexed/Leonida/commit/366f55e48e60a144628ef81c794f97356026f0a3) | observed |
+| 2026-11-22 | 338 | 5 | 3 | 10 | 356 | [a161e7b3](https://github.com/ItsNotRexed/Leonida/commit/a161e7b3534f500bc9356d94e590b7dff9d0e71c) | observed |
 
 ## Asset tools · Python and C# definitions
 
@@ -50,7 +50,7 @@ Units: definitions.
 | UTC day | Bodies | Guarded | No-op | Stubs | Total | Source | Measurement |
 |---|---:|---:|---:|---:|---:|---|---|
 | 2026-11-21 | 554 | 4 | 0 | 0 | 558 | [4abd5457](https://github.com/ItsNotRexed/Leonida/commit/4abd54571b6efa02d97eda4711792fa00b455dc3) | rescanned |
-| 2026-11-22 | 655 | 4 | 0 | 0 | 659 | [366f55e4](https://github.com/ItsNotRexed/Leonida/commit/366f55e48e60a144628ef81c794f97356026f0a3) | observed |
+| 2026-11-22 | 655 | 4 | 0 | 0 | 659 | [a161e7b3](https://github.com/ItsNotRexed/Leonida/commit/a161e7b3534f500bc9356d94e590b7dff9d0e71c) | observed |
 
 ## Asset exporter · command branches
 
@@ -59,7 +59,7 @@ Units: commands.
 | UTC day | Bodies | Guarded | No-op | Stubs | Total | Source | Measurement |
 |---|---:|---:|---:|---:|---:|---|---|
 | 2026-11-21 | 5 | 0 | 0 | 0 | 5 | [4abd5457](https://github.com/ItsNotRexed/Leonida/commit/4abd54571b6efa02d97eda4711792fa00b455dc3) | rescanned |
-| 2026-11-22 | 5 | 0 | 0 | 0 | 5 | [366f55e4](https://github.com/ItsNotRexed/Leonida/commit/366f55e48e60a144628ef81c794f97356026f0a3) | observed |
+| 2026-11-22 | 5 | 0 | 0 | 0 | 5 | [a161e7b3](https://github.com/ItsNotRexed/Leonida/commit/a161e7b3534f500bc9356d94e590b7dff9d0e71c) | observed |
 
 ## Other Python tools
 
@@ -68,7 +68,7 @@ Units: definitions.
 | UTC day | Bodies | Guarded | No-op | Stubs | Total | Source | Measurement |
 |---|---:|---:|---:|---:|---:|---|---|
 | 2026-11-21 | 188 | 9 | 0 | 0 | 197 | [4abd5457](https://github.com/ItsNotRexed/Leonida/commit/4abd54571b6efa02d97eda4711792fa00b455dc3) | rescanned |
-| 2026-11-22 | 446 | 26 | 0 | 3 | 475 | [366f55e4](https://github.com/ItsNotRexed/Leonida/commit/366f55e48e60a144628ef81c794f97356026f0a3) | observed |
+| 2026-11-22 | 446 | 26 | 0 | 3 | 475 | [a161e7b3](https://github.com/ItsNotRexed/Leonida/commit/a161e7b3534f500bc9356d94e590b7dff9d0e71c) | observed |
 
 ## Unmeasured historical trees
 
