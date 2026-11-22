@@ -36,6 +36,10 @@ happens **on your PC, from your own copy of the game**.
 Discord: https://discord.gg/rexed
 <br>
 
+[![Leonida implementation and contribution tracker](https://raw.githubusercontent.com/omdev74/leonida-progress/main/data/dashboard.svg)](https://github.com/omdev74/leonida-progress)
+
+Automatically refreshed from the public coordination tables. Implementation status, not game completion; [sources and definitions](https://github.com/omdev74/leonida-progress/blob/main/data/report.md).
+
 ## Project status
 
 **Early. The game does not boot yet.** Everything that can be done without the game's executable is in place, so
