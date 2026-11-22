@@ -1126,5 +1126,119 @@ class TestValuCvtPknormI16F16ConditionCodes(unittest.TestCase):
         self.assertEqual(bor1, 0)
 
 
+# ==============================================================================
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestValuCvtPknormI16F16IEEE754Boundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormals_evaluation(self) -> None:
+        # Smallest positive subnormal in f16 (2^-24 ~= 5.96e-8) -> round(5.96e-8 * 32767) = 0
+        self.assertEqual(oracle_cvt_snorm16_f16(SUBNORM_MIN_F16), 0)
+        self.assertTrue(is_subnormal16(SUBNORM_MIN_F16))
+
+        # Smallest negative subnormal -> round(-5.96e-8 * 32767) = 0
+        self.assertEqual(oracle_cvt_snorm16_f16(NEG_SUBNORM_MIN_F16), 0)
+
+        # Largest positive subnormal (0x03FF ~= 6.097e-5) -> round(6.097e-5 * 32767) = 2
+        self.assertEqual(oracle_cvt_snorm16_f16(SUBNORM_MAX_F16), 2)
+        # Largest negative subnormal (0x83FF) -> round(-6.097e-5 * 32767) = -2 (0xFFFE)
+        self.assertEqual(oracle_cvt_snorm16_f16(NEG_SUBNORM_MAX_F16), (-2 & 0xFFFF))
+
+        # Packed combination of subnormals
+        res = oracle_v_cvt_pknorm_i16_f16(SUBNORM_MIN_F16, NEG_SUBNORM_MIN_F16)
+        self.assertEqual(res, 0x00000000)
+
+    def test_all_nan_variants_evaluate_to_zero(self) -> None:
+        nan_cases = [
+            POS_QNAN_F16,
+            NEG_QNAN_F16,
+            POS_SNAN_F16,
+            NEG_SNAN_F16,
+            0x7E01,
+            0x7FFF,
+            0xFFFF,
+            0x7D00,
+            0xFD00,
+        ]
+        for nan_word in nan_cases:
+            with self.subTest(nan_pattern=hex(nan_word)):
+                self.assertTrue(is_nan16(nan_word))
+                self.assertEqual(oracle_cvt_snorm16_f16(nan_word), 0)
+                # Test as S0 with normal S1
+                res_s0 = oracle_v_cvt_pknorm_i16_f16(nan_word, POS_ONE_F16)
+                self.assertEqual(res_s0, (0x7FFF << 16) | 0)
+                # Test as S1 with normal S0
+                res_s1 = oracle_v_cvt_pknorm_i16_f16(POS_ONE_F16, nan_word)
+                self.assertEqual(res_s1, (0 << 16) | 0x7FFF)
+                # Test both channels NaN
+                self.assertEqual(oracle_v_cvt_pknorm_i16_f16(nan_word, nan_word), 0)
+
+    def test_infinity_boundaries(self) -> None:
+        self.assertTrue(is_inf16(POS_INF_F16))
+        self.assertTrue(is_inf16(NEG_INF_F16))
+        self.assertEqual(oracle_cvt_snorm16_f16(POS_INF_F16), 0x7FFF)
+        self.assertEqual(oracle_cvt_snorm16_f16(NEG_INF_F16), 0x8001)
+
+        res_pos_neg = oracle_v_cvt_pknorm_i16_f16(POS_INF_F16, NEG_INF_F16)
+        self.assertEqual(res_pos_neg, (0x8001 << 16) | 0x7FFF)
+
+        res_neg_pos = oracle_v_cvt_pknorm_i16_f16(NEG_INF_F16, POS_INF_F16)
+        self.assertEqual(res_neg_pos, (0x7FFF << 16) | 0x8001)
+
+    def test_signed_zeros_permutations(self) -> None:
+        combos = [
+            (POS_ZERO_F16, POS_ZERO_F16),
+            (POS_ZERO_F16, NEG_ZERO_F16),
+            (NEG_ZERO_F16, POS_ZERO_F16),
+            (NEG_ZERO_F16, NEG_ZERO_F16),
+        ]
+        for s0, s1 in combos:
+            with self.subTest(s0=hex(s0), s1=hex(s1)):
+                self.assertTrue(is_zero16(s0))
+                self.assertTrue(is_zero16(s1))
+                self.assertEqual(oracle_v_cvt_pknorm_i16_f16(s0, s1), 0x00000000)
+
+    def test_finite_boundary_extremes(self) -> None:
+        # Smallest positive normal float: 2^-14 ~= 6.1035e-5 -> round(6.1035e-5 * 32767) = 2
+        flt_min = 0x0400
+        self.assertEqual(oracle_cvt_snorm16_f16(flt_min), 2)
+
+        # Largest float < 1.0 (1.0 - 2^-11) -> 0x3BFF
+        one_minus_eps = 0x3BFF
+        val_sub_1 = bits_to_f16(one_minus_eps)
+        self.assertEqual(oracle_cvt_snorm16_f16(one_minus_eps), round(val_sub_1 * 32767.0) & 0xFFFF)
+
+        # Smallest float > 1.0 (1.0 + 2^-10) -> 0x3C01 -> clamps to 0x7FFF
+        one_plus_eps = 0x3C01
+        self.assertEqual(oracle_cvt_snorm16_f16(one_plus_eps), 0x7FFF)
+
+        # Maximum finite positive float in f16 (65504.0) -> clamps to 0x7FFF
+        max_finite = 0x7BFF
+        self.assertEqual(oracle_cvt_snorm16_f16(max_finite), 0x7FFF)
+
+        # Maximum finite negative float in f16 (-65504.0) -> clamps to 0x8001
+        neg_max_finite = 0xFBFF
+        self.assertEqual(oracle_cvt_snorm16_f16(neg_max_finite), 0x8001)
+
+    def test_modifier_interaction_with_boundaries(self) -> None:
+        # abs(-inf) -> +inf -> 0x7FFF
+        res_abs_inf = oracle_v_cvt_pknorm_i16_f16(NEG_INF_F16, POS_ZERO_F16, abs0=True)
+        self.assertEqual(extract_half(res_abs_inf, high_half=False), 0x7FFF)
+
+        # neg(+inf) -> -inf -> 0x8001
+        res_neg_inf = oracle_v_cvt_pknorm_i16_f16(POS_INF_F16, POS_ZERO_F16, neg0=True)
+        self.assertEqual(extract_half(res_neg_inf, high_half=False), 0x8001)
+
+        # abs and neg on NaN still yield 0x0000
+        res_mod_nan = oracle_v_cvt_pknorm_i16_f16(POS_QNAN_F16, NEG_SNAN_F16, abs0=True, neg1=True)
+        self.assertEqual(res_mod_nan, 0x00000000)
+
+        # abs(-0.0) -> +0.0 -> 0x0000
+        res_abs_z = oracle_v_cvt_pknorm_i16_f16(NEG_ZERO_F16, NEG_ZERO_F16, abs0=True, abs1=True)
+        self.assertEqual(res_abs_z, 0x00000000)
+
+
 if __name__ == "__main__":
     unittest.main()
