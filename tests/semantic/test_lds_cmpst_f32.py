@@ -150,6 +150,83 @@ class LDSMemory:
 
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class DSOpcode(Enum):
+    DS_CMPST_F32 = "ds_cmpst_f32"
+    DS_CMPST_RTN_F32 = "ds_cmpst_rtn_f32"
+
+
+class RegType(Enum):
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        max_limit = DEFAULT_NUM_VGPRS if self.reg_type == RegType.VGPR else DEFAULT_NUM_SGPRS
+        if not (0 <= self.index < max_limit):
+            raise ValueError(f"Register index out of bounds: {self.reg_type.value}[{self.index}]")
+
+    def __str__(self) -> str:
+        return f"{self.reg_type.value}[{self.index}]"
+
+
+@dataclass(frozen=True)
+class ImmediateF32:
+    val: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "val", u32(self.val))
+
+    def __str__(self) -> str:
+        return f"0x{self.val:X}"
+
+
+Operand = Union[RegisterOperand, ImmediateF32]
+
+
+@dataclass(frozen=True)
+class DSCmpstF32Instruction:
+    """Symbolic AST node for ds_cmpst_f32 / ds_cmpst_rtn_f32 instruction."""
+    vaddr: RegisterOperand
+    vdata0: Operand  # Float compare value
+    vdata1: Operand  # Float new value
+    vdst: Optional[RegisterOperand] = None  # None for ds_cmpst_f32, present for ds_cmpst_rtn_f32
+    offset: int = 0
+    gds: bool = False
+
+    @property
+    def opcode(self) -> DSOpcode:
+        return DSOpcode.DS_CMPST_RTN_F32 if self.vdst is not None else DSOpcode.DS_CMPST_F32
+
+    def __post_init__(self) -> None:
+        if self.vaddr.reg_type != RegType.VGPR:
+            raise ValueError(f"vaddr must be a VGPR, got {self.vaddr.reg_type}")
+        if self.vdst is not None and self.vdst.reg_type != RegType.VGPR:
+            raise ValueError(f"vdst must be a VGPR, got {self.vdst.reg_type}")
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"offset out of bounds: {self.offset}")
+
+    def disassemble(self) -> str:
+        parts = [self.opcode.value]
+        if self.vdst is not None:
+            parts.append(str(self.vdst))
+        parts.extend([str(self.vaddr), str(self.vdata0), str(self.vdata1)])
+        if self.offset != 0:
+            parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return f"{parts[0]} {', '.join(parts[1:])}"
+
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Phase 1: Unit tests for reference mathematical oracle and architectural model."""
 
@@ -214,6 +291,44 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(old, val)
         self.assertEqual(mem, new_val)
         self.assertEqual(lds.read_dword(addr), new_val)
+
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_non_returning_ast(self) -> None:
+        vaddr = RegisterOperand(1, RegType.VGPR)
+        vdata0 = RegisterOperand(2, RegType.VGPR)
+        vdata1 = RegisterOperand(3, RegType.VGPR)
+        instr = DSCmpstF32Instruction(vaddr=vaddr, vdata0=vdata0, vdata1=vdata1, offset=16)
+
+        self.assertEqual(instr.opcode, DSOpcode.DS_CMPST_F32)
+        self.assertIsNone(instr.vdst)
+        self.assertEqual(instr.disassemble(), "ds_cmpst_f32 v[1], v[2], v[3], offset:16")
+
+    def test_returning_ast(self) -> None:
+        vdst = RegisterOperand(0, RegType.VGPR)
+        vaddr = RegisterOperand(1, RegType.VGPR)
+        vdata0 = ImmediateF32(f32_to_bits(1.0))
+        vdata1 = ImmediateF32(f32_to_bits(2.0))
+        instr = DSCmpstF32Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, vdata1=vdata1)
+
+        self.assertEqual(instr.opcode, DSOpcode.DS_CMPST_RTN_F32)
+        self.assertEqual(instr.disassemble(), "ds_cmpst_rtn_f32 v[0], v[1], 0x3F800000, 0x40000000")
+
+    def test_ast_validation_errors(self) -> None:
+        v0 = RegisterOperand(0, RegType.VGPR)
+        s0 = RegisterOperand(0, RegType.SGPR)
+
+        with self.assertRaises(ValueError):
+            DSCmpstF32Instruction(vaddr=s0, vdata0=v0, vdata1=v0)
+        with self.assertRaises(ValueError):
+            DSCmpstF32Instruction(vdst=s0, vaddr=v0, vdata0=v0, vdata1=v0)
+        with self.assertRaises(ValueError):
+            DSCmpstF32Instruction(vaddr=v0, vdata0=v0, vdata1=v0, offset=-1)
+        with self.assertRaises(ValueError):
+            DSCmpstF32Instruction(vaddr=v0, vdata0=v0, vdata1=v0, offset=65536)
 
 
 
