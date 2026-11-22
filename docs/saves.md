@@ -101,12 +101,18 @@ to it holds the same save. The wrapper's header is the only place the autosave's
 
 ## Importing into the runtime
 
-The offline XGameSave shim of the open #279 (`xgameruntime_services.cpp` there; **not on `main` yet**, where the
-`XGameSave*` imports have no implementation and get the loader's default answers, classified in
-`runtime/shims/registry.cpp`) keeps `XGameSave` data in
-`LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`, with names
-%-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB]` writes payloads
-in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
+`QueryApiImpl` serves `XGameSaveImpl` (`IXGameSaveImpl3`, `runtime/shims/xgameruntime_save.cpp`), the way a title's
+statically linked `XGameSave*` thunks reach the runtime. It keeps `XGameSave` data in
+`LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`, with container and
+blob names %-encoded (`[A-Za-z0-9_-]` kept, `.` kept except as the first character, every other byte `%XX`). Files and
+folders starting with `.` are the shim's own (a container's `.display-name`, and the staging and backup folders of an
+update being committed), so they never collide with an encoded name. A container exists once an update to it is
+submitted; each update is applied atomically, built in a staging folder and swapped in by renaming. The quota is the
+documented 256 MB per user, capped by the drive's free space. The offline XGameSave shim of the open #279
+(`xgameruntime_services.cpp` there) used the same layout through named `XGameSave*` exports.
+`python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB]` writes payloads in that
+layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256); `xgamesave_test` reads a blob
+written that way back through `XGameSaveReadBlobData`.
 
 Checked with #279's shim: four imported blobs (2 KB to 1.2 MB) read back byte-identical through its
 `XGameSaveReadBlobData`.

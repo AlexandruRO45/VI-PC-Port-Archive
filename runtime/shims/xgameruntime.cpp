@@ -26,6 +26,7 @@
 #include <XTaskQueue.h>
 
 #include "shims.h"
+#include "xgameruntime_save.h"
 
 namespace {
 
@@ -343,6 +344,7 @@ RuntimeObject& system_object();  // XSystemImpl, defined after the XSystem funct
 
 HRESULT WINAPI QueryApiImpl(const GUID* class_id, REFIID interface_id, void** out) {
     if (out) *out = nullptr;
+    if (HRESULT hr = E_FAIL; rt::xgr::query_save(class_id, interface_id, out, &hr)) return hr;   // XGameSaveImpl
     if (class_id && out) {
         for (RuntimeObject* o : {&g_threading, &g_error, &g_networking, &system_object()})
             if (*class_id == *o->class_id) return object_query_interface(o, interface_id, out);
