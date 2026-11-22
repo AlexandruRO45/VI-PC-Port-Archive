@@ -703,7 +703,10 @@ if(TARGET Vulkan::Headers)
     if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
       function(descriptor_test_shader shader definition)
         set(source ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader})
-        set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/${definition}.spv)
+        # LEONIDA_TEST_CS_SAMPLE_SPV -> generated/cs_sample.spv, the file the windows CI job checks for.
+        string(REGEX REPLACE "^LEONIDA_TEST_(.*)_SPV$" "\\1" name "${definition}")
+        string(TOLOWER "${name}" name)
+        set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/${name}.spv)
         add_custom_command(OUTPUT ${binary}
           COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 ${ARGN} -o ${binary} ${source}
           DEPENDS ${source} COMMENT "Compiling descriptor test shader ${shader}" VERBATIM)
