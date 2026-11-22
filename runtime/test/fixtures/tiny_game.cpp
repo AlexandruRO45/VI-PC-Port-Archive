@@ -3,7 +3,7 @@
 //   gta6rt --run tiny_game.exe -- hello 42 [tls] [eh] [exit-code]
 // It checks its arguments, a static initializer, the heap, a file round trip, a second thread, the xgameruntime.dll
 // imports (answered by the shim registry: the stub DLL it links against would fail them), and that it is the
-// process's own image (GetModuleHandle*, GetModuleHandleEx* and GetModuleFileName* name tiny_game.exe, not
+// process's own image (GetModuleHandle*, GetModuleHandleEx* and GetModuleFileName* name its own file, not
 // gta6rt.exe), then calls exit() with 0 (42 with `exit-code`) when everything held. Two checks are opt-in, by
 // argument (CTest's run_tiny_game_tls and run_tiny_game_eh): `tls`, thread_local on the game's own threads, which
 // needs the loader's per-thread TLS (gta6rt starts main on a separate thread); and `eh`, a C++ exception caught
@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <string>
 #include <thread>
 #include <vector>
@@ -97,18 +98,19 @@ void check_module_identity() {
         return;
     }
     std::printf("tiny_game: GetModuleFileNameW(NULL) = %ls\n", path);
-    const wchar_t kName[] = L"\\tiny_game.exe";
-    const DWORD name_len = static_cast<DWORD>(std::wcslen(kName));
+    // This source builds tiny_game.exe and the static-CRT tiny_game_static.exe, so the file is told by its headers,
+    // not by its name.
     const bool full = len > 2 && ((path[1] == L':' && path[2] == L'\\') || (path[0] == L'\\' && path[1] == L'\\'));
-    const bool named = len > name_len && CompareStringOrdinal(path + len - name_len, static_cast<int>(name_len), kName,
-                                                              static_cast<int>(name_len), TRUE) == CSTR_EQUAL;
-    check(full && named && file_is_this_image(path),
-          "GetModuleFileNameW(NULL) is the full path of tiny_game.exe, the file this image was mapped from");
+    check(full && file_is_this_image(path),
+          "GetModuleFileNameW(NULL) is the full path of the game's own file, the one this image was mapped from");
     wchar_t again[1024] = {};
     check(GetModuleFileNameW(self, again, 1024) == len && std::wcscmp(again, path) == 0,
           "GetModuleFileNameW(the game's HMODULE) gives the same path");
-    check(GetModuleHandleW(path) == self && GetModuleHandleW(L"TINY_GAME.EXE") == self,
-          "GetModuleHandleW finds the game by that full path and by its file name in any case");
+    const wchar_t* slash = std::wcsrchr(path, L'\\');
+    std::wstring upper = slash ? slash + 1 : path;
+    for (auto& c : upper) c = static_cast<wchar_t>(std::towupper(c));
+    check(GetModuleHandleW(path) == self && GetModuleHandleW(upper.c_str()) == self,
+          "GetModuleHandleW finds the game by that full path and by its file name in upper case");
     SetLastError(ERROR_SUCCESS);
     check(GetModuleHandleW(L"tiny_game") == nullptr && GetLastError() == ERROR_MOD_NOT_FOUND,
           "GetModuleHandleW(\"tiny_game\") adds \".dll\", so it doesn't name the EXE (ERROR_MOD_NOT_FOUND)");
