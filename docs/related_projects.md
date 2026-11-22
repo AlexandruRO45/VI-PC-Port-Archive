@@ -99,6 +99,38 @@ lands), the IID/extension tables, and the call-sequence observations that Leonid
 [d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi) still lists as unknown. SCARAB forwards to
 D3D12; Leonida translates to Vulkan. The ABI facts carry over, the forwarding architecture does not.
 
+## ivall/xcl and omonkeyz/xbox-emulator
+
+<https://github.com/ivall/xcl>, <https://github.com/omonkeyz/xbox-emulator>
+
+Two Rust compatibility layers for Xbox Series titles, each with its own shims for the console's OS libraries.
+xbox-emulator continues TomBox; xcl draws on TomBox's findings, so where the two agree that is one observation,
+not two independent ones. Neither targets this game; what they add is conventions observed while running other
+titles.
+
+**Licence:** xcl is **GPL-2.0-only**, which is incompatible with GPL-3.0-or-later: **no xcl code may be copied**,
+as for americas-recomp above. xbox-emulator is GPL-3.0, which is compatible, and the SCARAB rule applies: facts
+first, our own implementation, and the pull request names the file a fact came from.
+
+**What we use them for:** leads to check on this package. The `xmem.dll` answers in
+[runtime_imports.md](runtime_imports.md#what-the-xmemdll-answers-carry) started there: the fields of the
+`XMemAlloc` attribute word and the memory-kind word `XMemVirtualQuery` returns. Both rest on the call sites of
+the package's own DLLs, not on either project.
+
+## brcly/TuxBox
+
+<https://github.com/brcly/TuxBox>
+
+A project that runs Xbox Series titles through Proton on Linux and records each library's behaviour as evidence
+files: which exports a title calls, with which arguments, and what the provider answered.
+
+**Licence: none.** The repository has no licence file, so all rights are reserved, as for 6stars above. **No
+TuxBox code, comment, identifier or table may be copied into Leonida.**
+
+**What we use it for:** measured argument values. Two `XMemAlloc` attribute words it logged on retail titles, with
+the alignment each block had, corroborate the attribute-word layout in
+[runtime_imports.md](runtime_imports.md#what-the-xmemdll-answers-carry).
+
 ## microsoft/libHttpClient
 
 <https://github.com/microsoft/libHttpClient>
