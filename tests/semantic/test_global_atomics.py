@@ -84,7 +84,24 @@ def atomic(kind, m, data, cmp=None, glc=True, offset=0, vaddr=TARGET):
     return mem.get(OUT), mem.get(TARGET)
 
 
+def structural_errors(spv):
+    """The spirv-val rule the first version broke: OpSelectionMerge must be the second-to-last instruction of its
+    block, directly before OpBranchConditional or OpSwitch. spirv_mini_interp does not check it."""
+    lines = [ln.strip() for ln in spv.splitlines() if ln.strip() and not ln.strip().startswith(";")]
+    return [lines[i + 1] for i, ln in enumerate(lines)
+            if ln.startswith("OpSelectionMerge") and not lines[i + 1].startswith(("OpBranchConditional", "OpSwitch"))]
+
+
 class GlobalAtomics(unittest.TestCase):
+    def test_selection_merge_directly_precedes_its_branch(self):
+        # Found by @mokkymiah and @Impre-visible: OpLoad %active sat between the merge and the branch, so every
+        # global atomic failed spirv-val.
+        for line in ("global_atomic_add v5, v1, v2, s[0:1] glc", "global_atomic_or v1, v2, s[0:1]",
+                     "global_atomic_cmpswap v5, v1, v[2:3], s[0:1] glc"):
+            with self.subTest(line=line):
+                spv = translate(["v_mov_b32_e32 v1, 0x2000", "v_mov_b32_e32 v2, 7", "v_mov_b32_e32 v3, 7", line])
+                self.assertEqual(structural_errors(spv), [])
+
     def test_returning_forms(self):
         for kind, fn in MODEL.items():
             for m in VALUES:
