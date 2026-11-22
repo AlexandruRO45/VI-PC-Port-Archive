@@ -398,5 +398,137 @@ class TestSymbolicAST(unittest.TestCase):
         self.assertEqual(inst2.to_assembly(), asm2)
 
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarMachineState:
+    """Architectural register and local memory state for 64-bit scalar operations."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.vgprs: List[int] = [0] * DEFAULT_NUM_VGPRS
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+
+    def get_vgpr(self, reg: RegSingle) -> int:
+        return self.vgprs[reg.index]
+
+    def set_vgpr(self, reg: RegSingle, val: int) -> None:
+        self.vgprs[reg.index] = u32(val)
+
+    def get_vgpr_pair(self, reg: RegPair) -> int:
+        lo = self.vgprs[reg.index]
+        hi = self.vgprs[reg.index + 1]
+        return (hi << 32) | lo
+
+    def set_vgpr_pair(self, reg: RegPair, val: int) -> None:
+        self.vgprs[reg.index] = u32(val)
+        self.vgprs[reg.index + 1] = u32(val >> 32)
+
+
+class ScalarInterpreter:
+    """Deterministic scalar interpreter for ds_nor_rtn_b64 and ds_nor_b64."""
+
+    def execute(self, state: ScalarMachineState, inst: DSNorRtnB64Instruction) -> Optional[int]:
+        vaddr_val = state.get_vgpr(inst.vaddr)
+        vdata_val = state.get_vgpr_pair(inst.vdata)
+
+        old_val, new_val = state.lds.atomic_nor_rtn_b64(
+            byte_addr=vaddr_val,
+            val=vdata_val,
+            offset=inst.offset.value,
+        )
+
+        if inst.opcode.is_return:
+            assert inst.vdst is not None
+            state.set_vgpr_pair(inst.vdst, old_val)
+            return old_val
+        return None
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic 64-bit scalar instruction execution."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(DEFAULT_LDS_SIZE_BYTES)
+        self.state = ScalarMachineState(lds=self.lds)
+        self.interp = ScalarInterpreter()
+
+    def test_ds_nor_rtn_b64_execution(self) -> None:
+        self.lds.write_qword(16, 0x0000000000000000)
+        self.state.set_vgpr(RegSingle(2), 16)
+        self.state.set_vgpr_pair(RegPair(4), 0x0000000000000000)
+        self.state.set_vgpr_pair(RegPair(0), 0xDEADBEEFCAFEBABE)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata=RegPair(4),
+        )
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(self.state.get_vgpr_pair(RegPair(0)), 0)
+        self.assertEqual(self.state.get_vgpr(RegSingle(0)), 0)
+        self.assertEqual(self.state.get_vgpr(RegSingle(1)), 0)
+        self.assertEqual(self.state.get_vgpr(RegSingle(2)), 16)
+        self.assertEqual(self.lds.read_qword(16), MASK64)
+
+    def test_ds_nor_b64_non_return(self) -> None:
+        self.lds.write_qword(32, 0x00000000FFFFFFFF)
+        self.state.set_vgpr(RegSingle(2), 32)
+        self.state.set_vgpr_pair(RegPair(4), 0xFFFFFFFF00000000)
+        self.state.set_vgpr_pair(RegPair(0), 0x1122334455667788)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_B64,
+            vaddr=RegSingle(2),
+            vdata=RegPair(4),
+        )
+        ret = self.interp.execute(self.state, inst)
+
+        self.assertIsNone(ret)
+        self.assertEqual(self.state.get_vgpr_pair(RegPair(0)), 0x1122334455667788)
+        self.assertEqual(self.lds.read_qword(32), 0)
+
+    def test_double_nor_identity_64bit(self) -> None:
+        initial = 0x0123456789ABCDEF
+        self.lds.write_qword(8, initial)
+        self.state.set_vgpr(RegSingle(2), 8)
+        self.state.set_vgpr_pair(RegPair(4), 0)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata=RegPair(4),
+        )
+
+        ret1 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret1, initial)
+        inverted = (~initial) & MASK64
+        self.assertEqual(self.lds.read_qword(8), inverted)
+
+        ret2 = self.interp.execute(self.state, inst)
+        self.assertEqual(ret2, inverted)
+        self.assertEqual(self.lds.read_qword(8), initial)
+
+    def test_offset_immediate_computation_64bit(self) -> None:
+        self.lds.write_qword(24, 0x5555555555555555)
+        self.state.set_vgpr(RegSingle(2), 16)
+        self.state.set_vgpr_pair(RegPair(4), 0xAAAAAAAAAAAAAAAA)
+
+        inst = DSNorRtnB64Instruction(
+            opcode=DSOpcode.DS_NOR_RTN_B64,
+            vdst=RegPair(0),
+            vaddr=RegSingle(2),
+            vdata=RegPair(4),
+            offset=OffsetImmediate(8),
+        )
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 0x5555555555555555)
+        self.assertEqual(self.lds.read_qword(24), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
