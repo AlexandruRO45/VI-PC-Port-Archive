@@ -163,6 +163,10 @@ class PeInspectTest(unittest.TestCase):
         cls.report32 = pe_inspect.inspect(cls.image32, cls.dir)
 
     @classmethod
+    def build_image32(cls):
+        return build_image(is64=False)
+
+    @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
@@ -272,6 +276,22 @@ class PeInspectTest(unittest.TestCase):
         self.assertEqual(written["imports"][0]["dll"], "kernel32.dll")
         with open(os.path.join(out, "sample.md"), encoding="utf-8") as f:
             self.assertIn("# sample.dll", f.read())
+
+    def test_cli_handles_same_basename_different_paths(self):
+        # Create a second image with the same filename in a different directory
+        with tempfile.TemporaryDirectory() as tmp2:
+            img2 = os.path.join(tmp2, "sample.dll")
+            with open(img2, "wb") as f:
+                f.write(self.build_image32())
+            out = os.path.join(self.dir, "reports_same_name")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(pe_inspect.main([self.image, img2, "--out", out]), 0)
+            # Both should have been written: sample.json + sample_1.json (or vice versa)
+            files = sorted(os.listdir(out))
+            self.assertEqual(len(files), 4)  # 2 json + 2 md
+            stems = [os.path.splitext(f)[0] for f in files]
+            self.assertIn("sample", stems)
+            self.assertIn("sample_1", stems)
 
     def test_cli_reports_a_non_pe_file(self):
         bad = os.path.join(self.dir, "not_pe_cli.bin")

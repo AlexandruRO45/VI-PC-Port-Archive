@@ -364,6 +364,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     rc = 0
+    seen_stems: dict[str, int] = {}
     for img in a.image:
         try:
             r = inspect(img, a.game_dir or os.path.dirname(os.path.abspath(img)))
@@ -371,7 +372,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{img}: not a PE image ({e})", file=sys.stderr)
             rc = 1
             continue
-        stem = os.path.join(a.out, os.path.splitext(r["file"])[0])
+        base_stem = os.path.splitext(os.path.basename(img))[0]
+        stem = base_stem
+        if base_stem in seen_stems:
+            seen_stems[base_stem] += 1
+            stem = f"{base_stem}_{seen_stems[base_stem]}"
+        else:
+            seen_stems[base_stem] = 0
+        stem = os.path.join(a.out, stem)
         with open(stem + ".json", "w", encoding="utf-8") as f:
             json.dump(r, f, indent=1)
         with open(stem + ".md", "w", encoding="utf-8") as f:
