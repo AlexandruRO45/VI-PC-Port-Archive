@@ -27,6 +27,17 @@ def check_scanner_tracks_pixel_aot():
         opcode = f"v_{name}_f32"
         assert is_opcode_recognized(opcode) and is_opcode_recognized(opcode + "_e32"), opcode
         assert is_instruction_supported(f"{opcode}_e32 v1, v2, v3"), opcode
+    for name, (arity, _) in pixel_aot.INTEGER.items():
+        opcode = f"v_{name}"
+        assert is_opcode_recognized(opcode), opcode
+        operands = ", ".join(f"v{k}" for k in range(1, arity + 2))
+        assert is_instruction_supported(f"{opcode} {operands}"), opcode
+        if arity <= 2:
+            assert is_opcode_recognized(opcode + "_e32"), opcode
+            assert is_instruction_supported(f"{opcode}_e32 {operands}"), opcode
+    assert not is_instruction_supported("v_bfi_b32_e32 v0, v1, v2, v3")
+    assert not is_instruction_supported("v_xor_b32 v0, v1")
+    assert not is_instruction_supported("v_not_b32 v0, -v1")
 
 
 def check():
