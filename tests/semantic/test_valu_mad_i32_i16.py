@@ -27,6 +27,8 @@ Mathematical Properties and Bounds:
 """
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
+import re
 import struct
 import unittest
 
@@ -114,6 +116,149 @@ def ref_mad_i32_i16(
         return to_u32(res_signed)
 
     return to_u32(raw_sum)
+
+
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+    INLINE_CONST = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    """Represents a vector register, scalar register, inline constant, or literal."""
+    reg_type: RegType
+    index: int = 0
+    literal_val: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.reg_type == RegType.VGPR:
+            if not (0 <= self.index < NUM_VGPRS):
+                raise ValueError(f"VGPR index {self.index} out of range [0, {NUM_VGPRS - 1}]")
+        elif self.reg_type == RegType.SGPR:
+            if not (0 <= self.index < NUM_SGPRS):
+                raise ValueError(f"SGPR index {self.index} out of range [0, {NUM_SGPRS - 1}]")
+        elif self.reg_type == RegType.LITERAL:
+            if self.literal_val is None:
+                raise ValueError("Literal operand requires literal_val")
+            if not (0 <= self.literal_val <= MASK32):
+                raise ValueError(f"Literal value {self.literal_val:#x} out of range [0, {MASK32:#x}]")
+        elif self.reg_type == RegType.INLINE_CONST:
+            if self.literal_val is None:
+                raise ValueError("Inline constant operand requires literal_val")
+
+    @classmethod
+    def vgpr(cls, index: int) -> Operand:
+        return cls(RegType.VGPR, index=index)
+
+    @classmethod
+    def sgpr(cls, index: int) -> Operand:
+        return cls(RegType.SGPR, index=index)
+
+    @classmethod
+    def literal(cls, value: int) -> Operand:
+        return cls(RegType.LITERAL, literal_val=to_u32(value))
+
+    @classmethod
+    def inline_const(cls, value: int) -> Operand:
+        return cls(RegType.INLINE_CONST, literal_val=value)
+
+    def disassemble(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        if self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        if self.reg_type == RegType.LITERAL:
+            assert self.literal_val is not None
+            return f"0x{self.literal_val:08X}"
+        if self.reg_type == RegType.INLINE_CONST:
+            assert self.literal_val is not None
+            return str(self.literal_val)
+        raise ValueError(f"Unknown RegType: {self.reg_type}")
+
+
+@dataclass(frozen=True)
+class VMadI32I16Instruction:
+    """Symbolic AST node for RDNA2 v_mad_i32_i16 instruction."""
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+    op_sel: tuple[int, int] = (0, 0)
+
+    def __post_init__(self) -> None:
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.reg_type}")
+
+    def disassemble(self) -> str:
+        parts = [
+            "v_mad_i32_i16",
+            f"{self.dst.disassemble()}, {self.src0.disassemble()}, {self.src1.disassemble()}, {self.src2.disassemble()}",
+        ]
+        if self.clamp:
+            parts.append("clamp")
+        if self.op_sel != (0, 0):
+            parts.append(f"op_sel:[{self.op_sel[0]},{self.op_sel[1]}]")
+        return " ".join(parts)
+
+
+def parse_v_mad_i32_i16(asm_line: str) -> VMadI32I16Instruction:
+    """Parse assembly string into VMadI32I16Instruction AST node."""
+    line = asm_line.strip()
+    if not line.startswith("v_mad_i32_i16"):
+        raise ValueError(f"Expected opcode 'v_mad_i32_i16', got '{line}'")
+
+    rest = line[len("v_mad_i32_i16"):].strip()
+    tokens = rest.split()
+    clamp = False
+    op_sel = (0, 0)
+
+    operand_tokens_raw: list[str] = []
+    for tok in tokens:
+        if tok == "clamp":
+            clamp = True
+        elif tok.startswith("op_sel:[") and tok.endswith("]"):
+            content = tok[len("op_sel:["):-1]
+            sel_parts = content.split(",")
+            op_sel = (int(sel_parts[0]), int(sel_parts[1]))
+        else:
+            operand_tokens_raw.append(tok)
+
+    operands_str = " ".join(operand_tokens_raw)
+    op_list = [t.strip() for t in operands_str.split(",") if t.strip()]
+    if len(op_list) != 4:
+        raise ValueError(f"v_mad_i32_i16 requires 4 operands, got {len(op_list)}: {op_list}")
+
+    def parse_op(tok: str) -> Operand:
+        m_vgpr = re.fullmatch(r"v(\d+)", tok)
+        if m_vgpr:
+            return Operand.vgpr(int(m_vgpr.group(1)))
+        m_sgpr = re.fullmatch(r"s(\d+)", tok)
+        if m_sgpr:
+            return Operand.sgpr(int(m_sgpr.group(1)))
+        if tok.startswith("0x") or tok.startswith("-0x"):
+            return Operand.literal(int(tok, 16))
+        try:
+            val = int(tok, 10)
+            if -16 <= val <= 64:
+                return Operand.inline_const(val)
+            return Operand.literal(val)
+        except ValueError:
+            pass
+        raise ValueError(f"Cannot parse operand token: '{tok}'")
+
+    dst = parse_op(op_list[0])
+    src0 = parse_op(op_list[1])
+    src1 = parse_op(op_list[2])
+    src2 = parse_op(op_list[3])
+
+    return VMadI32I16Instruction(dst=dst, src0=src0, src1=src1, src2=src2, clamp=clamp, op_sel=op_sel)
 
 
 # ==============================================================================
@@ -243,6 +388,60 @@ class TestReferenceMathematicalOracle(unittest.TestCase):
             rf.read_vgpr(256)
         with self.assertRaises(IndexError):
             rf.read_sgpr(106)
+
+
+# ==============================================================================
+# Unit Tests: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class TestSymbolicAST(unittest.TestCase):
+    """Validation and syntax testing for AST nodes and expressions."""
+
+    def test_operand_creation(self) -> None:
+        v0 = Operand.vgpr(0)
+        self.assertEqual(v0.reg_type, RegType.VGPR)
+        self.assertEqual(v0.index, 0)
+        self.assertEqual(v0.disassemble(), "v0")
+
+        s5 = Operand.sgpr(5)
+        self.assertEqual(s5.disassemble(), "s5")
+
+        lit = Operand.literal(0x1234)
+        self.assertEqual(lit.disassemble(), "0x00001234")
+
+        inline = Operand.inline_const(42)
+        self.assertEqual(inline.disassemble(), "42")
+
+    def test_instruction_creation(self) -> None:
+        instr = VMadI32I16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.sgpr(2),
+            src2=Operand.literal(100),
+            clamp=True,
+            op_sel=(1, 0),
+        )
+        self.assertEqual(instr.disassemble(), "v_mad_i32_i16 v0, v1, s2, 0x00000064 clamp op_sel:[1,0]")
+
+    def test_instruction_destination_vgpr_validation(self) -> None:
+        with self.assertRaises(TypeError):
+            VMadI32I16Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr(3),
+            )
+
+    def test_parse_assembly_roundtrip(self) -> None:
+        asm1 = "v_mad_i32_i16 v0, v1, s2, v3"
+        instr1 = parse_v_mad_i32_i16(asm1)
+        self.assertEqual(instr1.disassemble(), asm1)
+
+        asm2 = "v_mad_i32_i16 v10, v2, v3, 0x0000000A clamp op_sel:[1,1]"
+        instr2 = parse_v_mad_i32_i16(asm2)
+        self.assertEqual(instr2.disassemble(), asm2)
+        self.assertTrue(instr2.clamp)
+        self.assertEqual(instr2.op_sel, (1, 1))
 
 
 if __name__ == "__main__":
