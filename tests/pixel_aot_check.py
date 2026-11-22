@@ -1,4 +1,5 @@
 """Exercise offline pixel translation with independently assembled test programs."""
+from fractions import Fraction
 from pathlib import Path
 import hashlib
 import json
@@ -1104,6 +1105,49 @@ def check_mad_draw(directory, compiler, renderer, backend):
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"A fused or denormal-preserving result escaped detection: {wrong_values}")
+
+
+# v_madak_f32 computes S0 * S1 + K and v_madmk_f32 computes S0 * K + S1, with K a 32-bit literal. Unlike the
+# fma forms they round the product before the add and flush binary32 denormals, like v_mad_f32.
+# 4097 * 4097 - 16785408 is 0 unfused and 1.0 fused; 2^-127 * 2^126 + 0.5 is 0.5 with the denormal input flushed.
+MAD_LITERAL_BODY = [
+    "v_mov_b32_e32 v13, s44",
+    "v_madak_f32 v12, s44, v13, 0xcb801000",
+    "v_mov_b32_e32 v13, s45",
+    "v_madmk_f32 v13, s44, 0x45800800, v13",
+    "v_mov_b32_e32 v15, s47",
+    "v_madak_f32 v14, s46, v15, 0x3f000000",
+    "v_mov_b32_e32 v15, 0.5",
+    "v_madmk_f32 v15, s46, 0x7e800000, v15",
+]
+
+
+def check_mad_literal_draw(directory, compiler, renderer, backend):
+    source = directory / "mad_literal.hlsl"
+    shader = directory / "mad_literal.cso"
+    case = directory / "mad_literal.case"
+    source.write_text(translate(with_constants(MAD_LITERAL_BODY)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    constants = bytearray(256)
+    struct.pack_into("<4f", constants, 12, *MAD_INPUTS)
+    a, c, tiny, large = MAD_INPUTS
+    # Exact rational arithmetic gives the fused result; the unfused one rounds the product to binary32 first.
+    fused = float(Fraction(a) * Fraction(a) + Fraction(c))
+    unfused = single(single(a * a) + c)
+    assert fused == 1.0 and unfused == 0.0
+    assert single(tiny) == tiny and 0 < tiny < 2.0 ** -126 and single(tiny * large) == 0.5
+    expected = [unfused, unfused, 0.5, 0.5]
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    write_case(case, constants, tuple(map(half_rtz, expected)))
+    subprocess.run(draw, check=True)
+    # A reference that fuses the first two rows or keeps the denormal in the last two exports 1.0 there.
+    for k in range(4):
+        wrong_values = list(expected)
+        wrong_values[k] = 1.0
+        write_case(case, constants, tuple(map(half_rtz, wrong_values)))
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"A fused or denormal-preserving literal result escaped detection in channel {k}")
 
 
 def check_predicate_draws(directory, compiler, renderer, backend):
@@ -4135,6 +4179,17 @@ def check_controls(directory):
     assert body.count("mad32(") == 4 and " mad(" not in body, body
     must_reject(translate, with_constants(["v_mad_f32 v12, s44, s45"]))
     must_reject(translate, with_constants(["v_mac_f32_e32 v14, s44, v15, v14"]))
+    # v_madak_f32 and v_madmk_f32 use the same helper. The literal is the last operand of madak and the
+    # second of madmk; a register there, a missing operand, and the e64, DPP and SDWA spellings are refused.
+    body = translate(with_constants(MAD_LITERAL_BODY)).split("float4 main", 1)[1]
+    assert body.count("mad32(") == 4 and " mad(" not in body and "asfloat(3414167552u)" in body, body
+    must_reject(translate, with_constants(["v_madak_f32 v12, s44, v13, v14"]))
+    must_reject(translate, with_constants(["v_madmk_f32 v12, s44, v13, 0x3e800000"]))
+    must_reject(translate, with_constants(["v_madak_f32 v12, s44, 0x3e800000"]))
+    must_reject(translate, with_constants(["v_madak_f32_e64 v12, s44, v13, 0x3e800000"]))
+    must_reject(translate, with_constants(["v_madmk_f32_e64 v12, s44, 0x3e800000, v13"]))
+    must_reject(translate, with_constants(["v_madak_f32_dpp v12, v13, v14, 0x3e800000 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf"]))
+    must_reject(translate, with_constants(["v_madmk_f32_sdwa v12, v13, 0x3e800000, v14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD"]))
 
     # 64-bit scalar ALU and 32-bit BFE controls.
     program = scalar64()
@@ -4524,6 +4579,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((scalar(), translate))
     fixtures.append((lod_zero_sample(), translate))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
+    fixtures.append((with_constants(MAD_LITERAL_BODY), translate))
     fixtures.append((unpack_bytes(), translate))
     fixtures.append((reciprocal_iflag(), translate))
     fixtures.append((offset_nibbles(), translate))
@@ -5951,6 +6007,7 @@ def check_blend_and_scalar_draws(directory, compiler, renderer, backend):
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError(f"Mutation of {label} escaped detection")
     check_mad_draw(directory, compiler, renderer, backend)
+    check_mad_literal_draw(directory, compiler, renderer, backend)
     source.write_text(translate(scalar()), encoding="ascii")
     compile_shader(compiler, source, shader, ieee=False)
     for words in SCALAR_WORDS:

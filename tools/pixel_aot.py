@@ -1699,16 +1699,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, n in enumerate(dest):
                 vector[f"v{n}"] = f"sample{i}.{'xyzw'[j]}"
                 sample_dest[f"v{n}"] = samples
-        elif m := match(r"v_(fmaak|fmamk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+        elif m := match(r"v_(fmaak|fmamk|madak|madmk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
+            # The mad forms use the unfused, denormal-flushing helper; the fma forms are fused.
             op, dst, *tokens = m.groups()
-            literal = tokens[2] if op == "fmaak" else tokens[1]
+            literal = tokens[2] if op.endswith("ak") else tokens[1]
             if mask != "entry" or not re.fullmatch(r"0x[0-9a-f]{1,8}", literal):
                 raise ValueError("Invalid literal multiply-add")
             if dst in sample_dest:
                 raise ValueError("Write overlaps an outstanding sample")
             values = [fp_operand(t, scalar, vector, pending, sample_dest) for t in tokens]
             vector[dst] = f"alu{i}"
-            lines.append(f"    precise float alu{i} = {ALU['fma'][1].format(*values)};")
+            lines.append(f"    precise float alu{i} = {ALU['fma' if op.startswith('fma') else 'mad'][1].format(*values)};")
         elif m := match(r"v_mov_b32_sdwa (v\d+), (sext\()?([vs]\d+|-?\d+(?:\.\d+)?)(\))? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)"):
             dst, sext, src, close, dst_sel, unused, src_sel = m.groups()
             if mask != "entry" or bool(sext) != bool(close):

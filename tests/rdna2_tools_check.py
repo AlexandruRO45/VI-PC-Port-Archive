@@ -1051,6 +1051,14 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertTrue(is_instruction_supported(line), line)
         self.assertFalse(is_instruction_supported("s_mulk_i32 v50, 0x3"))
 
+    def test_literal_mad_forms_take_four_operands(self):
+        """v_madak_f32 and v_madmk_f32 are supported with four operands; e64 and a missing operand are not."""
+        for line in ("v_madak_f32 v5, v1, v2, 0x11213141", "v_madmk_f32 v5, v1, 0x11213141, v3"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("v_madak_f32_e64 v5, v1, v2, 0x11213141", "v_madmk_f32 v5, v1, 0x11213141",
+                     "v_madak_f32_dpp v5, v1, v2, 0x11213141 quad_perm:[0,1,2,3]"):
+            self.assertFalse(is_instruction_supported(line), line)
+
     def test_float_to_word_conversions_are_plain_e32_only(self):
         """v_cvt_u32_f32 and v_cvt_i32_f32 are supported as e32 with a register or hex literal source."""
         for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
