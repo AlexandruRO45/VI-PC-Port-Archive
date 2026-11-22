@@ -16,8 +16,11 @@ Programs are assembled with real llvm-mc (-mcpu=gfx1013 -show-encoding), transla
 validated with spirv-as + spirv-val (--target-env vulkan1.2), and executed in tests/semantic/spirv_mini_interp.py.
 Standard library only; no game data.
 """
+from collections import defaultdict, deque
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -183,6 +186,76 @@ SPECIAL_MATRIX = {
 }
 
 
+def _parse_spirv_ssa(spv_text):
+    """Parse SPIR-V assembly into SSA definitions, resolved 32-bit constants, stores, and def-use edges."""
+    defs = {}
+    consts = {}
+    access_chains = {}
+    ssa_uses = defaultdict(list)
+    slot_stores = defaultdict(list)
+    slot_loads = defaultdict(list)
+    output_vars = set()
+    output_stores = []
+
+    for raw in spv_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(";"):
+            continue
+        m = re.match(r"^(%\S+)\s*=\s*(Op\S+)(.*)$", line)
+        if m:
+            dst, opcode, rest = m.group(1), m.group(2), m.group(3).split()
+            defs[dst] = (opcode, rest)
+            if opcode == "OpConstant" and len(rest) >= 2:
+                if rest[0] == "%uint":
+                    consts[dst] = int(rest[1], 0)
+                elif rest[0] == "%float":
+                    consts[dst] = struct.unpack("<I", struct.pack("<f", float(rest[1])))[0]
+            elif opcode == "OpBitcast" and len(rest) >= 2 and rest[1] in consts:
+                consts[dst] = consts[rest[1]]
+            elif opcode == "OpVariable" and len(rest) >= 2 and rest[1] == "Output":
+                output_vars.add(dst)
+            elif opcode == "OpAccessChain" and len(rest) >= 3:
+                access_chains[dst] = (rest[1], tuple(rest[2:]))
+            elif opcode == "OpLoad" and len(rest) >= 2 and rest[1] in access_chains:
+                slot_loads[access_chains[rest[1]]].append(dst)
+            for tok in rest:
+                if tok.startswith("%"):
+                    ssa_uses[tok].append(dst)
+            continue
+
+        m_store = re.match(r"^OpStore\s+(%\S+)\s+(%\S+)$", line)
+        if m_store:
+            ptr, val = m_store.group(1), m_store.group(2)
+            if ptr in access_chains:
+                slot_stores[access_chains[ptr]].append(val)
+            if ptr in output_vars:
+                output_stores.append((ptr, val))
+
+    val_to_slots = defaultdict(list)
+    for slot, vals in slot_stores.items():
+        for v in vals:
+            val_to_slots[v].append(slot)
+
+    def reachable(start, follow_memory=False):
+        seen = {start}
+        q = deque([start])
+        while q:
+            cur = q.popleft()
+            for nxt in ssa_uses.get(cur, ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    q.append(nxt)
+            if follow_memory:
+                for slot in val_to_slots.get(cur, ()):
+                    for nxt in slot_loads.get(slot, ()):
+                        if nxt not in seen:
+                            seen.add(nxt)
+                            q.append(nxt)
+        return seen
+
+    return defs, consts, output_stores, reachable
+
+
 def _is_f16_nan(h):
     return (h & 0x7C00) == 0x7C00 and (h & 0x3FF) != 0
 
@@ -278,9 +351,89 @@ class F16TranscendentalSpecialsTests(unittest.TestCase):
                 )
                 self.assertEqual(got, OLD_HI | want_h)
 
+    def _assert_sin_cos_inf_guard_dataflow(self, spv, ext_op):
+        defs, consts, output_stores, reachable = _parse_spirv_ssa(spv)
+        is_inf_nodes = [
+            (dst, args[1])
+            for dst, (opc, args) in defs.items()
+            if opc == "OpIsInf" and len(args) >= 2 and args[0] == "%bool"
+        ]
+        self.assertTrue(is_inf_nodes, f"missing OpIsInf %bool in SPIR-V for {ext_op}")
+
+        trig_nodes = [
+            dst
+            for dst, (opc, args) in defs.items()
+            if opc == "OpExtInst" and len(args) >= 3 and args[0] == "%float" and args[2] == ext_op
+        ]
+        self.assertTrue(trig_nodes, f"missing GLSL {ext_op} in SPIR-V")
+
+        matched = False
+        for is_inf_id, src_id in is_inf_nodes:
+            # 1) Pre-trig sanitization: OpSelect %float %is_inf +0.0 %src -> RoundEven -> Sin/Cos
+            pre_selects = [
+                dst
+                for dst, (opc, args) in defs.items()
+                if opc == "OpSelect"
+                and len(args) >= 4
+                and args[0] == "%float"
+                and args[1] == is_inf_id
+                and consts.get(args[2]) == 0
+                and args[3] == src_id
+            ]
+            live_pre = []
+            for psel in pre_selects:
+                reach_ssa = reachable(psel, follow_memory=False)
+                has_round = any(
+                    defs[nid][0] == "OpExtInst" and len(defs[nid][1]) >= 3 and defs[nid][1][2] == "RoundEven"
+                    for nid in reach_ssa
+                    if nid in defs
+                )
+                if has_round and any(tid in reach_ssa for tid in trig_nodes):
+                    live_pre.append(psel)
+            if not live_pre:
+                continue
+
+            # 2) Post-trig canonical NaN select: OpSelect %float %is_inf %qnan %trig -> pack/store
+            trig_reach = set()
+            for tid in trig_nodes:
+                trig_reach |= reachable(tid, follow_memory=False)
+
+            post_selects = [
+                dst
+                for dst, (opc, args) in defs.items()
+                if opc == "OpSelect"
+                and len(args) >= 4
+                and args[0] == "%float"
+                and args[1] == is_inf_id
+                and consts.get(args[2]) in (0x7FC00000, 0xFFC00000)
+                and args[3] in trig_reach
+            ]
+            for sel_id in post_selects:
+                reach_ssa = reachable(sel_id, follow_memory=False)
+                reaches_pack = any(
+                    defs[nid][0] == "OpBitcast" and defs[nid][1][0] == "%uint"
+                    or (defs[nid][0] == "OpExtInst" and len(defs[nid][1]) >= 3 and defs[nid][1][2] == "PackHalf2x16")
+                    for nid in reach_ssa
+                    if nid in defs
+                )
+                reach_mem = reachable(sel_id, follow_memory=True)
+                reaches_out = any(val in reach_mem for _, val in output_stores)
+                if reaches_pack and reaches_out:
+                    matched = True
+                    break
+            if matched:
+                break
+
+        self.assertTrue(
+            matched,
+            f"expected live OpIsInf -> OpSelect(+0) -> RoundEven -> {ext_op} -> "
+            f"OpSelect(qNaN) -> pack -> OpStore chain",
+        )
+
     def test_spirv_guards_sanitize_before_undefined_ops(self):
-        # Verify emitted SPIR-V guards +-inf before Sin/Cos/turn_angle and -0.0 before Sqrt.
-        for op in ("v_sin_f16", "v_cos_f16"):
+        # Verify emitted SPIR-V guards +-inf before Sin/Cos/turn_angle (both pre- and post-OpSelects live)
+        # and -0.0 before Sqrt.
+        for op, ext_op in (("v_sin_f16", "Sin"), ("v_cos_f16", "Cos")):
             with self.subTest(op=op):
                 disasm = f"; ps_{op}_guard\n" + _assemble_gfx1013([
                     "v_mov_b32 v0, 0",
@@ -291,8 +444,7 @@ class F16TranscendentalSpecialsTests(unittest.TestCase):
                 ])
                 spv = translate_listing(f"ps_{op}_guard", disasm.encode("utf-8"))
                 _validate_spirv(spv)
-                self.assertIn("OpIsInf %bool", spv)
-                self.assertLess(spv.index("OpIsInf %bool"), spv.index("RoundEven"))
+                self._assert_sin_cos_inf_guard_dataflow(spv, ext_op)
 
         disasm_sqrt = "; ps_sqrt_guard\n" + _assemble_gfx1013([
             "v_mov_b32 v0, 0",
