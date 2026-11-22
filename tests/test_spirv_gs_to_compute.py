@@ -6,7 +6,11 @@ import sys
 
 import pytest
 
-from conftest import make_dxbc, signature_chunk
+from conftest import make_dxbc, requires_tools, signature_chunk
+
+# Every test assembles gs_tri (or a VS) with llvm-mc and validates the SPIR-V: skip without them, as the other
+# translator tests do, instead of a TypeError from conftest's Shader when no llvm-mc is found.
+pytestmark = requires_tools
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
