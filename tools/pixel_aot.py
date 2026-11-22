@@ -1441,8 +1441,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         # lowered program is known, and every other register, field or value is refused.
         if m := match(r"s_setreg_imm32_b32 hwreg\((\w+)(?:, (\d+), (\d+))?\), (\S+)"):
             register, offset, size, value = m.groups()
-            if register in FLAT_SCRATCH and offset is None and re.fullmatch(r"-?\d+|0x[0-9a-f]{1,8}", value):
-                continue
+            if register in FLAT_SCRATCH and offset is None:
+                if re.fullmatch(r"0x[0-9a-f]{1,8}", value):
+                    continue
+                if re.fullmatch(r"-?[0-9]{1,10}", value) and -0x80000000 <= int(value) <= 0xffffffff:
+                    continue
             if (register, offset, size) != ("HW_REG_MODE", "2", "2"):
                 raise ValueError(f"Unsupported hardware register write: {line}")
             if value not in HALF_ROUNDING:
