@@ -881,5 +881,104 @@ class TestDsDecSrc2U64RegisterAliasing(unittest.TestCase):
         self.assertEqual(simd.read_lane_vgpr(1, 0), 0x108)
 
 
+# ==============================================================================
+# Phase 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+@dataclasses.dataclass(frozen=True)
+class AtomicDecSrc2StatusFlags:
+    """Architectural condition codes and status flags for ds_dec_src2_u64."""
+    wrapped: bool
+    zero: bool
+    negative: bool
+    borrow: bool
+    threshold_reset: bool
+    unaligned_addr: bool
+
+
+def evaluate_ds_dec_src2_flags(
+    val_a: int,
+    val_b: int,
+    eff_addr: int,
+) -> AtomicDecSrc2StatusFlags:
+    """Evaluate architectural flags for a 64-bit dual-source decrement with wrap operation."""
+    u_a = u64(val_a)
+    u_b = u64(val_b)
+
+    wrapped = (u_a == 0 or u_a > u_b)
+    threshold_reset = (u_a > u_b)
+    borrow = (u_a == 0)
+
+    new_val_a = u_b if wrapped else u64(u_a - 1)
+    zero = (new_val_a == 0)
+    negative = bool(new_val_a & (1 << 63))
+    unaligned_addr = bool(eff_addr & 0x7)
+
+    return AtomicDecSrc2StatusFlags(
+        wrapped=wrapped,
+        zero=zero,
+        negative=negative,
+        borrow=borrow,
+        threshold_reset=threshold_reset,
+        unaligned_addr=unaligned_addr,
+    )
+
+
+class TestDsDecSrc2U64ConditionCodesAndStatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_normal_decrement_flags(self) -> None:
+        flags = evaluate_ds_dec_src2_flags(
+            val_a=10,
+            val_b=20,
+            eff_addr=0x100,
+        )
+        self.assertFalse(flags.wrapped)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.borrow)
+        self.assertFalse(flags.threshold_reset)
+        self.assertFalse(flags.unaligned_addr)
+
+    def test_zero_wrap_flags(self) -> None:
+        flags = evaluate_ds_dec_src2_flags(
+            val_a=0,
+            val_b=15,
+            eff_addr=0x200,
+        )
+        self.assertTrue(flags.wrapped)
+        self.assertTrue(flags.borrow)
+        self.assertFalse(flags.threshold_reset)
+        self.assertFalse(flags.zero)
+
+    def test_greater_threshold_reset_flags(self) -> None:
+        flags = evaluate_ds_dec_src2_flags(
+            val_a=100,
+            val_b=50,
+            eff_addr=0x300,
+        )
+        self.assertTrue(flags.wrapped)
+        self.assertTrue(flags.threshold_reset)
+        self.assertFalse(flags.borrow)
+
+    def test_negative_flag_on_msb_set(self) -> None:
+        # High bit set in threshold val_b (0x8000_0000_0000_0000)
+        flags = evaluate_ds_dec_src2_flags(
+            val_a=0,
+            val_b=0x8000_0000_0000_0000,
+            eff_addr=0x400,
+        )
+        self.assertTrue(flags.negative)
+        self.assertTrue(flags.wrapped)
+
+    def test_unaligned_qword_address_detection(self) -> None:
+        for offset in range(1, 8):
+            flags = evaluate_ds_dec_src2_flags(5, 10, 0x100 + offset)
+            self.assertTrue(flags.unaligned_addr)
+
+        flags_aligned = evaluate_ds_dec_src2_flags(5, 10, 0x108)
+        self.assertFalse(flags_aligned.unaligned_addr)
+
+
 if __name__ == "__main__":
     unittest.main()
