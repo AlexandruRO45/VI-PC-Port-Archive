@@ -11849,10 +11849,10 @@ def assemble(gen):
 # whose only 64-bit integers are that idiom doesn't need the Int64 capability (Vulkan shaderInt64, which Intel's
 # drivers lack, #313): lower_addr64 rewrites it to (low, high) pairs of 32-bit words, OpIAddCarry / OpISubBorrow
 # carrying into the high word, compares high word first, and bitcasts the pair (a uvec2) to the pointer, as
-# GL_EXT_buffer_reference_uvec2 does. A shader with any other 64-bit integer use (64-bit multiplies, shifts by other
+# GL_EXT_buffer_reference_uvec2 does. A shader with any other 64-bit integer use (full-width multiplies, shifts by other
 # amounts, a 64-bit OpPhi or variable) is left exactly as it was and keeps Int64. --int64-addresses turns the lowering off.
 _A64_PRODUCERS = ("OpUConvert", "OpShiftLeftLogical", "OpShiftRightLogical", "OpBitwiseOr", "OpBitwiseAnd", "OpIAdd",
-                  "OpISub", "OpSConvert", "OpBitcast", "OpShiftRightArithmetic")
+                  "OpISub", "OpSConvert", "OpBitcast", "OpShiftRightArithmetic", "OpIMul", "OpSelect")
 # 64-bit compares of two addresses: high words first, then the low words.
 _A64_CMP = {"OpULessThan": ("OpULessThan", False), "OpULessThanEqual": ("OpULessThanEqual", False),
             "OpUGreaterThan": ("OpULessThan", True), "OpUGreaterThanEqual": ("OpULessThanEqual", True),
@@ -11891,6 +11891,9 @@ def lower_addr64(text):
             del cmp[res]
         elif a[0] not in v64 or a[1] not in v64:
             return text
+    # Dynamic scalar-buffer bounds multiply two zero-extended uints. Their full product fits in two words.
+    widened = {res for res, (op, a) in prod.items()
+               if op == "OpUConvert" and len(a) == 1 and rtype.get(a[0]) == "%uint"}
     for res, (op, a) in prod.items():            # the idiom, exactly
         ok = (op in ("OpUConvert", "OpSConvert") and len(a) == 1 and a[0] not in v64 and
               rtype.get(a[0]) in ("%uint", "%int")) or \
@@ -11899,6 +11902,11 @@ def lower_addr64(text):
               a[0] in v64 and c64.get(a[1]) == 32) or \
              (op in ("OpBitwiseOr", "OpBitwiseAnd", "OpIAdd", "OpISub") and len(a) == 2 and a[0] in v64 and
               a[1] in v64)
+        if op == "OpIMul":
+            ok = len(a) == 2 and all(v in widened for v in a)
+        elif op == "OpSelect":
+            ok = (len(a) == 3 and rtype.get(a[0]) == "%bool" and
+                  all(v in v64 and rtype[v] == rtype[res] for v in a[1:]))
         if not ok:
             return text
     for line in lines:                           # any other mention of a 64-bit type or value: keep Int64
@@ -11925,6 +11933,20 @@ def lower_addr64(text):
             op, a = prod[res]
             if op == "OpUConvert":
                 pair[res] = (a[0], const(0))
+            elif op == "OpSelect":
+                n += 1
+                p = f"%a64_{n}"
+                cond, yes, no = a
+                for i, suffix in enumerate(("l", "h")):
+                    out.append(f"         {p}{suffix} = OpSelect %uint {cond} {pair[yes][i]} {pair[no][i]}")
+                pair[res] = (p + "l", p + "h")
+            elif op == "OpIMul":
+                n += 1
+                p = f"%a64_{n}"
+                out += [f"         {p}s = OpUMulExtended %umul {pair[a[0]][0]} {pair[a[1]][0]}",
+                        f"         {p}l = OpCompositeExtract %uint {p}s 0",
+                        f"         {p}h = OpCompositeExtract %uint {p}s 1"]
+                pair[res] = (p + "l", p + "h")
             elif op == "OpBitcast":                      # between the 64-bit integer types: the same words
                 pair[res] = pair[a[0]]
             elif op == "OpShiftLeftLogical":

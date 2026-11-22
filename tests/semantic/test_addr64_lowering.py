@@ -60,9 +60,9 @@ def translate(name, body_lines, lowered=True):
         rdna2spirv.ADDR_PAIR = saved
 
 
-def run(spv, heap, memory):
+def run(spv, heap, memory, descriptor=VSHARP):
     """Run every lane once; the lanes all store the same word at heap + 0. Returns the memory afterwards."""
-    pc = VSHARP + [0] * 28 + [heap & M32, (heap >> 32) & M32]
+    pc = descriptor + [0] * 28 + [heap & M32, (heap >> 32) & M32]
     return si.run_workgroup(spv, THREADS, THREADS,
                             inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
                             push_constants=pc, memory=dict(memory))
@@ -133,6 +133,39 @@ class AddressLoweringTests(unittest.TestCase):
                 got = run(lowered, heap, memory)
                 self.assertEqual(want[heap & M64], MAGIC)
                 self.assertEqual(got, want)
+
+    def test_dynamic_scalar_buffer_bounds(self):
+        # Offset 8 ends at byte 12. The large structured limit is 2**32 + 8:
+        # discarding its high word would incorrectly reject the load.
+        body = ["s_buffer_load_dword s8, s[0:3], 8", "s_waitcnt lgkmcnt(0)",
+                "s_mov_b32 s1, 0", "s_mov_b32 s2, -1",
+                "v_mov_b32 v1, s8", "buffer_store_dword v1, off, s[0:3], 0"]
+        native = translate("cs_a64_bounds", body, lowered=False)
+        lowered = rdna2spirv.lower_addr64(native)
+        self.assertNotIn("OpCapability Int64", lowered)
+        self.assertIn("OpUMulExtended %umul", lowered)
+        for stride, records, expected in [(0, 12, MAGIC), (0, 8, 0), (4, 2, 0), (4, 0x40000002, MAGIC)]:
+            desc = [0, stride << 16, records, VSHARP[3]]
+            for module in (native, lowered):
+                with self.subTest(stride=stride, records=records, lowered=module == lowered):
+                    self.assertEqual(run(module, 0x1000, {0x1008: MAGIC}, desc)[0x1000], expected)
+
+        # With the structured limit on the true arm, its high word must survive there too.
+        select = next(line for line in native.splitlines() if "OpSelect %ulong" in line)
+        prefix, cond, raw, structured = select.rsplit(" ", 3)
+        compare = next(line for line in native.splitlines() if line.strip().startswith(cond + " ="))
+        reversed_arms = native.replace(compare, compare.replace("OpIEqual", "OpINotEqual"))
+        reversed_arms = reversed_arms.replace(select, f"{prefix} {cond} {structured} {raw}")
+        reversed_lowered = rdna2spirv.lower_addr64(reversed_arms)
+        self.assertNotIn("OpCapability Int64", reversed_lowered)
+        self.assertEqual(run(reversed_lowered, 0x1000, {0x1008: MAGIC}, [0, 4 << 16, 0x40000002, VSHARP[3]])[0x1000],
+                         MAGIC)
+
+        # A full-width operand requires cross products. Keep the entire module intact.
+        product = next(line for line in native.splitlines() if "OpIMul %ulong" in line)
+        address = next(line.split()[0] for line in native.splitlines() if "OpBitwiseOr %ulong" in line)
+        unsupported = native.replace(product, product.rsplit(" ", 1)[0] + " " + address)
+        self.assertEqual(rdna2spirv.lower_addr64(unsupported), unsupported)
 
     def test_dropping_the_carry_is_caught(self):
         heap, base = CASES[1]
