@@ -27,6 +27,7 @@ Standard library only: Python 3.9+ compatible, zero game data, zero external dep
 import abc
 from dataclasses import dataclass
 import enum
+from fractions import Fraction
 import math
 import struct
 import unittest
@@ -741,6 +742,227 @@ class SIMDWavefront:
                 )
                 self.lanes[lane].set_vgpr_pair(dst_reg, res)
         return self.load_vgpr_pair_wave(dst_reg)
+
+
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class StatusFlags:
+    """IEEE 754 exception flags and architectural condition codes."""
+
+    def __init__(
+        self,
+        *,
+        invalid: bool = False,
+        div_by_zero: bool = False,
+        overflow: bool = False,
+        underflow: bool = False,
+        inexact: bool = False,
+        is_negative: bool = False,
+        is_zero: bool = False,
+        is_inf: bool = False,
+        is_nan: bool = False,
+        is_subnormal: bool = False,
+    ) -> None:
+        self.invalid = invalid
+        self.div_by_zero = div_by_zero
+        self.overflow = overflow
+        self.underflow = underflow
+        self.inexact = inexact
+        self.is_negative = is_negative
+        self.is_zero = is_zero
+        self.is_inf = is_inf
+        self.is_nan = is_nan
+        self.is_subnormal = is_subnormal
+
+    def __repr__(self) -> str:
+        flags = [k for k, v in self.__dict__.items() if v]
+        return f"StatusFlags({', '.join(flags)})"
+
+
+def compute_div_fixup_status_flags(
+    s0_bits: int,
+    s1_bits: int,
+    s2_bits: int,
+    *,
+    clamp: bool = False,
+    omod: float = 1.0,
+) -> tuple[int, StatusFlags]:
+    """Compute v_div_fixup_f64 result along with IEEE 754 status flags and condition codes."""
+    res = ref_div_fixup_f64(s0_bits, s1_bits, s2_bits, clamp=clamp, omod=omod)
+
+    invalid = False
+    div_by_zero = False
+    overflow = False
+    underflow = False
+    inexact = False
+
+    # Check SNaN inputs
+    if is_f64_snan(s0_bits) or is_f64_snan(s1_bits) or is_f64_snan(s2_bits):
+        invalid = True
+
+    # Check 0.0 / 0.0
+    if is_f64_zero(s1_bits) and is_f64_zero(s2_bits):
+        invalid = True
+
+    # Check inf / inf
+    if is_f64_inf(s1_bits) and is_f64_inf(s2_bits):
+        invalid = True
+
+    # Division by zero: finite non-zero numerator divided by zero denominator
+    if is_f64_zero(s1_bits) and not is_f64_zero(s2_bits) and not is_f64_nan(s2_bits) and not is_f64_inf(s2_bits):
+        div_by_zero = True
+
+    # S0 NaN recovery implies intermediate calculation overflowed
+    if is_f64_nan(s0_bits) and not is_f64_nan(s1_bits) and not is_f64_nan(s2_bits):
+        overflow = True
+        inexact = True
+
+    # Exponent underflow
+    if not is_f64_nan(s1_bits) and not is_f64_nan(s2_bits):
+        if not is_f64_zero(s1_bits) and not is_f64_zero(s2_bits) and not is_f64_inf(s1_bits) and not is_f64_inf(s2_bits):
+            if (f64_unbiased_exponent(s2_bits) - f64_unbiased_exponent(s1_bits)) < -1075:
+                underflow = True
+                inexact = True
+
+    is_negative = bool(f64_sign(res))
+    is_zero = is_f64_zero(res)
+    is_inf = is_f64_inf(res)
+    is_nan = is_f64_nan(res)
+    is_subnormal = is_f64_subnormal(res)
+
+    flags = StatusFlags(
+        invalid=invalid,
+        div_by_zero=div_by_zero,
+        overflow=overflow,
+        underflow=underflow,
+        inexact=inexact,
+        is_negative=is_negative,
+        is_zero=is_zero,
+        is_inf=is_inf,
+        is_nan=is_nan,
+        is_subnormal=is_subnormal,
+    )
+    return res, flags
+
+
+def evaluate_vcc_predicate(wave: SIMDWavefront, reg_idx: int, predicate: str) -> int:
+    """Generate 64-bit condition mask (VCC) from per-lane predicate evaluation across active EXEC lanes."""
+    vcc = 0
+    active_mask = wave.exec_mask & ((1 << wave.wave_size) - 1)
+    for lane in range(wave.wave_size):
+        if (active_mask >> lane) & 1:
+            val_u64 = wave.lanes[lane].get_vgpr_pair(reg_idx)
+            cond = False
+            if predicate == "eq_zero":
+                cond = is_f64_zero(val_u64)
+            elif predicate == "ge_zero":
+                cond = not is_f64_nan(val_u64) and f64_sign(val_u64) == 0
+            elif predicate == "lt_zero":
+                cond = not is_f64_nan(val_u64) and f64_sign(val_u64) == 1 and not is_f64_zero(val_u64)
+            elif predicate == "is_nan":
+                cond = is_f64_nan(val_u64)
+            elif predicate == "is_inf":
+                cond = is_f64_inf(val_u64)
+            elif predicate == "is_finite":
+                cond = not is_f64_nan(val_u64) and not is_f64_inf(val_u64)
+            else:
+                raise ValueError(f"Unknown predicate: {predicate}")
+
+            if cond:
+                vcc |= (1 << lane)
+    return vcc
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Test suite for condition codes, status flags, and carry/borrow generation."""
+
+    def test_invalid_operation_flags(self) -> None:
+        # 0.0 / 0.0 -> Invalid operation, Indefinite QNaN
+        res1, flags1 = compute_div_fixup_status_flags(F64_ONE, F64_POS_ZERO, F64_POS_ZERO)
+        self.assertTrue(flags1.invalid)
+        self.assertTrue(flags1.is_nan)
+        self.assertEqual(res1, F64_INDEFINITE_QNAN)
+
+        # Inf / Inf -> Invalid operation, Indefinite QNaN
+        res2, flags2 = compute_div_fixup_status_flags(F64_ONE, F64_POS_INF, F64_POS_INF)
+        self.assertTrue(flags2.invalid)
+        self.assertTrue(flags2.is_nan)
+        self.assertEqual(res2, F64_INDEFINITE_QNAN)
+
+        # SNaN input operand -> Invalid operation
+        snan = (F64_POS_INF | 0x0001000000000000) & ~F64_QUIET_BIT
+        res3, flags3 = compute_div_fixup_status_flags(F64_ONE, F64_TWO, snan)
+        self.assertTrue(flags3.invalid)
+        self.assertTrue(flags3.is_nan)
+
+    def test_div_by_zero_flags(self) -> None:
+        # 10.0 / +0.0 -> +Inf, div_by_zero
+        res, flags = compute_div_fixup_status_flags(F64_ONE, F64_POS_ZERO, f64_to_u64(10.0))
+        self.assertTrue(flags.div_by_zero)
+        self.assertFalse(flags.invalid)
+        self.assertTrue(flags.is_inf)
+        self.assertFalse(flags.is_negative)
+        self.assertEqual(res, F64_POS_INF)
+
+        # -10.0 / +0.0 -> -Inf, div_by_zero
+        res_neg, flags_neg = compute_div_fixup_status_flags(F64_ONE, F64_POS_ZERO, f64_to_u64(-10.0))
+        self.assertTrue(flags_neg.div_by_zero)
+        self.assertTrue(flags_neg.is_negative)
+        self.assertEqual(res_neg, F64_NEG_INF)
+
+    def test_overflow_flag_from_s0_nan(self) -> None:
+        # S0 is NaN from intermediate overflow -> output is signed Inf, overflow flag set
+        res, flags = compute_div_fixup_status_flags(F64_CANONICAL_QNAN, F64_TWO, F64_FOUR)
+        self.assertTrue(flags.overflow)
+        self.assertTrue(flags.inexact)
+        self.assertTrue(flags.is_inf)
+        self.assertEqual(res, F64_POS_INF)
+
+    def test_underflow_flag(self) -> None:
+        # Exponent difference underflow: min subnormal / 1024.0
+        s2 = F64_MIN_SUBNORMAL
+        s1 = f64_to_u64(1024.0)
+        res, flags = compute_div_fixup_status_flags(F64_ONE, s1, s2)
+        self.assertTrue(flags.underflow)
+        self.assertTrue(flags.inexact)
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+        self.assertEqual(res, F64_POS_ZERO)
+
+    def test_condition_codes_signed_zeros(self) -> None:
+        # 0.0 / 2.0 -> +0.0
+        res, flags = compute_div_fixup_status_flags(F64_ONE, F64_TWO, F64_POS_ZERO)
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+
+        # -0.0 / 2.0 -> -0.0
+        res_neg, flags_neg = compute_div_fixup_status_flags(F64_ONE, F64_TWO, F64_NEG_ZERO)
+        self.assertTrue(flags_neg.is_zero)
+        self.assertTrue(flags_neg.is_negative)
+
+    def test_vcc_predicate_mask_generation(self) -> None:
+        wave = SIMDWavefront(wave_size=64)
+        # EXEC active for lanes 0..31
+        wave.exec_mask = 0x00000000FFFFFFFF
+
+        # Alternate positive and negative numbers in v[0:1]
+        for lane in range(64):
+            val = f64_to_u64(5.0) if (lane % 2 == 0) else f64_to_u64(-5.0)
+            wave.lanes[lane].set_vgpr_pair(0, val)
+
+        # ge_zero matches even lanes in 0..31 (0x55555555)
+        vcc_ge = evaluate_vcc_predicate(wave, 0, "ge_zero")
+        self.assertEqual(vcc_ge, 0x55555555)
+
+        # lt_zero matches odd lanes in 0..31 (0xAAAAAAAA)
+        vcc_lt = evaluate_vcc_predicate(wave, 0, "lt_zero")
+        self.assertEqual(vcc_lt, 0xAAAAAAAA)
+
+        # High lanes 32..63 are inactive in EXEC, so VCC upper bits are 0
+        self.assertEqual(vcc_ge >> 32, 0)
+        self.assertEqual(vcc_lt >> 32, 0)
 
 
 # ==============================================================================
