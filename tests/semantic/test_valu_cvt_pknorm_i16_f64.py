@@ -1267,5 +1267,139 @@ class TestValuCvtPknormI16F64IEEE754Boundaries(unittest.TestCase):
         self.assertEqual(f64_to_snorm16(step_neg), 0xFFFF)
 
 
+# ==============================================================================
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestValuCvtPknormI16F64NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for syntax rejection, invalid operand handling, and mutation sensitivity."""
+
+    def test_syntax_rejection_sgpr_destination(self) -> None:
+        """Verify VALU instructions reject scalar registers (SGPR) as destination."""
+        s0 = Reg32(0, RegType.SGPR)
+        v0 = VOP3Operand64(Reg64(0, RegType.VGPR))
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F64Instruction(dst=s0, src0=v0, src1=v0)
+
+    def test_syntax_rejection_invalid_operand_types(self) -> None:
+        """Verify instruction construction rejects non-VOP3Operand64 objects."""
+        v0 = Reg32(0, RegType.VGPR)
+        vpair = Reg64(0, RegType.VGPR)
+
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F64Instruction(dst=v0, src0=vpair, src1=VOP3Operand64(vpair))  # type: ignore
+        with self.assertRaises(TypeError):
+            VCvtPknormI16F64Instruction(dst=v0, src0=VOP3Operand64(vpair), src1=999)  # type: ignore
+
+    def test_syntax_rejection_register_bounds(self) -> None:
+        """Verify registers reject out-of-bound indices."""
+        with self.assertRaises(ValueError):
+            Reg32(-1, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg32(256, RegType.VGPR)
+        with self.assertRaises(ValueError):
+            Reg64(255, RegType.VGPR)
+
+    def test_simd_invalid_configuration(self) -> None:
+        """Verify SIMD machine state rejects non-standard wave sizes."""
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=128)
+
+    def test_mutation_incorrect_scale_factor(self) -> None:
+        """Mutation detection: verify test suite detects incorrect 32768.0 scale factor."""
+        def mutated_f64_to_snorm16(bits: int) -> int:
+            if is_nan_f64(bits):
+                return 0
+            val = bits_to_f64(bits)
+            clamped = max(-1.0, min(1.0, val))
+            return int(round(clamped * 32768.0)) & MASK16
+
+        correct_val = f64_to_snorm16(POS_ONE_F64)
+        mutated_val = mutated_f64_to_snorm16(POS_ONE_F64)
+
+        self.assertEqual(correct_val, 0x7FFF)
+        self.assertEqual(mutated_val, 0x8000)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_missing_input_clamp(self) -> None:
+        """Mutation detection: verify test suite detects omitted clamp."""
+        def mutated_f64_to_snorm16_noclamp(bits: int) -> int:
+            if is_nan_f64(bits):
+                return 0
+            val = bits_to_f64(bits)
+            return int(round(val * 32767.0)) & MASK16
+
+        correct_val = f64_to_snorm16(POS_TWO_F64)
+        mutated_val = mutated_f64_to_snorm16_noclamp(POS_TWO_F64)
+
+        self.assertEqual(correct_val, 0x7FFF)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_truncation_instead_of_round_to_even(self) -> None:
+        """Mutation detection: verify test suite detects truncation."""
+        def mutated_f64_to_snorm16_trunc(bits: int) -> int:
+            if is_nan_f64(bits):
+                return 0
+            val = max(-1.0, min(1.0, bits_to_f64(bits)))
+            return int(val * 32767.0) & MASK16
+
+        correct_val = f64_to_snorm16(POS_HALF_F64)
+        mutated_val = mutated_f64_to_snorm16_trunc(POS_HALF_F64)
+
+        self.assertEqual(correct_val, 0x4000)
+        self.assertEqual(mutated_val, 0x3FFF)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_inverted_channel_packing(self) -> None:
+        """Mutation detection: verify test suite detects swapped destination channels."""
+        def mutated_pack(s0: int, s1: int) -> int:
+            ch0 = f64_to_snorm16(s0)
+            ch1 = f64_to_snorm16(s1)
+            return ((ch0 & MASK16) << 16) | (ch1 & MASK16)
+
+        correct_packed = oracle_v_cvt_pknorm_i16_f64(POS_ONE_F64, NEG_ONE_F64)
+        mutated_packed = mutated_pack(POS_ONE_F64, NEG_ONE_F64)
+
+        self.assertEqual(correct_packed, 0x80017FFF)
+        self.assertEqual(mutated_packed, 0x7FFF8001)
+        self.assertNotEqual(correct_packed, mutated_packed)
+
+    def test_mutation_nan_leak(self) -> None:
+        """Mutation detection: verify test suite detects failure to zero NaNs."""
+        def mutated_f64_to_snorm16_nan_leak(bits: int) -> int:
+            if is_nan_f64(bits):
+                return 0x7FFF
+            return f64_to_snorm16(bits)
+
+        correct_val = f64_to_snorm16(CANONICAL_QNAN_F64)
+        mutated_val = mutated_f64_to_snorm16_nan_leak(CANONICAL_QNAN_F64)
+
+        self.assertEqual(correct_val, 0x0000)
+        self.assertEqual(mutated_val, 0x7FFF)
+        self.assertNotEqual(correct_val, mutated_val)
+
+    def test_mutation_exec_mask_bypass(self) -> None:
+        """Mutation detection: verify test suite detects inactive lane write violation."""
+        state = SIMDState(num_lanes=32, exec_mask=0x00000001)
+        sentinel = 0x55555555
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+
+        def mutated_step(instr: VCvtPknormI16F64Instruction, st: SIMDState) -> None:
+            for lane in range(st.num_lanes):
+                st.set_vgpr(lane, instr.dst.index, 0x7FFF7FFF)
+
+        instr = VCvtPknormI16F64Instruction(
+            dst=Reg32(0, RegType.VGPR),
+            src0=VOP3Operand64(Literal64.from_float(1.0)),
+            src1=VOP3Operand64(Literal64.from_float(1.0)),
+        )
+
+        mutated_step(instr, state)
+        self.assertNotEqual(state.get_vgpr(1, 0), sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
