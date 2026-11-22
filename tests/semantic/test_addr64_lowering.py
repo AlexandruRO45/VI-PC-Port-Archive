@@ -79,6 +79,19 @@ def load_program(base):
 CASES = [(0x1000, 0x2000), (0x1_FFFF_FFF0, 0x20), (0xFFFF_FFFF_FFFF_FFF0, 0x10)]
 
 
+def global_program(base, offset):
+    """global_load_dword from the 64-bit VGPR address `base` with the signed instruction offset, stored at heap + 0.
+    The offset is sign-extended through a 64-bit signed integer (Gen.global_address), the one signed form the
+    lowering handles."""
+    return [f"v_mov_b32 v2, {base & M32:#x}", f"v_mov_b32 v3, {(base >> 32) & M32:#x}",
+            f"global_load_dword v4, v[2:3], off offset:{offset}", "s_waitcnt vmcnt(0)",
+            "buffer_store_dword v4, off, s[0:3], 0", "s_waitcnt vmcnt(0)"]
+
+
+# (heap base, VGPR address, signed offset): a negative offset across the low-word boundary, and a positive one.
+GLOBAL_CASES = [(0x1000, 0x1_0000_0000, -4), (0x1000, 0x2000, -2048), (0x1_FFFF_FFF0, 0x20, 2044)]
+
+
 class AddressLoweringTests(unittest.TestCase):
     def test_lowered_module_has_no_int64(self):
         spv = translate("cs_a64_plain", load_program(0x2000))
@@ -106,6 +119,19 @@ class AddressLoweringTests(unittest.TestCase):
                 want = run(translate("cs_a64_ref", load_program(base), lowered=False), heap, memory)
                 got = run(translate("cs_a64_low", load_program(base)), heap, memory)
                 self.assertEqual(want[heap & M64], MAGIC)     # the reference read the word at heap + base
+                self.assertEqual(got, want)
+
+    def test_signed_global_offset_same_address_as_the_int64_form(self):
+        for heap, base, offset in GLOBAL_CASES:
+            with self.subTest(heap=hex(heap), base=hex(base), offset=offset):
+                addr = (heap + base + offset) & M64
+                memory = {addr: MAGIC, (addr + 4) & M64: 0x0BAD0004, (addr - 4) & M64: 0x0BAD0000}
+                lowered = translate("cs_a64_glo", global_program(base, offset))
+                self.assertNotIn("OpCapability Int64", lowered)       # the sign-extension is lowered too
+                self.assertNotIn("%long", lowered)
+                want = run(translate("cs_a64_glo_ref", global_program(base, offset), lowered=False), heap, memory)
+                got = run(lowered, heap, memory)
+                self.assertEqual(want[heap & M64], MAGIC)
                 self.assertEqual(got, want)
 
     def test_dropping_the_carry_is_caught(self):

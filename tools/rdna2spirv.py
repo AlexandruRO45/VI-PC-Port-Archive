@@ -10497,15 +10497,15 @@ def assemble(gen):
 # ---- 64-bit addresses without Int64 ----
 # Every PhysicalStorageBuffer address the generator builds is one idiom: widen a 32-bit word (OpUConvert), shift a
 # high word left by 32, OR, add or subtract (64-bit constants included), AND a mask, take a word back (narrow to
-# 32 bits, or shift right by 32), compare two such values (the NUM_RECORDS bound), convert to a pointer. A shader
+# 32 bits, or shift right by 32), sign-extend a dword (the signed offset of a global_* access) and shift it right
+# arithmetically by 32, compare two such values (the NUM_RECORDS bound), convert to a pointer. A shader
 # whose only 64-bit integers are that idiom doesn't need the Int64 capability (Vulkan shaderInt64, which Intel's
 # drivers lack, #313): lower_addr64 rewrites it to (low, high) pairs of 32-bit words, OpIAddCarry / OpISubBorrow
 # carrying into the high word, compares high word first, and bitcasts the pair (a uvec2) to the pointer, as
-# GL_EXT_buffer_reference_uvec2 does. A shader with any other 64-bit integer use (64-bit multiplies, arithmetic
-# shifts, signed widening, bitcasts, other shift amounts, a 64-bit OpPhi or variable) is left exactly as it was and
-# keeps Int64. --int64-addresses turns the lowering off.
+# GL_EXT_buffer_reference_uvec2 does. A shader with any other 64-bit integer use (64-bit multiplies, shifts by other
+# amounts, a 64-bit OpPhi or variable) is left exactly as it was and keeps Int64. --int64-addresses turns the lowering off.
 _A64_PRODUCERS = ("OpUConvert", "OpShiftLeftLogical", "OpShiftRightLogical", "OpBitwiseOr", "OpBitwiseAnd", "OpIAdd",
-                  "OpISub")
+                  "OpISub", "OpSConvert", "OpBitcast", "OpShiftRightArithmetic")
 # 64-bit compares of two addresses: high words first, then the low words.
 _A64_CMP = {"OpULessThan": ("OpULessThan", False), "OpULessThanEqual": ("OpULessThanEqual", False),
             "OpUGreaterThan": ("OpULessThan", True), "OpUGreaterThanEqual": ("OpULessThanEqual", True),
@@ -10515,12 +10515,14 @@ _A64_ID = re.compile(r"%[\w.]+")
 
 def lower_addr64(text):
     lines = text.split("\n")
-    t64, c64, prod, conv, cmp, narrow = set(), {}, {}, {}, {}, {}
+    t64, c64, prod, conv, cmp, narrow, rtype = set(), {}, {}, {}, {}, {}, {}
     for line in lines:
         w = line.split()
         if len(w) < 3 or w[1] != "=":
             continue
         res, op, args = w[0], w[2], w[3:]
+        if args:
+            rtype[res] = args[0]                        # the result type of every typed instruction
         if op == "OpTypeInt" and args[:1] == ["64"]:
             t64.add(res)
         elif op == "OpConstant" and args and args[0] in t64:
@@ -10543,9 +10545,11 @@ def lower_addr64(text):
         elif a[0] not in v64 or a[1] not in v64:
             return text
     for res, (op, a) in prod.items():            # the idiom, exactly
-        ok = (op == "OpUConvert" and len(a) == 1 and a[0] not in v64) or \
-             (op in ("OpShiftLeftLogical", "OpShiftRightLogical") and len(a) == 2 and a[0] in v64 and
-              c64.get(a[1]) == 32) or \
+        ok = (op in ("OpUConvert", "OpSConvert") and len(a) == 1 and a[0] not in v64 and
+              rtype.get(a[0]) in ("%uint", "%int")) or \
+             (op == "OpBitcast" and len(a) == 1 and a[0] in v64) or \
+             (op in ("OpShiftLeftLogical", "OpShiftRightLogical", "OpShiftRightArithmetic") and len(a) == 2 and
+              a[0] in v64 and c64.get(a[1]) == 32) or \
              (op in ("OpBitwiseOr", "OpBitwiseAnd", "OpIAdd", "OpISub") and len(a) == 2 and a[0] in v64 and
               a[1] in v64)
         if not ok:
@@ -10574,10 +10578,32 @@ def lower_addr64(text):
             op, a = prod[res]
             if op == "OpUConvert":
                 pair[res] = (a[0], const(0))
+            elif op == "OpBitcast":                      # between the 64-bit integer types: the same words
+                pair[res] = pair[a[0]]
             elif op == "OpShiftLeftLogical":
                 pair[res] = (const(0), pair[a[0]][0])
             elif op == "OpShiftRightLogical":
                 pair[res] = (pair[a[0]][1], const(0))
+            elif op in ("OpSConvert", "OpShiftRightArithmetic"):
+                # A sign-extended dword (a 32-bit value widened, or the arithmetic shift by 32, which keeps the high
+                # word and sign-extends it): the high word is the sign, the value shifted right arithmetically by 31.
+                n += 1
+                p = f"%a64_{n}"
+                if op == "OpSConvert":
+                    low = a[0]
+                    if rtype.get(low) == "%int":
+                        out.append(f"         {p}l = OpBitcast %uint {low}")
+                        low, signed = p + "l", a[0]
+                    else:
+                        out.append(f"         {p}i = OpBitcast %int {low}")
+                        signed = p + "i"
+                else:
+                    low = pair[a[0]][1]
+                    out.append(f"         {p}i = OpBitcast %int {low}")
+                    signed = p + "i"
+                out += [f"         {p}s = OpShiftRightArithmetic %int {signed} {const(31)}",
+                        f"         {p}h = OpBitcast %uint {p}s"]
+                pair[res] = (low, p + "h")
             else:
                 n += 1
                 (xl, xh), (yl, yh), p = pair[a[0]], pair[a[1]], f"%a64_{n}"
@@ -10619,9 +10645,11 @@ def lower_addr64(text):
                     f"         {res} = OpBitcast {conv[res][0]} {p}v"]
             continue
         out.append(line)
-        if line.strip() == "%uint = OpTypeInt 32 0":
-            out.append("%v2uint_a = OpTypeVector %uint 2")
-            out += [f"{name} = OpConstant %uint {v}" for v, name in sorted(uc.items())]
+    # The pair type and the 32-bit constants the rewrite used, declared right after %uint (constants are made as the
+    # body is rewritten, so they go in once it is done).
+    at = next(i for i, l in enumerate(out) if l.strip() == "%uint = OpTypeInt 32 0") + 1
+    out[at:at] = ["%v2uint_a = OpTypeVector %uint 2"] + \
+        [f"{name} = OpConstant %uint {v}" for v, name in sorted(uc.items())]
     return "\n".join(out)
 
 
