@@ -180,17 +180,17 @@ def container_code(program, *, stage, llvm=None):
     return image[start:ends[0]]
 
 
-def disassemble(code, library, *, cpu=b"gfx1013", offsets=False):
+def disassemble(code, library, *, cpu=b"gfx1013", offsets=False, features=b""):
     llvm = C.CDLL(library)
     for component in ("TargetInfo", "Target", "TargetMC", "AsmPrinter", "Disassembler"):
         getattr(llvm, "LLVMInitializeAMDGPU" + component)()
     pointer, string = C.c_void_p, C.c_char_p
-    llvm.LLVMCreateDisasmCPU.argtypes = [string, string, pointer, C.c_int, pointer, pointer]
-    llvm.LLVMCreateDisasmCPU.restype = pointer
+    llvm.LLVMCreateDisasmCPUFeatures.argtypes = [string, string, string, pointer, C.c_int, pointer, pointer]
+    llvm.LLVMCreateDisasmCPUFeatures.restype = pointer
     llvm.LLVMDisasmInstruction.argtypes = [pointer, pointer, C.c_uint64, C.c_uint64, pointer, C.c_size_t]
     llvm.LLVMDisasmInstruction.restype = C.c_size_t
     llvm.LLVMDisasmDispose.argtypes = [pointer]
-    ctx = llvm.LLVMCreateDisasmCPU(b"amdgcn--amdpal", cpu, None, 0, None, None)
+    ctx = llvm.LLVMCreateDisasmCPUFeatures(b"amdgcn--amdpal", cpu, features, None, 0, None, None)
     if not ctx:
         raise ValueError(f"LLVM has no {cpu.decode()} disassembler")
     raw = C.create_string_buffer(code)
@@ -342,6 +342,13 @@ COMPARE = {
 INT_COMPARE = {
     "f": "false", "lt": "{0} < {1}", "eq": "{0} == {1}", "le": "{0} <= {1}",
     "gt": "{0} > {1}", "ne": "{0} != {1}", "ge": "{0} >= {1}", "t": "true",
+}
+# 32-bit integer operations on register bits. Shift counts use their low five bits, as on the target.
+INTEGER = {
+    "and_b32": (2, "{0} & {1}"), "or_b32": (2, "{0} | {1}"), "xor_b32": (2, "{0} ^ {1}"),
+    "not_b32": (1, "~{0}"), "bfi_b32": (3, "({0} & {1}) | (~{0} & {2})"),
+    "lshlrev_b32": (2, "{1} << ({0} & 31u)"), "lshrrev_b32": (2, "{1} >> ({0} & 31u)"),
+    "ashrrev_i32": (2, "asuint(asint({1}) >> ({0} & 31u))"),
 }
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 SALU_BIT64 = {
@@ -588,10 +595,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
 
         if ended:
             raise ValueError("Instruction follows program end")
-        if exported and line != "s_endpgm":
-            raise ValueError("Unexpected instruction after color export")
         if match(r"(?:s_inst_prefetch|s_nop) (?:0x[0-9a-f]+|\d+)"):
             continue
+        if match(r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])"):
+            continue
+        if match(r"s_waitcnt\s+expcnt\([0-7]\)"):
+            continue
+        if exported and line != "s_endpgm":
+            raise ValueError("Unexpected instruction after color export")
         # Scheduling hints with no effect on results. Each operand is limited to the width
         # of its RDNA 2 field: clause length minus one, wave priority and sleep duration.
         if m := match(r"(s_clause|s_setprio|s_sleep) (0x[0-9a-f]+|\d+)"):
@@ -607,6 +618,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # Only the newest limit samples can remain outstanding. Filtering
             # the current set also preserves guarantees made by earlier waits.
             sample_dest = {reg: issue for reg, issue in sample_dest.items() if issue > samples - limit}
+        elif match(r"s_waitcnt (?:vmcnt\(0\) lgkmcnt\(0\)|lgkmcnt\(0\) vmcnt\(0\))"):
+            pending.clear()
+            sample_dest.clear()
         elif m := match(r"s_mov_b64 s\[(\d+):(\d+)\], exec"):
             regs = registers(*m.groups(), 2)
             for n in regs:
@@ -865,6 +879,15 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(rf"v_({'|'.join(INTEGER)})(?:_e32|_e64)? (v\d+), (.+)"):
+            op, dst, sources = m.groups()
+            tokens = sources.split(", ")
+            arity, template = INTEGER[op]
+            if mask != "entry" or dst in sample_dest or len(tokens) != arity:
+                raise ValueError("Invalid integer operation")
+            args = [int_operand(t, scalar, vector, pending, sample_dest, signed=False) for t in tokens]
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = asfloat({template.format(*args)});")
         elif m := match(rf"v_cmp_class_f32(?:_e32|_e64)? {LANE_MASK}, ([^,]+), ([^,]+)"):
             dst, value, classes = m.groups()
             regs = lane_mask(dst)
@@ -970,6 +993,23 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"abs({expression})"
             if negate:
                 expression = f"(-{expression})"
+            if clamp:
+                expression = f"saturate({expression})"
+            vector[dst] = f"alu{i}"
+            lines.append(f"    precise float alu{i} = {expression};")
+        elif m := match(r"v_cvt_f32_ubyte([0-3])(?:_e32|_e64)? (v\d+), ([vs]\d+|0x[0-9a-f]{1,8}|\d+)( clamp)?"):
+            # Byte N of the source word as an unsigned integer. The source is read as bits,
+            # so float modifiers do not apply and are rejected by the pattern.
+            byte, dst, source, clamp = m.groups()
+            if mask != "entry":
+                raise ValueError("Invalid conversion")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            if re.fullmatch(r"0x[0-9a-f]{1,8}|\d+", source):
+                word = f"{int(source, 0) & 0xffffffff}u"
+            else:
+                word = f"asuint({fp_operand(source, scalar, vector, pending, sample_dest)})"
+            expression = f"float(({word} >> {8 * int(byte)}u) & 0xffu)"
             if clamp:
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"

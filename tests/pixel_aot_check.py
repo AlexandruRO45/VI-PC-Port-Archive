@@ -428,6 +428,16 @@ def absolute_value():
     return program
 
 
+def unpack_bytes():
+    # Each output takes a different byte of a constant word, in e32 and e64 forms.
+    return with_constants([
+        "v_cvt_f32_ubyte0_e32 v12, s44",
+        "v_cvt_f32_ubyte1_e64 v13, s45",
+        "v_cvt_f32_ubyte2_e32 v14, s46",
+        "v_cvt_f32_ubyte3_e64 v15, s47 clamp",
+    ])
+
+
 def ceiling():
     return with_constants([
         "v_ceil_f32_e32 v12, s44",
@@ -591,6 +601,50 @@ def check_reciprocal_draw(directory, compiler, renderer, backend):
                 raise AssertionError("Substituting reciprocal for reciprocal square root escaped detection")
         else:
             subprocess.run(draw, check=True)
+
+
+def bitwise_program():
+    # Emit exact finite binary32 colors by placing result bits directly in their mantissas.
+    return with_constants([
+        "v_mov_b32_e32 v18, s46",
+        "v_mov_b32_e32 v19, s47",
+        "v_lshlrev_b32_e32 v20, s44, v18",
+        "v_lshrrev_b32_e32 v20, s45, v20",
+        "v_ashrrev_i32_e32 v21, 20, v19",
+        "v_not_b32_e32 v22, v18",
+        "v_bfi_b32 v23, 0x00700000, v18, v19",
+        "v_xor_b32_e32 v22, v19, v22",
+        *[instruction for index in range(4) for instruction in (
+            f"v_and_b32_e32 v{12+index}, 0x007f0000, v{20+index}",
+            f"v_or_b32_e32 v{12+index}, 0x3f800000, v{12+index}",
+        )],
+    ])
+
+
+def check_bitwise_draw(directory, compiler, renderer, backend):
+    shader = directory / "bits.cso"
+    source = directory / "bits.hlsl"
+    case = directory / "bits.case"
+    for logical in (False, True):
+        program = bitwise_program()
+        if logical:
+            program = [line.replace("v_ashrrev_i32", "v_lshrrev_b32") for line in program]
+        source.write_text(translate(program), encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        for left, right, a, b in ((36, 33, 0x40d10000, 0xc0250000), (35, 37, 0x3e270000, 0xbf620000)):
+            words = (((a << (left % 32)) & 0xffffffff) >> (right % 32),
+                     (b - 2**32) >> 20, ~a ^ b, (a & 0x00700000) | (b & ~0x00700000))
+            colors = struct.pack("<4I", *[0x3f800000 | (value & 0x007f0000) for value in words])
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, left, right, a, b)
+            case.write_bytes(constants + colors * 64)
+            draw = [renderer, backend, "--check-pixel-case", shader, case]
+            if logical:
+                wrong = subprocess.run(draw, capture_output=True, text=True)
+                if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                    raise AssertionError("Logical shift substituted for arithmetic shift escaped detection")
+            else:
+                subprocess.run(draw, check=True)
 
 
 def check_fract_draw(directory, compiler, renderer, backend):
@@ -1806,6 +1860,12 @@ def check_three_way_templates():
 
 
 def check_controls(directory):
+    program = bitwise_program()
+    for before, after in (("s44, v18", "s44, |v18|"), ("20, v19", "20, v19 clamp"),
+                          ("0x00700000, v18, v19", "0x00700000, v18")):
+        altered = [line.replace(before, after) for line in program]
+        assert altered != program
+        must_reject(translate, altered)
     program = buffer_color(True)
     assert "float2 main(" in translate_buffer_color(program)
     assert "SamplerState" not in translate_buffer_color(program)
@@ -1934,6 +1994,18 @@ def check_controls(directory):
     must_reject(translate, program[:-1])
     for wait in ("s_waitcnt vmcnt(0)", "s_waitcnt lgkmcnt(0)"):
         must_reject(translate, [line for line in program if line != wait])
+    for exp_inst in ("s_waitcnt_expcnt null, 0x0", "s_waitcnt_expcnt null, 0x3", "s_waitcnt_expcnt null, 0",
+                     "s_waitcnt_expcnt s0, 0x0", "s_waitcnt_expcnt 0x3", "s_waitcnt_expcnt 0",
+                     "s_waitcnt expcnt(0)", "s_waitcnt expcnt(7)"):
+        assert "return float4(" in translate([exp_inst] + program)
+        assert translate(program[:-1] + [exp_inst, program[-1]]) == translate(program)
+    must_reject(translate, program + ["s_waitcnt_expcnt null, 0"])
+    must_reject(translate, ["s_waitcnt_expcnt null, 0x8"] + program)
+    must_reject(translate, ["s_waitcnt_expcnt null, 8"] + program)
+    must_reject(translate, ["s_waitcnt_expcnt 0x8"] + program)
+    must_reject(translate, ["s_waitcnt_expcnt invalid"] + program)
+    must_reject(translate, ["s_waitcnt_expcnt null, invalid"] + program)
+    must_reject(translate, ["s_waitcnt expcnt(8)"] + program)
 
     wait = program.index("s_waitcnt vmcnt(0)")
     overwrite = "v_floor_f32_e32 v13, 1.0"
@@ -2256,6 +2328,7 @@ def check_binary(directory, assembler, objcopy, library):
                 (scalar64(), translate)]
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((with_constants(RECIPROCAL_BODY), translate))
+    fixtures.append((bitwise_program(), translate))
     fixtures.append((fract_values(), translate))
     fixtures.extend([(frexp_mant_values(), translate), (ldexp_values(), translate)])
     fixtures.append((three_way(), translate))
@@ -2273,9 +2346,12 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.append((scalar(), translate))
     fixtures.append((with_constants(LITERAL_FMA_BODY), translate))
+    fixtures.append((unpack_bytes(), translate))
     fixtures.append((scheduling_hints(), translate))
     fixtures.extend((buffer_color(rg), translate_buffer_color) for rg in (False, True))
     fixtures.extend((attribute_color(rg), translate_attribute) for rg in (False, True))
+    exp_sync_program = ["s_waitcnt_expcnt null, 0"] + assembly(False)[:-1] + ["s_waitcnt_expcnt null, 0", "s_endpgm"]
+    fixtures.append((exp_sync_program, translate))
     for index, (instructions, lower_fixture) in enumerate(fixtures):
         source = directory / "fixture.s"
         obj = directory / "fixture.o"
@@ -2508,6 +2584,32 @@ def check_buffer_color_draw(directory, compiler, renderer, backend):
         wrong = subprocess.run(draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError("Wrong buffer color escaped detection")
+def check_unpack_byte_draws(directory, compiler, renderer, backend):
+    instructions = unpack_bytes()
+    source = directory / "ubyte.hlsl"
+    shader = directory / "ubyte.cso"
+    case = directory / "ubyte.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    compile_shader = [compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source]
+    source.write_text(translate(instructions), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    # Every word is a normal binary32 value, so its bits survive the constant buffer, and
+    # all four bytes of each word differ, so reading the wrong byte changes the result.
+    for words in ((0x40ff8001, 0x3e7f02c3, 0x41a5005a, 0x00102030 | 0x3f000000),
+                  (0x4280ff7f, 0x3f11fe22, 0x407f8013, 0x00000000 | 0x40c08070)):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        values = [float((word >> 8 * n) & 0xff) for n, word in enumerate(words)]
+        values[3] = min(values[3], 1.0)
+        case.write_bytes(constants + struct.pack("<4f", *values) * 64)
+        subprocess.run(draw, check=True)
+
+    wrong = [line.replace("ubyte1", "ubyte0") for line in instructions]
+    source.write_text(translate(wrong), encoding="ascii")
+    subprocess.run(compile_shader, check=True)
+    result = subprocess.run(draw, capture_output=True, text=True)
+    if result.returncode != 1 or "pixel_mismatch" not in result.stderr:
+        raise AssertionError("Reading the wrong byte escaped detection")
 
 
 def check_render(directory, compiler, renderer, backend):
@@ -2524,8 +2626,14 @@ def check_render(directory, compiler, renderer, backend):
             wrong = subprocess.run([*draw, "rgba"], capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError("The renderer failed to detect the changed channel order")
+    check_bitwise_draw(directory, compiler, renderer, backend)
     check_movk_draw(directory, compiler, renderer, backend)
     check_half_draw(directory, compiler, renderer, backend)
+    for exp_shader_inst in ("s_waitcnt_expcnt null, 0x3", "s_waitcnt expcnt(0)"):
+        exp_program = [exp_shader_inst] + assembly(False)[:-1] + [exp_shader_inst, "s_endpgm"]
+        source.write_text(translate(exp_program), encoding="ascii")
+        subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        subprocess.run([renderer, backend, "--check-pixel", shader, "rgba"], check=True)
     program = arithmetic()
     source.write_text(translate(program), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
@@ -2624,6 +2732,7 @@ def check_render(directory, compiler, renderer, backend):
     if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
         raise AssertionError("The renderer failed to detect the missing absolute value")
     check_ceiling_draws(directory, compiler, renderer, backend)
+    check_unpack_byte_draws(directory, compiler, renderer, backend)
     source.write_text(translate(select()), encoding="ascii")
     subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
     for constants in ((.5, .75, .375, .25), (.125, .5, 1.0, 0.0)):

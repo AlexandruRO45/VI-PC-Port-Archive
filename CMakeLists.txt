@@ -118,6 +118,7 @@ add_custom_command(OUTPUT "${pixel_vs}" COMMAND "${DXC_EXECUTABLE}" -T vs_6_0 -E
     -Fh "${pixel_vs}" -Vn pixel_aot_vs "${CMAKE_CURRENT_SOURCE_DIR}/tests/pixel_aot_vs.hlsl"
     DEPENDS tests/pixel_aot_vs.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/pixel_aot_render.cpp "${pixel_vs}")
+target_sources(offscreen_check PRIVATE tests/mesh_entry_draw.cpp)
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp tests/ffx_recurrent_views.cpp)
 target_sources(offscreen_check PRIVATE tests/ffx_rcas_views.cpp)
 foreach(storage IN ITEMS Native Packed)
@@ -145,6 +146,7 @@ target_sources(offscreen_check PRIVATE tests/bvh_atomics.cpp tests/bvh_numeric.c
 # A title graphics allocation opened as a D3D12 heap and addressed through translated GPU addresses.
 target_sources(offscreen_check PRIVATE tests/gpu_alias.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/era_heap.cpp)
 # The same allocations read by a shader through 64-bit title addresses (src/title_va_lookup.hlsli).
+target_sources(offscreen_check PRIVATE tests/depth_mask_draw.cpp)
 target_sources(offscreen_check PRIVATE tests/gpu_alias_lookup.cpp)
 # Graphics allocations given desktop GPU addresses when a device is attached (src/era_title_gpu.cpp).
 target_sources(offscreen_check PRIVATE tests/gpu_alias_registry.cpp src/era_title_gpu.cpp src/era_query.cpp)
@@ -224,7 +226,12 @@ add_custom_command(OUTPUT "${ray_header}"
     COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CSMain -Vn ray_query -Fh "${ray_header}"
             -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_query.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_query.hlsl"
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_query.cso" DEPENDS tests/ray_query.hlsl VERBATIM)
-target_sources(offscreen_check PRIVATE "${ray_header}" tests/dxr_facing.cpp)
+set(candidates_header "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.h")
+add_custom_command(OUTPUT "${candidates_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E CSMain -Vn ray_candidates -Fh "${candidates_header}"
+            -Fo "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.cso" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ray_candidates.hlsl"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/ray_candidates.cso" DEPENDS tests/ray_candidates.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE "${ray_header}" "${candidates_header}" tests/dxr_facing.cpp tests/dxr_opacity.cpp)
 foreach(layout IN ITEMS root tables)
     set(header "${CMAKE_CURRENT_BINARY_DIR}/compute_${layout}.h")
     set(binary "${CMAKE_CURRENT_BINARY_DIR}/compute_${layout}.cso")
@@ -290,6 +297,8 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(dxr_update_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME dxr_facing_${adapter} COMMAND offscreen_check ${adapter} --dxr-facing)
     set_tests_properties(dxr_facing_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    add_test(NAME dxr_opacity_${adapter} COMMAND offscreen_check ${adapter} --dxr-opacity)
+    set_tests_properties(dxr_opacity_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_buffer_ops_${adapter} COMMAND offscreen_check ${adapter} --buffer-ops)
     add_test(NAME gpu_alias_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias)
     add_test(NAME gpu_alias_lookup_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-lookup)
@@ -511,6 +520,19 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_entry_order COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/entry_order_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_entry_order>" "$<TARGET_FILE:cpu_entry_order_lifted>")
+    cpu_asm_fixture(cpu_dead_read dead_read)
+    cpu_translation(cpu_dead_read cpu_switch_aot
+        read_dead,cmp_dead,byte_dead,pair_dead,read_live,read_skip,sum_zero,add_in_place)
+    # The same translation built with /O2, where the compiler removes a read that the generated C++ lets it remove.
+    set(dead_read_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_read_lifted_o2.dll")
+    add_custom_command(OUTPUT "${dead_read_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_read_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_read_lifted_o2.obj" "/Fe${dead_read_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_dead_read_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_dead_read_lifted_o2 ALL DEPENDS "${dead_read_o2}")
+    add_test(NAME cpu_aot_dead_reads COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/dead_read_check.py" "$<TARGET_FILE:cpu_guarded_call>"
+        "$<TARGET_FILE:cpu_dead_read>" "$<TARGET_FILE:cpu_dead_read_lifted>" "${dead_read_o2}")
     cpu_asm_fixture(cpu_narrow narrow)
     cpu_translation(cpu_narrow cpu_switch_aot
         byte_merge,word_ops,byte_shift,byte_unary,al_less,mixed_width,ax_copy,zx_byte,set_less,set_zx,store_only,store_ret0,self_loop,qword_ops,flag_results,imul3_fresh)
@@ -586,6 +608,34 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/dead_div_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_guarded_call>" "$<TARGET_FILE:cpu_dead_div>" "$<TARGET_FILE:cpu_dead_div_lifted>"
         "${dead_div_o2}")
+    set(cpu_avx2_exports
+        "op_broadcasti128,op_extracti128_lo,op_extracti128_hi,op_inserti128_lo,op_inserti128_hi,"
+        "op_perm2i128_mix,op_perm2i128_swap,op_perm2i128_zero_lo,op_perm2i128_zero_hi,"
+        "op_perm2i128_zero_both,op_perm2i128_ignored,op_pbroadcastb_xmm,op_pbroadcastb_ymm,"
+        "op_pbroadcastw_xmm,op_pbroadcastw_ymm,op_pbroadcastd_xmm,op_pbroadcastd_ymm,"
+        "op_pbroadcastq_xmm,op_pbroadcastq_ymm,op_permd,op_permps,op_permq,op_permq_dup,"
+        "op_permpd,op_pblendd_xmm,op_pblendd_ymm,op_pblendd_ymm_all,op_pblendd_ymm_none,"
+        "op_psllvd_xmm,op_psllvd_ymm,op_psllvq_xmm,op_psllvq_ymm,op_psravd_xmm,op_psravd_ymm,"
+        "op_psrlvd_xmm,op_psrlvd_ymm,op_psrlvq_xmm,op_psrlvq_ymm,op_zeroupper,op_pipeline,"
+        "op_movdqu_store128,op_movdqu_copy128,"
+        "op_gatherdps_xmm,op_gatherdps_ymm,op_gatherdps_ymm_scale1_disp,op_gatherdpd_xmm,"
+        "op_gatherdpd_ymm,op_gatherqps_xmm_vm64x,op_gatherqps_xmm_vm64y,op_gatherqpd_xmm,"
+        "op_gatherqpd_ymm,op_pgatherdd_xmm,op_pgatherdd_ymm,op_pgatherdq_xmm,op_pgatherdq_ymm,"
+        "op_pgatherqd_xmm_vm64x,op_pgatherqd_xmm_vm64y,op_pgatherqq_xmm,op_pgatherqq_ymm,"
+        "op_pgatherdd_ymm_rdx,"
+        "op_pmaskmovd_load_xmm,op_pmaskmovd_load_ymm,op_pmaskmovq_load_xmm,op_pmaskmovq_load_ymm,"
+        "op_pmaskmovd_store_xmm,op_pmaskmovd_store_ymm,op_pmaskmovq_store_xmm,op_pmaskmovq_store_ymm")
+    string(CONCAT cpu_avx2_exports ${cpu_avx2_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx2_regs_${variant} avx2_regs)
+        cpu_translation(cpu_avx2_regs_${variant} cpu_avx2_aot "${cpu_avx2_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx2_regs_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_avx2_regs COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx2_regs_check.py"
+        "$<TARGET_FILE:cpu_avx2_regs_original>"
+        "$<TARGET_FILE:cpu_avx2_regs_original_lifted>"
+        "$<TARGET_FILE:cpu_avx2_regs_altered_lifted>")
     cpu_asm_fixture(cpu_chained chained)
     cpu_translation(cpu_chained cpu_chained_aot choose_value)
     cpu_asm_fixture(cpu_chained_jne chained)
@@ -834,6 +884,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_bmi1 COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bmi1.py"
         check "$<TARGET_FILE:cpu_bmi1>" "$<TARGET_FILE:cpu_bmi1_lifted>")
     set_tests_properties(cpu_aot_bmi1 PROPERTIES SKIP_RETURN_CODE 77)
+    cpu_asm_fixture(cpu_bit_ops bit_ops)
+    set(bit_ops_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_bit_ops_lifted.cpp")
+    add_custom_command(OUTPUT "${bit_ops_fixture}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bit_ops.py"
+            emit "$<TARGET_FILE:cpu_bit_ops>" "${bit_ops_fixture}"
+        DEPENDS cpu_bit_ops tests/cpu/bit_ops.py tools/ffx_version_query.py
+            tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_bit_ops_lifted SHARED "${bit_ops_fixture}")
+    add_test(NAME cpu_aot_bit_ops COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/bit_ops.py"
+        check "$<TARGET_FILE:cpu_bit_ops>" "$<TARGET_FILE:cpu_bit_ops_lifted>")
+    set_tests_properties(cpu_aot_bit_ops PROPERTIES SKIP_RETURN_CODE 77)
+
     cpu_asm_fixture(cpu_rotates_shifts rotates_shifts)
     set(rotates_shifts_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_rotates_shifts_lifted.cpp")
     add_custom_command(OUTPUT "${rotates_shifts_fixture}"
@@ -1267,20 +1329,21 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:blast_source>" "$<TARGET_FILE:blast_lifted>" "$<TARGET_FILE:archive_codec_lifted>")
 
     function(crc_line_program target polynomial)
-        # Use the same optimized source PE as input to both Debug and Release AOT builds.
+        # Use the same CRC object optimization flags in Debug and Release.
         set(crc_object "${CMAKE_CURRENT_BINARY_DIR}/${target}_step.obj")
         add_custom_command(OUTPUT "${crc_object}"
             COMMAND "${CMAKE_CXX_COMPILER}" /nologo /c /O1 /GS- /Zl "/DCRC_POLYNOMIAL=${polynomial}" "/Fo${crc_object}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/crc_line/crc_step.cpp"
             DEPENDS tests/cpu/crc_line/crc_step.cpp VERBATIM)
-        add_executable(${target} tests/cpu/crc_line/entry.asm "${crc_object}")
+        add_executable(${target} tests/cpu/crc_line/entry.asm tests/cpu/exe_startup.asm "${crc_object}")
         set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
-        target_link_options(${target} PRIVATE /ENTRY:program_entry /EXPORT:crc_step /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
-        target_link_libraries(${target} PRIVATE ucrt)
+        target_link_options(${target} PRIVATE /ENTRY:native_startup /EXPORT:native_entry /EXPORT:crc_step
+            /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE ucrt cpu_exe_io)
         set(crc_source "${CMAKE_CURRENT_BINARY_DIR}/${target}_lifted.cpp")
         add_custom_command(OUTPUT "${crc_source}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tools/cpu_stdio_exe_aot.py"
-                "$<TARGET_FILE:${target}>" "${crc_source}"
+                "$<TARGET_FILE:${target}>" "${crc_source}" --entry-export native_entry
             DEPENDS ${target} tools/cpu_stdio_exe_aot.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
             VERBATIM)
         add_executable(${target}_lifted "${crc_source}")
@@ -1290,7 +1353,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     crc_line_program(cpu_crc_castagnoli 0x82f63b78u)
     add_test(NAME cpu_native_crc_line COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/crc_line_check.py" "$<TARGET_FILE:pe_map>"
-        "$<TARGET_FILE:cpu_crc_line>" "$<TARGET_FILE:cpu_crc_line_lifted>"
+        "$<TARGET_FILE:cpu_exe_io>" "$<TARGET_FILE:cpu_crc_line>" "$<TARGET_FILE:cpu_crc_line_lifted>"
         "$<TARGET_FILE:cpu_crc_castagnoli>" "$<TARGET_FILE:cpu_crc_castagnoli_lifted>")
     foreach(variant IN ITEMS original inverted pair swapped framed image)
         set(native cpu_exe_${variant})
@@ -1409,6 +1472,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_reloc_free_check.py" "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_register_probe>" "$<TARGET_FILE:cpu_import_original>"
         "$<TARGET_FILE:cpu_import_provider>")
+    cpu_asm_fixture(cpu_forwarder forwarder)
+    target_link_libraries(cpu_forwarder PRIVATE cpu_import_provider)
+    add_test(NAME cpu_native_forwarder COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/forwarder_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_forwarder>" "$<TARGET_FILE:cpu_import_provider>")
     cpu_asm_fixture(cpu_seh_original seh_route)
     add_test(NAME cpu_native_seh COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_seh_check.py" "$<TARGET_FILE:cpu_seh_original>"
@@ -1572,6 +1640,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_BINARY_DIR}/ProbeArrayAtomics.cso" "${CMAKE_SOURCE_DIR}/tests/gpu_alias_writes.hlsl"
         "${CMAKE_SOURCE_DIR}/src")
     foreach(adapter IN ITEMS hardware warp)
+        add_test(NAME mesh_indexed_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_indexed_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_indexed_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME mesh_entry_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_entry_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME compute_store_aot_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -1589,6 +1665,14 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" buffer-color "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_buffer_color_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME depth_mask_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/depth_mask_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(depth_mask_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME sampled_coverage_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/sampled_coverage_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(sampled_coverage_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_aot_attribute_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_attribute_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
