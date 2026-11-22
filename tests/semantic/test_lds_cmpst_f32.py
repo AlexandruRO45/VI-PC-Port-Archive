@@ -596,5 +596,59 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
 
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarInterpreter()
+
+    def test_aliasing_vdst_equals_vaddr(self) -> None:
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x50
+        val = f32_to_bits(7.5)
+        new_val = f32_to_bits(15.0)
+
+        state.lds.write_dword(addr, val)
+        state.set_vgpr(0, addr)
+        state.set_vgpr(1, val)
+        state.set_vgpr(2, new_val)
+
+        instr = DSCmpstF32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(0, RegType.VGPR),
+            vdata0=RegisterOperand(1, RegType.VGPR),
+            vdata1=RegisterOperand(2, RegType.VGPR),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, val)
+        self.assertEqual(new_mem, new_val)
+        self.assertEqual(state.get_vgpr(0), val)
+        self.assertEqual(state.lds.read_dword(addr), new_val)
+
+    def test_aliasing_vdata0_equals_vdata1(self) -> None:
+        state = ScalarState(lds_size_dwords=1024)
+        addr = 0x60
+        val = f32_to_bits(9.0)
+
+        state.lds.write_dword(addr, val)
+        state.set_vgpr(1, addr)
+        state.set_vgpr(2, val)
+
+        instr = DSCmpstF32Instruction(
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            vdata1=RegisterOperand(2, RegType.VGPR),
+        )
+
+        old_val, new_mem, swapped = self.interp.execute(instr, state)
+        self.assertTrue(swapped)
+        self.assertEqual(old_val, val)
+        self.assertEqual(new_mem, val)
+        self.assertEqual(state.get_vgpr(2), val)
+
+
+
 if __name__ == "__main__":
     unittest.main()
