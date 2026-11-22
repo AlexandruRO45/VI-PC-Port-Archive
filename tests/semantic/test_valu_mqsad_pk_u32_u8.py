@@ -1267,5 +1267,196 @@ class TestValuMqsadPkU32U8IEEE754Boundaries(unittest.TestCase):
             self.assertEqual(d_clamped, min(1016 + a, MASK32))
 
 
+class TestValuMqsadPkU32U8NegativeControlsAndMutations(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Operand.vgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.vgpr_quad(-1)
+        with self.assertRaises(ValueError):
+            Operand.vgpr_quad(253)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+        with self.assertRaises(ValueError):
+            Operand.sgpr_quad(-1)
+        with self.assertRaises(ValueError):
+            Operand.sgpr_quad(103)
+
+    def test_syntax_rejection_valu_destination_must_be_vgpr_quad(self) -> None:
+        with self.assertRaises(TypeError):
+            VMqsadPkU32U8Instruction(
+                dst=Operand.sgpr_quad(0),
+                src0=Operand.vgpr_pair(4),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr_quad(8),
+            )
+        with self.assertRaises(ValueError):
+            VMqsadPkU32U8Instruction(
+                dst=Operand.vgpr_pair(0),
+                src0=Operand.vgpr_pair(4),
+                src1=Operand.vgpr(2),
+                src2=Operand.vgpr_quad(8),
+            )
+
+    def test_syntax_rejection_invalid_simd_lane_count(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=16)
+        with self.assertRaises(ValueError):
+            SIMDState(num_lanes=65)
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        ref = pack_u8x8(10, 20, 30, 40, 50, 60, 70, 80)
+        query = pack_u8x8(10, 20, 30, 40, 0, 0, 0, 0) & MASK32
+        acc = pack_u32x4(1, 2, 3, 4)
+        correct = ref_mqsad_pk_u32_u8(ref, query, acc)
+
+        for bit in range(128):
+            corrupted = correct ^ (1 << bit)
+            self.assertNotEqual(correct, corrupted)
+
+    def test_mutation_missing_byte_zero_masking_detected(self) -> None:
+        """Mutant: Fails to mask out query bytes when query byte == 0."""
+        def mutant_mqsad(src0: int, src1: int, src2: int) -> int:
+            out = []
+            for k in range(4):
+                ref_slice = (src0 >> (8 * k)) & MASK32
+                total = 0
+                for j in range(4):
+                    r_b = extract_byte(ref_slice, j)
+                    q_b = extract_byte(src1, j)
+                    # Bug: no check if q_b != 0!
+                    total += abs(r_b - q_b)
+                total += extract_u32(src2, k)
+                out.append(total & MASK32)
+            return pack_u32x4(out[0], out[1], out[2], out[3])
+
+        # Query has zero byte: [100, 0, 100, 100]
+        # Ref has [100, 50, 100, 100]
+        # In correct MSAD: byte 1 is masked -> diff = 0.
+        # In mutant: byte 1 contributes |50 - 0| = 50!
+        ref = pack_u8x8(100, 50, 100, 100, 0, 0, 0, 0)
+        query = pack_u8x8(100, 0, 100, 100, 0, 0, 0, 0) & MASK32
+
+        oracle_res = ref_mqsad_pk_u32_u8(ref, query, 0)
+        mutant_res = mutant_mqsad(ref, query, 0)
+        self.assertEqual(unpack_u32x4(oracle_res)[0], 0)
+        self.assertEqual(unpack_u32x4(mutant_res)[0], 50)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_signed_byte_subtraction_detected(self) -> None:
+        """Mutant: Casts bytes to signed int8 (-128..127) before subtracting."""
+        def mutant_mqsad(src0: int, src1: int, src2: int) -> int:
+            def to_s8(b: int) -> int:
+                b &= 0xFF
+                return b - 256 if (b & 0x80) else b
+
+            out = []
+            for k in range(4):
+                ref_slice = (src0 >> (8 * k)) & MASK32
+                total = 0
+                for j in range(4):
+                    r_b = to_s8(extract_byte(ref_slice, j))
+                    q_b = to_s8(extract_byte(src1, j))
+                    if extract_byte(src1, j) != 0:
+                        total += abs(r_b - q_b)
+                total += extract_u32(src2, k)
+                out.append(total & MASK32)
+            return pack_u32x4(out[0], out[1], out[2], out[3])
+
+        ref = pack_u8x8(0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0)
+        query = 0xFFFF_FFFF  # bytes: 255 (signed -1)
+        oracle_res = ref_mqsad_pk_u32_u8(ref, query, 0)
+        mutant_res = mutant_mqsad(ref, query, 0)
+        self.assertEqual(unpack_u32x4(oracle_res)[0], 1020)
+        self.assertEqual(unpack_u32x4(mutant_res)[0], 4)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_sliding_window_stride_detected(self) -> None:
+        """Mutant: Uses 2-byte stride instead of 1-byte stride."""
+        def mutant_mqsad(src0: int, src1: int, src2: int) -> int:
+            out = []
+            for k in range(4):
+                ref_slice = (src0 >> (16 * k)) & MASK32
+                sad = ref_msad_u8_quad(ref_slice, src1 & MASK32)
+                out.append((sad + extract_u32(src2, k)) & MASK32)
+            return pack_u32x4(out[0], out[1], out[2], out[3])
+
+        ref = pack_u8x8(10, 20, 30, 40, 50, 60, 70, 80)
+        query = pack_u8x8(10, 20, 30, 40, 0, 0, 0, 0) & MASK32
+        oracle_res = ref_mqsad_pk_u32_u8(ref, query, 0)
+        mutant_res = mutant_mqsad(ref, query, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_omitted_accumulator_detected(self) -> None:
+        """Mutant: Computes SAD without adding accumulator src2."""
+        def mutant_mqsad(src0: int, src1: int, src2: int) -> int:
+            out = []
+            for k in range(4):
+                ref_slice = (src0 >> (8 * k)) & MASK32
+                sad = ref_msad_u8_quad(ref_slice, src1 & MASK32)
+                out.append(sad & MASK32)
+            return pack_u32x4(out[0], out[1], out[2], out[3])
+
+        ref = pack_u8x8(1, 2, 3, 4, 5, 6, 7, 8)
+        query = 0x04030201
+        acc = pack_u32x4(100, 200, 300, 400)
+        oracle_res = ref_mqsad_pk_u32_u8(ref, query, acc)
+        mutant_res = mutant_mqsad(ref, query, acc)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_omitted_clamp_detected(self) -> None:
+        """Mutant: Fails to clamp when clamp modifier is active."""
+        def mutant_mqsad(src0: int, src1: int, src2: int, clamp: bool) -> int:
+            out = []
+            for k in range(4):
+                ref_slice = (src0 >> (8 * k)) & MASK32
+                sad = ref_msad_u8_quad(ref_slice, src1 & MASK32)
+                raw = sad + extract_u32(src2, k)
+                out.append(raw & MASK32)
+            return pack_u32x4(out[0], out[1], out[2], out[3])
+
+        ref = pack_u8x8(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+        query = 0x01010101
+        acc = pack_u32x4(0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF)
+        oracle_res = ref_mqsad_pk_u32_u8(ref, query, acc, clamp=True)
+        mutant_res = mutant_mqsad(ref, query, acc, clamp=True)
+        self.assertEqual(unpack_u32x4(oracle_res), (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF))
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_ignore_simd_exec_mask_detected(self) -> None:
+        """Mutant: SIMD interpreter writes to inactive lanes ignoring EXEC mask."""
+        sentinel = 0xCAFE_BABE_DEAD_BEEF_BAAD_F00D_FEED_FACE
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)
+        for lane in range(32):
+            state.write_lane(Operand.vgpr_quad(0), lane, sentinel)
+
+        class BuggySIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VMqsadPkU32U8Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    res = ref_mqsad_pk_u32_u8(0, 0, 0)
+                    state.write_lane(instr.dst, lane, res)
+                    results.append(res)
+                return results
+
+        buggy = BuggySIMDInterpreter()
+        instr = VMqsadPkU32U8Instruction(
+            dst=Operand.vgpr_quad(0),
+            src0=Operand.literal64(0),
+            src1=Operand.literal(0),
+            src2=Operand.literal128(0),
+        )
+        buggy.step(instr, state)
+
+        corrupted = [lane for lane in range(32) if state.read_lane(Operand.vgpr_quad(0), lane) != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
