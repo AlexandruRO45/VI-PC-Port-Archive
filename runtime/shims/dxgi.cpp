@@ -8,11 +8,14 @@
 
 #include "dxgi.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <mutex>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "d3d12_com.h"
@@ -100,6 +103,97 @@ private:
     ULONG refs_ = 1;
 };
 
+// A monitor as an IDXGIOutput: the description comes from the monitor API, and the mode list from the display's own
+// modes, so a game that asks what the screen can do gets the real answers.
+class Output final : public DxgiObject<Output, IDXGIOutput1Stubs, IDXGIObject, IDXGIOutput, IDXGIOutput1> {
+public:
+    explicit Output(HMONITOR monitor) : monitor_(monitor) {
+        MONITORINFOEXW info{};
+        info.cbSize = sizeof(info);
+        if (GetMonitorInfoW(monitor_, &info) != FALSE) {
+            info_ = info;
+            device_name_ = info.szDevice;
+        }
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_OUTPUT_DESC* out) override {
+        if (!out) return E_INVALIDARG;
+        std::memset(out, 0, sizeof(*out));
+        wcscpy_s(out->DeviceName, device_name_.c_str());
+        out->DesktopCoordinates = info_.rcMonitor;
+        out->AttachedToDesktop = TRUE;
+        out->Rotation = DXGI_MODE_ROTATION_IDENTITY;
+        out->Monitor = monitor_;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDisplayModeList(DXGI_FORMAT format, UINT, UINT* count,
+                                                 DXGI_MODE_DESC* modes) override {
+        if (!count) return E_INVALIDARG;
+        std::vector<DXGI_MODE_DESC> found;
+        DEVMODEW mode{};
+        mode.dmSize = sizeof(mode);
+        for (DWORD i = 0; EnumDisplaySettingsW(device_name_.c_str(), i, &mode) != FALSE; ++i) {
+            if (!mode.dmPelsWidth || !mode.dmPelsHeight) continue;
+            DXGI_MODE_DESC desc{};
+            desc.Width = mode.dmPelsWidth;
+            desc.Height = mode.dmPelsHeight;
+            desc.RefreshRate = {mode.dmDisplayFrequency ? mode.dmDisplayFrequency : 60, 1};
+            desc.Format = format;
+            desc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+            desc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+            found.push_back(desc);
+        }
+        if (!modes) {
+            *count = static_cast<UINT>(found.size());
+            return S_OK;
+        }
+        const UINT filled = std::min<UINT>(*count, static_cast<UINT>(found.size()));
+        std::copy_n(found.begin(), filled, modes);
+        *count = filled;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE FindClosestMatchingMode(const DXGI_MODE_DESC* want, DXGI_MODE_DESC* got,
+                                                      IUnknown*) override {
+        if (!want || !got) return E_INVALIDARG;
+        UINT count = 0;
+        if (FAILED(GetDisplayModeList(want->Format, 0, &count, nullptr)) || !count) return DXGI_ERROR_NOT_FOUND;
+        std::vector<DXGI_MODE_DESC> modes(count);
+        if (FAILED(GetDisplayModeList(want->Format, 0, &count, modes.data())) || !count) return DXGI_ERROR_NOT_FOUND;
+        *got = modes.front();
+        std::uint64_t best = UINT64_MAX;
+        for (const DXGI_MODE_DESC& mode : modes) {
+            const std::uint64_t distance =
+                std::uint64_t(std::abs(LONG(mode.Width) - LONG(want->Width))) +
+                std::uint64_t(std::abs(LONG(mode.Height) - LONG(want->Height))) * 10 +
+                std::uint64_t(std::abs(LONG(mode.RefreshRate.Numerator) - LONG(want->RefreshRate.Numerator)));
+            if (mode.Width == want->Width && mode.Height == want->Height &&
+                mode.RefreshRate.Numerator == want->RefreshRate.Numerator) {
+                *got = mode;
+                return S_OK;
+            }
+            if (distance < best) {
+                best = distance;
+                *got = mode;
+            }
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE WaitForVBlank() override {
+        Sleep(16);  // one frame at 60 Hz; a real vblank wait would need D3DKMTWaitForVerticalBlankEvent
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE TakeOwnership(IUnknown*, BOOL) override { return S_OK; }
+    void STDMETHODCALLTYPE ReleaseOwnership() override {}
+
+private:
+    HMONITOR monitor_ = nullptr;
+    MONITORINFOEXW info_{};
+    std::wstring device_name_;
+};
+
 // One adapter: the host GPU, described generically. A game uses the description for settings only.
 class Adapter final : public DxgiObject<Adapter, IDXGIAdapter1Stubs, IDXGIObject, IDXGIAdapter, IDXGIAdapter1> {
 public:
@@ -122,9 +216,14 @@ public:
         wcscpy_s(out->Description, desc.Description);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE EnumOutputs(UINT, IDXGIOutput** out) override {
-        if (out) *out = nullptr;
-        return DXGI_ERROR_NOT_FOUND;  // output enumeration is future work: the window is what presents
+    HRESULT STDMETHODCALLTYPE EnumOutputs(UINT index, IDXGIOutput** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (index != 0) return DXGI_ERROR_NOT_FOUND;  // one output: the primary monitor
+        const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        if (!monitor) return DXGI_ERROR_NOT_FOUND;  // headless: a game that asks still gets a clean answer
+        auto* output = new Output(monitor);
+        return output->QueryInterface(__uuidof(IDXGIOutput), reinterpret_cast<void**>(out));
     }
     HRESULT STDMETHODCALLTYPE CheckInterfaceSupport(REFGUID, LARGE_INTEGER*) override { return DXGI_ERROR_UNSUPPORTED; }
 };
@@ -228,9 +327,43 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* fullscreen, IDXGIOutput** target) override {
-        if (fullscreen) *fullscreen = FALSE;
+        if (fullscreen) *fullscreen = fullscreen_ ? TRUE : FALSE;
         if (target) *target = nullptr;
         return S_OK;
+    }
+
+    // Borderless fullscreen: the window becomes a popup covering the monitor, and the swapchain is recreated at the
+    // monitor's size; turning it off restores the window's placement and the client-area swapchain.
+    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fullscreen, IDXGIOutput*) override {
+        const bool want = fullscreen != FALSE;
+        if (want == fullscreen_) return S_OK;
+        if (want) {
+            saved_style_ = GetWindowLongW(window_, GWL_STYLE);
+            saved_placement_.length = sizeof(saved_placement_);
+            GetWindowPlacement(window_, &saved_placement_);
+            const HMONITOR monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO info{};
+            info.cbSize = sizeof(info);
+            if (!monitor || GetMonitorInfoW(monitor, &info) == FALSE) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+            SetWindowLongW(window_, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowPos(window_, HWND_TOP, info.rcMonitor.left, info.rcMonitor.top,
+                         info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top,
+                         SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+            desc_.Width = UINT(info.rcMonitor.right - info.rcMonitor.left);
+            desc_.Height = UINT(info.rcMonitor.bottom - info.rcMonitor.top);
+        } else {
+            SetWindowLongW(window_, GWL_STYLE, saved_style_);
+            SetWindowPlacement(window_, &saved_placement_);
+            RECT client{};
+            GetClientRect(window_, &client);
+            if (client.right > client.left && client.bottom > client.top) {
+                desc_.Width = UINT(client.right - client.left);
+                desc_.Height = UINT(client.bottom - client.top);
+            }
+        }
+        fullscreen_ = want;
+        release_buffers();
+        return create_presenter() ? S_OK : E_FAIL;
     }
 
     HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* out) override {
@@ -324,6 +457,9 @@ private:
     ID3D12Device* device_ = nullptr;
     HWND window_ = nullptr;
     DXGI_SWAP_CHAIN_DESC1 desc_{};
+    bool fullscreen_ = false;
+    DWORD saved_style_ = 0;
+    WINDOWPLACEMENT saved_placement_{};
     std::vector<ID3D12Resource*> buffers_;
     leonida::wsi::Presenter presenter_;
     UINT64 presents_ = 0;

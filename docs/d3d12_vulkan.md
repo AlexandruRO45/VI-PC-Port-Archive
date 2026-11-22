@@ -761,12 +761,16 @@ are covered).
 **PresentX.** Public Xbox documentation mentions `ID3D12CommandQueue::PresentX`,
 `D3D12XBOX_FRAME_PIPELINE_TOKEN` and `D3D12XBOX_PRESENT_PLANE_PARAMETERS` in the game-streaming APIs
 ([example](https://docs.xbox.com/reference/system/xgamestreaming/functions/xgamestreamingsetresolution)). PresentX
-is not in the public `d3d12.h` vtable; its slot and struct layouts are **Open**. The layer now has the body a queue
-proxy will call: `rt::d3d12::present_x(queue, planes)` (`runtime/shims/d3d12_present.{h,cpp}`) presents a plane's
-resource through the swapchain the process registered (`set_presentation_target`, called by the DXGI swapchain), so
-PresentX ends in the same `vkQueuePresentKHR` as `Present`. Source/destination rectangles and additional planes are
-logged and not composited yet; plane composition is the remaining piece. The queue slot stays open until the trace
-shows the call.
+is not in the public `d3d12.h` vtable; its slot and struct layouts are **Open**. The layer has the body a queue
+proxy will call: `rt::d3d12::present_x(queue, planes)` (`runtime/shims/d3d12_present.{h,cpp}`) takes up to eight
+planes, each a resource with an optional source rectangle and destination rectangle, and presents them through the
+swapchain the process registered (`set_presentation_target`, called by the DXGI swapchain). The presenter does the
+composition on the GPU in one submission: one plane that fills the swapchain with its own format is a
+`vkCmdCopyImage`, anything else is `vkCmdBlitImage` with nearest filtering (source rect → destination rect), and
+every source is put back in the layout the layer's tracker names. `dxgi_window_test` composites the triangle into
+the left half of the window and a blue plane into the right half through one PresentX call, and captures the
+resulting swapchain image. The queue slot stays open until the trace shows the call.
+
 
 **What is implemented: shared-device WSI (PR C, step 5).** The renderer and the window share one `VkInstance`,
 `VkPhysicalDevice`, `VkDevice` and graphics queue: `create_vulkan_device_standalone(..., presentable = true)` enables

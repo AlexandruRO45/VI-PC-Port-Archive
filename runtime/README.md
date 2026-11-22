@@ -111,11 +111,26 @@ Current limits, by design:
   depth views, committed resources and copies (uploads, readbacks, BC textures); see `docs/d3d12_vulkan.md`
   section 3.2 for what is missing.
 - `dxgi.dll` — `CreateDXGIFactory`, `CreateDXGIFactory1` and `CreateDXGIFactory2` (`shims/dxgi.cpp`,
-  registered in `shims/dxgi_shims.cpp` so the linker keeps it): one adapter, and swapchains whose back
-  buffers are D3D12 committed render targets presented through the shared-device WSI presenter
-  (`vkCmdCopyImage` into the swapchain image + `vkQueuePresentKHR`), with `ResizeBuffers`. `PresentX`
-  presents through the same path (`rt::d3d12::present_x`). `docs/d3d12_vulkan.md` section 4.5 has the
-  details and what is still a stub.
+  registered in `shims/dxgi_shims.cpp` so the linker keeps it): one adapter with its primary monitor as an
+  `IDXGIOutput` (`GetDesc`, `GetDisplayModeList` from the display's own modes, `FindClosestMatchingMode`,
+  `WaitForVBlank`), and swapchains whose back buffers are D3D12 committed render targets presented through the
+  shared-device WSI presenter (`vkCmdCopyImage` into the swapchain image + `vkQueuePresentKHR`), with
+  `ResizeBuffers` and borderless `SetFullscreenState`. `PresentX` presents through the same path and composes
+  several planes with their source/destination rectangles. `docs/d3d12_vulkan.md` section 4.5 has the details
+  and what is still a stub.
+- `xinput1_4.dll` (`shims/xinput.cpp`) — `XInputGetState`, `XInputSetState`, `XInputGetCapabilities`,
+  `XInputEnable`, `XInputGetBatteryInformation`, `XInputGetKeystroke`. A test injects the pad state with
+  `XInputSetTestState`; without an injection an older host XInput (`xinput1_3.dll`, `xinput9_1_0.dll`) is
+  forwarded to, so a physical pad works. `xinput_test` goes through the table.
+- `kernel32.dll` asynchrony (`shims/async_io.cpp`) — `CreateFile2`, `ReadFileScatter`, `WriteFileGather`,
+  `CreateIoCompletionPort`, `GetQueuedCompletionStatus`, `PostQueuedCompletionStatus`, forwarded to the host
+  through `GetProcAddress` (never a direct call, which would land back in a shim DLL that exports the same
+  names). Files and ports stay host handles. `async_io_test` writes two pages with a gather, waits on the port,
+  reads them back with a scatter and round-trips a posted packet.
+- `xgameruntime.dll` (`shims/xgameruntime.cpp`) — `XGameRuntimeInitialize`/`Uninitialize`, `XSystemGetDeviceType`,
+  `XSystemGetConsoleId`, and the XTaskQueue/XAsync surface over `third_party/xtaskqueue` (Microsoft's
+  MIT-licensed implementation). `xgameruntime_test` runs work on the thread pool and a completion on the
+  "game loop" thread, through the shim table.
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own

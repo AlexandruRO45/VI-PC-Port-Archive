@@ -23,6 +23,7 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_win32.h>  // VkWin32SurfaceCreateInfoKHR and its PFN types
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -61,6 +62,22 @@ public:
     // Copies `source` (same device, in `source_layout`) into the next swapchain image and presents it. Equal format
     // and size are a plain copy; anything else is blitted with nearest filtering, cropped to the common area.
     bool present(VkImage source, VkFormat source_format, VkExtent2D source_extent, VkImageLayout source_layout);
+
+    // One plane of a composite present (Xbox PresentX): a source image, the part of it to show and where it goes.
+    struct Plane {
+        VkImage image = VK_NULL_HANDLE;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        VkExtent2D extent{};
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkRect2D source{};       // a zero size means the whole image
+        VkRect2D destination{};  // a zero size means the whole swapchain
+    };
+
+    // Presents several planes in order. A single plane that covers the whole image and the whole swapchain with the
+    // swapchain's own format is a plain copy; everything else is blitted with nearest filtering, which is also what
+    // makes a source/destination rectangle work. Each source is left in the layout it was given.
+    bool present(const Plane* planes, std::size_t count);
+
 
     // Debug aid for the window test: the next present also copies the finished swapchain image into `buffer` (RGBA8,
     // row pitch = extent().width * 4, offset 0) before presenting it, so the exact pixels that reach the screen can be

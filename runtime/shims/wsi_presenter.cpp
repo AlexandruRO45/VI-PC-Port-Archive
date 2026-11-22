@@ -144,8 +144,10 @@ bool Presenter::create(const Gpu& gpu, HWND window, VkFormat format, VkExtent2D 
         }
     }
 
+    // The caller's extent wins: DXGI lets a swapchain be smaller or larger than the window and scales it into the
+    // window's client area on present. The surface's current extent is only the default when the caller passes none.
     extent_ = extent;
-    if (capabilities.currentExtent.width != UINT32_MAX) extent_ = capabilities.currentExtent;
+    if (!extent_.width || !extent_.height) extent_ = capabilities.currentExtent;
     extent_.width = std::clamp(extent_.width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width);
     extent_.height = std::clamp(extent_.height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
     if (!extent_.width || !extent_.height) {
@@ -232,7 +234,16 @@ bool Presenter::create(const Gpu& gpu, HWND window, VkFormat format, VkExtent2D 
 
 bool Presenter::present(VkImage source, VkFormat source_format, VkExtent2D source_extent,
                         VkImageLayout source_layout) {
-    if (!ok() || !source) return false;
+    Plane plane{};
+    plane.image = source;
+    plane.format = source_format;
+    plane.extent = source_extent;
+    plane.layout = source_layout;
+    return present(&plane, 1);
+}
+
+bool Presenter::present(const Plane* planes, std::size_t count) {
+    if (!ok() || !planes || !count) return false;
     if (fn_.vkWaitForFences(gpu_.device, 1, &in_flight_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
 
     std::uint32_t index = 0;
@@ -262,29 +273,63 @@ bool Presenter::present(VkImage source, VkFormat source_format, VkExtent2D sourc
         fn_.vkCmdPipelineBarrier(command_, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
     };
 
-    // The rendered image goes to TRANSFER_SRC and back again, so the layer's tracker keeps the layout it left.
-    barrier(source, source_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
-            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     barrier(images_[index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    const std::uint32_t width = std::min(source_extent.width, extent_.width);
-    const std::uint32_t height = std::min(source_extent.height, extent_.height);
-    if (source_format == format_ && source_extent.width == extent_.width && source_extent.height == extent_.height) {
-        VkImageCopy region{};
-        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.dstSubresource = region.srcSubresource;
-        region.extent = {width, height, 1};
-        fn_.vkCmdCopyImage(command_, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[index],
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    } else {
-        VkImageBlit region{};
-        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.dstSubresource = region.srcSubresource;
-        region.srcOffsets[1] = {std::int32_t(width), std::int32_t(height), 1};
-        region.dstOffsets[1] = {std::int32_t(width), std::int32_t(height), 1};
-        fn_.vkCmdBlitImage(command_, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[index],
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+    // Each plane goes to TRANSFER_SRC and back to the layout its renderer left it in, so the layer's tracker stays
+    // right. A single plane that fills the swapchain with its own format is copied; anything else is blitted, which
+    // is what crops and positions a plane.
+    const auto clamp_rect = [](VkRect2D rect, VkExtent2D limit) {
+        VkRect2D out = rect;
+        out.offset.x = std::max(0, out.offset.x);
+        out.offset.y = std::max(0, out.offset.y);
+        const std::uint32_t left = std::uint32_t(out.offset.x), top = std::uint32_t(out.offset.y);
+        out.extent.width = left < limit.width ? std::min(out.extent.width, limit.width - left) : 0;
+        out.extent.height = top < limit.height ? std::min(out.extent.height, limit.height - top) : 0;
+        return out;
+    };
+    for (std::size_t plane_index = 0; plane_index < count; ++plane_index) {
+        const Plane& plane = planes[plane_index];
+        if (!plane.image) continue;
+        VkRect2D source = plane.source;
+        if (!source.extent.width || !source.extent.height)
+            source = {{0, 0}, {plane.extent.width, plane.extent.height}};
+        source = clamp_rect(source, plane.extent);
+        VkRect2D destination = plane.destination;
+        if (!destination.extent.width || !destination.extent.height) destination = {{0, 0}, extent_};
+        destination = clamp_rect(destination, extent_);
+        if (!source.extent.width || !source.extent.height || !destination.extent.width || !destination.extent.height)
+            continue;
+
+        barrier(plane.image, plane.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const bool whole = source.offset.x == 0 && source.offset.y == 0 && source.extent.width == plane.extent.width &&
+                           source.extent.height == plane.extent.height && destination.offset.x == 0 &&
+                           destination.offset.y == 0 && destination.extent.width == extent_.width &&
+                           destination.extent.height == extent_.height;
+        const bool same_extent = plane.extent.width == extent_.width && plane.extent.height == extent_.height;
+        if (count == 1 && whole && same_extent && plane.format == format_) {
+            VkImageCopy region{};
+            region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.dstSubresource = region.srcSubresource;
+            region.extent = {extent_.width, extent_.height, 1};
+            fn_.vkCmdCopyImage(command_, plane.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[index],
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        } else {
+            VkImageBlit region{};
+            region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.dstSubresource = region.srcSubresource;
+            region.srcOffsets[0] = {source.offset.x, source.offset.y, 0};
+            region.srcOffsets[1] = {source.offset.x + std::int32_t(source.extent.width),
+                                    source.offset.y + std::int32_t(source.extent.height), 1};
+            region.dstOffsets[0] = {destination.offset.x, destination.offset.y, 0};
+            region.dstOffsets[1] = {destination.offset.x + std::int32_t(destination.extent.width),
+                                    destination.offset.y + std::int32_t(destination.extent.height), 1};
+            fn_.vkCmdBlitImage(command_, plane.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[index],
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+        }
+        barrier(plane.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, plane.layout, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
     }
 
     if (capture_) {
@@ -303,8 +348,6 @@ bool Presenter::present(VkImage source, VkFormat source_format, VkExtent2D sourc
                 VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     }
-    barrier(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, source_layout, VK_ACCESS_TRANSFER_READ_BIT,
-            VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 
     fn_.vkEndCommandBuffer(command_);
     // The image's own semaphore: its previous signal was consumed by the present that used this image, and the image

@@ -136,6 +136,19 @@ if(WIN32)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
+  # XInput and the kernel32 asynchrony shims, resolved through the shim table the runtime installs.
+  add_executable(xinput_test test/xinput_test.cpp shims/xinput.cpp shims/registry.cpp)
+  target_include_directories(xinput_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xinput_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xinput_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xinput_test PRIVATE /OPT:NOREF)
+
+  add_executable(async_io_test test/async_io_test.cpp shims/async_io.cpp shims/registry.cpp)
+  target_include_directories(async_io_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(async_io_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(async_io_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(async_io_test PRIVATE /OPT:NOREF)
+
   # Descriptor slot sizes, handle arithmetic and dirty ranges (P0/P1 of docs/d3d12_vulkan_analysis.md).
   # CPU only: no Vulkan, no GPU and no game data, so they build and run before the Vulkan SDK is installed.
   add_executable(descriptor_increment_test test/descriptor_increment_test.cpp)
@@ -302,6 +315,8 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+    add_test(NAME xinput COMMAND xinput_test)
+    add_test(NAME async_io COMMAND async_io_test)
     add_test(NAME descriptor_increment COMMAND descriptor_increment_test)
     add_test(NAME descriptor_handles COMMAND descriptor_handles_test)
     add_test(NAME bindless_allocator COMMAND bindless_allocator_test)
@@ -372,7 +387,7 @@ if(Vulkan_FOUND)
       OUTPUT ${LEONIDA_DXGI_STUBS}
       COMMAND Python3::Interpreter -I ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py --out ${LEONIDA_DXGI_STUBS}
               --header dxgi.h --header dxgi1_2.h --include dxgi.h --include dxgi1_2.h
-              IDXGIAdapter1 IDXGIFactory2 IDXGISwapChain1
+              IDXGIAdapter1 IDXGIFactory2 IDXGISwapChain1 IDXGIOutput1
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_d3d12_stubs.py
       COMMENT "Generating DXGI COM stubs"
       VERBATIM)

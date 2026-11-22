@@ -1,14 +1,16 @@
 // DXGI + PresentX over shared-device WSI (PR C, API compatibility): a real window whose frame is recorded through
-// the D3D12 COM surface and presented by the DXGI swapchain and, for a few frames, by ID3D12CommandQueue::PresentX.
+// the D3D12 COM surface and presented by the DXGI swapchain and by ID3D12CommandQueue::PresentX.
 //
-// CreateDXGIFactory1 -> EnumAdapters1 -> IDXGIFactory2::CreateSwapChainForHwnd -> GetBuffer(0) gives back a D3D12
-// committed render target; the list records OMSetRenderTargets/IASetVertexBuffers/SetPipelineState/DrawInstanced and
-// ExecuteCommandLists runs it. Present() hands that image to the shared-device presenter, which copies it on the GPU
-// into the swapchain image and presents it. PresentX() does the same through the layer's Xbox present path. Mid-run
-// ResizeBuffers() recreates the swapchain at 320x240 and the loop keeps drawing and presenting there.
+// CreateDXGIFactory1 -> EnumAdapters1 (and EnumOutputs, which answers with the primary monitor's modes) ->
+// IDXGIFactory2::CreateSwapChainForHwnd -> GetBuffer(0) gives back a D3D12 committed render target; the list records
+// OMSetRenderTargets/IASetVertexBuffers/SetPipelineState/DrawInstanced and ExecuteCommandLists runs it. Present()
+// hands that image to the shared-device presenter, which copies it on the GPU into the swapchain image and presents
+// it. PresentX() composes: the triangle's render target goes into the left half of the swapchain and a second target
+// cleared to blue into the right half, through the same presenter. Mid-run ResizeBuffers() recreates the swapchain at
+// 320x240, and the end toggles SetFullscreenState on and off and presents after each.
 //
-// One captured swapchain image (the first present) proves the pixels that reached the screen: the triangle's orange
-// on the zero-filled target.
+// Two captured swapchain images (the first Present and the PresentX composite) prove the pixels that reached the
+// screen; the first is also written to dxgi_window.bmp.
 //
 // No game data, no keys. Exit 77 means no Vulkan device or no window. Set LEONIDA_VK_VALIDATION=1 for validation.
 
@@ -37,8 +39,8 @@ int failures = 0;
         }                                                                \
     } while (0)
 
-constexpr ULONGLONG kRunMilliseconds = 3000;
-constexpr ULONGLONG kResizeAtMilliseconds = 1500;
+constexpr ULONGLONG kRunMilliseconds = 2500;
+constexpr ULONGLONG kResizeAtMilliseconds = 1200;
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
@@ -98,7 +100,29 @@ void destroy_capture(const rt::d3d12::VulkanDeviceInfo& info, CaptureBuffer& cap
     capture = CaptureBuffer{};
 }
 
-// The captured frame as a BGRA BMP, so the presented image can be looked at outside the test.
+struct PixelCounts {
+    std::size_t orange = 0;
+    std::size_t blue = 0;
+    std::size_t other = 0;
+};
+
+// Counts pixels in a rectangle of a captured RGBA8 image (the swapchain format is R8G8B8A8 here).
+PixelCounts count_pixels(const void* mapped, VkExtent2D extent, VkOffset2D from, VkExtent2D size) {
+    PixelCounts counts{};
+    if (!mapped) return counts;
+    const auto* pixels = static_cast<const std::uint8_t*>(mapped);
+    for (std::uint32_t y = from.y; y < from.y + size.height && y < extent.height; ++y) {
+        const std::uint8_t* line = pixels + std::size_t(y) * extent.width * 4;
+        for (std::uint32_t x = from.x; x < from.x + size.width && x < extent.width; ++x) {
+            const std::uint8_t r = line[x * 4], g = line[x * 4 + 1], b = line[x * 4 + 2];
+            if (r > 200 && g > 30 && g < 120 && b < 40) ++counts.orange;
+            else if (b > 200 && r < 40 && g < 40) ++counts.blue;
+            else if (r || g || b) ++counts.other;
+        }
+    }
+    return counts;
+}
+
 bool write_bmp(const char* path, const std::uint8_t* pixels, std::uint32_t width, std::uint32_t height) {
     const std::uint32_t row_bytes = (width * 3 + 3) & ~3u;
     const std::uint32_t image_bytes = row_bytes * height;
@@ -150,7 +174,7 @@ int main() {
     }
     RECT rect{0, 0, 640, 480};
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida - DXGI swapchain over shared-device WSI",
+    HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida - DXGI + PresentX over shared-device WSI",
                                   WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left,
                                   rect.bottom - rect.top, nullptr, nullptr, window_class.hInstance, nullptr);
     if (!window) {
@@ -168,19 +192,49 @@ int main() {
     }
     const rt::d3d12::VulkanDeviceInfo info = rt::d3d12::vulkan_device_info(device.p);
 
-    // The DXGI surface: factory, adapter, swapchain for the window.
+    // The DXGI surface: factory, adapter, its output (the primary monitor), swapchain for the window.
     Ref<IDXGIFactory2> factory;
     EXPECT(SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory2), factory.as_void())));
     Ref<IDXGIAdapter1> adapter;
     if (factory.p) EXPECT(SUCCEEDED(factory->EnumAdapters1(0, adapter.out())));
+    {
+        Ref<IDXGIAdapter1> none;  // only one adapter: the host GPU
+        EXPECT(factory.p && factory->EnumAdapters1(1, none.out()) == DXGI_ERROR_NOT_FOUND);
+    }
     if (adapter.p) {
         DXGI_ADAPTER_DESC1 desc{};
         EXPECT(SUCCEEDED(adapter->GetDesc1(&desc)));
         std::printf("dxgi_window_test: adapter: %S\n", desc.Description);
-    }
-    {
-        Ref<IDXGIAdapter1> none;  // only one adapter: the host GPU
-        EXPECT(factory.p && factory->EnumAdapters1(1, none.out()) == DXGI_ERROR_NOT_FOUND);
+
+        // The display: a real monitor answers with a name and the modes it supports.
+        Ref<IDXGIOutput> output;
+        const HRESULT enumerated = adapter->EnumOutputs(0, output.out());
+        if (SUCCEEDED(enumerated)) {
+            DXGI_OUTPUT_DESC output_desc{};
+            EXPECT(SUCCEEDED(output->GetDesc(&output_desc)));
+            EXPECT(output_desc.AttachedToDesktop);
+            UINT mode_count = 0;
+            EXPECT(SUCCEEDED(output->GetDisplayModeList(DXGI_FORMAT_R8G8B8A8_UNORM, 0, &mode_count, nullptr)));
+            EXPECT(mode_count > 0);
+            std::vector<DXGI_MODE_DESC> modes(mode_count);
+            EXPECT(SUCCEEDED(output->GetDisplayModeList(DXGI_FORMAT_R8G8B8A8_UNORM, 0, &mode_count, modes.data())));
+            EXPECT(mode_count > 0 && modes[0].Width > 0 && modes[0].Height > 0);
+            DXGI_MODE_DESC wanted{};
+            wanted.Width = 640;
+            wanted.Height = 480;
+            wanted.RefreshRate = {60, 1};
+            wanted.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            DXGI_MODE_DESC closest{};
+            EXPECT(SUCCEEDED(output->FindClosestMatchingMode(&wanted, &closest, nullptr)));
+            EXPECT(closest.Width > 0 && closest.Height > 0);
+            EXPECT(SUCCEEDED(output->WaitForVBlank()));
+            std::printf("dxgi_window_test: output %S, %u modes, closest to 640x480 is %ux%u\n", output_desc.DeviceName,
+                        mode_count, closest.Width, closest.Height);
+        } else {
+            std::printf("dxgi_window_test: no display output (headless); the output checks are skipped\n");
+        }
+        Ref<IDXGIOutput> extra;
+        EXPECT(adapter->EnumOutputs(1, extra.out()) == DXGI_ERROR_NOT_FOUND);
     }
 
     RECT client{};
@@ -208,16 +262,26 @@ int main() {
     HWND reported_window = nullptr;
     EXPECT(SUCCEEDED(swapchain->GetHwnd(&reported_window)) && reported_window == window);
 
-    // Back buffer, view, pipeline, vertex buffer: the frame the game would record.
+    // Back buffer, views, pipeline and vertex buffer: the frame the game would record.
     Ref<ID3D12Resource> backbuffer;
     EXPECT(SUCCEEDED(swapchain->GetBuffer(0, __uuidof(ID3D12Resource), backbuffer.as_void())));
     D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{};
     rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    rtv_heap_desc.NumDescriptors = 1;
+    rtv_heap_desc.NumDescriptors = 2;
     Ref<ID3D12DescriptorHeap> rtv_heap;
     EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&rtv_heap_desc, __uuidof(ID3D12DescriptorHeap), rtv_heap.as_void())));
+    const UINT rtv_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv2 = D3D12_CPU_DESCRIPTOR_HANDLE{rtv.ptr + rtv_stride};
     if (backbuffer.p && rtv_heap.p) device->CreateRenderTargetView(backbuffer.p, nullptr, rtv);
+
+    // The second render target of the composite: a plain blue plane covering the right half of the window.
+    const D3D12_RESOURCE_DESC overlay_desc =
+        texture_desc(swap_desc.Width, swap_desc.Height, DXGI_FORMAT_R8G8B8A8_UNORM,
+                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    Ref<ID3D12Resource> overlay;
+    EXPECT(SUCCEEDED(create_texture(device.p, overlay_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, overlay.out())));
+    if (overlay.p && rtv_heap.p) device->CreateRenderTargetView(overlay.p, nullptr, rtv2);
 
     Ref<ID3D12PipelineState> pipeline;
     EXPECT(SUCCEEDED(create_pipeline(device.p, DXGI_FORMAT_R8G8B8A8_UNORM, pipeline.out())));
@@ -248,17 +312,86 @@ int main() {
                                                __uuidof(ID3D12GraphicsCommandList), list.as_void())));
     Ref<ID3D12Fence> fence;
     EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), fence.as_void())));
+    UINT64 fence_value = 0;
+    bool list_open = true;  // a list starts open; Reset only applies from the second recording on
 
-    // The capture of the first presented frame (the test's only CPU readback).
-    CaptureBuffer capture;
+    // The captures: the first Present and the PresentX composite (the test's only CPU readback).
+    CaptureBuffer capture, composite;
     EXPECT(create_capture(info, VkDeviceSize(swap_desc.Width) * swap_desc.Height * 4, capture));
+    EXPECT(create_capture(info, VkDeviceSize(swap_desc.Width) * swap_desc.Height * 4, composite));
     leonida::wsi::Presenter* presenter = rt::d3d12::presentation_target();
     EXPECT(presenter != nullptr);
-    if (presenter && capture.buffer) presenter->capture_next_frame(capture.buffer);
 
+    // One recorded frame: the triangle into the swapchain's back buffer.
+    const auto record_triangle = [&] {
+        if (!list_open) {
+            EXPECT(SUCCEEDED(allocator->Reset()));
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        }
+        list_open = false;
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->IASetVertexBuffers(0, 1, &vertex_view);
+        list->SetPipelineState(pipeline.p);
+        list->DrawInstanced(3, 1, 0, 0);
+        EXPECT(list->Close() == S_OK);
+        list_open = false;
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        return wait_for(queue.p, fence.p, ++fence_value);
+    };
+    // The overlay plane: cleared to blue, no draw.
+    const auto record_overlay = [&] {
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        const FLOAT blue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+        list->ClearRenderTargetView(rtv2, blue, 0, nullptr);
+        EXPECT(list->Close() == S_OK);
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        return wait_for(queue.p, fence.p, ++fence_value);
+    };
+
+    // 1. A plain Present, captured: the triangle covers part of the zero-filled back buffer.
+    EXPECT(record_triangle());
+    if (presenter && capture.buffer) presenter->capture_next_frame(capture.buffer);
+    EXPECT(SUCCEEDED(swapchain->Present(0, 0)));
+    vkDeviceWaitIdle(info.device);
+    const PixelCounts whole = count_pixels(capture.mapped, presenter ? presenter->extent() : VkExtent2D{},
+                                           {0, 0}, presenter ? presenter->extent() : VkExtent2D{});
+    std::printf("dxgi_window_test: first Present: %zu orange, %zu other of %u\n", whole.orange, whole.other,
+                swap_desc.Width * swap_desc.Height);
+    EXPECT(whole.orange > 0);
+    EXPECT(whole.other == 0);
+    if (capture.mapped && whole.orange)
+        write_bmp("dxgi_window.bmp", static_cast<const std::uint8_t*>(capture.mapped), swap_desc.Width,
+                  swap_desc.Height);
+
+    // 2. The PresentX composite: triangle on the left half, blue overlay on the right half, one call.
+    EXPECT(record_overlay());
+    if (presenter && composite.buffer) presenter->capture_next_frame(composite.buffer);
+    const std::uint32_t half = swap_desc.Width / 2;
+    const rt::d3d12::PresentPlane planes[] = {
+        {backbuffer.p, {}, {0, 0, LONG(half), LONG(swap_desc.Height)}},
+        {overlay.p, {}, {LONG(half), 0, LONG(swap_desc.Width), LONG(swap_desc.Height)}},
+    };
+    EXPECT(SUCCEEDED(rt::d3d12::present_x(queue.p, planes)));
+    vkDeviceWaitIdle(info.device);
+    const VkExtent2D extent = presenter ? presenter->extent() : VkExtent2D{};
+    const PixelCounts left = count_pixels(composite.mapped, extent, {0, 0}, {half, swap_desc.Height});
+    const PixelCounts right =
+        count_pixels(composite.mapped, extent, {LONG(half), 0}, {swap_desc.Width - half, swap_desc.Height});
+    std::printf("dxgi_window_test: PresentX composite: left %zu orange / %zu other, right %zu blue / %zu orange / "
+                "%zu other\n",
+                left.orange, left.other, right.blue, right.orange, right.other);
+    EXPECT(left.orange > 0);      // the triangle reached the left half
+    EXPECT(left.other == 0);
+    EXPECT(right.blue > 0);       // the overlay covers the right half
+    EXPECT(right.orange == 0);    // and the triangle did not spill into it
+    EXPECT(right.other == 0);
+
+    // 3. Frames for a while: Present normally, and five frames through PresentX (a single plane, the old path).
     int frames = 0, present_x_frames = 0;
     bool resized = false;
-    UINT64 fence_value = 0;
     const ULONGLONG start = GetTickCount64();
     bool running = true;
     while (running) {
@@ -266,9 +399,15 @@ int main() {
         const ULONGLONG elapsed = GetTickCount64() - start;
         if (!running || elapsed > kRunMilliseconds) break;
 
-        // Resize once, halfway: the swapchain recreates itself at 320x240 and the back buffer is re-acquired.
+        // Resize once, half-way: the window's client area becomes 320x240 (as a game does on WM_SIZE), then the
+        // swapchain is recreated at that size and the back buffer is re-acquired.
         if (!resized && elapsed > kResizeAtMilliseconds) {
             resized = true;
+            RECT outer{0, 0, 320, 240};
+            AdjustWindowRect(&outer, WS_OVERLAPPEDWINDOW, FALSE);
+            SetWindowPos(window, nullptr, 0, 0, outer.right - outer.left, outer.bottom - outer.top,
+                         SWP_NOMOVE | SWP_NOZORDER);
+            pump_messages(running);
             EXPECT(SUCCEEDED(swapchain->ResizeBuffers(2, 320, 240, DXGI_FORMAT_UNKNOWN, 0)));
             DXGI_SWAP_CHAIN_DESC1 after{};
             EXPECT(SUCCEEDED(swapchain->GetDesc1(&after)));
@@ -279,26 +418,11 @@ int main() {
             if (backbuffer.p) device->CreateRenderTargetView(backbuffer.p, nullptr, rtv);
         }
 
-        // One frame of recording into the swapchain's back buffer.
-        if (frames > 0) {
-            EXPECT(SUCCEEDED(allocator->Reset()));
-            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
-        }
-        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        list->IASetVertexBuffers(0, 1, &vertex_view);
-        list->SetPipelineState(pipeline.p);
-        list->DrawInstanced(3, 1, 0, 0);
-        EXPECT(list->Close() == S_OK);
-        ID3D12CommandList* lists[] = {list.p};
-        queue->ExecuteCommandLists(1, lists);
-        if (!wait_for(queue.p, fence.p, ++fence_value)) break;
-
-        // Frames 4..8 go through PresentX instead of the swapchain, to exercise the Xbox present path.
-        const bool via_present_x = frames >= 4 && frames < 9;
+        if (!record_triangle()) break;
         HRESULT presented = E_FAIL;
-        if (via_present_x) {
-            const rt::d3d12::PresentPlane planes[] = {{backbuffer.p, {}, {}}};
-            presented = rt::d3d12::present_x(queue.p, planes);
+        if (frames >= 3 && frames < 8) {
+            const rt::d3d12::PresentPlane single[] = {{backbuffer.p, {}, {}}};
+            presented = rt::d3d12::present_x(queue.p, single);
             if (SUCCEEDED(presented)) ++present_x_frames;
         } else {
             presented = swapchain->Present(0, 0);
@@ -312,41 +436,51 @@ int main() {
     pump_messages(running);
     vkDeviceWaitIdle(info.device);
 
-    // What the first present put on the swapchain: the triangle on the zero-filled target.
-    std::size_t orange = 0, lit = 0, other = 0;
-    if (capture.mapped) {
-        const auto* pixels = static_cast<const std::uint8_t*>(capture.mapped);
-        for (std::uint32_t i = 0; i < swap_desc.Width * swap_desc.Height; ++i) {
-            const std::uint8_t r = pixels[i * 4], g = pixels[i * 4 + 1], b = pixels[i * 4 + 2];
-            if (r || g || b) ++lit;
-            if (r > 200 && g > 30 && g < 120 && b < 40) ++orange;
-            else if (r || g || b) ++other;
+    // 4. Fullscreen on and off: both recreate the swapchain at a new size, and a frame is presented after each.
+    if (swapchain.p) {
+        EXPECT(SUCCEEDED(swapchain->SetFullscreenState(TRUE, nullptr)));
+        BOOL fullscreen = FALSE;
+        EXPECT(SUCCEEDED(swapchain->GetFullscreenState(&fullscreen, nullptr)) && fullscreen);
+        backbuffer.p->Release();
+        backbuffer.p = nullptr;
+        EXPECT(SUCCEEDED(swapchain->GetBuffer(0, __uuidof(ID3D12Resource), backbuffer.as_void())));
+        if (backbuffer.p) device->CreateRenderTargetView(backbuffer.p, nullptr, rtv);
+        if (backbuffer.p) {
+            record_triangle();
+            EXPECT(SUCCEEDED(swapchain->Present(0, 0)));
         }
+        EXPECT(SUCCEEDED(swapchain->SetFullscreenState(FALSE, nullptr)));
+        EXPECT(SUCCEEDED(swapchain->GetFullscreenState(&fullscreen, nullptr)) && !fullscreen);
+        backbuffer.p->Release();
+        backbuffer.p = nullptr;
+        EXPECT(SUCCEEDED(swapchain->GetBuffer(0, __uuidof(ID3D12Resource), backbuffer.as_void())));
+        if (backbuffer.p) device->CreateRenderTargetView(backbuffer.p, nullptr, rtv);
+        if (backbuffer.p) {
+            record_triangle();
+            EXPECT(SUCCEEDED(swapchain->Present(0, 0)));
+        }
+        vkDeviceWaitIdle(info.device);
     }
+
     UINT last_present = 0;
     swapchain->GetLastPresentCount(&last_present);
-    if (capture.mapped && orange)
-        write_bmp("dxgi_window.bmp", static_cast<const std::uint8_t*>(capture.mapped), swap_desc.Width,
-                  swap_desc.Height);
-    std::printf("dxgi_window_test: %d frames (%d via PresentX), %zu/%u captured pixels lit (%zu orange), last "
-                "present count %u\n",
-                frames, present_x_frames, lit, swap_desc.Width * swap_desc.Height, orange, last_present);
+    std::printf("dxgi_window_test: %d frames (%d via PresentX), last present count %u\n", frames, present_x_frames,
+                last_present);
 
     std::FILE* log = std::fopen("dxgi_window.log", "w");
     if (log) {
-        std::fprintf(log, "dxgi=1 present_x=%d frames=%d orange=%zu lit=%zu presents=%u\n", present_x_frames, frames,
-                     orange, lit, last_present);
+        std::fprintf(log, "dxgi=1 present_x=%d frames=%d orange=%zu composite=%zu/%zu presents=%u\n",
+                     present_x_frames, frames, whole.orange, left.orange, right.blue, last_present);
         std::fclose(log);
     }
 
     destroy_capture(info, capture);
+    destroy_capture(info, composite);
     DestroyWindow(window);
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
 
     EXPECT(frames > 0);
-    EXPECT(present_x_frames == 5);   // the PresentX frames all went through the layer's present path
-    EXPECT(orange > 0);              // the DXGI present put the triangle on the swapchain image
-    EXPECT(other == 0);
+    EXPECT(present_x_frames == 5);
     EXPECT(last_present > 0);
 
     if (failures) {
