@@ -453,5 +453,147 @@ class TestVSadU32U16ScalarInterpreter(unittest.TestCase):
             self.assertEqual(res, expected)
             self.assertEqual(self.state.vgprs[0], expected)
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    """Vector execution state for Wave32 and Wave64 SIMD architectures."""
+    num_lanes: int = 32
+    exec_mask: int = MASK32
+    vgprs: List[List[int]] = field(default_factory=list)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"Invalid SIMD lane count {self.num_lanes}, must be 32 or 64")
+        if not self.vgprs:
+            self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        mask_limit = MASK32 if self.num_lanes == 32 else MASK64
+        self.exec_mask &= mask_limit
+
+    def is_lane_active(self, lane: int) -> bool:
+        """Query whether a SIMD work-item lane is active under current EXEC mask."""
+        return bool((self.exec_mask >> lane) & 1)
+
+    def read_lane(self, op: Operand, lane: int) -> int:
+        """Read operand value for a specific SIMD lane."""
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[lane][op.index] & MASK32
+        if op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        assert op.literal_value is not None
+        return op.literal_value & MASK32
+
+    def write_lane(self, op: Operand, lane: int, value: int) -> None:
+        """Write 32-bit dword to destination VGPR for a specific SIMD lane."""
+        assert op.reg_type == RegType.VGPR
+        self.vgprs[lane][op.index] = value & MASK32
+
+
+class SIMDInterpreter:
+    """SIMD vector interpreter modeling Wave32 / Wave64 lane divergence and EXEC masking."""
+
+    def step(self, instr: VSadU32U16Instruction, state: SIMDState) -> List[Optional[int]]:
+        """Execute a v_sad_u32_u16 instruction across all SIMD lanes under EXEC masking."""
+        results: List[Optional[int]] = []
+        for lane in range(state.num_lanes):
+            if state.is_lane_active(lane):
+                s0 = state.read_lane(instr.src0, lane)
+                s1 = state.read_lane(instr.src1, lane)
+                s2 = state.read_lane(instr.src2, lane)
+
+                res = ref_sad_u32_u16(
+                    s0,
+                    s1,
+                    s2,
+                    op_sel0=instr.op_sel0,
+                    op_sel1=instr.op_sel1,
+                    clamp=instr.clamp,
+                )
+                state.write_lane(instr.dst, lane, res)
+                results.append(res)
+            else:
+                results.append(None)
+        return results
+
+
+class TestVSadU32U16SIMD(unittest.TestCase):
+    """Test suite verifying SIMD execution, lane divergence, and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDInterpreter()
+
+    def test_simd_wave32_full_exec(self) -> None:
+        """Wave32 execution with all 32 lanes active."""
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFF_FFFF)
+        for lane in range(32):
+            state.vgprs[lane][1] = lane
+            state.vgprs[lane][2] = 0
+            state.vgprs[lane][3] = 0x0001_0000
+
+        instr = VSadU32U16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+
+        results = self.interp.step(instr, state)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            expected = lane + 0x0001_0000
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.vgprs[lane][0], expected)
+
+    def test_simd_wave64_full_exec(self) -> None:
+        """Wave64 execution with all 64 lanes active."""
+        state = SIMDState(num_lanes=64, exec_mask=MASK64)
+        for lane in range(64):
+            state.vgprs[lane][1] = 50
+            state.vgprs[lane][2] = 0
+            state.vgprs[lane][3] = lane
+
+        instr = VSadU32U16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+
+        results = self.interp.step(instr, state)
+        self.assertEqual(len(results), 64)
+        for lane in range(64):
+            expected = 50 + lane
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(state.vgprs[lane][0], expected)
+
+    def test_simd_wave32_divergence_mask(self) -> None:
+        """Wave32 divergent execution: only even lanes active (0x55555555)."""
+        sentinel = 0xCAFE_BABE
+        state = SIMDState(num_lanes=32, exec_mask=0x5555_5555)
+        for lane in range(32):
+            state.vgprs[lane][0] = sentinel
+            state.vgprs[lane][1] = 0x0000_FFFF
+            state.vgprs[lane][2] = 0x0000_0000
+            state.vgprs[lane][3] = 0
+
+        instr = VSadU32U16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+
+        results = self.interp.step(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], 0xFFFF)
+                self.assertEqual(state.vgprs[lane][0], 0xFFFF)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.vgprs[lane][0], sentinel)
+
 if __name__ == "__main__":
     unittest.main()
