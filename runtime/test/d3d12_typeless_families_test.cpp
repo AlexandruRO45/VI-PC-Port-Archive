@@ -7,7 +7,10 @@
 // compiled by d3dcompiler_47). The layer's shaders are GLSL stand-ins for translated ones (test/glsl/vs_fullscreen.vert,
 // ps_typeless_float.frag, ps_typeless_uint.frag), found by the FSSM hash of their containers in a translator-style
 // index; without glslangValidator at build time only the clears run. The draws run twice: into a 4x4 2D texture and
-// into a 4-texel 1D one through a TEXTURE1D RTV (a 1D attachment view).
+// into a 4-texel 1D one through a TEXTURE1D RTV (a 1D attachment view). Each shape runs twice where the device has
+// room for both push-constant layouts: with the 144-byte VS, and with its --pc-tail-ubo twin (vs_fullscreen.vert
+// compiled with -DPC_TAIL, 128 bytes) on a layer device limited to 128 bytes, the Vulkan minimum. A device below 144
+// bytes cannot build the 144-byte PSO and runs the twin alone (TEST-613). Each is compared with the host.
 // A view format the layer does not map yet (its CheckFeatureSupport gives no RENDER_TARGET) is reported and skipped,
 // so the R8 family and the 16-bit integer and normalized formats are covered as soon as their mapping lands.
 // Synthetic data only. LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation.
@@ -279,6 +282,28 @@ int main() {
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
     }
     info.shader_dir = library.string();
+    // The --pc-tail-ubo twin: the same pixel shaders (they declare no push constants) with the 128-byte VS.
+    const auto tail_library = std::filesystem::temp_directory_path() / "leonida_typeless_families_test_tail";
+    std::filesystem::create_directories(tail_library);
+    std::filesystem::copy_file(LEONIDA_TYPELESS_VS_TAIL_SPV, tail_library / "vs.spv", overwrite);
+    std::filesystem::copy_file(LEONIDA_TYPELESS_PS_FLOAT_SPV, tail_library / "ps_float.spv", overwrite);
+    std::filesystem::copy_file(LEONIDA_TYPELESS_PS_UINT_SPV, tail_library / "ps_uint.spv", overwrite);
+    {
+        std::ofstream index(tail_library / "index.json", std::ios::binary);
+        index << "{\"vs\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, \"input_signature\": []},\n"
+                 " \"ps_float\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_float_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, \"outputs\": [0]},\n"
+                 " \"ps_uint\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_uint_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, \"outputs\": [0]}}";
+    }
+    rt::d3d12::VulkanDeviceInfo limited = info;
+    limited.shader_dir = tail_library.string();
+    limited.max_push_constants_size = 128;
+    limited.push_constants_need_fallback = true;
+    Ref<ID3D12Device> ours_tail;
+    if (FAILED(rt::d3d12::create_vulkan_device(limited, IID_PPV_ARGS(&ours_tail.p)))) return 1;
+    if (!rt::d3d12::device_push_constants_need_fallback(ours_tail.p)) return 1;
 #endif
     Ref<ID3D12Device> ours, host, warp;
     std::string adapter;
@@ -388,6 +413,19 @@ int main() {
         {DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM, false},
         {DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UINT, true},
     };
+    // The 144-byte layout where the device has room for it, and the --pc-tail-ubo twin on the 128-byte device always.
+    const bool short_device = rt::d3d12::device_push_constants_need_fallback(ours.p);
+    if (short_device)
+        std::printf("this device's maxPushConstantsSize is %u, below the 144 bytes the full VS declares: the "
+                    "--pc-tail-ubo twin draws alone\n",
+                    rt::d3d12::device_max_push_constants_size(ours.p));
+    struct Layout {
+        const char* name;
+        ID3D12Device* device;
+    };
+    std::vector<Layout> layouts;
+    if (!short_device) layouts.push_back({"144 B", ours.p});
+    layouts.push_back({"pc-tail", ours_tail.p});
     for (const bool line : {false, true}) {
         for (const auto& c : draws) {
             if (!renders(ours.p, c.typeless, c.view)) {
@@ -397,29 +435,35 @@ int main() {
                 continue;
             }
             const char* shape = line ? "1D " : "";
-            std::vector<unsigned char> mine, reference;
+            std::vector<unsigned char> reference;
             if (!render_and_read(host.p, c.typeless, c.view, nullptr, c.uint ? &host_uint : &host_float, reference,
                                  line)) {
                 std::fprintf(stderr, "typeless %d view %d %sdraw: the host refused\n", int(c.typeless), int(c.view),
                              shape);
                 return 1;
             }
-            if (!render_and_read(ours.p, c.typeless, c.view, nullptr, c.uint ? &ours_uint : &ours_float, mine,
-                                 line)) {
-                std::fprintf(stderr, "typeless %d view %d %sdraw: the layer failed\n", int(c.typeless), int(c.view),
-                             shape);
-                return 1;
-            }
-            ++drawn;
-            const bool same = mine == reference;
-            draws_failed += !same;
             const std::size_t texel = reference.size() / (line ? 4 : 16);
-            std::printf("typeless %d view %d %sdraw (%s): host %s, layer %s%s\n", int(c.typeless), int(c.view), shape,
-                        c.uint ? "7, 300, 1000, 3" : "0.5, -2, 1.5, 0.25", hex(reference, texel).c_str(),
-                        hex(mine, texel).c_str(), same ? "" : "  MISMATCH");
+            for (const auto& layout : layouts) {
+                std::vector<unsigned char> mine;
+                if (!render_and_read(layout.device, c.typeless, c.view, nullptr, c.uint ? &ours_uint : &ours_float,
+                                     mine, line)) {
+                    std::fprintf(stderr, "typeless %d view %d %sdraw: the layer (%s) failed\n", int(c.typeless),
+                                 int(c.view), shape, layout.name);
+                    return 1;
+                }
+                ++drawn;
+                const bool same = mine == reference;
+                draws_failed += !same;
+                std::printf("typeless %d view %d %sdraw (%s): host %s, layer (%s) %s%s\n", int(c.typeless),
+                            int(c.view), shape, c.uint ? "7, 300, 1000, 3" : "0.5, -2, 1.5, 0.25",
+                            hex(reference, texel).c_str(), layout.name, hex(mine, texel).c_str(),
+                            same ? "" : "  MISMATCH");
+            }
         }
     }
-    std::printf("%u draws compared with %s, %u differ\n", drawn, adapter.c_str(), draws_failed);
+    std::printf("%u draws compared with %s (%s), %u differ\n", drawn, adapter.c_str(),
+                short_device ? "the --pc-tail-ubo VS alone" : "the 144-byte VS and its --pc-tail-ubo twin",
+                draws_failed);
 #endif
     if (vk.validation_errors()) {
         std::fprintf(stderr, "%u Vulkan validation errors\n", vk.validation_errors());

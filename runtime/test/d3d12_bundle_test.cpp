@@ -10,6 +10,10 @@
 // (the default adapter inherits the parent's topology when it does not, WARP removes the device, so that is not
 // asserted). The layer alone is also checked for the order of a bundle's commands in its parent, for the trace
 // (one line per call the application made, however often the bundle runs) and for object lifetimes.
+// The layer runs every scenario twice where the device has room for both push-constant layouts: with the 144-byte
+// shaders, and with their --pc-tail-ubo twins (the same GLSL compiled with -DPC_TAIL: 128 push-constant bytes per
+// stage, the PS's heap base in a set-1 uniform block) on a layer device limited to 128 bytes, the Vulkan minimum. A
+// device below 144 bytes cannot build the 144-byte PSOs and runs the twins alone (TEST-613). Both are held to the table.
 // Both host adapters always run (LEONIDA_HOST_ADAPTER is not read), except under Wine, where the host is skipped.
 // No game data.
 #include "test_temp_dir.h"
@@ -35,8 +39,9 @@
 #include <variant>
 #include <vector>
 
-#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV)
-#error "LEONIDA_TEST_VS_SPV and LEONIDA_TEST_PS_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_TAIL_SPV) || \
+    !defined(LEONIDA_TEST_PS_TAIL_SPV)
+#error "LEONIDA_TEST_{VS,PS}{,_TAIL}_SPV must name the compiled test shaders"
 #endif
 
 #define CHECK(condition) do { \
@@ -766,24 +771,46 @@ int main() {
     const auto vs_program = fssm_program({0x56530101, 0xbf810000});
     const auto ps_program = fssm_program({0x50530101, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
-    const testfiles::ScratchDir scratch("leonida_bundle_test");  // removed on every way out of main
+    // Removed on every way out of main. One library folder per push-constant layout.
+    const testfiles::ScratchDir scratch("leonida_bundle_test");
+    const testfiles::ScratchDir tail_scratch("leonida_bundle_test_tail");
     const auto& library = scratch.path();
+    const auto& tail_library = tail_scratch.path();
     REQUIRE(testfiles::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv"));
     REQUIRE(testfiles::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv"));
+    REQUIRE(testfiles::copy_file(LEONIDA_TEST_VS_TAIL_SPV, tail_library / "vs_draw_tail.spv"));
+    REQUIRE(testfiles::copy_file(LEONIDA_TEST_PS_TAIL_SPV, tail_library / "ps_draw_tail.spv"));
+    constexpr char vs_inputs[] =
+        "\"input_signature\": ["
+        "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
+        "\"system_value\": 0, \"component_type\": \"float\"}, "
+        "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
+        "\"system_value\": 0, \"component_type\": \"float\"}]";
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs_draw\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": ["
-                 "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
-                 "\"system_value\": 0, \"component_type\": \"float\"}, "
-                 "{\"semantic\": \"POSITION\", \"semantic_index\": 0, \"register\": 1, \"mask\": 3, \"rw_mask\": 3, "
-                 "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
-                 " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, " << vs_inputs << "},\n"
+              << " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
     }
+    {
+        // The VS reads neither heap nor code base, so it has no set-1 block; the PS reads the heap base from it.
+        std::ofstream index(tail_library / "index.json", std::ios::binary);
+        index << "{\"vs_draw_tail\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, " << vs_inputs << "},\n"
+              << " \"ps_draw_tail\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 128, "
+                 "\"pc_tail\": {\"set\": 1, \"binding\": 0, \"bytes\": 16}, \"outputs\": [0]}}";
+    }
     const unsigned errors_before = vk.validation_errors();
-    std::vector<std::string> layer_grids;
-    std::vector<HRESULT> layer_closes;
+    struct LayerRun {
+        const char* name = "";
+        bool ran = false;
+        std::vector<std::string> grids;
+        std::vector<HRESULT> closes;
+    } layers[2];
+    layers[0].name = "the layer (144-byte push constants)";
+    layers[1].name = "the layer (--pc-tail-ubo, 128 bytes)";
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = vk.instance_proc;
@@ -796,8 +823,29 @@ int main() {
         info.shader_dir = library.string();
         Ref<ID3D12Device> ours;
         REQUIRE(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p))));
-        REQUIRE(run_all(ours.p, false, nullptr, vs_container, ps_container, list, layer_grids, layer_closes));
-        REQUIRE(layer_checks(ours.p, vs_container, ps_container, library));
+        if (rt::d3d12::device_push_constants_need_fallback(ours.p)) {
+            std::printf("this device's maxPushConstantsSize is %u, below the 144 bytes the full shaders declare: "
+                        "the --pc-tail-ubo twins run alone\n",
+                        rt::d3d12::device_max_push_constants_size(ours.p));
+        } else {
+            REQUIRE(run_all(ours.p, false, nullptr, vs_container, ps_container, list, layers[0].grids,
+                            layers[0].closes));
+            REQUIRE(layer_checks(ours.p, vs_container, ps_container, library));
+            layers[0].ran = true;
+        }
+
+        // The twins on a device limited to the Vulkan minimum of 128 push-constant bytes, which is what a device
+        // below 144 bytes is anyway; on one with more room it is the fallback path the device would not take.
+        rt::d3d12::VulkanDeviceInfo limited = info;
+        limited.shader_dir = tail_library.string();
+        limited.max_push_constants_size = 128;
+        limited.push_constants_need_fallback = true;
+        Ref<ID3D12Device> tail;
+        REQUIRE(SUCCEEDED(rt::d3d12::create_vulkan_device(limited, IID_PPV_ARGS(&tail.p))));
+        REQUIRE(rt::d3d12::device_push_constants_need_fallback(tail.p));
+        REQUIRE(run_all(tail.p, false, nullptr, vs_container, ps_container, list, layers[1].grids, layers[1].closes));
+        REQUIRE(layer_checks(tail.p, vs_container, ps_container, tail_library));
+        layers[1].ran = true;
     }
 
     // The host: Windows' D3D12 on the default adapter and on WARP.
@@ -842,14 +890,17 @@ int main() {
     };
     for (std::size_t i = 0; i < list.size(); ++i) {
         if (!list[i].expected) {
-            std::printf("%s | layer %s", list[i].name, layer_grids[i].c_str());
+            std::printf("%s", list[i].name);
+            for (const auto& layer : layers)
+                if (layer.ran) std::printf(" | %s %s", layer.name, layer.grids[i].c_str());
             for (const auto& host : hosts)
                 if (host.ran) std::printf(" | %s %s", host.name, host.grids[i].c_str());
             std::printf("\n");
             ++failures;
             continue;
         }
-        verdict("the layer", list[i], layer_grids[i], layer_closes[i]);
+        for (const auto& layer : layers)
+            if (layer.ran) verdict(layer.name, list[i], layer.grids[i], layer.closes[i]);
         for (const auto& host : hosts) {
             if (!host.ran) continue;
             if (&host == &hosts[0] && list[i].warp_oracle_only) {
@@ -872,7 +923,8 @@ int main() {
     }
     if (!hosts[0].ran && !hosts[1].ran && !hostwine::host_is_wine())
         std::fprintf(stderr, "no D3D12 reference device (default adapter or WARP)\n");
-    std::printf("bundles: %zu scenarios on the layer, %u host comparisons, %u failures\n", list.size(), compared,
-                failures);
+    std::printf("bundles: %zu scenarios on the layer with %s, %u host comparisons, %u failures\n", list.size(),
+                layers[0].ran ? "144-byte push constants and the --pc-tail-ubo twins" : "the --pc-tail-ubo twins alone",
+                compared, failures);
     return failures ? 1 : 0;
 }

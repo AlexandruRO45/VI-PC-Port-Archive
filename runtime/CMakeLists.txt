@@ -1769,6 +1769,16 @@ if(TARGET Vulkan::Headers)
         target_sources(d3d12_typeless_families_test PRIVATE ${binary})
         target_compile_definitions(d3d12_typeless_families_test PRIVATE ${definition}="${binary}")
       endforeach()
+      # The VS's --pc-tail-ubo twin (TEST-613): 128 push-constant bytes, so the draws also run on a device whose
+      # maxPushConstantsSize is the 128-byte Vulkan minimum. The pixel shaders declare no push constants.
+      set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/typeless_vs_tail.spv)
+      add_custom_command(OUTPUT ${binary}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -DPC_TAIL -o ${binary}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_fullscreen.vert
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/vs_fullscreen.vert
+        COMMENT "Compiling the --pc-tail-ubo typeless draw test shader vs_fullscreen.vert" VERBATIM)
+      target_sources(d3d12_typeless_families_test PRIVATE ${binary})
+      target_compile_definitions(d3d12_typeless_families_test PRIVATE LEONIDA_TYPELESS_VS_TAIL_SPV="${binary}")
     else()
       message(STATUS "glslangValidator not found: d3d12_typeless_families_test runs its clears only")
     endif()
@@ -2520,11 +2530,15 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_pipeline_library_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_pipeline_library COMMAND d3d12_pipeline_library_test)
       set_tests_properties(d3d12_pipeline_library PROPERTIES SKIP_RETURN_CODE 77)
-      # ExecuteBundle: what a bundle's draws inherit and hand back, against the host runtime and WARP.
-      add_executable(d3d12_bundle_test test/d3d12_bundle_test.cpp ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
+      # ExecuteBundle: what a bundle's draws inherit and hand back, against the host runtime and WARP. The draw
+      # shaders' --pc-tail-ubo twins (TEST-613) run the same scenarios on a 128-byte push-constant device.
+      add_executable(d3d12_bundle_test test/d3d12_bundle_test.cpp ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS}
+                     ${LEONIDA_TEST_VS_TAIL} ${LEONIDA_TEST_PS_TAIL})
       target_link_libraries(d3d12_bundle_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
       target_compile_definitions(d3d12_bundle_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS
-                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_VS_TAIL_SPV="${LEONIDA_TEST_VS_TAIL}"
+                                 LEONIDA_TEST_PS_TAIL_SPV="${LEONIDA_TEST_PS_TAIL}")
       target_compile_options(d3d12_bundle_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bundle COMMAND d3d12_bundle_test)
       set_tests_properties(d3d12_bundle PROPERTIES SKIP_RETURN_CODE 77)

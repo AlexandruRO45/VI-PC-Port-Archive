@@ -1,14 +1,17 @@
 #version 460
 // A vertex shader with no vertex inputs, written to the translator's runtime contract (docs/design.md, "User data"),
 // standing in for a translated full-screen pass in d3d12_draw_test: its pipeline has no vertex bindings. Vertices 0,
-// 1 and 2 make one triangle that covers the whole viewport, and the colour is yellow.
+// 1 and 2 make one triangle that covers the whole viewport, and the colour is yellow. Compiled with -DPC_TAIL it is a
+// shader translated with --pc-tail-ubo that reads neither heap base nor code base (128 push-constant bytes, no set 1).
 
 layout(location = 0) out vec4 out_color;
 
 layout(push_constant) uniform UserData {
     uint s[32];
+#ifndef PC_TAIL
     uvec2 heap_base;
     uvec2 code_base;
+#endif
 } pc;
 
 void main() {
