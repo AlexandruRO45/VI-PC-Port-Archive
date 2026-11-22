@@ -45,6 +45,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -2132,6 +2133,9 @@ public:
     std::vector<detail::PreparedCopy> copies;
     std::size_t copy_count = 0;
     std::vector<detail::PreparedQuery> queries;
+    // The resolve runs' storage of the last execution's queries, emptied, for this execution's ResolveQueryData:
+    // `queries` is refilled from empty, and each PreparedQuery's own vector would otherwise be made again.
+    std::vector<std::vector<detail::QueryResolveRun>> spare_resolves;
     VkQueryPool segment_pool = VK_NULL_HANDLE;
     std::uint32_t segment_base = 0;
     std::uint32_t segment_count = 0;
@@ -2344,6 +2348,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.commands.assign(commands.size(), {});
     out.draw_count = 0;
     out.copy_count = 0;
+    for (auto& query : out.queries) {
+        if (!query.resolves.capacity()) continue;
+        query.resolves.clear();
+        out.spare_resolves.push_back(std::move(query.resolves));
+    }
     out.queries.clear();
     out.segment_pool = VK_NULL_HANDLE;
     out.segment_base = out.segment_count = 0;
@@ -2772,7 +2781,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     out.readback_src_stages |= VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
                 }
             }
-            out.queries.push_back({i, heap, statistics_active});
+            auto& query = out.queries.emplace_back(detail::PreparedQuery{i, heap, statistics_active});
+            if (std::holds_alternative<ResolveQueries>(command) && !out.spare_resolves.empty()) {
+                query.resolves = std::move(out.spare_resolves.back());
+                out.spare_resolves.pop_back();
+            }
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
             const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
@@ -2876,6 +2889,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
 // Keep every physical pool referenced by the recorded batch alive until that batch completes.
 class QueryReplay {
 public:
+    QueryReplay() = default;
+    QueryReplay(const QueryReplay&) = delete;  // pending_ allocates from arena_
+    QueryReplay& operator=(const QueryReplay&) = delete;
+
     // `statistics_pool` holds the list's pipeline-statistics segments (plan_statistics_segments). Without one, the
     // list's statistics queries are not split: ordinary helper commands are refused, as are resolves that dispatch.
     ReplayResult plan(PreparedList& list, const std::shared_ptr<const OcclusionSegmentPool>& pool = {},
@@ -2991,7 +3008,10 @@ private:
         if (std::find(retained.begin(), retained.end(), pool) == retained.end()) retained.push_back(pool);
     }
 
-    std::map<std::pair<QueryPool*, std::uint32_t>, Value> pending_;
+    // One node per query a submission begins or ends. A QueryReplay lives for one submission and pending_ never
+    // erases, so its nodes come from an arena that grows in a few blocks instead of one allocation per node.
+    std::pmr::monotonic_buffer_resource arena_{4096};
+    std::pmr::map<std::pair<QueryPool*, std::uint32_t>, Value> pending_{&arena_};
 };
 
 inline void emit_query(const PreparedList& list, const detail::PreparedQuery& query, VkCommandBuffer cb,

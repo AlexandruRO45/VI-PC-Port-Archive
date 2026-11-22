@@ -562,6 +562,13 @@ int main(int argc, char** argv) {
             },
             reps, warmup);
         check(kind.name, r);
+        // Preparing a list kept from the last run allocates nothing for any kind, but for the first block of
+        // QueryReplay's arena when the list has queries: at most one allocation per list.
+        if (self_test && r.prepare.allocations * double(r.commands) > 1.5) {
+            std::fprintf(stderr, "FAIL %s: %.0f allocations preparing %zu commands\n", kind.name,
+                         r.prepare.allocations * double(r.commands), r.commands);
+            ++failures;
+        }
         if (!self_test) print_row(kind.name, r, csv);
     }
     const auto frame = [&](CommandList& list) {
