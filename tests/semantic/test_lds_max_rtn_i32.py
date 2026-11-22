@@ -261,6 +261,53 @@ class DSMaxRtnI32Instruction:
 
 
 # ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarThreadState:
+    """Scalar thread architectural execution state (VGPRs, SGPRs, and LDS reference)."""
+
+    def __init__(self, lds: Optional[LDSMemory] = None) -> None:
+        self.vgprs: List[int] = [0] * DEFAULT_NUM_VGPRS
+        self.sgprs: List[int] = [0] * DEFAULT_NUM_SGPRS
+        self.m0: int = 0
+        self.vcc: int = 0
+        self.scc: int = 0
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx]
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = u32(val)
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs[idx]
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = u32(val)
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar execution interpreter for Data Share (DS) instructions."""
+
+    def execute(self, state: ScalarThreadState, inst: DSMaxRtnI32Instruction) -> int:
+        """Execute ds_max_rtn_i32 on the scalar thread state.
+
+        1. Read address from inst.vaddr VGPR.
+        2. Read data from inst.vdata0 VGPR.
+        3. Perform atomic signed maximum on LDS at eff_addr = vaddr + offset.
+        4. Write original memory value into inst.vdst VGPR.
+        5. Returns the returned old memory value.
+        """
+        vaddr = state.get_vgpr(inst.vaddr.index)
+        vdata = state.get_vgpr(inst.vdata0.index)
+        old_val, _ = state.lds.atomic_max_rtn_i32(vaddr, vdata, inst.offset)
+        state.set_vgpr(inst.vdst.index, old_val)
+        return old_val
+
+
+# ==============================================================================
 # Unit Tests
 # ==============================================================================
 
@@ -426,6 +473,119 @@ class TestDSMaxRtnI32AST(unittest.TestCase):
         inst = DSMaxRtnI32Instruction(vdst=vdst, vaddr=vaddr, vdata0=vdata0, offset=60)
         parsed = DSMaxRtnI32Instruction.parse(inst.to_assembly())
         self.assertEqual(inst, parsed)
+
+
+class TestDSMaxRtnI32ScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=1024)
+        self.state = ScalarThreadState(lds=self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_execution_signed_positive_update(self) -> None:
+        # Memory initially -50, operand 10 -> memory becomes 10, vdst receives -50
+        addr = 0x20
+        self.lds.write_dword(addr, u32(-50))
+        self.state.set_vgpr(1, addr)         # vaddr
+        self.state.set_vgpr(2, 10)           # vdata0
+        self.state.set_vgpr(0, 0xCAFEBABE)   # vdst initial canary
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, u32(-50))
+        self.assertEqual(self.state.get_vgpr(0), u32(-50))
+        self.assertEqual(self.lds.read_dword(addr), 10)
+
+    def test_scalar_execution_signed_no_update(self) -> None:
+        # Memory initially 100, operand -200 -> memory remains 100, vdst receives 100
+        addr = 0x80
+        self.lds.write_dword(addr, 100)
+        self.state.set_vgpr(1, addr)
+        self.state.set_vgpr(2, u32(-200))
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 100)
+        self.assertEqual(self.state.get_vgpr(0), 100)
+        self.assertEqual(self.lds.read_dword(addr), 100)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        # Address in VGPR is 0x40, offset is 0x10 -> effective address is 0x50
+        base_addr = 0x40
+        offset = 0x10
+        eff_addr = base_addr + offset
+        self.lds.write_dword(eff_addr, u32(-10))
+        self.state.set_vgpr(1, base_addr)
+        self.state.set_vgpr(2, 5)
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+            offset=offset,
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, u32(-10))
+        self.assertEqual(self.state.get_vgpr(0), u32(-10))
+        self.assertEqual(self.lds.read_dword(eff_addr), 5)
+        # Verify base address was untouched
+        self.assertEqual(self.lds.read_dword(base_addr), 0)
+
+    def test_scalar_execution_sequential_running_maximum(self) -> None:
+        addr = 0x100
+        self.lds.write_dword(addr, u32(-100))
+        self.state.set_vgpr(1, addr)
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        steps = [
+            (-50, -100, -50),
+            (-75, -50, -50),
+            (0, -50, 0),
+            (25, 0, 25),
+            (10, 25, 25),
+            (INT32_MAX, 25, INT32_MAX),
+            (1000, INT32_MAX, INT32_MAX),
+        ]
+
+        for op_val, expected_old, expected_new in steps:
+            self.state.set_vgpr(2, u32(op_val))
+            ret = self.interp.execute(self.state, inst)
+            self.assertEqual(s32(ret), expected_old)
+            self.assertEqual(s32(self.state.get_vgpr(0)), expected_old)
+            self.assertEqual(s32(self.lds.read_dword(addr)), expected_new)
+
+    def test_scalar_unaligned_address_drop_low_bits(self) -> None:
+        self.lds.write_dword(0x20, 77)
+        # Low 2 bits of 0x23 are 0b11; should map to aligned 0x20
+        self.state.set_vgpr(1, 0x23)
+        self.state.set_vgpr(2, 99)
+
+        inst = DSMaxRtnI32Instruction(
+            vdst=RegisterOperand(0, RegType.VGPR),
+            vaddr=RegisterOperand(1, RegType.VGPR),
+            vdata0=RegisterOperand(2, RegType.VGPR),
+        )
+
+        ret = self.interp.execute(self.state, inst)
+        self.assertEqual(ret, 77)
+        self.assertEqual(self.lds.read_dword(0x20), 99)
 
 
 if __name__ == "__main__":
