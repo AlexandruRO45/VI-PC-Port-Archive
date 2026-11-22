@@ -109,13 +109,16 @@ def test_parked_masks():
 def test_masks_through_a_vgpr():
     use = ins("s_mov_b32", sp("exec_lo"), s(3))
     masks = [ins("s_mov_b32", s(3), sp("exec_lo")), ins("v_cmp_eq_u32_e64", s(47), v(1), v(2))]
-    # An OR of two masks done in the vector unit and read back: still a mask, through v51.
+    # An OR of two masks done in the vector unit reads them as data: the wave's bits, gathered before the op,
+    # written to the lanes EXEC has on (SHADER-402). The VGPR holds data, and so does the SGPR read back from it:
+    # used as a mask, each lane takes its own bit of it (#1792).
     via = [ins("v_or_b32_e32", v(51), s(3), s(47)), ins("v_or3_b32", v(51), s(3), s(47), v(51)),
            ins("v_readfirstlane_b32", s(3), v(51))]
     blocks = [masks + via + [use]]
     got, writes = L.analyse(blocks, [[]])
-    assert set(got[id(use)]) == {3, 47, ("v", 51)}
-    assert writes == {id(via[0]), id(via[1])}
+    assert set(got[id(use)]) == {47} and writes == set()
+    assert not any(isinstance(k, tuple) for k in got[id(via[2])])
+    assert set(reads_of(masks + via, 2)) == set(reads_of(masks + via, 3)) == {("sgpr", 3), ("sgpr", 47)}
     # A v_mov_b32 copy of a mask SGPR is data: the wave's bits, gathered at the copy (#210), in the lanes EXEC has
     # on (SHADER-21 part 2). Read back, it is data too, so EXEC takes each lane's bit of it.
     copied = [ins("v_mov_b32_e32", v(51), s(3)), ins("v_readfirstlane_b32", s(3), v(51))]
@@ -133,16 +136,16 @@ def test_masks_through_a_vgpr():
 def test_vmov_mask_copy_is_exec_gated():
     # SHADER-21 part 2: a mask copied into a VGPR with v_mov_b32 is an ordinary
     # VALU write, so inactive lanes keep the old VGPR; it holds the wave's bits as data
-    # (#210). Only per-lane mask computations (v_or3_b32 etc.) take the all-lanes store.
+    # (#210). So does a mask computed in the vector unit (v_or3_b32 etc., SHADER-402).
     cmp_ = ins("v_cmp_lt_u32_e64", sp("vcc_lo"), v(5), v(6))
     copy = ins("v_mov_b32_e32", v(2), sp("vcc_lo"))
     calc = ins("v_or3_b32", v(3), sp("vcc_lo"), sp("vcc_lo"), sp("vcc_lo"))
     use = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
     blocks = [[cmp_, copy, calc, use]]
     got, writes = L.analyse(blocks, [[]])
-    assert ("v", 2) not in got[id(use)] and ("v", 3) in got[id(use)]
-    assert writes == {id(calc)}
+    assert not any(isinstance(k, tuple) for k in got[id(use)]) and writes == set()
     assert reads_of([cmp_, copy], 1) == {("special", "vcc_lo"): L.MASK_LO}   # gathered at the copy (#210)
+    assert reads_of([cmp_, copy, calc], 2) == {("special", "vcc_lo"): L.MASK_LO}
 
 
 def test_bfm64_and_half_kinds():
@@ -216,12 +219,16 @@ def test_data_reads():
     store = ins("buffer_store_dword", v(10), v(2), s(0, 4), imm(0))
     assert reads_of([cmp, mov]) == {("sgpr", 20): L.MASK_LO}
     assert reads_of([cmp, mov, store]) == {}
-    # A mask computed in the vector unit (every lane written) stays one bit per lane, gathered where it is read.
+    # A mask computed in the vector unit is gathered there too, and written to the active lanes only
+    # (cs_mask_vgpr_or, SHADER-402). The two halves of a wave64 mask meeting in one VGPR are each gathered
+    # (cs_wm_vgpr_halves).
     vor = ins("v_or_b32_e32", v(10), s(20), s(20))
-    assert reads_of([cmp, vor]) == {}
-    assert reads_of([cmp, vor, store]) == {("vgpr", 10): L.MASK_LO}
-    # One lane of that VGPR then overwritten with data (v_writelane): no gather, which would take the lane's data
-    # as its bit (crosslane_fuzz seed 6, cs_xl32_600042).
+    assert reads_of([cmp, vor]) == {("sgpr", 20): L.MASK_LO}
+    assert reads_of([cmp, vor, store]) == {}
+    assert reads_of([cmp, ins("v_xor_b32_e64", v(10), s(20), s(21))]) == {("sgpr", 20): L.MASK_LO,
+                                                                          ("sgpr", 21): L.MASK_HI}
+    # One lane of that VGPR then overwritten with data (v_writelane): the VGPR is data already, so nothing is
+    # gathered at the store, which would take the lane's data as its bit (crosslane_fuzz seed 6, cs_xl32_600042).
     wl = ins("v_writelane_b32", v(10), s(15), imm(27))
     assert reads_of([cmp, vor, wl, store]) == {}
     assert reads_of([cmp, vor, wl, ins("v_mov_b32_e32", v(11), v(10)),

@@ -204,10 +204,8 @@ class Gen:
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
         self.ever_mask = set()         # SGPRs that held a lane mask anywhere in the shader (conservative)
         self.cur_masks = {}
-        self.mask_writes = set()       # id(instruction) of the ones that write a lane mask to a VGPR
         self.mask_data_reads = {}      # id(instruction) -> lane-mask registers it reads as data (lane_masks.py)
         self.mask_data = {}            # those registers' whole-wave bits for the current instruction
-        self.write_all_lanes = False
         self.dpp_guard = None       # per-lane bool: a DPP instruction's row/bank/valid write mask
         self.parked = {}               # (vgpr, lane) a mask is parked in -> the spare SGPR slot that keeps it per lane
         self.uses_lds = False
@@ -1012,11 +1010,7 @@ class Gen:
             self.set_exec(val)
             return
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
-            # VALU writes only land in active lanes. The exception is a lane mask on its way through a VGPR
-            # (lane_masks.py): every lane works out its own bit of it, active or not.
-            if self.write_all_lanes:
-                self.store_reg("vgpr", a["r"], val)
-                return
+            # VALU writes only land in active lanes, a lane mask read as data included (lane_masks.py).
             p, old, r = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %vgpr {self.cu(a['r'])}")
             self.emit(f"{old} = OpLoad %uint {p}")
@@ -3627,7 +3621,7 @@ class Gen:
         """Run the lane-mask analysis and give every VGPR lane a mask is fetched back from a slot of its own,
         after the real registers in the %sgpr array (the array grows by as many)."""
         self.mask_data_reads = {}
-        self.lane_masks, self.mask_writes, self.lane_either = lane_masks.analyse(*blocks, wave64=self.wave64, include_either=True, reads=self.mask_data_reads)
+        self.lane_masks, _, self.lane_either = lane_masks.analyse(*blocks, wave64=self.wave64, include_either=True, reads=self.mask_data_reads)
         # lane_masks merges a mask on one path with plain data on another by dropping the register,
         # so "not in cur_masks" does not prove it is data on every path. Keep a conservative set.
         self.ever_mask = {r for m in self.lane_masks.values() for r in m if isinstance(r, int)}
@@ -4237,7 +4231,6 @@ class Gen:
         deciding the other bits (PAD = zero, SEXT = sign-extend, PRESERVE = keep the old bits). VOPC has no
         dst_sel; v_cmpx (GFX10) has no written destination operand."""
         self.cur_masks = self.lane_masks.get(id(ins), {})
-        self.write_all_lanes = id(ins) in self.mask_writes
         self.cur_uniform_readlane = bool(self.w64g) and id(ins) in self.w64g["uniform_readlane"]
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
@@ -4719,11 +4712,6 @@ class Gen:
             # lane took its own value. That is the same thing only when all lanes hold the value, and after a
             # kill the dead lanes don't: where the result is an address (a loop that picks a descriptor per group
             # of lanes), they loaded from wherever their stale register pointed.
-            if a[1]["k"] == "vgpr" and ("v", a[1]["r"]) in self.cur_masks:
-                # A lane mask that went through the vector unit (three SGPRs ORed with v_or3_b32, say). The
-                # hardware reads the first lane's copy of the whole mask; here the lane's own copy is its bit.
-                self.dst(a[0], self.src_u(a[1]))
-                return
             if self.emulate:
                 # The wave's active lanes as two mask words and every lane's value, in one round.
                 v, act = self.src_u(a[1]), self.active_b()

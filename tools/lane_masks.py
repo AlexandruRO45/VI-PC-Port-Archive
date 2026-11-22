@@ -9,9 +9,9 @@ instruction says which of the two it has, so this module works it out from what 
 
     masks, writes = analyse(blocks, succ)   # blocks: lists of instructions; succ: successor block numbers per block
     masks[id(ins)]                      # dict mapping each register holding a lane mask on every path to ins
-                                        # (SGPR number, "vcc", ("lane", vgpr, lane) parked in a VGPR lane, or
-                                        # ("v", vgpr) passing through a VGPR) to its kind (MASK, MASK_LO, MASK_HI)
-    id(ins) in writes                   # ins computes a mask into a VGPR (a plain copy does not count)
+                                        # (SGPR number, "vcc", or ("lane", vgpr, lane) parked in a VGPR lane) to
+                                        # its kind (MASK, MASK_LO, MASK_HI)
+    writes                              # always empty: no VGPR holds a mask (below); kept for callers' unpacking
 
 A register counts as a mask only if every path to the instruction wrote a mask to it. Anything else is treated
 as data, which is what the translator did for all of them before.
@@ -21,11 +21,12 @@ fetches them back later (v_readlane_b32). When the SGPR is a saved EXEC, the val
 lane's bit again, not the bit of the lane it was parked in.
 
 Masks through a VGPR: the compiler does some scalar work in the vector unit, such as an OR of three SGPRs
-(v_mov_b32 / v_or3_b32, then v_readfirstlane_b32 to get the scalar back). On hardware every lane computes the same
-whole mask and the first lane's copy is read. Here each lane computes its own bit, so it has to read its own
-copy, and it has to compute it whether or not it is active. A plain copy of a mask (v_mov_b32) is different:
-it moves an already-computed value, so it is an ordinary VALU write and inactive lanes keep the old VGPR
-(SHADER-21 part 2).
+(v_mov_b32 / v_or3_b32, then v_readfirstlane_b32 to get the scalar back). On hardware every active lane computes
+the same whole mask, and lanes EXEC leaves off keep the old VGPR. So a VALU op that reads a mask reads it as data:
+data_reads gathers the wave's bits first, the write is an ordinary EXEC-gated one, and the VGPR holds plain data.
+An SGPR read back from it with v_readfirstlane_b32 is data too; used as a mask later, each lane takes its own bit
+of it (#1792). Until SHADER-402 each lane computed its own bit into the VGPR, in every lane, which overwrote the
+lanes EXEC had left off (#210, #2290).
 """
 
 MASK = "mask"           # full lane mask (64-bit pair, vcc, or wave32 single register)
@@ -39,7 +40,6 @@ COPIES = ("s_mov_b", "s_not_b", "s_wqm_b")
 BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b",
            "s_cselect_b")
 NO_DESTINATION = ("s_cmp", "s_bitcmp", "v_cmpx", "s_set", "s_rfe")      # their first operand is a source
-VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_xor_b32", "v_xor3_b32", "v_not_b32")
 
 
 def base_op(op):
@@ -74,8 +74,6 @@ def kind(state, a):
         if n == 2 and any(k in MASK_KINDS for k in ks):
             return MASK
         return ks[0] if len(set(ks)) == 1 else None
-    if a["k"] == "vgpr" and a.get("n", 1) == 1:
-        return state.get(("v", a["r"]))
     if a["k"] == "imm" and a["v"] in (0, -1):
         return EITHER
     return None
@@ -125,7 +123,7 @@ def mask_sdst(a, wave64):
 
 
 def step(state, ins, wave64=False):
-    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR.
+    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction.
     wave64: the shader runs 64-lane waves, so a VALU mask destination is an SGPR pair (mask_sdst)."""
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
@@ -139,8 +137,6 @@ def step(state, ins, wave64=False):
             state.pop(lane_slot(a[0], a[2]), None)
         else:
             state[lane_slot(a[0], a[2])] = k
-        if ("v", a[0]["r"]) in state:                   # one lane of a mask copied into this VGPR now holds
-            state[("vw", a[0]["r"])] = True             # something else: data_reads no longer gathers it
         return
     if op == "v_readlane_b32" and len(a) == 3:                                  # sD = vS[lane]
         put(state, a[0], state.get(lane_slot(a[1], a[2])))
@@ -150,25 +146,12 @@ def step(state, ins, wave64=False):
         put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else mask_sdst(a[0], wave64), MASK)
         return
     if a[0]["k"] == "vgpr":                             # any other write to a VGPR ends what was parked in it
-        # A mask only when every source is one (or a constant 0 / -1) on every path: no EITHER for VGPRs, whose
-        # plain writes skip inactive lanes. The sources are looked at first: the destination can be one of them.
-        kinds = [kind(state, x) for x in a[1:]] if op in VECTOR_BITWISE and a[0].get("n", 1) == 1 else [None]
-        if op == "v_mov_b32" and a[1]["k"] != "vgpr":
-            kinds = [None]      # v_mov_b32 vN, <mask SGPR / VCC / EXEC> writes the wave's bits to the active lanes, as
-                                # data: data_reads gathers them before the copy, the store is EXEC-gated (#210, #2290)
+        # A VGPR never holds a lane mask here. A VALU op that reads a mask (v_mov_b32 vN, s20; v_or_b32 vN, vcc_lo,
+        # s20; v_xor_b32 vN, s20, s21) gets the wave's bits, gathered by data_reads, and writes them to the active
+        # lanes only, as hardware does: lanes EXEC leaves off keep the old VGPR (#210, #2290, SHADER-402).
         written = range(a[0]["r"], a[0]["r"] + a[0].get("n", 1))
-        vw = {k for k in state if isinstance(k, tuple) and k[0] == "vw"}
         for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
             del state[key]
-        if None not in kinds and any(k in MASK_KINDS for k in kinds):
-            ms = {k for k in kinds if k in MASK_KINDS}
-            state[("v", a[0]["r"])] = ms.pop() if len(ms) == 1 else MASK
-            if any(x["k"] == "vgpr" and ("vw", x["r"]) in vw for x in a[1:]):
-                state[("vw", a[0]["r"])] = True          # copied from a VGPR with an overwritten lane: still not gathered
-            # A plain copy (v_mov_b32) is an ordinary VALU write: inactive lanes keep the old
-            # VGPR (SHADER-21 part 2). Only per-lane mask computations take the all-lanes store,
-            # because whole-wave readers (wave_mask, v_readfirstlane) read every lane's bit.
-            return op != "v_mov_b32"
     if "_saveexec_b" in op or "_wrexec_b" in op or op == "s_bfm_b64":
         put(state, a[0], MASK)
     elif op.startswith(COPIES) and len(a) > 1:
@@ -218,7 +201,7 @@ def reg_keys(a):
 
 def reg_kind(state, key):
     """The mask kind of one 32-bit register: MASK_LO (lanes 0-31), MASK_HI (lanes 32-63), MASK (a wave32 mask, or a
-    VGPR mixing both halves), or None."""
+    plain data), or None."""
     k, r = key
     if k == "special":
         if r.startswith("exec"):
@@ -227,7 +210,9 @@ def reg_kind(state, key):
         if vk not in MASK_KINDS:
             return None
         return MASK_LO if r == "vcc_lo" else MASK_HI
-    k = state.get(r if k == "sgpr" else ("v", r))
+    if k != "sgpr":
+        return None                                     # a VGPR holds data, never a mask (step)
+    k = state.get(r)
     return k if k in MASK_KINDS else None
 
 
@@ -243,8 +228,7 @@ def data_reads(ins, state):
     if op.startswith(("s_", "v_")) and not op.startswith("v_cmp") and a[0]["k"] == "special" and \
             a[0].get("t", "").startswith(("exec", "vcc")):
         return {}
-    if op.startswith(BITWISE) or (op in VECTOR_BITWISE and a[0].get("n", 1) == 1 and
-                                  not (op == "v_mov_b32" and a[1]["k"] != "vgpr")):
+    if op.startswith(BITWISE):
         kinds = [kind(state, x) for x in a[1:]]
         if None not in kinds and any(k in MASK_KINDS for k in kinds):
             return {}                                   # the result is a mask too
@@ -263,9 +247,6 @@ def data_reads(ins, state):
     out = {}
     for x in srcs:
         for key in reg_keys(x):
-            if key[0] == "vgpr" and ("vw", key[1]) in state:
-                continue        # a mask copied into this VGPR, then one lane overwritten by v_writelane: the
-                                # gather would take that lane's data as its bit, so the VGPR is read lane by lane
             k = reg_kind(state, key)
             if k is not None:
                 out[key] = k
@@ -312,8 +293,6 @@ def analyse(blocks, succ, wave64=False, *, include_either=False, reads=None):
                         merged[r] = a_k
                     else:
                         merged[r] = MASK
-                # a VGPR one of whose lanes v_writelane overwrote on either path stays so (data_reads)
-                merged.update({r: True for r in entry[s].keys() | state.keys() if isinstance(r, tuple) and r[0] == "vw"})
             if merged != entry[s]:
                 entry[s] = merged
                 work.append(s)
@@ -328,6 +307,5 @@ def analyse(blocks, succ, wave64=False, *, include_either=False, reads=None):
                 dr = data_reads(ins, state)
                 if dr:
                     reads[id(ins)] = dr
-            if step(state, ins, wave64):
-                writes.add(id(ins))
+            step(state, ins, wave64)
     return (out, writes, either) if include_either else (out, writes)
