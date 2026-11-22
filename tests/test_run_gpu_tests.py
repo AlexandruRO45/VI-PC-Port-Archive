@@ -452,10 +452,6 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
                         self.assertEqual(check.pixel_test("unused", tmp, name), want)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AnsiWorkPathTest(unittest.TestCase):
     def test_ascii_path_is_kept(self):
         self.assertEqual(rgt.ansi_path("C:\\Users\\bob\\x", nt=True, codec="ascii"), "C:\\Users\\bob\\x")
@@ -480,3 +476,7 @@ class AnsiWorkPathTest(unittest.TestCase):
             self.assertTrue(work.startswith(os.path.join(drive, "leonida_gpu_tests")))
             self.assertTrue(os.path.isdir(work))
             self.assertEqual(os.listdir(uni), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
