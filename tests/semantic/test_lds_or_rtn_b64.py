@@ -84,6 +84,22 @@ class LDSMemory:
         struct.pack_into("<Q", self.mem, idx, u64(val))
 
 
+
+def compute_or_zero_u64(a: int, b: int) -> int:
+    """Calculate whether 64-bit bitwise OR produces zero."""
+    return 1 if ((u64(a) | u64(b)) == 0) else 0
+
+
+def compute_or_sign_u64(a: int, b: int) -> int:
+    """Calculate sign bit (bit 63) of 64-bit bitwise OR result."""
+    return 1 if bool((u64(a) | u64(b)) & 0x8000000000000000) else 0
+
+
+def compute_or_popcount_u64(a: int, b: int) -> int:
+    """Calculate population count of 64-bit bitwise OR result."""
+    return bin(u64(a) | u64(b)).count("1")
+
+
 def ref_ds_or_rtn_b64(
     mem: LDSMemory,
     vaddr: int,
@@ -667,6 +683,37 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
             self.assertEqual(state.get_vgpr(r), 0xE000 + r)
         for s in range(5):
             self.assertEqual(state.get_sgpr(s), 0xF000 + s)
+
+
+class TestConditionCodesAndFlags(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and bitwise status generation."""
+
+    def test_flags_preserved_on_zero_and_negative_results(self) -> None:
+        state = ScalarMachineState(lds_bytes=1024)
+        state.lds.write_qword(8, 0x8000000000000000)
+        state.set_vgpr(2, 8)
+        state.set_vgpr64(RegPair(4), 0)
+
+        instr = DSOrRtnB64Instruction(
+            dst=RegPair(0),
+            addr=RegSingle(2),
+            data=RegPair(4),
+        )
+        interp = ScalarInterpreter()
+        old_val = interp.execute(instr, state)
+
+        self.assertEqual(old_val, 0x8000000000000000)
+        self.assertEqual(state.lds.read_qword(8), 0x8000000000000000)
+
+    def test_mathematical_bitwise_status_oracles(self) -> None:
+        self.assertEqual(compute_or_zero_u64(0, 0), 1)
+        self.assertEqual(compute_or_zero_u64(0, 1), 0)
+
+        self.assertEqual(compute_or_sign_u64(0x8000000000000000, 0), 1)
+        self.assertEqual(compute_or_sign_u64(0x7FFFFFFFFFFFFFFF, 0), 0)
+
+        self.assertEqual(compute_or_popcount_u64(0x0F, 0xF0), 8)
+        self.assertEqual(compute_or_popcount_u64(0, 0), 0)
 
 
 if __name__ == '__main__':
