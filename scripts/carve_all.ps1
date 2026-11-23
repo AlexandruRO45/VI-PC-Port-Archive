@@ -21,6 +21,10 @@ $archives = foreach ($f in Get-ChildItem -LiteralPath $Game -Recurse -Filter *.r
     [pscustomobject]@{ file = $f; relative = $rel; destination = Join-Path $Out $name }
 }
 
+if (-not $archives) {
+    throw "No .rpf archives found in '$Game'."
+}
+
 $rows = @()
 foreach ($archive in $archives) {
     $f = $archive.file

@@ -14,6 +14,23 @@ INDEX = {"summary": {"files": 1, "bink2_files": 0, "span": 10, "compressed_bytes
 
 @unittest.skipUnless(os.name == "nt", "PowerShell research script")
 class CarveAllGamePathTest(unittest.TestCase):
+    def test_no_archives_reports_error_without_replacing_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game, out = Path(tmp, "game"), Path(tmp, "out")
+            game.mkdir()
+            out.mkdir()
+            (game / "readme.txt").touch()
+            coverage = out / "coverage.json"
+            previous = b'[{"archive": "previous.rpf"}]\n'
+            coverage.write_bytes(previous)
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                 "-Game", str(game), "-Out", str(out)], capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("No .rpf archives found", result.stderr)
+            self.assertEqual(coverage.read_bytes(), previous)
+
     def test_invalid_cached_summary_does_not_replace_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:
             game, out = Path(tmp, "game"), Path(tmp, "out")
