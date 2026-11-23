@@ -124,6 +124,13 @@ HRESULT WINAPI create_versioned_root_signature_deserializer(const void* data, SI
 
     std::vector<uint8_t> cleared;
     if (rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(data, static_cast<size_t>(size), cleared)) {
+        uint32_t hash[4];
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        rt::d3d12_xs::dxbc_checksum(bytes, static_cast<size_t>(size), hash);
+        if (std::memcmp(bytes + 4, hash, sizeof(hash)) != 0) {
+            if (out) *out = nullptr;
+            return E_INVALIDARG;
+        }
         return fn(cleared.data(), cleared.size(), iid, out);
     }
     return fn(data, size, iid, out);

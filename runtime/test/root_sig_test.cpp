@@ -484,6 +484,12 @@ void test_deserializer() {
     check(versioned != nullptr, "shim registry exposes the versioned deserializer");
     if (versioned) {
         ID3D12VersionedRootSignatureDeserializer* de = nullptr;
+        auto bad_checksum = tampered;
+        bad_checksum[4] ^= 1;
+        HRESULT bad_hr = versioned(bad_checksum.data(), bad_checksum.size(), IID_PPV_ARGS(&de));
+        check(FAILED(bad_hr) && !de, "versioned shim rejects Xbox flags with corrupt checksum");
+        if (de) de->Release();
+        de = nullptr;
         HRESULT versioned_hr = versioned(tampered.data(), tampered.size(), IID_PPV_ARGS(&de));
         check(SUCCEEDED(versioned_hr) && de, "versioned shim accepts Xbox flags");
         if (de) {
