@@ -322,14 +322,15 @@ def tally(rows, stages_known):
     }
 
 
-def non_negative(text):
-    """--limit: a count of blobs. A negative one would slice from the end (paths[:-1] drops the last blob)."""
+def at_least_one(text):
+    """--limit: a count of blobs. A negative one would slice from the end (paths[:-1] drops the last blob), and zero
+    would report an empty corpus with exit 0, which reads like a clean run."""
     try:
         value = int(text, 0)
     except ValueError:
         raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
-    if value < 0:
-        raise argparse.ArgumentTypeError("must be 0 or more")
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
     return value
 
 
@@ -337,7 +338,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Read the FSSM pixel-shader input table.")
     ap.add_argument("path", help="an .fssm file or a directory of them")
     ap.add_argument("--json", action="store_true", help="print one JSON document instead of lines")
-    ap.add_argument("--limit", type=non_negative, help="stop after this many blobs")
+    ap.add_argument("--limit", type=at_least_one, help="stop after this many blobs")
     ap.add_argument("--bindings", action="store_true", help="also parse the post-code binding table")
     args = ap.parse_args(argv)
 
