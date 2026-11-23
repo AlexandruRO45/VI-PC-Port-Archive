@@ -404,5 +404,30 @@ class TestValuMax3U32ConditionCodes(unittest.TestCase):
         self.assertEqual(compute_max3_status_flags(50, 100, 25).winner_index, 1)
         self.assertEqual(compute_max3_status_flags(25, 50, 100).winner_index, 2)
 
+# ---------------------------------------------------------------------------
+# Stage 7: IEEE 754 boundary extremes, integer boundaries, and bitwise limits
+# ---------------------------------------------------------------------------
+
+class TestValuMax3U32IEEE754EdgeCases(unittest.TestCase):
+    """Stage 7: Boundary extremes, integer limits, and bit-pattern invariance for v_max3_u32."""
+
+    def test_integer_boundary_extremes(self) -> None:
+        self.assertEqual(oracle_max3_u32(0, 0, 0), 0)
+        self.assertEqual(oracle_max3_u32(MASK32, 0, 0), MASK32)
+        self.assertEqual(oracle_max3_u32(0x7FFF_FFFF, 0x8000_0000, 0), 0x8000_0000)
+        self.assertEqual(oracle_max3_u32(0x8000_0000, 0x8000_0001, 0x8000_0002), 0x8000_0002)
+
+    def test_float_bitpatterns_treated_as_integers(self) -> None:
+        pos_inf = struct.unpack(">I", struct.pack(">f", float("inf")))[0]
+        neg_inf = struct.unpack(">I", struct.pack(">f", float("-inf")))[0]
+        qnan = struct.unpack(">I", struct.pack(">f", float("nan")))[0]
+
+        res = oracle_max3_u32(pos_inf, neg_inf, qnan)
+        expected = max(pos_inf, neg_inf, qnan)
+        self.assertEqual(res, expected)
+
+        res_trans = run_translated_max3_u32(pos_inf, neg_inf, qnan)
+        self.assertEqual(res_trans, expected)
+
 if __name__ == "__main__":
     unittest.main()
