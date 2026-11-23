@@ -143,7 +143,10 @@ def render(data, offset, bpe, wpx, mode, out):
         struct.pack_into("<II4s", hdr, 76, 32, 4, b"DX10")
         body = bytes(hdr) + struct.pack("<IIIII", 98, 3, 0, 1, 0)  # BC7_UNORM, TEXTURE2D
     im = Image.open(io.BytesIO(body + lin.tobytes())).convert("RGB")
-    im.save(out)
+    try:
+        im.save(out)
+    except ValueError as e:
+        raise SystemExit(f"--out {out}: {e}") from None
     return im.size
 
 
