@@ -17,6 +17,9 @@ set(CMAKE_SYSTEM_PROCESSOR AMD64)
 if(NOT XWIN_DIR)
   set(XWIN_DIR "$ENV{XWIN_DIR}")
 endif()
+if(XWIN_DIR)
+  file(TO_CMAKE_PATH "${XWIN_DIR}" XWIN_DIR)
+endif()
 if(NOT XWIN_DIR OR NOT EXISTS "${XWIN_DIR}/VC/Tools/MSVC")
   message(FATAL_ERROR "Set XWIN_DIR (or -DXWIN_DIR=) to an xwin splat made with --use-winsysroot-style")
 endif()
@@ -53,11 +56,29 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT _xwin_debug_crt)
 endif()
 set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
 
-# The Vulkan headers are the same on every platform, but /usr/include also holds glibc's, which must not shadow the
-# MSVC CRT. Point Vulkan_INCLUDE_DIR at a folder that holds only vulkan/ and vk_video/ (links to the host copies),
-# unless another folder was given (-DVulkan_INCLUDE_DIR=<Vulkan-Headers>/include). The links are (re)made on every
-# configure, so deleting the folder doesn't silently drop the Vulkan targets.
-if(CMAKE_BINARY_DIR)
+# The runtime does not use C++20 named modules. Default module dependency scanning off so Ninja + clang-cl does not
+# invoke a mismatched clang-scan-deps (for instance from another LLVM toolchain on PATH on Windows).
+if(NOT DEFINED CMAKE_CXX_SCAN_FOR_MODULES)
+  set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE BOOL "Disable C++20 module dependency scanning")
+endif()
+
+# On native Windows hosts, discover Vulkan headers directly from VULKAN_SDK without creating symlinks (which require
+# Developer Mode or Administrator privileges on Windows). On non-Windows hosts, /usr/include also holds glibc's
+# headers, which must not shadow the MSVC CRT, so point Vulkan_INCLUDE_DIR at a folder that holds only vulkan/ and
+# vk_video/ (links to the host copies), unless another folder was given (-DVulkan_INCLUDE_DIR=<Vulkan-Headers>/include).
+# The links are (re)made on every configure, so deleting the folder doesn't silently drop the Vulkan targets.
+if(CMAKE_HOST_WIN32)
+  if(NOT Vulkan_INCLUDE_DIR AND DEFINED ENV{VULKAN_SDK} AND NOT "$ENV{VULKAN_SDK}" STREQUAL "")
+    file(TO_CMAKE_PATH "$ENV{VULKAN_SDK}" _xwin_vulkan_sdk)
+    string(REGEX REPLACE "/+$" "" _xwin_vulkan_sdk "${_xwin_vulkan_sdk}")
+    foreach(_sdk_inc "${_xwin_vulkan_sdk}/Include" "${_xwin_vulkan_sdk}/include")
+      if(EXISTS "${_sdk_inc}/vulkan/vulkan.h")
+        set(Vulkan_INCLUDE_DIR "${_sdk_inc}" CACHE PATH "Vulkan headers from VULKAN_SDK" FORCE)
+        break()
+      endif()
+    endforeach()
+  endif()
+elseif(CMAKE_BINARY_DIR)
   set(_xwin_vulkan "${CMAKE_BINARY_DIR}/xwin-vulkan-include")
   if(NOT Vulkan_INCLUDE_DIR OR Vulkan_INCLUDE_DIR STREQUAL _xwin_vulkan)
     foreach(_host_include /usr/include /usr/local/include)
@@ -101,7 +122,8 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 find_program(LEONIDA_ML64 NAMES ml64 llvm-ml64)
 
 # ctest runs the PE tests through Wine, or Proton's wine (-DCMAKE_CROSSCOMPILING_EMULATOR=<Proton>/files/bin/wine).
-if(NOT CMAKE_CROSSCOMPILING_EMULATOR)
+# Native Windows hosts execute PE binaries directly without an emulator.
+if(NOT CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   find_program(XWIN_WINE NAMES wine wine64)
   if(XWIN_WINE)
     set(CMAKE_CROSSCOMPILING_EMULATOR "${XWIN_WINE}")
