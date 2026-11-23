@@ -339,6 +339,39 @@ CVT_F32_SAT_CASES = (
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
 # v_cvt_pk_u8_f32 (cs_cvt_pk_u8.asm), measured natively on RDNA2 (gfx1036): halves round to even, NaN gives 0.
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
+# v_cvt_pknorm_i16_f16 / _u16_f16 (cs_cvt_pknorm_f16.asm): tools/cvt_pknorm_f16_probe.py's cases (the ones measured on
+# gfx1036, without the raw-omod encodings), i16 then u16, plain then with clamp; expected_pknorm_f16 gives each word.
+CS_CVT_PKNORM_F16_WORDS = [
+    0x400F2000, 0x20000000, 0x80012000, 0x20000000,
+    0x400F7FFF, 0x7FFF0000, 0x80017FFF, 0x7FFF0000,
+    0x20000000, 0x20000000, 0xBFF1400F, 0xC0083FF8,
+    0x80017FFF, 0x00000000, 0x00000000, 0x7FFF7FFF,
+    0x7FFFE000, 0x7FFF0000, 0xC0004000, 0x400F0000,
+    0x400F0000, 0x400FC000, 0x00000000, 0x400F4000,
+    0x400F0000, 0x400F7FFF, 0x7FFF0000, 0x20000000,
+    0x20000000, 0x801F4000, 0x40000000, 0x00004000,
+    0x40000000, 0x801FFFFF, 0xFFFF0000, 0x0000FFFF,
+    0xFFFF0000, 0x40000000, 0x40000000, 0x0000801F,
+    0x00007FF0, 0x0000FFFF, 0x00000000, 0x00000000,
+    0xFFFFFFFF, 0xFFFF0000, 0xFFFF0000, 0x00008000,
+    0x801F0000, 0x801F0000, 0x801F0000, 0x00000000,
+    0x801F8000, 0x801F0000, 0x801FFFFF, 0xFFFF0000,
+    0x40000000, 0x40000000, 0x400F2000, 0x20000000,
+    0x80012000, 0x20000000, 0x400F7FFF, 0x7FFF0000,
+    0x80017FFF, 0x7FFF0000, 0x20000000, 0x20000000,
+    0xBFF1400F, 0xC0083FF8, 0x80017FFF, 0x00000000,
+    0x00000000, 0x7FFF7FFF, 0x7FFFE000, 0x7FFF0000,
+    0xC0004000, 0x400F0000, 0x400F0000, 0x400FC000,
+    0x00000000, 0x400F4000, 0x400F0000, 0x400F7FFF,
+    0x7FFF0000, 0x20000000, 0x20000000, 0x801F4000,
+    0x40000000, 0x00004000, 0x40000000, 0x801FFFFF,
+    0xFFFF0000, 0x0000FFFF, 0xFFFF0000, 0x40000000,
+    0x40000000, 0x0000801F, 0x00007FF0, 0x0000FFFF,
+    0x00000000, 0x00000000, 0xFFFFFFFF, 0xFFFF0000,
+    0xFFFF0000, 0x00008000, 0x801F0000, 0x801F0000,
+    0x801F0000, 0x00000000, 0x801F8000, 0x801F0000,
+    0x801FFFFF, 0xFFFF0000, 0x40000000, 0x40000000,
+]
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
@@ -708,6 +741,15 @@ def tbuffer_store_test(tools, spirv, env=None):
 def fmt_d16_xyz_test(tools, spirv, env=None):
     """The d16_xyz/d16_xy loads and d16_xyz stores of cs_fmt_d16_xyz.asm: the whole 80-word heap."""
     return dump_test(tools, spirv, "cs_fmt_d16_xyz", FMT_D16_XYZ_WORDS, len(FMT_D16_XYZ_WORDS), env)
+
+
+def cvt_pknorm_f16_test(tools, spirv, env=None):
+    """cs_cvt_pknorm_f16.asm: the 116 result words (CS_CVT_PKNORM_F16_WORDS) and the untouched words after them in a
+    128-word heap. Wave32, one group: pinned to a 32-wide subgroup like compute_test does."""
+    env = dict(os.environ if env is None else env)
+    env.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_cvt_pknorm_f16") or 32))
+    want = CS_CVT_PKNORM_F16_WORDS + [0xEEEEEEEE] * (128 - len(CS_CVT_PKNORM_F16_WORDS))
+    return dump_test(tools, spirv, "cs_cvt_pknorm_f16", want, 128, env)
 
 
 class Skip(str):
@@ -1736,6 +1778,7 @@ def main():
     results.append(("cs_fmt_all", fmt_all_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
     results.append(("cs_fmt_d16_xyz", fmt_d16_xyz_test(tools, spirv)))
+    results.append(("cs_cvt_pknorm_f16", cvt_pknorm_f16_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
