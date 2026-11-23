@@ -297,6 +297,53 @@ static inline void pcmp_write_mask(uint8_t out[16], uint16_t mask, uint8_t imm) 
         }
     }
 }
+static inline bool avx_cmp_pred(bool lt, bool eq, bool gt, bool unord, uint8_t pred) {
+    switch (pred & 0x0fu) {
+        case 0x0u: return eq;
+        case 0x1u: return lt;
+        case 0x2u: return lt || eq;
+        case 0x3u: return unord;
+        case 0x4u: return !eq;
+        case 0x5u: return !lt;
+        case 0x6u: return gt || unord;
+        case 0x7u: return !unord;
+        case 0x8u: return eq || unord;
+        case 0x9u: return lt || unord;
+        case 0xau: return lt || eq || unord;
+        case 0xbu: return false;
+        case 0xcu: return lt || gt;
+        case 0xdu: return eq || gt;
+        case 0xeu: return gt;
+        default:   return true;
+    }
+}
+static inline bool avx_cmp_f32(uint32_t x, uint32_t y, uint8_t pred) {
+    __m128 a{}, b{};
+    memcpy(&a, &x, 4);
+    memcpy(&b, &y, 4);
+    const bool sig = (((pred & 3u) == 1u || (pred & 3u) == 2u) != ((pred & 0x10u) != 0));
+    const bool unord = (x & 0x7fffffffu) > 0x7f800000u || (y & 0x7fffffffu) > 0x7f800000u;
+    const volatile int c_eq = sig ? _mm_comieq_ss(a, b) : _mm_ucomieq_ss(a, b);
+    const volatile int c_lt = sig ? _mm_comilt_ss(a, b) : _mm_ucomilt_ss(a, b);
+    const bool eq = !unord && (c_eq != 0);
+    const bool lt = !unord && (c_lt != 0);
+    const bool gt = !unord && !eq && !lt;
+    return avx_cmp_pred(lt, eq, gt, unord, pred);
+}
+static inline bool avx_cmp_f64(uint64_t x, uint64_t y, uint8_t pred) {
+    __m128d a{}, b{};
+    memcpy(&a, &x, 8);
+    memcpy(&b, &y, 8);
+    const bool sig = (((pred & 3u) == 1u || (pred & 3u) == 2u) != ((pred & 0x10u) != 0));
+    const bool unord = (x & 0x7fffffffffffffffull) > 0x7ff0000000000000ull ||
+                       (y & 0x7fffffffffffffffull) > 0x7ff0000000000000ull;
+    const volatile int c_eq = sig ? _mm_comieq_sd(a, b) : _mm_ucomieq_sd(a, b);
+    const volatile int c_lt = sig ? _mm_comilt_sd(a, b) : _mm_ucomilt_sd(a, b);
+    const bool eq = !unord && (c_eq != 0);
+    const bool lt = !unord && (c_lt != 0);
+    const bool gt = !unord && !eq && !lt;
+    return avx_cmp_pred(lt, eq, gt, unord, pred);
+}
 """
 HEADER = INTEGER_HEADER + "struct Query { word type, next, effect, device, count, ids, names; };\n"
 
@@ -559,6 +606,48 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                 f"for (size_t l = 0; l < {nbytes}; l += 16) {{ "
                 f"{vtype} a, b; memcpy(&a, lhs.data() + l, 16); memcpy(&b, rhs.data() + l, 16); "
                 f"const {vtype} r = {fn}(a, b); memcpy({dst}.data() + l, &r, 16); }}{zero_hi} }}")
+
+    avx_cmp_fp_ops = {
+        M.VCMPPS: (4, False),
+        M.VCMPPD: (8, False),
+        M.VCMPSS: (4, True),
+        M.VCMPSD: (8, True),
+    }
+    has_wide |= any(i.mnemonic in avx_cmp_fp_ops for i in body)
+
+    def lower_avx_cmp_fp(insn, guest_reader, vec_reader):
+        """Lower VEX-encoded VCMPPS/VCMPPD (128/256-bit) and VCMPSS/VCMPSD (scalar) for all 32 predicates."""
+        elem_size, is_scalar = avx_cmp_fp_ops[insn.mnemonic]
+        dest = insn.op0_register
+        valid_regs = wide_xmm if (is_scalar or dest not in wide) else wide
+        nbytes = elem_size if is_scalar else (32 if dest in wide else 16)
+        if (insn.encoding != EncodingKind.VEX or insn.op_count != 4
+                or insn.op0_kind != K.REGISTER or dest not in valid_regs
+                or insn.op1_kind != K.REGISTER or insn.op1_register not in valid_regs
+                or insn.op2_kind not in (K.REGISTER, K.MEMORY)
+                or (insn.op2_kind == K.REGISTER and insn.op2_register not in valid_regs)
+                or (insn.op2_kind == K.MEMORY and MemorySizeExt.size(insn.memory_size) != nbytes)
+                or insn.op3_kind != K.IMMEDIATE8):
+            raise ValueError(f"unsupported AVX FP compare operation at {insn.ip:#x}: {insn}")
+        dst, src1 = wide_any[dest], wide_any[insn.op1_register]
+        pred = insn.immediate(3) & 0x1f
+        elem_t, cmp_fn, true_mask = (
+            ("uint32_t", "avx_cmp_f32", "0xffffffffu") if elem_size == 4
+            else ("uint64_t", "avx_cmp_f64", "0xffffffffffffffffull")
+        )
+        if is_scalar:
+            rhs_init = (f"memcpy(&b, {wide_xmm[insn.op2_register]}.data(), {elem_size});"
+                        if insn.op2_kind == K.REGISTER else f"b = {guest_reader(elem_t)};")
+            return (f"{{ const auto lhs = {src1}; {elem_t} a, b; memcpy(&a, lhs.data(), {elem_size}); {rhs_init} "
+                    f"const {elem_t} m = {cmp_fn}(a, b, {pred}u) ? {true_mask} : 0; "
+                    f"{dst} = {{}}; memcpy({dst}.data(), lhs.data(), 16); memcpy({dst}.data(), &m, {elem_size}); }}")
+        rhs = wide_any[insn.op2_register] if insn.op2_kind == K.REGISTER else vec_reader(nbytes)
+        zero_hi = f" memset({dst}.data() + 16, 0, 16);" if nbytes == 16 else ""
+        return (f"{{ const auto lhs = {src1}; const auto rhs = {rhs}; "
+                f"for (size_t l = 0; l < {nbytes}; l += {elem_size}) {{ "
+                f"{elem_t} a, b; memcpy(&a, lhs.data() + l, {elem_size}); memcpy(&b, rhs.data() + l, {elem_size}); "
+                f"const {elem_t} m = {cmp_fn}(a, b, {pred}u) ? {true_mask} : 0; "
+                f"memcpy({dst}.data() + l, &m, {elem_size}); }}{zero_hi} }}")
 
     avx_shift_pack_ops = {
         M.VPSLLW, M.VPSLLD, M.VPSLLQ, M.VPSRLW, M.VPSRLQ, M.VPSRAW, M.VPSRAD, M.VPSLLDQ,
@@ -2717,6 +2806,8 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                             f"memcpy({dst}.data()+l+k*{ls}, &va, {ls}); memcpy({dst}.data()+l+8+k*{ls}, &vb, {ls}); }} }}{zero_hi} }}")
         elif op in avx_horiz_fp_ops:
             stmt = lower_avx_horiz_fp(i, vector)
+        elif op in avx_cmp_fp_ops:
+            stmt = lower_avx_cmp_fp(i, guest, vector)
         elif op == M.VMOVUPS and i.op1_kind == K.MEMORY:
             stmt = f"{wide[i.op0_register]} = {vector(32)};"
         elif op == M.VMOVUPS and i.op0_kind == K.MEMORY:
