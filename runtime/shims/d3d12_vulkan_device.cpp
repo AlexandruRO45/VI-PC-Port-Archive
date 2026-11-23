@@ -4194,15 +4194,18 @@ struct ShaderCacheStore {
             const std::uint64_t key_len = lens[0];
             const std::uint64_t val_len = lens[1];
             if (!key_len || !val_len || key_len > remaining || val_len > remaining - key_len) return;
-            if (val_len > max_file_bytes || bytes > max_file_bytes - val_len) return;
+            if (val_len > max_file_bytes) return;
             std::string k(static_cast<std::size_t>(key_len), '\0');
             std::vector<std::uint8_t> v(static_cast<std::size_t>(val_len));
             if (!in.read(k.data(), static_cast<std::streamsize>(key_len)) ||
                 !in.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(val_len)))
                 return;
             remaining -= key_len + val_len;
-            loaded.emplace(std::move(k), std::move(v));
-            bytes += static_cast<std::size_t>(val_len);
+            auto [it, inserted] = loaded.emplace(std::move(k), std::move(v));
+            if (inserted) {
+                if (bytes > max_file_bytes - val_len) return;
+                bytes += static_cast<std::size_t>(val_len);
+            }
         }
         entries = std::move(loaded);
         total_bytes = bytes;
@@ -4220,6 +4223,7 @@ struct ShaderCacheStore {
                       static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(seq));
         std::filesystem::path tmp = disk_path;
         tmp += suffix;
+        bool write_ok = false;
         {
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
             if (!out) return false;
@@ -4233,7 +4237,12 @@ struct ShaderCacheStore {
                 out.write(k.data(), static_cast<std::streamsize>(k.size()));
                 out.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size()));
             }
-            if (!out.good()) return false;
+            out.flush();
+            write_ok = out.good();
+        }
+        if (!write_ok) {
+            std::filesystem::remove(tmp, ec);
+            return false;
         }
         if (!MoveFileExW(tmp.c_str(), disk_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
             std::filesystem::remove(tmp, ec);
@@ -5882,6 +5891,9 @@ public:
             return d3d12_trace::result(method, E_INVALIDARG);
         constexpr UINT kKnownFlags = D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED | D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR;
         if (UINT(desc->Flags) & ~kKnownFlags) return d3d12_trace::result(method, E_INVALIDARG);
+        auto& registry = process_shader_cache_registry();
+        if (registry.disabled.load(std::memory_order_relaxed))
+            return d3d12_trace::result(method, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
         if (!out) return d3d12_trace::result(method, S_FALSE);
         std::wstring disk_path;
         if (desc->Mode == D3D12_SHADER_CACHE_MODE_DISK) {
@@ -5896,7 +5908,6 @@ public:
             disk_path = path.wstring();
         }
         const ShaderCacheKey key{desc->Identifier, desc->Mode, std::move(disk_path)};
-        auto& registry = process_shader_cache_registry();
         const UINT max_file_bytes = desc->MaximumValueFileSizeBytes ? desc->MaximumValueFileSizeBytes
                                                                     : ShaderCacheStore::kDefaultMaxValueFileBytes;
         std::shared_ptr<ShaderCacheStore> store;

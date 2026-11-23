@@ -48,6 +48,7 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool is_vulkan_
         EXPECT(dev->CreateShaderCacheSession(nullptr, __uuidof(ID3D12ShaderCacheSession), nullptr) == E_INVALIDARG);
     }
     EXPECT(dev->CreateShaderCacheSession(&desc, __uuidof(ID3D12ShaderCacheSession), nullptr) == S_FALSE);
+    EXPECT(dev->CreateShaderCacheSession(&desc, __uuidof(ID3D12Fence), nullptr) == S_FALSE);
 
     D3D12_SHADER_CACHE_SESSION_DESC bad = desc;
     bad.Identifier = zero_id;
@@ -66,6 +67,16 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool is_vulkan_
     void* wrong_iid = nullptr;
     EXPECT(dev->CreateShaderCacheSession(&desc, __uuidof(ID3D12Fence), &wrong_iid) == E_NOINTERFACE && !wrong_iid);
 
+    // MODE_MEMORY accepts disk-oriented flags and MaximumValueFileSizeBytes (Windows 11 host parity).
+    {
+        D3D12_SHADER_CACHE_SESSION_DESC mem_extra = desc;
+        mem_extra.Identifier = id2;
+        mem_extra.Flags = D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR | D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED;
+        mem_extra.MaximumValueFileSizeBytes = 4096;
+        Ref<ID3D12ShaderCacheSession> s_extra;
+        EXPECT(dev->CreateShaderCacheSession(&mem_extra, IID_PPV_ARGS(&s_extra.p)) == S_OK && s_extra.p);
+    }
+
     // 2. StoreValue / FindValue / GetDesc / GetDevice.
     Ref<ID3D12ShaderCacheSession> s1;
     EXPECT(SUCCEEDED(dev->CreateShaderCacheSession(&desc, IID_PPV_ARGS(&s1.p))) && s1.p);
@@ -81,6 +92,9 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool is_vulkan_
     UINT sz = sizeof(out_v);
     EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, &sz) == DXGI_ERROR_NOT_FOUND);
     EXPECT(sz == sizeof(out_v));
+    // Size query (pValue == nullptr) on a missing key returns DXGI_ERROR_NOT_FOUND and leaves *pValueSize untouched.
+    sz = 99;
+    EXPECT(s1->FindValue(&k1, sizeof(k1), nullptr, &sz) == DXGI_ERROR_NOT_FOUND && sz == 99);
     if (is_vulkan_layer) {
         EXPECT(s1->FindValue(nullptr, sizeof(k1), &out_v, &sz) == E_INVALIDARG);
     }
@@ -102,7 +116,9 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool is_vulkan_
     EXPECT(s1->FindValue(&k1, sizeof(k1), nullptr, &sz) == S_OK && sz == sizeof(v1));
     sz = 2;
     EXPECT(s1->FindValue(&k1, sizeof(k1), nullptr, &sz) == S_OK && sz == sizeof(v1));
-    // Non-null buffer too small returns DXGI_ERROR_MORE_DATA and writes required size.
+    // Non-null buffer too small (including 0) returns DXGI_ERROR_MORE_DATA and writes required size.
+    sz = 0;
+    EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, &sz) == DXGI_ERROR_MORE_DATA && sz == sizeof(v1));
     sz = 2;
     EXPECT(s1->FindValue(&k1, sizeof(k1), &out_v, &sz) == DXGI_ERROR_MORE_DATA && sz == sizeof(v1));
     // Oversized buffer returns S_OK, writes exact stored size, and copies payload.
@@ -146,8 +162,10 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool is_vulkan_
     if (is_vulkan_layer) s3->SetDeleteOnDestroy();
     s3.reset();
 
-    // 4. ShaderCacheControl invalid-argument checks (same on host and layer).
+    // 4. ShaderCacheControl invalid-argument checks & DISABLE precedence (same on host and layer).
     EXPECT(dev->ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS(0), D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE) ==
+           E_INVALIDARG);
+    EXPECT(dev->ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS(0x10), D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE) ==
            E_INVALIDARG);
     EXPECT(dev->ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
                                    D3D12_SHADER_CACHE_CONTROL_FLAGS(0)) == E_INVALIDARG);
@@ -156,6 +174,29 @@ int exercise_shader_cache(ID3D12Device9* dev, const char* label, bool is_vulkan_
     EXPECT(dev->ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
                                    D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE | D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) ==
            E_INVALIDARG);
+
+    // DISABLE takes precedence over null-output capability check (S_FALSE), while E_INVALIDARG still comes first.
+    {
+        Ref<ID3D12ShaderCacheSession> s_dis;
+        EXPECT(SUCCEEDED(dev->CreateShaderCacheSession(&desc, IID_PPV_ARGS(&s_dis.p))) && s_dis.p);
+        EXPECT(dev->ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
+                                       D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR |
+                                           D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) == S_OK);
+        EXPECT(dev->CreateShaderCacheSession(&desc, __uuidof(ID3D12ShaderCacheSession), nullptr) ==
+               DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+        D3D12_SHADER_CACHE_SESSION_DESC bad_zero = desc;
+        bad_zero.Identifier = zero_id;
+        EXPECT(dev->CreateShaderCacheSession(&bad_zero, __uuidof(ID3D12ShaderCacheSession), nullptr) == E_INVALIDARG);
+        sz = sizeof(out_v);
+        EXPECT(s_dis->FindValue(&k1, 0, &out_v, &sz) == E_INVALIDARG);
+        EXPECT(s_dis->FindValue(&k1, sizeof(k1), &out_v, &sz) == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+        EXPECT(s_dis->StoreValue(&k1, 0, &v1, sizeof(v1)) == E_INVALIDARG);
+        EXPECT(s_dis->StoreValue(&k1, sizeof(k1), &v1, sizeof(v1)) == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE);
+        EXPECT(dev->ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_APPLICATION_MANAGED,
+                                       D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR |
+                                           D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE) == S_OK);
+        EXPECT(dev->CreateShaderCacheSession(&desc, __uuidof(ID3D12ShaderCacheSession), nullptr) == S_FALSE);
+    }
 
     std::printf("shader cache (%s): validation, StoreValue/FindValue, size queries, sharing and SetDeleteOnDestroy OK\n",
                 label);
@@ -379,6 +420,68 @@ int main() {
             UINT sz = sizeof(val);
             EXPECT(s_c->FindValue(&k, sizeof(k), &val, &sz) == DXGI_ERROR_NOT_FOUND);
             s_c->SetDeleteOnDestroy();
+        }
+        // Duplicate keys in an on-disk cache file must not inflate byte accounting for DXGI_ERROR_CACHE_FULL.
+        {
+            const std::filesystem::path dup_file =
+                temp_dir / L"leonida_sc_31415926535849798323846264338327.bin";
+            std::ofstream out(dup_file, std::ios::binary | std::ios::trunc);
+            const std::uint32_t hdr[4] = {0x3143534Cu, 2u, 2u, 0u};
+            const std::uint64_t ver = 7;
+            const std::uint32_t lens[2] = {sizeof(k), sizeof(v)};
+            const std::uint64_t v_dup = 0xFEDCBA9876543210ull;
+            out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+            out.write(reinterpret_cast<const char*>(&ver), sizeof(ver));
+            // Entry 1: (k, v)
+            out.write(reinterpret_cast<const char*>(lens), sizeof(lens));
+            out.write(reinterpret_cast<const char*>(&k), sizeof(k));
+            out.write(reinterpret_cast<const char*>(&v), sizeof(v));
+            // Entry 2: duplicate key k with v_dup (ignored by emplace; must not add 8 bytes to total_bytes)
+            out.write(reinterpret_cast<const char*>(lens), sizeof(lens));
+            out.write(reinterpret_cast<const char*>(&k), sizeof(k));
+            out.write(reinterpret_cast<const char*>(&v_dup), sizeof(v_dup));
+            out.close();
+
+            D3D12_SHADER_CACHE_SESSION_DESC tight_desc = disk_desc;
+            tight_desc.MaximumValueFileSizeBytes = 12;  // 8 (unique k) + 4 (k2) == 12; double-count would be 16 > 12
+            Ref<ID3D12Device9> dev_dup;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&dev_dup.p))));
+            Ref<ID3D12ShaderCacheSession> s_dup;
+            EXPECT(SUCCEEDED(dev_dup->CreateShaderCacheSession(&tight_desc, IID_PPV_ARGS(&s_dup.p))) && s_dup.p);
+            std::uint64_t got_v = 0;
+            UINT sz = sizeof(got_v);
+            EXPECT(s_dup->FindValue(&k, sizeof(k), &got_v, &sz) == S_OK && sz == sizeof(v) && got_v == v);
+            const std::uint32_t k2 = 0x22334455u;
+            const std::uint32_t v4 = 0x13579BDFu;
+            EXPECT(s_dup->StoreValue(&k2, sizeof(k2), &v4, sizeof(v4)) == S_OK);
+            const std::uint32_t k3 = 0x66778899u;
+            const std::uint8_t v1 = 0x42u;
+            EXPECT(s_dup->StoreValue(&k3, sizeof(k3), &v1, sizeof(v1)) == DXGI_ERROR_CACHE_FULL);
+            s_dup->SetDeleteOnDestroy();
+        }
+        // Failed save_to_disk_locked (e.g. target path blocked by a directory) must roll back and leave no .tmp files.
+        {
+            const std::filesystem::path blocked_path =
+                temp_dir / L"leonida_sc_31415926535849798323846264338327.bin";
+            std::filesystem::remove_all(blocked_path, ec);
+            std::filesystem::create_directory(blocked_path, ec);
+            EXPECT(!ec);
+
+            Ref<ID3D12Device9> dev_fail;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&dev_fail.p))));
+            Ref<ID3D12ShaderCacheSession> s_fail;
+            EXPECT(SUCCEEDED(dev_fail->CreateShaderCacheSession(&disk_desc, IID_PPV_ARGS(&s_fail.p))) && s_fail.p);
+            EXPECT(s_fail->StoreValue(&k, sizeof(k), &v, sizeof(v)) == E_FAIL);
+            std::uint64_t val = 0;
+            UINT sz = sizeof(val);
+            EXPECT(s_fail->FindValue(&k, sizeof(k), &val, &sz) == DXGI_ERROR_NOT_FOUND);
+            bool tmp_leaked = false;
+            for (const auto& entry : std::filesystem::directory_iterator(temp_dir)) {
+                if (entry.is_regular_file() && entry.path().extension() == L".tmp") tmp_leaked = true;
+            }
+            EXPECT(!tmp_leaked);
+            s_fail.reset();
+            std::filesystem::remove_all(blocked_path, ec);
         }
         // Inactive non-USE_WORKING_DIR disk file must be removed by ShaderCacheControl CLEAR.
         {
