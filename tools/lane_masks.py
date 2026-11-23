@@ -52,6 +52,7 @@ SGPR_REL_DST = ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32")
 VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_and_or_b32",
                   "v_xor_b32", "v_xor3_b32", "v_xnor_b32", "v_bfi_b32", "v_not_b32")
 
+_OPCODE_CACHE_LIMIT = 4096
 _BASE_OP_CACHE = {}
 _OP_INFO_CACHE = {}
 _VCC_OPERAND = {"k": "special", "t": "vcc"}
@@ -85,7 +86,8 @@ def base_op(op):
         if op.endswith(suffix):
             res = op[:-len(suffix)]
             break
-    _BASE_OP_CACHE[op] = res
+    if len(_BASE_OP_CACHE) < _OPCODE_CACHE_LIMIT:
+        _BASE_OP_CACHE[op] = res
     return res
 
 
@@ -135,7 +137,8 @@ def _op_info(raw_op):
         is_vop3b_mask = ((op.startswith("v_") and "_co_" in op)
                          or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64"))
         info = (_OP_GENERAL, op, vec_bitwise_ok, is_v_mov, salu_kind, is_b64, is_b32, is_vop3b_mask)
-    _OP_INFO_CACHE[raw_op] = info
+    if len(_OP_INFO_CACHE) < _OPCODE_CACHE_LIMIT:
+        _OP_INFO_CACHE[raw_op] = info
     return info
 
 

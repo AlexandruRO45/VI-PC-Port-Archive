@@ -362,6 +362,15 @@ def test_single_block_and_step_monkeypatch_and_snapshot_stability():
     assert len(calls) == len(blk)
 
 
+def test_opcode_caches_are_bounded():
+    # Submitting more distinct opcode names than _OPCODE_CACHE_LIMIT must not grow either cache past the cap.
+    limit = L._OPCODE_CACHE_LIMIT
+    for i in range(limit + 500):
+        L.analyse([[ins(f"s_probe_bound_{i}", s(0))]], [[]])
+    assert len(L._BASE_OP_CACHE) <= limit
+    assert len(L._OP_INFO_CACHE) <= limit
+
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
@@ -373,4 +382,5 @@ if __name__ == "__main__":
     test_writelane_sdwa_dpp_swaps_stores_and_div_scale()
     test_v_and_or_xnor_bfi_track_vector_masks()
     test_single_block_and_step_monkeypatch_and_snapshot_stability()
+    test_opcode_caches_are_bounded()
     print("ok")
