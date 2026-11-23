@@ -8,17 +8,26 @@ Usage:
 made in (forward slashes, as `cygpath -m` prints it). Paths under it are mapped to --root, the Linux checkout (default:
 this repository), which must hold the Windows build's runtime/build folder at the same place.
 
-Every test is run and reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
+Some tests open files through absolute paths compiled into them (the GLSL test shaders, LEONIDA_TEST_*_SPV under
+runtime/build/generated). For those, the drive of --windows-root is pointed at --root in the Wine prefix for the run
+($WINEPREFIX, else ~/.wine), unless that drive is already in use there.
+
+Every test is reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
+--timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
 """
 import argparse
+from graphlib import CycleError, TopologicalSorter
 import json
 import math
+import ntpath
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +41,7 @@ def _make_parent(path: str) -> None:
 
 
 def norm(path: str) -> str:
-    return path.replace("\\", "/").rstrip("/")
+    return ntpath.normpath(path).replace("\\", "/").rstrip("/")
 
 
 def map_path(arg: str, windows_root: str, root: str) -> str | None:
@@ -46,6 +55,51 @@ def map_path(arg: str, windows_root: str, root: str) -> str | None:
     return None
 
 
+class DriveMap:
+    """Points the drive of the Windows checkout at the Linux one inside the Wine prefix, for the run.
+
+    A test that opens D:/a/Leonida/Leonida/runtime/build/generated/x.spv (a path compiled into it) then reads
+    <root>/runtime/build/generated/x.spv. The drive is a dosdevices link to a scratch folder holding a/Leonida/Leonida
+    as a link to the root; both are removed afterwards. A drive the prefix already has (c:, z:, or one set up by
+    hand) is left alone, and so is a root without a drive letter.
+    """
+
+    def __init__(self, windows_root: str, root: str, prefix: str):
+        self.windows_root, self.root, self.prefix = norm(windows_root), os.path.abspath(root), prefix
+        self.link = self.scratch = None
+        self.note = ""
+
+    def __enter__(self):
+        m = re.fullmatch(r"([A-Za-z]):/(.+)", self.windows_root)
+        if not m:
+            self.note = f"{self.windows_root} has no drive letter: no drive mapped"
+            return self
+        drive, rest = m.group(1).lower(), [p for p in m.group(2).split("/") if p]
+        dosdevices = os.path.join(self.prefix, "dosdevices")
+        link = os.path.join(dosdevices, drive + ":")
+        if not os.path.isdir(dosdevices):
+            self.note = f"no Wine prefix at {self.prefix}: drive {drive}: not mapped"
+            return self
+        if os.path.lexists(link):
+            self.note = f"drive {drive}: is already set in {dosdevices}: left as it is"
+            return self
+        self.scratch = tempfile.mkdtemp(prefix="wine-drive-")
+        parent = os.path.join(self.scratch, *rest[:-1])
+        os.makedirs(parent, exist_ok=True)
+        os.symlink(self.root, os.path.join(parent, rest[-1]))
+        os.symlink(self.scratch, link)
+        self.link = link
+        self.note = f"drive {drive}: maps {self.windows_root} to {self.root} for this run"
+        return self
+
+    def __exit__(self, *exc):
+        if self.link and os.path.islink(self.link):
+            os.unlink(self.link)
+        if self.scratch:
+            shutil.rmtree(self.scratch, ignore_errors=True)   # removes the links, never what they point to
+        return False
+
+
 def wine_path(path: str) -> str:
     """Wine's Z: drive is the Unix root, so a Windows program reads /x/y as Z:\\x\\y."""
     return "Z:" + os.path.abspath(path).replace("/", "\\")
@@ -53,6 +107,24 @@ def wine_path(path: str) -> str:
 
 def properties(test: dict) -> dict:
     return {p["name"]: p["value"] for p in test.get("properties", [])}
+
+
+def fixture_dependencies(tests: list[dict]) -> dict[int, tuple[int, ...]]:
+    """Find the listed setup tests that must finish before each fixture consumer."""
+    metadata = [properties(test) for test in tests]
+    setups: dict[str, list[int]] = {}
+    for index, props in enumerate(metadata):
+        for fixture in props.get("FIXTURES_SETUP", []):
+            setups.setdefault(fixture, []).append(index)
+    return {
+        index: tuple(dict.fromkeys(
+            setup
+            for fixture in props.get("FIXTURES_REQUIRED", [])
+            for setup in setups.get(fixture, ())
+            if setup != index
+        ))
+        for index, props in enumerate(metadata)
+    }
 
 
 def truthy(value) -> bool:
@@ -65,8 +137,11 @@ def regex_list(value: str | list[str]) -> list[str]:
     return [value] if isinstance(value, str) else value
 
 
-def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
+def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...] = ()) -> tuple[str, str]:
     """Returns (status, detail): status is pass, fail or skip."""
+    props = properties(test)
+    if truthy(props.get("DISABLED")):
+        return "skip", "disabled by CTest"
     command = test.get("command")
     if not command:
         return "fail", "no command (target not built?)"
@@ -76,22 +151,44 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
         return "skip", f"runs {command[0]}, not a program from the build"
     if not os.path.isfile(exe):
         return "fail", f"executable not in the artifact: {command[0]}"
+    if failed_setups:
+        return "fail", "failed fixture setup: " + ", ".join(failed_setups)
     argv = list(wine) + [exe]
     for a in command[1:]:
         mapped = map_path(a, args.windows_root, args.root)
         argv.append(wine_path(mapped) if mapped is not None else a)
-    props = properties(test)
     cwd = props.get("WORKING_DIRECTORY")
     cwd = map_path(cwd, args.windows_root, args.root) if cwd else os.path.dirname(exe)
     if not cwd or not os.path.isdir(cwd):
         cwd = os.path.dirname(exe)
+    assignments = props.get("ENVIRONMENT", [])
+    if not isinstance(assignments, list):
+        return "fail", "invalid CTest ENVIRONMENT: expected a list of NAME=value entries"
+    env = os.environ.copy()
+    for assignment in assignments:
+        if not isinstance(assignment, str):
+            return "fail", "invalid CTest ENVIRONMENT entry: expected NAME=value"
+        key, equals, value = assignment.partition("=")
+        if not key or not equals or "\0" in assignment:
+            return "fail", "invalid CTest ENVIRONMENT entry: expected NAME=value"
+        env[key] = value
+    timeout = args.timeout
+    if "TIMEOUT" in props:
+        try:
+            ctest_timeout = float(props["TIMEOUT"])
+        except (TypeError, ValueError):
+            return "fail", "invalid CTest TIMEOUT"
+        if not math.isfinite(ctest_timeout) or ctest_timeout < 0:
+            return "fail", "invalid CTest TIMEOUT"
+        if ctest_timeout > 0:
+            timeout = min(timeout, ctest_timeout)
     start = time.monotonic()
     try:
-        proc = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=args.timeout)
+        proc = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=timeout)
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace")
-        return "fail", f"timed out after {args.timeout} s\n{out}"
+        return "fail", f"timed out after {timeout} s\n{out}"
     except OSError as e:                  # a mistyped --wine, or a missing one: report the test, do not abort the run
         return "fail", f"could not start {argv[0]}: {e.strerror or e}"
     elapsed = time.monotonic() - start
@@ -105,10 +202,13 @@ def run_test(test: dict, args, wine: list[str]) -> tuple[str, str]:
     if skip_code is not None and code == int(skip_code):
         return "skip", f"exit {code} (skip) in {elapsed:.1f} s\n{out}"
     detail = f"exit {code} in {elapsed:.1f} s\n{out}"
+    skip_patterns = regex_list(props.get("SKIP_REGULAR_EXPRESSION", []))
     required = regex_list(props.get("PASS_REGULAR_EXPRESSION", []))
     forbidden = regex_list(props.get("FAIL_REGULAR_EXPRESSION", []))
     # A required match takes the place of the exit code. A forbidden match overrides either kind of success.
     try:
+        if any(re.search(pattern, out, re.DOTALL) for pattern in skip_patterns):
+            return "skip", f"matched CTest SKIP_REGULAR_EXPRESSION: {detail}"
         passed = any(re.search(pattern, out, re.DOTALL) for pattern in required) if required else code == 0
         if any(re.search(pattern, out, re.DOTALL) for pattern in forbidden):
             passed = False
@@ -143,6 +243,20 @@ def wine_command(text: str) -> list[str]:
     return parts
 
 
+def valid_test_row(test) -> bool:
+    if not isinstance(test, dict) or not isinstance(test.get("name"), str):
+        return False
+    # CTest can omit the command for a target that was not built.
+    command = test.get("command", [])
+    if not isinstance(command, list) or not all(isinstance(arg, str) and "\0" not in arg for arg in command):
+        return False
+    entries = test.get("properties", [])
+    return isinstance(entries, list) and all(
+        isinstance(entry, dict) and isinstance(entry.get("name"), str) and "value" in entry
+        for entry in entries
+    )
+
+
 def read_tests(path: str) -> list[dict] | None:
     """The tests in a `ctest --show-only=json-v1` file, or None when it is not one."""
     try:
@@ -151,10 +265,11 @@ def read_tests(path: str) -> list[dict] | None:
     except (OSError, ValueError) as e:
         print(f"ERROR: cannot read {path}: {e}", file=sys.stderr)
         return None
-    if not isinstance(doc, dict) or not isinstance(doc.get("tests", []), list):
+    tests = doc.get("tests") if isinstance(doc, dict) else None
+    if not isinstance(tests, list) or not all(valid_test_row(t) for t in tests):
         print(f"ERROR: {path} is not the output of ctest --show-only=json-v1", file=sys.stderr)
         return None
-    return doc.get("tests", [])
+    return tests
 
 
 def main() -> int:
@@ -165,7 +280,8 @@ def main() -> int:
     ap.add_argument("--wine", type=wine_command, default=os.environ.get("WINE", "wine"),
                     help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
-    ap.add_argument("--timeout", type=positive_seconds, default=120.0, help="seconds per test (default 120)")
+    ap.add_argument("--timeout", type=positive_seconds, default=120.0,
+                    help="maximum seconds per test; a shorter CTest TIMEOUT applies (default 120)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
     ap.add_argument("--label", help="named in the summary's heading, e.g. the Wine version")
     args = ap.parse_args()
@@ -173,16 +289,27 @@ def main() -> int:
     tests = read_tests(args.tests)
     if tests is None:
         return 2
+    dependencies = fixture_dependencies(tests)
+    try:
+        order = list(TopologicalSorter(dependencies).static_order())
+    except CycleError:
+        print("ERROR: CTest fixture setup dependencies form a cycle", file=sys.stderr)
+        return 2
     wine = args.wine
     results = {}
-    for test in tests:
-        name = test.get("name", "?")
-        status, detail = run_test(test, args, wine)
-        results[name] = status
-        print(f"[{status.upper()}] {name}", flush=True)
-        if status != "pass":
-            for line in detail.rstrip().splitlines()[-40:]:
-                print(f"    {line}")
+    prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
+    names = [test.get("name", "?") for test in tests]
+    with DriveMap(args.windows_root, args.root, prefix) as drive:
+        print(drive.note, flush=True)
+        for index in order:
+            name = names[index]
+            failed_setups = tuple(names[setup] for setup in dependencies[index] if results[names[setup]] == "fail")
+            status, detail = run_test(tests[index], args, wine, failed_setups=failed_setups)
+            results[name] = status
+            print(f"[{status.upper()}] {name}", flush=True)
+            if status != "pass":
+                for line in detail.rstrip().splitlines()[-40:]:
+                    print(f"    {line}")
 
     missing = [n for n in args.require if n not in results]
     failed_required = [n for n in args.require if results.get(n) != "pass"]
@@ -197,7 +324,7 @@ def main() -> int:
     if args.summary:
         try:
             _make_parent(args.summary)
-            with open(args.summary, "a", encoding="utf-8") as f:
+            with open(args.summary, "a", encoding="utf-8", newline="\n") as f:
                 f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
                 f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
                 f.write("| Test | Result | Required |\n|---|---|---|\n")
