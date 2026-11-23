@@ -297,8 +297,11 @@ The executable's first boot confirms them, or names the slots that differ.
 
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
-- **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
-  closes). Association and audio-endpoint registrations hand out tokens that never fire. The user has no audio
+- **Devices:** every device belongs to the offline user, once the title has added it: `XUserFindForDevice` hands out
+  an `XUserHandle` the title closes only after `XUserAddAsync` (or the add-by-id call for the local user) has
+  completed. Before that it answers `E_GAMEUSER_USER_NOT_FOUND` and writes no handle, because the reference says it
+  "cannot return a user handle to a user that hasn't been signed in with a call to `XUserAddAsync`" (RT-382).
+  **ASSUMPTION:** that HRESULT; the reference page names no code for this case. Association and audio-endpoint registrations hand out tokens that never fire. The user has no audio
   endpoint of its own (`ERROR_NOT_FOUND`). Finding a controller shows no UI and gives an all-zero device id, as
   documented for desktop. **ASSUMPTION:** `APP_LOCAL_DEVICE_ID` is 32 bytes.
 
