@@ -267,6 +267,7 @@ DWORD WINAPI game_thread(void* p) {
     // An EXE entry point (mainCRTStartup and friends) takes the PEB pointer and returns the process exit code.
     auto entry = reinterpret_cast<DWORD(WINAPI*)(void*)>(call->entry);
     const DWORD code = entry(nullptr);
+    flush_streams();                  // the entry point returned without calling exit(): flush as exit() does
     end_run(static_cast<int>(code));  // returning from the entry point is an exit too
 }
 
