@@ -129,6 +129,13 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
             EXPECT(hr4 == E_NOINTERFACE && !adapter4.p);
             EXPECT(second_hr == DXGI_ERROR_NOT_FOUND && !second.p);
         }
+        Ref<IDXGIFactory4> factory4;
+        EXPECT(factory->QueryInterface(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory4.p)) == S_OK);
+        EXPECT(factory->EnumAdapters(0, nullptr) == DXGI_ERROR_INVALID_CALL);
+        EXPECT(factory->EnumAdapters(1, nullptr) == DXGI_ERROR_INVALID_CALL);
+        EXPECT(factory->EnumAdapters1(0, nullptr) == DXGI_ERROR_INVALID_CALL);
+        EXPECT(factory4->EnumAdapterByLuid(device_luid, __uuidof(IDXGIAdapter), nullptr) == DXGI_ERROR_INVALID_CALL);
+        EXPECT(factory4->EnumWarpAdapter(__uuidof(IDXGIAdapter), nullptr) == DXGI_ERROR_INVALID_CALL);
     }
     // The next step of the sequence. Which answer comes back is the adapter's business (a software adapter has no
     // output; the layer's adapter has none before D3D-313): it is one of the two, and an output only with S_OK.

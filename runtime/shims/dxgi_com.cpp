@@ -1379,7 +1379,7 @@ public:
 
     // IDXGIFactory
     HRESULT STDMETHODCALLTYPE EnumAdapters(UINT index, IDXGIAdapter** out) override {
-        if (!out) return E_POINTER;
+        if (!out) return DXGI_ERROR_INVALID_CALL;
         *out = nullptr;
         if (index != 0) return DXGI_ERROR_NOT_FOUND;
         auto* adapter = new Adapter(this, gipa_, instance_, physical_);
@@ -1432,7 +1432,7 @@ public:
 
     // IDXGIFactory1
     HRESULT STDMETHODCALLTYPE EnumAdapters1(UINT index, IDXGIAdapter1** out) override {
-        if (!out) return E_POINTER;
+        if (!out) return DXGI_ERROR_INVALID_CALL;
         *out = nullptr;
         if (index != 0) return DXGI_ERROR_NOT_FOUND;
         auto* adapter = new Adapter(this, gipa_, instance_, physical_);
@@ -1567,7 +1567,7 @@ public:
 
     // IDXGIFactory4
     HRESULT STDMETHODCALLTYPE EnumAdapterByLuid(LUID luid, REFIID riid, void** out) override {
-        if (!out) return E_POINTER;
+        if (!out) return DXGI_ERROR_INVALID_CALL;
         *out = nullptr;
         auto* adapter = new Adapter(this, gipa_, instance_, physical_);
         const LUID actual = adapter->luid();
@@ -1579,7 +1579,9 @@ public:
         adapter->Release();
         return hr;
     }
-    HRESULT STDMETHODCALLTYPE EnumWarpAdapter(REFIID, void**) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE EnumWarpAdapter(REFIID, void** out) override {
+        return out ? DXGI_ERROR_NOT_FOUND : DXGI_ERROR_INVALID_CALL;
+    }
 
     // IDXGIFactory5
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(DXGI_FEATURE feature, void* data, UINT size) override {
