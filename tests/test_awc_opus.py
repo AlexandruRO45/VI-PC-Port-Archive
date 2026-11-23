@@ -634,6 +634,34 @@ class ExportBankTest(unittest.TestCase):
             pages = parse_ogg_pages(f.read())
         self.assertEqual(pages[-1]["granule"], 312 + 2880)
 
+    def test_opus_head_records_the_declared_rate(self):
+        # The rate field is the content's native sample rate. Granules are always 48 kHz, so OpusHead's
+        # input_sample_rate is the only place a tool learns it, and it must not read back as 48000.
+        packet = bytes([0x08])          # SILK 20 ms, code 0: 960 frames
+        opus = bytearray(3 * 2048)
+        for block in range(3):
+            struct.pack_into("<H", opus, block * 2048, len(packet))
+            opus[block * 2048 + 2:block * 2048 + 2 + len(packet)] = packet
+        for rate, name in ((32000, "rate32k_head"), (12000, "rate12k_head")):
+            with self.subTest(rate=rate):
+                path = os.path.join(self.tmp.name, name + ".awc")
+                with open(path, "wb") as f:
+                    f.write(build_bank([(11, format_block(1920, rate, 0x0B, 1), bytes(opus))]))
+                awc.export_bank(path, self.out)
+                with open(os.path.join(self.out, name, "0000000B.ogg"), "rb") as f:
+                    pages = parse_ogg_pages(f.read())
+                version, channels, preskip, in_rate, gain, mapping = struct.unpack_from("<BBHIhB", pages[0]["body"], 8)
+                self.assertEqual((version, channels, preskip, in_rate, gain, mapping), (1, 1, 312, rate, 0, 0))
+                self.assertEqual(pages[-1]["granule"], 312 + 1920)
+
+    def test_end_length_takes_the_declared_count_as_is_at_32_48_28k(self):
+        self.assertEqual(awc.end_length(960, 48000), 960)
+        self.assertEqual(awc.end_length(960, 32000), 960)
+        self.assertEqual(awc.end_length(960, 28000), 960)
+        self.assertEqual(awc.end_length(960, 12000), 3840)
+        self.assertEqual(awc.end_length(960, 44100), 1044)
+        self.assertEqual(awc.end_length(960, 0), 0)
+
     def test_inconsistent_format_frame_count_falls_back(self):
         # +0x0C is authoritative only when it agrees with the interleaved +0 count:
         # 1920 * 2 != 9999, so the block is malformed and +0 / channels (4999) is used
@@ -764,6 +792,20 @@ class StreamedMusicTest(unittest.TestCase):
             pages = parse_ogg_pages(f.read())
         version, channels, preskip, in_rate, gain, mapping = struct.unpack_from("<BBHIhB", pages[0]["body"], 8)
         self.assertEqual((version, channels, preskip, in_rate, gain, mapping), (1, 2, 312, 48000, 0, 0))
+        self.assertEqual(pages[-1]["granule"], 312 + 960)
+
+    def test_music_declared_samples_are_48khz_not_scaled_by_rate(self):
+        # Two 960-frame packets are 1920 frames. The descriptor declares 960 at a 32 kHz rate: like the
+        # format tag, the count is already the 48 kHz-domain end length. The old scale-by-rate formula
+        # aimed the trim at 312 + 1440, past the declared end, and kept 480 frames of padding.
+        path = os.path.join(self.tmp.name, "music32k.awc")
+        with open(path, "wb") as f:
+            f.write(build_music_bank([[0x08], [0x08]], 960, rate=32000))
+        awc.export_bank(path, self.out)
+        with open(os.path.join(self.out, "music32k", "00000100.ogg"), "rb") as f:
+            pages = parse_ogg_pages(f.read())
+        version, channels, preskip, in_rate, gain, mapping = struct.unpack_from("<BBHIhB", pages[0]["body"], 8)
+        self.assertEqual((version, channels, preskip, in_rate, gain, mapping), (1, 1, 312, 32000, 0, 0))
         self.assertEqual(pages[-1]["granule"], 312 + 960)
 
     def test_short_final_block_keeps_its_music(self):

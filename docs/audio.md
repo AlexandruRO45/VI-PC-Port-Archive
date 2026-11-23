@@ -100,7 +100,9 @@ The exporter writes that value as `OpusHead` pre-skip and emits the EOS page at 
 would let its granule go backwards when the trim point falls before that page starts, and decoders would keep the
 excess: a 27-packet real-libopus fixture decoded 24,960 frames for 24,000 declared, while the reaching-packet
 form decodes exactly 24,000. An oversized `--pre-skip` is clamped to the stream length so the final granule never
-falls below it.
+falls below it. `OpusHead`'s input_sample_rate is the stream's declared rate: granules are always
+48 kHz samples (RFC 7845), and the tag is informational, recording the content's rate for tools that
+clock or report it. It was hard-coded to 48000, which made a 32 kHz stream's tag claim 48000.
 
 The format tag's sample count is already in 48 kHz frames even when its rate field is 32 kHz, and `+0x0C` is the
 per-channel frame count (equal to `+0` for mono and half of it for stereo in all 7,451 measured streams, 0.5% of
@@ -139,6 +141,10 @@ An Opus packet's TOC stereo bit (`packet[0] & 0x04`) gives the real count, and t
 counts interleaved samples across those packet channels. The exporter therefore writes a stereo Ogg with
 `OpusHead channels=2` and `samples / 2` as the end granule when the packets are stereo; mono groups keep their
 count unchanged. Reading `samples` as a frame count produces a file that reports twice its real duration.
+At 32/48/28 kHz the count is already in the 48 kHz granule domain (measured over the corpus: the packets' TOC
+frame sum exceeds it by 0.7..5.6%), so the end trim uses it as-is at those rates; the old scale-by-rate formula
+over-aimed the 32 kHz trim 1.5x, past the payload, and the end padding was never dropped. Other rates keep the
+scaled count.
 
 ## What the exporters write
 

@@ -69,7 +69,7 @@ def export_bank(path: str, out_dir: str, min_seconds: float, max_seconds: float,
     rows = []
     for (cid, frames, rate, packets, channel_count, duration), stem in zip(selected, stems):
         op = os.path.join(od, stem + ".ogg")
-        awc.write_ogg_opus(op, packets, channel_count, cid, frames * 48000 // rate)
+        awc.write_ogg_opus(op, packets, channel_count, cid, awc.end_length(frames, rate))
         rows.append({
             "bank": bank,
             "stream": f"{cid:08X}",

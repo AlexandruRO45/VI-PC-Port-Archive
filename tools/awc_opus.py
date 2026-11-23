@@ -13,7 +13,8 @@ delay (libopus at 48 kHz) that RFC 7845 says the decoder drops using OpusHead's 
 does not store it, so the exporter writes OPUS_PRE_SKIP (overridable with --pre-skip) into OpusHead and makes the
 trimmed final granule `pre_skip + length`. The format block's +0 count is interleaved across channels and already
 in 48 kHz frames even when its rate field is 32 kHz; +0x0C is the per-channel frame count (equal to +0 for mono
-and half of it for stereo in all 7,451 measured streams).
+and half of it for stereo in all 7,451 measured streams). OpusHead's input_sample_rate is the stream's declared
+rate (RFC 7845: granules are always 48 kHz samples; the tag is informational and records the content's rate).
 
 Streamed music (tag 0x48 descriptor: u32 blocks, u32 chunk size, u32 channels, then 16 bytes per channel: id,
 samples, rate at +10, codec at +12) is split into one Ogg Opus per descriptor channel: each chunk starts with a
@@ -21,7 +22,8 @@ samples, rate at +10, codec at +12) is split into one Ogg Opus per descriptor ch
 its run of 2048-byte subblocks after the 2048-aligned header, and the first `skip` samples of a chunk repeat the
 previous chunk's tail and are dropped (whole packets). The descriptor's `channels` is the number of channel
 groups, not necessarily the packet channel count: an Opus packet's TOC stereo bit gives the real channel count,
-and the descriptor's `samples` counts interleaved samples across those packet channels.
+and the descriptor's `samples` counts interleaved samples across those packet channels; like the format block's
+count, at 32/48/28 kHz it is already in the 48 kHz granule domain, so the end trim takes it as-is.
 
 Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each bank's relative path.
 
@@ -103,10 +105,13 @@ OPUS_PRE_SKIP = 312
 
 
 def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length: int = 0,
-                   pre_skip: int = OPUS_PRE_SKIP) -> int:
+                   pre_skip: int = OPUS_PRE_SKIP, rate: int = 48000) -> int:
     """length: the stream's declared per-channel sample count at 48 kHz; the EOS page's granule position is
     trimmed to pre_skip + length (Ogg Opus granules count the pre-skip too), so decoders drop the encoder priming
     at the start and stop at the exact end instead of the padded last frame.
+
+    rate: the stream's declared native sample rate, written to OpusHead's informational input_sample_rate
+    (RFC 7845: granules are always 48 kHz samples; the tag records the content's rate for tools that use it).
 
     The EOS page is emitted at the packet that first reaches pre_skip + length; any later packets are encoder
     padding and are dropped. Clamping only the final page would make its granule smaller than the previous page's
@@ -119,7 +124,7 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
     total = sum(opus_samples(p) for p in packets)
     if pre_skip > total:
         pre_skip = total          # a granule below the pre-skip makes the stream undecodable
-    head = b"OpusHead" + struct.pack("<BBHIhB", 1, channels, pre_skip, 48000, 0, 0)
+    head = b"OpusHead" + struct.pack("<BBHIhB", 1, channels, pre_skip, rate, 0, 0)
     tags = b"OpusTags" + struct.pack("<I", 8) + b"leonida " + struct.pack("<I", 0)
     out = [ogg_page(serial, 0, 0, [head], 0x02), ogg_page(serial, 1, 0, [tags], 0x00)]
     seq, granule, pending, size = 2, 0, [], 0
@@ -145,6 +150,18 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
                 break
     write_file(path, b"".join(out))
     return written
+
+
+def end_length(samples: int, rate: int) -> int:
+    """The 48 kHz-domain end-trim length for a stream's declared sample count.
+
+    Streams declared at 32/48/28 kHz store the count in the 48 kHz granule domain (measured over the corpus: the
+    packets' TOC frame sum exceeds it by 0.7..5.6%), so it is used as-is; scaling it by 48000/rate over-aimed the
+    32 kHz trim target 1.5x, past the payload, so the end padding was never dropped. The rare other rates store
+    the native-domain count, which is scaled to 48 kHz (the trim then only applies when the TOC sum exceeds it)."""
+    if rate in (32000, 48000, 28000):
+        return samples
+    return samples * 48000 // rate if rate else 0
 
 
 @functools.cache
@@ -407,9 +424,9 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_shee
             if cue_sheet:
                 channel_counts[cid] += 1
             if pk:
-                n48 = samples * 48000 // rate if rate else 0
+                n48 = end_length(samples, rate)
                 granule = write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, packet_channels, cid, n48,
-                                         pre_skip=pre_skip)
+                                         pre_skip=pre_skip, rate=rate)
                 if cue_sheet and rate == 48000 and samples > 0:
                     frame_limits[cid] = min(samples, max(0, granule - pre_skip))
                 counts["music"] += 1
@@ -426,7 +443,7 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_shee
                 if not frames or frames * s["channels"] != s["samples"]:
                     frames = s["samples"] // max(1, s["channels"])
                 write_ogg_opus(os.path.join(od, stem + ".ogg"), pk, s["channels"], s["id"], frames,
-                               pre_skip=pre_skip)
+                               pre_skip=pre_skip, rate=s["rate"])
                 counts["opus"] += 1
                 continue
         if s["codec"] == 2 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 4:
