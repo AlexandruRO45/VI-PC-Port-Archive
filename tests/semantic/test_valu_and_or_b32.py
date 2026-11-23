@@ -297,6 +297,137 @@ class TestValuAndOrB32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(results, [0x1F, 0xBF])
         self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 2), 0xBF)
 
+# ---------------------------------------------------------------------------
+# SIMD Wavefront Interpreter (Multi-Lane Divergence & 32/64-Bit EXEC Masking)
+# ---------------------------------------------------------------------------
+
+class SIMDVALUWavefrontInterpreter:
+    """Multi-lane SIMD interpreter modeling Wave32 and Wave64 execution for v_and_or_b32."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size} (must be 32 or 64)")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: list[int] = [0] * 106
+
+    def set_exec_mask(self, mask: int) -> None:
+        valid_mask = (1 << self.wave_size) - 1
+        self.exec_mask = mask & valid_mask
+
+    def read_lane_reg_u32(self, lane: int, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[lane][idx] & MASK32
+        return self.sgprs[idx] & MASK32
+
+    def write_lane_reg_u32(self, lane: int, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[lane][idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def resolve_lane_operand(self, lane: int, op: Register | int) -> int:
+        if isinstance(op, Register):
+            return self.read_lane_reg_u32(lane, op.kind, op.index)
+        return op & MASK32
+
+    def step(self, inst: Instruction) -> list[int | None]:
+        lane_inputs: list[tuple[int, int, int]] = []
+        for lane in range(self.wave_size):
+            s0 = self.resolve_lane_operand(lane, inst.src0)
+            s1 = self.resolve_lane_operand(lane, inst.src1)
+            s2 = self.resolve_lane_operand(lane, inst.src2)
+            lane_inputs.append((s0, s1, s2))
+
+        lane_results: list[int | None] = []
+        for lane in range(self.wave_size):
+            is_active = bool((self.exec_mask >> lane) & 1)
+            if not is_active:
+                lane_results.append(None)
+                continue
+
+            s0, s1, s2 = lane_inputs[lane]
+            res = ref_and_or_b32(s0, s1, s2)
+            self.write_lane_reg_u32(lane, inst.dst.kind, inst.dst.index, res)
+            lane_results.append(res)
+
+        return lane_results
+
+
+class TestValuAndOrB32SIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_all_lanes_active(self) -> None:
+        simd = SIMDVALUWavefrontInterpreter(wave_size=32)
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 1 << lane)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, 0xFFFFFFFF)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 3, 0)
+
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Register(RegKind.VGPR, 3),
+        )
+        results = simd.step(inst)
+
+        for lane in range(32):
+            self.assertEqual(results[lane], 1 << lane)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 1 << lane)
+
+    def test_wave64_alternating_exec_mask(self) -> None:
+        simd = SIMDVALUWavefrontInterpreter(wave_size=64)
+        exec_mask = 0x5555555555555555  # Even lanes active
+        simd.set_exec_mask(exec_mask)
+
+        for lane in range(64):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, 0x11111111)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, 0xFFFFFFFF)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, 0xAAAAAAAA)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 3, 0x05050505)
+
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Register(RegKind.VGPR, 3),
+        )
+        results = simd.step(inst)
+
+        expected_val = (0xFFFFFFFF & 0xAAAAAAAA) | 0x05050505  # 0xAF05AF05
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], expected_val)
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), expected_val)
+            else:
+                self.assertIsNone(results[lane])
+                # Inactive lane must retain initial destination value
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 0x11111111)
+
+    def test_all_inactive_lanes(self) -> None:
+        simd = SIMDVALUWavefrontInterpreter(wave_size=32)
+        simd.set_exec_mask(0)
+
+        for lane in range(32):
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 0, 0x77777777)
+
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=0xFFFFFFFF,
+            src1=0xFFFFFFFF,
+            src2=0xFFFFFFFF,
+        )
+        results = simd.step(inst)
+        self.assertEqual(results, [None] * 32)
+        for lane in range(32):
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 0), 0x77777777)
+
 class TestValuAndOrB32Oracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and bitwise truth tables."""
 
