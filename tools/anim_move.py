@@ -33,6 +33,8 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import anim_index  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MAGIC = b"MoVE"
@@ -50,6 +52,7 @@ KNOWN_SCHEMA_HASHES = {
     anim_index.joaat32("motiontree"): "motiontree",
 }
 MAX_STANDALONE_FILE_BYTES = 128 * 1024 * 1024
+MAX_CONTAINER_DEPTH = 128
 
 
 class DecodeError(ValueError):
@@ -61,10 +64,12 @@ def is_move_container(data):
 
 
 def expected_total_size(data):
-    """Return `46 + 5 * N_desc + body_size` once the preamble up to `N_desc` is available, or None if truncated."""
+    """Return `46 + 5 * N_desc + body_size` once a valid v19 preamble up to `N_desc` is available, or None."""
     if not is_move_container(data) or len(data) < 48:
         return None
-    body_size = struct.unpack_from("<I", data, 0x18)[0]
+    version, z0, z1, z2, _network_hash, body_size, z3 = struct.unpack_from("<7I", data, 4)
+    if version != VERSION or (z0, z1, z2, z3) != (0, 0, 0, 0):
+        return None
     pos = 0x20
     n_req = struct.unpack_from("<I", data, pos)[0]
     pos += 4 + 4 * n_req
@@ -74,7 +79,9 @@ def expected_total_size(data):
     pos += 4 + 4 * n_flag
     if pos + 8 > len(data):
         return None
-    n_desc = struct.unpack_from("<I", data, pos + 4)[0]
+    preamble_mode, n_desc = struct.unpack_from("<2I", data, pos)
+    if preamble_mode not in (0, 1, 2):
+        return None
     return 46 + 5 * n_desc + body_size
 
 
@@ -175,8 +182,10 @@ def _parse_param_blocks(data, start, end_limit, count):
     return blocks, p
 
 
-def _parse_container(data, off, end_limit, stats):
+def _parse_container(data, off, end_limit, stats, depth=0):
     """Recursively decode a `Type 1` (`StateMachine`), `Type 3` (`InlinedStateMachine`), or `Type 22` (`MotionTree`)."""
+    if depth > MAX_CONTAINER_DEPTH:
+        raise DecodeError(f"state container nesting exceeds {MAX_CONTAINER_DEPTH} levels at 0x{off:x}")
     if off + 0x24 > end_limit or end_limit > len(data):
         raise DecodeError(f"truncated state container at 0x{off:x}")
     (ntype, nidx, name_hash, init_rel, flags_0c,
@@ -219,6 +228,10 @@ def _parse_container(data, off, end_limit, stats):
             if fwd_inputs:
                 children_end_limit = min(fwd_inputs)
         child_table_end = child_table_off + 8 * n_children
+        if child_table_end > children_end_limit:
+            raise DecodeError(
+                f"truncated {kind} child directory at 0x{off:x}: ends at 0x{child_table_end:x} > 0x{children_end_limit:x}"
+            )
         tr_start = off + 0x24 + tr_rel if n_transitions > 0 else child_table_end
         if n_transitions > 0 and tr_start != child_table_end:
             raise DecodeError(
@@ -237,6 +250,11 @@ def _parse_container(data, off, end_limit, stats):
         first_child_off = child_entries[0][1] if child_entries else children_end_limit
         if n_def_tr == 0 and def_tr_rel == 0:
             def_tr_start = first_child_off
+        if (n_transitions or n_def_tr) and not (child_table_end <= def_tr_start <= first_child_off):
+            raise DecodeError(
+                f"{kind} at 0x{off:x}: default-transition offset 0x{def_tr_start:x} "
+                f"outside 0x{child_table_end:x}..0x{first_child_off:x}"
+            )
         transitions = _parse_transitions(data, tr_start, def_tr_start, n_transitions) if n_transitions else []
         def_transitions = _parse_default_transitions(data, def_tr_start, first_child_off, n_def_tr) if n_def_tr else []
         stats["transitions"] += len(transitions)
@@ -246,7 +264,7 @@ def _parse_container(data, off, end_limit, stats):
         children = []
         for i, (ch_hash, ch_off) in enumerate(child_entries):
             ch_end = child_entries[i + 1][1] if i + 1 < n_children else children_end_limit
-            child = _parse_container(data, ch_off, ch_end, stats)
+            child = _parse_container(data, ch_off, ch_end, stats, depth + 1)
             if child["name_hash"] != ch_hash:
                 raise DecodeError(
                     f"child state at 0x{ch_off:x} hash 0x{child['name_hash']:08x} != directory hash 0x{ch_hash:08x}"
@@ -297,7 +315,7 @@ def _parse_container(data, off, end_limit, stats):
 
     embedded = []
     if root_node_type in (TYPE_STATE_MACHINE, TYPE_INLINED_STATE_MACHINE):
-        embedded.append(_parse_container(data, init_target, end_limit, stats))
+        embedded.append(_parse_container(data, init_target, end_limit, stats, depth + 1))
 
     return {
         "offset": off,
@@ -411,6 +429,8 @@ def _collect_move_streams_rpf(path, start=None, limit=None):
             j = i + 1
             while (want is not None and len(blob) < want and j < len(rows)
                    and prev_size == anim_index.MAX_CHUNK
+                   and rows[j]["size"] <= anim_index.MAX_CHUNK
+                   and len(blob) + rows[j]["size"] <= MAX_STANDALONE_FILE_BYTES
                    and rows[j]["offset"] <= prev_end + 16
                    and rows[j]["signature"] not in anim_index.STOP_SIGNATURES):
                 blob += _inflate_at(fh, rows[j]["offset"], rows[j]["stored"])
@@ -458,7 +478,10 @@ def _collect_move_streams_dir(path):
         j = i + 1
         while (want is not None and len(blob) < want and j < len(entries)
                and len(entries[j - 1][2]) == anim_index.MAX_CHUNK
-               and not is_move_container(entries[j][2])):
+               and len(entries[j][2]) <= anim_index.MAX_CHUNK
+               and len(blob) + len(entries[j][2]) <= MAX_STANDALONE_FILE_BYTES
+               and anim_index.classify(entries[j][2], entries[j][0], len(entries[j][2]))["signature"]
+               not in anim_index.STOP_SIGNATURES):
             blob += entries[j][2]
             stream_count += 1
             j += 1
@@ -575,8 +598,13 @@ def _write_json_atomic(path, doc):
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             json.dump(doc, f, indent=1)
-        os.replace(tmp_path, path)
+        os.chmod(tmp_path, published_mode(path))
+        replace_retry(tmp_path, path)
     except BaseException:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
         try:
             os.unlink(tmp_path)
         except OSError:

@@ -9,6 +9,7 @@ No game file or game asset name is used.
 """
 import json
 import os
+import stat
 import struct
 import subprocess
 import sys
@@ -396,6 +397,107 @@ class AnimMoveTest(unittest.TestCase):
         for broken in ("\u00c3\u2014", "\u00e2\u20ac", "\u00c2"):
             self.assertNotIn(broken, source)
         self.assertIn("N_req \u00d7 u32 request hashes", source)
+
+    def test_parse_move_rejects_excessive_nesting_without_recursion_error(self):
+        cur = build_motion_tree(name_hash=0x55550001)
+        prev_hash = 0x55550001
+        for i in range(anim_move.MAX_CONTAINER_DEPTH + 5):
+            h = 0x55550002 if prev_hash == 0x55550001 else 0x55550001
+            cur = build_state_machine([(prev_hash, cur)], name_hash=h)
+            prev_hash = h
+        blob = build_move_resource(cur, requests=(), flags=(), preamble_mode=0, descriptors_5b=())
+        with self.assertRaisesRegex(anim_move.DecodeError, "nesting exceeds"):
+            anim_move.parse_move(blob)
+        carved = os.path.join(self.tmp.name, "deep")
+        os.makedirs(carved)
+        with open(os.path.join(carved, "00010000.bin"), "wb") as f:
+            f.write(blob)
+        resources, summary = anim_move.scan(carved)
+        self.assertEqual(summary["counts"]["move_resources_unparsed"], 1)
+        self.assertIn("nesting exceeds", resources[0]["error"])
+
+    def test_parse_move_rejects_overlapping_transitions_and_truncated_child_dir(self):
+        mt = build_motion_tree(name_hash=0x55550001)
+
+        # n_transitions=0, n_def_tr=1 with def_tr_rel pointing backward into header bytes before child_table_end.
+        sm_back = bytearray(build_state_machine([(0x55550001, mt)], name_hash=HASH_SM))
+        struct.pack_into("<HHi", sm_back, 0x30, 0x30, 1, 0x20)
+        struct.pack_into("<Ii", sm_back, 0x50, 1, 0x30 - 0x54)
+        blob_back = build_move_resource(bytes(sm_back), requests=(), flags=(), preamble_mode=0, descriptors_5b=())
+        with self.assertRaisesRegex(anim_move.DecodeError, "default-transition offset"):
+            anim_move.parse_move(blob_back)
+
+        # n_transitions=1, n_def_tr=0 with def_tr_rel pointing past first_child_off into child bytes.
+        tr = build_transition(0x40, cond_kind=1)
+        sm_fwd = bytearray(build_state_machine([(0x55550001, mt)], name_hash=HASH_SM, transitions=(tr,)))
+        # Extend transition size by 0x10 and move def_tr_rel 0x10 bytes past first_child_off.
+        first_child = 0x58 + 8 + len(tr)
+        struct.pack_into("<I", sm_fwd, 0x58 + 8 + 0x10, len(tr) + 0x10)
+        struct.pack_into("<Ii", sm_fwd, 0x50, 0, (first_child + 0x10) - 0x54)
+        blob_fwd = build_move_resource(bytes(sm_fwd), requests=(), flags=(), preamble_mode=0, descriptors_5b=())
+        with self.assertRaisesRegex(anim_move.DecodeError, "default-transition offset"):
+            anim_move.parse_move(blob_fwd)
+
+        # Truncated child directory: n_children runs past children_end_limit.
+        sm_trunc = bytearray(build_state_machine([(0x55550001, mt)], name_hash=HASH_SM))
+        sm_trunc[0x12] = 250
+        blob_trunc = build_move_resource(bytes(sm_trunc), requests=(), flags=(), preamble_mode=0, descriptors_5b=())
+        with self.assertRaisesRegex(anim_move.DecodeError, "child directory"):
+            anim_move.parse_move(blob_trunc)
+
+    def test_continuation_joining_stops_at_stop_signatures_oversized_and_bad_headers(self):
+        two = self._sample_large_two_stream_resource()
+
+        # expected_total_size rejects wrong version, non-zero reserved words, and invalid preamble_mode.
+        bad_ver = bytearray(two[:MAX_CHUNK])
+        struct.pack_into("<I", bad_ver, 4, 18)
+        self.assertIsNone(anim_move.expected_total_size(bytes(bad_ver)))
+
+        bad_res = bytearray(two[:MAX_CHUNK])
+        struct.pack_into("<I", bad_res, 8, 1)
+        self.assertIsNone(anim_move.expected_total_size(bytes(bad_res)))
+
+        bad_mode = bytearray(two[:MAX_CHUNK])
+        struct.pack_into("<I", bad_mode, 0x28, 3)  # requests=0, flags=0 -> preamble_mode at 0x28
+        self.assertIsNone(anim_move.expected_total_size(bytes(bad_mode)))
+
+        # Directory scan must not glue an RBF0 (STOP_SIGNATURES) stream onto a truncated 64 KiB MoVE stream.
+        carved_stop = os.path.join(self.tmp.name, "carved_stop")
+        os.makedirs(carved_stop)
+        with open(os.path.join(carved_stop, "00010000.bin"), "wb") as f:
+            f.write(two[:MAX_CHUNK])
+        with open(os.path.join(carved_stop, "00020000.bin"), "wb") as f:
+            f.write(b"RBF0" + b"\x00" * 128)
+        items_stop, _ = anim_move._collect_move_streams_dir(carved_stop)
+        self.assertEqual(len(items_stop), 1)
+        self.assertEqual(items_stop[0][1], 1)
+        self.assertEqual(len(items_stop[0][3]), MAX_CHUNK)
+
+        # Both directory and RPF scans must not join a continuation chunk larger than MAX_CHUNK (64 KiB).
+        oversized = b"\x01" * (MAX_CHUNK + 16)
+        carved_big = os.path.join(self.tmp.name, "carved_big")
+        os.makedirs(carved_big)
+        with open(os.path.join(carved_big, "00010000.bin"), "wb") as f:
+            f.write(two[:MAX_CHUNK])
+        with open(os.path.join(carved_big, "00020000.bin"), "wb") as f:
+            f.write(oversized)
+        items_big, _ = anim_move._collect_move_streams_dir(carved_big)
+        self.assertEqual(items_big[0][1], 1)
+
+        rpf_big = os.path.join(self.tmp.name, "oversized_cont.rpf")
+        write_rpf(rpf_big, [two[:MAX_CHUNK], oversized])
+        rpf_items, _ = anim_move._collect_move_streams_rpf(rpf_big)
+        self.assertEqual(rpf_items[0][1], 1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_atomic_json_preserves_existing_mode(self):
+        out = os.path.join(self.tmp.name, "mode_report.json")
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write("{}")
+        os.chmod(out, 0o644)
+        anim_move._write_json_atomic(out, {"ok": True})
+        self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o644)
+
 
 
 if __name__ == "__main__":
