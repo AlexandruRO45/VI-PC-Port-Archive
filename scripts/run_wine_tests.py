@@ -10,7 +10,8 @@ this repository), which must hold the Windows build's runtime/build folder at th
 
 Some tests open files through absolute paths compiled into them (the GLSL test shaders, LEONIDA_TEST_*_SPV under
 runtime/build/generated). For those, the drive of --windows-root is pointed at --root in the Wine prefix for the run
-($WINEPREFIX, else ~/.wine), unless that drive is already in use there.
+($WINEPREFIX, else the prefix the Wine command uses by default: ~/.wine, or for umu-run ~/Games/umu/$GAMEID), unless
+that drive is already in use there.
 
 Every test is reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
 others show what does and doesn't work under Wine yet without failing the job.
@@ -285,6 +286,22 @@ def wine_command(text: str) -> list[str]:
     return parts
 
 
+def default_prefix(wine: list[str], environ=os.environ) -> str:
+    """The Wine prefix the tests run in when $WINEPREFIX is not set.
+
+    Plain Wine uses ~/.wine. umu-run (UMU-Proton) makes its own: ~/Games/$STORE when STORE is set, else
+    ~/Games/umu/$GAMEID, with GAMEID defaulting to umu-default. The drive map has to land in that one.
+    """
+    if environ.get("WINEPREFIX"):
+        return environ["WINEPREFIX"]
+    home = os.path.expanduser("~")
+    if os.path.basename(wine[0]) in ("umu-run", "umu_run.py"):
+        if environ.get("STORE"):
+            return os.path.join(home, "Games", environ["STORE"])
+        return os.path.join(home, "Games", "umu", environ.get("GAMEID") or "umu-default")
+    return os.path.join(home, ".wine")
+
+
 def valid_test_property(entry) -> bool:
     if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or "value" not in entry:
         return False
@@ -354,7 +371,7 @@ def main() -> int:
     wine = args.wine
     results = {}
     results_by_index: dict[int, str] = {}
-    prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
+    prefix = default_prefix(wine)
     with DriveMap(args.windows_root, args.root, prefix) as drive:
         print(drive.note, flush=True)
         for index in order:

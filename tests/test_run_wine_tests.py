@@ -368,6 +368,48 @@ subprocess.Popen([sys.executable, {helper!r}])
                 run.assert_not_called()
 
 
+class DefaultPrefixTest(unittest.TestCase):
+    """Without $WINEPREFIX the drive is mapped in the prefix the Wine command itself uses."""
+
+    def setUp(self):
+        self.home = os.path.join(os.sep, "home", "tester")
+        patch = mock.patch.object(rwt.os.path, "expanduser",
+                                  lambda p: self.home + p[1:] if p.startswith("~") else p)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_wineprefix_wins_for_every_command(self):
+        for wine in (["wine"], ["umu-run"], ["/usr/bin/umu-run"]):
+            with self.subTest(wine=wine):
+                self.assertEqual(rwt.default_prefix(wine, {"WINEPREFIX": "/p", "GAMEID": "g"}), "/p")
+
+    def test_plain_wine_uses_dot_wine(self):
+        for wine in (["wine"], ["/opt/wine-10/bin/wine64"], ["proton", "run"]):
+            with self.subTest(wine=wine):
+                self.assertEqual(rwt.default_prefix(wine, {}), os.path.join(self.home, ".wine"))
+
+    def test_an_empty_wineprefix_falls_back_to_the_default(self):
+        self.assertEqual(rwt.default_prefix(["wine"], {"WINEPREFIX": ""}), os.path.join(self.home, ".wine"))
+
+    def test_umu_run_uses_its_own_default_prefix(self):
+        for wine in (["umu-run"], ["/usr/bin/umu-run"], ["/opt/umu/umu_run.py"]):
+            with self.subTest(wine=wine):
+                self.assertEqual(rwt.default_prefix(wine, {}),
+                                 os.path.join(self.home, "Games", "umu", "umu-default"))
+
+    def test_umu_run_follows_gameid_and_store(self):
+        self.assertEqual(rwt.default_prefix(["umu-run"], {"GAMEID": "umu-0"}),
+                         os.path.join(self.home, "Games", "umu", "umu-0"))
+        self.assertEqual(rwt.default_prefix(["umu-run"], {"GAMEID": "", "STORE": ""}),
+                         os.path.join(self.home, "Games", "umu", "umu-default"))
+        self.assertEqual(rwt.default_prefix(["umu-run"], {"GAMEID": "umu-0", "STORE": "egs"}),
+                         os.path.join(self.home, "Games", "egs"))
+
+    def test_gameid_alone_does_not_move_a_plain_wine_prefix(self):
+        self.assertEqual(rwt.default_prefix(["wine"], {"GAMEID": "umu-0", "STORE": "egs"}),
+                         os.path.join(self.home, ".wine"))
+
+
 @unittest.skipIf(os.name == "nt", "the runner and its dosdevices links are for Linux and macOS")
 class DriveMapTest(unittest.TestCase):
     def setUp(self):
@@ -654,6 +696,30 @@ class MainTest(unittest.TestCase):
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = rwt.main()
         return code, out.getvalue(), err.getvalue()
+
+    @unittest.skipIf(os.name == "nt", "umu-run and its dosdevices links are for Linux")
+    def test_umu_run_without_wineprefix_maps_the_drive_in_umus_prefix(self):
+        home = self.root / "home"
+        dosdevices = home / "Games" / "umu" / "umu-default" / "dosdevices"
+        dosdevices.mkdir(parents=True)
+        (home / ".wine" / "dosdevices").mkdir(parents=True)
+        umu = self.root / "bin" / "umu-run"
+        umu.parent.mkdir()
+        umu.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8", newline="\n")
+        umu.chmod(0o755)
+        (self.artifact / "sees_drive.py").write_text(
+            "import os, sys\n"
+            f"sys.exit(0 if os.path.isdir({str(dosdevices / 'd:' / 'win' / 'root' / 'artifact')!r}) else 1)\n",
+            encoding="utf-8", newline="\n")
+        environ = {k: v for k, v in os.environ.items() if k not in ("WINEPREFIX", "GAMEID", "STORE")}
+        environ["HOME"] = str(home)
+        with mock.patch.dict(os.environ, environ, clear=True):
+            code, out, _ = self.run_main([ctest_entry("drive", self.command("sees_drive.py"))],
+                                         "--wine", str(umu), "--require", "drive")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"drive d: maps {WINDOWS_ROOT}", out)
+        self.assertFalse(os.path.lexists(dosdevices / "d:"))
+        self.assertFalse(os.path.lexists(home / ".wine" / "dosdevices" / "d:"))
 
     def test_a_bad_timeout_is_refused_by_argparse(self):
         for text in ("0", "-1", "abc", "nan", "inf", "-inf"):
