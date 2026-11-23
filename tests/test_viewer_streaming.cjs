@@ -448,8 +448,18 @@ function fixture(count = 1) {
             return id;
         },
         clearTimeout: id => timers.delete(id),
-        THREE: { MeshStandardMaterial: class {}, Group, DoubleSide: 2,
-            LoaderUtils: { extractUrlBase: url => url.slice(0, url.lastIndexOf('/') + 1) || './' } },
+        THREE: {
+            MeshStandardMaterial: class Material {
+                disposed = false;
+                dispose() { this.disposed = true; }
+                onBeforeCompile() {}
+                customProgramCacheKey() { return 'stock'; }
+                clone() { return new Material(); }
+            },
+            SkinnedMesh: class { normalizeSkinWeights() { this.normalized = true; } },
+            Group, DoubleSide: 2,
+            LoaderUtils: { extractUrlBase: url => url.slice(0, url.lastIndexOf('/') + 1) || './' },
+        },
         AbortController,
         fetch: (url, { signal }) => new Promise((resolve, reject) => {
             const request = { url, signal, reject };
@@ -929,4 +939,96 @@ test('camera hash round-trips and malformed hashes are ignored', () => {
                        '#cam=1,2,,4,5', '#cam=1,2,3,4,5,6', '#other=1,2,3,4,5', undefined, null]) {
         assert.equal(camHelpers.parseCamHash(bad), null, String(bad));
     }
+});
+
+function fakeSkinMaterial(hook = () => {}) {
+    const material = {
+        disposed: false,
+        dispose() { this.disposed = true; },
+        onBeforeCompile: hook,
+        customProgramCacheKey: () => 'stock',
+    };
+    material.clone = () => Object.assign(fakeSkinMaterial(hook), { clone: material.clone });
+    return material;
+}
+
+function makeSkinnedMesh(f, extra = true, material = fakeSkinMaterial()) {
+    const attr = { itemSize: 4 };
+    const attributes = { skinIndex: attr, skinWeight: attr, ...(extra ? { joints_1: attr, weights_1: attr } : {}) };
+    const SkinnedMesh = vm.runInContext('THREE.SkinnedMesh', f.context);
+    return Object.assign(new SkinnedMesh(), {
+        isMesh: true,
+        isSkinnedMesh: true,
+        geometry: { attributes, dispose() {} },
+        material,
+        userData: { gltfExtras: 'preserved' },
+    });
+}
+
+const STOCK_SKIN_SHADER = ['skinning_pars_vertex', 'skinbase_vertex', 'skinnormal_vertex', 'skinning_vertex']
+    .map(name => `#include <${name}>`).join('\n');
+
+test('a second JOINTS_1/WEIGHTS_1 set skins positions and normals, and keeps the first weights raw', () => {
+    const f = fixture();
+    const full = makeSkinnedMesh(f, true), first = makeSkinnedMesh(f, false);
+    full.normalizeSkinWeights();
+    first.normalizeSkinWeights();
+    assert.equal(full.normalized, undefined);
+    assert.equal(first.normalized, true);
+
+    const calls = [];
+    const stock = fakeSkinMaterial(() => calls.push('stock'));
+    const skinVariant = vm.runInContext('skinVariant', f.context);
+    const variant = skinVariant(full, stock);
+    assert.notEqual(variant, stock);
+    assert.equal(variant.skinning, true);
+    assert.equal(variant.customProgramCacheKey(), 'stock|skin-influences-8');
+    const shader = { vertexShader: STOCK_SKIN_SHADER };
+    variant.onBeforeCompile(shader, {});
+    assert.deepEqual(calls, ['stock']);
+    assert.match(shader.vertexShader, /attribute vec4 joints_1;[\s\S]*attribute vec4 weights_1;/);
+    const skinNormal = shader.vertexShader.split('boneMatX1 * skinVertex')[0];
+    assert.match(skinNormal, /skinW1\.w \* boneMatW1;\s*skinMatrix = bindMatrixInverse \* skinMatrix \* bindMatrix;\s*objectNormal/);
+    assert.match(shader.vertexShader, /boneMatW1 \* skinVertex \* skinW1\.w/);
+    assert.match(shader.vertexShader, /1\.0 \/ skinTotal/);
+    assert.equal(stock.onBeforeCompile.length, 0);
+    assert.equal(skinVariant(full, stock), variant);
+});
+
+test('eight-influence skinned meshes keep per-mesh variants across clay, wireframe and eviction', async t => {
+    const f = fixture();
+    const tex = { isTexture: true, dispose: t.mock.fn() };
+    const stock = [Object.assign(fakeSkinMaterial(), { map: tex }), fakeSkinMaterial()];
+    const mesh = makeSkinnedMesh(f, true, stock);
+    const plain = makeSkinnedMesh(f, false);
+
+    f.frame();
+    await f.succeed(0, { traverse: visit => { visit(mesh); visit(plain); } });
+    assert.ok(Array.isArray(mesh.material) && mesh.material.every((m, i) => m !== stock[i]));
+    assert.equal(plain.material, plain.material);
+    const originalVariants = mesh.material;
+
+    vm.runInContext('clay = true; applyClay()', f.context);
+    const clayVariant = mesh.material;
+    const clayMat = vm.runInContext('clayMat', f.context);
+    assert.notEqual(clayVariant, clayMat);
+    assert.equal(clayMat.skinning, undefined);
+    assert.equal(plain.material, clayMat);
+
+    vm.runInContext('wire = true; applyWire()', f.context);
+    assert.equal(clayVariant.wireframe, true);
+    for (const m of originalVariants) assert.equal(m.wireframe, true);
+    for (const m of stock) assert.equal(m.wireframe, true);
+
+    vm.runInContext('clay = false; applyClay()', f.context);
+    assert.equal(mesh.material, originalVariants);
+    assert.deepEqual(mesh.userData, { gltfExtras: 'preserved' });
+
+    vm.runInContext('clay = true; applyClay()', f.context);
+    f.state.drop('chunk_0');
+    assert.ok(originalVariants.every(m => m.disposed));
+    assert.equal(clayVariant.disposed, true);
+    assert.ok(stock.every(m => m.disposed));
+    assert.equal(tex.dispose.mock.callCount(), 1);
+    assert.equal(clayMat.disposed, false);
 });
