@@ -461,5 +461,48 @@ class SCbranchVcczScalarInterpreterTests(unittest.TestCase):
         state_nz = SaluMachineState(pc=30, vcc=0x8000)
         self.assertEqual(step_branch(instr, state_nz), 31)
 
-if __name__ == '__main__':
+class SCbranchVcczTranslatorTests(unittest.TestCase):
+    def test_branches_registry(self):
+        self.assertIn("s_cbranch_vccz", rdna2spirv.BRANCHES)
+
+    def test_branch_condition_emission(self):
+        g = rdna2spirv.Gen("cs")
+        cond = rdna2spirv.branch_condition(g, "s_cbranch_vccz")
+        self.assertTrue(g.uses_vote)
+        body = "\n".join(g.body)
+        self.assertIn("OpGroupNonUniformAny", body)
+        self.assertIn("OpLogicalNot", body)
+
+    def test_execution_vccz_taken(self):
+        lines = [
+            ("s_mov_b32 s20, 7", 4),
+            ("s_mov_b32 vcc_lo, 0", 4),
+            ("s_cbranch_vccz 1", 4),
+            ("s_mov_b32 s20, 9", 4),
+            ("v_mov_b32_e32 v6, s20", 4),
+            ("v_lshlrev_b32_e32 v5, 2, v0", 4),
+            ("buffer_store_dword v6, v5, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv = translate_cs_branch("cs_cbranch_vccz_taken", lines)
+        val = run_cs_branch(spv)
+        self.assertEqual(val, 7)
+
+    def test_execution_vccz_fallthrough(self):
+        lines = [
+            ("s_mov_b32 s20, 7", 4),
+            ("s_mov_b32 vcc_lo, 1", 4),
+            ("s_cbranch_vccz 1", 4),
+            ("s_mov_b32 s20, 9", 4),
+            ("v_mov_b32_e32 v6, s20", 4),
+            ("v_lshlrev_b32_e32 v5, 2, v0", 4),
+            ("buffer_store_dword v6, v5, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv = translate_cs_branch("cs_cbranch_vccz_fallthrough", lines)
+        val = run_cs_branch(spv)
+        self.assertEqual(val, 9)
+
+
+if __name__ == "__main__":
     unittest.main()
