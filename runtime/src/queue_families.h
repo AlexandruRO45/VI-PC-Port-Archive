@@ -47,6 +47,16 @@ inline QueueFamilies pick_queue_families(std::span<const VkQueueFamilyProperties
     return out;
 }
 
+// Whether the device backs any D3D12 reserved resource with sparse tiles (enabled features, the physical device's
+// sparse properties): a sparse buffer needs sparseResidencyBuffer, a sparse texture sparseResidencyImage2D, both
+// aliasing and zero reads from unbound tiles. The Device constructor's sparse_buffer_memory_types and
+// sparse_image_tiles never go further than this; device creation passes it to sparse_capable_queue_families, so the
+// queues move to a sparse-capable family exactly when a reserved resource can reach vkQueueBindSparse.
+inline bool offers_sparse_tiles(const VkPhysicalDeviceFeatures& enabled, const VkPhysicalDeviceSparseProperties& sparse) {
+    return enabled.sparseBinding && enabled.sparseResidencyAliased && sparse.residencyNonResidentStrict &&
+           (enabled.sparseResidencyBuffer || enabled.sparseResidencyImage2D);
+}
+
 // A D3D12 COPY/COMPUTE queue may call UpdateTileMappings at any time. Vulkan binds sparse
 // pages on the VkQueue itself, so a family without SPARSE_BINDING cannot back that D3D12
 // queue when reserved buffers are offered. Use the graphics family (already checked for

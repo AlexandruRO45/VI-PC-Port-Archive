@@ -129,7 +129,34 @@ int check_picker() {
         const auto corrected = sparse_capable_queue_families(f, preferred, true);
         EXPECT(corrected.compute == 2 && corrected.copy == 0);  // mixed capabilities
     }
-    std::printf("queue family picker: 7 layouts ok\n");
+    // The gate device creation passes to sparse_capable_queue_families must be the Device's own: reserved textures
+    // alone still bind on the D3D12 queue's VkQueue, and without zero reads from unbound tiles nothing is sparse.
+    {
+        constexpr VkQueueFlags S = VK_QUEUE_SPARSE_BINDING_BIT;
+        const std::array f{fam(G | S), fam(T), fam(C)};
+        const auto preferred = pick_queue_families(f, 0);
+        VkPhysicalDeviceFeatures image_only{};
+        image_only.sparseBinding = image_only.sparseResidencyImage2D = image_only.sparseResidencyAliased = VK_TRUE;
+        VkPhysicalDeviceSparseProperties strict{};
+        strict.residencyNonResidentStrict = VK_TRUE;
+        EXPECT(offers_sparse_tiles(image_only, strict));
+        const auto images = sparse_capable_queue_families(f, preferred, offers_sparse_tiles(image_only, strict));
+        EXPECT(images.compute == 0 && images.copy == 0);  // no vkQueueBindSparse on a family without SPARSE_BINDING
+        VkPhysicalDeviceFeatures all = image_only;
+        all.sparseResidencyBuffer = VK_TRUE;
+        EXPECT(offers_sparse_tiles(all, strict));
+        const VkPhysicalDeviceSparseProperties loose{};
+        EXPECT(!offers_sparse_tiles(all, loose));
+        const auto none = sparse_capable_queue_families(f, preferred, offers_sparse_tiles(all, loose));
+        EXPECT(none.compute == 2 && none.copy == 1);  // no sparse tiles offered: dedicated families stay
+        VkPhysicalDeviceFeatures no_alias = all;
+        no_alias.sparseResidencyAliased = VK_FALSE;
+        EXPECT(!offers_sparse_tiles(no_alias, strict));
+        VkPhysicalDeviceFeatures no_binding = all;
+        no_binding.sparseBinding = VK_FALSE;
+        EXPECT(!offers_sparse_tiles(no_binding, strict));
+    }
+    std::printf("queue family picker: 8 layouts ok\n");
     return 0;
 }
 

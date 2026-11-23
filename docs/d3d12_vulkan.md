@@ -2401,6 +2401,10 @@ The trace will enumerate them.
     keep the fully allocated fallback. The image is transitioned while still unbound and kept in `GENERAL` so
     mapping an alias preserves contents. Image tiles use dedicated device-local heap memory and can alias tiles
     of compatible sparse images. Buffer and placed-resource aliases with texture tiles are outside this path.
+  - The tile APIs bind on the D3D12 queue's own `VkQueue`, so when the device offers sparse buffers or sparse
+    textures (`offers_sparse_tiles` in `src/queue_families.h`, the gate both device creation and the device use),
+    COPY and COMPUTE queues whose dedicated family lacks `VK_QUEUE_SPARSE_BINDING_BIT` run on the graphics family.
+    A device that offers neither keeps its dedicated families (checked by `vk_queue_test`, synthetic layouts).
   - `CopyTiles` transfers RGBA8 tiles in either direction. Partial edge blocks use the full 512-byte linear row
     pitch and transfer only in-bounds texels. Byte-unaligned offsets use transfer scratch.
     `d3d12_texture_tiles_test` compares initially unmapped tiles, column mappings, aliases, and a fence-delayed
