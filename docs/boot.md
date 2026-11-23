@@ -1,8 +1,10 @@
 # First boot: the runbook and the two traces
 
-**Status: prepared, not yet run against the retail executable.** The package in the repository's test corpus does
-not contain `game_scarlett_master.exe` (RT-5), so this page is the procedure and the trace tool for the day it
-arrives. Nothing here quotes game data; a real trace stays on the player's machine.
+**Status: `--dry-run` has been run on the retail executable; `--init` and `--run` have not.** The package in the
+repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the dry-run on an executable supplied
+separately maps it and leaves 30 imports unimplemented
+([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
+trace tool for the first boot. Nothing here quotes game data; a real trace stays on the player's machine.
 
 ## 1. What the first boot produces
 
