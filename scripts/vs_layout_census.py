@@ -183,8 +183,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("dxbc", help="<work>/shaders/dxbc from make_game.py")
     ap.add_argument("--json", help="also write the counts as JSON")
-    ap.add_argument("--limit", type=int, help="stop after this many containers (index order)")
+    ap.add_argument("--limit", type=int, help="stop after this many containers in index order (0 selects none)")
     a = ap.parse_args(argv)
+    if a.limit is not None and a.limit < 0:
+        ap.error("--limit must be non-negative")
     index_path = os.path.join(a.dxbc, "index.json")
     if a.json and os.path.exists(a.json) and os.path.exists(index_path) and os.path.samefile(a.json, index_path):
         print(f"vs_layout_census: error: --json would overwrite the input {index_path}", file=sys.stderr)
