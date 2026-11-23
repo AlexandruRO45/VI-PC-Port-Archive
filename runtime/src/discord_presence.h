@@ -40,6 +40,7 @@ struct Config {
 };
 
 bool parse_config(std::string_view json, Config& config, std::string& error);
+bool parse_settings(std::string_view json, std::string& application_id, std::string& error);
 Config load_config(const std::filesystem::path& path);
 bool capture(bool active, const XboxPresenceIds* ids, Snapshot& snapshot) noexcept;
 std::optional<std::string> resolve(const Config& config, const Snapshot& snapshot);

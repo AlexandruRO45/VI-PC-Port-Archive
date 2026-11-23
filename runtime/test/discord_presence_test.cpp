@@ -230,6 +230,31 @@ int main() {
     s.token_ids.clear();
     check(!resolve(config, s), "missing positional token is not published");
     Config bad;
+    std::string application_id;
+    check(parse_settings(R"({"richpresence_application_id":""})", application_id, error) && application_id.empty(),
+          "empty user ID disables presence without requiring a hook profile");
+    check(parse_settings("{}", application_id, error) && application_id.empty(), "missing user ID is optional");
+    check(parse_settings(R"({"richpresence_application_id":"123456789012345679"})", application_id, error) &&
+          application_id == "123456789012345679", "single user Application ID parses");
+    check(!parse_settings(R"({"richpresence_application_id":"invalid"})", application_id, error), "invalid ID is rejected");
+    check(!parse_settings(R"({"richpresence_application_id":123456789012345678})", application_id, error),
+          "ID is a string to avoid numeric precision loss");
+    check(!parse_settings("malformed JSON", application_id, error), "malformed user settings are rejected");
+    const auto settings_dir = std::filesystem::temp_directory_path() /
+        ("leonida_presence_settings_" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::create_directories(settings_dir / "leonida");
+    const auto settings_path = settings_dir / "discord_presence.json";
+    { std::ofstream file(settings_path); file << R"({"richpresence_application_id":""})"; }
+    check(load_config(settings_path).application_id.empty(), "blank ID loads without any internal profile");
+    { std::ofstream file(settings_path); file << "{}"; }
+    check(load_config(settings_path).application_id.empty(), "absent ID loads without any internal profile");
+    { std::ofstream file(settings_dir / "leonida" / "presence_profile.json"); file << config_text; }
+    { std::ofstream file(settings_path); file << R"({"richpresence_application_id":"123456789012345679"})"; }
+    const auto combined = load_config(settings_path);
+    check(combined.application_id == "123456789012345679", "user ID overrides the internal profile's legacy ID");
+    check(resolve(combined, Snapshot{true,"synthetic-service","explore",{"island"}}) == "Exploring Synthetic Island",
+          "separate profile still resolves Xbox presence");
+    std::filesystem::remove_all(settings_dir);
     check(parse_config(R"({"application_id":"","_comment":["Enter your own public Application ID"]})", bad, error) &&
           bad.application_id.empty(), "generated blank Application ID disables optional presence");
     check(!parse_config("{}", bad, error), "incomplete configuration is rejected");

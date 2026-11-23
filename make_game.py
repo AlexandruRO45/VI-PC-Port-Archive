@@ -2262,17 +2262,34 @@ def build_pipeline_check(jobs: int) -> None:
 
 
 def package_discord_presence(game: str, out: str, image: str, profile: str | None = None) -> None:
-    """Prepare the user's setup beside the runtime; never write to the input package or replace edits on rebuild."""
+    """Generate one optional user setting; keep verified hook data in the runtime's internal profile."""
     destination = os.path.join(out, "discord_presence.json")
+    internal = os.path.join(out, "leonida", "presence_profile.json")
     logo = os.path.join(game, "xbs_logo_480.png")
     if os.path.isfile(logo):
         copied_logo = os.path.join(out, "xbs_logo_480.png")
         if not os.path.exists(copied_logo) or not os.path.samefile(logo, copied_logo):
             shutil.copy2(logo, copied_logo)
+    settings = None
+    if os.path.exists(destination):
+        try:
+            with open(destination, encoding="utf-8") as f:
+                settings = json.load(f)
+        except (OSError, ValueError):
+            log("runtime: preserving unreadable Discord settings; optional presence will stay disabled")
+            return
+        if not isinstance(settings, dict):
+            log("runtime: preserving invalid Discord settings; optional presence will stay disabled")
+            return
+    presence = None
     if profile:
         # This is private user configuration, including their local presence catalogue; never a repository asset.
         with open(profile, encoding="utf-8") as f:
             presence = json.load(f)
+    elif settings and "richpresence_application_id" not in settings and settings.get("strings") and \
+            settings.get("call_rva") not in (None, "0x0") and settings.get("setter_rva") not in (None, "0x0"):
+        presence = settings  # Migrate an existing complete profile without losing its local catalogue.
+    if presence is not None:
         if not isinstance(presence, dict) or not isinstance(presence.get("application_id"), str) or \
                 not re.fullmatch(r"[0-9]{16,20}", presence["application_id"]) or not presence.get("strings"):
             fail("runtime: Discord configuration needs an Application ID and a verified local strings catalogue "
@@ -2281,37 +2298,27 @@ def package_discord_presence(game: str, out: str, image: str, profile: str | Non
             digest = hashlib.file_digest(f, "sha256").hexdigest()
         if presence.get("image_sha256") != digest:
             fail("runtime: Discord profile SHA-256 does not match this executable")
-        if os.path.exists(destination) and os.path.samefile(profile, destination):
-            return
-    elif os.path.exists(destination):
-        return
-    else:
-        digest = ""
-        if os.path.isfile(image):
-            with open(image, "rb") as f:
-                digest = hashlib.file_digest(f, "sha256").hexdigest()
-        presence = {
-            "_comment": [
-                "Discord setup: https://discord.com/developers/applications",
-                "Create an application named Grand Theft Auto VI. Under General Information, copy Application ID.",
-                "Paste that public ID into application_id below. Leave it empty to disable presence.",
-                "Do not enter a client secret, password, or user token.",
-                "Upload the bundled xbs_logo_480.png under Rich Presence > Art Assets as xbs_logo_480.",
-                "Restart the game after editing. This file is read automatically; no launch flags are needed.",
-                "The hook RVAs and strings must come from a verified profile for this exact executable.",
-                "0x0 and an empty strings object are unconfigured placeholders, not working Xbox presence data."
-            ],
-            "application_id": "", "image_sha256": digest,
-            "call_rva": "0x0", "setter_rva": "0x0", "strings": {}
-        }
+        os.makedirs(os.path.dirname(internal), exist_ok=True)
+        if not profile or not os.path.exists(internal) or not os.path.samefile(profile, internal):
+            with open(internal, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(presence, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+    application_id = (settings.get("richpresence_application_id", settings.get("application_id", ""))
+                      if settings is not None else (presence or {}).get("application_id", ""))
+    if settings == {"richpresence_application_id": application_id}:
+        return  # Preserve the user's formatting as well as their ID on subsequent builds.
     with open(destination, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(presence, f, ensure_ascii=False, indent=2)
+        json.dump({"richpresence_application_id": application_id}, f, indent=2)
         f.write("\n")
 
 
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
             *, work: str | None = None, discord_presence: str | None = None) -> None:
     destinations = [*RUNTIME_FILES, "game_path.txt", "discord_presence.json"]
+    if discord_presence:
+        if os.path.isfile(os.path.join(out, "leonida")):
+            fail("runtime: the internal leonida profile path must be a directory")
+        destinations.append(os.path.join("leonida", "presence_profile.json"))
     if os.path.isfile(os.path.join(game, "xbs_logo_480.png")):
         destinations.append("xbs_logo_480.png")
     if os.name == "nt":

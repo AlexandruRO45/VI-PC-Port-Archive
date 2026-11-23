@@ -175,7 +175,7 @@ int wmain(int argc, wchar_t** argv) {
                     discord = std::make_unique<leonida::discord_presence::Bridge>(std::move(config));
                     discord->install(main_module.base, main_module.size, image);
                     std::fprintf(stderr, "[rt] presence: local Discord bridge enabled\n");
-                } else std::fprintf(stderr, "[rt] presence: disabled; enter your Application ID in discord_presence.json\n");
+                } else std::fprintf(stderr, "[rt] presence: disabled\n");
             } catch (const std::exception& e) {
                 discord.reset();
                 std::fprintf(stderr, "[rt] presence: disabled: %s\n", e.what());

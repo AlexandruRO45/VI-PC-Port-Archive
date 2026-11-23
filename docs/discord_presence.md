@@ -1,105 +1,62 @@
 # Local Discord Rich Presence
 
-An optional bridge observes the game's call to `XblPresenceSetPresenceAsync`, copies its SCID, presence ID and
-ordered token IDs, resolves them using a private local catalogue, and sends the result to the Discord desktop
-client through Windows named pipes. It never calls Xbox Live or Rockstar services. It requires no Discord user
-token, OAuth login, server, or additional library. Discord itself controls whether your activity is visible.
+The runtime observes attempted Xbox presence updates, resolves their IDs using a verified local catalogue, and
+sends the resolved sentence to the Discord desktop client over local IPC. It never contacts Xbox Live or Rockstar.
+The activity is Playing, named **Grand Theft Auto VI**, with the resolved sentence in `details`, image asset
+`xbs_logo_480`, and a **Leonida** button linking to https://github.com/ItsNotRexed/Leonida.
 
-The activity is Playing (`type: 0`), named **Grand Theft Auto VI**, with the resolved sentence in `details`.
-Its large image asset is `xbs_logo_480`, and its **Leonida** button links to
-<https://github.com/ItsNotRexed/Leonida>.
+## Optional user setting
 
-## Setup file beside the output game
-
-Every runtime build creates `discord_presence.json` beside `gta6rt.exe`, even without a presence option.
-It contains an empty `application_id` and `_comment` instructions for creating your own Discord application,
-copying its public Application ID, and setting up its artwork. `_comment` is ordinary JSON data so the file
-remains valid JSON. Rebuilding preserves an existing setup file, including your edits.
-
-The builder copies `xbs_logo_480.png` from your game package into the output when present. It never writes into
-the package. Discord cannot display that local file directly: upload the copied image to your own application's
-Rich Presence assets under `xbs_logo_480`. This is required once per Discord application.
-
-Leave `application_id` empty to disable presence. A blank or invalid configuration does not prevent the game
-from starting. After setup, restart the game; the runtime reads the adjacent file automatically.
-
-The generated template records the executable hash, but its zero hook RVAs and empty strings are placeholders.
-Entering an Application ID alone does not supply the missing Xbox text catalogue or a verified hook profile.
-For a complete profile, supply the file during the build as described below.
-
-## Supplying a complete profile before building
-
-1. In the [Discord Developer Portal](https://discord.com/developers/applications), create an application named
-   **Grand Theft Auto VI**. Copy its Application ID. The portal application name must match: Discord may display
-   that registered name instead of the activity's `name` field.
-2. Upload your own `xbs_logo_480.png` in that application's Rich Presence art assets, using the asset key
-   **xbs_logo_480**. The runtime output includes the image copied from your game package; none is distributed in
-   the repository. Wait for Discord to finish processing the asset.
-3. Create a private configuration outside the repository and game package, following the schema below.
-   Use the SHA-256 and verified callsite/setter RVAs for your exact executable. RVAs are hexadecimal strings.
-   Populate `strings` with verified local text in your chosen language. Do not upload the resulting catalogue.
-4. Build normally, adding `--discord-presence C:\private\discord_presence.json` to `make_game.py`.
-   The runtime stage checks the executable hash and bundles that configuration beside `gta6rt.exe`.
-5. Start the Discord desktop client and enable activity sharing. Double-click **Play.cmd** in the finished
-   Windows output. This runs the game with its output overlay. `gta6rt --run` automatically loads the bundled
-   `discord_presence.json`; no presence flags or setup are needed at each launch.
-
-Existing build options, including `--runtime-build`, still apply. The launcher passes its arguments to the game.
-The Wine launcher also reaches the same automatic configuration loading, but Windows named-pipe access to a host
-Discord client under Wine has not been verified. Native Windows is the supported integration target.
-
-To use another configuration explicitly, pass `gta6rt --run <exe> --discord-presence <file>`.
-The bridge never activates during `--dry-run` or `--init`. Remove the bundled JSON to disable automatic activation.
-Rebuilding an output without the option preserves an existing private configuration.
-
-## Configuration schema (synthetic example only)
+Every runtime build creates `discord_presence.json` beside `gta6rt.exe` with exactly one field:
 
 ```json
 {
-  "application_id": "123456789012345678",
-  "image_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "call_rva": "0x1010",
-  "setter_rva": "0x1100",
-  "strings": {
-    "synthetic-service": {
-      "presences": { "explore": "Exploring {0}", "menu": "In the menu" },
-      "tokens": { "island": "Synthetic Island" }
-    }
-  }
+  "richpresence_application_id": ""
 }
 ```
 
-These values do not describe a retail executable. The hook validates the executable hash, mapped x64 PE sections,
-and the single `E8 rel32` instruction's original target before changing any code. Installation happens before
-image initialization. A verified instruction boundary is required; this does not scan arbitrary bytes for calls.
-The original setter still receives all four arguments and retains its original result and asynchronous behavior.
+The runtime reads this file automatically. Users can enter their own public Discord Application ID.
+A missing file, missing field or blank ID leaves presence disabled. Invalid settings, unavailable Discord or a
+missing/invalid hook profile do not prevent game startup. Rebuilds preserve an entered ID and its formatting.
+There are no setup comments, hashes, hook RVAs or catalogues in this user-facing file.
 
-Xbox presence IDs are not formatted dashboard text. The catalogue must map each SCID and presence ID to its
-actual sentence, with positional `{0}` through `{15}` substitutions using the corresponding ordered token IDs.
-Repeated placeholders and literal braces (`{{` and `}}`) work. No retail catalogue is included, and no runtime
-connection retrieves one. Unknown IDs, missing tokens, invalid input, inactive presence, and text outside
-Discord's 2–128 Unicode character details limit clear or withhold activity rather than publish a guess.
+The builder copies `xbs_logo_480.png` from the user's game package into the output when available. The package is
+never modified. Discord requires this image registered on the user's application under the asset key
+`xbs_logo_480`; it cannot display a local PNG directly. The application name should be Grand Theft Auto VI.
 
-## Behavior and limits
+## Internal profile
 
-The hook copies bounded input immediately; a worker resolves and publishes it at most once every five seconds.
-Only acknowledged updates are deduplicated. Discord disconnects and errors trigger retries; restarting Discord
-resends the current activity. Local pipe clients use identification-only security to prevent server impersonation.
-IPC reads and writes have a one-second deadline and support cancellation. Shutdown stops the worker and attempts
-to clear activity before the runtime's explicit `ExitProcess` call, which skips C++ destructors.
+A builder can supply a complete verified private profile with `make_game.py --discord-presence FILE`.
+The builder stores this separately as `leonida/presence_profile.json` inside the output. Its internal schema
+contains `application_id` (the legacy build-time ID), `image_sha256`, hexadecimal `call_rva` and `setter_rva`, and
+`strings` mapping each SCID to `presences` and `tokens` dictionaries. The runtime always uses the user's adjacent
+`richpresence_application_id` instead of the legacy ID. Migrating an old complete configuration preserves its
+profile in the internal location and reduces the user file to the single setting.
 
-This observes attempted Xbox presence updates. The original offline setter can still fail, and earlier game
-guards can prevent any call from occurring. It does not bypass those guards. Synthetic tests verify the bridge;
-they do not prove that a retail game reaches this call or that Discord renders the artwork and button. Discord
-buttons may be hidden on your own profile; verify visibility from another account after setup.
+The profile is not a user-editable setup template. No zero RVAs or empty catalogues are generated for users to
+fill in. A verified retail hook profile and text catalogue are not distributed. Entering an Application ID alone
+cannot supply missing profile data; the runtime disables presence and continues starting the game in that case.
 
-Run the focused check with:
+The hook validates the executable SHA-256, mapped executable sections and a single verified direct-call target
+before patching. It does not scan arbitrary bytes. All four original arguments, the result and async behavior
+are preserved. Local templates support ordered `{0}` through `{15}` token substitutions and escaped braces.
+Unknown IDs, missing tokens, inactive presence or invalid details clear or withhold activity rather than guess.
+
+A worker publishes at most once every five seconds, deduplicates acknowledgements, reconnects and handles
+PING/PONG. IPC uses identification-only pipe security, bounded I/O and cancellation. Shutdown attempts to clear
+activity before the runtime's explicit ExitProcess call. No game-service guard or offline failure is bypassed.
+
+## Validation and limits
+
+Synthetic tests cover packaging, migration, optional user settings, profile loading, resolution, IPC and the
+native observer ABI. Actual retail gameplay and Discord rendering remain unverified. Native Windows is the
+integration target; Wine host-Discord IPC is unverified.
 
 ```powershell
 cmake --build runtime/build --config RelWithDebInfo --target discord_presence_test gta6rt
 ctest --test-dir runtime/build -C RelWithDebInfo -R '^discord_presence$' --output-on-failure
 ```
 
-Protocol and ABI references: [Discord RPC](https://docs.discord.com/developers/topics/rpc),
-[Discord Rich Presence setup](https://docs.discord.com/developers/discord-social-sdk/development-guides/setting-rich-presence),
+References: [Discord RPC](https://docs.discord.com/developers/topics/rpc),
+[Discord Rich Presence assets](https://docs.discord.com/developers/discord-social-sdk/development-guides/setting-rich-presence),
 [XblPresenceRichPresenceIds](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/live/xsapi-c/presence_c/structs/xblpresencerichpresenceids).

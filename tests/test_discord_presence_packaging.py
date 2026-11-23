@@ -27,17 +27,20 @@ class PackagingTest(unittest.TestCase):
             make_game.package_discord_presence(str(game), str(output), str(image))
             config = output / "discord_presence.json"
             setup = json.loads(config.read_text(encoding="utf-8"))
-            self.assertEqual(setup["application_id"], "")
-            self.assertIn("https://discord.com/developers/applications", " ".join(setup["_comment"]))
-            self.assertEqual(setup["image_sha256"], hashlib.sha256(b"synthetic image").hexdigest())
+            self.assertEqual(setup, {"richpresence_application_id": ""})
+            self.assertFalse((output / "leonida" / "presence_profile.json").exists())
             self.assertEqual((output / logo.name).read_bytes(), logo.read_bytes())
-            setup["application_id"] = "123456789012345678"
+            setup["richpresence_application_id"] = "123456789012345678"
             with config.open("w", encoding="utf-8", newline="\n") as stream:
                 json.dump(setup, stream)
             before = config.read_bytes()
             make_game.package_discord_presence(str(game), str(output), str(image))
             self.assertEqual(config.read_bytes(), before)
             self.assertEqual({p.name: p.read_bytes() for p in game.iterdir()}, source)
+            with config.open("w", encoding="utf-8", newline="\n") as stream:
+                json.dump({"_comment": ["old setup"], "application_id": "", "call_rva": "0x0", "strings": {}}, stream)
+            make_game.package_discord_presence(str(game), str(output), str(image))
+            self.assertEqual(json.loads(config.read_text(encoding="utf-8")), {"richpresence_application_id": ""})
 
     def test_stage_runner_forwards_private_configuration(self):
         for overlap in (False, True):
@@ -70,9 +73,18 @@ class PackagingTest(unittest.TestCase):
             with mock.patch.object(make_game, "log"):
                 make_game.runtime(str(game), str(output), {"expected_exe": "synthetic.exe"},
                                   str(build), discord_presence=str(config))
-            self.assertEqual(json.loads((output / "discord_presence.json").read_text(encoding="utf-8")), profile)
+            self.assertEqual(json.loads((output / "discord_presence.json").read_text(encoding="utf-8")),
+                             {"richpresence_application_id": profile["application_id"]})
+            self.assertEqual(json.loads((output / "leonida" / "presence_profile.json").read_text(encoding="utf-8")), profile)
             self.assertEqual(config.read_bytes(), before)
             self.assertEqual(list(game.iterdir()), [game / "synthetic.exe"])
+            # Migrate a previously bundled complete profile into internal data while preserving its ID.
+            with (output / "discord_presence.json").open("w", encoding="utf-8", newline="\n") as stream:
+                json.dump(profile, stream)
+            make_game.package_discord_presence(str(game), str(output), str(game / "synthetic.exe"))
+            self.assertEqual(json.loads((output / "discord_presence.json").read_text(encoding="utf-8")),
+                             {"richpresence_application_id": profile["application_id"]})
+            self.assertEqual(json.loads((output / "leonida" / "presence_profile.json").read_text(encoding="utf-8")), profile)
             if os.name == "nt":
                 launcher = (output / "Play.ps1").read_text(encoding="utf-8")
                 self.assertIn("--run $image --overlay", launcher)

@@ -150,11 +150,35 @@ bool parse_config(std::string_view json, Config& config, std::string& error) {
     config = std::move(next); error.clear();
     return true;
 }
+bool parse_settings(std::string_view json, std::string& application_id, std::string& error) {
+    Json root;
+    error = "presence: invalid richpresence_application_id";
+    application_id.clear();
+    if (json.size() > 65536 || !JsonReader(json).parse(root) || root.kind != Json::Kind::object) return false;
+    if (root.find("richpresence_application_id") && !string_field(root, "richpresence_application_id", application_id))
+        return false;
+    if (!application_id.empty()) {
+        uint64_t value = 0;
+        if (application_id.size() < 16 || application_id.size() > 20 ||
+            application_id.find_first_not_of("0123456789") != std::string::npos ||
+            std::from_chars(application_id.data(), application_id.data() + application_id.size(), value).ec !=
+                std::errc() || !value) return false;
+    }
+    error.clear();
+    return true;
+}
 Config load_config(const std::filesystem::path& path) {
     const auto bytes = read_file(path, 4 * 1024 * 1024);
-    Config config; std::string error;
-    if (!parse_config(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()), config, error))
+    std::string application_id, error;
+    if (!parse_settings(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()), application_id, error))
         throw std::runtime_error(error);
+    if (application_id.empty()) return {};
+    const auto profile = read_file(path.parent_path() / L"leonida" / L"presence_profile.json", 4 * 1024 * 1024);
+    Config config;
+    if (!parse_config(std::string_view(reinterpret_cast<const char*>(profile.data()), profile.size()), config, error) ||
+        config.image_sha256.empty())
+        throw std::runtime_error(error.empty() ? "presence: invalid internal hook profile" : error);
+    config.application_id = std::move(application_id);
     return config;
 }
 bool capture(bool active, const XboxPresenceIds* ids, Snapshot& snapshot) noexcept {
