@@ -894,7 +894,10 @@ public:
     }
 
     bool execute_indirect(const ExecuteIndirect& indirect) {
-        if (!indirect.argument_buffer || !indirect.stride) return false;
+        if (!indirect.argument_buffer || !indirect.stride || indirect.stride % 4) return false;
+        if (indirect.argument_offset % 4) return false;
+        if (!indirect.count_buffer && indirect.count_offset) return false;
+        if (indirect.count_buffer && indirect.count_offset % 4) return false;
         if (indirect.state && (!indirect.state->pipeline || indirect.kind == IndirectKind::dispatch)) return false;
         // A mesh dispatch carries DispatchMesh's state, a draw kind a draw's.
         if (indirect.state && indirect.state->mesh != (indirect.kind == IndirectKind::dispatch_mesh)) return false;
