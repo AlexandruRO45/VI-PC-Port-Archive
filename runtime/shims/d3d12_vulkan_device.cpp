@@ -3847,7 +3847,7 @@ public:
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
         // Fetched before the stall opens: the first call creates the cache and loads its seed (and a second thread
-        // waits for that), which is not the compile.
+        // waits for that), which is not the compile. The same goes for anything a compile has to wait for first.
         const VkPipelineCache cache = device_.pipeline_cache();
         VkResult created = VK_ERROR_UNKNOWN;
         {

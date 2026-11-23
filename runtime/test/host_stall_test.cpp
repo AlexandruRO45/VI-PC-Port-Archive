@@ -5,14 +5,17 @@
 // progress, start again after a round more than 2 s long) on a virtual clock, with the same ledger calls the shim
 // makes: when a Sleep returns, and when the check fires under back-to-back, recurring, short and never-ending
 // stalls. Part 3 runs the Sleep the registry serves on real threads: a short Sleep is not held, a long one is, and
-// a stall that never ends releases it at the limit.
+// a stall that never ends releases it at the limit, and compiles that take turns count only their driver calls.
 // Synthetic threads only: no game files, no GPU.
 #include <windows.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -49,7 +52,7 @@ SleepFn served_sleep(const char* dll) { return reinterpret_cast<SleepFn>(rt::shi
 // ---- Part 1: the ledger ------------------------------------------------------------------------------------------
 
 void ledger_checks() {
-    Ledger l;
+    Ledger l(ms(60000));
     check(!l.open(ms(5)) && l.stalled(ms(5)) == ms(0), "an empty ledger has no stall");
     const Ledger::Id first = l.begin(ms(10));
     check(l.open(ms(10)) && l.stalled(ms(10)) == ms(0) && l.stalled(ms(25)) == ms(15), "an open stall counts up to now");
@@ -120,7 +123,7 @@ void limit_checks() {
 void owed_checks() {
     // The review's probe: a Sleep(15) under a stall from 0 to 185 ms that the host woke at 185 ms. 15 ms outside
     // the stall are still owed, so it returns at 200 ms (it used to return at 185 + 185 + 15).
-    Ledger l;
+    Ledger l(ms(60000));
     const Ledger::Mark start = l.mark(ms(0));
     const Ledger::Id id = l.begin(ms(0));
     check(l.owed(start, ms(15), ms(185)) == ms(15), "under an open stall the whole sleep is owed");
@@ -144,10 +147,11 @@ struct Stall {
 };
 
 // The shim's steps with the time passed in: mark, the host's sleep, then owed()/look_again() until nothing is owed,
-// woken early by every stall that begins or ends. Times in milliseconds; sleeps start in order.
+// woken early by every stall that begins or ends. Times in milliseconds; sleeps start in order. The limit is 60 s
+// here unless a case passes another, whatever kStallLimit is.
 class Sim {
 public:
-    explicit Sim(const std::vector<Stall>& stalls, Nanoseconds limit = rt::host_stall::kStallLimit) : ledger_(limit) {
+    explicit Sim(const std::vector<Stall>& stalls, Nanoseconds limit = ms(60000)) : ledger_(limit) {
         ids_.resize(stalls.size());
         for (std::size_t i = 0; i < stalls.size(); ++i) {
             events_.push_back({stalls[i].begin_ms, false, i});
@@ -361,6 +365,81 @@ void sleep_held_by_a_stall(SleepFn guest_sleep) {
     check(elapsed_ms(after) < 1900, "a later Sleep is not held by a closed stall");
 }
 
+// Compiles that take turns, as behind a compile gate: a thread waits for its turn, then opens the stall around the
+// driver call alone, then gives the turn back. Between two turns no stall is open and none is counted, although a
+// compiler is waiting; unrelated Sleeps go on at every point.
+void compiles_that_take_turns(SleepFn guest_sleep) {
+    auto& gate = rt::host_stall::gate();
+    std::mutex turn_mutex;
+    std::condition_variable turn_changed;
+    bool turn_taken = false;
+    std::atomic<int> in_driver{0};  // which compiler is inside its driver call (1 or 2), 0 for none
+    std::atomic<bool> driver_may_return[2] = {false, false};
+    std::atomic<bool> second_may_take_turn{false};
+    std::atomic<bool> second_is_waiting{false};
+
+    const auto compile = [&](int who) {
+        {
+            std::unique_lock<std::mutex> lock(turn_mutex);
+            if (who == 2) second_is_waiting = true;
+            turn_changed.wait(lock, [&] { return !turn_taken && (who == 1 || second_may_take_turn.load()); });
+            turn_taken = true;
+        }
+        {
+            const rt::host_stall::Scope compiling;
+            in_driver = who;
+            while (!driver_may_return[who - 1].load()) std::this_thread::sleep_for(milliseconds(1));
+            in_driver = 0;
+        }
+        {
+            const std::lock_guard<std::mutex> lock(turn_mutex);
+            turn_taken = false;
+        }
+        turn_changed.notify_all();
+    };
+    // Four unrelated threads poll with Sleep(1); how many come back within a bounded wait. The count outlives this
+    // call, so a poll that was held and comes back late touches nothing that is gone.
+    const auto polls_that_return = [guest_sleep] {
+        const auto done = std::make_shared<std::atomic<int>>(0);
+        for (int i = 0; i < 4; ++i)
+            std::thread([guest_sleep, done] {
+                guest_sleep(1);
+                ++*done;
+            }).detach();
+        for (int i = 0; i < 1000 && done->load() < 4; ++i) std::this_thread::sleep_for(milliseconds(5));
+        return done->load();
+    };
+    const auto wait_for = [](const auto& condition) {
+        for (int i = 0; i < 2000 && !condition(); ++i) std::this_thread::sleep_for(milliseconds(5));
+        return condition();
+    };
+
+    std::thread first(compile, 1);
+    check(wait_for([&] { return in_driver.load() == 1; }), "the first compiler is in its driver call");
+    std::thread second(compile, 2);
+    check(wait_for([&] { return second_is_waiting.load(); }), "the second compiler waits for its turn");
+    const Nanoseconds in_first = gate.mark().stalled;
+    check(polls_that_return() == 4, "four Sleep(1) polls return while a compile is in the driver and another waits");
+    check(gate.mark().stalled > in_first, "the driver call counts as a stall");
+
+    // Between the turns: the first has given its turn back, the second has not been let in yet.
+    driver_may_return[0] = true;
+    first.join();
+    const Ledger::Mark between = gate.mark();
+    check(polls_that_return() == 4, "four Sleep(1) polls return between two turns");
+    const auto long_start = std::chrono::steady_clock::now();
+    guest_sleep(1000);
+    check(elapsed_ms(long_start) < 1900, "a Sleep(1000) between two turns is not held by the waiting compiler");
+    check(gate.mark().stalled == between.stalled, "no stall time is counted while a compiler only waits for its turn");
+
+    second_may_take_turn = true;
+    turn_changed.notify_all();
+    check(wait_for([&] { return in_driver.load() == 2; }), "the second compiler gets its turn");
+    driver_may_return[1] = true;
+    second.join();
+    check(gate.mark().stalled > between.stalled, "and its driver call counts as a stall again");
+}
+
 void sleep_under_a_stall_that_never_ends(SleepFn guest_sleep) {
     // The limit set to 300 ms for the test; the stall stays open across the whole Sleep. Without the limit this
     // Sleep would not return and the test would time out.
@@ -391,6 +470,7 @@ int main() {
         sleep_without_a_stall(guest_sleep);
         poll_under_a_stall(guest_sleep);
         sleep_held_by_a_stall(guest_sleep);
+        compiles_that_take_turns(guest_sleep);
         sleep_under_a_stall_that_never_ends(guest_sleep);
     }
     std::printf("%d checks, %d failed\n", checks, failures);

@@ -38,8 +38,9 @@ using Nanoseconds = std::chrono::nanoseconds;
 
 // The shortest guest Sleep that is held: the round of the title's hang check.
 inline constexpr std::uint32_t kHeldSleepMs = 1000;
-// How long one stall may count. One stall is one pipeline; the 52 of the cold run took 55.7 s together.
-inline constexpr Nanoseconds kStallLimit = std::chrono::seconds(60);
+// How long one stall may count. One stall is one driver call for one pipeline; the longest measured took 50 s
+// (docs/retail_boot_chain.md, 5.2), and a slower machine needs room above that.
+inline constexpr Nanoseconds kStallLimit = std::chrono::minutes(10);
 
 // Whether a guest Sleep of this length is held. A yield and an endless sleep have no duration to stretch.
 inline bool sleep_is_held(std::uint32_t milliseconds) {
@@ -196,7 +197,8 @@ inline Gate& gate() {
 }
 
 // Brackets host-only work on behalf of a title call that returns at once on the console. Construct it right before
-// the host call, with the call's arguments already evaluated: what runs inside counts as a stall.
+// the host call and nothing else: what runs inside counts as a stall. The call's arguments are evaluated first, and
+// a thread that has to wait its turn to compile (a lock, a ticket of a compile gate) waits before it opens one.
 class Scope {
 public:
     Scope() : id_(gate().begin()) {}
