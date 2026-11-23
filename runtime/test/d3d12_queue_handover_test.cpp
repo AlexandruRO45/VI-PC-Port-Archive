@@ -13,11 +13,13 @@
 // other queues keep working, the held batch never runs, the queue is destroyed and the layer reports it), and a fence
 // released while a batch waits for it.
 //
-// The same cases run on the Vulkan layer and on the host D3D12 runtime (the adapter is named in the output). Results are
-// compared byte for byte with the data written by the CPU: a consumer replayed against the layout from before its
-// producer ran reads a zero-filled texture and fails here (and with LEONIDA_VK_VALIDATION=1 under sync validation).
+// The same cases run on the Vulkan layer and, on Windows, on the host D3D12 runtime (the adapter is named in the
+// output; under Wine the host is vkd3d, see main). Results are compared byte for byte with the data written by the
+// CPU: a consumer replayed against the layout from before its producer ran reads a zero-filled texture and fails here
+// (and with LEONIDA_VK_VALIDATION=1 under sync validation).
 // No game data.
 #include "../shims/d3d12_com.h"
+#include "host_wine.h"
 
 #include <dxgi1_4.h>
 #include <io.h>
@@ -563,8 +565,18 @@ int main() {
     const int layer_cases = cases_run;
     std::printf("Vulkan layer: %d cases passed, every one exact\n", layer_cases);
 
+    // Under Wine the host is vkd3d, which records a new texture's first layout transition (UNDEFINED to the layout of
+    // its state) into the first list recorded that names it, not the first one executed (d3d12_command_list_track_
+    // resource_usage, libs/vkd3d/command.c). These cases record lists in submission order and run them in dependency
+    // order, so a list that runs first finds its texture still UNDEFINED: with the host's validation layer on
+    // (VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation set for wine, which loads it into every Vulkan instance of the
+    // process) that is reported as VUID-vkCmdDraw-None-09600, vkd3d's error and not this layer's, and the late
+    // transition may discard what the earlier list wrote. So the host pass runs on Windows only, like the other host
+    // comparisons (host_wine.h).
     std::wstring name;
-    if (auto host = native_device(name)) {
+    if (hostwine::host_is_wine()) {
+        // host_is_wine() says the comparison is skipped
+    } else if (auto host = native_device(name)) {
         arm("host runtime", 300000);
         cases_run = 0;
         if (!run_all(host.Get(), false)) return 1;
