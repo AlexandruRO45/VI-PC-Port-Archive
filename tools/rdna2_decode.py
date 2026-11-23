@@ -873,7 +873,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         neg_lo = (w1 >> 29) & 7
         entry = T.VOP3P.get(opc)
         if entry is None:
-            return None, 4
+            return None, 12 if (255 in (src0, src1, src2) and need(12)) else 8
         name, spec = entry
         lit = None
         nbytes = 8
@@ -926,7 +926,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         is_vop3b = opc in T.VOP3B
         entry = T.VOP3B.get(opc) if is_vop3b else T.VOP3.get(opc)
         if entry is None:
-            return None, 4
+            s0, s1, s2 = w1 & 0x1FF, (w1 >> 9) & 0x1FF, (w1 >> 18) & 0x1FF
+            return None, 12 if (255 in (s0, s1, s2) and need(12)) else 8
         name, spec = entry
         if opc == 0x140 and mcpu.startswith("gfx101"):
             name = "v_mad_legacy_f32"
@@ -979,11 +980,14 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             elif fn == "SRC2":
                 args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4)))
         if op_sel:
-            # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC).
-            nbits = nsrc if opc < 0x100 else (nsrc + 1)
-            bits = [(op_sel >> i) & 1 for i in range(nsrc)]
-            if nbits > nsrc:
-                bits.append((op_sel >> 3) & 1)
+            if opc in (0x377, 0x378):  # v_permlane(x)16_b32: op_sel:[FI, BOUND_CTRL]
+                bits = [op_sel & 1, (op_sel >> 1) & 1]
+            else:
+                # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC).
+                nbits = nsrc if opc < 0x100 else (nsrc + 1)
+                bits = [(op_sel >> i) & 1 for i in range(nsrc)]
+                if nbits > nsrc:
+                    bits.append((op_sel >> 3) & 1)
             mods.append(f"op_sel:[{','.join(str(b) for b in bits)}]")
         if clamp:
             mods.append("clamp")

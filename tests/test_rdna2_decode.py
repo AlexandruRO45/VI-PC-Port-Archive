@@ -417,6 +417,23 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(parsed[3]["args"][1]["k"], "fimm")
         self.assertEqual(parsed[3]["args"][1]["v"], 1.0)
 
+    def test_unknown_vop3p_and_vop3_preserve_full_instruction_size(self):
+        # Unknown VOP3P opcode 0x7F (hi6=0x33 -> 0xCC7F0000): 8-byte base without literal, 12-byte with src0=255.
+        # Its w1 (0x7E02028A, which happens to look like v_mov_b32_e32 v1, 10) must NOT be decoded as a separate insn.
+        endpgm = bytes([0x00, 0x00, 0x81, 0xBF])
+        raw8 = struct.pack("<II", 0xCC7F0000, 0x7E02028A) + endpgm
+        dec8 = rdna2_decode.decode_bytes(raw8, wave32=True)
+        self.assertEqual(dec8["invalid"], 1)
+        self.assertEqual([i["op"] for i in dec8["insns"]], ["s_endpgm"])
+        self.assertEqual(dec8["insns"][0]["pc"], 8)
+
+        # With src0 = 255 (literal dword), full length is 12 bytes so the literal word is skipped too.
+        raw12 = struct.pack("<III", 0xCC7F0000, 0x000000FF, 0x7E02028A) + endpgm
+        dec12 = rdna2_decode.decode_bytes(raw12, wave32=True)
+        self.assertEqual(dec12["invalid"], 1)
+        self.assertEqual([i["op"] for i in dec12["insns"]], ["s_endpgm"])
+        self.assertEqual(dec12["insns"][0]["pc"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()

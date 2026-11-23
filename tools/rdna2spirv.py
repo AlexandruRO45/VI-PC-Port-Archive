@@ -16160,7 +16160,63 @@ def decode_binary_file(path):
         code = blob[start:end]
     info = rdna2_decode.decode_bytes(code, code_start=start, name=name, wave32=wave32)
     info["direct"] = True
+    info["code"] = code
+    info["wave32"] = wave32
     return info
+
+
+def decode_reachable_direct(code, code_start, wave32, mcpu="gfx1030"):
+    """Fail-closed recursive-descent decode from entry for direct binary streams that contain undecodable words.
+
+    Follows exact instruction lengths and branch targets from PC 0 (`code_start`). Any undecodable instruction
+    reachable from entry (including unknown multiword VOP3P/VOP3 opcodes) raises Unsupported immediately instead
+    of trusting potentially shifted linear-sweep PCs, while unreachable embedded data tables jumped over by
+    branches are never decoded.
+    """
+    decoded = {}
+    import rdna2_decode
+    work = [(0, [])]
+    while work:
+        off, recent = work.pop()
+        while off not in decoded:
+            if off < 0 or off >= len(code) or (off & 3) != 0:
+                raise Unsupported(f"branch outside code at pc 0x{code_start + off:x}")
+            ins, nbytes = rdna2_decode._decode_one(code, off, wave32, mcpu)
+            if ins is None:
+                raise Unsupported(f"undecodable instruction at pc 0x{code_start + off:x}")
+            ins["pc"] = code_start + off
+            decoded[off] = ins
+            recent = (recent + [ins])[-4:]
+            op = base_op(ins["op"])
+            nxt_off = off + nbytes
+            if op in BRANCHES:
+                imm = next((x for x in ins["args"] if x["k"] == "imm"), None)
+                v = (imm["v"] & 0xFFFF) if imm else 0
+                tgt_off = nxt_off + 4 * (v - 0x10000 if v & 0x8000 else v)
+                if tgt_off < 0 or tgt_off >= len(code) or (tgt_off & 3) != 0:
+                    raise Unsupported("branch into data")
+                work.append((tgt_off, []))
+                if op == "s_branch":
+                    break
+            elif op == "s_setpc_b64":
+                folded = fold_far_branches(recent)
+                if len(folded) == 1 and "target" in folded[0]:
+                    tgt_off = folded[0]["target"] - code_start
+                    if tgt_off < 0 or tgt_off >= len(code) or (tgt_off & 3) != 0:
+                        raise Unsupported("branch into data")
+                    work.append((tgt_off, []))
+                break
+            elif op == "s_endpgm":
+                break
+            if nxt_off >= len(code):
+                raise Unsupported(f"fallthrough past end of code at pc 0x{code_start + nxt_off:x}")
+            off = nxt_off
+    ordered = [decoded[o] for o in sorted(decoded)]
+    for prev, cur in zip(ordered, ordered[1:]):
+        if prev["pc"] + len(prev["enc"]) // 2 > cur["pc"]:
+            raise Unsupported(f"overlapping instructions at pc 0x{cur['pc']:x}")
+    return fold_far_branches(ordered)
+
 
 def translate(path):
     info = decode_binary_file(path) if path.endswith((".fssm", ".code")) else parse_file(path)
@@ -16174,9 +16230,9 @@ def translate(path):
         raise Unsupported("no instructions (nothing tab-indented?)")
     if info["invalid"]:
         if info.get("direct"):
-            # Direct binary decode already assigned exact byte PCs across undecodable data words.
-            insns = fold_far_branches(insns)
-            insns = reachable_code(insns, info.get("code_end"))
+            # Fail closed on any reachable undecodable instruction (including unknown multiword encodings) while
+            # safely skipping unreachable embedded data tables via recursive-descent decode from entry.
+            insns = decode_reachable_direct(info["code"], info["code_start"], info["wave32"])
         else:
             # Undecodable words are constant tables embedded in the code range (147/155 such VS/PS use s_getpc_b64 to
             # read them). LLVM skips them, so re-anchor every instruction to its true offset in the FSSM blob, then

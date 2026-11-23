@@ -199,6 +199,44 @@ class DirectBinaryTranslateTests(unittest.TestCase):
                  mock.patch.object(make_game.shutil, "disk_usage", return_value=mock.Mock(free=500 * 2**30)):
                 make_game.preflight(["shaders"], work, disasm_backend="python")
 
+    def test_direct_translate_fails_closed_on_reachable_unknown_vop3p(self):
+        # Reachable unknown VOP3P opcode (8-byte and 12-byte with literal) must raise Unsupported rather than
+        # decoding w1 as a separate instruction or silently truncating the block.
+        endpgm = bytes([0x00, 0x00, 0x81, 0xBF])
+        mov_v1 = bytes([0x8A, 0x02, 0x02, 0x7E])
+        cases = (
+            ("8byte_entry", struct.pack("<II", 0xCC7F0000, 0x7E02028A) + endpgm),
+            ("8byte_mid", mov_v1 + struct.pack("<II", 0xCC7F0000, 0x7E02028A) + endpgm),
+            ("12byte_lit", mov_v1 + struct.pack("<III", 0xCC7F0000, 0x000000FF, 0x7E02028A) + endpgm),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "fssm"))
+            for label, code in cases:
+                with self.subTest(case=label):
+                    p = os.path.join(d, "fssm", f"cs_{label}.fssm")
+                    with open(p, "wb") as f:
+                        f.write(_make_fssm(code))
+                    with self.assertRaises(rdna2spirv.Unsupported):
+                        rdna2spirv.translate(p)
+
+    def test_direct_translate_skips_unreachable_data_resembling_vop3p(self):
+        # An unreachable embedded data word (0xCC7F0000, resembling an 8-byte VOP3P prefix) jumped over by
+        # s_branch +1 must NOT swallow s_endpgm 4 bytes later: recursive-descent decode skips the data word cleanly.
+        code = (
+            bytes([0x8A, 0x02, 0x02, 0x7E])    # pc+0:  v_mov_b32_e32 v1, 10
+            + bytes([0x01, 0x00, 0x82, 0xBF])  # pc+4:  s_branch +1 -> pc+12
+            + struct.pack("<I", 0xCC7F0000)    # pc+8:  unreachable data word with VOP3P prefix
+            + bytes([0x00, 0x00, 0x81, 0xBF])  # pc+12: s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "fssm"))
+            p = os.path.join(d, "fssm", "cs_emb_vop3p_data.fssm")
+            with open(p, "wb") as f:
+                f.write(_make_fssm(code))
+            spv = rdna2spirv.translate(p)
+            _validate(spv)
+            self.assertIn("OpReturn", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
