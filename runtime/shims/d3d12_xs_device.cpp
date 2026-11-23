@@ -1300,31 +1300,6 @@ void destroy_present_state(void* present_state) {
 }
 
 LRESULT CALLBACK present_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    if (message == WM_ERASEBKGND) return 1;
-    if (message == WM_PAINT) {
-        PAINTSTRUCT paint{};
-        HDC dc = BeginPaint(window, &paint);
-        RECT area{};
-        GetClientRect(window, &area);
-        HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
-        FillRect(dc, &area, black);
-        DeleteObject(black);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(220, 220, 220));
-        RECT text = area;
-        text.top = (area.bottom - area.top) / 2 - 34;
-        DrawTextW(dc, L"Extracting shaders...", -1, &text, DT_CENTER | DT_SINGLELINE);
-        RECT bar = area;
-        bar.left = (area.right - area.left) / 2 - 180;
-        bar.right = bar.left + 360;
-        bar.top = (area.bottom - area.top) / 2 + 8;
-        bar.bottom = bar.top + 6;
-        HBRUSH light = CreateSolidBrush(RGB(220, 220, 220));
-        FillRect(dc, &bar, light);
-        DeleteObject(light);
-        EndPaint(window, &paint);
-        return 0;
-    }
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
