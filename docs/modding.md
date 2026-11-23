@@ -56,7 +56,9 @@ refused until a hook provides the game's mission state, so a mod never silently 
 
 `mod.json` is UTF-8. A byte-order mark in front is accepted (Notepad's "UTF-8 with BOM", Windows
 PowerShell 5.1's `-Encoding utf8`). A UTF-16 file, which PowerShell 5.1's `>` writes, is skipped with
-`mod.json is UTF-16; save it as UTF-8`.
+`mod.json is UTF-16; save it as UTF-8`. JSON escapes work too: a character outside the BMP
+written as a surrogate pair (`\ud83c\udf34`, the way Python's `json.dump` writes it by default) reads as
+that one character.
 
 The format is in `runtime/src/mods.h`; `runtime/test/mods_test.cpp` (ctest `mods`) covers it.
 
