@@ -44,6 +44,12 @@ class Contract(unittest.TestCase):
     def test_classification_order_and_evidence(self):
         cases = {
             "**not yet GPU-verified**; Source: LLVM `SIInstrInfo.cpp`": ("not_gpu", "partial"),
+            # Without "yet" (rows of docs/design.md say it both ways); GPU-verified alone must not win.
+            "CPU-checked by `test_vcmp64_null_src.py`; **not GPU-verified, no corpus count**.": ("not_gpu", "partial"),
+            "Not in the translated corpus, not GPU-checked.": ("not_gpu", "partial"),
+            "CPU-checked by `test_alu_swaprel.py`. **Not GPU-verified.**": ("not_gpu", "partial"),
+            # ...but other GPU evidence in the row still counts: the denial names the translated shader.
+            "CPU-checked. Not GPU-verified. Then measured on gfx1100 (RX 7900 XTX) with tools/hw_oracle": ("gpu", "verified"),
             "**GPU-checked** (TEST-298) on an NVIDIA GeForce RTX 2060": ("gpu", "verified"),
             "Source: LLVM `VOPProfileI2F`": ("reference", "implemented"),
             "a count over the corpus: 0 of the 26,503 shaders": ("corpus", "implemented"),

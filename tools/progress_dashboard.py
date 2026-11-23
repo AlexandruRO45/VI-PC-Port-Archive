@@ -605,11 +605,23 @@ CONFIRMATION = [
 OPEN = re.compile(r"\bstill open\b|\bremains? open\b|\bopen items?\b", re.I)
 
 
+# "Not GPU-verified" without "yet" denies a GPU check of the translated shader. It contains "GPU-verified", so it is
+# taken out before the rules run: other GPU evidence in the row (a hardware measurement) still counts, and a row with
+# none is not_gpu rather than verified on the strength of its own denial.
+NOT_GPU = re.compile(r"\bnot GPU-(?:verified|checked)", re.I)
+
+
 def classify_contract(text):
+    denied = NOT_GPU.search(text)
+    rest = NOT_GPU.sub("", text) if denied else text
     for kind, status, rx in CONFIRMATION:
-        m = rx.search(text)
+        m = rx.search(rest)
         if m:
+            if denied and kind not in ("gpu", "not_gpu"):
+                break
             return kind, status, m.group(0)
+    if denied:
+        return "not_gpu", "partial", denied.group(0)
     return "unstated", "unknown", None
 
 
