@@ -38,6 +38,11 @@ def ctest_entry(name, command, properties=None):
     return entry
 
 
+def python_wine():
+    """The interpreter as a --wine command line: quoted, so a path with spaces stays one argument."""
+    return f'"{sys.executable.replace(os.sep, "/")}"'
+
+
 class PathMappingTest(unittest.TestCase):
     def test_paths_under_the_windows_checkout_are_mapped(self):
         self.assertEqual(rwt.map_path("D:/win/root", WINDOWS_ROOT, "/repo"), "/repo")
@@ -454,7 +459,7 @@ class DriveMapTest(unittest.TestCase):
         listing.write_text(json.dumps({"tests": [ctest_entry("compiled_in_path", [WINDOWS_ROOT + "/probe.py"])]}),
                            encoding="utf-8")
         argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
-                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/")]
+                "--root", str(self.root), "--wine", python_wine()]
         out = io.StringIO()
         with mock.patch.dict(os.environ, {"WINEPREFIX": str(self.prefix)}), mock.patch.object(sys, "argv", argv), \
                 contextlib.redirect_stdout(out):
@@ -491,7 +496,7 @@ class MainTest(unittest.TestCase):
     def run_main(self, entries, *extra, stderr=False, root=None):
         listing = self.list_tests(entries)
         argv = ["run_wine_tests.py", "--tests", listing, "--windows-root", WINDOWS_ROOT,
-                "--root", str(self.root if root is None else root), "--wine", sys.executable.replace(os.sep, "/"), *extra]
+                "--root", str(self.root if root is None else root), "--wine", python_wine(), *extra]
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = rwt.main()
@@ -570,7 +575,7 @@ class MainTest(unittest.TestCase):
         listing = self.root / "notes.txt"
         listing.write_text("this is not ctest output\n", encoding="utf-8")
         argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
-                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/")]
+                "--root", str(self.root), "--wine", python_wine()]
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = rwt.main()
@@ -649,7 +654,7 @@ class MainTest(unittest.TestCase):
         listing = self.root / "wrong.json"
         listing.write_text(json.dumps(document), encoding="utf-8")
         argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
-                "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/")]
+                "--root", str(self.root), "--wine", python_wine()]
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = rwt.main()
@@ -683,6 +688,16 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rwt.wine_command("prog 'two words'"), ["prog", "two words"])
         with self.assertRaises(argparse.ArgumentTypeError):
             rwt.wine_command("   ")
+
+    def test_python_wine_command_line_stays_one_argument(self):
+        # Every main() run here passes the interpreter as --wine; quoted, a path with spaces survives the split.
+        self.assertEqual(rwt.wine_command(python_wine()), [sys.executable.replace(os.sep, "/")])
+
+    def test_an_unquoted_spaced_wine_splits_but_the_quoted_form_does_not(self):
+        # The same check on a synthetic path, so it guards the quoting on machines whose interpreter has no space.
+        spaced = "C:/Program Files/Python314/python.exe"
+        self.assertEqual(rwt.wine_command(spaced), ["C:/Program", "Files/Python314/python.exe"])
+        self.assertEqual(rwt.wine_command(f'"{spaced}"'), [spaced])
 
 
 if __name__ == "__main__":
