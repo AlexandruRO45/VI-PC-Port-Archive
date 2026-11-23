@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -176,6 +177,48 @@ private:
     std::condition_variable cv_;
     uint64_t used_ = 0;
     unsigned inflight_ = 0;
+};
+
+// The order a range's modules start in: largest .spv first, so the longest driver compiles run alongside the small
+// ones instead of alone after them. A module counts as large above `large_bytes` (0: none is). The next large module
+// starts only when `admits` says the gate would let it in now, or when no small module is left; otherwise the
+// largest small module starts, so a thread never waits at the gate while small work is pending. Equal sizes keep
+// index order. Thread-safe.
+class StartOrder {
+public:
+    StartOrder(const std::vector<uint64_t>& sizes, uint64_t large_bytes) {
+        for (size_t i = 0; i < sizes.size(); ++i)
+            (large_bytes && sizes[i] > large_bytes ? large_ : small_).push_back({i, sizes[i]});
+        const auto larger = [](const Item& a, const Item& b) { return a.bytes > b.bytes; };
+        std::stable_sort(large_.begin(), large_.end(), larger);
+        std::stable_sort(small_.begin(), small_.end(), larger);
+    }
+
+    // The next index to start, or false when every module has started.
+    template <typename Admits>
+    bool next(size_t& index, Admits&& admits) {
+        std::lock_guard<std::mutex> g(mu_);
+        const bool large_left = large_next_ < large_.size();
+        const bool small_left = small_next_ < small_.size();
+        if (large_left && (!small_left || admits(large_[large_next_].bytes))) {
+            index = large_[large_next_++].index;
+            return true;
+        }
+        if (!small_left) return false;
+        index = small_[small_next_++].index;
+        return true;
+    }
+
+    size_t large_count() const { return large_.size(); }
+
+private:
+    struct Item {
+        size_t index;
+        uint64_t bytes;
+    };
+    std::vector<Item> large_, small_;
+    size_t large_next_ = 0, small_next_ = 0;
+    std::mutex mu_;
 };
 
 }  // namespace leonida

@@ -1444,7 +1444,20 @@ int main(int argc, char** argv) {
     std::map<std::string, uint32_t> modules_ok, modules_bad, big_skipped;
     std::map<std::string, StageStats> stats;
     std::map<std::string, VkShaderModule> stub_cache;
-    std::atomic<size_t> next{0}, done{0};
+    std::atomic<size_t> done{0};
+    // Largest module first (large_module_gate.h): the longest driver compiles start early and run alongside the small
+    // ones. The range, the counts and the cache stay those of index order.
+    std::vector<uint64_t> work_bytes(work.size());
+    for (size_t i = 0; i < work.size(); ++i) {
+        std::error_code size_error;
+        const auto bytes = std::filesystem::file_size(dir + "/" + *work[i].first + ".spv", size_error);
+        work_bytes[i] = size_error ? 0 : uint64_t(bytes);
+    }
+    leonida::StartOrder start_order(work_bytes, large_module_bytes);
+    std::fprintf(stderr, "modules start largest first (%zu large)\n", start_order.large_count());
+    auto admits_now = [&](uint64_t bytes) {
+        return large_exclusive || large_gate.admits(leonida::large_module_estimate(bytes));
+    };
     std::atomic<uint32_t> total_pipes_done{0};
     // What each worker is doing in the driver: creating the shader module, then creating its pipeline.
     struct InFlight {
@@ -1572,7 +1585,7 @@ int main(int argc, char** argv) {
     };
 
     auto worker = [&] {
-        for (size_t k; (k = next++) < work.size();) {
+        for (size_t k; start_order.next(k, admits_now);) {
             const std::string& name = *work[k].first;
             const ShaderMeta& meta = *work[k].second;
             const std::string& stage = meta.stage;

@@ -153,6 +153,48 @@ static int cgroup_limits_are_read_up_the_tree() {
 }
 #endif
 
+static std::vector<size_t> drain(leonida::StartOrder& order, bool admit) {
+    std::vector<size_t> started;
+    for (size_t k; order.next(k, [&](uint64_t) { return admit; });) started.push_back(k);
+    return started;
+}
+
+static int start_order_largest_first() {
+    // Index:                     0   1    2  3    4   5
+    const std::vector<uint64_t> sizes{10, 500, 30, 700, 30, 5};
+    leonida::StartOrder all_small(sizes, 0);   // no large threshold: one list, by size
+    CHECK(all_small.large_count() == 0);
+    CHECK((drain(all_small, true) == std::vector<size_t>{3, 1, 2, 4, 0, 5}));   // equal sizes keep index order
+
+    leonida::StartOrder admitted(sizes, 100);   // 1 and 3 are large
+    CHECK(admitted.large_count() == 2);
+    CHECK((drain(admitted, true) == std::vector<size_t>{3, 1, 2, 4, 0, 5}));
+
+    // While the gate is full, the small modules go first; the large ones start once nothing else is left.
+    leonida::StartOrder held(sizes, 100);
+    CHECK((drain(held, false) == std::vector<size_t>{2, 4, 0, 5, 3, 1}));
+
+    leonida::StartOrder empty(std::vector<uint64_t>{}, 100);
+    size_t k = 99;
+    CHECK(!empty.next(k, [](uint64_t) { return true; }));
+    return 0;
+}
+
+static int start_order_hands_out_each_index_once_across_threads() {
+    std::vector<uint64_t> sizes(2000);
+    for (size_t i = 0; i < sizes.size(); ++i) sizes[i] = (i * 7919) % 1000;
+    leonida::StartOrder order(sizes, 900);
+    std::vector<std::atomic<int>> seen(sizes.size());
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t)
+        threads.emplace_back([&, t] {
+            for (size_t k; order.next(k, [&](uint64_t) { return t % 2 == 0; });) seen[k]++;
+        });
+    for (auto& th : threads) th.join();
+    for (const auto& s : seen) CHECK(s.load() == 1);
+    return 0;
+}
+
 int main() {
 #if defined(__linux__)
     if (int r = cgroup_limits_are_read_up_the_tree()) return r;
@@ -163,6 +205,8 @@ int main() {
     if (int r = ticket_releases()) return r;
     if (int r = threads_never_exceed_the_budget()) return r;
     if (int r = estimate_and_memory_query()) return r;
+    if (int r = start_order_largest_first()) return r;
+    if (int r = start_order_hands_out_each_index_once_across_threads()) return r;
     std::puts("large_module_gate: ok");
     return 0;
 }

@@ -283,6 +283,18 @@ of the arenas (16 modules, 6 threads: 6.2 GB; with `MALLOC_ARENA_MAX=1`: 2.1 GB)
 - `--inflight-file` names every module in flight when a large one enters or leaves the driver, so with several
   large modules in flight it names all of them; the `pipelines` stage of `make_game.py` checks each alone.
 
+### Start order
+
+The modules of a run start largest `.spv` first (`leonida::StartOrder` in the same header), not in index order. A
+driver compiles one pipeline on one thread, so a range ends with its last long compile. In index order a giant
+ray-tracing compute module that comes up late compiles alone while the other threads have nothing left. On a
+full-corpus run (RTX 4080, NVIDIA 621.24, 24 jobs, 500-entry batches) one ran for more than 30 minutes that way,
+and batches took 19 to 27 minutes. Started first, it compiles alongside the small ones. The next large module
+starts only while the gate above would admit it; otherwise the largest small one starts, so no thread waits at the
+gate while small work is pending. Equal sizes keep index order. The run prints `modules start largest first (N
+large)`. `--start` and `--count` still select the range in index order, and the counts, the cache and the
+`--isolate` bisection are unchanged.
+
 ## Skipping huge modules
 
 `vk_pipeline_check` now accepts `--max-bytes N`:
