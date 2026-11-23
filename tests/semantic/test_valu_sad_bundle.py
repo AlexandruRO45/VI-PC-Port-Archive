@@ -148,5 +148,55 @@ class TestVSadU32ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.vgprs[0], 70)
 
 
+class WaveState:
+    def __init__(self, wave_size: int = 64) -> None:
+        self.wave_size = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: list[dict[int, int]] = [{i: 0 for i in range(256)} for _ in range(wave_size)]
+
+    def read_lane_u32(self, lane: int, op: Operand) -> int:
+        if op.reg_type == RegType.IMM:
+            return op.index_or_val & MASK32
+        elif op.reg_type == RegType.VGPR:
+            return self.vgprs[lane][op.index_or_val] & MASK32
+        raise ValueError(f"Unsupported operand: {op}")
+
+    def write_lane_u32(self, lane: int, idx: int, val: int) -> None:
+        if (self.exec_mask >> lane) & 1:
+            self.vgprs[lane][idx] = val & MASK32
+
+def step_simd_sad_u32(wave: WaveState, instr: Instruction) -> None:
+    if instr.opcode != "v_sad_u32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.read_lane_u32(lane, instr.src0)
+            s1 = wave.read_lane_u32(lane, instr.src1)
+            s2 = wave.read_lane_u32(lane, instr.src2)
+            wave.write_lane_u32(lane, instr.dst.index_or_val, ref_sad_u32(s0, s1, s2))
+
+
+class TestVSadU32SIMD(unittest.TestCase):
+    """SIMD multi-lane divergence and 32-bit wrapping for v_sad_u32."""
+
+    def test_simd_multi_lane_divergence(self):
+        wave = WaveState(wave_size=64)
+        wave.exec_mask = 0x5555555555555555
+        for lane in range(64):
+            wave.vgprs[lane][1] = 50 + lane
+            wave.vgprs[lane][2] = 20
+            wave.vgprs[lane][3] = 0
+            wave.vgprs[lane][0] = 9999
+
+        instr = Instruction("v_sad_u32", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        step_simd_sad_u32(wave, instr)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[lane][0], 30 + lane)
+            else:
+                self.assertEqual(wave.vgprs[lane][0], 9999)
+
+
 if __name__ == "__main__":
     unittest.main()
