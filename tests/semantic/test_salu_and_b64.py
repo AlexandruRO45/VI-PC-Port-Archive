@@ -230,5 +230,105 @@ class SaluAndB64AstTests(unittest.TestCase):
                 src1=OperandAST.sgpr_pair(2),
             )
 
+class ScalarState:
+    """Models 64-bit RDNA2 scalar execution state: SGPRs, EXEC, VCC, SCC, and NULL."""
+
+    def __init__(self, num_sgprs: int = 106) -> None:
+        self.sgprs = [0] * num_sgprs
+        self.exec: int = MASK64
+        self.vcc: int = 0
+        self.scc: int = 0
+
+    def read_sgpr64(self, idx: int) -> int:
+        if not (0 <= idx < len(self.sgprs) - 1):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        lo = self.sgprs[idx] & MASK32
+        hi = self.sgprs[idx + 1] & MASK32
+        return (hi << 32) | lo
+
+    def write_sgpr64(self, idx: int, val: int) -> None:
+        if not (0 <= idx < len(self.sgprs) - 1):
+            raise IndexError(f"SGPR index out of range: {idx}")
+        self.sgprs[idx] = val & MASK32
+        self.sgprs[idx + 1] = (val >> 32) & MASK32
+
+    def resolve_src64(self, src: Union[int, str, OperandAST]) -> int:
+        if isinstance(src, OperandAST):
+            if src.kind == OperandKind.IMM64:
+                return src.value & MASK64 if src.value is not None else 0
+            src = src.name
+
+        if isinstance(src, int):
+            return src & MASK64
+        if src == "exec":
+            return self.exec & MASK64
+        if src == "vcc":
+            return self.vcc & MASK64
+        if src == "null":
+            return 0
+        if src.startswith("s[") and ":" in src:
+            idx = int(src[2:].split(":")[0])
+            return self.read_sgpr64(idx)
+        try:
+            return int(src, 0) & MASK64
+        except ValueError:
+            raise ValueError(f"Unknown 64-bit source operand: {src}")
+
+    def write_dst64(self, dst: Union[str, OperandAST], val: int) -> None:
+        if isinstance(dst, OperandAST):
+            dst = dst.name
+
+        val = val & MASK64
+        if dst == "exec":
+            self.exec = val
+        elif dst == "vcc":
+            self.vcc = val
+        elif dst == "null":
+            pass
+        elif dst.startswith("s[") and ":" in dst:
+            idx = int(dst[2:].split(":")[0])
+            self.write_sgpr64(idx, val)
+        else:
+            raise ValueError(f"Unknown 64-bit destination operand: {dst}")
+
+    def step_s_and_b64(self, dst: Union[str, OperandAST], src0: Union[int, str, OperandAST], src1: Union[int, str, OperandAST]) -> int:
+        """Executes s_and_b64: D = S0 & S1, and sets SCC = (D != 0)."""
+        s0_val = self.resolve_src64(src0)
+        s1_val = self.resolve_src64(src1)
+        res = ref_s_and_b64(s0_val, s1_val)
+        self.write_dst64(dst, res)
+        self.scc = ref_scc(res)
+        return res
+
+
+class SaluAndB64InterpreterTests(unittest.TestCase):
+    """Interpreter unit tests executing s_and_b64 across scalar state."""
+
+    def test_interpreter_basic_and(self) -> None:
+        state = ScalarState()
+        v0 = 0x01234567_89ABCDEF
+        v1 = 0xFEEDBEEF_CAFED00D
+        state.write_sgpr64(0, v0)
+        state.write_sgpr64(2, v1)
+
+        res = state.step_s_and_b64("s[4:5]", "s[0:1]", "s[2:3]")
+        expected = v0 & v1
+        self.assertEqual(res, expected)
+        self.assertEqual(state.read_sgpr64(4), expected)
+        self.assertEqual(state.scc, 1)
+
+    def test_interpreter_null_destination_still_updates_scc(self) -> None:
+        state = ScalarState()
+        state.write_sgpr64(0, 0x12345678_00000000)
+        state.write_sgpr64(2, 0x12345678_00000000)
+
+        res = state.step_s_and_b64("null", "s[0:1]", "s[2:3]")
+        self.assertEqual(res, 0x12345678_00000000)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.read_sgpr64(0), 0x12345678_00000000)
+
+        state.step_s_and_b64("null", 0x55555555_55555555, 0xAAAAAAAA_AAAAAAAA)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
