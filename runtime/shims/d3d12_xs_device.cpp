@@ -44,7 +44,11 @@
 namespace rt::d3d12_xs {
 namespace {
 
-constexpr unsigned kMaxSlots = 128;
+// The console device calls past ID3D12Device14's 83 slots: slot 133 (CreatePlacedResourceX, three sites in the
+// retail image) is the first one measured. A table shorter than the slot the title uses makes the vtable read land
+// in the zeroed tail of the allocation, so the call goes to address 0 and the process dies with an access violation
+// at 0: no stack, no slot name. 192 keeps the refused tail (logged, E_NOTIMPL) in front of that.
+constexpr unsigned kMaxSlots = 192;
 static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,

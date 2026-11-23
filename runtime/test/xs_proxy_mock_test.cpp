@@ -755,6 +755,12 @@ int check_xbox_slots() {
     EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
            xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
 
+    // 133 CreatePlacedResourceX: the retail title calls it, and it is past ID3D12Device14's 83 slots. The table has
+    // to cover it: a shorter one lets the vtable read land in the zeroed tail of the allocation, so the call goes to
+    // address 0 and the process dies with an access violation at 0 instead of naming the slot.
+    EXPECT(hr_of(raw(device, 133, 0, 0, 0, 0)) == E_NOTIMPL);
+    EXPECT(xs::device_slot_hits(133) == 1);
+
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
