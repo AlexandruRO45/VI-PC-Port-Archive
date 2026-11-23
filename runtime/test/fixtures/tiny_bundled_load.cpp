@@ -39,12 +39,15 @@ int main() {
     HMODULE mod = LoadLibraryW(L"tiny_bundled_dll.dll");
     if (!mod) return fail("LoadLibraryW(tiny_bundled_dll.dll)", GetLastError());
 
-    // Must be mapped by rt::Loader, not by the host Windows loader.
-    HMODULE host_view = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"tiny_bundled_dll.dll", &host_view) &&
-        host_view == mod) {
+    // Must be mapped by rt::Loader, not by the host Windows loader. GetModuleHandleEx answers for mapped
+    // modules now, so the host-loader check reads the mapping: host-loaded images are MEM_IMAGE.
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(mod, &info, sizeof(info)) && info.Type == MEM_IMAGE)
         return fail("tiny_bundled_dll.dll came from the host loader, not rt::Loader", 0);
-    }
+    HMODULE view = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"tiny_bundled_dll.dll", &view) ||
+        view != mod)
+        return fail("GetModuleHandleExW(tiny_bundled_dll.dll)", GetLastError());
 
     if (GetModuleHandleW(L"tiny_bundled_dll.dll") != mod)
         return fail("GetModuleHandleW after LoadLibrary returns the same handle", 0);

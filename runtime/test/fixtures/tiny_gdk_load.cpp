@@ -62,9 +62,15 @@ int main() {
     HMODULE runtime = LoadLibraryW(L"xgameruntime.dll");
     if (!runtime) return fail("LoadLibraryW(xgameruntime.dll)", GetLastError());
     // The loader shim hands out a pseudo-handle for a module it owns: not an image the host loaded.
-    HMODULE host_view = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"xgameruntime.dll", &host_view) && host_view == runtime)
+    // GetModuleHandleEx answers for owned modules now, so the host-loader check reads the mapping:
+    // host-loaded images are MEM_IMAGE.
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(runtime, &info, sizeof(info)) && info.Type == MEM_IMAGE)
         return fail("xgameruntime.dll came from the host loader, not the shims", 0);
+    HMODULE view = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"xgameruntime.dll", &view) ||
+        view != runtime)
+        return fail("GetModuleHandleExW(xgameruntime.dll)", GetLastError());
 
     const char* names[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2", "UninitializeApiImpl",
                            "QueryApiImpl"};
