@@ -128,13 +128,18 @@ class Restart(unittest.TestCase):
     """run_with_restarts: a hung check is recorded as HANG and the title is run again with it skipped."""
 
     def test_taskkill_failure_stops_live_child(self):
-        proc = mock.Mock(pid=123)
-        proc.poll.return_value = None
-        with mock.patch.object(xc.os, "name", "nt"), mock.patch.object(
-            xc.subprocess, "run", return_value=mock.Mock(returncode=1)
+        for taskkill in (
+            {"return_value": mock.Mock(returncode=1)},
+            {"side_effect": OSError("taskkill could not start")},
         ):
-            xc.kill_tree(proc)
-        proc.kill.assert_called_once_with()
+            with self.subTest(taskkill=taskkill):
+                proc = mock.Mock(pid=123)
+                proc.poll.return_value = None
+                with mock.patch.object(xc.os, "name", "nt"), mock.patch.object(
+                    xc.subprocess, "run", **taskkill
+                ):
+                    xc.kill_tree(proc)
+                proc.kill.assert_called_once_with()
 
     def run_fake(self, honour):
         env = dict(os.environ, HONOUR_SKIP="1" if honour else "0")
