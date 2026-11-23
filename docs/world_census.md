@@ -69,9 +69,11 @@ The unread bytes are mostly small alignment and metadata gaps between streams. T
 (`raw_maps = 0`, `raw_meta = 0`), so the census is not missing a map class. No unaligned zlib stream
 that inflates to a `0DRP` header was found in a gap (`missed_zlib_meta = 0`). The 840 rejected
 candidates are 16-byte-aligned zlib headers that do not inflate to a stream ending inside the archive
-(`scan_shard`: `assemble` raises a zlib error or returns `None`); they are ordinary archive payload, not
-counted maps. A stream that inflates but does not form a complete or valid `0x7a` resource is counted as
-`incomplete` or `invalid` instead, and both are 0 here.
+(`scan_shard`: `assemble` raises an inflate error (zlib, struct or index) or returns `None`); they are
+ordinary archive payload, not counted maps. A stream that inflates without the `0DRPz` prefix of a `0x7a`
+resource is ordinary payload and accepted. One with that prefix that does not come out whole (truncated,
+not parsing, or still short of a page) is `incomplete`; `invalid` is a second parse check behind it. Both
+are 0 here.
 
 ## Other archives
 
