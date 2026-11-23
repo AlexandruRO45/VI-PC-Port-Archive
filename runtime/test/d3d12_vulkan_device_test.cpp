@@ -589,6 +589,8 @@ int compare_footprints(ID3D12Device* ours) {
 // whole number of alignments and at least the texels of its top mip; both sizes are printed. Also checks the
 // Device4/Device8 variants' per-resource layout. Returns the number of mismatches, or -1 without a host device.
 int compare_allocation_info(ID3D12Device* ours) {
+    // Device4 and Device8 use PC vtable slots here. Keep the base-device calls on the proxy.
+    ID3D12Device* const pc = xs_test::pc_device(ours);
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
     const auto with = [](D3D12_RESOURCE_DESC desc, UINT64 alignment, UINT samples = 1) {
@@ -929,9 +931,9 @@ int compare_allocation_info(ID3D12Device* ours) {
     {
         Ref<ID3D12Device4> ours4, host4;
         Ref<ID3D12Device8> ours8_mask, host8_mask;
-        ours->QueryInterface(IID_PPV_ARGS(&ours4.p));
+        pc->QueryInterface(IID_PPV_ARGS(&ours4.p));
         host->QueryInterface(IID_PPV_ARGS(&host4.p));
-        ours->QueryInterface(IID_PPV_ARGS(&ours8_mask.p));
+        pc->QueryInterface(IID_PPV_ARGS(&ours8_mask.p));
         host->QueryInterface(IID_PPV_ARGS(&host8_mask.p));
         const D3D12_RESOURCE_DESC buffer = buffer_desc(256);
         D3D12_RESOURCE_DESC1 buffer1{};
@@ -996,7 +998,7 @@ int compare_allocation_info(ID3D12Device* ours) {
         }
     }
 
-    if (FAILED(ours->QueryInterface(IID_PPV_ARGS(&ours8.p)))) return mismatches + 1;
+    if (FAILED(pc->QueryInterface(IID_PPV_ARGS(&ours8.p)))) return mismatches + 1;
     const D3D12_RESOURCE_DESC mixed[] = {with(texture_desc(16, 16, rgba8, none), k4), buffer_desc(300),
                                          with(texture_desc(64, 64, rgba8, rt), 0, 4)};
     D3D12_RESOURCE_DESC1 mixed1[3]{};
