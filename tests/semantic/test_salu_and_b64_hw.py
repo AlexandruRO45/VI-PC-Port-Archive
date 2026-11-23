@@ -610,5 +610,81 @@ class SaluAndB64ConditionCodeTests(unittest.TestCase):
                 self.assertEqual(out[2], want_scc)
 
 
+class SaluAndB64Ieee754BitwiseTests(unittest.TestCase):
+    """IEEE 754 boundary extremes, subnormals, and NaN bit-pattern handling."""
+
+    def test_f64_sign_bit_clearing(self):
+        """s_and_b64 with 0x7FFFFFFFFFFFFFFF implements exact fabs() on IEEE 754 double."""
+        abs_mask = 0x7FFFFFFF_FFFFFFFF
+        test_doubles = [
+            -0.0,
+            0.0,
+            -1.0,
+            1.0,
+            -math.pi,
+            math.pi,
+            -float("inf"),
+            float("inf"),
+            -float("nan"),
+            float("nan"),
+            -1e-308,  # subnormal
+        ]
+        for d in test_doubles:
+            raw_bits = struct.unpack("<Q", struct.pack("<d", d))[0]
+            masked_bits = ref_s_and_b64(raw_bits, abs_mask)
+            unpacked = struct.unpack("<d", struct.pack("<Q", masked_bits))[0]
+            if math.isnan(d):
+                self.assertTrue(math.isnan(unpacked))
+            else:
+                self.assertEqual(unpacked, abs(d))
+                self.assertGreaterEqual(math.copysign(1.0, unpacked), 0.0)
+
+    def test_packed_f32_dual_masking(self):
+        """Masking sign bits of two packed single-precision floats simultaneously."""
+        abs_mask_2xf32 = 0x7FFFFFFF_7FFFFFFF
+        f0, f1 = -42.5, -128.125
+        raw_bits = struct.unpack("<Q", struct.pack("<2f", f0, f1))[0]
+        masked = ref_s_and_b64(raw_bits, abs_mask_2xf32)
+        r0, r1 = struct.unpack("<2f", struct.pack("<Q", masked))
+        self.assertEqual(r0, abs(f0))
+        self.assertEqual(r1, abs(f1))
+
+    def test_packed_f16_quad_masking(self):
+        """Masking sign bits of four packed half-precision floats simultaneously."""
+        abs_mask_4xf16 = 0x7FFF7FFF_7FFF7FFF
+        h0, h1, h2, h3 = -1.5, -2.5, -3.5, -4.5
+        raw_bits = struct.unpack("<Q", struct.pack("<4e", h0, h1, h2, h3))[0]
+        masked = ref_s_and_b64(raw_bits, abs_mask_4xf16)
+        r0, r1, r2, r3 = struct.unpack("<4e", struct.pack("<Q", masked))
+        self.assertEqual((r0, r1, r2, r3), (abs(h0), abs(h1), abs(h2), abs(h3)))
+
+    def test_spirv_hardware_f64_bitwise_passthrough(self):
+        """Verify translator preserves double precision bit patterns without canonicalization."""
+        abs_mask = 0x7FFFFFFF_FFFFFFFF
+        neg_val = -3.141592653589793
+        raw_bits = struct.unpack("<Q", struct.pack("<d", neg_val))[0]
+        lines = [
+            f"s_mov_b32 s0, {lo32(raw_bits):#x}",
+            f"s_mov_b32 s1, {hi32(raw_bits):#x}",
+            f"s_mov_b32 s2, {lo32(abs_mask):#x}",
+            f"s_mov_b32 s3, {hi32(abs_mask):#x}",
+            "s_and_b64 s[4:5], s[0:1], s[2:3]",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+            "v_mov_b32 v2, s6",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_salu_and_b64_f64", lines)
+        out = mrt0_words(spv)
+        res64 = join64(out[0], out[1])
+        expected = ref_s_and_b64(raw_bits, abs_mask)
+        self.assertEqual(res64, expected)
+        res_float = struct.unpack("<d", struct.pack("<Q", res64))[0]
+        self.assertEqual(res_float, abs(neg_val))
+
+
 if __name__ == "__main__":
     unittest.main()
