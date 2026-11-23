@@ -18,6 +18,7 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
 | 2 | The 2 MiB reserve+commit calls carry attribute words the shim refuses, and `PAGE_GRAPHICS_*` bits (0x800..0x40000) on top of `PAGE_READWRITE` | Local: accept the attribute word, drop the graphics bits and keep the CPU protection. All seven startup allocations then succeed. #6843 measures the attribute words; no PR changes the check yet |
 | 3 | `xgameruntime.lib`'s thunk treats a missing `XErrorReport` as fatal | #6582 |
 | 4 | Access violation in the title's allocator: its `/GA` code reads its TLS from module index 0 | #4313 |
+| 4w | Wine only, right after the TLS stop: the boot stops at `gameinput.dll` ordinal 1. Without the SDL3 shim (`-DLEONIDA_SDL3_FETCH=ON`; the default cross build has none) and the `#1` alias from #7216, the title reads through a null pointer right after the call; with both, the boot goes on past this point | SDL3 shim build plus #7216 |
 | 5 | Fatal assert when `DStorageGetFactory` returns null | #4348 |
 | 6 | `XMemAllocatePhysicalPages` unimplemented; the title asserts on FALSE | Local stand-in, §2 |
 | 7 | `D3D12XboxCreateDevice` succeeds; device slot 26 is called with its arguments swapped | Local, §3.1 |
