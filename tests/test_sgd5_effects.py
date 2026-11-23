@@ -42,14 +42,22 @@ def post_pass(words=(), blocks=(b"", b""), packed=0, entries=b""):
     return data + b"".join(u32(len(block)) + block for block in blocks) + u32(packed) + entries
 
 
-def effect(name, ordinals=None, techniques=(), pool_tail=b"", suffix=None):
+def default_state_rows(width):
+    # One row per table that the render-state decoders accept: solid fill and cull none, compare never.
+    return [{16: b"\x03\x01", 24: b"\x00\x00\x01"}.get(width, b"").ljust(width, b"\0")]
+
+
+def effect(name, ordinals=None, techniques=(), pool_tail=b"", suffix=None, states=None):
+    """``states`` maps a table row width (16, 24, 68, 36) to the list of its rows; an empty list is an empty table."""
     data = bytearray(label(name) + u32(0xDEADBEEF))
     for group in range(6):
         entries = (ordinals or {}).get(group, ())
         data += u32(len(entries)) + b"".join(u32(i) for i in entries)
     data += bytes(80)
     for width in (16, 24, 68, 36):
-        data += u32(1) + bytes(width)
+        table = (states or {}).get(width)
+        table = default_state_rows(width) if table is None else table
+        data += u32(len(table)) + b"".join(table)
 
     pool = bytearray(b"\0")
     headers = bytearray()
@@ -60,7 +68,7 @@ def effect(name, ordinals=None, techniques=(), pool_tail=b"", suffix=None):
         rows.extend(passes)
     data += u32(len(techniques)) + headers + u32(len(rows))
     for row in rows:
-        data += bytes(row) + bytes(18)
+        data += bytes(row) + bytes(24 - len(row))  # a row longer than six bytes also sets the state selectors
     pool += pool_tail
     return data + (post_pass() if suffix is None else suffix) + u32(len(pool)) + pool
 

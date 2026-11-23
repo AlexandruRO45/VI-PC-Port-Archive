@@ -140,6 +140,7 @@ class Effect(NamedTuple):
     pass_end: int
     pool: int
     end: int
+    tables: tuple = ()  # (count, first row, row width) of the rasterizer, depth/stencil, blend and fourth tables
 
 
 def effect_records(data, groups, count):
@@ -156,7 +157,9 @@ def effect_records(data, groups, count):
             raise ValueError("invalid effect program lists")
         lists, pos = arrays
         pos = advance(data, pos, 80)
+        tables = []
         for width in (16, 24, 68, 36):
+            tables.append((u32(data, pos), pos + 4, width))  # row count, first row, bytes per row
             pos = advance(data, pos + 4, width * u32(data, pos))
         rows = pos + 4
         pass_count_at = advance(data, rows, 4 * u32(data, pos))
@@ -167,7 +170,7 @@ def effect_records(data, groups, count):
         if (end == pool + 4 or data[pool + 4] != 0 or data[end - 1] != 0
                 or not POOL.fullmatch(data, pool + 4, end)):
             raise ValueError("invalid counted string pool")
-        yield Effect(start, name, lists, rows, first, pass_end, pool, end)
+        yield Effect(start, name, lists, rows, first, pass_end, pool, end, tuple(tables))
         start = end
     if not 4 <= len(data) - start <= 4096 or u32(data, start) != 1 or any(data[start + 4:]):
         raise ValueError("declared effects do not reach the database terminator and zero padding")
