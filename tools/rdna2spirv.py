@@ -14350,7 +14350,8 @@ class Gen:
         # Exports from inactive lanes don't happen: keep the previous output value.
         old, sel = self.tmp(), self.tmp()
         self.emit(f"{old} = OpLoad %v4float {name}")
-        if self.stage == "ps" and tgt.startswith("mrt") and None in comps:
+        is_partial = None in comps
+        if is_partial:
             # EN gates each component (each RG/BA pair when compressed). Keep the previous export in off slots.
             self.partial_color_outputs.add(name)
             for i, comp in enumerate(comps):
@@ -14365,6 +14366,8 @@ class Gen:
             for half, hv in enumerate(self.f16_halves_of(n, v)):
                 hname = f"%out_f16h{n}_{half}"
                 self.outputs[hname] = f"loc{self.f16_half_locs[n][half]}"
+                if is_partial:
+                    self.partial_color_outputs.add(hname)
                 old, sel = self.tmp(), self.tmp()
                 self.emit(f"{old} = OpLoad %v4float {hname}")
                 self.emit(f"{sel} = OpSelect %v4float {self.active_b()} {hv} {old}")

@@ -215,5 +215,54 @@ class OnlyWhereNeeded(unittest.TestCase):
             self.assertFalse(rdna2spirv.writes_exec(shader_ir.parse_line("\t" + line)), line)
 
 
+class PartialVertexExports(unittest.TestCase):
+    VS_INPUTS = {"%vertex_id": 0, "%base_vertex": 0, "%instance_id": 0, "%base_instance": 0}
+
+    def test_partial_param_and_pos0_keep_previous_components(self):
+        lines = [
+            "v_mov_b32_e32 v0, 1.0",
+            "v_mov_b32_e32 v1, 2.0",
+            "v_mov_b32_e32 v2, 0x40400000",
+            "v_mov_b32_e32 v3, 0x40800000",
+            "exp param0 v0, off, off, off",
+            "exp param0 off, v1, off, off",
+            "exp pos0 v0, v1, off, off",
+            "exp pos0 off, off, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        shader = support.translate_lines("vs_partial_param_and_pos0", sized(lines))
+        got = run_fragment(shader, inputs=self.VS_INPUTS)
+        self.assertEqual(got["%out_param0"], (ONE, 0x40000000, 0, 0))
+        self.assertEqual(got["%out_pos"], (ONE, 0x40000000, 0x40400000, 0x40800000))
+
+    def test_all_off_export_preserves_prior_param_and_pos0(self):
+        lines = [
+            "v_mov_b32_e32 v0, 1.0",
+            "v_mov_b32_e32 v1, 2.0",
+            "exp param0 v0, v1, off, off",
+            "exp param0 off, off, off, off",
+            "exp pos0 v0, off, v1, off",
+            "exp pos0 off, off, off, off done vm",
+            "s_endpgm",
+        ]
+        shader = support.translate_lines("vs_all_off_preserves", sized(lines))
+        got = run_fragment(shader, inputs=self.VS_INPUTS)
+        self.assertEqual(got["%out_param0"], (ONE, 0x40000000, 0, 0))
+        self.assertEqual(got["%out_pos"], (ONE, 0, 0x40000000, 0))
+
+    def test_first_partial_param_initializes_off_channels(self):
+        lines = [
+            "v_mov_b32_e32 v0, 1.0",
+            "exp param0 off, v0, off, off",
+            "exp pos0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        shader = support.translate_lines("vs_first_partial_param", sized(lines))
+        got = run_fragment(shader, inputs=self.VS_INPUTS)
+        self.assertEqual(got["%out_param0"], (0, ONE, 0, 0))
+        self.assertIn("%initial_mrt = OpConstantNull %v4float", shader)
+        self.assertIn("%out_param0 = OpVariable %_ptr_Output_v4 Output %initial_mrt", shader)
+
+
 if __name__ == "__main__":
     unittest.main()
