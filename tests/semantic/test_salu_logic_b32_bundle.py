@@ -14,16 +14,13 @@ In AMD RDNA2 ISA (SOP2 encoding format):
   SCC = 1 if sdst != 0 else 0
 
 Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
-Exercises tools/rdna2spirv.py via support.translate_lines(...) and support.mrt0_words for hardware-accurate translation.
+All tests compile real assembly listings through support.translate_lines(...)
+and execute the translated SPIR-V in spirv_mini_interp via support.mrt0_words.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum, auto
 import os
-import struct
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -32,621 +29,782 @@ TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS_DIR)
 sys.path.insert(0, HERE)
 
-try:
-    import rdna2spirv
-    import support
-except Exception:
-    rdna2spirv = None  # type: ignore
-    support = None  # type: ignore
+import rdna2spirv  # noqa: E402
+import support  # noqa: E402
 
 MASK32: int = 0xFFFFFFFF
 MASK64: int = 0xFFFFFFFFFFFFFFFF
 
 
-def u32(val: int) -> int:
-    return val & MASK32
+def run_salu_logic_ps(lines: list[str], name: str = "ps_salu_logic") -> list[int]:
+    all_lines = list(lines) + [
+        "s_cselect_b32 s15, 1, 0",
+        "v_mov_b32 v0, s0",
+        "v_mov_b32 v1, s15",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, all_lines)
+    return support.mrt0_words(spv)
 
 
-class Opcode(Enum):
-    S_AND_B32 = "s_and_b32"
-    S_OR_B32 = "s_or_b32"
-    S_XOR_B32 = "s_xor_b32"
-    S_ANDN2_B32 = "s_andn2_b32"
-    S_ORN2_B32 = "s_orn2_b32"
-    S_NAND_B32 = "s_nand_b32"
-    S_NOR_B32 = "s_nor_b32"
-    S_XNOR_B32 = "s_xnor_b32"
-
-
-class OperandKind(Enum):
-    SGPR = auto()
-    IMM = auto()
-
-
-@dataclass(frozen=True)
-class ASTOperand:
-    kind: OperandKind
-    index: int = 0
-    value: int = 0
-
-    @classmethod
-    def sgpr(cls, idx: int) -> ASTOperand:
-        return cls(kind=OperandKind.SGPR, index=idx)
-
-    @classmethod
-    def imm(cls, val: int) -> ASTOperand:
-        return cls(kind=OperandKind.IMM, value=val & MASK32)
-
-
-@dataclass(frozen=True)
-class ASTInstruction:
-    opcode: Opcode
-    dst: ASTOperand
-    src0: ASTOperand
-    src1: ASTOperand
-
-    def disasm(self) -> str:
-        def fmt(op: ASTOperand) -> str:
-            if op.kind == OperandKind.SGPR:
-                return f"s{op.index}"
-            return hex(op.value)
-        return f"{self.opcode.value} {fmt(self.dst)}, {fmt(self.src0)}, {fmt(self.src1)}"
-
-
-class ScalarMachineState:
-    def __init__(self, num_sgprs: int = 106) -> None:
-        self.sgprs: list[int] = [0] * num_sgprs
-        self.scc: int = 0
-
-    def read_operand(self, op: ASTOperand) -> int:
-        if op.kind == OperandKind.SGPR:
-            return self.sgprs[op.index] & MASK32
-        return op.value & MASK32
-
-    def write_sgpr(self, idx: int, val: int) -> None:
-        self.sgprs[idx] = val & MASK32
-
-
-GLOBAL_ORACLE_MAP: dict[Opcode, Callable[[int, int], tuple[int, int]]] = {}
-
-
-class ScalarInterpreter:
-    def step(self, instr: ASTInstruction, state: ScalarMachineState) -> tuple[int, int]:
-        s0 = state.read_operand(instr.src0)
-        s1 = state.read_operand(instr.src1)
-        res, scc = GLOBAL_ORACLE_MAP[instr.opcode](s0, s1)
-        if instr.dst.kind == OperandKind.SGPR:
-            state.write_sgpr(instr.dst.index, res)
-        state.scc = scc
-        return res, scc
-
-def ref_s_and_b32(s0: int, s1: int) -> tuple[int, int]:
-    res = u32(s0 & s1)
-    scc = 1 if res != 0 else 0
-    return res, scc
-
-GLOBAL_ORACLE_MAP[Opcode.S_AND_B32] = ref_s_and_b32
-
+# ==============================================================================
+# 1. s_and_b32: Bitwise AND
+# ==============================================================================
 
 class TestSAndB32Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res, scc = ref_s_and_b32(0x12345678, 0x0F0F0F0F)
-        self.assertEqual(res, 0x2040608)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_and_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_oracle_s_and_b32")
+        self.assertEqual(words[0], 0x02040608)
+        self.assertEqual(words[1], 1)
 
     def test_oracle_zero_inputs(self) -> None:
-        res, scc = ref_s_and_b32(0, 0)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0",
+            "s_mov_b32 s2, 0",
+            "s_and_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_zero_s_and_b32")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
+
 
 class TestSAndB32ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(Opcode.S_AND_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        self.assertEqual(inst.disasm(), "s_and_b32 s0, s1, s2")
+        ast_prog = [
+            "s_and_b32 s0, s1, s2",
+            "s_cselect_b32 s15, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s15",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_s_and_b32", ast_prog)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("%scc", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(1, 0x12345678)
-        state.write_sgpr(2, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_AND_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x2040608)
-        self.assertEqual(state.sgprs[0], 0x2040608)
-        self.assertEqual(state.scc, scc)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_and_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_step_s_and_b32")
+        self.assertEqual(words[0], 0x02040608)
+        self.assertEqual(words[1], 1)
+
 
 class TestSAndB32SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_preservation(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 0x12345678)
-        state.write_sgpr(1, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_AND_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(0), ASTOperand.sgpr(1))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x2040608)
-        self.assertEqual(state.sgprs[0], 0x2040608)
+        prog = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_and_b32 s0, s0, s1",
+        ]
+        words = run_salu_logic_ps(prog, "ps_alias_s_and_b32")
+        self.assertEqual(words[0], 0x02040608)
+        self.assertEqual(words[1], 1)
 
     def test_ieee754_bit_transparency(self) -> None:
-        qnan = 0x7FC00000
-        snan = 0x7F800001
-        res, _ = ref_s_and_b32(qnan, snan)
-        self.assertIsInstance(res, int)
+        prog = [
+            "s_mov_b32 s1, 0x7FC00000",
+            "s_mov_b32 s2, 0x7F800001",
+            "s_and_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_ieee_s_and_b32")
+        self.assertEqual(words[0], 0x7FC00000 & 0x7F800001)
+        self.assertEqual(words[1], 1)
+
 
 class TestSAndB32Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
-        lines = [
-            "s_mov_b32 s0, 0x12345678",
-            "s_mov_b32 s1, 0x0F0F0F0F",
-            "s_and_b32 s2, s0, s1",
-            "v_mov_b32_e32 v0, s2",
-            "exp mrt0, v0, v0, v0, v0 done",
-            "s_endpgm",
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_and_b32 s0, s1, s2",
         ]
-        spv = support.translate_lines("ps_bundle_s_and_b32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0x2040608)
+        words = run_salu_logic_ps(prog, "ps_bundle_s_and_b32")
+        self.assertEqual(words[0], 0x02040608)
 
-def ref_s_or_b32(s0: int, s1: int) -> tuple[int, int]:
-    res = u32(s0 | s1)
-    scc = 1 if res != 0 else 0
-    return res, scc
+    def test_inline_constant_folding(self) -> None:
+        prog = [
+            "s_and_b32 s0, 5, 3",
+        ]
+        words = run_salu_logic_ps(prog, "ps_fold_s_and_b32")
+        self.assertEqual(words[0], 5 & 3)
+        self.assertEqual(words[1], 1)
 
-GLOBAL_ORACLE_MAP[Opcode.S_OR_B32] = ref_s_or_b32
 
+# ==============================================================================
+# 2. s_or_b32: Bitwise OR
+# ==============================================================================
 
 class TestSOrB32Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res, scc = ref_s_or_b32(0x12345678, 0x0F0F0F0F)
-        self.assertEqual(res, 0x1f3f5f7f)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_or_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_oracle_s_or_b32")
+        self.assertEqual(words[0], 0x1F3F5F7F)
+        self.assertEqual(words[1], 1)
 
     def test_oracle_zero_inputs(self) -> None:
-        res, scc = ref_s_or_b32(0, 0)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0",
+            "s_mov_b32 s2, 0",
+            "s_or_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_zero_s_or_b32")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
+
 
 class TestSOrB32ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(Opcode.S_OR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        self.assertEqual(inst.disasm(), "s_or_b32 s0, s1, s2")
+        ast_prog = [
+            "s_or_b32 s0, s1, s2",
+            "s_cselect_b32 s15, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s15",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_s_or_b32", ast_prog)
+        self.assertIn("OpBitwiseOr", spv)
+        self.assertIn("%scc", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(1, 0x12345678)
-        state.write_sgpr(2, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_OR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x1f3f5f7f)
-        self.assertEqual(state.sgprs[0], 0x1f3f5f7f)
-        self.assertEqual(state.scc, scc)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_or_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_step_s_or_b32")
+        self.assertEqual(words[0], 0x1F3F5F7F)
+        self.assertEqual(words[1], 1)
+
 
 class TestSOrB32SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_preservation(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 0x12345678)
-        state.write_sgpr(1, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_OR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(0), ASTOperand.sgpr(1))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x1f3f5f7f)
-        self.assertEqual(state.sgprs[0], 0x1f3f5f7f)
+        prog = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_or_b32 s0, s0, s1",
+        ]
+        words = run_salu_logic_ps(prog, "ps_alias_s_or_b32")
+        self.assertEqual(words[0], 0x1F3F5F7F)
+        self.assertEqual(words[1], 1)
 
     def test_ieee754_bit_transparency(self) -> None:
-        qnan = 0x7FC00000
-        snan = 0x7F800001
-        res, _ = ref_s_or_b32(qnan, snan)
-        self.assertIsInstance(res, int)
+        prog = [
+            "s_mov_b32 s1, 0x7FC00000",
+            "s_mov_b32 s2, 0x7F800001",
+            "s_or_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_ieee_s_or_b32")
+        self.assertEqual(words[0], 0x7FC00000 | 0x7F800001)
+        self.assertEqual(words[1], 1)
+
 
 class TestSOrB32Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
-        lines = [
-            "s_mov_b32 s0, 0x12345678",
-            "s_mov_b32 s1, 0x0F0F0F0F",
-            "s_or_b32 s2, s0, s1",
-            "v_mov_b32_e32 v0, s2",
-            "exp mrt0, v0, v0, v0, v0 done",
-            "s_endpgm",
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_or_b32 s0, s1, s2",
         ]
-        spv = support.translate_lines("ps_bundle_s_or_b32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0x1f3f5f7f)
+        words = run_salu_logic_ps(prog, "ps_bundle_s_or_b32")
+        self.assertEqual(words[0], 0x1F3F5F7F)
 
-def ref_s_xor_b32(s0: int, s1: int) -> tuple[int, int]:
-    res = u32(s0 ^ s1)
-    scc = 1 if res != 0 else 0
-    return res, scc
+    def test_inline_constant_folding(self) -> None:
+        prog = [
+            "s_or_b32 s0, 5, 3",
+        ]
+        words = run_salu_logic_ps(prog, "ps_fold_s_or_b32")
+        self.assertEqual(words[0], 5 | 3)
+        self.assertEqual(words[1], 1)
 
-GLOBAL_ORACLE_MAP[Opcode.S_XOR_B32] = ref_s_xor_b32
 
+# ==============================================================================
+# 3. s_xor_b32: Bitwise XOR
+# ==============================================================================
 
 class TestSXorB32Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res, scc = ref_s_xor_b32(0x12345678, 0x0F0F0F0F)
-        self.assertEqual(res, 0x1d3b5977)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_xor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_oracle_s_xor_b32")
+        self.assertEqual(words[0], 0x1D3B5977)
+        self.assertEqual(words[1], 1)
 
     def test_oracle_zero_inputs(self) -> None:
-        res, scc = ref_s_xor_b32(0, 0)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0",
+            "s_mov_b32 s2, 0",
+            "s_xor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_zero_s_xor_b32")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
+
 
 class TestSXorB32ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(Opcode.S_XOR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        self.assertEqual(inst.disasm(), "s_xor_b32 s0, s1, s2")
+        ast_prog = [
+            "s_xor_b32 s0, s1, s2",
+            "s_cselect_b32 s15, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s15",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_s_xor_b32", ast_prog)
+        self.assertIn("OpBitwiseXor", spv)
+        self.assertIn("%scc", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(1, 0x12345678)
-        state.write_sgpr(2, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_XOR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x1d3b5977)
-        self.assertEqual(state.sgprs[0], 0x1d3b5977)
-        self.assertEqual(state.scc, scc)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_xor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_step_s_xor_b32")
+        self.assertEqual(words[0], 0x1D3B5977)
+        self.assertEqual(words[1], 1)
+
 
 class TestSXorB32SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_preservation(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 0x12345678)
-        state.write_sgpr(1, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_XOR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(0), ASTOperand.sgpr(1))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x1d3b5977)
-        self.assertEqual(state.sgprs[0], 0x1d3b5977)
+        prog = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_xor_b32 s0, s0, s1",
+        ]
+        words = run_salu_logic_ps(prog, "ps_alias_s_xor_b32")
+        self.assertEqual(words[0], 0x1D3B5977)
+        self.assertEqual(words[1], 1)
 
     def test_ieee754_bit_transparency(self) -> None:
-        qnan = 0x7FC00000
-        snan = 0x7F800001
-        res, _ = ref_s_xor_b32(qnan, snan)
-        self.assertIsInstance(res, int)
+        prog = [
+            "s_mov_b32 s1, 0x7FC00000",
+            "s_mov_b32 s2, 0x7F800001",
+            "s_xor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_ieee_s_xor_b32")
+        self.assertEqual(words[0], 0x7FC00000 ^ 0x7F800001)
+        self.assertEqual(words[1], 1)
+
 
 class TestSXorB32Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
-        lines = [
-            "s_mov_b32 s0, 0x12345678",
-            "s_mov_b32 s1, 0x0F0F0F0F",
-            "s_xor_b32 s2, s0, s1",
-            "v_mov_b32_e32 v0, s2",
-            "exp mrt0, v0, v0, v0, v0 done",
-            "s_endpgm",
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_xor_b32 s0, s1, s2",
         ]
-        spv = support.translate_lines("ps_bundle_s_xor_b32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0x1d3b5977)
+        words = run_salu_logic_ps(prog, "ps_bundle_s_xor_b32")
+        self.assertEqual(words[0], 0x1D3B5977)
 
-def ref_s_andn2_b32(s0: int, s1: int) -> tuple[int, int]:
-    res = u32(s0 & (~s1 & MASK32))
-    scc = 1 if res != 0 else 0
-    return res, scc
+    def test_inline_constant_folding(self) -> None:
+        prog = [
+            "s_xor_b32 s0, 5, 3",
+        ]
+        words = run_salu_logic_ps(prog, "ps_fold_s_xor_b32")
+        self.assertEqual(words[0], 5 ^ 3)
+        self.assertEqual(words[1], 1)
 
-GLOBAL_ORACLE_MAP[Opcode.S_ANDN2_B32] = ref_s_andn2_b32
 
+# ==============================================================================
+# 4. s_andn2_b32: Bitwise AND with NOT second source
+# ==============================================================================
 
 class TestSAndn2B32Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res, scc = ref_s_andn2_b32(0x12345678, 0x0F0F0F0F)
-        self.assertEqual(res, 0x10305070)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_andn2_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_oracle_s_andn2_b32")
+        self.assertEqual(words[0], 0x10305070)
+        self.assertEqual(words[1], 1)
 
     def test_oracle_zero_inputs(self) -> None:
-        res, scc = ref_s_andn2_b32(0, 0)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0",
+            "s_mov_b32 s2, 0",
+            "s_andn2_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_zero_s_andn2_b32")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
+
 
 class TestSAndn2B32ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(Opcode.S_ANDN2_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        self.assertEqual(inst.disasm(), "s_andn2_b32 s0, s1, s2")
+        ast_prog = [
+            "s_andn2_b32 s0, s1, s2",
+            "s_cselect_b32 s15, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s15",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_s_andn2_b32", ast_prog)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpNot", spv)
+        self.assertIn("%scc", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(1, 0x12345678)
-        state.write_sgpr(2, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_ANDN2_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x10305070)
-        self.assertEqual(state.sgprs[0], 0x10305070)
-        self.assertEqual(state.scc, scc)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_andn2_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_step_s_andn2_b32")
+        self.assertEqual(words[0], 0x10305070)
+        self.assertEqual(words[1], 1)
+
 
 class TestSAndn2B32SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_preservation(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 0x12345678)
-        state.write_sgpr(1, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_ANDN2_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(0), ASTOperand.sgpr(1))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x10305070)
-        self.assertEqual(state.sgprs[0], 0x10305070)
+        prog = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_andn2_b32 s0, s0, s1",
+        ]
+        words = run_salu_logic_ps(prog, "ps_alias_s_andn2_b32")
+        self.assertEqual(words[0], 0x10305070)
+        self.assertEqual(words[1], 1)
 
     def test_ieee754_bit_transparency(self) -> None:
-        qnan = 0x7FC00000
-        snan = 0x7F800001
-        res, _ = ref_s_andn2_b32(qnan, snan)
-        self.assertIsInstance(res, int)
+        prog = [
+            "s_mov_b32 s1, 0x7FC00000",
+            "s_mov_b32 s2, 0x7F800001",
+            "s_andn2_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_ieee_s_andn2_b32")
+        self.assertEqual(words[0], 0x7FC00000 & (~0x7F800001 & MASK32))
+        self.assertEqual(words[1], 1)
+
 
 class TestSAndn2B32Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
-        lines = [
-            "s_mov_b32 s0, 0x12345678",
-            "s_mov_b32 s1, 0x0F0F0F0F",
-            "s_andn2_b32 s2, s0, s1",
-            "v_mov_b32_e32 v0, s2",
-            "exp mrt0, v0, v0, v0, v0 done",
-            "s_endpgm",
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_andn2_b32 s0, s1, s2",
         ]
-        spv = support.translate_lines("ps_bundle_s_andn2_b32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
+        words = run_salu_logic_ps(prog, "ps_bundle_s_andn2_b32")
         self.assertEqual(words[0], 0x10305070)
 
-def ref_s_orn2_b32(s0: int, s1: int) -> tuple[int, int]:
-    res = u32(s0 | (~s1 & MASK32))
-    scc = 1 if res != 0 else 0
-    return res, scc
+    def test_inline_constant_folding(self) -> None:
+        prog = [
+            "s_andn2_b32 s0, 5, 3",
+        ]
+        words = run_salu_logic_ps(prog, "ps_fold_s_andn2_b32")
+        self.assertEqual(words[0], 5 & (~3 & MASK32))
+        self.assertEqual(words[1], 1)
 
-GLOBAL_ORACLE_MAP[Opcode.S_ORN2_B32] = ref_s_orn2_b32
 
+# ==============================================================================
+# 5. s_orn2_b32: Bitwise OR with NOT second source
+# ==============================================================================
 
 class TestSOrn2B32Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res, scc = ref_s_orn2_b32(0x12345678, 0x0F0F0F0F)
-        self.assertEqual(res, 0xf2f4f6f8)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_orn2_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_oracle_s_orn2_b32")
+        self.assertEqual(words[0], 0xF2F4F6F8)
+        self.assertEqual(words[1], 1)
 
     def test_oracle_zero_inputs(self) -> None:
-        res, scc = ref_s_orn2_b32(0, 0)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0",
+            "s_mov_b32 s2, 0",
+            "s_orn2_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_zero_s_orn2_b32")
+        self.assertEqual(words[0], 0xFFFFFFFF)
+        self.assertEqual(words[1], 1)
+
 
 class TestSOrn2B32ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(Opcode.S_ORN2_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        self.assertEqual(inst.disasm(), "s_orn2_b32 s0, s1, s2")
+        ast_prog = [
+            "s_orn2_b32 s0, s1, s2",
+            "s_cselect_b32 s15, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s15",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_s_orn2_b32", ast_prog)
+        self.assertIn("OpBitwiseOr", spv)
+        self.assertIn("OpNot", spv)
+        self.assertIn("%scc", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(1, 0x12345678)
-        state.write_sgpr(2, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_ORN2_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0xf2f4f6f8)
-        self.assertEqual(state.sgprs[0], 0xf2f4f6f8)
-        self.assertEqual(state.scc, scc)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_orn2_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_step_s_orn2_b32")
+        self.assertEqual(words[0], 0xF2F4F6F8)
+        self.assertEqual(words[1], 1)
+
 
 class TestSOrn2B32SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_preservation(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 0x12345678)
-        state.write_sgpr(1, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_ORN2_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(0), ASTOperand.sgpr(1))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0xf2f4f6f8)
-        self.assertEqual(state.sgprs[0], 0xf2f4f6f8)
+        prog = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_orn2_b32 s0, s0, s1",
+        ]
+        words = run_salu_logic_ps(prog, "ps_alias_s_orn2_b32")
+        self.assertEqual(words[0], 0xF2F4F6F8)
+        self.assertEqual(words[1], 1)
 
     def test_ieee754_bit_transparency(self) -> None:
-        qnan = 0x7FC00000
-        snan = 0x7F800001
-        res, _ = ref_s_orn2_b32(qnan, snan)
-        self.assertIsInstance(res, int)
+        prog = [
+            "s_mov_b32 s1, 0x7FC00000",
+            "s_mov_b32 s2, 0x7F800001",
+            "s_orn2_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_ieee_s_orn2_b32")
+        self.assertEqual(words[0], 0x7FC00000 | (~0x7F800001 & MASK32))
+        self.assertEqual(words[1], 1)
+
 
 class TestSOrn2B32Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
-        lines = [
-            "s_mov_b32 s0, 0x12345678",
-            "s_mov_b32 s1, 0x0F0F0F0F",
-            "s_orn2_b32 s2, s0, s1",
-            "v_mov_b32_e32 v0, s2",
-            "exp mrt0, v0, v0, v0, v0 done",
-            "s_endpgm",
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_orn2_b32 s0, s1, s2",
         ]
-        spv = support.translate_lines("ps_bundle_s_orn2_b32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0xf2f4f6f8)
+        words = run_salu_logic_ps(prog, "ps_bundle_s_orn2_b32")
+        self.assertEqual(words[0], 0xF2F4F6F8)
 
-def ref_s_nand_b32(s0: int, s1: int) -> tuple[int, int]:
-    res = u32(~(s0 & s1))
-    scc = 1 if res != 0 else 0
-    return res, scc
+    def test_inline_constant_folding(self) -> None:
+        prog = [
+            "s_orn2_b32 s0, 5, 3",
+        ]
+        words = run_salu_logic_ps(prog, "ps_fold_s_orn2_b32")
+        self.assertEqual(words[0], (5 | (~3)) & MASK32)
+        self.assertEqual(words[1], 1)
 
-GLOBAL_ORACLE_MAP[Opcode.S_NAND_B32] = ref_s_nand_b32
 
+# ==============================================================================
+# 6. s_nand_b32: Bitwise NAND
+# ==============================================================================
 
 class TestSNandB32Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res, scc = ref_s_nand_b32(0x12345678, 0x0F0F0F0F)
-        self.assertEqual(res, 0xfdfbf9f7)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_nand_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_oracle_s_nand_b32")
+        self.assertEqual(words[0], 0xFDFBF9F7)
+        self.assertEqual(words[1], 1)
 
     def test_oracle_zero_inputs(self) -> None:
-        res, scc = ref_s_nand_b32(0, 0)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0",
+            "s_mov_b32 s2, 0",
+            "s_nand_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_zero_s_nand_b32")
+        self.assertEqual(words[0], 0xFFFFFFFF)
+        self.assertEqual(words[1], 1)
+
 
 class TestSNandB32ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(Opcode.S_NAND_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        self.assertEqual(inst.disasm(), "s_nand_b32 s0, s1, s2")
+        ast_prog = [
+            "s_nand_b32 s0, s1, s2",
+            "s_cselect_b32 s15, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s15",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_s_nand_b32", ast_prog)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpNot", spv)
+        self.assertIn("%scc", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(1, 0x12345678)
-        state.write_sgpr(2, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_NAND_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0xfdfbf9f7)
-        self.assertEqual(state.sgprs[0], 0xfdfbf9f7)
-        self.assertEqual(state.scc, scc)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_nand_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_step_s_nand_b32")
+        self.assertEqual(words[0], 0xFDFBF9F7)
+        self.assertEqual(words[1], 1)
+
 
 class TestSNandB32SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_preservation(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 0x12345678)
-        state.write_sgpr(1, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_NAND_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(0), ASTOperand.sgpr(1))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0xfdfbf9f7)
-        self.assertEqual(state.sgprs[0], 0xfdfbf9f7)
+        prog = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_nand_b32 s0, s0, s1",
+        ]
+        words = run_salu_logic_ps(prog, "ps_alias_s_nand_b32")
+        self.assertEqual(words[0], 0xFDFBF9F7)
+        self.assertEqual(words[1], 1)
 
     def test_ieee754_bit_transparency(self) -> None:
-        qnan = 0x7FC00000
-        snan = 0x7F800001
-        res, _ = ref_s_nand_b32(qnan, snan)
-        self.assertIsInstance(res, int)
+        prog = [
+            "s_mov_b32 s1, 0x7FC00000",
+            "s_mov_b32 s2, 0x7F800001",
+            "s_nand_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_ieee_s_nand_b32")
+        self.assertEqual(words[0], (~(0x7FC00000 & 0x7F800001)) & MASK32)
+        self.assertEqual(words[1], 1)
+
 
 class TestSNandB32Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
-        lines = [
-            "s_mov_b32 s0, 0x12345678",
-            "s_mov_b32 s1, 0x0F0F0F0F",
-            "s_nand_b32 s2, s0, s1",
-            "v_mov_b32_e32 v0, s2",
-            "exp mrt0, v0, v0, v0, v0 done",
-            "s_endpgm",
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_nand_b32 s0, s1, s2",
         ]
-        spv = support.translate_lines("ps_bundle_s_nand_b32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0xfdfbf9f7)
+        words = run_salu_logic_ps(prog, "ps_bundle_s_nand_b32")
+        self.assertEqual(words[0], 0xFDFBF9F7)
 
-def ref_s_nor_b32(s0: int, s1: int) -> tuple[int, int]:
-    res = u32(~(s0 | s1))
-    scc = 1 if res != 0 else 0
-    return res, scc
+    def test_inline_constant_folding(self) -> None:
+        prog = [
+            "s_nand_b32 s0, 5, 3",
+        ]
+        words = run_salu_logic_ps(prog, "ps_fold_s_nand_b32")
+        self.assertEqual(words[0], (~(5 & 3)) & MASK32)
+        self.assertEqual(words[1], 1)
 
-GLOBAL_ORACLE_MAP[Opcode.S_NOR_B32] = ref_s_nor_b32
 
+# ==============================================================================
+# 7. s_nor_b32: Bitwise NOR
+# ==============================================================================
 
 class TestSNorB32Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res, scc = ref_s_nor_b32(0x12345678, 0x0F0F0F0F)
-        self.assertEqual(res, 0xe0c0a080)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_nor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_oracle_s_nor_b32")
+        self.assertEqual(words[0], 0xE0C0A080)
+        self.assertEqual(words[1], 1)
 
     def test_oracle_zero_inputs(self) -> None:
-        res, scc = ref_s_nor_b32(0, 0)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0",
+            "s_mov_b32 s2, 0",
+            "s_nor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_zero_s_nor_b32")
+        self.assertEqual(words[0], 0xFFFFFFFF)
+        self.assertEqual(words[1], 1)
+
 
 class TestSNorB32ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(Opcode.S_NOR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        self.assertEqual(inst.disasm(), "s_nor_b32 s0, s1, s2")
+        ast_prog = [
+            "s_nor_b32 s0, s1, s2",
+            "s_cselect_b32 s15, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s15",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_s_nor_b32", ast_prog)
+        self.assertIn("OpBitwiseOr", spv)
+        self.assertIn("OpNot", spv)
+        self.assertIn("%scc", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(1, 0x12345678)
-        state.write_sgpr(2, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_NOR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0xe0c0a080)
-        self.assertEqual(state.sgprs[0], 0xe0c0a080)
-        self.assertEqual(state.scc, scc)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_nor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_step_s_nor_b32")
+        self.assertEqual(words[0], 0xE0C0A080)
+        self.assertEqual(words[1], 1)
+
 
 class TestSNorB32SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_preservation(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 0x12345678)
-        state.write_sgpr(1, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_NOR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(0), ASTOperand.sgpr(1))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0xe0c0a080)
-        self.assertEqual(state.sgprs[0], 0xe0c0a080)
+        prog = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_nor_b32 s0, s0, s1",
+        ]
+        words = run_salu_logic_ps(prog, "ps_alias_s_nor_b32")
+        self.assertEqual(words[0], 0xE0C0A080)
+        self.assertEqual(words[1], 1)
 
     def test_ieee754_bit_transparency(self) -> None:
-        qnan = 0x7FC00000
-        snan = 0x7F800001
-        res, _ = ref_s_nor_b32(qnan, snan)
-        self.assertIsInstance(res, int)
+        prog = [
+            "s_mov_b32 s1, 0x7FC00000",
+            "s_mov_b32 s2, 0x7F800001",
+            "s_nor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_ieee_s_nor_b32")
+        self.assertEqual(words[0], (~(0x7FC00000 | 0x7F800001)) & MASK32)
+        self.assertEqual(words[1], 1)
+
 
 class TestSNorB32Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
-        lines = [
-            "s_mov_b32 s0, 0x12345678",
-            "s_mov_b32 s1, 0x0F0F0F0F",
-            "s_nor_b32 s2, s0, s1",
-            "v_mov_b32_e32 v0, s2",
-            "exp mrt0, v0, v0, v0, v0 done",
-            "s_endpgm",
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_nor_b32 s0, s1, s2",
         ]
-        spv = support.translate_lines("ps_bundle_s_nor_b32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0xe0c0a080)
+        words = run_salu_logic_ps(prog, "ps_bundle_s_nor_b32")
+        self.assertEqual(words[0], 0xE0C0A080)
 
-def ref_s_xnor_b32(s0: int, s1: int) -> tuple[int, int]:
-    res = u32(~(s0 ^ s1))
-    scc = 1 if res != 0 else 0
-    return res, scc
+    def test_inline_constant_folding(self) -> None:
+        prog = [
+            "s_nor_b32 s0, 5, 3",
+        ]
+        words = run_salu_logic_ps(prog, "ps_fold_s_nor_b32")
+        self.assertEqual(words[0], (~(5 | 3)) & MASK32)
+        self.assertEqual(words[1], 1)
 
-GLOBAL_ORACLE_MAP[Opcode.S_XNOR_B32] = ref_s_xnor_b32
 
+# ==============================================================================
+# 8. s_xnor_b32: Bitwise XNOR (Equivalence)
+# ==============================================================================
 
 class TestSXnorB32Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res, scc = ref_s_xnor_b32(0x12345678, 0x0F0F0F0F)
-        self.assertEqual(res, 0xe2c4a688)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_xnor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_oracle_s_xnor_b32")
+        self.assertEqual(words[0], 0xE2C4A688)
+        self.assertEqual(words[1], 1)
 
     def test_oracle_zero_inputs(self) -> None:
-        res, scc = ref_s_xnor_b32(0, 0)
-        self.assertEqual(scc, 1 if res != 0 else 0)
+        prog = [
+            "s_mov_b32 s1, 0",
+            "s_mov_b32 s2, 0",
+            "s_xnor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_zero_s_xnor_b32")
+        self.assertEqual(words[0], 0xFFFFFFFF)
+        self.assertEqual(words[1], 1)
+
 
 class TestSXnorB32ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
-        inst = ASTInstruction(Opcode.S_XNOR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        self.assertEqual(inst.disasm(), "s_xnor_b32 s0, s1, s2")
+        ast_prog = [
+            "s_xnor_b32 s0, s1, s2",
+            "s_cselect_b32 s15, 1, 0",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s15",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_s_xnor_b32", ast_prog)
+        self.assertIn("OpBitwiseXor", spv)
+        self.assertIn("OpNot", spv)
+        self.assertIn("%scc", spv)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(1, 0x12345678)
-        state.write_sgpr(2, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_XNOR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(1), ASTOperand.sgpr(2))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0xe2c4a688)
-        self.assertEqual(state.sgprs[0], 0xe2c4a688)
-        self.assertEqual(state.scc, scc)
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_xnor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_step_s_xnor_b32")
+        self.assertEqual(words[0], 0xE2C4A688)
+        self.assertEqual(words[1], 1)
+
 
 class TestSXnorB32SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_preservation(self) -> None:
-        state = ScalarMachineState()
-        state.write_sgpr(0, 0x12345678)
-        state.write_sgpr(1, 0x0F0F0F0F)
-        inst = ASTInstruction(Opcode.S_XNOR_B32, ASTOperand.sgpr(0), ASTOperand.sgpr(0), ASTOperand.sgpr(1))
-        res, scc = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0xe2c4a688)
-        self.assertEqual(state.sgprs[0], 0xe2c4a688)
+        prog = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_xnor_b32 s0, s0, s1",
+        ]
+        words = run_salu_logic_ps(prog, "ps_alias_s_xnor_b32")
+        self.assertEqual(words[0], 0xE2C4A688)
+        self.assertEqual(words[1], 1)
 
     def test_ieee754_bit_transparency(self) -> None:
-        qnan = 0x7FC00000
-        snan = 0x7F800001
-        res, _ = ref_s_xnor_b32(qnan, snan)
-        self.assertIsInstance(res, int)
+        prog = [
+            "s_mov_b32 s1, 0x7FC00000",
+            "s_mov_b32 s2, 0x7F800001",
+            "s_xnor_b32 s0, s1, s2",
+        ]
+        words = run_salu_logic_ps(prog, "ps_ieee_s_xnor_b32")
+        self.assertEqual(words[0], (~(0x7FC00000 ^ 0x7F800001)) & MASK32)
+        self.assertEqual(words[1], 1)
+
 
 class TestSXnorB32Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
-        lines = [
-            "s_mov_b32 s0, 0x12345678",
-            "s_mov_b32 s1, 0x0F0F0F0F",
-            "s_xnor_b32 s2, s0, s1",
-            "v_mov_b32_e32 v0, s2",
-            "exp mrt0, v0, v0, v0, v0 done",
-            "s_endpgm",
+        prog = [
+            "s_mov_b32 s1, 0x12345678",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_xnor_b32 s0, s1, s2",
         ]
-        spv = support.translate_lines("ps_bundle_s_xnor_b32", lines)
-        self.assertIn("OpEntryPoint", spv)
-        words = support.mrt0_words(spv)
-        self.assertEqual(words[0], 0xe2c4a688)
+        words = run_salu_logic_ps(prog, "ps_bundle_s_xnor_b32")
+        self.assertEqual(words[0], 0xE2C4A688)
+
+    def test_inline_constant_folding(self) -> None:
+        prog = [
+            "s_xnor_b32 s0, 5, 3",
+        ]
+        words = run_salu_logic_ps(prog, "ps_fold_s_xnor_b32")
+        self.assertEqual(words[0], (~(5 ^ 3)) & MASK32)
+        self.assertEqual(words[1], 1)
 
 
 if __name__ == "__main__":
