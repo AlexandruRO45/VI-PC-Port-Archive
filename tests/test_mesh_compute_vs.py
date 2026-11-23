@@ -226,6 +226,113 @@ class Cli(unittest.TestCase):
         self.assertEqual(len(stderr.splitlines()), 1)
         self.assertIn("Permission denied", stderr)
 
+    def test_a_damaged_layout_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lay = layout(params=(0,))
+            lay["params"] = {"0": [16]}          # what a hand-edited index.json actually looks like
+            write_index(tmp, {"ms_a": {"mesh_compute": lay}})
+            with mock.patch.object(vs, "tool_path", return_value="spirv-as"):
+                rc, stdout, stderr = self.run_main(["mesh_compute_vs.py", tmp])
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(stderr.splitlines()), 1)
+        self.assertIn("ms_a.mesh_compute params location 0", stderr)
+
+
+class DamagedLayout(unittest.TestCase):
+    """index.json is a file on disk that other tools and people edit. A layout that cannot make a shader has to
+    say which field of it, and must not reach the assembler as a KeyError or a TypeError traceback."""
+
+    def test_a_wrong_typed_field_names_the_field(self):
+        lay = layout()
+        lay["max_vertices"] = "x"
+        with self.assertRaisesRegex(vs.LayoutError, "max_vertices: expected an integer, got 'x'"):
+            vs.vs_spvasm(lay)
+
+    def test_the_params_offsets_are_checked(self):
+        lay = layout(params=(0,))
+        lay["params"] = {"0": [1, 2]}
+        with self.assertRaisesRegex(vs.LayoutError, "params location 0"):
+            vs.vs_spvasm(lay)
+
+    def test_a_missing_field_is_named(self):
+        lay = layout()
+        del lay["slot_bytes"]
+        with self.assertRaisesRegex(vs.LayoutError, "no slot_bytes"):
+            vs.vs_spvasm(lay)
+
+    def test_a_bool_is_not_an_integer(self):
+        lay = layout()
+        lay["max_primitives"] = True
+        with self.assertRaisesRegex(vs.LayoutError, "max_primitives"):
+            vs.vs_spvasm(lay)
+
+    def test_the_distance_offsets_only_matter_with_distances(self):
+        lay = layout()
+        del lay["clip_offset"]                   # clip_count 0: those floats are never loaded
+        self.assertTrue(vs.vs_spvasm(lay))
+        lay = layout(clip=1)
+        del lay["clip_offset"]
+        with self.assertRaisesRegex(vs.LayoutError, "no clip_offset"):
+            vs.vs_spvasm(lay)
+
+    def test_f16_halves_must_be_locations_paired_with_two(self):
+        for bad in (None, 5, {"0": 5}, {"0": ["a", "b"]}, {"x": [1, 2]}):
+            with self.subTest(bad=bad):
+                lay = layout(params=(0,))
+                lay["f16_halves"] = bad
+                with self.assertRaises(vs.LayoutError):
+                    vs.vs_spvasm(lay)
+
+    def test_a_checked_layout_builds_the_same_shader(self):
+        for lay in (layout(), layout(clip=5, cull=2, params=(2, 9)), layout(maxv=1, maxp=256)):
+            with self.subTest(maxv=lay["max_vertices"]):
+                self.assertEqual(vs.vs_spvasm(vs.check_layout(lay)), vs.vs_spvasm(lay))
+
+    def test_the_f16_halves_argument_may_come_back_with_int_keys(self):
+        """pair_f16_halves answers with string keys because JSON has no int ones; a caller that already read them
+        back as ints describes the same shader and gets the same shader."""
+        lay = layout(params=(0, 4))
+        halves = vs.pair_f16_halves(lay, {"0": [28, 29], "4": [26, 27]})
+        self.assertEqual(vs.vs_spvasm(lay, f16_halves={int(k): v for k, v in halves.items()}),
+                         vs.vs_spvasm(lay, f16_halves=halves))
+
+
+class DamagedIndex(unittest.TestCase):
+    def test_one_bad_entry_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good, bad = layout(), layout()
+            bad["max_vertices"] = "x"
+            write_index(tmp, {"ms_a": {"mesh_compute": good}, "ms_b": {"mesh_compute": bad}})
+            kept = os.path.join(tmp, "ms_a.mesh_vs.spvasm")
+            with open(kept, "w", encoding="utf-8") as f:
+                f.write("previous run\n")
+            with self.assertRaises(vs.LayoutError) as ctx:
+                vs.write_for_index(tmp)
+            self.assertIn("ms_b", str(ctx.exception))            # says which entry of the index is broken
+            with open(kept, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "previous run\n")     # not truncated by the entry that failed
+            self.assertFalse(os.path.exists(os.path.join(tmp, "ms_b.mesh_vs.spvasm")))
+
+    def test_an_entry_names_itself(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_a": {"mesh_compute": [layout()]}})
+            with self.assertRaisesRegex(vs.LayoutError, r"ms_a\.mesh_compute: expected an object"):
+                vs.write_for_index(tmp)
+
+    def test_an_index_that_is_not_json_is_one_named_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "index.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"ms_a": ')
+            with self.assertRaises(vs.LayoutError) as ctx:
+                vs.write_for_index(tmp)
+            self.assertIn(path, str(ctx.exception))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("[]")
+            with self.assertRaisesRegex(vs.LayoutError, "got list"):
+                vs.write_for_index(tmp)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,78 @@ USER_SGPRS = 32       # push constants: s0..s31, heap base, code base, then the 
 F16_HALF_TOP = 29
 
 
+class LayoutError(RuntimeError):
+    """An index.json "mesh_compute" layout that cannot make a vertex shader. A RuntimeError so main's one ERROR
+    line and exit 1 cover it, like the spirv-as / spirv-val failures already do."""
+
+
+# the fields vs_spvasm reads out of every layout, whatever the shader's counts turn out to be
+INT_FIELDS = ("slot_bytes", "vertices", "vertex_stride", "primitives", "primitive_stride",
+              "max_vertices", "max_primitives", "clip_count", "cull_count")
+
+
+def _int(value, what):
+    """An integer field of a layout. bools are out: True as a byte offset is a damaged index, not a layout."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise LayoutError(f"{what}: expected an integer, got {value!r}")
+    return value
+
+
+def check_layout(lay, name="mesh_compute layout"):
+    """The layout of one index.json "mesh_compute" entry, normalized so vs_spvasm can read it blind.
+
+    rdna2spirv.mesh_compute_layout writes every field as an int and keys the param offsets by the location as a
+    string (JSON has no int keys); the copy returned here has those keys as ints, so vs_spvasm reads the layout
+    without coercing anything. index.json is a file on disk that other tools and people edit, and a missing or
+    wrong-typed field used to die as a bare KeyError/TypeError that named neither the entry nor the field, from
+    write_for_index only after that entry's .spvasm had been truncated. Here it is a LayoutError naming both,
+    raised before any output is opened. Idempotent, so vs_spvasm may check what write_for_index already checked.
+    """
+    if not isinstance(lay, dict):
+        raise LayoutError(f"{name}: expected an object, got {type(lay).__name__}")
+    out = {}
+    for key in INT_FIELDS:
+        if key not in lay:
+            raise LayoutError(f"{name}: no {key}")
+        out[key] = _int(lay[key], f"{name} {key}")
+    for key in ("clip_offset", "cull_offset"):
+        count = "clip_count" if key == "clip_offset" else "cull_count"
+        if out[count] and key not in lay:      # vs_spvasm only loads those floats when the count is non-zero
+            raise LayoutError(f"{name}: no {key} for {out[count]} distances")
+        if key in lay:
+            out[key] = _int(lay[key], f"{name} {key}")
+    params = lay.get("params")
+    if not isinstance(params, dict):
+        raise LayoutError(f"{name} params: expected an object of location -> byte offset, "
+                          f"got {type(params).__name__}")
+    out["params"] = {}
+    for loc, off in params.items():
+        try:
+            location = int(loc)
+        except (TypeError, ValueError):
+            raise LayoutError(f"{name} params: {loc!r} is not a shader location") from None
+        out["params"][location] = _int(off, f"{name} params location {location}")
+    if "f16_halves" in lay:      # vs_spvasm reads it as an object, so null is a bad layout, not an absent one
+        halves = lay["f16_halves"]
+        if not isinstance(halves, dict):
+            raise LayoutError(f"{name} f16_halves: expected an object of location -> [low, high], "
+                              f"got {type(halves).__name__}")
+        out["f16_halves"] = {}
+        for loc, pair in halves.items():
+            try:
+                location = int(loc)
+            except (TypeError, ValueError):
+                raise LayoutError(f"{name} f16_halves: {loc!r} is not a shader location") from None
+            if isinstance(pair, str) or not hasattr(pair, "__iter__"):
+                raise LayoutError(f"{name} f16_halves {location}: expected [low, high], got {pair!r}")
+            pair = [_int(v, f"{name} f16_halves {location}") for v in pair]
+            out["f16_halves"][location] = pair      # int keys, as vs_spvasm compares them against params
+    for key, value in lay.items():
+        if key not in out:
+            out[key] = value
+    return out
+
+
 def pair_f16_halves(layout, ps_f16_halves, ps_raw_inputs=(), top=F16_HALF_TOP):
     """Choose non-colliding `f16_halves` ({str(param): [lo, hi]}) for a (--mesh-compute, PS) pair (SHADER-378).
 
@@ -70,9 +142,10 @@ def vs_spvasm(layout, f16_halves=None):
     lay = dict(layout)
     if f16_halves is not None:
         lay["f16_halves"] = f16_halves
-    params = sorted((int(k), int(v)) for k, v in lay["params"].items())
-    maxv, maxp = int(lay["max_vertices"]), int(lay["max_primitives"])
-    clip, cull = int(lay["clip_count"]), int(lay["cull_count"])
+    lay = check_layout(lay)      # every field below is an int by the time it is read
+    params = sorted(lay["params"].items())
+    maxv, maxp = lay["max_vertices"], lay["max_primitives"]
+    clip, cull = lay["clip_count"], lay["cull_count"]
     consts = {}
 
     def c(v):
@@ -149,7 +222,7 @@ def vs_spvasm(layout, f16_halves=None):
     for loc, off in params:
         vals = load_floats("%vbase", off, 4)
         body += [f"%par{loc} = OpCompositeConstruct %v4float {' '.join(vals)}", f"OpStore %out{loc} %par{loc}"]
-    halves = sorted((int(k), [int(x) for x in v]) for k, v in lay.get("f16_halves", {}).items())
+    halves = sorted(lay.get("f16_halves", {}).items())
     offsets = dict(params)
     used_locs = set(offsets)
     for loc, hlocs in halves:
@@ -224,29 +297,37 @@ def vs_spvasm(layout, f16_halves=None):
 
 
 def write_for_index(spirv_dir):
-    """Write <name>.mesh_vs.spvasm for every entry of <spirv_dir>/index.json with a "mesh_compute" layout."""
+    """Write <name>.mesh_vs.spvasm for every entry of <spirv_dir>/index.json with a "mesh_compute" layout.
+
+    Every layout is checked and assembled before the first output is opened, so an index that turns out unusable
+    leaves the previous run's .spvasm files alone instead of truncating one of them."""
     index_path = os.path.join(spirv_dir, "index.json")
     if not os.path.isfile(index_path):
         return []
     try:
         with open(index_path, encoding="utf-8") as f:
             index = json.load(f)
-    except (ValueError, RecursionError) as e:
-        raise RuntimeError(f"{index_path}: invalid JSON ({e})") from None
+    except (ValueError, RecursionError) as e:      # json's own message says where in the file, this says which file
+        raise LayoutError(f"{index_path}: invalid JSON ({e})") from None
     if not isinstance(index, dict):
-        raise RuntimeError(f"{index_path}: expected a shader index object")
-    written = []
+        raise LayoutError(f"{index_path}: expected a shader index object of mesh shader name -> metadata, "
+                          f"got {type(index).__name__}")
+    todo = []
     for name, meta in sorted(index.items()):
         lay = meta.get("mesh_compute") if isinstance(meta, dict) else None
         if not lay:
             continue
+        who = f"{name}.mesh_compute"
         try:
-            asm = vs_spvasm(lay)
-        except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as e:
-            raise RuntimeError(f"{index_path}: invalid mesh_compute layout for {name!r}: {e}") from None
-        path = os.path.join(spirv_dir, name + SUFFIX + ".spvasm")
+            text = vs_spvasm(check_layout(lay, who))
+        except (LayoutError, ValueError) as e:      # check_layout names the field; vs_spvasm's f16_halves checks do not
+            raise LayoutError(f"{index_path}: invalid mesh_compute layout for {name!r}: "
+                              f"{str(e).removeprefix('mesh_compute_vs: ')}") from None
+        todo.append((os.path.join(spirv_dir, name + SUFFIX + ".spvasm"), text))
+    written = []
+    for path, text in todo:
         with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(asm)
+            f.write(text)
         written.append(path)
     return written
 
