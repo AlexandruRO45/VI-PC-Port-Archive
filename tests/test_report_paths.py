@@ -166,8 +166,9 @@ class FoldingVolumeTests(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.p("reports"))), [])
 
     def test_a_folder_that_does_not_exist_is_not_created(self):
-        self.assertFalse(report_paths.same_name_on_folding_volume(self.p("missing", "R.json"),
-                                                                  self.p("missing", "r.json")))
+        expected = report_paths.same_name_on_folding_volume(self.p("R.json"), self.p("r.json"))
+        self.assertEqual(report_paths.same_name_on_folding_volume(self.p("missing", "R.json"),
+                                                                 self.p("missing", "r.json")), expected)
         self.assertFalse(os.path.exists(self.p("missing")))
 
     def test_same_report_path_asks_the_volume_when_the_name_rules_disagree(self):
@@ -184,6 +185,26 @@ class FoldingVolumeTests(unittest.TestCase):
         with mock.patch.object(report_paths.os.path, "realpath", wraps=os.path.realpath) as resolved:
             report_paths.same_report_path(self.p("out.json"), self.p("lights.json"))
         self.assertEqual(resolved.call_count, 2, "each path is resolved once, not once per check")
+
+
+class MissingReportParentTests(unittest.TestCase):
+    def test_shared_missing_parent_uses_its_existing_ancestor(self):
+        ancestor = os.path.abspath("synthetic-volume")
+        missing = os.path.join(ancestor, "new", "reports")
+        scratch = os.path.join(ancestor, ".probe")
+        first, second = (os.path.join(missing, name) for name in ("Report.json", "report.json"))
+        for folds in (True, False):
+            with self.subTest(folds=folds):
+                existing = {ancestor}
+                if folds:
+                    existing.add(os.path.join(scratch, "report.json"))
+                with mock.patch.object(report_paths.os.path, "exists", side_effect=existing.__contains__), \
+                        mock.patch.object(report_paths.tempfile, "TemporaryDirectory") as temporary, \
+                        mock.patch.object(report_paths, "open", mock.mock_open(), create=True) as opened:
+                    temporary.return_value.__enter__.return_value = scratch
+                    self.assertEqual(report_paths._same_resolved_name(first, second), folds)
+                temporary.assert_called_once_with(prefix=".leonida-report-", dir=ancestor)
+                opened.assert_called_once_with(os.path.join(scratch, "Report.json"), "xb")
 
 
 class NoPrivateCopiesTests(unittest.TestCase):
