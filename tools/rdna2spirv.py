@@ -6224,7 +6224,7 @@ class Gen:
                 return
             if mask is not None:
                 offset = (mask & -mask).bit_length() - 1
-                width = mask.bit_count()
+                width = bin(mask).count("1")
                 if mask == ((1 << width) - 1) << offset:
                     # RDNA takes the field from its final bit positions; SPIR-V takes its low bits.
                     if offset:

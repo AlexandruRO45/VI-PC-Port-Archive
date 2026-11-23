@@ -309,8 +309,76 @@ class TestBfiConditionCodes(unittest.TestCase):
         self.assertEqual(interp.vgpr[0], 0x12345678)
 
 
+
+def run_bfi_translator(mask: int, field: int, base: int, *, operands: str = "v1, v2, v3") -> tuple[int, str]:
+    """Translate and run `v_bfi_b32 v4, <operands>` via tools/rdna2spirv.py; return (word, spv)."""
+    lines = [
+        f"v_mov_b32 v1, {mask:#010x}",
+        f"v_mov_b32 v2, {field:#010x}",
+        f"v_mov_b32 v3, {base:#010x}",
+        f"v_bfi_b32 v4, {operands}",
+        "exp mrt0 v4, v4, v4, v4 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_bfi_b32", lines)
+    words = mrt0_words(spv)
+    return words[0], spv
+
+
+class TestBfiTranslator(unittest.TestCase):
+    def test_translator_dynamic_mask(self):
+        cases = [
+            (0x00000000, 0x12345678, 0x9ABCDEF0, 0x9ABCDEF0),
+            (0xFFFFFFFF, 0x12345678, 0x9ABCDEF0, 0x12345678),
+            (0x55555555, 0xFFFFFFFF, 0x00000000, 0x55555555),
+            (0xAAAAAAAA, 0xFFFFFFFF, 0x00000000, 0xAAAAAAAA),
+            (0x0000FFFF, 0x11112222, 0x33334444, 0x33332222),
+            (0xFFFF0000, 0x11112222, 0x33334444, 0x11114444),
+        ]
+        for m, f, b, exp in cases:
+            with self.subTest(mask=hex(m)):
+                got, _ = run_bfi_translator(m, f, b)
+                self.assertEqual(got, exp)
+
+    def test_translator_constant_contiguous_mask(self):
+        # Contiguous mask translates through OpBitFieldInsert optimization
+        got, spv = run_bfi_translator(0, 0xAABBCCDD, 0x11223344, operands="0x000000ff, v2, v3")
+        self.assertEqual(got, 0x112233DD)
+        self.assertIn("OpBitFieldInsert", spv)
+
+    def test_translator_constant_zero_mask(self):
+        # Mask 0 optimizes to destination being base directly
+        got, _ = run_bfi_translator(0, 0xDEADBEEF, 0x12345678, operands="0x0, v2, v3")
+        self.assertEqual(got, 0x12345678)
+
+    def test_translator_constant_all_ones_mask(self):
+        # Mask 0xFFFFFFFF optimizes to destination being field directly
+        got, _ = run_bfi_translator(0, 0xDEADBEEF, 0x12345678, operands="0xffffffff, v2, v3")
+        self.assertEqual(got, 0xDEADBEEF)
+
+    def test_translator_sgpr_inputs(self):
+        setup = [
+            "s_mov_b32 s0, 0x00ff0000",
+            "v_mov_b32 v2, 0x11223344",
+            "v_mov_b32 v3, 0xaabbccdd",
+            "v_bfi_b32 v4, s0, v2, v3",
+            "exp mrt0 v4, v4, v4, v4 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_bfi_sgpr", setup)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 0xaa22ccdd)
+
+    def test_spirv_structure(self):
+        _, spv = run_bfi_translator(0x55555555, 0x11111111, 0x22222222)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpBitwiseOr", spv)
+        self.assertIn("%out_mrt0 = OpVariable", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
