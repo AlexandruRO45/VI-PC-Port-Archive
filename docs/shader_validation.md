@@ -1809,7 +1809,7 @@ Hardware validation was executed via `tools/hw_oracle` and `tools/salu_diff.py` 
 
 - **GPU**: AMD Radeon(TM) Graphics (`gfx1036`), AMD Windows driver `32.0.21045.29003`, Windows 11, `amdhip64_6.dll`, AMD clang 23.0.0git (`rocm-sdk-core 10.0.0`).
 - **Second-silicon verification of #1746 (`tools/int_hw_probe.py`)**:
-  - `python -I tools/int_hw_probe.py --oracle both --wave both`: **87 cases: 87 match, 0 known divergence, 0 unexpected mismatch, 0 wave32/64 diff** on native `gfx1036` (corroborating that the 5 divergences originally reported by #1746 are now fully resolved on `main`).
+  - `python -I tools/int_hw_probe.py --oracle both --wave both`: **87 cases (the tool's count at the time): 87 match, 0 known divergence, 0 unexpected mismatch, 0 wave32/64 diff** on native `gfx1036` (corroborating that the 5 divergences originally reported by #1746 are now fully resolved on `main`).
 - **SALU operations (`s_absdiff_i32`, `s_mul_hi_i32`, `s_lshl1..4_add_u32`)**:
   - `python -I tools/salu_diff.py --ops s_absdiff_i32,s_mul_hi_i32,s_lshl1_add_u32,s_lshl2_add_u32,s_lshl3_add_u32,s_lshl4_add_u32 --programs 500 --oracle translator,hw`: **500 passed, 0 mismatches**.
   - Confirmed SCC preserved across operations with prior SCC=0 and SCC=1.
