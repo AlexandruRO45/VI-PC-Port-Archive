@@ -596,6 +596,44 @@ class VRsqF64TranslatorTests(unittest.TestCase):
         with self.assertRaises(Exception):
             translate_lines("ps_bad_rsq_f64", ["v_rsq_f64"])
 
+# -----------------------------------------------------------------------------
+# Opcode 6: v_sqrt_f64
+# -----------------------------------------------------------------------------
+def oracle_sqrt_f64(bits: int) -> int:
+    """Reference mathematical oracle for v_sqrt_f64 (double square root sqrt(x))."""
+    if is_nan_u64(bits):
+        return F64_QNAN
+    if bits == F64_POS_ZERO:
+        return F64_POS_ZERO
+    if bits == F64_NEG_ZERO:
+        return F64_NEG_ZERO
+    if bits == F64_POS_INF:
+        return F64_POS_INF
+    val = u64_to_f64(bits)
+    if val < 0.0:
+        return F64_QNAN
+    try:
+        res = math.sqrt(val)
+        return f64_to_u64(res)
+    except ValueError:
+        return F64_QNAN
+
+
+class VSqrtF64OracleTests(unittest.TestCase):
+    def test_sqrt_f64_basic(self):
+        self.assertEqual(oracle_sqrt_f64(F64_POS_ZERO), F64_POS_ZERO)
+        self.assertEqual(oracle_sqrt_f64(F64_NEG_ZERO), F64_NEG_ZERO)
+        self.assertEqual(oracle_sqrt_f64(F64_POS_ONE), F64_POS_ONE)
+        self.assertEqual(oracle_sqrt_f64(f64_to_u64(4.0)), f64_to_u64(2.0))
+        self.assertEqual(oracle_sqrt_f64(f64_to_u64(9.0)), f64_to_u64(3.0))
+        self.assertEqual(oracle_sqrt_f64(f64_to_u64(2.25)), f64_to_u64(1.5))
+
+    def test_sqrt_f64_inf_and_negative(self):
+        self.assertEqual(oracle_sqrt_f64(F64_POS_INF), F64_POS_INF)
+        self.assertTrue(is_nan_u64(oracle_sqrt_f64(f64_to_u64(-1.0))))
+        self.assertTrue(is_nan_u64(oracle_sqrt_f64(F64_NEG_INF)))
+        self.assertTrue(is_nan_u64(oracle_sqrt_f64(F64_QNAN)))
+
 
 if __name__ == "__main__":
     unittest.main()
