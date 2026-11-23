@@ -19,6 +19,10 @@ import os
 import re
 import sys
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 INTERFACE = re.compile(
     r'MIDL_INTERFACE\("[0-9a-fA-F-]+"\)\s*\n\s*(\w+)\s*:\s*public\s+(\w+)\s*\{\s*public:(.*?)\n\s*\};', re.S)
 METHOD = re.compile(r'virtual\s+(.*?)\s*STDMETHODCALLTYPE\s+(\w+)\s*\((.*)\)\s*(const)?\s*=\s*0\s*;\s*$', re.S)
@@ -144,16 +148,6 @@ def write_if_changed(path, text):
         f.write(text)
 
 
-def same_path(first, second):
-    """True when writing first would replace second (same file, or a case/symlink alias of it)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def write_report(path, text):
     """write_if_changed with a one-line ERROR instead of a traceback; False when it could not write."""
     try:
@@ -183,7 +177,7 @@ def main():
     for path in (args.out, args.report):
         if path and os.path.isdir(path):
             parser.error(f"{path} is a folder, not a file")
-    if args.out and args.report and same_path(args.out, args.report):
+    if args.out and args.report and same_report_path(args.out, args.report):
         parser.error("--out and --report must use different paths")
     header = args.header or find_header()
     if not header:
@@ -192,7 +186,7 @@ def main():
         parser.error(f"--header {header}: no such file")
     for path in [header] + list(args.source):
         for flag, target in (("--out", args.out), ("--report", args.report)):
-            if target and same_path(target, path):
+            if target and same_report_path(target, path):
                 parser.error(f"{flag} {target} would overwrite the input {path}")
     with open(header, encoding="utf-8", errors="replace") as f:
         interfaces = parse_interfaces(f.read())
