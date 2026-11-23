@@ -293,7 +293,7 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
     helpers.forEach((helper, i) => assert.equal(boundsGroup.children[i], helper));
 });
 
-test('Shift speeds the camera up and Ctrl slows it down, on either side of the keyboard', async () => {
+async function animationFixture(frameSeconds) {
     class Vector3 {
         constructor(x = 0, y = 0, z = 0) { Object.assign(this, { x, y, z }); }
         set(x, y, z) { return Object.assign(this, { x, y, z }); }
@@ -307,6 +307,7 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
     }
     const handlers = new Map();
     let frame;
+    const hud = {};
     const camera = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn camera; })()`, {
         THREE: {
             WebGLRenderer: class {
@@ -322,17 +323,30 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
                 getWorldDirection(v) { return v.set(0, 0, -1); }
             },
             DirectionalLight: class { position = { set() {} }; },
-            Clock: class { getDelta() { return 0.1; } },
+            Clock: class { getDelta() { return frameSeconds; } },
             Color: class {}, Fog: class {}, HemisphereLight: class {}, MeshStandardMaterial: class {}, Euler: class {},
             Group: class { add() {} },
             Vector3,
         },
-        document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
+        document: { body: { prepend() {} }, getElementById: id => id === 'hud' ? hud : {}, addEventListener() {} },
         addEventListener: (type, handler) => handlers.set(type, handler),
         devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
         performance: { now: () => 0 },
         fetch: manifestResponse({ spawn: [0, 0, 0], chunks: [] }), GLTFLoader: class {},
     });
+    return { camera, handlers, frame, hud };
+}
+
+test('slow frames report actual FPS and cap camera movement', async () => {
+    const { camera, handlers, frame, hud } = await animationFixture(0.2);
+    handlers.get('keydown')({ code: 'KeyE' });
+    for (let i = 0; i < 6; i++) frame();
+    assert.match(hud.innerHTML, /\b5 fps\b/);
+    assert.equal(camera.position.y, 24); // 6 movement steps capped at 0.1 s, at 40 m/s
+});
+
+test('Shift speeds the camera up and Ctrl slows it down, on either side of the keyboard', async () => {
+    const { camera, handlers, frame } = await animationFixture(0.1);
     // One frame is 0.1 s at the default 40 m/s, so E alone climbs 4 m.
     const climb = (...modifiers) => {
         for (const code of ['KeyE', ...modifiers]) handlers.get('keydown')({ code });
