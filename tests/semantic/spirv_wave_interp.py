@@ -940,17 +940,23 @@ class _Wave:
                 return _Poison("bit-field insert beyond the width")
             mk = ((1 << cnt) - 1) << off
             return ((base & ~mk) | ((ins << off) & mk)) & w
-        if op in ("OpIAddCarry", "OpISubBorrow"):
-            x, y = self.int_of(lane, a[1]) & MASK, self.int_of(lane, a[2]) & MASK
+        if op in ("OpIAddCarry", "OpISubBorrow", "OpUMulExtended", "OpSMulExtended"):
+            # Result struct {low half, carry / borrow / high half of the full product}. Both members have the
+            # operands' type, 32 or 64 bits (SPIR-V spec), so the width is the member type's, not a fixed 32.
+            k = m.types[a[0]]
+            if k[0] != "struct" or len(k[1]) != 2:
+                raise UnsupportedConstruct(f"{op} with result type {a[0]}")
+            bits = m.bits(k[1][0])
+            w = (1 << bits) - 1
+            x, y = self.int_of(lane, a[1]) & w, self.int_of(lane, a[2]) & w
             if op == "OpIAddCarry":
-                return ((x + y) & MASK, (x + y) >> 32)
-            return ((x - y) & MASK, 1 if x < y else 0)
-        if op in ("OpUMulExtended", "OpSMulExtended"):
-            x, y = self.int_of(lane, a[1]) & MASK, self.int_of(lane, a[2]) & MASK
+                return ((x + y) & w, (x + y) >> bits)
+            if op == "OpISubBorrow":
+                return ((x - y) & w, 1 if x < y else 0)
             if op == "OpSMulExtended":
-                x, y = _signed(x, 32), _signed(y, 32)
-            p = (x * y) & 0xFFFFFFFFFFFFFFFF
-            return (p & MASK, p >> 32)
+                x, y = _signed(x, bits), _signed(y, bits)
+            p = (x * y) & ((1 << 2 * bits) - 1)
+            return (p & w, p >> bits)
         raise UnsupportedConstruct(op)
 
     @staticmethod
