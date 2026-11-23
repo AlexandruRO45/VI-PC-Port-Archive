@@ -41,6 +41,35 @@ class DumpWords(unittest.TestCase):
                 self.assertIsNone(rgt.dump_words(line))
 
 
+class ResultAudit(unittest.TestCase):
+    """run_suite appends exactly one row per selected fixture; result_audit turns a forgotten or a duplicated
+    append into a failed run instead of a quietly shifted report (cs_tbuffer_store and cs_fmt_d16_xyz each had
+    one before this guard)."""
+    NAMES = ["a", "b"]
+
+    def test_one_row_per_fixture_is_clean(self):
+        self.assertEqual(rgt.result_audit(self.NAMES, [("a", True, "x"), ("b", None, "y")]), [])
+
+    def test_a_fixture_without_a_row_is_reported(self):
+        self.assertEqual(rgt.result_audit(self.NAMES, [("a", True, "x")]),
+                         ["b: selected but no result recorded"])
+
+    def test_a_fixture_with_two_rows_is_reported(self):
+        self.assertEqual(rgt.result_audit(self.NAMES, [("a", True, "x"), ("a", True, "x"), ("b", True, "y")]),
+                         ["a: 2 results recorded"])
+
+    def test_a_row_for_an_unselected_fixture_is_reported(self):
+        self.assertEqual(rgt.result_audit(self.NAMES, [("a", True, "x"), ("b", True, "y"), ("c", True, "z")]),
+                         ["c: result recorded for a fixture that was not selected"])
+
+    def test_an_optional_fixture_may_have_no_row(self):
+        # vs_ids (a drawn vertex shader) and cs_bench_mix (a benchmark input) are built but are not tests
+        self.assertEqual(rgt.result_audit(["a", "vs_ids", "cs_bench_mix"], [("a", True, "x")],
+                                          optional={"vs_ids", "cs_bench_mix"}), [])
+        self.assertEqual(rgt.result_audit(["a", "vs_ids"], [("a", True, "x")]),
+                         ["vs_ids: selected but no result recorded"])
+
+
 class PackedFormatFixture(unittest.TestCase):
     def test_filtered_suite_counts_a_packed_store_mismatch(self):
         name = "cs_fmt_1010102"

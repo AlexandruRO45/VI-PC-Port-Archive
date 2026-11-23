@@ -6,6 +6,7 @@ Usage:
 --llvm-mc (or LLVM_MC) is a path or a whole command, e.g. "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc".
 """
 import argparse
+from collections import Counter
 import json
 import math
 import os
@@ -331,6 +332,23 @@ def dump_words(msg: str) -> list[int] | None:
     check.py): trailing text, a missing word or a non-number is a malformed dump, not a result."""
     m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", msg, re.MULTILINE)
     return [int(x) for x in m.group(1).split()] if m else None
+
+
+def result_audit(names: list[str], results: list[tuple[str, bool | None, str]],
+                 optional: object = ()) -> list[str]:
+    """Problems with one run's result list: a selected fixture with no row (a dispatch branch that computes its
+    result and never appends it), one with more than one row (an append pasted into the wrong branch), and a row
+    for a fixture that was not selected. Every branch of run_suite's dispatch expects to append exactly one.
+    `optional` names may have no row: helper shaders built only for another test, and benchmark inputs."""
+    counts = Counter(name for name, *_ in results)
+    allowed_missing = set(optional)
+    problems = [f"{name}: selected but no result recorded" for name in names
+                if not counts[name] and name not in allowed_missing]
+    problems += [f"{name}: {counts[name]} results recorded" for name in names if counts[name] > 1]
+    selected = set(names)
+    problems += [f"{name}: result recorded for a fixture that was not selected"
+                 for name in counts if name not in selected]
+    return problems
 
 
 def subgroup_pin_skip(msg: str, cs_env: dict | None) -> Skip | None:
@@ -953,11 +971,11 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_tbuffer_store":
             # tbuffer_store_format_*: the instruction's format, words measured natively on a Radeon 680M (the .asm header)
             problem = tbuffer_store_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "128/128 dumped words exact"))
         elif name == "cs_fmt_d16_xyz":
             # d16_xyz / d16_xy typed-buffer loads and d16_xyz stores (cs_fmt_d16_xyz.asm header)
             problem = fmt_d16_xyz_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "80/80 dumped words exact"))
-            results.append((name, not problem, problem or "128/128 dumped words exact"))
         elif name in ("cs_global_neg_offset", "cs_global_mem_ext"):
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
@@ -1495,7 +1513,16 @@ def run_suite(a, work: str) -> int:
         skipped += ok is None
         print(f"  {tag:4s}  {name:<20s}  {detail}")
     print(f"\n{passed}/{len(results)} passed" + (f", {skipped} skipped" if skipped else ""))
-    if passed + skipped != len(results):
+    # Helper shaders built only for another test (a drawn vertex shader, a mip dependency) and the cs_bench_*
+    # inputs have no row of their own by design; a failed translation still records one, so they are excluded
+    # from the "no row" side and not from the "unexpected row" side.
+    partners = {os.path.splitext(f)[0] for f in DRAWN_WITH.values()} | set(TEXTURE_MIP_DEPENDENCIES) \
+        | set(PIXEL_VERTEX.values())
+    bench = {os.path.splitext(f)[0] for f in asm_files if f.startswith("cs_bench_")}
+    audit = result_audit([os.path.splitext(f)[0] for f in asm_files], results, optional=partners | bench)
+    for problem in audit:
+        print(f"result audit: {problem}", file=sys.stderr)
+    if audit or passed + skipped != len(results):
         return 1
     if getattr(a, "require_pass", False) and not passed:
         print("error: --require-pass: no GPU tests passed", file=sys.stderr)
