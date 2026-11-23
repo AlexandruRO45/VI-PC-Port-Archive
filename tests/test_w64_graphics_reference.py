@@ -39,6 +39,22 @@ class TierCReferenceTests(unittest.TestCase):
                         else:
                             self.assertEqual(result, "")
 
+    def test_default_run_that_repeats_64_is_not_compared_as_tier_c(self) -> None:
+        name = "ps_w64_c_lane_id"
+        wave64 = [(i % 64, i % 32, i % 64, 0) for i in range(64 * 64)]
+        wave32 = [(i % 32, i % 32, i % 64, 0) for i in range(64 * 64)]
+        with tempfile.TemporaryDirectory() as work:
+            (Path(work) / f"{name}.spv").touch()
+            (Path(work) / f"{name}.ref64.raw").write_bytes(
+                b"".join(struct.pack("<4I", *pixel) for pixel in wave64)
+            )
+            def draw_for_size(_tools, _spirv, _name, size, _tmp):
+                # Both forced sizes apply, and the default draw repeats the 64-wide one.
+                return (wave64 if size in (64, None) else wave32), None, True
+            with patch.dict(os.environ, W64G_REF=work, W64G_SAVE_REF=""), \
+                    patch.object(w64_graphics, "draw", side_effect=draw_for_size):
+                self.assertEqual(w64_graphics.check(work, work, name), "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -435,11 +435,11 @@ def check(tools, spirv, name):
             for size, (words, heap) in runs.items():
                 if size == 64:
                     continue
-                if tier == "C" and comparable(name, ref_words, None) != comparable(name, words, None):
-                    return "a partition-invariant word differs from the 64-lane reference"
+                if size is None and len(runs) > 1:
+                    continue                      # the default draw repeats one of the forced sizes
                 if tier == "C":
                     if comparable(name, ref_words, None) != comparable(name, words, None):
-                        return "a word that must not depend on the partition differs from the 64-lane reference"
+                        return "a partition-invariant word differs from the 64-lane reference"
                     if not partition_dependent(name, ref_words, words):
                         return "tier C but the run equals the 64-lane reference: the detector is wrong"
                     compared = True
