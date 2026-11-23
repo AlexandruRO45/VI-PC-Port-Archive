@@ -149,7 +149,7 @@ class ShaderStats(unittest.TestCase):
                                    "waves/SIMD median 16 (1 of 2)\n")
 
     def test_growth_p90_uses_nearest_rank(self):
-        for count, expected in ((10, 9), (11, 10)):
+        for count, expected in ((5, 5), (10, 9), (11, 10)):
             with self.subTest(count=count):
                 listings = {f"ps_{i}": PS_FLAT for i in range(1, count + 1)}
                 rows = [f"ps_{i},ps,Instructions,{8 * i}" for i in range(1, count + 1)]
