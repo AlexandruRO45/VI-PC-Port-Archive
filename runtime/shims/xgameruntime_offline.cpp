@@ -330,6 +330,27 @@ template <int Slot> HRESULT STDMETHODCALLTYPE client_not_connected(void*) {
 }
 static_assert((static_cast<uint32_t>(E_GAMESTREAMING_NOT_INITIALIZED) & 0xFF) == 0, "reads as false in al");
 
+// Public GDK signatures: the client ID is passed through but no client exists offline.
+HRESULT STDMETHODCALLTYPE streaming_register_properties(void*, uint64_t, XTaskQueueHandle queue, void* context,
+                                                        void* callback, XTaskQueueRegistrationToken* token) {
+    return streaming_register_connection(nullptr, queue, context, callback, token);
+}
+HRESULT STDMETHODCALLTYPE streaming_dimensions(void*, uint64_t, uint32_t* width, uint32_t* height) {
+    if (width) *width = 0;
+    if (height) *height = 0;
+    return client_not_connected<8>(nullptr);
+}
+size_t STDMETHODCALLTYPE streaming_location_size(void*) { return 0; }
+HRESULT STDMETHODCALLTYPE streaming_location(void*, size_t size, char* name) {
+    if (size && name) name[0] = 0;
+    return client_not_connected<16>(nullptr);
+}
+HRESULT STDMETHODCALLTYPE streaming_session(void*, uint64_t, size_t size, char* session, size_t* used) {
+    if (size && session) session[0] = 0;
+    if (used) *used = 0;
+    return client_not_connected<32>(nullptr);
+}
+
 // 11: XGameStreamingConnectionState XGameStreamingGetConnectionState(XGameStreamingClientId client): 0, the first
 // enumerator, taken to be Disconnected; there is no client to ask about either way, and the executable has no caller.
 uint32_t STDMETHODCALLTYPE streaming_connection_state(void*) { return 0; }
@@ -340,17 +361,17 @@ const void* const kStreamingVtable[] = {
     FN(streaming_initialize),              // 3  XGameStreamingInitialize
     FN(streaming_uninitialize),            // 4  XGameStreamingUninitialize
     FN(streaming_is_streaming),            // 5  XGameStreamingIsStreaming
-    FN(client_not_connected<6>),           // 6  XGameStreamingRegisterClientPropertiesChanged (per client)
+    FN(streaming_register_properties),           // 6  XGameStreamingRegisterClientPropertiesChanged (per client)
     FN(streaming_unregister),              // 7  XGameStreamingUnregisterClientPropertiesChanged
-    FN(client_not_connected<8>),           // 8  XGameStreamingGetStreamPhysicalDimensions
+    FN(streaming_dimensions),           // 8  XGameStreamingGetStreamPhysicalDimensions
     FN(streaming_client_count),            // 9  XGameStreamingGetClientCount
     FN(client_not_connected<10>),          // 10 XGameStreamingGetClients
     FN(streaming_connection_state),        // 11 XGameStreamingGetConnectionState
     FN(streaming_register_connection),     // 12 XGameStreamingRegisterConnectionStateChanged
     FN(streaming_unregister),              // 13 XGameStreamingUnregisterConnectionStateChanged
     FN(client_not_connected<14>),          // 14 XGameStreamingGetStreamAddedLatency
-    FN(client_not_connected<15>),          // 15 XGameStreamingGetServerLocationNameSize
-    FN(client_not_connected<16>),          // 16 XGameStreamingGetServerLocationName
+    FN(streaming_location_size),          // 15 XGameStreamingGetServerLocationNameSize
+    FN(streaming_location),          // 16 XGameStreamingGetServerLocationName
     FN(client_not_connected<17>),          // 17 XGameStreamingHideTouchControls
     FN(client_not_connected<18>),          // 18 XGameStreamingShowTouchControlLayout
     FN(client_not_connected<19>),          // 19 XGameStreamingHideTouchControlsOnClient
@@ -366,7 +387,7 @@ const void* const kStreamingVtable[] = {
     FN(client_not_connected<29>),          // 29 XGameStreamingGetTouchBundleVersionNameSize
     FN(client_not_connected<30>),          // 30 XGameStreamingGetTouchBundleVersion
     FN(client_not_connected<31>),          // 31 XGameStreamingGetClientIPAddress
-    FN(client_not_connected<32>),          // 32 XGameStreamingGetSessionId (2)
+    FN(streaming_session),          // 32 XGameStreamingGetSessionId (2)
     FN(client_not_connected<33>),          // 33 XGameStreamingGetDisplayDetails (3)
     FN(client_not_connected<34>),          // 34 XGameStreamingSetResolution (3)
 };

@@ -154,6 +154,22 @@ int main() {
     check(FAILED(at<NoArgs>(streaming, 10)(streaming)) && !at<Bool>(streaming, 21)(streaming),
           "a per-client call fails as an HRESULT and reads false as a bool");
 
+    using RegisterProperties = HRESULT (STDMETHODCALLTYPE*)(void*, uint64_t, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+    using Dimensions = HRESULT (STDMETHODCALLTYPE*)(void*, uint64_t, uint32_t*, uint32_t*);
+    using LocationSize = size_t (STDMETHODCALLTYPE*)(void*);
+    using Location = HRESULT (STDMETHODCALLTYPE*)(void*, size_t, char*);
+    using Session = HRESULT (STDMETHODCALLTYPE*)(void*, uint64_t, size_t, char*, size_t*);
+    token = {};
+    check(at<RegisterProperties>(streaming, 6)(streaming, 0, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &token) == S_OK && token.token != 0 && at<Bool>(streaming, 7)(streaming), "client properties registration and unregister");
+    uint32_t width = 99, height = 99;
+    check(FAILED(at<Dimensions>(streaming, 8)(streaming, 0, &width, &height)) && width == 0 && height == 0, "offline dimensions are cleared");
+    check(at<LocationSize>(streaming, 15)(streaming) == 0, "offline location size is zero");
+    char location[8] = "present";
+    check(FAILED(at<Location>(streaming, 16)(streaming, sizeof(location), location)) && location[0] == 0, "offline location is empty");
+    char session[8] = "present";
+    size_t session_used = 99;
+    check(FAILED(at<Session>(streaming, 32)(streaming, 0, sizeof(session), session, &session_used)) && session[0] == 0 && session_used == 0, "offline session is empty");
+
     // ---- XDisplay ----
     void* display = nullptr;
     check(query(&kDisplayClass, kDisplayClass, &display) == S_OK && display, "XDisplayImpl for its class id");
