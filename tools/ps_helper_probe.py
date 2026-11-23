@@ -255,6 +255,9 @@ def main(argv=None):
     ap.add_argument("--build", required=True, help="runtime build folder with vk_harness")
     ap.add_argument("--json", help="write {device, checks, words} here")
     a = ap.parse_args(argv)
+    if a.json and os.path.isdir(a.json):
+        print(f"ERROR: --json is a directory, not a report file: {a.json}", file=sys.stderr)
+        return 2
     try:
         device, res = measure(a.build)
     except ps_oracle.Unavailable as e:
