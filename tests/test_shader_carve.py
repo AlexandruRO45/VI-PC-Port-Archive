@@ -542,6 +542,47 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         with open(blocker, "rb") as f:
             self.assertEqual(f.read(), b"x")
 
+    def test_unreadable_archive_is_one_line_error(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        stderr = io.StringIO()
+        with mock.patch("shader_carve.mmap.mmap", side_effect=OSError(22, "invalid argument")), \
+                contextlib.redirect_stderr(stderr):
+            code = shader_carve.main([self.archive, self.out])
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr.getvalue().strip().splitlines(),
+                         [f"ERROR: cannot read {self.archive}: invalid argument"])
+
+    def test_unwritable_shader_file_is_one_line_error(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        os.makedirs(os.path.join(self.out, "valid.dxbc"))  # a folder where the .dxbc goes
+
+        res = self.run_carve(self.archive, self.out)
+
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        lines = res.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith(f"ERROR: cannot write {os.path.join(self.out, 'valid.dxbc')}: "), lines)
+        # no index.json: it is make_game.py's proof of a finished carve
+        self.assertEqual(sorted(os.listdir(self.out)), ["valid.dxbc"])
+
+    def test_unwritable_index_is_one_line_error(self):
+        dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+        stderr = io.StringIO()
+        with mock.patch("shader_carve.replace_retry", side_effect=OSError(28, "No space left on device")), \
+                contextlib.redirect_stderr(stderr):
+            code = shader_carve.main([self.archive, self.out])
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr.getvalue().strip().splitlines(),
+                         [f"ERROR: cannot write {os.path.join(self.out, 'index.json')}: No space left on device"])
+        self.assertNotIn("index.json", os.listdir(self.out))
+
     def test_carve_preserves_existing_index_temp_sibling(self):
         dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
         with open(self.archive, "wb") as f:
