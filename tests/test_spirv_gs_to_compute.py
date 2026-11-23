@@ -139,6 +139,17 @@ def test_phi_from_entry_block_names_the_split_block(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs SPIRV-Tools on PATH")
+def test_rejects_valid_geometry_module_with_two_entry_points(tmp_path):
+    optional_entry = 'OpEntryPoint Geometry %main "other" %in_pos %out_pos'
+    source = PHI_GS.replace("OpExecutionMode %main Triangles", optional_entry + "\nOpExecutionMode %main Triangles")
+    binary = tmp_path / "two_entries.spv"
+    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", binary], input=source, text=True, check=True)
+    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", binary], check=True)
+    with pytest.raises(gsc.Unsupported, match="exactly one entry point"):
+        gsc.rewrite(source)
+
+
 @pytest.mark.skipif(not HAVE_SPIRV or not shutil.which("spirv-dis"), reason="needs SPIRV-Tools on PATH")
 @pytest.mark.parametrize("target", ["vulkan1.0", "vulkan1.1", "vulkan1.2"])
 def test_cli_preserves_valid_capture_across_spirv_versions(tmp_path: Path, target: str) -> None:

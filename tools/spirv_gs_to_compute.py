@@ -63,10 +63,12 @@ def find_type(defs, op, operands):
 def layout_of(text):
     """The shader's inputs, outputs and sizes; raises Unsupported for what the rewrite can't handle."""
     defs, deco = parse(text)
-    ep = re.search(r"^\s*OpEntryPoint Geometry (%\w+) ", text, re.M)
-    if not ep:
+    entries = re.findall(r"^[ \t]*OpEntryPoint[ \t]+(\w+)[ \t]+(%\w+)\b", text, re.M)
+    if not any(model == "Geometry" for model, _ in entries):
         raise Unsupported("not a geometry shader")
-    main = ep.group(1)
+    if len(entries) != 1:
+        raise Unsupported("geometry capture requires exactly one entry point")
+    _, main = entries[0]
     modes = re.findall(rf"^\s*OpExecutionMode {re.escape(main)} (.*)$", text, re.M)
     modes = [m.split() for m in modes]
     verts_in = next((IN_VERTS[m[0]] for m in modes if m[0] in IN_VERTS), None)
