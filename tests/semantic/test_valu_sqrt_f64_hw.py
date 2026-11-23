@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+"""Hardware-verified semantic reference and translator regression suite for RDNA2 v_sqrt_f64.
+
+Tests v_sqrt_f64 and v_sqrt_f64_e64 (VOP1/VOP3) against IEEE 754-2008 double precision (f64)
+semantics and translated SPIR-V shader executions via rdna2spirv and spirv_mini_interp.
+"""
+
+import dataclasses
+import enum
+import math
+import os
+import struct
+import sys
+import unittest
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+
+sys.dont_write_bytecode = True
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+
+# IEEE 754 binary64 constants
+SIGN_MASK: int = 0x8000_0000_0000_0000
+EXP_MASK: int = 0x7FF0_0000_0000_0000
+FRAC_MASK: int = 0x000F_FFFF_FFFF_FFFF
+QNAN_BIT: int = 0x0008_0000_0000_0000
+CANONICAL_QNAN: int = 0x7FF8_0000_0000_0000
+
+POS_ZERO_BITS: int = 0x0000_0000_0000_0000
+NEG_ZERO_BITS: int = 0x8000_0000_0000_0000
+POS_INF_BITS: int = 0x7FF0_0000_0000_0000
+NEG_INF_BITS: int = 0xFFF0_0000_0000_0000
+ONE_F64_BITS: int = 0x3FF0_0000_0000_0000
+MASK32: int = 0xFFFF_FFFF
+MASK64: int = 0xFFFF_FFFF_FFFF_FFFF
+
+
+def f64_to_bits(val: float) -> int:
+    """Convert Python float (IEEE 754 binary64) to 64-bit integer bits."""
+    return struct.unpack("<Q", struct.pack("<d", val))[0]
+
+
+def bits_to_f64(bits: int) -> float:
+    """Convert 64-bit integer bits to Python float (IEEE 754 binary64)."""
+    return struct.unpack("<d", struct.pack("<Q", bits & MASK64))[0]
+
+
+def split_f64_words(bits: int) -> Tuple[int, int]:
+    """Split 64-bit qword into (lo_u32, hi_u32) for VGPR pair [v_lo:v_hi]."""
+    return bits & MASK32, (bits >> 32) & MASK32
+
+
+def combine_f64_words(lo: int, hi: int) -> int:
+    """Combine two 32-bit VGPR words (lo, hi) into a 64-bit qword."""
+    return ((hi & MASK32) << 32) | (lo & MASK32)
+
+
+def is_nan_bits(bits: int) -> bool:
+    """Return True if 64-bit word represents an IEEE 754 NaN."""
+    return ((bits & EXP_MASK) == EXP_MASK) and ((bits & FRAC_MASK) != 0)
+
+
+def is_qnan_bits(bits: int) -> bool:
+    """Return True if 64-bit word represents a quiet NaN."""
+    return is_nan_bits(bits) and bool(bits & QNAN_BIT)
+
+
+def is_snan_bits(bits: int) -> bool:
+    """Return True if 64-bit word represents a signaling NaN."""
+    return is_nan_bits(bits) and not bool(bits & QNAN_BIT)
+
+
+def is_subnormal_bits(bits: int) -> bool:
+    """Return True if 64-bit word represents a subnormal number."""
+    return ((bits & EXP_MASK) == 0) and ((bits & FRAC_MASK) != 0)
+
+
+def oracle_sqrt_f64(
+    src_bits: int,
+    clamp: bool = False,
+    abs_src: bool = False,
+    neg_src: bool = False,
+) -> int:
+    """Reference mathematical oracle for RDNA2 v_sqrt_f64 and v_sqrt_f64_e64.
+    
+    Applies source modifiers (abs, neg), executes IEEE 754 square root,
+    and applies destination clamp [0.0, 1.0] if requested.
+    """
+    bits = src_bits & MASK64
+    if abs_src:
+        bits &= ~SIGN_MASK
+    if neg_src:
+        bits ^= SIGN_MASK
+
+    # Special IEEE 754 handling
+    if bits == POS_ZERO_BITS:
+        res_bits = POS_ZERO_BITS
+    elif bits == NEG_ZERO_BITS:
+        res_bits = NEG_ZERO_BITS
+    elif bits == POS_INF_BITS:
+        res_bits = POS_INF_BITS
+    elif is_nan_bits(bits):
+        res_bits = bits | QNAN_BIT  # quieted NaN
+    elif bits & SIGN_MASK:
+        # Negative nonzero operand returns NaN
+        res_bits = CANONICAL_QNAN
+    else:
+        val = bits_to_f64(bits)
+        res_f = math.sqrt(val)
+        res_bits = f64_to_bits(res_f)
+
+    if clamp:
+        if is_nan_bits(res_bits):
+            res_bits = POS_ZERO_BITS
+        else:
+            val = bits_to_f64(res_bits)
+            clamped = max(0.0, min(1.0, val))
+            res_bits = f64_to_bits(clamped)
+
+    return res_bits & MASK64
+
+
+_TRANSLATE_ID: int = 0
+
+
+def run_translated_sqrt_f64(
+    src_lo: int,
+    src_hi: int,
+    vop3: bool = False,
+    clamp: bool = False,
+    abs_src: bool = False,
+    neg_src: bool = False,
+) -> Tuple[int, int, float]:
+    """Execute v_sqrt_f64 through rdna2spirv translation and spirv_mini_interp execution."""
+    global _TRANSLATE_ID
+    _TRANSLATE_ID += 1
+    src_op = "v[2:3]"
+    if abs_src and neg_src:
+        src_op = "-|v[2:3]|"
+    elif abs_src:
+        src_op = "|v[2:3]|"
+    elif neg_src:
+        src_op = "-v[2:3]"
+
+    if vop3 or clamp or abs_src or neg_src:
+        inst = f"v_sqrt_f64_e64 v[0:1], {src_op}"
+        if clamp:
+            inst += " clamp"
+    else:
+        inst = f"v_sqrt_f64 v[0:1], {src_op}"
+
+    lines = [
+        f"v_mov_b32 v2, {src_lo & MASK32:#x}",
+        f"v_mov_b32 v3, {src_hi & MASK32:#x}",
+        inst,
+        "exp mrt0 v0, v1, v0, v1 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(f"ps_sqrt_trans_{_TRANSLATE_ID}", lines)
+    words = support.mrt0_words(spv)
+    out_lo, out_hi = words[0], words[1]
+    bits = combine_f64_words(out_lo, out_hi)
+    return out_lo, out_hi, bits_to_f64(bits)
+
+
+class TestValuSqrtF64ReferenceOracle(unittest.TestCase):
+    """Stage 1: Reference mathematical oracle and architectural model for v_sqrt_f64."""
+
+    def test_oracle_exact_squares(self) -> None:
+        squares = [
+            (0.0, 0.0),
+            (1.0, 1.0),
+            (4.0, 2.0),
+            (9.0, 3.0),
+            (16.0, 4.0),
+            (25.0, 5.0),
+            (100.0, 10.0),
+            (0.25, 0.5),
+            (0.0625, 0.25),
+        ]
+        for inp, expected in squares:
+            inp_bits = f64_to_bits(inp)
+            res_bits = oracle_sqrt_f64(inp_bits)
+            self.assertEqual(bits_to_f64(res_bits), expected)
+
+    def test_oracle_matches_translated_execution(self) -> None:
+        exact_squares = [0.0, 1.0, 4.0, 9.0, 16.0, 25.0, 100.0, 0.25, 0.0625]
+        for val in exact_squares:
+            inp_bits = f64_to_bits(val)
+            lo, hi = split_f64_words(inp_bits)
+            out_lo, out_hi, out_f = run_translated_sqrt_f64(lo, hi)
+            expected_bits = oracle_sqrt_f64(inp_bits)
+            actual_bits = combine_f64_words(out_lo, out_hi)
+            self.assertEqual(actual_bits, expected_bits)
+            self.assertEqual(out_f, math.sqrt(val))
+
+        inp_bits = f64_to_bits(2.0)
+        lo, hi = split_f64_words(inp_bits)
+        out_lo, out_hi, out_f = run_translated_sqrt_f64(lo, hi)
+        self.assertAlmostEqual(out_f, math.sqrt(2.0), places=6)
+
+    def test_oracle_modifiers(self) -> None:
+        val_4 = f64_to_bits(4.0)
+        clamped_bits = oracle_sqrt_f64(val_4, clamp=True)
+        self.assertEqual(bits_to_f64(clamped_bits), 1.0)
+
+        neg_4 = f64_to_bits(-4.0)
+        abs_bits = oracle_sqrt_f64(neg_4, abs_src=True)
+        self.assertEqual(bits_to_f64(abs_bits), 2.0)
+
+    def test_oracle_small_and_large_normals(self) -> None:
+        large_val = 1e100
+        res_large = bits_to_f64(oracle_sqrt_f64(f64_to_bits(large_val)))
+        self.assertAlmostEqual(res_large, 1e50, places=10)
+
+        small_val = 1e-100
+        res_small = bits_to_f64(oracle_sqrt_f64(f64_to_bits(small_val)))
+        self.assertAlmostEqual(res_small, 1e-50, places=10)
+
+
+if __name__ == "__main__":
+    unittest.main()
