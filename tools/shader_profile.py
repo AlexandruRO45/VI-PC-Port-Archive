@@ -23,6 +23,10 @@ import re
 import sys
 from collections import Counter, defaultdict
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 FAMILIES = [("s_buffer_", "smem"), ("s_load", "smem"), ("s_", "scalar"), ("v_", "vector"), ("ds_", "lds"),
             ("buffer_", "buffer"), ("tbuffer_", "buffer"), ("image_", "image"), ("global_", "global"),
             ("flat_", "flat"), ("scratch_", "scratch"), ("exp", "export")]
@@ -281,16 +285,6 @@ def stage_map(disasm_dir) -> dict:
         return {}
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -304,7 +298,7 @@ def main():
         return 2
     path = a.out or os.path.join(a.src, "..", "profile.json")
     index = carve_index_path(a.src)
-    if same_output_path(index, path):
+    if same_report_path(index, path):
         print(f"ERROR: output would overwrite the shader carve index {index}", file=sys.stderr)
         return 2
     if os.path.isdir(path):
@@ -321,7 +315,7 @@ def main():
         print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
         return 2
     for entry in shader_files:
-        if same_output_path(entry.path, path):
+        if same_report_path(entry.path, path):
             print(f"ERROR: output would overwrite input shader {entry.path}", file=sys.stderr)
             return 2
     occ, users = Counter(), Counter()
