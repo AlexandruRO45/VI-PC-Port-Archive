@@ -154,18 +154,20 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 | DLL | Unimplemented imports | What the names suggest (not measured) |
 |---|---:|---|
 | `xmem.dll` | 7: `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemIsToolsMemAvailable`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter` | the console's physical page and default allocation routines; `XMemAlloc`, `XMemFree`, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics` and `XMemTransferMemory` already bind |
-| `d3d12_xs.dll` | 1: `D3D12ConfigureVirtualMemoryX` | GPU virtual memory setup |
+| `d3d12_xs.dll` | 1: `D3D12ConfigureVirtualMemoryX` | GPU virtual memory setup (now served in `runtime/shims/d3d12_xs.cpp`) |
 | `xg_xs.dll` | 2: `XGCreateTextureComputer`, `XGSuggestSwizzleMode` | texture layout computation |
 | `XCRDAPI.dll` | 1: `DStorageGetFactory` | DirectStorage |
 | `chad.dll` | 5: `XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand` | the audio DSP |
 | `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
 | `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
 
-Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
-they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
-`xapu.dll`, `AcpHal.dll`) with no shim at all.
+At `1cc6e3c1`, only two of these DLLs had a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), holding 8 of
+the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`, `xapu.dll`,
+`AcpHal.dll`) with no shim at all.
 
-The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
+All eight imports in those two shimmed DLLs are served now — the seven `xmem.dll` imports (see the `xmem.dll` notes
+above) and `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` (`runtime/shims/d3d12_xs.cpp`, which accepts the descriptor
+and returns `S_OK` because the PC/Vulkan side owns virtual memory) — so the same dry run lists 22.
 
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
