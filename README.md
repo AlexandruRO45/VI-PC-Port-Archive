@@ -242,7 +242,7 @@ The biggest open pieces:
   [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
   unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
 - **Xbox D3D12 → Vulkan**: the `d3d12_xs` command list and descriptor heap model.
-- **Model recovery**: investigate the 71 unrecovered fragment candidates in [`levels.rpf`](docs/models.md#full-archive-re-count-at-e293917).
+- **Model recovery**: investigate the 7 unrecovered candidates in [`levels.rpf`](docs/models.md#re-count-at-7ef5c51-asset-128-asset-129).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Never attach game files, extracted assets or generated shaders to issues or
 pull requests.

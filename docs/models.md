@@ -98,11 +98,13 @@ What moved between `917e9b9` and `e293917`:
   [rpf9-explorer#12](https://github.com/breadbbbb/rpf9-explorer/pull/12) recovers all 11 zero-radius
   dictionary children in `core_restofworld` (797 → 808); `story000_restofworld.rpf` already
   recovered its 3 models at `917e9b9`, so its delta is 0.
-- **Remaining 72 rejects (down from 1,282 at `917e9b9`).** Aside from the single texture-dictionary
-  candidate in `textures.rpf`, all 71 remaining rejects are in `levels.rpf` (0 texture dictionaries,
-  0 zlib checksum errors). Sampled headers are fragment candidates (`LooksLikeFragment == true`)
-  whose `ProbeRequiredExtents` reports `MetadataComplete == false` on the first zlib block with
-  `RequiredSystemBytes` extending into subsequent 16-byte-aligned zlib continuation blocks.
+- **72 rejects at `e293917` (down from 1,282 at `917e9b9`).** Aside from the single texture-dictionary
+  candidate in `textures.rpf`, all 71 were in `levels.rpf` (0 texture dictionaries, 0 zlib checksum
+  errors). At `7ef5c51`, 7 `levels.rpf` rejects remain
+  ([re-count](#re-count-at-7ef5c51-asset-128-asset-129)). Upstream
+  [rpf9-explorer#18](https://github.com/breadbbbb/rpf9-explorer/pull/18) attributes 64 of the 71 to
+  `ReadMesh`'s 65,535 triangle and vertex-reference caps, hit after a complete probe, not to the
+  probe itself.
 
 Method checks: sharded 4 MiB `FindCandidateOffsets` was verified exact-equal against the
 single-threaded scan on `packs.rpf` (`26,389 == 26,389`), and `tools/rpf9dump models` end-to-end
@@ -192,8 +194,34 @@ where the old scan looked. The two `levels.rpf` byte ranges were chosen around t
 in the `e293917` export (up to 64,288 triangles; that decoder could not read a mesh above 65,535). Of the
 four new `levels.rpf` models, two have a single mesh above 65,535 triangles (66,251 and 76,793); the
 other two have no mesh above 56,095 triangles, so the reason the old decoder dropped them was not
-determined here. The rest of `levels.rpf` and the other archives were not re-run at this pin: a full
+determined here. The rest of `levels.rpf` and the other archives were not exported at this pin: a full
 `levels.rpf` export is about 213 GB.
+
+A reviewer ran the full `levels.rpf` scan and recovery at `7ef5c51` (`FindCandidateOffsets` and
+`RecoverAtOffsets` only, no export; [PR #4687
+comment](https://github.com/ItsNotRexed/Leonida/pull/4687#issuecomment-7092314127)); it was not
+re-run for this page:
+
+| `levels.rpf` | `e293917` | `7ef5c51` |
+|---|---:|---:|
+| Candidates | 235,330 | **235,580** |
+| Recovered | 235,259 | **235,573** |
+| Rejects | 71 | **7** |
+
+The +314 recovered match the 64 large-mesh fragments #18 reports plus the 250 new mid-page candidates
+from #19, all of which were recovered. All 7 remaining rejects are at a page start + 0x10, each on its
+own 4 KiB page, in three nearby clusters:
+
+| Cluster | Reject offsets |
+|---|---|
+| 1 | `0x100EF0E010` |
+| 2 | `0x110CCB2010`, `0x110CCB5010`, `0x110CCBD010` |
+| 3 | `0x1119F3F010`, `0x1119F43010`, `0x1119F5C010` |
+
+Upstream #18, measured at `e293917` plus #18 alone, also leaves 7 candidates unrecovered: six
+fragments whose drawable has no level of detail and empty bounds, so they have no geometry, and one
+with a `model + 40` bone array that the probe sizes as `boneCount * 4` bytes, which runs 32 bytes past
+the system page. The counts agree, but the 7 offsets above were not matched against that breakdown.
 
 The same pin also carries upstream #13 (Opus playback timing), #15 (RbPlus 64 KiB 4 BPP tiling), #16
 and #17 (clip and PSIN recovery), #22 (external BCPack history tables) and #24 (drawable levels of
@@ -689,8 +717,10 @@ jacket's `GM_U01_*` helpers); every weight sums to 255 and the rest-pose reconst
 3. **Done:** all ten `MODEL_ARCHIVES` were re-counted and read-back decoded at `e293917` (**382,781
    models**, **0 decode failures**; table above; the `levels.rpf` geometry cells are not
    independently reproduced).
-4. Investigate the 71 remaining unrecovered fragment candidates in `levels.rpf` (and the 1
-   texture-dictionary candidate in `textures.rpf`) if further upstream recovery is wanted.
+4. Investigate the 7 remaining unrecovered candidates in `levels.rpf` at `7ef5c51` (upstream #18
+   reports 6 with no geometry and 1 with an oversized bone array; see the
+   [re-count](#re-count-at-7ef5c51-asset-128-asset-129)) and the 1 texture-dictionary candidate in
+   `textures.rpf`, if further upstream recovery is wanted.
 5. Keep issue #29 in sync with the `e293917` counts.
 3. **Done:** `tools/rpf9dump models` was re-run over the model-bearing archives at `e293917`;
    the six non-`levels.rpf` archives total 39,454 rows (+3,203, almost all recovered fragments).
