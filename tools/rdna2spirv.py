@@ -18121,6 +18121,7 @@ def main():
     last_progress = 0.0
     label = f"shard {shard}" if shard is not None else "translate"
     missing_inputs = 0
+    unreadable_inputs = 0
 
     def drop_stale(name):
         # A shader that no longer translates must not stay published from an earlier run: remove its old
@@ -18138,6 +18139,14 @@ def main():
             # retire this shader's previous module and index entry on a retry.
             print(f"ERROR: {name}: missing translation input {e.filename}", file=sys.stderr)
             missing_inputs += 1
+            drop_stale(name)
+            continue
+        except OSError as e:
+            # A listing, container or sidecar that is there but cannot be read (a directory where a file belongs,
+            # a permission error) is one shader's failed input, as a missing one is: report it and keep going.
+            print(f"ERROR: {name}: cannot read translation input {e.filename or p}: {e.strerror or e}",
+                  file=sys.stderr)
+            unreadable_inputs += 1
             drop_stale(name)
             continue
         except Unsupported as e:
@@ -18204,7 +18213,7 @@ def main():
         for name in invalid:
             old.pop(name, None)
     old.update(meta)
-    if shard is None or not missing_inputs:
+    if shard is None or not (missing_inputs or unreadable_inputs):
         write_index(idx_path, old)
     if shard is None:
         import spirv_stubs
@@ -18218,6 +18227,9 @@ def main():
         print(f"  {v:6}  {k}")
     if missing_inputs:
         print(f"{missing_inputs} of {len(files)} selected shaders missing required inputs", file=sys.stderr)
+    if unreadable_inputs:
+        print(f"{unreadable_inputs} of {len(files)} selected shaders had unreadable inputs", file=sys.stderr)
+    if missing_inputs or unreadable_inputs:
         return 1
 
 

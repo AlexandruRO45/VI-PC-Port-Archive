@@ -389,7 +389,7 @@ class ValidatedOutput(unittest.TestCase):
             with self.subTest(interrupted=interrupted):
                 selection = src
                 if interrupted:
-                    # The compute input retires its module, then the next listing hits a read error.
+                    # The compute input retires its module, then the next listing's container cannot be read.
                     container.unlink()
                     container.mkdir()
                     selection = src.parent
@@ -400,13 +400,20 @@ class ValidatedOutput(unittest.TestCase):
                 result = subprocess.run([sys.executable, "-I", TOOL, str(selection), "--out", str(self.out),
                                          "--shard", "0/1"], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)   # ps_fixture's container is a directory
                 self.assertIn("missing translation input", result.stderr)
                 if interrupted:
+                    # ps_fixture is selected and its container is a directory: it fails like a missing input does,
+                    # so its own module is retired too. Only a module the run did not select is left alone (below).
+                    self.assertIn("ps_fixture: cannot read translation input", result.stderr)
                     self.assertIn("ps_fixture.dxbc", result.stderr)
                 self.assertFalse(part.exists())
                 self.assertFalse(self.index.exists())
                 self.assertFalse(stale.exists())
-                self.assertEqual(self.module.read_bytes(), b"previous pixel")
+                if interrupted:
+                    self.assertFalse(self.module.exists())
+                else:
+                    self.assertEqual(self.module.read_bytes(), b"previous pixel")
 
     @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "requires SPIRV-Tools")
     def test_failed_shard_retry_cannot_be_merged(self):
@@ -544,6 +551,142 @@ class ValidatedOutput(unittest.TestCase):
         self.assertIn("1 pass spirv-val", self.translate())
         self.assertEqual(self.module.read_bytes(), b"new module")
         self.assertIn("ps_fixture", json.loads(self.index.read_text(encoding="utf-8")))
+
+
+class UnreadableInput(unittest.TestCase):
+    """A listing, container or sidecar that is there but cannot be read (a directory where a file belongs, a file
+    without read permission) is one shader's failed input, as a missing one is: one ERROR line, the run keeps going
+    and exits 1. It used to be an IsADirectoryError/PermissionError traceback out of main()."""
+
+    def shader(self, root, name, container=True):
+        (root / "disasm" / (name + ".s")).write_text("\ts_endpgm\n", encoding="utf-8")
+        if container:
+            (root / (name + ".dxbc")).write_bytes(b"DXBC" + bytes(28))
+
+    def run_tool(self, root):
+        return subprocess.run([sys.executable, "-I", TOOL, str(root / "disasm"), "--out", str(root / "spirv")],
+                              capture_output=True, text=True, errors="replace")
+
+    def deny(self, path):
+        """chmod 0 path, or skip when that does not deny a read here (root, or a volume that ignores the mode)."""
+        os.chmod(path, 0)
+        try:
+            with open(path, "rb"):
+                pass
+        except PermissionError:
+            return
+        self.skipTest(f"chmod 0 does not deny a read here: {path}")
+
+    def test_each_unreadable_input_kind_is_one_error_line_and_the_run_continues(self):
+        def container_dir(root):
+            self.shader(root, "ps_bad", container=False)
+            (root / "ps_bad.dxbc").mkdir()
+            return "ps_bad", "ps_bad.dxbc"
+
+        def container_denied(root):
+            self.shader(root, "ps_bad")
+            self.deny(root / "ps_bad.dxbc")
+            return "ps_bad", "ps_bad.dxbc"
+
+        def fssm_dir(root):
+            self.shader(root, "cs_bad", container=False)
+            (root / "fssm" / "cs_bad.fssm").mkdir(parents=True)
+            return "cs_bad", "cs_bad.fssm"
+
+        def fssm_denied(root):
+            self.shader(root, "cs_bad", container=False)
+            (root / "fssm").mkdir()
+            (root / "fssm" / "cs_bad.fssm").write_bytes(bytes(0x148))
+            self.deny(root / "fssm" / "cs_bad.fssm")
+            return "cs_bad", "cs_bad.fssm"
+
+        def fspx_json_denied(root):
+            self.shader(root, "cs_bad", container=False)
+            (root / "fspx").mkdir()
+            (root / "fspx" / "cs_bad.json").write_text('{"rsrc2": 0, "threads": [1, 1, 1]}', encoding="utf-8")
+            self.deny(root / "fspx" / "cs_bad.json")
+            return "cs_bad", "cs_bad.json"
+
+        def listing_denied(root):
+            self.shader(root, "ps_bad")
+            self.deny(root / "disasm" / "ps_bad.s")
+            return "ps_bad", "ps_bad.s"
+
+        for build in (container_dir, container_denied, fssm_dir, fssm_denied, fspx_json_denied, listing_denied):
+            with self.subTest(kind=build.__name__), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "disasm").mkdir()
+                self.shader(root, "ps_ok")      # a readable shader in the same run still translates
+                bad, basename = build(root)
+                p = self.run_tool(root)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                errors = [line for line in p.stderr.splitlines() if line.startswith("ERROR: ")]
+                self.assertEqual(len(errors), 1, p.stderr)
+                self.assertIn(f"ERROR: {bad}: cannot read translation input ", errors[0])
+                self.assertIn(basename, errors[0])
+                self.assertIn("1 of 2 selected shaders had unreadable inputs", p.stderr)
+                out = root / "spirv"
+                self.assertFalse((out / (bad + ".spv")).exists())
+                self.assertFalse((out / (bad + ".spvasm")).exists())
+                self.assertTrue((out / "ps_ok.spv").is_file())
+                self.assertEqual(set(json.loads((out / "index.json").read_text(encoding="utf-8"))), {"ps_ok"})
+                again = self.run_tool(root)     # the same command run twice fails the same way
+                self.assertEqual(again.returncode, 1, again.stderr)
+                self.assertEqual(again.stderr, p.stderr)
+
+    def test_an_unreadable_shader_retires_its_previous_module_and_index_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "disasm").mkdir()
+            self.shader(root, "ps_bad", container=False)
+            (root / "ps_bad.dxbc").mkdir()
+            self.shader(root, "ps_ok")
+            out = root / "spirv"
+            out.mkdir()
+            (out / "ps_bad.spv").write_bytes(b"old module")
+            (out / "index.json").write_text(json.dumps({"ps_bad": {"stage": "ps"}, "ps_old": {"stage": "vs"}}),
+                                            encoding="utf-8")
+            p = self.run_tool(root)
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse((out / "ps_bad.spv").exists())
+            self.assertEqual(set(json.loads((out / "index.json").read_text(encoding="utf-8"))), {"ps_ok", "ps_old"})
+
+    def test_a_missing_input_keeps_the_message_it_had(self):
+        # L7: only a file that is there and unreadable takes the new path; an absent one reports as it always did.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "disasm").mkdir()
+            self.shader(root, "cs_gone", container=False)
+            p = self.run_tool(root)
+            self.assertEqual(p.returncode, 1, p.stderr)
+            errors = [line for line in p.stderr.splitlines() if line.startswith("ERROR: ")]
+            self.assertEqual(len(errors), 1, p.stderr)
+            self.assertIn("ERROR: cs_gone: missing translation input ", errors[0])
+            self.assertIn("cs_gone.fssm", errors[0])
+            self.assertIn("1 of 1 selected shaders missing required inputs", p.stderr)
+            self.assertNotIn("unreadable", p.stderr)
+
+    def test_a_readable_run_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "disasm").mkdir()
+            self.shader(root, "ps_ok")
+
+            def spirv_tool(cmd, **kwargs):
+                if cmd[0] == "spirv-as":
+                    Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            err = io.StringIO()
+            with mock.patch.object(sys, "argv", [TOOL, str(root / "disasm"), "--out", str(root / "spirv")]), \
+                    mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err):
+                self.assertIsNone(rdna2spirv.main())
+            self.assertEqual(err.getvalue(), "")
+            self.assertTrue((root / "spirv" / "ps_ok.spv").is_file())
+            self.assertIn("ps_ok", json.loads((root / "spirv" / "index.json").read_text(encoding="utf-8")))
 
 
 class EmptyShader(unittest.TestCase):
