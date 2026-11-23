@@ -445,8 +445,11 @@ def verify(p):
     d = read(p)
     h, es = parse_jsav(d)
     blocks = jsav_blocks(d, es)
-    for b in blocks:
-        json.loads(b)                 # every block must be valid JSON on its own
+    for index, b in enumerate(blocks):
+        try:
+            json.loads(b)             # every block must be valid JSON on its own
+        except RecursionError as e:
+            raise ValueError(f'JSAV block {index} exceeds the JSON nesting limit') from e
     rebuilt = build_jsav(h['version'], h['code_blocks'], [int(e['hash'], 16) for e in es],
                          [e['flags'] for e in es], blocks)
     if rebuilt == d:
