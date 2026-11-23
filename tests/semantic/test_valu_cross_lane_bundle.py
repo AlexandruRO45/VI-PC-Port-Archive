@@ -262,6 +262,14 @@ class TestWriteLaneAliasing(unittest.TestCase):
         self.assertIn("OpSelect", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestWriteLaneTranslator(unittest.TestCase):
+    def test_translator_mutation_guard(self):
+        prog = ["s_mov_b32 s5, 0xBEEF", "s_mov_b32 s6, 12", "v_writelane_b32 v2, s5, s6", "s_endpgm"]
+        spv = support.translate_lines("cs_wl_trans", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpSelect", spv)
+        self.assertIn("OpBitwiseAnd", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
