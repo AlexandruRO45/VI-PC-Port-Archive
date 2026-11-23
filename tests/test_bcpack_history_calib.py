@@ -997,6 +997,164 @@ class Bc6hConfirmationDepthTest(unittest.TestCase):
             self.assertIn("bit depth out of bounds", err.getvalue())
 
 
+class ConflictingReferenceTest(unittest.TestCase):
+    """Two references that disagree on one built-in entry confirm neither value."""
+
+    def test_conflicting_bc1_references_are_not_confirmed(self):
+        lanes = [[1]] + [[0]] * 11  # -1 -> distance 255 -> built-in entry 1
+        cal = calib.BcSimpleCalibrator(1)
+        cal.add_reference_chunk(lanes, struct.pack("<HHI", 0x1234, 0x5678, 0), 1)
+        cal.add_reference_chunk(lanes, struct.pack("<HHI", 0xFFFF, 0x0000, 0), 1)
+        doc, stats = cal.build_document(replace=True)
+        self.assertNotIn("1", doc["confirmed"])
+        self.assertEqual(stats["reference_conflicts"], 1)
+        self.assertEqual(stats["disputed_entries"], 1)
+        self.assertEqual(stats["confirmed_entries"], 0)
+        with self.assertRaises(bcpack.BcpackProvisionalError):
+            bcpack._bc1_blocks(lanes, 1, None, history={"bc1": doc})
+
+    def test_agreeing_bc1_references_stay_confirmed(self):
+        lanes = [[1]] + [[0]] * 11
+        cal = calib.BcSimpleCalibrator(1)
+        ref = struct.pack("<HHI", 0x1234, 0x5678, 0)
+        cal.add_reference_chunk(lanes, ref, 1)
+        cal.add_reference_chunk(lanes, ref, 1)
+        doc, stats = cal.build_document(replace=True)
+        self.assertIn("1", doc["confirmed"])
+        self.assertEqual(stats["reference_conflicts"], 0)
+        self.assertEqual(stats["disputed_entries"], 0)
+        self.assertEqual(bcpack._bc1_blocks(lanes, 1, None, history={"bc1": doc})[:4], ref[:4])
+
+    def test_disputed_bc1_entry_falls_back_to_pool_observations(self):
+        lanes = [[1]] + [[0]] * 11
+        cal = calib.BcSimpleCalibrator(1)
+        cal.add_reference_chunk(lanes, struct.pack("<HHI", 0x1234, 0x5678, 0), 1)
+        cal.add_reference_chunk(lanes, struct.pack("<HHI", 0xFFFF, 0x0000, 0), 1)
+        cal.add_pool_chunk(lanes, 1, lambda _off: (0, 0), 0, lambda _x, _y: [(128, 128, 128)] * 4)
+        doc, _stats = cal.build_document(replace=True)
+        self.assertNotIn("1", doc["confirmed"])
+        self.assertIn("1", doc["provisional"])
+
+    def test_disputed_bc1_entry_without_replace_decodes_with_builtin_confirmed_value(self):
+        # The overlay keeps the built-in confirmed table, which outranks the pool provisional fit.
+        self.assertIn(1, bcpack._tables.BC1_HISTORY_CONFIRMED)
+        lanes = [[1]] + [[0]] * 11
+        ref_a = struct.pack("<HHI", 0x1234, 0x5678, 0)
+        ref_b = struct.pack("<HHI", 0xFFFF, 0x0000, 0)
+        cal = calib.BcSimpleCalibrator(1)
+        cal.add_reference_chunk(lanes, ref_a, 1)
+        cal.add_reference_chunk(lanes, ref_b, 1)
+        cal.add_pool_chunk(lanes, 1, lambda _off: (0, 0), 0, lambda _x, _y: [(128, 128, 128)] * 4)
+        doc, stats = cal.build_document(replace=False)
+        self.assertNotIn("replace", doc)
+        self.assertNotIn("1", doc["confirmed"])
+        self.assertIn("1", doc["provisional"])
+        self.assertEqual(stats["disputed_ids"], [1])
+        builtin = bcpack._bc1_blocks(lanes, 1, None)
+        self.assertEqual(bcpack._bc1_blocks(lanes, 1, None, history={"bc1": doc}), builtin)
+        self.assertNotIn(builtin[:4], (ref_a[:4], ref_b[:4]))
+
+    @staticmethod
+    def _bc6h_truth(endpoint_w=32768, index=1):
+        truth = Bc6hConfirmationDepthTest.truth()
+        truth["endpointHistory"] = {"255": [[endpoint_w, 544, 0, 0] for _ in range(3)]}
+        truth["indexHistory"] = {"255": [index] * 16}
+        return truth
+
+    def test_conflicting_bc6h_endpoint_references_are_not_confirmed(self):
+        lanes = Bc6hConfirmationDepthTest.lanes([14])
+        raw = encode_lanes(lanes, 6)
+        ref_a = bcpack.decode(raw, 6, 16, history=self._bc6h_truth(endpoint_w=0x8000))
+        ref_b = bcpack.decode(raw, 6, 16, history=self._bc6h_truth(endpoint_w=0x1000))
+        self.assertNotEqual(ref_a, ref_b)
+        cal = calib.Bc6hCalibrator()
+        cal.add_reference_chunk(lanes, ref_a, 1)
+        cal.add_reference_chunk(lanes, ref_b, 1)
+        doc, stats = cal.build_document()
+        self.assertGreater(stats["reference_conflicts"], 0)
+        self.assertEqual(stats["endpoint_confirmed"], 0)
+        self.assertNotEqual(doc["endpointClass"][255], 3)
+        self.assertEqual(doc["endpointConfirmedBits"][255], [[0, 0, 0, 0]] * 3)
+        with self.assertRaises(bcpack.BcpackProvisionalError):
+            bcpack.decode(raw, 6, 16, history=doc)
+        self.assertEqual(stats["endpoint_disputed"], 1)
+
+    def test_conflicting_bc6h_index_references_are_not_confirmed(self):
+        lanes = Bc6hConfirmationDepthTest.lanes([1], endpoints=False, indices=True)
+        raw = encode_lanes(lanes, 6)
+        ref_a = bcpack.decode(raw, 6, 16, history=self._bc6h_truth(index=1))
+        ref_b = bcpack.decode(raw, 6, 16, history=self._bc6h_truth(index=5))
+        self.assertNotEqual(ref_a, ref_b)
+        cal = calib.Bc6hCalibrator()
+        cal.add_reference_chunk(lanes, ref_a, 1)
+        cal.add_reference_chunk(lanes, ref_b, 1)
+        doc, stats = cal.build_document()
+        self.assertGreater(stats["reference_conflicts"], 0)
+        self.assertEqual(stats["index_confirmed"], 0)
+        self.assertNotEqual(doc["indexClass"][255], 3)
+        self.assertEqual(doc["indexConfirmedBits"][255], [0] * 16)
+        with self.assertRaises(bcpack.BcpackProvisionalError):
+            bcpack.decode(raw, 6, 16, history=doc)
+        self.assertEqual(stats["index_disputed"], 1)
+        self.assertEqual(stats["index_disputed_ids"], [255])
+        self.assertEqual(stats["endpoint_disputed_ids"], [])
+
+    def test_disputed_bc6h_index_entry_falls_back_to_pool_observations(self):
+        lanes = Bc6hConfirmationDepthTest.lanes([1], endpoints=False, indices=True)
+        raw = encode_lanes(lanes, 6)
+        cal = calib.Bc6hCalibrator()
+        cal.add_reference_chunk(lanes, bcpack.decode(raw, 6, 16, history=self._bc6h_truth(index=1)), 1)
+        cal.add_reference_chunk(lanes, bcpack.decode(raw, 6, 16, history=self._bc6h_truth(index=5)), 1)
+        cal.add_pool_chunk(lanes, 1)
+        pool_only = calib.Bc6hCalibrator()
+        pool_only.add_pool_chunk(lanes, 1)
+        doc, stats = cal.build_document()
+        self.assertEqual(stats["index_disputed"], 1)
+        self.assertEqual(doc["indexClass"][255], 2)
+        self.assertEqual(doc, pool_only.build_document()[0])
+
+    @staticmethod
+    def _bc7_mode6_lanes():
+        lanes = [[0, 0] for _ in bcpack.LANE_WIDTHS[7]]
+        lanes[1] = [15, 15]  # distance 255 -> built-in entry 1 for endpoints and indices
+        tab = bptc.load_bc7()
+        rank = tab["config"].index((6, 0, 0, 0))
+        lanes[15] = list(divmod(tab["rank_of"].index(rank), 16))
+        return lanes
+
+    def _bc7_conflict(self, block_b):
+        lanes = self._bc7_mode6_lanes()
+        block_a = bytes([1 << 6]) + bytes(15)
+        cal = calib.Bc7Calibrator()
+        cal.add_reference_chunk(lanes, block_a, 1)
+        self.assertEqual(cal.conflicts, 0)
+        cal.add_reference_chunk(lanes, block_b, 1)
+        doc, stats = cal.build_document()
+        self.assertGreater(stats["reference_conflicts"], 0)
+        with self.assertRaises(bcpack.BcpackProvisionalError):
+            bcpack.decode(encode_lanes(lanes, 7), 7, 16, history=doc)
+        return doc, stats
+
+    def test_conflicting_bc7_endpoint_references_are_not_confirmed(self):
+        # Bits 8..15 are mode 6 endpoint bits; the indices (bits 65..127) agree.
+        doc, stats = self._bc7_conflict(bytes([1 << 6, 0xFF]) + bytes(14))
+        self.assertEqual(stats["endpoint_disputed_entries"], 1)
+        self.assertEqual(stats["index_disputed_entries"], 0)
+        self.assertEqual(stats["endpoint_disputed_ids"], [1])
+        self.assertEqual(stats["endpoint_confirmed_slots"], 0)
+        self.assertEqual(doc["historyEndpointConfirmedBits"][1], [0] * 24)
+        self.assertGreater(sum(doc["historyIndexConfirmedBits"][1]), 0)
+
+    def test_conflicting_bc7_index_references_are_not_confirmed(self):
+        # Byte 15 holds mode 6 index bits only; the endpoints agree.
+        doc, stats = self._bc7_conflict(bytes([1 << 6]) + bytes(14) + bytes([0xFF]))
+        self.assertEqual(stats["index_disputed_entries"], 1)
+        self.assertEqual(stats["endpoint_disputed_entries"], 0)
+        self.assertEqual(stats["index_confirmed_slots"], 0)
+        self.assertEqual(doc["historyIndexConfirmedBits"][1], [0] * 32)
+        self.assertGreater(sum(doc["historyEndpointConfirmedBits"][1]), 0)
+
+
 class PoolSelfCalibrationTest(unittest.TestCase):
     def test_mixed_bc7_and_bc6h_pool_self_calibration_unlocks_provisional_check_and_export(self):
         with tempfile.TemporaryDirectory() as tmp:

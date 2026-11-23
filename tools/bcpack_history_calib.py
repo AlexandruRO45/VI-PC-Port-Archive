@@ -10,7 +10,13 @@ Two complementary calibration paths are supported (and may be combined):
    `--ref-pairs PAIRS.json`): algebraically inverts built-in history references
    against exact BCn reference blocks, producing **confirmed** entries
    (`class 3` with per-field `ConfirmedBits` for BC6H, `ConfirmedBits` for BC7,
-   `confirmed` for BC1-BC5).
+   `confirmed` for BC1-BC5). An entry two references disagree on is disputed:
+   neither value is confirmed and the `*disputed*` stats count and list it.
+   BC6H, BC7, and BC1-BC5 with `--replace` then fall back to pool
+   self-calibration (if any). Without `--replace`, BC1-BC5 files overlay the
+   built-in tables, so a disputed entry decodes with the built-in confirmed
+   value when there is one, and otherwise with the pool or built-in
+   provisional value.
 2. Pool self-calibration (from TTPF `.ttpf` files or directories): combines
    exact algebraic bitstream constraints (BC6H/BC7 anchor MSB constraints and
    BC7 Mode-1 shared p-bit parity), intra-block smoothness index voting, and
@@ -871,6 +877,8 @@ class BcSimpleCalibrator:
         self.mods = BC_MODS[codec]
         self.ncols = len(self.mods)
         self.confirmed = {}
+        # Entries two references disagree on: neither value is confirmed.
+        self.disputed = set()
         self.conflicts = 0
         self.ref_blocks = 0
         self.pool_chunks = 0
@@ -938,6 +946,7 @@ class BcSimpleCalibrator:
                 self.confirmed[entry] = solved
             elif prev != solved:
                 self.conflicts += 1
+                self.disputed.add(entry)
             self.ref_blocks += 1
 
     def _quadrant_weights(self, lanes, i):
@@ -1020,7 +1029,7 @@ class BcSimpleCalibrator:
                 acc = tuple((prev[k] + dz[k]) % mods[k] for k in range(self.ncols))
             roots[i] = root
             deltas[i] = acc
-            if root in self.confirmed:
+            if root in self.confirmed and root not in self.disputed:
                 continue
             xy = inv_lookup(chunk_rel_start + i * eb)
             if xy is None:
@@ -1121,8 +1130,9 @@ class BcSimpleCalibrator:
         return top[0][1], top[0][2]
 
     def build_document(self, replace=False):
+        confirmed = {k: v for k, v in self.confirmed.items() if k not in self.disputed}
         provisional = {}
-        entries = sorted({k for (k, _) in self.obs} - set(self.confirmed))
+        entries = sorted({k for (k, _) in self.obs} - set(confirmed))
         for k in entries:
             if self.codec == 1:
                 if not all((k, c) in self.obs for c in range(3)):
@@ -1151,14 +1161,16 @@ class BcSimpleCalibrator:
 
         doc = {
             "codec": CODEC_KEYS[self.codec],
-            "confirmed": {str(k): list(self.confirmed[k]) for k in sorted(self.confirmed)},
+            "confirmed": {str(k): list(confirmed[k]) for k in sorted(confirmed)},
             "provisional": {str(k): list(provisional[k]) for k in sorted(provisional)},
         }
         if replace:
             doc["replace"] = True
         stats = {
-            "confirmed_entries": len(self.confirmed),
+            "confirmed_entries": len(confirmed),
             "provisional_entries": len(provisional),
+            "disputed_entries": len(self.disputed),
+            "disputed_ids": sorted(self.disputed),
             "reference_blocks": self.ref_blocks,
             "reference_conflicts": self.conflicts,
             "pool_chunks": self.pool_chunks,
@@ -1177,6 +1189,9 @@ class Bc6hCalibrator:
         self.ref_ix = [[[0, 0] for _ in range(16)] for _ in range(256)]
         self.ref_ep_seen = [False] * 256
         self.ref_ix_seen = [False] * 256
+        # Entries two references disagree on: none of their bits are confirmed.
+        self.ep_disputed = set()
+        self.ix_disputed = set()
         self.conflicts = 0
         self.ref_blocks = 0
         self.pool_chunks = 0
@@ -1242,6 +1257,7 @@ class Bc6hCalibrator:
                         nb2, nv2, conf = _merge_top_bits(cb, cv, nb, val, slot_widths[q])
                         if conf:
                             self.conflicts += 1
+                            self.ep_disputed.add(ke)
                         else:
                             self.ref_ep[ke][c][q][0] = nb2
                             self.ref_ep[ke][c][q][1] = nv2
@@ -1267,6 +1283,7 @@ class Bc6hCalibrator:
                         nb2, nv2, conf = _merge_top_bits(cb, cv, ibits, v, 4)
                         if conf:
                             self.conflicts += 1
+                            self.ix_disputed.add(ki)
                         else:
                             self.ref_ix[ki][p][0] = nb2
                             self.ref_ix[ki][p][1] = nv2
@@ -1464,12 +1481,16 @@ class Bc6hCalibrator:
         ih = [[0] * 16 for _ in range(256)]
         ep_cb = [[[self.ref_ep[k][c][q][0] for q in range(4)] for c in range(3)] for k in range(256)]
         ix_cb = [[self.ref_ix[k][p][0] for p in range(16)] for k in range(256)]
+        for k in self.ep_disputed:
+            ep_cb[k] = [[0, 0, 0, 0] for _ in range(3)]
+        for k in self.ix_disputed:
+            ix_cb[k] = [0] * 16
         ec = [0] * 256
         ic = [0] * 256
 
         for k in range(256):
-            # Endpoints
-            if self.ref_ep_seen[k]:
+            # Endpoints (a disputed reference falls back to pool observations)
+            if self.ref_ep_seen[k] and k not in self.ep_disputed:
                 defaults = (0x8000, 0x200, 0x20, 0x20)
                 for c in range(3):
                     for q in range(4):
@@ -1501,7 +1522,11 @@ class Bc6hCalibrator:
                     ec[k] = 2
 
             # Indices
-            if self.ref_ix_seen[k] and all(self.ref_ix[k][p][0] > 0 for p in range(16)):
+            if (
+                self.ref_ix_seen[k]
+                and k not in self.ix_disputed
+                and all(self.ref_ix[k][p][0] > 0 for p in range(16))
+            ):
                 ih[k] = [self.ref_ix[k][p][1] for p in range(16)]
                 ic[k] = 3
             elif any(self.ix_obs[k]):
@@ -1549,6 +1574,10 @@ class Bc6hCalibrator:
             "index_confirmed": sum(1 for c in ic if c == 3),
             "index_provisional": sum(1 for c in ic if c == 1),
             "index_last_resort": sum(1 for c in ic if c == 2),
+            "endpoint_disputed": len(self.ep_disputed),
+            "index_disputed": len(self.ix_disputed),
+            "endpoint_disputed_ids": sorted(self.ep_disputed),
+            "index_disputed_ids": sorted(self.ix_disputed),
             "reference_blocks": self.ref_blocks,
             "reference_conflicts": self.conflicts,
             "pool_chunks": self.pool_chunks,
@@ -1565,6 +1594,9 @@ class Bc7Calibrator:
         # Exact reference-pair constraints
         self.ref_ep = [[[0, 0] for _ in range(24)] for _ in range(256)]
         self.ref_ix = [[[0, 0] for _ in range(32)] for _ in range(256)]
+        # Entries two references disagree on: none of their bits are confirmed.
+        self.ep_disputed = set()
+        self.ix_disputed = set()
         self.conflicts = 0
         self.ref_blocks = 0
         self.pool_chunks = 0
@@ -1634,6 +1666,7 @@ class Bc7Calibrator:
                             nb2, nv2, conf = _merge_top_bits(cb0, cv0, bits, v, 8)
                             if conf:
                                 self.conflicts += 1
+                                self.ep_disputed.add(ke)
                             else:
                                 self.ref_ep[ke][slot][0] = nb2
                                 self.ref_ep[ke][slot][1] = nv2
@@ -1661,6 +1694,7 @@ class Bc7Calibrator:
                         nb2, nv2, conf = _merge_top_bits(cb0, cv0, pri_bits, v, 4)
                         if conf:
                             self.conflicts += 1
+                            self.ix_disputed.add(ki)
                         else:
                             self.ref_ix[ki][p][0] = nb2
                             self.ref_ix[ki][p][1] = nv2
@@ -1683,6 +1717,7 @@ class Bc7Calibrator:
                             nb2, nv2, conf = _merge_top_bits(cb0, cv0, sec_bits, v, 4)
                             if conf:
                                 self.conflicts += 1
+                                self.ix_disputed.add(ki)
                             else:
                                 self.ref_ix[ki][16 + p][0] = nb2
                                 self.ref_ix[ki][16 + p][1] = nv2
@@ -1939,11 +1974,15 @@ class Bc7Calibrator:
         ix_conf_slots = 0
         ix_prov_slots = 0
 
+        no_ref = [0, 0]
         for k in range(256):
+            # A disputed entry keeps none of its reference bits.
+            ref_ix = [no_ref] * 32 if k in self.ix_disputed else self.ref_ix[k]
+            ref_ep = [no_ref] * 24 if k in self.ep_disputed else self.ref_ep[k]
             # Indices: exact reference beats algebraic/smoothness
             eff_masks = list(self.valid_ix[k])
             for p in range(32):
-                rb, rv = self.ref_ix[k][p]
+                rb, rv = ref_ix[p]
                 if rb > 0:
                     sh = 4 - rb
                     rmask = 0
@@ -1986,7 +2025,7 @@ class Bc7Calibrator:
                             best_h = surv[len(surv) // 2] if surv else 0
                         hist_ix[k][p] = best_h
                         hist_ix_b[k][p] = 4
-                        if self.ref_ix[k][p][0] == 0:
+                        if ref_ix[p][0] == 0:
                             ix_prov_slots += 1
             if any(self.ix_obs[k][16:]):
                 for p in range(16, 32):
@@ -2006,7 +2045,7 @@ class Bc7Calibrator:
                             best_h = surv[len(surv) // 2] if surv else 0
                         hist_ix[k][p] = best_h
                         hist_ix_b[k][p] = 2
-                        if self.ref_ix[k][p][0] == 0:
+                        if ref_ix[p][0] == 0:
                             ix_prov_slots += 1
 
             # Endpoints: exact reference takes precedence per slot; otherwise sibling-mip fit
@@ -2014,8 +2053,8 @@ class Bc7Calibrator:
                 for c in range(4):
                     s0 = sub * 8 + c
                     s1 = sub * 8 + 4 + c
-                    rb0, rv0 = self.ref_ep[k][s0]
-                    rb1, rv1 = self.ref_ep[k][s1]
+                    rb0, rv0 = ref_ep[s0]
+                    rb1, rv1 = ref_ep[s1]
                     if rb0 > 0:
                         hist_ep[k][s0] = rv0
                         hist_ep_b[k][s0] = rb0
@@ -2068,6 +2107,10 @@ class Bc7Calibrator:
             "endpoint_last_resort_slots": len(last_resort),
             "index_confirmed_slots": ix_conf_slots,
             "index_provisional_slots": ix_prov_slots,
+            "endpoint_disputed_entries": len(self.ep_disputed),
+            "index_disputed_entries": len(self.ix_disputed),
+            "endpoint_disputed_ids": sorted(self.ep_disputed),
+            "index_disputed_ids": sorted(self.ix_disputed),
             "reference_blocks": self.ref_blocks,
             "reference_conflicts": self.conflicts,
             "pool_chunks": self.pool_chunks,

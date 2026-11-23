@@ -1045,9 +1045,14 @@ All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing de
    now derives local `bc1.json`..`bc7.json` history files into `<work>` for the pure-Python
    decoder (`tools/bcpack.py` / `tools/ttpf_mips.py --history <path>`), either by exact
    algebraic inversion from reference block/DDS pairs (`--ref-dds`, `--ref-pairs`, yielding
-   confirmed strict-mode entries) or by read-only pool self-calibration across mixed
-   BCPack + raw/zlib mip chains (yielding provisional entries). Once BC6H/BC7 land in
-   `TtpfReader`, it can consume the same local directory.
+   confirmed strict-mode entries) or by read-only pool self-calibration across mixed BCPack +
+   raw/zlib mip chains (yielding provisional entries). An entry two references disagree on is
+   disputed: it confirms nothing, and the `*disputed*` stats count it and list its entry ids.
+   BC6H, BC7, and BC1-BC5 with `--replace` fall back to pool self-calibration for it; without
+   `--replace` the BC1-BC5 files overlay the built-in tables, so a disputed entry decodes with
+   the built-in confirmed value when there is one (252 of 256 BC1 entries) and otherwise with
+   the pool or built-in provisional value. Once BC6H/BC7 land in `TtpfReader`, it can consume
+   the same local directory.
 
 ## Reproduce
 
@@ -1080,7 +1085,7 @@ full BC or validated 2D uncompressed chain when every source mip uses a supporte
 of the tests need game files: `tests/test_bcpack.py` builds synthetic rANS BCPack streams from
 scratch for all six codecs (including synthetic external history JSONs for BC6H/BC7),
 `tests/test_bcpack_history_calib.py` tests exact reference inversion (`--ref-pairs`,
-`--ref-dds`), prefix rANS lane decoding, and mixed-mip pool self-calibration on synthetic
+`--ref-dds`), conflicting references, prefix rANS lane decoding, and mixed-mip pool self-calibration on synthetic
 inputs across all six codecs, `tests/test_tex_headers.py` tests the layout rule on synthetic
 headers, and `tests/test_ttpf_mips.py` builds synthetic zlib, uncompressed 2D, and BCPack (BC1
 and BC7) RDS5 pools.
