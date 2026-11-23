@@ -454,6 +454,21 @@ def shrink(lines, check_fn=check):
     return seed + body + obs
 
 
+def check_hw_rows(hw, count):
+    """Refuse a hardware batch that can't be compared: no list, the wrong number of results, or a result that is None
+    or has fewer than 4 words. A str result (why the program was skipped) is kept. Runs before both comparison paths,
+    so the Vulkan judge never sees a row check() would have refused."""
+    if hw is None:
+        raise RuntimeError("no result from the hardware runner")
+    if len(hw) != count:
+        raise RuntimeError(f"the hardware runner returned {len(hw)} results for {count} programs")
+    for i, row in enumerate(hw):
+        if row is None:
+            raise RuntimeError(f"no result from the hardware runner for program {i}")
+        if not isinstance(row, str) and len(row) < 4:
+            raise RuntimeError(f"the hardware runner returned {len(row)} words for program {i} (expected 4)")
+
+
 def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None, wave=32, build=None, work=None,
               vk_constants=False):
     counts = {"pass": 0, "mismatch": 0, "skip": {}, "vk": {}, "vk_failures": []}
@@ -462,8 +477,7 @@ def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=Non
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
     if "hw" in backends:
         hw = oracle.run([hw_kernel(p, wave) for p in progs])
-        if len(hw) != len(progs):
-            raise RuntimeError(f"the hardware runner returned {len(hw)} results for {len(progs)} programs")
+        check_hw_rows(hw, len(progs))
     else:
         hw = [None] * programs
     if "vk" in backends:
