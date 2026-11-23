@@ -6711,14 +6711,19 @@ class Gen:
             # The counts are uniform (from SGPR m0), and all invocations synchronize at the post-alloc barrier.
             m = self.tmp()
             self.emit(f"{m} = OpLoad %uint %m0")
+            # The lead is the first invocation of the wave that sends it (thread = wave id * 64 + lane): any wave may
+            # send the allocation, wave 0 need not (ms_wave_info_s3). Two waves sending store the same counts, so the
+            # store is atomic, which keeps it free of SharedMemoryDataRace (SHADER-766).
             li = self.local_index()
+            lane = self.tmp()
+            self.emit(f"{lane} = OpBitwiseAnd %uint {li} {self.cu(63)}")
             is_lead = self.tmp()
-            self.emit(f"{is_lead} = OpIEqual %bool {li} {self.cu(0)}")
+            self.emit(f"{is_lead} = OpIEqual %bool {lane} {self.cu(0)}")
             do_lbl, end_lbl = self.tmp() + "_alloc_do", self.tmp() + "_alloc_end"
             self.emit(f"OpSelectionMerge {end_lbl} None")
             self.emit(f"OpBranchConditional {is_lead} {do_lbl} {end_lbl}")
             self.emit(f"{do_lbl} = OpLabel")
-            self.emit(f"OpStore %ms_counts {m}")
+            self.emit(f"OpAtomicStore %ms_counts {self.cu(2)} {self.cu(0)} {m}")   # Workgroup scope, relaxed
             self.emit(f"OpBranch {end_lbl}")
             self.emit(f"{end_lbl} = OpLabel")
             self.ms_alloc = True
