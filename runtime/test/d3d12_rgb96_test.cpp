@@ -16,6 +16,7 @@
 //   - how long an upload and a readback take at 64x64 and 256x256, and up to 4096x4096 with LEONIDA_RGB96_LARGE
 //     set (single runs, each on a new queue).
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
+#include "host_adapter.h"
 #include "host_wine.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -23,6 +24,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 #define CHECK(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
@@ -579,8 +581,12 @@ int main() {
             std::fprintf(stderr, "WARP reference unavailable\n");
             return 77;  // Wine: ctest skips
         }
+        // The hardware host runs on the layer's adapter: on a PC with two GPUs D3D12's default adapter can be the
+        // other one (host_adapter.h; LEONIDA_HOST_ADAPTER picks another, "warp" WARP).
         Ref<ID3D12Device> hardware;
-        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&hardware.p)))) return 77;
+        std::string hardware_name;
+        if (!hostadapter::single(vk, &hardware.p, hardware_name)) return 77;
+        std::printf("hardware host: %s\n", hardware_name.c_str());
 
         constexpr DXGI_FORMAT formats[] = {DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32_UINT,
                                            DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_TYPELESS};

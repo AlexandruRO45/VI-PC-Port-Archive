@@ -979,7 +979,11 @@ and any validation error fails them.
   `LEONIDA_HOST_ADAPTER` (`warp`, or part of an adapter's name; the adapter used is printed). `d3d12_vulkan_device`
   picks it through `runtime/test/d3d12_copy_compare.h`; `d3d12_copy_xfmt`, `d3d12_depth_resolve`,
   `d3d12_fence_events`, `d3d12_indirect_zero`, `d3d12_node_mask`, `d3d12_query_rules` and `d3d12_resource_desc`,
-  which also compare with WARP, through `runtime/test/host_adapter.h`. Some answers are the
+  which also compare with WARP, through `runtime/test/host_adapter.h`, as do `d3d12_method_variants`,
+  `d3d12_private_data`, `d3d12_rgb96` (its hardware side), `d3d12_sampler2` and `d3d12_subresource_copy`, which
+  compare with one host device (`hostadapter::single`; with `LEONIDA_HOST_ADAPTER=warp` that device is WARP).
+  `d3d12_fence_timing` keeps D3D12's default adapter: its host answer is the runtime's NUMA table, compared only
+  when that adapter is NUMA. Some answers are the
   driver's choice, so pick the host side when two adapters disagree: `GetResourceTiling` splits standard and packed
   mips differently on an NVIDIA, an AMD and a WARP host, and the test accepts any split.
   - Copies against the host (D3D-46, `d3d12_copy_compare.h`): the same scenario runs on the layer and on the host and

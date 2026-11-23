@@ -1,5 +1,6 @@
 // Which adapter a test's host D3D12 reference devices run on, for the tests that create those devices themselves and
-// compare the layer with a hardware adapter and with WARP. copycmp::create_host (d3d12_copy_compare.h) answers the
+// compare the layer with a hardware adapter and with WARP (reference()), or with one host device (single()).
+// copycmp::create_host (d3d12_copy_compare.h) answers the
 // same question for the tests that go through it. It reads LEONIDA_HOST_ADAPTER and matches the name through wanted()
 // and named() below, so the two cannot come to read the variable differently. The rule:
 //   - LEONIDA_HOST_ADAPTER names the hardware side by part of an adapter's name, without case. A name that matches no
@@ -102,6 +103,29 @@ inline bool reference(IDXGIFactory4* factory, const vktest::Device& vk, bool war
     static_assert(sizeof(luid) == sizeof(id.deviceLUID));
     std::memcpy(&luid, id.deviceLUID, sizeof(luid));
     return reference(factory, id.deviceLUIDValid ? &luid : nullptr, warp, adapter, name);
+}
+
+// The host device of a test that compares the layer with one host device rather than with a hardware and a WARP pass:
+// on the adapter reference() picks for the hardware pass (the layer's own, or the one LEONIDA_HOST_ADAPTER names), or
+// on WARP when LEONIDA_HOST_ADAPTER=warp. `name` is the adapter, for the test to print. False with a null device when
+// there is none (no DXGI factory, no WARP, or no device of that interface on the adapter): the test then compares
+// nothing, rather than compare with a GPU the layer doesn't run on.
+inline bool single(const vktest::Device& vk, REFIID riid, void** device, std::string& name) {
+    *device = nullptr;
+    IDXGIFactory4* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+    IDXGIAdapter* adapter = nullptr;
+    const bool found = reference(factory, vk, wanted() == "warp", &adapter, name);
+    const bool made = found && SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, riid, device));
+    if (adapter) adapter->Release();
+    factory->Release();
+    if (!made) *device = nullptr;
+    return made;
+}
+
+template <class T>
+inline bool single(const vktest::Device& vk, T** device, std::string& name) {
+    return single(vk, __uuidof(T), reinterpret_cast<void**>(device), name);
 }
 
 }  // namespace hostadapter

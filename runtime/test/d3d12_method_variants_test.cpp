@@ -4,13 +4,16 @@
 // GetCopyableFootprints1 with GetCopyableFootprints. The device is called directly, not through the Xbox-ABI proxy,
 // because the proxy's slot 76 is the Xbox texture method, not CreateCommittedResource3 (docs/d3d12_vulkan.md
 // section 7). The newer arguments' edge cases are checked against the PC runtime's answers, live when the host has
-// a D3D12 device. A texture from CreateCommittedResource3 goes through an upload, a copy and a readback on a queue
+// a D3D12 device on the layer's adapter (host_adapter.h; LEONIDA_HOST_ADAPTER picks another, "warp" WARP). A texture
+// from CreateCommittedResource3 goes through an upload, a copy and a readback on a queue
 // from CreateCommandQueue1. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -528,13 +531,11 @@ int main() {
 
         // The newer arguments' edge cases, each with the answer the PC runtime gives (and, when the host has a
         // D3D12 device, compared with it live). Placed cases use standalone_device so the heap arena is present.
-        const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
-                                             reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
-                                       : nullptr;
+        // The host runs on the layer's adapter: on a PC with two GPUs D3D12's default adapter can be the other one.
         Ref<ID3D12Device10> host;
-        const bool have_host =
-            create_host && SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)));
+        std::string host_name;
+        const bool have_host = hostadapter::single(d, &host.p, host_name);
+        if (have_host) std::printf("edge cases compared with the host runtime on %s\n", host_name.c_str());
         Ref<ID3D12Device> standalone_base;
         Ref<ID3D12Device10> standalone_device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&standalone_base.p))));

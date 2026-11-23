@@ -5,9 +5,11 @@
 // block, subresources past the last, and null pointers. Every HRESULT is recorded, and every read records a hash of
 // its whole destination buffer (so bytes written outside the region count too). The two records must be the same,
 // step by step. A step the host runtime faults on is reported and not compared. No shaders or game data. Skips (77)
-// without a Vulkan GPU; without a host D3D12 device only the layer's own record is printed. Set
-// LEONIDA_D3D49_VERBOSE=1 to print every step.
+// without a Vulkan GPU; without a host D3D12 device only the layer's own record is printed. The host runs on the
+// layer's adapter (host_adapter.h; LEONIDA_HOST_ADAPTER picks another, "warp" WARP). Set LEONIDA_D3D49_VERBOSE=1 to
+// print every step.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -291,14 +293,14 @@ int main() {
     if (device_status != vktest::DeviceStatus::ready) return 1;
     const bool verbose = GetEnvironmentVariableA("LEONIDA_D3D49_VERBOSE", nullptr, 0) > 0;
 
-    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
-                                         reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
-                                   : nullptr;
+    // The host runs on the layer's adapter: on a PC with two GPUs D3D12's default adapter can be the other one.
     Ref<ID3D12Device> host;
+    std::string host_name;
     Record theirs;
-    if (create_host && SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
+    if (hostadapter::single(d, &host.p, host_name)) {
+        std::printf("subresource copy: host %s\n", host_name.c_str());
         EXPECT(run(host.p, d.bc, theirs));
+    }
 
     // Once per copy path: on the host with VK_EXT_host_image_copy where the GPU has it, and through a staging submit
     // (a second D3D12 device on the same Vulkan device, told the extension is off).

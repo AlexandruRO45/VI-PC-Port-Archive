@@ -2,15 +2,18 @@
 // bytes it writes for descriptions CreateSampler can express, for UINT border colours (the S#'s border types are
 // the same for integers) and for non-normalized coordinates (CreateSampler's S# with FORCE_UNNORMALIZED). Which
 // descriptions the PC runtime refuses, and the D3D12_OPTIONS17 answer, are compared with the host's runtime live
-// when there is one: a refused description leaves the slot as it was. No shaders or game data. Set
-// LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails.
+// when there is one, on the layer's adapter (host_adapter.h; LEONIDA_HOST_ADAPTER picks another, "warp" WARP): a
+// refused description leaves the slot as it was. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under
+// VK_LAYER_KHRONOS_validation; any validation error fails.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -408,14 +411,12 @@ int main() {
             return 1;
         }
         {
-            const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-            const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
-                                                 reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
-                                           : nullptr;
+            // The host runs on the layer's adapter: on a PC with two GPUs D3D12's default adapter can be the other one.
             Ref<ID3D12Device11> host;
+            std::string host_name;
             Slots host_slots;
-            if (create_host && SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))) &&
-                host_slots.create(host.p)) {
+            if (hostadapter::single(d, &host.p, host_name) && host_slots.create(host.p)) {
+                std::printf("edge cases compared with the host runtime on %s\n", host_name.c_str());
                 D3D12_FEATURE_DATA_D3D12_OPTIONS17 theirs17{};
                 EXPECT(SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS17, &theirs17,
                                                            sizeof(theirs17))));
