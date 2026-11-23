@@ -141,9 +141,11 @@ def test_a_bad_census_is_one_line_not_a_traceback(tmp_path, capsys):
     a_list.write_text("[]", encoding="utf-8")
     a_number = tmp_path / "num.json"
     a_number.write_text("7", encoding="utf-8")
+    deep_json = tmp_path / "deep.json"
+    deep_json.write_text("[" * 50_000 + "]" * 50_000, encoding="utf-8")
     folder = tmp_path / "folder"
     folder.mkdir()
-    for path in (tmp_path / "missing.json", folder, not_json, a_list, a_number):
+    for path in (tmp_path / "missing.json", folder, not_json, a_list, a_number, deep_json):
         capsys.readouterr()
         code = wave64_halves.main(["--census", str(path)])
         out = capsys.readouterr()

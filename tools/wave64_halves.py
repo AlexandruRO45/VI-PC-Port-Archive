@@ -1723,7 +1723,7 @@ def main(argv=None):
     except OSError as exc:
         print(f"ERROR: cannot read {args.census}: {exc.strerror or exc}", file=sys.stderr)
         return 2
-    except ValueError as exc:  # json.JSONDecodeError
+    except (ValueError, RecursionError) as exc:  # json.JSONDecodeError, UnicodeDecodeError, or nesting limit
         print(f"ERROR: {args.census} is not JSON: {exc}", file=sys.stderr)
         return 2
     if not isinstance(index, dict):
