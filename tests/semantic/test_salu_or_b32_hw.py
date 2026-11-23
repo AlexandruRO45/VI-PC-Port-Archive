@@ -161,5 +161,161 @@ class SaluOrB32OracleTests(unittest.TestCase):
         self.assertEqual(out[0], 0x32)
         self.assertEqual(out[1], 1)
 
+
+class OperandType(enum.Enum):
+    SGPR = "sgpr"
+    IMM_INT = "imm_int"
+    IMM_HEX = "imm_hex"
+    SPECIAL = "special"
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    name: str
+    op_type: OperandType
+    value: Optional[int] = None
+
+    @classmethod
+    def sgpr(cls, idx: int) -> Operand:
+        if not (0 <= idx <= 105):
+            raise ValueError(f"SGPR index out of range [0, 105]: s{idx}")
+        return cls(name=f"s{idx}", op_type=OperandType.SGPR, value=idx)
+
+    @classmethod
+    def imm_int(cls, val: int) -> Operand:
+        return cls(name=str(val), op_type=OperandType.IMM_INT, value=val)
+
+    @classmethod
+    def imm_hex(cls, val: int) -> Operand:
+        return cls(name=f"{val:#x}", op_type=OperandType.IMM_HEX, value=val & MASK32)
+
+    @classmethod
+    def special(cls, name: str) -> Operand:
+        valid_specials = {"exec_lo", "exec_hi", "vcc_lo", "vcc_hi", "m0", "scc", "null"}
+        if name not in valid_specials:
+            raise ValueError(f"Invalid special register: {name}")
+        return cls(name=name, op_type=OperandType.SPECIAL)
+
+
+@dataclasses.dataclass
+class AstInstruction:
+    opcode: str
+    dst: Operand
+    src0: Operand
+    src1: Operand
+
+    def emit_asm(self) -> str:
+        return f"{self.opcode} {self.dst.name}, {self.src0.name}, {self.src1.name}"
+
+    def type_check(self) -> bool:
+        if self.opcode != "s_or_b32":
+            return False
+        if self.dst.op_type not in (OperandType.SGPR, OperandType.SPECIAL):
+            return False
+        return True
+
+
+class Expr:
+    def evaluate(self, env: Dict[str, int]) -> int:
+        raise NotImplementedError
+
+
+@dataclasses.dataclass
+class ConstExpr(Expr):
+    val: int
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        return self.val & MASK32
+
+
+@dataclasses.dataclass
+class RegExpr(Expr):
+    name: str
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        return env.get(self.name, 0) & MASK32
+
+
+@dataclasses.dataclass
+class BitwiseOrExpr(Expr):
+    left: Expr
+    right: Expr
+
+    def evaluate(self, env: Dict[str, int]) -> int:
+        l = self.left.evaluate(env)
+        r = self.right.evaluate(env)
+        return ref_s_or_b32(l, r)
+
+
+class SaluOrB32AstTests(unittest.TestCase):
+    """Symbolic AST opcode definitions and typed expressions for s_or_b32."""
+
+    def test_ast_construction_and_formatting(self):
+        """Construct AST nodes and format into assembly lines."""
+        inst = AstInstruction(
+            opcode="s_or_b32",
+            dst=Operand.sgpr(2),
+            src0=Operand.sgpr(0),
+            src1=Operand.sgpr(1),
+        )
+        self.assertTrue(inst.type_check())
+        self.assertEqual(inst.emit_asm(), "s_or_b32 s2, s0, s1")
+
+        inst_imm = AstInstruction(
+            opcode="s_or_b32",
+            dst=Operand.sgpr(4),
+            src0=Operand.sgpr(4),
+            src1=Operand.imm_hex(0x80000000),
+        )
+        self.assertTrue(inst_imm.type_check())
+        self.assertEqual(inst_imm.emit_asm(), "s_or_b32 s4, s4, 0x80000000")
+
+    def test_ast_type_validation(self):
+        """Validate destination constraints and register index bounds."""
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+        with self.assertRaises(ValueError):
+            Operand.special("invalid_reg")
+
+        bad_dst_inst = AstInstruction(
+            opcode="s_or_b32",
+            dst=Operand.imm_int(42),
+            src0=Operand.sgpr(0),
+            src1=Operand.sgpr(1),
+        )
+        self.assertFalse(bad_dst_inst.type_check())
+
+    def test_ast_expression_evaluation(self):
+        """Evaluate symbolic AST expression trees against reference oracle."""
+        env = {"s0": 0x00FF0000, "s1": 0x0000FF00}
+        expr = BitwiseOrExpr(RegExpr("s0"), RegExpr("s1"))
+        self.assertEqual(expr.evaluate(env), 0x00FFFF00)
+
+        nested = BitwiseOrExpr(expr, ConstExpr(0x000000FF))
+        self.assertEqual(nested.evaluate(env), 0x00FFFFFF)
+
+    def test_ast_assembly_translation(self):
+        """Generate assembly from AST and translate with support.translate_lines."""
+        inst = AstInstruction(
+            opcode="s_or_b32",
+            dst=Operand.sgpr(2),
+            src0=Operand.sgpr(0),
+            src1=Operand.imm_hex(0xFF),
+        )
+        lines = [
+            "s_mov_b32 s0, 0x1000",
+            inst.emit_asm(),
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_ast_or_emit", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 0x10FF)
+
 if __name__ == "__main__":
     unittest.main()
