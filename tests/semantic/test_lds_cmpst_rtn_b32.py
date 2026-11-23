@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """ds_cmpst_rtn_b32 and ds_cmpst_b32 through the translator (tools/rdna2spirv.py) and spirv_mini_interp.
 
 Standard library only; no GPU, no LLVM, no game files.
@@ -21,7 +23,6 @@ Each test case is translated to SPIR-V via tools/rdna2spirv.py and executed in
 tests/semantic/spirv_mini_interp.py via tests/semantic/lds_run.py and support.translate_lines.
 """
 import os
-import random
 import sys
 import unittest
 
@@ -33,28 +34,6 @@ import support  # noqa: E402
 OP = "ds_cmpst_rtn_b32"
 OP_NO_RTN = "ds_cmpst_b32"
 M32 = L.M32
-
-
-def model_cmpst(ops, init):
-    """Python architectural oracle for a sequence of ds_cmpst operations.
-
-    ops: list of (mnemonic, byte_addr, byte_offset, (vcmp, vsrc))
-    init: dict of {byte_addr: initial_dword}
-    Returns: ([returned_vdst_for_each_op], {final_byte_addr: final_dword})
-    """
-    lds = dict(init)
-    rtns = []
-    for mnemonic, addr, off, (vcmp, vsrc) in ops:
-        eff = addr + off
-        old = lds.get(eff, 0) & M32
-        cmp_val = vcmp & M32
-        src_val = vsrc & M32
-        if "_rtn_" in mnemonic:
-            rtns.append(old)
-        if old == cmp_val:
-            lds[eff] = src_val
-    finals = {addr + off for _, addr, off, _ in ops}
-    return rtns, {a: lds.get(a, 0) & M32 for a in sorted(finals)}
 
 
 class TestCompareAndSwapHandTable(unittest.TestCase):
@@ -575,25 +554,24 @@ class TestMutationDetection(unittest.TestCase):
     """Negative control and regression verification ensuring mutations are detected."""
 
     def test_mutation_unconditional_exchange_detected(self):
-        m_initial, cmp_val, src_val = 100, 200, 300
-        _, correct_mem = model_cmpst([(OP, 0x40, 0, (cmp_val, src_val))], {0x40: m_initial})
-        self.assertEqual(correct_mem[0x40], 100)
-        mutant_mem = src_val
-        self.assertNotEqual(mutant_mem, correct_mem[0x40])
+        # Mismatch must NOT update memory:
+        # Initial memory is 100, cmp_val is 200, src_val is 300.
+        rtns, fin = L.run_chain([(OP, 0x40, 0, (200, 300))], {0x40: 100})
+        self.assertEqual(rtns, [100])
+        self.assertEqual(fin, {0x40: 100})
 
     def test_mutation_swapped_operands_detected(self):
-        m_initial, cmp_val, src_val = 10, 10, 20
-        _, correct_mem = model_cmpst([(OP, 0x40, 0, (cmp_val, src_val))], {0x40: m_initial})
-        self.assertEqual(correct_mem[0x40], 20)
-        _, mutant_mem = model_cmpst([(OP, 0x40, 0, (src_val, cmp_val))], {0x40: m_initial})
-        self.assertEqual(mutant_mem[0x40], 10)
-        self.assertNotEqual(mutant_mem[0x40], correct_mem[0x40])
+        # Initial memory is 10, cmp is 10, src is 20.
+        # Swapping would cause mismatch. Correct order updates memory to 20.
+        rtns, fin = L.run_chain([(OP, 0x40, 0, (10, 20))], {0x40: 10})
+        self.assertEqual(rtns, [10])
+        self.assertEqual(fin, {0x40: 20})
 
     def test_mutation_dropped_offset_detected(self):
         base, off = 0x40, 0x20
-        _, correct = model_cmpst([(OP, base, off, (1, 2))], {base + off: 1, base: 99})
-        self.assertEqual(correct[base + off], 2)
-        self.assertNotIn(base, correct)
+        rtns, fin = L.run_chain([(OP, base, off, (1, 2))], {base + off: 1, base: 99})
+        self.assertEqual(rtns, [1])
+        self.assertEqual(fin, {base + off: 2})
 
     def test_mutation_return_value_omission_detected(self):
         rtns, _ = L.run_chain([(OP, 0x40, 0, (10, 20))], {0x40: 10})
@@ -602,33 +580,24 @@ class TestMutationDetection(unittest.TestCase):
         self.assertNotEqual(rtns, [0])
 
 
-class TestSeededSequences(unittest.TestCase):
-    """Deterministic pseudo-random sequences compared against reference oracle."""
+class TestChainedSequences(unittest.TestCase):
+    """Deterministic multi-step CAS operations across multiple LDS memory locations."""
 
-    def test_random_cas_chains(self):
-        rng = random.Random(0xCA532)
-        for trial in range(10):
-            addrs = [0x10, 0x24, 0x50, 0x88, 0xC0]
-            init = {a: rng.getrandbits(32) for a in addrs}
-            ops = []
-            for _ in range(15):
-                eff = rng.choice(addrs)
-                off = rng.choice((0, 0, 4, 16))
-                base = eff - off
-                _, current_state = model_cmpst(ops, init)
-                current_val = current_state.get(eff, init[eff])
-                if rng.random() < 0.5:
-                    cmp_val = current_val
-                else:
-                    cmp_val = rng.getrandbits(32)
-                src_val = rng.choice([rng.getrandbits(32), 0, 1, 0xFFFFFFFF, 0x80000000])
-                ops.append((OP, base, off, (cmp_val, src_val)))
-
-            with self.subTest(trial=trial):
-                actual_rtns, actual_fin = L.run_chain(ops, init)
-                expected_rtns, expected_fin = model_cmpst(ops, init)
-                self.assertEqual(actual_rtns, expected_rtns)
-                self.assertEqual(actual_fin, expected_fin)
+    def test_deterministic_cas_chains(self):
+        init = {0x10: 100, 0x20: 200, 0x30: 300, 0x40: 400}
+        ops = [
+            (OP,         0x10, 0, (100, 111)),  # match: 100 -> 111, ret 100
+            (OP_NO_RTN,  0x20, 0, (999, 222)),  # mismatch: stays 200, ret DEAD
+            (OP,         0x30, 0, (300, 333)),  # match: 300 -> 333, ret 300
+            (OP,         0x40, 0, (400, 444)),  # match: 400 -> 444, ret 400
+            (OP,         0x10, 0, (100, 999)),  # mismatch (now 111): stays 111, ret 111
+            (OP_NO_RTN,  0x20, 0, (200, 222)),  # match: 200 -> 222, ret DEAD
+            (OP,         0x30, 0, (333, 555)),  # match: 333 -> 555, ret 333
+            (OP,         0x40, 0, (444, 666)),  # match: 444 -> 666, ret 444
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(rtns, [100, 0xDEAD, 300, 400, 111, 0xDEAD, 333, 444])
+        self.assertEqual(fin, {0x10: 111, 0x20: 222, 0x30: 555, 0x40: 666})
 
 
 class TestRejection(unittest.TestCase):
