@@ -462,6 +462,28 @@ def _win_vram_map() -> dict:
     return found
 
 
+def _linux_vulkan_identity():
+    """Query the runtime's Vulkan device in a bounded subprocess, isolating native driver failures."""
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vk_subgroup_info.py")
+    try:
+        info = json.loads(_run([sys.executable, "-I", helper]))
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(info, dict):
+        return None
+    name, vendor, device = info.get("device"), info.get("vendor_id"), info.get("device_id")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if not all(type(value) is int and 0 <= value <= 0xffff for value in (vendor, device)):
+        return None
+    return name.strip(), (vendor, device)
+
+
+def _pci_id(text):
+    match = re.search(r"\[([0-9a-fA-F]{4})\]$", text)
+    return int(match[1], 16) if match else None
+
+
 def detect_gpus() -> list:
     """All GPUs found, as (name, vram_gb or None)."""
     gpus = []
@@ -504,7 +526,8 @@ def detect_gpus() -> list:
         except ValueError:
             pass
     else:
-        for line in _run(["lspci", "-mm"]).splitlines():
+        pci_gpus = []
+        for line in _run(["lspci", "-mm", "-nn"]).splitlines():
             try:
                 tok = shlex.split(line)
             except ValueError:
@@ -515,11 +538,26 @@ def detect_gpus() -> list:
             vname = ("NVIDIA" if "nvidia" in vend else
                      "AMD" if ("amd" in vend or "advanced micro" in vend) else
                      "Intel" if "intel" in vend else tok[2])
-            br = re.search(r"\[(.+)\]", tok[3])
-            name = f"{vname} {br.group(1) if br else tok[3]}"
+            vendor_id, device_id = _pci_id(tok[2]), _pci_id(tok[3])
+            product = re.sub(r"\s+\[[0-9a-fA-F]{4}\]$", "", tok[3])
+            if product == "Device" and device_id is not None:
+                product += f" {device_id:04x}"  # keep the only identity an old PCI database knows
+            br = re.search(r"\[(.+)\]", product)
+            name = f"{vname} {br.group(1) if br else product}"
             if vname == "NVIDIA" and any("nvidia" in g[0].lower() for g in gpus):
                 continue  # already reported by nvidia-smi
+            pci_gpus.append((len(gpus), (vendor_id, device_id)))
             gpus.append((name, None))
+        # PCI databases may expose only a chip codename (e.g. HawkPoint1). The existing Vulkan probe knows the
+        # product name, but only for its selected device: never copy it to another adapter or an ambiguous pair.
+        if any(gpu_score(gpus[index][0]) is None and None not in identity for index, identity in pci_gpus):
+            vulkan = _linux_vulkan_identity()
+            if vulkan:
+                name, identity = vulkan
+                matches = [index for index, pci_identity in pci_gpus if pci_identity == identity]
+                if len(matches) == 1 and gpu_score(gpus[matches[0]][0]) is None:
+                    index = matches[0]
+                    gpus[index] = (name, gpus[index][1])
     return gpus
 
 
