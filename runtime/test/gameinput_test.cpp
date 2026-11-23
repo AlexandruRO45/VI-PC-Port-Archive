@@ -1506,6 +1506,26 @@ void test_force_feedback(IGameInput* input) {
         check(created == 20000, "force feedback: 20,000 effects created and released while the poll thread runs");
     }
 
+    // GameInputForceFeedbackEnvelope: a sustainDuration of UINT64_MAX is an effect that runs forever.
+    GameInputForceFeedbackParams forever = params;
+    forever.data.constant.envelope.attackDuration = 50'000;
+    forever.data.constant.envelope.attackGain = 0.5f;
+    forever.data.constant.envelope.sustainDuration = UINT64_MAX;
+    forever.data.constant.envelope.sustainGain = 1.0f;
+    forever.data.constant.envelope.playCount = 1;
+    IGameInputForceFeedbackEffect* held = nullptr;
+    check(dev->CreateForceFeedbackEffect(0, &forever, reinterpret_cast<void**>(&held)) == S_OK && held,
+          "force feedback: CreateForceFeedbackEffect with a sustainDuration of UINT64_MAX");
+    if (held) {
+        rt::gameinput::poll();
+        check(g_fake.last.type == SDL_HAPTIC_CONSTANT && g_fake.last.constant.length == 60000 &&
+                  g_fake.last.constant.attack_length == 50,
+              "force feedback: it is SDL's 60 s hold after its attack, not the wrapped sum of the durations");
+        check(held->GetState() == GameInputFeedbackRunning, "force feedback: and it keeps running");
+        held->Release();
+        rt::gameinput::poll();
+    }
+
     detach(wheel);
     rt::gameinput::poll();
     check(g_fake.closes == 1 && !dev->IsForceFeedbackMotorPoweredOn(0),

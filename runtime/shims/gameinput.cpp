@@ -339,7 +339,8 @@ uint32_t play_count(const GameInputForceFeedbackParams& p) {
 // One GameInput effect as SDL's template. GameInput's eleven kinds are SDL's eleven force-feedback effects, so the
 // kind picks the SDL type and the fields are magnitudes; conditions have no envelope in GameInput either. Returns
 // false for a kind the shim does not map. `endless` says the effect has no duration of its own (GameInput left the
-// envelope empty), which is what the poll thread re-runs before the SDL length runs out.
+// envelope empty, or gave UINT64_MAX, its "run forever", as sustainDuration), which is what the poll thread re-runs
+// before the SDL length runs out.
 bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool* endless, uint32_t* length_ms,
                   SDL_HapticEffect* out) {
     std::memset(out, 0, sizeof *out);
@@ -348,7 +349,8 @@ bool build_effect(const GameInputForceFeedbackParams& p, float gain, bool* endle
     const GameInputForceFeedbackEnvelope env = envelope_kind ? p.data.constant.envelope : GameInputForceFeedbackEnvelope{};
     const bool used = envelope_kind && envelope_used(env);
     const float level = gain * (used ? env.sustainGain : 1.0f);  // GameInput's sustainGain is the effect's level
-    const uint64_t total_us = used ? env.attackDuration + env.sustainDuration + env.releaseDuration : 0;
+    const bool forever = used && env.sustainDuration == UINT64_MAX;
+    const uint64_t total_us = used && !forever ? env.attackDuration + env.sustainDuration + env.releaseDuration : 0;
     *endless = total_us == 0;
     *length_ms = total_us == 0 ? kHapticHoldMs
                               : static_cast<uint32_t>(std::clamp<uint64_t>((total_us + 999) / 1000, 1, 86'400'000));
