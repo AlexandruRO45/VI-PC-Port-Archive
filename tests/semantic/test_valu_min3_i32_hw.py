@@ -440,5 +440,46 @@ class TestVMin3I32ConditionCodes(unittest.TestCase):
         is_negative = bool(res & SIGN_BIT32)
         self.assertFalse(is_negative)
 
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
+
+class TestVMin3I32IEEE754Bitwise(unittest.TestCase):
+    """Unit tests verifying that IEEE 754 float bit patterns are compared strictly as signed integers."""
+
+    FLOAT32_PATTERNS = {
+        "pos_zero": 0x0000_0000,
+        "neg_zero": 0x8000_0000,
+        "pos_inf": 0x7F80_0000,
+        "neg_inf": 0xFF80_0000,
+        "qnan": 0x7FC0_0000,
+        "snan": 0x7F80_0001,
+        "min_subnormal": 0x0000_0001,
+        "max_subnormal": 0x007F_FFFF,
+        "min_normal": 0x0080_0000,
+        "max_normal": 0x7F7F_FFFF,
+    }
+
+    def test_neg_zero_less_than_pos_zero(self):
+        """In signed 32-bit integer, 0x80000000 (-2147483648) is less than 0x00000000 (0)."""
+        neg_zero = self.FLOAT32_PATTERNS["neg_zero"]
+        pos_zero = self.FLOAT32_PATTERNS["pos_zero"]
+        res = v_min3_i32_oracle(pos_zero, neg_zero, 1)
+        self.assertEqual(res, neg_zero)
+
+    def test_neg_zero_is_signed_min_int32(self):
+        neg_zero = self.FLOAT32_PATTERNS["neg_zero"]
+        for name, pattern in self.FLOAT32_PATTERNS.items():
+            with self.subTest(pattern_name=name):
+                # 0x80000000 is <= any 32-bit integer
+                res = v_min3_i32_oracle(pattern, neg_zero, 0)
+                self.assertEqual(res, neg_zero)
+
+    def test_neg_inf_signed_comparison(self):
+        """0xFF800000 is -8388608 in signed int32, which is less than 0 but greater than 0x80000000."""
+        neg_inf = self.FLOAT32_PATTERNS["neg_inf"]
+        res = v_min3_i32_oracle(0, neg_inf, 100)
+        self.assertEqual(res, neg_inf)
+
 if __name__ == "__main__":
     unittest.main()
