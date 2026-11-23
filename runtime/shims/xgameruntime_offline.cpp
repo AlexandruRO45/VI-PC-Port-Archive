@@ -29,6 +29,7 @@
 // it: see `client_not_connected` (XGameStreaming) and `offline_failure`.
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -36,7 +37,7 @@
 #include <cstring>
 #include <iterator>
 #include <mutex>
-#include <set>
+#include <vector>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -460,27 +461,40 @@ HRESULT STDMETHODCALLTYPE device_find_user(void*, const APP_LOCAL_DEVICE_ID* dev
 //        XUserDeviceAssociationChangedCallback* callback, XTaskQueueRegistrationToken* token)
 // 7: HRESULT XUserRegisterForDefaultAudioEndpointUtf16Changed(XTaskQueueHandle, void*, callback, token*)
 // Associations and endpoints never change offline: a token, no callback. Each of the two registrations keeps the
-// tokens it handed out, so its unregister slot can tell a live token from one it never issued (RT-391).
+// tokens it handed out, so its unregister slot can tell a live token from one it never issued (RT-391). The tokens
+// live in one vector per registration: its default constructor allocates nothing, so nothing runs or can fail when
+// the runtime loads. These calls run on the title's threads, so a failed allocation while registering refuses the
+// registration (E_OUTOFMEMORY, no token handed out) instead of throwing into the title.
 enum class DeviceRegistration { association, audio_endpoint };
-std::set<uint64_t> g_device_tokens[2];
+std::vector<uint64_t> g_device_tokens[2];   // guarded by g_streaming_mutex
 
 template <DeviceRegistration Kind>
 HRESULT STDMETHODCALLTYPE device_register(void*, XTaskQueueHandle, void*, void* callback,
                                           XTaskQueueRegistrationToken* token) {
     if (!callback || !token) return E_INVALIDARG;
     std::lock_guard<std::mutex> lock(g_streaming_mutex);
+    try {
+        g_device_tokens[static_cast<int>(Kind)].push_back(g_next_token);
+    } catch (...) {
+        return E_OUTOFMEMORY;
+    }
     token->token = g_next_token++;
-    g_device_tokens[static_cast<int>(Kind)].insert(token->token);
     return S_OK;
 }
 
 // 5, 8: bool ...Unregister...(XTaskQueueRegistrationToken token, bool wait): no callback is ever running, so `wait`
 // changes nothing. True removes a token the matching register slot handed out and has not taken back; a token
 // already unregistered, never issued, or issued by the other registration is false, and stays as it was.
+// Removing a token moves the last one into its place: it allocates nothing and can't throw.
 template <DeviceRegistration Kind>
 bool STDMETHODCALLTYPE device_unregister(void*, XTaskQueueRegistrationToken token, bool) {
     std::lock_guard<std::mutex> lock(g_streaming_mutex);
-    return g_device_tokens[static_cast<int>(Kind)].erase(token.token) != 0;
+    std::vector<uint64_t>& live = g_device_tokens[static_cast<int>(Kind)];
+    const auto it = std::find(live.begin(), live.end(), token.token);
+    if (it == live.end()) return false;
+    *it = live.back();
+    live.pop_back();
+    return true;
 }
 
 // 6: HRESULT XUserGetDefaultAudioEndpointUtf16(XUserLocalId user, XUserDefaultAudioEndpointKind kind,
