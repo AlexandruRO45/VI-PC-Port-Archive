@@ -199,6 +199,8 @@ def load_manifest(manifest: str) -> dict:
     for rel, info in files.items():
         if not (isinstance(info, dict) and type(info.get("size")) is int and isinstance(info.get("sha256"), str)):
             raise ManifestError(f"{manifest}: entry {rel!r} needs an integer \"size\" and a \"sha256\" string")
+        if info["size"] < 0:
+            raise ManifestError(f"{manifest}: entry {rel!r} has a negative file size")
     return files
 
 

@@ -417,6 +417,9 @@ class ManifestCliTest(unittest.TestCase):
             "entry_is_a_number": b'{"files": {"sample.dat": 5}}',
             "no_sha256": b'{"files": {"sample.dat": {"size": 22}}}',
             "size_is_a_string": b'{"files": {"sample.dat": {"size": "22", "sha256": "00"}}}',
+            "size_is_negative": (
+                f'{{"files": {{"sample.dat": {{"size": -1, "sha256": "{good_hash}"}}}}}}'
+            ).encode(),
             "dup_sha256": (
                 f'{{"files": {{"sample.dat": {{"size": 22, "sha256": "{"0" * 64}", "sha256": "{good_hash}"}}}}}}'
             ).encode(),
