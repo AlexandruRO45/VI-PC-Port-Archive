@@ -377,6 +377,17 @@ class TestVBfmB32Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0xff0)
 
+def ref_v_alignbyte_b32(s0: int, s1: int, s2: int) -> int:
+    return (((s0 << 32) | s1) >> ((s2 & 3) * 8)) & MASK32
+
+GLOBAL_ORACLE_MAP[Opcode.V_ALIGNBYTE_B32] = ref_v_alignbyte_b32
+
+
+class TestVAlignbyteB32Oracle(unittest.TestCase):
+    def test_oracle_execution(self) -> None:
+        res = ref_v_alignbyte_b32(0x12345678, 0x9abcdef0, 2)
+        self.assertEqual(res, 0x56789abc)
+
 
 if __name__ == "__main__":
     unittest.main()
