@@ -67,11 +67,11 @@ def joaat(text: str, *, case_sensitive: bool = False) -> int:
     Latin-1 cannot occur in a name and becomes ``?``. Encoding to UTF-8 first and lower-casing the bytes
     afterwards gave a different hash for any non-ASCII name, since bytes.lower() only folds ASCII.
 
-    Pass ``case_sensitive=True`` for the field/struct-name variant, which keeps the exact bytes (UTF-8).
-    Every field name measured so far is ASCII, where both encodings agree.
+    Pass ``case_sensitive=True`` for the field/struct-name variant, which keeps the exact Latin-1 bytes, as the
+    ``joaat_cs`` copies in ``world_archetypes`` and ``fog_volumes`` do. Every field name measured so far is ASCII.
     """
     if case_sensitive:
-        data = text.encode("utf-8")
+        data = text.encode("latin-1")
     else:
         data = text.lower().encode("latin-1", "replace")
     h = 0
