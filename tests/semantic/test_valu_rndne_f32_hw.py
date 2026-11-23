@@ -526,5 +526,48 @@ class TestValuRndneF32ConditionCodes(unittest.TestCase):
         self.assertEqual(flags.vcc, 0xFFFFFFFFFFFFFFFF)
 
 
+class TestValuRndneF32IEEE754EdgeCases(unittest.TestCase):
+    """Test suite for IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zeroes(self):
+        self.assertEqual(ref_rndne_f32(F32_POS_ZERO), F32_POS_ZERO)
+        self.assertEqual(ref_rndne_f32(F32_NEG_ZERO), F32_NEG_ZERO)
+
+    def test_subnormals_round_to_signed_zero(self):
+        self.assertEqual(ref_rndne_f32(F32_MIN_SUBNORMAL), F32_POS_ZERO)
+        self.assertEqual(ref_rndne_f32(F32_MAX_SUBNORMAL), F32_POS_ZERO)
+        self.assertEqual(ref_rndne_f32(F32_MIN_SUBNORMAL | 0x80000000), F32_NEG_ZERO)
+        self.assertEqual(ref_rndne_f32(F32_MAX_SUBNORMAL | 0x80000000), F32_NEG_ZERO)
+
+    def test_infinities_preserved(self):
+        self.assertEqual(ref_rndne_f32(F32_POS_INF), F32_POS_INF)
+        self.assertEqual(ref_rndne_f32(F32_NEG_INF), F32_NEG_INF)
+
+    def test_nans_preserved(self):
+        qnan_res = ref_rndne_f32(F32_QNAN)
+        self.assertTrue((qnan_res & 0x7F800000) == 0x7F800000 and (qnan_res & 0x007FFFFF) != 0)
+        snan_res = ref_rndne_f32(F32_SNAN)
+        self.assertTrue((snan_res & 0x7F800000) == 0x7F800000 and (snan_res & 0x007FFFFF) != 0)
+
+    def test_large_floats_no_fractional_bits(self):
+        exp23 = f32_to_bits(8388608.0)
+        self.assertEqual(ref_rndne_f32(exp23), exp23)
+        odd_half = f32_to_bits(8388607.5)
+        self.assertEqual(ref_rndne_f32(odd_half), exp23)
+        even_half = f32_to_bits(8388606.5)
+        self.assertEqual(ref_rndne_f32(even_half), f32_to_bits(8388606.0))
+        self.assertEqual(ref_rndne_f32(F32_MAX_FLOAT), F32_MAX_FLOAT)
+
+    def test_near_zero_transitions(self):
+        just_below_half = f32_to_bits(0.49999997)
+        self.assertEqual(ref_rndne_f32(just_below_half), F32_POS_ZERO)
+        just_above_half = f32_to_bits(0.50000006)
+        self.assertEqual(ref_rndne_f32(just_above_half), F32_ONE)
+        just_below_neg_half = f32_to_bits(-0.49999997)
+        self.assertEqual(ref_rndne_f32(just_below_neg_half), F32_NEG_ZERO)
+        just_above_neg_half = f32_to_bits(-0.50000006)
+        self.assertEqual(ref_rndne_f32(just_above_neg_half), F32_NEG_ONE)
+
+
 if __name__ == "__main__":
     unittest.main()
