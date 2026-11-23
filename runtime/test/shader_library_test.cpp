@@ -308,6 +308,15 @@ int main() {
     // Malformed numbers and escapes are refused, never thrown.
     CHECK(!JsonReader("[-]").parse(json));
     CHECK(!JsonReader("[1e999]").parse(json));
+    CHECK(!JsonReader("[-1e999]").parse(json));
+    // An underflow only loses precision (glibc's strtod still sets ERANGE): a subnormal double, which Python's
+    // json.dump writes as it is, and a value under every double, which reads as zero.
+    {
+        Json tiny;
+        CHECK(JsonReader("[5e-324, 1e-310, 1e-400, -1e-400]").parse(tiny) && tiny.array.size() == 4);
+        CHECK(tiny.array[0].number == 5e-324 && tiny.array[0].number > 0 && tiny.array[1].number == 1e-310);
+        CHECK(tiny.array[2].number == 0 && tiny.array[3].number == 0);
+    }
     CHECK(!JsonReader("[1.2.3]").parse(json));
     CHECK(!JsonReader("\"\\uzzzz\"").parse(json));
     CHECK(!JsonReader("\"\\u0x41\"").parse(json));
