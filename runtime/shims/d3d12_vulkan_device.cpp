@@ -441,6 +441,20 @@ UINT view_slices(const D3D12_RESOURCE_DESC& resource, UINT first_layer, UINT lay
     return remaining ? resource.DepthOrArraySize - first_layer : layer_count;
 }
 
+// Returns 0, 1, 2, or 3 from LEONIDA_TEXTURE_MIP_DROP (default 0).
+inline UINT configured_texture_mip_drop() {
+    static const UINT drop = []() -> UINT {
+        char text[16]{};
+        size_t length = 0;
+        if (getenv_s(&length, text, "LEONIDA_TEXTURE_MIP_DROP") == 0 && length > 1) {
+            const int val = std::atoi(text);
+            return static_cast<UINT>(std::clamp(val, 0, 3));
+        }
+        return 0;
+    }();
+    return drop;
+}
+
 // The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
 // texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
 // Keeps the optional VkImageFormatListCreateInfo alongside VkImageCreateInfo so info.pNext stays valid.
@@ -450,6 +464,7 @@ struct TextureCreateInfo {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
     std::array<VkFormat, 2> view_formats{};
+    UINT mips_dropped = 0;
 
     TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
@@ -459,9 +474,23 @@ struct TextureCreateInfo {
             info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
         info.imageType = volume ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
         info.format = format.format;
-        info.extent = {std::uint32_t(desc.Width), one_d ? 1u : desc.Height,
-                       volume ? UINT(desc.DepthOrArraySize) : 1u};
-        info.mipLevels = desc.MipLevels;
+
+        // Low-VRAM texture quality switch (LEONIDA_TEXTURE_MIP_DROP, #6043):
+        // Only drop mips for pure sampled textures (no RenderTarget, DepthStencil, or UAV):
+        const bool is_render_target = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
+        const bool is_depth_stencil = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+        const bool is_uav           = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+        const bool can_drop         = !is_render_target && !is_depth_stencil && !is_uav;
+
+        if (can_drop && desc.MipLevels > 1) {
+            mips_dropped = std::min<UINT>(configured_texture_mip_drop(), desc.MipLevels - 1);
+        }
+
+        const uint32_t width  = std::max(1u, static_cast<uint32_t>(desc.Width >> mips_dropped));
+        const uint32_t height = one_d ? 1u : std::max(1u, desc.Height >> mips_dropped);
+
+        info.extent = {width, height, volume ? UINT(desc.DepthOrArraySize) : 1u};
+        info.mipLevels = desc.MipLevels - mips_dropped;
         info.arrayLayers = volume ? 1 : desc.DepthOrArraySize;
         info.samples = VkSampleCountFlagBits(std::max(1u, desc.SampleDesc.Count));
         info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -1694,6 +1723,8 @@ public:
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
+    UINT mips_dropped() const { return mips_dropped_; }
+    UINT image_mip_levels() const { return desc_.MipLevels > mips_dropped_ ? desc_.MipLevels - mips_dropped_ : 1; }
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
     const DeviceState& device_state() const { return device_; }
 
@@ -1931,6 +1962,7 @@ public:
         const bool one_d = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
         TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
+        mips_dropped_ = create.mips_dropped;
         VkImageCreateInfo& info = create.info;
         if (!castable.empty()) {
             // D3D12 always allows a view in the resource's own format, whether or not the castable list names
@@ -2158,6 +2190,17 @@ private:
     HRESULT cpu_copy(bool write, UINT subresource, const D3D12_BOX* box, void* data, UINT row_pitch,
                      UINT depth_pitch) {
         if (!image_ || !data) return E_INVALIDARG;
+        if (mips_dropped_ > 0) {
+            const UINT orig_mips = desc_.MipLevels;
+            const UINT mip = subresource % orig_mips;
+            const UINT slice = subresource / orig_mips;
+            if (mip < mips_dropped_) {
+                if (!write) std::memset(data, 0, row_pitch);
+                return S_OK;
+            }
+            const UINT new_mips = desc_.MipLevels - mips_dropped_;
+            subresource = slice * new_mips + (mip - mips_dropped_);
+        }
         Region r{};
         if (!region(subresource, box, r)) return E_INVALIDARG;
         if (!r.rows || !r.slices) return S_OK;  // an empty box: nothing to copy
@@ -2362,6 +2405,7 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    UINT mips_dropped_ = 0;
 };
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
@@ -5942,6 +5986,14 @@ public:
             default:
                 log_once("shader-resource view dimension not supported:", desc->ViewDimension);
                 return;
+            }
+        }
+        if (r->mips_dropped() > 0) {
+            const UINT drop = r->mips_dropped();
+            view.first_mip = (view.first_mip >= drop) ? (view.first_mip - drop) : 0;
+            const UINT avail_mips = r->image_mip_levels() > view.first_mip ? (r->image_mip_levels() - view.first_mip) : 1;
+            if (view.mip_count != UINT_MAX && view.mip_count > 0) {
+                view.mip_count = std::min(view.mip_count, avail_mips);
             }
         }
         write_image_descriptor(*r, view, destination, false);
