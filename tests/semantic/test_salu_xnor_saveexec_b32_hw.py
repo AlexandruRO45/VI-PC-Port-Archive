@@ -394,5 +394,28 @@ class TestSaluXnorSaveexecB32ConditionCodes(unittest.TestCase):
         self.assertEqual(hw_hi, 0xFFFFFFFF)
         self.assertEqual(hw_scc, 0)
 
+# --- Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling ---
+
+class TestSaluXnorSaveexecB32IEEE754BitPatterns(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling tests."""
+
+    def test_float_bit_patterns(self) -> None:
+        cases = {
+            "pos_zero (+0.0f)": 0x00000000,
+            "neg_zero (-0.0f)": 0x80000000,
+            "pos_one (+1.0f)": 0x3F800000,
+            "neg_one (-1.0f)": 0xBF800000,
+            "pos_inf (+inf)": 0x7F800000,
+            "neg_inf (-inf)": 0xFF800000,
+            "quiet_nan (qNaN)": 0x7FC00000,
+            "min_subnormal": 0x00000001,
+        }
+        for name, bits in cases.items():
+            with self.subTest(case=name):
+                exp_lo, _, exp_scc = ref_s_xnor_saveexec_b32(bits, 0x55555555)
+                hw_lo, _, hw_scc, _ = run_salu_xnor_saveexec_b32(bits, 0x55555555, 0x000000FF)
+                self.assertEqual(hw_lo, exp_lo)
+                self.assertEqual(hw_scc, exp_scc)
+
 if __name__ == "__main__":
     unittest.main()
