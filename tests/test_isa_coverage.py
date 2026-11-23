@@ -162,6 +162,32 @@ class FixtureTests(unittest.TestCase):
         os.unlink(cls.xml)
         os.unlink(cls.src)
 
+    def run_translator(self, source):
+        return subprocess.run([sys.executable, "-I", ic.__file__, "--isa", self.xml,
+                               "--translator", source, "--json"], capture_output=True, timeout=15)
+
+    def test_utf8_bom_keeps_the_same_translator_report(self):
+        bom_source = _fixture("\ufeff" + FIXTURE_SRC, ".py")
+        self.addCleanup(os.unlink, bom_source)
+        plain = self.run_translator(self.src)
+        bom = self.run_translator(bom_source)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual(bom.returncode, 0, bom.stderr)
+        self.assertEqual(json.loads(bom.stdout), json.loads(plain.stdout))
+
+    def test_invalid_translator_syntax_reports_the_source_line(self):
+        source = _fixture("# fixture\nif :\n", ".py")
+        self.addCleanup(os.unlink, source)
+        result = self.run_translator(source)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertNotIn(b"Traceback", result.stderr)
+        diagnostic = result.stderr.splitlines()[-1].decode(errors="replace")
+        self.assertIn("--translator", diagnostic)
+        self.assertIn(os.path.basename(source), diagnostic)
+        self.assertIn("syntax", diagnostic.lower())
+        self.assertRegex(diagnostic, r"(?:line\s+|:)2\b")
+
     def test_reads_metadata_and_encoding_groups(self):
         self.assertEqual(self.isa["architecture"], "AMD RDNA 2")
         self.assertEqual(self.isa["license"], "MIT")
