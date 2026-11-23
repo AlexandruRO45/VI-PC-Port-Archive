@@ -342,6 +342,20 @@ class Cli(unittest.TestCase):
         with self.assertRaises(rbf0_tree.SelectionError):
             list(rbf0_encode.resources("unused"))
 
+    def test_check_limit_is_not_a_verdict_on_the_rest_of_the_carve(self):
+        self.put("00001000.bin", every_record(True))
+        self.put("00002000.bin", every_record(False))
+        code, out = self.run_main("--check", self.carve)
+        self.assertEqual(code, 0, out)                                 # the whole carve: a verdict
+        self.assertNotIn("checked", out)
+        code, out = self.run_main("--check", self.carve, "--limit", "1")
+        self.assertEqual(code, 1, out)                                 # a clean slice: not a verdict
+        self.assertIn("1 resource(s): 1 exact, 0 different, 0 refused", out)
+        self.assertIn("checked 1 of 2 resource(s)", out)
+        code, out = self.run_main("--check", self.carve, "--limit", "2")   # covers the carve: a verdict again
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 resource(s): 2 exact, 0 different, 0 refused", out)
+
     def test_encode_report_to_new_directory(self):
         self.put("00000100.bin", every_record(True))
         docs, summary = rbf0_tree.decode_source(self.carve)

@@ -404,6 +404,11 @@ def _rows(source):
     return [row], lambda _row: data
 
 
+def starts_resource(row):
+    """True when a row begins a resource; a 64 KiB continuation chunk holds the rest of the one before it."""
+    return row["head"][:4] == MAGIC
+
+
 def decode_source(source, roots=None, offset=None, limit=None, progress=None):
     """Decode RBF0 resources, joining 64 KiB continuations, and return (docs, summary).
 
@@ -414,7 +419,7 @@ def decode_source(source, roots=None, offset=None, limit=None, progress=None):
     if offset is not None and offset < 0:
         raise SelectionError("--offset must be non-negative")
     rows, read = _rows(source)
-    starts = [i for i, row in enumerate(rows) if row["head"][:4] == MAGIC]
+    starts = [i for i, row in enumerate(rows) if starts_resource(row)]
     if not starts:
         raise SystemExit(f"no RBF0 resource in {source}")
     if offset is not None:

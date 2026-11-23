@@ -482,6 +482,12 @@ float bits and NUL terminators all survive. The encoder also writes an edited tr
 changed by hand. It then checks each string and text against the recorded byte length when one is present, so a
 change that alters a length needs that field dropped or updated.
 
+`--limit N` stops `--check` after N resources. A run that stops before the end is not a verdict on the source: it
+prints `checked N of M resource(s)` and exits 1 even when every resource it compared was byte-identical, so a clean
+slice cannot be read as a verified carve. A limit at or above the resource count runs the whole source, prints no
+`checked` line and is a verdict. Exit 0 means the whole source was compared and no resource was refused or encoded
+to different bytes.
+
 ## 10. Reproduction
 
 ```powershell

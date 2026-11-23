@@ -22,7 +22,8 @@ Usage:
     python -I rbf0_encode.py --check <carve-dir | resource> [--limit N]
         Decode every RBF0 resource (joining 64 KiB continuations as rbf0_tree.py does), encode it, and compare the
         result with the original bytes. Prints counts only: exact, different, and refused by reason. Exit 1 when a
-        resource encodes to different bytes or was refused: only a run where every resource is exact exits 0.
+        resource encodes to different bytes or was refused, or when --limit stopped the run before the whole
+        source: only a run over the whole source with every resource exact exits 0.
     python -I rbf0_encode.py <rbf0_tree.json> <new_out_dir>
         Write each resource of an rbf0_tree.py JSON report (possibly edited) as <offset>.rbf. The directory must be
         new or empty.
@@ -220,7 +221,8 @@ def resources(source, limit=None):
 
 
 def check(source, limit=None):
-    """Counts for the round trip over `source`: total, exact, different and refused by reason."""
+    """Counts for the round trip over `source`: total, exact, different and refused by reason, plus how many
+    resources the source holds, so a run stopped by `limit` can say how much of it it covered."""
     counts = {"resources": 0, "exact": 0, "different": 0, "refused": 0}
     reasons = dict.fromkeys(REASONS, 0)
     layouts = {}
@@ -239,6 +241,12 @@ def check(source, limit=None):
             layout["exact"] += 1
         else:
             counts["different"] += 1
+    # Only a limited run can stop short of the source; counting it is a second walk, so do it only then.
+    if limit is None:
+        counts["total"] = counts["resources"]
+    else:
+        rows, _read = rbf0_tree._rows(source)
+        counts["total"] = sum(1 for row in rows if rbf0_tree.starts_resource(row))
     return {**counts, "refused_by_reason": {k: v for k, v in reasons.items() if v}, "by_layout": layouts}
 
 
@@ -285,7 +293,8 @@ def write_all(report, out_dir):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--check", metavar="SOURCE", help="round-trip every resource of a carve directory or file")
-    ap.add_argument("--limit", type=int, help="with --check, stop after N resources")
+    ap.add_argument("--limit", type=int, help="with --check, stop after N resources; a run that stops before "
+                                               "the end is not a verdict on the rest of the source and exits 1")
     ap.add_argument("report", nargs="?", help="an rbf0_tree.py JSON report to encode")
     ap.add_argument("out", nargs="?", help="a new or empty output directory")
     a = ap.parse_args(argv)
@@ -301,11 +310,14 @@ def main(argv=None):
         except rbf0_tree.SelectionError as e:
             ap.error(str(e))
         print(f"{r['resources']} resource(s): {r['exact']} exact, {r['different']} different, {r['refused']} refused")
+        if r["resources"] < r["total"]:
+            print(f"  checked {r['resources']} of {r['total']} resource(s): --limit {a.limit} stopped the run, "
+                  "which is not a verdict on the rest")
         for reason, n in r["refused_by_reason"].items():
             print(f"  refused ({reason}): {n}")
         for layout, c in sorted(r["by_layout"].items()):
             print(f"  {layout}: {c['exact']} of {c['resources']} exact")
-        return 1 if r["different"] or r["refused"] else 0
+        return 1 if r["different"] or r["refused"] or r["resources"] < r["total"] else 0
     if not a.report or not a.out:
         ap.error("give --check SOURCE, or a report and an output directory")
     if a.limit is not None:
