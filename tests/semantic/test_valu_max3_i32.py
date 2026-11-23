@@ -610,5 +610,106 @@ class TestVMax3I32IEEE754EdgeCases(unittest.TestCase):
         self.assertEqual(unsigned_max, 0xFFFFFFFF)
         self.assertNotEqual(signed_max, unsigned_max)
 
+# ==============================================================================
+# SECTION 8: Translator-Backed SPIR-V Execution and Mutation Detection
+# ==============================================================================
+
+def run_translator_v_max3_i32(
+    s0: int,
+    s1: int,
+    s2: int,
+    *,
+    inline: Sequence[int] = (),
+    name: str = "ps_v_max3_i32",
+) -> int:
+    """Translate and run v_max3_i32 via tools/rdna2spirv and return output word."""
+    xs = (s0, s1, s2)
+    lines: List[str] = []
+    operands: List[str] = []
+
+    for i, x in enumerate(xs):
+        if i in inline:
+            operands.append(str(to_signed_i32(x)))
+        else:
+            lines.append(f"v_mov_b32 v{i + 1}, {x & MASK32:#x}")
+            operands.append(f"v{i + 1}")
+
+    lines.append(f"v_max3_i32 v0, {', '.join(operands)}")
+    lines.append("exp mrt0 v0, v0, v0, v0 done vm")
+    lines.append("s_endpgm")
+
+    spv = support.translate_lines(name, lines)
+    return support.mrt0_words(spv)[0]
+
+
+class TestVMax3I32TranslatorExecution(unittest.TestCase):
+    """Commit 8: Translator-backed execution tests for v_max3_i32."""
+
+    def test_translator_emits_glsl_smax_chain(self) -> None:
+        """Verify rdna2spirv emits chained OpExtInst %glsl SMax for v_max3_i32."""
+        lines = [
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 20",
+            "v_mov_b32 v3, 30",
+            "v_max3_i32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_i32_emit_check", lines)
+        self.assertIn("OpExtInst %uint %glsl SMax", spv)
+        smax_count = spv.count("OpExtInst %uint %glsl SMax")
+        self.assertEqual(smax_count, 2)
+
+    def test_translator_execution_matrix(self) -> None:
+        """Verify executed SPIR-V output matches reference oracle across diverse test vectors."""
+        test_cases = [
+            (10, 20, 30),
+            (-10, -20, -5),
+            (-1, 0, 1),
+            (0, 0xFFFFFFFF, 10),
+            (0x7FFFFFFF, 0x80000000, 0),
+            (0x80000000, 0x80000001, 0x7FFFFFFE),
+            (0x12345678, 0x87654321, 0x00000000),
+            (0xFFFFFFFE, 0xFFFFFFFF, 0x00000001),
+        ]
+        for idx, (s0, s1, s2) in enumerate(test_cases):
+            with self.subTest(idx=idx, s0=hex(s0 & MASK32), s1=hex(s1 & MASK32), s2=hex(s2 & MASK32)):
+                expected = ref_v_max3_i32(s0, s1, s2)
+                actual = run_translator_v_max3_i32(s0, s1, s2, name=f"ps_max3_matrix_{idx}")
+                self.assertEqual(actual, expected)
+
+    def test_translator_execution_all_permutations(self) -> None:
+        """Verify executed SPIR-V matches oracle across all 6 permutations of an asymmetric triple."""
+        triple = (-15, 0, 45)
+        expected = ref_v_max3_i32(*triple)
+        for idx, perm in enumerate(itertools.permutations(triple)):
+            with self.subTest(perm=perm):
+                actual = run_translator_v_max3_i32(*perm, name=f"ps_max3_perm_{idx}")
+                self.assertEqual(actual, expected)
+
+    def test_translator_inline_constants(self) -> None:
+        """Verify translator handles inline constant operands."""
+        actual = run_translator_v_max3_i32(50, -16, 10, inline=(1, 2), name="ps_max3_inline_const")
+        self.assertEqual(actual, 50)
+
+    def test_mutation_detection_smax_replaced_by_smin(self) -> None:
+        """Mutation detection: replacing SMax with SMin in emitted SPIR-V is detected."""
+        lines = [
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 50",
+            "v_mov_b32 v3, 100",
+            "v_max3_i32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_mut_test", lines)
+        orig_word = support.mrt0_words(spv)[0]
+        self.assertEqual(orig_word, 100)
+
+        mutated_spv = spv.replace("SMax", "SMin")
+        mutated_word = support.mrt0_words(mutated_spv)[0]
+        self.assertEqual(mutated_word, 10)
+        self.assertNotEqual(orig_word, mutated_word)
+
 if __name__ == "__main__":
     unittest.main()
