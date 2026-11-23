@@ -29,7 +29,8 @@ class GpuScore(unittest.TestCase):
         self.assertEqual(pc.gpu_score("Intel(R) UHD Graphics 770"), 15)
 
     def test_arc_integrated_models_are_not_scored_as_discrete(self):
-        for name in ("Intel(R) Arc(TM) B390 GPU", "Intel Arc B370 Graphics", "Arc B390 (1 GB VRAM)"):
+        for name in ("Intel(R) Arc(TM) B390 GPU", "Intel Arc B370 Graphics",
+                     "Arc B390 (1 GB VRAM)", "Intel ArcB390"):
             with self.subTest(name=name):
                 self.assertEqual(pc.gpu_lookup(name), (None, False))
         self.assertEqual(pc.gpu_lookup("Intel Arc B580"), (100, True))

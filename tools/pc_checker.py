@@ -139,7 +139,7 @@ GEN_GROWTH = 1.25   # assumed uplift per generation beyond the tables
 _NV_SUFFIX = {"ti": 1.15, "super": 1.1, "ti super": 1.25}
 _RX_SUFFIX = {"xt": 1.12, "xtx": 1.3, "gre": 0.9}
 _VARIANT_WORDS = {"ti", "super", "xt", "xtx", "gre"}
-_UNSCORED_ARC_IGPU = re.compile(r"\barc b (?:370|390)\b")
+_UNSCORED_ARC_IGPU = re.compile(r"\barc\s*b\s*(?:370|390)\b")
 
 
 def _gen_score(table: dict, series: int, tier: int, step: int):
