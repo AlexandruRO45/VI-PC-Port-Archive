@@ -457,5 +457,31 @@ class TestVExpF32SIMDAndIEEE(unittest.TestCase):
                 self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 111.0)
 
 
+def run_hw_exp_f32(src_val: float) -> float:
+    bits = f32_to_bits(src_val)
+    lines = [
+        f"v_mov_b32 v0, {bits:#x}",
+        "v_exp_f32 v0, v0",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_exp_f32_hw", lines)
+    out_bits = support.mrt0_words(spv)[0]
+    return bits_to_f32(out_bits)
+
+
+class TestVExpF32HardwareTranslator(unittest.TestCase):
+    """Translator integration and hardware execution tests for v_exp_f32."""
+
+    def test_translator_exp_values(self):
+        self.assertEqual(run_hw_exp_f32(0.0), 1.0)
+        self.assertEqual(run_hw_exp_f32(1.0), 2.0)
+        self.assertEqual(run_hw_exp_f32(2.0), 4.0)
+        self.assertEqual(run_hw_exp_f32(3.0), 8.0)
+        self.assertEqual(run_hw_exp_f32(-1.0), 0.5)
+        self.assertEqual(run_hw_exp_f32(-2.0), 0.25)
+        self.assertEqual(run_hw_exp_f32(float("-inf")), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
