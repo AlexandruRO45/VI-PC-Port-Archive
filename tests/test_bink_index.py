@@ -170,6 +170,22 @@ class TestScanAndWrite(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual((summary["zero_padding"], summary["rpf_trailer"], summary["unread_bytes"]), (0, 0, 147))
 
+    def test_bink_shaped_trailer_is_not_scanned_as_video(self):
+        trailer = make_stream()
+        self.assertEqual(len(trailer) % 16, 0)
+        rows, summary = bink.scan_target(self.rpf(len(trailer), trailer))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(summary["rpf_trailer"], len(trailer))
+        self.assertEqual((summary["zero_padding"], summary["unread_bytes"]), (100, 0))
+
+    def test_stream_crossing_declared_trailer_start_invalidates_hint(self):
+        for tail_size, hint in ((48, 160), (49, 464)):
+            with self.subTest(tail_size=tail_size, hint=hint):
+                rows, summary = bink.scan_target(self.rpf(hint, bytes(range(1, tail_size + 1))))
+                self.assertEqual(len(rows), 1)
+                self.assertEqual((summary["zero_padding"], summary["rpf_trailer"], summary["unread_bytes"]),
+                                 (0, 0, 100 + tail_size))
+
     def test_fractional_rates_are_indexed(self):
         path = os.path.join(self.dir, "fractional.bk2")
         with open(path, "wb") as fh:

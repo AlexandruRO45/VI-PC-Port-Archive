@@ -165,9 +165,13 @@ def scan_file(path, source):
             pos = start
             last = start
             zero = unread = 0
+            scan_end = len(data)
+            if 0 < trailer_size <= scan_end - start:
+                scan_end -= trailer_size
             while True:
-                match = SIG.search(data, pos)
-                if not match:
+                # A signature starting before the boundary can expose an invalid trailer hint.
+                match = SIG.search(data, pos, scan_end + 3)
+                if not match or match.start() >= scan_end:
                     break
                 row = parse_header(data, match.start())
                 if row is None:
@@ -179,10 +183,11 @@ def scan_file(path, source):
                 row["source"] = source
                 row["_path"] = path
                 rows.append(row)
-                last = match.start() + row["size"]
-                pos = last
-            trailer = trailer_size if 0 < trailer_size <= len(data) - last else 0
-            z, u = _gap(data, last, len(data) - trailer)
+                last = pos = match.start() + row["size"]
+                if last > scan_end:
+                    scan_end = len(data)
+            trailer = len(data) - scan_end
+            z, u = _gap(data, last, scan_end)
             zero += z
             unread += u
             span = len(data) - start
