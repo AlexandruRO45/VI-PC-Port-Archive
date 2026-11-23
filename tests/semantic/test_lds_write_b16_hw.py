@@ -305,5 +305,23 @@ class TestDSWriteB16StatusFlags(unittest.TestCase):
         self.assertEqual(wave.exec_mask, orig_mask)
 
 
+# ==============================================================================
+# IEEE 754 Half-Precision Bit-Pattern Boundary Extremes
+# ==============================================================================
+
+class TestDSWriteB16IEEE754BitPatterns(unittest.TestCase):
+    def test_floating_point_bit_exact_storage(self):
+        patterns = [
+            POS_ZERO, NEG_ZERO, ONE, TWO, THREE, HALF, NEG_ONE,
+            POS_INF, NEG_INF, QNAN, SNAN, MIN_NORMAL, MAX_NORMAL, MIN_SUB, MAX_SUB,
+        ]
+        lds = LDSMemory()
+        addr = 0x100
+        for i, pat in enumerate(patterns):
+            ref_ds_write_b16(lds, base_addr=addr, data=pat, offset=i * 2)
+        for i, pat in enumerate(patterns):
+            self.assertEqual(lds.read_u16(addr + i * 2), pat)
+
+
 if __name__ == '__main__':
     unittest.main()
