@@ -29,6 +29,23 @@ constexpr Results expected{{
     {patterns[0], 0, patterns[2], patterns[2]},
     {0, patterns[1], 0, 0},
 }};
+// Per tile: every word of it read the value Results holds for it.
+using Whole = std::array<std::array<bool, tiles_per_buffer>, snapshots>;
+
+bool all_whole(const Whole& whole) {
+    return std::all_of(whole.begin(), whole.end(),
+                       [](const auto& snapshot) { return std::all_of(snapshot.begin(), snapshot.end(), [](bool w) { return w; }); });
+}
+
+// Intel's D3D12 driver (Xe-LP, tiled resources tier 4: Iris Xe 101.7092, UHD 730 101.7085) drops B[0]'s mapping in
+// the update before snapshot 1, where B[0]'s range is D3D12_TILE_RANGE_FLAG_SKIP, and the tile reads zeros. D3D12
+// leaves a skipped range's mapping as it was. Mapping B[0] explicitly instead (FLAG_NONE, heap tile 0, the same
+// mapping) reads back right on that GPU. Only this exact native readback counts as a host quirk; any other fails.
+bool skip_range_quirk(const Results& native, const Whole& whole) {
+    Results quirk = expected;
+    quirk[1][0] = 0;
+    return native == quirk && all_whole(whole);
+}
 
 D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes) {
     D3D12_RESOURCE_DESC desc{};
@@ -50,7 +67,8 @@ struct Gate {
     ~Gate() { if (fence) fence->Signal(1); }
 };
 
-bool run(ID3D12Device& device, Results& result, bool layer = false) {
+// The layer must read every tile right. The native half reports what it read (`result`, `whole`) and main judges it.
+bool run(ID3D12Device& device, Results& result, Whole& whole, bool layer = false) {
     ComPtr<ID3D12Resource> a, b, upload, readback;
     const auto reserved = buffer_desc(buffer_bytes);
     EXPECT(SUCCEEDED(device.CreateReservedResource(&reserved, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&a))));
@@ -179,6 +197,7 @@ bool run(ID3D12Device& device, Results& result, bool layer = false) {
         for (UINT tile = 0; tile < tiles_per_buffer; ++tile) {
             const auto* first = data + (i * tiles_per_buffer + tile) * words_per_tile;
             result[i][tile] = *first;
+            whole[i][tile] = std::all_of(first, first + words_per_tile, [&](auto word) { return word == *first; });
             const auto* bad = std::find_if(first, first + words_per_tile, [&](auto word) { return word != expected[i][tile]; });
             if (bad == first + words_per_tile) continue;
             ++wrong_tiles;
@@ -191,7 +210,7 @@ bool run(ID3D12Device& device, Results& result, bool layer = false) {
         }
     }
     readback->Unmap(0, &empty);
-    EXPECT(wrong_tiles == 0);
+    if (layer) EXPECT(wrong_tiles == 0);
     return true;
 }
 
@@ -272,7 +291,8 @@ int main() {
         return 77;
     }
     Results observed{}, native{};
-    if (!run(*vulkan.Get(), observed, true)) return 1;
+    Whole observed_whole{}, native_whole{};
+    if (!run(*vulkan.Get(), observed, observed_whole, true)) return 1;
     std::puts("Vulkan replay: 12 full tiles matched across aliased, skipped, unmapped, reused and remapped ranges");
     std::puts("A rejected update left all tile mappings intact");
     const LUID layer_luid = vulkan->GetAdapterLuid();
@@ -289,8 +309,16 @@ int main() {
                                  "tier 2 or more\n");
             return 1;
         }
-        if (!run(*device.Get(), native) || native != observed) return 1;
-        std::puts("Native D3D12 matched all three GPU readbacks");
+        if (!run(*device.Get(), native, native_whole)) return 1;
+        if (native == expected && all_whole(native_whole)) {
+            std::puts("Native D3D12 matched all three GPU readbacks");
+        } else if (skip_range_quirk(native, native_whole)) {
+            std::puts("Native D3D12 host quirk: snapshot 1 tile 0 reads zeros, the driver dropped B[0]'s mapping under "
+                      "a D3D12_TILE_RANGE_FLAG_SKIP range; the layer kept it, as D3D12 specifies");
+        } else {
+            std::fprintf(stderr, "Native D3D12 differs from the expected readbacks\n");
+            return 1;
+        }
     }
     return 0;
 }
