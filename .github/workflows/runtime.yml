@@ -105,12 +105,10 @@ jobs:
       wine-artifact: ${{ steps.upload-wine-artifact.outcome }}
     env:
       SCCACHE_GHA_ENABLED: "true"
-      # The pinned SDL3 release: the same SHA-256 as URL_HASH in runtime/CMakeLists.txt. The SDL3 cache is keyed
-      # on it, so a new pin starts from an empty cache. The cache only has content once the job fetches SDL3
-      # (Depends on: #7113); until then these steps are inert.
+      # The pinned SDL3 release, the same SHA-256 as URL_HASH in runtime/CMakeLists.txt; the SDL3 cache below is
+      # keyed on it. Bump SDL3_CACHE_SALT when the SDL3 build options change - the cache holds objects and
+      # generated files, and no toolchain version notices an option change.
       SDL3_TARBALL_SHA256: f3bb06f55bed9557227a700af2ea62e49497ebdf58037732a731a5fb3ef8581f
-      # Bump when the SDL3 build options in runtime/CMakeLists.txt change: the cache holds generated files and
-      # objects, and nothing else in its key notices a changed option.
       SDL3_CACHE_SALT: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -248,16 +246,16 @@ jobs:
         id: sdl3-toolset
         shell: pwsh
         run: |
-          # cl with no arguments writes its usage and its banner on different streams and does not always put the
-          # banner first, so read the executable's file version instead of its output.
+          # cl with no arguments writes its usage and its banner on different streams, so the banner is not always
+          # first; read the executable's file version instead.
           $cl = (Get-Item -LiteralPath (Get-Command cl -CommandType Application).Source).VersionInfo.FileVersion
           if (-not $cl) {
             throw "Could not read cl's file version for the SDL3 cache key"
           }
           $cmake = (& cmake --version | Select-Object -First 1)
           $ninja = (& ninja --version)
-          $versions = "$cl $cmake $ninja"
-          "version=$($versions -replace '[^0-9A-Za-z._-]+', '-')" >> $env:GITHUB_OUTPUT
+          $version = "$cl $cmake $ninja" -replace '[^0-9A-Za-z._-]+', '-'
+          "version=$version" >> $env:GITHUB_OUTPUT
       - name: Cache the SDL3 fetch and build
         id: sdl3-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
