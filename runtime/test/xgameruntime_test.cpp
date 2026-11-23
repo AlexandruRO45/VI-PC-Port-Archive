@@ -628,13 +628,13 @@ void check_run_time_load() {
             {0x3720de07, 0xe8e4, 0x44a3, {0xad, 0x32, 0xb3, 0x59, 0xe8, 0xad, 0xbe, 0x55}},
             {0xf92d8712, 0x2b27, 0x4d8a, {0xbf, 0x01, 0x11, 0xa6, 0xf8, 0xe3, 0xeb, 0x42}},
             package3};
-        bool all = true;
+        bool chain_answers = true;
         for (const GUID& iid : chain) {
             void* same = nullptr;
-            all = all && query(&package_cls, iid, &same) == S_OK && same == pk;
+            chain_answers = chain_answers && query(&package_cls, iid, &same) == S_OK && same == pk;
             if (same) release(same);
         }
-        check(all, "IXPackageImpl3 answers for IXPackageImpl and IXPackageImpl2 too");
+        check(chain_answers, "IXPackageImpl3 answers for IXPackageImpl and IXPackageImpl2 too");
         release(pk);
     }
     {
