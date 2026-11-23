@@ -27,10 +27,22 @@ def row_targets(text):
 
 
 def rows(text):
-    """One entry per table row, in order: a page listed twice appears twice."""
+    """One entry per table row, in order: a page listed twice appears twice. Fenced examples do not count."""
     found = []
+    fence = None
     for line in text.splitlines():
-        match = ROW.match(line.strip())
+        stripped = line.strip()
+        if fence is None:
+            opener = re.match(r"(`{3,}|~{3,})", stripped)
+            if opener:
+                fence = opener.group(1)
+                continue
+        elif stripped.startswith(fence[0] * len(fence)):
+            fence = None
+            continue
+        else:
+            continue
+        match = ROW.match(stripped)
         if match:
             found.append(normalise((match.group(1) or match.group(2)).split("#", 1)[0]))
     return found
@@ -98,6 +110,15 @@ class IndexTest(unittest.TestCase):
             text = "| Document | Content |\n|---|---|\n| [one.md](one.md) | listed |\n"
             self.assertEqual(missing_rows(tmp, text), ["two.md"])
             self.assertEqual(missing_rows(tmp, text + "| [two.md](two.md) | listed |\n"), [])
+
+    def test_a_row_inside_a_fenced_example_does_not_cover_a_page(self):
+        for mark in ("```", "~~~"):
+            with self.subTest(fence=mark), tempfile.TemporaryDirectory() as tmp:
+                write_tree(tmp, ["one.md", "two.md"])
+                text = ("| Document | Content |\n|---|---|\n| [one.md](one.md) | listed |\n"
+                        f"{mark}markdown\n| [two.md](two.md) | example |\n{mark}\n")
+                self.assertEqual(missing_rows(tmp, text), ["two.md"])
+                self.assertEqual(missing_rows(tmp, text + "| [two.md](two.md) | listed |\n"), [])
 
     def test_a_row_without_a_page_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
