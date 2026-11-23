@@ -282,6 +282,51 @@ class SummaryTests(unittest.TestCase):
             with open(os.path.join(src, "cs_tri.s"), encoding="utf-8") as f:
                 self.assertIn("image_bvh", f.read())
 
+    def test_output_must_not_overwrite_carve_index_or_native_blob(self):
+        # scan_listing reads <disasm>/../index.json (via rdna2spirv.stage_of) and <disasm>/../fssm/<name>.fssm
+        # or <disasm>/../fspx/<name>.code (via load_program -> rdna2spirv.native_blob), so --out must not name
+        # any of them or a hardlink alias of them.
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work) / "dxbc"
+            disasm = root / "disasm"
+            fssm = root / "fssm"
+            fspx = root / "fspx"
+            disasm.mkdir(parents=True)
+            fssm.mkdir()
+            fspx.mkdir()
+            self.directory(str(disasm), {"cs_tri": listing(CALL32, "s_endpgm")})
+            index = root / "index.json"
+            index_bytes = b'[{"file": "cs_tri.dxbc", "stage": "cs"}]'
+            index.write_bytes(index_bytes)
+            fssm_blob = fssm / "cs_tri.fssm"
+            fssm_bytes = b"FSSM\x00\x00\x00\x00"
+            fssm_blob.write_bytes(fssm_bytes)
+            fspx_blob = fspx / "cs_tri.code"
+            fspx_bytes = b"\x01\x02\x03\x04"
+            fspx_blob.write_bytes(fspx_bytes)
+
+            for victim, expected in ((index, index_bytes), (fssm_blob, fssm_bytes), (fspx_blob, fspx_bytes)):
+                with self.subTest(victim=victim.name):
+                    err = io.StringIO()
+                    with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(err), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        census.main([str(disasm), "--out", str(victim)])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("must not overwrite an input", err.getvalue())
+                    self.assertEqual(victim.read_bytes(), expected)
+                    alias = root / f"alias_{victim.name}"
+                    try:
+                        os.link(victim, alias)
+                    except OSError:
+                        continue
+                    err = io.StringIO()
+                    with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(err), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        census.main([str(disasm), "--out", str(alias)])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("must not overwrite an input", err.getvalue())
+                    self.assertEqual(victim.read_bytes(), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -72,8 +72,9 @@ from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import rdna2spirv  # noqa: E402  (base_op, BRANCHES, fold_far_branches, reachable_code, native_blob, stage_of)
+from report_paths import same_report_path  # noqa: E402
 from shader_ir import parse_file  # noqa: E402
-from wave64_graphics_scan import scanned_paths  # noqa: E402
+from wave64_graphics_scan import metadata_paths, scanned_paths  # noqa: E402
 
 FORMS = ("image_bvh_intersect_ray", "image_bvh64_intersect_ray")
 CATEGORIES = ("ratio", "high_half", "raw_integer", "raw_float", "raw_other", "select")
@@ -914,6 +915,21 @@ def print_summary(s, out=None):
     w("limits: " + "; ".join(f"{k} {v}" for k, v in s["limits"].items()))
 
 
+def census_input_paths(listings):
+    """Every file the census may read for its listings: FSSM/FSPX sidecars and the carve index."""
+    seen = set()
+    for path in metadata_paths(listings):
+        if path not in seen:
+            seen.add(path)
+            yield path
+    for path in listings:
+        name = os.path.splitext(os.path.basename(path))[0]
+        code = rdna2spirv.native_paths(path, name)[1]
+        if code not in seen:
+            seen.add(code)
+            yield code
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Count image_bvh*_intersect_ray sites, their descriptor fields and how "
                                              "their result words are read (counts only, no names)")
@@ -927,8 +943,13 @@ def main(argv=None) -> int:
             ap.error(f"{args.out} is a directory, not a JSON file")
         if not os.path.isdir(os.path.dirname(os.path.abspath(args.out))):
             ap.error(f"output directory does not exist: {os.path.dirname(os.path.abspath(args.out))}")
-        if os.path.exists(args.out) and any(os.path.samefile(args.out, p) for p in scanned_paths(args.src)):
-            ap.error("output must not overwrite a listing it scans")
+        # --out must not replace any input the census reads (each scanned listing, its FSSM or FSPX blob
+        # read by load_program -> native_blob, and the carve index read by stage_of), even through an alias
+        # or a case-only spelling on a folding volume.
+        listings = scanned_paths(args.src)
+        for path in [*listings, *census_input_paths(listings)]:
+            if os.path.isfile(path) and same_report_path(args.out, path):
+                ap.error(f"output must not overwrite an input it scans: {path}")
     summary = summarise(*scan_directory(args.src))
     print_summary(summary)
     if args.out:
