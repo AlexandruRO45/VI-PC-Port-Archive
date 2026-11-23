@@ -209,7 +209,8 @@ is not measured.
 table in order, inflates each stream to learn its extent, keeps only the first 4 bytes, and stops at the first
 stream whose output starts with the magic. It then appends the following contiguous streams (up to 1 MiB of zero
 padding) until the header's declared total is reached, writes the file under the temporary directory and runs
-the checks below. `--budget` bounds the compressed bytes examined and `--max-streams` the number of streams; a
+the checks below. `--budget` bounds the compressed bytes examined (default 8 GiB) and `--max-streams` the number of
+streams (default 200,000), so a folder that holds no cache still ends; a
 source folder is scanned in sorted order and the report names the archive index and the stream offset, never the
 path.
 
