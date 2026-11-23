@@ -68,33 +68,41 @@
   <div class="layout">
     <section class="panel stack" aria-labelledby="library-heading">
       <h2 id="library-heading">Local library</h2>
+      <div class="row">
+        <button id="refresh" type="button">Refresh catalog</button>
+        <p class="status" id="catalog-status" role="status">Loading the local catalog…</p>
+      </div>
       <label>Category
         <select id="category">
+          <option value="all">All categories</option>
           <option value="props">Props</option>
           <option value="ped-parts">Ped parts</option>
           <option value="vehicles">Vehicles</option>
         </select>
       </label>
-      <div class="stack file-controls" aria-describedby="import-help">
-        <label>Add GLB files
-          <input id="files" type="file" accept=".glb,.png" multiple>
-        </label>
-        <label>Add a folder
-          <input id="folder" type="file" webkitdirectory multiple>
-        </label>
-      </div>
-      <p class="hint" id="import-help">Files stay in your browser. Choose a category before adding files, or pick a folder with Props, Ped parts, or Vehicles subfolders.</p>
-      <p class="status" id="import-status" role="status" hidden></p>
       <label>Search by name
         <input id="search" type="search" autocomplete="off">
       </label>
-      <p class="status" id="results" role="status">No assets added.</p>
+      <p class="status" id="results" role="status"></p>
       <ul class="files" id="models" aria-label="Models"></ul>
       <div class="pager" id="pager" aria-label="Results pages" hidden>
         <button id="previous" type="button">Previous</button>
         <span id="page"></span>
         <button id="next" type="button">Next</button>
       </div>
+      <details>
+        <summary>Add files manually</summary>
+        <div class="stack file-controls" aria-describedby="import-help">
+          <p class="hint" id="import-help">Loose files use the selected category, or Props when all categories are shown. A folder can contain Props, Ped parts, or Vehicles subfolders.</p>
+          <label>Add GLB files
+            <input id="files" type="file" accept=".glb,.png" multiple>
+          </label>
+          <label>Add a folder
+            <input id="folder" type="file" webkitdirectory multiple>
+          </label>
+          <p class="status" id="import-status" role="status" hidden></p>
+        </div>
+      </details>
     </section>
     <section class="panel stack" aria-labelledby="name">
       <h2 id="name">Asset preview</h2>
@@ -117,7 +125,7 @@
       <label class="preview-file" id="attachment" hidden>Attach preview PNG
         <input id="png" type="file" accept=".png,image/png" aria-describedby="preview-help">
       </label>
-      <p class="hint" id="preview-help">The translated preview is a static offline PNG. Rename the <code>image.png</code> from First Light’s <code>--png</code> run to <code>&lt;model-stem&gt;.shader.png</code> and pick it with its GLB in the same folder, or attach the PNG directly.</p>
+      <p class="hint" id="preview-help">The translated preview is a static PNG from an offline Vulkan draw. When adding files manually, select <code>&lt;model-stem&gt;.shader.png</code> with its GLB or attach the PNG directly.</p>
     </section>
   </div>
 </main>

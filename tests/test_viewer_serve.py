@@ -193,6 +193,15 @@ class HandlerTest(unittest.TestCase):
         (world / "sub").mkdir(parents=True)
         (world / "ok.bin").write_bytes(b"world-bytes")
         (world / "model.glb").write_bytes(b"glTF")
+        catalog = root / "catalog"
+        (catalog / "Prop parts").mkdir(parents=True)
+        (catalog / "catalog.json").write_bytes(b'{"version":1,"assets":[],"status":{"complete":true}}')
+        (catalog / "Prop parts" / "Box #2%.glb").write_bytes(b"glTF")
+        (catalog / "Prop parts" / "Box #2%.png").write_bytes(b"\x89PNG")
+        (catalog / "Prop parts" / "catalog.json").write_bytes(b"nested manifest")
+        (catalog / "Prop parts" / "original.obj").write_bytes(b"source model")
+        (catalog / "original.rpf").write_bytes(b"archive")
+        (catalog / "original.spv").write_bytes(b"shader")
         (root / "site").mkdir()
         (root / "site" / "index.html").write_text("<!doctype html><title>viewer</title>", encoding="utf-8")
         (root / "site" / "assets.html").write_text("<!doctype html><title>assets</title>", encoding="utf-8")
@@ -205,6 +214,7 @@ class HandlerTest(unittest.TestCase):
                 pass
 
         QuietHandler.world = str(world)      # a class body cannot see the enclosing function's locals
+        QuietHandler.catalog = str(catalog)
 
         cls.server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), functools.partial(QuietHandler, directory=str(root / "site")))
@@ -324,6 +334,49 @@ class HandlerTest(unittest.TestCase):
                 self.assertEqual(status, 403)
                 self.assertNotIn(content, body)
 
+    def test_configured_catalog_serves_manifest_and_encoded_generated_files(self):
+        items = (("catalog.json", "application/json", b'"version":1'),
+                 ("Prop%20parts/Box%20%232%25.glb", "model/gltf-binary", b"glTF"),
+                 ("Prop%20parts/Box%20%232%25.png", "image/png", b"\x89PNG"))
+        for item, mime, payload in items:
+            with self.subTest(item=item):
+                route = "/catalog/" + item + "?v=1"
+                status, head, body = raw_request(self.port, route)
+                self.assertEqual(status, 200)
+                self.assertIn("content-type: " + mime, head.lower())
+                self.assertIn("cache-control: no-store", head.lower())
+                self.assertIn(payload, body)
+                status, _, body = raw_request(self.port, route, method="HEAD")
+                self.assertEqual((status, body), (200, b""))
+                status, _, body = raw_request(self.port, route, host="foreign.example")
+                self.assertEqual(status, 403)
+                self.assertNotIn(payload, body)
+
+    def test_catalog_never_lists_directories_or_serves_source_files(self):
+        routes = ("/catalog/", "/catalog/Prop%20parts/", "/catalog/Prop%20parts/catalog.json",
+                  "/catalog/original.rpf", "/catalog/original.spv", "/catalog/Prop%20parts/original.obj",
+                  "/catalog/catalog%2Ejson", "/catalog/catalog.json::$DATA", "/catalog/%2e%2e/world/model.glb",
+                  "/catalog/..%5cworld/model.glb", "/catalog/C:/example.png", "/catalog/NUL.png",
+                  "/catalog/Prop%20parts//Box%20%232%25.glb", "/catalog/%ff.png")
+        with mock.patch("builtins.open", side_effect=AssertionError("a refused catalog path reached open")) as opened:
+            for route in routes:
+                with self.subTest(route=route):
+                    self.assertEqual(raw_request(self.port, route)[0], 403)
+            opened.assert_not_called()
+        self.assertEqual(raw_request(self.port, "/catalog/absent.png")[0], 404)
+        self.assertEqual(raw_request(self.port, "/catalog/catalog.json", method="POST")[0], 501)
+
+    def test_catalog_symlink_cannot_escape_or_alias_a_source_file(self):
+        root = Path(self._tmp.name)
+        catalog = root / "catalog"
+        for link, target in (("escape.glb", root / "world" / "model.glb"),
+                             ("alias.png", catalog / "original.rpf")):
+            try:
+                (catalog / link).symlink_to(target)
+            except (OSError, NotImplementedError) as error:
+                self.skipTest(f"cannot create a symlink here: {error}")
+            self.assertEqual(raw_request(self.port, "/catalog/" + link)[0], 403, link)
+
     def test_nothing_else_outside_world_is_served(self):
         # These reached SimpleHTTPRequestHandler unguarded: on Windows /NUL opened the device (200, empty) and
         # the stream, trailing-dot and trailing-space forms returned the page or the server's own source.
@@ -383,6 +436,7 @@ class NoWorldHandlerTest(unittest.TestCase):
                 status, _, body = raw_request(port, "/", host=f"127.0.0.1:{port}")
                 self.assertEqual(status, 200)
                 self.assertIn(b"<title>viewer</title>", body)
+                self.assertEqual(raw_request(port, "/catalog/catalog.json")[0], 404)
                 # A world folder that happens to sit in the viewer folder is not served: /world/ exists only
                 # with --world, behind safe_world_path.
                 for target in ("/world/world.json", "/world/NUL", "/world/world.json::$DATA"):

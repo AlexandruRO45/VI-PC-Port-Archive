@@ -5,9 +5,17 @@ const { test } = require("node:test");
 const vm = require("node:vm");
 
 const source = readFileSync(join(__dirname, "../viewer/assets.js"), "utf8");
-const { catalogEntries, checkLocalGLB } = vm.runInNewContext(
-  source + "\n;({ catalogEntries, checkLocalGLB });",
-  { document: { getElementById: () => ({}) }, TextDecoder },
+function assetContext(globals = {}) {
+  return vm.createContext({
+    document: { getElementById: () => ({}) },
+    window: { addEventListener() {} },
+    TextDecoder, AbortController, AbortSignal, setTimeout, clearTimeout,
+    ...globals,
+  });
+}
+
+const { catalogEntries, checkLocalGLB, parseCatalog } = vm.runInContext(
+  source + "\n;({ catalogEntries, checkLocalGLB, parseCatalog });", assetContext(),
 );
 
 function file(name, folder = "") {
@@ -48,6 +56,91 @@ test("matching previews are scoped to the model's folder and file selection", ()
   ], "props");
   assert.deepEqual(Array.from(entries, entry => entry.preview), [undefined, preview, loosePreview]);
   assert.equal(catalogEntries([file("Chair.glb")], "props")[0].preview, undefined);
+});
+
+test("catalog paths encode individual segments and retain the library status", () => {
+  const status = { complete: false, processed: 2, total: 5 };
+  const result = parseCatalog({ version: 1, status, assets: [
+    { name: "Trolley", category: "props", model: "Props/Pad #2%.glb", preview: "Pics/Pad ?2.png" },
+    { name: "Rover", category: "vehicles", model: "Vehicles/Rover.GLB" },
+  ] });
+  assert.equal(result.status, status);
+  assert.equal(result.entries[0].modelUrl, "/catalog/Props/Pad%20%232%25.glb");
+  assert.equal(result.entries[0].previewUrl, "/catalog/Pics/Pad%20%3F2.png");
+  assert.equal(result.entries[1].previewUrl, undefined);
+});
+
+test("catalog entries reject absolute paths, unsafe segments, and unexpected types", () => {
+  const parse = model => parseCatalog({
+    version: 1, status: { complete: false },
+    assets: [{ name: "Cart", category: "vehicles", model }],
+  });
+  for (const path of ["http://example.test/cart.glb", "/cart.glb", "C:/cart.glb", "../cart.glb",
+    "cars/./cart.glb", "cars//cart.glb", "cars\\cart.glb", "cars/cart.obj", "cars/a\u0000b.glb"]) {
+    assert.throws(() => parse(path), /Invalid catalog file path/);
+  }
+  assert.throws(() => parseCatalog({ version: 2, assets: [], status: { complete: true } }), /version 1/);
+});
+
+test("catalog refresh keeps the selected model and search while adding its new preview", async () => {
+  const initial = { name: "Cart", category: "vehicles", model: "vehicles/cart.glb" };
+  const button = { disabled: false };
+  const status = {};
+  const context = assetContext({
+    document: { getElementById: id => ({ refresh: button, "catalog-status": status })[id] || {} },
+    fetch: async (url, options) => {
+      assert.equal(url, "/catalog/catalog.json");
+      assert.equal(options.redirect, "error");
+      return { ok: true, json: async () => ({
+        version: 1, status: { complete: true },
+        assets: [{ ...initial, preview: "vehicles/cart.png" }],
+      }) };
+    },
+    initial,
+  });
+  vm.runInContext(source + `
+    catalogAssets = parseCatalog({ version: 1, status: { complete: false }, assets: [initial] }).entries;
+    selected = catalogAssets[0];
+    category.value = "vehicles";
+    search.value = "cart";
+    let renders = 0;
+    let loads = 0;
+    renderList = () => renders++;
+    selectAsset = () => loads++;
+    imageStage.hidden = true;
+  `, context);
+  await vm.runInContext("refreshCatalog()", context);
+  assert.equal(status.textContent, "Catalog ready.");
+  assert.equal(vm.runInContext("selected.previewUrl", context), "/catalog/vehicles/cart.png");
+  assert.equal(vm.runInContext("translated.disabled", context), false);
+  assert.equal(vm.runInContext("category.value + ':' + search.value", context), "vehicles:cart");
+  assert.equal(vm.runInContext("renders + ':' + loads", context), "1:0");
+});
+
+test("a catalog build polls until complete and reports waiting, partial, and empty states", async () => {
+  const button = { disabled: false };
+  const status = {};
+  let pending;
+  const payloads = [
+    { status: 503 },
+    { ok: true, json: async () => ({ version: 1, status: { complete: false, processed: 1, total: 3 },
+      assets: [{ name: "Cart", category: "vehicles", model: "cart.glb" }] }) },
+    { ok: true, json: async () => ({ version: 1, status: { complete: true }, assets: [] }) },
+  ];
+  const context = assetContext({
+    document: { getElementById: id => ({ refresh: button, "catalog-status": status })[id] || {} },
+    fetch: async () => payloads.shift(),
+    setTimeout: (callback, delay) => { assert.equal(delay, 5000); pending = callback; },
+    clearTimeout: () => { pending = undefined; },
+  });
+  vm.runInContext(source + "\napplyCatalog = entries => { catalogAssets = entries; };", context);
+  await vm.runInContext("refreshCatalog()", context);
+  assert.match(status.textContent, /Waiting for the generated catalog/);
+  await pending();
+  assert.match(status.textContent, /Building catalog \(1\/3\).*Partial results/);
+  await pending();
+  assert.equal(status.textContent, "The catalog is empty.");
+  assert.equal(pending, undefined);
 });
 
 test("the binary glTF check accepts embedded buffers and images", () => {

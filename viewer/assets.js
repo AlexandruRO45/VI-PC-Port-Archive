@@ -16,15 +16,101 @@ const categories = new Map([
   ["pedparts", "ped-parts"], ["peds", "ped-parts"],
   ["vehicles", "vehicles"], ["cars", "vehicles"],
 ]);
-const assets = [];
+const manualAssets = [];
+let catalogAssets = [];
+let assets = [];
 const pageSize = 12;
 let page = 0;
 let selected;
 let loadId = 0;
 let imageId = 0;
+let modelRequest;
+let imageRequest;
 let imageUrl;
 let viewer;
 let viewerPromise;
+let catalogTimer;
+let catalogPolling = false;
+
+function catalogURL(path, extension) {
+  if (typeof path !== "string" || !path.toLowerCase().endsWith(extension) || /[\\:\x00-\x1f]/.test(path))
+    throw new Error("Invalid catalog file path.");
+  const parts = path.split("/");
+  if (parts.some(part => !part || /[. ]$/.test(part))) throw new Error("Invalid catalog file path.");
+  return "/catalog/" + parts.map(encodeURIComponent).join("/");
+}
+
+function parseCatalog(manifest) {
+  if (manifest?.version !== 1 || !Array.isArray(manifest.assets) || typeof manifest.status?.complete !== "boolean")
+    throw new Error("Expected a version 1 catalog with build status.");
+  const entries = new Map();
+  for (const entry of manifest.assets) {
+    if (!entry || typeof entry.name !== "string" || !entry.name.trim() ||
+        !["props", "ped-parts", "vehicles"].includes(entry.category))
+      throw new Error("Invalid catalog asset.");
+    const modelUrl = catalogURL(entry.model, ".glb");
+    const previewUrl = entry.preview === undefined ? undefined : catalogURL(entry.preview, ".png");
+    const key = entry.category + ":" + modelUrl;
+    entries.set(key, {
+      key, name: entry.name, category: entry.category, path: entry.model, modelUrl, previewUrl,
+      previewName: entry.preview?.split("/").at(-1),
+    });
+  }
+  return { entries: [...entries.values()], status: manifest.status };
+}
+
+async function refreshCatalog() {
+  const button = byId("refresh");
+  if (button.disabled) return;
+  clearTimeout(catalogTimer);
+  button.disabled = true;
+  const status = byId("catalog-status");
+  try {
+    const response = await fetch("/catalog/catalog.json", {
+      redirect: "error", cache: "no-store", signal: AbortSignal.timeout(8000),
+    });
+    if (response.status === 404 || response.status === 503) {
+      catalogPolling = response.status === 503;
+      status.textContent = catalogPolling ? "Waiting for the generated catalog…" :
+        "No catalog configured. Start the viewer with --catalog DIR or add files manually.";
+      return;
+    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const catalog = parseCatalog(await response.json());
+    applyCatalog(catalog.entries);
+    const { complete, processed, total, message } = catalog.status;
+    catalogPolling = !complete;
+    const progress = Number.isSafeInteger(processed) && Number.isSafeInteger(total) ? ` (${processed}/${total})` : "";
+    const detail = typeof message === "string" && message.trim() ? ` ${message}` : "";
+    status.textContent = (complete ? (catalogAssets.length ? "Catalog ready." : "The catalog is empty.") :
+      `Building catalog${progress}. ${catalogAssets.length ? "Partial results are available." : "No models are ready yet."}`) +
+      detail;
+  } catch (error) {
+    status.textContent = `Could not refresh the catalog. ${error.message}`;
+  } finally {
+    button.disabled = false;
+    if (catalogPolling) catalogTimer = setTimeout(refreshCatalog, 5000);
+  }
+}
+
+function applyCatalog(entries) {
+  if (entries.length === catalogAssets.length && entries.every((entry, index) => {
+    const old = catalogAssets[index];
+    return old.key === entry.key && old.name === entry.name && old.previewUrl === entry.previewUrl;
+  })) return;
+  catalogAssets = entries;
+  rebuildLibrary();
+  const updated = selected?.key && catalogAssets.find(asset => asset.key === selected.key);
+  if (updated) {
+    const previewChanged = selected.previewUrl !== updated.previewUrl;
+    selected = updated;
+    byId("name").textContent = updated.name;
+    translated.disabled = !updated.previewUrl;
+    if (previewChanged && !imageStage.hidden) showMode(updated.previewUrl ? "image" : "model");
+  }
+  if (selected) renderList();
+  else selectAsset(matchingAssets()[0]);
+}
 
 function catalogEntries(files, fallbackCategory) {
   const paths = Array.from(files, file => [file.webkitRelativePath || file.name, file]);
@@ -38,52 +124,60 @@ function catalogEntries(files, fallbackCategory) {
     const folderCategory = folders.map(folder => categories.get(folder.toLowerCase().replace(/[ _-]/g, "")))
       .find(Boolean);
     const preview = previews.get(path.replace(/\.glb$/i, ".shader.png").toLowerCase());
-    added.push({ path, file, preview, category: folderCategory || fallbackCategory });
+    added.push({ path, name: file.name, file, preview, category: folderCategory || fallbackCategory });
   }
   return added;
 }
 
 function addFiles(files) {
-  const added = catalogEntries(files, category.value);
+  const added = catalogEntries(files, category.value === "all" ? "props" : category.value);
   const status = byId("import-status");
   status.hidden = false;
   status.textContent = added.length ? `Added ${added.length} GLB ${added.length === 1 ? "file" : "files"}.` :
     "This selection contains no GLB files. Add a GLB to the library first.";
   if (!added.length) return;
-  for (const asset of added) assets.push(asset);
-  assets.sort((a, b) => a.file.name.localeCompare(b.file.name, undefined, { numeric: true }) ||
-    a.path.localeCompare(b.path));
-  if (!added.some(asset => asset.category === category.value)) category.value = added[0].category;
+  for (const asset of added) manualAssets.push(asset);
+  rebuildLibrary();
+  if (category.value !== "all" && !added.some(asset => asset.category === category.value)) category.value = added[0].category;
   search.value = "";
   page = 0;
-  if (selected?.category !== category.value) selectAsset(added.find(asset => asset.category === category.value));
-  else renderList();
+  selectAsset(added.find(asset => category.value === "all" || asset.category === category.value));
+}
+
+function rebuildLibrary() {
+  assets = [...catalogAssets, ...manualAssets];
+  assets.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }) ||
+    a.path.localeCompare(b.path));
+}
+
+function matchingAssets() {
+  const query = search.value.trim().toLowerCase();
+  return assets.filter(asset => (category.value === "all" || asset.category === category.value) &&
+    asset.name.toLowerCase().includes(query));
 }
 
 function renderList() {
-  const available = assets.filter(asset => asset.category === category.value);
-  const query = search.value.trim().toLowerCase();
-  const matches = available.filter(asset => asset.file.name.toLowerCase().includes(query));
+  const matches = matchingAssets();
   const pageCount = Math.max(1, Math.ceil(matches.length / pageSize));
   page = Math.min(page, pageCount - 1);
   byId("results").textContent = matches.length ? `${matches.length} ${matches.length === 1 ? "model" : "models"}` :
-    available.length ? "No models match this search." : "No models in this category.";
+    search.value.trim() ? "No models match this search." : "No models in this view.";
   const list = byId("models");
   list.replaceChildren();
   for (const asset of matches.slice(page * pageSize, (page + 1) * pageSize)) {
     const item = document.createElement("li");
     const button = document.createElement("button");
     button.type = "button";
-    button.textContent = asset.file.name;
+    button.textContent = asset.name;
     button.setAttribute("aria-pressed", String(asset === selected));
-    if (asset.path !== asset.file.name) {
+    if (asset.path.includes("/")) {
       const folder = document.createElement("span");
       folder.className = "path";
       folder.textContent = asset.path.slice(0, asset.path.lastIndexOf("/"));
-      button.append(folder);
+      button.append(" ", folder);
     }
     button.onclick = () => {
-      if (asset === selected) return;
+      if (asset === selected && modelError.hidden) return;
       list.querySelector('[aria-pressed="true"]')?.setAttribute("aria-pressed", "false");
       button.setAttribute("aria-pressed", "true");
       selectAsset(asset, false);
@@ -103,8 +197,15 @@ function clearImage() {
   imageUrl = undefined;
 }
 
+async function fetchCatalogFile(url, signal) {
+  const response = await fetch(url, { redirect: "error", cache: "no-store", signal });
+  if (!response.ok) throw new Error(`Catalog file is unavailable (HTTP ${response.status}).`);
+  return response;
+}
+
 async function showMode(mode) {
   const id = ++imageId;
+  imageRequest?.abort();
   const showingImage = mode === "image";
   interactive.setAttribute("aria-pressed", String(!showingImage));
   translated.setAttribute("aria-pressed", String(showingImage));
@@ -119,25 +220,29 @@ async function showMode(mode) {
     return;
   }
   const asset = selected;
-  const file = asset.preview;
-  capture.textContent = `Offline capture · ${file.name}`;
+  capture.textContent = `Offline capture · ${asset.preview?.name || asset.previewName}`;
   imageStatus.textContent = "Loading preview PNG…";
   const image = new Image();
-  image.alt = `Offline translated Vulkan capture for ${asset.file.name}`;
+  image.alt = `Offline translated Vulkan capture for ${asset.name}`;
   try {
+    imageRequest = new AbortController();
+    const file = asset.preview || await (await fetchCatalogFile(asset.previewUrl, imageRequest.signal)).blob();
     const signature = new Uint8Array(await file.slice(0, 8).arrayBuffer());
     if (id !== imageId) return;
     if (signature.join() !== "137,80,78,71,13,10,26,10") throw new Error("Invalid PNG signature");
     imageUrl = URL.createObjectURL(file);
-    image.src = imageUrl;
-    await image.decode();
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = reject;
+      image.src = imageUrl;
+    });
     if (id !== imageId) return;
     imageStage.append(image);
     imageStatus.textContent = "";
   } catch {
     if (id === imageId) {
       clearImage();
-      imageStatus.textContent = "Could not open this PNG. Choose another preview image.";
+      imageStatus.textContent = "Could not open this preview PNG.";
     }
   }
 }
@@ -145,19 +250,22 @@ async function showMode(mode) {
 async function selectAsset(asset, updateList = true) {
   selected = asset;
   const id = ++loadId;
+  modelRequest?.abort();
   viewer?.clear();
   fit.disabled = true;
   interactive.disabled = !asset;
-  translated.disabled = !asset?.preview;
-  byId("attachment").hidden = !asset;
-  byId("name").textContent = asset?.file.name || "Asset preview";
+  translated.disabled = !asset?.preview && !asset?.previewUrl;
+  byId("attachment").hidden = !asset?.file;
+  byId("name").textContent = asset?.name || "Asset preview";
   showMode("model");
   modelError.hidden = true;
   modelStatus.textContent = asset ? "Loading GLB…" : "Select a GLB to view its model and materials.";
   if (updateList) renderList();
   if (!asset) return;
   try {
-    const bytes = await asset.file.arrayBuffer();
+    modelRequest = new AbortController();
+    const model = asset.file || await fetchCatalogFile(asset.modelUrl, modelRequest.signal);
+    const bytes = await model.arrayBuffer();
     if (id !== loadId) return;
     checkLocalGLB(bytes);
     viewerPromise ??= createViewer().catch(error => {
@@ -342,8 +450,7 @@ for (const input of [byId("files"), byId("folder")]) {
 }
 category.onchange = () => {
   page = 0;
-  search.value = "";
-  selectAsset(undefined);
+  renderList();
 };
 search.oninput = () => { page = 0; renderList(); };
 byId("previous").onclick = () => { page--; renderList(); };
@@ -354,8 +461,10 @@ fit.onclick = () => viewer?.fitModel();
 png.onchange = () => {
   const file = png.files[0];
   png.value = "";
-  if (!selected || !file) return;
+  if (!selected?.file || !file) return;
   selected.preview = file;
   translated.disabled = false;
   showMode("image");
 };
+byId("refresh").onclick = refreshCatalog;
+window.addEventListener("DOMContentLoaded", refreshCatalog, { once: true });

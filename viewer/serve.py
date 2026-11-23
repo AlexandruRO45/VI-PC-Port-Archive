@@ -1,10 +1,11 @@
-"""Serve the map viewer on http://127.0.0.1:8765 (local only).
+"""Serve the map and asset viewer on http://127.0.0.1:8765 (local only).
 
 Usage:
-    python -I serve.py [--world DIR] [--port 8765]
+    python -I serve.py [--world DIR] [--catalog DIR] [--port 8765]
 
 `--world` is the folder holding world.json and the .glb chunks, typically <work>\\world. It's served at
 /world/ so game-derived files never need to live in this repo. Without it, the viewer shows test terrain.
+`--catalog` points to the generated asset library with catalog.json, GLBs and optional PNG previews.
 """
 from __future__ import annotations
 
@@ -77,13 +78,41 @@ def host_allowed(host: str | None) -> bool:
 
 def safe_world_path(world_dir: str, req_path: str) -> str | None:
     """Resolve a /world/... request path safely inside world_dir, or return None."""
-    if not world_dir or not isinstance(req_path, str):
+    if not isinstance(req_path, str):
         return None
     clean = req_path.split("#", 1)[0].split("?", 1)[0]
     if not clean.startswith("/world/"):
         return None
-    rel = urllib.parse.unquote(clean[len("/world/"):])
-    if not rel or "\x00" in rel:
+    return _safe_root_path(world_dir, urllib.parse.unquote(clean[len("/world/"):]))
+
+
+def safe_catalog_path(catalog_dir: str, req_path: str) -> str | None:
+    """Resolve the root manifest or a generated GLB or PNG below the catalog root."""
+    clean = req_path.split("#", 1)[0].split("?", 1)[0]
+    if not clean.startswith("/catalog/"):
+        return None
+    try:
+        rel = urllib.parse.unquote(clean[len("/catalog/"):], errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if "\\" in rel or any(part.endswith((".", " ")) for part in rel.split("/")):
+        return None
+    if any(ord(char) < 32 for char in rel):
+        return None
+    suffix = os.path.splitext(rel)[1].lower()
+    manifest = clean == "/catalog/catalog.json"
+    if not manifest and suffix not in (".glb", ".png"):
+        return None
+    target = _safe_root_path(catalog_dir, rel)
+    if target is None or os.path.splitext(target)[1].lower() != suffix:
+        return None
+    if manifest and os.path.normcase(target) != os.path.normcase(os.path.join(os.path.realpath(catalog_dir), rel)):
+        return None
+    return target
+
+
+def _safe_root_path(root: str, rel: str) -> str | None:
+    if not root or not rel or "\x00" in rel:
         return None
     if rel.startswith(("/", "\\")) or rel.endswith(("/", "\\")):
         return None
@@ -94,22 +123,22 @@ def safe_world_path(world_dir: str, req_path: str) -> str | None:
             return None
     if os.path.isabs(rel) or os.path.isabs(norm):
         return None
-    real_world = os.path.realpath(world_dir)
-    real_target = os.path.realpath(os.path.join(real_world, *parts))
+    real_root = os.path.realpath(root)
+    real_target = os.path.realpath(os.path.join(real_root, *parts))
     try:
-        common = os.path.commonpath([real_world, real_target])
+        common = os.path.commonpath([real_root, real_target])
     except ValueError:
         return None
-    if os.path.normcase(common) != os.path.normcase(real_world):
+    if os.path.normcase(common) != os.path.normcase(real_root):
         return None
-    if os.path.normcase(real_target) == os.path.normcase(real_world):
+    if os.path.normcase(real_target) == os.path.normcase(real_root):
         return None
     if os.path.isdir(real_target):
         return None
     return real_target
 
 
-# Outside /world/ serve only the viewer's named files, matched before any decoding. This
+# Outside /world/ and /catalog/ serve only the viewer's named files, matched before any decoding. This
 # keeps the guards of safe_world_path from being needed twice: a device name (/NUL), an alternate data stream
 # (/index.html::$DATA) or a trailing dot or space (/index.html.) never reaches the file system.
 _VIEWER_FILES = frozenset({"/", "/index.html", "/assets.html", "/assets.js"})
@@ -117,9 +146,12 @@ _VIEWER_FILES = frozenset({"/", "/index.html", "/assets.html", "/assets.js"})
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     world = None
+    catalog = None
     extensions_map = {
         **http.server.SimpleHTTPRequestHandler.extensions_map,
         ".glb": "model/gltf-binary",
+        ".png": "image/png",
+        ".json": "application/json",
     }
 
     def handle(self):
@@ -144,6 +176,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if safe_world_path(self.world, self.path) is None:
                 self.send_error(403, "Forbidden")
                 return None
+        elif self.catalog and clean.startswith("/catalog/"):
+            target = safe_catalog_path(self.catalog, clean)
+            if target is None:
+                self.send_error(403, "Forbidden")
+                return None
+            if not os.path.isfile(target):
+                if clean == "/catalog/catalog.json":
+                    self.send_error(503, "Waiting for catalog.json")
+                else:
+                    self.send_error(404, "File not found")
+                return None
         elif clean not in _VIEWER_FILES:
             self.send_error(404, "File not found")
             return None
@@ -154,6 +197,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.world and clean.startswith("/world/"):
             resolved = safe_world_path(self.world, path)
             return resolved if resolved is not None else ""
+        if self.catalog and clean.startswith("/catalog/"):
+            return safe_catalog_path(self.catalog, clean) or ""
         if clean not in _VIEWER_FILES:
             return ""
         return super().translate_path(path)
@@ -189,12 +234,16 @@ class ViewerServer(http.server.ThreadingHTTPServer):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--world", help="exported world directory (omit to show test terrain)")
+    ap.add_argument("--catalog", help="generated asset catalog directory containing catalog.json, GLBs and PNGs")
     ap.add_argument("--port", type=port_number, default=8765,
                     help="0 asks the OS for a free port; the bound port is printed")
     a = ap.parse_args()
     if a.world is not None and not os.path.isdir(a.world):
         ap.error(f"--world is not a directory: {a.world}")
+    if a.catalog is not None and not os.path.isdir(a.catalog):
+        ap.error(f"--catalog is not a directory: {a.catalog}")
     Handler.world = a.world
+    Handler.catalog = a.catalog
     try:
         srv = ViewerServer(("127.0.0.1", a.port), functools.partial(Handler, directory=HERE))
     except OSError as e:
@@ -204,7 +253,8 @@ def main():
     try:
         # Inside the try: a Ctrl+C that arrives once this line is out (the test sends SIGINT as soon as it reads it)
         # must stop the viewer too, not escape between the print and serve_forever() with a traceback.
-        print(f"viewer: http://127.0.0.1:{srv.server_address[1]}/  world: {Handler.world or '(none: test terrain)'}",
+        print(f"viewer: http://127.0.0.1:{srv.server_address[1]}/  world: {Handler.world or '(none: test terrain)'}"
+              f"  catalog: {Handler.catalog or '(none)'}",
               flush=True)
         srv.serve_forever()
     except KeyboardInterrupt:      # Ctrl+C is how the viewer is stopped
