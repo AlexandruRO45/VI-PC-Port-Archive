@@ -227,7 +227,7 @@ class RunTestTest(unittest.TestCase):
             ("PASS_REGULAR_EXPRESSION", 2, "pass"),
             ("SKIP_REGULAR_EXPRESSION", 0, "skip"),
         )
-        for newline in (b"\n", b"\r\n", b"\r\r\n"):
+        for newline in (b"\n", b"\r\n", b"\r\r\n", b"\0", b"\r\0", b"\r\r\0"):
             output = newline.join((b"prefix", b"suffix\rkept", b""))
             for expression, exit_code, expected in cases:
                 with self.subTest(newline=newline, expression=expression):
