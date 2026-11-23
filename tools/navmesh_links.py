@@ -222,26 +222,29 @@ def _iter_resources(path, start=0, limit=None):
     if os.path.isdir(path):
         with os.scandir(path) as entries:
             files = sorted(e.name for e in entries if e.name.lower().endswith(".bin") and e.is_file())
-        idx = 0
-        while idx < len(files):
-            with open(os.path.join(path, files[idx]), "rb") as fh:
-                d0 = fh.read()
-            idx += 1
-            if len(d0) < 64:
-                continue
-            cls = nd.classify(d0)
-            buf = bytearray(d0)
-            n = 1
-            while nd.wants_more(cls, buf, n) and idx < len(files):
-                with open(os.path.join(path, files[idx]), "rb") as fh:
-                    dn = fh.read()
-                if len(dn) >= 64 and nd.classify(dn) != "other":
-                    break
-                buf.extend(dn)
-                idx += 1
-                n += 1
-            if cls == "navmesh":
+        buf = None
+        n = 0
+        for name in files:
+            with open(os.path.join(path, name), "rb") as fh:
+                head = fh.read(nd.HEADER_NAV)
+                cls = nd.classify(head) if len(head) >= 64 else "other"
+                if cls != "other" and buf is not None:
+                    yield bytes(buf)
+                    buf = None
+                if cls == "navmesh":
+                    buf = bytearray(head)
+                    n = 0
+                elif buf is None:
+                    continue
+                else:
+                    buf.extend(head)
+                buf.extend(fh.read())
+            n += 1
+            if not nd.wants_more("navmesh", buf, n):
                 yield bytes(buf)
+                buf = None
+        if buf is not None:
+            yield bytes(buf)
         return
 
     size = os.path.getsize(path)

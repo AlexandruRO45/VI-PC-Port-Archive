@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 import zlib
 
@@ -203,6 +204,19 @@ def build_tile(
 
 
 class NavmeshLinksTest(unittest.TestCase):
+    def test_unrelated_carved_part_only_needs_its_header(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "part.BIN"), "wb") as stream:
+                stream.write(b"X" * 256)
+                stream.truncate(4 << 20)
+            tracemalloc.start()
+            try:
+                self.assertEqual(list(nl._iter_resources(folder)), [])
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            self.assertLess(peak, 1 << 20)
+
     def test_valid_rpf_and_carved_dir(self):
         s1 = build_tile(flags=3)
         s2 = build_tile(flags=1, sector=(260 << 9) | 251, two_streams=True)
