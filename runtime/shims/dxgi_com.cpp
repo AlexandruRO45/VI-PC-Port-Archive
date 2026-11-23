@@ -536,6 +536,49 @@ std::uint32_t primary_device_local_heap(const VkPhysicalDeviceMemoryProperties& 
     return best;
 }
 
+// What Windows' own dxgi.dll reports for the adapter with this LUID, where Vulkan has no equivalent: the PCI
+// revision and subsystem ID, and on an integrated GPU the memory split (Vulkan's largest DEVICE_LOCAL heap there is
+// the driver's system-memory-backed heap, e.g. 10.5 GiB on a Radeon iGPU where Windows reports a 485 MiB carve-out).
+// The system dxgi.dll is opened by its full path, so a shim loaded as dxgi.dll never finds itself; answers are kept
+// per LUID. False when the system DXGI is missing (Wine without it, a stub) or doesn't know the LUID.
+bool host_adapter_desc(const LUID& luid, DXGI_ADAPTER_DESC1& out) {
+    static std::mutex mutex;
+    static std::map<std::pair<LONG, DWORD>, std::pair<bool, DXGI_ADAPTER_DESC1>> cache;
+    const auto key = std::make_pair(luid.HighPart, luid.LowPart);
+    std::lock_guard lock(mutex);
+    if (const auto it = cache.find(key); it != cache.end()) {
+        out = it->second.second;
+        return it->second.first;
+    }
+    DXGI_ADAPTER_DESC1 desc{};
+    bool ok = false;
+    wchar_t path[MAX_PATH];
+    const UINT n = GetSystemDirectoryW(path, MAX_PATH);
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&host_adapter_desc), &self);
+    if (n && n + 10 < MAX_PATH && wcscat_s(path, L"\\dxgi.dll") == 0) {
+        if (HMODULE dxgi = LoadLibraryW(path); dxgi && dxgi != self) {
+            using Create = HRESULT(WINAPI*)(REFIID, void**);
+            if (const auto create = reinterpret_cast<Create>(GetProcAddress(dxgi, "CreateDXGIFactory1"))) {
+                IDXGIFactory4* factory = nullptr;
+                if (SUCCEEDED(create(IID_PPV_ARGS(&factory))) && factory) {
+                    IDXGIAdapter1* adapter = nullptr;
+                    if (SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) && adapter) {
+                        ok = SUCCEEDED(adapter->GetDesc1(&desc));
+                        adapter->Release();
+                    }
+                    factory->Release();
+                }
+            }
+            // Kept loaded: the factory's own threads may outlive Release, and the system DXGI is cheap to keep.
+        }
+    }
+    cache[key] = {ok, desc};
+    out = desc;
+    return ok;
+}
+
 // Vulkan-backed IDXGIAdapter3 reporting the physical device's name, IDs, LUID (matching
 // ID3D12Device::GetAdapterLuid), memory heap sizes, and video memory budget info.
 class Adapter final : public IDXGIAdapter3 {
@@ -729,7 +772,7 @@ private:
             desc_.Description[std::size(desc_.Description) - 1] = L'\0';
             desc_.VendorId = props.vendorID;
             desc_.DeviceId = props.deviceID;
-            desc_.Revision = props.driverVersion;
+            desc_.Revision = 0;  // the PCI revision (not the Vulkan driver version); from the system DXGI below
             if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) desc_.Flags = DXGI_ADAPTER_FLAG_SOFTWARE;
         }
 
@@ -746,6 +789,16 @@ private:
             }
             desc_.DedicatedVideoMemory = static_cast<SIZE_T>(dedicated);
             desc_.SharedSystemMemory = static_cast<SIZE_T>(shared);
+        }
+        // Same GPU as seen by Windows: its PCI revision, subsystem ID and memory split replace the Vulkan estimates.
+        DXGI_ADAPTER_DESC1 host{};
+        if ((desc_.AdapterLuid.LowPart || desc_.AdapterLuid.HighPart) && host_adapter_desc(desc_.AdapterLuid, host) &&
+            host.VendorId == desc_.VendorId && host.DeviceId == desc_.DeviceId) {
+            desc_.Revision = host.Revision;
+            desc_.SubSysId = host.SubSysId;
+            desc_.DedicatedVideoMemory = host.DedicatedVideoMemory;
+            desc_.DedicatedSystemMemory = host.DedicatedSystemMemory;
+            desc_.SharedSystemMemory = host.SharedSystemMemory;
         }
 
         if (const auto enum_exts = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(

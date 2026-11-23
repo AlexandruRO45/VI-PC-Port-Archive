@@ -863,8 +863,44 @@ int main() {
                 if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mem.memoryHeaps[i].size > max_local)
                     max_local = mem.memoryHeaps[i].size;
             }
-            if (desc1.DedicatedVideoMemory != static_cast<SIZE_T>(max_local))
+            // Windows' own adapter of the same LUID, when the system dxgi.dll knows it, is the reference for what
+            // Vulkan can't say (PCI revision, subsystem ID, an integrated GPU's memory split); otherwise the
+            // primary DEVICE_LOCAL heap (without double-counting BAR1).
+            DXGI_ADAPTER_DESC1 host{};
+            bool have_host = false;
+            wchar_t path[MAX_PATH];
+            if (const UINT n = GetSystemDirectoryW(path, MAX_PATH); n && n + 10 < MAX_PATH) {
+                wcscat_s(path, L"\\dxgi.dll");
+                using Create = HRESULT(WINAPI*)(REFIID, void**);
+                const HMODULE dxgi = LoadLibraryW(path);
+                const auto create = dxgi ? reinterpret_cast<Create>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+                IDXGIFactory4* host_factory = nullptr;
+                if (create && SUCCEEDED(create(IID_PPV_ARGS(&host_factory))) && host_factory) {
+                    IDXGIAdapter1* host_adapter = nullptr;
+                    if (SUCCEEDED(host_factory->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&host_adapter))) &&
+                        host_adapter) {
+                        have_host = SUCCEEDED(host_adapter->GetDesc1(&host)) && host.VendorId == desc1.VendorId &&
+                                    host.DeviceId == desc1.DeviceId;
+                        host_adapter->Release();
+                    }
+                    host_factory->Release();
+                }
+            }
+            if (have_host) {
+                std::printf("adapter vs the system DXGI: revision %u/%u, subsys %08x/%08x, dedicated %llu/%llu MiB, "
+                            "shared %llu/%llu MiB\n", desc1.Revision, host.Revision, desc1.SubSysId, host.SubSysId,
+                            static_cast<unsigned long long>(desc1.DedicatedVideoMemory >> 20),
+                            static_cast<unsigned long long>(host.DedicatedVideoMemory >> 20),
+                            static_cast<unsigned long long>(desc1.SharedSystemMemory >> 20),
+                            static_cast<unsigned long long>(host.SharedSystemMemory >> 20));
+                if (desc1.Revision != host.Revision || desc1.SubSysId != host.SubSysId ||
+                    desc1.DedicatedVideoMemory != host.DedicatedVideoMemory ||
+                    desc1.DedicatedSystemMemory != host.DedicatedSystemMemory ||
+                    desc1.SharedSystemMemory != host.SharedSystemMemory)
+                    return fail("Adapter revision, subsystem ID or memory sizes differ from the system DXGI's adapter");
+            } else if (desc1.DedicatedVideoMemory != static_cast<SIZE_T>(max_local)) {
                 return fail("DedicatedVideoMemory should match the primary DEVICE_LOCAL heap (without double-counting BAR1)");
+            }
         }
         if (desc0.VendorId != desc1.VendorId || desc2.DeviceId != desc1.DeviceId)
             return fail("Adapter desc mismatch between GetDesc/GetDesc1/GetDesc2");
