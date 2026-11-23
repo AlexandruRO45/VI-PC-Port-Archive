@@ -17,6 +17,20 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
+
+# MSVC AddressSanitizer for the runtime and its tests (docs/testing.md, "AddressSanitizer on Windows"): the loader and
+# the shims are Windows-only, so a Linux sanitizer build never compiles them. The targets it leaves out are chosen at
+# the end of this file, once every target exists. /RTC1 (Debug) can't be combined with /fsanitize=address.
+option(LEONIDA_ASAN "Build the runtime and its tests with MSVC AddressSanitizer (/fsanitize=address)" OFF)
+if(LEONIDA_ASAN)
+  if(NOT MSVC)
+    message(FATAL_ERROR "LEONIDA_ASAN is for MSVC and clang-cl; on Linux and macOS pass -fsanitize=address in "
+                        "CMAKE_CXX_FLAGS instead.")
+  endif()
+  foreach(_lang C CXX)
+    string(REGEX REPLACE "/RTC[1csu]+" "" CMAKE_${_lang}_FLAGS_DEBUG "${CMAKE_${_lang}_FLAGS_DEBUG}")
+  endforeach()
+endif()
 if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Custom CMAKE_CXX_FLAGS can replace MSVC's default /EHsc. Require C++ stack unwinding so error
   # paths in the runtime and its libraries still destroy automatic objects when an exception leaves a frame.
@@ -3069,4 +3083,33 @@ if(WIN32 AND MSVC)
     endif()
     target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)
   endforeach()
+endif()
+
+# LEONIDA_ASAN (see the option at the top): every C and C++ target is instrumented except
+#   - the CRT-free fixtures linked with /NODEFAULTLIB: ASan needs a CRT, and MSVC can't link one in (LNK1394);
+#   - the fixture images under test/fixtures, which rt::Loader maps itself. Windows never loads them, so ASan's
+#     start-up, which sets the shadow-memory offset each instrumented image reads, never runs for them, and they
+#     fault on their first checked access (pe_loader and loader_tls crash that way).
+# /INCREMENTAL:NO because the linker drops /INCREMENTAL for ASan objects anyway, with an LNK4300 warning per target.
+# Targets of subdirectories (SDL3 from LEONIDA_SDL3_FETCH) are left as they are.
+if(LEONIDA_ASAN)
+  get_property(_asan_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  set(_asan_count 0)
+  foreach(_target IN LISTS _asan_targets)
+    get_target_property(_type ${_target} TYPE)
+    if(NOT _type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY|STATIC_LIBRARY|OBJECT_LIBRARY)$")
+      continue()
+    endif()
+    get_target_property(_link_options ${_target} LINK_OPTIONS)
+    get_target_property(_sources ${_target} SOURCES)
+    if("/NODEFAULTLIB" IN_LIST _link_options OR _sources MATCHES "(^|;|/)test/fixtures/")
+      continue()
+    endif()
+    target_compile_options(${_target} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/fsanitize=address>)
+    if(_type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
+      target_link_options(${_target} PRIVATE /INCREMENTAL:NO)
+    endif()
+    math(EXPR _asan_count "${_asan_count} + 1")
+  endforeach()
+  message(STATUS "LEONIDA_ASAN: ${_asan_count} targets built with /fsanitize=address")
 endif()

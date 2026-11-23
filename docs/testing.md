@@ -182,6 +182,33 @@ instruments the translated shaders and reports what they actually do at run time
 an image read through a view whose numeric type doesn't match the shader's (a T# FORMAT that disagrees with the
 bound view). It runs on llvmpipe. `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=1` adds synchronization validation.
 
+## AddressSanitizer on Windows
+
+The loader, its shims and their tests are Windows code, so a Linux sanitizer build never compiles them. The CMake
+option `LEONIDA_ASAN` builds the runtime and its tests with MSVC AddressSanitizer (`/fsanitize=address`), which stops
+a test at its first out-of-bounds access, use after free or double free and prints where the memory came from. Use
+a build folder of its own: every object is compiled again.
+
+```powershell
+cmake -S runtime -B runtime/build-asan -DLEONIDA_ASAN=ON
+cmake --build runtime/build-asan --config RelWithDebInfo
+ctest --test-dir runtime/build-asan -C RelWithDebInfo --output-on-failure
+```
+
+Run it from a Developer PowerShell (or after `vcvars64.bat`): the tests load `clang_rt.asan_dynamic-x86_64.dll`
+from the compiler's `bin` folder, and it comes with Visual Studio's "C++ AddressSanitizer" component, which the
+"Desktop development with C++" workload installs by default. A report starts with `ERROR: AddressSanitizer:`.
+
+Two kinds of target stay uninstrumented, and the configure prints how many are built with it:
+
+- the fixtures linked with `/NODEFAULTLIB` (`tiny_tls_cb_only`, `dll_thread_calls`, `gameinput_host`): ASan needs a
+  CRT, and MSVC can't link one in (LNK1394);
+- the fixture images under `runtime/test/fixtures`, which `rt::Loader` maps itself. Windows never loads them, so
+  ASan's start-up never runs for them. Instrumented, they fault on their first checked access, which makes
+  `pe_loader` and `loader_tls` crash with a report from an `<unknown module>`.
+
+In Debug the option also drops `/RTC1`, which MSVC can't combine with `/fsanitize=address`.
+
 ## The Windows runtime on Linux, under Wine or Proton
 
 The Linux build above makes only the Vulkan programs. The loader (`gta6rt`), its shims and their tests are Windows
