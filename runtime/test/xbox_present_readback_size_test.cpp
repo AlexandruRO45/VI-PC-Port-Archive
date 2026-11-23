@@ -20,6 +20,7 @@ int main() {
     EXPECT(!xbox_present_readback_size_matches(0, 2, 1, 0, 0));
     EXPECT(!xbox_present_readback_size_matches(4, 2, 1, 0, 0));
     EXPECT(!xbox_present_readback_size_matches(7, 2, 1, 2, 1));
+    EXPECT(!xbox_present_readback_size_matches(9, 2, 1, 2, 1));  // Two whole pixels plus a trailing byte.
     EXPECT(!xbox_present_readback_size_matches(12, 2, 1, 2, 1));
     return 0;
 }
