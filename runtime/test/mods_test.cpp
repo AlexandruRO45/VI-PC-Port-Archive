@@ -85,6 +85,9 @@ int main() {
     check(!parse_mod("", "m", mod, error) && !parse_mod("{", "m", mod, error) &&
               error == "mod.json is not a JSON object",
           "an empty or one-byte manifest is not mistaken for UTF-16");
+    // Python's json.dump writes a character outside the BMP as a surrogate pair escape; the name is UTF-8 again.
+    check(parse_mod(R"({"name":"Lucia \ud83c\udf34"})", "m", mod, error) && mod.name == "Lucia \xF0\x9F\x8C\xB4",
+          "an escaped surrogate pair in the name reads as one UTF-8 character");
 
     // "camera": first-person view (docs/modding.md, "First-person view")
     check(parse_mod(R"({"camera":{"view_mode":"first_person","first_person_value":4,"contexts":[0]}})", "fp", mod,

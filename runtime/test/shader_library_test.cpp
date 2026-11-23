@@ -313,6 +313,18 @@ int main() {
     CHECK(!JsonReader("\"\\u0x41\"").parse(json));
     CHECK(!JsonReader("\"\\u00").parse(json));
     CHECK(JsonReader("\"\\u0041\"").parse(json) && json.string == "A");
+    // A surrogate pair is one character outside the BMP, the way Python's json.dump escapes it: 4 bytes of UTF-8,
+    // not two 3-byte sequences.
+    const auto json_string = [](std::string_view text) {
+        Json value;
+        return JsonReader(text).parse(value) && value.kind == Json::Kind::string ? value.string : "(no string)";
+    };
+    CHECK(json_string("\"\\ud83d\\ude00\"") == "\xf0\x9f\x98\x80");                                  // U+1F600
+    CHECK(json_string("\"\\uD800\\uDC00\\uDBFF\\uDFFF\"") == "\xf0\x90\x80\x80\xf4\x8f\xbf\xbf");  // U+10000, U+10FFFF
+    // A lone surrogate, or a high one before an escape that is not a low one, keeps its 3-byte sequence.
+    CHECK(json_string("\"\\ud83d\\u0041\"") == "\xed\xa0\xbd" "A");
+    CHECK(json_string("\"\\ude00\\ud83dx\"") == "\xed\xb8\x80\xed\xa0\xbd" "x");
+    CHECK(!JsonReader("\"\\ud83d\\uzzzz\"").parse(json) && !JsonReader("\"\\ud83d\\").parse(json));
 
     const auto shader = container({{dynamic, 600}});
     CHECK(dxbc_part(shader, "PRIV").size() == 4 && !dxbc_part(shader, "DXIL").empty() && dxbc_part(shader, "RTS0").empty());
