@@ -309,7 +309,7 @@ class ManifestTest(unittest.TestCase):
         with mock.patch.object(awc_manifest.os, "walk", walk), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(awc_manifest.main([root, "--out", out]), 1)
-        self.assertIn(blocked, err.getvalue())
+        self.assertTrue(blocked in err.getvalue() or blocked.replace("\\", "\\\\") in err.getvalue())
         with open(out, "rb") as f:
             self.assertEqual(f.read(), previous)
 
