@@ -6,13 +6,16 @@
 //   XMemVirtualQuery(process, address, out64)
 //   XMemGetWorkingSetStatistics(kind, out)   (kind 0x20000001 at all seven FSR call sites)
 //
-// The attribute word is measured, and it is not decoded: across the executable's 23 `XMemVirtualAlloc` call sites the
-// `attributes` argument is one of eight constants (0x3, 0x7, 0x21, 0x23, 0x27, 0x181, 0x183, 0x283) and the two
-// `XMemAlloc` sites that pass a constant pass 0xf0814000; none of them carries an alignment or memory-type field, so
-// no call site asks for a different alignment. The 0x5e50000 this comment used to cite is the synthetic value in
-// `runtime/test/xmem_test.cpp` (and the tiny bundled-DLL fixture), not an argument of any image's call site. Every
-// block therefore stays 64-byte aligned (covers cache lines and SIMD) and a size of zero is rounded up to one byte so
-// the result is a stable, non-null pointer that XMemFree can release.
+// The attribute word is measured, but its bits are not decoded: across the executable's 23 `XMemVirtualAlloc` call
+// sites the `attributes` argument is one of eight constants (0x3, 0x7, 0x21, 0x23, 0x27, 0x181, 0x183, 0x283), and
+// two of the three `XMemAlloc` sites pass 0xf0814000 (the third is not a constant). Those constants do not establish
+// an alignment requirement: the 2 MiB regions at the five sites with `allocation_type` 0x20003000 get their alignment
+// from that allocation type below, not from `attributes`. The 0x5e50000 this comment used to cite is the synthetic
+// value in `runtime/test/xmem_test.cpp` (and the tiny bundled-DLL fixture), not an argument of any image's call site.
+//
+// The 64-byte alignment of heap blocks is a choice in this shim (it covers cache lines and SIMD), not a requirement
+// the measurements prove. A size of zero is rounded up to one byte so the result is a stable, non-null pointer that
+// XMemFree can release.
 //
 // The default allocators, the physical-page functions and XMemIsToolsMemAvailable follow argument shapes measured
 // locally at a title's call sites (each function says which). The page functions are built on the Windows placeholder

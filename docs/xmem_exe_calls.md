@@ -102,9 +102,16 @@ Observed constants, where the window before the call loads one:
 | `XMemIsToolsMemAvailable` | 1 | arguments not read |
 
 An earlier version of the `runtime/shims/xmem.cpp` comment said one call site "passes `0x5e50000`" as the attribute
-word. No site in this image does: the two `XMemAlloc` sites whose attribute is a constant pass `0xf0814000`, and
-`0x5e50000` is the synthetic value in `runtime/test/xmem_test.cpp` and the tiny bundled-DLL fixture. The comment now
-records the measured set (the eight `XMemVirtualAlloc` attribute words above) instead.
+word. No site in this image does: the two `XMemAlloc` sites whose attribute is a constant pass `0xf0814000` (the
+third site's attribute is not a constant), and `0x5e50000` is the synthetic value in `runtime/test/xmem_test.cpp` and
+the tiny bundled-DLL fixture. The comment now records the measured set (the eight `XMemVirtualAlloc` attribute words
+above) instead.
+
+Those constants do not establish an alignment requirement. The five `XMemVirtualAlloc` sites with `allocation_type`
+`0x20003000` select 2 MiB pages through that argument; the shim's 2 MiB alignment for a host-placed region comes from
+the allocation type, not from the attribute word. The third `XMemAlloc` site's attribute is unknown and the attribute
+bits are not decoded. The shim's 64-byte alignment for heap blocks is a choice (cache lines and SIMD), not a
+requirement proven here.
 
 ## What this does not show
 
