@@ -176,20 +176,26 @@ def summarise(meshes, min_fraction=0.9):
     return out
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("archive", help="navmeshes.rpf")
     ap.add_argument("--common", help="a tools/rpf9_carve.py carve of common.rpf (CVehiclePoints counts, hash search)")
     ap.add_argument("--out", help="write the summary as JSON here")
     ap.add_argument("--min-fraction", type=float, default=0.9)
     ap.add_argument("--static-every", type=int, default=0, help="also measure every Nth static tile as a control")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if not 0 <= a.min_fraction <= 1:
         ap.error("--min-fraction must be between 0 and 1")
     if a.static_every < 0:
         ap.error("--static-every must be non-negative")
     if a.out and same_report_path(a.out, a.archive):
         ap.error("--out would overwrite the archive")
+    if a.out:
+        if os.path.isdir(a.out):
+            ap.error(f"--out is a directory: {a.out}")
+        parent = os.path.dirname(os.path.abspath(a.out))
+        if not os.path.isdir(parent):
+            ap.error(f"--out parent directory does not exist: {parent}")
     if not os.path.exists(a.archive):
         print(f"ERROR: cannot read {a.archive}: no such file or folder", file=sys.stderr)
         return 2
@@ -209,8 +215,11 @@ def main():
     text = json.dumps(report, indent=1)
     print(text)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text + "\n")
+        try:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text + "\n")
+        except OSError as exc:
+            ap.error(f"cannot write --out ({a.out}): {exc}")
     return 0
 
 
