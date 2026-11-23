@@ -70,6 +70,10 @@ class RunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS})
             self.assertEqual(run(tmp, "-j", "1")[0], 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"sample_pkg/__init__.py": "import unittest\nclass T(unittest.TestCase):\n"
+                                                  "    def test_init(self): pass\n"})
+            self.assertEqual(run(tmp, "-j", "1")[0], 0)
 
     def test_an_empty_suite_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

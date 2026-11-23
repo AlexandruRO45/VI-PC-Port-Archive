@@ -32,6 +32,15 @@ def test_modules(directory):
     return names
 
 
+def has_package_init(directory):
+    """Whether `directory` contains at least one child package initializer `unittest discover` can inspect."""
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return False
+    return any(os.path.isfile(os.path.join(directory, d, "__init__.py")) for d in entries)
+
+
 def run_module(directory, module, verbose):
     """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
     cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
@@ -51,12 +60,13 @@ def main(argv=None):
         ap.error("--jobs must be at least 1")
     directory = os.path.abspath(a.directory)
     modules = test_modules(directory)
+    if a.jobs == 1 and (modules or has_package_init(directory)):
+        rc = subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
+                              *(["-v"] if a.verbose else [])])
+        return 1 if rc else 0
     if not modules:
         print(f"no test*.py files in {directory}")
         return 1
-    if a.jobs == 1:
-        return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
-                                *(["-v"] if a.verbose else [])])
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     modules.sort(key=lambda m: -os.path.getsize(os.path.join(directory, *m.split(".")) + ".py"))
     start, total, failed = time.monotonic(), 0, []
