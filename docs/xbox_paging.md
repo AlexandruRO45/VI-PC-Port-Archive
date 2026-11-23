@@ -21,9 +21,11 @@ vk_xbox_paging_test.cpp` checks it on a real device.
   D3D12 tiled resources. It waits for everything the queue submitted before it, and the next submission waits for
   it, which is the console's GPU-timeline order for these calls.
 - **Lifetimes**: a region's pages come from one `PagePool`, which outlives it, and one `PageMapper` changes it.
-  Destroying a region gives back the mappings it still holds. A call refuses pages its pool has taken back, but a
-  title that releases a page on one thread while mapping it on another is freeing memory it still uses, as it would
-  be on the console.
+  A pool's binds all go through one queue, since tickets of different timelines do not compare. Destroying a region
+  gives back the mappings it still holds. A released page is not handed out again while an arena still maps it, so
+  a stale mapping never shows a new owner's data. A call refuses pages that are free when it runs; a page id has no
+  generation, though, so a title that maps from a pool after releasing its pages and allocating new ones maps the
+  new owner's pages. That is the title using memory it freed, as it would be on the console.
 - Only `D3D12XBOX_PAGE_MAPPING_RANGE_TYPE` 0 (incrementing page indices) is documented publicly (the
   Xbox-GDK-Samples AdvancedESRAM README). Other range types are refused until a call site shows them.
 
@@ -46,6 +48,9 @@ running: the bind waits on the GPU, not on the CPU.
 
 ## Not done
 
+- Held batches: `bind_sparse_ordered`, like `update_tiles` for tiled resources, binds at once even while the queue holds
+  batches behind a `Wait()` whose `Signal()` is not submitted yet, so a bind can run ahead of work submitted before
+  it. Holding binds with the batches fixes both.
 - Wiring into `d3d12_xs_device` once the slots are measured from a real run.
 - The CPU side of physical pages: on the console the CPU and GPU see the same page; here CPU writes need a host copy
   uploaded before the GPU reads the page.

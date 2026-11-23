@@ -107,7 +107,7 @@ public:
         for (std::uint32_t c = 0; c < chunks_.size() && left; ++c) {
             if (!chunks_[c].memory) continue;
             for (std::uint32_t i = 0; i < kPagesPerChunk && left; ++i) {
-                if (chunks_[c].used[i]) continue;
+                if (!available(chunks_[c], i)) continue;
                 take(c, i, 1, out);
                 --left;
             }
@@ -126,19 +126,21 @@ public:
         return true;
     }
 
-    // Pages go back to the free list now: a later mapping of a reused page is a later bind on the queue, so the GPU
-    // sees it after everything already submitted. Chunk memory is freed only by trim().
+    // Pages go back to the free list now, but a page an arena still maps is not handed out again until it is
+    // unmapped, so a stale mapping never shows a new owner's data. Chunk memory is freed only by trim().
     void release(std::span<const PageId> pages) {
         std::lock_guard lock(mutex_);
         release_locked(pages);
     }
 
-    // The arena maps (or unmaps) a page with a bind that completes at `ticket` on the bind queue's timeline.
+    // The arena maps (or unmaps) a page with a bind that completes at `ticket` on the bind queue's timeline. A pool's
+    // binds all go through one queue: tickets of different timelines do not compare.
     void note_mapped(PageId id, int delta, std::uint64_t ticket) {
         std::lock_guard lock(mutex_);
         if (!known(id)) return;
         auto& chunk = chunks_[page_chunk(id)];
         chunk.mapped += delta;
+        chunk.mapped_pages[page_index(id)] += delta;
         chunk.last_bind = std::max(chunk.last_bind, ticket);
     }
 
@@ -188,15 +190,19 @@ private:
     struct Chunk {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::vector<bool> used;
+        std::vector<std::int32_t> mapped_pages;  // arena pages bound to each page
         std::uint32_t free_count = 0;
         std::int64_t mapped = 0;      // arena pages currently bound to pages of this chunk
         std::uint64_t last_bind = 0;  // ticket of the last bind that referenced this chunk
     };
 
+    // Free and not mapped by any arena.
+    static bool available(const Chunk& chunk, std::uint32_t i) { return !chunk.used[i] && !chunk.mapped_pages[i]; }
+
     static std::uint32_t find_run(const Chunk& chunk, std::uint32_t count) {
         std::uint32_t run = 0;
         for (std::uint32_t i = 0; i < kPagesPerChunk; ++i) {
-            run = chunk.used[i] ? 0 : run + 1;
+            run = available(chunk, i) ? run + 1 : 0;
             if (run == count) return i + 1 - count;
         }
         return UINT32_MAX;
@@ -246,6 +252,7 @@ private:
         if (c == chunks_.size()) chunks_.emplace_back();
         chunks_[c].memory = memory;
         chunks_[c].used.assign(kPagesPerChunk, false);
+        chunks_[c].mapped_pages.assign(kPagesPerChunk, 0);
         chunks_[c].free_count = kPagesPerChunk;
         chunks_[c].mapped = 0;
         chunks_[c].last_bind = 0;
