@@ -281,8 +281,10 @@ def run(path, start=None, limit=None, extents=False):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, one carved 0x7a file, or a folder of carved files")
-    ap.add_argument("--start", type=int, help="first byte of an RPF9 data-area window")
-    ap.add_argument("--limit", type=int, help="window size in bytes (default: to the end of the archive)")
+    # The same argument types world_index uses for its own window, so a negative --start, --limit 0 and a negative
+    # --limit are refused here instead of scanning nothing and reporting every count as 0.
+    ap.add_argument("--start", type=WI._count(0), help="first byte of an RPF9 data-area window")
+    ap.add_argument("--limit", type=WI._count(1), help="window size in bytes (default: to the end of the archive)")
     ap.add_argument("--out", default=os.path.join("reports", "world_archetypes.json"))
     ap.add_argument("--check-extents", action="store_true",
                     help="also compare each map's entitiesExtents with its transformed archetype boxes")
