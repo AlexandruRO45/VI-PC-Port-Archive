@@ -498,6 +498,48 @@ class VRcpF64TranslatorTests(unittest.TestCase):
         with self.assertRaises(Exception):
             translate_lines("ps_bad_rcp_f64", ["v_rcp_f64"])
 
+# -----------------------------------------------------------------------------
+# Opcode 5: v_rsq_f64
+# -----------------------------------------------------------------------------
+def oracle_rsq_f64(bits: int) -> int:
+    """Reference mathematical oracle for v_rsq_f64 (double reciprocal square root 1.0 / sqrt(x))."""
+    if is_nan_u64(bits):
+        return F64_QNAN
+    if bits == F64_POS_ZERO:
+        return F64_POS_INF
+    if bits == F64_NEG_ZERO:
+        return F64_NEG_INF
+    if bits == F64_POS_INF:
+        return F64_POS_ZERO
+    val = u64_to_f64(bits)
+    if val < 0.0:
+        return F64_QNAN
+    try:
+        res = 1.0 / math.sqrt(val)
+        return f64_to_u64(res)
+    except ZeroDivisionError:
+        return F64_POS_INF
+    except OverflowError:
+        return F64_POS_INF
+
+
+class VRsqF64OracleTests(unittest.TestCase):
+    def test_rsq_f64_basic(self):
+        self.assertEqual(oracle_rsq_f64(F64_POS_ONE), F64_POS_ONE)
+        self.assertEqual(oracle_rsq_f64(f64_to_u64(4.0)), f64_to_u64(0.5))
+        self.assertEqual(oracle_rsq_f64(f64_to_u64(16.0)), f64_to_u64(0.25))
+        self.assertEqual(oracle_rsq_f64(f64_to_u64(0.25)), f64_to_u64(2.0))
+
+    def test_rsq_f64_zeros_and_inf(self):
+        self.assertEqual(oracle_rsq_f64(F64_POS_ZERO), F64_POS_INF)
+        self.assertEqual(oracle_rsq_f64(F64_NEG_ZERO), F64_NEG_INF)
+        self.assertEqual(oracle_rsq_f64(F64_POS_INF), F64_POS_ZERO)
+
+    def test_rsq_f64_negative_nan(self):
+        self.assertTrue(is_nan_u64(oracle_rsq_f64(f64_to_u64(-4.0))))
+        self.assertTrue(is_nan_u64(oracle_rsq_f64(F64_NEG_INF)))
+        self.assertTrue(is_nan_u64(oracle_rsq_f64(F64_QNAN)))
+
 
 if __name__ == "__main__":
     unittest.main()
