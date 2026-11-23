@@ -139,6 +139,26 @@ def fixture_dependencies(tests: list[dict]) -> dict[int, tuple[int, ...]]:
     }
 
 
+def fixture_cleanup_dependencies(tests: list[dict]) -> dict[int, tuple[int, ...]]:
+    """Find the listed setup and consumer tests that must finish before each cleanup."""
+    metadata = [properties(test) for test in tests]
+    members: dict[str, list[int]] = {}
+    for index, props in enumerate(metadata):
+        for prop in ("FIXTURES_SETUP", "FIXTURES_REQUIRED"):
+            for fixture in props.get(prop, []):
+                members.setdefault(fixture, []).append(index)
+    return {
+        index: tuple(dict.fromkeys(
+            member
+            for fixture in props["FIXTURES_CLEANUP"]
+            for member in members.get(fixture, ())
+            if member != index
+        ))
+        for index, props in enumerate(metadata)
+        if "FIXTURES_CLEANUP" in props
+    }
+
+
 def truthy(value) -> bool:
     """A ctest boolean property. The JSON carries it as a string, so "0" must stay false."""
     return str(value).strip().lower() in ("1", "on", "true", "yes")
@@ -293,6 +313,8 @@ def valid_test_property(entry) -> bool:
         return isinstance(value, str) and "\0" not in value
     if name in ("PASS_REGULAR_EXPRESSION", "FAIL_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"):
         return isinstance(value, str) or (isinstance(value, list) and all(isinstance(p, str) for p in value))
+    if name == "FIXTURES_CLEANUP":
+        return isinstance(value, list) and all(isinstance(fixture, str) for fixture in value)
     return True
 
 
@@ -343,6 +365,9 @@ def main() -> int:
     indices = {name: index for index, name in enumerate(names)}
     setups = fixture_dependencies(tests)
     sorter = TopologicalSorter(setups)
+    for index, prerequisites in fixture_cleanup_dependencies(tests).items():
+        # Cleanup runs after these tests even if they fail.
+        sorter.add(index, *prerequisites)
     for index, test in enumerate(tests):
         # DEPENDS controls order. Only failed fixture setups block a consumer.
         sorter.add(index, *(indices[name] for name in properties(test).get("DEPENDS", []) if name in indices))

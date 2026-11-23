@@ -527,6 +527,35 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("[FAIL] bad", out)
 
+    def test_fixture_cleanup_follows_setups_and_consumers_even_after_failure(self):
+        cleanup = ctest_entry("cleanup", self.command("ok.py"), {"FIXTURES_CLEANUP": ["input"]})
+        for setup_script, consumer_script, expected in (
+            ("ok.py", "ok.py", ["[PASS] setup", "[PASS] consumer"]),
+            ("ok.py", "bad.py", ["[PASS] setup", "[FAIL] consumer"]),
+            ("bad.py", "ok.py", ["[FAIL] setup", "[FAIL] consumer"]),
+            ("bad.py", None, ["[FAIL] setup"]),
+        ):
+            with self.subTest(setup=setup_script, consumer=consumer_script):
+                setup = ctest_entry("setup", self.command(setup_script), {"FIXTURES_SETUP": ["input"]})
+                entries = [cleanup, setup]
+                if consumer_script:
+                    entries.insert(1, ctest_entry("consumer", self.command(consumer_script),
+                                                  {"FIXTURES_REQUIRED": ["input"]}))
+                code, out, err = self.run_main(entries, "--require", "cleanup")
+                self.assertEqual(code, 0, err or out)
+                self.assertEqual([line for line in out.splitlines() if line.startswith("[")],
+                                 [*expected, "[PASS] cleanup"])
+
+    def test_malformed_fixture_cleanup_is_rejected_before_launch(self):
+        for fixtures in ("input", [None], 3):
+            with self.subTest(fixtures=fixtures):
+                entry = ctest_entry("cleanup", self.command("ok.py"), {"FIXTURES_CLEANUP": fixtures})
+                with mock.patch.object(rwt, "run_test", return_value=("pass", "")) as launch:
+                    code, _, err = self.run_main([entry])
+                self.assertEqual(code, 2)
+                self.assertIn("not the output of ctest", err)
+                launch.assert_not_called()
+
     def test_malformed_skip_return_code_does_not_stop_later_tests(self):
         entries = [
             ctest_entry("bad_property", self.command("ok.py"), {"SKIP_RETURN_CODE": "invalid"}),
