@@ -144,5 +144,18 @@ class SCbranchExecnzAstTests(unittest.TestCase):
         self.assertEqual(ast.mnemonic, "s_cbranch_execnz")
         self.assertEqual(ast.target_offset, 4)
 
+class SCbranchExecnzScalarInterpreterTests(unittest.TestCase):
+    def test_branch_taken_advances_pc(self):
+        state = SaluMachineState(pc=10, exec_mask=0x1)
+        instr = BranchInstructionAST("s_cbranch_execnz", target_offset=5)
+        new_pc = step_branch(instr, state)
+        self.assertEqual(new_pc, 16)  # 10 + 1 + 5
+
+    def test_branch_not_taken_falls_through(self):
+        state = SaluMachineState(pc=10, exec_mask=0x0)
+        instr = BranchInstructionAST("s_cbranch_execnz", target_offset=5)
+        new_pc = step_branch(instr, state)
+        self.assertEqual(new_pc, 11)  # 10 + 1
+
 if __name__ == '__main__':
     unittest.main()
