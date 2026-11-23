@@ -312,6 +312,16 @@ class TestWriteForIndex(unittest.TestCase):
                 ["index.json", "ps_a.bary_gs.spvasm", "ps_z.bary_gs.spvasm"],
             )
 
+    def test_index_saved_with_utf8_bom_is_read(self):
+        # A Windows editor or PowerShell 5.1 Set-Content saves JSON with a UTF-8 BOM.
+        index = {"ps_bom": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "index.json")
+            with open(path, "wb") as f:
+                f.write(json.dumps(index).encode("utf-8-sig"))
+            written = bary_fallback_gs.write_for_index(tmp)
+            self.assertEqual(written, [os.path.join(tmp, "ps_bom" + bary_fallback_gs.SUFFIX + ".spvasm")])
+
     def test_index_without_bary_fallback_entries_returns_empty(self):
         index = {
             "vs_a": {"stage": "vs"},
