@@ -100,3 +100,44 @@ not an `E_NOTIMPL`.
 
 These are one run's first failures, not a list of what is missing. Every stand-in above is local and untested
 beyond "the title goes on to the next call". Nothing has reached a draw or a present yet.
+
+## 5. Past stop 17: the renderer and the title's own window
+
+**Status: measured on one machine, 2026-11-23 (evening).** Setup: `main` `9f53c502e` with #7524, #6582, #4348,
+#6964, #6954, #7076, #7021, #6953, #7218, #7066, #7110 and #7052 merged locally, plus the two-line slot-25
+return-buffer fix posted on #7110. Windows 11 26200, RTX 3070 Ti (driver 32.0.15.9649), Vulkan runtime 1.4.329,
+SDK 1.4.357.0, MSVC `RelWithDebInfo`, `LEONIDA_D3D12=vulkan`, own 1.0.2.1 copy. The setup follows the same rule as
+section 1: it shares outcomes, not the executable.
+
+The run creates the title's **own main window** and builds the device side of a frame. The window is empty: no
+swapchain and no present call appear in the trace.
+
+| Milestone | Measured |
+|---|---|
+| Device | `D3D12XboxCreateDevice` ok on the Vulkan device |
+| Queues, allocators, lists, fences | 5 queues (slots 8 and 48), 7 allocators, 5 fences, 581 command-list/`Close` pairs |
+| Descriptor heaps | 5 `CreateDescriptorHeap`; one holds about 1.24 million descriptors; heap slots 9 and 10 answer the title's chosen address |
+| Placed buffer | device slot 133, a 182,452,224-byte buffer at the title's own VA, right after the 185 MB and 10 MB `XMemVirtualAlloc` calls |
+| Views and sizes | slot 70 SRV from raw words, slot 25 `GetResourceAllocationInfo`, slot 127 two 3840x2160 textures, RTV/SRV/UAV creation |
+| Root signature and PSO | `CreateRootSignature` (slot 16) and Xbox `CreateComputePipelineState` (slot 62) are reached |
+
+The trace holds 1,639 `[d3d12-trace]` calls, none `failed`, `unsupported` or `refused`. Three things stop the run,
+in this order:
+
+1. **The placed buffer's pages are not all importable.** The range is committed but 74 MiB of it is
+   `PAGE_WRITECOMBINE`, which `VK_EXT_external_memory_host` refuses until each region is recached read-write. On
+   this driver imports also succeed only up to about **64 MiB in total**: 64 MiB imports, 128 MiB fails with
+   `VK_ERROR_OUT_OF_DEVICE_MEMORY`, and 16 MiB chunks fail on the fifth. The ordinary-buffer fallback does not hold
+   the title's VA, so slot 70 writes a null view. #7218's import needs a fallback for ranges over that budget (an
+   aliased VA, or a copy through a shadow buffer).
+2. **A debug-only page check.** After the views the title computes `alignment - size + base` and requires at most
+   2 MiB - 1; at the trap `size` is 0 and `alignment` 64 MiB. It is soft: `LEONIDA_SKIP_INT3=1` steps over it and
+   the run continues to the root signature and the compute PSO.
+3. **The shader index.** With the soft check skipped, the first PSO is requested and the run ends with
+   `0xE06D7363` because `LEONIDA_SHADERS` is unset. The variable names the folder that holds `index.json` and the
+   `.spv` files; the optional `fspx/` and `bvh/` indexes live under that same folder. A partial index only misses
+   the hashes it does not hold.
+
+What this does not show: a swapchain, a present, or a drawn frame. The window is the title's own launch window,
+created through the host's window API before the D3D scene. The 2 MiB check is one run's observation, not decoded
+console behaviour.
