@@ -229,5 +229,28 @@ class TestSBfeI32Reference(unittest.TestCase):
         self.assertEqual(scc, 1)
 
 
+def step_scalar_bfe_i32(state: SaluState, instr: Instruction) -> None:
+    if instr.opcode != "s_bfe_i32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    src0 = state.read_u32(instr.src0)
+    ctl = state.read_u32(instr.src1)
+    val, scc = ref_bfe_i32(src0, ctl)
+    state.write_u32(instr.dst.index_or_val, val)
+    state.scc = scc
+
+
+class TestSBfeI32ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for s_bfe_i32."""
+
+    def test_scalar_interpreter_execution(self):
+        state = SaluState()
+        state.write_u32(0, 0x00000F00)
+        state.write_u32(1, 8 | (4 << 16))
+        instr = Instruction("s_bfe_i32", Operand.sgpr32(2), Operand.sgpr32(0), Operand.sgpr32(1))
+        step_scalar_bfe_i32(state, instr)
+        self.assertEqual(state.sgprs[2], MASK32)
+        self.assertEqual(state.scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
