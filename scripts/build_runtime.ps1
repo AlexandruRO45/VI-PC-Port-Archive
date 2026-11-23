@@ -25,7 +25,7 @@ function Invoke-ToolProbe([string]$Exe, [string[]]$ProbeArgs) {
 }
 
 function Find-BuildTool([string]$Preferred, [string]$CommandName, [scriptblock]$Validate) {
-    if ($Preferred -and (Test-Path $Preferred)) { return $Preferred }
+    if ($Preferred -and (Test-Path -LiteralPath $Preferred -PathType Leaf) -and (& $Validate $Preferred)) { return $Preferred }
     foreach ($cmd in @(Get-Command $CommandName -CommandType Application -All -ErrorAction SilentlyContinue)) {
         if ($cmd.Source -and ($cmd.Source -match "\.(exe|cmd|bat)$") -and (Test-Path $cmd.Source) -and (& $Validate $cmd.Source)) {
             return $cmd.Source
@@ -45,11 +45,15 @@ $out = Join-Path $src "build"
 New-Item -ItemType Directory -Force $out | Out-Null
 
 $cmakeDir = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
-# Skip MSYS/devkitPro cmake on PATH (docs/design.md): native Windows builds advertise Visual Studio + Ninja generators.
+# One capabilities probe reports the version and generators, including for Visual Studio's bundled CMake.
 $cmake = Find-BuildTool (Join-Path $cmakeDir "CMake\bin\cmake.exe") "cmake" {
     param($p)
-    $help = Invoke-ToolProbe $p @("--help")
-    ($null -ne $help) -and ($help -match "Visual Studio") -and ($help -match "\bNinja\b")
+    $json = Invoke-ToolProbe $p @("-E", "capabilities")
+    if (-not $json) { return $false }
+    try { $caps = $json | ConvertFrom-Json -ErrorAction Stop } catch { return $false }
+    $version = $caps.version
+    ($version.major -gt 3 -or ($version.major -eq 3 -and $version.minor -ge 24)) -and
+        ($caps.generators.name -like "Visual Studio *") -and ($caps.generators.name -contains "Ninja")
 }
 $ninja = Find-BuildTool (Join-Path $cmakeDir "Ninja\ninja.exe") "ninja" {
     param($p)
@@ -78,7 +82,7 @@ $build || exit /b 1
 } else {
     # Keep this list in step with runtime\CMakeLists.txt. Optional parts that need a dependency are left out here:
     # the GameInput shim (SDL3), so controllers go through the host's GameInput.dll, if any, as without the shim.
-    Write-Warning "CMake and Ninja weren't found (neither VS C++ CMake tools nor native PATH tools): building with cl.exe directly, without the GameInput shim (SDL3). Install CMake + Ninja or VS's CMake tools component to get it."
+    Write-Warning "Native Windows CMake 3.24+ and Ninja are required for the CMake build. Building with cl.exe directly, without the GameInput shim (SDL3)."
     $xtaskqueueDir = Join-Path $root "third_party\xtaskqueue"
     $xtaskqueueFiles = "Source\Task\TaskQueue.cpp", "Source\Task\AsyncLib.cpp", "Source\Task\ThreadPool_win32.cpp", "Source\Task\WaitTimer_win32.cpp" | ForEach-Object { "`"$xtaskqueueDir\$_`"" }
     $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\file_system.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\xgameruntime_user.cpp", "shims\xgameruntime_gamesave.cpp", "shims\xgameruntime_store.cpp", "shims\xgameruntime_offline.cpp", "shims\winhttp_offline.cpp", "shims\library_loader.cpp", "shims\process.cpp" | ForEach-Object { "`"$src\$_`"" }

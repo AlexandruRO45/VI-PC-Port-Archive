@@ -5,6 +5,7 @@ check.py / run_gpu_tests.py stop with "missing vk_compute_test", and so do the f
 
     python -I tests/test_build_runtime_fallback.py
 """
+import json
 import os
 from pathlib import Path
 import re
@@ -107,6 +108,14 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         lookup_start = text.index("$cmakeDir = Join-Path")
         lookup_end = text.index("$cfg = if")
         snippet = text[helpers_start:helpers_end] + "\n" + text[lookup_start:lookup_end]
+        # Use executable batch fixtures in the fake VS tree, just as for tools on PATH.
+        snippet = snippet.replace(r"CMake\bin\cmake.exe", r"CMake\bin\cmake.cmd")
+        snippet = snippet.replace(r"Ninja\ninja.exe", r"Ninja\ninja.cmd")
+
+        def write_cmake(path: Path, major: int, minor: int, generators: list[str]):
+            caps = {"version": {"major": major, "minor": minor}, "generators": [{"name": g} for g in generators]}
+            path.write_text('@echo off\nif not "%*"=="-E capabilities" exit /b 1\necho ' + json.dumps(caps) + "\n",
+                            encoding="ascii", newline="\r\n")
 
         def run_probe(vs_dir: Path, path_dirs: list[Path]) -> tuple[str, str]:
             ps = (
@@ -136,16 +145,14 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             for d in (vs_empty, msys_dir, native_cmake_dir, native_ninja_dir):
                 d.mkdir()
 
-            # MSYS/devkitPro-like cmake: lacks Visual Studio generators in --help.
+            # MSYS/devkitPro-like cmake: lacks Visual Studio generators.
             msys_cmake = msys_dir / "cmake.cmd"
-            msys_cmake.write_text("@echo off\r\necho * Ninja\r\necho   Unix Makefiles\r\nexit /b 0\r\n", encoding="ascii")
+            write_cmake(msys_cmake, 4, 0, ["Ninja", "Unix Makefiles"])
 
             # Native Windows cmake: lists both Visual Studio and Ninja generators.
             native_cmake = native_cmake_dir / "cmake.cmd"
-            native_cmake.write_text(
-                "@echo off\r\necho   Visual Studio 18 2026\r\necho * Ninja\r\nexit /b 0\r\n",
-                encoding="ascii",
-            )
+            generators = ["Visual Studio 17 2022", "Ninja"]
+            write_cmake(native_cmake, 4, 0, generators)
             native_ninja = native_ninja_dir / "ninja.cmd"
             native_ninja.write_text("@echo off\r\necho 1.12.1\r\nexit /b 0\r\n", encoding="ascii")
 
@@ -166,14 +173,26 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
 
             # 4) VS bundled CMake + Ninja present -> must prefer VS over PATH.
             vs_full = root / "vs_full"
-            vs_cmake = vs_full / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "CMake" / "bin" / "cmake.exe"
-            vs_ninja = vs_full / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "Ninja" / "ninja.exe"
+            vs_cmake = vs_full / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "CMake" / "bin" / "cmake.cmd"
+            vs_ninja = vs_full / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "Ninja" / "ninja.cmd"
             vs_cmake.parent.mkdir(parents=True)
             vs_ninja.parent.mkdir(parents=True)
-            vs_cmake.write_bytes(b"")
-            vs_ninja.write_bytes(b"")
+            write_cmake(vs_cmake, 3, 24, generators)
+            vs_ninja.write_bytes(native_ninja.read_bytes())
             cmake, ninja = run_probe(vs_full, [native_cmake_dir, native_ninja_dir])
             self.assertEqual(Path(cmake).resolve(), vs_cmake.resolve())
+            self.assertEqual(Path(ninja).resolve(), vs_ninja.resolve())
+
+            # The preferred version falls below the minimum; a compatible PATH CMake takes its place.
+            write_cmake(vs_cmake, 3, 23, generators)
+            cmake, ninja = run_probe(vs_full, [native_cmake_dir])
+            self.assertEqual(Path(cmake).resolve(), native_cmake.resolve())
+            self.assertEqual(Path(ninja).resolve(), vs_ninja.resolve())
+
+            # An old PATH copy must not send the build down the CMake branch either.
+            write_cmake(native_cmake, 3, 20, generators)
+            cmake, ninja = run_probe(vs_full, [native_cmake_dir])
+            self.assertEqual(cmake, "")
             self.assertEqual(Path(ninja).resolve(), vs_ninja.resolve())
 
 if __name__ == "__main__":
