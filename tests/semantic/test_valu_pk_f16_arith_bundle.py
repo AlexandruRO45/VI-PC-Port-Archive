@@ -242,5 +242,26 @@ class TestValuPkF16ArithBundle(unittest.TestCase):
         val = ast.eval_scalar(w1, w2)
         self.assertEqual(val, pack_f16x2(0x4000, 0x4200))
 
+    def test_v_pk_max_f16_simd_divergence_and_boundaries(self):
+        state = MachineState(num_lanes=64)
+        state.exec_mask = 0x5555555555555555 # alternating lanes
+        for l in range(64):
+            state.vgpr[0][l] = 0xBAADF00D
+            state.vgpr[1][l] = pack_f16x2(0x3c00, 0x4000)
+            state.vgpr[2][l] = pack_f16x2(0x4000, 0x4200)
+        ast = InstructionAST("v_pk_max_f16", dst=0, srcs=[1, 2])
+        ast.execute_simd(state)
+        for l in range(64):
+            if l % 2 == 0:
+                self.assertEqual(state.vgpr[0][l], pack_f16x2(0x4000, 0x4200))
+            else:
+                self.assertEqual(state.vgpr[0][l], 0xBAADF00D)
+
+        # Boundary checks: NaN, -Inf, +0.0 vs -0.0
+        res_nan = ref_pk_max_f16(pack_f16x2(QNAN, NEG_INF), pack_f16x2(0x3c00, 0x4000))
+        lo, hi = unpack_f16x2(res_nan)
+        self.assertEqual(lo, 0x3c00)
+        self.assertEqual(hi, 0x4000)
+
 if __name__ == '__main__':
     unittest.main()
