@@ -526,6 +526,45 @@ class Gen:
             self.emit(f"{h} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(0)} {self.cu(16)}")
         return h
 
+    def mul_extended(self, x, y, *, signed=False, need_lo=False):
+        """32x32 -> (lo, hi) in ``%uint`` from 16-bit half-products, without ``OpSMulExtended`` or ``OpUMulExtended``.
+
+        Intel's Windows Gen9.5 driver (UHD Graphics 630, 31.0.101.2111) swaps the signedness of ``OpSMulExtended`` and
+        ``OpUMulExtended`` when constant-folding: ``OpSMulExtended`` folds as unsigned (``cs_w32_int_ext`` out[4] =
+        0x3fffffff instead of 0xc0000000, out[5] = 0xff004000 instead of 0x4000) and ``OpUMulExtended`` folds as signed
+        whenever an operand has bit 31 set (``cs_w32_salu64`` out[7] = 0 instead of 0xfffffffe). Writing
+        ``X = x1 * 2^16 + x0`` and ``Y = y1 * 2^16 + y0`` with ``x0, y0 in [0, 0xFFFF]`` and ``x1, y1`` in
+        ``[0, 0xFFFF]`` (unsigned) or ``[-0x8000, 0x7FFF]`` (signed) keeps every partial product in 32-bit range and
+        uses only 32-bit ``OpIMul``, ``OpIAdd`` and 16-bit shifts/masks."""
+        x0, y0 = self.u16_half(x, 0), self.u16_half(y, 0)
+        if signed:
+            x1, y1 = self.tou(self.i16_half(x, 1)), self.tou(self.i16_half(y, 1))
+        else:
+            x1, y1 = self.u16_half(x, 1), self.u16_half(y, 1)
+        p0, p1, p2, p3 = (self.tmp() for _ in range(4))
+        self.emit(f"{p0} = OpIMul %uint {x0} {y0}")
+        self.emit(f"{p1} = OpIMul %uint {x1} {y0}")
+        self.emit(f"{p2} = OpIMul %uint {x0} {y1}")
+        self.emit(f"{p3} = OpIMul %uint {x1} {y1}")
+        p0_hi = self.u16_half(p0, 1)
+        p1_lo, p2_lo = self.u16_half(p1, 0), self.u16_half(p2, 0)
+        if signed:
+            p1_hi, p2_hi = self.tou(self.i16_half(p1, 1)), self.tou(self.i16_half(p2, 1))
+        else:
+            p1_hi, p2_hi = self.u16_half(p1, 1), self.u16_half(p2, 1)
+        m0, mid, h0, h1, hi = (self.tmp() for _ in range(5))
+        self.emit(f"{m0} = OpIAdd %uint {p0_hi} {p1_lo}")
+        self.emit(f"{mid} = OpIAdd %uint {m0} {p2_lo}")
+        mid_hi = self.u16_half(mid, 1)
+        self.emit(f"{h0} = OpIAdd %uint {p3} {p1_hi}")
+        self.emit(f"{h1} = OpIAdd %uint {h0} {p2_hi}")
+        self.emit(f"{hi} = OpIAdd %uint {h1} {mid_hi}")
+        lo = None
+        if need_lo:
+            lo = self.tmp()
+            self.emit(f"{lo} = OpIMul %uint {x} {y}")
+        return lo, hi
+
     def src_h(self, s):
         """Raw 32 bits of an operand of a 16-bit float op, before its neg/abs. An inline float constant (0.5, 1.0,
         -2.0, ...) is the f16 value in the low half over a zero high half, not f32 bits. Measured on an RX 6800
@@ -6930,19 +6969,11 @@ class Gen:
             # sign-extended from bit 23 for i24 (RDNA2 ISA). The low 32 bits are v_mul_u32_u24 / v_mul_i32_i24.
             x, y = self.src_u(a[1]), self.src_u(a[2])
             signed = op == "v_mul_hi_i32_i24"
-            xs, ys, s, r = (self.tmp() for _ in range(4))
+            xs, ys = self.tmp(), self.tmp()
             ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
             self.emit(f"{xs} = {ext} %uint {x} {self.cu(0)} {self.cu(24)}")
             self.emit(f"{ys} = {ext} %uint {y} {self.cu(0)} {self.cu(24)}")
-            if signed:
-                xi, yi, hi = self.as_int(xs), self.as_int(ys), self.tmp()
-                self.emit(f"{s} = OpSMulExtended %smul {xi} {yi}")
-                self.emit(f"{hi} = OpCompositeExtract %int {s} 1")
-                self.emit(f"{r} = OpBitcast %uint {hi}")
-                self.uses_smul = True
-            else:
-                self.emit(f"{s} = OpUMulExtended %umul {xs} {ys}")
-                self.emit(f"{r} = OpCompositeExtract %uint {s} 1")
+            _, r = self.mul_extended(xs, ys, signed=signed)
             self.dst(a[0], r)
         elif op in ("v_mul_i32_i24", "v_mad_i32_i24"):
             # signed 24-bit operands (sign-extended from bit 23), low 32 bits of the product (+ src2 for mad)
@@ -7769,12 +7800,7 @@ class Gen:
             self.emit(f"{r} = OpNot %uint {x}")
             self.dst(a[0], r)
         elif op == "v_mul_hi_i32":
-            x, y = self.as_int(self.src_u(a[1])), self.as_int(self.src_u(a[2]))
-            s, hi, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{s} = OpSMulExtended %smul {x} {y}")
-            self.emit(f"{hi} = OpCompositeExtract %int {s} 1")
-            self.emit(f"{r} = OpBitcast %uint {hi}")
-            self.uses_smul = True
+            _, r = self.mul_extended(self.src_u(a[1]), self.src_u(a[2]), signed=True)
             self.dst(a[0], r)
         elif op in ("v_add_f16", "v_sub_f16", "v_subrev_f16", "v_mul_f16", "v_max_f16", "v_min_f16"):
             # f16 math on the low halves (op_sel:[src0,src1,dst] in the VOP3 form); the other half of the destination
@@ -9318,19 +9344,11 @@ class Gen:
         elif op.startswith("s_bitcmp"):
             self.bitcmp(op, a)
         elif op == "s_mul_hi_u32":
-            x, y = self.src_u(a[1]), self.src_u(a[2])
-            s, r = self.tmp(), self.tmp()
-            self.emit(f"{s} = OpUMulExtended %umul {x} {y}")
-            self.emit(f"{r} = OpCompositeExtract %uint {s} 1")
+            _, r = self.mul_extended(self.src_u(a[1]), self.src_u(a[2]))
             self.dst(a[0], r)
         elif op == "s_mul_hi_i32":
             # High 32 bits of the signed 64-bit product; SCC is not written.
-            x, y = self.as_int(self.src_u(a[1])), self.as_int(self.src_u(a[2]))
-            s, hi, r = self.tmp(), self.tmp(), self.tmp()
-            self.emit(f"{s} = OpSMulExtended %smul {x} {y}")
-            self.emit(f"{hi} = OpCompositeExtract %int {s} 1")
-            self.emit(f"{r} = OpBitcast %uint {hi}")
-            self.uses_smul = True
+            _, r = self.mul_extended(self.src_u(a[1]), self.src_u(a[2]), signed=True)
             self.dst(a[0], r)
         elif op == "s_absdiff_i32":
             # RDNA2 ISA: D = S0 - S1 as a 32-bit signed value, negated if negative; SCC = (D != 0). The difference
@@ -9381,10 +9399,7 @@ class Gen:
             self.emit(f"{r} = OpBitwiseOr %uint {keep} {ins_}")
             self.dst(a[0], r)
         elif op == "v_mul_hi_u32":
-            x, y = self.src_u(a[1]), self.src_u(a[2])
-            s, r = self.tmp(), self.tmp()
-            self.emit(f"{s} = OpUMulExtended %umul {x} {y}")
-            self.emit(f"{r} = OpCompositeExtract %uint {s} 1")
+            _, r = self.mul_extended(self.src_u(a[1]), self.src_u(a[2]))
             self.dst(a[0], r)
         elif op in ("v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32"):
             # D = {sat16(S1), sat16(S0)} (RDNA ISA pseudocode: u32_to_u16 / i32_to_i16 saturate): the low half from
@@ -10017,20 +10032,7 @@ class Gen:
             else:
                 raise Unsupported(op + " operands")
             x, y = self.src_u(s0), self.src_u(s1)
-            pm, p_lo, p_hi = self.tmp(), self.tmp(), self.tmp()
-            if signed:
-                ph = self.tmp()
-                self.emit(f"{pm} = OpSMulExtended %smul {self.as_int(x)} {self.as_int(y)}")
-                pl = self.tmp()
-                self.emit(f"{pl} = OpCompositeExtract %int {pm} 0")
-                self.emit(f"{ph} = OpCompositeExtract %int {pm} 1")
-                self.emit(f"{p_lo} = OpBitcast %uint {pl}")
-                self.emit(f"{p_hi} = OpBitcast %uint {ph}")
-                self.uses_smul = True
-            else:
-                self.emit(f"{pm} = OpUMulExtended %umul {x} {y}")
-                self.emit(f"{p_lo} = OpCompositeExtract %uint {pm} 0")
-                self.emit(f"{p_hi} = OpCompositeExtract %uint {pm} 1")
+            p_lo, p_hi = self.mul_extended(x, y, signed=signed, need_lo=True)
             s_lo, r_lo, c0, s_h1, h1, c1, s_h2, r_hi, c2 = (self.tmp() for _ in range(9))
             self.emit(f"{s_lo} = OpIAddCarry %umul {p_lo} {c_lo}")
             self.emit(f"{r_lo} = OpCompositeExtract %uint {s_lo} 0")
