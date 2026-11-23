@@ -266,6 +266,60 @@ class ScalarLDSInterpreter:
         return [self.step(inst) for inst in prog.instructions]
 
 
+
+# ---------------------------------------------------------------------------
+# SIMD Wavefront Interpreter (Multi-Lane Divergence & 32/64-Bit EXEC Masking)
+# ---------------------------------------------------------------------------
+
+class SIMDLDSWavefrontInterpreter:
+    """Multi-lane SIMD interpreter modeling Wave32 and Wave64 execution for ds_read_i16."""
+
+    def __init__(self, wave_size: int = 64, capacity_dwords: int = LDS_SIZE_DWORDS) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Invalid wave_size: {wave_size} (must be 32 or 64)")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.vgprs: list[list[int]] = [[0] * 256 for _ in range(wave_size)]
+        self.sgprs: list[int] = [0] * 106
+        self.lds: LDSModel = LDSModel(capacity_dwords)
+
+    def set_exec_mask(self, mask: int) -> None:
+        valid_mask = (1 << self.wave_size) - 1
+        self.exec_mask = mask & valid_mask
+
+    def read_lane_reg_u32(self, lane: int, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[lane][idx] & MASK32
+        return self.sgprs[idx] & MASK32
+
+    def write_lane_reg_u32(self, lane: int, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[lane][idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def step(self, inst: Instruction) -> list[int | None]:
+        """Executes a ds_read_i16 instruction across all lanes in the wavefront."""
+        lane_vaddrs: list[int] = []
+        for lane in range(self.wave_size):
+            va = self.read_lane_reg_u32(lane, RegKind.VGPR, inst.vaddr.index)
+            lane_vaddrs.append(va)
+
+        lane_results: list[int | None] = []
+        for lane in range(self.wave_size):
+            is_active = bool((self.exec_mask >> lane) & 1)
+            if not is_active:
+                lane_results.append(None)
+                continue
+
+            res = self.lds.read_i16(lane_vaddrs[lane], inst.offset.offset)
+            self.write_lane_reg_u32(lane, RegKind.VGPR, inst.vdst.index, res)
+            lane_results.append(res)
+
+        return lane_results
+
+
 class TestLdsReadI16ReferenceOracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and hardware translator execution."""
 
@@ -408,6 +462,82 @@ class TestLdsReadI16ScalarInterpreter(unittest.TestCase):
         res_hi = self.interp.step(inst_hi)
         self.assertEqual(res_hi, 5)
         self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 4), 5)
+
+
+
+class TestLdsReadI16SIMD(unittest.TestCase):
+    """Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_divergent_addresses(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter(wave_size=32, capacity_dwords=1024)
+        for lane in range(32):
+            val16 = (0x8000 | lane) if (lane % 2 == 1) else (100 + lane)
+            simd.lds.write_dword(lane * 4, val16)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, lane * 4)
+
+        inst = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        results = simd.step(inst)
+        self.assertEqual(len(results), 32)
+        for lane in range(32):
+            expected = oracle_ds_read_i16((0x8000 | lane) if (lane % 2 == 1) else (100 + lane))
+            self.assertEqual(results[lane], expected)
+            self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 2), expected)
+
+    def test_wave64_exec_masking_partial(self) -> None:
+        simd = SIMDLDSWavefrontInterpreter(wave_size=64, capacity_dwords=1024)
+        simd.set_exec_mask(0x00000000FFFFFFFF)  # Only lower 32 active
+        for lane in range(64):
+            simd.lds.write_dword(lane * 4, 0xFFFF)  # -1 in i16
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 1, lane * 4)
+            simd.write_lane_reg_u32(lane, RegKind.VGPR, 2, 0x12345678)
+
+        inst = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        results = simd.step(inst)
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(results[lane], 0xFFFFFFFF)
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 2), 0xFFFFFFFF)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(simd.read_lane_reg_u32(lane, RegKind.VGPR, 2), 0x12345678)
+
+    def test_translator_simd_divergent_reads(self) -> None:
+        # Multi-lane compute shader where each lane reads 16-bit word from lane * 4
+        # Lane 0 writes 0x000A, Lane 1 writes 0xFFFF (-1), Lane 2 writes 0x8000 (-32768)
+        lines = [
+            "v_lshlrev_b32_e32 v1, 2, v0",  # v1 = lane * 4
+            "v_cmp_eq_u32_e32 vcc, 0, v0",
+            "s_and_saveexec_b64 s[4:5], vcc",
+            "v_mov_b32_e32 v2, 0x000A",
+            "ds_write_b32 v1, v2",
+            "s_mov_b64 exec, s[4:5]",
+            "v_cmp_eq_u32_e32 vcc, 1, v0",
+            "s_and_saveexec_b64 s[4:5], vcc",
+            "v_mov_b32_e32 v2, 0xFFFF",
+            "ds_write_b32 v1, v2",
+            "s_mov_b64 exec, s[4:5]",
+            "v_cmp_eq_u32_e32 vcc, 2, v0",
+            "s_and_saveexec_b64 s[4:5], vcc",
+            "v_mov_b32_e32 v2, 0x8000",
+            "ds_write_b32 v1, v2",
+            "s_mov_b64 exec, s[4:5]",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_i16 v3, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "buffer_store_dword v3, v1, s[0:3], 0 offen",
+        ]
+        mem = run_compute_kernel(lines, lanes=3)
+        self.assertEqual(mem.get(0), 10)
+        self.assertEqual(mem.get(4), 0xFFFFFFFF)
+        self.assertEqual(mem.get(8), 0xFFFF8000)
 
 
 if __name__ == "__main__":
