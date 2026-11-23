@@ -28,6 +28,7 @@
 
 #include <windows.h>
 #include <dxgi1_4.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cerrno>
@@ -151,12 +152,17 @@ const char* slot_name(unsigned slot) {
     }
 }
 
-void note_slot(unsigned slot) {
+std::atomic<CallerLocator> g_caller_locator{nullptr};
+
+// `caller` is the return address of the guest's call into the thunk, or 0 when the slot's own handler has no thunk
+// frame to read it from (the log line then has no tail).
+void note_slot(unsigned slot, std::uint64_t caller = 0) {
     if (slot >= kMaxSlots) return;
     count_hit(g_hits[slot]);
     const bool first = first_call(g_first[slot]);
     if (first) {
-        std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call\n", slot, slot_name(slot));
+        std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) first call%s\n", slot, slot_name(slot),
+                     first_call_caller_suffix(caller).c_str());
     } else if (slot >= 3 && trace_enabled()) {
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) call\n", slot, slot_name(slot));
     }
@@ -1119,13 +1125,13 @@ std::uint64_t forward_device(DeviceProxy* self, std::uint64_t a1, std::uint64_t 
 
 // A device slot past the PC device's vtable (the real device predates the interface): E_NOTIMPL, logged once per
 // slot. The generic thunk and the slots the proxy handles itself (31/34/35/45/46/50, 75) log the same line.
-HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
+HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count, std::uint64_t caller = 0) {
     bool expected = false;
     if (slot < kMaxSlots && g_beyond_warned[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed))
         std::fprintf(stderr,
                      "[rt] d3d12_xs: device slot %u (%s) is beyond the PC device vtable (%u slots); returning "
-                     "E_NOTIMPL\n",
-                     slot, slot_name(slot), slot_count);
+                     "E_NOTIMPL%s\n",
+                     slot, slot_name(slot), slot_count, first_call_caller_suffix(caller).c_str());
     return E_NOTIMPL;
 }
 
@@ -1530,7 +1536,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
     } else {
-        note_slot(Slot);
+        // proxy_slot<Slot> is the vtable entry itself, so its return address is the guest's call site. Read here,
+        // in the thunk's own frame, before anything is called.
+        const std::uint64_t caller = reinterpret_cast<std::uint64_t>(_ReturnAddress());
+        note_slot(Slot, caller);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
@@ -1558,7 +1567,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
                                                          reinterpret_cast<void**>(a5)));
         }
-        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count, caller));
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
         // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
@@ -1831,6 +1840,18 @@ std::uint64_t heap_slot_hits(unsigned slot) {
 
 bool heap_slot_first_call_seen(unsigned slot) {
     return slot < kHeapSlots && g_heap_first[slot].load(std::memory_order_relaxed);
+}
+
+void set_caller_locator(CallerLocator locator) {
+    g_caller_locator.store(locator, std::memory_order_relaxed);
+}
+
+std::string first_call_caller_suffix(std::uint64_t caller) {
+    if (!caller) return {};
+    if (const CallerLocator locate = g_caller_locator.load(std::memory_order_relaxed)) return " from " + locate(caller);
+    char text[32];
+    std::snprintf(text, sizeof text, " from 0x%llx", static_cast<unsigned long long>(caller));
+    return text;
 }
 
 void reset_device_proxy_stats() {

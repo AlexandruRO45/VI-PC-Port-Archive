@@ -150,6 +150,9 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
     }
 
+    // The device proxy's first-call lines name the guest caller as module+RVA (needs the loader's module table).
+    rt::d3d12_xs::set_caller_locator([](std::uint64_t address) { return rt::shims::module_offset(address); });
+
     static std::atomic<bool> proxy_logged{false};
     if (!proxy_logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,

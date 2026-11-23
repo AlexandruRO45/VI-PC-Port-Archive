@@ -124,7 +124,7 @@ the de-duplicated 1–22. It maps each question to the event to look for; it doe
 | # | Question | Signal in the first trace |
 |---|---|---|
 | 1 | `D3D12XboxCreateDevice` 24-word params and flags | first `D3D12XboxCreateDevice` in the D3D12 trace; the shim prints the 24 words as an `[rt]` line in the same log, with or without `--trace-d3d12` (grep `^\[rt\]`); accept unknown flags |
-| 2 | Xbox device/heap/queue/command-list slots | queue, fence and allocator method names in the D3D12 trace; device slots past the PC vtable print an `[rt] d3d12_xs: device slot …` line instead and record nothing; compare with the SDK vtable |
+| 2 | Xbox device/heap/queue/command-list slots | queue, fence and allocator method names in the D3D12 trace; device slots past the PC vtable print an `[rt] d3d12_xs: device slot …` line instead and record nothing; the first call of each device slot the proxy forwards by number, and that refusal, end in `from <module+RVA>`, the guest's call site (the arguments are not logged); compare with the SDK vtable |
 | 3 | Root signature → `s0..s31` | `CreateRootSignature`, `SetGraphicsRootSignature`, then the shader's user-SGPR reads; mask `0x03000000` on a copy |
 | 4 | Descriptor bytes and heap increments | first `CreateShaderResourceView`/`CreateSampler` and the first draw; dump the heap bytes and compare with the T#/S# parser |
 | 5 | VA range and arena capacity | `GetGPUVirtualAddress` and every descriptor base; high-water mark |

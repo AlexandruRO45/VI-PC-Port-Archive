@@ -50,6 +50,7 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <string>
 
 namespace rt::d3d12_xs {
 
@@ -156,5 +157,14 @@ bool device_slot_first_call_seen(unsigned slot);
 std::uint64_t heap_slot_hits(unsigned slot);
 bool heap_slot_first_call_seen(unsigned slot);
 void reset_device_proxy_stats();
+
+// Where a forwarded device slot was called from. The first call of each slot the generic thunk forwards by number
+// (and the "beyond the PC device vtable" refusal) logs its return address as "from <text>". The locator turns the
+// address into text; the runtime installs rt::shims::module_offset (module+RVA). Without one the line carries the
+// bare address. Only the caller's address is logged, never the call's arguments (raw guest values).
+using CallerLocator = std::string (*)(std::uint64_t address);
+void set_caller_locator(CallerLocator locator);
+// The " from <text>" tail of those log lines for `caller` (empty for 0). A test helper.
+std::string first_call_caller_suffix(std::uint64_t caller);
 
 }  // namespace rt::d3d12_xs

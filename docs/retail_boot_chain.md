@@ -58,6 +58,11 @@ tracking and #5378 a Vulkan sparse-binding mapper; neither is wired to these exp
 
 ## 3. Device calls whose Xbox shape differs from the PC
 
+The call sites below were found from the first-call line the proxy prints for each device slot it forwards by
+number: `[rt] d3d12_xs: device slot N (forwarded) first call from <module+RVA>` (the same tail is on the "beyond the PC
+device vtable" line). The address is the return address of the title's call, so it names the instruction after the
+`call [vtable+N*8]` to look at; the arguments are raw guest values and are not logged.
+
 ### 3.1 Struct-returning methods take the return buffer first
 
 Device slot 26 (`GetCustomHeapProperties`, which returns a `D3D12_HEAP_PROPERTIES`) is called as

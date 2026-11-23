@@ -821,6 +821,59 @@ int run_env_slots(bool valid) {
     return 0;
 }
 
+// ---- 8b. The caller of a forwarded slot's first call ----
+
+std::uint64_t g_located[4];
+unsigned g_located_count = 0;
+
+std::string record_locator(std::uint64_t address) {
+    if (g_located_count < std::size(g_located)) g_located[g_located_count] = address;
+    ++g_located_count;
+    return "mock+0x10";
+}
+
+// True when `address` lies in this executable's image: the thunk's return address is the test's call into the vtable,
+// not an address inside the shim's own thunk or a helper.
+bool in_this_image(std::uint64_t address) {
+    HMODULE module = nullptr;
+    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCWSTR>(address), &module) &&
+           module == GetModuleHandleW(nullptr);
+}
+
+int check_forwarded_caller() {
+    EXPECT(xs::first_call_caller_suffix(0).empty());
+    EXPECT(xs::first_call_caller_suffix(0x1234).rfind(" from 0x1234") == 0);  // no locator yet: the bare address
+    xs::set_caller_locator(&record_locator);
+    EXPECT(xs::first_call_caller_suffix(0x1234) == " from mock+0x10");
+    g_located_count = 0;
+
+    // A forwarded slot (not one of the thunk's own routes): its first call asks the locator for the caller, once.
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 11, true);
+    EXPECT(device);
+    xs::reset_device_proxy_stats();
+    EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 1);
+    EXPECT(g_located_count == 1 && in_this_image(g_located[0]));
+    EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 2 && g_located_count == 1);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+
+    // The same for a slot past the PC device's vtable (an ID3D12Device-only mock): E_NOTIMPL, caller logged once.
+    g_located_count = 0;
+    void* old_device = make_device(mock, 0, false);
+    EXPECT(old_device);
+    xs::reset_device_proxy_stats();
+    EXPECT(hr_of(raw(old_device, 70)) == E_NOTIMPL && mock->calls[70] == 0);
+    // Two lines, each with the caller: the slot's first call and the refusal.
+    EXPECT(g_located_count == 2 && in_this_image(g_located[0]) && g_located[1] == g_located[0]);
+    EXPECT(hr_of(raw(old_device, 70)) == E_NOTIMPL && g_located_count == 2);
+    EXPECT(release(old_device) == 0 && mock->refs == 0);
+
+    xs::set_caller_locator(nullptr);
+    std::printf("%s: a forwarded slot's first call and a refused one log their caller\n", g_label);
+    return 0;
+}
+
 // ---- 9. The refused tail and the guard region ----
 
 int check_tail(bool want_guarded) {
@@ -948,7 +1001,8 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() ||
+        check_forwarded_caller())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
