@@ -537,3 +537,44 @@ class TestVMovreldB32Integration(unittest.TestCase):
         ]
         with self.assertRaises(rdna2spirv.Unsupported):
             support.translate_lines("ps_vmovreld_sgpr_src", lines)
+
+
+class TestVMovrelsB32Oracle(unittest.TestCase):
+    def test_oracle_model_against_translator(self):
+        for m0 in (0, 2):
+            with self.subTest(m0=m0):
+                vgprs = [0] * NUM_VGPRS
+                vgprs[4] = 0x44556677
+                vgprs[6] = 0x8899AABB
+                expected = oracle_v_movrels_b32(1, 4, m0, vgprs)
+                lines = [
+                    "v_mov_b32 v4, 0x44556677",
+                    "v_mov_b32 v6, 0x8899AABB",
+                    f"s_mov_b32 m0, {m0}",
+                    "v_movrels_b32 v1, v4",
+                    "v_mov_b32 v0, v1",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines(f"ps_vmovrels_oracle_{m0}", lines)
+                out = support.mrt0_words(spv)
+                self.assertEqual(out[0], expected[1])
+
+    def test_oracle_base_read(self):
+        lines = [
+            "v_mov_b32 v7, 0x12344321",
+            "s_mov_b32 m0, 0",
+            "v_movrels_b32 v1, v7",
+            "v_mov_b32 v0, v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovrels_base", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x12344321)
