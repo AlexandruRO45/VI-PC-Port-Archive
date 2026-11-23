@@ -477,6 +477,43 @@ class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
                 self.assertEqual(check.pixel_test("unused", tmp, self.NAME), f"missing {self.NAME}.spv")
 
 
+class ClampFormsUnderMinLodFallback(unittest.TestCase):
+    """ps_texture_cl and ps_texture_b_cl under LEONIDA_MINLOD_FALLBACK=1: --min-lod-fallback folds the clamp of
+    image_sample_d_cl only, so the translator refuses these ("without shaderResourceMinLod") and there is no .spv.
+    run_gpu_tests.py SKIPs them there; without the flag a missing .spv stays a translation failure."""
+
+    def run_suite(self, name, flag):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+            env = {"LEONIDA_MINLOD_FALLBACK": "1" if flag else "0"}
+            out = io.StringIO()
+            with (patch.dict(rgt.os.environ, env),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", return_value=(0, "1 shaders: 0 translated, 0 pass spirv-val")),
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(out)):
+                rc = rgt.run_suite(args, tmp)
+            return rc, out.getvalue()
+
+    def test_skips_under_the_flag(self):
+        for name in ("ps_texture_cl", "ps_texture_b_cl"):
+            with self.subTest(name=name):
+                rc, out = self.run_suite(name, True)
+                self.assertIn("SKIP (image_sample_cl/_b_cl need shaderResourceMinLod", out)
+                self.assertNotIn("missing .spv", out)
+                self.assertEqual(rc, 0, out)
+
+    def test_missing_spv_without_the_flag_still_fails(self):
+        rc, out = self.run_suite("ps_texture_cl", False)
+        self.assertIn("missing .spv (translation failed)", out)
+        self.assertEqual(rc, 1, out)
+
+    def test_other_shaders_still_fail_under_the_flag(self):
+        rc, out = self.run_suite("ps_texture_grad_cl_a16", True)
+        self.assertIn("missing .spv (translation failed)", out)
+        self.assertEqual(rc, 1, out)
+
+
 class F16InterpUnderBaryFallback(unittest.TestCase):
     """ps_interp_f16_high and ms_f16_pack under LEONIDA_BARY_FALLBACK=1. --bary-fallback alone has no PerVertexKHR
     inputs, so the f16 halves can't be interpolated and both are skipped. With --f16-interp-fallback as well (on by

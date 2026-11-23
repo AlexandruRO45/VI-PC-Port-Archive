@@ -742,6 +742,9 @@ def _w64_graphics_only() -> frozenset:
 W64_GRAPHICS_ONLY = _w64_graphics_only()
 
 
+NEEDS_MIN_LOD = ("ps_texture_cl", "ps_texture_b_cl")   # clamp forms --min-lod-fallback cannot express
+
+
 def run_suite(a, work: str) -> int:
     asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
     # The wave64 pixel fixtures of runtime/test/shaders/w64_graphics.py (tiers A-C, #1541) are checked by that
@@ -865,6 +868,12 @@ def run_suite(a, work: str) -> int:
             # is no .spv (the f16 fallback is on by default where PerVertexKHR doesn't compile: MoltenVK).
             results.append((name, None, "SKIP (computed I/J pairs need PerVertexKHR inputs: "
                                         "no --bary-fallback / --f16-interp-fallback)"))
+            continue
+        if name in NEEDS_MIN_LOD and os.environ.get("LEONIDA_MINLOD_FALLBACK") == "1":
+            # --min-lod-fallback folds the clamp of image_sample_d_cl only; the translator refuses the other clamp
+            # forms ("without shaderResourceMinLod"), so there is no .spv on a device that needs the fallback.
+            results.append((name, None, "SKIP (image_sample_cl/_b_cl need shaderResourceMinLod: "
+                                        "--min-lod-fallback covers image_sample_d_cl only)"))
             continue
         if not os.path.isfile(spv):
             results.append((name, False, "missing .spv (translation failed)"))
