@@ -929,6 +929,32 @@ void test_headers_and_reloc_tail_bounds() {
     }
 }
 
+void test_oversized_file_is_rejected() {
+    std::printf("\\n--- PE file size limit ---\\n");
+    const auto path = g_temp_dir / "oversized_pe.bin";
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        check_condition(false, "create oversized sparse PE fixture");
+        return;
+    }
+    LARGE_INTEGER size{};
+    size.QuadPart = (1ll << 30) + 1;
+    const bool sized = SetFilePointerEx(file, size, nullptr, FILE_BEGIN) && SetEndOfFile(file);
+    CloseHandle(file);
+    if (!sized) {
+        check_condition(false, "extend oversized PE fixture beyond 1 GiB");
+        return;
+    }
+    bool rejected = false;
+    try {
+        rt::Loader loader(g_temp_dir);
+        loader.load(path);
+    } catch (const std::runtime_error& e) {
+        rejected = std::string(e.what()).find("1 GiB size limit") != std::string::npos;
+    }
+    check_condition(rejected, "PE input larger than 1 GiB is rejected before allocation");
+}
+
 }  // namespace
 
 int main() {
@@ -941,6 +967,7 @@ int main() {
     std::filesystem::create_directories(g_temp_dir);
 
     try {
+        test_oversized_file_is_rejected();
         test_range_wrapping_arithmetic();
         test_string_null_termination_direct();
         test_import_table_null_termination();
