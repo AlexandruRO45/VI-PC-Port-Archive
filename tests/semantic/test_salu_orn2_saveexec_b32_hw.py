@@ -104,3 +104,91 @@ class TestSaluOrn2SaveexecB32Oracle(unittest.TestCase):
         self.assertEqual(new_exec, ALL_LANES_ACTIVE_32)
         self.assertEqual(sdst, sample_exec)
         self.assertEqual(scc, 1)
+
+
+class Opcode(Enum):
+    S_ORN2_SAVEEXEC_B32 = auto()
+
+
+class OperandKind(Enum):
+    SGPR = auto()
+    EXEC_LO = auto()
+    VCC_LO = auto()
+    LITERAL32 = auto()
+    INLINE_CONST = auto()
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    kind: OperandKind
+    index: int = 0
+    count: int = 1
+    value: int = 0
+
+    @classmethod
+    def sgpr(cls, index: int) -> ASTOperand:
+        if index < 0 or index > 105:
+            raise ValueError(f"SGPR index out of range: s{index}")
+        return cls(kind=OperandKind.SGPR, index=index, count=1)
+
+    @classmethod
+    def exec_lo(cls) -> ASTOperand:
+        return cls(kind=OperandKind.EXEC_LO, count=1)
+
+    @classmethod
+    def vcc_lo(cls) -> ASTOperand:
+        return cls(kind=OperandKind.VCC_LO, count=1)
+
+    @classmethod
+    def literal32(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.LITERAL32, count=1, value=u32(val))
+
+    @classmethod
+    def inline_const(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.INLINE_CONST, count=1, value=u32(val))
+
+
+@dataclass(frozen=True)
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+
+    def validate(self) -> None:
+        if self.opcode != Opcode.S_ORN2_SAVEEXEC_B32:
+            raise ValueError(f"Unsupported opcode: {self.opcode}")
+        if self.dst.kind not in (OperandKind.SGPR, OperandKind.EXEC_LO):
+            raise TypeError(f"Destination must be SGPR or EXEC_LO, got {self.dst.kind}")
+        if self.dst.count != 1:
+            raise ValueError(f"Destination must be 32-bit (1 register), got {self.dst.count}")
+        if self.src0.count != 1:
+            raise ValueError(f"Source must be 32-bit operand, got {self.src0.count}")
+
+
+class TestSaluOrn2SaveexecB32AST(unittest.TestCase):
+    """Test suite for AST opcode definitions and operand validation."""
+
+    def test_ast_construction_valid_operands(self):
+        inst = ASTInstruction(
+            opcode=Opcode.S_ORN2_SAVEEXEC_B32,
+            dst=ASTOperand.sgpr(4),
+            src0=ASTOperand.sgpr(6),
+        )
+        inst.validate()
+        self.assertEqual(inst.opcode, Opcode.S_ORN2_SAVEEXEC_B32)
+        self.assertEqual(inst.dst.kind, OperandKind.SGPR)
+        self.assertEqual(inst.dst.index, 4)
+        self.assertEqual(inst.src0.index, 6)
+
+    def test_ast_rejects_out_of_range_sgpr(self):
+        with self.assertRaises(ValueError):
+            ASTOperand.sgpr(106)
+
+    def test_ast_rejects_invalid_dst_kind(self):
+        inst = ASTInstruction(
+            opcode=Opcode.S_ORN2_SAVEEXEC_B32,
+            dst=ASTOperand.literal32(0x123),
+            src0=ASTOperand.sgpr(6),
+        )
+        with self.assertRaises(TypeError):
+            inst.validate()
