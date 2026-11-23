@@ -345,5 +345,86 @@ class TestMed3I32ScalarInterpreter(unittest.TestCase):
             self.assertEqual(expected, shader_res)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking (Commit 4)
+# ==============================================================================
+
+class SimdWaveState:
+    def __init__(self, lane_count: int = 64) -> None:
+        self.lane_count = lane_count
+        self.vgprs: List[List[int]] = [[0] * 256 for _ in range(lane_count)]
+        self.exec_mask: int = (1 << lane_count) - 1
+
+    def execute_med3_i32(self, inst: Med3I32InstructionAST) -> None:
+        for lane in range(self.lane_count):
+            if not ((self.exec_mask >> lane) & 1):
+                continue
+
+            def resolve_lane_operand(op: OperandAST) -> int:
+                if op.kind == OperandKind.REG:
+                    assert op.reg is not None
+                    return self.vgprs[lane][op.reg.index]
+                assert op.imm is not None
+                return u32(op.imm)
+
+            s0 = resolve_lane_operand(inst.src0)
+            s1 = resolve_lane_operand(inst.src1)
+            s2 = resolve_lane_operand(inst.src2)
+            self.vgprs[lane][inst.dst.index] = ref_med3_i32(s0, s1, s2)
+
+
+class TestMed3I32SimdDivergence(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_uniform_execution(self):
+        wave = SimdWaveState(lane_count=32)
+        wave.exec_mask = 0xFFFFFFFF
+        for lane in range(32):
+            wave.vgprs[lane][1] = u32(-50)
+            wave.vgprs[lane][2] = u32(0)
+            wave.vgprs[lane][3] = u32(50)
+
+        inst = parse_med3_i32_asm("v_med3_i32 v0, v1, v2, v3")
+        wave.execute_med3_i32(inst)
+
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][0], 0)
+
+    def test_wave64_divergent_lanes(self):
+        wave = SimdWaveState(lane_count=64)
+        wave.exec_mask = 0xFFFFFFFFFFFFFFFF
+        for lane in range(64):
+            wave.vgprs[lane][1] = u32(lane * 10 - 320)
+            wave.vgprs[lane][2] = u32(0)
+            wave.vgprs[lane][3] = u32(100)
+
+        inst = parse_med3_i32_asm("v_med3_i32 v0, v1, v2, v3")
+        wave.execute_med3_i32(inst)
+
+        for lane in range(64):
+            v1_val = lane * 10 - 320
+            expected = ref_med3_i32(v1_val, 0, 100)
+            self.assertEqual(wave.vgprs[lane][0], expected)
+
+    def test_wave64_exec_masking_preservation(self):
+        wave = SimdWaveState(lane_count=64)
+        for lane in range(64):
+            wave.vgprs[lane][0] = 0xDEADBEEF
+            wave.vgprs[lane][1] = 10
+            wave.vgprs[lane][2] = 20
+            wave.vgprs[lane][3] = 30
+
+        # Enable only even lanes
+        wave.exec_mask = 0x5555555555555555
+        inst = parse_med3_i32_asm("v_med3_i32 v0, v1, v2, v3")
+        wave.execute_med3_i32(inst)
+
+        for lane in range(64):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[lane][0], 20)
+            else:
+                self.assertEqual(wave.vgprs[lane][0], 0xDEADBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
