@@ -437,7 +437,9 @@ What is implemented (all of it testable without the game):
   - Single-sampled `A8_UNORM` 1D, 2D and 3D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs
     expose (0, 0, 0, A) before applying the caller's component mapping. Format support reports `TEXTURE1D`,
     `TEXTURE2D` and `TEXTURE3D`, as the host runtime does (RTX 4090 and WARP, `d3d12_a8_dimensions_test`, which also
-    compares sizes and alignments), and includes `MIP` when the Vulkan image supports multiple levels.
+    checks that every description the references size gets a size with WARP's alignment; the sizes themselves are
+    not pinned, since the host adapter and WARP differ on some small-alignment ones), and includes `MIP` when the
+    Vulkan image supports multiple levels.
     Render-target, depth-stencil and UAV creation are unsupported for this format. The retail title sizes a 1D
     128-texel one through device slot 25.
   - reserved resources and `GetResourceTiling` (section 4.2);

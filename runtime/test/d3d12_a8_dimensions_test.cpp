@@ -288,7 +288,8 @@ int main() {
             }
         }
     }
-    std::printf("A8_UNORM dimensions: %u references, %u descriptions sized, %u texels round-tripped, %u failures\n",
-                references, sized, texels, failures);
-    return failures ? 1 : 0;
+    std::printf("A8_UNORM dimensions: %u references, %u descriptions sized, %u texels round-tripped, %u failures, "
+                "%u Vulkan validation errors\n",
+                references, sized, texels, failures, vk.validation_errors());
+    return failures || vk.validation_errors() ? 1 : 0;
 }
