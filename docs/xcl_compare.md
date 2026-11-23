@@ -45,7 +45,8 @@ two runs, so a check that fails in both for different reasons is still listed.
 A check that prints nothing for `--timeout` seconds (15 by default) is a hang. The tool records the stacks of the
 title's threads with `cdb.exe` from the Windows SDK debugging tools (when installed), stops the title, and starts it
 again with that check skipped, so a hang does not hide the checks after it. `--skip <fragment>` skips checks by
-name. Both need two small local changes to the title's `check` function, which upstream XCL does not have: print
+name, and repeating it skips several. Both need two small local changes to the title's `check` function, which
+upstream XCL does not have: print
 `[RUN] <check>` before each check, and return early with `[SKIP] <check>` when `XCL_TESTTITLE_SKIP` holds part of
 its name. Without them the check in progress is taken from XCL's order, and a hang ends the run (the tool notices
 the repeat and stops).
