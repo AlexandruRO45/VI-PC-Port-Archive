@@ -294,6 +294,15 @@ For each returned entry, `tools/rpf9dump/Program.cs` reads the segments, splits 
 offset, OBJ name, model name, mesh/vertex/triangle counts, fragment and bone-binding flags, bounds,
 per-mesh shader indices, embedded textures, and material texture references.
 
+The exporter writes OBJ, not GLB. `tools/batch_glb.py` converts a whole folder of those OBJs in one
+pass, one `<name>.glb` per `<name>.obj`, with `--jobs` worker threads (default: the CPU count) and an
+optional `--textures <dir>` of `.png`/`.dds` files linked to materials by case-insensitive basename and
+embedded. `--up z` (the default) rotates RAGE's Z-up into glTF's Y-up, `--up y` keeps the source axis,
+and `--max-tex-size` caps the dimension of a decoded DDS (0 leaves it unconstrained). A texture that
+cannot be read or decoded is left out of that model and printed on one line, the run ends with
+`converted <n>/<total> models`, and the exit status is 1 only when a model failed to convert (or the
+input folder is missing).
+
 Three arrays describe the geometries one by one, in the same order as the OBJ's `o` groups:
 `MeshTris` (triangles), `MeshModels` (the position of the model in the drawable's primary-LOD model
 list) and `MeshGeoms` (the position of the geometry in that model). That pair is the geometry index
