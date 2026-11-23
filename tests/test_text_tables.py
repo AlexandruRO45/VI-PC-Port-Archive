@@ -285,6 +285,46 @@ def make_variant_resource(groups, pad_before_variants=0):
 
 
 class TestVariants(unittest.TestCase):
+    def test_string_reference_integrity(self):
+        original = make_variant_resource([("ZZ_REF", 0, 0, [("abc", 0, 0, 0), ("def", 0, 0, 0)])])
+        record = len(original) - 32
+        blob = original.index(b"abc\0def\0")
+        for offset, chunk, edit, reason, recovered in [
+            (0, 0, None, None, "abc"),  # both records share the first string
+            (4, 0, None, None, "def"),
+            (5, 0, None, "offset inside a string", "ef"),
+            (8, 0, None, "offset outside chunk", None),
+            (0, 1, None, "missing chunk", None),
+            (4, 0, (7, 65), "missing NUL in chunk", None),  # next block starts with NUL
+            (4, 0, (5, 255), "invalid UTF-8 at chunk offset 0x5", "d\ufffdf"),
+        ]:
+            with self.subTest(offset=offset, chunk=chunk, reason=reason):
+                data = bytearray(original)
+                struct.pack_into("<Q", data, record, (offset << 20) | 4 | chunk)
+                if edit:
+                    data[blob + edit[0]] = edit[1]
+                expected = ["abc"] + ([] if recovered is None else [recovered])
+                table, = T.variant_tables(data)
+                self.assertEqual([v["text"] for v in table[T.joaat("ZZ_REF")]], expected)
+                if reason:
+                    with self.assertRaisesRegex(ValueError, f"record {record:#x}, chunk {chunk}, offset {offset:#x}: {reason}"):
+                        list(T.variant_tables(data, strict=True))
+                else:
+                    self.assertEqual(list(T.variant_tables(data, strict=True)), [table])
+
+    def test_strict_cli_preserves_report_on_bad_reference(self):
+        data = bytearray(make_variant_resource([("ZZ_REF", 0, 0, [("abc", 0, 0, 0)])]))
+        struct.pack_into("<Q", data, len(data) - 32, (1 << 20) | 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "ref.bin"), data)
+            out = write(os.path.join(tmp, "variants.csv"), b"previous")
+            for flags in ([], ["--variants", out]):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(T.main([src, "--verify-variant-strings", *flags]), 2)
+                self.assertIn(f"{src} resource 0x0: variant record", err.getvalue())
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"previous")
+
     def test_variant_groups_past_4k_byte_offset(self):
         # 130 dummy records push byte offset to 4160 (>= 4096), verifying (ptr4 >> 20) is a byte offset.
         res = make_variant_resource([
@@ -325,9 +365,9 @@ class TestVariants(unittest.TestCase):
         # Short variant tables ("Bonjour") guess "xx" alone; when Scan provides archive_lang, variants inherit it.
         res = make_variant_resource([("ZZ_GREET", 10, 11, [("Bonjour", 0, 1, 0)])])
         scan = T.VariantScan()
-        scan.archive_lang = {("arc", 0x1000): "fr"}
+        scan.add("src", 0x1000, make_resource(EN), archive=("arc", 0x1000))
         scan.add("src", 0x1100, res, archive=("arc", 0x1000))
-        self.assertEqual([(s, o, lang) for s, o, lang, _vt in scan.variants], [("src", 0x1100, "fr")])
+        self.assertEqual([(s, o, lang) for s, o, lang, _vt in scan.variants], [("src", 0x1100, "en")])
 
     def test_variants_read_the_source_once(self):
         # A source that disappears as soon as its scan ends must not be reopened for the variant rows: they

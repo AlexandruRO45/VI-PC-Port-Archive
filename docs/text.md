@@ -221,6 +221,13 @@ keys and their text sit in different archives, and every report comes from that 
 
 Standard library only. The four archives above take about 2 minutes on one core from a carve.
 
+Use `--verify-variant-strings` alone or with a report to check each decoded variant record's
+string reference. The offset must select the start of its chunk or follow a NUL byte. The
+string must terminate within that chunk and decode as UTF-8. Multiple records can share a
+string. The first failure reports the resource, record and chunk offsets and exits with status
+2 before publishing reports. Default recovery skips missing chunks, out-of-range offsets and
+unterminated strings, accepts suffix pointers and replaces malformed UTF-8 with U+FFFD.
+
 `tools/opus_tags.py` writes the `--dialogue` rows into the exported Ogg Opus files as `LABEL`, `SPEAKER` and
 `SUBTITLE` comments (see [audio.md](audio.md#tags-names-and-subtitles)).
 

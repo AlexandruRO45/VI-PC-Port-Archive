@@ -230,7 +230,32 @@ def _descriptor_entries(buf: bytes, at: int) -> list:
     return entries
 
 
-def variant_tables(buf: bytes):
+def _variant_text(buf, chunks, ref, strict):
+    chunk = ref & 3
+    offset = ref >> 20
+    if chunk >= len(chunks):
+        if strict:
+            raise ValueError("missing chunk")
+        return None
+    lo, hi = chunks[chunk]
+    start = lo + offset
+    if strict:
+        if start >= hi:
+            raise ValueError("offset outside chunk")
+        if start != lo and buf[start - 1] != 0:
+            raise ValueError("offset inside a string")
+    end = buf.find(b"\0", start, hi)
+    if end < 0:
+        if strict:
+            raise ValueError("missing NUL in chunk")
+        return None
+    try:
+        return buf[start:end].decode("utf-8", "strict" if strict else "replace")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"invalid UTF-8 at chunk offset {offset + error.start:#x}") from None
+
+
+def variant_tables(buf: bytes, *, strict=False):
     """Yield {label_hash: [variant_dict, ...]} for tables carrying 0x956a9df5 / 0x10075946 variant groups."""
     for m in DESCRIPTOR.finditer(buf):
         hash_bytes = struct.unpack("<I", m.group(2))[0]
@@ -261,17 +286,16 @@ def variant_tables(buf: bytes):
             for k in range(count):
                 v_off = r_off + k * 32
                 ref = struct.unpack_from("<Q", buf, v_off)[0]
-                chunk_idx = ref & 3
-                if chunk_idx >= len(chunks):
-                    continue
-                lo, hi = chunks[chunk_idx]
-                start = lo + (ref >> 20)
-                end = buf.find(b"\0", start, hi)
-                if not (lo <= start <= end):
+                try:
+                    text = _variant_text(buf, chunks, ref, strict)
+                except ValueError as error:
+                    raise ValueError(f"variant record {v_off:#x}, chunk {ref & 3}, "
+                                     f"offset {ref >> 20:#x}: {error}") from None
+                if text is None:
                     continue
                 gender, plurality, case = buf[v_off + 8], buf[v_off + 9], buf[v_off + 10]
                 items.append({
-                    "text": buf[start:end].decode("utf-8", "replace"),
+                    "text": text,
                     "gender": TEXT_GENDERS[gender] if gender < len(TEXT_GENDERS) else str(gender),
                     "plurality": TEXT_PLURALITIES[plurality] if plurality < len(TEXT_PLURALITIES) else str(plurality),
                     "case": "None" if case == 0 else f"Case{case}",
@@ -492,8 +516,9 @@ class VariantScan(Scan):
     grew a nested-archive argument on ``main``): the subclass only observes the bytes the scan already read.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, strict=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.strict = strict
         self.variant_found = []                             # (source, offset, guess, archive, {hash: [variant]})
 
     def add(self, *args, **kwargs):
@@ -504,9 +529,12 @@ class VariantScan(Scan):
         except TypeError:  # 16282101 base Scan.add takes (source, offset, data) without `archive`
             super().add(source, offset, data)
         if _is_resource(data) and b"\x01\x01\x00\x00" in data:
-            for table in variant_tables(data):
-                texts = [v["text"] for items in table.values() for v in items]
-                self.variant_found.append((source, offset, language(texts), archive, table))
+            try:
+                for table in variant_tables(data, strict=self.strict):
+                    texts = [v["text"] for items in table.values() for v in items]
+                    self.variant_found.append((source, offset, language(texts), archive, table))
+            except ValueError as error:
+                raise ValueError(f"{source} resource {offset:#x}: {error}") from None
 
     @property
     def variants(self):
@@ -548,6 +576,8 @@ def main(argv=None) -> int:
     ap.add_argument("--tables", help="CSV: one row per string table (source, offset, lang, group, counts)")
     ap.add_argument("--strings", help="CSV: every string (source, offset, lang, hash, label, text)")
     ap.add_argument("--variants", help="CSV: grammatical variant entries (0x956a9df5 / 0x10075946)")
+    ap.add_argument("--verify-variant-strings", action="store_true",
+                    help="reject invalid string references in decoded variant records")
     a = ap.parse_args(argv)
     out_flags = [(flag, path) for flag, path in (("--dialogue", a.dialogue), ("--tables", a.tables),
                                                  ("--strings", a.strings), ("--variants", a.variants)) if path]
@@ -567,7 +597,7 @@ def main(argv=None) -> int:
         if any(os.path.exists(o) and os.path.samefile(path, o) for o in outs):
             ap.error("an output must not overwrite an input")
 
-    scan = VariantScan() if a.variants is not None else Scan()
+    scan = VariantScan(strict=a.verify_variant_strings) if a.variants is not None or a.verify_variant_strings else Scan()
     try:
         for source in a.sources:
             starts = archive_starts(source)
@@ -670,6 +700,9 @@ def main(argv=None) -> int:
     print(f"{len(scan.tables)} string tables ({', '.join(f'{k} {per_lang[k]}' for k in langs)}); "
           f"{len(scan.pairs)} dialogue keys, {lines} lines; lines with text: "
           + ", ".join(f"{k} {with_text[k]}" for k in langs))
+    if a.verify_variant_strings:
+        records = sum(len(items) for _, _, _, _, table in scan.variant_found for items in table.values())
+        print(f"verified variant strings: {len(scan.variant_found)} tables, {records} records")
     if scan.archive_lang:
         by_archive = sum(found[3] in scan.archive_lang for found in scan.found)
         changed = sum(lang != found[2] for (_s, _o, lang, _t), found in zip(scan.tables, scan.found))
