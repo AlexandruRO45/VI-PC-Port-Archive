@@ -15,6 +15,7 @@ import concurrent.futures
 import fnmatch
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -24,11 +25,18 @@ def _raise_scan_error(error):
     raise error
 
 
+def _has_package_marker(directory):
+    try:
+        return stat.S_ISREG(os.stat(os.path.join(directory, "__init__.py")).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
 def test_modules(directory):
     """Dotted names of the test modules unittest discover finds under `directory` (it enters packages only)."""
     names = []
     for base, dirs, files in os.walk(directory, onerror=_raise_scan_error):
-        dirs[:] = sorted(d for d in dirs if os.path.isfile(os.path.join(base, d, "__init__.py")))
+        dirs[:] = sorted(d for d in dirs if _has_package_marker(os.path.join(base, d)))
         prefix = os.path.relpath(base, directory).replace(os.sep, ".")
         for name in sorted(files):
             if fnmatch.fnmatchcase(name, "test*.py"):

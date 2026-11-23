@@ -102,6 +102,30 @@ class RunnerTest(unittest.TestCase):
                         f"error: cannot discover semantic tests in {blocked}: Permission denied",
                     ])
 
+    def test_package_marker_permission_error_does_not_run_a_partial_suite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_ok.py": PASS, "pkg/__init__.py": "",
+                        "pkg/locked/__init__.py": "", "pkg/locked/test_failure.py": FAIL})
+            marker = os.path.join(tmp, "pkg", "locked", "__init__.py")
+            stat_path = os.stat
+
+            def stat_with_denied_marker(path, *args, **kwargs):
+                if path == marker:
+                    raise PermissionError(errno.EACCES, "Permission denied", path)
+                return stat_path(path, *args, **kwargs)
+
+            stderr = io.StringIO()
+            with (mock.patch.object(r.os, "stat", side_effect=stat_with_denied_marker),
+                  mock.patch.object(r, "run_module", wraps=r.run_module) as worker,
+                  contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr)):
+                code = r.main([tmp, "-j", "2"])
+
+            self.assertEqual(code, 1)
+            worker.assert_not_called()
+            self.assertEqual(stderr.getvalue().splitlines(), [
+                f"error: cannot discover semantic tests in {marker}: Permission denied",
+            ])
+
 
 if __name__ == "__main__":
     unittest.main()
