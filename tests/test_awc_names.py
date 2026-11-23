@@ -349,8 +349,7 @@ class TestCli(unittest.TestCase):
             banks = os.path.join(tmp, "banks")
             blocked = os.path.join(banks, "blocked")
             os.makedirs(blocked)
-            words = write(os.path.join(tmp, "words.txt"), "alpha
-")
+            words = write(os.path.join(tmp, "words.txt"), "alpha\n")
             scandir = os.scandir
 
             def list_directory(path):
@@ -359,11 +358,11 @@ class TestCli(unittest.TestCase):
                 return scandir(path)
 
             err = io.StringIO()
-            with mock.patch.object(os, "scandir", list_directory),                     contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(os, "scandir", list_directory), \
+                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                 rc = A.main([banks, "--words", words])
             self.assertEqual(rc, 2, err.getvalue())
-            self.assertEqual(err.getvalue().count("
-"), 1, err.getvalue())
+            self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
             self.assertIn("awc_names: error:", err.getvalue())
             self.assertIn("blocked", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
