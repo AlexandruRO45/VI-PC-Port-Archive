@@ -121,6 +121,10 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 text, invalid = rdna2_decode.disasm_bytes(words(0xB9010000 | reg_id | 31 << 11), mcpu=mcpu)
                 self.assertEqual(invalid, 0)
                 self.assertEqual(text.split(";")[0].strip(), f"s_getreg_b32 s1, hwreg({name})")
+        # The s_setreg_imm32_b32 call site passes mcpu too: llvm-mc 23.1.6 prints these for 0xBA80F81D 0x5 (id 29).
+        for mcpu, name in (("gfx1030", "HW_REG_SHADER_CYCLES"), ("gfx1013", "29")):
+            text, invalid = rdna2_decode.disasm_bytes(words(0xBA80F81D, 5), mcpu=mcpu)
+            self.assertEqual((text.split(";")[0].strip(), invalid), (f"s_setreg_imm32_b32 hwreg({name}), 5", 0))
 
     def test_s_ttracedata_imm_keeps_simm16(self):
         for word, value in ((0xBFA80000, 0x0), (0xBFA80001, 0x1),

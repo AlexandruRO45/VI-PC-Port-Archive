@@ -114,6 +114,15 @@ _HWREG_NAMES = {  # GFX10 ids, as llvm-mc names them for gfx1013 and gfx1030 (4 
 }
 _HWREG_NAMES_GFX101 = {22: "HW_REG_XNACK_MASK"}  # gfx101x only; gfx1030 prints hwreg(22)
 _HWREG_NAMES_GFX103 = {29: "HW_REG_SHADER_CYCLES"}  # gfx1030 and later only; gfx101x prints hwreg(29)
+_HWREG_BY_TARGET = {
+    True: {**_HWREG_NAMES, **_HWREG_NAMES_GFX101},
+    False: {**_HWREG_NAMES, **_HWREG_NAMES_GFX103},
+}
+
+
+def _is_gfx101(mcpu: str) -> bool:
+    """GFX10.1 (gfx1010-gfx1013, gfx10-1-generic) rather than GFX10.3, for the opcodes and names that differ."""
+    return mcpu.startswith(("gfx101", "gfx10-1-"))
 
 _SENDMSG_NAMES = {
     1: "MSG_INTERRUPT",
@@ -253,7 +262,7 @@ def _format_hwreg(simm16: int, mcpu: str = "gfx1013") -> str:
     reg_id = simm16 & 0x3F
     offset = (simm16 >> 6) & 0x1F
     size = ((simm16 >> 11) & 0x1F) + 1
-    names = {**_HWREG_NAMES, **(_HWREG_NAMES_GFX103 if mcpu.startswith("gfx103") else _HWREG_NAMES_GFX101)}
+    names = _HWREG_BY_TARGET[_is_gfx101(mcpu)]
     rname = names.get(reg_id, str(reg_id))
     if offset == 0 and size == 32:
         return f"hwreg({rname})"
@@ -930,7 +939,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         if entry is None:
             return None, 4
         name, spec = entry
-        if opc == 0x140 and mcpu.startswith("gfx101"):
+        if opc == 0x140 and _is_gfx101(mcpu):
             name = "v_mad_legacy_f32"
         sdst = (w0 >> 8) & 0x7F
         abs_bits = 0 if is_vop3b else ((w0 >> 8) & 7)
