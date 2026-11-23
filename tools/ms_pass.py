@@ -104,13 +104,18 @@ def inflate_chain(fh, start: int, max_blocks: int = 64, cap: int = INFLATE_CAP) 
 
 
 def load_drawable(rpf: str, item: dict) -> dict:
-    """The first geometry of a static drawable: its raw vertex block and meshlet group, parsed by meshlet_page."""
+    """The geometry of a single-geometry static drawable: its raw vertex block and meshlet group, parsed by
+    meshlet_page. A drawable with more than one geometry is refused: this tool draws one geometry, and a pass on the
+    first alone would cover part of the drawable without saying so."""
     with open(rpf, "rb") as fh:
         blocks = inflate_chain(fh, int(item["Offset"]))
     for split in range(1, len(blocks) + 1):
         system, graphics = b"".join(blocks[:split]), b"".join(blocks[split:])
         try:
             geometries = list(mp.drawable_geometries(system, int(item.get("Drawable") or 0)))
+            if len(geometries) > 1:
+                raise SystemExit(f"{item.get('File')}: {len(geometries)} geometries; this tool draws "
+                                 "single-geometry drawables only")
             bind = mp.draw_binding(system, graphics, geometries[0])
             block, vend = mp.parse_other_block(graphics, bind["vertex_block"])
             group, gend = mp.parse_group(graphics, bind["meshlet_group"])
@@ -127,9 +132,9 @@ def load_drawable(rpf: str, item: dict) -> dict:
 
 
 def candidates(manifest: dict) -> list[dict]:
-    """Static single-mesh drawables (no bones, not a fragment), smallest first."""
+    """Static single-geometry drawables (no bones, not a fragment, one entry in MeshGeoms), smallest first."""
     out = [i for i in manifest.get("Items", []) if not i.get("HasBoneBindings") and not i.get("IsFragment")
-           and i.get("Verts") and i.get("Tris")]
+           and i.get("Verts") and i.get("Tris") and len(i.get("MeshGeoms") or [None]) == 1]
     return sorted(out, key=lambda i: (i["Tris"], i["Verts"]))
 
 
@@ -230,9 +235,11 @@ def mat_mul(a, b):
     return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
 
 
-def camera(lo, hi, yaw_deg: float, pitch_deg: float, fov_deg: float = 50.0):
+def camera(lo, hi, yaw_deg: float, pitch_deg: float, fov_deg: float = 50.0, aspect: float = 1.0):
     """A perspective camera looking at the bounds' centre from (yaw, pitch), framing the bounding sphere. Column-
-    vector convention, clip = M * (x, y, z, 1), Vulkan clip space (NDC y = -1 is the top row, depth 0..1)."""
+    vector convention, clip = M * (x, y, z, 1), Vulkan clip space (NDC y = -1 is the top row, depth 0..1). `aspect`
+    is the target's width / height: the x scale is divided by it, so a square stays square on a rectangular target
+    (fov_deg is the vertical field of view)."""
     centre = [(lo[i] + hi[i]) / 2 for i in range(3)]
     radius = max(math.sqrt(sum((hi[i] - lo[i]) ** 2 for i in range(3))) / 2, 1e-6)
     yaw, pitch, half = math.radians(yaw_deg), math.radians(pitch_deg), math.radians(fov_deg) / 2
@@ -253,7 +260,8 @@ def camera(lo, hi, yaw_deg: float, pitch_deg: float, fov_deg: float = 50.0):
             [-f[0], -f[1], -f[2], sum(f[i] * eye[i] for i in range(3))],
             [0.0, 0.0, 0.0, 1.0]]
     t, near, far = 1 / math.tan(half), dist * 0.1, dist * 4
-    proj = [[t, 0, 0, 0], [0, t, 0, 0], [0, 0, far / (near - far), near * far / (near - far)], [0, 0, -1, 0]]
+    proj = [[t / aspect, 0, 0, 0], [0, t, 0, 0], [0, 0, far / (near - far), near * far / (near - far)],
+            [0, 0, -1, 0]]
     return mat_mul(proj, view)
 
 
@@ -314,7 +322,8 @@ def rasterize(tris2d, width: int, height: int, subpixel_bits: int = SUBPIXEL_BIT
 
 
 def read_raw(path: str, width: int, height: int):
-    data = open(path, "rb").read()
+    with open(path, "rb") as f:
+        data = f.read()
     if len(data) != width * height * 16:
         raise ValueError(f"{path}: {len(data)} bytes, expected {width * height * 16} (RGBA32F)")
     return struct.unpack(f"<{width * height * 4}f", data)
@@ -322,7 +331,8 @@ def read_raw(path: str, width: int, height: int):
 
 def read_mask(path: str, width: int, height: int) -> set:
     """GPU coverage from vk_harness's VKH_COVERAGE_MASK: one stencil byte per pixel, non-zero where a fragment ran."""
-    data = open(path, "rb").read()
+    with open(path, "rb") as f:
+        data = f.read()
     if len(data) != width * height:
         raise ValueError(f"{path}: {len(data)} bytes, expected {width * height} (one per pixel)")
     return {i for i, v in enumerate(data) if v}
@@ -350,7 +360,9 @@ def passed(result: dict) -> bool:
 
 def wave64_mode(choice: str) -> bool:
     """Whether to translate with --wave64-emulate. "auto" asks tools/vk_subgroup_info.py, as make_game.py does: a
-    wave64 mesh shader runs natively only where the GPU can require 64-wide mesh subgroups (`native64`)."""
+    wave64 mesh shader runs natively only where the GPU can require 64-wide mesh subgroups (`native64`). Where the
+    probe gives no answer this emulates, while make_game.py then builds native: emulation runs at any size, so the
+    check still means something on a device nobody could ask."""
     if choice in ("on", "off"):
         return choice == "on"
     try:
@@ -415,9 +427,11 @@ def draw(harness: str, ms: str, out: str, spec: dict, heap: bytes, sgprs: list[i
                        capture_output=True, text=True)
     if r.returncode:
         raise SystemExit(f"vk_harness exited {r.returncode}: {r.stderr.strip()[-500:]}")
-    if not emulate and "not available" in r.stderr:
-        raise SystemExit(f"this GPU can't require {spec['subgroup_size']}-wide subgroups for the native wave64 module "
-                         "(vk_harness: 'not available'); run with --wave64-emulate on")
+    if not emulate and f"mesh subgroup size: {spec['subgroup_size']}\n" not in r.stderr + "\n":
+        # vk_harness prints "mesh subgroup size: N" only when the mesh stage got the required size, and
+        # "... not available" otherwise; anything else is no confirmation, so the run is not recorded as native.
+        raise SystemExit(f"this GPU did not require {spec['subgroup_size']}-wide subgroups for the native wave64 "
+                         "mesh shader (no 'mesh subgroup size' line from vk_harness); run with --wave64-emulate on")
     return raw
 
 
@@ -475,7 +489,7 @@ def main(argv=None) -> int:
         raise SystemExit(f"{d['meshlets']} meshlets: vk_harness draws one workgroup (docs/ms_pass.md, limits)")
     lo = [min(p[i] for p in d["positions"]) for i in range(3)]
     hi = [max(p[i] for p in d["positions"]) for i in range(3)]
-    m = camera(lo, hi, a.yaw, a.pitch)
+    m = camera(lo, hi, a.yaw, a.pitch, aspect=a.width / a.height)
     tris2d = [tuple(project(m, d["positions"][i], a.width, a.height) for i in t) for t in d["triangles"]]
     heap, layout = build_heap(spec, d["vertex_block"], d["meshlet_group"], view_proj_words(m))
     out = a.out or os.path.join(a.work, "ms_pass", "out")
@@ -505,7 +519,8 @@ def run_controls(a, d, m, lo, hi, spec, ms, out) -> bool:
     drawn = (read_mask(os.path.join(out, "coverage.bin"), a.width, a.height),
              read_raw(os.path.join(out, "image.raw"), a.width, a.height))
     swapped = [(p[1], p[0], p[2]) for p in d["positions"]]
-    controls = [("CPU camera 3 degrees off", camera(lo, hi, a.yaw + 3.0, a.pitch), d["positions"], drawn),
+    controls = [("CPU camera 3 degrees off", camera(lo, hi, a.yaw + 3.0, a.pitch, aspect=a.width / a.height),
+                 d["positions"], drawn),
                 ("CPU x and y axes swapped", m, swapped, drawn)]
     heap, layout = build_heap(spec, d["vertex_block"], d["meshlet_group"], view_proj_words(m))
     slot = layout["table"] + spec["slots"]["meshlet_group"]

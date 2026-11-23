@@ -54,8 +54,11 @@ matrix M: the transpose of M, row by row. Measured: the other order draws nothin
 - **Subgroup mode.** The mesh shader is wave64. `--wave64-emulate auto` (the default) translates it natively only
   where the GPU can require 64-wide mesh subgroups (`tools/vk_subgroup_info.py` `native64`, as `make_game.py`
   decides) and otherwise with `--wave64-emulate`; the mode is printed with the result and kept in the output's
-  `manifest.json`. A native draw whose required size the GPU refuses fails instead of running at another size. On
-  the 760M both modes give byte-identical frames in both poses.
+  `manifest.json`. Where the probe gives no answer, `auto` emulates, while `make_game.py` then builds native:
+  emulation runs at any subgroup size, so the check still means something on a device nobody could ask. A native
+  draw counts only when `vk_harness` confirms the mesh stage got the required size (`mesh subgroup size: 64`); its
+  "not available", or no line at all (a device whose `requiredSubgroupSizeStages` leaves out the mesh stage), fails
+  instead of running at another size. On the 760M both modes give byte-identical frames in both poses.
 - The camera is a perspective view of the bounding sphere from a chosen yaw and pitch. A pose that clips a vertex is
   refused, so the CPU side needs no clipper.
 
@@ -92,6 +95,11 @@ zlib reader on synthetic inputs without the package or a GPU; with `LEONIDA_MS_P
 
 ## 6. Limits and next steps
 
+- **One geometry.** A drawable with more than one geometry is refused, and `--list` leaves those out (`MeshGeoms`
+  in the export's manifest): drawing only the first would pass on part of the drawable without saying so. 274 of
+  the 282 static candidates in `data.rpf` have one geometry.
+- **Rectangular targets.** `--width` and `--height` may differ; the camera divides its x scale by the aspect, so a
+  square stays square (the GPU and the CPU share the projection, so a stretch would not show in the comparison).
 - **One meshlet.** `vk_harness` draws one mesh workgroup (`vkCmdDrawMeshTasksEXT(1, 1, 1)`), so the tool refuses a
   drawable with more. A `VKH_MESH_GROUPS` knob would take the next drawables (several meshlets, axis word 1).
 - **One mesh shader.** The table offsets are per shader (`SHADERS` in `tools/ms_pass.py`, keyed by FSSM SHA-256);

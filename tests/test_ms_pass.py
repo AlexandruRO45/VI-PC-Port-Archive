@@ -95,6 +95,20 @@ class Camera(unittest.TestCase):
         self.assertAlmostEqual(y, 64.0, places=6)
         self.assertLess(mp.project(m, (0.0, 0.4, 0.0), 128, 128)[1], 64.0)    # +y is up: a smaller row
 
+    def test_a_square_stays_square_on_a_rectangular_target(self):
+        # A 192 x 96 target (whattheflop's case on #4815): the front face of a cube seen head-on is as wide as it is
+        # tall in pixels. Without the aspect in the x scale it comes out twice as wide.
+        lo, hi = (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)
+
+        def extent(m):
+            pts = [mp.project(m, (x, y, 1.0), 192, 96) for x in (-1.0, 1.0) for y in (-1.0, 1.0)]
+            return (max(p[0] for p in pts) - min(p[0] for p in pts), max(p[1] for p in pts) - min(p[1] for p in pts))
+
+        w, h = extent(mp.camera(lo, hi, 0, 0, aspect=192 / 96))
+        self.assertAlmostEqual(w, h, places=6)
+        w1, h1 = extent(mp.camera(lo, hi, 0, 0))   # the square-target camera on the same target: stretched 2:1
+        self.assertAlmostEqual(w1 / h1, 2.0, places=6)
+
     def test_a_clipped_vertex_is_refused(self):
         m = mp.camera(self.LO, self.HI, 35, 25)
         with self.assertRaises(mp.CameraError):
@@ -224,6 +238,37 @@ class Inflate(unittest.TestCase):
 
     def test_no_zlib_header_gives_nothing(self):
         self.assertEqual(mp.inflate_chain(io.BytesIO(b"\x00" * 64), 0), [])
+
+
+class Candidates(unittest.TestCase):
+    def test_multi_geometry_and_skinned_drawables_are_left_out(self):
+        items = [{"File": "a", "Verts": 24, "Tris": 12, "MeshGeoms": [0]},
+                 {"File": "b", "Verts": 8, "Tris": 4, "MeshGeoms": [0, 1]},          # two geometries
+                 {"File": "c", "Verts": 8, "Tris": 4, "MeshGeoms": [0], "HasBoneBindings": True},
+                 {"File": "d", "Verts": 12, "Tris": 6}]                              # a manifest without MeshGeoms
+        self.assertEqual([i["File"] for i in mp.candidates({"Items": items})], ["d", "a"])
+
+
+class NativeConfirmation(unittest.TestCase):
+    """A native draw counts only when vk_harness says the mesh stage got the required size."""
+
+    def run_draw(self, stderr, emulate=False):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as out, mock.patch.object(mp.subprocess, "run") as run, \
+                mock.patch.object(mp, "heap_env", return_value=""):
+            run.return_value = mock.Mock(returncode=0, stderr=stderr)
+            return mp.draw("vk_harness", "ms.spv", out, {"subgroup_size": 64}, b"", [0], 16, 16, emulate)
+
+    def test_native_needs_the_harness_to_confirm_the_mesh_size(self):
+        self.assertTrue(self.run_draw("mesh subgroup size: 64\n").endswith("image.raw"))
+        # Silence (the omission whattheflop found), "not available", a fragment-only line or another size: refused.
+        for stderr in ("", "mesh subgroup size: 64 not available\n", "fragment subgroup size: 64\n",
+                       "mesh subgroup size: 32\n"):
+            with self.subTest(stderr=stderr), self.assertRaises(SystemExit):
+                self.run_draw(stderr)
+
+    def test_an_emulated_draw_requests_no_size(self):
+        self.assertTrue(self.run_draw("", emulate=True).endswith("image.raw"))
 
 
 class Wave64Mode(unittest.TestCase):

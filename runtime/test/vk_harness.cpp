@@ -650,8 +650,17 @@ int main(int argc, char** argv) {
         // in requiredSubgroupSizeStages), so the fragment stage of a plain draw already has the size asked for.
         const bool fixed = !mesh && !gs_tested && sgProps.minSubgroupSize == sgProps.maxSubgroupSize;
         if (stages[1].pNext == &reqSg || fixed) std::fprintf(stderr, "fragment subgroup size: %u\n", req_sg);
+        // A mesh draw says whether the mesh stage got the size: in range with subgroupSizeControl is not enough when
+        // requiredSubgroupSizeStages leaves out the mesh stage, and a silent omission would pass for a native run.
+        if (mesh) {
+            if (stages[0].pNext == &reqSg)
+                std::fprintf(stderr, "mesh subgroup size: %u\n", req_sg);
+            else
+                std::fprintf(stderr, "mesh subgroup size: %u not available\n", req_sg);
+        }
     } else if (req_sg > 0) {
         std::fprintf(stderr, "fragment subgroup size: %u not available\n", req_sg);
+        if (mesh) std::fprintf(stderr, "mesh subgroup size: %u not available\n", req_sg);
     }
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkVertexInputBindingDescription vbind{0, vertex_stride, VK_VERTEX_INPUT_RATE_VERTEX};
