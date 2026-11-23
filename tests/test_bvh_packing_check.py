@@ -6,11 +6,13 @@ invariant is reported under its own reason. Also scans a small fake archive with
 import contextlib
 import io
 import json
+import multiprocessing
 import os
 import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +20,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import bvh_packing_check as C  # noqa: E402
 import bvh_rehydrate as R  # noqa: E402
+import pool_workers  # noqa: E402
 
 FLAGS = 0x80000000 | R.FLAG_DEHYDRATED | 0x00020006
 ELEMENTS, NODES = 0x100, 0x200
@@ -236,6 +239,78 @@ class TestArchive(unittest.TestCase):
             self.assertEqual(rep["kinds"].get("bvh4-chunk-joined"), 1)
             self.assertEqual(rep["kinds"].get("continuation"), 1)
             self.assertNotIn("raw", rep["kinds"])
+
+    def test_scan_archive_clamps_pool_workers(self):
+        good = payload(build())
+        bad = payload(build(orders=[GOOD_ORDER, 0x05, GOOD_ORDER, GOOD_ORDER]))
+        path = self.write_rpf([good, bad] * 3)
+        serial, _ = C.scan_archive(path, 1, 8, progress=False)
+        serial_rep = serial.report()
+        # With window=8, this archive produces > 64 windows so the 61-worker Windows cap is exercised.
+        self.assertGreater((os.path.getsize(path) - 16) // 8, 64)
+
+        sizes = []
+
+        class RecordingPool:
+            def __init__(self, processes=None, initializer=None):
+                sizes.append(processes)
+
+            def imap_unordered(self, fn, jobs):
+                return [fn(job) for job in jobs]
+
+            def close(self):
+                pass
+
+            def join(self):
+                pass
+
+            def terminate(self):
+                pass
+
+        with mock.patch.object(pool_workers, "MAX_PROCESS_WORKERS", 61), \
+                mock.patch.object(multiprocessing, "Pool", RecordingPool):
+            for workers, expected_pool in ((2, 2), (61, 61), (62, 61), (200, 61)):
+                tally, _ = C.scan_archive(path, workers, 8, progress=False)
+                self.assertEqual(sizes.pop(), expected_pool)
+                self.assertEqual(tally.report()["checked"], serial_rep["checked"])
+                self.assertEqual(tally.report()["passed"], serial_rep["passed"])
+            # Also cap pool size to len(jobs) when fewer windows than workers exist.
+            window = max(1, (os.path.getsize(path) - 16 + 2) // 3)
+            serial_3, _ = C.scan_archive(path, 1, window, progress=False)
+            tally, _ = C.scan_archive(path, 20, window, progress=False)
+            self.assertEqual(sizes.pop(), 3)
+            self.assertEqual(tally.report()["checked"], serial_3.report()["checked"])
+            # Serial mode must not create a pool at all.
+            C.scan_archive(path, 1, 8, progress=False)
+            self.assertEqual(sizes, [])
+
+    def test_scan_archive_terminates_pool_on_error(self):
+        path = self.write_rpf([payload(build()), payload(build())])
+        events = []
+
+        class FailingPool:
+            def __init__(self, processes=None, initializer=None):
+                pass
+
+            def imap_unordered(self, fn, jobs):
+                def gen():
+                    yield C.Tally()
+                    raise RuntimeError("boom")
+                return gen()
+
+            def close(self):
+                events.append("close")
+
+            def terminate(self):
+                events.append("terminate")
+
+            def join(self):
+                events.append("join")
+
+        with mock.patch.object(multiprocessing, "Pool", FailingPool):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                C.scan_archive(path, 2, 16, progress=False)
+        self.assertEqual(events, ["terminate", "join"])
 
     def test_cli_json_and_exit_status(self):
         with tempfile.TemporaryDirectory() as d:

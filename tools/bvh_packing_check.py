@@ -49,6 +49,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bvh_index as I  # noqa: E402
 import bvh_rehydrate as R  # noqa: E402
+import pool_workers  # noqa: E402
 
 BOX_TYPES = (R.BOX16, R.BOX32)
 HALF_MAX = 65504.0
@@ -453,11 +454,12 @@ def scan_archive(path, workers, window, start=None, limit=None, progress=True):
     jobs = [(path, a, min(a + window, hi)) for a in range(lo, hi, window)]
     total = Tally()
     t0 = time.time()
-    if workers <= 1 or len(jobs) <= 1:
+    pool_size = min(pool_workers.process_workers(workers), len(jobs))
+    if pool_size <= 1:
         results = map(scan_window, jobs)
         pool = None
     else:
-        pool = multiprocessing.Pool(workers, initializer=I.below_normal)
+        pool = multiprocessing.Pool(pool_size, initializer=I.below_normal)
         results = pool.imap_unordered(scan_window, jobs)
     try:
         for done, t in enumerate(results, 1):
@@ -466,6 +468,12 @@ def scan_archive(path, workers, window, start=None, limit=None, progress=True):
                 print("  %d/%d windows, %d streams checked, %d failed (%.0fs)"
                       % (done, len(jobs), total.checked, total.checked - total.passed, time.time() - t0),
                       file=sys.stderr, flush=True)
+    except BaseException:
+        if pool is not None:
+            pool.terminate()
+            pool.join()
+            pool = None
+        raise
     finally:
         if pool is not None:
             pool.close()
