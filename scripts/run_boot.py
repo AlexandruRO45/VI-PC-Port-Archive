@@ -74,10 +74,10 @@ def diagnostic(pid, out, reason, budget):
     return result
 
 
-def loader_command(runtime, mode, image, package, out):
+def loader_command(runtime, mode, image, package, out, startup_only=False):
     command = list(map(str, [runtime, "--" + mode, image, "--game-dir", package, "--overlay",
                           out / "overlay", "--trace", out / "startup.jsonl"]))
-    if mode != "dry-run":
+    if mode != "dry-run" and not startup_only:
         command.append("--trace-d3d12")
     return command
 
@@ -91,7 +91,13 @@ def main(argv=None):
     parser.add_argument("--diagnose-after", type=seconds, metavar="SECONDS",
                         help="also take a snapshot if the loader is still active at this time")
     parser.add_argument("--capture-timeout", type=seconds, default=10, metavar="SECONDS")
+    parser.add_argument("--guest-arg", action="append", default=[], metavar="ARG",
+                        help="append one argument to the guest command line in run mode")
+    parser.add_argument("--startup-only", action="store_true",
+                        help="collect and parse only the startup trace for workloads without D3D12 calls")
     a = parser.parse_args(argv)
+    if a.guest_arg and a.mode != "run":
+        parser.error("--guest-arg requires run mode")
     if os.name != "nt":
         parser.error("the capture runner requires Windows")
     if a.diagnose_after and a.diagnose_after >= a.deadline:
@@ -118,7 +124,9 @@ def main(argv=None):
     if shaders:
         env["LEONIDA_SHADERS"] = str(Path(shaders).resolve())
     env.setdefault("LEONIDA_D3D12", "vulkan")
-    command = loader_command(runtime, a.mode, image, package, out)
+    command = loader_command(runtime, a.mode, image, package, out, a.startup_only)
+    if a.guest_arg:
+        command.extend(["--", *a.guest_arg])
     report = dict(command=command, deadline=a.deadline, diagnose_after=a.diagnose_after,
                   capture_timeout=a.capture_timeout, runtime_sha256=None,
                   runner_checkout_revision=revision(HERE), runtime_checkout_revision=revision(runtime.parent),
@@ -160,7 +168,7 @@ def main(argv=None):
         try:
             cmd = [sys.executable, "-I", "-X", "utf8", str(HERE.parent / "tools" / "boot_trace.py"),
                    str(out / "startup.jsonl"), "--json"]
-            if a.mode != "dry-run":
+            if a.mode != "dry-run" and not a.startup_only:
                 cmd.extend(["--d3d12", str(out / "stderr.log")])
             report["parser_exit_code"] = subprocess.run(cmd, stdout=summary, stderr=log).returncode
         except OSError as exc:

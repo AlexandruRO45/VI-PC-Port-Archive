@@ -96,9 +96,8 @@ int main(int argc, char** argv) {
     std::printf("tiny_startup_cmdline: %s\n", ok ? "PASS" : "FAIL");
     if (!ok) return 1;
     if (argc == 2) {
-        // Mark entry before the controls which deliberately never return to the loader.
+        // Preserve the entry marker when the abnormal-exit control terminates the process.
         std::fflush(stdout);
-        if (std::strcmp(argv[1], "timeout") == 0) Sleep(INFINITE);
         if (std::strcmp(argv[1], "abnormal") == 0) TerminateProcess(GetCurrentProcess(), 73);
         if (std::strcmp(argv[1], "exit-code") == 0) return 42;
     }

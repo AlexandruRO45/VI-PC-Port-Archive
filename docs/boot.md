@@ -18,10 +18,12 @@ The defaults use the Ninja layout under `runtime/build`. For a Visual Studio bui
 output directory. Missing build artifacts fail the rehearsal.
 
 The command copies the synthetic executable and its DLL to a fresh temporary folder, runs the
-first-look inspection tools and checks the loader's three phases using `boot_trace.py --json`.
+first-look inspection tools and checks the loader's three phases through `scripts/run_boot.py`.
+Each phase checks the runner's process status and the startup summary produced by `boot_trace.py`.
 A successful guest returns 42. The controls check the unresolved import in the dry-run output,
-a DLL that rejects attach, a guest that terminates its process, and a guest still waiting five
-seconds after launch. Temporary reports and traces are removed after the run.
+a DLL that rejects attach, a guest that terminates its process, and a DLL still waiting at the
+five-second deadline. The timeout must capture a dump and identify the outstanding attach on
+its originating thread. Temporary reports, traces and dumps are removed after the run.
 
 **Optional GPU check.** With the frame fixture and Vulkan prerequisites built, run
 `ctest --test-dir runtime/build -C RelWithDebInfo -R "^run_tiny_frame$" --output-on-failure`.
