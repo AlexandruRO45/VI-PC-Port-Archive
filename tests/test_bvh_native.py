@@ -227,16 +227,25 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         leaves = [(0, 0x81, 0, 1, 0x09)] * 8
         for root_wide in (True, False):
             self.assert_native(tree(leaves, random.Random(24), root_wide=root_wide, overrides=False), [geometry])
-        # BOX16 overrides include signed zeros, subnormals and signed NaNs. A BOX32 parent reads
-        # them back, exercising unpack("<e") canonicalization and the reduction's tie order.
+        # BOX16 overrides include signed zeros, subnormals and infinities. A BOX32 parent reads
+        # them back, exercising the reduction's tie order.
+        self.assert_native(self.half_override_tree(dict(enumerate((0x8000, 0x0001, 0x8001, 0xfc00, 0x7c00, 0xfbff)))),
+                           [QUADS])
+
+    def half_override_tree(self, overrides):
         src = bytearray(tree([(0, 1, 0, None, 0x09)] * 8, random.Random(24), overrides=False))
         hdr = R.Header(src)
         narrow = hdr.offset_to_nodes + 128
-        overrides = dict(enumerate((0x8000, 0x0001, 0x8001, 0xfc00, 0x7c00, 0xfeff)))
-        overrides.update({11: 0x7d01, 17: 0x7e00, 23: 0xfe01})
         data = box_group([([ptr(hdr.offset_to_elements + 64 * i, R.TRI0) for i in range(4, 8)], overrides)], False)
         src[narrow:narrow + len(data)] = data
-        self.assert_native(bytes(src), [QUADS])
+        return bytes(src)
+
+    def test_half_nan_bounds_fall_back_to_python(self):
+        # struct.unpack("<e") canonicalizes half NaN payloads on CPython <= 3.12 and keeps them on 3.14,
+        # so a stream with a half NaN is left to whichever Python is running.
+        for nan in (0x7c01, 0x7d01, 0x7e00, 0x7e01, 0xfc01, 0xfe01, 0xfeff, 0xffff):
+            with self.subTest(nan=hex(nan)):
+                self.assert_fallback(self.half_override_tree({3: 0x0001, 11: nan, 17: 0x8000}), [QUADS])
 
     def test_fallback_on_float_edges(self):
         src, _, _ = build([(0, 1, 0, None, 0x09)], root_wide=False)

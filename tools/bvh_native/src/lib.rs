@@ -240,17 +240,19 @@ fn write_leaves(
     Some(())
 }
 
-fn half_value(half: u16) -> f32 {
+// A half NaN is refused: struct.unpack("<e") canonicalizes its payload on CPython <= 3.12 but keeps
+// it on 3.14, so Python decides and matches whichever interpreter is running.
+fn half_value(half: u16) -> Option<f32> {
     let sign = u32::from(half & 0x8000) << 16;
     let fraction = u32::from(half & 0x03ff);
     let bits = match (half >> 10) & 31 {
         // The integer multiplication by a power of two is exact for every half subnormal.
         0 => (fraction as f32 * (1.0 / 16_777_216.0)).to_bits(),
         31 if fraction == 0 => f32::INFINITY.to_bits(),
-        31 => 0x7fc0_0000, // struct.unpack("<e") canonicalizes the payload and keeps the sign.
+        31 => return None,
         exp => (u32::from(exp) + 112) << 23 | fraction << 13,
     };
-    f32::from_bits(sign | bits)
+    Some(f32::from_bits(sign | bits))
 }
 
 fn half_bound(x: f32, upper: bool) -> Option<u16> {
@@ -310,7 +312,7 @@ fn node_bounds(dst: &[u8], ptr: u32) -> Option<[f32; 6]> {
     let mut bounds = [0.0; 6];
     for (component, bound) in bounds.iter_mut().enumerate() {
         let read_value = |point: &[u8]| match kind {
-            BOX16 => u16_at(point, 2 * component).map(half_value),
+            BOX16 => u16_at(point, 2 * component).and_then(half_value),
             BOX32 => f32_at(point, 4 * component),
             _ => f32_at(point, 4 * (component % 3)),
         };
@@ -552,12 +554,15 @@ mod tests {
 
     #[test]
     fn half_unpack_matches_python_special_values() {
-        assert_eq!(half_value(0x8000).to_bits(), (-0.0_f32).to_bits());
-        assert_eq!(half_value(0x8001), -2.0_f32.powi(-24));
-        assert_eq!(half_value(0x7bff), 65504.0);
-        assert_eq!(half_value(0x7c00), f32::INFINITY);
-        assert_eq!(half_value(0xfe01).to_bits(), 0xffc0_0000);
-        assert_eq!(half_bound(half_value(0xfe01), true), Some(0xfe00));
+        assert_eq!(half_value(0x8000).map(f32::to_bits), Some((-0.0_f32).to_bits()));
+        assert_eq!(half_value(0x8001), Some(-2.0_f32.powi(-24)));
+        assert_eq!(half_value(0x7bff), Some(65504.0));
+        assert_eq!(half_value(0x7c00), Some(f32::INFINITY));
+        assert_eq!(half_value(0xfc00), Some(f32::NEG_INFINITY));
+        // Every half NaN payload is left to Python.
+        for nan in [0x7c01, 0x7e00, 0x7e01, 0xfc01, 0xfe01, 0xffff] {
+            assert_eq!(half_value(nan), None);
+        }
     }
 
     #[test]

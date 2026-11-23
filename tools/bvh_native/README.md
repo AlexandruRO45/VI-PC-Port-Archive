@@ -17,7 +17,7 @@ python -I tests/test_bvh_native.py
 The Python tool automatically looks for the appropriate 64-bit library in `target/release`
 (`bvh_native.dll`, `libbvh_native.so`, or `libbvh_native.dylib`). Set `LEONIDA_BVH_NATIVE=0` to run
 the Python implementation. Python also handles unavailable libraries, rejected input, custom geometry,
-and edge cases such as input float32 NaN payloads or finite BOX16 bounds past the half range on the
+and edge cases such as input float32 NaN payloads, half NaN bounds (CPython 3.14 keeps their payload bits where 3.12 quiets them) or finite BOX16 bounds past the half range on the
 inward side. A native refusal discards the partial output before Python runs.
 
 The standard-library tests generate leveled trees, paired leaves, both box types, and transforms in
