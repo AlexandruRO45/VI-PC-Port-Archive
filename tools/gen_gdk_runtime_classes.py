@@ -125,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                   "gdk_runtime_classes.json"))
     a = ap.parse_args(argv)
+    if os.path.isdir(a.out):
+        ap.error(f"--out {a.out} is a folder, not a file")
     try:
         table = build(a.docs)
     except OSError as e:
