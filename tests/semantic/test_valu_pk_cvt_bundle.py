@@ -292,5 +292,16 @@ class VCvtPknormI16F16SimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.get_vgpr(lane, 0), 0x12345678)
 
+class VCvtPknormI16F16EdgeCasesTests(unittest.TestCase):
+    def test_clamp_extremes(self):
+        self.assertEqual(ref_norm16_i16(0x4000), 0x7FFF)
+        self.assertEqual(ref_norm16_i16(0x7C00), 0x7FFF)
+        self.assertEqual(ref_norm16_i16(0xC000), 0x8001)
+        self.assertEqual(ref_norm16_i16(0xFC00), 0x8001)
+
+    def test_nan_produces_zero(self):
+        self.assertEqual(ref_norm16_i16(0x7E00), 0x0000)
+        self.assertEqual(ref_norm16_i16(0xFE00), 0x0000)
+
 if __name__ == '__main__':
     unittest.main()
