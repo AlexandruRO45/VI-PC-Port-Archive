@@ -17,14 +17,9 @@ if TOOLS_DIR not in sys.path:
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-try:
-    import rdna2spirv  # noqa: E402
-    import support  # noqa: E402
-    import lds_run  # noqa: E402
-except Exception:  # noqa: E722
-    rdna2spirv = None  # type: ignore
-    support = None  # type: ignore
-    lds_run = None  # type: ignore
+import lds_run  # noqa: E402
+import rdna2spirv  # noqa: E402
+import support  # noqa: E402
 
 MASK32: int = 0xFFFFFFFF
 SIGN_BIT32: int = 0x80000000
@@ -663,9 +658,6 @@ class TestLdsOrB32TranslationAndExecution(unittest.TestCase):
     """End-to-end SPIR-V translation and execution under support and spirv_mini_interp."""
 
     def test_translator_ds_or_b32_basic(self) -> None:
-        if support is None or rdna2spirv is None or lds_run is None:
-            self.skipTest("support/rdna2spirv/lds_run not available in this Python environment")
-
         asm = [
             "v_mov_b32_e32 v0, 0x10",
             "v_mov_b32_e32 v1, 0x0F",
@@ -676,9 +668,6 @@ class TestLdsOrB32TranslationAndExecution(unittest.TestCase):
         self.assertIn("OpAtomicOr", spvasm)
 
     def test_execution_ds_or_b32_chain(self) -> None:
-        if support is None or rdna2spirv is None or lds_run is None:
-            self.skipTest("support/rdna2spirv/lds_run not available in this Python environment")
-
         # Initialize LDS byte 0x20 with 0xF0, then execute ds_or_b32 with 0x0F
         rets, mem = lds_run.run_chain([("ds_or_b32", 0x20, 0, [0x0F])], {0x20: 0xF0})
         self.assertEqual(mem[0x20], 0xFF)
