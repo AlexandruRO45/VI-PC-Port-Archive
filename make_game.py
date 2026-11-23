@@ -1561,7 +1561,8 @@ def keep_recorded_fallback(flag: str, work: str) -> bool:
 
 
 def smallest_max_subgroup(vulkaninfo_text: str):
-    """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None."""
+    """The smallest maxSubgroupSize vulkaninfo reports over all devices (text or --json output), or None.
+    Software renderers (llvmpipe, lavapipe, SwiftShader) are skipped when hardware devices are present (BUILD-3069)."""
     size = r'maxSubgroupSize"?\s*[=:]\s*(\d+)'
     # A device's own name is the least indented one; deeper ones (VK_KHR_maintenance7's layered APIs, e.g.
     # MoltenVK's Metal device, in both the text and the --json output) belong to the device above them.
@@ -1573,13 +1574,24 @@ def smallest_max_subgroup(vulkaninfo_text: str):
         return min(sizes) if sizes else None
     # One section per device (a 1.3 device can print the size twice, in two property structs): one value each,
     # and a device that prints none makes the answer unknown rather than being left out of the smallest.
+    # Software renderers are filtered out when hardware devices exist.
     per_device = []
+    software_devices = []
+    software_names = ('llvmpipe', 'lavapipe', 'SwiftShader')
     for a, b in zip(starts, starts[1:] + [len(vulkaninfo_text)]):
-        sizes = [int(n) for n in re.findall(size, vulkaninfo_text[a:b])]
+        section = vulkaninfo_text[a:b]
+        sizes = [int(n) for n in re.findall(size, section)]
         if not sizes:
             return None
-        per_device.append(min(sizes))
-    return min(per_device)
+        device_min = min(sizes)
+        # Check if this is a software renderer
+        is_software = any(name.lower() in section[a:a+200].lower() for name in software_names)
+        if is_software:
+            software_devices.append(device_min)
+        else:
+            per_device.append(device_min)
+    # If we have hardware devices, use only those; otherwise fall back to software
+    return min(per_device) if per_device else (min(software_devices) if software_devices else None)
 
 
 def wave64_settings(mode: str, *, mesh_compute: bool = False) -> tuple[bool, bool]:
