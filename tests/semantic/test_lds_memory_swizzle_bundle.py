@@ -548,6 +548,19 @@ class TestDsReadI16Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0xFFFFFF80)
 
+def ref_ds_write_b16(lds: LdsModel, addr: int, val: int, offset: int = 0) -> None:
+    """Reference mathematical oracle for ds_write_b16."""
+    lds.write_u16(addr + offset, val)
+
+
+class TestDsWriteB16Oracle(unittest.TestCase):
+    def test_write_b16_preserves_neighbor_bytes(self) -> None:
+        lds = LdsModel()
+        lds.write_u32(0x50, 0x11223344)
+        ref_ds_write_b16(lds, 0x50, 0xAAAA, offset=2)
+        # Bytes 0 and 1 (0x3344) preserved, bytes 2 and 3 replaced by 0xAAAA
+        self.assertEqual(lds.read_u32(0x50), 0xAAAA3344)
+
 
 if __name__ == "__main__":
     unittest.main()
