@@ -4,7 +4,8 @@ One cache blob was found in the package data, stored as a single resource in the
 archive. It is a chain of 4,205 adjacent zlib streams: 4,204 full 64 KiB streams and a 27,436-byte last one, with
 31,437 bytes of zero padding between the streams. Concatenating the inflated bytes in archive order gives
 **275,540,780 bytes** (0x106C6B2C); the first stream starts at archive offset 0x10579000 and the chain is the last
-resource in the archive. This page describes that file; `tools/psocache_inspect.py` checks a carved copy of it.
+resource in the archive. This page describes that file; `tools/psocache_inspect.py` checks a carved copy of it, and
+`scripts/check_no_game_data.py` matches the magic, so a carved copy fails the no-game-data check under any name.
 
 The blob is little-endian. In the tables, *measured* means the field's value and the region arithmetic were checked
 on this file. *Unproven* means the field is only located and described, not decoded.
