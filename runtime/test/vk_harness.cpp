@@ -264,9 +264,18 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    // vkGetPhysicalDevice{Features,Properties}2 and the VkPhysicalDeviceVulkan11/12Features chains below are core in
+    // 1.2 (the instance enables no VK_KHR_get_physical_device_properties2), and Vulkan13Features in 1.3: on an older
+    // device they are not valid pNext members (VUID-VkPhysicalDeviceFeatures2-pNext-pNext), so skip (77) instead.
+    if (props.apiVersion < VK_API_VERSION_1_2) {
+        std::fprintf(stderr, "unsupported: %s is Vulkan %u.%u, the harness needs 1.2\n", props.deviceName,
+                     VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion));
+        return 77;
+    }
+    const bool vk13 = props.apiVersion >= VK_API_VERSION_1_3;
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    props2.pNext = &sgProps;
+    if (vk13) props2.pNext = &sgProps;   // 1.3 core; reported as 0..0 on 1.2
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
     uint32_t qn = 0;
@@ -401,7 +410,7 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13q.pNext = &f12q;
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2q.pNext = &f13q;
+    f2q.pNext = vk13 ? static_cast<void*>(&f13q) : static_cast<void*>(&f12q);
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
     // Translated vertex shaders read BaseVertex / BaseInstance (DrawParameters) to give v0 / v3 the hardware's
     // zero-based ids.

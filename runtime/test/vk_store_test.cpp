@@ -86,6 +86,13 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     std::fprintf(stderr, "device: %s\n", props.deviceName);
+    // VkPhysicalDeviceVulkan12Features (below, in VkDeviceCreateInfo's chain) is 1.2 core: invalid pNext on an
+    // older device (VUID-VkDeviceCreateInfo-pNext-pNext), so skip (77) there.
+    if (props.apiVersion < VK_API_VERSION_1_2) {
+        std::printf("unsupported: Vulkan %u.%u device, the test needs 1.2\n", VK_API_VERSION_MAJOR(props.apiVersion),
+                    VK_API_VERSION_MINOR(props.apiVersion));
+        return 77;
+    }
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);

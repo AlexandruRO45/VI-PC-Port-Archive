@@ -282,8 +282,10 @@ int main(int argc, char** argv) {
     int best = -1;
     for (auto p : pds) {
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(p, &pp);
+        if (pp.apiVersion < VK_API_VERSION_1_2) continue;   // VkPhysicalDeviceVulkan12Features below is 1.2 core
         if (int r = leonida::vk_test::device_rank(pp.deviceType, pp.vendorID); r > best) { pd = p; props = pp; best = r; }
     }
+    if (best < 0) { std::fprintf(stderr, "unsupported: no Vulkan 1.2 physical device\n"); return 77; }
     constexpr uint32_t push_words = 36, push_bytes = push_words * 4;
     if (props.limits.maxPushConstantsSize < push_bytes) { std::fprintf(stderr, "unsupported: push constants\n"); return 77; }
     std::fprintf(stderr, "device: %s\n", props.deviceName);

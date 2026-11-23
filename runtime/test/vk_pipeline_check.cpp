@@ -926,11 +926,20 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    // The *2 queries, float controls and VkPhysicalDeviceVulkan11/12Features are 1.2 core here; subgroup size
+    // control and VkPhysicalDeviceVulkan13Features are 1.3 core. Chaining a struct the device's version lacks is
+    // invalid (VUID-...-pNext-pNext): below 1.2, skip (77); on 1.2 the 1.3 structs stay unlinked (all false).
+    if (props.apiVersion < VK_API_VERSION_1_2) {
+        std::fprintf(stderr, "unsupported: %s is Vulkan %u.%u, the check needs 1.2\n", props.deviceName,
+                     VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion));
+        return 77;
+    }
+    const bool vk13 = props.apiVersion >= VK_API_VERSION_1_3;
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceFloatControlsProperties fcProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    props2.pNext = &sgProps;
-    sgProps.pNext = &fcProps;
+    if (vk13) { props2.pNext = &sgProps; sgProps.pNext = &fcProps; }
+    else props2.pNext = &fcProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
 
@@ -963,7 +972,7 @@ int main(int argc, char** argv) {
     };
     link(&f11, reinterpret_cast<VkBaseOutStructure*>(&f11), nullptr, true);   // shaderDrawParameters (VS v0/v3)
     link(&f12, reinterpret_cast<VkBaseOutStructure*>(&f12), nullptr, true);
-    link(&f13, reinterpret_cast<VkBaseOutStructure*>(&f13), nullptr, true);
+    link(&f13, reinterpret_cast<VkBaseOutStructure*>(&f13), nullptr, vk13);
     const bool ext_mesh = link(&mesh, reinterpret_cast<VkBaseOutStructure*>(&mesh), VK_EXT_MESH_SHADER_EXTENSION_NAME, want_mesh);
     const bool ext_bary = link(&bary, reinterpret_cast<VkBaseOutStructure*>(&bary), VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, want_bary);
     const bool ext_lock = link(&lock, reinterpret_cast<VkBaseOutStructure*>(&lock), VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, want_lock);

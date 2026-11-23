@@ -161,6 +161,13 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDevice pd = pds[chosen];
     VkPhysicalDeviceProperties properties = candidates[chosen];
+    // VkPhysicalDeviceVulkan11/12Features (VkDeviceCreateInfo's chain below) are 1.2 core: invalid pNext members on
+    // an older device (VUID-VkDeviceCreateInfo-pNext-pNext), so every texture-test mode skips there.
+    if (properties.apiVersion < VK_API_VERSION_1_2) {
+        std::fprintf(stderr, "unsupported: %s is Vulkan %u.%u, the texture tests need 1.2\n", properties.deviceName,
+                     VK_API_VERSION_MAJOR(properties.apiVersion), VK_API_VERSION_MINOR(properties.apiVersion));
+        return 77;
+    }
     constexpr uint32_t push_words = 36;
     // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only; the heap base is in a uniform block at set 1
     // (vk_pc_tail.h), so a 128-byte device runs these tests too.

@@ -178,9 +178,17 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    // The *2 queries and VkPhysicalDeviceVulkan12Features (bufferDeviceAddress) are 1.2 core here, and the 1.3
+    // structs below are 1.3 core: chaining them on an older device is invalid (VUID-...-pNext-pNext), so skip (77).
+    if (props.apiVersion < VK_API_VERSION_1_2) {
+        std::fprintf(stderr, "unsupported: %s is Vulkan %u.%u, the test needs 1.2\n", props.deviceName,
+                     VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion));
+        return 77;
+    }
+    const bool vk13 = props.apiVersion >= VK_API_VERSION_1_3;
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
-    subgroup.pNext = &sgProps;
+    if (vk13) subgroup.pNext = &sgProps;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &subgroup;
     vkGetPhysicalDeviceProperties2(pd, &props2);
@@ -196,7 +204,7 @@ int main(int argc, char** argv) {
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2q.pNext = &f13q;
+    if (vk13) f2q.pNext = &f13q;   // left all false on 1.2
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
     const char* sg_env = std::getenv("VKC_SUBGROUP_SIZE");
     const uint32_t req_sg = require_wave64 ? 64u : (sg_env ? uint32_t(std::atoi(sg_env)) : 0u);
