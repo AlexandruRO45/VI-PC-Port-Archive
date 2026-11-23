@@ -11,7 +11,7 @@ import sys
 import tempfile
 import unittest
 import zlib
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -249,14 +249,37 @@ class CliTest(unittest.TestCase):
         s = self.run_cli(folder)
         self.assertEqual((s["interior_names"], s["placed_interior_names"]), (2, 2))
 
+    def cli_exit(self, argv):
+        """Run main() with a parse error and return (exit code, stderr)."""
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as raised:
+            T.main(argv)
+        return raised.exception.code, err.getvalue()
+
     def test_bad_arguments(self):
         for argv in (["nope", "--names", self.names], [self.names, "--names", self.names, "--jobs", "0"]):
-            with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
-                sys.stderr, saved = io.StringIO(), sys.stderr
-                try:
-                    T.main(argv)
-                finally:
-                    sys.stderr = saved
+            code, _ = self.cli_exit(argv)
+            self.assertEqual(code, 2, argv)
+
+    def test_negative_or_empty_windows_are_rejected(self):
+        # A negative window made range(lo, hi) empty, so the report counted nothing and the run exited 0.
+        for extra, message in ((["--start", "-1"], "--start must not be negative"),
+                               (["--limit", "-5"], "--limit must be at least 1"),
+                               (["--limit", "0"], "--limit must be at least 1")):
+            code, err = self.cli_exit([self.names, "--names", self.names, *extra])
+            self.assertEqual(code, 2, extra)
+            self.assertIn(message, err)
+
+    def test_start_outside_the_archive_is_rejected(self):
+        # The archive header starts at byte 4, so 0 is outside the data area, and nothing lives past size.
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([interiors(), placements()]))
+        size = os.path.getsize(path)
+        for start in (0, size, size + 4096):
+            code, err = self.cli_exit([path, "--names", self.names, "--start", "%d" % start])
+            self.assertEqual(code, 2, start)
+            self.assertIn("outside the data area", err)
 
 
 if __name__ == "__main__":

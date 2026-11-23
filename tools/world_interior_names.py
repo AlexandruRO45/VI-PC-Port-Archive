@@ -149,7 +149,13 @@ def scan(path, start=None, limit=None, jobs=1):
     if magic[:4] != b"9FPR":
         return {row.get("file", i): parse(data) for i, (row, data) in enumerate(WA.iter_resources(path, start, limit))}
     size = os.path.getsize(path)
-    lo = start if start is not None else WI._u32(magic, 4)
+    data_start = WI._u32(magic, 4)
+    lo = start if start is not None else data_start
+    # A window that starts before the data area or past the end of the archive held no resource, so the report was an
+    # empty one and the run still exited 0. instance_lists.py rejects the same window.
+    if start is not None and not data_start <= lo < size:
+        raise ValueError("--start 0x%x is outside the data area of %s (0x%x..0x%x)"
+                         % (lo, path, data_start, size))
     hi = min(size, lo + limit) if limit is not None else size
     n = max(1, jobs)
     step = max(1, -(-(hi - lo) // n))
@@ -268,7 +274,16 @@ def main(argv=None):
             ap.error("no such file or folder: %s" % p)
     if a.jobs < 1:
         ap.error("--jobs must be at least 1")
-    summary, rows = resolve(load_names(a.names), scan(a.path, a.start, a.limit, a.jobs))
+    if a.start is not None and a.start < 0:
+        ap.error("--start must not be negative")
+    if a.limit is not None and a.limit < 1:
+        ap.error("--limit must be at least 1")
+    names = load_names(a.names)
+    try:
+        found = scan(a.path, a.start, a.limit, a.jobs)
+    except ValueError as exc:
+        ap.error(str(exc))
+    summary, rows = resolve(names, found)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:
         json.dump({"summary": summary, "keys": rows}, f, indent=1, sort_keys=True)
