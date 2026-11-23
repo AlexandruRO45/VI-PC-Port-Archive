@@ -1,6 +1,7 @@
 # ---- never commit the game or anything made from it ----
 # (archives, executables, carved files, shaders, textures, models, audio, reports that quote game data)
 reports/
+*.navmesh-decode.json
 work/
 /assets/*
 !/assets/logo.png
