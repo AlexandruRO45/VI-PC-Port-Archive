@@ -479,12 +479,12 @@ def test_packed_r10g10b10a2_writes_a_png(eq, tmp_path, monkeypatch, capsys):
 
 
 def test_undecodable_format_keeps_the_dds_and_counts_unsupported(eq, tmp_path, monkeypatch, capsys):
-    carve, expected = build_case(eq, tmp_path, 41, top_first=True)  # R32_FLOAT: dds_png has no decoder
-    t = texture(41, "R32_FLOAT", 64, 64, mips=2)
+    carve, expected = build_case(eq, tmp_path, 95, top_first=True)  # BC6H_UF16: dds_png has no decoder
+    t = texture(95, "BC6H_UF16", 64, 64, mips=2)
     out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
     assert code is None  # main() returns None, so the process exits 0
-    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_R32_FLOAT.dds"]
-    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_R32_FLOAT.dds").read_bytes()[148:] == expected
+    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_BC6H_UF16.dds"]
+    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_BC6H_UF16.dds").read_bytes()[148:] == expected
     assert json.loads((out / "export_log.json").read_text(encoding="utf-8"))[0]["export"]["png"] == "unsupported"
     assert text.splitlines()[1:] == ["png: {'unsupported': 1}"]
 
@@ -493,9 +493,15 @@ def test_mixed_run_counts_each_kind(eq, tmp_path, monkeypatch, capsys):
     carve, _ = build_case(eq, tmp_path, 28, top_first=True)
     with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:
         write_blob(carve, "x.rpf", 0x2000, f.read())  # same 4 bpe size, so the equation is already in place
+    # a 16-bpe BC6H blob at 0x3000: same shape build_case makes, at another offset (dds_png cannot decode BC6H)
+    eq(16)
+    offs, bw, bh = T.detile_offsets(16, 16, 16)
+    bc6h = tile(gradient(16, 16, 16), offs, T.level_bytes(16, 16, 16, bw, bh)) \
+        + noise(T.level_bytes(8, 8, 16, bw, bh))
+    write_blob(carve, "x.rpf", 0x3000, bc6h)
     textures = [texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2),
-                texture(41, "R32_FLOAT", 64, 64, mips=2, gpu=0x2000),
-                texture(9999, "X", 4, 4, 1, gpu=0x3000)]
+                texture(95, "BC6H_UF16", 64, 64, mips=2, gpu=0x3000),
+                texture(9999, "X", 4, 4, 1, gpu=0x4000)]
     out, code, text = png_main(tmp_path, monkeypatch, capsys, textures, carve, "--png")
     assert text.splitlines()[1] == "png: {'written': 1, 'unsupported': 1}"
     assert len([f for f in tree(out) if f.endswith(".png")]) == 1
