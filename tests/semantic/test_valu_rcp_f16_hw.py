@@ -362,5 +362,55 @@ class RcpF16Ieee754EdgeCasesTests(unittest.TestCase):
         res = oracle_rcp_f16(F16_MAX_NORMAL)
         self.assertLess(u16_to_f16(res), 0.001)
 
+class RcpF16TranslatorIntegrationTests(unittest.TestCase):
+    def _run_ps(self, line: str, v0_val: int = 0x4000, initial_dst: int = 0xDEADBEEF) -> int:
+        lines = [
+            f"v_mov_b32 v0, {v0_val:#010x}",
+            f"v_mov_b32 v1, {initial_dst:#010x}",
+            line,
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_rcp_f16", lines)
+        words = mrt0_words(spv)
+        return words[0]
+
+    def test_translator_basic_reciprocal(self):
+        # 1.0 / 2.0 (0x4000) = 0.5 (0x3800), high half 0xdead preserved
+        word = self._run_ps("v_rcp_f16 v1, v0", v0_val=0x4000)
+        self.assertEqual(word, 0xDEAD3800)
+
+    def test_translator_neg_and_abs(self):
+        # 1.0 / -2.0 = -0.5 (0xb800)
+        word = self._run_ps("v_rcp_f16 v1, -v0", v0_val=0x4000)
+        self.assertEqual(word, 0xDEADB800)
+
+        # 1.0 / |-2.0| = 0.5 (0x3800)
+        word = self._run_ps("v_rcp_f16 v1, |v0|", v0_val=0xC000)
+        self.assertEqual(word, 0xDEAD3800)
+
+    def test_translator_clamp_and_omod(self):
+        # 1.0 / 0.5 = 2.0 -> clamp to 1.0 (0x3c00)
+        word = self._run_ps("v_rcp_f16 v1, v0 clamp", v0_val=0x3800)
+        self.assertEqual(word, 0xDEAD3C00)
+
+        # 1.0 / 2.0 = 0.5 -> mul:2 = 1.0 (0x3c00)
+        word = self._run_ps("v_rcp_f16 v1, v0 mul:2", v0_val=0x4000)
+        self.assertEqual(word, 0xDEAD3C00)
+
+        # 1.0 / 2.0 = 0.5 -> div:2 = 0.25 (0x3400)
+        word = self._run_ps("v_rcp_f16 v1, v0 div:2", v0_val=0x4000)
+        self.assertEqual(word, 0xDEAD3400)
+
+    def test_translator_opsel(self):
+        # Read from high half: 0x4000 (2.0) -> 0.5 (0x3800) written to low half
+        word = self._run_ps("v_rcp_f16 v1, v0 op_sel:[1,0]", v0_val=0x40001234)
+        self.assertEqual(word, 0xDEAD3800)
+
+        # Write to high half: 0.5 (0x3800) -> high half updated, low half 0xbeef preserved
+        word = self._run_ps("v_rcp_f16 v1, v0 op_sel:[0,1]", v0_val=0x4000, initial_dst=0xDEADBEEF)
+        self.assertEqual(word, 0x3800BEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
