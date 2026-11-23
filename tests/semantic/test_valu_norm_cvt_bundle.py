@@ -279,5 +279,30 @@ class TestVCvtNormI16F16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & 0xFFFF, 0x7FFF)
 
+def ref_v_cvt_norm_u16_f16(s0: int, old_dst: int = 0) -> int:
+    if is_nan_f16(s0):
+        res_u16 = 0
+    else:
+        res_u16 = norm_u16(bits_to_f16(s0 & 0xFFFF))
+    return ((old_dst & 0xFFFF0000) | (res_u16 & 0xFFFF)) & MASK32
+
+GLOBAL_ORACLE_MAP[Opcode.V_CVT_NORM_U16_F16] = ref_v_cvt_norm_u16_f16
+
+
+class TestVCvtNormU16F16Oracle(unittest.TestCase):
+    def test_basic_conversion(self) -> None:
+        # 1.0 -> 0xFFFF (65535)
+        res = ref_v_cvt_norm_u16_f16(0x3C00, old_dst=0xFEED0000)
+        self.assertEqual(res & 0xFFFF, 0xFFFF)
+        self.assertEqual(res >> 16, 0xFEED)
+
+    def test_fractional_and_clamp(self) -> None:
+        # 0.5 -> 0x8000 (32768)
+        res_half = ref_v_cvt_norm_u16_f16(0x3800, old_dst=0x43210000)
+        self.assertEqual(res_half & 0xFFFF, 0x8000)
+        # Negative -> clamped to 0.0 -> 0
+        res_neg = ref_v_cvt_norm_u16_f16(0xBC00, old_dst=0x55550000)
+        self.assertEqual(res_neg & 0xFFFF, 0)
+
 if __name__ == "__main__":
     unittest.main()
