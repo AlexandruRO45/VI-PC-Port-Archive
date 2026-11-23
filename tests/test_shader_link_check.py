@@ -116,6 +116,87 @@ def kinds(producer, consumer, **kwargs):
     return [item.kind for item in link.compare_stages(producer.reflect(), consumer.reflect(), **kwargs)]
 
 
+class NativeMeshLinkTest(unittest.TestCase):
+    def fixture(self, slots=(0, 2), big_endian=False):
+        # Three independent export values. The middle one has the same type as its
+        # neighbors, so simply matching the two modules' dense locations passes.
+        ms = ModuleFixture("ms")
+        pixel = ModuleFixture("ps")
+        per_vertex = ms.array(ms.numeric(32, 4), 3)
+        vector = pixel.numeric(32, 4)
+        producer = bytearray(0x2a0)
+        producer[:4] = b"FSSM"
+        struct.pack_into("<I", producer, 0x29c, 3)
+        consumer = bytearray(0x138 + 8 * (len(slots) + 1))
+        consumer[:4] = b"FSSM"
+        for param in range(3):
+            ms.variable(spv.STORAGE_OUTPUT, per_vertex, param)
+            struct.pack_into("6B", producer, 0x1dc + 6 * param, 6, 21 + param, param, 0, 0, 0)
+        for attr, slot in enumerate(slots):
+            pixel.variable(spv.STORAGE_INPUT, vector, attr)
+            struct.pack_into("8B", consumer, 0x138 + 8 * attr, 6, 21 + slot, 15, attr, 0, 0, slot + 1, 2)
+        pixel.variable(spv.STORAGE_OUTPUT, vector, 1)
+        return ms.binary(), pixel.binary(big_endian), producer, consumer
+
+    def test_sparse_export_changes_only_the_fragment_input_location(self):
+        for swap in (False, True):
+            with self.subTest(big_endian=swap):
+                ms, pixel, producer, consumer = self.fixture(big_endian=swap)
+                before = spv.reflect_module(pixel, "ps")
+                self.assertEqual(link.compare_stages(spv.reflect_module(ms, "ms"), before), [])
+                linked, slots = link.link_mesh_fragment(ms, pixel, producer, consumer)
+                after = spv.reflect_module(linked, "ps")
+                self.assertEqual(slots, [0, 2])
+                self.assertEqual([d.varyings[0].address.location for d in after.inputs], slots)
+                self.assertEqual(after.outputs, before.outputs)
+                self.assertEqual(len(pixel), len(linked))
+                self.assertEqual(sum(x != y for x, y in zip(pixel, linked)), 1)
+
+    def test_identity_is_byte_identical(self):
+        ms, pixel, producer, consumer = self.fixture(slots=(0, 1, 2))
+        self.assertEqual(link.link_mesh_fragment(ms, pixel, producer, consumer), (pixel, [0, 1, 2]))
+
+    def test_command_keeps_inputs_and_last_good_output_on_failure(self):
+        ms, ps, producer, consumer = self.fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            args = ["link-mesh"]
+            for flag, name, data in (("--ms", "m.spv", ms), ("--ps", "p.spv", ps),
+                                     ("--ms-fssm", "m.fssm", producer), ("--ps-fssm", "p.fssm", consumer)):
+                (folder / name).write_bytes(data)
+                args.extend([flag, str(folder / name)])
+            output = folder / "linked.spv"
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(link.main(args + ["--out", str(output)]), 0)
+                good = output.read_bytes()
+                self.assertEqual(link.main(args + ["--out", str(folder / "p.spv")]), 2)
+                self.assertEqual((folder / "p.spv").read_bytes(), ps)
+                (folder / "m.fssm").write_bytes(producer[:10])
+                self.assertEqual(link.main(args + ["--out", str(output)]), 2)
+                self.assertEqual(output.read_bytes(), good)
+
+    def test_dense_permutation_is_ambiguous_with_an_already_linked_input(self):
+        with self.assertRaisesRegex(ValueError, "dense permutation"):
+            link.link_mesh_fragment(*self.fixture(slots=(1, 0)))
+
+    def test_conflicting_native_records_and_module_counts_are_rejected(self):
+        ms, pixel, producer, consumer = self.fixture()
+        consumer[0x138 + 8 + 6] = 2
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            link.link_mesh_fragment(ms, pixel, producer, consumer)
+        consumer[0x138 + 8 + 6] = 3
+        consumer[0x138 + 8 + 3] = 7
+        with self.assertRaisesRegex(ValueError, "record index"):
+            link.link_mesh_fragment(ms, pixel, producer, consumer)
+        consumer[0x138 + 8 + 3] = 1
+        producer[0x1dc + 6 + 1] = producer[0x1dc + 1]
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            link.link_mesh_fragment(ms, pixel, producer, consumer)
+        ms, _, producer, consumer = self.fixture(slots=(0, 1, 2))
+        with self.assertRaisesRegex(ValueError, "dense translated"):
+            link.link_mesh_fragment(ms, pixel, producer, consumer)
+
+
 class ReflectTest(unittest.TestCase):
     def test_reads_other_byte_order(self):
         shader = output()

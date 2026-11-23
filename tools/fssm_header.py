@@ -131,6 +131,34 @@ def interpolants(blob):
     return len(inputs), mask
 
 
+def mesh_pixel_slots(mesh, pixel):
+    """Match a translated mesh export to each pixel input ordinal in a supplied native pair."""
+    export_table, export_count = 0x1dc, 0x29c
+    if mesh[:4] != MAGIC or len(mesh) < export_count + 4 or pixel[:4] != MAGIC:
+        raise ValueError("expected both native FSSM headers")
+    count = _u32(mesh, export_count)
+    if not 0 < count <= (export_count - export_table) // 6:
+        raise ValueError("unsupported mesh export count")
+    exports = {}
+    for offset in range(export_table, export_table + 6 * count, 6):
+        kind, semantic, param = mesh[offset:offset + 3]
+        if kind != RECORD_KIND or semantic in exports or param in exports.values() or param >= 32:
+            raise ValueError("unsupported or ambiguous mesh export record")
+        exports[semantic] = param
+    inputs = pixel_inputs(pixel)
+    if not inputs or len(inputs) > 32:
+        raise ValueError("expected a pixel input table")
+    slots = []
+    for ordinal, row in enumerate(inputs):
+        if row["index"] != ordinal:
+            raise ValueError("unsupported pixel input record index")
+        slot = exports.get(row["semantic"])
+        if slot is None or slot + 1 != row["slot"] or slot in slots:
+            raise ValueError("mesh export and pixel input records disagree or are ambiguous")
+        slots.append(slot)
+    return set(exports.values()), slots
+
+
 def read_methods(blob):
     """Return the read method (flags bits 0-1) of each pixel input, in table order.
 

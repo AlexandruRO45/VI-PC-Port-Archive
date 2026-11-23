@@ -534,6 +534,25 @@ the other 25,030 blobs matches the pattern.
 
 ## Pixel-shader inputs
 
+For a translated native MeshEXT and fragment pair, the fragment's dense input ordinal can
+skip a producer export. In three inspected pairs the mesh FSSM had six-byte rows starting
+at `0x1dc` with a u32 count at `0x29c`. A row with kind 6 carries the interface key at
+byte 1 and the zero-based mesh export at byte 2. For every matched pixel input key,
+the one-based slot at byte 6 of its eight-byte row agreed with that export plus one.
+Two pairs skipped a mesh export and one used consecutive exports. The original programs'
+DXIL signatures and native parameter exports corroborated these joins. These fields describe
+the compiled stages; the active pipeline for a particular draw is separate.
+
+`python -I tools/shader_link_check.py link-mesh --ms mesh.spv --ms-fssm mesh.fssm
+--ps pixel.spv --ps-fssm pixel.fssm --out paired-pixel.spv` writes a separate fragment
+module for that pair. Supply the original dense fragment translation and the native sidecar
+for each shader. The command checks both headers and standalone float4 locations, changes
+the fragment input Location literals and rechecks the linked interface. Use the resulting
+fragment module with the specified producer. A nonidentity permutation within the same dense
+set of locations cannot distinguish original and already-linked modules, so the command
+rejects it. Synthetic tests cover a type-compatible skipped
+export, an identity pair, both SPIR-V byte orders and conflicting records.
+
 `tools/fssm_header.py` decodes the FSSM input table: 8-byte records from 0x138 while the first byte is 6.
 Byte 1 is the semantic id, byte 2 the component mask, byte 3 the running index, byte 6 the parameter slot,
 and byte 7 holds flags (bits 0–1 = the **read method**: 0x01 read through `v_interp_mov_f32`, 0x02 through

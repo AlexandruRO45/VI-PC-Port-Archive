@@ -11,11 +11,14 @@ import json
 import os
 from pathlib import Path
 import re
+import struct
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from fssm_header import mesh_pixel_slots  # noqa: E402
+import spirv_interface as spv  # noqa: E402
 from spirv_interface import (Address, Declaration, InterfaceError, NumericType,  # noqa: E402
                              StageInterface, reflect_module)
 
@@ -230,13 +233,13 @@ def write_report(path: Path, doc):
             temporary.unlink(missing_ok=True)
 
 
-def ensure_report_is_separate(output, inputs):
+def ensure_report_is_separate(output, inputs, label="report"):
     if output is None:
         return
     out = output.resolve()
     for source in dict.fromkeys(inputs):
         if out == source.resolve() or (out.exists() and source.exists() and out.samefile(source)):
-            raise ValueError(f"report would overwrite an input file: {source}")
+            raise ValueError(f"{label} would overwrite an input file: {source}")
 
 
 def inspect(args):
@@ -264,6 +267,72 @@ def declaration_row(declaration):
         "varyings": [{**asdict(varying.address), "type": varying.type.describe(),
                       "per_primitive": varying.per_primitive} for varying in declaration.varyings],
     }
+
+
+def parameter_ids(declarations):
+    """Plain one-location per-vertex variables emitted by the native mesh/fragment translation."""
+    by_location = {}
+    for decl in declarations:
+        if decl.structure or len(decl.varyings) != 1:
+            raise ValueError("expected standalone shader parameters")
+        varying, = decl.varyings
+        addr = varying.address
+        if (addr.index or addr.component or varying.per_primitive or varying.type != NumericType("f", 32, 4)
+                or addr.location in by_location):
+            raise ValueError("expected one float vec4 per parameter location")
+        by_location[addr.location] = decl.symbol
+    return by_location
+
+
+def link_mesh_fragment(mesh_spv, pixel_spv, mesh_fssm, pixel_fssm):
+    export_slots, input_slots = mesh_pixel_slots(mesh_fssm, pixel_fssm)
+    producer = reflect_module(mesh_spv, "ms")
+    module = spv.Module(pixel_spv)
+    if len(module.entry_points) != 1:
+        raise ValueError("expected a single fragment entry point")
+    consumer = module.reflect("ps")
+    inputs = parameter_ids(consumer.inputs)
+    if set(parameter_ids(producer.outputs)) != export_slots or set(inputs) != set(range(len(input_slots))):
+        raise ValueError("native tables do not match the mesh exports and dense translated pixel inputs")
+    if set(input_slots) == set(inputs) and input_slots != list(range(len(inputs))):
+        raise ValueError("a dense permutation cannot distinguish original from already linked locations")
+
+    # Edit only direct Location literals on the original fragment input IDs. The same numeric
+    # location can also occur on a render target, or be an operand of an unrelated instruction.
+    edits = {inputs[i]: slot for i, slot in enumerate(input_slots) if i != slot}
+    words = spv.parse_words(pixel_spv)
+    linked = bytearray(pixel_spv)
+    endian = "<" if pixel_spv[:4] == struct.pack("<I", spv.SPIRV_MAGIC) else ">"
+    for opcode, operands, offset in spv.instructions(words):
+        if opcode == spv.OP_DECORATE and operands[1] == spv.DEC_LOCATION and operands[0] in edits:
+            struct.pack_into(endian + "I", linked, 4 * (offset + 3), edits.pop(operands[0]))
+    if edits:
+        raise ValueError("expected direct Location decorations on translated inputs")
+    linked_interface = reflect_module(linked, "ps")
+    problems = compare_stages(producer, linked_interface)
+    if problems:
+        raise ValueError(problems[0].display())
+    return bytes(linked), input_slots
+
+
+def link_mesh(args):
+    ensure_report_is_separate(args.out, [args.ms, args.ps, args.ms_fssm, args.ps_fssm], "linked module")
+    linked, slots = link_mesh_fragment(args.ms.read_bytes(), args.ps.read_bytes(),
+                                       args.ms_fssm.read_bytes(), args.ps_fssm.read_bytes())
+    # Publish only after checking the complete pair. Keep the translated input available for
+    # other pipelines that use the same fragment shader with a different producer.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=args.out.parent, prefix=".mesh-link-", delete=False) as f:
+            temporary = Path(f.name)
+            f.write(linked)
+        os.chmod(temporary, published_mode(args.out.absolute()))
+        os.replace(temporary, args.out)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    print("Fragment input ordinals map to mesh exports:", ", ".join(map(str, slots)))
+    return 0
 
 
 def run_checks(args):
@@ -316,8 +385,16 @@ def main(argv=None):
     single.add_argument("--stage", choices=STAGES, help="select a stage when multiple entry points share a name")
     single.add_argument("--entry", default="main")
     single.add_argument("--report", type=Path, help="write the reflection to JSON")
+    mesh = commands.add_parser("link-mesh", help="link a translated native MeshEXT/fragment pair using its FSSM headers")
+    mesh.add_argument("--ms", type=Path, required=True, help="translated mesh module")
+    mesh.add_argument("--ps", type=Path, required=True, help="original dense translated fragment module")
+    mesh.add_argument("--ms-fssm", type=Path, required=True, help="native header for --ms")
+    mesh.add_argument("--ps-fssm", type=Path, required=True, help="native header for --ps")
+    mesh.add_argument("--out", type=Path, required=True, help="separate linked fragment module")
     args = parser.parse_args(argv)
     try:
+        if args.command == "link-mesh":
+            return link_mesh(args)
         return inspect(args) if args.command == "inspect" else run_checks(args)
     except (OSError, ValueError) as exc:
         print(f"shader_link_check: error: {exc}", file=sys.stderr)
