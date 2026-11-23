@@ -378,6 +378,8 @@ void check_run_time_load() {
               "slot 18 is XTaskQueueSubmitCallback");
         check(!reinterpret_cast<IsEmpty>(slot(t, 28))(t, queue, XTaskQueuePort::Work),
               "slot 28 reports queued work nonempty");
+        check(reinterpret_cast<IsEmpty>(slot(t, 28))(t, queue, XTaskQueuePort::Completion),
+              "slot 28 reports completion empty while work is queued");
         using Dispatch = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort, uint32_t);
         check(reinterpret_cast<Dispatch>(slot(t, 16))(t, queue, XTaskQueuePort::Work, 0) && s_ran.load() == 1,
               "slot 16 is XTaskQueueDispatch: the callback ran on the work port");
@@ -396,8 +398,14 @@ void check_run_time_load() {
                   !reinterpret_cast<IsSensitive>(slot(t, 30))(t),
               "slots 27 and 30 set and read this thread's time-sensitive flag");
         static std::atomic<int> s_begins{0};
+        static bool s_context_ok = false;
+        static const uint8_t* s_parameter = nullptr;
         XAsyncProvider* provider = [](XAsyncOp op, const XAsyncProviderData* data) -> HRESULT {
             if (op == XAsyncOp::Begin) {
+                auto* context = static_cast<uint8_t*>(data->context);
+                s_context_ok = context && context != s_parameter &&
+                               std::memcmp(context, s_parameter, 4) == 0 && context[15] == 0;
+                if (context) context[15] = 0x7f;
                 s_begins.fetch_add(1);
                 XAsyncComplete(data->async, S_OK, 0);
             }
@@ -406,10 +414,13 @@ void check_run_time_load() {
         XAsyncBlock alloc_block{};
         using BeginAlloc = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, const void*, const char*, XAsyncProvider*,
                                                         size_t, size_t, void*);
+        uint8_t parameter[] = {0x12, 0x34, 0x56, 0x78};
+        s_parameter = parameter;
         const HRESULT alloc_hr =
-            reinterpret_cast<BeginAlloc>(slot(t, 8))(t, &alloc_block, nullptr, "test", provider, 16, 0, nullptr);
+            reinterpret_cast<BeginAlloc>(slot(t, 8))(t, &alloc_block, nullptr, "test", provider, 16, sizeof(parameter), parameter);
         check(alloc_hr == S_OK && s_begins.load() == 1,
               "slot 8 begins the allocated provider");
+        check(s_context_ok, "slot 8 provides a 16-byte context with a copied parameter block");
         if (alloc_hr == S_OK) {
             using Status = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, bool);
             check(reinterpret_cast<Status>(slot(t, 3))(t, &alloc_block, true) == S_OK,
