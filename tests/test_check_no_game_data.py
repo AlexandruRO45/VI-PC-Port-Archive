@@ -262,6 +262,19 @@ class CheckNoGameData(unittest.TestCase):
         self.assertIn("renamed.txt: FSSM shader", result.stdout)
         self.assertNotIn("untracked.bin", result.stdout)
 
+    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    def test_default_mode_from_a_subfolder_checks_the_whole_repository(self):
+        git = ["git", "-c", "init.defaultBranch=main"]
+        subprocess.run([*git, "init", "-q", self.dir], check=True)
+        os.mkdir(os.path.join(self.dir, "other"))
+        os.mkdir(os.path.join(self.dir, "sub"))
+        self.write(os.path.join("other", "x.bin"), b"DDS " + bytes(12))
+        self.write(os.path.join("sub", "a.txt"), b"plain text\n")
+        subprocess.run(["git", "add", "other/x.bin", "sub/a.txt"], cwd=self.dir, check=True)
+        result = run([], cwd=os.path.join(self.dir, "sub"))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("x.bin: DDS texture", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

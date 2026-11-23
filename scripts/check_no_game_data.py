@@ -247,8 +247,13 @@ def classify_file(path):
 
 
 def tracked_files(root):
-    out = subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True).stdout
-    return [os.path.join(root, p) for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
+    """Every file the repository holding `root` tracks, as absolute paths: `git ls-files` runs from the top of the
+    work tree, so a run from a subfolder still checks the whole repository."""
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=root, check=True, capture_output=True).stdout
+    # One line ending in a newline, with '/' separators even on Windows.
+    top = os.path.normpath(top.decode("utf-8", "surrogateescape").rstrip("\r\n"))
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=top, check=True, capture_output=True).stdout
+    return [os.path.join(top, p) for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
 def check(paths):
