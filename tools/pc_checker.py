@@ -952,6 +952,7 @@ def main():
     ap = argparse.ArgumentParser(description="Compare this PC with the Leonida reference specs")
     ap.add_argument("--cli", action="store_true", help="text mode, no window")
     ap.add_argument("--profile", type=int, default=1,
+                    choices=range(1, len(PROFILES) + 1),
                     help="1 = Xbox Series X, 2 = community 1080p Low estimate")
     ap.add_argument("--cpu", help="override the detected CPU")
     ap.add_argument("--gpu", help="override the detected GPU")
