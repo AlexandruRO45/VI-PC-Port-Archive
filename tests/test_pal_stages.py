@@ -238,6 +238,17 @@ class TestCli(unittest.TestCase):
         tally = json.loads(result.stdout)["tally"]
         self.assertEqual((tally["blobs"], tally["errors"]), (1, 1))
 
+    def test_a_folder_with_no_candidate_file_is_a_failure(self):
+        # `0 blobs, errors 0` from a folder that selected nothing reads like a clean run, like an empty
+        # folder did; files_of() treats a folder of unrelated files exactly like an empty one.
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "readme.txt"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("not a shader\n")
+            result = subprocess.run([sys.executable, "-I", TOOL, folder], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("no .fssm or .dxbc file to read", result.stderr)
+        self.assertIn("0 blobs, errors 0", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
