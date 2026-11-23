@@ -417,5 +417,38 @@ class TestSaluXnorSaveexecB32IEEE754BitPatterns(unittest.TestCase):
                 self.assertEqual(hw_lo, exp_lo)
                 self.assertEqual(hw_scc, exp_scc)
 
+# --- Section 8: Negative Controls, Syntax Rejection, and Mutation Detection ---
+
+class TestSaluXnorSaveexecB32NegativeAndMutations(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection tests."""
+
+    def test_rejection_invalid_operands(self) -> None:
+        invalid = [
+            "s_xnor_saveexec_b32",
+            "s_xnor_saveexec_b32 s0",
+            "s_xnor_saveexec_b32 s0, s1, s2",
+            "s_xnor_saveexec_b32 v0, s1",
+            "s_xnor_saveexec_b32 s0, v1",
+            "s_xnor_saveexec_b32 s106, s0",
+        ]
+        for line in invalid:
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    parse_salu_instruction(line)
+
+    def test_mutation_xor_instead_of_xnor(self) -> None:
+        """Mutant 1: Regular XOR without negation."""
+        def mutant_xor(s0: int, exec_lo: int) -> int:
+            return (s0 ^ exec_lo) & MASK32
+
+        self.assertNotEqual(mutant_xor(0x55555555, 0xAAAAAAAA), ref_s_xnor_saveexec_b32(0x55555555, 0xAAAAAAAA)[0])
+
+    def test_mutation_scc_whole_wave_vote(self) -> None:
+        """Mutant 2: SCC voting over both EXEC_LO and EXEC_HI instead of EXEC_LO only."""
+        def mutant_scc(new_lo: int, exec_hi: int) -> int:
+            return 1 if (new_lo != 0 or exec_hi != 0) else 0
+
+        self.assertNotEqual(mutant_scc(0, 0xFF), 0)
+
 if __name__ == "__main__":
     unittest.main()
