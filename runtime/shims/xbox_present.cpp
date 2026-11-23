@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -60,27 +61,56 @@ XboxPresentation::~XboxPresentation() {
 // Windows' SDR white level costs a QueryDisplayConfig and two DisplayConfigGetDeviceInfo calls (measured in
 // xbox_present_test, docs section 4.5): too much for the present path, which would hitch once a second and feed the pacer.
 // So it is read here, about once a second while an HDR10 swapchain is in use, and PresentX reads the cached value.
+void XboxPresentation::set_white_wanted(bool wanted) {
+    {
+        std::lock_guard lock(worker_mutex_);
+        if (wanted && pacer_.suspended()) wanted = false;
+        if (white_wanted_.load(std::memory_order_relaxed) == wanted) return;
+        white_wanted_.store(wanted, std::memory_order_release);
+        white_refresh_requested_ = wanted;
+    }
+    worker_wake_.notify_all();
+}
+
+void XboxPresentation::sync_white_worker() {
+    set_white_wanted(sdr_white_override_.load() <= 0.0f && presenter_->hdr_active());
+}
+
 void XboxPresentation::display_white_worker() {
     std::unique_lock lock(worker_mutex_);
     while (!worker_stop_) {
-        if (white_wanted_.load()) {
+        if (white_wanted_.load(std::memory_order_relaxed)) {
+            white_refresh_requested_ = false;
             lock.unlock();
             const float nits = presenter_->display_sdr_white_nits();
-            if (nits > 0.0f) display_white_ = nits;  // a failed query keeps the last good value
+            if (std::isfinite(nits) && nits > 0.0f) display_white_ = nits;  // a failed query keeps the last good value
             lock.lock();
+            if (worker_stop_) break;
+            if (white_refresh_requested_) continue;
         }
-        worker_wake_.wait_for(lock, std::chrono::seconds(1), [this] { return worker_stop_; });
+        if (white_wanted_.load(std::memory_order_relaxed))
+            worker_wake_.wait_for(lock, std::chrono::seconds(1), [this] {
+                return worker_stop_ || white_refresh_requested_ || !white_wanted_.load(std::memory_order_relaxed);
+            });
+        else
+            worker_wake_.wait(lock, [this] {
+                return worker_stop_ || white_wanted_.load(std::memory_order_relaxed);
+            });
     }
 }
 
 float XboxPresentation::effective_sdr_white_nits() {
-    if (sdr_white_override_ > 0.0f) return sdr_white_override_;
-    if (!presenter_->hdr_active()) return 203.0f;  // the Windows setting belongs to HDR mode
-    if (!white_wanted_.exchange(true)) {  // first HDR10 present: have it read now
-        std::lock_guard lock(worker_mutex_);
-        worker_wake_.notify_all();
+    const float override_nits = sdr_white_override_.load();
+    if (override_nits > 0.0f) {
+        set_white_wanted(false);
+        return override_nits;
     }
-    const float cached = display_white_;
+    if (!presenter_->hdr_active()) {
+        set_white_wanted(false);
+        return 203.0f;  // the Windows setting belongs to HDR mode
+    }
+    set_white_wanted(true);
+    const float cached = display_white_.load();
     return cached > 0.0f ? cached : 203.0f;
 }
 
@@ -120,6 +150,7 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
 
     if (plane_count == 0) {
         const HRESULT result = presenter_->present_blank(sync_interval);
+        sync_white_worker();
         if (SUCCEEDED(result)) {
             pacer_.note_untokened_present();
             ++presents_;
@@ -238,6 +269,7 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
             tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
         }
         const HRESULT result = presenter_->present_planes(composed, sync_interval, tear);
+        sync_white_worker();
         if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
         pacer_.commit_present_token(token, plane_count,
                                     tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
@@ -269,6 +301,7 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
     }
     const HRESULT result = presenter_->present(resource, sync_interval, rect, tear);
+    sync_white_worker();
     if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
     pacer_.commit_present_token(token, plane_count,
                                 tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
@@ -281,6 +314,7 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
 // (it polls the suspended state and gives up). A present that was already past that point finishes normally.
 HRESULT XboxPresentation::SuspendX(UINT) {
     pacer_.suspend();
+    set_white_wanted(false);
     return S_OK;
 }
 

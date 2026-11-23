@@ -1409,6 +1409,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME xbox_present COMMAND xbox_present_test)
     set_tests_properties(xbox_present PROPERTIES SKIP_RETURN_CODE 77)
 
+    # XboxPresentation SDR-white background worker wakeup, HDR10/SDR/SuspendX lifecycle, and finite setters
+    # (shims/xbox_present.cpp) over a stub WindowPresenter: pure CPU, no GPU or window needed.
+    add_executable(xbox_present_white_worker_test test/xbox_present_white_worker_test.cpp shims/xbox_present.cpp)
+    target_link_libraries(xbox_present_white_worker_test PRIVATE Vulkan::Headers)
+    target_compile_definitions(xbox_present_white_worker_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xbox_present_white_worker_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME xbox_present_white_worker COMMAND xbox_present_white_worker_test)
+
     # First light through D3D12 (docs/first_light.md): the real model and translated VS/PS that tools/first_light.py
     # wrote to LEONIDA_FIRST_LIGHT_DIR, drawn through the device proxy. Skips (77) unless that variable is set.
     add_executable(d3d12_first_light_test test/d3d12_first_light_test.cpp shims/d3d12_xs_device.cpp)

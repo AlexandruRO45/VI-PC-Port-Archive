@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -145,13 +146,13 @@ public:
     // back to automatic: while the swapchain is HDR10, the SDR content brightness Windows has for the output the window
     // is on (a background thread refreshes it once a second; PresentX only reads the cached value), else 203 (ITU-R
     // BT.2408's reference white). Applies to the next PresentX. The setters may be called from any thread.
-    void set_sdr_white_nits(float nits) { sdr_white_override_ = nits > 0.0f ? nits : 0.0f; }
+    void set_sdr_white_nits(float nits) { sdr_white_override_ = std::isfinite(nits) && nits > 0.0f ? nits : 0.0f; }
     // How SDR planes are decoded and an SDR output is encoded: piecewise sRGB (default) or gamma 2.2. The environment
     // variable LEONIDA_SDR_EOTF=gamma22 (or 2.2; any case; "srgb" is the default; other values are logged once and
     // ignored) chooses when the object is made.
     void set_sdr_eotf(leonida::PresentPlanes::SdrEotf eotf) { sdr_eotf_ = eotf; }
     // Peak of HDR10 content in nits, the white point of the tone map onto an SDR output (default 1000; no metadata is read).
-    void set_hdr_peak_nits(float nits) { hdr_peak_nits_ = nits > 0.0f ? nits : 1000.0f; }
+    void set_hdr_peak_nits(float nits) { hdr_peak_nits_ = std::isfinite(nits) && nits > 0.0f ? nits : 1000.0f; }
 
     leonida::FramePacer& pacer() { return pacer_; }
     WindowPresenter& presenter() { return *presenter_; }
@@ -161,6 +162,8 @@ public:
 
 private:
     float effective_sdr_white_nits();  // override, else the cached Windows setting while HDR10, else 203
+    void set_white_wanted(bool wanted);
+    void sync_white_worker();
     void display_white_worker();       // refreshes display_white_ off the present path
     std::unique_ptr<WindowPresenter> presenter_;
     std::unique_ptr<leonida::FrameClock> own_clock_;
@@ -179,6 +182,7 @@ private:
     std::mutex worker_mutex_;
     std::condition_variable worker_wake_;
     bool worker_stop_ = false;
+    bool white_refresh_requested_ = false;
     std::thread display_white_thread_;
     bool logged_null_token_ = false, logged_stale_token_ = false, logged_repeated_token_ = false;
 };
