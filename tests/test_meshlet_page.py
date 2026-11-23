@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "meshlet_page.py")
@@ -821,6 +822,37 @@ class CliTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out2, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["totals"]["pages"], 3)
+
+    @staticmethod
+    def _walk_listing(reverse):
+        """An os.walk whose sub-folder listing comes back in the given order, as a file system may return it."""
+        real_walk = os.walk
+
+        def walk(top, *args, **kwargs):
+            for root, dirs, files in real_walk(top, *args, **kwargs):
+                dirs.sort(reverse=reverse)
+                yield root, dirs, files
+        return walk
+
+    def test_directory_walk_is_sorted_and_names_use_forward_slashes(self):
+        data = page(block(4))
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "carve")
+            for sub in ("c", "a", "b"):
+                os.makedirs(os.path.join(folder, sub))
+                with open(os.path.join(folder, sub, "p.bin"), "wb") as fh:
+                    fh.write(data)
+            reports = {}
+            for reverse in (False, True):
+                with self.subTest(reverse=reverse), mock.patch("os.walk", self._walk_listing(reverse)):
+                    names = [name for name, _ in mp.iter_inputs([folder])]
+                    self.assertEqual(names, ["a/p.bin", "b/p.bin", "c/p.bin"])
+                    out = os.path.join(tmp, f"report{int(reverse)}.json")
+                    self.assertEqual(mp.main([folder, "--json", out, "--quiet"]), 0)
+                    with open(out, encoding="utf-8") as fh:
+                        reports[reverse] = json.load(fh)
+            self.assertEqual(reports[False], reports[True])
+            self.assertEqual([p["name"] for p in reports[True]["pages"]], ["a/p.bin", "b/p.bin", "c/p.bin"])
 
     def test_page_report_write_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:

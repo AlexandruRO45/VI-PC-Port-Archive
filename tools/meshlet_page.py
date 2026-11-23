@@ -758,7 +758,8 @@ def iter_archive(path):
 def iter_inputs(paths, existing_report=None):
     for path in paths:
         if os.path.isdir(path):
-            for root, _, files in os.walk(path):
+            for root, dirs, files in os.walk(path):
+                dirs.sort()  # the walk order, and so the report's page order, must not depend on the file system
                 for f in sorted(files):
                     full = os.path.join(root, f)
                     with open(full, "rb") as fh:
@@ -768,7 +769,7 @@ def iter_inputs(paths, existing_report=None):
                             if is_mesh_page(data):
                                 if existing_report and same_output_path(existing_report, full):
                                     raise PageError(f"--json would overwrite the input {full}")
-                                yield os.path.relpath(full, path), data
+                                yield os.path.relpath(full, path).replace(os.sep, "/"), data
         elif path.lower().endswith(".rpf"):
             yield from iter_archive(path)
         else:
