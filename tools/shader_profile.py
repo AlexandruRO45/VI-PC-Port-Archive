@@ -322,6 +322,9 @@ def main():
     except OSError as e:
         print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
         return 2
+    if not shader_files and os.path.exists(path):
+        print(f"ERROR: no .s files in {a.src}; keeping existing report {path}", file=sys.stderr)
+        return 2
     for entry in shader_files:
         if same_output_path(entry.path, path):
             print(f"ERROR: output would overwrite input shader {entry.path}", file=sys.stderr)

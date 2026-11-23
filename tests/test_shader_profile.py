@@ -665,6 +665,25 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         with open(shader_file, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), original_content)
 
+    def test_cli_empty_corpus_preserves_an_existing_report(self):
+        tool = os.path.join(ROOT, "tools", "shader_profile.py")
+        report = os.path.join(self.tmp.name, "profile.json")
+        original = b'{"previous": true}\n'
+        for folder_has_s_subdir in (False, True):
+            with self.subTest(folder_has_s_subdir=folder_has_s_subdir):
+                if folder_has_s_subdir:
+                    os.mkdir(os.path.join(self.disasm_dir, "subfolder.s"))
+                with open(report, "wb") as f:
+                    f.write(original)
+                result = subprocess.run(
+                    [sys.executable, "-I", tool, self.disasm_dir],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("no .s files", result.stderr)
+                with open(report, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
     def test_unreadable_listing_reports_its_path_and_preserves_report(self):
         from io import StringIO
         from unittest.mock import patch
