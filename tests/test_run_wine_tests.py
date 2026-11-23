@@ -674,6 +674,33 @@ class MainTest(unittest.TestCase):
             self.run_main([ctest_entry("ok", self.command("ok.py"))], "--wine", "")
         self.assertEqual(ctx.exception.code, 2)
 
+    def run_main_without_wine(self, entries, wine_env):
+        listing = self.list_tests(entries)
+        argv = ["run_wine_tests.py", "--tests", listing, "--windows-root", WINDOWS_ROOT, "--root", str(self.root)]
+        seen = []
+
+        def fake_run_test(test, args, wine, **kwargs):
+            seen.append(wine)
+            return "PASS", ""
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"WINE": wine_env}), mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(rwt, "run_test", fake_run_test), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = rwt.main()
+        return code, seen
+
+    def test_an_empty_wine_variable_falls_back_to_wine(self):
+        # WINE= (exported but empty) means unset, as ${WINE:-wine} in gta6rt.sh does.
+        code, seen = self.run_main_without_wine([ctest_entry("ok", self.command("ok.py"))], "")
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [["wine"]])
+
+    def test_the_wine_variable_is_split_like_wine(self):
+        code, seen = self.run_main_without_wine([ctest_entry("ok", self.command("ok.py"))], "umu-run 'my wine'")
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [["umu-run", "my wine"]])
+
     def test_an_unclosed_quote_in_wine_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as ctx:
             self.run_main([ctest_entry("ok", self.command("ok.py"))], "--wine", "wine 'unclosed")
