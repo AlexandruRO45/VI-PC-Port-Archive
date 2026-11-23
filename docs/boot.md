@@ -91,7 +91,11 @@ Read the startup trace first; the first event that is not the expected one is th
 4. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
    so the process behaviour is the same with or without the trace. When the report reaches `--limit`, it reserves
    the final slot for the last observed exception. The trace also includes handled exceptions, so the last
-   observation alone does not establish what caused the run to stop.
+   observation alone does not establish what caused the run to stop. The summary names the codes it knows
+   (`code 0x80000003 breakpoint`, `code 0xc0000374 heap corruption`), which matters on this path: #6824 reports
+   that every stop so far was the title's own `int3` after a call that refused it, and the process then ends with
+   the heap-corruption status, so a bare `0xc0000374` reads as a heap bug when the break above it is the cause.
+   Codes the tool does not know print bare, as before.
 5. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
 6. **D3D12 trace** — the `failed`, `unsupported`, `refused` and `partial` lines name the method. A `partial`
    submission ran the supported commands from a list. The runtime's `[rt]` diagnostic names the command it left out.

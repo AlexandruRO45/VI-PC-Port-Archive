@@ -166,6 +166,54 @@ class BootTraceTests(unittest.TestCase):
                 self.assertEqual(startup["exceptions"][-1]["stack"], final["stack"])
                 self.assertIn("synthetic.exe+0x2010 (read 0x0)", bt.format_text(summary, limit))
 
+    def test_exception_codes_are_named(self):
+        # A run that stops on a shim that refuses its call breaks on the title's own int3, and the process then
+        # dies with the heap-corruption status (#6824). Both only help once the line says what the code is.
+        events = [
+            {"kind": "exception", "code": code, "at": f"synthetic.exe+0x{0x1000 + i:x}"}
+            for i, code in enumerate(("0x80000003", "0xc0000374", "0xc0000005"))
+        ]
+        self.write(self.startup, [STARTUP[0], *events])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(bt.main([self.startup, "--json"]), 0)
+        summary = json.loads(output.getvalue())
+        startup = summary["startup"]
+        self.assertEqual(
+            [exc["name"] for exc in startup["exceptions"]],
+            ["breakpoint", "heap corruption", "access violation"],
+        )
+        text = bt.format_text(summary, 10)
+        for line in (
+            "code 0x80000003 breakpoint at synthetic.exe+0x1000",
+            "code 0xc0000374 heap corruption at synthetic.exe+0x1001",
+            "code 0xc0000005 access violation at synthetic.exe+0x1002",
+        ):
+            self.assertIn(line, text)
+
+    def test_exception_code_names_tolerate_numbers_and_unknown_codes(self):
+        events = [
+            {"kind": "exception", "code": -1073741819, "at": "synthetic.exe+0x1000"},
+            {"kind": "exception", "code": 3221225477, "at": "synthetic.exe+0x1010"},
+            {"kind": "exception", "code": "0xC00000FD", "at": "synthetic.exe+0x1020"},
+            {"kind": "exception", "code": "0xdeadbeef", "at": "synthetic.exe+0x1030"},
+            {"kind": "exception", "code": None, "at": "synthetic.exe+0x1040"},
+            {"kind": "exception", "at": "synthetic.exe+0x1050"},
+        ]
+        self.write(self.startup, [STARTUP[0], *events])
+        startup = bt.parse_startup(self.startup)
+        self.assertEqual(
+            [exc["name"] for exc in startup["exceptions"]],
+            ["access violation", "access violation", "stack overflow", None, None, None],
+        )
+        text = bt.format_text({"startup": startup, "d3d12": None}, 10)
+        # The code as the file wrote it stays on the line, named or not.
+        self.assertIn("code -1073741819 access violation at synthetic.exe+0x1000", text)
+        self.assertIn("code 3221225477 access violation at synthetic.exe+0x1010", text)
+        self.assertIn("code 0xC00000FD stack overflow at synthetic.exe+0x1020", text)
+        self.assertIn("code 0xdeadbeef at synthetic.exe+0x1030", text)
+        self.assertIn("code None at synthetic.exe+0x1040", text)
+
     def test_debug_text_is_not_printed(self):
         self.write(self.startup, STARTUP)
         text = bt.format_text(bt.summarize(bt.parse_startup(self.startup), None), 10)
@@ -397,8 +445,8 @@ class BootTraceTests(unittest.TestCase):
             "x.dll!Foo from game.exe+0x10",
             "by dll (unique imports): x.dll 1, y.dll 1",
             "exceptions: 2",
-            "code 0xc0000005 at game.exe+0x40 (read 0x0)",
-            "code 0xe06d7363 at game.exe+0x30 (C++ throw)",
+            "code 0xc0000005 access violation at game.exe+0x40 (read 0x0)",
+            "code 0xe06d7363 C++ exception at game.exe+0x30 (throw)",
             "stack: game.exe+0x40, game.exe+0x120",
             "exit: 0",
         ):

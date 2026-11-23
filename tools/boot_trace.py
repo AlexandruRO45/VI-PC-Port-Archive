@@ -32,6 +32,51 @@ import sys
 
 D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
 
+# Exception codes a boot run reaches, keyed by the unsigned 32-bit value (winerror.h). `breakpoint` is the one a
+# run stops on when the title breaks after a call that refused it, and the process then exits with the
+# `heap corruption` status: read bare, `0xc0000374` looks like a heap bug and sends triage the wrong way (#6824).
+EXCEPTION_CODES = {
+    0x40010004: "control-C",
+    0x40010005: "live tracing",
+    0x40010006: "debug print (OutputDebugString)",
+    0x40010008: "thread name",
+    0x80000003: "breakpoint",
+    0x80000004: "single step",
+    0xC0000005: "access violation",
+    0xC0000006: "in-page access violation",
+    0xC000001D: "illegal instruction",
+    0xC0000025: "noncontinuable",
+    0xC0000094: "integer divide by zero",
+    0xC0000096: "privileged instruction",
+    0xC00000FD: "stack overflow",
+    0xC0000121: "invalid dispatcher sequence",
+    0xC0000135: "DLL not found",
+    0xC0000139: "entry point not found",
+    0xC000013A: "console control-C exit",
+    0xC0000374: "heap corruption",
+    0xC0000409: "stack buffer overrun (__fastfail)",
+    0xC000041D: "fatal user callback",
+    0xE06D7363: "C++ exception",
+}
+
+
+def _code_name(code) -> str | None:
+    """Name an exception code, whether the trace wrote it as `0x...` or as a number. None when it is unknown."""
+    value = None
+    if type(code) is int:
+        value = code & 0xFFFFFFFF  # the codes are unsigned; a JSON round trip can carry them signed
+    elif isinstance(code, str):
+        text = code.strip().lower()
+        if text.startswith("0x"):
+            text = text[2:]
+        try:
+            value = int(text, 16) & 0xFFFFFFFF
+        except ValueError:
+            return None
+    if value is None:
+        return None
+    return EXCEPTION_CODES.get(value)
+
 
 class TraceError(ValueError):
     """The file is unreadable or holds no valid trace event."""
@@ -136,6 +181,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 stack = event.get("stack")
                 detail = {
                     "code": event.get("code"),
+                    "name": _code_name(event.get("code")),
                     "at": event.get("at"),
                     "cpp": event.get("cpp"),
                     "access": event.get("access"),
@@ -251,13 +297,16 @@ def format_text(summary: dict, limit: int) -> str:
             out.append(f"  exceptions: {startup['exception_count']}")
             for exc in startup["exceptions"][:limit]:
                 cpp = exc.get("cpp")
-                detail = " (C++ throw)" if cpp is True else f" ({cpp})" if cpp else ""
+                detail = " (throw)" if cpp is True else f" ({cpp})" if cpp else ""
                 if exc.get("access"):
                     detail += f" ({exc['access']}"
                     if exc.get("address"):
                         detail += f" {exc['address']}"
                     detail += ")"
-                out.append(f"    code {exc['code']} at {exc['at']}{detail}")
+                name = exc.get("name")
+                out.append(
+                    f"    code {exc['code']}{' ' + name if name else ''} at {exc['at']}{detail}"
+                )
                 if exc.get("stack"):
                     out.append(f"      stack: {_tail(exc['stack'], limit)}")
         if startup["error"]:
