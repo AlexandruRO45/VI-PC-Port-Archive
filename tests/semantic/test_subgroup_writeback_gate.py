@@ -23,6 +23,14 @@ class SubgroupWritebackGateTests(unittest.TestCase):
         defs = {row[0]: (number, row[2:]) for number, row in enumerate(rows)
                 if len(row) >= 3 and row[1] == "="}
 
+        eager = {row[1]: row[2] for row in rows if len(row) == 3 and row[0] == "OpStore" and row[1].startswith("%eager")}
+
+        def unwrap(value):
+            """The value an eager() copy (a Function variable stored and loaded back, SHADER-529) holds."""
+            while value in defs and defs[value][1][0] == "OpLoad" and defs[value][1][2] in eager:
+                value = eager[defs[value][1][2]]
+            return value
+
         def find(value, opcode):
             self.assertIn(value, defs)
             order, args = defs[value]
@@ -50,8 +58,8 @@ class SubgroupWritebackGateTests(unittest.TestCase):
         else:
             select_order, (_, gate, fetched, _) = find(stored, "OpSelect")
         if source_activity:
-            _, (_, _, fetched, _) = find(fetched, "OpSelect")
-        self.assertEqual(fetched, shuffle)
+            _, (_, _, fetched, _) = find(unwrap(fetched), "OpSelect")
+        self.assertEqual(unwrap(fetched), shuffle)
 
         compare_order, (_, got, salt) = find(gate, "OpIEqual")
         gate_shuffle_order, (_, _, flag, lane) = find(got, "OpGroupNonUniformShuffle")
@@ -105,8 +113,48 @@ class SubgroupWritebackGateTests(unittest.TestCase):
             "v_permlanex16_b32 v4, v1, 0, 0",
         ], 32, emulate=False)
         salts = self.gate_salts(spv)
-        self.assertEqual(len(salts), 2)
-        self.assertEqual(len(set(salts)), 2, "both permlane writes read EXEC through the same value")
+        self.assertEqual(len(salts), 3)   # both permlanes and the v_writelane_b32's lane test
+        self.assertEqual(len(set(salts)), 3, "two gates read their lane flag through the same value")
+
+    def assert_write_reads_lane_after_shuffle(self, spv):
+        """The last write of v2 is select(c, value, old) where c (through any OpLogicalAnd) is a gate: an own-lane
+        shuffle of a salted lane flag, compared with the salt, emitted after the data shuffle."""
+        rows = [line.split() for line in spv.splitlines()]
+        defs = {row[0]: (number, row[2:]) for number, row in enumerate(rows) if len(row) >= 3 and row[1] == "="}
+        shuffles = sorted(number for number, args in defs.values() if args[0] == "OpGroupNonUniformShuffle")
+        stores = [row[2] for row in rows if len(row) == 3 and row[0] == "OpStore"
+                  and defs.get(row[1], (None, []))[1] == ["OpAccessChain", "%_ptr_Function_uint", "%vgpr", "%c2"]]
+        self.assertTrue(stores)
+        order, args = defs[stores[-1]]
+        self.assertEqual(args[0], "OpSelect")
+        conds = [args[2]]
+        gates = []
+        while conds:
+            _, (op, *rest) = defs[conds.pop()]
+            if op == "OpLogicalAnd":
+                conds += rest[1:]
+            elif op == "OpIEqual":
+                gates.append(rest[1:])
+        self.assertEqual(len(gates), 1, "the write is gated by one post-shuffle lane read")
+        got, salt = gates[0]
+        got_order, (op, _, _, flag, lane) = defs[got]
+        self.assertEqual(op, "OpGroupNonUniformShuffle")
+        self.assertEqual(defs[lane][1], ["OpLoad", "%uint", "%sg_lane"])
+        self.assertEqual(defs[flag][1][0], "OpSelect")
+        self.assertEqual(defs[flag][1][3], salt)
+        self.assertLess(shuffles[0], got_order, "the gate reads the lane after the data shuffle")
+
+    def test_writelane_of_a_readlane_reads_its_lane_test_after_the_shuffle(self):
+        # NVIDIA 580.65.06 gives the shuffle to every lane of select(lane == 0, shuffle(v, 7), old):
+        # crosslane_fuzz cs_xl32_203106417, a v_writelane_b32 of a v_readlane_b32 result.
+        spv, _ = translate_cs("cs_writeback_gate_writelane", [
+            "v_mov_b32_e32 v1, v0",
+            "v_mov_b32_e32 v2, 99",
+            "s_mov_b32 s28, 7",
+            "v_readlane_b32 s4, v1, s28",
+            "v_writelane_b32 v2, s4, 0",
+        ], 32, emulate=False)
+        self.assert_write_reads_lane_after_shuffle(spv)
 
 
 if __name__ == "__main__":

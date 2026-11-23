@@ -1030,7 +1030,8 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
-                      "cs_mask_vgpr_exec", "cs_w32_permlane_exec0", "cs_w32_writelane_permlane_exec0"):
+                      "cs_mask_vgpr_exec", "cs_w32_permlane_exec0", "cs_w32_writelane_permlane_exec0",
+                      "cs_w32_readlane_writelane"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -1105,6 +1106,7 @@ def run_suite(a, work: str) -> int:
                 # v_permlane16/x16 under EXEC = 0 keep v4 (NVIDIA select-after-shuffle miscompile; .asm header)
                 "cs_w32_permlane_exec0": [7, 58, 109, 160, 211, 262, 313, 364],
                 "cs_w32_writelane_permlane_exec0": [0x7E8B8958, 0xF6C106A1, 0x7E8B898C, 0xF6C106A9, 0x7E8B89C0, 0xF6C106B1, 0x7E8B89F4, 0xF6C106B9],
+                "cs_w32_readlane_writelane": [0x9B75597D, 0x9B75597D, 0x996D74AF, 0x9B75597D, 0x996D74C7, 0x9B75597D, 0x996D74DF, 0x9B75597D],
                 "cs_w32_sincos": [1, 1, 1, 1, 1, 1],                  # SHADER-88 (cs_w32_sincos.asm): angles in turns
                 # SHADER-74: v_permlane16/x16 FI / BOUND_CTRL with the source lane off in EXEC (cs_w32_permlane_fi.asm)
                 "cs_w32_permlane_fi": [1000, 0, 4, 1, 1000, 0, 52, 49],
@@ -1143,7 +1145,8 @@ def run_suite(a, work: str) -> int:
                                   "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_w32_andn2_exec",
-                                  "cs_w32_permlane_exec0", "cs_w32_writelane_permlane_exec0") and not emulated and not partial
+                                  "cs_w32_permlane_exec0", "cs_w32_writelane_permlane_exec0",
+                                  "cs_w32_readlane_writelane") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)

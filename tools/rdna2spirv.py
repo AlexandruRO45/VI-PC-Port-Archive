@@ -7593,6 +7593,11 @@ class Gen:
                 self.emit(f"{me} = OpLoad %uint %sg_lane")
             self.emit(f"{m} = OpBitwiseAnd %uint {ln} {self.cu(63 if self.wave64 else 31)}")
             self.emit(f"{eq} = OpIEqual %bool {me} {m}")
+            if not self.emulate:
+                # select(lane == n, s, old) with s from a v_readlane_b32 (a shuffle) gives s to every lane on
+                # NVIDIA 580.65.06 (crosslane_fuzz cs_xl32_203106417); the lane test read back through
+                # gate_after_subgroup does not.
+                eq = self.gate_after_subgroup(eq)
             p = self.reg_ptr("vgpr", a[0]["r"])
             self.emit(f"{old} = OpLoad %uint {p}")
             self.emit(f"{r} = OpSelect %uint {eq} {val} {old}")
