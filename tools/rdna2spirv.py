@@ -12873,10 +12873,10 @@ class Gen:
                 if d16:
                     # d16: the compare result is an f16 in the low half, as in the other d16 paths below. Until
                     # 2026-11-21 it was written as f32 bits, whose low half is 0 for every result (1.0 = 0x3f800000).
-                    r = self.f16_bits(d)
+                    # Like the odd last component below, it writes only that half and keeps the high one (SHADER-1065).
+                    self.write_lo16({"k": "vgpr", "r": vdata["r"], "n": 1}, self.f16_bits(d))
                 else:
-                    r = self.tou(d)
-                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, r)
+                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, self.tou(d))
                 return
             else:
                 raise Unsupported(op)
@@ -12892,9 +12892,18 @@ class Gen:
         if d16:
             # d16: components are packed two per register as f16 (x|y<<16, z|w<<16).
             for i in range(0, len(comps), 2):
-                second = comps[i + 1] if i + 1 < len(comps) else "%f0"
-                p = self.pack_f16_pair_int(comps[i], second)
-                self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, p)
+                odd_last = i + 1 >= len(comps)
+                p = self.pack_f16_pair_int(comps[i], "%f0" if odd_last else comps[i + 1])
+                reg = {"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}
+                if odd_last:
+                    # An odd last component fills only the low half; RDNA2 keeps the VGPR's high half (gfx1031 and
+                    # gfx1036 through tools/hw_oracle, SHADER-1065), as image_read_typed already does. Until then it
+                    # was paired with 0.0 and the whole VGPR written, so the high half came back 0.
+                    lo = self.tmp()
+                    self.emit(f"{lo} = OpBitwiseAnd %uint {p} {self.cu(0xFFFF)}")
+                    self.write_lo16(reg, lo)
+                else:
+                    self.dst(reg, p)
         else:
             for i, comp in enumerate(comps):
                 self.dst({"k": "vgpr", "r": vdata["r"] + i, "n": 1}, self.tou(comp))
