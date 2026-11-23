@@ -8,8 +8,9 @@
 //      resource_mutex_ -> tracker_mutex_ -> submit_mutex_ lock hierarchy without data races or deadlocks.
 //   4. A swapchain-destroy WSI layer which calls vkDeviceWaitIdle cannot overlap vkQueueSubmit on another thread.
 // Step 3 has a watchdog: if it has not finished after LEONIDA_PRESENTER_SYNC_WATCHDOG_S seconds (default 60) the
-// test prints where it is (presents done, worker rounds) and exits with 3 instead of spinning until someone kills it
-// (TEST-840: on an AMD Windows 26.11.2 iGPU about half the runs never left step 3, at full CPU, and stalled `ctest`).
+// test prints where it is (presents done, worker rounds, and the rounds again a second later) and ends with exit
+// code 3 at once (TerminateProcess) instead of spinning until someone kills it (TEST-840: on an AMD Windows 26.11.2
+// iGPU about half the runs never left step 3, at full CPU, and stalled `ctest`).
 // LEONIDA_PRESENTER_SYNC_STALL=1 makes step 3 stall on purpose, which is how the watchdog itself is tested.
 // Skips with exit code 77 when no Vulkan 1.3 device with Win32 presentation is available. No game data.
 #ifndef WIN32_LEAN_AND_MEAN
@@ -376,7 +377,20 @@ int main() {
                         "worker failed: %d\n", watchdog_seconds, presents_done.load(),
                         static_cast<unsigned long long>(worker_rounds.load()), int(worker_failed.load()));
             std::fflush(stdout);
-            std::_Exit(3);
+            // A second read says whether the worker is still looping (all presents done, rounds frozen: the worker
+            // side; presents stopped, rounds still growing: present()). TerminateProcess, not _Exit: _Exit ends in
+            // ExitProcess, which runs every DLL's DLL_PROCESS_DETACH, the driver's included, and on an AMD 26.11.2
+            // card the stalled runs took 35 to 40 s more to exit after this report.
+            const unsigned long long rounds_first = worker_rounds.load();
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            const unsigned long long rounds_second = worker_rounds.load();
+            std::printf("presenter sync: one second later: %d presents done, %llu worker rounds (%s)\n",
+                        presents_done.load(),
+                        static_cast<unsigned long long>(rounds_second),
+                        rounds_second > rounds_first ? "the worker is still looping" : "the worker has stopped too");
+            std::fflush(stdout);
+            TerminateProcess(GetCurrentProcess(), 3);
         });
         std::thread worker([&] {
             std::uint64_t round = 0;
