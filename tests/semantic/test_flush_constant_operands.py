@@ -46,8 +46,10 @@ def run(lines):
 
 
 def flush_compares(spv):
-    # Each run-time flush is one FAbs feeding a compare with FLT_MIN; nothing else in these programs takes FAbs.
-    return sum(" FAbs " in ln for ln in spv.splitlines())
+    # A run-time flush is an FAbs feeding a compare with FLT_MIN, or, flushed on the bits, one mask of the exponent
+    # field; nothing else in these programs does either, except an |x| source modifier's own FAbs.
+    return sum(" FAbs " in ln or ("= OpBitwiseAnd %uint" in ln and ln.endswith(" %c7f800000"))
+               for ln in spv.splitlines())
 
 
 class ConstantOperandValues(unittest.TestCase):
