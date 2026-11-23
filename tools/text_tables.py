@@ -318,15 +318,17 @@ def archive_of(starts: list, offset: int):
 def read_labels(path: str) -> dict:
     """{hash: label}: a hashdict.py JSON maps hashes already; a text file is hashed word by word."""
     with open(path, "rb") as fh:
-        first = fh.read(1).lstrip()
-    if path.lower().endswith(".json") or first == b"{":
-        with open(path, encoding="utf-8") as fh:
+        head = fh.read(4)
+    if head.startswith(b"\xef\xbb\xbf"):  # an editor saved the file as UTF-8 with a BOM
+        head = head[3:]
+    if path.lower().endswith(".json") or head.lstrip()[:1] == b"{":
+        with open(path, encoding="utf-8-sig") as fh:
             doc = json.load(fh)
         if not isinstance(doc, dict):
             raise ValueError(f"{path}: expected a JSON object of hash -> label, got {type(doc).__name__}")
         return {int(h, 16): str(v).upper() for h, v in doc.items()}
     out = {}
-    with open(path, encoding="utf-8", errors="replace") as fh:
+    with open(path, encoding="utf-8-sig", errors="replace") as fh:
         for line in fh:
             for w in LABEL_WORD.findall(line):
                 out.setdefault(joaat(w), w.upper())
