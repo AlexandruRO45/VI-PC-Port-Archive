@@ -311,5 +311,75 @@ class TestSaluNandSaveexecB32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(fresh.exec_lo, res_exec)
         self.assertEqual(fresh.scc, res_scc)
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit Wavefront Models
+# ==============================================================================
+
+class WavefrontState:
+    """Architectural wavefront modeling EXEC_LO vs EXEC_HI divergence."""
+
+    def __init__(self, wave_size: int = 64) -> None:
+        self.wave_size = wave_size
+        self.exec_lo = MASK32
+        self.exec_hi = MASK32
+        self.sgprs = [0] * 106
+        self.scc = 0
+
+    @property
+    def exec_mask_64(self) -> int:
+        return (self.exec_hi << 32) | self.exec_lo
+
+
+class WavefrontInterpreter:
+    """Wavefront execution engine enforcing half-width EXEC_LO semantics."""
+
+    def step_nand_saveexec_b32(self, dst_idx: int, s0_val: int, state: WavefrontState) -> None:
+        old_lo = state.exec_lo
+        old_hi = state.exec_hi
+        new_lo, saved_d, scc = ref_nand_saveexec_b32(s0_val, old_lo)
+        state.sgprs[dst_idx] = saved_d
+        state.exec_lo = new_lo
+        # In Wave64, exec_hi is untouched!
+        state.exec_hi = old_hi
+        state.scc = scc
+
+
+# ==============================================================================
+# Unit Tests: SIMD Multi-Lane Divergence
+# ==============================================================================
+
+class TestSaluNandSaveexecB32SIMD(unittest.TestCase):
+    """Unit tests for multi-lane divergence and EXEC_HI preservation."""
+
+    def setUp(self) -> None:
+        self.interp = WavefrontInterpreter()
+
+    def test_wave64_preserves_exec_hi(self) -> None:
+        state = WavefrontState(wave_size=64)
+        state.exec_lo = 0x1234_5678
+        state.exec_hi = 0xDEAD_BEEF
+
+        self.interp.step_nand_saveexec_b32(dst_idx=2, s0_val=0xFFFF_FFFF, state=state)
+        # EXEC_LO is nand-ed
+        self.assertEqual(state.exec_lo, (~0x1234_5678) & MASK32)
+        # EXEC_HI is untouched!
+        self.assertEqual(state.exec_hi, 0xDEAD_BEEF)
+        # Saved D is old EXEC_LO
+        self.assertEqual(state.sgprs[2], 0x1234_5678)
+        self.assertEqual(state.scc, 1)
+
+    def test_divergent_lane_activity(self) -> None:
+        state = WavefrontState(wave_size=64)
+        state.exec_lo = 0x0000_FFFF
+        self.interp.step_nand_saveexec_b32(dst_idx=0, s0_val=0x0000_00FF, state=state)
+        # new_lo = ~(0xFF) = 0xFFFF_FF00
+        # Lanes 0..7 are deactivated (0), lanes 8..31 are active (1)
+        for lane in range(32):
+            active = bool((state.exec_lo >> lane) & 1)
+            if lane < 8:
+                self.assertFalse(active)
+            else:
+                self.assertTrue(active)
+
 if __name__ == "__main__":
     unittest.main()
