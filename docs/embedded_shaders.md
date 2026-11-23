@@ -188,8 +188,9 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
   `Box32Rehydration` and `LeafRehydration` are exactly the programs that would turn the dehydrated BVH packs
   into runtime trees ([bvh.md](bvh.md) §3.1). `LeafRehydration` translates since #1871, `Box32Rehydration`
   translates since #1968 (`427c1376`), and `Box16Rehydration` since #1864 (`buffer_store_short`, `8f208d09a`).
-* **What is still open.** None of the 52 has been executed on a GPU; translation and `spirv-val` do not prove the
-  output. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
+* **What is still open.** Translation and `spirv-val` do not prove the output. The GPU run below (TEST-594) shows the
+  translated programs execute cleanly and checks six of them byte for byte; it does not check the others' results.
+  Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
   above comes from `ILDN`, not from a runtime trace. The `STAT` metadata-only shape is consistent with reflection,
   but whether the builder consumes it has not been measured.
 * **They run on a GPU (TEST-594).** `tools/bvh_gpu_smoke.py` translates them from the package and runs each through
