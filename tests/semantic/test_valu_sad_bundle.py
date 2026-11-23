@@ -618,5 +618,28 @@ class TestVMqsadU32U8Reference(unittest.TestCase):
         self.assertEqual(outs, [6, 10, 14, 18])
 
 
+def step_scalar_mqsad(state: ValuState, dst_reg: int, s0_pair_reg: int, s1_reg: int, s2_quad_reg: int) -> None:
+    s0_64 = state.read_u64(Operand.vgpr(s0_pair_reg, 2))
+    s1 = state.read_u32(Operand.vgpr(s1_reg))
+    s2_quad = [state.read_u32(Operand.vgpr(s2_quad_reg + k)) for k in range(4)]
+    outs = ref_mqsad_u32_u8(s0_64, s1, s2_quad)
+    for k in range(4):
+        state.write_u32(dst_reg + k, outs[k])
+
+
+class TestVMqsadU32U8ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for v_mqsad_u32_u8."""
+
+    def test_scalar_interpreter_execution(self):
+        state = ValuState()
+        state.write_u32(0, 0x04030201)
+        state.write_u32(1, 0x08070605)
+        state.write_u32(2, 0x01010101)
+        for k in range(4):
+            state.write_u32(4 + k, 10)
+        step_scalar_mqsad(state, dst_reg=8, s0_pair_reg=0, s1_reg=2, s2_quad_reg=4)
+        self.assertEqual([state.vgprs[8 + k] for k in range(4)], [16, 20, 24, 28])
+
+
 if __name__ == "__main__":
     unittest.main()
