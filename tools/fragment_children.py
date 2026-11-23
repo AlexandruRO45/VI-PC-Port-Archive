@@ -49,6 +49,7 @@ import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I keeps the script directory off sys.path
+from report_paths import same_report_path  # noqa: E402
 import skin_streams as ss  # noqa: E402
 
 SYSTEM = 0x50000000
@@ -350,7 +351,7 @@ def main(argv=None):
     for out in (a.records, a.json):
         if not out:
             continue
-        if os.path.isdir(out) or ss.same_output_path(out, a.archive):
+        if os.path.isdir(out) or same_report_path(out, a.archive):
             print(f"error: {out} is a directory or the input", file=sys.stderr)
             return 2
         parent = os.path.dirname(os.path.abspath(out))
