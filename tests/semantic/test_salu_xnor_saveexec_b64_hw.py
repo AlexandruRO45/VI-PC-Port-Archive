@@ -181,5 +181,106 @@ class TestSALUXnorSaveexecReferenceOracle(unittest.TestCase):
                 self.assertEqual(hw_ff1, expected_ff1)
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class SALUOpcode(Enum):
+    """SALU 64-bit SOP1 saveexec opcodes."""
+    S_XNOR_SAVEEXEC_B64 = "s_xnor_saveexec_b64"
+    S_XOR_SAVEEXEC_B64 = "s_xor_saveexec_b64"
+    S_AND_SAVEEXEC_B64 = "s_and_saveexec_b64"
+    S_OR_SAVEEXEC_B64 = "s_or_saveexec_b64"
+
+
+class RegKind(Enum):
+    """Register kinds for 64-bit operands."""
+    SGPR_PAIR = "s"
+    VCC = "vcc"
+    EXEC = "exec"
+
+
+@dataclass(frozen=True)
+class Register64:
+    """Represents a 64-bit register operand (e.g. s[6:7], vcc, exec)."""
+    kind: RegKind
+    index: int = 0
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.SGPR_PAIR:
+            if self.index < 0 or self.index > 104:
+                raise ValueError(f"SGPR pair index out of range [0, 104]: {self.index}")
+            if self.index % 2 != 0:
+                raise ValueError(f"SGPR pair must be even aligned, got {self.index}")
+
+    @property
+    def name(self) -> str:
+        if self.kind == RegKind.SGPR_PAIR:
+            return f"s[{self.index}:{self.index + 1}]"
+        return self.kind.value
+
+    def __str__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class Immediate64:
+    """64-bit constant immediate operand."""
+    val: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "val", u64(self.val))
+
+    def __str__(self) -> str:
+        return f"{self.val:#x}"
+
+
+Operand64 = Union[Register64, Immediate64]
+
+
+@dataclass(frozen=True)
+class SXnorSaveexecInstruction:
+    """Symbolic AST node for s_xnor_saveexec_b64."""
+    dst: Register64
+    src0: Operand64
+    opcode: SALUOpcode = SALUOpcode.S_XNOR_SAVEEXEC_B64
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != RegKind.SGPR_PAIR:
+            raise ValueError(f"Destination must be an SGPR pair, got {self.dst}")
+
+    def disassemble(self) -> str:
+        return f"{self.opcode.value} {self.dst}, {self.src0}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST opcode definitions and typed expressions."""
+
+    def test_valid_ast_construction_sgpr_src(self) -> None:
+        dst = Register64(RegKind.SGPR_PAIR, 6)
+        src = Register64(RegKind.SGPR_PAIR, 12)
+        instr = SXnorSaveexecInstruction(dst=dst, src0=src)
+
+        self.assertEqual(instr.opcode, SALUOpcode.S_XNOR_SAVEEXEC_B64)
+        self.assertEqual(str(instr.dst), "s[6:7]")
+        self.assertEqual(str(instr.src0), "s[12:13]")
+        self.assertEqual(instr.disassemble(), "s_xnor_saveexec_b64 s[6:7], s[12:13]")
+
+    def test_valid_ast_construction_special_regs(self) -> None:
+        dst = Register64(RegKind.SGPR_PAIR, 8)
+        instr_vcc = SXnorSaveexecInstruction(dst=dst, src0=Register64(RegKind.VCC))
+        instr_exec = SXnorSaveexecInstruction(dst=dst, src0=Register64(RegKind.EXEC))
+
+        self.assertEqual(instr_vcc.disassemble(), "s_xnor_saveexec_b64 s[8:9], vcc")
+        self.assertEqual(instr_exec.disassemble(), "s_xnor_saveexec_b64 s[8:9], exec")
+
+    def test_imm64_construction(self) -> None:
+        dst = Register64(RegKind.SGPR_PAIR, 0)
+        imm = Immediate64(0x12345678_9ABCDEF0)
+        instr = SXnorSaveexecInstruction(dst=dst, src0=imm)
+
+        self.assertEqual(instr.disassemble(), "s_xnor_saveexec_b64 s[0:1], 0x123456789abcdef0")
+
+
 if __name__ == "__main__":
     unittest.main()
