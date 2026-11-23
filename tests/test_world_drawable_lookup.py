@@ -64,9 +64,37 @@ class DrawableLookupTest(unittest.TestCase):
                                               "predicted_placements": -score, "predicted_identities": count})
                 else:
                     self.assertIsNone(result)
-        for invalid in (0, -1, 1 << 63):
+        for invalid in (0, -1, 1 << 63, True, False, 1.5):
             with self.assertRaises(ValueError):
                 lookup.export_window(report, invalid)
+
+    def test_report_rows_wraps_recursion_error_as_value_error(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested.json"
+            path.write_text("{}", encoding="utf-8", newline="\n")
+            with patch.object(lookup.json, "load", side_effect=RecursionError("maximum recursion depth exceeded")):
+                with self.assertRaises(ValueError):
+                    lookup.report_rows(path, "files")
+
+    def test_lookup_rejects_negative_and_oversized_placement_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            h = world_names.joaat("one")
+            placements = [
+                {"archetype": f"{h:x}", "key": "-1", "position": [0, 0, 0],
+                 "rotation": [0, 0, 0, 1], "lod_level": 6},
+                {"archetype": f"{h:x}", "key": "10000000000000000", "position": [0, 0, 0],
+                 "rotation": [0, 0, 0, 1], "lod_level": 6},
+            ]
+            for file, data in [("defs", {"archetypes": [{"name": h, "asset_name": h, "asset_type": 2}]}),
+                               ("names", {"summary": {"archive": "test.rpf"}, "files": []})]:
+                (root / file).write_text(json.dumps(data), encoding="utf-8", newline="\n")
+            (root / "entities").write_text("\n".join(map(json.dumps, placements)), encoding="utf-8", newline="\n")
+            result = lookup.lookup(root / "entities", root / "defs", root / "names", [])
+            self.assertEqual(result["outcomes"], {"missing_or_invalid_key": 2})
+            self.assertEqual(result["candidates"], [])
 
 
 if __name__ == "__main__":

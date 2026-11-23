@@ -12,7 +12,10 @@ import world_names
 
 def report_rows(path, field):
     with open(path, encoding="utf-8-sig") as handle:
-        report = json.load(handle)
+        try:
+            report = json.load(handle)
+        except RecursionError:
+            raise ValueError(f"{path}: JSON nesting too deep") from None
     if not isinstance(report, dict) or not isinstance(report.get(field), list):
         raise ValueError(f"{path}: expected a {field} array")
     if any(not isinstance(row, dict) for row in report[field]):
@@ -32,6 +35,9 @@ def lookup(placements, archetypes, names, manifests):
         try:
             key = int(row.get("key"), 16)
         except (TypeError, ValueError):
+            outcomes["missing_or_invalid_key"] += 1
+            continue
+        if not 0 <= key <= 0xFFFFFFFFFFFFFFFF:
             outcomes["missing_or_invalid_key"] += 1
             continue
         wanted[row["_arch"], key] += 1
@@ -84,7 +90,7 @@ def lookup(placements, archetypes, names, manifests):
 
 def export_window(report, budget):
     """Maximize single-offset placement predictions within one archive's scan budget."""
-    if not 0 < budget <= (1 << 63) - 1:
+    if type(budget) is not int or not 0 < budget <= (1 << 63) - 1:
         raise ValueError("window bytes must be a positive signed 64-bit integer")
 
     weights = Counter()
