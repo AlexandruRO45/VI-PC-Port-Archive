@@ -63,6 +63,9 @@ class ToolStartupTests(unittest.TestCase):
                                       timeout=TIMEOUT, errors="replace")
                 self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
                 self.assertNotIn("Traceback", proc.stderr)
+                with open(path, encoding="utf-8") as source:
+                    if "argparse.ArgumentParser" in source.read():
+                        self.assertIn("usage:", proc.stdout.lower())
 
     def test_the_two_fixed_tools_are_in_the_scan(self):
         names = {os.path.splitext(os.path.basename(path))[0] for path in sibling_importers()}
