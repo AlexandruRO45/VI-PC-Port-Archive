@@ -111,6 +111,15 @@ class VertexShader(unittest.TestCase):
 
 
 class GeometryShaderLookup(unittest.TestCase):
+    def test_job_env_drops_inherited_per_job_variables(self):
+        base = {"PATH": "p", "VKS_GS": "stale.spv", "VKS_TEX": "1", "VKS_NEED_MAINTENANCE8": "1"}
+        env = ps_sweep.job_env(base, 9, "z", {}, None)
+        for k in ps_sweep.JOB_VARS:
+            self.assertNotIn(k, env)
+        self.assertEqual((env["PATH"], env["VKS_TIMEOUT_S"]), ("p", "9"))
+        env = ps_sweep.job_env(base, 9, "t", {"needs_maintenance8": True}, "g.spv")
+        self.assertEqual((env["VKS_GS"], env["VKS_TEX"], env["VKS_NEED_MAINTENANCE8"]), ("g.spv", "1", "1"))
+
     def test_gs_is_the_bary_gs_file_beside_the_pixel_shader(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertIsNone(ps_sweep.gs_for(d, "x1"))
