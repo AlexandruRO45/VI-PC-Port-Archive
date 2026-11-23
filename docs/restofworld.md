@@ -715,6 +715,15 @@ Bit 30 set means `cross(normal, tangent)` runs along `+v`. The shaders turn a se
 which operand order they use was not traced here. The 8-bit form in core_restofworld fits least;
 this check does not say why.
 
+Over the whole game (the same seven-archive run as for the normal):
+
+| Form | Vertices checked | Along u | Random angle | Bit 30 = bitangent side |
+| --- | --- | --- | --- | --- |
+| 10-bit | 67,646,981 | 65,247,675 (96.5%) | 15,656,493 (23.1%) | 64,884,198 (99.4%) |
+| 8-bit | 5,897,766 | 5,361,088 (90.9%) | 1,272,320 (21.6%) | 5,296,402 (98.8%) |
+
+So the 8-bit form's weak fit in the core_restofworld sample (56.4%) is local to that archive.
+
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the bodies of the
 `RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
 core graphics blocks, final-slot widths remain unresolved (`0x21`, the last unread component type,
