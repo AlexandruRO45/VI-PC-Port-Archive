@@ -18113,6 +18113,22 @@ def main():
         files = files[:a.limit]
     if shard is not None:
         files = files[shard::sn]
+    import json as _js
+    old = {}
+    if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
+        # A partial run merges into the index already in --out. Read it before any module is written: an index.json
+        # this run cannot use (another file's JSON, a truncated write, a Windows editor's BOM) used to reach
+        # old.pop()/old.update() and traceback after the whole run, leaving its index replaced.
+        try:
+            with open(idx_path, encoding="utf-8-sig") as f:
+                old = _js.load(f)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot read the existing index {idx_path}: {e}; delete it and run again", file=sys.stderr)
+            return 2
+        if not isinstance(old, dict):
+            print(f"ERROR: {idx_path} is not a shader index (an object of shader names); "
+                  "delete it and run again", file=sys.stderr)
+            return 2
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
@@ -18196,13 +18212,8 @@ def main():
             else:
                 eta = ""
             print(f"  {label}: {i}/{total} ({pct}%){eta}", flush=True)
-    import json as _js
-    old = {}
-    if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
-        with open(idx_path, encoding="utf-8") as f:
-            old = _js.load(f)  # partial runs merge into an existing index
-        for name in invalid:
-            old.pop(name, None)
+    for name in invalid:
+        old.pop(name, None)
     old.update(meta)
     if shard is None or not missing_inputs:
         write_index(idx_path, old)

@@ -546,6 +546,52 @@ class ValidatedOutput(unittest.TestCase):
         self.assertIn("ps_fixture", json.loads(self.index.read_text(encoding="utf-8")))
 
 
+class ResumeIndex(unittest.TestCase):
+    """A partial run merges into the index.json already in --out; one that is not a shader index is refused with
+    one error line before any module is written (it used to reach old.pop()/old.update() and traceback after the
+    whole translation, with the index already replaced)."""
+
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.src = self.tmp / "disasm"
+        self.src.mkdir()
+        (self.src / "ps_x.s").write_text("\ts_endpgm\n", encoding="utf-8")
+        (self.tmp / "ps_x.dxbc").write_bytes(b"DXBC" + bytes(28))
+        self.out = self.tmp / "spirv"
+        self.out.mkdir()
+        self.index = self.out / "index.json"
+
+    def test_a_non_object_or_broken_index_is_one_error_line_and_writes_nothing(self):
+        for text in ("[]", "null", "42", '"ps_x"', "", '{"ps_x": }'):
+            with self.subTest(text=text):
+                self.index.write_text(text, encoding="utf-8")
+                p = subprocess.run([sys.executable, "-I", TOOL, str(self.src), "--out", str(self.out)],
+                                   capture_output=True, text=True, errors="replace")
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+                self.assertTrue(p.stderr.startswith("ERROR: "), p.stderr)
+                self.assertIn("index.json", p.stderr)
+                self.assertEqual(self.index.read_text(encoding="utf-8"), text)  # kept for the user to inspect
+                self.assertFalse((self.out / "ps_x.spv").exists())
+                self.assertFalse((self.out / "ps_x.spvasm").exists())
+
+    def test_an_index_saved_with_a_bom_is_read_and_merged(self):
+        # A Windows text editor adds one; the run must keep the entries it already holds.
+        self.index.write_bytes(b'\xef\xbb\xbf{"ps_kept": {"stage": "vs"}}')
+
+        def spirv_tool(cmd, **kwargs):
+            if cmd[0] == "spirv-as":
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                redirect_stdout(io.StringIO()):
+            self.assertIsNone(rdna2spirv.main())
+        self.assertEqual(set(json.loads(self.index.read_text(encoding="utf-8"))), {"ps_kept", "ps_x"})
+
+
 class EmptyShader(unittest.TestCase):
     """A .s with no tab-indented instruction parses to an empty shader.
 
