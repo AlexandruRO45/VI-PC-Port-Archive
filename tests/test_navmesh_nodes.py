@@ -277,6 +277,12 @@ class ArchiveTest(unittest.TestCase):
             f.write("{}\n")
         os.chmod(out, 0o444)
         try:
+            try:   # the mode only binds a process that cannot open the file for writing
+                with open(out, "ab"):
+                    pass
+                self.skipTest("the 0o444 --out is still writable (running as root, or a file system ignoring modes)")
+            except OSError:
+                pass
             junk = os.path.join(self.tmp.name, "junk.rpf")
             with open(junk, "wb") as f:
                 f.write(b"not an archive")
