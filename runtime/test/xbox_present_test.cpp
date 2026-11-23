@@ -62,6 +62,9 @@ struct Px {
 
 constexpr HRESULT invalid_state = HRESULT_FROM_WIN32(ERROR_INVALID_STATE);
 constexpr UINT width = 320, height = 240;
+// The test drives resizing itself. A resizable top-level window can be tiled by the host compositor under Wine,
+// which gives it the tile's size instead of the requested client area.
+constexpr DWORD window_style = WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
 
 // The swapchain frame as RGB, whatever its channel order.
 struct Frame {
@@ -270,8 +273,8 @@ int main() {
     window_class.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
     EXPECT(RegisterClassW(&window_class));
     RECT frame_rect{0, 0, int(width), int(height)};
-    AdjustWindowRect(&frame_rect, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida: PresentX on Vulkan", WS_OVERLAPPEDWINDOW,
+    AdjustWindowRect(&frame_rect, window_style, FALSE);
+    HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida: PresentX on Vulkan", window_style,
                                   100, 100, frame_rect.right - frame_rect.left, frame_rect.bottom - frame_rect.top,
                                   nullptr, nullptr, window_class.hInstance, nullptr);
     EXPECT(window);
@@ -1084,7 +1087,7 @@ int main() {
             const UINT sizes[][2] = {{400, 300}, {200, 150}, {width, height}};
             for (const auto& size : sizes) {
                 RECT outer{0, 0, LONG(size[0]), LONG(size[1])};
-                AdjustWindowRect(&outer, WS_OVERLAPPEDWINDOW, FALSE);
+                AdjustWindowRect(&outer, window_style, FALSE);
                 SetWindowPos(window, nullptr, 0, 0, outer.right - outer.left, outer.bottom - outer.top,
                              SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
                 pump();
