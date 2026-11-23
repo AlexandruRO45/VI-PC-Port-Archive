@@ -104,5 +104,65 @@ class SXnorB64AstValidationTests(unittest.TestCase):
         self.assertEqual(ast.src1.kind, RegKind.IMM)
         self.assertEqual(ast.src1.raw_val, 0)
 
+class ScalarRegisterState:
+    def __init__(self):
+        self.sgprs: dict[int, int] = {}
+        self.scc: int = 0
+
+    def get_sgpr_pair(self, idx: int) -> int:
+        lo = self.sgprs.get(idx, 0) & MASK32
+        hi = self.sgprs.get(idx + 1, 0) & MASK32
+        return (hi << 32) | lo
+
+    def set_sgpr_pair(self, idx: int, val: int):
+        val &= MASK64
+        self.sgprs[idx] = val & MASK32
+        self.sgprs[idx + 1] = (val >> 32) & MASK32
+
+    def get_operand_val(self, op: Operand64) -> int:
+        if op.kind == RegKind.SGPR:
+            return self.get_sgpr_pair(op.index)
+        else:
+            return op.raw_val & MASK64
+
+
+def execute_scalar_xnor_b64(state: ScalarRegisterState, ast: InstructionAST) -> None:
+    s0 = state.get_operand_val(ast.src0)
+    s1 = state.get_operand_val(ast.src1)
+    res, scc = oracle_xnor_b64(s0, s1)
+    state.set_sgpr_pair(ast.dst.index, res)
+    state.scc = scc
+
+
+class SXnorB64ScalarInterpreterTests(unittest.TestCase):
+    def test_scalar_execution_basic(self):
+        state = ScalarRegisterState()
+        state.set_sgpr_pair(0, 0x000000000000FFFF)
+        state.set_sgpr_pair(2, 0xFFFFFFFF0000FFFF)
+        ast = InstructionAST(
+            "s_xnor_b64",
+            Operand64(RegKind.SGPR, 4),
+            Operand64(RegKind.SGPR, 0),
+            Operand64(RegKind.SGPR, 2),
+        )
+        execute_scalar_xnor_b64(state, ast)
+        res = state.get_sgpr_pair(4)
+        self.assertEqual(res, 0x00000000FFFFFFFF)
+        self.assertEqual(state.scc, 1)
+
+    def test_scalar_execution_zero_result(self):
+        state = ScalarRegisterState()
+        state.set_sgpr_pair(0, 0x123456789ABCDEF0)
+        state.set_sgpr_pair(2, (~0x123456789ABCDEF0) & MASK64)
+        ast = InstructionAST(
+            "s_xnor_b64",
+            Operand64(RegKind.SGPR, 4),
+            Operand64(RegKind.SGPR, 0),
+            Operand64(RegKind.SGPR, 2),
+        )
+        execute_scalar_xnor_b64(state, ast)
+        self.assertEqual(state.get_sgpr_pair(4), 0)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
