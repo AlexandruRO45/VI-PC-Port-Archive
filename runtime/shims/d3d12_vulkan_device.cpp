@@ -2646,7 +2646,11 @@ public:
                 code_stage = &stage;
             }
             stage.words = library->spirv(*stage.entry);
-            if (stage.words.empty()) return E_FAIL;
+            if (stage.words.empty()) {
+                // Name the file, as the compute path does: a stale or partial shader folder must not fail silently.
+                std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", stage.entry->name.c_str());
+                return E_FAIL;
+            }
         }
         // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
         // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.

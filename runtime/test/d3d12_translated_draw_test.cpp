@@ -37,6 +37,8 @@
 
 #include <array>
 #include <cstring>
+#include <io.h>
+#include <string>
 
 #ifndef LEONIDA_TEST_M15_DIR
 #error "LEONIDA_TEST_M15_DIR must name the folder build.py wrote (spirv/index.json, fssm/*.fssm)"
@@ -55,6 +57,30 @@ std::vector<std::uint8_t> read_file(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
+
+// Sends stderr (where the layer logs) to a file while it lives.
+struct StderrCapture {
+    std::filesystem::path path;
+    int saved = -1;
+    explicit StderrCapture(const std::filesystem::path& file) : path(file) {
+        std::fflush(stderr);
+        std::FILE* out = std::fopen(path.string().c_str(), "wb");
+        saved = _dup(2);
+        if (out && saved >= 0) _dup2(_fileno(out), 2);
+        if (out) std::fclose(out);
+    }
+    std::string finish() {
+        std::fflush(stderr);
+        if (saved >= 0) {
+            _dup2(saved, 2);
+            _close(saved);
+            saved = -1;
+        }
+        std::ifstream in(path, std::ios::binary);
+        return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    }
+    ~StderrCapture() { finish(); }
+};
 
 // One 32-byte vertex record, as vs_m15.asm reads it: position xyzw, then colour rgba.
 struct Vertex {
@@ -167,6 +193,36 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
         pso_desc.VS = {unknown_container.data(), unknown_container.size()};
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
+
+        // A stage the index lists but whose .spv is gone (a stale or partial shader folder): the PSO fails, and the
+        // log names the file, as the compute path does.
+        {
+            const std::filesystem::path partial = std::filesystem::temp_directory_path() / "leonida_m15_missing_spv";
+            std::filesystem::remove_all(partial);
+            std::filesystem::copy(root_dir / "spirv", partial, std::filesystem::copy_options::recursive);
+            EXPECT(std::filesystem::remove(partial / "ps_m15.spv"));
+            rt::d3d12::VulkanDeviceInfo partial_info = info;
+            partial_info.shader_dir = partial.string();
+            ID3D12Device* partial_inner = nullptr;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(partial_info, IID_PPV_ARGS(&partial_inner))));
+            Ref<ID3D12Device> partial_device;
+            EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(partial_inner, __uuidof(ID3D12Device),
+                                                               reinterpret_cast<void**>(&partial_device.p))));
+            rt::d3d12::set_device_outer(partial_inner, partial_device.p);
+            Ref<ID3D12RootSignature> partial_root;
+            EXPECT(SUCCEEDED(partial_device->CreateRootSignature(0, root_blob.data(), root_blob.size(),
+                                                                 IID_PPV_ARGS(&partial_root.p))));
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC partial_desc = pso_desc;
+            partial_desc.pRootSignature = partial_root.p;
+            partial_desc.VS = {vs_container.data(), vs_container.size()};
+            Ref<ID3D12PipelineState> partial_pso;
+            StderrCapture log(partial / "stderr.txt");
+            const HRESULT hr =
+                partial_device->CreateGraphicsPipelineState(&partial_desc, IID_PPV_ARGS(&partial_pso.p));
+            const std::string text = log.finish();
+            EXPECT(hr == E_FAIL && !partial_pso.p);
+            EXPECT(text.find("ps_m15.spv is missing or not SPIR-V") != std::string::npos);
+        }
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
