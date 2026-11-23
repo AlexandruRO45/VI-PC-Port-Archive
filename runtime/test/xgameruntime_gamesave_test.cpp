@@ -295,6 +295,26 @@ int main() {
     int64_t fquota = 0;
     check(at<FilesQuota>(save, 32)(save, user, "SCID", &fquota) == S_OK && fquota == (int64_t{1} << 30),
           "FilesGetRemainingQuota of an empty folder");
+    // Empty or path-separator configurationId must be rejected with E_INVALIDARG (never inspect the files root).
+    {
+        const std::filesystem::path extra = root / L"files" / L"other";
+        std::filesystem::create_directories(extra, ec);
+        {
+            std::ofstream f(extra / L"blob.bin", std::ios::binary);
+            f << "12345678";
+        }
+        int64_t untouched_quota = -1;
+        for (const char* bad_id : {static_cast<const char*>(nullptr), "", "a/b", "a\\b", "/", "\\"}) {
+            XAsyncBlock bad_async{};
+            check(at<FolderAsync>(save, 30)(save, user, bad_id, &bad_async) == E_INVALIDARG,
+                  "FilesGetFolderWithUiAsync rejects empty or path-separator configId");
+            untouched_quota = -1;
+            check(at<FilesQuota>(save, 32)(save, user, bad_id, &untouched_quota) == E_INVALIDARG &&
+                      untouched_quota == -1,
+                  "FilesGetRemainingQuota rejects empty or path-separator configId");
+        }
+        std::filesystem::remove_all(extra, ec);
+    }
 
     // ---- a handle that outlives its container, after the heap hands the address out again ----
     // An update and an async read keep the container handle they were made from. Once that container is closed, the

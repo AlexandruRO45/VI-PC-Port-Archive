@@ -151,6 +151,13 @@ bool valid_container_name(const char* name) {
 
 bool valid_blob_name(const char* name) { return name && name[0] && std::strlen(name) <= kMaxBlobName; }
 
+bool valid_config_id(const char* id) {
+    if (!id || !id[0]) return false;
+    for (const char* p = id; *p; ++p)
+        if (*p == '/' || *p == '\\') return false;
+    return true;
+}
+
 std::wstring widen(const std::string& s) {
     if (s.empty()) return {};
     const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
@@ -858,7 +865,7 @@ HRESULT STDMETHODCALLTYPE save_submit_result(void*, XAsyncBlock* async) {
 // 30: HRESULT XGameSaveFilesGetFolderWithUiAsync(XUserHandle requestingUser, const char* configurationId,
 //                                                XAsyncBlock* async): a folder of its own, <root>\files\<configId>.
 HRESULT STDMETHODCALLTYPE files_folder_async(void*, XUserHandle user, const char* config_id, XAsyncBlock* async) {
-    if (!user || !config_id) return E_INVALIDARG;
+    if (!user || !valid_config_id(config_id)) return E_INVALIDARG;
     auto* job = new Job{&kFolderIdentity};
     job->user = user;
     job->text = config_id;
@@ -878,7 +885,7 @@ HRESULT STDMETHODCALLTYPE files_folder_result(void*, XAsyncBlock* async, size_t 
 //                                             int64_t* remainingQuota)
 HRESULT STDMETHODCALLTYPE files_quota(void*, XUserHandle user, const char* config_id, int64_t* remaining) {
     if (!remaining) return E_POINTER;
-    if (!user || !config_id) return E_INVALIDARG;
+    if (!user || !valid_config_id(config_id)) return E_INVALIDARG;
     const fs::path root = save_root();
     if (root.empty()) return E_GS_OUT_OF_LOCAL_STORAGE;
     uint64_t used = 0;
