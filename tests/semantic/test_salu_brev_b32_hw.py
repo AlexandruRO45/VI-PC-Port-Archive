@@ -630,6 +630,47 @@ class TestSaluBrevB32ConditionCodes(unittest.TestCase):
                 self.assertEqual(res, ref_s_brev_b32(0x12345678))
                 self.assertEqual(out_scc, scc)
 
+# --- Section 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling ---
+
+class TestSaluBrevB32IEEE754BitPatterns(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling tests."""
+
+    def test_ieee754_boundary_patterns(self) -> None:
+        cases = {
+            "pos_zero (+0.0f)": 0x00000000,
+            "neg_zero (-0.0f)": 0x80000000,
+            "pos_one (+1.0f)": 0x3F800000,
+            "neg_one (-1.0f)": 0xBF800000,
+            "pos_inf (+inf)": 0x7F800000,
+            "neg_inf (-inf)": 0xFF800000,
+            "quiet_nan (qNaN)": 0x7FC00000,
+            "neg_quiet_nan (-qNaN)": 0xFFC00000,
+            "signaling_nan (sNaN)": 0x7F800001,
+            "min_subnormal": 0x00000001,
+            "max_subnormal": 0x007FFFFF,
+            "min_normal": 0x00800000,
+            "max_normal": 0x7F7FFFFF,
+        }
+        for name, bits in cases.items():
+            with self.subTest(case=name):
+                expected = ref_s_brev_b32(bits)
+                self.assertEqual(ref_s_brev_b32_bitwise(bits), expected)
+                hw_res = run_salu_brev_ps(bits)
+                self.assertEqual(hw_res, expected)
+
+    def test_float_roundtrip_bit_integrity(self) -> None:
+        """Verify no NaN-boxing or flush-to-zero occurs during bit reversal."""
+        nan_payloads = [
+            0x7FC00001,
+            0x7FC0ABCD,
+            0xFFC00001,
+            0x7FFFFFFF,
+        ]
+        for nan in nan_payloads:
+            with self.subTest(nan=hex(nan)):
+                res = run_salu_brev_ps(nan)
+                self.assertEqual(res, ref_s_brev_b32(nan))
+
 
 if __name__ == "__main__":
     unittest.main()
