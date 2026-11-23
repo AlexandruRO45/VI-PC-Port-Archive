@@ -183,6 +183,12 @@ class TestDenormModeSyntax(unittest.TestCase):
         except rdna2spirv.Unsupported as e:
             self.assertIn("denormal mode writes are not modelled", str(e))
 
+class TestDenormModeTranslator(unittest.TestCase):
+    def test_translator_rejection_guard(self):
+        prog = ["s_denorm_mode 3", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("cs_denorm_trans", prog, fssm=saveexec_run.fssm())
+
 
 if __name__ == "__main__":
     unittest.main()
