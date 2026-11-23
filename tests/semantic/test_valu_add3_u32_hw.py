@@ -466,5 +466,61 @@ class TestValuAdd3U32RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.state.vgprs[4], 0xBBBB_BBBB)
 
 
+# ---------------------------------------------------------------------------
+# Stage 6: Condition codes, status flags, and carry/borrow generation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class Add3StatusFlags:
+    """Status flags and carry analysis for 3-operand addition."""
+    zero: bool
+    negative: bool
+    carry_count: int  # 0, 1, or 2 (since 3 * (2^32 - 1) < 3 * 2^32)
+    parity: bool      # True if even parity
+
+
+def compute_add3_status_flags(a: int, b: int, c: int) -> Add3StatusFlags:
+    total = u32(a) + u32(b) + u32(c)
+    res = total & MASK32
+    carry = total >> 32
+    zero = (res == 0)
+    negative = bool(res & SIGN_BIT32)
+    parity = (bin(res).count("1") % 2 == 0)
+    return Add3StatusFlags(
+        zero=zero,
+        negative=negative,
+        carry_count=carry,
+        parity=parity,
+    )
+
+
+class TestValuAdd3U32ConditionCodes(unittest.TestCase):
+    """Stage 6: Condition codes, status flags, and carry generation for v_add3_u32."""
+
+    def test_status_flags_zero(self) -> None:
+        flags = compute_add3_status_flags(0, 0, 0)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertEqual(flags.carry_count, 0)
+        self.assertTrue(flags.parity)
+
+    def test_status_flags_single_carry(self) -> None:
+        flags = compute_add3_status_flags(MASK32, 1, 0)
+        self.assertTrue(flags.zero)
+        self.assertEqual(flags.carry_count, 1)
+
+    def test_status_flags_double_carry(self) -> None:
+        flags = compute_add3_status_flags(MASK32, MASK32, MASK32)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertEqual(flags.carry_count, 2)
+        self.assertEqual(flags.carry_count * (1 << 32) + (MASK32 - 2), MASK32 * 3)
+
+    def test_status_flags_negative(self) -> None:
+        flags = compute_add3_status_flags(0x8000_0000, 0, 0)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+
+
 if __name__ == "__main__":
     unittest.main()
