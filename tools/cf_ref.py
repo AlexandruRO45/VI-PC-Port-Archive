@@ -246,6 +246,26 @@ class WaveMachine(cpu_ref.Machine):
                 self._write_scalar_dst(a[0], r)
             self.scc = 1 if r else 0
             return None
+        if base in ("s_getpc_b64", "s_setpc_b64"):
+            # s_getpc_b64: D = the byte address of the next instruction (the listing's code starts at 0).
+            # s_setpc_b64: jump to the address in S0.
+            self._expect(ins, 1)
+            r = a[0]
+            if r["k"] != "sgpr" or r.get("n", 1) != 2:
+                raise Unsupported(op, self.pc, "expected an SGPR pair")
+            if base == "s_getpc_b64":
+                self.sgpr[r["r"]] = self.next_pc & MASK32
+                self.sgpr[r["r"] + 1] = (self.next_pc >> 32) & MASK32
+                return None
+            return self.sgpr.get(r["r"], 0) | (self.sgpr.get(r["r"] + 1, 0) << 32)
+        if base in ("s_addc_u32", "s_subb_u32"):
+            # D = S0 + S1 + SCC / S0 - S1 - SCC; SCC = the carry / borrow out.
+            self._expect(ins, 3)
+            x, y = self._int_src(a[1], 0, scalar=True), self._int_src(a[2], 0, scalar=True)
+            t = x + y + self.scc if base == "s_addc_u32" else x - y - self.scc
+            self.scc = (1 if t >> 32 else 0) if base == "s_addc_u32" else (1 if t < 0 else 0)
+            self._write_scalar_dst(a[0], t & MASK32)
+            return None
         if base in ("v_readlane_b32", "v_writelane_b32"):
             # VOP3, EXEC ignored: readlane sD = vS[lane]; writelane vD[lane] = sS, every other lane kept. The lane
             # is S1[4:0] in wave32 and S1[5:0] in wave64.

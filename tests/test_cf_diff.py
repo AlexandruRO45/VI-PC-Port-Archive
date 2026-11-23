@@ -90,6 +90,37 @@ LANE_CASES = {
                                                                    ("lanes", "write", "s10", 9, 13), ("probe", 4)])],
 }
 
+# The far-branch idiom (fold_far_branches): s_getpc_b64; s_add|sub_u32 K; s_addc|subb_u32 0|-1; s_setpc_b64.
+FAR_CASES = {
+    "forward over a block that never runs": [("far", "fwd", 0, [("probe", 3), ("op", "v_add_nc_u32 v9, 1, v9")]),
+                                             ("probe", 5)],
+    "loop back edge, s_sub_u32 / s_subb_u32": [("far", "sub", 3, [("probe", 3)])],
+    "loop back edge, s_add_u32 -K / s_addc_u32 -1": [("far", "addneg", 2, [("probe", 3),
+                                                                           ("op", "s_add_u32 s10, s10, 1")])],
+    "nested in a divergent if": [("if", ("gt", "u32", 4, 0), True, [
+        ("far", "sub", 2, [("probe", 3), ("far", "fwd", 0, [("probe", 9)])])])],
+}
+
+
+@pytest.mark.parametrize("case", sorted(FAR_CASES))
+@pytest.mark.parametrize("wave", (32, 64))
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_far_branches(case, wave, structured):
+    status, detail = cf_diff.run_case("ps_far", FAR_CASES[case], wave, structured)
+    assert status == "match", detail
+
+
+def test_far_branch_cases_catch_a_lost_sign(monkeypatch):
+    """With the s_sub_u32 form read as +K, the loop case jumps the wrong way."""
+    orig = rdna2spirv.fold_far_branches
+
+    def wrong(insns):
+        flipped = [dict(x, op="s_add_u32") if rdna2spirv.base_op(x["op"]) == "s_sub_u32" else x for x in insns]
+        flipped = [dict(x, op="s_addc_u32") if rdna2spirv.base_op(x["op"]) == "s_subb_u32" else x for x in flipped]
+        return orig(flipped)
+    monkeypatch.setattr(rdna2spirv, "fold_far_branches", wrong)
+    assert cf_diff.run_case("ps_far", FAR_CASES["loop back edge, s_sub_u32 / s_subb_u32"], 32)[0] != "match"
+
 
 @pytest.mark.parametrize("case", sorted(LANE_CASES))
 @pytest.mark.parametrize("wave", (32, 64))
@@ -273,7 +304,7 @@ def test_generator_covers_every_shape():
     for i in range(200):
         walk(cf_diff.generate(random.Random(i), 32))
     assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe",
-            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall", "wqm", "lanes"} <= kinds
+            "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall", "wqm", "lanes", "far"} <= kinds
 
 
 @pytest.mark.parametrize("op_name", ("andn2", "orn2", "xor", "nand", "nor", "xnor"))

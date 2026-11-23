@@ -33,6 +33,9 @@ Shapes (each nests, up to --depth):
   lanes     v_readlane (added to every active lane) / v_writelane (into a data VGPR) of a constant lane (also one
             past the wave, which wraps) or an SGPR lane, at any depth: EXEC is ignored, so an inactive lane is read
             or written too
+  far       the far-branch idiom s_getpc_b64 -> s_add_u32 K -> s_addc_u32 0 -> s_setpc_b64 over a block that never
+            runs, or as the back edge of a uniform counter loop (s_sub_u32 K / s_subb_u32 0, or s_add_u32 -K /
+            s_addc_u32 -1)
   wqm       s_wqm of EXEC (after narrowing it to a compare) or of VCC into EXEC: every lane of a quad with an active
             lane runs the body, even one an enclosing if had turned off [-> s_cbranch_execz]; EXEC restored with
             s_mov; or s_wqm of a compare into an SGPR -> s_cbranch_scc0/1 (SCC = any quad on)
@@ -151,7 +154,11 @@ class Gen:
         kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
                          "vloop", "irr", "sccmask", "csel", "ifs", "ifs", "cexec", "halfexec", "halfscc", "scmpmask",
                          "cselmask", "vccloop", "cmpxloop", "mread", "mread", "waterfall",
-                         "waterfall", "wqm", "wqm", "lanes", "lanes"))
+                         "waterfall", "wqm", "wqm", "lanes", "lanes", "far"))
+        if kind == "far":
+            if r.random() < 0.5:
+                return ("far", "fwd", 0, [self.probe()] + self.block(depth))
+            return ("far", r.choice(("sub", "addneg")), r.randrange(1, 4), [self.probe()] + self.block(depth))
         if kind == "lanes":
             lane = f"s{r.choice(SREGS)}" if r.random() < 0.3 else r.randrange(0, 2 * self.wave)
             # Writes favour v8/v9, which go straight to the export, so a lost write to an inactive lane shows.
@@ -428,6 +435,28 @@ class Emitter:
                 self.nodes(body)
                 self.depth -= 1
                 self.place(end)
+        elif kind == "far":
+            # s[2:3] is scratch: the four instructions use it and nothing reads it after the jump.
+            _, form, trips, body = n
+            if form == "fwd":
+                end = self.label()
+                self.items.append(("far", "add", end))
+                self.depth += 1
+                self.nodes(body)            # never runs
+                self.depth -= 1
+                self.place(end)
+            else:
+                ctr, head, out_ = 14 + self.depth, self.label(), self.label()
+                self.ins(f"s_mov_b32 s{ctr}, 0")
+                self.place(head)
+                self.depth += 1
+                self.nodes(body)
+                self.depth -= 1
+                self.ins(f"s_add_u32 s{ctr}, s{ctr}, 1")
+                self.ins(f"s_cmp_ge_u32 s{ctr}, {trips}")
+                self.br("s_cbranch_scc1", out_)
+                self.items.append(("far", form, head))
+                self.place(out_)
         elif kind == "lanes":
             _, rw, lane, v, sr = n
             sel = lane if isinstance(lane, str) else str(lane)
@@ -657,7 +686,7 @@ class Emitter:
             if it[0] == "label":
                 where[it[1]] = pc
                 continue
-            size = 4 if it[0] == "br" else _size(it[1])
+            size = 4 if it[0] == "br" else FAR_SIZE if it[0] == "far" else _size(it[1])
             sized.append((it, pc, size))
             pc += size
         out = []
@@ -665,9 +694,24 @@ class Emitter:
             if it[0] == "br":
                 off = (where[it[2]] - (at + 4)) // 4
                 out.append((f"{it[1]} {off}", size))
+            elif it[0] == "far":
+                # s_getpc_b64 gives at + 4; the target is that plus K (the s_add_u32 literal always takes 4 bytes).
+                _, form, label = it
+                k = where[label] - (at + 4)
+                if form == "add":
+                    lines = [f"s_add_u32 s2, s2, 0x{k & 0xFFFFFFFF:x}", "s_addc_u32 s3, s3, 0"]
+                elif form == "sub":
+                    lines = [f"s_sub_u32 s2, s2, 0x{-k & 0xFFFFFFFF:x}", "s_subb_u32 s3, s3, 0"]
+                else:
+                    lines = [f"s_add_u32 s2, s2, 0x{k & 0xFFFFFFFF:x}", "s_addc_u32 s3, s3, -1"]
+                for text, sz in [("s_getpc_b64 s[2:3]", 4), (lines[0], 8), (lines[1], 4), ("s_setpc_b64 s[2:3]", 4)]:
+                    out.append((text, sz))
             else:
                 out.append((it[1], size))
         return out
+
+
+FAR_SIZE = 20       # s_getpc_b64 (4) + s_add/sub_u32 with a literal (8) + s_addc/subb_u32 (4) + s_setpc_b64 (4)
 
 
 def _size(text):

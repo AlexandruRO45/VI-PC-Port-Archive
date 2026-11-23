@@ -992,5 +992,25 @@ class LaneSelectTests(CfRefTestCase):
         self.assertEqual(res["exports"][4][0], 104)
 
 
+class FarBranchTests(CfRefTestCase):
+    def test_getpc_carry_ops_and_setpc(self):
+        # Byte PCs: s_mov 0x0 (literal, 8 bytes), s_add 0x8, s_addc 0xc, s_sub 0x10, s_subb 0x14, s_getpc 0x18,
+        # s_add 0x1c (8 bytes), s_addc 0x24, s_setpc 0x28, s_endpgm 0x2c. s_getpc gives 0x1c; + 0x10 is the end.
+        items = [
+            "s_mov_b32 s0, 0xffffffff",
+            "s_add_u32 s1, s0, 2",                  # 1, carry out
+            "s_addc_u32 s2, 5, 0",                  # 5 + 0 + carry = 6, no carry out
+            "s_sub_u32 s3, 0, 1",                   # 0xffffffff, borrow out
+            "s_subb_u32 s4, 10, 2",                 # 10 - 2 - borrow = 7
+            ("s_getpc_b64 s[6:7]", 4),
+            ("s_add_u32 s6, s6, 0x10", 8),
+            ("s_addc_u32 s7, s7, 0", 4),
+            ("s_setpc_b64 s[6:7]", 4),
+            "s_endpgm",
+        ]
+        sg = self.run_items(items, wave=32)["sgpr"]
+        self.assertEqual((sg[1], sg[2], sg[3], sg[4]), (1, 6, MASK32, 7))
+        self.assertEqual((sg[6], sg[7]), (0x2c, 0))
+
 if __name__ == "__main__":
     unittest.main()
