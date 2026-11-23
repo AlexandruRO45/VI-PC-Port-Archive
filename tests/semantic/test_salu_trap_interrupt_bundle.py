@@ -150,5 +150,31 @@ class TestSTtraceDataPreservation(unittest.TestCase):
         self.assertEqual(words, [0xFEEDFACE, 0xCAFEBABE, 0xFEEDFACE, 0xCAFEBABE])
 
 
+class TestSTtraceDataChaining(unittest.TestCase):
+    def test_consecutive_ttracedata(self):
+        lines = [
+            "s_mov_b32 s0, 0x100",
+            "s_ttracedata s0",
+            "s_ttracedata s0",
+            "s_ttracedata s0",
+            "v_mov_b32 v0, s0",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x100, 0x100, 0x100, 0x100])
+
+    def test_interleaved_alu_ttracedata(self):
+        lines = [
+            "s_mov_b32 s0, 10",
+            "s_ttracedata s0",
+            "s_add_u32 s0, s0, 5",
+            "s_ttracedata s0",
+            "s_add_u32 s0, s0, 5",
+            "s_ttracedata s0",
+            "v_mov_b32 v0, s0",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [20, 20, 20, 20])
+
+
 if __name__ == "__main__":
     unittest.main()
