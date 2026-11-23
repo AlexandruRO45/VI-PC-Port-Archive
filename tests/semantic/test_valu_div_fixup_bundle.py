@@ -476,5 +476,28 @@ class TestVDivFixupF16Reference(unittest.TestCase):
         self.assertEqual(ref_div_fixup_f16(0x3c00, 0x3c00, 0x3c00), 0x3c00)
 
 
+def step_scalar_div_fixup_f16(state: ValuDivState, instr: Instruction) -> None:
+    if instr.opcode != "v_div_fixup_f16":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    s0 = state.vgprs[int(instr.src0.index_or_val)] & MASK16
+    s1 = state.vgprs[int(instr.src1.index_or_val)] & MASK16
+    s2 = state.vgprs[int(instr.src2.index_or_val)] & MASK16
+    res = ref_div_fixup_f16(s0, s1, s2)
+    state.vgprs[int(instr.dst.index_or_val)] = res
+
+
+class TestVDivFixupF16ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for v_div_fixup_f16."""
+
+    def test_scalar_interpreter_execution(self):
+        state = ValuDivState()
+        state.vgprs[1] = 0x4000
+        state.vgprs[2] = 0x3C00
+        state.vgprs[3] = 0x4000
+        instr = Instruction("v_div_fixup_f16", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        step_scalar_div_fixup_f16(state, instr)
+        self.assertEqual(state.vgprs[0], 0x4000)
+
+
 if __name__ == "__main__":
     unittest.main()
