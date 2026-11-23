@@ -354,6 +354,20 @@ class ManifestCliTest(unittest.TestCase):
         self.assertEqual(p_verify.returncode, 0, p_verify.stderr)
         self.assertIn("OK", p_verify.stdout)
 
+    def test_create_reports_file_progress_when_all_files_are_empty(self):
+        empty_dir = os.path.join(self.tmp.name, "empty-files")
+        os.mkdir(empty_dir)
+        for name in ("a.dat", "b.dat", "c.dat"):
+            with open(os.path.join(empty_dir, name), "wb"):
+                pass
+
+        for jobs in ("1", "2"):
+            with self.subTest(jobs=jobs):
+                result = self.run_cli("create", empty_dir, "--out", self.out_manifest, "--jobs", jobs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                progress = [line.split(" files", 1)[0] for line in result.stdout.splitlines() if line.startswith("[")]
+                self.assertEqual(progress, ["[ 33.3%] 1/3", "[ 66.7%] 2/3", "[100.0%] 3/3"])
+
     def test_in_tree_manifest_is_ignored_on_create_and_verify(self):
         manifest_path = os.path.join(self.pkg, "reports", "manifest.json")
         for _ in range(2):

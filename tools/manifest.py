@@ -145,7 +145,7 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
         done += size
         count += 1
         rate = done / max(time.time() - t0, 1e-6) / 2**20
-        pct = done / total if total else 1.0
+        pct = done / total if total else count / len(files)
         # One line per completed file, printed only from the main thread. Completion order is not
         # stable with threads, so this reports counts and bytes rather than coupling output to a path.
         print(f"[{pct:6.1%}] {count}/{len(files)} files {rate:7.0f} MiB/s", flush=True)
