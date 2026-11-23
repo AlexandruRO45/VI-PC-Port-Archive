@@ -278,6 +278,16 @@ class BootTraceTests(unittest.TestCase):
                 self.assertEqual(trace["methods"], ["CreateDevice"])
                 self.assertEqual(trace["ignored_lines"], 1)
 
+    def test_powershell_can_add_a_newline_to_a_truncated_outcome(self):
+        with open(self.d3d12, "w", encoding="utf-16", newline="\r\n") as f:
+            f.write("gta6rt.exe : [d3d12-trace] #1 CreateDevice ok\n"
+                    "[d3d12-trace] #2 CreateDescriptorHeap fai\n")
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["calls"], 1)
+        self.assertEqual(trace["last_seq"], 1)
+        self.assertEqual(trace["outcomes"], {"ok": 1})
+        self.assertEqual(trace["ignored_lines"], 1)
+
     def test_powershell_error_record_prefix_keeps_the_first_call(self):
         self.write_lines(
             self.d3d12,
