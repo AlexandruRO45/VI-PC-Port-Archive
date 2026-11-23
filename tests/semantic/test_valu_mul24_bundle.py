@@ -142,5 +142,30 @@ class VMulU32U24TranslatorTests(unittest.TestCase):
         with self.assertRaises(Exception):
             translate_lines("ps_bad_mul_u24", ["v_mul_u32_u24"])
 
+# -----------------------------------------------------------------------------
+# Opcode 2: v_mul_i32_i24
+# -----------------------------------------------------------------------------
+def oracle_mul_i32_i24(s0: int, s1: int) -> int:
+    """Reference mathematical oracle for v_mul_i32_i24."""
+    i0 = sext24(s0)
+    i1 = sext24(s1)
+    return (i0 * i1) & MASK32
+
+
+class VMulI32I24OracleTests(unittest.TestCase):
+    def test_mul_i24_basic(self):
+        self.assertEqual(oracle_mul_i32_i24(10, 20), 200)
+
+    def test_mul_i24_negative(self):
+        # -10 * 20 = -200 (0xFFFFFF38)
+        self.assertEqual(oracle_mul_i32_i24(-10, 20), u32(-200))
+        # -10 * -20 = 200
+        self.assertEqual(oracle_mul_i32_i24(-10, -20), 200)
+
+    def test_mul_i24_sign_extension_from_bit23(self):
+        # 0x00800000 is -8388608 in 24-bit two's complement. -8388608 * 2 = -16777216
+        res = oracle_mul_i32_i24(0x00800000, 2)
+        self.assertEqual(res, u32(-16777216))
+
 if __name__ == "__main__":
     unittest.main()
