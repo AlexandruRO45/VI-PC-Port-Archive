@@ -205,6 +205,7 @@ def rbw_registers(insns):
         dst_also_read = (
             reads_imm_dst or "fmac" in op or "mac_" in op or op == "v_writelane_b32"
             or op == "v_swap_b32" or (not is_gf_atomic and "_atomic_" in op)
+            or op in VOP_DOT_ACCUM
         )
         # A direct-to-LDS MUBUF/MTBUF load writes LDS, not a VGPR: args[0] holds the 4-dword LDS address and is read.
         is_lds_load = op.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods
