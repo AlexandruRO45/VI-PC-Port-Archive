@@ -129,6 +129,9 @@ def main(argv=None):
             ap.error(f"--json {a.json} is a folder, not a file")
         if same_report_path(a.json, a.exe):
             ap.error(f"--json {a.json} would overwrite the input {a.exe}")
+        if os.path.isfile(a.json) and not os.access(a.json, os.W_OK):
+            print(f"ERROR: --json {a.json} is not writable", file=sys.stderr)
+            return 2
     try:
         hashes = [(h, parse_hash(h)) for h in (a.hash or ["player_story000_00", "cs_mandy"])]
     except ValueError as e:
