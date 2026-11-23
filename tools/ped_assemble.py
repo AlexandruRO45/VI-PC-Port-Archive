@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import itertools
 import json
 import math
 import os
@@ -105,6 +106,7 @@ DEFAULT_GENITAL_CENTROID_TOL = 0.0016
 DEFAULT_VERTEX_QUANT_TOL = 1e-4
 DEFAULT_NORMAL_COS_MIN = 0.85
 DEFAULT_WELD_TOL = 1e-4
+_NEIGHBOR_CELLS = tuple(itertools.product((-1, 0, 1), repeat=3))
 
 ROLE_UPPER_BODY = "upper_body"
 ROLE_LOWER_BODY = "lower_body"
@@ -269,16 +271,11 @@ def _vec_cross(a: tuple[float, float, float], b: tuple[float, float, float]) -> 
     )
 
 
-def _vec_len(v: tuple[float, float, float]) -> float:
-    return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
-
-
 def _vec_norm(v: tuple[float, float, float]) -> tuple[float, float, float] | None:
-    length = _vec_len(v)
-    if length <= 1e-12:
+    length = math.hypot(*v)
+    if not length or not math.isfinite(length):
         return None
-    inv = 1.0 / length
-    return (v[0] * inv, v[1] * inv, v[2] * inv)
+    return (v[0] / length, v[1] / length, v[2] / length)
 
 
 def _identity_mat4_col() -> tuple[float, ...]:
@@ -456,6 +453,25 @@ def _cell_of(p: tuple[float, float, float], cell_size: float) -> tuple[int, int,
     return (math.floor(p[0] * inv), math.floor(p[1] * inv), math.floor(p[2] * inv))
 
 
+def _covers_corner(point, corners, normal, plane_tolerance, edge_tolerance):
+    """Test plane separation and distance to the finite triangle's footprint."""
+    height = _vec_dot(_vec_sub(point, corners[0]), normal)
+    if abs(height) > plane_tolerance:
+        return False
+    projected = tuple(p - height * n for p, n in zip(point, normal))
+    inside = True
+    for a, b in zip(corners, (corners[1], corners[2], corners[0])):
+        edge = _vec_sub(b, a)
+        delta = _vec_sub(projected, a)
+        if _vec_dot(_vec_cross(edge, delta), normal) < 0:
+            inside = False
+            along = max(0.0, min(1.0, _vec_dot(delta, edge) / _vec_dot(edge, edge)))
+            nearest = tuple(x + along * dx for x, dx in zip(a, edge))
+            if math.dist(projected, nearest) <= edge_tolerance:
+                return True
+    return inside
+
+
 def find_coplanar_overlap_indices(
     target: MeshPart,
     ref_parts: list[MeshPart],
@@ -470,11 +486,9 @@ def find_coplanar_overlap_indices(
     Combines two checks:
     1. Canonical quantized vertex-set triangle key matching (``vertex_tol``),
        catching exact 1:1 shared triangles regardless of vertex index order.
-    2. Spatial-hashed centroid + plane distance + normal alignment checks
-       (``centroid_tol``, ``plane_tol``, ``normal_cos_min``), catching slightly
-       offset coplanar overlap strips (e.g. ``hand_*_nude_cull`` vs
-       ``feet_*_nude_cull`` / ``bodynipplesgen_*`` / ``bodygenitalsgen_fr1_*``)
-       while preserving nearby non-coplanar geometry.
+    2. For nearby aligned faces, all three target corners must project inside
+       the reference face (within ``centroid_tol`` of its edges). A coplanar
+       patch may share the centroid while leaving most of the target exposed.
     """
     if not target.triangles or not ref_parts:
         return set(), {
@@ -488,10 +502,10 @@ def find_coplanar_overlap_indices(
 
     eff_plane_tol = float(centroid_tol if plane_tol is None else plane_tol)
     cell_size = max(float(centroid_tol), 1e-4)
-    ctol_sq = float(centroid_tol) * float(centroid_tol)
+    corner_plane_tol = max(eff_plane_tol * 1.5, eff_plane_tol + 1e-4)
 
-    ref_exact_keys: dict[tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]], list[tuple[float, float, float] | None]] = defaultdict(list)
-    grid: dict[tuple[int, int, int], list[tuple[tuple[float, float, float], tuple[float, float, float] | None]]] = defaultdict(list)
+    ref_exact_keys = defaultdict(list)
+    grid = defaultdict(list)
 
     for ref in ref_parts:
         if ref.coord_space != target.coord_space:
@@ -501,9 +515,12 @@ def find_coplanar_overlap_indices(
             )
         for tri in ref.triangles:
             p0, p1, p2, cent, norm = _triangle_geometry(ref.positions, tri, ref.translation)
+            if norm is None:
+                continue  # A line or point covers no surface.
             key = _canonical_tri_key(p0, p1, p2, vertex_tol)
-            ref_exact_keys[key].append(norm)
-            grid[_cell_of(cent, cell_size)].append((cent, norm))
+            face = (cent, norm, (p0, p1, p2))
+            ref_exact_keys[key].append(face)
+            grid[_cell_of(cent, cell_size)].append(face)
 
     culled: set[int] = set()
     exact_hits = 0
@@ -514,62 +531,29 @@ def find_coplanar_overlap_indices(
 
         # Tier 1: exact canonical quantized vertex key match
         key = _canonical_tri_key(p0, p1, p2, vertex_tol)
-        if key in ref_exact_keys:
-            matched_exact = False
-            if normal_cos_min <= 0.0 or norm is None:
-                matched_exact = True
-            else:
-                for rn in ref_exact_keys[key]:
-                    if rn is None or abs(_vec_dot(norm, rn)) >= normal_cos_min:
-                        matched_exact = True
-                        break
-            if matched_exact:
-                culled.add(ti)
-                exact_hits += 1
-                continue
-
-        # Tier 2: 3D spatial hash neighbor search for coplanar centroid/plane/normal overlap
-        cx, cy, cz = _cell_of(cent, cell_size)
-        hit = False
-        for dx in (-1, 0, 1):
-            if hit:
-                break
-            for dy in (-1, 0, 1):
-                if hit:
-                    break
-                for dz in (-1, 0, 1):
-                    bucket = grid.get((cx + dx, cy + dy, cz + dz))
-                    if not bucket:
-                        continue
-                    for rcent, rnorm in bucket:
-                        ddx = cent[0] - rcent[0]
-                        ddy = cent[1] - rcent[1]
-                        ddz = cent[2] - rcent[2]
-                        if ddx * ddx + ddy * ddy + ddz * ddz > ctol_sq:
-                            continue
-                        if normal_cos_min > 0.0 and norm is not None and rnorm is not None:
-                            if abs(_vec_dot(norm, rnorm)) < normal_cos_min:
-                                continue
-                        if rnorm is not None:
-                            # Both centroid and all 3 vertices must lie near the reference triangle plane
-                            # to reject skewed non-coplanar faces whose centroid happens to cross the plane.
-                            plane_d = abs(ddx * rnorm[0] + ddy * rnorm[1] + ddz * rnorm[2])
-                            if plane_d > eff_plane_tol:
-                                continue
-                            v_plane_limit = max(eff_plane_tol * 1.5, eff_plane_tol + 1e-4)
-                            if (
-                                abs(_vec_dot(_vec_sub(p0, rcent), rnorm)) > v_plane_limit
-                                or abs(_vec_dot(_vec_sub(p1, rcent), rnorm)) > v_plane_limit
-                                or abs(_vec_dot(_vec_sub(p2, rcent), rnorm)) > v_plane_limit
-                            ):
-                                continue
-                        hit = True
-                        break
-                    if hit:
-                        break
-        if hit:
+        corners = (p0, p1, p2)
+        exact = (ref for _, rn, ref in ref_exact_keys.get(key, ())
+                 if norm is None or abs(_vec_dot(norm, rn)) >= normal_cos_min)
+        if any(all(math.dist(a, b) <= vertex_tol for a, b in zip(corners, order))
+               for ref in exact for order in itertools.permutations(ref)):
             culled.add(ti)
-            proximity_hits += 1
+            exact_hits += 1
+            continue
+
+        # The spatial hash selects candidates. Only geometric coverage removes a face.
+        cx, cy, cz = _cell_of(cent, cell_size)
+        buckets = (grid.get((cx + dx, cy + dy, cz + dz), ()) for dx, dy, dz in _NEIGHBOR_CELLS)
+        for rcent, rnorm, ref in itertools.chain.from_iterable(buckets):
+            if math.dist(cent, rcent) > centroid_tol:
+                continue
+            if norm is not None and abs(_vec_dot(norm, rnorm)) < normal_cos_min:
+                continue
+            if abs(_vec_dot(_vec_sub(cent, rcent), rnorm)) > eff_plane_tol:
+                continue
+            if all(_covers_corner(p, ref, rnorm, corner_plane_tol, centroid_tol) for p in corners):
+                culled.add(ti)
+                proximity_hits += 1
+                break
 
     stats = {
         "target": target.name,

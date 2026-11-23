@@ -192,6 +192,18 @@ class StandingSpaceTests(unittest.TestCase):
 
 
 class CoplanarCullingAndSeamTests(unittest.TestCase):
+    def test_proximity_culling_requires_coverage_of_the_target_face(self):
+        def face(name, points):
+            return pa.MeshPart(name, points, [(0, 1, 2)])
+
+        outer = face("outer", [(-3, -1, 0), (3, -1, 0), (0, 2, 0)])
+        inner = face("patch", [(-0.3, -0.1, 0), (0.3, -0.1, 0), (0, 0.2, 0)])
+        line = face("degenerate", [(-1, 0, 0), (1, 0, 0), (0, 0, 0)])
+        self.assertEqual(pa.find_coplanar_overlap_indices(outer, [inner, line])[0], set())
+        self.assertEqual(pa.find_coplanar_overlap_indices(inner, [outer])[0], {0})
+        outer.triangles = [(2, 1, 0)]
+        self.assertEqual(pa.find_coplanar_overlap_indices(inner, [outer])[0], {0})
+
     def test_weld_collapsed_faces_do_not_contribute_edge_incidence(self):
         part = pa.MeshPart(name="panel", positions=[(0, 0, 0), (1, 0, 0), (0, 1, 0),
                                                     (0.00001, 0.00001, 0), (0, 0.00001, 0)],
