@@ -113,6 +113,10 @@ int test_min_switch_time() {
     // Exactly at the window's end counts (the window is "less than min_switch_us").
     EXPECT(t.observe(dualsense, InputFamily::PlayStation5, button(2 | 4), 1900 * ms) == InputEdge::Button);
     EXPECT(t.active() == InputFamily::PlayStation5 && t.generation() == 3);
+    // An out-of-order (earlier) timestamp must not underflow unsigned subtraction and bypass the debounce window.
+    t.observe(xbox, InputFamily::Xbox, rest(), 1800 * ms);
+    EXPECT(t.observe(xbox, InputFamily::Xbox, button(1), 1850 * ms) == InputEdge::None);
+    EXPECT(t.active() == InputFamily::PlayStation5 && t.generation() == 3);
 
     // A zero window lets every deliberate input switch at once.
     ActiveInputTracker fast(InputFamily::Xbox, {0.35f, 0.3f, 0});

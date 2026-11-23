@@ -95,7 +95,8 @@ public:
         const InputEdge edge = edge_between(it->second, now);
         it->second = now;
         if (edge == InputEdge::None || family == tracked_) return InputEdge::None;
-        if (changed_once_ && time_us - changed_at_ < thresholds_.min_switch_us) return InputEdge::None;
+        if (changed_once_ && (time_us < changed_at_ || time_us - changed_at_ < thresholds_.min_switch_us))
+            return InputEdge::None;
         const InputFamily before = active();
         tracked_ = family;
         changed_at_ = time_us;
