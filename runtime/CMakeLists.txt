@@ -247,6 +247,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xcrdapi_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xcrdapi_test PRIVATE /OPT:NOREF)
 
+  # xg_xs.dll's two measured exports: object storage for XGCreateTextureComputer and the no-write suggestion/computer
+  # slots. The test resolves both through the registry, as the mapped title does.
+  add_executable(xg_xs_test
+    test/xg_xs_test.cpp
+    shims/xg_xs.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xg_xs_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xg_xs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xg_xs_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xg_xs_test PRIVATE /OPT:NOREF)
+
   # The Zen 2 instructions a desktop CPU may lack (src/cpu_emulation.h): decoded, emulated on a CONTEXT, and run for
   # real with the #UD handler installed, so an Intel host takes the emulated path and an AMD one the native path.
   add_executable(cpu_emulation_test test/cpu_emulation_test.cpp)
@@ -1121,6 +1133,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xcrdapi_test)
     add_test(NAME xcrdapi COMMAND xcrdapi_test)
+  endif()
+  if(WIN32 AND TARGET xg_xs_test)
+    add_test(NAME xg_xs COMMAND xg_xs_test)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
