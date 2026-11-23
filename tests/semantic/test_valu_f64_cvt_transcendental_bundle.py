@@ -399,6 +399,48 @@ class VCvtF64U32TranslatorTests(unittest.TestCase):
         with self.assertRaises(Exception):
             translate_lines("ps_bad_cvt_f64_u32", ["v_cvt_f64_u32"])
 
+# -----------------------------------------------------------------------------
+# Opcode 4: v_rcp_f64
+# -----------------------------------------------------------------------------
+def oracle_rcp_f64(bits: int) -> int:
+    """Reference mathematical oracle for v_rcp_f64 (double reciprocal 1.0 / x)."""
+    if is_nan_u64(bits):
+        return F64_QNAN
+    if bits == F64_POS_ZERO:
+        return F64_POS_INF
+    if bits == F64_NEG_ZERO:
+        return F64_NEG_INF
+    if bits == F64_POS_INF:
+        return F64_POS_ZERO
+    if bits == F64_NEG_INF:
+        return F64_NEG_ZERO
+    val = u64_to_f64(bits)
+    try:
+        res = 1.0 / val
+        return f64_to_u64(res)
+    except ZeroDivisionError:
+        return F64_POS_INF if val >= 0 else F64_NEG_INF
+    except OverflowError:
+        return F64_POS_INF if val > 0 else F64_NEG_INF
+
+
+class VRcpF64OracleTests(unittest.TestCase):
+    def test_rcp_f64_basic(self):
+        self.assertEqual(oracle_rcp_f64(F64_POS_ONE), F64_POS_ONE)
+        self.assertEqual(oracle_rcp_f64(f64_to_u64(2.0)), f64_to_u64(0.5))
+        self.assertEqual(oracle_rcp_f64(f64_to_u64(-2.0)), f64_to_u64(-0.5))
+        self.assertEqual(oracle_rcp_f64(f64_to_u64(4.0)), f64_to_u64(0.25))
+
+    def test_rcp_f64_zeros_and_infinities(self):
+        self.assertEqual(oracle_rcp_f64(F64_POS_ZERO), F64_POS_INF)
+        self.assertEqual(oracle_rcp_f64(F64_NEG_ZERO), F64_NEG_INF)
+        self.assertEqual(oracle_rcp_f64(F64_POS_INF), F64_POS_ZERO)
+        self.assertEqual(oracle_rcp_f64(F64_NEG_INF), F64_NEG_ZERO)
+
+    def test_rcp_f64_nan_preservation(self):
+        self.assertTrue(is_nan_u64(oracle_rcp_f64(F64_QNAN)))
+        self.assertTrue(is_nan_u64(oracle_rcp_f64(F64_SNAN)))
+
 
 if __name__ == "__main__":
     unittest.main()
