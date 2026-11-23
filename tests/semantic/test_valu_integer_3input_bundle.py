@@ -515,5 +515,25 @@ class TestLshlOrB32Translator(unittest.TestCase):
             actual = run_translated_triop("v_lshl_or_b32", a, b, c)
             self.assertEqual(actual, expected)
 
+# ---------------------------------------------------------------------------
+# Opcode 5: v_and_or_b32 - Reference Oracle
+# ---------------------------------------------------------------------------
+
+def oracle_and_or_b32(a: int, b: int, c: int) -> int:
+    return (((a & MASK32) & (b & MASK32)) | (c & MASK32)) & MASK32
+
+
+class TestAndOrB32Oracle(unittest.TestCase):
+    def test_basic_and_or(self) -> None:
+        # (0xFF & 0x0F) | 0xF0 = 0x0F | 0xF0 = 0xFF
+        self.assertEqual(oracle_and_or_b32(0xFF, 0x0F, 0xF0), 0xFF)
+        self.assertEqual(oracle_and_or_b32(0, MASK32, 42), 42)
+
+    def test_mask_and_insert(self) -> None:
+        val = 0x1234_5678
+        mask = 0xFFFF_0000
+        insert = 0x0000_ABCD
+        self.assertEqual(oracle_and_or_b32(val, mask, insert), 0x1234_ABCD)
+
 if __name__ == "__main__":
     unittest.main()
