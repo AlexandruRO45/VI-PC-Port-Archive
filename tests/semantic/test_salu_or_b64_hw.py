@@ -366,5 +366,64 @@ class TestSOrB64ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.vcc, ALL64)
         self.assertEqual(self.state.scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 64-Bit Lane Masking
+# -----------------------------------------------------------------------------
+
+class SIMDMultiLaneDivergenceModel:
+    """Models multi-lane execution in Wave64 environments using s_or_b64."""
+
+    @staticmethod
+    def active_lanes_from_mask(mask: int) -> Set[int]:
+        return {lane for lane in range(64) if (mask & (1 << lane)) != 0}
+
+    @staticmethod
+    def or_lane_mask(s0_mask: int, s1_mask: int) -> Tuple[int, int]:
+        """In Wave64 flow control, s_or_b64 computes lane activation mask unions:
+        Lanes are ON if they are in S0 OR in S1.
+        """
+        return s_or_b64_oracle(s0_mask, s1_mask)
+
+
+class TestSOrB64SIMDDivergence(unittest.TestCase):
+    """Unit tests for SIMD Wave64 multi-lane divergence and mask union."""
+
+    def test_or_lane_union(self):
+        # S0 covers low half (lanes 0..31)
+        s0 = 0x0000_0000_FFFF_FFFF
+        # S1 covers high half (lanes 32..63)
+        s1 = 0xFFFF_FFFF_0000_0000
+
+        d, scc = SIMDMultiLaneDivergenceModel.or_lane_mask(s0, s1)
+        self.assertEqual(d, ALL64)
+        self.assertEqual(scc, 1)
+
+        active = SIMDMultiLaneDivergenceModel.active_lanes_from_mask(d)
+        self.assertEqual(active, set(range(64)))
+
+    def test_checkerboard_lane_union(self):
+        # S0 = even lanes, S1 = odd lanes
+        s0 = 0x5555_5555_5555_5555
+        s1 = 0xAAAA_AAAA_AAAA_AAAA
+        d, scc = s_or_b64_oracle(s0, s1)
+        self.assertEqual(d, ALL64)
+        self.assertEqual(scc, 1)
+
+        active = SIMDMultiLaneDivergenceModel.active_lanes_from_mask(d)
+        self.assertEqual(len(active), 64)
+
+    def test_sparse_boundary_lanes(self):
+        s0 = (1 << 0)
+        s1 = (1 << 63)
+        d, scc = s_or_b64_oracle(s0, s1)
+        self.assertEqual(d, (1 << 0) | (1 << 63))
+        self.assertEqual(scc, 1)
+
+    def test_empty_lane_masks(self):
+        d, scc = s_or_b64_oracle(0, 0)
+        self.assertEqual(d, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(SIMDMultiLaneDivergenceModel.active_lanes_from_mask(d), set())
+
 if __name__ == "__main__":
     unittest.main()
