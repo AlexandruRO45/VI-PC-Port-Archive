@@ -160,7 +160,9 @@ def load_streams(source, skip_report=None):
         rows, _summary = bink_index.scan_target(source, skip_report=skip_report)
         label, start = "stream {i}", 1
     out = []
+    seen = {}
     for j, row in enumerate(rows):
+        row_label = label.format(i=start + j)
         try:
             if not isinstance(row, dict):
                 raise TypeError("row is not an object")
@@ -174,10 +176,14 @@ def load_streams(source, skip_report=None):
             out.append({"source": row["source"], "offset": offset, "size": size,
                         "width": width, "height": height, "frames": frames})
         except (KeyError, ValueError, TypeError, OverflowError) as error:
-            raise ValueError(f"{label.format(i=start + j)} is missing or unusable: {error}") from None
+            raise ValueError(f"{row_label} is missing or unusable: {error}") from None
         if not isinstance(out[-1]["source"], str):
-            raise ValueError(f"{label.format(i=start + j)} has a non-string source")
+            raise ValueError(f"{row_label} has a non-string source")
         out[-1]["source"] = out[-1]["source"].replace("\\", "/")  # an older Windows index wrote "\"
+        key = (out[-1]["source"], offset)
+        if key in seen:
+            raise ValueError(f"{row_label} duplicates {seen[key]} (same source and offset)")
+        seen[key] = row_label
     # A directory of carved files sorts by file name; carves name files by archive offset.
     out.sort(key=lambda r: (r["source"], r["offset"]))
     return out

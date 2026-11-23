@@ -481,8 +481,8 @@ class TestReportErrors(unittest.TestCase):
             fh.write(text)
         return path
 
-    def run_cli(self, source, tmp):
-        xml = self.write(tmp, "list.xml", mount_xml(["a/b.bk2"]))
+    def run_cli(self, source, tmp, mount_paths=("a/b.bk2",)):
+        xml = self.write(tmp, "list.xml", mount_xml(mount_paths))
         out = os.path.join(tmp, "names.csv")
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
@@ -576,6 +576,29 @@ class TestReportErrors(unittest.TestCase):
             self.assertIn(pins, err.getvalue())
             self.assertIn("row 2", err.getvalue())
             self.assertFalse(os.path.exists(out))
+
+    def test_duplicate_stream_rows_are_refused_after_normalization(self):
+        base = {"source": "cutscene/pack.rpf", "offset": 16, "size": 10,
+                "width": 20, "height": 20, "frames": 1}
+        duplicate = dict(base, source="cutscene\\pack.rpf", offset="0x10")
+        cases = (
+            ("index.json", json.dumps({"streams": [base, duplicate]}), "stream 2", "stream 1"),
+            ("index.csv", "source,offset,size,width,height,frames\n"
+                          "cutscene/pack.rpf,16,10,20,20,1\n"
+                          "cutscene\\pack.rpf,0x10,10,20,20,1\n", "row 3", "row 2"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, contents, second, first in cases:
+                with self.subTest(name=name):
+                    source = self.write(tmp, name, contents)
+                    code, err, out = self.run_cli(source, tmp, ("a/b.bk2", "a/c.bk2"))
+                    self.assertEqual(code, 1)
+                    self.assertIn(f"{second} duplicates {first}", err)
+                    self.assertFalse(os.path.exists(out))
+
+            other = dict(base, source="different.rpf")
+            source = self.write(tmp, "good.json", json.dumps({"streams": [other, base]}))
+            self.assertEqual(names_mod.load_streams(source), [base, other])
 
     def test_rejects_invalid_stream_numbers_and_keeps_zero_offset(self):
         base = {"source": "a.rpf", "offset": 0, "size": 1, "width": 1, "height": 1, "frames": 1}
