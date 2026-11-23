@@ -246,6 +246,7 @@ const CHUNK_DOWNLOAD_TIMEOUT_MS = 30_000;
 const MAX_LOAD_ATTEMPTS = 3, RETRY_DELAY_MS = 1000;
 const loader = new GLTFLoader();
 const live = new Map(); let inflight = 0, wire = false, clay = false, failed = 0;
+let lastCandidateScan;
 const originalMaterials = new WeakMap();
 const clayMat = new THREE.MeshStandardMaterial({ color: 0xb8c0ca, roughness: 0.85, wireframe: wire, side: THREE.DoubleSide });
 const boundsGroup = new THREE.Group(); boundsGroup.visible = false; scene.add(boundsGroup);
@@ -322,6 +323,7 @@ function range(def, p) {
 function drop(id) {
   const c = live.get(id); if (!c) return;
   live.delete(id);
+  lastCandidateScan = undefined;
   c.controller?.abort();
   if (c.obj) {
     scene.remove(c.obj);
@@ -358,6 +360,7 @@ async function loadChunk(entry) {
     entry.controller = null;
     entry.previous = null;
     inflight--;
+    lastCandidateScan = undefined;
   }
 }
 function stream(now = performance.now()) {
@@ -388,13 +391,23 @@ function stream(now = performance.now()) {
   // Always evict stale chunks, but only look for new work when a slot is free.
   if (inflight >= MAX_INFLIGHT) return;
 
+  // Between camera moves or queue changes, only an in-range retry can make work eligible.
+  if (lastCandidateScan && lastCandidateScan.x === p.x && lastCandidateScan.y === p.y &&
+      lastCandidateScan.z === p.z && now < lastCandidateScan.nextRetryAt) return;
+  let nextRetryAt = Infinity;
   const want = [];
   for (const def of world.chunks) {
     const entry = live.get(def.id);
-    if (entry && (entry.obj || entry.loading || entry.attempts >= MAX_LOAD_ATTEMPTS || now < entry.retryAt)) continue;
+    if (entry && (entry.obj || entry.loading || entry.attempts >= MAX_LOAD_ATTEMPTS)) continue;
     const { d: distance, load } = range(def, p);
-    if (load) want.push({ def, distance });
+    if (!load) continue;
+    if (entry && now < entry.retryAt) {
+      nextRetryAt = Math.min(nextRetryAt, entry.retryAt);
+      continue;
+    }
+    want.push({ def, distance });
   }
+  lastCandidateScan = { x: p.x, y: p.y, z: p.z, nextRetryAt };
   want.sort((a, b) => a.distance - b.distance);
   for (const { def } of want) {
     if (inflight >= MAX_INFLIGHT) break;

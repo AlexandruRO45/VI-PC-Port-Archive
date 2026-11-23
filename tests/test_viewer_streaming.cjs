@@ -651,6 +651,47 @@ test('candidate distances are computed once and nearest chunks load first', () =
     assert.deepEqual(reads, Array(distances.length).fill(1));
 });
 
+test('a settled stationary camera skips the manifest scan until its position changes', async () => {
+    const f = fixture(2);
+    const far = f.context.world.chunks[1];
+    const bounds = [0, 1400, 0, 1, 1401, 1];
+    let reads = 0;
+    Object.defineProperty(far, 'bounds', { get() { reads++; return bounds; } });
+
+    f.frame();
+    await f.succeed(0, f.object());
+    f.frame();
+    const beforeIdle = reads;
+    for (let i = 1; i <= 60; i++) f.frame(i * 16);
+    assert.equal(reads, beforeIdle);
+    assert.equal(f.requests.length, 1);
+
+    f.context.camera.position.y = 1;
+    f.frame(1000);
+    assert.equal(f.requests[1]?.url, '1.glb');
+});
+
+test('a stationary camera skips scans during backoff and retries at the deadline', async () => {
+    const f = fixture(1);
+    const chunks = f.context.world.chunks;
+    const iterate = chunks[Symbol.iterator];
+    let scans = 0;
+    chunks[Symbol.iterator] = function () { scans++; return iterate.call(this); };
+
+    f.frame();
+    await f.fail(0);
+    f.frame();
+    const beforeBackoff = scans;
+    f.frame(500);
+    f.frame(999);
+    assert.equal(scans, beforeBackoff);
+    assert.equal(f.requests.length, 1);
+
+    f.frame(1000);
+    assert.equal(f.requests.length, 2);
+    assert.equal(f.requests[1].url, '0.glb');
+});
+
 test('pending requests are not duplicated and retries obey the inflight limit', async () => {
     const f = fixture(6);
     f.frame();
