@@ -24,6 +24,30 @@ public partial class AchievementsView : UserControl
         public string Description => A.Secret && !revealed ? Loc.T("Secret achievement: click to show what it is for.") : A.Description;
         public string State => Loc.T(A.Secret ? "LOCKED · SECRET" : "LOCKED");
         public Cursor Cursor => A.Secret && !revealed ? Cursors.Hand : Cursors.Arrow;
+        /// <summary>The downloaded picture, in grey while it is locked (like a locked achievement on Xbox); null until it
+        /// has been downloaded, and the tile art shows instead.</summary>
+        public System.Windows.Media.ImageSource? Picture
+        {
+            get
+            {
+                if (AchievementList.PicturePath(A) is not string p) return null;
+                try
+                {
+                    var b = new System.Windows.Media.Imaging.BitmapImage();
+                    b.BeginInit();
+                    b.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                    b.DecodePixelWidth = 256;
+                    b.UriSource = new Uri(p);
+                    b.EndInit();
+                    var grey = new System.Windows.Media.Imaging.FormatConvertedBitmap(b, System.Windows.Media.PixelFormats.Gray8, null, 0);
+                    grey.Freeze();
+                    return grey;
+                }
+                catch (Exception) { return null; }
+            }
+        }
+        public Visibility ArtVisibility => AchievementList.PicturePath(A) == null ? Visibility.Visible : Visibility.Collapsed;
+
         /// <summary>The first letter or digit of the name ("T**s Ass…" → T).</summary>
         public string Initial => A.Name.FirstOrDefault(char.IsLetterOrDigit) is var c and not '\0' ? char.ToUpperInvariant(c).ToString() : "?";
         /// <summary>A gradient from the logo's colours, the same one for an achievement every time.</summary>

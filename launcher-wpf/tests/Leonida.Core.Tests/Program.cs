@@ -355,6 +355,8 @@ Check(HardwareDetector.MemoryTypeName(26) == "DDR4" && HardwareDetector.MemoryTy
     Check(AchievementList.Parse("""[ { "name": "Bare", "gamerscore": 10, "hidden": true } ]""") is [{ Secret: true, Id: 1 }], "a bare array and the older 'hidden' key are read too");
     bool Fails(string j) { try { AchievementList.Parse(j); return false; } catch (FormatException) { return true; } }
     Check(Fails("{ \"x\": 1 }") && Fails("not json"), "a file that is not a list is refused");
+    Check(AchievementList.Parse("""[ { "name": "Pic", "image": "images/01-pic.jpg" } ]""") is [{ Image: "images/01-pic.jpg" }]
+          && AchievementList.PicturePath(new Achievement(1, "x", "", 0, false, "images/none-here.jpg")) == null, "a picture's path is read; one not downloaded has no local file");
     Check(new LauncherSettings { AllowOnline = false }.AllowAchievements == false, "an old settings file with online off turns the achievement list off too");
 }
 

@@ -2,7 +2,7 @@ using System.Text.Json;
 
 namespace Leonida.Core;
 
-public sealed record Achievement(int Id, string Name, string Description, int Gamerscore, bool Secret);
+public sealed record Achievement(int Id, string Name, string Description, int Gamerscore, bool Secret, string? Image = null);
 
 /// <summary>
 /// GTA VI's achievement list, from github.com/Dom-in/Gta6AchivmentsList (the game downloads its own from Xbox Live,
@@ -11,11 +11,22 @@ public sealed record Achievement(int Id, string Name, string Description, int Ga
 /// </summary>
 public static class AchievementList
 {
-    public const string Url = "https://raw.githubusercontent.com/Dom-in/Gta6AchivmentsList/main/achievements.json";
+    public const string Base = "https://raw.githubusercontent.com/Dom-in/Gta6AchivmentsList/main/";
+    public const string Url = Base + "achievements.json";
     public const string Page = "https://github.com/Dom-in/Gta6AchivmentsList";
 
     public static string CachePath => Path.Combine(AppPaths.Local, "achievements.json");
     public static string OverridePath => Path.Combine(AppPaths.Roaming, "achievements.json");
+    /// <summary>The downloaded pictures, by file name.</summary>
+    public static string PicturesFolder => Path.Combine(AppPaths.Local, "achievements");
+
+    /// <summary>The picture on this PC, or null until it has been downloaded.</summary>
+    public static string? PicturePath(Achievement a)
+    {
+        if (string.IsNullOrWhiteSpace(a.Image)) return null;
+        var p = Path.Combine(PicturesFolder, Path.GetFileName(a.Image.Split('?')[0]));
+        return File.Exists(p) ? p : null;
+    }
 
     /// <summary>Raised (on any thread) when a newer list has been saved to the cache.</summary>
     public static event Action? Updated;
@@ -39,7 +50,9 @@ public static class AchievementList
                 bool B(string k) => e.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.True;
                 var name = S("name");
                 if (name.Length == 0) continue;
-                list.Add(new Achievement(I("id") is > 0 and var id ? id : list.Count + 1, name, S("description"), Math.Max(0, I("gamerscore")), B("secret") || B("hidden")));
+                var image = S("image");
+                list.Add(new Achievement(I("id") is > 0 and var id ? id : list.Count + 1, name, S("description"), Math.Max(0, I("gamerscore")),
+                                         B("secret") || B("hidden"), image.Length > 0 ? image : null));
             }
             return list;
         }
@@ -68,7 +81,8 @@ public static class AchievementList
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
             http.DefaultRequestHeaders.UserAgent.ParseAdd("LeonidaLauncher/1.0");   // a generic client name, nothing personal
             var json = await http.GetStringAsync(Url, ct);
-            if (Parse(json).Count == 0) return false;
+            var parsed = Parse(json);
+            if (parsed.Count == 0) return false;
             var old = File.Exists(CachePath) ? await File.ReadAllTextAsync(CachePath, ct) : null;
             if (old != json)
             {
@@ -79,11 +93,40 @@ public static class AchievementList
             }
             else File.SetLastWriteTime(CachePath, DateTime.Now);
             Updated?.Invoke();
+            if (await DownloadPicturesAsync(http, parsed, ct) > 0) Updated?.Invoke();
             return true;
         }
         catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException or FormatException or UnauthorizedAccessException)
         {
             return false;
         }
+    }
+
+    /// <summary>The pictures not on this PC yet, from the list's repository (a path in it) or an https address;
+    /// four at a time. Returns how many were saved.</summary>
+    static async Task<int> DownloadPicturesAsync(HttpClient http, List<Achievement> list, CancellationToken ct)
+    {
+        Directory.CreateDirectory(PicturesFolder);
+        var saved = 0;
+        using var gate = new SemaphoreSlim(4);
+        await Task.WhenAll(list.Where(a => !string.IsNullOrWhiteSpace(a.Image) && PicturePath(a) == null).Select(async a =>
+        {
+            await gate.WaitAsync(ct);
+            try
+            {
+                var src = a.Image!.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ? a.Image : Base + a.Image.TrimStart('/');
+                var bytes = await http.GetByteArrayAsync(src, ct);
+                if (bytes.Length < 4 || bytes.Length > 4_000_000) return;
+                bool jpeg = bytes[0] == 0xFF && bytes[1] == 0xD8, png = bytes[0] == 0x89 && bytes[1] == 0x50;
+                if (!jpeg && !png) return;   // a picture, nothing else
+                var dest = Path.Combine(PicturesFolder, Path.GetFileName(a.Image.Split('?')[0]));
+                await File.WriteAllBytesAsync(dest + ".tmp", bytes, ct);
+                File.Move(dest + ".tmp", dest, true);
+                Interlocked.Increment(ref saved);
+            }
+            catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException or UnauthorizedAccessException) { }
+            finally { gate.Release(); }
+        }));
+        return saved;
     }
 }
