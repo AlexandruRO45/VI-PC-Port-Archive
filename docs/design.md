@@ -54,6 +54,8 @@ docs/        notes
 .\scripts\first_look.ps1 -Exe "<game>\game_scarlett_master.exe"
 ```
 
+It rebuilds `runtime\build\gta6rt.exe` first when that loader is older than any file under `runtime\src`,
+`runtime\shims` or `runtime\CMakeLists.txt`, so the dry run below never uses the shim table from before a pull.
 This writes `reports/exe/` (JSON plus a readable summary). Check it in this order:
 
 1. **Section entropy.** Sections near 8.0 bits/byte are still encrypted or compressed. If `.text` is one of them,
@@ -74,6 +76,9 @@ This writes `reports/exe/` (JSON plus a readable summary). Check it in this orde
    `VERIFY` note of the runtime and the docs, with file and line. Notes in a shim whose class the exe calls are
    marked **called** and come first: those are the ones its first boot reaches, such as the `XStoreGameLicense`
    sizes.
+7. **Mods.** `hash_lookup.json` (`tools/find_hash_lookup.py`) ranks the candidates for the archetype-lookup function
+   in the image by how many direct callers each one has; the top RVA is what `gta6rt --archetype-lookup` takes
+   ([modding.md](modding.md#day-one-finding-the-hook)).
 
 Then `runtime\build\gta6rt.exe --dry-run <exe>` maps the image and binds every import to the shim table without
 running any game code. It reports what it couldn't bind.
