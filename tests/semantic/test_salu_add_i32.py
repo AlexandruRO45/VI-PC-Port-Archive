@@ -168,5 +168,141 @@ class TestSAddI32ReferenceOracle(unittest.TestCase):
         self.assertEqual(dst, 0)
         self.assertEqual(scc, 0)
 
+class OperandKind(enum.Enum):
+    SGPR = "sgpr"
+    VGPR = "vgpr"
+    LITERAL = "literal"
+    INLINE_INT = "inline_int"
+
+
+@dataclasses.dataclass(frozen=True)
+class Reg:
+    kind: OperandKind
+    index: int
+
+    def __post_init__(self) -> None:
+        if self.kind == OperandKind.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+        if self.kind == OperandKind.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+
+    def format_asm(self) -> str:
+        prefix = "s" if self.kind == OperandKind.SGPR else "v"
+        return f"{prefix}{self.index}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Imm:
+    value: int
+    is_inline: bool = False
+
+    def __post_init__(self) -> None:
+        if self.is_inline and not (-16 <= self.value <= 64):
+            raise ValueError(f"Inline integer {self.value} out of range [-16, 64]")
+
+    def format_asm(self) -> str:
+        if self.is_inline:
+            return str(self.value)
+        return hex(to_u32(self.value))
+
+
+class Opcode(enum.Enum):
+    S_ADD_I32 = "s_add_i32"
+    S_ADD_U32 = "s_add_u32"
+    S_SUB_I32 = "s_sub_i32"
+    S_MOV_B32 = "s_mov_b32"
+    S_CSELECT_B32 = "s_cselect_b32"
+
+
+@dataclasses.dataclass(frozen=True)
+class SOP2Inst:
+    opcode: Opcode
+    sdst: Reg
+    ssrc0: Reg | Imm
+    ssrc1: Reg | Imm
+
+    def __post_init__(self) -> None:
+        if self.sdst.kind != OperandKind.SGPR:
+            raise ValueError("sdst must be an SGPR")
+        lit_count = 0
+        if isinstance(self.ssrc0, Imm) and not self.ssrc0.is_inline:
+            lit_count += 1
+        if isinstance(self.ssrc1, Imm) and not self.ssrc1.is_inline:
+            lit_count += 1
+        if lit_count > 1:
+            raise ValueError("SOP2 cannot encode more than one 32-bit literal constant")
+
+    def format_asm(self) -> str:
+        return f"{self.opcode.value} {self.sdst.format_asm()}, {self.ssrc0.format_asm()}, {self.ssrc1.format_asm()}"
+
+
+class TestSAddI32AST(unittest.TestCase):
+    """Unit tests for symbolic AST representation and serialization."""
+
+    def test_reg_creation_and_formatting(self) -> None:
+        r0 = Reg(OperandKind.SGPR, 0)
+        r105 = Reg(OperandKind.SGPR, 105)
+        v5 = Reg(OperandKind.VGPR, 5)
+        self.assertEqual(r0.format_asm(), "s0")
+        self.assertEqual(r105.format_asm(), "s105")
+        self.assertEqual(v5.format_asm(), "v5")
+
+    def test_imm_creation_and_formatting(self) -> None:
+        imm_inline = Imm(1, is_inline=True)
+        imm_inline_neg = Imm(-16, is_inline=True)
+        imm_lit = Imm(0x12345678, is_inline=False)
+        self.assertEqual(imm_inline.format_asm(), "1")
+        self.assertEqual(imm_inline_neg.format_asm(), "-16")
+        self.assertEqual(imm_lit.format_asm(), "0x12345678")
+
+    def test_instruction_formatting(self) -> None:
+        inst_rr = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 0),
+            ssrc0=Reg(OperandKind.SGPR, 1),
+            ssrc1=Reg(OperandKind.SGPR, 2),
+        )
+        self.assertEqual(inst_rr.format_asm(), "s_add_i32 s0, s1, s2")
+
+        inst_ri = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 0),
+            ssrc0=Reg(OperandKind.SGPR, 1),
+            ssrc1=Imm(42, is_inline=True),
+        )
+        self.assertEqual(inst_ri.format_asm(), "s_add_i32 s0, s1, 42")
+
+        inst_rl = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 0),
+            ssrc0=Reg(OperandKind.SGPR, 1),
+            ssrc1=Imm(0x7FFFFFFF, is_inline=False),
+        )
+        self.assertEqual(inst_rl.format_asm(), "s_add_i32 s0, s1, 0x7fffffff")
+
+    def test_ast_validation_errors(self) -> None:
+        with self.assertRaises(ValueError):
+            Reg(OperandKind.SGPR, 106)
+        with self.assertRaises(ValueError):
+            Reg(OperandKind.SGPR, -1)
+        with self.assertRaises(ValueError):
+            Imm(65, is_inline=True)
+        with self.assertRaises(ValueError):
+            Imm(-17, is_inline=True)
+        with self.assertRaises(ValueError):
+            SOP2Inst(
+                opcode=Opcode.S_ADD_I32,
+                sdst=Reg(OperandKind.VGPR, 0),
+                ssrc0=Reg(OperandKind.SGPR, 1),
+                ssrc1=Reg(OperandKind.SGPR, 2),
+            )
+        with self.assertRaises(ValueError):
+            SOP2Inst(
+                opcode=Opcode.S_ADD_I32,
+                sdst=Reg(OperandKind.SGPR, 0),
+                ssrc0=Imm(0x1000, is_inline=False),
+                ssrc1=Imm(0x2000, is_inline=False),
+            )
+
 if __name__ == "__main__":
     unittest.main()
