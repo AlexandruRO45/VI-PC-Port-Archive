@@ -163,18 +163,18 @@ void CheckFinalReleaseRace()
     // One contender thread for every round. A new thread per round waits for a scheduler quantum before it
     // first runs when the cores are busy (no wake-up boost, unlike a thread released from a wait), which
     // alone kept 1000 rounds past ctest's timeout. Each step of a round is numbered by the round, so no flag
-    // needs resetting between rounds.
+    // needs resetting between rounds. The contender announces it is ready for the next round as soon as it has
+    // finished this one, and reads the round's state only after `go`, so a round costs the owner one wait
+    // (`finished`) and the contender one (`go`): with one CPU each wait is a context switch.
     ApiRefState* state = nullptr;
     std::atomic<int> rundownCount{ 0 };
     bool pinned = false;
-    std::atomic<int> started{ 0 }, ready{ 0 }, go{ 0 }, finished{ 0 };
+    std::atomic<int> ready{ 0 }, go{ 0 }, finished{ 0 };
 
     std::thread contender([&]
     {
         for (int round = 1; round <= rounds; ++round)
         {
-            WaitUntil(started, round);
-
             ready.store(round, std::memory_order_release);
             ready.notify_one();
 
@@ -202,8 +202,6 @@ void CheckFinalReleaseRace()
         state = &roundState;
         rundownCount.store(0);
 
-        started.store(round, std::memory_order_release);
-        started.notify_one();
         WaitUntil(ready, round);
 
         go.store(round, std::memory_order_release);
