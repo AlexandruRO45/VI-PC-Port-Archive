@@ -454,6 +454,15 @@ class Outputs(unittest.TestCase):
                         self.assertIn(f"{option} must be a positive integer".encode("ascii"), result.stderr)
                         self.assertFalse(os.path.exists(out))
 
+    def test_test_filter_requires_run_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            cmd = [sys.executable, "-I", TOOL, "--out", out, "--tests", "test_boot_trace"]
+            result = subprocess.run(cmd, capture_output=True, cwd=ROOT, timeout=120)
+            self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"--tests requires --run-tests", result.stderr)
+            self.assertFalse(os.path.exists(out))
+
     def test_invalid_test_filter_is_an_argument_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")
