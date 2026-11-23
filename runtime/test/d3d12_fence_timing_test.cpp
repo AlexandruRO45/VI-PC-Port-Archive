@@ -2,7 +2,8 @@
 // event and blocking), fence rewinds with CPU and queue signals, queue GetClockCalibration on both
 // paths (calibrated timestamps on the standalone device when it exposes both clock domains, the submitted timestamp
 // query otherwise), GetAdapterLuid (must name a DXGI adapter) and GetCustomHeapProperties (compared with the host PC
-// runtime's answer when the host adapter is NUMA, as the layer reports itself). No shaders or game data.
+// runtime's answer when the host adapter has the architecture the layer reports: NUMA on a discrete GPU, UMA on an
+// integrated one). No shaders or game data.
 // LEONIDA_VK_VALIDATION=1 runs the test-made device under VK_LAYER_KHRONOS_validation; any validation error fails
 // the test.
 #include "vk_test_device.h"
@@ -359,8 +360,14 @@ int check_custom_heap_properties(ID3D12Device* device, const vktest::Device& d) 
         D3D12_CPU_PAGE_PROPERTY page;
         D3D12_MEMORY_POOL pool;
     };
+    // The D3D12 documentation's table for the architecture the layer reports: a NUMA adapter (a discrete GPU) keeps
+    // DEFAULT in L1, a UMA one (an integrated GPU) has everything in L0.
+    D3D12_FEATURE_DATA_ARCHITECTURE ours_arch{};
+    EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &ours_arch, sizeof(ours_arch))));
+    EXPECT(!ours_arch.CacheCoherentUMA);
+    const D3D12_MEMORY_POOL gpu_pool = ours_arch.UMA ? D3D12_MEMORY_POOL_L0 : D3D12_MEMORY_POOL_L1;
     const Want table[] = {
-        {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE, D3D12_MEMORY_POOL_L1},
+        {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE, gpu_pool},
         {D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L0},
         {D3D12_HEAP_TYPE_READBACK, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0},
     };
@@ -376,8 +383,8 @@ int check_custom_heap_properties(ID3D12Device* device, const vktest::Device& d) 
            custom.MemoryPoolPreference == D3D12_MEMORY_POOL_UNKNOWN && custom.CreationNodeMask == 1 &&
            custom.VisibleNodeMask == 1);
 
-    // The host runtime on a NUMA adapter (the answer the layer gives in D3D12_FEATURE_ARCHITECTURE) must agree. It
-    // runs on the layer's adapter: D3D12's default adapter can be another GPU (host_adapter.h).
+    // The host runtime on an adapter of the architecture the layer reports (D3D12_FEATURE_ARCHITECTURE) must agree.
+    // It runs on the layer's adapter: D3D12's default adapter can be another GPU (host_adapter.h).
     Ref<IDXGIFactory4> factory;
     Ref<IDXGIAdapter> adapter;
     Ref<ID3D12Device> host;
@@ -390,8 +397,10 @@ int check_custom_heap_properties(ID3D12Device* device, const vktest::Device& d) 
     }
     D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
     EXPECT(SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture))));
-    if (architecture.UMA) {
-        std::printf("GetCustomHeapProperties: the host adapter is UMA; not compared\n");
+    if (architecture.UMA != ours_arch.UMA || architecture.CacheCoherentUMA != ours_arch.CacheCoherentUMA) {
+        std::printf("GetCustomHeapProperties: the host adapter is %s and the layer's %s; not compared\n",
+                    architecture.UMA ? (architecture.CacheCoherentUMA ? "cache-coherent UMA" : "UMA") : "NUMA",
+                    ours_arch.UMA ? "UMA" : "NUMA");
         return 0;
     }
     for (const Want& want : table) {
