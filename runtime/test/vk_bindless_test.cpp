@@ -87,6 +87,40 @@ float pixel_error(const float* pixel, const float* want) {
     return error;
 }
 
+unsigned imgatomic_bad_pixels(const float* readback, std::uint32_t width, std::uint32_t height) {
+    unsigned bad = 0;
+    for (std::uint32_t y = 0; y < height; ++y) {
+        for (std::uint32_t x = 0; x < width; ++x) {
+            // Even columns export white. Discarded odd columns retain the clear value.
+            const float want = (x & 1) ? 0.25f : 1.0f;
+            const float* pixel = readback + (std::size_t(y) * width + x) * 4;
+            bad += pixel[0] != want || pixel[1] != want || pixel[2] != want || pixel[3] != want;
+        }
+    }
+    return bad;
+}
+
+int imgatomic_oracle_self_test() {
+    const std::array<float, 16> correct{
+        1.0f, 1.0f, 1.0f, 1.0f, 0.25f, 0.25f, 0.25f, 0.25f,
+        1.0f, 1.0f, 1.0f, 1.0f, 0.25f, 0.25f, 0.25f, 0.25f,
+    };
+    EXPECT(imgatomic_bad_pixels(correct.data(), 2, 2) == 0);
+    for (std::size_t pixel = 0; pixel < correct.size(); pixel += 4) {
+        for (std::size_t channel = 1; channel < 4; ++channel) {
+            auto wrong = correct;
+            wrong[pixel + channel] = 0.0f;
+            EXPECT(imgatomic_bad_pixels(wrong.data(), 2, 2) == 1);
+        }
+    }
+    auto wrong = correct;
+    wrong[1] = 0.0f;
+    wrong[2] = 0.0f;
+    wrong[3] = std::numeric_limits<float>::quiet_NaN();
+    EXPECT(imgatomic_bad_pixels(wrong.data(), 2, 2) == 1);
+    return 0;
+}
+
 DescriptorKey numbered(std::uint32_t n) {
     return {n, 0x9e3779b9u * n, n ^ 0x55555555u, n >> 3, 7, n * n, 0x80000000u, ~n};
 }
@@ -106,6 +140,8 @@ std::uint32_t probe_depth(std::span<const std::uint32_t> table, const Descriptor
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--self-test-imgatomic-oracle") == 0)
+        return imgatomic_oracle_self_test();
     if (argc < 3) {
         std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv | ps_imgatomic.spv>\n");
         return 2;
@@ -860,11 +896,7 @@ int main(int argc, char** argv) {
                     std::printf("  %s texel %zu: got 0x%08x, want 0x%08x\n", names[k],
                                 k == 3 ? i - 3 * AW * AW : i % (AW * AW), got[i], want[i]);
             }
-            const float* rt = static_cast<const float*>(readback_map);
-            unsigned bad_rt = 0;
-            for (std::uint32_t py = 0; py < H; ++py)
-                for (std::uint32_t px = 0; px < W; ++px)
-                    bad_rt += rt[(py * W + px) * 4] != ((px & 1) ? 0.25f : 1.0f);
+            const unsigned bad_rt = imgatomic_bad_pixels(static_cast<const float*>(readback_map), W, H);
             std::printf("ps_imgatomic: %u of %zu texels wrong (2D umax/umin/or 8x8 each, 3D umax 4x4x4); "
                         "%u of %u render-target pixels wrong (odd columns discarded)\n",
                         wrong, want.size(), bad_rt, W * H);
