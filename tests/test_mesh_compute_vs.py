@@ -149,6 +149,123 @@ class Assembly(unittest.TestCase):
                     vs.build_for_index(tmp)
         self.assertIn("spirv-as failed for", str(ctx.exception))
 
+    def test_python_assembler_without_validation_builds_all_layouts_with_no_subprocess(self):
+        import spirv_asm
+
+        f16_lay = layout(params=(0, 1, 2))
+        f16_lay["f16_halves"] = {"0": [28, 29], "2": [24, 25]}
+        layouts = {
+            "ms_plain": layout(),
+            "ms_clip_cull": layout(clip=5, cull=2, params=(0, 2, 7)),
+            "ms_many_params": layout(maxv=128, maxp=128, params=tuple(range(18))),
+            "ms_f16_halves": f16_lay,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {name: {"mesh_compute": lay} for name, lay in layouts.items()})
+            with (mock.patch.object(vs, "tool_path") as tool_mock,
+                  mock.patch.object(vs.subprocess, "run") as run_mock):
+                built = vs.build_for_index(tmp, assembler="python", validate=False)
+            tool_mock.assert_not_called()
+            run_mock.assert_not_called()
+
+            self.assertEqual(
+                [os.path.basename(p) for p in built],
+                [name + ".mesh_vs.spv" for name in sorted(layouts)],
+            )
+            for spv in built:
+                asm = spv[: -len(".spv")] + ".spvasm"
+                self.assertTrue(os.path.isfile(asm))
+                with open(spv, "rb") as f:
+                    data = f.read()
+                self.assertEqual(len(data) % 4, 0)
+                self.assertEqual(int.from_bytes(data[:4], "little"), spirv_asm.SPIRV_MAGIC)
+                self.assertEqual(int.from_bytes(data[4:8], "little"), spirv_asm.TARGET_ENV_VERSION["vulkan1.2"])
+                with open(asm, encoding="utf-8") as f:
+                    expected = spirv_asm.assemble(f.read(), target_env="vulkan1.2")
+                self.assertEqual(data, expected)
+            self.assertFalse(any(p.startswith(".mesh-vs-") for p in os.listdir(tmp)))
+
+    def test_python_assembler_with_validation_invokes_only_spirv_val(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_a": {"mesh_compute": layout(params=(0,))}})
+            final = os.path.join(tmp, "ms_a.mesh_vs.spv")
+            with open(final, "wb") as f:
+                f.write(b"previous shader")
+
+            with (mock.patch.object(vs, "tool_path", side_effect=lambda name: name) as tool_mock,
+                  mock.patch.object(vs.subprocess, "run",
+                                    return_value=subprocess.CompletedProcess(["spirv-val"], 1, "", "bad")) as run_mock):
+                with self.assertRaisesRegex(RuntimeError, "spirv-val failed"):
+                    vs.build_for_index(tmp, assembler="python", validate=True)
+            self.assertEqual([c.args[0] for c in tool_mock.call_args_list], ["spirv-val"])
+            self.assertEqual(run_mock.call_count, 1)
+            self.assertEqual(run_mock.call_args.args[0][:3], ["spirv-val", "--target-env", "vulkan1.2"])
+            with open(final, "rb") as f:
+                self.assertEqual(f.read(), b"previous shader")
+
+            with (mock.patch.object(vs, "tool_path", side_effect=lambda name: name) as tool_mock,
+                  mock.patch.object(vs.subprocess, "run",
+                                    return_value=subprocess.CompletedProcess(["spirv-val"], 0, "", "")) as run_mock):
+                built = vs.build_for_index(tmp, assembler="python", validate=True)
+            self.assertEqual(built, [final])
+            self.assertEqual([c.args[0] for c in tool_mock.call_args_list], ["spirv-val"])
+            self.assertEqual(run_mock.call_count, 1)
+
+    def test_spirv_as_without_validation_skips_spirv_val(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_a": {"mesh_compute": layout()}})
+
+            def fake_as(cmd, **_kwargs):
+                with open(cmd[-1], "wb") as f:
+                    f.write(b"synthetic binary")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with (mock.patch.object(vs, "tool_path", side_effect=lambda name: name) as tool_mock,
+                  mock.patch.object(vs.subprocess, "run", side_effect=fake_as) as run_mock):
+                built = vs.build_for_index(tmp, assembler="spirv-as", validate=False)
+            self.assertEqual(built, [os.path.join(tmp, "ms_a.mesh_vs.spv")])
+            self.assertEqual([c.args[0] for c in tool_mock.call_args_list], ["spirv-as"])
+            self.assertEqual(run_mock.call_count, 1)
+            self.assertEqual(run_mock.call_args.args[0][0], "spirv-as")
+
+    def test_python_assembler_error_preserves_published_binary_and_cleans_staging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asm = os.path.join(tmp, "ms_a.mesh_vs.spvasm")
+            final = os.path.join(tmp, "ms_a.mesh_vs.spv")
+            with open(asm, "w", encoding="utf-8", newline="\n") as f:
+                f.write("OpNotARealOpcode\n")
+            with open(final, "wb") as f:
+                f.write(b"previous shader")
+            with mock.patch.object(vs, "write_for_index", return_value=[asm]):
+                with self.assertRaisesRegex(RuntimeError, r"spirv_asm failed for .*ms_a\.mesh_vs\.spvasm"):
+                    vs.build_for_index(tmp, assembler="python", validate=False)
+            with open(final, "rb") as f:
+                self.assertEqual(f.read(), b"previous shader")
+            self.assertEqual(sorted(os.listdir(tmp)), ["ms_a.mesh_vs.spv", "ms_a.mesh_vs.spvasm"])
+
+    def test_unknown_assembler_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with (mock.patch.object(vs, "tool_path") as tool_mock,
+                  mock.patch.object(vs.subprocess, "run") as run_mock):
+                with self.assertRaisesRegex(ValueError, "unknown assembler"):
+                    vs.build_for_index(tmp, assembler="bogus")
+            tool_mock.assert_not_called()
+            run_mock.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("spirv-val"), "needs spirv-val")
+    def test_python_assembled_helpers_pass_spirv_val(self):
+        f16_lay = layout(params=(0, 1))
+        f16_lay["f16_halves"] = {"0": [28, 29]}
+        layouts = {
+            "ms_plain": layout(),
+            "ms_clip_cull": layout(clip=5, cull=2, params=(0, 2)),
+            "ms_f16": f16_lay,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {name: {"mesh_compute": lay} for name, lay in layouts.items()})
+            built = vs.build_for_index(tmp, assembler="python", validate=True)
+            self.assertEqual(len(built), len(layouts))
+
 
 class Cli(unittest.TestCase):
     def run_main(self, argv, **env):
@@ -198,7 +315,48 @@ class Cli(unittest.TestCase):
                 rc, stdout, stderr = self.run_main(["mesh_compute_vs.py", flag])
                 self.assertEqual(rc, 0)
                 self.assertIn("mesh_compute_vs.py <spirv dir>", stdout)
+                self.assertIn("--assembler", stdout)
+                self.assertIn("--no-validate", stdout)
                 self.assertEqual(stderr, "")
+
+    def test_cli_python_assembler_flags_and_isolated_subprocess(self):
+        for bad_argv in (
+            ["mesh_compute_vs.py", ".", "--assembler", "bogus"],
+            ["mesh_compute_vs.py", ".", "--assembler"],
+            ["mesh_compute_vs.py", ".", "--unknown-flag"],
+        ):
+            with self.subTest(argv=bad_argv):
+                rc, stdout, stderr = self.run_main(bad_argv)
+                self.assertEqual(rc, 2)
+                self.assertEqual(stdout, "")
+                self.assertIn("Vertex shaders that draw", stderr)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_a": {"mesh_compute": layout(clip=1, params=(0,))}})
+            rc, stdout, stderr = self.run_main(
+                ["mesh_compute_vs.py", tmp, "--assembler=python", "--no-validate"],
+                PATH="",
+            )
+            self.assertEqual(rc, 0, stderr)
+            self.assertEqual(stderr, "")
+            self.assertEqual(stdout.splitlines(), [os.path.join(tmp, "ms_a.mesh_vs.spv")])
+
+        tool_path = os.path.join(ROOT, "tools", "mesh_compute_vs.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {"ms_iso": {"mesh_compute": layout(params=(0, 1))}})
+            env = {k: v for k, v in os.environ.items() if k.upper() != "PATH"}
+            env["PATH"] = ""
+            p = subprocess.run(
+                [sys.executable, "-I", tool_path, tmp, "--assembler", "python", "--no-validate"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stderr, "")
+            self.assertEqual(p.stdout.splitlines(), [os.path.join(tmp, "ms_iso.mesh_vs.spv")])
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "ms_iso.mesh_vs.spv")))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "ms_iso.mesh_vs.spvasm")))
 
     def test_a_missing_directory_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as tmp:

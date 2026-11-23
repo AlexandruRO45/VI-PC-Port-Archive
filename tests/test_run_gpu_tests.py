@@ -840,5 +840,56 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
 
 
+class MeshComputeAssemblerForwarding(unittest.TestCase):
+    """run_suite forwards the resolved assembler and validation flag to mesh_compute_vs.build_for_index."""
+
+    def test_forwards_assembler_and_validate_flags(self):
+        cases = (
+            ("python", False, None, "python", False),
+            ("python", False, "/usr/bin/spirv-val", "python", True),
+            ("python", True, "/usr/bin/spirv-val", "python", False),
+            ("spirv-as", False, "/usr/bin/spirv-val", "spirv-as", True),
+            ("spirv-as", True, "/usr/bin/spirv-val", "spirv-as", False),
+        )
+        for asm_choice, no_val_flag, val_bin, want_asm, want_val in cases:
+            with self.subTest(assembler=asm_choice, no_validate=no_val_flag, spirv_val=bool(val_bin)):
+                calls = []
+
+                def fake_build(spirv_dir, **kwargs):
+                    calls.append((spirv_dir, kwargs))
+                    return []
+
+                def fake_run(cmd, env=None, gpu=True):
+                    if rgt.TRANSLATOR in cmd:
+                        out_dir = cmd[cmd.index("--out") + 1]
+                        for s in os.listdir(cmd[cmd.index(rgt.TRANSLATOR) + 1]):
+                            Path(out_dir, Path(s).stem + ".spv").touch()
+                        return 0, ""
+                    if os.path.basename(cmd[0]).startswith("vk_harness"):
+                        return rgt.UNSUPPORTED, "unsupported: stub"
+                    return 0, ""
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    args = SimpleNamespace(
+                        filter="ms_tri",
+                        build=tmp,
+                        llvm_mc="unused",
+                        assembler=asm_choice,
+                        no_validate=no_val_flag,
+                    )
+                    out = io.StringIO()
+                    with (patch.object(rgt, "MESH_COMPUTE", True),
+                          patch.object(rgt.shutil, "which", return_value=val_bin),
+                          patch.dict(sys.modules, {"mesh_compute_vs": SimpleNamespace(build_for_index=fake_build)}),
+                          patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                          patch.object(rgt, "spirv_as"),
+                          patch.object(rgt, "run_cmd", side_effect=fake_run),
+                          contextlib.redirect_stdout(out), contextlib.redirect_stderr(out)):
+                        rc = rgt.run_suite(args, tmp)
+                self.assertEqual(rc, 0, out.getvalue())
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][1], {"assembler": want_asm, "validate": want_val})
+
+
 if __name__ == "__main__":
     unittest.main()

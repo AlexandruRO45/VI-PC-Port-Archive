@@ -929,7 +929,7 @@ def run_suite(a, work: str) -> int:
 
     if MESH_COMPUTE:
         import mesh_compute_vs
-        for vs_spv in mesh_compute_vs.build_for_index(spirv_dir):
+        for vs_spv in mesh_compute_vs.build_for_index(spirv_dir, assembler=assembler, validate=not no_validate):
             print("mesh compute VS:", os.path.basename(vs_spv))
 
     # 3. Build helper SPIR-V shaders
