@@ -102,6 +102,13 @@ def bank_ids(path: str) -> list:
     return [v & M29 for v in struct.unpack(f"<{n}I", table)]
 
 
+def _stream_id(row) -> int:
+    """One stream id from a bank manifest's Streams entry; a non-object entry is an input error, not a traceback."""
+    if not isinstance(row, dict):
+        raise ValueError(f"expected each stream to be an object, got {type(row).__name__}")
+    return int(row["Id"], 16) & M29
+
+
 def load_banks(source: str) -> dict:
     """{bank label: [stream ids]} from AWC banks, a Python inventory, or an rpf9dump manifest."""
     if os.path.isfile(source) and source.lower().endswith(".json"):
@@ -109,7 +116,12 @@ def load_banks(source: str) -> dict:
             doc = json.load(fh)
         if isinstance(doc, dict) and "bank_count" in doc and "streams" in doc:
             grouped = collections.defaultdict(list)
-            for row in doc["streams"]:
+            rows = doc["streams"]
+            if not isinstance(rows, list):
+                raise ValueError("expected a list of streams")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError(f"expected each stream to be an object, got {type(row).__name__}")
                 bank = row["bank"]
                 # Match the export folder used by awc_opus, including nested bank paths.
                 label = os.path.splitext(bank)[0] if bank.lower().endswith(".awc") else bank
@@ -122,7 +134,7 @@ def load_banks(source: str) -> dict:
         for bank in banks:
             if not isinstance(bank, dict):
                 raise ValueError(f"expected each bank to be an object, got {type(bank).__name__}")
-            out[bank["Path"]] = [int(s["Id"], 16) & M29 for s in bank.get("Streams") or []]
+            out[bank["Path"]] = [_stream_id(s) for s in bank.get("Streams") or []]
         return out
     if os.path.isfile(source):
         return {os.path.splitext(os.path.basename(source))[0]: bank_ids(source)}

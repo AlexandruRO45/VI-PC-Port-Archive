@@ -327,7 +327,9 @@ class TestCli(unittest.TestCase):
     def test_malformed_banks_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             words = write(os.path.join(tmp, "words.json"), json.dumps(["x"]))
-            for doc in ([1], [["Path"]]):
+            # a bank whose Streams entry is not an object, and an rpf9dump manifest whose streams row is not one
+            for doc in ([1], [["Path"]], {"Banks": [{"Path": "p/a.awc", "Streams": ["not an object"]}]},
+                        {"bank_count": 1, "streams": ["not a row"]}):
                 banks = write(os.path.join(tmp, "banks.json"), json.dumps(doc))
                 err = io.StringIO()
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
