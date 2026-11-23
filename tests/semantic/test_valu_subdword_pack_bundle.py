@@ -193,6 +193,12 @@ class TestPermLane16Reference(unittest.TestCase):
         self.assertIn("OpGroupNonUniformShuffle", spv)
         self.assertIn("OpBitFieldUExtract", spv)
 
+class TestPermLane16Nibbles(unittest.TestCase):
+    def test_nibble_extraction_spirv(self):
+        spv = run_cs_permlane("v_permlane16_b32", 0x11111111, 0x22222222, name="cs_p16_nib")
+        self.assertIn("OpBitFieldUExtract", spv)
+        self.assertIn("OpUGreaterThanEqual", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
