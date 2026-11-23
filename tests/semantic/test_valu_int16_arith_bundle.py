@@ -188,6 +188,26 @@ class TestVAddU16Translator(unittest.TestCase):
         words = mrt0_words(spv)
         self.assertEqual(words, [300, 0xFFFF, 300, 0xFFFF])
 
+def ref_v_sub_i16(s0: int, s1: int, clamp: bool = False) -> int:
+    x = (s0 & 0x7FFF) - (s0 & 0x8000)
+    y = (s1 & 0x7FFF) - (s1 & 0x8000)
+    res = x - y
+    if clamp:
+        res = max(-32768, min(32767, res))
+    return res & MASK16
+
+
+class TestVSubI16Reference(unittest.TestCase):
+    def test_ref_sub_i16(self):
+        self.assertEqual(ref_v_sub_i16(500, 200), 300)
+
+    def test_ref_sub_i16_negative(self):
+        self.assertEqual(ref_v_sub_i16(100, 200), 0xFF9C)  # -100
+
+    def test_ref_sub_i16_clamp(self):
+        self.assertEqual(ref_v_sub_i16(0x8000, 10, clamp=True), 0x8000)  # -32768 - 10 clamped
+        self.assertEqual(ref_v_sub_i16(0x7FFF, 0xFFFF, clamp=True), 0x7FFF)  # 32767 - (-1) clamped
+
 
 if __name__ == "__main__":
     unittest.main()
