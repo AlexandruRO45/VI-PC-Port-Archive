@@ -376,5 +376,23 @@ class VCubeTcTranslatorTests(unittest.TestCase):
         val = u32_to_f32(mrt0_words(spv)[0])
         self.assertEqual(val, -2.5)  # +Z major: tc = -y = -2.5
 
+# -----------------------------------------------------------------------------
+# Opcode 4: v_cubema_f32
+# -----------------------------------------------------------------------------
+def oracle_cubema_f32(x: float, y: float, z: float) -> float:
+    return select_cube_face(x, y, z)[3]
+
+
+class VCubeMaOracleTests(unittest.TestCase):
+    def test_cubema_magnitudes(self):
+        # +X major: 2 * x = 6.0
+        self.assertEqual(oracle_cubema_f32(3.0, 1.0, 1.0), 6.0)
+        # -X major: 2 * x = -6.0
+        self.assertEqual(oracle_cubema_f32(-3.0, 1.0, 1.0), -6.0)
+        # +Y major: 2 * y = 8.0
+        self.assertEqual(oracle_cubema_f32(1.0, 4.0, 1.0), 8.0)
+        # +Z major: 2 * z = 10.0
+        self.assertEqual(oracle_cubema_f32(1.0, 1.0, 5.0), 10.0)
+
 if __name__ == "__main__":
     unittest.main()
