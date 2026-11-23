@@ -514,5 +514,19 @@ class VPackB32F16SimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.get_vgpr(lane, 0), 0x0)
 
+class VPackB32F16EdgeCasesTests(unittest.TestCase):
+    def test_modifiers_order(self):
+        h = ref_pack_half(0xBC00, sel=0, abs_mod=True, neg_mod=True)
+        self.assertEqual(h, 0xBC00)
+
+        h_abs = ref_pack_half(0xBC00, sel=0, abs_mod=True, neg_mod=False)
+        self.assertEqual(h_abs, 0x3C00)
+
+    def test_nan_payloads_preserved(self):
+        qnan = 0x7E01
+        snan = 0x7C01
+        res = ref_pack_b32_f16(qnan, snan)
+        self.assertEqual(res, (snan << 16) | qnan)
+
 if __name__ == '__main__':
     unittest.main()
