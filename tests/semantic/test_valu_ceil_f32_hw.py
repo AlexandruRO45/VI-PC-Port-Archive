@@ -15,7 +15,6 @@ import os
 import struct
 import sys
 import unittest
-import warnings
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -23,8 +22,6 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools"))
 sys.path.insert(0, HERE)
 
-import rdna2spirv  # noqa: E402
-import spirv_mini_interp as si  # noqa: E402
 import support  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
@@ -142,6 +139,183 @@ class TestCeilReferenceOracle(unittest.TestCase):
                 ]
                 words = run_ceil_ps(lines, f"ps_ceil_c1_{idx}")
                 self.assertEqual(words[0], expected)
+
+    def test_translator_emits_ceil_not_floor(self):
+        """Verify SPIR-V text contains OpExtInst Ceil and does not contain Floor."""
+        lines = [
+            "v_mov_b32 v1, 0x3FC00000",
+            "v_ceil_f32 v0, v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ceil_spv_check", lines)
+        self.assertIn("OpExtInst %float %glsl Ceil", spv)
+        self.assertNotIn("Floor", spv)
+
+    def test_translator_positive_fractional_inputs(self):
+        """Verify translator execution for positive fractional values."""
+        cases = [
+            (0x3FC00000, 0x40000000),  # +1.5 -> +2.0
+            (0x3E800000, 0x3F800000),  # +0.25 -> +1.0
+            (0x40066666, 0x40400000),  # +2.1 -> +3.0
+            (0x3F7FFFFF, 0x3F800000),  # +0.99999994 -> +1.0
+        ]
+        for idx, (inp, expected) in enumerate(cases):
+            with self.subTest(inp=hex(inp)):
+                lines = [
+                    f"v_mov_b32 v1, {inp:#x}",
+                    "v_ceil_f32 v0, v1",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_ceil_ps(lines, f"ps_ceil_pos_{idx}")
+                self.assertEqual(words[0], expected)
+
+    def test_translator_negative_fractional_inputs(self):
+        """Verify translator execution for negative fractional values (ceil differs from floor and trunc)."""
+        cases = [
+            (0xBF000000, 0x80000000),  # -0.5 -> -0.0 (floor gives -1.0 0xBF800000)
+            (0xBFC00000, 0xBF800000),  # -1.5 -> -1.0 (floor gives -2.0 0xC0000000)
+            (0xBE800000, 0x80000000),  # -0.25 -> -0.0 (floor gives -1.0 0xBF800000)
+            (0xC0300000, 0xC0000000),  # -2.75 -> -2.0 (floor gives -3.0 0xC0400000)
+            (0xBF7FFFFF, 0x80000000),  # -0.99999994 -> -0.0
+        ]
+        for idx, (inp, expected) in enumerate(cases):
+            with self.subTest(inp=hex(inp)):
+                lines = [
+                    f"v_mov_b32 v1, {inp:#x}",
+                    "v_ceil_f32 v0, v1",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_ceil_ps(lines, f"ps_ceil_neg_{idx}")
+                self.assertEqual(words[0], expected)
+
+    def test_translator_integral_values_unchanged(self):
+        """Verify translator leaves exact integers unchanged."""
+        cases = [
+            0x3F800000,  # +1.0
+            0xBF800000,  # -1.0
+            0x40800000,  # +4.0
+            0xC0A00000,  # -5.0
+        ]
+        for idx, val in enumerate(cases):
+            with self.subTest(val=hex(val)):
+                lines = [
+                    f"v_mov_b32 v1, {val:#x}",
+                    "v_ceil_f32 v0, v1",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_ceil_ps(lines, f"ps_ceil_int_{idx}")
+                self.assertEqual(words[0], val)
+
+    def test_translator_special_values_passthrough(self):
+        """Verify translator preserves infinities and NaN bit-exact."""
+        cases = [
+            0x7F800000,  # +inf
+            0xFF800000,  # -inf
+            0x7FC00000,  # qNaN
+        ]
+        for idx, val in enumerate(cases):
+            with self.subTest(val=hex(val)):
+                lines = [
+                    f"v_mov_b32 v1, {val:#x}",
+                    "v_ceil_f32 v0, v1",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_ceil_ps(lines, f"ps_ceil_spec_{idx}")
+                self.assertEqual(words[0], val)
+
+    def test_translator_signed_zeros_passthrough(self):
+        """Verify translator preserves signed zero identity."""
+        for idx, val in enumerate([0x00000000, 0x80000000]):
+            with self.subTest(val=hex(val)):
+                lines = [
+                    f"v_mov_b32 v1, {val:#x}",
+                    "v_ceil_f32 v0, v1",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_ceil_ps(lines, f"ps_ceil_zero_{idx}")
+                self.assertEqual(words[0], val)
+
+    def test_translator_mutation_ceil_to_floor_caught(self):
+        """Verify that oracle and translator agree, and that a floor mutant differs.
+
+        This test acts as a mutation-catching guard: if tools/rdna2spirv.py emits Floor
+        instead of Ceil, the translated result will differ from the oracle for fractional values.
+        """
+        # +1.5 ceil -> +2.0
+        translated_pos = run_ceil_ps([
+            "v_mov_b32 v1, 0x3FC00000",
+            "v_ceil_f32 v0, v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ], "ps_ceil_mut_pos")
+        self.assertEqual(translated_pos[0], 0x40000000)
+        floor_pos = f32_to_u32(math.floor(u32_to_f32(0x3FC00000)))  # 1.0 -> 0x3F800000
+        self.assertNotEqual(translated_pos[0], floor_pos)
+
+        # -0.5 ceil -> -0.0
+        translated_neg = run_ceil_ps([
+            "v_mov_b32 v1, 0xBF000000",
+            "v_ceil_f32 v0, v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ], "ps_ceil_mut_neg")
+        self.assertEqual(translated_neg[0], 0x80000000)
+        floor_neg = f32_to_u32(math.floor(u32_to_f32(0xBF000000)))  # -1.0 -> 0xBF800000
+        self.assertNotEqual(translated_neg[0], floor_neg)
+
+    def test_translator_clamp_modifier(self):
+        """Verify VOP3 clamp modifier clips ceil result to [0.0, 1.0]."""
+        lines_hi = [
+            "v_mov_b32 v1, 0x40133333",  # 2.3 -> ceil = 3.0 -> clamped to 1.0
+            "v_ceil_f32 v0, v1 clamp",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv_hi = support.translate_lines("ps_ceil_clamp_hi", lines_hi)
+        self.assertIn("OpExtInst %float %glsl FClamp", spv_hi)
+        words_hi = support.mrt0_words(spv_hi)
+        self.assertEqual(words_hi[0], 0x3F800000)  # 1.0
+
+        lines_lo = [
+            "v_mov_b32 v1, 0xBFC00000",  # -1.5 -> ceil = -1.0 -> clamped to 0.0
+            "v_ceil_f32 v0, v1 clamp",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words_lo = run_ceil_ps(lines_lo, "ps_ceil_clamp_lo")
+        self.assertEqual(words_lo[0], 0x00000000)  # 0.0
+
+    def test_translator_e64_neg_modifier(self):
+        """Verify VOP3 e64 neg modifier negates input before computing ceil."""
+        lines = [
+            "v_mov_b32 v1, 0x3FC00000",  # +1.5 -> negated to -1.5 -> ceil(-1.5) = -1.0
+            "v_ceil_f32_e64 v0, -v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_ceil_ps(lines, "ps_ceil_e64_neg")
+        self.assertEqual(words[0], 0xBF800000)  # -1.0
 
 
 class Vop1Opcode:
@@ -345,9 +519,19 @@ class TestCeilNegativeControlsAndMutations(unittest.TestCase):
             support.translate_lines("ps_ceil_bad_op", ["v_ceil_f32_nonexistent v0, v1", "s_endpgm"])
 
     def test_mutation_detection_floor_instead_of_ceil(self):
-        # Oracle catches mutation if floor is used instead of ceil (e.g. floor(1.5) = 1.0 != ceil(1.5) = 2.0)
+        # Oracle and translator catch mutation if floor is used instead of ceil (e.g. floor(1.5) = 1.0 != ceil(1.5) = 2.0)
         floor_oracle = lambda u: f32_to_u32(math.floor(u32_to_f32(u)))
         self.assertNotEqual(v_ceil_f32_oracle(0x3FC00000), floor_oracle(0x3FC00000))
+        lines = [
+            "v_mov_b32 v1, 0x3FC00000",
+            "v_ceil_f32 v0, v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_ceil_ps(lines, "ps_ceil_mut_control")
+        self.assertEqual(words[0], 0x40000000)
+        self.assertNotEqual(words[0], floor_oracle(0x3FC00000))
 
 
 if __name__ == "__main__":
