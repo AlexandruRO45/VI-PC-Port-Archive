@@ -1493,6 +1493,14 @@ class Gen:
                 self.emit(f"{b} = OpCopyObject %bool {'%false' if cond == 'f' else '%true'}")
         elif cond not in ops:
             raise Unsupported(op)
+        elif is_float and cond == "nlg":
+            # "Equal or unordered", with -0 equal to +0: FUnordEqual, or both operands zero (see fabs_f32).
+            eq, zx, zy, both = (self.tmp() for _ in range(4))
+            self.emit(f"{eq} = OpFUnordEqual %bool {x} {y}")
+            self.emit(f"{zx} = OpFOrdEqual %bool {self.fabs_f32(x)} %f0")
+            self.emit(f"{zy} = OpFOrdEqual %bool {self.fabs_f32(y)} %f0")
+            self.emit(f"{both} = OpLogicalAnd %bool {zx} {zy}")
+            self.emit(f"{b} = OpLogicalOr %bool {eq} {both}")
         else:
             self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
         if scalar and ty in ("u32", "i32") and use_wave_equal:
@@ -5246,6 +5254,14 @@ class Gen:
         self.emit(f"{r} = OpSelect %float {small} {z} {f}")
         return r
 
+    def fabs_f32(self, f):
+        """|f|. Used where a zero test must also hold for -0: AMD's Windows driver (gfx1036, 26.3.1) answered
+        OpFOrdEqual(-0, 0.0) and OpFUnordEqual(-0, +0) false once a pixel shader's %active came from
+        HelperInvocation (SHADER-412, #2715). FAbs(x) == 0.0 is the same IEEE answer on a correct driver."""
+        a = self.tmp()
+        self.emit(f"{a} = OpExtInst %float %glsl FAbs {f}")
+        return a
+
     def flush_f32_mods(self, v, mods):
         """Flush a subnormal sum before output modifiers and flush again after them (SHADER-340, RDNA1 gfx1010)."""
         v = self.flush_f32(v)
@@ -7978,8 +7994,8 @@ class Gen:
             x, y = (self.flush_f32(self.src_f(t)) for t in a[1:3])
             m, zx, zy, either, r = (self.tmp() for _ in range(5))
             self.emit(f"{m} = OpFMul %float {x} {y}")
-            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
-            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")
+            self.emit(f"{zx} = OpFOrdEqual %bool {self.fabs_f32(x)} %f0")   # -0 too (fabs_f32)
+            self.emit(f"{zy} = OpFOrdEqual %bool {self.fabs_f32(y)} %f0")
             self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
             self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
             r = self.flush_f32(self.clamp_mods(r, mods))
@@ -7998,8 +8014,8 @@ class Gen:
             x, y, z = (self.flush_f32(self.src_f(t)) for t in srcs)
             m, zx, zy, either, sel, r = (self.tmp() for _ in range(6))
             self.emit(f"{m} = OpFMul %float {x} {y}")
-            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
-            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")
+            self.emit(f"{zx} = OpFOrdEqual %bool {self.fabs_f32(x)} %f0")   # -0 too (fabs_f32)
+            self.emit(f"{zy} = OpFOrdEqual %bool {self.fabs_f32(y)} %f0")
             self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
             self.emit(f"{sel} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
             self.emit(f"{r} = OpFAdd %float {sel} {z}")
