@@ -48,12 +48,14 @@ static PFN_vkGetInstanceProcAddr gipa;
     } while (0)
 
 static std::vector<uint32_t> read_spv(const char* p) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f.good()) return {};
-    std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
-    std::vector<uint32_t> w(b.size() / 4);
-    std::memcpy(w.data(), b.data(), w.size() * 4);
-    return w;
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    const std::streamoff bytes = f.tellg();
+    if (bytes > 0 && bytes % sizeof(uint32_t) == 0) {
+        std::vector<uint32_t> words(static_cast<std::size_t>(bytes) / sizeof(uint32_t));
+        if (f.seekg(0) && f.read(reinterpret_cast<char*>(words.data()), bytes)) return words;
+    }
+    std::fprintf(stderr, "failed to read shader module: %s\n", p);
+    return {};
 }
 
 #include "../src/descriptor_table.h"
@@ -146,6 +148,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
         return 2;
     }
+    const auto vertex_code = read_spv(vs_path.c_str());
+    if (vertex_code.empty()) return 2;
+    const auto fragment_code = read_spv(fs_path.c_str());
+    if (fragment_code.empty()) return 2;
+
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
     // at 0, as the views here start at level 0: image_get_resinfo minifies a 2D array's layers from BASE_LEVEL.
     const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT :
@@ -223,7 +230,6 @@ int main(int argc, char** argv) {
                  pdp.limits.minTexelOffset, int(pdp.limits.maxTexelOffset),
                  pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
     VkPhysicalDeviceFeatures have; vkGetPhysicalDeviceFeatures(pd, &have);
-    const auto fragment_code = read_spv(fs_path.c_str());
     using leonida::vk_test::spirv_declares_capability;
     const bool dynamic_sampled = spirv_declares_capability(fragment_code.data(), fragment_code.size() * 4,
         leonida::vk_test::spv_sampled_image_array_dynamic_indexing);
@@ -235,7 +241,7 @@ int main(int argc, char** argv) {
     f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
     f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
     // shaderInt64 only when a stage has 64-bit integers: SHADER-423's address pairs need none (TEST-468).
-    const bool int64 = leonida::vk_test::needs_shader_int64(read_spv(vs_path.c_str())) ||
+    const bool int64 = leonida::vk_test::needs_shader_int64(vertex_code) ||
                        leonida::vk_test::needs_shader_int64(fragment_code);
     if (int64 && !have.shaderInt64) {
         std::printf("unsupported: shaderInt64 (a stage declares Int64)\n");
@@ -251,7 +257,8 @@ int main(int argc, char** argv) {
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
     fma.query(gipa, inst, pd);
     // A device without VK_KHR_shader_fma cannot create a pipeline from a stage that uses OpFmaKHR: skip the pair.
-    if (!fma.accepts_file(vs_path.c_str()) || !fma.accepts_file(fs_path.c_str())) return 77;
+    if (!fma.accepts(vertex_code.data(), vertex_code.size() * 4, vs_path.c_str()) ||
+        !fma.accepts(fragment_code.data(), fragment_code.size() * 4, fs_path.c_str())) return 77;
     if (fma.supported()) { enable.push_back(fma.extension()); fma.link_after(&f2); }
     bool m8_on = false;
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
@@ -477,18 +484,13 @@ int main(int argc, char** argv) {
     vkUpdateDescriptorSets(dev, 4, wr, 0, nullptr);
     // Pipeline.
     bool tail_block = false;   // a stage reads the --pc-tail-ubo block (declares set 1)
-    auto module = [&](const char* p, VkShaderModule* m) {
-        auto code = read_spv(p);
-        if (code.empty()) {
-            std::fprintf(stderr, "failed to read shader module: %s\n", p);
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
+    auto module = [&](const std::vector<uint32_t>& code, VkShaderModule* m) {
         if (pc_tail && leonida::vk_test::spirv_declares_set(code.data(), code.size() * 4, leonida::vk_test::pc_tail_set))
             tail_block = true;
         VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; smi.codeSize = code.size() * 4; smi.pCode = code.data();
         return vkCreateShaderModule(dev, &smi, nullptr, m);
     };
-    VkShaderModule vs, fs; CHECK(module(vs_path.c_str(), &vs)); CHECK(module(fs_path.c_str(), &fs));
+    VkShaderModule vs, fs; CHECK(module(vertex_code, &vs)); CHECK(module(fragment_code, &fs));
     VkPipelineShaderStageCreateInfo st[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
