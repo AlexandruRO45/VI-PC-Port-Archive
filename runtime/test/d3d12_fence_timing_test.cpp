@@ -353,7 +353,7 @@ int check_luid(ID3D12Device* device) {
     return 0;
 }
 
-int check_custom_heap_properties(ID3D12Device* device) {
+int check_custom_heap_properties(ID3D12Device* device, const vktest::Device& d) {
     struct Want {
         D3D12_HEAP_TYPE type;
         D3D12_CPU_PAGE_PROPERTY page;
@@ -376,10 +376,15 @@ int check_custom_heap_properties(ID3D12Device* device) {
            custom.MemoryPoolPreference == D3D12_MEMORY_POOL_UNKNOWN && custom.CreationNodeMask == 1 &&
            custom.VisibleNodeMask == 1);
 
-    // The host runtime on a NUMA adapter (the answer the layer gives in D3D12_FEATURE_ARCHITECTURE) must agree.
+    // The host runtime on a NUMA adapter (the answer the layer gives in D3D12_FEATURE_ARCHITECTURE) must agree. It
+    // runs on the layer's adapter: D3D12's default adapter can be another GPU (host_adapter.h).
+    Ref<IDXGIFactory4> factory;
+    Ref<IDXGIAdapter> adapter;
     Ref<ID3D12Device> host;
-    if (hostwine::host_is_wine() ||
-        FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+    std::string name;
+    if (hostwine::host_is_wine() || FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+        !hostadapter::reference(factory.p, d, false, &adapter.p, name) ||
+        FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
         std::printf("GetCustomHeapProperties: no host D3D12 device to compare with\n");
         return 0;
     }
@@ -415,7 +420,7 @@ int check_custom_heap_properties(ID3D12Device* device) {
         }
     }
     std::printf("GetCustomHeapProperties: DEFAULT, UPLOAD, READBACK, CUSTOM, an unknown type and node mask 2 match "
-                "the host runtime\n");
+                "the host runtime on %s\n", name.c_str());
     return 0;
 }
 
@@ -461,7 +466,7 @@ int main() {
         rewind_failures += check_cpu_rewind(device.p, "Xbox-ABI proxy");
         rewind_failures += check_pending_gpu_rewind(device.p, queue.p, "Xbox-ABI proxy");
         EXPECT(check_luid(device.p) == 0);
-        EXPECT(check_custom_heap_properties(device.p) == 0);
+        EXPECT(check_custom_heap_properties(device.p, d) == 0);
     }
 
     // The standalone device enables VK_KHR/EXT_calibrated_timestamps where the GPU has it.
