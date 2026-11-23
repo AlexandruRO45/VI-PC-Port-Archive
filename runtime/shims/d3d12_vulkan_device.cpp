@@ -2251,14 +2251,6 @@ public:
         return S_OK;
     }
 
-    // Registers [va_, va_ + width) as reached by shaders at `shader_va` (src/title_va_alias.h): the root views and
-    // buffer V#s the layer writes for an address in it get the matching address of the buffer's GPU copy.
-    void alias_title_shader_va(std::uint64_t shader_va) {
-        if (!leonida::title_va_aliases().add(va_, desc_.Width, shader_va)) return;
-        title_shader_va_ = shader_va;
-        shader_aliased_ = true;
-    }
-
     // The fallback of create_host_buffer, for pages the driver will not import: write-combined or uncached ones (in
     // retail 74 MiB of the title's 182 MiB range), pages not committed yet, a device without
     // VK_EXT_external_memory_host, or a driver past its import budget (an RTX 3070 Ti answers
@@ -2349,6 +2341,14 @@ public:
         device_.add_shadow({pages, shadow_, std::size_t(desc_.Width)});
         if (buffer_va_) alias_title_shader_va(buffer_va_ - device_.arena.address);
         return S_OK;
+    }
+
+    // Registers [va_, va_ + width) as reached by shaders at `shader_va` (src/title_va_alias.h): the root views and
+    // buffer V#s the layer writes for an address in it get the matching address of the buffer's GPU copy.
+    void alias_title_shader_va(std::uint64_t shader_va) {
+        if (!leonida::title_va_aliases().add(va_, desc_.Width, shader_va)) return;
+        title_shader_va_ = shader_va;
+        shader_aliased_ = true;
     }
 
     HRESULT create_sparse_buffer() {

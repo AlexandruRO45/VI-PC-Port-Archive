@@ -1124,12 +1124,6 @@ public:
         std::unique_lock lock(resource_mutex_);
         set_resource_locked(id, binding);
     }
-    // Whether `va` is in a buffer this context knows by VA (the index buffer_at searches).
-    bool knows_buffer_va(std::uint64_t va) {
-        std::shared_lock lock(resource_mutex_);
-        BufferVaIndex<ResourceId>::Hit hit{};
-        return buffer_vas_.find(va, hit);
-    }
     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
         std::unique_lock rlock(resource_mutex_);
         set_resource_locked(id, binding);
@@ -1286,6 +1280,13 @@ public:
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
         std::lock_guard lock(tracker_mutex_);
         return tracker_.layout(id, subresource);
+    }
+
+    // Whether `va` is in a buffer this context knows by VA (the index buffer_at searches).
+    bool knows_buffer_va(std::uint64_t va) {
+        std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        return buffer_vas_.find(va, hit);
     }
 
     bool has_resource(ResourceId id) {
