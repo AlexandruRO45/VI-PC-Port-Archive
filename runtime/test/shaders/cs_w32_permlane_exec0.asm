@@ -2,7 +2,8 @@
 ; lanes only). Regression guard for an NVIDIA driver miscompile (RTX 5080, Linux 580.65.06): select(active, shuffle,
 ; old) kept the shuffle in every lane when active was computed before the shuffle and old was itself a select (here:
 ; the v_writelane_b32 write). Reduced from crosslane_fuzz.py seed 91001 (cs_xl32_9100373491). docs/design.md
-; "Write gate of a subgroup result".
+; "Write gate of a subgroup result". Only that driver miscompiles it: on other drivers (Windows 616.92, 617.14,
+; 621.24, AMD) a translator without the gate passes too, so a pass there proves nothing about the gate.
 ; v1 = lane, v3 = 16 * lane + 1000 (permlane source), v4 = 51 * lane + 7 (destination), v7 = 46 * lane + 2000.
 ; v_cmp v7 < v1 is false in every lane, so s_and_saveexec leaves EXEC = 0. v_writelane_b32 writes lane 16 anyway
 ; (it ignores EXEC); both permlanes must leave v4 alone. EXEC = -1 again, lanes 0-7 store v4.
