@@ -3916,19 +3916,6 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
          }},
-        // 0xFFFFFFFF descriptors in a CPU-only heap: far past what the process can allocate, E_OUTOFMEMORY on the host
-        // runtime. The layer keeps these heaps in host memory, so the allocation must fail with that HRESULT, not
-        // throw std::bad_alloc out of CreateDescriptorHeap. (A CPU-only sampler heap of that size is left out: the
-        // host answered E_OUTOFMEMORY in one run and S_OK in the next on an RX 9060 XT.)
-        {"descriptor heap: 0xFFFFFFFF RTV", [](ID3D12Device* d) {
-             return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 0xFFFFFFFFu});
-         }},
-        {"descriptor heap: 0xFFFFFFFF DSV", [](ID3D12Device* d) {
-             return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 0xFFFFFFFFu});
-         }},
-        {"descriptor heap: 0xFFFFFFFF CBV/SRV/UAV", [](ID3D12Device* d) {
-             return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 0xFFFFFFFFu});
-         }},
         // CreateCommandQueue.
         {"command queue: null description", [](ID3D12Device* d) {
              void* out = nullptr;
@@ -5554,6 +5541,27 @@ int main() {
         if (argument_mismatches < 0)
             std::printf("invalid arguments: no host D3D12 device to compare with, skipped\n");
         EXPECT(argument_mismatches <= 0);
+        // A CPU-only descriptor heap of 0xFFFFFFFF descriptors (128 GiB of host memory here) must come back as an
+        // HRESULT, never as a std::bad_alloc out of CreateDescriptorHeap. The host's answer depends on the driver (on
+        // an RX 9060 XT the native runtime gives E_OUTOFMEMORY for RTV, DSV and CBV/SRV/UAV; WARP gives it for RTV and
+        // S_OK for the other two), so the layer is held to "returns", not to one host. Not under Wine, whose
+        // allocator can hand out that much address space, which the heap's zero fill would then touch.
+        if (!copycmp::host_is_wine()) {
+            const InvalidCase huge_heaps[] = {
+                [](ID3D12Device* d) { return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 0xFFFFFFFFu}); },
+                [](ID3D12Device* d) { return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 0xFFFFFFFFu}); },
+                [](ID3D12Device* d) {
+                    return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 0xFFFFFFFFu});
+                },
+            };
+            for (const InvalidCase call : huge_heaps) {
+                const HRESULT hr = call_guarded(call, device.p);
+                if (hr != E_OUTOFMEMORY && hr != S_OK)
+                    std::fprintf(stderr, "CreateDescriptorHeap of 0xFFFFFFFF CPU-only descriptors: 0x%08lx\n",
+                                 static_cast<unsigned long>(hr));
+                EXPECT(hr == E_OUTOFMEMORY || hr == S_OK);
+            }
+        }
         const int feature_error_mismatches = compare_check_feature_support(device.p);
         if (feature_error_mismatches < 0)
             std::printf("CheckFeatureSupport error paths: no host D3D12 device to compare with, skipped\n");
