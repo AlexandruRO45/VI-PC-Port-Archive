@@ -378,19 +378,19 @@ class TestCli(unittest.TestCase):
             [(0x180, good_element())],
         ))
         with tempfile.TemporaryDirectory() as folder:
-            for name in ("b.bin", "a.bin"):
+            for name in ("b.BIN", "a.bin"):
                 with open(os.path.join(folder, name), "wb") as handle:
                     handle.write(one)
             with open(os.path.join(folder, "notes.txt"), "w", encoding="utf-8") as handle:
                 handle.write("not a stream")
             result = M.collect(folder)
-            self.assertEqual([record["file"] for record in result], ["a.bin", "b.bin"])
+            self.assertEqual([record["file"] for record in result], ["a.bin", "b.BIN"])
             completed = subprocess.run(
                 [sys.executable, "-I", TOOL, folder, "--json"],
                 capture_output=True, text=True, check=True,
             )
             payload = json.loads(completed.stdout)
-            self.assertEqual([record["file"] for record in payload["files"]], ["a.bin", "b.bin"])
+            self.assertEqual([record["file"] for record in payload["files"]], ["a.bin", "b.BIN"])
             self.assertEqual(payload["summary"]["files"], 2)
             self.assertEqual(payload["summary"]["records"], 4)
             self.assertEqual(payload["summary"]["entities"], 2)

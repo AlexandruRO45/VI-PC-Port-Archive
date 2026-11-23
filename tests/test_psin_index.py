@@ -361,7 +361,7 @@ class TestCli(unittest.TestCase):
     def test_json_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             good = make_psin([("LSCH", b""), ("CHKS", b"\x00" * 4)])
-            with open(os.path.join(tmp, "00000001.bin"), "wb") as f:
+            with open(os.path.join(tmp, "00000001.Bin"), "wb") as f:
                 f.write(good)
             with open(os.path.join(tmp, "00000002.bin"), "wb") as f:
                 f.write(b"not a psin")

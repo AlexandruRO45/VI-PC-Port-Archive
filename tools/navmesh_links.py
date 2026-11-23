@@ -220,7 +220,8 @@ def new_stats():
 
 def _iter_resources(path, start=0, limit=None):
     if os.path.isdir(path):
-        files = sorted(f for f in os.listdir(path) if f.endswith(".bin"))
+        with os.scandir(path) as entries:
+            files = sorted(e.name for e in entries if e.name.lower().endswith(".bin") and e.is_file())
         idx = 0
         while idx < len(files):
             with open(os.path.join(path, files[idx]), "rb") as fh:

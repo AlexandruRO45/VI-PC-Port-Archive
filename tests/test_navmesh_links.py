@@ -223,8 +223,9 @@ class NavmeshLinksTest(unittest.TestCase):
 
             carve = os.path.join(tmp, "carved")
             os.mkdir(carve)
+            os.mkdir(os.path.join(carve, "empty.bin"))
             for idx, st in enumerate(streams):
-                with open(os.path.join(carve, f"{idx:04d}.bin"), "wb") as fh:
+                with open(os.path.join(carve, f"{idx:04d}.BIN"), "wb") as fh:
                     fh.write(st)
             doc_carve = nl.scan(carve)
 

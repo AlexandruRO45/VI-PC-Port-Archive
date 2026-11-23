@@ -323,7 +323,7 @@ def files_in(src):
             yield os.path.basename(src), f.read()
         return
     for name in sorted(os.listdir(src)):
-        if not name.endswith(".bin"):
+        if not name.lower().endswith(".bin"):
             continue
         path = os.path.join(src, name)
         if os.path.isfile(path):
