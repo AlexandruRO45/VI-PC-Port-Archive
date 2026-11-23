@@ -87,6 +87,41 @@ class FrametimeStatsTest(unittest.TestCase):
         self.assertIn("Average FPS", res.stdout)
         self.assertIn("+20.", res.stdout)  # approx +20% FPS improvement
 
+    def test_presentmon_legacy_columns(self):
+        path = os.path.join(self.tmp_dir.name, "presentmon.csv")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("Application,ProcessID,MsBetweenPresents\n")
+            f.write("fixture.exe,4321,16\n")
+            f.write("fixture.exe,4321,24\n")
+
+        parsed = frametime_stats.parse_frametimes_ms(path)
+        self.assertEqual(parsed, [16.0, 24.0])
+        metrics = frametime_stats.compute_metrics(parsed)
+        self.assertAlmostEqual(metrics["p50_ms"], 20.0, places=1)
+        self.assertAlmostEqual(metrics["avg_fps"], 50.0, places=1)
+
+    def test_explicit_ms_header_large_value_not_scaled(self):
+        path = os.path.join(self.tmp_dir.name, "large_ms.csv")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("frametime_ms\n")
+            f.write("150000\n")
+
+        parsed = frametime_stats.parse_frametimes_ms(path)
+        self.assertEqual(parsed, [150000.0])
+
+    def test_cli_target_fps(self):
+        ms_values = [16.6] * 40 + [33.3] * 10
+        csv_path = self._create_csv("target.csv", "frametime_ms", ms_values)
+
+        res = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "frametime_stats.py"),
+             csv_path, "--target-fps", "60", "--json"],
+            capture_output=True, text=True, check=True
+        )
+        data = json.loads(res.stdout)
+        self.assertEqual(data["target_fps"], 60.0)
+        self.assertEqual(data["target_hit_pct"], 80.0)
+
 
 if __name__ == "__main__":
     unittest.main()

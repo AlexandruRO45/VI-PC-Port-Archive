@@ -42,33 +42,44 @@ def parse_frametimes_ms(path: str) -> list[float]:
             return []
 
         col_idx = None
-        is_ns = False
-        is_fps = False
+        mode = "auto"  # "ns", "ms", "fps", or "auto" (magnitude heuristic)
 
         # Detect column header
         lower_headers = [h.strip().lower() for h in header_row]
         for idx, h in enumerate(lower_headers):
             if h in ("frametime_ns", "frametime(ns)", "frametime_nsec"):
                 col_idx = idx
-                is_ns = True
+                mode = "ns"
                 break
-            if h in ("frametime_ms", "frametime(ms)", "frametime", "frame_time", "frametime_msec", "ms"):
+            if h in (
+                "frametime_ms",
+                "frametime(ms)",
+                "frametime",
+                "frame_time",
+                "frametime_msec",
+                "ms",
+                "msbetweenpresents",
+                "msbetweenpresent",
+                "msbetweendisplaychange",
+            ):
                 col_idx = idx
+                mode = "ms"
                 break
             if h in ("fps", "current_fps"):
                 col_idx = idx
-                is_fps = True
+                mode = "fps"
                 break
 
         if col_idx is None:
             # Maybe there are no headers and it's just raw numbers
             try:
                 val = float(header_row[0].strip())
+                col_idx = 0
+                mode = "auto"
                 if val > 100000.0:
                     frametimes.append(val / 1_000_000.0)
                 else:
                     frametimes.append(val)
-                col_idx = 0
             except ValueError:
                 # First row was a header we didn't recognize, find first numeric column in next row
                 pass
@@ -82,8 +93,8 @@ def parse_frametimes_ms(path: str) -> list[float]:
                     try:
                         v = float(cell.strip())
                         col_idx = idx
+                        mode = "auto"
                         if v > 100000.0:
-                            is_ns = True
                             frametimes.append(v / 1_000_000.0)
                         else:
                             frametimes.append(v)
@@ -103,13 +114,18 @@ def parse_frametimes_ms(path: str) -> list[float]:
             except ValueError:
                 continue
 
-            if is_ns or val > 100000.0:
+            if mode == "ns":
                 frametimes.append(val / 1_000_000.0)
-            elif is_fps:
+            elif mode == "fps":
                 if val > 0:
                     frametimes.append(1000.0 / val)
-            else:
+            elif mode == "ms":
                 frametimes.append(val)
+            else:  # mode == "auto" (unlabeled input)
+                if val > 100000.0:
+                    frametimes.append(val / 1_000_000.0)
+                else:
+                    frametimes.append(val)
 
     return [ft for ft in frametimes if ft > 0 and math.isfinite(ft)]
 
@@ -134,10 +150,14 @@ def percentile(sorted_data: list[float], p: float) -> float:
     return sorted_data[low] * (1.0 - frac) + sorted_data[high] * frac
 
 
-def compute_metrics(frametimes: list[float], stutter_threshold_ms: float = 20.0) -> dict:
+def compute_metrics(
+    frametimes: list[float],
+    stutter_threshold_ms: float = 20.0,
+    target_fps: float | None = None,
+) -> dict:
     """Compute FPS and latency statistics from frame times in ms."""
     if not frametimes:
-        return {
+        res = {
             "count": 0,
             "duration_s": 0.0,
             "avg_fps": 0.0,
@@ -154,6 +174,10 @@ def compute_metrics(frametimes: list[float], stutter_threshold_ms: float = 20.0)
             "stutter_count": 0,
             "stutter_time_pct": 0.0,
         }
+        if target_fps is not None:
+            res["target_fps"] = target_fps
+            res["target_hit_pct"] = 0.0
+        return res
 
     count = len(frametimes)
     total_time_ms = sum(frametimes)
@@ -182,7 +206,7 @@ def compute_metrics(frametimes: list[float], stutter_threshold_ms: float = 20.0)
     stutter_time_ms = sum(stuttering_frames)
     stutter_time_pct = (stutter_time_ms / total_time_ms * 100.0) if total_time_ms > 0 else 0.0
 
-    return {
+    metrics = {
         "count": count,
         "duration_s": round(duration_s, 2),
         "avg_fps": round(avg_fps, 2),
@@ -199,6 +223,14 @@ def compute_metrics(frametimes: list[float], stutter_threshold_ms: float = 20.0)
         "stutter_count": stutter_count,
         "stutter_time_pct": round(stutter_time_pct, 2),
     }
+
+    if target_fps is not None and target_fps > 0:
+        target_ms = 1000.0 / target_fps
+        on_time = [ft for ft in frametimes if ft <= target_ms * 1.05]
+        metrics["target_fps"] = target_fps
+        metrics["target_hit_pct"] = round(len(on_time) / count * 100.0, 2)
+
+    return metrics
 
 
 def format_report(name: str, metrics: dict) -> str:
@@ -219,6 +251,8 @@ def format_report(name: str, metrics: dict) -> str:
         "--------------------------------------",
         f"Stutters:        {metrics['stutter_count']} frames ({metrics['stutter_time_pct']}% of runtime)",
     ]
+    if metrics.get("target_fps") is not None:
+        lines.append(f"Target FPS ({metrics['target_fps']:.0f}):  {metrics.get('target_hit_pct', 0.0)}% of frames on time")
     return "\n".join(lines)
 
 
@@ -230,7 +264,6 @@ def format_comparison(name1: str, m1: dict, name2: str, m2: dict) -> str:
         diff = ((v2 - v1) / v1) * 100.0
         sign = "+" if diff > 0 else ""
         text = f"{sign}{diff:.1f}%"
-        good = (diff > 0) if higher_is_better else (diff < 0)
         return f"{text:>8}"
 
     lines = [
@@ -249,6 +282,10 @@ def format_comparison(name1: str, m1: dict, name2: str, m2: dict) -> str:
         f"{'Stutter Frames':<24} | {m1['stutter_count']:>10}   | {m2['stutter_count']:>10}   | {delta(m1['stutter_count'], m2['stutter_count'], False)}",
         f"{'Stutter Time %':<24} | {m1['stutter_time_pct']:>9.1f}%  | {m2['stutter_time_pct']:>9.1f}%  | {delta(m1['stutter_time_pct'], m2['stutter_time_pct'], False)}",
     ]
+    if m1.get("target_hit_pct") is not None and m2.get("target_hit_pct") is not None:
+        lines.append(
+            f"{'Target Hit %':<24} | {m1['target_hit_pct']:>9.1f}%  | {m2['target_hit_pct']:>9.1f}%  | {delta(m1['target_hit_pct'], m2['target_hit_pct'], True)}"
+        )
     return "\n".join(lines)
 
 
@@ -256,6 +293,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("logs", nargs="+", help="CSV log file(s) to analyze")
     ap.add_argument("--compare", action="store_true", help="compare exactly two log files")
+    ap.add_argument("--target-fps", type=float, default=None,
+                    help="target frame rate in FPS to evaluate frame delivery (default: None)")
     ap.add_argument("--stutter-threshold", type=float, default=20.0,
                     help="frametime threshold in ms considered a stutter (default: 20.0)")
     ap.add_argument("--json", action="store_true", help="output result as JSON")
@@ -272,8 +311,8 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
-        m1 = compute_metrics(ft1, args.stutter_threshold)
-        m2 = compute_metrics(ft2, args.stutter_threshold)
+        m1 = compute_metrics(ft1, args.stutter_threshold, args.target_fps)
+        m2 = compute_metrics(ft2, args.stutter_threshold, args.target_fps)
 
         if args.json:
             print(json.dumps({
@@ -288,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     for log_path in args.logs:
         try:
             fts = parse_frametimes_ms(log_path)
-            metrics = compute_metrics(fts, args.stutter_threshold)
+            metrics = compute_metrics(fts, args.stutter_threshold, args.target_fps)
             results.append({"path": log_path, **metrics})
             if not args.json:
                 print(format_report(os.path.basename(log_path), metrics))
@@ -306,4 +345,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(errors="replace")
     sys.exit(main())
