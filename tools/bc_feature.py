@@ -43,6 +43,10 @@ def block_average(blocks: np.ndarray, bpe: int) -> np.ndarray:
 
 
 def smoothness(img: np.ndarray) -> float:
-    """Neighbour difference relative to the image's own spread (lower = more coherent)."""
-    d = np.abs(np.diff(img, axis=0)).mean() + np.abs(np.diff(img, axis=1)).mean()
-    return float(d / (img.std() + 1e-6))
+    """Neighbour difference relative to the image's own spread (lower = more coherent).
+
+    An axis with one block has no neighbours and contributes zero.
+    """
+    vertical = np.abs(np.diff(img, axis=0)).mean() if img.shape[0] > 1 else 0.0
+    horizontal = np.abs(np.diff(img, axis=1)).mean() if img.shape[1] > 1 else 0.0
+    return float((vertical + horizontal) / (img.std() + 1e-6))

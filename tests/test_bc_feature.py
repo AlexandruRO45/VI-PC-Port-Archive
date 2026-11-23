@@ -344,6 +344,14 @@ class BCFeatureImplementationTests(unittest.TestCase):
         data = np.frombuffer(block, dtype=np.uint8).reshape(1, 16)
         np.testing.assert_allclose(bc_feature.block_average(data, bpe=16)[0], [170, 0, 85])
 
+    def test_smoothness_with_one_block_along_an_axis(self):
+        row = np.array([[[0, 0, 0], [4, 4, 4], [12, 12, 12]]], dtype=np.float32)
+        expected = 6.0 / (float(row.std()) + 1e-6)
+        for image in (row, row.swapaxes(0, 1)):
+            with self.subTest(shape=image.shape):
+                self.assertAlmostEqual(bc_feature.smoothness(image), expected, places=6)
+        self.assertEqual(bc_feature.smoothness(np.array([[[0, 2, 5]]], dtype=np.float32)), 0.0)
+
     def test_smoothness_metric(self):
         """smoothness returns neighbor difference relative to spread (lower = more coherent)."""
         # Flat/constant image has zero neighbor differences -> 0.0
