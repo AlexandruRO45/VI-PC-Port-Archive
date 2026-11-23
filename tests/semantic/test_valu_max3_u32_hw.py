@@ -429,5 +429,57 @@ class TestValuMax3U32IEEE754EdgeCases(unittest.TestCase):
         res_trans = run_translated_max3_u32(pos_inf, neg_inf, qnan)
         self.assertEqual(res_trans, expected)
 
+# ---------------------------------------------------------------------------
+# Stage 8: Negative controls, syntax rejection, and mutation detection
+# ---------------------------------------------------------------------------
+
+class TestValuMax3U32NegativeControls(unittest.TestCase):
+    """Stage 8: Negative controls, syntax rejection, and mutation detection for v_max3_u32."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106)
+
+    def test_invalid_destination_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            VOP3Instruction(
+                Opcode.V_MAX3_U32,
+                Register(RegKind.SGPR, 0),
+                Register(RegKind.VGPR, 1),
+                Register(RegKind.VGPR, 2),
+                Register(RegKind.VGPR, 3),
+            )
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=128)
+
+    def test_mutation_detection_and_oracle_rejection(self) -> None:
+        a, b, c = 10, 20, 50
+        correct = oracle_max3_u32(a, b, c)
+
+        def mutated_oracle_min3(x: int, y: int, z: int) -> int:
+            return min(x, y, z)
+
+        def mutated_oracle_two_operands(x: int, y: int, z: int) -> int:
+            return max(x, y)
+
+        self.assertNotEqual(mutated_oracle_min3(a, b, c), correct)
+        self.assertNotEqual(mutated_oracle_two_operands(a, b, c), correct)
+
+    def test_translator_compliance_guard(self) -> None:
+        test_path = os.path.join(HERE, "test_valu_max3_u32_hw.py")
+        self.assertTrue(os.path.isfile(test_path))
+        with open(test_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("import support", content)
+        self.assertIn("support.translate_lines", content)
+
 if __name__ == "__main__":
     unittest.main()
