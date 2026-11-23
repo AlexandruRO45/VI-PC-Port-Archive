@@ -248,7 +248,6 @@ int fspx_checks() {
     return 0;
 }
 
-
 }  // namespace
 
 int main() {

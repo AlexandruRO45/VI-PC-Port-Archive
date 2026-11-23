@@ -14,7 +14,7 @@
 
 int main() {
     using namespace leonida;
-    // Restore even when CHECK returns early; the rest of this executable uses the original locale.
+    // Restore the caller's numeric locale even when CHECK returns early.
     struct RestoreLocale {
         std::string saved = std::setlocale(LC_NUMERIC, nullptr);
         ~RestoreLocale() { std::setlocale(LC_NUMERIC, saved.c_str()); }
