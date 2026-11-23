@@ -613,7 +613,7 @@ def measure_block(data, at, T, rng, found=None):
                     tt.setdefault(f"facenormal_{name}", []).append(good / tot)
             # the shaders' decode again, split by whether the scored corner's vertex sits on a crease (ASSET-280)
             if tag == 0x21:
-                fgood = ftot = 0
+                fgood = ftot = agood = atot = 0
                 for (a, b, c), fn in zip(stris, face_normals):
                     if fn is None:
                         continue
@@ -625,11 +625,15 @@ def measure_block(data, at, T, rng, found=None):
                         add(tt, f"facenormal_{key}_corners")
                         good = abs(nv[0] * fn[0] + nv[1] * fn[1] + nv[2] * fn[2]) > 0.8
                         add(tt, f"facenormal_{key}_good", good)
+                        agood += good
+                        atot += 1
                         if key == "flat":
                             fgood += good
                             ftot += 1
-                if ftot:  # the block's score with its crease corners left out
+                if ftot:  # the block's score with its crease corners left out, and with them, over the same blocks
+                    add(tt, "facenormal_flat_blocks")
                     tt.setdefault("facenormal_flat", []).append(fgood / ftot)
+                    tt.setdefault("facenormal_all_same_blocks", []).append(agood / atot)
     # tag 0x21 tangent: against the first 0x28 (texture coordinate) stream of the block, if it has one
     s21 = [(i, off) for i, (tag, off) in sorted(slots.items()) if tag == 0x21 and i]
     s28 = [off for i, (tag, off) in sorted(slots.items()) if tag == 0x28 and i]

@@ -704,23 +704,29 @@ once per sampled triangle it is in). `facenormal_flat_median` is the block media
 The second half of the table runs the same tool with the looser face-variation predicate `|cos| < 0.8` (any two
 faces that one normal may not both match within 0.8):
 
-| Sample | Blocks | Vertex share, block median | Corners at such vertices | Agreement there | Agreement, other corners | Block median, all | Block median, other corners |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Crease, abs(cos) <= 0.28** | | | | | | | |
-| core_restofworld, first 120 streams | 143 | 0.202 | 29.8% | 0.429 | 0.833 | 0.633 | 0.810 |
-| core_restofworld, all 958 streams | 1,152 | 0.194 | 29.9% | 0.430 | 0.860 | 0.705 | 0.841 |
-| levels, first 200 streams | 187 | 0.000 | 6.2% | 0.235 | 0.925 | 1.000 | 1.000 |
-| levels, first 1,000 streams | 880 | 0.000 | 10.7% | 0.315 | 0.886 | 0.982 | 0.996 |
-| **Face variation, abs(cos) < 0.8** | | | | | | | |
-| core_restofworld, first 120 streams | 143 | 0.547 | 64.3% | 0.618 | 0.884 | 0.633 | 0.911 |
-| core_restofworld, all 958 streams | 1,152 | 0.528 | 58.8% | 0.597 | 0.922 | 0.705 | 0.958 |
-| levels, first 200 streams | 187 | 0.038 | 22.3% | 0.614 | 0.959 | 1.000 | 1.000 |
-| levels, first 1,000 streams | 880 | 0.075 | 29.1% | 0.567 | 0.931 | 0.982 | 1.000 |
+| Sample | Blocks | Blocks keeping other corners | Vertex share, block median | Corners at such vertices | Agreement there | Agreement, other corners | Block median, all corners | Same blocks, other corners only |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Crease, abs(cos) <= 0.28** | | | | | | | | |
+| core_restofworld, first 120 streams | 143 | 142 | 0.202 | 29.8% | 0.429 | 0.833 | 0.646 | 0.810 |
+| core_restofworld, all 958 streams | 1,152 | 1,144 | 0.194 | 29.9% | 0.430 | 0.860 | 0.708 | 0.841 |
+| levels, first 200 streams | 187 | 187 | 0.000 | 6.2% | 0.235 | 0.925 | 1.000 | 1.000 |
+| levels, first 1,000 streams | 880 | 880 | 0.000 | 10.7% | 0.315 | 0.886 | 0.982 | 0.996 |
+| **Face variation, abs(cos) < 0.8** | | | | | | | | |
+| core_restofworld, first 120 streams | 143 | 136 | 0.547 | 64.3% | 0.618 | 0.884 | 0.693 | 0.911 |
+| core_restofworld, all 958 streams | 1,152 | 1,109 | 0.528 | 58.8% | 0.597 | 0.922 | 0.727 | 0.958 |
+| levels, first 200 streams | 187 | 187 | 0.038 | 22.3% | 0.614 | 0.959 | 1.000 | 1.000 |
+| levels, first 1,000 streams | 880 | 880 | 0.075 | 29.1% | 0.567 | 0.931 | 0.982 | 1.000 |
+
+The last two columns are medians over the same blocks: those that keep at least one scored corner after the
+filter (`facenormal_flat_blocks`, `facenormal_all_same_blocks_median`, `facenormal_flat_median`), so a block whose
+corners are all filtered out cannot move the median by dropping out. Over all 1,152 blocks the all-corner median is
+0.705.
 
 core_restofworld blocks are small and coarse (median 92 vertices on the first 120 streams against 416 in
 levels): a fifth of a block's vertices are creases no normal can serve, against none in the median levels block.
-Leaving the crease corners out closes about half of the block-median gap (whole archive 0.705 against 0.982,
-0.841 against 0.996); leaving out every corner with face variation closes most of it (0.958 against 1.000).
+Within the same blocks, leaving the crease corners out closes about half of the block-median gap (whole
+archive 0.708 against 0.982 becomes 0.841 against 0.996); leaving out every corner with face variation closes most
+of it (0.727 against 0.982 becomes 0.958 against 1.000).
 Where the faces at a vertex agree, the two archives agree about equally often (0.92 and 0.93 pooled). The
 looser predicate is a measure of face variation, not of impossibility: at a 60 degree fold the bisector still
 scores 0.866 on both faces. On the first 120 streams, no per-block anisotropic rescale of the positions (factors

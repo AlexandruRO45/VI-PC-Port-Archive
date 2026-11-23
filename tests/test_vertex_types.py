@@ -211,6 +211,9 @@ class BlockTests(unittest.TestCase):
         self.assertGreater(nrm["facenormal_crease_corners"], 0)
         self.assertLess(nrm["facenormal_crease_good"], nrm["facenormal_crease_corners"])
         self.assertGreater(nrm["facenormal_flat_good"], 0)
+        # the block keeps non-crease corners, so it counts once and its all-corner score sits beside it
+        self.assertEqual(nrm["facenormal_flat_blocks"], 1)
+        self.assertLess(nrm["facenormal_all_same_blocks_median"], nrm["facenormal_flat_median"])
 
     def test_a_60_degree_fold_is_not_a_crease(self):
         # |cos 60| = 0.5 > CREASE_COS: the bisector is within |cos| 0.866 of both faces, so one normal can pass both
@@ -226,6 +229,8 @@ class BlockTests(unittest.TestCase):
         self.assertNotIn("facenormal_crease_corners", nrm)
         self.assertEqual(nrm["facenormal_flat_good"], nrm["facenormal_flat_corners"])
         self.assertEqual(nrm["facenormal_flat_median"], 1.0)
+        self.assertEqual(nrm["facenormal_flat_blocks"], 1)
+        self.assertEqual(nrm["facenormal_all_same_blocks_median"], 1.0)
 
     def test_positions_follow_the_surface(self):
         _, out = measure(block())
