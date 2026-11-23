@@ -2,7 +2,10 @@
 #include "pipeline_progress.h"
 
 #include <cmath>
+#include <atomic>
 #include <cstdio>
+#include <thread>
+#include <vector>
 
 #define CHECK(condition) do {                                        \
     if (!(condition)) {                                              \
@@ -59,7 +62,41 @@ static int stalled() {
     return 0;
 }
 
+// Workers finish modules of one size while a sampler (the watchdog) reads: every snapshot must hold a whole number of
+// modules, i.e. bytes, weight and the large count all agree with done. If done were bumped before the rest was
+// published, a sample taken between the two would show done ahead of bytes.
+static int snapshots_are_consistent() {
+    constexpr uint64_t kBytes = 1000;
+    constexpr size_t kModules = 200000;
+    leonida::ProgressCounters counters;
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> torn{0}, samples{0};
+    std::thread sampler([&] {
+        while (!stop.load()) {
+            const auto s = counters.snapshot();
+            samples++;
+            if (s.bytes != static_cast<double>(s.done) * kBytes || s.large != s.done ||
+                std::fabs(s.weight - static_cast<double>(s.done) * leonida::module_weight(kBytes)) > 1e-3 * (s.done + 1))
+                torn++;
+        }
+    });
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 4; t++)
+        workers.emplace_back([&] { for (size_t i = 0; i < kModules / 4; i++) counters.complete(kBytes, true); });
+    for (auto& w : workers) w.join();
+    stop = true;
+    sampler.join();
+    const auto end = counters.snapshot();
+    CHECK(end.done == kModules);
+    CHECK(end.bytes == static_cast<double>(kModules) * kBytes);
+    CHECK(end.large == kModules);
+    CHECK(samples.load() > 0);
+    CHECK(torn.load() == 0);
+    return 0;
+}
+
 int main() {
+    if (int rc = snapshots_are_consistent()) return rc;
     if (int rc = weights_and_format()) return rc;
     if (int rc = steady_rate()) return rc;
     if (int rc = cache_hits_forgotten()) return rc;

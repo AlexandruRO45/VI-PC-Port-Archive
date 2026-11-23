@@ -12,12 +12,46 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <mutex>
 #include <string>
+#include <cstddef>
 #include <utility>
 
 namespace leonida {
 
 inline double module_weight(uint64_t spirv_bytes) { return std::pow(static_cast<double>(spirv_bytes), 1.5); }
+
+// The finished-module totals the progress line prints. A module's count, bytes, weight and large flag are published
+// together under one lock, so a sample taken by the watchdog while workers run always describes a whole number of
+// finished modules (never a count that is ahead of its bytes).
+class ProgressCounters {
+public:
+    struct Snapshot {
+        size_t done = 0;
+        double bytes = 0, weight = 0;
+        size_t large = 0;
+    };
+
+    // Returns the module count after this one.
+    size_t complete(uint64_t spirv_bytes, bool large) {
+        const double weight = module_weight(spirv_bytes);
+        std::lock_guard<std::mutex> g(mu_);
+        s_.done++;
+        s_.bytes += static_cast<double>(spirv_bytes);
+        s_.weight += weight;
+        if (large) s_.large++;
+        return s_.done;
+    }
+
+    Snapshot snapshot() const {
+        std::lock_guard<std::mutex> g(mu_);
+        return s_;
+    }
+
+private:
+    mutable std::mutex mu_;
+    Snapshot s_;
+};
 
 class ProgressEta {
 public:

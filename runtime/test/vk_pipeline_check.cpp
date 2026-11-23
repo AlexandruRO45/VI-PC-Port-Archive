@@ -1443,7 +1443,8 @@ int main(int argc, char** argv) {
     std::map<std::string, uint32_t> modules_ok, modules_bad, big_skipped;
     std::map<std::string, StageStats> stats;
     std::map<std::string, VkShaderModule> stub_cache;
-    std::atomic<size_t> next{0}, done{0};
+    std::atomic<size_t> next{0};
+    leonida::ProgressCounters progress;   // count, bytes, weight and large flag of finished modules, published together
     // Time-based progress (pipeline_progress.h): bytes and weights of every module, finished ones summed as they go.
     std::vector<uint64_t> module_bytes(work.size(), 0);
     double total_weight = 0, total_bytes = 0;
@@ -1456,13 +1457,9 @@ int main(int argc, char** argv) {
         total_bytes += static_cast<double>(module_bytes[i]);
         if (large_module_bytes && module_bytes[i] > large_module_bytes) large_total++;
     }
-    double done_weight = 0, done_bytes = 0;   // under mu
-    size_t large_done = 0;
+    // Every path of a module's turn ends here, once. Returns the finished-module count.
     auto complete_module = [&](size_t i) {
-        std::lock_guard<std::mutex> g(mu);
-        done_weight += leonida::module_weight(module_bytes[i]);
-        done_bytes += static_cast<double>(module_bytes[i]);
-        if (large_module_bytes && module_bytes[i] > large_module_bytes) large_done++;
+        return progress.complete(module_bytes[i], large_module_bytes && module_bytes[i] > large_module_bytes);
     };
     std::atomic<uint32_t> total_pipes_done{0};
     // What each worker is doing in the driver: creating the shader module, then creating its pipeline.
@@ -1591,10 +1588,7 @@ int main(int argc, char** argv) {
     };
 
     auto worker = [&] {
-        size_t previous = SIZE_MAX;   // finished when the next one is taken (every path below ends in a loop turn)
         for (size_t k; (k = next++) < work.size();) {
-            if (previous != SIZE_MAX) complete_module(previous);
-            previous = k;
             const std::string& name = *work[k].first;
             const ShaderMeta& meta = *work[k].second;
             const std::string& stage = meta.stage;
@@ -1607,7 +1601,7 @@ int main(int argc, char** argv) {
                     std::printf("MODULE CRASH %s (%s, killed the driver in an earlier run; not retried)\n",
                                 name.c_str(), stage.c_str());
                 }
-                ++done;
+                complete_module(k);
                 continue;
             }
             std::ifstream f(dir + "/" + name + ".spv", std::ios::binary | std::ios::ate);
@@ -1619,7 +1613,7 @@ int main(int argc, char** argv) {
                     std::printf("BIG SKIP %s (%lld bytes, limit %zu)\n",
                                 name.c_str(), static_cast<long long>(file_size), max_bytes);
                 }
-                ++done;
+                complete_module(k);
                 continue;
             }
             uint32_t shared_memory_limit = 0;
@@ -1631,7 +1625,7 @@ int main(int argc, char** argv) {
                 modules_bad[stage]++;
                 std::printf("MODULE FAIL %s (workgroup memory %u bytes exceeds %s %u)\n",
                             name.c_str(), meta.lds_bytes, limit_name, shared_memory_limit);
-                ++done;
+                complete_module(k);
                 continue;
             }
             if (const std::string miss = check_missing_module_feature(meta); !miss.empty()) {
@@ -1899,12 +1893,11 @@ int main(int argc, char** argv) {
                 std::lock_guard<std::mutex> g(mu);
                 if (inflight.erase(std::this_thread::get_id()) && inflight.empty()) write_inflight();
             }
-            if (++done % 1000 == 0) {
+            if (const size_t n_finished = complete_module(k); n_finished % 1000 == 0) {
                 std::lock_guard<std::mutex> g(mu);
-                std::fprintf(stderr, "  %zu/%zu (%.0fs)\n", size_t(done), work.size(), elapsed());
+                std::fprintf(stderr, "  %zu/%zu (%.0fs)\n", n_finished, work.size(), elapsed());
             }
         }
-        if (previous != SIZE_MAX) complete_module(previous);
     };
     if (iso_child) std::printf("ISO-READY\n");
     std::fflush(stdout);
@@ -1928,12 +1921,13 @@ int main(int argc, char** argv) {
                                  job.phase[0] == 'm' ? "creating the shader module of" : "compiling",
                                  job.name.c_str(), s);
             }
-            eta.sample(elapsed(), done_weight);
+            const auto snap = progress.snapshot();
+            eta.sample(elapsed(), snap.weight);
             if (now - last_progress >= std::chrono::minutes(5)) {   // the module count says little: sizes differ 1000x
                 last_progress = now;
                 std::fprintf(stderr, "  progress: %zu/%zu modules, %.2f/%.2f GB of SPIR-V, %zu/%zu large done, "
                                      "rough ETA %s, elapsed %s\n",
-                             size_t(done), work.size(), done_bytes / 1e9, total_bytes / 1e9, large_done, large_total,
+                             snap.done, work.size(), snap.bytes / 1e9, total_bytes / 1e9, snap.large, large_total,
                              leonida::format_duration(eta.eta_seconds(total_weight)).c_str(),
                              leonida::format_duration(elapsed()).c_str());
             }
