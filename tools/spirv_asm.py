@@ -183,7 +183,7 @@ def _u32_literal(tok: str, lineno: int) -> int:
     return _int_literal(tok, 32, False, lineno)
 
 
-_HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
+_HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?p([+-]?\d+)$")
 _FLOAT_SPEC = {
     16: (5, 10, 15, "<e", "<H"),
     32: (8, 23, 127, "<f", "<I"),
@@ -221,17 +221,24 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
             return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits) | mant
         if e_biased > exp_max:
             return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
-        if 0 < e_biased < exp_max and top <= mant_bits:
+        if 0 < e_biased < exp_max:
             frac = sig & ((1 << top) - 1)
-            mant = frac << (mant_bits - top)
+            if top > mant_bits:
+                mant = frac >> (top - mant_bits)
+            else:
+                mant = frac << (mant_bits - top)
             return (sign << (exp_bits + mant_bits)) | (e_biased << mant_bits) | mant
-        try:
-            fv = float.fromhex(tok)
-            return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
-        except OverflowError:
-            return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
-        except ValueError as exc:
-            raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
+        # SPIRV-Tools discards excess hex-float bits instead of rounding. For
+        # subnormals, scale directly into units of the least subnormal and
+        # truncate there too; very small values naturally become signed zero.
+        shift = exp + bias + mant_bits - 1
+        if shift >= 0:
+            mant = sig << shift
+        elif -shift >= sig.bit_length():
+            mant = 0
+        else:
+            mant = sig >> -shift
+        return (sign << (exp_bits + mant_bits)) | mant
     try:
         fv = float(tok)
     except ValueError as exc:

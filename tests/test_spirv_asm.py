@@ -267,6 +267,76 @@ OpFunctionEnd
             self.assertEqual(len(words), len(ref_words))
             self.assertEqual(words[:2] + words[3:], ref_words[:2] + ref_words[3:])
 
+    def test_hex_float_excess_precision_truncates_like_spirv_as(self):
+        # SPIRV-Tools drops excess hexadecimal mantissa bits instead of rounding them.
+        literals = (
+            ("0x1.8p-24", 16, 0x0001),
+            ("0x1.ffffp-24", 16, 0x0001),
+            ("0x1.0000018p+0", 32, 0x3F800000),
+            ("0x1.0000038p+0", 32, 0x3F800001),
+            ("0x1.ffffffp+127", 32, 0x7F7FFFFF),
+            ("0x1p-10000", 32, 0x00000000),
+            ("-0x1p-10000", 32, 0x80000000),
+            ("0x1.00000000000018p+0", 64, 0x3FF0000000000001),
+            ("0x1.fffffffffffff8p+1023", 64, 0x7FEFFFFFFFFFFFFF),
+        )
+        for literal, width, expected in literals:
+            with self.subTest(literal=literal, width=width):
+                self.assertEqual(spirv_asm._parse_float_bits(literal, width, 1), expected)
+
+        # The hex-float exponent marker is lowercase in SPIRV-Tools; uppercase X remains accepted.
+        with self.assertRaisesRegex(spirv_asm.SpirvAsmError, "invalid float literal"):
+            spirv_asm._parse_float_bits("0x1P+0", 32, 1)
+        self.assertEqual(spirv_asm._parse_float_bits("0X1.8p+0", 32, 1), 0x3FC00000)
+
+        if SPIRV_AS:
+            asm = (
+                "OpCapability Shader\n"
+                "OpCapability Float16\n"
+                "OpCapability Float64\n"
+                "OpMemoryModel Logical GLSL450\n"
+                'OpEntryPoint GLCompute %main "main"\n'
+                "OpExecutionMode %main LocalSize 1 1 1\n"
+                "%void = OpTypeVoid\n"
+                "%fn = OpTypeFunction %void\n"
+                "%f16 = OpTypeFloat 16\n"
+                "%f32 = OpTypeFloat 32\n"
+                "%f64 = OpTypeFloat 64\n"
+                "%h0 = OpConstant %f16 0x1.8p-24\n"
+                "%h1 = OpConstant %f16 0x1.ffffp-24\n"
+                "%f0 = OpConstant %f32 0x1.0000018p+0\n"
+                "%f1 = OpConstant %f32 0x1.0000038p+0\n"
+                "%f2 = OpConstant %f32 0x1.ffffffp+127\n"
+                "%f3 = OpConstant %f32 0x1p-10000\n"
+                "%f4 = OpConstant %f32 -0x1p-10000\n"
+                "%d0 = OpConstant %f64 0x1.00000000000018p+0\n"
+                "%d1 = OpConstant %f64 0x1.fffffffffffff8p+1023\n"
+                "%main = OpFunction %void None %fn\n"
+                "%entry = OpLabel\n"
+                "OpReturn\n"
+                "OpFunctionEnd\n"
+            )
+            spv = spirv_asm.assemble(asm, target_env="vulkan1.2")
+            _validate(spv)
+            words = struct.unpack(f"<{len(spv) // 4}I", spv)
+            with tempfile.TemporaryDirectory() as d:
+                sa, sv = os.path.join(d, "m.spvasm"), os.path.join(d, "m.spv")
+                with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(asm)
+                subprocess.run([SPIRV_AS, sa, "-o", sv, "--target-env", "vulkan1.2"], check=True)
+                with open(sv, "rb") as f:
+                    ref = struct.unpack(f"<{os.path.getsize(sv) // 4}I", f.read())
+            self.assertEqual(words[:2] + words[3:], ref[:2] + ref[3:])
+
+            bad_asm = asm.replace("0x1.0000018p+0", "0x1P+0")
+            with tempfile.TemporaryDirectory() as d:
+                sa = os.path.join(d, "bad.spvasm")
+                with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(bad_asm)
+                result = subprocess.run([SPIRV_AS, sa, "-o", os.path.join(d, "bad.spv"), "--target-env",
+                                         "vulkan1.2"], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_translated_shaders_validate_and_match_spirv_as(self):
         # Translate diverse synthetic shaders (PS ALU/dot4/f16/branches, CS LDS/atomics/wave64-emulate)
         # and verify every binary assembled by spirv_asm passes spirv-val.
