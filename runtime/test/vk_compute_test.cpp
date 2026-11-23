@@ -2,6 +2,7 @@
 // Usage: vk_compute_test cs.spv groups expect [--require-wave64]
 //   expect = "mirror64": out[g*64 + t] == g*64 + (63 - t)   (runtime/test/shaders/cs_lds.asm)
 //            "workgroup_yz": pass 2x3x4 for groups; check the Y/Z histogram (cs_workgroup_yz.asm)
+//            "mskor": check each group's old values and final LDS words against both serial lane orders
 //            "exec64", "wavemask", "bvh": see cs_exec64.asm, cs_wavemask.asm, cs_bvh.asm; anything else prints out[0..7]
 //   VKC_BENCH=N (env): dispatch N more times after the checked one and print the median / min / max wall time of one
 //   dispatch (submit to queue idle) as "bench ms: median=.. min=.. max=.. n=..". The buffer is not cleared in between.
@@ -617,6 +618,21 @@ static int run(int argc, char** argv) {
         }
         std::printf("single-group origins: %u/%u matched\n", origins - wrong_origins, origins);
         return bad || wrong_origins ? 1 : 0;
+    }
+    if (!std::strcmp(argv[3], "mskor")) {
+        constexpr uint32_t seed = 0xabcd1200;
+        for (uint32_t g = 0; g < groups; ++g) {
+            const uint32_t* w = out + 4 * size_t(g);
+            const bool lane0_first = w[0] == seed && w[1] == seed + 1 && w[2] == seed + 2;
+            const bool lane1_first = w[1] == seed && w[0] == seed + 2 && w[2] == seed + 1;
+            if ((!lane0_first && !lane1_first) || (w[3] != seed + 1 && w[3] != seed + 2)) {
+                if (!bad) std::fprintf(stderr, "group %u: old=(%08x,%08x), final=(%08x,%08x)\n",
+                                       g, w[0], w[1], w[2], w[3]);
+                ++bad;
+            }
+        }
+        std::printf("%u LDS mskor groups: %u non-serial results\n", groups, bad);
+        return bad ? 1 : 0;
     }
     if (!std::strcmp(argv[3], "mirror64")) {
         for (uint32_t g = 0; g < groups; g++)

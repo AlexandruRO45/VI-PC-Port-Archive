@@ -156,6 +156,9 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, (WAVE32_WORDS[name] + [0] * 8)[:8])) + "\n"
             if name == "cs_workgroup_yz":     # #186: vk_compute_test's 2x3x4 Y/Z histogram line
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
+            if name == "cs_lds_mskor_contended":
+                self.assertEqual(args, ("64", "mskor"))
+                return 0, "64 LDS mskor groups: 0 non-serial results\n"
             if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
             if name in check.STORE_WORDS:     # vk_store_test "words": the three images, judged by check.py
@@ -906,6 +909,22 @@ class Wave32LaneDumps(unittest.TestCase):
                 check.compute_test("tools", tmp, "cs_barrier_loop", "1", "dump", expected_words=[1],
                                    env={"VKC_SUBGROUP_SIZE": "64"})
             self.assertEqual(run.call_args.kwargs["env"]["VKC_SUBGROUP_SIZE"], "64")   # a caller's choice wins
+
+    def test_mskor_judges_workgroup_results_at_any_subgroup_width(self):
+        name = "cs_lds_mskor_contended"
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "index.json").write_text(json.dumps({name: {"subgroup_size": 32}}),
+                                               encoding="utf-8", newline="\n")
+            for rc, line, should_pass in (
+                (0, "64 LDS mskor groups: 0 non-serial results", True),
+                (1, "64 LDS mskor groups: 64 non-serial results", False),
+                (0, "64 groups x 64: 0 mismatches", False),  # old harness's default mode
+            ):
+                with self.subTest(line=line), patch.object(check, "run", return_value=(rc, line)) as run:
+                    result = check.compute_test("tools", tmp, name, "64", "mskor")
+                    self.assertEqual(result == "", should_pass)
+                    self.assertNotIsInstance(result, check.Skip)
+                    self.assertNotIn("VKC_SUBGROUP_SIZE", run.call_args.kwargs.get("env", {}))
 
     def test_recorded_wave_size_that_cannot_be_pinned_is_a_skip(self):
         with tempfile.TemporaryDirectory() as tmp:

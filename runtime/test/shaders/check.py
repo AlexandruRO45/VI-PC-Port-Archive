@@ -74,6 +74,7 @@ def not_found_message(build, missing):
             "Vulkan headers (vulkan-headers on Arch) and configure again.")
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
+           ("cs_lds_mskor_contended", "64", "mskor"),
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 COMPUTE += [("cs_bvh32", "1", "bvh")]   # TEST-184: image_bvh_intersect_ray, the 32-bit node pointer; same scene and words
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
@@ -898,7 +899,8 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         env = {**WAVE32_LANE_ENV, **(env or {})}
     # Run at the wave size the translator recorded, as run_gpu_tests.py does: a wave32 test left to the device's
     # default runs 64-wide on AMD (subgroups 32..64), and cs_barrier_loop's four waves of 32 became two.
-    sg = None if "VKC_SUBGROUP_SIZE" in (env or {}) else subgroup_size(spirv, name)
+    # The contended LDS fixture uses local invocation IDs and workgroup atomics at any subgroup width.
+    sg = None if mode == "mskor" or "VKC_SUBGROUP_SIZE" in (env or {}) else subgroup_size(spirv, name)
     if sg:
         env = {**(env or {}), "VKC_SUBGROUP_SIZE": str(sg)}
     extra = {"env": dict(os.environ, **env)} if env else {}
@@ -918,6 +920,9 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         return "64-wide subgroup was not confirmed (rebuild vk_compute_test)"
     if mode == "workgroup_yz":
         if "2x3x4 workgroup Y/Z: 0 mismatches" in out.splitlines():
+            return ""
+    elif mode == "mskor":
+        if f"{groups} LDS mskor groups: 0 non-serial results" in out.splitlines():
             return ""
     elif expected_words is not None:
         m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)

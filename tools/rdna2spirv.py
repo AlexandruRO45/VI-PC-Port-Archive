@@ -4662,24 +4662,6 @@ class Gen:
             if d is not None:
                 for w in range(2):
                     self.dst({"k": "vgpr", "r": d["r"] + w, "n": 1}, olds[w])
-        elif op in ("ds_mskor_b32", "ds_mskor_rtn_b32"):
-            # tmp = M[A]; M[A] = (tmp & ~DATA) | DATA2; the _rtn_ form returns tmp (RDNA2 ISA, DS). As two atomics:
-            # AND with ~DATA (its result is tmp, exactly), then OR with DATA2. The memory ends as the single op
-            # leaves it unless another lane's op on the same dword lands between the two; the returned value is exact.
-            d, ad, msk, dat = (a[0], a[1], a[2], a[3]) if rtn else (None, a[0], a[1], a[2])
-            addr = self.src_u(ad)
-            inv = self.tmp()
-            m_val, d_val = self.src_u(msk), self.src_u(dat)
-            self.emit(f"{inv} = OpNot %uint {m_val}")
-
-            def mskor(p):
-                old, _or = self.tmp(), self.tmp()
-                self.emit(f"{old} = OpAtomicAnd %uint {p} {sc} {sem} {inv}")
-                self.emit(f"{_or} = OpAtomicOr %uint {p} {sc} {sem} {d_val}")
-                return old
-            old = self.lds_access(addr, off, mskor)       # bounds-checked when lds_bound is set (SHADER-309)
-            if d is not None:
-                self.dst(d, old)
         elif op in ("ds_add_f32", "ds_add_rtn_f32"):
             # M = M + DATA as binary32 (RDNA2 ISA, DS_ADD_F32); the _rtn_ form returns the old M. No core SPIR-V atomic
             # adds floats on Workgroup memory, so this is an OpAtomicCompareExchange loop with an OpFAdd (round to
@@ -4724,16 +4706,19 @@ class Gen:
                                   f"{self.src_u(src)} {self.src_u(cmp_)}")
             if d is not None:
                 self.dst(d, old)
-        elif name in ("ds_inc_u32", "ds_dec_u32", "ds_rsub_u32", "ds_min_f32", "ds_max_f32"):
+        elif name in ("ds_inc_u32", "ds_dec_u32", "ds_rsub_u32", "ds_mskor_b32", "ds_min_f32", "ds_max_f32"):
             # RDNA2 ISA 32-bit DS atomics via Workgroup-scope OpAtomicCompareExchange CAS loop:
             #   ds_inc_u32:  M = (M >= DATA) ? 0 : M + 1          (unsigned compare)
             #   ds_dec_u32:  M = (M == 0 || M > DATA) ? DATA : M - 1  (unsigned compare)
             #   ds_rsub_u32: M = DATA - M                         (32-bit wrapping)
+            #   ds_mskor_b32: M = (M & ~DATA) | DATA2
             #   ds_min_f32 / ds_max_f32: GLSL.std.450 NMin / NMax (no shader float atomic extension needed)
-            if len(a) != (3 if rtn else 2):
+            operands = a[1:] if rtn else a
+            if len(operands) != (3 if name == "ds_mskor_b32" else 2):
                 raise Unsupported(op + " operands")
-            d, ad, dat = (a[0], a[1], a[2]) if rtn else (None, a[0], a[1])
-            if dat["k"] != "vgpr" or dat.get("n", 1) != 1 or \
+            d = a[0] if rtn else None
+            ad, dat = operands[:2]
+            if any(arg["k"] != "vgpr" or arg.get("n", 1) != 1 for arg in operands[1:]) or \
                     (d is not None and (d["k"] != "vgpr" or d.get("n", 1) != 1)):
                 raise Unsupported(op + " operands")
             addr = self.src_u(ad)
@@ -4742,6 +4727,10 @@ class Gen:
             if name in ("ds_min_f32", "ds_max_f32"):
                 val_f = self.tmp()
                 self.emit(f"{val_f} = OpBitcast %float {val}")
+            elif name == "ds_mskor_b32":
+                keep_mask = self.tmp()
+                self.emit(f"{keep_mask} = OpNot %uint {val}")
+                data2 = self.src_u(operands[2])
 
             def cas(p):
                 entry_lbl = self.current_label_placeholder()
@@ -4767,6 +4756,10 @@ class Gen:
                 elif name == "ds_rsub_u32":
                     new_u = self.tmp()
                     self.emit(f"{new_u} = OpISub %uint {val} {cur}")
+                elif name == "ds_mskor_b32":
+                    kept, new_u = self.tmp(), self.tmp()
+                    self.emit(f"{kept} = OpBitwiseAnd %uint {cur} {keep_mask}")
+                    self.emit(f"{new_u} = OpBitwiseOr %uint {kept} {data2}")
                 else:
                     cur_f, new_f, new_u = self.tmp(), self.tmp(), self.tmp()
                     self.emit(f"{cur_f} = OpBitcast %float {cur}")

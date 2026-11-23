@@ -877,6 +877,9 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
             results.append((name, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches" in msg.splitlines(), msg))
+        elif name == "cs_lds_mskor_contended":
+            rc, msg = run_cmd([vk_compute, spv, "64", "mskor"])
+            results.append((name, rc == 0 and "64 LDS mskor groups: 0 non-serial results" in msg.splitlines(), msg))
         elif name == "cs_lds":
             rc, msg = run_cmd([vk_compute, spv, "4", "mirror64"], env=cs_env)
             results.append((name, rc == 0, verdict_line(rc, msg)))
