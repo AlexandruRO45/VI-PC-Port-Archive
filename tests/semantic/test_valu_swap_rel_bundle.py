@@ -138,6 +138,20 @@ class TestSwapTranslator(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestSwapRelOracle(unittest.TestCase):
+    def test_oracle_swaprel(self):
+        vgprs = {0: 10, 1: 20}
+        out = model_swaprel(0, 1, 0, vgprs)
+        self.assertEqual(out[0], 20)
+        self.assertEqual(out[1], 10)
+
+    def test_translator_swaprel_oracle(self):
+        prog = ["s_mov_b32 m0, 0", "v_mov_b32_e32 v0, 10", "v_mov_b32_e32 v1, 20", "v_swaprel_b32 v0, v1", "s_endpgm"]
+        spv = support.translate_lines("cs_swaprel_oracle", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpSelect", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
