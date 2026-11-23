@@ -22,6 +22,7 @@ MISSING_INPUT_TOOLS = (
     "gamedata_maps",
     "navmesh_index",
     "pe_inspect",
+    "psocache_usersig",
     "rtti_scan",
     "shader_disasm",
     "tile_probe",
