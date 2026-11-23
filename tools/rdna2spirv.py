@@ -11924,7 +11924,7 @@ class Gen:
         self._scan = (body, len(body), open_)
         return not open_
 
-    def store_gather_taps(self, first_vgpr: int, taps: list[str], d16: bool) -> None:
+    def store_gather_taps(self, first_vgpr: int, taps: list[str], d16: bool, has_status: bool = False) -> None:
         """Write four taps in gather order, two per destination VGPR for d16."""
         if d16:
             words = [self.pack_f16_pair_int(taps[0], taps[1]), self.pack_f16_pair_int(taps[2], taps[3])]
@@ -11932,6 +11932,8 @@ class Gen:
             words = [self.tou(tap) for tap in taps]
         for i, word in enumerate(words):
             self.dst({"k": "vgpr", "r": first_vgpr + i, "n": 1}, word)
+        if has_status:
+            self.dst({"k": "vgpr", "r": first_vgpr + len(words), "n": 1}, self.cu(0))
 
     GATHER4_LOD_OPS = (
         "image_gather4_c_l", "image_gather4_c_l_o",
@@ -12344,7 +12346,8 @@ class Gen:
                     self.emit(f"{sel} = OpSelect %float {out} {border_v} {comp}")
                     comp = sel
                 taps.append(self.gather_depth_compare(cmp_state, ref, comp))
-            self.store_gather_taps(vdata["r"], taps, d16)
+            has_status = "tfe" in mods or "lwe" in mods
+            self.store_gather_taps(vdata["r"], taps, d16, has_status=has_status)
             return
 
         def gather_mip(image: str, cls: int, ty: str) -> str:
@@ -12371,8 +12374,9 @@ class Gen:
             self.emit(f"{result} = OpCompositeConstruct {ty} {' '.join(taps)}")
             return result
 
+        has_status = "tfe" in mods or "lwe" in mods
         self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
-                              0xf, vdata, d16, gather_mip)
+                              0xf, vdata, d16, gather_mip, has_status=has_status)
 
     def desc_lookup_sgpr(self, a, n):
         """desc_lookup for an SGPR descriptor range (n=8: T#, n=4: S#), cached for the rest of the basic block.
@@ -12492,7 +12496,7 @@ class Gen:
         if op == "image_sample_c_l":
             # Vulkan Dref returns one scalar. Other component masks require the depth view's swizzle.
             if (dim != "dim:SQ_RSRC_IMG_2D" or dmask != 1 or len(addr) != (3 if a16 else 4)
-                    or any(m not in (dim, dm, "a16", "d16") for m in mods)):
+                    or any(m not in (dim, dm, "a16", "d16", "tfe", "lwe") for m in mods)):
                 raise Unsupported(op + " needs scalar 2D depth comparison")
         img_idx = self.desc_lookup_sgpr(a[2], 8)
         img = None              # a coherent image_load reads the storage view, not this sampled one
@@ -12544,11 +12548,13 @@ class Gen:
             else:
                 iv = self.tmp()
                 self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
+            has_status = "tfe" in mods or "lwe" in mods
             if coherent:
-                self.image_load_coherent(view_dim, self.sgpr_word(a[2], 1), iv, img_idx, dmask, vdata, d16)
+                self.image_load_coherent(view_dim, self.sgpr_word(a[2], 1), iv, img_idx, dmask, vdata, d16,
+                                         has_status=has_status)
                 return
             self.image_load_typed(view_dim, self.sgpr_word(a[2], 1), iv, img, img_idx,
-                                  dmask, vdata, self.cu(0), d16)
+                                  dmask, vdata, self.cu(0), d16, has_status=has_status)
             return
         else:
             smp_idx = self.desc_lookup_sgpr(a[3], 4)
@@ -12684,7 +12690,8 @@ class Gen:
                     return result
 
                 self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
-                                      0xf, vdata, d16, gather_mip)
+                                      0xf, vdata, d16, gather_mip,
+                                      has_status=("tfe" in mods or "lwe" in mods))
                 self.uses_fhalf = True
                 return
             if op == "image_gather4_lz":
@@ -12711,7 +12718,8 @@ class Gen:
                     self.uses_int_sampler = True
                     # dmask selects one texture channel; all four taps are written.
                     self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
-                                          0xf, vdata, d16, gather)
+                                          0xf, vdata, d16, gather,
+                                          has_status=("tfe" in mods or "lwe" in mods))
                     return
                 res = gather(img, 0, "%v4float")
                 comps = []
@@ -12719,7 +12727,8 @@ class Gen:
                     comp = self.tmp()
                     self.emit(f"{comp} = OpCompositeExtract %float {res} {c}")
                     comps.append(comp)
-                self.store_gather_taps(vdata["r"], comps, d16)
+                self.store_gather_taps(vdata["r"], comps, d16,
+                                       has_status=("tfe" in mods or "lwe" in mods))
                 return
             kind = op[len("image_sample"):]          # '', '_lz', '_l', '_b', '_c_lz', '_d', '_d_cl' (+ '_o')
             off = None
@@ -12807,7 +12816,8 @@ class Gen:
 
                 self.uses_int_sampler = True
                 self.image_read_typed(dim, self.sgpr_word(a[2], 1), img, img_idx,
-                                      dmask, vdata, d16, sample)
+                                      dmask, vdata, d16, sample,
+                                      has_status=("tfe" in mods or "lwe" in mods))
                 return
             res = self.tmp()
             if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b"):
@@ -12877,6 +12887,8 @@ class Gen:
                 else:
                     r = self.tou(d)
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, r)
+                if "tfe" in mods or "lwe" in mods:
+                    self.dst({"k": "vgpr", "r": vdata["r"] + 1, "n": 1}, self.cu(0))
                 return
             else:
                 raise Unsupported(op)
@@ -12889,15 +12901,20 @@ class Gen:
                 comps.append(comp)
         if len(comps) != ncomp:
             raise Unsupported("dmask")
+        has_status = "tfe" in mods or "lwe" in mods
         if d16:
             # d16: components are packed two per register as f16 (x|y<<16, z|w<<16).
             for i in range(0, len(comps), 2):
                 second = comps[i + 1] if i + 1 < len(comps) else "%f0"
                 p = self.pack_f16_pair_int(comps[i], second)
                 self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, p)
+            if has_status:
+                self.dst({"k": "vgpr", "r": vdata["r"] + (len(comps) + 1) // 2, "n": 1}, self.cu(0))
         else:
             for i, comp in enumerate(comps):
                 self.dst({"k": "vgpr", "r": vdata["r"] + i, "n": 1}, self.tou(comp))
+            if has_status:
+                self.dst({"k": "vgpr", "r": vdata["r"] + len(comps), "n": 1}, self.cu(0))
 
     # image atomic -> SPIR-V op (guarded inside `if (active)` so inactive lanes skip the access)
     IMG_ATOMICS = {"image_atomic_umin": "OpAtomicUMin", "image_atomic_umax": "OpAtomicUMax",
@@ -12995,14 +13012,14 @@ class Gen:
             self.emit(f"{half} = OpExtInst %uint %glsl UMin {bits} {self.cu(0xFFFF)}")
         return half
 
-    def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, lod, d16=False):
+    def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, lod, d16=False, has_status=False):
         def fetch(image, _cls, ty):
             res = self.tmp()
             self.emit(f"{res} = OpImageFetch {ty} {image} {iv} Lod {lod}")
             return res
-        self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch)
+        self.image_read_typed(dim, t1, img, idx, dmask, vdata, d16, fetch, has_status=has_status)
 
-    def image_load_coherent(self, dim, t1, iv, idx, dmask, vdata, d16):
+    def image_load_coherent(self, dim, t1, iv, idx, dmask, vdata, d16, has_status=False):
         """image_load with glc: a coherent read. On GFX10 a device-scope load is glc + dlc and a device-scope store
         glc (Mesa ac_get_hw_cache_flags maps ACCESS_COHERENT to exactly these bits); the POPS pixel shaders read and
         write their ordered images that way. Through the sampled array (image_load_typed) the read could not see
@@ -13025,9 +13042,9 @@ class Gen:
             res = self.tmp()
             self.emit(f"{res} = OpImageRead {ty} {image} {iv}")
             return res
-        self.image_read_typed(dim, t1, None, idx, dmask, vdata, d16, read, view)
+        self.image_read_typed(dim, t1, None, idx, dmask, vdata, d16, read, view, has_status=has_status)
 
-    def image_read_typed(self, dim, t1, img, idx, dmask, vdata, d16, read, view=None):
+    def image_read_typed(self, dim, t1, img, idx, dmask, vdata, d16, read, view=None, has_status=False):
         """Read an image using the component type selected by FORMAT in T# word 1.
         read(image, cls, ty) emits the fetch or gather and returns its four components. The float view also
         handles a lookup miss: index zero holds the RGBA8_UNORM fallback. view(cls) loads the image of class cls
@@ -13117,6 +13134,10 @@ class Gen:
         self.emit(f"{L['e3']} = OpLabel")
         self.emit(f"OpBranch {L['e2']}")
         self.emit(f"{L['e2']} = OpLabel")
+        if has_status:
+            ncomp = bin(dmask).count("1")
+            data_regs = (ncomp + 1) // 2 if d16 else ncomp
+            self.dst({"k": "vgpr", "r": vdata["r"] + data_regs, "n": 1}, self.cu(0))
 
     def unpack_image_a16_uints(self, words: list[str]) -> list[str]:
         """Unpack the unsigned address components of a samplerless MIMG instruction, low half first."""
@@ -13406,7 +13427,8 @@ class Gen:
             self.emit(f"{iv} = OpCompositeConstruct %v3int {xs[0]} {xs[1]} {xs[2]}")
             dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
             self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, idx, int(dm.split(":")[1], 0),
-                                  vdata, xs[3], d16="d16" in mods)
+                                  vdata, xs[3], d16="d16" in mods,
+                                  has_status=("tfe" in mods or "lwe" in mods))
             return
         packed_mip = op == "image_load_mip" and "tfe" not in mods and "lwe" not in mods
         if ((dim != "dim:SQ_RSRC_IMG_2D" and not (is3d_atomic or array_query))
@@ -13511,7 +13533,8 @@ class Gen:
             xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:3]]
         iv = self.tmp()
         self.emit(f"{iv} = OpCompositeConstruct %v2int {xs[0]} {xs[1]}")
-        self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, idx, dmask, vdata, xs[2], d16="d16" in mods)
+        self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, idx, dmask, vdata, xs[2],
+                              d16="d16" in mods, has_status=("tfe" in mods or "lwe" in mods))
 
 
     def interp_pair_src(self, op, a, ins):
@@ -17157,7 +17180,7 @@ def interp_copy_sources(insns):
         if not (a and a[0].get("k") == "vgpr") or base_op(ins["op"]).startswith(
                 ("buffer_store", "tbuffer_store", "scratch_store", "global_store", "image_store", "ds_write")):
             continue
-        for r in vgpr_dest_registers(ins, extra=int("tfe" in ins["mods"])):
+        for r in vgpr_dest_registers(ins, extra=int("tfe" in ins["mods"] or "lwe" in ins["mods"])):
             writes.setdefault(r, []).append(ins)
     copies = {}
     grew = True
