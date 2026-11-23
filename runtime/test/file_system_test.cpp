@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <aclapi.h>
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <clocale>
@@ -55,6 +56,9 @@ using CopyFileExWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID
 using CopyFile2Fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS*);
 using SetFileAttributesWFn = BOOL(WINAPI*)(LPCWSTR, DWORD);
 using SetFileAttributesAFn = BOOL(WINAPI*)(LPCSTR, DWORD);
+// The CRT's own file entry points: __cdecl, int return, errno for the reason.
+using RemoveFn = int(__cdecl*)(const char*);
+using WStat64Fn = int(__cdecl*)(const wchar_t*, struct _stat64*);
 
 int g_checks = 0;
 int g_failures = 0;
@@ -503,6 +507,37 @@ void run_checks(const std::filesystem::path& root) {
               "deleting a nested package file does not hide its parent folder");
         check(contains(list(first_w, next_w, find_close, L"GAME:\\data\\*"), L"sub"),
               "the parent folder stays listed after deleting a nested package file");
+    }
+
+    // The CRT's own file entry points take the same console paths. The retail executable imports remove and
+    // _wstat64 from api-ms-win-crt-filesystem-l1-1-0.dll; bound to the host UCRT that drive does not exist, so
+    // they are answered over the same overlay/package view as CreateFileW and DeleteFileW. A host path stays the
+    // CRT's own.
+    {
+        const auto remove_fn = resolve<RemoveFn>("api-ms-win-crt-filesystem-l1-1-0.dll", "remove");
+        const auto wstat64 = resolve<WStat64Fn>("api-ms-win-crt-filesystem-l1-1-0.dll", "_wstat64");
+        check(remove_fn && wstat64, "remove() and _wstat64() resolve under the CRT filesystem set the title imports");
+        if (remove_fn && wstat64) {
+            write_path(package / "crt" / "sized.txt", "package");
+            struct _stat64 info{};
+            check(wstat64(L"GAME:\\crt\\sized.txt", &info) == 0 && info.st_size == 7,
+                  "_wstat64() reports a package file's size");
+            check(remove_fn("GAME:\\crt\\sized.txt") == 0, "remove() deletes a console path");
+            check(std::filesystem::exists(package / "crt" / "sized.txt"),
+                  "remove() leaves the package file in place");
+            check(attributes_w(L"GAME:\\crt\\sized.txt") == INVALID_FILE_ATTRIBUTES,
+                  "the name remove() hid is gone from the title's view");
+            info = {};
+            check(wstat64(L"GAME:\\crt\\sized.txt", &info) != 0, "_wstat64() reports the hidden name as missing");
+            check(remove_fn("GAME:\\crt\\sized.txt") != 0, "remove() reports the hidden name as missing");
+            write_path(root / "crt-host.txt", "host");
+            info = {};
+            check(wstat64((root / "crt-host.txt").c_str(), &info) == 0 && info.st_size == 4,
+                  "_wstat64() takes a host path as before");
+            const std::string host_path = (root / "crt-host.txt").string();
+            check(remove_fn(host_path.c_str()) == 0 && !std::filesystem::exists(root / "crt-host.txt"),
+                  "remove() deletes a host path as before");
+        }
     }
 
     // DeleteFile checks the visible file's read-only bit. A package file is hidden by a marker instead of being
