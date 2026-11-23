@@ -365,6 +365,33 @@ void test_names(World& w) {
     if (set_desc && SUCCEEDED(set_desc(self, L"MainDesc"))) check(thread_name(GetCurrentThreadId()) == "MainDesc", "SetThreadDescription names a thread too");
 }
 
+LONG CALLBACK handled_fault_veh(EXCEPTION_POINTERS* info) {
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    return (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_ACCESS_VIOLATION)
+        ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void test_emulated_instruction_budget() {
+    remove_fault_handlers();
+    PVOID emulator = AddVectoredExceptionHandler(1, &handled_fault_veh);
+    check(emulator != nullptr, "the dummy instruction emulator is installed");
+    if (!emulator) return;
+    FaultConfig config;
+    config.fault_reports = 2;
+    config.first_chance_limit = 10;
+    install_fault_handlers(config);
+    clear_out();
+    for (int i = 0; i < 4; ++i) RaiseException(EXCEPTION_ILLEGAL_INSTRUCTION, 0, 0, nullptr);
+    check(all_text().empty(), "handled illegal instructions are not reported");
+    for (int i = 0; i < 3; ++i) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+    const std::string t = all_text();
+    check_in(count_of(t, "first-chance fault: access violation") == 2 &&
+             count_of(t, "more than 2 first-chance faults") == 1,
+             "illegal instructions leave the fault budget for counted access violations", t);
+    remove_fault_handlers();
+    RemoveVectoredExceptionHandler(emulator);
+}
+
 void test_faults(World& w) {
     const auto base = reinterpret_cast<uint64_t>(g_image);
     (void)base;
@@ -780,6 +807,7 @@ int main(int argc, char** argv) {
     test_scan_buffer();
     test_names(w);
     test_faults(w);
+    test_emulated_instruction_budget();
     test_cpp_exceptions();
     remove_fault_handlers();
     install_fault_handlers(fc);

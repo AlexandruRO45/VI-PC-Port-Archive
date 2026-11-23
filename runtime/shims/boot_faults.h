@@ -96,7 +96,6 @@ inline bool is_fault_code(DWORD code) {
     switch (code) {
         case EXCEPTION_ACCESS_VIOLATION:
         case EXCEPTION_IN_PAGE_ERROR:
-        case EXCEPTION_ILLEGAL_INSTRUCTION:
         case EXCEPTION_PRIV_INSTRUCTION:
         case EXCEPTION_INT_DIVIDE_BY_ZERO:
         case EXCEPTION_INT_OVERFLOW:
@@ -324,6 +323,8 @@ inline void log_first_chance(const EXCEPTION_POINTERS& info) {
 
 inline LONG handle(EXCEPTION_POINTERS* info) {
     const EXCEPTION_RECORD& r = *info->ExceptionRecord;
+    // The earlier-installed instruction emulator gets these after this VEH.
+    if (r.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
     if (r.ExceptionCode == kThreadNameException) {
         note_thread_name_exception(r);
         return EXCEPTION_CONTINUE_SEARCH;
