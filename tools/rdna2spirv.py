@@ -373,6 +373,7 @@ class Gen:
                                   # single defining plain v_mov of it); valid I/J sources (SHADER-177)
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
+        self.out_pcs = None   # per basic block: exact next-%pc set (cfg_structure.END when a block can terminate)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
@@ -15289,7 +15290,7 @@ def assemble(gen):
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
-    tree, nesting = (capped_tree(gen.succ) if gen.blocks and not gen.emulate and not gen.bar_rounds
+    tree, nesting = (capped_tree(gen.succ, gen.out_pcs) if gen.blocks and not gen.emulate and not gen.bar_rounds
                      else (None, None))
     if nesting is not None:
         gen.nesting = nesting
@@ -16826,6 +16827,7 @@ def translate(path):
                 g.cu(n)
             raw_edges = split_edges
     succ = [list(dict.fromkeys(e)) for e in raw_edges]
+    g.out_pcs = native_out_pcs(blocks, raw_edges, succ)
     g.vm_latch = stage == "ps" and exec_changes_after_vm(blocks, succ)
     g.park_masks((blocks, succ))
     halves_analysis(g, blocks, succ)
@@ -17101,14 +17103,38 @@ def translate(path):
 _DEF = re.compile(r"(%\w+) = (Op\w+)(?: (%\w+))?")
 
 
-def capped_tree(succ):
-    """(tree, nesting): the structured tree for `succ` and its depth, or (None, None) under --dispatch-loop or when
-    cfg_structure can't structure it; tree is None (nesting still the measured depth) when it nests deeper than
-    MAX_STRUCTURED_DEPTH. assemble() emits exactly this tree, and needs_barrier_rounds() decides from the same one
-    (SHADER-427 review): a barrier in a tree that falls back to the dispatch loop isn't at a structured top level."""
+def native_out_pcs(blocks, raw_edges, succ):
+    """Exact set of possible next-%pc values after each block (`cfg_structure.END` when a block can terminate).
+
+    Matches the terminator emission in `translate()`: a conditional branch in the last block with no fallthrough
+    (`len(raw_edges[b]) == 1`) writes either `tgt` or `len(blocks)` (`END`), even though `succ[b]` only lists `[tgt]`."""
+    out = {}
+    for b, blk in enumerate(blocks):
+        s = set(succ[b])
+        if not s:
+            s.add(cfg_structure.END)
+        elif len(raw_edges[b]) == 1:
+            last = next((ins for ins in blk if base_op(ins["op"]) == "s_endpgm" or base_op(ins["op"]) in BRANCHES), None)
+            if last is not None:
+                op = base_op(last["op"])
+                if op in BRANCHES and op != "s_branch":
+                    s.add(cfg_structure.END)
+        out[b] = frozenset(s)
+    return out
+
+
+def capped_tree(succ, out_pcs=None):
+    """(tree, nesting): the structured tree for `succ` (with provably-true `%pc` guards unwrapped and hoisted
+    spine guards coalesced) and its depth, or (None, None) under --dispatch-loop or when cfg_structure can't
+    structure it; tree is None (nesting still the measured depth) when it nests deeper than MAX_STRUCTURED_DEPTH.
+    assemble() emits exactly this tree, and needs_barrier_rounds() decides from the same one (SHADER-427 review):
+    a barrier in a tree that falls back to the dispatch loop isn't at a structured top level."""
     tree = cfg_structure.structure(succ) if STRUCTURED else None
     if tree is None:
         return None, None
+    if out_pcs is None:
+        out_pcs = {b: frozenset(s) if s else frozenset((cfg_structure.END,)) for b, s in enumerate(succ)}
+    tree = cfg_structure.unwrap_known_pc_guards(tree, out_pcs)
     nesting = cfg_structure.depth(tree)
     if MAX_STRUCTURED_DEPTH and nesting > MAX_STRUCTURED_DEPTH:
         return None, nesting                         # too deep to validate cheaply: use the flat form
@@ -17135,7 +17161,7 @@ def needs_barrier_rounds(g, blocks, succ):
                 break
     if not with_barrier:
         return False
-    tree, _ = capped_tree(succ)         # the tree assemble() emits: over MAX_STRUCTURED_DEPTH it's the dispatch loop
+    tree, _ = capped_tree(succ, g.out_pcs)   # the tree assemble() emits: over MAX_STRUCTURED_DEPTH it's the dispatch loop
     top = {it[1] for it in tree if it[0] == "block"} if tree is not None else set()
     return not with_barrier <= top
 

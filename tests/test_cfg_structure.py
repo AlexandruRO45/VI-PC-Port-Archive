@@ -146,10 +146,18 @@ def _check_random_graphs():
         loops += '"loop"' in repr(tree).replace("'", '"')
         placed = blocks_in(tree)
         assert len(placed) == len(set(placed)), f"a block is placed twice: {succ}"
+        out_pcs = {b: (frozenset(s) if s else frozenset((S.END,))) for b, s in enumerate(succ)}
+        utree = S.unwrap_known_pc_guards(tree, out_pcs, 0)
+        uplaced = blocks_in(utree)
+        assert sorted(uplaced) == sorted(placed) and len(uplaced) == len(set(uplaced)), (
+            f"unwrap_known_pc_guards changed block set for {succ}")
+        assert S.depth(utree) <= S.depth(tree), f"unwrap_known_pc_guards increased depth for {succ}"
         for seed in range(6):
             want = walk(succ, chooser(succ, seed), 200)
             got = S.run(tree, chooser(succ, seed), 200)
             assert got == want, f"graph {succ} seed {seed}: tree ran {got}, graph runs {want}"
+            ugot = S.run(utree, chooser(succ, seed), 200)
+            assert ugot == want, f"unwrapped graph {succ} seed {seed}: tree ran {ugot}, graph runs {want}"
     assert structured > 5000 and refused > 1000 and loops > 2000, (structured, refused, loops)
     assert split_ok > 1000 and split_ok + split_cap == refused, (split_ok, split_cap, refused)
     return structured, refused, loops, split_ok, split_cap
@@ -247,10 +255,67 @@ def test_deep_sequential_chains_stay_flat_and_iterative():
         assert got == want
 
 
+def test_unwrap_known_pc_guards():
+    def count_guards(tree):
+        n = 0
+        stack = [tree]
+        while stack:
+            for it in stack.pop():
+                if it[0] == "guard":
+                    n += 1
+                    stack.append(it[2])
+                elif it[0] == "loop":
+                    stack.append(it[2])
+        return n
+
+    def out_pcs_for(succ):
+        return {b: (frozenset(s) if s else frozenset((S.END,))) for b, s in enumerate(succ)}
+
+    # 1. Diamond join block unwraps to top level: 0 -> {1, 2} -> 3.
+    diamond = [[1, 2], [3], [3], []]
+    dtree = S.unwrap_known_pc_guards(S.structure(diamond), out_pcs_for(diamond))
+    assert dtree == [("block", 0), ("guard", 2, [("block", 2)]), ("guard", 1, [("block", 1)]), ("block", 3)]
+
+    # 2. Loop exit block unwraps to top level: 0 -> {0, 1}, 1 -> END.
+    loop = [[0, 1], []]
+    ltree = S.unwrap_known_pc_guards(S.structure(loop), out_pcs_for(loop))
+    assert ltree == [("loop", 0, [("block", 0)]), ("block", 1)]
+
+    # 3. Early-exit + 200 sequential diamonds: all 200 hoisted spine guards coalesce and unwrap.
+    succ_early = [[1, 2], []]
+    cur = 2
+    for _ in range(200):
+        succ_early.append([cur + 1, cur + 2])
+        succ_early.append([cur + 2])
+        cur += 2
+    succ_early.append([])
+    raw = S.structure(succ_early)
+    unwrapped = S.unwrap_known_pc_guards(raw, out_pcs_for(succ_early))
+    assert count_guards(raw) == 402
+    assert count_guards(unwrapped) == 202
+    assert S.depth(unwrapped) <= S.depth(raw)
+    for seed in range(4):
+        want = walk(succ_early, chooser(succ_early, seed), 500)
+        assert S.run(unwrapped, chooser(succ_early, seed), 500) == want
+
+    # 4. Join after an arm that can exit early keeps its guard because END is in cur_pc:
+    #    0 -> {1, 2}, 1 -> 3, 2 -> {4 (END), 3}, 3 -> END, 4 -> END.
+    early_arm = [[1, 2], [3], [4, 3], [], []]
+    eatree = S.unwrap_known_pc_guards(S.structure(early_arm), out_pcs_for(early_arm))
+    assert eatree[-1] == ("guard", 3, [("block", 3)])
+
+    # 5. Conditional branch that can also fall off to END keeps a subsequent guard wrapped.
+    cond_end = [[1, 2], [2], []]
+    out_with_end = {0: frozenset((1, 2)), 1: frozenset((2, S.END)), 2: frozenset((S.END,))}
+    cetree = S.unwrap_known_pc_guards(S.structure(cond_end), out_with_end)
+    assert cetree[-1][0] == "guard" and cetree[-1][1] == 2
+
+
 if __name__ == "__main__":
     test_depth()
     test_shapes()
     test_deep_sequential_chains_stay_flat_and_iterative()
+    test_unwrap_known_pc_guards()
     structured, refused, loops, split_ok, split_cap = _check_random_graphs()
     print(f"ok: {structured} graphs structured and run, {refused} irreducible "
           f"({split_ok} split-structured, {split_cap} capped), {loops} with loops")
