@@ -3062,8 +3062,8 @@ private:
     }
 
     // Runs one held operation as the call would have, with its own waits and none of the ones queued since.
-    // A submission that fails leaves its waits for the next one, as when the call is not held (a transient
-    // vkQueueSubmit failure is retried by the application's next call), ahead of the waits asked for since.
+    // A failed submit leaves its waits for the application's next call. Held batches that follow it keep
+    // the waits they had captured. A mapping that submits no work forwards its waits in queue order.
     void run(Deferred& op) {
         auto later_waits = std::move(waits_);
         auto later_values = std::move(wait_values_);
@@ -3099,21 +3099,20 @@ private:
         case Deferred::Kind::tile_mapping:
             if (!op.tile_mapping())
                 std::fprintf(stderr, "[rt] d3d12: a held tile mapping failed when it was released\n");
+            if (!waits_.empty() || !logical_waits_.empty() || !wait_pins_.empty())
+                preserve_tile_waits(later_waits, later_values, later_pins, later_logical);
             break;
         }
-        // A rejected submission or a no-op mapping leaves its waits for the next submission.
-        if (!waits_.empty() || !logical_waits_.empty() || !wait_pins_.empty())
-            preserve_deferred_waits(later_waits, later_values, later_pins, later_logical);
         const auto pin_ticket = context_.is_device_lost() ? UINT64_MAX : submitted_;
         retire_pins(op.pins, pin_ticket);
-        waits_ = std::move(later_waits);
-        wait_values_ = std::move(later_values);
-        wait_pins_ = std::move(later_pins);
-        logical_waits_ = std::move(later_logical);
+        waits_.insert(waits_.end(), later_waits.begin(), later_waits.end());
+        wait_values_.insert(wait_values_.end(), later_values.begin(), later_values.end());
+        for (auto& pin : later_pins) wait_pins_.push_back(std::move(pin));
+        for (auto& wait : later_logical) logical_waits_.push_back(std::move(wait));
     }
 
-    void preserve_deferred_waits(std::vector<VkSemaphore>& later_waits, std::vector<std::uint64_t>& later_values,
-                                 std::vector<std::shared_ptr<void>>& later_pins, LogicalWaits& later_logical) {
+    void preserve_tile_waits(std::vector<VkSemaphore>& later_waits, std::vector<std::uint64_t>& later_values,
+                             std::vector<std::shared_ptr<void>>& later_pins, LogicalWaits& later_logical) {
         const auto next = std::find_if(held_.begin(), held_.end(), [](const Deferred& op) {
             return op.kind != Deferred::Kind::marker;
         });
@@ -3125,6 +3124,10 @@ private:
             add_wait(semaphores, values, waits_[i], wait_values_[i]);
         for (auto& pin : wait_pins_) pins.push_back(std::move(pin));
         for (auto& wait : logical_waits_) logical.push_back(std::move(wait));
+        waits_.clear();
+        wait_values_.clear();
+        wait_pins_.clear();
+        logical_waits_.clear();
     }
 
     bool ready(const Deferred& op) const {

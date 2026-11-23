@@ -4968,22 +4968,21 @@ int compare_check_feature_support(ID3D12Device* ours) {
     return mismatches;
 }
 
-// Fences and queues must follow the host runtime's semantics: Signal raises the completed value and a null event set
-// for a reached value blocks until then. Runs the same sequence on ours and the host and compares the completed value
-// and the HRESULT at each step. A signal of an already-passed (lower) value is a documented deviation: the shim drops
-// it and stays monotonic because a Vulkan timeline cannot go back, so that case is checked against the documented
-// behaviour rather than the host. Returns the number of mismatches, or -1 when the host has no D3D12 device.
+// Runs the same fence and queue signal sequence on the layer and host D3D12, including a rewind after a higher
+// value completed. Returns the number of mismatches, or -1 when the host has no D3D12 device.
 int compare_fences(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     Ref<ID3D12CommandQueue> oq, hq;
-    Ref<ID3D12Fence> of, hf;
+    Ref<ID3D12Fence> of, hf, layer_marker, host_marker;
     if (FAILED(ours->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&oq.p))) ||
         FAILED(host->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&hq.p))) ||
         FAILED(ours->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&of.p))) ||
-        FAILED(host->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hf.p))))
+        FAILED(host->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hf.p))) ||
+        FAILED(ours->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&layer_marker.p))) ||
+        FAILED(host->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&host_marker.p))))
         return -1;
     int mismatches = 0;
     const auto check = [&](const char* what, UINT64 a, UINT64 b) {
@@ -5006,13 +5005,23 @@ int compare_fences(ID3D12Device* ours) {
     check("completed at 9", of->GetCompletedValue(), hf->GetCompletedValue());
     // An event for an already-reached value returns at once.
     check_hr("event at reached 9", of->SetEventOnCompletion(9, nullptr), hf->SetEventOnCompletion(9, nullptr));
-    // A signal of an already-passed (lower) value: the host is free to lower the fence on some drivers, but a Vulkan
-    // timeline only increases. The shim deliberately drops it and keeps the higher value (see Fence::claim in
-    // d3d12_com.cpp), so this is checked against the documented behaviour, not the host.
-    check_hr("signal 3 (lower)", oq->Signal(of.p, 3), S_OK);
-    if (of->GetCompletedValue() != 9 && mismatches++ < 24)
-        std::fprintf(stderr, "fence lower signal: ours %llu, want 9\n",
-                     static_cast<unsigned long long>(of->GetCompletedValue()));
+    // Waiting for 3 on the rewinding fence can return while it still holds 9. Use fresh queue markers to observe
+    // that both lower signals have run, then compare the exact rewind value.
+    check_hr("signal 3 (lower)", oq->Signal(of.p, 3), hq->Signal(hf.p, 3));
+    check_hr("layer marker after rewind", oq->Signal(layer_marker.p, 1), S_OK);
+    check_hr("host marker after rewind", hq->Signal(host_marker.p, 1), S_OK);
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    while ((layer_marker->GetCompletedValue() == 0 || host_marker->GetCompletedValue() == 0) &&
+           GetTickCount64() < deadline)
+        Sleep(1);
+    if (layer_marker->GetCompletedValue() != 1 || host_marker->GetCompletedValue() != 1) {
+        std::fputs("fence lower signal: a queue marker did not complete\n", stderr);
+        return mismatches + 1;
+    }
+    const UINT64 lower = of->GetCompletedValue();
+    check("lower signal", lower, hf->GetCompletedValue());
+    if (lower != 3 && mismatches++ < 24)
+        std::fprintf(stderr, "fence lower signal: ours %llu, want 3\n", static_cast<unsigned long long>(lower));
     return mismatches;
 }
 
