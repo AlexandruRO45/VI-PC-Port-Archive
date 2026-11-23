@@ -305,3 +305,16 @@ class TestValuLshlrevB16RegisterAliasing(unittest.TestCase):
         res = state.execute(inst)
         self.assertEqual(res, 8)
         self.assertEqual(state.vgpr[0], 8)
+
+
+class TestValuLshlrevB16ConditionCodes(unittest.TestCase):
+    """Test suite for condition codes and flag preservation."""
+
+    def test_flags_neutrality(self):
+        # VALU shifts do not update SCC or VCC
+        scc = 0
+        vcc = 0
+        res = ref_lshlrev_b16(1, 0x8000)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(vcc, 0)
