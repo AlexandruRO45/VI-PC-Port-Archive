@@ -5795,20 +5795,49 @@ class Gen:
                 return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
             sel, selhi = bits("op_sel", [0, 0]), bits("op_sel_hi", [1, 1])
             sh_src, val_src = self.src_u(a[1]), self.src_u(a[2])
-            halves = []
-            for h, sl in ((0, sel), (1, selhi)):
-                amt, val, am, r16 = self.tmp(), self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(16 * sl[0])} {self.cu(4)}")
-                ext = "OpBitFieldSExtract" if op.endswith("i16") else "OpBitFieldUExtract"
-                self.emit(f"{val} = {ext} %uint {val_src} {self.cu(16 * sl[1])} {self.cu(16)}")
-                k = {"v_pk_lshlrev_b16": "OpShiftLeftLogical", "v_pk_lshrrev_b16": "OpShiftRightLogical",
-                     "v_pk_ashrrev_i16": "OpShiftRightArithmetic"}[op]
-                self.emit(f"{am} = {k} %uint {val} {amt}")
-                self.emit(f"{r16} = OpBitwiseAnd %uint {am} {self.cu(0xFFFF)}")
-                halves.append(r16)
-            hi, r = self.tmp(), self.tmp()
-            self.emit(f"{hi} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
-            self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
+            amts = []
+            for sl in (sel, selhi):
+                t, amt = self.tmp(), self.tmp()
+                self.emit(f"{t} = OpShiftRightLogical %uint {sh_src} {self.cu(16 * sl[0])}")
+                self.emit(f"{amt} = OpBitwiseAnd %uint {t} {self.cu(15)}")
+                amts.append(amt)
+            # the half to shift, placed in bits 31:16 of a word (the other half zero)
+            tops = []
+            for sl in (sel, selhi):
+                t = self.tmp()
+                if sl[1]:
+                    self.emit(f"{t} = OpBitwiseAnd %uint {val_src} {self.cu(0xFFFF0000)}")
+                else:
+                    self.emit(f"{t} = OpShiftLeftLogical %uint {val_src} {self.cu(16)}")
+                tops.append(t)
+            lo, hi = self.tmp(), self.tmp()
+            if op == "v_pk_ashrrev_i16":
+                # high result in place (bits 31:16 of an arithmetic shift of the top half), low result from a shift of
+                # the top half by 16 + amt
+                a16, l32, h32 = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{a16} = OpIAdd %uint {amts[0]} {self.cu(16)}")
+                self.emit(f"{l32} = OpShiftRightArithmetic %uint {tops[0]} {a16}")
+                self.emit(f"{lo} = OpBitwiseAnd %uint {l32} {self.cu(0xFFFF)}")
+                self.emit(f"{h32} = OpShiftRightArithmetic %uint {tops[1]} {amts[1]}")
+                self.emit(f"{hi} = OpBitwiseAnd %uint {h32} {self.cu(0xFFFF0000)}")
+            elif op == "v_pk_lshrrev_b16":
+                a16, l32, h32 = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{a16} = OpIAdd %uint {amts[0]} {self.cu(16)}")
+                self.emit(f"{l32} = OpShiftRightLogical %uint {tops[0]} {a16}")
+                self.emit(f"{lo} = OpBitwiseAnd %uint {l32} {self.cu(0xFFFF)}")
+                self.emit(f"{h32} = OpShiftRightLogical %uint {tops[1]} {amts[1]}")
+                self.emit(f"{hi} = OpBitwiseAnd %uint {h32} {self.cu(0xFFFF0000)}")
+            else:
+                # shift left: the low half of the result comes from the low bits, so shift the half placed at the top
+                # right by 16 first
+                l16, l32, h32 = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{l16} = OpShiftRightLogical %uint {tops[0]} {self.cu(16)}")
+                self.emit(f"{l32} = OpShiftLeftLogical %uint {l16} {amts[0]}")
+                self.emit(f"{lo} = OpBitwiseAnd %uint {l32} {self.cu(0xFFFF)}")
+                self.emit(f"{h32} = OpShiftLeftLogical %uint {tops[1]} {amts[1]}")
+                self.emit(f"{hi} = OpBitwiseAnd %uint {h32} {self.cu(0xFFFF0000)}")
+            r = self.tmp()
+            self.emit(f"{r} = OpBitwiseOr %uint {lo} {hi}")
             self.dst(a[0], r)
         elif op in ("v_sin_f32", "v_cos_f32"):
             # RDNA takes the angle in turns: reduce in turns, then sin/cos(x * 2*pi).
