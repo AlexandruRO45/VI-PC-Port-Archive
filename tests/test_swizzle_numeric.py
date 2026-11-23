@@ -1,9 +1,14 @@
 """Regression coverage for numeric ds_swizzle offsets emitted by LLVM."""
 
+import os
+import sys
+
 import pytest
 
-from conftest import requires_tools
-from semantic.support import translate_lines
+from conftest import ROOT, requires_tools
+
+sys.path.insert(0, os.path.join(ROOT, "tests", "semantic"))
+from support import translate_lines
 
 
 @requires_tools
