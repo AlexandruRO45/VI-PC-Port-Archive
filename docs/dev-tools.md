@@ -50,13 +50,18 @@ Pass `--out PATH` or `--out=PATH` with a new or empty directory. Relative
 paths are interpreted from the directory where you run the CLI, including
 when you invoke `scripts/dev.py` by its full path from another directory.
 
-The runner uses exit code `0` for a successful scene and `1` for a scene
-check failure. Exit code `2` indicates a usage or prerequisite error. The
-runner prints the path to its structured `report.json` when it writes the
-report. Open it in the output directory for the result and per-run details.
-The directory also holds the logs and any frame records, PPM images and
-other outputs produced before the run finished. A rejected run may leave
-no report. If the runner rejects an occupied directory, any report already
-there belongs to an earlier run.
+The CLI forwards the runner's exit code and diagnostics. Exit code `0`
+means the scene checks passed. Exit code `1` can indicate a scene check
+failure or a failure before the runner can write a report, such as an
+output directory it cannot create. Exit code `2` indicates a usage or
+prerequisite error.
+
+When the runner writes `report.json`, it prints the path. Open that file
+for the scene result and per-run details. For example, if the full run
+starts and the loader exits with an error, `runs.full.returncode` records
+the loader's exit code while the CLI returns the runner's exit code.
+The output directory also holds any logs, frame records and PPM images
+the runner produced. If the runner rejects an occupied directory, any
+report already there belongs to an earlier run.
 
 You can also invoke `python -I scripts/run_guest_scene.py` directly.
