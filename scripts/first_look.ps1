@@ -58,10 +58,13 @@ $rt = Find-RuntimeLoader $build $folders
 $sources = @("runtime\src", "runtime\shims", "runtime\CMakeLists.txt") | ForEach-Object { Join-Path $root $_ } |
     Where-Object { Test-Path -LiteralPath $_ }
 $newest = $sources | ForEach-Object { Get-ChildItem -LiteralPath $_ -Recurse -File -ErrorAction SilentlyContinue } |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-$stale = $rt -and $newest -and ($newest.LastWriteTime -gt (Get-Item -LiteralPath $rt).LastWriteTime)
+    Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+$stale = $rt -and $newest -and ($newest.LastWriteTimeUtc -gt (Get-Item -LiteralPath $rt).LastWriteTimeUtc)
 if ($stale) { Write-Host "$rt is older than $($newest.Name): rebuilding it first" }
-if (-not $rt -or $stale) {
+$tlsName = "gta6rt_tls_host.dll"
+$hasTls = $rt -and (Test-Path -LiteralPath (Join-Path (Split-Path -LiteralPath $rt) $tlsName) -PathType Leaf)
+if (-not $hasTls -or $stale) {
+    if (-not $hasTls) { Write-Host "Missing runtime files: gta6rt.exe and $tlsName must be in the same folder; rebuilding the runtime" }
     $cache = Join-Path $build "CMakeCache.txt"
     if ((Test-Path -LiteralPath $cache -PathType Leaf) -and
         (Select-String -LiteralPath $cache -Pattern '^CMAKE_GENERATOR:INTERNAL=Visual Studio ' -Quiet)) {
@@ -85,7 +88,9 @@ if (-not $rt -or $stale) {
         & (Join-Path $PSScriptRoot "build_runtime.ps1")
     }
     $rt = Find-RuntimeLoader $build $folders
-    if (-not $rt) { throw "Build finished but gta6rt.exe was not found in $build" }
+    if (-not $rt) { throw "runtime build did not produce gta6rt.exe in $build" }
+    $tlsHost = Join-Path (Split-Path -LiteralPath $rt) $tlsName
+    if (-not (Test-Path -LiteralPath $tlsHost -PathType Leaf)) { throw "runtime build did not produce $tlsHost" }
 }
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
 & {

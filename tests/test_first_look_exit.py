@@ -48,6 +48,7 @@ class FirstLookExitTest(unittest.TestCase):
             fixture = scripts / "gta6rt.exe"
             (scripts / "build_runtime.ps1").write_text(
                 'Copy-Item "$PSScriptRoot/gta6rt.exe" "$PSScriptRoot/../runtime/build/gta6rt.exe"\n'
+                'New-Item -ItemType File -Force "$PSScriptRoot/../runtime/build/gta6rt_tls_host.dll" | Out-Null\n'
                 'Set-Content "$PSScriptRoot/built.txt" built\n', encoding="utf-8", newline="\n",
             )
             source = root / "runtime" / "src" / "loader.cpp"
@@ -59,9 +60,11 @@ class FirstLookExitTest(unittest.TestCase):
                 '@echo off\nset "cfg=%~6"\nif not defined cfg set "cfg=Debug"\n'
                 'if not exist "%~2\\%cfg%" mkdir "%~2\\%cfg%"\n'
                 'copy /y "%~dp0gta6rt.exe" "%~2\\%cfg%\\gta6rt.exe" >nul\n'
+                'type nul > "%~2\\%cfg%\\gta6rt_tls_host.dll"\n'
                 'echo %cfg% > "%~dp0built.txt"\n', encoding="ascii",
             )
             vs_configs = {
+                "vs-missing-dll": "Debug;Release;RelWithDebInfo",
                 "vs-first": "Debug;Release;MinSizeRel;RelWithDebInfo",
                 "vs-release-only": "Release",
                 "vs-stale-Release": "Debug;Release;RelWithDebInfo",
@@ -74,6 +77,7 @@ class FirstLookExitTest(unittest.TestCase):
                 ("flat", ["", "RelWithDebInfo"], "build", False, 17),
                 ("stale-Release", ["Release"], "build", True, 0),
                 ("missing", [], "build", True, 0),
+                ("vs-missing-dll", ["Release"], "Release", True, 0),
                 ("vs-first", [], "RelWithDebInfo", True, 0),
                 ("vs-release-only", [], "Release", True, 0),
                 ("vs-stale-Release", ["Release"], "Release", True, 0),
@@ -93,6 +97,8 @@ class FirstLookExitTest(unittest.TestCase):
                         loader = build / folder / "gta6rt.exe"
                         loader.parent.mkdir(exist_ok=True)
                         shutil.copyfile(fixture, loader)
+                        if layout != "vs-missing-dll":
+                            loader.with_name("gta6rt_tls_host.dll").touch()
                         if layout in ("stale-Release", "vs-stale-Release"):
                             older = source.stat().st_mtime - 3600
                             os.utime(loader, (older, older))

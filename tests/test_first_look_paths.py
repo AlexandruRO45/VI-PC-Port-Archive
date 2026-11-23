@@ -46,6 +46,7 @@ public class Loader { public static void Main(string[] args) { System.Console.Wr
 """], cwd=tmp, env=env, check=True, timeout=30)
             loader = repo / "runtime/build/Release/gta6rt.exe"
             shutil.move(Path(tmp, "gta6rt.exe"), loader)
+            loader.with_name("gta6rt_tls_host.dll").touch()
             command = [*ps, "Set-Location -LiteralPath $env:FIRST_LOOK_PACKAGE; "
                             "& $env:FIRST_LOOK_SCRIPT -Exe 'fixture[1].exe'"]
             result = subprocess.run(command, cwd=tmp, env=env, capture_output=True, timeout=30)
@@ -68,6 +69,8 @@ public class Loader { public static void Main(string[] args) { System.Console.Wr
             (repo / "scripts/build_runtime.ps1").write_text(
                 'Copy-Item -LiteralPath "$PSScriptRoot/../runtime/build/Release/gta6rt.exe" '
                 '-Destination "$PSScriptRoot/../runtime/build/gta6rt.exe"\n'
+                'Copy-Item -LiteralPath "$PSScriptRoot/../runtime/build/Release/gta6rt_tls_host.dll" '
+                '-Destination "$PSScriptRoot/../runtime/build/gta6rt_tls_host.dll"\n'
                 'Set-Content -LiteralPath (Join-Path $PSScriptRoot "built.txt") -Value built\n',
                 encoding="utf-8", newline="\n",
             )
