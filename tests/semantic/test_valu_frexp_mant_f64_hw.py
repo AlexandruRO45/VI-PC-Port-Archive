@@ -657,5 +657,61 @@ class TestValuFrexpMantF64StatusFlags(unittest.TestCase):
         flags_inf = classify_frexp_mant_f64(0x7FF0000000000000)
         self.assertTrue(flags_inf.infinite)
 
+# ---------------------------------------------------------------------------
+# Phase 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+F64_POS_ZERO: int = 0x0000000000000000
+F64_NEG_ZERO: int = 0x8000000000000000
+F64_POS_INF: int = 0x7FF0000000000000
+F64_NEG_INF: int = 0xFFF0000000000000
+F64_POS_QNAN: int = 0x7FF8000000000000
+F64_POS_SNAN: int = 0x7FF0000000000001
+F64_MIN_SUBNORMAL: int = 0x0000000000000001
+F64_MAX_SUBNORMAL: int = 0x000FFFFFFFFFFFFF
+
+
+class TestValuFrexpMantF64BoundaryExtremes(unittest.TestCase):
+    """Phase 7: Comprehensive IEEE 754 edge cases for v_frexp_mant_f64."""
+
+    def test_ieee754_signed_zeros_passthrough(self) -> None:
+        self.assertEqual(oracle_frexp_mant_f64_bits(F64_POS_ZERO), F64_POS_ZERO)
+        self.assertEqual(oracle_frexp_mant_f64_bits(F64_NEG_ZERO), F64_NEG_ZERO)
+
+    def test_ieee754_infinities_passthrough(self) -> None:
+        self.assertEqual(oracle_frexp_mant_f64_bits(F64_POS_INF), F64_POS_INF)
+        self.assertEqual(oracle_frexp_mant_f64_bits(F64_NEG_INF), F64_NEG_INF)
+
+    def test_ieee754_nans_passthrough(self) -> None:
+        res_q = oracle_frexp_mant_f64_bits(F64_POS_QNAN)
+        self.assertEqual(res_q, F64_POS_QNAN)
+
+        res_s = oracle_frexp_mant_f64_bits(F64_POS_SNAN)
+        self.assertEqual(res_s, F64_POS_SNAN)
+
+    def test_ieee754_subnormals_normalized_correctly(self) -> None:
+        # Smallest subnormal: fraction = 1
+        res_min = oracle_frexp_mant_f64_bits(F64_MIN_SUBNORMAL)
+        self.assertEqual(res_min, 0x3FE0000000000000)  # 0.5
+
+        # Largest subnormal: fraction = 0x000FFFFFFFFFFFFF
+        res_max = oracle_frexp_mant_f64_bits(F64_MAX_SUBNORMAL)
+        # Fraction shifted left 1 bit -> high fraction = 0x000FFFFF, low = 0xFFFFFFFE
+        self.assertEqual((res_max >> 52) & 0x7FF, 1022)
+
+    def test_translator_subnormal_execution(self) -> None:
+        """Verify translator correctly normalizes subnormal in execution."""
+        lines = [
+            "v_mov_b32 v2, 1",
+            "v_mov_b32 v3, 0",  # smallest positive subnormal
+            "v_frexp_mant_f64 v[0:1], v[2:3]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_frexp_subnormal", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[1], 0x3FE00000)
+        self.assertEqual(words[0], 0x0)
+
 if __name__ == "__main__":
     unittest.main()
