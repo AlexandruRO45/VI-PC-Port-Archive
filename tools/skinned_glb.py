@@ -50,8 +50,8 @@ skeleton; a hash that resolves nowhere is emitted as ``bone_0x........``.
 Output has one skin. Its joints are the full ped skeleton plus any drawable-local
 helper joints named by the palette. Every vertex keeps all eight influences as
 ``JOINTS_0``/``JOINTS_1`` (UNSIGNED_SHORT VEC4) and
-``WEIGHTS_0``/``WEIGHTS_1`` (FLOAT VEC4). Source weights are u8 values that sum
-to 255; they are normalised to 1.0. Bind matrices and inverse bind matrices use
+``WEIGHTS_0``/``WEIGHTS_1`` (FLOAT VEC4). Source weights are u8 values that usually sum
+to 255 (a 4-influence tail sums lower); each vertex is divided by its own sum. Bind matrices and inverse bind matrices use
 the same RAGE Z-up -> glTF Y-up conversion as positions, ``(x, y, z) -> (x, z, -y)``.
 
 Only skinned primitives are exported, with clay materials. Textures, UV atlas

@@ -25,8 +25,8 @@ descriptor word (the size code equals the element bytes only for the 4- and 8-by
 Skin semantics verified from the bytes (not from format names):
 
     semantic 16/17   weights: four u8 UNORM per slot; a vertex's bytes over all present weight slots sum
-                     to 255 (a small tail rounds: 247-254, and below 247 in one packed 4-influence
-                     population)
+                     to 255 in both 8-influence layouts; the 4-influence layouts have a tail that sums
+                     lower (247-254, and below 247 down to 127), so normalise by the vertex's own sum
     semantic 20/21   bone indices into the model's own bone list. In the packed layout each u32 holds a
                      12-bit index in bits 0..11 (bits 9..11 are never set; bits 12..31 are a separate
                      unidentified field). A zero-weight component may carry any index, so indices are

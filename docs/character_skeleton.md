@@ -202,12 +202,24 @@ on a deterministic sample (96 meshes per layout per archive; the census itself c
   index below the local bone count — zero violations in every sampled mesh of every layout, the two
   16-bit forms included (re-measured at `3faac557`); a zero-weight
   component may carry any index, so the check masks by weight.
-- **The weights are the UNORM bytes and sum to 255** over all present weight slots. Every sampled
-  vertex of every weighted layout in `data.rpf` and `levels.rpf` (the 16-bit four-influence layout
-  included: 1,586,335 sampled vertices), and of the 8-influence and 8-bit 4-influence layouts in
-  `packs.rpf`, sums to exactly 255. The packed 4-influence meshes in
-  `packs.rpf` round: of 50,648 sampled vertices, 31,884 sum to exactly 255, 11,604 to 247–254,
-  and 7,160 fall below 247 (as low as 164).
+- **The weights are the UNORM bytes and almost always sum to 255** over all present weight slots.
+  Both 8-influence layouts sum to exactly 255 at every vertex; the 4-influence layouts have a tail
+  that sums lower (never higher), down to 127. Every vertex of every weighted mesh, validated with
+  `tools/skin_streams.py --sample 100000000` at `3ee23bda`:
+
+  | Archive | Layout | Sum 255 | 247–254 | Below 247 | Lowest |
+  |---|---|---:|---:|---:|---:|
+  | `data.rpf` | 4-influence 8-bit | 6,113,605 | 0 | 49 | 127 |
+  | `packs.rpf` | 4-influence 8-bit | 2,263,766 | 231,927 | 187,373 | 127 |
+  | `packs.rpf` | 4-influence packed | 580,820 | 110,703 | 72,082 | 127 |
+  | `packs.rpf` | 8-influence 8-bit / packed | 47,276,325 / 9,482,620 | 0 | 0 | 255 |
+  | `levels.rpf` | 4-influence 8-bit | 92,171,672 | 12,549 | 24,750 | 127 |
+  | `levels.rpf` | 4-influence packed | 40,316,865 | 372 | 3,642 | 187 |
+  | `levels.rpf` | 4-influence 16-bit | 6,384,309 | 0 | 1 | 227 |
+  | `levels.rpf` | 8-influence 8-bit / packed | 570,631 / 59,218 | 0 | 0 | 255 |
+
+  A consumer must normalise each vertex by its own sum, not by 255 (`tools/skinned_glb.py`
+  `normalise_weights` does). An independent recount in #5016 gives the same bins.
 - **Packed `R32G32B32A32_UINT`: the bone index is bits 0–11 of each u32.** Bits 9–11 were never
   set in the sampled meshes; bit 8 appears only where the model has more than 256 bones. Bits
   12–31 hold a separate, dense, unidentified field (smooth per-vertex values in the high bits —
@@ -334,8 +346,8 @@ has been measured, so `0x8B` is rejected rather than guessed.
 The output has one skin. Its joints are the full ped skeleton plus any drawable-local helper
 joints named by the palette; a palette hash that resolves nowhere is emitted as
 `bone_0x........`, never given an invented name. Every vertex keeps all eight influences as
-`JOINTS_0`/`JOINTS_1` and `WEIGHTS_0`/`WEIGHTS_1`. The source u8 weights sum to 255 and are
-normalised to 1.0. Bind and inverse-bind matrices use the same Z-up to Y-up conversion as
+`JOINTS_0`/`JOINTS_1` and `WEIGHTS_0`/`WEIGHTS_1`. The source u8 weights usually sum to 255 (a 4-influence
+tail sums lower, see the layout section); each vertex is divided by its own sum, so it totals 1.0. Bind and inverse-bind matrices use the same Z-up to Y-up conversion as
 positions, `(x, y, z) -> (x, z, -y)`.
 
 ```bash
