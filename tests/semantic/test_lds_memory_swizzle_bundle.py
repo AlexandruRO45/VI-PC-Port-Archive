@@ -450,6 +450,21 @@ class TestDsReadU16Oracle(unittest.TestCase):
         lds.write_u16(0, 0xBEEF)
         self.assertEqual(ref_ds_read_u16(lds, LDS_SIZE, 0), 0xBEEF)
 
+class LdsReadU16Expr(ASTNode):
+    def __init__(self, offset: int = 0) -> None:
+        self.offset = offset
+
+    def eval(self, lds: LdsModel, addr: int) -> int:
+        return ref_ds_read_u16(lds, addr, self.offset)
+
+
+class TestDsReadU16AST(unittest.TestCase):
+    def test_read_u16_ast_eval(self) -> None:
+        lds = LdsModel()
+        lds.write_u16(0x40, 0x55AA)
+        expr = LdsReadU16Expr(offset=0x40)
+        self.assertEqual(expr.eval(lds, 0), 0x55AA)
+
 
 if __name__ == "__main__":
     unittest.main()
