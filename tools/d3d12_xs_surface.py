@@ -406,9 +406,10 @@ def check_iid_order():
 def find_sdk_include():
     """Return (um_dir, shared_dir) for the newest installed Windows SDK, or (None, None).
 
-    Discovery prefers a version folder whose um/ holds d3d12.h: a Windows Driver Kit can leave a newer, partial
-    Include/<version> (km/ plus a few um/ headers, no D3D headers), and checking against that would find none of the
-    standard GUIDs. With no such folder it takes the newest um/ as before. WINDOWS_SDK_INCLUDE names one explicitly.
+    Discovery takes only a version folder whose um/ holds d3d12.h, as d3d12_guid_sites.py and d3d12_iid_scan.py do:
+    a Windows Driver Kit can leave a newer, partial Include/<version> (km/ plus a few um/ headers, no D3D headers),
+    and checking against that would find none of the standard GUIDs. With only partial folders it finds no SDK, so
+    the check skips. WINDOWS_SDK_INCLUDE names one explicitly and is used as given.
     """
     env = os.environ.get("WINDOWS_SDK_INCLUDE") or os.environ.get("SDK_INCLUDE")
     if env:
@@ -426,12 +427,13 @@ def find_sdk_include():
         um = path if os.path.basename(path).lower() == "um" else os.path.join(path, "um")
         shared = os.path.join(os.path.dirname(um), "shared")
         if os.path.isdir(um):
+            if not env and not os.path.isfile(os.path.join(um, "d3d12.h")):
+                continue  # a partial kit: no D3D headers to check against
             name = os.path.basename(os.path.dirname(um))
-            complete = os.path.isfile(os.path.join(um, "d3d12.h"))
             try:
-                key = (complete, 1, tuple(map(int, name.split("."))))
+                key = (1, tuple(map(int, name.split("."))))
             except ValueError:
-                key = (complete, 0, name)
+                key = (0, name)
             if best is None or key > best[0]:
                 best = (key, um, shared)
     if not best:

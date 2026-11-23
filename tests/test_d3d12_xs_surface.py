@@ -81,6 +81,8 @@ def test_sdk_discovery_sorts_versions_numerically():
             vdir = os.path.join(include, ver)
             os.makedirs(os.path.join(vdir, "um"))
             os.makedirs(os.path.join(vdir, "shared"))
+            with open(os.path.join(vdir, "um", "d3d12.h"), "w", encoding="utf-8", newline="\n"):
+                pass  # discovery takes only an SDK with the D3D headers
         with mock.patch.dict(os.environ, {"ProgramFiles(x86)": tmp, "ProgramFiles": tmp},
                              clear=False):
             os.environ.pop("WINDOWS_SDK_INCLUDE", None)
@@ -114,6 +116,23 @@ def test_sdk_discovery_skips_a_newer_partial_kit():
         assert os.path.normcase(got_shared) == os.path.normcase(os.path.join(full, "shared")), got_shared
 
 
+def test_sdk_discovery_finds_no_sdk_among_only_partial_kits():
+    # With only partial kits there are no D3D headers to check against: discovery finds no SDK, so
+    # test_standard_iids_match_sdk skips and `--check --sdk` prints SKIP, instead of 83 GUIDs "not found".
+    with tempfile.TemporaryDirectory() as tmp:
+        partial = os.path.join(tmp, "Windows Kits", "10", "Include", "10.0.28000.0")
+        for sub in ("um", "shared", "km"):
+            os.makedirs(os.path.join(partial, sub))
+        with mock.patch.dict(os.environ, {"ProgramFiles(x86)": tmp, "ProgramFiles": tmp}, clear=False):
+            os.environ.pop("WINDOWS_SDK_INCLUDE", None)
+            os.environ.pop("SDK_INCLUDE", None)
+            assert S.find_sdk_include() == (None, None)
+            # Named explicitly, a folder is used as given, D3D headers or not.
+            os.environ["WINDOWS_SDK_INCLUDE"] = partial
+            got_um, _ = S.find_sdk_include()
+        assert os.path.normcase(got_um) == os.path.normcase(os.path.join(partial, "um")), got_um
+
+
 def test_scarab_cross_check():
     root = os.environ.get("SCARAB_REF")
     if not root:
@@ -131,6 +150,7 @@ if __name__ == "__main__":
     test_sdk_include_override_accepts_a_trailing_separator()
     test_sdk_discovery_sorts_versions_numerically()
     test_sdk_discovery_skips_a_newer_partial_kit()
+    test_sdk_discovery_finds_no_sdk_among_only_partial_kits()
     # Call the two optional checks through their real definitions so this runner cannot drift from them; both
     # raise unittest.SkipTest when their inputs (SDK headers, SCARAB_REF) are absent.
     for optional in (test_standard_iids_match_sdk, test_scarab_cross_check):
