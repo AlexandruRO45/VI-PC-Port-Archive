@@ -29,10 +29,13 @@ _Thrd_result __stdcall _Cnd_timedwait_for_unchecked(_Cnd_t cond, _Mtx_t mtx, uns
     _timespec64 deadline{};
     if (_timespec64_get(&deadline, TIME_UTC) != TIME_UTC) deadline = {};
     deadline.tv_sec += ms / 1000;
-    deadline.tv_nsec += static_cast<long>(ms % 1000) * 1000000L;
+    // Add 1 ms (1,000,000 ns) slop when ms > 0 so msvcp140's conversion back to milliseconds does not truncate sub-millisecond
+    // remainder and wake up early. For ms == 0 (zero-timeout poll), do not add slop so polls return immediately.
+    long slop = ms > 0 ? 1000000L : 0L;
+    deadline.tv_nsec += static_cast<long>(ms % 1000) * 1000000L + slop;
     if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec += 1;
-        deadline.tv_nsec -= 1000000000L;
+        deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+        deadline.tv_nsec %= 1000000000L;
     }
     // A spurious or early return is allowed ("unchecked"): the STL's callers check the clock themselves.
     return static_cast<_Thrd_result>(_Cnd_timedwait(cond, mtx, &deadline));
