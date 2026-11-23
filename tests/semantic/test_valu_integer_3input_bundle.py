@@ -337,5 +337,27 @@ class TestLshlAddU32Translator(unittest.TestCase):
             actual = run_translated_triop("v_lshl_add_u32", a, b, c)
             self.assertEqual(actual, expected)
 
+# ---------------------------------------------------------------------------
+# Opcode 3: v_add_lshl_u32 - Reference Oracle
+# ---------------------------------------------------------------------------
+
+def oracle_add_lshl_u32(a: int, b: int, c: int) -> int:
+    add_part = ((a & MASK32) + (b & MASK32)) & MASK32
+    return (add_part << (c & 31)) & MASK32
+
+
+class TestAddLshlU32Oracle(unittest.TestCase):
+    def test_basic_add_shift(self) -> None:
+        # (3 + 5) << 2 = 8 << 2 = 32
+        self.assertEqual(oracle_add_lshl_u32(3, 5, 2), 32)
+        self.assertEqual(oracle_add_lshl_u32(10, 20, 0), 30)
+
+    def test_add_wrap_before_shift(self) -> None:
+        # (0xFFFFFFFF + 1) = 0 => 0 << 5 = 0
+        self.assertEqual(oracle_add_lshl_u32(MASK32, 1, 5), 0)
+
+    def test_shift_count_mask(self) -> None:
+        self.assertEqual(oracle_add_lshl_u32(2, 3, 33), 10)
+
 if __name__ == "__main__":
     unittest.main()
