@@ -3,10 +3,11 @@
     python -I tests/test_docs_repo_paths.py
 
 `tests/test_docs_links.py` checks Markdown links; this checks the other way the docs point at code, a backticked
-`tools/...`, `runtime/...`, `tests/...` or `scripts/...` path. A rename, or a page written against an unmerged pull
-request, leaves such a path pointing at nothing (docs/saves.md described #279's `xgameruntime_services.cpp` as the
-runtime's save store while #279 was still open). Reads tracked files only (`git ls-files`, with a directory walk when
-git is not available); no game files.
+`tools/...`, `runtime/...`, `tests/...` or `scripts/...` path. It accepts forward-slash or Windows backslash separators
+and normalizes them before checking tracked paths. A rename, or a page written against an unmerged pull request, leaves
+such a path pointing at nothing (docs/saves.md described #279's `xgameruntime_services.cpp` as the runtime's save
+store while #279 was still open). Reads tracked files only (`git ls-files`, with a directory walk when git is not
+available); no game files.
 """
 import os
 import re
@@ -14,7 +15,8 @@ import subprocess
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PATH = re.compile(r"`((?:tools|runtime|tests|scripts)/[A-Za-z0-9_./\-]+)`")
+# Windows docs sometimes use backslashes; normalize captured paths before comparing with git's POSIX-style paths.
+PATH = re.compile(r"`((?:tools|runtime|tests|scripts)[/\\][A-Za-z0-9_./\\-]+)`")
 # Pages that quote another project's tree (SCARAB, americas-recomp): their paths are not this repository's.
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 # Build output, not tracked.
@@ -49,7 +51,7 @@ def missing_paths(pages, files):
             if in_fence or "://" in line:          # a link into another repository names its paths
                 continue
             for m in PATH.finditer(line):
-                path = m.group(1).rstrip("/.")
+                path = m.group(1).replace("\\", "/").rstrip("/.")
                 if "*" in path or path.startswith(BUILD_OUTPUT) or path in known:
                     continue
                 out.append((f"{page}:{n}", path))
@@ -61,6 +63,11 @@ class DocsRepoPaths(unittest.TestCase):
         pages = {"docs/a.md": "Run `tools/real.py`, then `tools/gone.py`.\n```\n`tools/in_fence.py`\n```\n"
                               "`runtime/build/x.exe` and `tests/` and [`tools/x.py`](https://example.org/tools/x.py)"}
         self.assertEqual(missing_paths(pages, ["tools/real.py", "tests/t.py"]), [("docs/a.md:1", "tools/gone.py")])
+
+    def test_checker_normalizes_windows_path_separators(self):
+        pages = {"docs/a.md": r"Run `tools\real.py`, then `runtime\gone.cpp`."}
+        files = ["tools/real.py", "runtime/src/existing.cpp"]
+        self.assertEqual(missing_paths(pages, files), [("docs/a.md:1", "runtime/gone.cpp")])
 
     def test_docs_name_existing_paths(self):
         files = tracked_files()
