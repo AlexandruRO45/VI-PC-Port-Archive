@@ -202,7 +202,10 @@ def _is_identity(m) -> bool:
 
 
 def _finite_matrix(m) -> bool:
-    return len(m) == 16 and all(isinstance(v, (int, float)) and math.isfinite(v) for v in m)
+    # A JSON matrix is a list/tuple of 16 finite numbers. A missing or wrong-shaped value is false, not a
+    # TypeError: callers turn false into a SkinError one error line.
+    return (isinstance(m, (list, tuple)) and len(m) == 16
+            and all(isinstance(v, (int, float)) and math.isfinite(v) for v in m))
 
 
 # ------------------------------------------------------------------------ files

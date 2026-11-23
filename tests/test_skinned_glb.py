@@ -240,6 +240,13 @@ class SkinnedGlbTest(unittest.TestCase):
             handle.write(payload)
         return path
 
+    def test_finite_matrix_is_total(self):
+        self.assertTrue(skinned_glb._finite_matrix(_matrix()))
+        self.assertTrue(skinned_glb._finite_matrix(tuple(_matrix())))
+        for value in (None, [], [1.0] * 15, [1.0] * 17, "0" * 16, [1.0] * 15 + ["x"], [1.0] * 15 + [None]):
+            with self.subTest(value=value):
+                self.assertFalse(skinned_glb._finite_matrix(value))
+
     def test_joint_count_and_palette_resolution(self):
         _gltf, _binary, stats = self._build()
         self.assertEqual(stats["ped_joints"], 3)
@@ -715,6 +722,24 @@ class SkinnedGlbTest(unittest.TestCase):
                 with open(path, "wb") as handle:
                     handle.write(data)
                 self._assert_one_line_error(self._run_cli(skeleton, component), path)
+
+    def test_cli_bone_without_bind_matrix_is_one_error_line(self):
+        root = self._case_root("skeleton_no_bind")
+        component = _component(root)
+        skeleton = _skeleton_dir(root)
+        path = os.path.join(skeleton, "model.json")
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        del data["drawable"]["skeleton"][0]["bind_matrix"]
+        _write_json(path, data)
+        result = self._run_cli(skeleton, component)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("error: "), result.stderr)
+        self.assertIn("SKEL_ROOT", lines[0])
+        self.assertIn("has no finite bind matrix", lines[0])
 
     def test_output_must_not_overwrite_a_source(self):
         skeleton = _skeleton_dir(self.root)
