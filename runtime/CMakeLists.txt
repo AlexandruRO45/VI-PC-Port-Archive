@@ -776,8 +776,14 @@ if(BUILD_TESTING)
       COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
     )
 
-    foreach(target dll_attach_a dll_attach_b dll_attach_importer)
-      add_library(${target} SHARED test/fixtures/dll_reentrant_attach.cpp)
+    set(attach_order_fixtures dll_attach_cycle_a dll_attach_cycle_b dll_attach_cycle_seed
+      dll_attach_failure_root dll_attach_failure_b dll_attach_failure_c)
+    foreach(target dll_attach_a dll_attach_b dll_attach_importer ${attach_order_fixtures})
+      if(target IN_LIST attach_order_fixtures)
+        add_library(${target} SHARED test/fixtures/dll_attach_order.cpp)
+      else()
+        add_library(${target} SHARED test/fixtures/dll_reentrant_attach.cpp)
+      endif()
       target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /GS-)
       target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
       target_link_options(${target} PRIVATE /NODEFAULTLIB /ENTRY:dll_attach_main)
@@ -792,6 +798,21 @@ if(BUILD_TESTING)
     # The import-only fixtures have no relocations, so give them distinct preferred bases.
     target_link_options(dll_attach_b PRIVATE /BASE:0x181000000)
     target_link_options(dll_attach_importer PRIVATE /BASE:0x182000000)
+    # Link B against a stand-in import library for A, then link the actual A against B.
+    set_target_properties(dll_attach_cycle_seed PROPERTIES OUTPUT_NAME dll_attach_cycle_a
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}/cycle-seed"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}/cycle-seed")
+    target_compile_definitions(dll_attach_cycle_seed PRIVATE ATTACH_CYCLE_SEED)
+    target_compile_definitions(dll_attach_cycle_a PRIVATE ATTACH_CYCLE ATTACH_CYCLE_A)
+    target_compile_definitions(dll_attach_cycle_b PRIVATE ATTACH_CYCLE)
+    target_link_libraries(dll_attach_cycle_b PRIVATE dll_attach_cycle_seed)
+    target_link_libraries(dll_attach_cycle_a PRIVATE dll_attach_cycle_b)
+    target_link_options(dll_attach_cycle_b PRIVATE /BASE:0x183000000)
+    target_compile_definitions(dll_attach_failure_root PRIVATE ATTACH_FAILURE_ROOT)
+    target_compile_definitions(dll_attach_failure_b PRIVATE ATTACH_FAILURE_B)
+    target_link_libraries(dll_attach_failure_b PRIVATE dll_attach_failure_root dll_attach_failure_c)
+    target_link_options(dll_attach_failure_b PRIVATE /BASE:0x184000000)
+    target_link_options(dll_attach_failure_c PRIVATE /BASE:0x185000000)
     add_executable(dll_reentrant_attach_test
       test/dll_reentrant_attach_test.cpp
       src/pe_loader.cpp
@@ -802,7 +823,8 @@ if(BUILD_TESTING)
     target_compile_definitions(dll_reentrant_attach_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dll_reentrant_attach_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
     target_link_libraries(dll_reentrant_attach_test PRIVATE psapi)
-    add_dependencies(dll_reentrant_attach_test dll_attach_a dll_attach_b dll_attach_importer)
+    add_dependencies(dll_reentrant_attach_test dll_attach_a dll_attach_b dll_attach_importer
+      dll_attach_cycle_a dll_attach_failure_b)
     set_target_properties(dll_reentrant_attach_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
     add_test(NAME dll_reentrant_attach COMMAND dll_reentrant_attach_test
       WORKING_DIRECTORY "$<TARGET_FILE_DIR:dll_reentrant_attach_test>")

@@ -1052,17 +1052,21 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
         }
     }
 
-    Module* mapped = nullptr;
+    const size_t first_new = init_order_.size();
     try {
         Module& m = load(candidate);
-        mapped = &m;
         initialise(m);
         std::fprintf(stderr, "[rt] loader: %s mapped from game_dir (run-time load)\n", m.name.c_str());
         return static_cast<void*>(m.base);
     } catch (const std::exception& e) {
-        // load() drops a module that failed to map or bind (dependencies included); this also drops one whose
-        // initialise() failed, so later GetModuleHandle/LoadLibrary calls don't see it. ~Loader frees it via order_.
-        forget_module(mapped ? mapped->path : candidate);
+        // Keep completed modules for detach, including successful nested loads. Pending modules from
+        // this load must neither remain visible by name nor be attached by the outer startup walk.
+        auto first_pending = std::remove_if(init_order_.begin() + first_new, init_order_.end(), [&](Module* m) {
+            if (m->initialised) return false;
+            forget_module(m->path);
+            return true;
+        });
+        init_order_.erase(first_pending, init_order_.end());
         std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
         SetLastError(ERROR_DLL_INIT_FAILED);
         return nullptr;
@@ -1162,11 +1166,12 @@ void Loader::initialise() {
     std::lock_guard lock(mutex_);
     // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
     // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.
-    // A nested LoadLibrary can append to init_order_ and invalidate its iterators.
-    for (size_t i = 0; i < init_order_.size(); ++i) initialise(*init_order_[i]);
+    // The mapping walk already breaks static import cycles. Keep that order here.
+    // A nested LoadLibrary can change the tail of init_order_ and invalidate its iterators.
+    for (size_t i = 0; i < init_order_.size(); ++i) initialise(*init_order_[i], false);
 }
 
-void Loader::initialise(Module& m) {
+void Loader::initialise(Module& m, bool attach_dependencies) {
     if (m.attaching || m.initialised) return;
 
     // TLS callbacks and DllMain can both re-enter initialise() through LoadLibrary.
@@ -1177,7 +1182,8 @@ void Loader::initialise(Module& m) {
     } reset_attaching{m.attaching};
 
     // A nested load attaches only its requested graph. The outer walk resumes after this module finishes.
-    for (auto* dep : m.dependencies) initialise(*dep);
+    if (attach_dependencies)
+        for (auto* dep : m.dependencies) initialise(*dep);
 
     // TLS was installed by load(); initialise() only delivers the events, so no slot is allocated or written twice.
     run_tls_callbacks(m, DLL_PROCESS_ATTACH);
@@ -1195,6 +1201,7 @@ void Loader::initialise(Module& m) {
             startup_trace::event("dllmain", "\"module\":" + startup_trace::quote(m.name) +
                                                 ",\"result\":" + std::to_string(ok));
         if (!ok) {
+            if (m.dynamic_load) forget_module(m.path);
             m.initialised = true;  // it ran: a second DLL_PROCESS_ATTACH would be wrong
             throw std::runtime_error(m.name + ": DllMain returned FALSE");
         }

@@ -128,7 +128,7 @@ public:
     bool owns_module_handle(void* module_handle) const;
 
 private:
-    void initialise(Module& m);
+    void initialise(Module& m, bool attach_dependencies = true);
     Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_ or names_mutex_
     void forget_module(const std::filesystem::path& path);
     Module& map_image(const std::filesystem::path& path, const std::string& narrow_key);
