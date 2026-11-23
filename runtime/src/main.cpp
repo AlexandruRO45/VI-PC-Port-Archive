@@ -154,7 +154,7 @@ int wmain(int argc, wchar_t** argv) {
     }
     // Instructions the console's CPU has and this one may lack (CLZERO so far) are emulated from #UD. Added after the
     // trace handler, so this one runs first and a handled instruction is not logged as an exception.
-    if (rt::cpu_ud_emulate::install()) std::fprintf(stderr, "[rt] cpu: emulating instructions this CPU lacks (runtime/README.md, "CPU instructions the host may lack")\n");
+    if (rt::cpu_ud_emulate::install()) std::fprintf(stderr, "[rt] cpu: emulating instructions this CPU lacks (runtime/README.md, CPU instructions the host may lack)\n");
 
     try {
         rt::Loader loader(game_dir);
