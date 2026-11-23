@@ -3,8 +3,9 @@
 Every case is translated by tools/rdna2spirv.py and executed with tests/spirv_interp.py (the interpreter that
 evaluates binary64). The expected words are written down by hand next to each case and rechecked against the
 plain-Python reference below; seeded random operands compare the translated result with the reference.
-Covers the special values, VOP3 abs/neg and mul:2 / mul:4 / div:2 / clamp, and SGPR-pair, inline-constant and literal
-sources (a 32-bit literal supplies bits 63:32 of a binary64 operand, bits 31:0 are zero).
+Covers the special values, VOP3 abs/neg and clamp, and SGPR-pair, inline-constant and literal sources (a 32-bit
+literal supplies bits 63:32 of a binary64 operand, bits 31:0 are zero). The omod (mul/div) rows are left out: whether
+it applies to the f64 ops is SHADER-721 (#4371).
 Standard library only: no GPU, no LLVM, no game data.
 """
 import math
@@ -57,14 +58,8 @@ MODS = [
     (bits(-4.0), "|v[0:1]|", "", bits(2.0)),
     (bits(-4.0), "-|v[0:1]|", "", QNAN),
     (bits(4.0), "-v[0:1]", "", QNAN),
-    (bits(0.25), "v[0:1]", " mul:2", bits(1.0)),
-    (bits(0.25), "v[0:1]", " mul:4", bits(2.0)),
-    (bits(0.25), "v[0:1]", " div:2", bits(0.25)),
     (bits(4.0), "v[0:1]", " clamp", bits(1.0)),                # 2 -> 1
     (bits(0.25), "v[0:1]", " clamp", bits(0.5)),
-    (bits(9.0), "v[0:1]", " div:2 clamp", bits(1.0)),          # 3 / 2 = 1.5 -> 1 (omod first; clamp first would give 0.5)
-    (bits(0.0625), "v[0:1]", " mul:2 clamp", bits(0.5)),       # 0.25 * 2
-    (bits(0.25), "v[0:1]", " mul:4 clamp", bits(1.0)),          # 0.5 * 4 = 2 -> 1
 ]
 
 
