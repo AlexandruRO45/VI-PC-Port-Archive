@@ -7,7 +7,8 @@
 //   - SetProcessPriorityBoost(GetCurrentProcess(), ...) mutates the host gta6rt scheduler priority-boost policy;
 //   - GetUserDefaultGeoName (Win10 1709+) can be absent on older hosts or Wine;
 //   - GetUserDefaultLocaleName and LocaleNameToLCID(nullptr, ...) reflect arbitrary host locales with no override;
-//   - WaitNamedPipeW/A(nullptr, ...) and SetNamedPipeHandleState(nullptr, ...) fault on null pointers/handles.
+//   - WaitNamedPipeW(nullptr, ...) faults on Windows 11, while WaitNamedPipeA(nullptr, ...) fails with
+//     ERROR_BAD_PATHNAME and SetNamedPipeHandleState(nullptr, ...) fails with ERROR_INVALID_HANDLE.
 #include <windows.h>
 
 #include <atomic>
@@ -200,7 +201,7 @@ BOOL WINAPI wait_named_pipe_w(LPCWSTR named_pipe_name, DWORD timeout) {
 
 BOOL WINAPI wait_named_pipe_a(LPCSTR named_pipe_name, DWORD timeout) {
     if (!named_pipe_name) {
-        SetLastError(ERROR_INVALID_PARAMETER);
+        SetLastError(ERROR_BAD_PATHNAME);
         return FALSE;
     }
     return ::WaitNamedPipeA(named_pipe_name, timeout);

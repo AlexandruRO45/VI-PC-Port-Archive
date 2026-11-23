@@ -130,7 +130,8 @@ void test_named_pipes() {
     SetLastError(0);
     check(!wait_w(nullptr, 0) && GetLastError() == ERROR_INVALID_PARAMETER, "WaitNamedPipeW rejects nullptr cleanly");
     SetLastError(0);
-    check(!wait_a(nullptr, 0) && GetLastError() == ERROR_INVALID_PARAMETER, "WaitNamedPipeA rejects nullptr cleanly");
+    check(!wait_a(nullptr, 0) && GetLastError() == ERROR_BAD_PATHNAME,
+          "WaitNamedPipeA rejects nullptr with ERROR_BAD_PATHNAME");
     SetLastError(0);
     check(!wait_w(L"\\\\.\\pipe\\leonida_nonexistent_test_pipe", 0) && GetLastError() == ERROR_FILE_NOT_FOUND,
           "WaitNamedPipeW reports ERROR_FILE_NOT_FOUND on missing pipe");
