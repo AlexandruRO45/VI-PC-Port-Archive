@@ -417,5 +417,20 @@ class TestSFf1I32B64ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.sgprs[2], 44)
 
 
+class TestSFf1I32B64Bounds(unittest.TestCase):
+    """Bit scanning boundary and edge cases for s_ff1_i32_b64."""
+
+    def test_dword_boundary_transitions(self):
+        self.assertEqual(ref_ff1_i32_b64(1 << 31), 31)
+        self.assertEqual(ref_ff1_i32_b64(1 << 32), 32)
+
+    def test_all_high_dword_powers_of_two(self):
+        for b in (32, 40, 48, 56, 62, 63):
+            self.assertEqual(ref_ff1_i32_b64(1 << b), b)
+
+    def test_mixed_low_and_high(self):
+        self.assertEqual(ref_ff1_i32_b64((1 << 48) | (1 << 4)), 4)
+
+
 if __name__ == "__main__":
     unittest.main()
