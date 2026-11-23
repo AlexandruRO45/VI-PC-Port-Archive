@@ -32,6 +32,7 @@ HELPERS = {
     "gamedata_xml": None,
     "gamedata_index": None,
     "navmesh_decode": "same_report_path",
+    "skin_streams": "same_report_path",
     "world_census": "same_report_path",
 }
 
@@ -87,6 +88,19 @@ class ReportPathCaseTest(unittest.TestCase):
         module = load("world_census")
         composed = self.dir / "café.json"
         decomposed = self.dir / unicodedata.normalize("NFD", "café.json")
+        folding = [True]
+        with mock.patch.object(report_paths, "sys", mock.Mock(platform="darwin")), \
+                mock.patch.object(report_paths, "case_insensitive_volume", lambda path: folding[0]):
+            self.assertTrue(module.same_report_path(str(composed), str(decomposed)))
+            folding[0] = False
+            self.assertFalse(module.same_report_path(str(composed), str(decomposed)))
+
+    def test_skin_streams_follows_the_folding_volume(self):
+        """The archive guard asks report_paths, so a `--json` that names an input only by another accent form is
+        refused where the tool's own realpath+normcase copy answered "two files" (APFS)."""
+        module = load("skin_streams")
+        composed = self.dir / "café.rpf"
+        decomposed = self.dir / unicodedata.normalize("NFD", "café.rpf")
         folding = [True]
         with mock.patch.object(report_paths, "sys", mock.Mock(platform="darwin")), \
                 mock.patch.object(report_paths, "case_insensitive_volume", lambda path: folding[0]):
