@@ -403,6 +403,7 @@ if (world.test) {
 }
 const hud = document.getElementById("hud"), clock = new THREE.Clock();
 let fpsT = 0, fpsN = 0, fps = 0;
+let lastHud = "";
 const fwd = new THREE.Vector3(), right = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0);
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
@@ -417,10 +418,14 @@ renderer.setAnimationLoop(() => {
   renderer.render(scene, camera);
   fpsN++; fpsT += dt; if (fpsT > 0.5) { fps = fpsN / fpsT; fpsN = 0; fpsT = 0; }
   const p = camera.position, loaded = [...live.values()].filter(c => c.obj).length;
-  hud.innerHTML = `<b>${world.test ? "test terrain" : "world"}</b><br>pos ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}<br>` +
+  const nextHud = `<b>${world.test ? "test terrain" : "world"}</b><br>pos ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}<br>` +
     `speed ${speed.toFixed(0)} m/s · ${fps.toFixed(0)} fps<br>chunks ${loaded}/${world.chunks.length} loaded, ${inflight} loading` +
     (failed ? `, <span style="color:var(--warn)">${failed} load errors</span>` : "") +
     `<br>draw calls ${renderer.info.render.calls}, tris ${(renderer.info.render.triangles / 1000).toFixed(0)}k`;
+  if (nextHud !== lastHud) {
+    hud.innerHTML = nextHud;
+    lastHud = nextHud;
+  }
 });
 </script>
 </body>
