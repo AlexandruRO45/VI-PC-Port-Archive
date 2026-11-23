@@ -19,7 +19,9 @@ OpEntryPoint Fragment %main "main" %out
 %v2uint = OpTypeVector %uint 2
 %v2bool = OpTypeVector %bool 2
 %_ptr_Output_uint = OpTypePointer Output %uint
+%_ptr_Output_v2uint = OpTypePointer Output %v2uint
 %out = OpVariable %_ptr_Output_uint Output
+%vout = OpVariable %_ptr_Output_v2uint Output
 %c0 = OpConstant %uint 0
 %c1 = OpConstant %uint 1
 %c2 = OpConstant %uint 2
@@ -46,6 +48,10 @@ OpEntryPoint Fragment %main "main" %out
 %int = OpTypeInt 32 1
 %t = OpConstantTrue %bool
 %f = OpConstantFalse %bool
+%const_a = OpConstantComposite %v2uint %c5 %c1
+%const_b = OpConstantComposite %v2uint %c3 %c9
+%const_lo = OpConstantComposite %v2uint %c1 %c2
+%const_hi = OpConstantComposite %v2uint %c7 %c3
 %_ptr_Function_uint = OpTypePointer Function %uint
 %arr = OpTypeArray %uint %c4
 %_ptr_Function_arr = OpTypePointer Function %arr
@@ -133,6 +139,26 @@ class InterpreterTests(unittest.TestCase):
                  "%lo = OpCompositeConstruct %v2uint %c1 %c2\n"
                  "%hi = OpCompositeConstruct %v2uint %c7 %c3\n")
         self.assertEqual(vector_words(clamp, "%r = OpExtInst %v2uint %glsl UClamp %x %lo %hi\n"), (5, 2))
+
+    def test_unsigned_min_max_accept_constant_composites(self):
+        # OpConstantComposite operands are lists in the interpreter; they must take the vector path too.
+        # Storing the result to a vector output also checks that the path returns a tuple, not a list.
+        got = si.run_fragment(HEADER + "%r = OpExtInst %v2uint %glsl UMin %const_a %const_b\n"
+                              "OpStore %vout %r\n" + FOOTER)
+        self.assertEqual(got["%vout"], (3, 1))
+        self.assertEqual(vector_words("", "%r = OpExtInst %v2uint %glsl UMax %const_a %const_b\n"), (5, 9))
+        # A list (constant composite) and a tuple (OpCompositeConstruct) together are still component-wise.
+        mixed = "%x = OpCompositeConstruct %v2uint %c5 %c1\n"
+        self.assertEqual(vector_words(mixed, "%r = OpExtInst %v2uint %glsl UMin %x %const_b\n"), (3, 1))
+        self.assertEqual(vector_words(mixed, "%r = OpExtInst %v2uint %glsl UMax %x %const_b\n"), (5, 9))
+
+    def test_uclamp_accepts_constant_composites(self):
+        got = si.run_fragment(HEADER + "%r = OpExtInst %v2uint %glsl UClamp %const_a %const_lo %const_hi\n"
+                              "OpStore %vout %r\n" + FOOTER)
+        self.assertEqual(got["%vout"], (5, 2))
+        mixed = "%x = OpCompositeConstruct %v2uint %c5 %c1\n"
+        self.assertEqual(vector_words(mixed, "%r = OpExtInst %v2uint %glsl UClamp %x %const_lo %const_hi\n"),
+                         (5, 2))
 
     def test_float_push_constant_load_is_typed(self):
         # OpLoad's result type is the type of the loaded object: a %float PushConstant member is a float.

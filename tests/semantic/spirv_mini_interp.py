@@ -457,6 +457,10 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             return values[x]
         raise UnsupportedConstruct(f"use of undefined id {x}")
 
+    def vector(x):
+        """Vectors from OpConstantComposite are lists; normalize them and OpCompositeConstruct tuples alike."""
+        return tuple(x) if isinstance(x, (list, tuple)) else x
+
     def walk(type_id, indices):
         """Byte offset and element type after selecting `indices` in an aggregate type."""
         off, cur = 0, type_id
@@ -1045,10 +1049,11 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             if len(a) < 3 or a[1] != "%glsl":
                 raise UnsupportedConstruct("extended instruction set")
             name, args = a[2], [val(x) for x in a[3:]]
-            if name in ("UMin", "UMax", "UClamp") and all(isinstance(v, tuple) for v in args):
+            if name in ("UMin", "UMax", "UClamp") and all(isinstance(vector(v), tuple) for v in args):
                 # GLSL.std.450 instructions 38/41/44: these take integer vectors and compute per component.
                 # Handle vector operands here, before the scalar branches, leaving the signed variants and
-                # their signedness keys untouched.
+                # their signedness keys untouched. Constant composites are lists, constructed vectors tuples.
+                operands = [vector(v) for v in args]
                 def unsigned_component(*c):
                     if name == "UMin":
                         return min(c)
@@ -1058,7 +1063,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     if lo > hi:
                         raise UnsupportedConstruct(f"GLSL.std.450 {name} with minVal > maxVal (undefined)")
                     return min(max(x, lo), hi)
-                values[res] = tuple(unsigned_component(*c) for c in zip(*args))
+                values[res] = tuple(unsigned_component(*c) for c in zip(*operands))
                 continue
             if name == "UnpackHalf2x16":
                 values[res] = (half_to_float(args[0]), half_to_float(args[0] >> 16))
