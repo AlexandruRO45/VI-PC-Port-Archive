@@ -272,8 +272,9 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                         self.assertEqual((operand["k"], operand["v"]), (kind, value))
 
     def test_ds_src2_ops_and_one_offset_forms(self):
-        # What llvm-mc 23.1.6 (gfx1013) prints for these DS words: the GFX10 *_src2_* ops take one address VGPR
-        # and one 16-bit offset, and so does ds_condxchg32_rtn_b64 (its "2_" is not a two-offset form).
+        # What llvm-mc 23.1.6 (gfx1013) prints for these DS words (unused fields zero, as llvm-mc requires): the
+        # GFX10 *_src2_* ops take one address VGPR and one 16-bit offset, and so does ds_condxchg32_rtn_b64 (its
+        # "2_" is not a two-offset form).
         for opcode, asm in (
             (0x80, "ds_add_src2_u32 v1 offset:16"), (0x8d, "ds_write_src2_b32 v1 offset:16"),
             (0x95, "ds_add_src2_f32 v1 offset:16"), (0xc6, "ds_max_src2_i64 v1 offset:16"),
@@ -282,10 +283,13 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             with self.subTest(asm=asm):
                 text, invalid = rdna2_decode.disasm_bytes(words(0xD8000010 | opcode << 18, 0x00000001))
                 self.assertEqual((text.split(";")[0].strip(), invalid), (asm, 0))
-        text, invalid = rdna2_decode.disasm_bytes(words(0xD8000010 | 0x7E << 18, 0x40030201))
+        # llvm-mc 23.1.6 refuses the src2 ops on gfx103x (two invalid words).
+        for mcpu in ("gfx1030", "gfx1036"):
+            self.assertEqual(rdna2_decode.disasm_bytes(words(0xD8000010 | 0x80 << 18, 0x00000001), mcpu=mcpu)[1], 2)
+        text, invalid = rdna2_decode.disasm_bytes(words(0xD8000010 | 0x7E << 18, 0x40000201))
         self.assertEqual((text.split(";")[0].strip(), invalid),
                          ("ds_condxchg32_rtn_b64 v[64:65], v1, v[2:3] offset:16", 0))
-        text, _ = rdna2_decode.disasm_bytes(words(0xD8000000 | 0x37 << 18 | 0x0201, 0x40030201))
+        text, _ = rdna2_decode.disasm_bytes(words(0xD8000000 | 0x37 << 18 | 0x0201, 0x40000001))
         self.assertEqual(text.split(";")[0].strip(), "ds_read2_b32 v[64:65], v1 offset0:1 offset1:2")
 
     def test_roundtrip_binary_to_spirv_and_interpreter(self):

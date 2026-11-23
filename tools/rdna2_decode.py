@@ -1005,6 +1005,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         data1 = (w1 >> 16) & 0xFF
         vdst = (w1 >> 24) & 0xFF
         entry = T.DS.get(opc)
+        if entry is None and mcpu.startswith("gfx101"):
+            entry = T.DS_GFX101.get(opc)
         if entry is None:
             return None, 4
         name, spec = entry
