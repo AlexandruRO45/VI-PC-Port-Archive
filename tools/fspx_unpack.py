@@ -175,6 +175,23 @@ def unpack_payload(payload: bytes):
     return (meta, blob), 0
 
 
+def python_listing(disasm, code: bytes, mcpu: str, wave32) -> "tuple[str | None, int]":
+    """The listing of `code` from the repository's own RDNA2 decoder (shader_disasm's "python" backend), or
+    (None, 0) when it gives none.
+
+    Used when llvm-mc leaves invalid words. llvm-mc 21.1.8 (the version scripts/build_llvm_mc.ps1 pins) refuses a
+    VOP3P v_dot4_i32_i8 with a non-default op_sel and then decodes the instruction's second dword as an instruction of
+    its own, so the listing holds a wrong instruction as well as a gap (docs/fspx.md, "What llvm-mc still rejects").
+    The Python decoder reads those words with their op_sel and op_sel_hi."""
+    try:
+        asm, invalid, _ = disasm.disasm(code, mcpu, backend="python", wave32=wave32 is not False)
+    except Exception as error:  # a decoder bug must not lose the llvm-mc listing
+        print(f"Python decoder failed ({type(error).__name__}: {error}); keeping the llvm-mc listing",
+              file=sys.stderr)
+        return None, 0
+    return (asm, invalid) if asm.strip() else (None, 0)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the FSPX compute programs in FidelityFX shader containers.")
     ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads")
@@ -254,14 +271,22 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                code = blob[6][start:end]
+                asm, invalid, err = disasm.disasm(code, a.mcpu)
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)
                     bad += 1
                     continue
+                decoder = a.mcpu
+                if invalid:
+                    py_asm, py_invalid = python_listing(disasm, code, a.mcpu, meta.get("wave32", True))
+                    if py_asm is not None and py_invalid < invalid:
+                        decoder = f"{a.mcpu}, Python decoder (llvm-mc left {invalid} invalid words)"
+                        entry["llvm_mc_invalid_words"] = invalid
+                        asm, invalid = py_asm, py_invalid
                 entry["invalid_words"] = invalid
-                listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
+                listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {decoder}, {invalid} invalid words\n" + asm
                 if err.strip():
                     listing += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
             if container:

@@ -149,6 +149,17 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
     `op_sel` 2 and `op_sel_hi` 5 the result is the dot product with the two 16-bit halves of the second source
     exchanged, in all 5 operand sets (4 of them give another word under the plain rule). So `op_sel` selects halves
     here as it does for the packed 16-bit ops. The words are in `tests/semantic/test_alu_dot4_i8.py`.
+  - With llvm-mc 21.1.8, the version `scripts/build_llvm_mc.ps1` pins, it is worse: 11 of the 29 programs list
+    invalid words. llvm-mc refuses such an instruction's first dword and then decodes its second dword as an
+    instruction of its own, so the listing also holds a wrong instruction. Synthetic example:
+    `00 50 16 cc 01 05 0e 0c` lists as an invalid word plus `v_fmac_legacy_f32_e32 v7, v1, v2`. Only 18 of the 29 then
+    translate ("fall-through into undecodable words").
+  - So when llvm-mc leaves invalid words in a program, `fspx_unpack.py --disasm` lists it with the repository's own
+    RDNA2 decoder (`shader_disasm.disasm(..., backend="python")`), which reads those words with their `op_sel` and
+    `op_sel_hi`. That listing is kept only when it has fewer invalid words. Its header says so, the index entry keeps
+    llvm-mc's count as `llvm_mc_invalid_words`, and llvm-mc's messages stay at the end of the listing.
+  - With llvm-mc 21.1.8 the 11 programs get the Python decoder's listing, and all 29 translate and pass `spirv-val`.
+    Measured on the 1.0.2.1 DLL, counts only.
 
 ## Kind 7: records
 

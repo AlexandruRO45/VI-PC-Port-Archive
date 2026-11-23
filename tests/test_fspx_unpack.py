@@ -179,12 +179,12 @@ class Cli(unittest.TestCase):
             code = fspx_unpack.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
-    def disassemble(self, body):
+    def disassemble(self, body, code=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         src = os.path.join(tmp.name, "one.fspx")
         with open(src, "wb") as f:
-            f.write(make_fspx([(0, kind0()), (6, program())]))
+            f.write(make_fspx([(0, kind0()), (6, program() if code is None else code)]))
         mc = os.path.join(tmp.name, "fake_mc.py")
         with open(mc, "w", encoding="utf-8", newline="\n") as f:
             f.write(body)
@@ -215,6 +215,8 @@ class Cli(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
 
     def test_disassembly_with_invalid_words_keeps_listing(self):
+        # llvm-mc reports an invalid word the repository's decoder reads: its listing replaces llvm-mc's, and the
+        # header and the index say so. llvm-mc's messages stay at the end of the listing.
         result, out = self.disassemble("import sys\n"
                                        "print('\\ts_endpgm')\n"
                                        "sys.stderr.write('warning: invalid instruction encoding\\n')\n")
@@ -222,9 +224,51 @@ class Cli(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
             listing = f.read()
-        self.assertIn("1 invalid words", listing)
-        self.assertIn("\ts_endpgm", listing)
+        self.assertIn("Python decoder (llvm-mc left 1 invalid words), 0 invalid words", listing)
+        self.assertIn("v_mov_b32_e32 v0, 0", listing)
+        self.assertIn("s_endpgm", listing)
         self.assertIn("warning: invalid instruction encoding", listing)
+        with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+            entry = json.load(f)[0]
+        self.assertEqual((entry["invalid_words"], entry["llvm_mc_invalid_words"]), (0, 1))
+
+    def test_dot4_op_sel_words_llvm_mc_misreads(self):
+        # v_dot4_i32_i8 v0, v1, v2, v3 op_sel:[0,1,0] op_sel_hi:[1,0,1] (synthetic operands). llvm-mc 21.1.8 refuses
+        # its first dword and decodes the second as v_fmac_legacy_f32_e32 v7, v1, v2; the fake below prints exactly
+        # that. The listing kept is the Python decoder's, with the half selects.
+        dot4 = struct.pack("<II", 0xCC165000, 0x0C0E0501)
+        code = prologue() + dot4 + ENDPGM + S_NOP * 4
+        result, out = self.disassemble("import sys\n"
+                                       "print('\\tv_fmac_legacy_f32_e32 v7, v1, v2')\n"
+                                       "print('\\ts_endpgm')\n"
+                                       "sys.stderr.write('<stdin>:1:1: warning: invalid instruction encoding\\n')\n",
+                                       code=code)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
+            listing = f.read()
+        self.assertIn("v_dot4_i32_i8 v0, v1, v2, v3 op_sel:[0,1,0] op_sel_hi:[1,0,1]", listing)
+        self.assertNotIn("\tv_fmac_legacy_f32_e32", listing)
+        self.assertIn("llvm-mc left 1 invalid words), 0 invalid words", listing)
+
+    def test_llvm_mc_listing_stays_when_the_python_decoder_does_no_better(self):
+        class FakeDisasm:
+            def __init__(self, result=None, error=None):
+                self.result, self.error = result, error
+
+            def disasm(self, code, mcpu, backend="llvm-mc", wave32=True):
+                assert backend == "python"
+                if self.error:
+                    raise self.error
+                return self.result
+
+        self.assertEqual(fspx_unpack.python_listing(FakeDisasm(("  \n", 0, "")), b"", "gfx1030", True), (None, 0))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got = fspx_unpack.python_listing(FakeDisasm(error=ValueError("boom")), b"", "gfx1030", True)
+        self.assertEqual(got, (None, 0))
+        self.assertIn("keeping the llvm-mc listing", err.getvalue())
+        self.assertEqual(fspx_unpack.python_listing(FakeDisasm(("\tx\n", 3, "")), b"", "gfx1030", False),
+                         ("\tx\n", 3))
 
     def test_clean_disassembly_keeps_listing(self):
         result, out = self.disassemble("print('\\ts_endpgm')\n")
