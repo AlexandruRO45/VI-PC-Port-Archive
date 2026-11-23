@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """RDNA (gfx10) shader -> SPIR-V assembly, version 0.
 
 Model: one SPIR-V invocation runs one lane. VGPRs and SGPRs are Function-scope uint arrays; float ops bitcast,
@@ -9614,16 +9616,19 @@ class Gen:
                 self.emit(f"{scaled} = OpSelect %uint {valid} {norm} {ov}")
                 self.emit(f"{r} = OpSelect %uint {isnorm} {scaled} {other}")
                 self.dst(a[0], self.tou(self.clamp_mods(self.tof(r), mods)))
-        elif op in ("v_frexp_mant_f64", "v_frexp_exp_i32_f64"):
-            # Binary64 frexp, bit-exact on the (lo, hi) dword pair without requiring Float64/Int64 unless VOP3 output
-            # modifiers are present. Measured natively on gfx1036 (wave32 & wave64, default denorm16_64=3, IEEE=0):
+        elif op in ("v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_ldexp_f64"):
+            # Binary64 frexp and ldexp, bit-exact on the (lo, hi) dword pair without requiring Float64/Int64 unless
+            # VOP3 output modifiers are present. Measured natively on gfx1036 (wave32 & wave64, default denorm16_64=3, IEEE=0):
             # - Normal inputs (biased exponent 1..2046): mant in [0.5, 1) with sign, exp = e - 1022.
             # - Non-zero subnormals (e == 0, frac != 0): normalized to mant in [0.5, 1) with sign, exp = msb - 1073
             #   (-1073..-1022), matching v_frexp_mant_f16 / v_frexp_exp_i16_f16.
             # - Signed zero: +-0 / exp 0. Infinities and NaNs: unchanged / exp 0.
+            # - v_ldexp_f64: D = S0 * 2^S1, scaling binary64 by signed 32-bit integer S1.
             sv = a[1]
             if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
                 lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+            elif sv.get("f64_literal"):
+                lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
             elif sv["k"] in ("imm", "fimm"):
                 bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
                         if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
@@ -9666,7 +9671,7 @@ class Gen:
                 self.emit(f"{r0} = OpSelect %uint {is_sub} {ex_sub} {self.cu(0)}")
                 self.emit(f"{r} = OpSelect %uint {isnorm} {ex_norm} {r0}")
                 self.dst(a[0], r)
-            else:
+            elif op == "v_frexp_mant_f64":
                 d = a[0]
                 if d["k"] != "vgpr" or d.get("n") != 2:
                     raise Unsupported(op + " destination")
@@ -9714,6 +9719,143 @@ class Gen:
                 self.emit(f"{other_lo} = OpSelect %uint {is_sub} {sub_lo} {lo}")
                 self.emit(f"{r_hi} = OpSelect %uint {isnorm} {m_hi} {other_hi}")
                 self.emit(f"{r_lo} = OpSelect %uint {isnorm} {lo} {other_lo}")
+                if any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods):
+                    self.uses_f64 = True
+                    v2, dv, mv2 = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{v2} = OpCompositeConstruct %v2uint_d {r_lo} {r_hi}")
+                    self.emit(f"{dv} = OpBitcast %double {v2}")
+                    dv = self.clamp_mods_f64(dv, mods)
+                    self.emit(f"{mv2} = OpBitcast %v2uint_d {dv}")
+                    r_lo, r_hi = self.tmp(), self.tmp()
+                    self.emit(f"{r_lo} = OpCompositeExtract %uint {mv2} 0")
+                    self.emit(f"{r_hi} = OpCompositeExtract %uint {mv2} 1")
+                self.dst({"k": "vgpr", "r": d["r"], "n": 1}, r_lo)
+                self.dst({"k": "vgpr", "r": d["r"] + 1, "n": 1}, r_hi)
+            else:
+                d = a[0]
+                if d["k"] != "vgpr" or d.get("n") != 2:
+                    raise Unsupported(op + " destination")
+                n = self.src_u(a[2])
+                sha0, sha, inva0, inva, a_lo, a_h1, a_h2, a_hi = (self.tmp() for _ in range(8))
+                self.emit(f"{sha0} = OpISub %uint {self.cu(20)} {mhu}")
+                self.emit(f"{sha} = OpBitwiseAnd %uint {sha0} {self.cu(31)}")
+                self.emit(f"{inva0} = OpIAdd %uint {mhu} {self.cu(12)}")
+                self.emit(f"{inva} = OpBitwiseAnd %uint {inva0} {self.cu(31)}")
+                self.emit(f"{a_lo} = OpShiftLeftLogical %uint {lo} {sha}")
+                self.emit(f"{a_h1} = OpShiftLeftLogical %uint {f_hi} {sha}")
+                self.emit(f"{a_h2} = OpShiftRightLogical %uint {lo} {inva}")
+                self.emit(f"{a_hi} = OpBitwiseOr %uint {a_h1} {a_h2}")
+                is_b1, shb1_0, shb1, b1_hi = (self.tmp() for _ in range(4))
+                self.emit(f"{is_b1} = OpULessThanEqual %bool {mlu} {self.cu(20)}")
+                self.emit(f"{shb1_0} = OpISub %uint {self.cu(20)} {mlu}")
+                self.emit(f"{shb1} = OpBitwiseAnd %uint {shb1_0} {self.cu(31)}")
+                self.emit(f"{b1_hi} = OpShiftLeftLogical %uint {lo} {shb1}")
+                shb2_0, shb2, invb2_0, invb2, b2_lo, b2_hi = (self.tmp() for _ in range(6))
+                self.emit(f"{shb2_0} = OpISub %uint {self.cu(52)} {mlu}")
+                self.emit(f"{shb2} = OpBitwiseAnd %uint {shb2_0} {self.cu(31)}")
+                self.emit(f"{invb2_0} = OpISub %uint {mlu} {self.cu(20)}")
+                self.emit(f"{invb2} = OpBitwiseAnd %uint {invb2_0} {self.cu(31)}")
+                self.emit(f"{b2_lo} = OpShiftLeftLogical %uint {lo} {shb2}")
+                self.emit(f"{b2_hi} = OpShiftRightLogical %uint {lo} {invb2}")
+                b_lo, b_hi, sub_lo, sub_hi_raw, sub_hi_frac = (self.tmp() for _ in range(5))
+                self.emit(f"{b_lo} = OpSelect %uint {is_b1} {self.cu(0)} {b2_lo}")
+                self.emit(f"{b_hi} = OpSelect %uint {is_b1} {b1_hi} {b2_hi}")
+                self.emit(f"{sub_lo} = OpSelect %uint {has_hi} {a_lo} {b_lo}")
+                self.emit(f"{sub_hi_raw} = OpSelect %uint {has_hi} {a_hi} {b_hi}")
+                self.emit(f"{sub_hi_frac} = OpBitwiseAnd %uint {sub_hi_raw} {self.cu(0x000FFFFF)}")
+
+                ex_norm, ex_hi, ex_lo, ex_sub, ex = (self.tmp() for _ in range(5))
+                self.emit(f"{ex_norm} = OpISub %uint {e} {self.cu(1023)}")
+                self.emit(f"{ex_hi} = OpISub %uint {mhu} {self.cu(1042)}")
+                self.emit(f"{ex_lo} = OpISub %uint {mlu} {self.cu(1074)}")
+                self.emit(f"{ex_sub} = OpSelect %uint {has_hi} {ex_hi} {ex_lo}")
+                self.emit(f"{ex} = OpSelect %uint {isnorm} {ex_norm} {ex_sub}")
+
+                norm_hi, sub_hi, sig_hi, sig_lo = (self.tmp() for _ in range(4))
+                self.emit(f"{norm_hi} = OpBitwiseOr %uint {f_hi} {self.cu(0x00100000)}")
+                self.emit(f"{sub_hi} = OpBitwiseOr %uint {sub_hi_frac} {self.cu(0x00100000)}")
+                self.emit(f"{sig_hi} = OpSelect %uint {isnorm} {norm_hi} {sub_hi}")
+                self.emit(f"{sig_lo} = OpSelect %uint {isnorm} {lo} {sub_lo}")
+
+                nb, small, neg, lim, nc = (self.tmp() for _ in range(5))
+                self.emit(f"{nb} = OpIAdd %uint {n} {self.cu(4096)}")
+                self.emit(f"{small} = OpULessThan %bool {nb} {self.cu(8193)}")
+                self.emit(f"{neg} = OpBitFieldUExtract %uint {n} {self.cu(31)} {self.cu(1)}")
+                self.emit(f"{lim} = OpSelect %uint {self.tmp_bool_nz(neg)} {self.cu(0xFFFFF000)} {self.cu(4096)}")
+                self.emit(f"{nc} = OpSelect %uint {small} {n} {lim}")
+
+                e2, target_exp = self.tmp(), self.tmp()
+                self.emit(f"{e2} = OpIAdd %uint {ex} {nc}")
+                self.emit(f"{target_exp} = OpIAdd %uint {e2} {self.cu(1023)}")
+
+                t_m1, valid, pos, posb, over = (self.tmp() for _ in range(5))
+                self.emit(f"{t_m1} = OpISub %uint {target_exp} {self.cu(1)}")
+                self.emit(f"{valid} = OpULessThan %bool {t_m1} {self.cu(2046)}")
+                self.emit(f"{pos} = OpBitFieldUExtract %uint {target_exp} {self.cu(31)} {self.cu(1)}")
+                self.emit(f"{posb} = OpIEqual %bool {pos} {self.cu(0)}")
+                self.emit(f"{over} = OpLogicalAnd %bool {posb} {self.tmp_bool_nz(target_exp)}")
+
+                sh_e, norm_f, norm_r_hi, norm_r_lo = (self.tmp() for _ in range(4))
+                self.emit(f"{sh_e} = OpShiftLeftLogical %uint {target_exp} {self.cu(20)}")
+                self.emit(f"{norm_f} = OpBitwiseAnd %uint {sig_hi} {self.cu(0x000FFFFF)}")
+                self.emit(f"{norm_r_hi} = OpBitwiseOr %uint {sgn} {sh_e}")
+                self.emit(f"{norm_r_hi} = OpBitwiseOr %uint {norm_r_hi} {norm_f}")
+                self.emit(f"{norm_r_lo} = OpCopyObject %uint {sig_lo}")
+
+                inf_hi = self.tmp()
+                self.emit(f"{inf_hi} = OpBitwiseOr %uint {sgn} {self.cu(0x7FF00000)}")
+
+                rs, rs_c, rs_u, is_deep_under = (self.tmp() for _ in range(4))
+                self.emit(f"{rs} = OpISub %int {self.as_int(self.cu(1))} {self.as_int(target_exp)}")
+                self.emit(f"{rs_c} = OpExtInst %int %glsl SClamp {rs} {self.as_int(self.cu(1))} {self.as_int(self.cu(56))}")
+                self.emit(f"{rs_u} = OpBitcast %uint {rs_c}")
+                self.emit(f"{is_deep_under} = OpSGreaterThan %bool {rs} {self.as_int(self.cu(55))}")
+
+                is_hi_zero = self.tmp()
+                self.emit(f"{is_hi_zero} = OpUGreaterThanEqual %bool {rs_u} {self.cu(21)}")
+                sh_hi0, sh_hi, inv_rs0, inv_rs = (self.tmp() for _ in range(4))
+                self.emit(f"{sh_hi0} = OpBitwiseAnd %uint {rs_u} {self.cu(31)}")
+                self.emit(f"{inv_rs0} = OpISub %uint {self.cu(32)} {sh_hi0}")
+                self.emit(f"{inv_rs} = OpBitwiseAnd %uint {inv_rs0} {self.cu(31)}")
+                d_hi, d_lo1, d_lo2, d_lo = (self.tmp() for _ in range(4))
+                self.emit(f"{d_hi} = OpShiftRightLogical %uint {sig_hi} {sh_hi0}")
+                self.emit(f"{d_lo1} = OpShiftRightLogical %uint {sig_lo} {sh_hi0}")
+                self.emit(f"{d_lo2} = OpShiftLeftLogical %uint {sig_hi} {inv_rs}")
+                self.emit(f"{d_lo} = OpBitwiseOr %uint {d_lo1} {d_lo2}")
+
+                is_gte32, sh32_0, sh32, d_lo_gte32 = (self.tmp() for _ in range(4))
+                self.emit(f"{is_gte32} = OpUGreaterThanEqual %bool {rs_u} {self.cu(32)}")
+                self.emit(f"{sh32_0} = OpISub %uint {rs_u} {self.cu(32)}")
+                self.emit(f"{sh32} = OpBitwiseAnd %uint {sh32_0} {self.cu(31)}")
+                self.emit(f"{d_lo_gte32} = OpShiftRightLogical %uint {sig_hi} {sh32}")
+
+                raw_den_hi, raw_den_lo = self.tmp(), self.tmp()
+                self.emit(f"{raw_den_hi} = OpSelect %uint {is_hi_zero} {self.cu(0)} {d_hi}")
+                self.emit(f"{raw_den_lo} = OpSelect %uint {is_gte32} {d_lo_gte32} {d_lo}")
+
+                den_hi0, den_lo0 = self.tmp(), self.tmp()
+                self.emit(f"{den_hi0} = OpSelect %uint {is_deep_under} {self.cu(0)} {raw_den_hi}")
+                self.emit(f"{den_lo0} = OpSelect %uint {is_deep_under} {self.cu(0)} {raw_den_lo}")
+                den_r_hi, den_r_lo = self.tmp(), self.tmp()
+                self.emit(f"{den_r_hi} = OpBitwiseOr %uint {sgn} {den_hi0}")
+                self.emit(f"{den_r_lo} = OpCopyObject %uint {den_lo0}")
+
+                non_norm_hi, non_norm_lo = self.tmp(), self.tmp()
+                self.emit(f"{non_norm_hi} = OpSelect %uint {over} {inf_hi} {den_r_hi}")
+                self.emit(f"{non_norm_lo} = OpSelect %uint {over} {self.cu(0)} {den_r_lo}")
+                fin_hi, fin_lo = self.tmp(), self.tmp()
+                self.emit(f"{fin_hi} = OpSelect %uint {valid} {norm_r_hi} {non_norm_hi}")
+                self.emit(f"{fin_lo} = OpSelect %uint {valid} {norm_r_lo} {non_norm_lo}")
+
+                fin = self.tmp()
+                self.emit(f"{fin} = OpLogicalOr %bool {isnorm} {is_sub}")
+                non_fin_hi, non_fin_lo = self.tmp(), self.tmp()
+                self.emit(f"{non_fin_hi} = OpSelect %uint {is_e0} {sgn} {hi}")
+                self.emit(f"{non_fin_lo} = OpSelect %uint {is_e0} {self.cu(0)} {lo}")
+                r_hi, r_lo = self.tmp(), self.tmp()
+                self.emit(f"{r_hi} = OpSelect %uint {fin} {fin_hi} {non_fin_hi}")
+                self.emit(f"{r_lo} = OpSelect %uint {fin} {fin_lo} {non_fin_lo}")
+
                 if any(m in ("clamp", "mul:2", "mul:4", "div:2") for m in mods):
                     self.uses_f64 = True
                     v2, dv, mv2 = self.tmp(), self.tmp(), self.tmp()
