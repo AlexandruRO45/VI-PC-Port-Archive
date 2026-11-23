@@ -3754,6 +3754,17 @@ Get-FileHash "$out/fitted-8253.dds" -Algorithm SHA256
 
 `tools/ttpf_batch_export.py` runs batch export over a range of texture indices in a TTPF (RDS5) pool. It enforces strict export by default, optionally retrying with fitted provisional calibration history when `--allow-provisional` is specified. Exports are written to temporary paths and published atomically on completion. Entry status, dimensions, DXGI codec, output DDS file size and SHA-256 are recorded in `manifest.json`. A failed export preserves existing DDS files. Use successful entries in the current manifest to identify this run's output.
 
+Build the standalone Rust exporter from this checkout with Cargo. From the repository root on Windows, run
+
+```powershell
+cargo build --locked --release --manifest-path third_party/ttpf-export/tools/bcpack_dds/Cargo.toml --target-dir out/bcpack-dds
+python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --xbox-1.0.2.1 --threads 8
+```
+
+The preset selects the shared profile and asset-key recipes. Use `--profile-dir PATH` for a local pair of JSON files. Use `--rust-exporter PATH` to select a different binary, or pass that option alone for strict export. Each successful output from the in-tree binary records its mode, SHA-256 and selected recipe path in the manifest. The recipe values are `strict`, `entry_strict`, `shared_profile` and `entry_fit`. These describe the texture-level selection, including textures that contain raw mip levels. See the [source notices](../third_party/ttpf-export/README.md) and [profile provenance](../tools/bcpack_profiles/xbox-1.0.2.1/README.md).
+
+The optional Python reference workflow uses the following commands.
+
 ```powershell
 python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --indices 0,8253 --allow-provisional --history "$out/history.json" --tools-path "$out/Leonida/tools"
 ```
@@ -3772,19 +3783,6 @@ python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --tools-path "$ru
 ```
 
 Add `--calibration path/to/profile.json` to retry strict decode failures using a local version-1 Leonida profile. This option requires NumPy and the calibration library. Use it by itself or with `--require-rust`. The separate legacy history mode uses `--allow-provisional --history`. Output produced by the local profile has `"mode": "fitted"` in the manifest.
-
-For Xbox 1.0.2.1, build the pinned standalone Leonida exporter and pass `--xbox-1.0.2.1` with `--rust-exporter`. The wrapper loads the bundled shared calibration and 163 asset-key recipes, and asks Rust to prefer fitted decoding. The verification covered all 51,156 textures in the BCPack catalog across 55 pools. Other inputs can use the strict default or an explicitly supplied version-1 calibration. Use the reference path above for Python history files.
-
-```powershell
-$batchCheckout = "$out/Leonida-rust-batch"
-$batchCommit = '86ca164c257f78ab5de586539d01dce214dc924f'
-git init "$batchCheckout"
-git -C "$batchCheckout" fetch --depth=1 https://github.com/wish131400/Leonida.git $batchCommit
-git -C "$batchCheckout" checkout --detach $batchCommit
-$batchTarget = "$out/bcpack-dds"
-cargo build --release --locked --manifest-path "$batchCheckout/tools/bcpack_dds/Cargo.toml" --target-dir "$batchTarget"
-python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --rust-exporter "$batchTarget/release/bcpack_dds.exe" --xbox-1.0.2.1 --threads 8
-```
 
 ### Drawing BC7 textures with a recompiled pixel shader
 
