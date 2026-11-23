@@ -91,6 +91,28 @@ def lea(target_rva: int, insn_rva: int, rex=b"\x48", opcode=b"\x8d", reg=b"\x15"
     return rex + opcode + reg + struct.pack("<i", target_rva - (insn_rva + 7))
 
 
+def pe32plus_sections(sections):
+    """A PE32+ image from (name, rva, virtual size, raw bytes, characteristics) rows; each section's raw data
+    starts on a 0x200 file boundary right after the previous one, so SizeOfRawData is len(raw bytes)."""
+    pe, opt_size = 0x80, 240
+    out = bytearray(0x400)
+    out[0:2] = b"MZ"
+    struct.pack_into("<I", out, 0x3C, pe)
+    out[pe:pe + 4] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", out, pe + 4, 0x8664, len(sections), 0, 0, 0, opt_size, 0x2022)
+    opt = pe + 24
+    struct.pack_into("<H", out, opt, 0x20B)
+    struct.pack_into("<Q", out, opt + 24, 0x180000000)
+    struct.pack_into("<I", out, opt + 108, 16)
+    for i, (name, rva, vsize, raw, chars) in enumerate(sections):
+        sec = opt + opt_size + 40 * i
+        out[sec:sec + 8] = name.ljust(8, b"\0")
+        struct.pack_into("<IIIII", out, sec + 8, vsize, rva, len(raw), len(out), 0)
+        struct.pack_into("<I", out, sec + 36, chars)
+        out += raw + b"\0" * (-len(raw) % 0x200)
+    return bytes(out)
+
+
 class GuidSites(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -133,6 +155,23 @@ class GuidSites(unittest.TestCase):
         image, _ = pe32plus(text, bytes(blob))
         r = sites.scan(self.write("t3.dll", image), KNOWN)
         self.assertEqual(r["guid_candidates"], [])
+
+    def test_zero_filled_section_tail_is_not_read_from_the_next_section(self):
+        # .data holds 0x200 file bytes but is 0x400 bytes in memory: 0x2200.. is zero-filled when loaded. The
+        # file bytes after .data's raw data belong to .rsrc, which holds a GUID; a lea to 0x2200 must not see it.
+        text = lea(0x2200, 0x1000) + lea(0x3000, 0x1007)
+        image = pe32plus_sections([
+            (b".text", 0x1000, len(text), text, 0x60000020),
+            (b".data", 0x2000, 0x400, b"\x11" * 0x200, 0xC0000040),
+            (b".rsrc", 0x3000, 0x200, UNKNOWN.bytes_le * 32, 0x40000040),
+        ])
+        r = sites.scan(self.write("t10.dll", image), KNOWN)
+        self.assertEqual(r["lea_count"], 2)
+        self.assertEqual([(c["value"], c["section"], c["rva"], c["refs"]) for c in r["guid_candidates"]],
+                         [(str(UNKNOWN), ".rsrc", 0x3000, 1)])
+        img = sites.Image(image)
+        self.assertEqual(img.read(0x21F8, 16), b"\x11" * 8 + b"\0" * 8)   # file bytes, then the zero fill
+        self.assertIsNone(img.rva_to_offset(0x2200))
 
     def test_iat_guid_load_is_named(self):
         rdata = QUEUE.bytes_le + b"\0" * (64 - 16)

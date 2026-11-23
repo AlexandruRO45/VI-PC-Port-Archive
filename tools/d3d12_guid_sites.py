@@ -91,23 +91,47 @@ class Image:
             self.sections.append({"name": name, "va": va, "vsize": vsize, "raw": raw, "rsize": rsize,
                                   "chars": chars})
 
-    def rva_to_offset(self, rva: int) -> int | None:
+    @staticmethod
+    def span(s: dict) -> int:
+        """A section's size in memory: VirtualSize, or SizeOfRawData when that is 0. As runtime/src/pe_loader.cpp
+        maps it, file bytes past the span are not mapped and the span past SizeOfRawData is zero-filled."""
+        return s["vsize"] or s["rsize"]
+
+    def _section(self, rva: int) -> dict | None:
         for s in self.sections:
-            if s["va"] <= rva < s["va"] + max(s["vsize"], s["rsize"]):
-                off = s["raw"] + rva - s["va"]
-                return off if off < len(self.data) else None
+            if s["va"] <= rva < s["va"] + self.span(s):
+                return s
         return None
 
+    def rva_to_offset(self, rva: int) -> int | None:
+        """The file offset of `rva`, or None when no file byte backs it (no section, or a zero-filled tail)."""
+        s = self._section(rva)
+        if s is None or rva - s["va"] >= min(s["rsize"], self.span(s)):
+            return None
+        off = s["raw"] + rva - s["va"]
+        return off if off < len(self.data) else None
+
     def read(self, rva: int, size: int) -> bytes | None:
-        off = self.rva_to_offset(rva)
-        return self.data[off:off + size] if off is not None else None
+        """Up to `size` bytes at `rva` as loaded: the section's file bytes, then zeros for its zero-filled tail.
+        Shorter when the range leaves the section or the file ends; None outside every section."""
+        s = self._section(rva)
+        if s is None:
+            return None
+        delta = rva - s["va"]
+        end = min(delta + size, self.span(s))
+        backed = min(s["rsize"], self.span(s))
+        lo, hi = min(delta, backed), min(end, backed)
+        blob = self.data[s["raw"] + lo:s["raw"] + hi]
+        if len(blob) < hi - lo:                      # the file ends inside the section's raw data
+            return blob
+        return blob + bytes(max(0, end - max(delta, backed)))
 
     def initialized(self) -> list[dict]:
         return [s for s in self.sections if s["rsize"] > 0]
 
     def section_of(self, rva: int) -> dict | None:
         for s in self.initialized():
-            if s["va"] <= rva < s["va"] + max(s["vsize"], s["rsize"]):
+            if s["va"] <= rva < s["va"] + self.span(s):
                 return s
         return None
 
@@ -249,7 +273,7 @@ def absolute_refs(img: Image) -> list[tuple[int, int]]:
             value = struct.unpack_from("<Q", blob, i)[0]
             if lo <= value < lo + 0x10000000:
                 target = value - lo
-                if any(t["va"] <= target < t["va"] + max(t["vsize"], t["rsize"]) for t in img.sections):
+                if any(t["va"] <= target < t["va"] + img.span(t) for t in img.sections):
                     out.append((s["va"] + i, target))
     return out
 
