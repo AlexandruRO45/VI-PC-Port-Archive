@@ -35,9 +35,9 @@ id but not an interface id is read as the class's implemented interface. The arg
 highest of rdx/r8/r9 (xmm1-3) written, or [rsp+20h+8k] stored, between the previous call and the slot call.
 
 Output: per image and class, the class and interface ids, the slots called with their method names and whether
-their thunks are referenced, the thunk count, and whether the runtime serves the class (a `constexpr GUID
-k...Class` with its id in one of runtime/shims/xgameruntime*.cpp: xgameruntime.cpp and the classes it hands on to
-xgameruntime_user.cpp, _gamesave.cpp, _store.cpp, _offline.cpp; the class only, not each slot); then the known ids present in the image that
+their thunks are referenced, the thunk count, and whether the runtime serves the class and requested interfaces (a
+`constexpr GUID k...Class` with its id in one of runtime/shims/xgameruntime*.cpp whose QueryApiImpl tables or checks
+accept each requested interface id, not each slot); then the known ids present in the image that
 no thunk reaches. Text by default, --json for JSON. --out DIR writes both, as <image file name>.gdk_calls.txt and
 .json (x.dll-2.gdk_calls.txt for a second input named x.dll), and prints one summary line per image instead.
 
@@ -401,9 +401,27 @@ class RuntimeTable:
         return None, None
 
 
-GUID_CONSTANT = re.compile(
-    r"constexpr\s+GUID\s+k(\w*?)Class\s*=\s*\{\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*,"
-    r"\s*\{([^}]*)\}\s*\}")
+IUNKNOWN = "00000000-0000-0000-c000-000000000046"
+_GUID_BRACE = (r"\{\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*,"
+               r"\s*\{([^}]*)\}\s*\}")
+GUID_CONSTANT = re.compile(r"constexpr\s+GUID\s+k(\w*?)Class\s*=\s*" + _GUID_BRACE)
+_NAMED_GUID = re.compile(r"(?:constexpr|const)\s+GUID\s+(\w+)\s*=\s*" + _GUID_BRACE)
+_BRACE_GUID = re.compile(_GUID_BRACE)
+_IID_PTR_ARRAY = re.compile(r"const\s+GUID\s*\*\s*(?:const\s+)?(\w+)\s*\[\s*\]\s*=\s*\{([^;]*)\}\s*;", re.DOTALL)
+_RUNTIME_OBJECT = re.compile(r"\bRuntimeObject\s+\w+\s*\{\s*[^,]+,\s*&\s*(\w+)\s*,\s*(\w+)\s*\}")
+_IFACE_ARRAY = re.compile(r"(?:constexpr|const)\s+GUID\s+k(\w*?)Interfaces\s*\[\s*\]\s*=\s*\{(.*?)\}\s*;", re.DOTALL)
+_IID_CHECK = re.compile(r"\b(?:iid|interface_id)\s*==\s*(\w+)\b|\b(\w+)\s*==\s*(?:iid|interface_id)\b")
+
+
+def _parse_guid_fields(d1: str, d2: str, d3: str, tail_text: str) -> str | None:
+    try:
+        tail = [int(x, 16) for x in tail_text.split(",") if x.strip()]
+        if len(tail) != 8:
+            return None
+        return str(uuid.UUID(fields=(int(d1, 16), int(d2, 16), int(d3, 16), tail[0],
+                                     tail[1], int.from_bytes(bytes(tail[2:]), "big"))))
+    except ValueError:          # not a GUID after all (a value out of range, a non-hex byte)
+        return None
 
 
 def read_runtime_source(path: str) -> str:
@@ -425,16 +443,77 @@ def served_classes(source: str) -> dict[str, str]:
     """{class id: constant name} for each `constexpr GUID k<Name>Class = {...}` in the runtime shim's source."""
     out = {}
     for m in GUID_CONSTANT.finditer(source):
-        try:
-            tail = [int(x, 16) for x in m.group(5).split(",") if x.strip()]
-            if len(tail) != 8:
-                continue
-            guid = uuid.UUID(fields=(int(m.group(2), 16), int(m.group(3), 16), int(m.group(4), 16), tail[0],
-                                     tail[1], int.from_bytes(bytes(tail[2:]), "big")))
-        except ValueError:          # not a GUID after all (a value out of range, a non-hex byte)
-            continue
-        out[str(guid)] = f"k{m.group(1)}Class"
+        guid = _parse_guid_fields(m.group(2), m.group(3), m.group(4), m.group(5))
+        if guid is not None:
+            out[guid] = f"k{m.group(1)}Class"
     return out
+
+
+def served_interfaces(source: str) -> dict[str, set[str]]:
+    """{class id: {served interface ids}} for each served class in the runtime shim's source.
+
+    QueryApiImpl accepts IUnknown and the class's own id for every served class, plus the interface ids listed in
+    that class's `k<Name>Iids[]` (`RuntimeObject`), `k<Name>Interfaces[]` table, or direct `iid == k...` checks.
+    """
+    classes = served_classes(source)
+    out: dict[str, set[str]] = {cid: {cid, IUNKNOWN} for cid in classes}
+    class_by_ident = {name: cid for cid, name in classes.items()}
+    class_by_stem = {name[1:-5]: cid for cid, name in classes.items()}
+
+    named_guids: dict[str, str] = {}
+    class_positions: list[tuple[int, str]] = []
+    for m in _NAMED_GUID.finditer(source):
+        guid = _parse_guid_fields(m.group(2), m.group(3), m.group(4), m.group(5))
+        if guid is None:
+            continue
+        ident = m.group(1)
+        named_guids[ident] = guid
+        if ident in class_by_ident:
+            class_positions.append((m.start(), class_by_ident[ident]))
+
+    iid_ptrs: dict[str, set[str]] = {}
+    for m in _IID_PTR_ARRAY.finditer(source):
+        iid_ptrs[m.group(1)] = {named_guids[tok] for tok in re.findall(r"&\s*(\w+)", m.group(2)) if tok in named_guids}
+
+    for m in _RUNTIME_OBJECT.finditer(source):
+        cid = class_by_ident.get(m.group(1))
+        if cid is not None and m.group(2) in iid_ptrs:
+            out[cid].update(iid_ptrs[m.group(2)])
+
+    for m in _IFACE_ARRAY.finditer(source):
+        stem, body = m.group(1), m.group(2)
+        tokens = re.findall(r"\b[A-Za-z_]\w*\b", body)
+        cid = next((class_by_ident[t] for t in tokens if t in class_by_ident), None) or class_by_stem.get(stem)
+        if cid is None:
+            continue
+        for gm in _BRACE_GUID.finditer(body):
+            guid = _parse_guid_fields(gm.group(1), gm.group(2), gm.group(3), gm.group(4))
+            if guid is not None:
+                out[cid].add(guid)
+        for tok in tokens:
+            if tok in named_guids:
+                out[cid].add(named_guids[tok])
+
+    if class_positions:
+        starts = [pos for pos, _ in class_positions]
+        for m in _IID_CHECK.finditer(source):
+            ident = m.group(1) or m.group(2)
+            if ident in named_guids and ident not in class_by_ident and named_guids[ident] != IUNKNOWN:
+                idx = bisect.bisect_right(starts, m.start()) - 1
+                if idx >= 0:
+                    out[class_positions[idx][1]].add(named_guids[ident])
+    return out
+
+
+def _interface_served(served: dict | None, cid: str, iid: str) -> bool | None:
+    if served is None:
+        return None
+    if cid not in served:
+        return False
+    entry = served[cid]
+    if isinstance(entry, str):
+        return iid in (cid, IUNKNOWN)
+    return iid in entry
 
 
 # ---- Scanning an image ----
@@ -799,7 +878,8 @@ def ranges(numbers) -> str:
     return ", ".join(out)
 
 
-def report(path: str, table: RuntimeTable, served: dict[str, str] | None) -> dict:
+def report(path: str, table: RuntimeTable,
+           served: dict[str, set[str]] | dict[str, str] | None) -> dict:
     """The JSON report of one image. Raises PeFormatError or OSError when it can't be read."""
     with open(path, "rb") as f:
         data = f.read()
@@ -816,16 +896,21 @@ def report(path: str, table: RuntimeTable, served: dict[str, str] | None) -> dic
         refs = site["references"]
         cls = classes.setdefault(cid, {
             "class": table.class_of(cid), "class_id": cid,
-            "served": None if served is None else cid in served,
+            "served": None,
             "thunks": 0, "referenced_thunks": 0, "interfaces": {}})
         cls["thunks"] += 1
         if cls["referenced_thunks"] is not None:
             cls["referenced_thunks"] = None if refs is None else cls["referenced_thunks"] + (refs > 0)
         names_from = table.interface_for(iid)
         iface = cls["interfaces"].setdefault(iid, {
-            "interface": table.label(iid), "interface_id": iid, "slots_named_from": names_from,
-            "without_layout": table.slot_table(names_from)[1] if names_from else [], "thunks": 0, "slots": {}})
+            "interface": table.label(iid), "interface_id": iid,
+            "served": _interface_served(served, cid, iid),
+            "slots_named_from": names_from,
+            "without_layout": table.slot_table(names_from)[1] if names_from else [],
+            "thunks": 0, "referenced_thunks": 0, "slots": {}})
         iface["thunks"] += 1
+        if iface["referenced_thunks"] is not None:
+            iface["referenced_thunks"] = None if refs is None else iface["referenced_thunks"] + (refs > 0)
         where = f"{site['function'] if site['function'] is not None else site['call']:#x}"
         for slot, args, _ in site["slots"]:
             method, via = table.method(names_from, slot)
@@ -847,7 +932,8 @@ def report(path: str, table: RuntimeTable, served: dict[str, str] | None) -> dic
             ifaces.append(dict(iface, slots=slots, slot_list=ranges(s["slot"] for s in slots),
                                referenced_slot_list=ranges(s["slot"] for s in slots if s["referenced"])
                                if known else None))
-        out_classes.append(dict(cls, interfaces=ifaces))
+        cls_served = None if served is None else (cid in served and all(i["served"] is True for i in ifaces))
+        out_classes.append(dict(cls, served=cls_served, interfaces=ifaces))
 
     reached = {table.class_of(c) for c in classes} | set(classes)
     unreached = []
@@ -920,8 +1006,10 @@ def to_text(r: dict) -> str:
         for iface in cls["interfaces"]:
             names = iface["slots_named_from"]
             source = "" if names is None or names in iface["interface"].split("/") else f", slots named from {names}"
+            iface_status = (f"  [{served_text(iface['served'])}]"
+                            if "served" in iface and iface["served"] != cls["served"] else "")
             out.append(f"  interface {iface['interface']}  {iface['interface_id']}{source}: "
-                       f"slots {iface['slot_list']}")
+                       f"slots {iface['slot_list']}{iface_status}")
             if iface["without_layout"]:
                 out.append(f"    (no documented layout for {', '.join(iface['without_layout'])}: its own methods, "
                            "if any, are named in its base's list; slots past the list are unknown)")
@@ -942,6 +1030,8 @@ def to_text(r: dict) -> str:
                    "Served status unknown (class as interface: slots called; the referenced ones):")
         for c in todo:
             for iface in c["interfaces"]:
+                if iface.get("served") is True:
+                    continue
                 ref = iface["referenced_slot_list"]
                 ref = "unknown" if ref is None else (ref or "none")
                 out.append(f"  {c['class'] or c['class_id']} as {iface['interface']}: {iface['slot_list']}; "
@@ -964,9 +1054,17 @@ def to_text(r: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+def _has_unserved_referenced(cls: dict) -> bool:
+    unserved = [i for i in cls["interfaces"] if i.get("served") is False]
+    if unserved and all("referenced_thunks" in i for i in unserved):
+        return any(bool(i["referenced_thunks"]) for i in unserved)
+    return bool(cls["referenced_thunks"])
+
+
 def summary(r: dict) -> str:
     todo = [c["class"] or c["class_id"] for c in r["classes"] if c["served"] is False]
-    live = [c["class"] or c["class_id"] for c in r["classes"] if c["served"] is False and c["referenced_thunks"]]
+    live = [c["class"] or c["class_id"] for c in r["classes"]
+            if c["served"] is False and _has_unserved_referenced(c)]
     ref = "?" if r["referenced_thunks"] is None else r["referenced_thunks"]
     text = (f"{r['file']:<32} thunks={r['thunks']} referenced={ref} classes={len(r['classes'])} "
             f"not-served={','.join(todo) or '-'} not-served-referenced={','.join(live) or '-'}")
@@ -982,8 +1080,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", help="write <image>.gdk_calls.txt and .json here and print a summary line per image")
     ap.add_argument("--table", default=DEFAULT_TABLE, help="the class table (default: %(default)s)")
     ap.add_argument("--runtime-source", default=DEFAULT_RUNTIME_SOURCE,
-                    help="a shim source, or a folder of xgameruntime*.cpp, whose `constexpr GUID k...Class` ids count "
-                         "as served (default: %(default)s)")
+                    help="a shim source, or a folder of xgameruntime*.cpp, whose `constexpr GUID k...Class` ids "
+                         "and QueryApiImpl interface tables count as served (default: %(default)s)")
     a = ap.parse_args(argv)
 
     try:
@@ -992,7 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cannot read the class table {a.table}: {e}", file=sys.stderr)
         return 1
     try:
-        served = served_classes(read_runtime_source(a.runtime_source))
+        served = served_interfaces(read_runtime_source(a.runtime_source))
     except OSError as e:
         print(f"warning: cannot read {a.runtime_source} ({e.strerror or e}); 'served' is unknown", file=sys.stderr)
         served = None

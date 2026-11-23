@@ -32,6 +32,7 @@ NETWORKING = "37e56907-2f10-41e8-b72f-36edb185331a"     # XNetworkingImpl
 NETWORKING2 = "bf2346b2-39af-4658-b5ea-44713c7e83b3"    # IXNetworkingImpl2
 PACKAGE = "af406016-e850-4aa8-a88d-2f3dcb9dac7e"        # XPackageImpl
 PACKAGE3 = "e2a4734b-2f4a-456d-aa8f-d065e04fb209"       # IXPackageImpl3
+PACKAGE4 = "0b9d556e-ab70-43f4-baa0-9999ac4cb040"       # IXPackageImpl4
 STORE = "0dd112ac-7c24-448c-b92b-3960fb5bd30c"          # XStoreImpl: present, no thunk
 UNKNOWN_CLASS = "11111111-2222-3333-4444-555555555555"
 UNKNOWN_IFACE = "66666666-7777-8888-9999-aaaaaaaaaaaa"
@@ -264,6 +265,81 @@ def build_image(with_pdata: bool = True) -> bytes:
     return bytes(buf)
 
 
+def build_mixed_package_image(reference_unserved: bool = False) -> bytes:
+    """PE image with XPackageImpl requested via IXPackageImpl3 (referenced) and IXPackageImpl4 (optionally referenced)."""
+    guids = {PACKAGE: 0x3000, PACKAGE3: 0x3010, PACKAGE4: 0x3020}
+    opt_size = 240
+    buf = bytearray(RDATA_RAW + RDATA_SIZE)
+    buf[0:2] = b"MZ"
+    struct.pack_into("<I", buf, 0x3C, 0x40)
+    buf[0x40:0x44] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", buf, 0x44, 0x8664, 2, 0, 0, 0, opt_size, 0x2022)
+    opt = 0x58
+    struct.pack_into("<H", buf, opt, 0x20B)
+    struct.pack_into("<I", buf, opt + 16, TEXT_RVA)
+    struct.pack_into("<Q", buf, opt + 24, IMAGE_BASE)
+    struct.pack_into("<II", buf, opt + 32, 0x1000, 0x200)
+    struct.pack_into("<II", buf, opt + 56, 0x4000, TEXT_RAW)
+    struct.pack_into("<H", buf, opt + 68, 2)
+    struct.pack_into("<I", buf, opt + 108, 16)
+
+    a = Asm(TEXT_RVA)
+    funcs = []
+
+    def begin(name):
+        a.label(name)
+        return a.here()
+
+    def end(start):
+        funcs.append((start, a.here()))
+        a.raw("CC" * (-len(a.buf) % 16))
+
+    s = begin("entry")
+    a.raw("4883EC28")
+    a.rel("E8", "pkg3_thunk")
+    if reference_unserved:
+        a.rel("E8", "pkg4_thunk")
+    a.raw("4883C428C3")
+    end(s)
+
+    s = begin("helper")
+    a.raw("33C0C3")
+    end(s)
+
+    for name, iid_rva, disp in (("pkg3_thunk", guids[PACKAGE3], 0x18), ("pkg4_thunk", guids[PACKAGE4], 0x20)):
+        s = begin(name)
+        a.raw("4883EC38")
+        a.raw("4C8D442428")
+        a.rel("488D15", iid_rva)
+        a.rel("488D0D", guids[PACKAGE])
+        a.rel("E8", "helper")
+        a.raw("85C0")
+        a.rel("78", f"{name}_done", 1)
+        a.raw(f"488B4C2428" "488B01" f"FF50{disp:02X}")
+        a.raw("488B4C2428" "488B01" "FF5010")
+        a.label(f"{name}_done")
+        a.raw("4883C438C3")
+        end(s)
+
+    code = a.finish()
+    buf[TEXT_RAW:TEXT_RAW + len(code)] = code
+    for guid, rva in guids.items():
+        at = RDATA_RAW + rva - RDATA_RVA
+        buf[at:at + 16] = uuid.UUID(guid).bytes_le
+    at = RDATA_RAW + PDATA_RVA - RDATA_RVA
+    for i, (b, e) in enumerate(funcs):
+        struct.pack_into("<III", buf, at + i * 12, b, e, 0x3F00)
+    struct.pack_into("<II", buf, opt + 112 + 3 * 8, PDATA_RVA, len(funcs) * 12)
+    sections = opt + opt_size
+    for i, (name, rva, size, raw, chars) in enumerate(((b".text", TEXT_RVA, TEXT_SIZE, TEXT_RAW, 0x60000020),
+                                                       (b".rdata", RDATA_RVA, RDATA_SIZE, RDATA_RAW, 0x40000040))):
+        at = sections + i * 40
+        buf[at:at + 8] = name.ljust(8, b"\0")
+        struct.pack_into("<IIII", buf, at + 8, size, rva, size, raw)
+        struct.pack_into("<I", buf, at + 36, chars)
+    return bytes(buf)
+
+
 def by_class(report: dict) -> dict:
     return {c["class"] or c["class_id"]: c for c in report["classes"]}
 
@@ -422,6 +498,70 @@ class ImageTest(unittest.TestCase):
         os.makedirs(empty, exist_ok=True)
         with self.assertRaises(OSError):
             grc.read_runtime_source(empty)
+
+    def test_served_interfaces_from_default_runtime_source(self):
+        served = grc.served_interfaces(grc.read_runtime_source(grc.DEFAULT_RUNTIME_SOURCE))
+        # RuntimeObject + kPackageIids[]: IXPackageImpl..IXPackageImpl3 are served, IXPackageImpl4 is not.
+        self.assertIn(PACKAGE, served[PACKAGE])
+        self.assertIn(grc.IUNKNOWN, served[PACKAGE])
+        self.assertIn(PACKAGE3, served[PACKAGE])
+        self.assertNotIn(PACKAGE4, served[PACKAGE])
+        # Direct `iid == kGamertagInterface` check in xgameruntime_user.cpp.
+        self.assertIn("cef4fac0-7676-4a94-a119-4c43f9eb5b74", served["01acd177-91f9-4763-a38e-ccbb55ce32e0"])
+        # Inline kSaveInterfaces[] and kStoreInterfaces[] tables in sibling shim files.
+        self.assertIn("1bfff3af-f14a-40a3-8e35-9ada906593f9", served["704c3f58-e629-4cc2-b197-30511b996fe2"])
+        self.assertIn("2d42fea5-e71d-4b76-97cd-c50afbb3ae5d", served[STORE])
+        self.assertIn("b09d803c-2414-4a05-82c6-66dfdc9e9a44", served[STORE])
+
+    def test_unserved_interface_on_served_class(self):
+        # kNetworkingClass is defined, but its table omits IXNetworkingImpl2 (requested by thunk2);
+        # kPackageClass serves IXPackageImpl3 (requested by thunk3).
+        src = (
+            SERVED_SOURCE
+            + "constexpr GUID kNetworkingClass = {0x37e56907, 0x2f10, 0x41e8, "
+              "{0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};\n"
+            + "const GUID* const kNetworkingIids[] = {&kNetworkingClass};\n"
+            + "RuntimeObject g_net{nullptr, &kNetworkingClass, kNetworkingIids};\n"
+            + "constexpr GUID kPackageClass = {0xaf406016, 0xe850, 0x4aa8, "
+              "{0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};\n"
+            + "constexpr GUID kPackage3 = {0xe2a4734b, 0x2f4a, 0x456d, "
+              "{0xaa, 0x8f, 0xd0, 0x65, 0xe0, 0x4f, 0xb2, 0x09}};\n"
+            + "const GUID* const kPackageIids[] = {&kPackageClass, &kPackage3};\n"
+            + "RuntimeObject g_pkg{nullptr, &kPackageClass, kPackageIids};\n"
+        )
+        self.assertIn(NETWORKING, grc.served_classes(src))
+        r = grc.report(self.path, self.table, grc.served_interfaces(src))
+        classes = by_class(r)
+        self.assertIs(classes["XPackageImpl"]["served"], True)
+        self.assertIs(classes["XPackageImpl"]["interfaces"][0]["served"], True)
+        self.assertIs(classes["XNetworkingImpl"]["served"], False)
+        self.assertIs(classes["XNetworkingImpl"]["interfaces"][0]["served"], False)
+        self.assertIn("not-served-referenced=XNetworkingImpl", grc.summary(r))
+        text = grc.to_text(r)
+        self.assertIn("XNetworkingImpl as IXNetworkingImpl2: 15; referenced: 15", text)
+        self.assertNotIn("XPackageImpl as IXPackageImpl3:", text)
+
+    def test_mixed_served_and_unserved_interfaces_on_same_class(self):
+        served = grc.served_interfaces(grc.read_runtime_source(grc.DEFAULT_RUNTIME_SOURCE))
+        unref_path = self.write("mixed_unref.dll", build_mixed_package_image(reference_unserved=False))
+        r_unref = grc.report(unref_path, self.table, served)
+        pkg = by_class(r_unref)["XPackageImpl"]
+        self.assertIs(pkg["served"], False)
+        ifaces = {i["interface"]: i for i in pkg["interfaces"]}
+        self.assertIs(ifaces["IXPackageImpl3"]["served"], True)
+        self.assertIs(ifaces["IXPackageImpl4"]["served"], False)
+        self.assertEqual(ifaces["IXPackageImpl3"]["referenced_thunks"], 1)
+        self.assertEqual(ifaces["IXPackageImpl4"]["referenced_thunks"], 0)
+        # Only IXPackageImpl3 is referenced, and it is served: not-served lists XPackageImpl, not-served-referenced=-.
+        self.assertIn("not-served=XPackageImpl not-served-referenced=-", grc.summary(r_unref))
+        text = grc.to_text(r_unref)
+        self.assertIn("interface IXPackageImpl3  " + PACKAGE3 + ": slots 3  [served by the runtime]", text)
+        self.assertNotIn("XPackageImpl as IXPackageImpl3:", text)
+        self.assertIn("XPackageImpl as IXPackageImpl4: 4; referenced: none", text)
+
+        ref_path = self.write("mixed_ref.dll", build_mixed_package_image(reference_unserved=True))
+        r_ref = grc.report(ref_path, self.table, served)
+        self.assertIn("not-served=XPackageImpl not-served-referenced=XPackageImpl", grc.summary(r_ref))
 
     def test_main_json_to_stdout(self):
         stdout, stderr = io.StringIO(), io.StringIO()
