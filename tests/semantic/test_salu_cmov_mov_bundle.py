@@ -235,6 +235,34 @@ class TestSCmovB64Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0xAABBCCDD)
 
+def ref_s_cmovk_i32(scc: int, simm16: int, old_dst: int) -> int:
+    """Reference mathematical oracle for s_cmovk_i32."""
+    v = simm16 & 0xFFFF
+    ext = (v - 0x10000 if v & 0x8000 else v) & MASK32
+    return ext if (scc & 1) else (old_dst & MASK32)
+
+
+class TestSCmovkI32Oracle(unittest.TestCase):
+    def test_positive_simm16(self) -> None:
+        self.assertEqual(ref_s_cmovk_i32(1, 42, 0), 42)
+        self.assertEqual(ref_s_cmovk_i32(0, 42, 100), 100)
+
+    def test_negative_simm16(self) -> None:
+        self.assertEqual(ref_s_cmovk_i32(1, -1, 0), MASK32)
+        self.assertEqual(ref_s_cmovk_i32(1, -42, 0), 0xFFFFFFD6)
+
+    def test_translator_oracle_verification(self) -> None:
+        body = [
+            "s_cmp_eq_u32 1, 1",
+            "s_mov_b32 s4, 0",
+            "s_cmovk_i32 s4, -1",
+            "v_mov_b32_e32 v1, s4",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_cmovk_oracle")
+        for l in range(32):
+            self.assertEqual(results[l], MASK32)
+
 
 if __name__ == "__main__":
     unittest.main()
