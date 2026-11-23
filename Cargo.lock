@@ -753,6 +753,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-profile"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tracing",
+ "victory-core",
+ "windows-sys",
+]
+
+[[package]]
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
