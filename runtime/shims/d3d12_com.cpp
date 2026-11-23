@@ -748,6 +748,7 @@ public:
     void STDMETHODCALLTYPE ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE view,
                                                         ID3D12Resource* resource, const UINT values[4], UINT count,
                                                         const D3D12_RECT* rects) override {
+        if (list_.closed()) return;
         if (!values) return check(false);
         clear_unordered_access(view, resource, false, {values[0], values[1], values[2], values[3]}, count, rects);
     }
@@ -755,6 +756,7 @@ public:
     void STDMETHODCALLTYPE ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE view,
                                                          ID3D12Resource* resource, const FLOAT values[4], UINT count,
                                                          const D3D12_RECT* rects) override {
+        if (list_.closed()) return;
         if (!values) return check(false);
         clear_unordered_access(view, resource, true,
                                {std::bit_cast<std::uint32_t>(values[0]), std::bit_cast<std::uint32_t>(values[1]),
@@ -1113,10 +1115,20 @@ private:
     static bool unordered_access_view(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource* resource,
                                       leonida::UavView& out) {
         namespace g = leonida::gfx10;
+        out.resource = resource_id(resource);
+        if (!out.resource) return false;
+        const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+        if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return false;
+        const bool is_buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        const bool is_texture = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
+                                desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                                desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if (!is_buffer && !is_texture) return false;
         g::ImageWords words{};
         std::memcpy(words.data(), reinterpret_cast<const void*>(handle.ptr), sizeof(words));
-        out.resource = resource_id(resource);
-        if (g::is_image(words)) {
+        const bool is_image = g::is_image(words);
+        if (is_image != is_texture) return false;
+        if (is_image) {
             g::Image image{};
             if (!g::decode(words, image)) return false;
             const bool volume = image.type == g::ImageType::image_3d;

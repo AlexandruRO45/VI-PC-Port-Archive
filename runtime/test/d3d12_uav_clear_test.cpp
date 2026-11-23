@@ -718,8 +718,9 @@ int main() {
                 l->ClearUnorderedAccessViewUint({0}, good, buffer.p, values, 1, &inside_out);
             }) == E_INVALIDARG);
 
-            // Refused at execution, before anything is submitted: a buffer view of a texture, a texture view of a
-            // buffer, a mip the texture does not have, a buffer view past the end, a rectangle clear of a volume.
+            // Buffer/texture view-resource mismatches are refused while recording (Close says E_INVALIDARG) so a
+            // buffer V# paired with a texture never records a raw 40-bit VA as out.offset; subresource/range/volume
+            // checks are refused at execution, before anything is submitted.
             D3D12_RESOURCE_DESC desc{};
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             desc.Width = desc.Height = 4;
@@ -747,17 +748,17 @@ int main() {
             past.offset = 512;
             const auto past_view = h.write(5, buffer_view(buffer->GetGPUVirtualAddress(), past));
             const D3D12_RECT rect{0, 0, 2, 2};
+            EXPECT(check([&](ID3D12GraphicsCommandList* l) {
+                l->ClearUnorderedAccessViewUint({0}, good, texture.p, values, 0, nullptr);
+            }) == E_INVALIDARG);
+            EXPECT(check([&](ID3D12GraphicsCommandList* l) {
+                l->ClearUnorderedAccessViewUint({0}, t_view, buffer.p, values, 0, nullptr);
+            }) == E_INVALIDARG);
             const auto replay = [&](auto&& body) {
                 HRESULT close = E_FAIL;
                 const auto result = h.run(close, body);
                 return close == S_OK ? result : leonida::ReplayResult::success;
             };
-            EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
-                l->ClearUnorderedAccessViewUint({0}, good, texture.p, values, 0, nullptr);
-            }) == leonida::ReplayResult::invalid_clear);
-            EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
-                l->ClearUnorderedAccessViewUint({0}, t_view, buffer.p, values, 0, nullptr);
-            }) == leonida::ReplayResult::invalid_clear);
             EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, t_mip1, texture.p, values, 0, nullptr);
             }) == leonida::ReplayResult::invalid_subresource);
