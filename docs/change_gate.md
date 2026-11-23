@@ -117,8 +117,8 @@ all of them came from forks. The CI workflow on the head commit each was merged 
 | cancelled, or no run | 2 |
 
 After a merge the push run does not finish either: 164 of the last 165 CI runs for pushes to `main` were cancelled
-by the next push, and the last one was still pending when read on 2026-11-24. At `867d922` three documentation tests
-fail on `main`. `tests/test_docs_cli_flags.py` and `tests/test_docs_links.py` have failed since #6691, and later
+by the next push, and the last one was still pending when read (2026-11-23, about 20:00 UTC). At `867d922` three
+documentation tests fail on `main`. `tests/test_docs_cli_flags.py` and `tests/test_docs_links.py` have failed since #6691, and later
 merges changed the items they report; `tests/test_docs_design_rows.py` has failed since #6579 (both found with
 `git bisect`). Neither pull request had a finished CI run when it was merged.
 
@@ -303,8 +303,8 @@ refuse. An entry that no longer matches anything is reported so the file does no
 - The 300 merges are one merge round (committed between 09:35 and 11:23 UTC-6 on 2026-11-23) of pull requests opened
   over a longer time; rates per pull request may differ in other rounds.
 - The merge counts in the introduction come from GitHub's search (`is:pr is:merged merged:<date>`), read on
-  2026-11-24.
+  2026-11-23 at about 20:00 UTC.
 - Section 1.4: the GraphQL search for pull requests merged on 2026-11-23, with the check suites of each one's last
   commit, taking the suite of the workflow named CI; the push runs from the Actions list for `main`; the first failing
   commit of each documentation test by `git bisect` between the oldest commit of the window and `867d922`, and each
-  pull request's checks from its page. All read on 2026-11-24.
+  pull request's checks from its page. All read on 2026-11-23 at about 20:00 UTC.
