@@ -883,21 +883,27 @@ void test_iid_policy_events_and_cancel(Env& env) {
     q->Release();
 }
 
-// Holds the queue's worker inside a copy: the copy's source is a guard page, and this handler waits on the first
-// touch until the test releases it. The guard is gone after that fault, so the copy then goes on.
-struct GuardHold {
+// Hold the worker on the first read of an inaccessible source page. Wine can clear PAGE_GUARD on this copy
+// without delivering the guard exception, so use PAGE_NOACCESS and restore access in the handler.
+constexpr uint32_t kStatsCopySize = 4096;
+struct CopyHold {
     uint8_t* page = nullptr;
     HANDLE entered = nullptr;
     HANDLE release = nullptr;
 };
-GuardHold* g_hold = nullptr;
+CopyHold* g_hold = nullptr;
 
-LONG CALLBACK hold_on_guard(EXCEPTION_POINTERS* x) {
+LONG CALLBACK hold_on_source_read(EXCEPTION_POINTERS* x) {
     const EXCEPTION_RECORD* e = x->ExceptionRecord;
-    if (!g_hold || e->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION || e->NumberParameters < 2)
+    if (!g_hold || e->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->NumberParameters < 2 ||
+        e->ExceptionInformation[0] != 0)
         return EXCEPTION_CONTINUE_SEARCH;
-    const auto* address = reinterpret_cast<const uint8_t*>(e->ExceptionInformation[1]);
-    if (address < g_hold->page || address >= g_hold->page + 4096) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t address = e->ExceptionInformation[1];
+    const auto begin = reinterpret_cast<uintptr_t>(g_hold->page);
+    if (address < begin || address - begin >= kStatsCopySize) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD old = 0;
+    if (!VirtualProtect(g_hold->page, kStatsCopySize, PAGE_READWRITE, &old))
+        return EXCEPTION_CONTINUE_SEARCH;
     SetEvent(g_hold->entered);
     WaitForSingleObject(g_hold->release, 10000);
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -916,23 +922,46 @@ void test_stats_timing(Env& env) {
     IDStorageQueueX2* q = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
     if (!q) return;
     IDStorageStatusArrayX* s = make_status(env, 1);
-    GuardHold hold;
-    hold.page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    CopyHold hold;
+    const auto cleanup = [&] {
+        if (hold.entered) CloseHandle(hold.entered);
+        if (hold.release) CloseHandle(hold.release);
+        if (hold.page) VirtualFree(hold.page, 0, MEM_RELEASE);
+        if (s) s->Release();
+        q->Release();
+    };
+    if (!s) {
+        cleanup();
+        return;
+    }
+    hold.page = static_cast<uint8_t*>(VirtualAlloc(nullptr, kStatsCopySize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     hold.entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     hold.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!hold.page || !hold.entered || !hold.release) {
-        check(false, "allocate the guard page and its events");
+        check(false, "allocate the held copy's source page and events");
+        cleanup();
         return;
     }
-    std::memset(hold.page, 0x5A, 4096);
+    std::memset(hold.page, 0x5A, kStatsCopySize);
     DWORD old = 0;
-    VirtualProtect(hold.page, 4096, PAGE_READWRITE | PAGE_GUARD, &old);
-    std::vector<uint8_t> out(4096, 0);
+    if (!VirtualProtect(hold.page, kStatsCopySize, PAGE_NOACCESS, &old)) {
+        check(false, "protect the held copy's source page");
+        cleanup();
+        return;
+    }
+    std::vector<uint8_t> out(kStatsCopySize, 0);
+    void* handler = AddVectoredExceptionHandler(1, hold_on_source_read);
+    if (!handler) {
+        check(false, "install the held copy's exception handler");
+        cleanup();
+        return;
+    }
+    g_hold = &hold;
     DSTORAGE_REQUEST r{};
     r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
     r.Source = hold.page;
     r.Destination = out.data();
-    r.SourceSize = r.DestinationSize = 4096;
+    r.SourceSize = r.DestinationSize = kStatsCopySize;
     q->EnqueueRequest(&r);
     q->EnqueueStatus(s, 0);
     DSTORAGE_PRIORITY_STATS p = realtime();
@@ -941,28 +970,23 @@ void test_stats_timing(Env& env) {
               p.TotalRequestDestinationByteCount == before.TotalRequestDestinationByteCount,
           "an enqueued request is not counted before Submit");
 
-    g_hold = &hold;
-    void* handler = AddVectoredExceptionHandler(1, hold_on_guard);
     q->Submit();
-    check(WaitForSingleObject(hold.entered, 10000) == WAIT_OBJECT_0, "the copy reached the guard page");
+    check(WaitForSingleObject(hold.entered, 10000) == WAIT_OBJECT_0, "the copy reached the protected page");
     p = realtime();
     check(p.TotalRequestCount == before.TotalRequestCount + 1 &&
-              p.TotalRequestSourceByteCount == before.TotalRequestSourceByteCount + 4096 &&
-              p.TotalRequestDestinationByteCount == before.TotalRequestDestinationByteCount + 4096,
+              p.TotalRequestSourceByteCount == before.TotalRequestSourceByteCount + kStatsCopySize &&
+              p.TotalRequestDestinationByteCount == before.TotalRequestDestinationByteCount + kStatsCopySize,
           "a submitted request is counted, with its sizes");
     check(p.PendingRequestCount == before.PendingRequestCount + 1, "a running request is pending");
     SetEvent(hold.release);
     check(wait_complete(s, 0), "the held copy completes");
+    q->Close();
     check_hr(s->GetHResult(0), S_OK, "the held copy succeeds");
-    check(out == std::vector<uint8_t>(4096, 0x5A), "the held copy moved every byte");
+    check(out == std::vector<uint8_t>(kStatsCopySize, 0x5A), "the held copy moved every byte");
     check(realtime().PendingRequestCount == before.PendingRequestCount, "a completed request is no longer pending");
     RemoveVectoredExceptionHandler(handler);
     g_hold = nullptr;
-    CloseHandle(hold.entered);
-    CloseHandle(hold.release);
-    VirtualFree(hold.page, 0, MEM_RELEASE);
-    s->Release();
-    q->Release();
+    cleanup();
 }
 
 void test_stats(Env& env) {
