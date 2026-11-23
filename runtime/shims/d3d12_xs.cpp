@@ -7,12 +7,14 @@
 // are overridden, the rest follow the PC vtable.
 #include <windows.h>
 #include <d3d12.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <type_traits>
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -22,6 +24,7 @@
 #include "d3d12_xs_device.h"
 #include "d3d12_xs_rootsig.h"
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace {
 
@@ -213,6 +216,62 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     return result(method, S_OK);
 }
 
+// Xbox-only: hands the title's memory manager the console's virtual-address ranges. The host has one address space
+// and the D3D12 layer allocates from it, so there is nothing to configure; success with no state is honest. The
+// argument list is not measured, so the first call records all four registers, a hex view of every argument that
+// points at readable memory, and the caller (startup trace, `d3d12_config_virtual_memory`). The caller then traps
+// (int3) 0x36 bytes later if the returned descriptors are not what it expects, so seeing the input layout is the
+// point of the dump.
+bool readable_range(const void* p, size_t bytes) {
+    if (!p) return false;
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(p, &info, sizeof(info)) != sizeof(info)) return false;
+    if (info.State != MEM_COMMIT) return false;
+    if (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    const uintptr_t offset = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(info.BaseAddress);
+    if (offset >= info.RegionSize) return false;
+    return bytes <= static_cast<size_t>(info.RegionSize - offset);
+}
+
+std::string describe_block(uint64_t value) {
+    const void* p = reinterpret_cast<const void*>(value);
+    constexpr size_t kDump = 64;
+    if (!p || !readable_range(p, kDump)) return "\"nonptr\"";
+    const auto* bytes = static_cast<const unsigned char*>(p);
+    static const char* digits = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(kDump * 2);
+    for (size_t i = 0; i < kDump; i++) {
+        hex.push_back(digits[bytes[i] >> 4]);
+        hex.push_back(digits[bytes[i] & 0xF]);
+    }
+    return "\"" + hex + "\"";
+}
+
+HRESULT __stdcall configure_virtual_memory(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    // The contract is unknown, including whether the caller reads a status or a pointer back from RAX. Recording one
+    // run is not enough to tell those apart, so the return is switchable for an experiment: LEONIDA_CVMX_RET=<n>
+    // returns n, unset returns S_OK. The caller traps (int3) at game+0x1e1d01b with S_OK, which is what a "the call
+    // gave me nothing" path looks like.
+    static const HRESULT configured = [] {
+        const char* text = std::getenv("LEONIDA_CVMX_RET");
+        if (!text || !*text) return static_cast<HRESULT>(S_OK);
+        return static_cast<HRESULT>(std::strtoull(text, nullptr, 0));
+    }();
+    if (rt::startup_trace::enabled()) {
+        std::string fields = "\"api\":\"D3D12ConfigureVirtualMemoryX\",\"args\":[\"" +
+                             rt::startup_trace::hex(a) + "\",\"" + rt::startup_trace::hex(b) + "\",\"" +
+                             rt::startup_trace::hex(c) + "\",\"" + rt::startup_trace::hex(d) + "\"]";
+        fields += ",\"mem\":[" + describe_block(a) + "," + describe_block(b) + "," + describe_block(c) + "]";
+        fields += ",\"ret\":" + rt::startup_trace::quote(rt::startup_trace::hex(static_cast<uint64_t>(
+                             static_cast<uint32_t>(configured))));
+        fields += ",\"caller\":" +
+                  rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(_ReturnAddress())));
+        rt::startup_trace::event("d3d12_config_virtual_memory", fields);
+    }
+    return configured;
+}
+
 static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
@@ -225,4 +284,5 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
+    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
 );
