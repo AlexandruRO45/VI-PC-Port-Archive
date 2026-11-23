@@ -185,6 +185,14 @@ Current limits, by design:
   `scripts/build_runtime.ps1` cl.exe fallback never builds it. See [docs/gameinput.md](../docs/gameinput.md) for the mapping, the `LEONIDA_DS_*` settings and what is
   unverified.
 
+### Console locale
+
+Set `LEONIDA_LOCALE` to a BCP-47 locale such as `fr-CA` before starting the runtime. The
+`GetUserDefaultLocaleName` and `GetSystemDefaultLocaleName` shims return that tag.
+`GetUserDefaultUILanguage` and `GetSystemDefaultUILanguage` return its Windows language ID.
+The default is `en-US`. An empty value or a tag without a recognized Windows language ID
+falls back to `en-US` and prints one warning to standard error per process.
+
 ### What `xgameruntime.dll` reports: environment overrides
 
 The `xgameruntime` shim (`shims/xgameruntime.cpp`) answers the title's questions about the console and its package

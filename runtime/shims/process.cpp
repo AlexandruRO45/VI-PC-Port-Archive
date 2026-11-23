@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <new>
 #include <string>
@@ -37,6 +38,57 @@
 
 namespace rt::process {
 namespace {
+
+struct ConsoleLocale {
+    wchar_t name[LOCALE_NAME_MAX_LENGTH] = L"en-US";
+    LANGID language = MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US);
+};
+
+ConsoleLocale console_locale() {
+    const DWORD saved_error = GetLastError();
+    wchar_t name[LOCALE_NAME_MAX_LENGTH]{};
+    SetLastError(ERROR_SUCCESS);
+    const DWORD length = GetEnvironmentVariableW(L"LEONIDA_LOCALE", name, LOCALE_NAME_MAX_LENGTH);
+    const bool unset = length == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND;
+    ConsoleLocale locale;
+    if (!unset) {
+        // Windows also recognizes names with an underscore suffix for a sort order.
+        // Restrict the override to BCP-47 characters before looking up its Windows language ID.
+        constexpr wchar_t tag_chars[] = L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-";
+        const LCID lcid = length && length < LOCALE_NAME_MAX_LENGTH && std::wcsspn(name, tag_chars) == length
+            ? LocaleNameToLCID(name, LOCALE_ALLOW_NEUTRAL_NAMES) : 0;
+        if (lcid && lcid != LOCALE_CUSTOM_DEFAULT && lcid != LOCALE_CUSTOM_UNSPECIFIED) {
+            std::wmemcpy(locale.name, name, length + 1);
+            locale.language = LANGIDFROMLCID(lcid);
+        } else {
+            static std::once_flag warned;
+            std::call_once(warned, [] {
+                std::fprintf(stderr, "[rt] invalid or unsupported LEONIDA_LOCALE; using en-US\n");
+            });
+        }
+    }
+    SetLastError(saved_error);
+    return locale;
+}
+
+int WINAPI console_locale_name(LPWSTR buffer, int capacity) {
+    if (capacity < 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    const auto locale = console_locale();
+    const int length = static_cast<int>(std::wcslen(locale.name)) + 1;
+    if (!buffer || capacity < length) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    std::wmemcpy(buffer, locale.name, length);
+    return length;
+}
+
+LANGID WINAPI console_ui_language() {
+    return console_locale().language;
+}
 
 std::vector<std::string> g_args;
 std::vector<std::wstring> g_wargs;
@@ -355,6 +407,11 @@ using namespace rt::process;
 #define COMMAND_LINE(dll) \
     {dll, "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)}, \
     {dll, "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)}
+#define CONSOLE_LOCALE(dll) \
+    {dll, "GetUserDefaultLocaleName", reinterpret_cast<void*>(&console_locale_name)}, \
+    {dll, "GetSystemDefaultLocaleName", reinterpret_cast<void*>(&console_locale_name)}, \
+    {dll, "GetUserDefaultUILanguage", reinterpret_cast<void*>(&console_ui_language)}, \
+    {dll, "GetSystemDefaultUILanguage", reinterpret_cast<void*>(&console_ui_language)}
 }  // namespace
 
 SHIM_TABLE(process,
@@ -376,4 +433,9 @@ SHIM_TABLE(process,
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),
+    CONSOLE_LOCALE("kernel32.dll"),
+    CONSOLE_LOCALE("kernelbase.dll"),
+    CONSOLE_LOCALE("api-ms-win-core-localization-l1-1-0.dll"),
+    CONSOLE_LOCALE("api-ms-win-core-localization-l1-2-0.dll"),
+    CONSOLE_LOCALE("api-ms-win-core-localization-l1-2-1.dll"),
 );

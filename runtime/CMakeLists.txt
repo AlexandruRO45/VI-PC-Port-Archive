@@ -224,6 +224,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
   target_link_libraries(process_cmdline_test PRIVATE shell32)
 
+  add_executable(console_locale_test
+    test/console_locale_test.cpp
+    shims/process.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(console_locale_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(console_locale_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(console_locale_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(console_locale_test PRIVATE /OPT:NOREF)
+
   # Console paths (GAME:) and the write overlay: the file shims resolved through the registry, over temporary folders.
   add_executable(file_system_test
     test/file_system_test.cpp
@@ -1031,6 +1041,7 @@ if(BUILD_TESTING)
     endforeach()
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
+    add_test(NAME console_locale COMMAND console_locale_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
     add_test(NAME xgameruntime_user COMMAND xgameruntime_user_test)
     add_test(NAME xgameruntime_gamesave COMMAND xgameruntime_gamesave_test)
