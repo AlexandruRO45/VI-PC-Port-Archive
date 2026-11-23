@@ -286,6 +286,37 @@ that rate take effect. RAD's Bink 1 value, `0x00080000`, changes nothing.
   before the next frame is due at the stream's rate.
 - The `HBINK` is readable for at least 256 bytes. Fields that matched no header value are not named here; the
   `BINKTRACK` prefix is in [`bink_audio_test.md`](../runtime/test/bink_audio_test.md).
+### The exe's path: frame buffers (RT-BINK-FRAMEBUFFERS)
+
+The retail exe imports 23 functions of `Bink2Scarlett.dll` (`BinkOpenWithOptions`, `BinkGetFrameBuffersInfo`,
+`BinkRegisterFrameBuffers`, `BinkDoFrame`, `BinkDoFrameAsyncMulti` and the rest of the async/volume/loop calls). It
+imports none of `BinkOpen`, `BinkCopyToBuffer`, `BinkGetSummary`, the track calls or the GPU buffer calls, and the
+DLL itself imports no `d3d12*` or `dxgi*` module. So a boot movie is decoded on the CPU into planes the game owns,
+and turning them into RGB is the game's own shader: Bink needs no `d3d12_xs` method and no compute shader here.
+The tests above (`BinkCopyToBuffer`) never ran the exe's calls.
+
+[`runtime/test/bink_framebuffers_test.cpp`](../runtime/test/bink_framebuffers_test.cpp) runs the exe's sequence
+through `rt::Loader`: it copies one stream out of `movies.rpf` to a temp file, `BinkOpenWithOptions(path, 0, 0)`,
+`BinkGetFrameBuffersInfo` into a sentinel-filled buffer, then `BinkRegisterFrameBuffers` with its own planes before the
+first `BinkDoFrame`. Measured on 1.0.2.1 over all 515 streams (`LEONIDA_BINK_LIMIT=515`; the default is 12 streams
+spread over the index), 515 of 515 pass every check:
+
+| Fact | Measured |
+|---|---|
+| Bytes `BinkGetFrameBuffersInfo` writes | exactly 264 (`0x108`), the structure below |
+| Layout | `u32 total_frames` (2), `u32 ya_width, ya_height, crcb_width, crcb_height`, a zero `u32`, then three frame sets of 80 bytes: planes Y, cR, cB, A of `{u8* buffer, u32 flag, u32 pitch}` (16 bytes) and 16 zero bytes. The third set is zero |
+| Planes | 4:2:0 (`crcb` = half of `ya` in both directions), 8 bits per sample, no alpha plane (`A.buffer` null) in all 515 |
+| Size | `ya` is the picture with its width rounded up to 32 and its height to 16 (720x1280 gives 736x1280, 1920x1080 gives 1920x1088, 1080x1080 gives 1088x1088) |
+| Pitch | each plane's width rounded up to 64 bytes (368 gives 384, 544 gives 576) |
+| Buffers | the library fills in its own allocations; the flag word is 1 for Y/cR/cB |
+| `BinkDoFrame` | writes the library's Y plane, and a caller's planes after `BinkRegisterFrameBuffers` |
+
+A caller must register its planes before the first decode: registering after a decode (and then `BinkNextFrame` and
+another decode) left the registered planes untouched on 21 of 515 streams. `BinkOpenWithOptions`'s second and third
+arguments (the flags word and the options pointer) were not told apart; both are 0 in the test. Not yet run:
+`BinkSetMemory`, `BinkSetOSFileCallbacks`, `BinkStartAsyncThread`, `BinkDoFrameAsyncMulti`/`Wait`, the stop calls,
+`BinkGetPlatformInfo`, `BinkGetKeyFrame`, `BinkShouldSkip` and `BinkSetSoundSystem`.
+
 ### Audio track decoding (`BinkOpenTrack` / `BinkGetTrackData`, ASSET-323)
 
 Using the same temporary `xmem.dll` → `msvcrt.dll` (`malloc`/`free`) copy of `Bink2Scarlett.dll` on Windows 11,
