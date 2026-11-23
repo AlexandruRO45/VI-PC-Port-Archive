@@ -67,9 +67,15 @@ if (-not $rt -or $stale) {
         if (-not $commandEntry) { throw "Missing CMAKE_COMMAND in $cache. Reconfigure the Visual Studio build and retry." }
         $cmake = $commandEntry.Matches.Groups[1].Value
         $folders = $configs
-        $existing = Find-RuntimeLoader $build $configs
+        $types = Select-String -LiteralPath $cache -Pattern '^CMAKE_CONFIGURATION_TYPES:[^=]+=(.+)$'
+        if ($types) {
+            $available = $types.Matches.Groups[1].Value -split ';'
+            $folders = @($configs | Where-Object { $_ -in $available })
+        }
+        $existing = Find-RuntimeLoader $build $folders
         $configArgs = @()
         if ($existing) { $configArgs = @("--config", (Split-Path (Split-Path $existing) -Leaf)) }
+        elseif ($types -and $folders.Count) { $configArgs = @("--config", $folders[0]) }
         & $cmake --build $build --target gta6rt @configArgs
         if ($LASTEXITCODE -ne 0) { throw "Building gta6rt in $build failed ($LASTEXITCODE)" }
     } else {
