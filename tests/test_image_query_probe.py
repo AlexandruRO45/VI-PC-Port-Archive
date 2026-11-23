@@ -128,7 +128,8 @@ class Comparison(unittest.TestCase):
         self.assertIn("MISMATCH resinfo", out.getvalue())
 
     def test_bad_wave_tokens_are_usage_errors_before_oracle_import(self):
-        for waves in ("invalid", "", "32,", "32,invalid"):
+        for waves in ("invalid", "", "32,", "32,invalid", "\u0663\u0662", "3_2", " 32 ", "+32",
+                      "064", "32,+64"):
             with self.subTest(waves=waves), mock.patch.object(pr, "_import_oracle") as oracle:
                 with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
                     pr.main(["--waves", waves])

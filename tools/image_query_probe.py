@@ -280,12 +280,10 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.self_test:
         return self_test()
-    try:
-        waves = [int(w) for w in a.waves.split(",")]
-    except ValueError:
+    waves = a.waves.split(",")
+    if any(w not in ("32", "64") for w in waves):
         p.error("--waves takes 32 and/or 64")
-    if any(w not in (32, 64) for w in waves):
-        p.error("--waves takes 32 and/or 64")
+    waves = [int(w) for w in waves]
     asm, runner = _import_oracle()
     try:
         oracle = runner.open_oracle()
