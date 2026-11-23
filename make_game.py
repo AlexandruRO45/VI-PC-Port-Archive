@@ -120,7 +120,7 @@ def py(tool: str, *args) -> None:
 
 
 def tool_available(cmd: str) -> bool:
-    """A PATH name, a path, or a whole command line such as 'wsl -e /usr/lib/llvm-21/bin/llvm-mc'."""
+    """A PATH name, a path, or a whole command line such as 'wsl -e /usr/lib/llvm-22/bin/llvm-mc'."""
     cmd = cmd.strip().strip('"')
     if os.path.isfile(cmd):
         return True
@@ -602,10 +602,10 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         mc = mc_command()[0]
         if not (os.path.isfile(mc) or shutil.which(mc)):
             missing.append(
-                "llvm-mc (LLVM 21+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
-                "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-21 in WSL and set "
+                "llvm-mc (LLVM 22+ with the AMDGPU target). The official Windows LLVM build has no AMDGPU "
+                "target: build a native one with scripts\\build_llvm_mc.ps1, or install llvm-22 in WSL and set "
                 "LLVM_MC to the whole command, e.g. "
-                "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc\" (docs/design.md)." + appdata_hint(mc))
+                "LLVM_MC=\"wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc\" (docs/design.md)." + appdata_hint(mc))
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
                 missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")

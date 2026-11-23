@@ -6,8 +6,11 @@ shader was reported "clean" (and make_game.py translated nothing). The probe now
 
     python -I tests/test_shader_disasm.py
 """
+import glob
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,13 +26,44 @@ PROBE = "0x00 0x00 0x81 0xbf"
 ASM = "\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n"
 
 
-def fssm() -> bytes:
-    """A minimal FSSM blob: the code offset at 0xC0, then s_nop + s_endpgm at offset + 0x28."""
+# v_pk_mul_f16 v0, v1, 0xfbff3c00 then s_endpgm: packed math with a 32-bit literal, as the FidelityFX programs use.
+PACKED_LITERAL_CODE = bytes.fromhex("004010cc01ff011a003cfffb") + b"\x00\x00\x81\xbf"
+
+# What LLVM 21.1.8 does with it (measured): an invalid word, then the literal read as an exp.
+LLVM21 = ("import sys\n"
+          "if '--version' in sys.argv:\n"
+          "    print('Ubuntu LLVM version 21.1.8')\n"
+          "    sys.exit(0)\n"
+          "if sys.stdin.read().strip() == %r:\n"
+          "    print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n"
+          "else:\n"
+          "    sys.stderr.write('<stdin>:1:1: warning: invalid instruction encoding\\n')\n"
+          "    print('\\texp mrt0 off, off, off, off done compr vm')\n" % PROBE)
+
+
+def fssm(code: bytes = CODE) -> bytes:
+    """A minimal FSSM blob: the code offset at 0xC0, then the code at offset + 0x28."""
     blob = bytearray(0x200)
     blob[0:4] = b"FSSM"
     blob[0xC0:0xC4] = (0x100).to_bytes(4, "little")
-    blob[0x128:0x12C] = CODE
+    blob[0x128:0x128 + len(code)] = code
     return bytes(blob)
+
+
+def real_llvm_mc():
+    """An llvm-mc with the AMDGPU target on this machine, newest first, or None."""
+    names = [os.environ.get("LLVM_MC"), shutil.which("llvm-mc")] + sorted(
+        glob.glob("/usr/lib/llvm-*/bin/llvm-mc"), key=lambda p: int(p.split("llvm-")[1].split("/")[0]), reverse=True)
+    for name in filter(None, names):
+        cmd = [name] if os.path.exists(name) else shlex.split(name)
+        try:
+            p = subprocess.run(cmd + ["--disassemble", "-triple=amdgcn--amdpal", "-mcpu=gfx1030"],
+                               input=PROBE, capture_output=True, text=True)
+        except OSError:
+            continue
+        if "s_endpgm" in p.stdout:
+            return name
+    return None
 
 
 class DisasmFailureTest(unittest.TestCase):
@@ -125,6 +159,33 @@ class DisasmFailureTest(unittest.TestCase):
             body = f.read()
         self.assertIn("s_endpgm", body)
         self.assertIn("0 invalid words", body)
+
+
+class PackedLiteralTest(DisasmFailureTest):
+    """LLVM 21 loses packed-math instructions with a literal (SHADER-804): refuse it, name the version."""
+
+    def test_llvm_21_is_refused_with_its_version_and_the_fix(self):
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(self.fake(LLVM21), out)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("LLVM 21.1.8", p.stderr)
+        self.assertIn("LLVM 22 or newer", p.stderr)
+        self.assertEqual(sorted(os.listdir(out)), [])
+
+    def test_the_packed_literal_is_decoded_by_the_llvm_mc_on_this_machine(self):
+        mc = real_llvm_mc()
+        if mc is None:
+            self.skipTest("no llvm-mc with the AMDGPU target")
+        with open(self.fssm, "wb") as f:
+            f.write(fssm(PACKED_LITERAL_CODE))
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool(mc, out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
+            listing = f.read()
+        self.assertIn("v_pk_mul_f16 v0, v1, 0xfbff3c00", listing)
+        self.assertIn("0 invalid words", listing)
+        self.assertNotIn("\texp", listing)
 
 
 class DisasmInputTest(unittest.TestCase):

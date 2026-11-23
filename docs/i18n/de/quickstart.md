@@ -32,16 +32,16 @@ Das Projekt steht noch am Anfang: **Das Spiel startet noch nicht.**
 - [Python 3.12+](https://www.python.org/downloads/) (bei der Installation *„Add python.exe to PATH“* anhaken).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` und `vulkaninfo`).
-- [LLVM 21+](https://github.com/llvm/llvm-project/releases) mit dem **AMDGPU-Target** (`llvm-mc`):
+- [LLVM 22+](https://github.com/llvm/llvm-project/releases) mit dem **AMDGPU-Target** (`llvm-mc`):
   - Der offizielle LLVM-Build für Windows enthält das AMDGPU-Target **nicht**.
   - Ein natives `llvm-mc.exe` mit AMDGPU baut `.\scripts\build_llvm_mc.ps1`, ausgeführt in PowerShell im
     Hauptordner des Repositorys. Das Skript braucht `git` und die C++-Tools von Visual Studio, setzt die Variable
     `LLVM_MC` für deinen Benutzer und bittet dich, danach ein neues Terminal zu öffnen, damit sie sichtbar wird.
-  - Mit WSL: `llvm-21` in Ubuntu installieren und die Variable in derselben PowerShell-Sitzung setzen, in der du
+  - Mit WSL: `llvm-22` in Ubuntu installieren und die Variable in derselben PowerShell-Sitzung setzen, in der du
     `make_game.py` startest:
 
     ```powershell
-    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'
+    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc'
     ```
 
     Mehr dazu in [`docs/design.md`](../../design.md#disassembling-shaders).
@@ -101,7 +101,7 @@ Die Stufen laufen in dieser Reihenfolge: `check` → `shaders` → `assets` → 
 - **Repository über „Download ZIP“ auf GitHub geladen**: Das ZIP enthält das Submodul `third_party/rpf9-explorer`
   nicht. Nimm `git clone --recursive` oder führe im Repository-Ordner `git submodule update --init --recursive` aus.
 - **`llvm-mc` lehnt `gfx1013` / AMDGPU ab**: Du hast vermutlich den offiziellen LLVM-Installer für Windows. Nimm
-  `scripts\build_llvm_mc.ps1` oder setze `LLVM_MC` auf das `llvm-mc` aus WSL (`llvm-21`).
+  `scripts\build_llvm_mc.ps1` oder setze `LLVM_MC` auf das `llvm-mc` aus WSL (`llvm-22`).
 - **Fehler `D3D12_ROOT_SIGNATURE_DESC2` beim Bauen der Runtime**: Aktualisiere das Windows SDK auf `10.0.26100` oder
   neuer (über den Visual Studio Installer oder `winget install Microsoft.WindowsSDK.10.0.26100`), lösche den
   Build-Ordner und konfiguriere neu.

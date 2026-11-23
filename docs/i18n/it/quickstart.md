@@ -31,7 +31,7 @@ Il progetto è in fase iniziale: **il gioco non si avvia ancora**.
 - [Python 3.12+](https://www.python.org/downloads/) (spunta «Add python.exe to PATH»).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/), per `spirv-as` / `spirv-val` (e `vulkaninfo`).
-- [LLVM 21+](https://github.com/llvm/llvm-project/releases) con il **target AMDGPU**, per `llvm-mc`:
+- [LLVM 22+](https://github.com/llvm/llvm-project/releases) con il **target AMDGPU**, per `llvm-mc`:
   - La build ufficiale di LLVM per Windows **non** include il target AMDGPU.
   - Per compilare un `llvm-mc.exe` nativo con AMDGPU, esegui questo comando dalla radice del repository
     (non serve WSL):
@@ -42,11 +42,11 @@ Il progetto è in fase iniziale: **il gioco non si avvia ancora**.
 
     Lo script richiede `git` e gli strumenti C++ di Visual Studio (vedi sotto), imposta `LLVM_MC` per il tuo
     utente e ti chiede di aprire un nuovo terminale per caricare la variabile.
-  - In alternativa, installa `llvm-21` in WSL (Ubuntu) e imposta la variabile con il comando completo, nella
+  - In alternativa, installa `llvm-22` in WSL (Ubuntu) e imposta la variabile con il comando completo, nella
     stessa sessione PowerShell da cui avvierai `make_game.py`:
 
     ```powershell
-    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'
+    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc'
     ```
 
     Vedi [`docs/design.md`](../../design.md#disassembling-shaders) per i dettagli.

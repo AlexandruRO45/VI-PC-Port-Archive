@@ -31,16 +31,16 @@ Proje henüz erken aşamadadır: **oyun şu an açılmıyor**.
 - [Python 3.12+](https://www.python.org/downloads/) (kurulumda *"Add python.exe to PATH"* seçeneğini işaretleyin).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` ve `vulkaninfo` için).
-- **AMDGPU hedefli** [LLVM 21+](https://github.com/llvm/llvm-project/releases) (`llvm-mc`):
+- **AMDGPU hedefli** [LLVM 22+](https://github.com/llvm/llvm-project/releases) (`llvm-mc`):
   - Resmi Windows LLVM kurulumu AMDGPU hedefini **içermez**.
   - AMDGPU destekli yerel `llvm-mc.exe` derlemek için depo kök dizininde PowerShell'den `.\scripts\build_llvm_mc.ps1`
     betiğini çalıştırın (`git` ve aşağıdaki Visual Studio C++ araçları gerekir). Betik kullanıcınız için `LLVM_MC`
     ortam değişkenini ayarlar; geçerli olması için yeni bir terminal açın.
-  - Alternatif olarak WSL (Ubuntu) içinde `llvm-21` kurup `make_game.py` çalıştıracağınız PowerShell oturumunda
+  - Alternatif olarak WSL (Ubuntu) içinde `llvm-22` kurup `make_game.py` çalıştıracağınız PowerShell oturumunda
     `LLVM_MC` değişkenini tam komut olarak ayarlayın:
 
     ```powershell
-    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'
+    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc'
     ```
 
     Ayrıntılar için [`docs/design.md`](../../design.md#disassembling-shaders) bölümüne bakın.
@@ -99,7 +99,7 @@ Aşamalar şu sırayla çalışır: `check` → `shaders` → `assets` → `runt
 - **GitHub'dan "Download ZIP" ile indirdiniz**: ZIP arşivi `third_party/rpf9-explorer` alt modülünü içermez.
   `git clone --recursive` kullanın veya depo klasöründe `git submodule update --init --recursive` çalıştırın.
 - **`llvm-mc`, `gfx1013` veya AMDGPU hedefini reddediyor**: Büyük olasılıkla resmi Windows LLVM kurulumu kullanılıyor.
-  `scripts\build_llvm_mc.ps1` ile yerel derleyin veya `LLVM_MC` değişkenini WSL içindeki `llvm-21` `llvm-mc` yoluna
+  `scripts\build_llvm_mc.ps1` ile yerel derleyin veya `LLVM_MC` değişkenini WSL içindeki `llvm-22` `llvm-mc` yoluna
   ayarlayın.
 - **CMake "needs the Windows SDK 10.0.26100 or newer" hatası veriyor** (veya MSVC `Desc_1_2` üyesini bulamıyor):
   Visual Studio Installer üzerinden ya da `winget install Microsoft.WindowsSDK.10.0.26100` komutuyla Windows SDK'yı

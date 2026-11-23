@@ -206,6 +206,21 @@ class Cli(unittest.TestCase):
         with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f), [])
 
+    def test_llvm_21_losing_packed_literals_stops_before_any_listing(self):
+        # LLVM 21.1.8 on v_pk_mul_f16 v0, v1, 0xfbff3c00: an invalid word, then the literal read as an exp.
+        result, out = self.disassemble("import sys\n"
+                                       "if '--version' in sys.argv:\n"
+                                       "    print('Ubuntu LLVM version 21.1.8')\n"
+                                       "    sys.exit(0)\n"
+                                       "sys.stdin.read()\n"
+                                       "sys.stderr.write('<stdin>:1:1: warning: invalid instruction encoding\\n')\n"
+                                       "print('\\texp mrt0 off, off, off, off done compr vm')\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("LLVM 21.1.8", result.stderr)
+        self.assertIn("LLVM 22 or newer", result.stderr)
+        self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
+        self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
+
     def test_empty_disassembly_writes_no_listing(self):
         result, out = self.disassemble("print('   ')\n")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -215,6 +230,9 @@ class Cli(unittest.TestCase):
 
     def test_disassembly_with_invalid_words_keeps_listing(self):
         result, out = self.disassemble("import sys\n"
+                                       "if sys.stdin.read().startswith('0x00 0x40'):  # the packed-literal check\n"
+                                       "    print('\\tv_pk_mul_f16 v0, v1, 0xfbff3c00')\n"
+                                       "    sys.exit(0)\n"
                                        "print('\\ts_endpgm')\n"
                                        "sys.stderr.write('warning: invalid instruction encoding\\n')\n")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

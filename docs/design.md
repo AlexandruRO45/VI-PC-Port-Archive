@@ -485,8 +485,8 @@ cross-half code on 32-wide subgroups.
 
 ## Disassembling shaders
 
-The AMDGPU disassembler needs LLVM 21+ built with the AMDGPU target (`llvm-mc`; on Linux the `llvm-21` package
-installs it at `/usr/lib/llvm-21/bin/llvm-mc`). The official Windows LLVM build has no AMDGPU target and ships no
+The AMDGPU disassembler needs LLVM 22+ built with the AMDGPU target (`llvm-mc`; on Linux the `llvm-22` package
+installs it at `/usr/lib/llvm-22/bin/llvm-mc`). The official Windows LLVM build has no AMDGPU target and ships no
 `llvm-mc.exe`. On Windows, either build a native one or run it from WSL.
 
 Native: `scripts\build_llvm_mc.ps1` fetches the LLVM sources the tool needs (sparse, shallow), builds `llvm-mc` alone
@@ -504,10 +504,10 @@ powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
 python -I make_game.py --game "D:\path\to\your\package" --stages shaders
 ```
 
-WSL: install `llvm-21` and give `LLVM_MC` the whole command:
+WSL: install `llvm-22` and give `LLVM_MC` the whole command:
 
 ```
-set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
+set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc
 python -I make_game.py --game "D:\path\to\your\package" --stages shaders
 ```
 
@@ -516,10 +516,16 @@ the tests, `runtime/test/shaders/build.py` and `scripts/run_gpu_tests.py`; the a
 on stdin, so a WSL command never receives a Windows file path.
 
 `shader_disasm.py` disassembles one `s_endpgm` before starting, so a missing tool or AMDGPU target stops the run
-with that reason instead of writing empty `.s` files. To disassemble by hand inside WSL:
+with that reason instead of writing empty `.s` files. It then disassembles one packed-math instruction with a 32-bit
+literal (`v_pk_mul_f16 v0, v1, 0xfbff3c00`), once per run (`fspx_unpack.py --disasm` does the same), and stops naming the
+LLVM version if that comes out as an invalid word. LLVM 21.1.8 prints `v_pk_*` (and some `v_fma_mix*`) with a literal as
+`invalid instruction encoding` and decodes the instruction's second word and the literal as other instructions: a literal
+whose top byte is 0xF8..0xFB, such as the f16 pair `0xfbff3c00` (-65504 in the high half), comes out as `exp mrt0 off,
+... done compr vm`. That was the one `exp` in FidelityFX FSPX programs 05, 06, 08, 09 and 28 ("reachable instruction with
+normalized encoding"). LLVM 22.1.8 and 23.1.6 decode them, so the minimum is LLVM 22 (SHADER-804). To disassemble by hand inside WSL:
 
 ```
-LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc python3 -I <repo>/tools/shader_disasm.py <work>/shaders/fssm
+LLVM_MC=/usr/lib/llvm-22/bin/llvm-mc python3 -I <repo>/tools/shader_disasm.py <work>/shaders/fssm
 ```
 
 Code starts at the u32 at FSSM offset 0xC0 (the code-section offset) plus 0x28 bytes into that section, and ends at the

@@ -31,7 +31,7 @@ RDNA2 GPU プログラムは Vulkan 向けの SPIR-V に翻訳され、モデル
 - [Python 3.12+](https://www.python.org/downloads/)（インストール時に "Add python.exe to PATH" を有効に）。
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)。
 - [Vulkan SDK](https://vulkan.lunarg.com/)（`spirv-as` / `spirv-val` 用）。
-- **AMDGPU target** を含む [LLVM 21+](https://github.com/llvm/llvm-project/releases)（`llvm-mc` 用）。
+- **AMDGPU target** を含む [LLVM 22+](https://github.com/llvm/llvm-project/releases)（`llvm-mc` 用）。
   - Windows 版の公式 LLVM には AMDGPU target が**含まれていません**。
   - Windows では、リポジトリのルートで次のコマンドを実行すると、AMDGPU target 付きのネイティブ `llvm-mc.exe` を
     ビルドし（WSL 不要。`git` と下記の Visual Studio の C++ ツールが必要）、`LLVM_MC` を設定します:
@@ -39,8 +39,8 @@ RDNA2 GPU プログラムは Vulkan 向けの SPIR-V に翻訳され、モデル
     ```powershell
     powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
     ```
-  - または WSL に `llvm-21` を入れて、`LLVM_MC` にコマンド全体を設定します:
-    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"`
+  - または WSL に `llvm-22` を入れて、`LLVM_MC` にコマンド全体を設定します:
+    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc"`
     （[docs/design.md](../../design.md#disassembling-shaders)）。
   - Linux では `PATH` に `llvm-mc` があれば十分です。
 - **Visual Studio 2022**（**C++ によるデスクトップ開発**）と **Windows SDK 10.0.26100 以降**。
@@ -120,7 +120,7 @@ python -I make_game.py --wave64-emulate off            # auto（既定）、on�
   実行してください。
 - **`llvm-mc` が `gfx1013` や AMDGPU を拒否する**: Windows 版の公式 LLVM を使っている可能性が高いです。
   リポジトリのルートで `powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1` を実行するか、
-  `LLVM_MC` を WSL の `llvm-mc`（`llvm-21`）に向けてください。
+  `LLVM_MC` を WSL の `llvm-mc`（`llvm-22`）に向けてください。
 - **CMake が "needs the Windows SDK 10.0.26100 or newer" で止まる**、または MSVC が `Desc_1_2` は
   `D3D12_VERSIONED_ROOT_SIGNATURE_DESC` のメンバーではないと報告する: Windows SDK を `10.0.26100` 以降に
   更新し（Visual Studio Installer、または `winget install Microsoft.WindowsSDK.10.0.26100`）、

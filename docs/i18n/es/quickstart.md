@@ -31,16 +31,16 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 - [Python 3.12+](https://www.python.org/downloads/) (marque «Add python.exe to PATH» durante la instalación).
 - [SDK de .NET 8](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [SDK de Vulkan](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` y `vulkaninfo`).
-- [LLVM 21+](https://github.com/llvm/llvm-project/releases) con el **destino AMDGPU** (`llvm-mc`):
+- [LLVM 22+](https://github.com/llvm/llvm-project/releases) con el **destino AMDGPU** (`llvm-mc`):
   - La versión oficial de LLVM para Windows **no incluye** el destino AMDGPU.
   - Para compilar un `llvm-mc.exe` nativo con ese destino, ejecute `.\scripts\build_llvm_mc.ps1` en PowerShell
     desde la raíz del repositorio. El script necesita `git` y las herramientas de C++ de Visual Studio. Define
     `LLVM_MC` para su usuario: abra después un terminal nuevo para que la variable se aplique.
-  - Con WSL, instale `llvm-21` en Ubuntu y pase el comando completo a `LLVM_MC`, en la sesión de PowerShell
+  - Con WSL, instale `llvm-22` en Ubuntu y pase el comando completo a `LLVM_MC`, en la sesión de PowerShell
     donde vaya a ejecutar `make_game.py`:
 
     ```powershell
-    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'
+    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc'
     ```
 
     Véase [`docs/design.md`](../../design.md#disassembling-shaders) para los detalles.
@@ -97,7 +97,7 @@ Las etapas se ejecutan en este orden: `check` → `shaders` → `assets` → `ru
 - **Usó «Download ZIP» en GitHub**: el ZIP no contiene el submódulo `third_party/rpf9-explorer`. Use
   `git clone --recursive`, o ejecute `git submodule update --init --recursive` en la carpeta del repositorio.
 - **`llvm-mc` rechaza `gfx1013` o el destino AMDGPU**: probablemente usa el instalador oficial de LLVM para
-  Windows. Ejecute `scripts\build_llvm_mc.ps1`, o apunte `LLVM_MC` al `llvm-mc` de WSL (`llvm-21`).
+  Windows. Ejecute `scripts\build_llvm_mc.ps1`, o apunte `LLVM_MC` al `llvm-mc` de WSL (`llvm-22`).
 - **CMake se detiene en «needs the Windows SDK 10.0.26100 or newer»**, o MSVC indica que `Desc_1_2` no es miembro
   de `D3D12_VERSIONED_ROOT_SIGNATURE_DESC`: actualice el SDK de Windows a `10.0.26100` o superior, con el
   Instalador de Visual Studio o con `winget install Microsoft.WindowsSDK.10.0.26100`, y luego borre
