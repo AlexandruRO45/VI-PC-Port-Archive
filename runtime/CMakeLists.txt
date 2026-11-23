@@ -1275,6 +1275,16 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(d3d12_gcl8_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_gcl8_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_gcl8 COMMAND d3d12_gcl8_test)
+
+    # The deferred D3D12 methods still on the generated stub return E_NOTIMPL (or are logged no-ops) until the
+    # game's trace shows a use; the test pins the list so a scout does not file them again.
+    add_executable(d3d12_not_planned_methods_test test/d3d12_not_planned_methods_test.cpp)
+    target_link_libraries(d3d12_not_planned_methods_test PRIVATE gta6rt_d3d12_com dxguid)  # IID_ID3D12Device11
+    target_compile_definitions(d3d12_not_planned_methods_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_not_planned_methods_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_not_planned_methods COMMAND d3d12_not_planned_methods_test)
+    set_tests_properties(d3d12_not_planned_methods PROPERTIES SKIP_RETURN_CODE 77)
+
     # Python runs on the host; a cross-compiled fixture runs through the emulator (Wine), which the script prepends.
     # The interpreter is named by path, because ctest would put the emulator in front of an executable target.
     set(_trace_runner)

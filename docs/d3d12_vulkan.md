@@ -1714,6 +1714,7 @@ The trace will enumerate them.
 | `ID3D12StateObject` (ray tracing) | likely unused | RT work includes compute traversal (`image_bvh*`) plus `XboxBvhBuilder`; a DXR state-object path is stubbed until the trace shows it. |
 | `ID3D12ShaderCacheSession` | `VkPipelineCache` | Stub with logging. |
 | DRED, protected sessions, meta commands, shared handles | stubs | Not needed for single-player boot; return a clean failure and log. |
+| Deferred method stubs: `CreateSharedHandle`, `OpenSharedHandle`, `OpenSharedHandleByName`, `OpenExistingHeapFromAddress`, `OpenExistingHeapFromFileMapping`, `CreateProtectedResourceSession`, `CreateProtectedResourceSession1`, `CreateLifetimeTracker`, `CreateStateObject`, `AddToStateObject`, `CreateSamplerFeedbackUnorderedAccessView` (device), and `SOSetTargets`, `SetViewInstanceMask`, `SetProtectedResourceSession`, `InitializeMetaCommand`, `ExecuteMetaCommand`, `SetPipelineState1`, `DispatchRays` (command list) | generated stubs | Not planned until the game's trace shows a use (see #313). The 10 `HRESULT` methods return `E_NOTIMPL`, the 8 `void` methods log `unimplemented` and return; each reports its name once. Pinned by `d3d12_not_planned_methods_test`; no host comparison until the trace shows a use. |
 
 ### 4.1 Device and feature queries
 
