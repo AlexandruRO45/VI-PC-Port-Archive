@@ -1013,16 +1013,77 @@ def cross_build_missing() -> list:
     return missing
 
 
+def _dotnet_candidates(on_path: "str | None") -> list[str]:
+    """Candidate `dotnet` executables to probe for an 8+ SDK, PATH hit first.
+
+    On Windows, `C:\\Program Files (x86)\\dotnet` often precedes `C:\\Program Files\\dotnet` on PATH (a 32-bit
+    runtime install puts it there); that x86 host reports no SDKs even when the x64 .NET 8+ SDK is installed.
+    A fresh install can also be missing from PATH until the terminal is reopened (#8434).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    p = ntpath if os.name == "nt" else os.path
+
+    def add(path: "str | None") -> None:
+        if not path:
+            return
+        key = p.normcase(p.normpath(path))
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+
+    if on_path:
+        add(on_path)
+    if os.name == "nt":
+        for entry in os.environ.get("PATH", "").split(";"):
+            entry = entry.strip().strip('"')
+            if entry:
+                exe = ntpath.join(entry, "dotnet.exe")
+                if os.path.isfile(exe):
+                    add(exe)
+        pf64 = os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles") or r"C:\Program Files"
+        pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+        local_app = os.environ.get("LOCALAPPDATA", "").strip().strip('"')
+        user_profile = os.environ.get("USERPROFILE", "").strip().strip('"')
+        dirs = [
+            os.environ.get("DOTNET_ROOT", "").strip().strip('"'),
+            ntpath.join(pf64, "dotnet"),
+            ntpath.join(pf, "dotnet"),
+            ntpath.join(local_app, "Microsoft", "dotnet") if local_app else "",
+            ntpath.join(user_profile, ".dotnet") if user_profile else "",
+        ]
+        for d in dirs:
+            if d:
+                exe = ntpath.join(d, "dotnet.exe")
+                if os.path.isfile(exe):
+                    add(exe)
+    return out
+
+
+def _dotnet_has_sdk_8(exe: str) -> bool:
+    try:
+        r = subprocess.run([exe, "--list-sdks"], capture_output=True, text=True, errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if r.returncode != 0:
+        return False
+    return any(int(m) >= 8 for m in re.findall(r"^\s*(\d+)\.", r.stdout.lstrip("\ufeff"), re.M))
+
+
+def dotnet_sdk_exe() -> "str | None":
+    """The `dotnet` host with an 8+ SDK: `"dotnet"` when the default PATH host qualifies, the full path when a
+    Windows fallback host had to be picked, or None if no 8+ SDK is installed."""
+    on_path = shutil.which("dotnet")
+    for i, exe in enumerate(_dotnet_candidates(on_path)):
+        if _dotnet_has_sdk_8(exe):
+            return "dotnet" if (i == 0 and on_path) else exe
+    return None
+
+
 def dotnet_sdk_ok() -> bool:
     """True if a .NET SDK 8 or newer is installed. `dotnet` is also on PATH with only a runtime, and then
     `dotnet build` fails with "No .NET SDKs were found"."""
-    if not shutil.which("dotnet"):
-        return False
-    try:
-        r = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return any(int(m) >= 8 for m in re.findall(r"^(\d+)\.", r.stdout, re.M))
+    return dotnet_sdk_exe() is not None
 
 
 def submodule_ready() -> bool:
@@ -1950,9 +2011,12 @@ def rpf9dump(work: str) -> str:
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if not os.path.isdir(core):
         fail("third_party/rpf9-explorer is empty. Run: git submodule update --init")
-    need("dotnet", "Install the .NET 8 SDK.")
+    dotnet = dotnet_sdk_exe()
+    if dotnet is None:
+        need("dotnet", "Install the .NET 8 SDK.")
+        dotnet = "dotnet"
     log("assets: building rpf9dump")
-    run(["dotnet", "build", os.path.join(TOOLS, "rpf9dump", "rpf9dump.csproj"), "-c", "Release",
+    run([dotnet, "build", os.path.join(TOOLS, "rpf9dump", "rpf9dump.csproj"), "-c", "Release",
          "-o", out_dir, "--nologo", "-v", "q"])
     return exe
 

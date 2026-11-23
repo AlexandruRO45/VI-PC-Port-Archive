@@ -545,6 +545,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
 
         with mock.patch.object(make_game, "ROOT", self.tmp.name), \
                 mock.patch.object(make_game, "MODEL_ARCHIVES", ["scene.rpf"]), \
+                mock.patch.object(make_game, "dotnet_sdk_exe", return_value=None), \
                 mock.patch.object(make_game, "need"), mock.patch.object(make_game, "py"), \
                 mock.patch.object(make_game, "run") as run, mock.patch("shutil.which", return_value=None):
             make_game.assets(self.game_dir, self.work_dir, wav=False, jobs=1)
