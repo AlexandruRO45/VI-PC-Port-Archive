@@ -550,5 +550,36 @@ class TestInterpP1llF16ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[2], f32_to_bits(1.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p1ll_f16 SIMD & Packed Attribute Handling
+# ------------------------------------------------------------------------------
+
+class SIMDWaveInterpP1llF16:
+    def __init__(self, wave_size: int = 64):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def step(self, insn: VInterpP1llF16Instruction, p0: float, p1: float):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                i_coord = bits_to_f32(self.vgprs[insn.src0.index][lane])
+                self.vgprs[insn.dst.index][lane] = ref_interp_p1ll_f16(i_coord, p0, p1)
+
+
+class TestInterpP1llF16SIMD(unittest.TestCase):
+    def test_simd_divergence(self):
+        wave = SIMDWaveInterpP1llF16(wave_size=32)
+        for lane in range(32):
+            wave.vgprs[0][lane] = f32_to_bits(float(lane) / 10.0)
+
+        insn = VInterpP1llF16Instruction(dst=RegisterOperand(OperandType.VGPR, 2), src0=RegisterOperand(OperandType.VGPR, 0), attr=AttrOperand(0, "x"))
+        wave.step(insn, 0.0, 10.0)
+
+        for lane in range(32):
+            expected = ref_interp_p1ll_f16(float(lane) / 10.0, 0.0, 10.0)
+            self.assertEqual(wave.vgprs[2][lane], expected)
+
+
 if __name__ == '__main__':
     unittest.main()
