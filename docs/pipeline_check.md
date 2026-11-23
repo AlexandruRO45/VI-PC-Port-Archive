@@ -31,7 +31,8 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 | `--stage all\|cs\|graphics` | Which stages to check. `--compute-only` and `--graphics-only` are aliases. |
 | `--slow SEC` | Print pipelines slower than SEC (default 30); compiles past 60 s are named while running. |
 | `--max-bytes N` | Skip `.spv` files larger than N bytes (0 = no limit); every skip is named. |
-| `--large-module-bytes N` | Compile modules larger than N bytes alone (default 4 MiB; 0 disables isolation). |
+| `--large-module-bytes N` | Modules larger than N bytes are "large" and go through the memory budget described under *Limiting concurrent compilation of large modules* (default 4 MiB; 0 disables the gate). |
+| `--large-parallel N` | How many large modules may be in the driver at once: 0 (default) = as many as fit three quarters of the memory available at start, up to `--jobs`, with small modules compiling alongside; 1 = each large module alone with the other threads waiting (the behaviour before the budget, and what 0 falls back to when the available memory cannot be read). |
 | `--stats FILE` | Write the driver's per-shader statistics as CSV rows `name,stage,statistic,value`. Needs `VK_KHR_pipeline_executable_properties`; use it without `cache.bin`, because a cached pipeline may come without statistics. |
 | `--cache-feedback` | Group successful pipeline creations by `VkPipelineCreationFeedback`: cache hits, no hit reported, and unavailable. |
 | `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
