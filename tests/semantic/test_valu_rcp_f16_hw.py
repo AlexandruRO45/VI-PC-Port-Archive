@@ -268,5 +268,42 @@ class RcpF16ScalarInterpreterTests(unittest.TestCase):
         self.assertEqual(res & 0xFFFF, 0xBABE)  # Preserved low half
         self.assertEqual(res >> 16, F16_HALF)    # High half computed 1/2 = 0.5
 
+class WavefrontState:
+    def __init__(self, lane_count: int = 32):
+        self.lane_count = lane_count
+        self.exec_mask = (1 << lane_count) - 1
+        self.lanes = [ScalarRegisterState() for _ in range(lane_count)]
+
+    def execute_instruction(self, ast: InstructionAST) -> None:
+        for lane in range(self.lane_count):
+            if (self.exec_mask >> lane) & 1:
+                execute_scalar_rcp_f16(self.lanes[lane], ast)
+
+
+class RcpF16SimdDivergenceTests(unittest.TestCase):
+    def test_simd_wave32_all_active(self):
+        wave = WavefrontState(lane_count=32)
+        for i in range(32):
+            wave.lanes[i].set_vgpr(0, F16_TWO)
+            wave.lanes[i].set_vgpr(1, 0x12340000)
+        ast = InstructionAST("v_rcp_f16", Operand(RegKind.VGPR, 1), Operand(RegKind.VGPR, 0))
+        wave.execute_instruction(ast)
+        for i in range(32):
+            self.assertEqual(wave.lanes[i].get_vgpr(1), 0x12340000 | F16_HALF)
+
+    def test_simd_exec_divergence_mask(self):
+        wave = WavefrontState(lane_count=32)
+        wave.exec_mask = 0x55555555  # Alternate even lanes active
+        for i in range(32):
+            wave.lanes[i].set_vgpr(0, F16_TWO)
+            wave.lanes[i].set_vgpr(1, 0xAAAA0000)
+        ast = InstructionAST("v_rcp_f16", Operand(RegKind.VGPR, 1), Operand(RegKind.VGPR, 0))
+        wave.execute_instruction(ast)
+        for i in range(32):
+            if i % 2 == 0:
+                self.assertEqual(wave.lanes[i].get_vgpr(1), 0xAAAA0000 | F16_HALF)
+            else:
+                self.assertEqual(wave.lanes[i].get_vgpr(1), 0xAAAA0000)  # Inactive lane unchanged
+
 if __name__ == "__main__":
     unittest.main()
