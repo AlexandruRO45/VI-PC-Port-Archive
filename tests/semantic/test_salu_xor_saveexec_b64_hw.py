@@ -484,5 +484,61 @@ class TestSXorSaveExecAliasing(unittest.TestCase):
         # s[10:11] untouched
         self.assertEqual(state.get_sgpr_pair(10), 0xAAAA_AAAA_AAAA_AAAA)
 
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# -----------------------------------------------------------------------------
+
+class TestSXorSaveExecConditionCodes(unittest.TestCase):
+    """Unit tests for SCC (Scalar Condition Code) flag generation and transitions."""
+
+    def test_scc_set_when_single_bit_nonzero(self):
+        """SCC must be set to 1 if any bit in new EXEC is set."""
+        for bit in (0, 1, 15, 16, 31, 32, 47, 48, 63):
+            with self.subTest(bit=bit):
+                mask = 1 << bit
+                new_exec, _, scc = s_xor_saveexec_b64_oracle(mask, 0)
+                self.assertEqual(scc, 1)
+                new_exec, _, scc = s_xor_saveexec_b64_oracle(0, mask)
+                self.assertEqual(scc, 1)
+
+    def test_scc_cleared_when_operands_equal(self):
+        """SCC must be strictly 0 when S0 ^ EXEC equals 0."""
+        patterns = (0, ALL64, 0x5555_5555_5555_5555, 0x1234_5678_9ABC_DEF0)
+        for pat in patterns:
+            with self.subTest(pattern=hex(pat)):
+                new_exec, _, scc = s_xor_saveexec_b64_oracle(pat, pat)
+                self.assertEqual(new_exec, 0)
+                self.assertEqual(scc, 0)
+
+    def test_scc_transitions_state_machine(self):
+        """Test all 4 state transitions for SCC: 0->0, 0->1, 1->0, 1->1."""
+        state = ScalarHardwareState()
+        instr = SXorSaveExecB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+
+        # 1. 0 -> 0 transition (0 ^ 0 = 0)
+        state.scc = 0
+        state.set_sgpr_pair(4, 0)
+        state.exec_mask = 0
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 0)
+
+        # 2. 0 -> 1 transition (1 ^ 0 = 1)
+        state.set_sgpr_pair(4, 1)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 1)
+
+        # 3. 1 -> 1 transition (2 ^ 1 = 3)
+        state.set_sgpr_pair(4, 2)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 1)
+
+        # 4. 1 -> 0 transition (exec ^ exec = 0)
+        state.set_sgpr_pair(4, state.exec_mask)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
