@@ -87,6 +87,8 @@ def test_import_does_not_read_the_addrlib_header(monkeypatch):
 
 
 def test_eq4k_reads_the_patterns_once_and_picks_the_entry_for_bpe(monkeypatch):
+    import amd_swizzle
+
     calls = []
     bits8 = [0, 0, 0] + [1 << k for k in range(5)] + [(1 << k) << 16 for k in range(4)]
     bits4 = [0, 0] + [1 << k for k in range(5)] + [(1 << k) << 16 for k in range(5)]
@@ -98,7 +100,7 @@ def test_eq4k_reads_the_patterns_once_and_picks_the_entry_for_bpe(monkeypatch):
         calls.append(1)
         return nibbles, tables
 
-    monkeypatch.setattr(T, "load", fake_load)
+    monkeypatch.setattr(amd_swizzle, "load", fake_load)
     monkeypatch.setattr(T, "_PATTERNS", [])
     monkeypatch.setattr(T, "_EQ", {})
     assert T.eq4k(8) == linear_eq(8)
