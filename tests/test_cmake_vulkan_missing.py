@@ -71,6 +71,14 @@ class CMakeListsUsesTheModuleTest(unittest.TestCase):
         for c in configures:
             self.assertIn("-DLEONIDA_REQUIRE_VULKAN=ON", c)
 
+    def test_linux_gpu_tools_builds_against_pinned_headers(self):
+        ci = (ROOT / ".github" / "workflows" / "runtime.yml").read_text(encoding="utf-8")
+        job = re.search(r"^  linux-gpu-tools:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", ci, re.M | re.S)
+        self.assertIsNotNone(job, "linux-gpu-tools job not found")
+        text = job.group(1)
+        self.assertIn("ref: 6802bb4733b63ed5efd3adb308a6c885ef180ea1", text)
+        self.assertIn("VULKAN_SDK: ${{ github.workspace }}/.vulkan-headers", text)
+
 
 if __name__ == "__main__":
     unittest.main()
