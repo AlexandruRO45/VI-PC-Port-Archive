@@ -490,6 +490,30 @@ class LodSetsTest(unittest.TestCase):
                 with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
                     self.assertEqual(sorted(json.load(f)["lod_bands"]), ["hd"])
 
+    def test_cli_counts_a_non_integer_lod_level_as_malformed(self):
+        # lodLevel is a u8 that world_index.py writes as a JSON integer. 0.0 and true compare equal to 0 and 1, so
+        # --lod-sets once appended the float to its integer tier array (TypeError, no world) and filed true as LOD.
+        import contextlib
+        import io
+        odd = (0.0, True, "0")
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = twp.write_assets(tmp)
+            ents = os.path.join(tmp, "e.jsonl")
+            twp.write_entities(ents, [self.lod_row((10, 10, 0), 0)]
+                               + [self.lod_row((12, 10, 0), level) for level in odd])
+            for extra in (["--lod-sets"], ["--instancing", "bake"]):   # iter_placements, load_placements
+                out = os.path.join(tmp, "w_" + extra[-1].lstrip("-"))
+                with self.subTest(extra=extra), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(world_build.main([assets, "--out", out, "--no-textures", "--placements", ents,
+                                                       "--lod-levels", "0,1", *extra]), 0)
+                    with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
+                        world = json.load(f)
+                    pl = world["stats"]["placements"]
+                    self.assertEqual((pl["rows"], pl["malformed"], pl["other_lod_level"], pl["selected"],
+                                      pl["placed"]), (4, 3, 0, 1, 1))
+                    if extra == ["--lod-sets"]:
+                        self.assertEqual([c["id"] for c in world["chunks"]], ["c_hd_0_-1"])
+
     def test_prune_stale_chunks_removes_obsolete_lod_set_chunks(self):
         import contextlib
         import io

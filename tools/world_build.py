@@ -87,6 +87,21 @@ def _placement_scale(value) -> float:
     return scale if math.isfinite(scale) else 1.0
 
 
+def _lod_level_selected(value, levels) -> bool:
+    """Whether one placement's lod_level is in ``levels``; a missing (null) level is not selected.
+
+    ``lodLevel`` is a u8 (docs/world.md) that ``world_index.py --entities-out`` writes as a JSON integer, so any
+    other value (float, bool, string, list, ...) raises and the callers count the row as malformed: ``0.0`` and
+    ``True`` would otherwise equal 0 and 1 and reach the integer tier array of ``--lod-sets``. Shared by
+    ``load_placements`` and ``iter_placements`` so the two readers stay in step.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("lod_level must be an integer")
+    return value in levels
+
+
 def _parse_archetype(value) -> int:
     """Parse one placement's archetype: a real JSON integer is used as-is, a string is base-16.
 
@@ -108,8 +123,8 @@ def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tu
 
     A row is kept when its lod_level is in lod_levels and, with region = (minx, miny, maxx, maxy) in RAGE
     world metres, its position lies inside it. Rows without a finite position, rotation or archetype are
-    counted as malformed and skipped, as are unhashable LOD values. Optional scales that are missing,
-    non-numeric or not representable as finite floats default to 1.0.
+    counted as malformed and skipped, as are LOD values that are not integers. Optional scales that are
+    missing, non-numeric or not representable as finite floats default to 1.0.
     """
     levels = set(lod_levels)
     counts = {"rows": 0, "malformed": 0, "other_lod_level": 0, "outside_region": 0, "selected": 0}
@@ -125,7 +140,7 @@ def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tu
                 arch = _parse_archetype(row["archetype"])
                 pos = [float(v) for v in row["position"]]
                 rot = [float(v) for v in row["rotation"]]
-                selected_lod = row.get("lod_level") in levels
+                selected_lod = _lod_level_selected(row.get("lod_level"), levels)
             except (ValueError, KeyError, TypeError, OverflowError):
                 counts["malformed"] += 1
                 continue
@@ -169,7 +184,7 @@ def iter_placements(path: str, counts: dict, lod_levels=DEFAULT_LOD_LEVELS, regi
                 arch = _parse_archetype(row["archetype"])
                 pos = [float(v) for v in row["position"]]
                 rot = [float(v) for v in row["rotation"]]
-                selected_lod = row.get("lod_level") in levels
+                selected_lod = _lod_level_selected(row.get("lod_level"), levels)
             except (ValueError, KeyError, TypeError, OverflowError):
                 counts["malformed"] += 1
                 continue
