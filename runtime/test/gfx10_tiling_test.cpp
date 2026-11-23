@@ -152,24 +152,40 @@ int main() {
     CHECK(!surface.tile(linear, tiled, max));
     CHECK(!surface.detile(tiled, linear, max));
 
-    // 1. Null-pointer spans with non-zero length must return false without dereferencing nullptr.
-    const std::span<const std::byte> null_const(static_cast<const std::byte*>(nullptr), tiled.size());
-    const std::span<std::byte> null_mut(static_cast<std::byte*>(nullptr), tiled.size());
-    CHECK(!surface.tile(null_const, tiled, 4));
-    CHECK(!surface.tile(linear, null_mut, 4));
-    CHECK(!surface.detile(null_const, linear, 4));
-    CHECK(!surface.detile(tiled, null_mut, 4));
+    // 1. Valid empty (null-pointer, zero-length) spans and undersized spans are rejected cleanly.
+    const std::span<const std::byte> empty_const(static_cast<const std::byte*>(nullptr), 0);
+    const std::span<std::byte> empty_mut(static_cast<std::byte*>(nullptr), 0);
+    CHECK(!surface.tile(empty_const, tiled, 4));
+    CHECK(!surface.tile(linear, empty_mut, 4));
+    CHECK(!surface.detile(empty_const, linear, 4));
+    CHECK(!surface.detile(tiled, empty_mut, 4));
 
     // 2. Adjacent slices in one staging buffer with an oversized source span whose active accessed
     // region [0, required_source) does not overlap destination [required_source, required_source + required_dest)
-    // must succeed.
-    std::vector<std::byte> arena(linear.size() + tiled.size(), std::byte{0x5a});
+    // must round-trip with a padded 8-byte row pitch while leaving the trailing guard bytes untouched.
+    constexpr std::size_t padded_pitch = 8;
+    const std::size_t padded_linear = (surface.height() - 1) * padded_pitch + surface.width() * surface.element_bytes();
+    constexpr std::size_t guard_bytes = 16;
+    std::vector<std::byte> arena(padded_linear + tiled.size() + guard_bytes, std::byte{0xee});
+    for (std::size_t i = 0; i < padded_linear; ++i) arena[i] = std::byte((i * 19 + 7) & 0xff);
+    const std::vector<std::byte> expected_linear(arena.begin(), arena.begin() + padded_linear);
     CHECK(surface.tile(std::span<const std::byte>(arena.data(), arena.size()),
-                       std::span<std::byte>(arena.data() + linear.size(), tiled.size()), 4));
-    CHECK(surface.detile(std::span<const std::byte>(arena.data() + linear.size(), tiled.size()),
-                         std::span<std::byte>(arena.data(), arena.size()), 4));
+                       std::span<std::byte>(arena.data() + padded_linear, tiled.size() + guard_bytes), padded_pitch));
+    std::fill_n(arena.begin(), padded_linear, std::byte{0xee});
+    CHECK(surface.detile(std::span<const std::byte>(arena.data() + padded_linear, tiled.size() + guard_bytes),
+                         std::span<std::byte>(arena.data(), arena.size()), padded_pitch));
+    for (std::size_t y = 0; y < surface.height(); ++y) {
+        const std::size_t row = y * padded_pitch;
+        for (std::size_t b = 0; b < surface.width() * surface.element_bytes(); ++b)
+            CHECK(arena[row + b] == expected_linear[row + b]);
+        for (std::size_t b = surface.width() * surface.element_bytes(); b < padded_pitch && row + b < padded_linear; ++b)
+            CHECK(arena[row + b] == std::byte{0xee});
+    }
+    for (std::size_t i = padded_linear + tiled.size(); i < arena.size(); ++i)
+        CHECK(arena[i] == std::byte{0xee});
 
     // 3. A failed make() on an already-initialized TiledSurface2D must reset `out` to invalid.
+
     CHECK(!TiledSurface2D::make(TileMode::sw_4kb_s, 0, 1, 1, surface));
     CHECK(surface.tiled_size() == 0 && surface.tile_width() == 0 && surface.tile_height() == 0);
     CHECK(surface.width() == 0 && surface.height() == 0 && surface.element_bytes() == 0);

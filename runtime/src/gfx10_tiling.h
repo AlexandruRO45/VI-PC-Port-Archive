@@ -128,10 +128,10 @@ private:
         const std::size_t linear_size = (height_ - 1) * pitch + row_bytes;
         const std::size_t source_bytes = to_tiled ? linear_size : size_;
         const std::size_t dest_bytes = to_tiled ? size_ : linear_size;
-        if (!source.data() || !destination.data() ||
-            source.size() < source_bytes ||
+        if (source.size() < source_bytes ||
             destination.size() < dest_bytes ||
             tiling_detail::overlap(source.first(source_bytes), destination.first(dest_bytes))) return false;
+
 
         const auto tile_x_bits = std::countr_zero(tile_width_);
         std::size_t x_offsets[256]{};
