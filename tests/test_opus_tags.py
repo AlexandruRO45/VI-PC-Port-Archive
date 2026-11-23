@@ -355,6 +355,21 @@ class TestFolder(unittest.TestCase):
         self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
         self.assertIn("SUBTITLE=Move. Now.", self.tags("story", "bank_01", "0ABCDEF1.ogg"))
 
+    def test_cli_checks_names_header_even_without_rows(self):
+        cmd = [sys.executable, "-I", TOOL, self.opus, "--names", self.names]
+        write_csv(self.names, ["source", "bank", "stream_id"], [])
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.splitlines(), [
+            f"opus_tags: error: cannot read a CSV: {self.names}: missing required CSV columns: name",
+        ])
+
+        write_csv(self.names, ["bank", "stream_id", "name"], [])
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), [])
+
     def test_cli_reports_a_clashing_id(self):
         clash = os.path.join(self.tmp.name, "clash_cli.csv")
         write_csv(clash, NAMES, [
