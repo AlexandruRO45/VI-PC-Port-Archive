@@ -427,6 +427,28 @@ OpFunctionEnd
                     self.assertEqual(len(r.stderr.splitlines()), 1)
                     self.assertFalse(os.path.exists(dst))
 
+    def test_cli_incomplete_bom_leaves_output_untouched(self):
+        for length in (1, 2):
+            for existing in (False, True):
+                with self.subTest(bom_bytes=length, existing=existing), tempfile.TemporaryDirectory() as d:
+                    src = os.path.join(d, "truncated.spvasm")
+                    dst = os.path.join(d, "output.spv")
+                    with open(src, "wb") as f:
+                        f.write(codecs.BOM_UTF8[:length])
+                    if existing:
+                        with open(dst, "wb") as f:
+                            f.write(b"existing output")
+                    result = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertTrue(result.stderr.startswith("ERROR:"), result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+                    if existing:
+                        with open(dst, "rb") as f:
+                            self.assertEqual(f.read(), b"existing output")
+                    else:
+                        self.assertFalse(os.path.exists(dst))
+
 
 _INT_HEAD = (
     "OpCapability Shader\nOpCapability Int64\nOpCapability Int16\nOpCapability Int8\n"

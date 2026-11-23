@@ -553,8 +553,9 @@ def main(argv=None) -> int:
                     help="target SPIR-V / Vulkan environment (default: vulkan1.2)")
     args = ap.parse_args(argv)
     try:
-        with open(args.src, encoding="utf-8-sig") as f:
-            text = f.read()
+        with open(args.src, "rb") as f:
+            # Decode the full buffer so a partial UTF-8 signature raises at EOF.
+            text = f.read().decode("utf-8-sig")
         data = assemble(text, target_env=args.target_env)
         with open(args.out, "wb") as f:
             f.write(data)
