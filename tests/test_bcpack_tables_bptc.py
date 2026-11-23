@@ -336,6 +336,21 @@ class TestHistoryHelpers(unittest.TestCase):
             self.assertEqual(second, {"endpointClass": {"0": 3}})
 
 
+    def test_history_file_saved_with_a_utf8_bom(self) -> None:
+        """A history JSON saved by Windows PowerShell 5.1 or Notepad starts with a UTF-8 BOM."""
+        doc = {"bc4": {}, "bc7": {"historyEndpoints": {"5": [[[1, 2, 3, 4]] * 2] * 3}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "history.json")
+            with open(path, "wb") as fh:
+                fh.write(b"\xef\xbb\xbf")
+                fh.write(json.dumps(doc).encode("utf-8"))
+            self.assertEqual(bptc.load_bc_history(4, path), ({}, {}, False))
+            self.assertEqual(
+                bptc._read_history_section(path, "bc7", "historyEndpoints"),
+                doc["bc7"],
+            )
+
+
 class TestLoadBc6h(unittest.TestCase):
     """Verifies load_bc6h() defaults, source resolution, and input validation."""
 
