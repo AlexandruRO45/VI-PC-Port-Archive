@@ -262,5 +262,23 @@ class TestDSWriteB16SIMDDivergence(unittest.TestCase):
             self.assertEqual(wave.lds.read_u16(base + lane * 2), 0x5555)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestDSWriteB16RegisterAliasing(unittest.TestCase):
+    def test_vaddr_aliases_vdata(self):
+        state = ScalarThreadState()
+        interp = ScalarDSInterpreter()
+        # Register v1 holds address 0x0080; its low 16 bits also serve as the data written!
+        state.vgprs[1] = 0x0080
+        inst = DSWriteB16Instruction(vaddr=VGPR(1), vdata=VGPR(1), offset=0)
+        interp.execute(state, inst)
+        # Value 0x0080 was written to address 0x0080
+        self.assertEqual(state.lds.read_u16(0x0080), 0x0080)
+        # Register v1 remained unchanged
+        self.assertEqual(state.vgprs[1], 0x0080)
+
+
 if __name__ == '__main__':
     unittest.main()
