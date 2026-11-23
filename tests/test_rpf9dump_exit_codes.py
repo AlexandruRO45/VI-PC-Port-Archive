@@ -79,6 +79,29 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
                     self.assertNotIn("Unhandled exception", done.stderr)
                     self.assertFalse(out.exists(), f"{label} source left {out} behind")
 
+    def test_non_archive_source_exits_2_before_the_output_folder_is_created(self):
+        # A file that exists but carries no 9FPR header is the same usage error as a mistyped path. ttpf, audio and
+        # xma read the archive document and used to die with an unhandled InvalidDataException after <out>/<name>
+        # existed; models and textures scan a headerless slice on purpose and must keep accepting one.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "not-an-archive.rpf"
+            src.write_bytes(bytes(range(256)) * 16)
+            for mode in ("ttpf", "audio", "xma"):
+                with self.subTest(mode=mode):
+                    out = root / f"out-{mode}"
+                    done = run(mode, src, out)
+                    self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                    self.assertIn("this mode can read", done.stderr)
+                    self.assertNotIn("Unhandled exception", done.stderr)
+                    self.assertFalse(out.exists(), f"{mode} left {out} behind on a non-archive source")
+            scan = root / "out-models"
+            done = run("models", src, scan)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertNotIn("Unhandled exception", done.stderr)
+            manifest = json.loads((scan / "not-an-archive" / "models" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["Count"], 0)
+
     def test_failed_xma_write_exits_nonzero_and_rerun_completes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
