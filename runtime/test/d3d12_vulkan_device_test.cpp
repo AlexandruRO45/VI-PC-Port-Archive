@@ -6453,10 +6453,8 @@ int main() {
             barrier = transition(ms_colour.p, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
             list->ResourceBarrier(1, &barrier);
             list->ClearRenderTargetView(rtv1, slice_green, 0, nullptr);
-            EXPECT(list->Close() == S_OK);
-            queue->ExecuteCommandLists(1, lists);
-            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_subresource);
-            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 2)) && SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
+            // CreateRenderTargetView validates slice bounds and writes a null descriptor, so Close fails cleanly.
+            EXPECT(list->Close() == E_INVALIDARG);
         }
 
         // 1D textures and 1D arrays use the same footprint path; one array layer is enough to prove the image

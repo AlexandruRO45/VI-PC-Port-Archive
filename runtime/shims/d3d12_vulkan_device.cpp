@@ -5574,6 +5574,104 @@ public:
         return kDescriptorSize;
     }
 
+    leonida::TargetView build_render_target_view(leonida::ResourceId rid, const D3D12_RESOURCE_DESC& rd,
+                                                 const Resource* r,
+                                                 const D3D12_RENDER_TARGET_VIEW_DESC* desc) const {
+        if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return {};
+        const Format resource_fmt = vulkan_format(rd.Format, false);
+        const bool typeless_color = resource_fmt.typeless && !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        const DXGI_FORMAT requested = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
+        if (rd.Format == DXGI_FORMAT_A8_UNORM || requested == DXGI_FORMAT_A8_UNORM) return {};
+
+        const Format named = vulkan_format(requested, false);
+        if (named.format == VK_FORMAT_UNDEFINED || named.typeless || named.rgb96 ||
+            named.aspects != VK_IMAGE_ASPECT_COLOR_BIT)
+            return {};
+
+        const bool msaa = rd.SampleDesc.Count > 1;
+        leonida::TargetView view{};
+        UINT plane = 0;
+        if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+            if (msaa) return {};
+            view = volume_rtv(rid, rd, desc);
+            if (!view.resource) return {};
+        } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+            if (msaa) return {};
+            if (!desc) {
+                view = line_target_view(rid, rd, 0, 0, rd.DepthOrArraySize);
+            } else if (desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D) {
+                view = line_target_view(rid, rd, desc->Texture1D.MipSlice, 0, 1);
+            } else if (desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY) {
+                view = line_target_view(rid, rd, desc->Texture1DArray.MipSlice,
+                                        desc->Texture1DArray.FirstArraySlice, desc->Texture1DArray.ArraySize);
+            } else {
+                log_once("render-target view dimension not supported:", desc->ViewDimension);
+                return {};
+            }
+            if (!view.resource) return {};
+        } else if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            if (!desc) {
+                view = {rid, 0, 0, rd.DepthOrArraySize};
+            } else if (!msaa && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
+                plane = desc->Texture2D.PlaneSlice;
+                view = {rid, desc->Texture2D.MipSlice, 0, 1};
+            } else if (!msaa && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY) {
+                plane = desc->Texture2DArray.PlaneSlice;
+                view = {rid, desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
+                        view_slices(rd, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize)};
+            } else if (msaa && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) {
+                view = {rid, 0, 0, 1};
+            } else if (msaa && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY) {
+                // Multisample textures have one mip, so only the slice range is chosen (as for the DSV).
+                view = {rid, 0, desc->Texture2DMSArray.FirstArraySlice,
+                        view_slices(rd, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize)};
+            } else {
+                log_once("render-target view dimension not supported:", desc->ViewDimension);
+                return {};
+            }
+            // Subtraction keeps malformed layer ranges from overflowing during validation.
+            if (plane || view.mip >= rd.MipLevels || !view.layer_count ||
+                view.first_layer >= rd.DepthOrArraySize ||
+                view.layer_count > rd.DepthOrArraySize - view.first_layer)
+                return {};
+        } else {
+            if (desc) log_once("render-target view dimension not supported:", desc->ViewDimension);
+            return {};
+        }
+
+        // A TYPELESS color texture of any family takes RTVs in its family's formats (D3D-275).
+        // An RGBA8 or BGRA8 texture whose castable list names the RTV's format in the other channel order, or
+        // across B8G8R8X8 and B8G8R8A8, gets an RTV in that format.
+        // A typed UNORM RGBA8 resource with a castable list may be viewed in a listed family format
+        // (D3D-85's committed path, D3D-90's placed one): its image is mutable and lists the view
+        // format, so the reinterpretation is the typeless path's. Only a UNORM image is advertised,
+        // as that is what the clear path reinterprets.
+        const bool cast_listed = r && requested != rd.Format && rgba8_any_order(rd.Format) &&
+                                 rgba8_any_order(requested) && r->lists_castable_format(requested);
+        const bool listed = requested == rd.Format ||
+                            (r && r->has_view_format_list() && r->allows_view_format(named.format));
+        if (typeless_color || cast_listed ||
+            (requested != rd.Format && listed && rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
+            const int family = leonida::detail::typeless_view_family(named.format);
+            const bool same_family =
+                alpha_unused(requested) == alpha_unused(rd.Format) &&
+                family == leonida::detail::typeless_view_family(resource_fmt.format);
+            if (!family || !(same_family || cast_listed)) {
+                log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
+                return {};
+            }
+            view.format = static_cast<leonida::ColorViewFormat>(named.format);
+        } else if (requested != rd.Format) {
+            log_once("unsupported RTV format cast:", int(requested));
+            return {};
+        }
+
+        VkFormatProperties properties{};
+        state_.format_properties(state_.info.physical, named.format, &properties);
+        if (!(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) return {};
+        return view;
+    }
+
     void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateRenderTargetView");
@@ -5590,104 +5688,7 @@ public:
             rd = resource->GetDesc();
         }
         if (rid) {
-            view = {rid, 0, 0, rd.DepthOrArraySize};
-            if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
-                view = volume_rtv(rid, rd, desc);
-            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D) {
-                view = line_target_view(rid, rd, desc->Texture1D.MipSlice, 0, 1);
-            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY) {
-                view = line_target_view(rid, rd, desc->Texture1DArray.MipSlice,
-                                        desc->Texture1DArray.FirstArraySlice, desc->Texture1DArray.ArraySize);
-            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
-                view = {rid, desc->Texture2D.MipSlice, 0, 1};
-            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS) {
-                view = {rid, 0, 0, 1};
-            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY) {
-                view = {rid, desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
-                        view_slices(rd, desc->Texture2DArray.FirstArraySlice, desc->Texture2DArray.ArraySize)};
-            } else if (desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY) {
-                // Multisample textures have one mip, so only the slice range is chosen (as for the DSV).
-                view = {rid, 0, desc->Texture2DMSArray.FirstArraySlice,
-                        view_slices(rd, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize)};
-            } else if (desc) {
-                log_once("render-target view dimension not supported:", desc->ViewDimension);
-                view = {};
-            }
-            // A TYPELESS color texture of any family takes RTVs in its family's formats (D3D-275; RGBA8 only before).
-            const bool typeless_color = vulkan_format(rd.Format, false).typeless &&
-                                        !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-            const bool typed_rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rd.Format == DXGI_FORMAT_R8G8B8A8_UINT;
-            // An RGBA8 or BGRA8 texture whose castable list names the RTV's format in the other channel order, or
-            // across B8G8R8X8 and B8G8R8A8, gets an RTV in that format.
-            const DXGI_FORMAT asked = desc && desc->Format != DXGI_FORMAT_UNKNOWN ? desc->Format : rd.Format;
-            const bool cast_listed = r && asked != rd.Format && rgba8_any_order(rd.Format) && rgba8_any_order(asked) &&
-                                     r->lists_castable_format(asked);
-            // A typed BGRA8 or B8G8R8X8 texture with a castable list refuses an RTV in another format the list
-            // doesn't name, as a typed RGBA8 texture does. Without a list it keeps the image's format, as before.
-            const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
-                                            r->has_castable_formats();
-            if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
-                view = {};
-            } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
-                       (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
-                if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
-                    (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format))
-                    view = {};
-            } else if (typeless_color || typed_rgba8 || cast_listed || typed_bgra8_listed) {
-                const DXGI_FORMAT requested = asked;
-                // A typed UNORM RGBA8 resource with a castable list may be viewed in a listed family format
-                // (D3D-85's committed path, D3D-90's placed one): its image is mutable and lists the view
-                // format, so the reinterpretation is the typeless path's. Only a UNORM image is advertised,
-                // as that is what the clear path reinterprets.
-                const bool listed = requested == rd.Format ||
-                                    (r && r->has_view_format_list() &&
-                                     r->allows_view_format(vulkan_format(requested, false).format));
-                if (typeless_color || cast_listed ||
-                    (requested != rd.Format && listed && rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
-                    const bool msaa = rd.SampleDesc.Count > 1;
-                    const bool plain_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D;
-                    const bool array_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
-                    const bool plain_2d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D;
-                    const bool array_2d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
-                    const bool ms = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS;
-                    const bool ms_array = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
-                    const UINT plane = plain_2d ? desc->Texture2D.PlaneSlice :
-                        array_2d ? desc->Texture2DArray.PlaneSlice : 0;
-                    const bool dim_ok = ((plain_1d || array_1d) && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) ||
-                                        ((plain_2d || array_2d || ms || ms_array) &&
-                                         rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
-                    // Subtraction keeps malformed layer ranges from overflowing during validation.
-                    if (!dim_ok || plane || !view.resource || view.mip >= rd.MipLevels ||
-                        !view.layer_count || view.first_layer >= rd.DepthOrArraySize ||
-                        view.layer_count > rd.DepthOrArraySize - view.first_layer ||
-                        !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
-                        view = {};
-                    } else {
-                        // The view's own format, of the resource's family (B8G8R8X8 and B8G8R8A8 are two families
-                        // that share Vulkan formats) or named by its castable list; the clear and the attachment
-                        // view reinterpret the image in it.
-                        const Format named = vulkan_format(requested, false);
-                        const int family = leonida::detail::typeless_view_family(named.format);
-                        const bool same_family =
-                            alpha_unused(requested) == alpha_unused(rd.Format) &&
-                            family == leonida::detail::typeless_view_family(vulkan_format(rd.Format, false).format);
-                        if (named.typeless || named.rgb96 || !family || !(same_family || cast_listed))
-                            view = {};
-                        else
-                            view.format = static_cast<leonida::ColorViewFormat>(named.format);
-                        if (view.resource) {
-                            const auto format = vulkan_format(requested, false);
-                            VkFormatProperties properties{};
-                            state_.format_properties(state_.info.physical, format.format, &properties);
-                            if (!(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) view = {};
-                        }
-                    }
-                } else if (requested != rd.Format) {
-                    view = {}; // No typed-resource format casting is advertised by this backend.
-                }
-                if (!view.resource) log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
-            }
+            view = build_render_target_view(rid, rd, r, desc);
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");
         }
