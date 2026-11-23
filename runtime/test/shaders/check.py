@@ -140,6 +140,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # cs_w64_mask_sgpr.asm headers; word = set lanes | lowest lane << 8)
             ("cs_w32_mask_sgpr", [16, 1028, 24, 4294967040, 32, 1040, 8, 4104]),
             ("cs_w64_mask_sgpr", [32, 8193, 4294967040, 64, 1048, 4120, 24, 25]),
+            # a single-SGPR VOP3 mask that is a certified half still reads the pair (cs_w64_mask_sgpr_half.asm)
+            ("cs_w64_mask_sgpr_half", [36, 36, 24, 24]),
             # s_andn2_saveexec_b32 / s_andn2_wrexec_b32: EXEC = S0 & ~EXEC, D old / new EXEC, SCC (cs_w32_andn2_exec.asm)
             ("cs_w32_andn2_exec", [1, 8, 16, 2064, 2068, 3, 20, 1544]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),

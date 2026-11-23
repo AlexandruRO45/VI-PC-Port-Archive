@@ -67,6 +67,10 @@ class GpuTestFixtures(unittest.TestCase):
     def test_wave64_native_subgroup(self):
         self.check(run(translate("cs_w64_mask_sgpr", 64), 64, 64), W64_WORDS)
 
+    def test_wave64_single_sgpr_half_fixture(self):
+        mem = run(translate("cs_w64_mask_sgpr_half", 64), 64, 64)
+        self.assertEqual([mem.get(4 * k) for k in range(4)], [36, 36, 24, 24])
+
     def test_wave64_emulated_translation(self):
         # Same per-lane bit test, lane = local index & 63, the pair's half chosen by lane < 32.
         spv = translate("cs_w64_mask_sgpr", 64, emulate=True)
@@ -156,6 +160,32 @@ class HandWrittenCases(unittest.TestCase):
                 "buffer_store_dword v8, v10, s[0:3], 0 offen"]
         mem = run(translate("cs_ms_ci64", 64, lines=body), 64, 64)
         self.assertEqual([mem.get(4 * i, 0) for i in range(64)], bits(0xFF00FF, 0, 32) + bits(0xF0F0F0F0, 0, 32))
+
+    def lanes64(self, name, setup, op):
+        body = ["s_mov_b64 exec, -1"] + setup + [op, "v_lshlrev_b32 v10, 2, v0",
+                                                 "buffer_store_dword v8, v10, s[0:3], 0 offen"]
+        mem = run(translate(name, 64, lines=body), 64, 64)
+        return [mem.get(4 * i, 0) for i in range(64)]
+
+    def test_wave64_single_sgpr_certified_half_reads_pair(self):
+        # s4 = exec_lo copy (a certified mask half), s5 independent data: lanes 32-63 take s5, not s4 (review of #2241).
+        setup = ["v_cmpx_gt_u32_e32 40, v0", "s_mov_b32 s4, exec_lo", "s_mov_b32 s5, 0xf0f0f0f0"]
+        want = [1] * 32 + bits(0xF0F0F0F0, 0, 8) + [0] * 24
+        for tag, op in (("cnd", "v_cndmask_b32_e64 v8, 0, 1, s4"), ("ci", "v_add_co_ci_u32_e64 v8, s6, 0, 0, s4")):
+            got = self.lanes64("cs_ms_half_" + tag, setup, op)
+            self.assertEqual(got[:40], want[:40], tag)
+
+    def test_wave64_single_sgpr_vcc_half_reads_pair(self):
+        setup = ["v_cmp_gt_u32_e32 vcc_lo, 8, v0", "s_mov_b32 s4, vcc_lo", "s_mov_b32 s5, 0x00ff00ff"]
+        want = bits(0xFF, 0, 8) + [0] * 24 + bits(0x00FF00FF, 0, 32)
+        for tag, op in (("cnd", "v_cndmask_b32_e64 v8, 0, 1, s4"), ("ci", "v_add_co_ci_u32_e64 v8, s6, 0, 0, s4")):
+            self.assertEqual(self.lanes64("cs_ms_vhalf_" + tag, setup, op), want, tag)
+
+    def test_wave64_single_sgpr_mask_low_data_high(self):
+        # s4 a v_cmp mask, s5 data from a constant: same exact data path as a pair that is not certified.
+        setup = ["v_cmp_eq_u32_e64 s[4:5], v0, 3", "s_mov_b32 s5, 0x80000001"]
+        got = self.lanes64("cs_ms_mixed", setup, "v_cndmask_b32_e64 v8, 0, 1, s4")
+        self.assertEqual(got, [1 if i == 3 else 0 for i in range(32)] + [1] + [0] * 30 + [1])
 
     def test_wave64_cndmask_certified_single_unchanged(self):
         body = ["s_mov_b64 exec, -1", "v_cmp_eq_u32_e64 s[4:5], v0, 40", "v_cndmask_b32_e64 v8, 0, 1, s4",

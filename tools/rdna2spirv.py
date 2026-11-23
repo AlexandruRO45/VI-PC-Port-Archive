@@ -5090,9 +5090,11 @@ class Gen:
     def vop3_mask_operand(self, m):
         """The carry-in / select mask operand of a VOP3 v_cndmask_b32 or v_add/sub/subrev_co_ci_u32. The corpus listing
         prints it in wave32 syntax in wave64 (`s4`, like `vcc_lo`), but the hardware reads the 64-bit pair s[4:5]
-        (llvm-mc gfx1030 encodes both spellings the same): a single SGPR that is not a certified mask becomes the pair,
-        so lanes 32-63 take their bit from r+1."""
-        if self.wave64 and m["k"] == "sgpr" and m.get("n", 1) == 1 and not self.holds_lane_mask(m):
+        (llvm-mc gfx1030 encodes both spellings the same): a single SGPR always becomes the pair, certified mask or
+        not (a mask half such as `s_mov_b32 s4, exec_lo` leaves s5 free to hold another mask or data), so lanes 32-63
+        take their bit from r+1. mask_src then selects lo/hi when both words are masks, else takes bit L of the
+        64-bit value, which is exact for a mask word too (it holds 0 / ~0 per invocation)."""
+        if self.wave64 and m["k"] == "sgpr" and m.get("n", 1) == 1:
             return dict(m, n=2)
         return m
 
