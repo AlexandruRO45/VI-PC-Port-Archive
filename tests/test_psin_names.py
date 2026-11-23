@@ -78,6 +78,25 @@ class TestDictionaries(unittest.TestCase):
                 f.write("prop_lamp_03\n\n")
             self.assertEqual(N.load_names([j, t]), {"prop_crate_01", "veh_frame", "prop_lamp_03"})
 
+    def test_utf8_bom_is_not_part_of_the_first_name(self):
+        # Windows PowerShell 5.1's `Out-File -Encoding utf8` writes a BOM; it used to stay on the first name.
+        with tempfile.TemporaryDirectory() as d:
+            t, j = os.path.join(d, "n.txt"), os.path.join(d, "n.json")
+            with open(t, "wb") as f:
+                f.write(b"\xef\xbb\xbfprop_lamp_03\r\nveh_frame\r\n")
+            with open(j, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps({"files": [{"names": ["prop_crate_01.#dr"]}]}).encode())
+            self.assertEqual(N.load_names([t, j]), {"prop_lamp_03", "veh_frame", "prop_crate_01"})
+
+    def test_utf16_name_list_is_refused(self):
+        # Windows PowerShell 5.1's `>` writes UTF-16; read as UTF-8 none of its names matched, silently.
+        with tempfile.TemporaryDirectory() as d:
+            t = os.path.join(d, "n.txt")
+            with open(t, "wb") as f:
+                f.write(b"\xff\xfe" + "prop_lamp_03\r\n".encode("utf-16-le"))
+            with self.assertRaisesRegex(ValueError, "UTF-16"):
+                N.load_names([t])
+
 
 class TestScan(unittest.TestCase):
     def folder(self, d, blobs):

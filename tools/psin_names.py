@@ -91,9 +91,12 @@ def load_names(paths):
     JSON, or not the shape rpf9_names.py writes, raises ValueError naming the file (--names is repeatable)."""
     names = set()
     for path in paths:
+        # A UTF-8 BOM (Windows PowerShell 5.1's `Out-File -Encoding utf8`) is dropped instead of becoming part of the
+        # first name; a UTF-16 text list (PowerShell 5.1's `>`) is refused, since read as UTF-8 none of its names
+        # match. A UTF-16 .json is already refused as "not JSON" below.
         if path.endswith(".json"):
             try:
-                with open(path, encoding="utf-8") as f:
+                with open(path, encoding="utf-8-sig") as f:
                     doc = json.load(f)
             except (ValueError, RecursionError) as e:   # ValueError: not JSON, or not UTF-8
                 raise ValueError(f"{path}: not JSON: {e}") from None
@@ -107,7 +110,11 @@ def load_names(paths):
                                      "strings")
                 names.update(SUFFIX.sub("", n) for n in listed)
         else:
-            with open(path, encoding="utf-8", errors="replace") as f:
+            with open(path, "rb") as f:
+                if f.read(2) in (b"\xff\xfe", b"\xfe\xff"):
+                    raise ValueError(f"{path}: the name list is UTF-16 (PowerShell 5.1's `>` writes it); save it as "
+                                     "UTF-8, e.g. with `Out-File -Encoding utf8`")
+            with open(path, encoding="utf-8-sig", errors="replace") as f:
                 names.update(line.strip() for line in f)
     names.discard("")
     return names

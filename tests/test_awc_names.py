@@ -294,6 +294,47 @@ class TestCli(unittest.TestCase):
             path = write(os.path.join(tmp, "hashes.json"), json.dumps({"0000abcd": "Some_Word"}))
             self.assertEqual(A.read_words(path), ["Some_Word"])
 
+    def named_rows(self, tmp, words):
+        """Run the CLI on a bank holding two dialogue streams with ``words`` as --words; the CSV rows it names."""
+        banks = os.path.join(tmp, "banks")
+        os.mkdir(banks)
+        write(os.path.join(banks, "dlg.awc"), make_bank(["zz_rootau_abcd_01", "zz_rootau_efgh_01"]))
+        out = os.path.join(tmp, "names.csv")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(A.main([banks, "--words", words, "--out", out]), 0)
+        with open(out, encoding="utf-8", newline="") as fh:
+            return list(csv.DictReader(fh))
+
+    def test_word_list_with_utf8_bom_keeps_its_first_word(self):
+        # Windows PowerShell 5.1's `Out-File -Encoding utf8` starts the file with a BOM; read as plain UTF-8 it stuck
+        # to the first word ("﻿zz_rootau_abcd_01"), which then named nothing.
+        lines = "zz_rootau_abcd_01\r\nzz_rootau_efgh_01\r\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = self.named_rows(tmp, write(os.path.join(tmp, "plain.txt"), lines.encode("utf-8")))
+        with tempfile.TemporaryDirectory() as tmp:
+            bom = self.named_rows(tmp, write(os.path.join(tmp, "bom.txt"), b"\xef\xbb\xbf" + lines.encode("utf-8")))
+            self.assertEqual(A.read_words(os.path.join(tmp, "bom.txt")), ["zz_rootau_abcd_01", "zz_rootau_efgh_01"])
+        self.assertEqual(len(plain), 2)
+        self.assertEqual(len(bom), len(plain))
+
+    def test_hashdict_json_words_with_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "hashes.json"), b"\xef\xbb\xbf" + b'{"0000abcd": "Some_Word"}')
+            self.assertEqual(A.read_words(path), ["Some_Word"])
+
+    def test_utf16_word_list_reports_rc_2_instead_of_naming_nothing(self):
+        # Windows PowerShell 5.1's `>` writes UTF-16LE with a BOM; read as UTF-8 no word matched and the run exited 0.
+        for bom, codec in ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+            with self.subTest(codec=codec), tempfile.TemporaryDirectory() as tmp:
+                write(os.path.join(tmp, "dlg.awc"), make_bank(["zz_rootau_abcd_01"]))
+                words = write(os.path.join(tmp, "words.txt"), bom + "zz_rootau_abcd_01\r\n".encode(codec))
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = A.main([tmp, "--words", words, "--out", os.path.join(tmp, "o.csv")])
+                self.assertEqual(rc, 2)
+                self.assertIn("UTF-16", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+
     def test_needs_a_dictionary(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             A.main([ROOT])
