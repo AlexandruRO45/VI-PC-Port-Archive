@@ -276,6 +276,29 @@ class ScanTest(unittest.TestCase):
         self.assertEqual((report["banks"], report["streamed_music"]["events"], report["other"]["chunks"]), (1, 1, 0))
         self.assertIsNone(report["other"]["events_per_chunk"])
 
+    def test_failed_replace_preserves_the_previous_report_and_cleans_up_temp_files(self):
+        src = self.write("one.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
+        report = self.write("markers.json", b"previous report\n")
+        with mock.patch.object(awc_markers, "replace_retry", side_effect=PermissionError(13, "locked", report)), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(awc_markers.main([src, "--out", report]), 1)
+        self.assertIn("cannot write", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+        with open(report, "rb") as f:
+            self.assertEqual(f.read(), b"previous report\n")
+        self.assertEqual([name for name in os.listdir(self.tmp.name) if name.startswith(".awc_markers-")], [])
+
+    def test_successful_staged_write_produces_valid_json_and_cleans_up_temp_files(self):
+        report = self.write("markers.json", b"previous report\n")
+        payload = {"banks": 1, "streams": 2}
+        awc_markers.write_json(report, payload)
+        with open(report, "rb") as f:
+            raw = f.read()
+        self.assertNotIn(b"\r", raw)
+        self.assertEqual(json.loads(raw), payload)
+        self.assertEqual([name for name in os.listdir(self.tmp.name) if name.startswith(".awc_markers-")], [])
+
     def test_runs_under_python_dash_i(self):
         path = self.write("one.awc", speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
         proc = subprocess.run([sys.executable, "-I", TOOL, path], capture_output=True, text=True, timeout=120)

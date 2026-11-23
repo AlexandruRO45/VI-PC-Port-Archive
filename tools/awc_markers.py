@@ -25,11 +25,15 @@ The report holds counts, sizes, 32-bit hashes and numeric ranges only.
 import argparse
 import json
 import os
+import stat
 import statistics
 import struct
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from rsc8_audio import parse_adat_at_file  # noqa: E402
 
 TAG_MUSIC, TAG_DATA, TAG_FORMAT, TAG_MARKER = 0x48, 0x55, 0x76, 0xBD
@@ -196,6 +200,45 @@ def scan(src: str) -> dict:
     return {"banks": banks, "streams": streams, **{name: _finish(g) for name, g in groups.items()}}
 
 
+def write_json(path, payload):
+    """Write `payload` as JSON via a sibling temporary file so a failed write preserves any previous report."""
+    destination = os.path.realpath(path)
+    try:
+        existing = os.stat(destination)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        with open(destination, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        return
+    if existing is not None:
+        # Fail before staging if an existing regular file is read-only or locked.
+        os.close(os.open(destination, os.O_WRONLY))
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            delete=False,
+            dir=os.path.dirname(destination) or ".",
+            prefix=".awc_markers-",
+            suffix=".tmp",
+        ) as staged:
+            json.dump(payload, staged, indent=2)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        if staged is not None:
+            try:
+                os.unlink(staged.name)
+            except FileNotFoundError:
+                pass
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Count AWC marker events (tag 0xBD); hashes and counts only.")
     ap.add_argument("src", help="an RPF9 archive, an .awc bank, or a directory scanned recursively for *.awc")
@@ -210,9 +253,12 @@ def main(argv=None) -> int:
         print(f"awc_markers: error: cannot read {error.filename or a.src}: {error.strerror or error}", file=sys.stderr)
         return 1
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=2)
-            f.write("\n")
+        try:
+            write_json(a.out, report)
+        except OSError as error:
+            print(f"awc_markers: error: cannot write {error.filename or a.out}: {error.strerror or error}",
+                  file=sys.stderr)
+            return 1
     print(f"{report['banks']} banks, {report['streams']} streams")
     for name in ("streamed_music", "other"):
         g = report[name]
