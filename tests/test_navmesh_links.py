@@ -290,6 +290,8 @@ class NavmeshLinksTest(unittest.TestCase):
             rpf = os.path.join(tmp, "nav.rpf")
             make_rpf(rpf, build_tile())
             rpf_upper = os.path.join(tmp, "NAV.RPF")
+            hard_link = os.path.join(tmp, "nav_hard.rpf")
+            os.link(rpf, hard_link)
             missing = os.path.join(tmp, "no_such.rpf")
             for argv in (
                 [missing],
@@ -299,6 +301,7 @@ class NavmeshLinksTest(unittest.TestCase):
                 [tmp, "--limit", "64"],
                 [rpf, "--out", tmp],
                 [rpf, "--out", rpf],
+                [rpf, "--out", hard_link],
             ):
                 rc = nl.main(argv)
                 self.assertEqual(rc, 2, f"expected exit code 2 for {argv}")
@@ -306,6 +309,14 @@ class NavmeshLinksTest(unittest.TestCase):
                 self.assertEqual(nl.main([rpf, "--out", rpf_upper]), 2)
                 with open(rpf, "rb") as fh:
                     self.assertEqual(fh.read(4), b"9FPR")
+
+    @unittest.skipUnless(os.name == "nt", "the file system folds case-only spellings onto one file")
+    def test_cli_out_case_only_spelling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "nav.rpf")
+            make_rpf(rpf, build_tile())
+            rc = nl.main([rpf, "--out", os.path.join(tmp, "NAV.RPF")])
+            self.assertEqual(rc, 2, "a case-only spelling of the input must not pass the --out guard")
 
 
 if __name__ == "__main__":
