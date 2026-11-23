@@ -361,6 +361,26 @@ class TestSLshrB64Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x789ABCDE)
 
+def ref_s_ashr_i64(src: int, shift: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_ashr_i64 -> (result, scc)."""
+    sh = shift & 63
+    val = src & MASK64
+    sval = val - (1 << 64) if val & (1 << 63) else val
+    res = (sval >> sh) & MASK64
+    scc = 1 if res != 0 else 0
+    return res, scc
+
+
+class TestSAshrI64Oracle(unittest.TestCase):
+    def test_positive_numbers(self) -> None:
+        self.assertEqual(ref_s_ashr_i64(0x1000000000, 4), (0x0100000000, 1))
+
+    def test_negative_sign_extension(self) -> None:
+        # 0x8000000000000000 >> 8 = 0xFF80000000000000
+        self.assertEqual(ref_s_ashr_i64(0x8000000000000000, 8), (0xFF80000000000000, 1))
+        # -1 (0xFFFFFFFFFFFFFFFF) >> any = -1
+        self.assertEqual(ref_s_ashr_i64(MASK64, 20), (MASK64, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
