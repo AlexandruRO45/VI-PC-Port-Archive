@@ -10,9 +10,12 @@ inline std::error_code prepare_xdxr_build_output(const std::filesystem::path& di
     if (ec) return ec;
 
     // A failed run must not leave the previous run's cases for the checker to pass.
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        const auto ext = entry.path().extension();
-        if (ext == ".bin" || ext == ".json") std::filesystem::remove(entry.path(), ec);
+    using std::filesystem::directory_iterator;
+    for (directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto ext = it->path().extension();
+        if (ext != ".bin" && ext != ".json") continue;
+        std::filesystem::remove(it->path(), ec);
+        if (ec) return ec;
     }
-    return {};
+    return ec;
 }

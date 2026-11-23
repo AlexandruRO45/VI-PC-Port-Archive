@@ -246,7 +246,7 @@ int main(int argc, char** argv) {
     }
     const std::string dir = argv[1];
     if (const auto ec = prepare_xdxr_build_output(dir, argc > 2)) {
-        std::fprintf(stderr, "cannot create output directory %s: %s\n", dir.c_str(), ec.message().c_str());
+        std::fprintf(stderr, "cannot prepare output directory %s: %s\n", dir.c_str(), ec.message().c_str());
         return 1;
     }
     vktest::Device gpu;

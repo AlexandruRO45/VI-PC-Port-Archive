@@ -40,4 +40,10 @@ int main() {
     CHECK(!fs::exists(output / "old.bin"));
     CHECK(fs::is_regular_file(output / "keep.txt"));
     CHECK(prepare_xdxr_build_output(output / "keep.txt", false));
+
+    const auto blocked = output / "stale.json";
+    CHECK(fs::create_directory(blocked));
+    CHECK(bool(std::ofstream(blocked / "keep.txt") << "keep"));
+    CHECK(prepare_xdxr_build_output(output, false));
+    CHECK(fs::is_regular_file(blocked / "keep.txt"));
 }
