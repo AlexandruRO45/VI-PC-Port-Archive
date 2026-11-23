@@ -98,11 +98,13 @@ dword and the buffer's bounds first.
 | Type | Low half | High half | Source |
 |---|---|---|---|
 | 0 | Sphere radius: clamped against the reflection ray to pick the closest point on the light. Brightness grows with radius², since intensity is radiance. | No effect. | Tested by @Silliana [on the pull request](https://github.com/ItsNotRexed/Leonida/pull/3157): radius 60 → 5 dimmed the light about 134× (radius² predicts 144×). |
-| unknown (rectangle) | Half-size along one axis of a rectangle. | Half-size along the other axis. | Shader: the light's position is moved by ± each half along its axis, and points are clamped to those bounds. |
-| unknown (axis length) | — | A length along the light's axis (clamped to ± half of it), also squared and compared against a distance. Probably a tube light's length (@Silliana's hypothesis, not tested). | Shader. |
+| 1 and 3 (rectangle) | Half-size along one axis of a rectangle. | Half-size along the other axis. | Shader: both types take the same path. The light's position is moved by ± each half along its axis, and points are clamped to those bounds. |
+| 2 (axis length) | — | A length along the light's axis (clamped to ± half of it), also squared and compared against a distance. Probably a tube light's length (@Silliana's hypothesis, not tested). | Shader: two separate sites test for type 2 before reading it. |
 
-The low half also sets one blend factor. No range-style falloff was found: neither half divides a distance, and the
-early reading of the high half as a range is dropped.
+Types 1 and 3 differ elsewhere: on type 1 the low half also sets one blend factor, and type 3 scales one term by
+about 0.966. No range-style falloff was found, so the early reading of the high half as a range is dropped. The type-2
+length does reach a reciprocal, but as the squared length minus a squared distance, where the closest point on the
+light is solved for, not as a falloff.
 
 A value that's too big makes the light too large. On a sphere light, the brightness grows with the square of the
 radius. That gives scattered single-pixel specular blowups that look like a translator bug, for example when a range
