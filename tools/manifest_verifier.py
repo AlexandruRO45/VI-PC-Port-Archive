@@ -28,6 +28,11 @@ import sys
 import time
 from typing import Callable, Optional, TextIO
 
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+from report_paths import same_report_path  # noqa: E402
+
 CHUNK = 8 * 1024 * 1024
 DEFAULT_MANIFEST = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
 CACHE_VERSION = 1
@@ -129,13 +134,23 @@ def _cache_stamp(path: str, st: os.stat_result) -> list[int]:
     return [st.st_size, st.st_mtime_ns, _change_time(path, st), st.st_dev, st.st_ino]
 
 
+def _valid_cache_entry(entry: object) -> bool:
+    return (
+        isinstance(entry, dict)
+        and isinstance(entry.get("sha256"), str)
+        and isinstance(entry.get("stamp"), list)
+        and len(entry["stamp"]) == 5
+        and all(type(v) is int for v in entry["stamp"])
+    )
+
+
 def load_cache(path: str) -> dict[str, dict]:
     """Loads the verify cache. missing or broken cache just counts as empty, never an error."""
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             doc = json.load(f)
-        if doc["version"] == CACHE_VERSION:
-            return {k: e for k, e in doc["files"].items() if isinstance(e, dict) and "stamp" in e and "sha256" in e}
+        if isinstance(doc, dict) and doc.get("version") == CACHE_VERSION and isinstance(doc.get("files"), dict):
+            return {k: e for k, e in doc["files"].items() if isinstance(k, str) and _valid_cache_entry(e)}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     return {}
@@ -213,7 +228,7 @@ def load_manifest(path: str) -> dict[str, dict]:
         return result
 
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             doc = json.load(f, object_pairs_hook=unique_object)
     except ValueError as err:
         raise ManifestError(f"{path} is not valid JSON ({err})") from None
@@ -336,6 +351,15 @@ def verify_manifest(
         raise ManifestError(f"target path is not a directory: {target_dir}")
 
     want = load_manifest(manifest_path)
+    if cache_path is not None:
+        if os.path.isdir(cache_path):
+            raise ManifestError(f"cache path is a directory: {cache_path}")
+        if same_report_path(cache_path, manifest_path):
+            raise ManifestError(f"cache path would overwrite manifest: {cache_path}")
+        for rel in sorted(want.keys()):
+            tracked_path = os.path.join(target_dir, *rel.split("/"))
+            if same_report_path(cache_path, tracked_path):
+                raise ManifestError(f"cache path would overwrite tracked file {rel!r}: {cache_path}")
     have = dict(walk(target_dir, exclude=manifest_path if cache_path is None else (manifest_path, cache_path)))
     if not want and have:
         # A cut-short create or a mistyped --manifest would otherwise print OK without checking a file.

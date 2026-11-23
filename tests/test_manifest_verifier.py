@@ -947,12 +947,54 @@ class TestVerifyCache(unittest.TestCase):
         self.assertFalse(os.path.exists(self.cache))
 
     def test_junk_cache_is_ignored(self) -> None:
-        for text in ("not json", "[]", '{"version": 999, "files": {}}', '{"version": 1, "files": {"k": 3}}'):
+        key = mv._cache_key(os.path.join(self.game, "a.bin"))
+        for text in (
+            "not json",
+            "[]",
+            '{"version": 999, "files": {}}',
+            '{"version": 1, "files": {"k": 3}}',
+            json.dumps({"version": 1, "files": {key: {"stamp": None, "sha256": 123}}}),
+            json.dumps({"version": 1, "files": {key: {"stamp": [True, 1, 2, 3, 4], "sha256": "a" * 64}}}),
+        ):
             with self.subTest(text=text):
                 with open(self.cache, "w", encoding="utf-8", newline="\n") as f:
                     f.write(text)
                 report = self.verify()
                 self.assertEqual((report.passed, report.cached), (True, 0))
+
+    def test_cache_and_manifest_accept_utf8_bom(self) -> None:
+        with open(self.manifest, "rb") as f:
+            raw_manifest = f.read()
+        with open(self.manifest, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + raw_manifest)
+        self.assertTrue(self.verify().passed)
+        with open(self.cache, "rb") as f:
+            raw_cache = f.read()
+        with open(self.cache, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + raw_cache)
+        with patch.object(mv, "sha256_file", side_effect=AssertionError("hashed again")):
+            report = self.verify()
+        self.assertEqual((report.passed, report.cached), (True, 2))
+
+    def test_cache_path_cannot_be_directory_or_overwrite_manifest_or_tracked_file(self) -> None:
+        tracked = os.path.join(self.game, "a.bin")
+        with open(self.manifest, "rb") as f:
+            manifest_before = f.read()
+        with open(tracked, "rb") as f:
+            tracked_before = f.read()
+        for bad_cache, msg in (
+            (self.game, "cache path is a directory"),
+            (self.manifest, "cache path would overwrite manifest"),
+            (os.path.join(self.game, "..", "manifest.json"), "cache path would overwrite manifest"),
+            (tracked, "cache path would overwrite tracked file 'a.bin'"),
+        ):
+            with self.subTest(bad_cache=bad_cache):
+                with self.assertRaisesRegex(mv.ManifestError, msg):
+                    mv.verify_manifest(self.game, self.manifest, cache_path=bad_cache)
+        with open(self.manifest, "rb") as f:
+            self.assertEqual(f.read(), manifest_before)
+        with open(tracked, "rb") as f:
+            self.assertEqual(f.read(), tracked_before)
 
     def test_cache_inside_target_and_strict(self) -> None:
         self.cache = os.path.join(self.game, "cache.json")
