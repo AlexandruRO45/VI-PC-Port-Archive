@@ -75,17 +75,19 @@ std::wstring lower(std::wstring s) {
 
 bool same_name(const wchar_t* a, const wchar_t* b) { return _wcsicmp(a, b) == 0; }
 
-// The narrow API (CreateFileA and friends) takes ANSI code page text, as the CRT does; the loader's own paths are
-// handled as wide strings everywhere else.
+// Filename inputs to CreateFileA and friends use the process's file API mode. A title can switch it with
+// SetFileApisToOEM/SetFileApisToANSI; take one snapshot for both conversion calls. The loader's paths stay wide.
 std::wstring widen_ansi(const char* s) {
     if (!s) return {};
-    const int n = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
+    const UINT code_page = ::AreFileApisANSI() ? CP_ACP : CP_OEMCP;
+    const int n = MultiByteToWideChar(code_page, 0, s, -1, nullptr, 0);
     if (n <= 1) return {};
     std::wstring w(static_cast<size_t>(n - 1), L'\0');
-    MultiByteToWideChar(CP_ACP, 0, s, -1, w.data(), n);
+    MultiByteToWideChar(code_page, 0, s, -1, w.data(), n);
     return w;
 }
 
+// Native Windows enumeration still returns ANSI names in OEM input mode; file_api_codepage_test compares both.
 void narrow_ansi(const std::wstring& wide, char* out, size_t capacity) {
     if (capacity == 0) return;
     const int n = WideCharToMultiByte(CP_ACP, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);

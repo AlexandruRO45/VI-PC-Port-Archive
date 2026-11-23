@@ -100,6 +100,11 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   package is never written.
 - Reads prefer the overlay copy and then the package. `FindFirstFile` merges the two folders, the overlay winning on a
   name, and hides deleted names, the marker folder and the copy folder.
+- Narrow filename inputs follow the process's file API mode: ANSI by default, or OEM after `SetFileApisToOEM`, as
+  reported by [`AreFileApisANSI`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-arefileapisansi).
+  Native Windows 11 enumeration continues to return ANSI names in either input mode; the shim preserves that output
+  behavior. CTest `file_api_codepage` compares the narrow APIs with native Windows across ANSI, OEM, and restored ANSI
+  mode using synthetic files and a character that round-trips differently on the detected code pages.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
   cannot reach outside the package and the overlay.
 

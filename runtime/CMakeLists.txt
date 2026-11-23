@@ -228,6 +228,17 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(file_system_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(file_system_test PRIVATE /OPT:NOREF)
 
+  # Native ANSI/OEM filename comparisons against the same file shim registry a mapped title uses.
+  add_executable(file_api_codepage_test
+    test/file_api_codepage_test.cpp
+    shims/file_system.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(file_api_codepage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(file_api_codepage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(file_api_codepage_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(file_api_codepage_test PRIVATE /OPT:NOREF)
+
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
     test/winhttp_offline_test.cpp
@@ -869,6 +880,10 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)
+  endif()
+  if(WIN32 AND TARGET file_api_codepage_test)
+    add_test(NAME file_api_codepage COMMAND file_api_codepage_test)
+    set_tests_properties(file_api_codepage PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
