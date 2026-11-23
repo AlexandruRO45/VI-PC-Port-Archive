@@ -439,5 +439,74 @@ class TestSAndn2B32Divergence(unittest.TestCase):
         self.assertEqual(state.exec_lo, 0x0000_FF00)
         self.assertEqual(state.scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 5: Register Aliasing and In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
+class TestSAndn2B32RegisterAliasing(unittest.TestCase):
+    """Unit tests verifying in-place operand aliasing and register preservation."""
+
+    def test_aliasing_dst_equals_src0(self):
+        state = ScalarState()
+        s0_val = 0x1234_5678
+        s1_val = 0x00FF_00FF
+        state.sgprs[0] = s0_val
+        state.sgprs[1] = s1_val
+
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=0),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=RegOperand(RegisterKind.SGPR, index=1),
+        )
+        res = ScalarInterpreter.step(instr, state)
+        expected = s0_val & (~s1_val & MASK32)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.sgprs[0], expected)
+        self.assertEqual(state.sgprs[1], s1_val)
+
+    def test_aliasing_dst_equals_src1(self):
+        state = ScalarState()
+        s0_val = 0x1234_5678
+        s1_val = 0x00FF_00FF
+        state.sgprs[0] = s0_val
+        state.sgprs[1] = s1_val
+
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=1),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=RegOperand(RegisterKind.SGPR, index=1),
+        )
+        res = ScalarInterpreter.step(instr, state)
+        expected = s0_val & (~s1_val & MASK32)
+        self.assertEqual(res, expected)
+        self.assertEqual(state.sgprs[0], s0_val)
+        self.assertEqual(state.sgprs[1], expected)
+
+    def test_aliasing_dst_equals_src0_and_src1(self):
+        state = ScalarState()
+        state.sgprs[5] = 0xDEAD_BEEF
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=5),
+            src0=RegOperand(RegisterKind.SGPR, index=5),
+            src1=RegOperand(RegisterKind.SGPR, index=5),
+        )
+        res = ScalarInterpreter.step(instr, state)
+        self.assertEqual(res, 0)
+        self.assertEqual(state.sgprs[5], 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_aliasing_special_exec_lo_self(self):
+        state = ScalarState()
+        state.exec_lo = 0x5555_5555
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+            src0=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+            src1=RegOperand(RegisterKind.SPECIAL, name="exec_lo"),
+        )
+        res = ScalarInterpreter.step(instr, state)
+        self.assertEqual(res, 0)
+        self.assertEqual(state.exec_lo, 0)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
