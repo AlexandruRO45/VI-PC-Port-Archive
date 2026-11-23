@@ -424,5 +424,41 @@ class TestSaluNandSaveexecB32Aliasing(unittest.TestCase):
         self.assertEqual(self.state.exec_lo, (~0x1234_5678) & MASK32)
         self.assertEqual(self.state.scc, 1)
 
+# ==============================================================================
+# Unit Tests: Condition Codes and Status Flags
+# ==============================================================================
+
+class TestSaluNandSaveexecB32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition code SCC generation and canary preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarSALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_scc_set_to_zero_when_result_zero(self) -> None:
+        # Result is 0 strictly when S0 & EXEC_LO == 0xFFFFFFFF
+        self.state.scc = 1  # canary
+        self.state.exec_lo = MASK32
+        inst = Instruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B32,
+            dst=Register(RegKind.SGPR, 0),
+            src0=Immediate(MASK32),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.exec_lo, 0)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_scc_set_to_one_when_result_non_zero(self) -> None:
+        self.state.scc = 0  # canary
+        self.state.exec_lo = 0
+        inst = Instruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B32,
+            dst=Register(RegKind.SGPR, 0),
+            src0=Immediate(0),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.exec_lo, MASK32)
+        self.assertEqual(self.state.scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
