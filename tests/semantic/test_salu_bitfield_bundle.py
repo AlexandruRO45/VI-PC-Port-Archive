@@ -513,5 +513,17 @@ class TestSBfmB32ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.sgprs[2], 0x00FFFF00)
 
 
+class TestSBfmB32Bounds(unittest.TestCase):
+    """Mask wrapping and boundary handling for s_bfm_b32."""
+
+    def test_max_width_and_offset_wrap(self):
+        # width 31, offset 0 -> 0x7FFFFFFF
+        self.assertEqual(ref_bfm_b32(31, 0), 0x7FFFFFFF)
+        # width 32 mod 32 = 0
+        self.assertEqual(ref_bfm_b32(32, 0), 0)
+        # offset 32 mod 32 = 0
+        self.assertEqual(ref_bfm_b32(8, 32), 0xFF)
+
+
 if __name__ == "__main__":
     unittest.main()
