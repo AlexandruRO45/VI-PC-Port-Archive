@@ -7,7 +7,6 @@ The tool parses the GLB container itself (12-byte header, JSON chunk, optional
 BIN chunk, 4-byte padding), then checks every skin and every mesh primitive:
 
 * skin names, joint counts and inverseBindMatrices counts,
-* the joint hierarchy, its declared skeleton root and its presence in each scene that uses the skin,
 * the inverseBindMatrices accessor type and finite values,
 * which mesh primitives carry skinning data and which are static,
 * JOINTS_n/WEIGHTS_n pairing, accessor types and vertex counts,
@@ -607,6 +606,7 @@ def _joint_tree_intervals(nodes, errors):
 
 
 def _check_joint_hierarchies(gltf, skins, mesh_bindings, errors):
+    """Each skin must have a common root in every scene containing a binding."""
     if not skins:
         return
     nodes = _list_field(gltf, "nodes", "glTF")

@@ -1266,6 +1266,8 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
             for name, allowed in _GLB_ATTRIBUTE_TYPES.items():
                 if name in attrs:
                     check_accessor(attrs[name], f"{where}.{name}", allowed)
+            if "indices" in prim:
+                check_accessor(prim["indices"], f"{where}.indices", ("SCALAR",))
             targets = prim.get("targets", [])
             if not isinstance(targets, list):
                 raise bad(f"{where}.targets must be a list")
@@ -1284,8 +1286,6 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
                     check_accessor(target[name], f"{label}.{name}", _GLB_ATTRIBUTE_TYPES[name])
                     if accessors[target[name]]["count"] != accessors[attrs[name]]["count"]:
                         raise bad(f"{label}.{name} count differs from the base attribute")
-            if "indices" in prim:
-                check_accessor(prim["indices"], f"{where}.indices", ("SCALAR",))
             if "material" not in prim:
                 continue
             material_index = prim["material"]
@@ -1384,6 +1384,40 @@ def _read_glb_accessor(doc: dict, bin_chunk: bytes, acc_idx: int) -> list:
     return out
 
 
+def _apply_default_morphs(base_rows, targets, weights, read_accessor, accessors):
+    """Bake the instance pose in mesh space, before skinning, placement or stitching."""
+    changed = set()
+    for weight, target in zip(weights, targets):
+        if not weight:
+            continue
+        for name, index in target.items():
+            if name not in base_rows:
+                continue
+            rows = base_rows[name]
+            changed.add(name)
+            accessor = accessors[index]
+            signed_norm = accessor.get("normalized") and accessor["componentType"] in (COMPONENT_BYTE, COMPONENT_SHORT)
+            for i, delta in enumerate(read_accessor(index)):
+                if signed_norm:
+                    delta = tuple(max(-1.0, v) for v in delta)
+                if name == "COLOR_0" and len(delta) == 3:
+                    delta = (*delta, 0.0)  # An RGB displacement preserves the base alpha.
+                rows[i] = tuple(base + weight * d for base, d in zip(rows[i], delta))
+
+    # Normalize or clamp once, after all targets have contributed.
+    for name in changed:
+        rows = base_rows[name]
+        for i, row in enumerate(rows):
+            if not all(math.isfinite(v) for v in row):
+                raise PedAssembleError(f"non-finite morphed {name}")
+            if name == "NORMAL":
+                rows[i] = glb_writer._normalize3(*row)
+            elif name == "COLOR_0":
+                rows[i] = tuple(max(0.0, min(1.0, v)) for v in row)
+            elif any(abs(v) > 3.4028234663852886e38 for v in row):
+                raise PedAssembleError(f"morphed {name} exceeds float32")
+
+
 def _extract_glb_skin_joint_names(
     doc: dict,
     skin_idx: object,
@@ -1431,39 +1465,8 @@ def _extract_glb_skin_joint_names(
     return joint_names
 
 
-def _read_posed_attribute(name, attributes, weighted_targets, read_accessor, accessors):
-    rows = read_accessor(attributes[name])
-    for i, row in enumerate(rows):
-        values = tuple(map(float, row))
-        rows[i] = (*values, 1.0) if name == "COLOR_0" and len(row) == 3 else values
-    changed = False
-    for weight, target in weighted_targets:
-        if name not in target:
-            continue
-        changed = True
-        index = target[name]
-        accessor = accessors[index]
-        signed_norm = accessor.get("normalized") and accessor["componentType"] in (COMPONENT_BYTE, COMPONENT_SHORT)
-        for i, delta in enumerate(read_accessor(index)):
-            if signed_norm:
-                delta = tuple(max(-1.0, x) for x in delta)
-            if name == "COLOR_0" and len(delta) == 3:
-                delta = (*delta, 0.0)
-            rows[i] = tuple(base + weight * d for base, d in zip(rows[i], delta))
-    if changed:
-        if any(not math.isfinite(v) for row in rows for v in row):
-            raise PedAssembleError(f"non-finite morphed {name}")
-        if name == "NORMAL":
-            rows = [glb_writer._normalize3(*row) for row in rows]
-        elif name == "COLOR_0":
-            rows = [tuple(max(0.0, min(1.0, v)) for v in row) for row in rows]
-        elif any(abs(v) > 3.4028234663852886e38 for row in rows for v in row):
-            raise PedAssembleError(f"morphed {name} exceeds float32")
-    return rows
-
-
 def read_glb_parts(path: str) -> list[MeshPart]:
-    """Read Y-up parts at their instance's default morph pose for static assembly."""
+    """Read mesh parts from a binary glTF 2.0 (``.glb``) file (always Y-up)."""
     with open(path, "rb") as f:
         data = f.read()
     if len(data) < 20 or data[:4] != GLB_MAGIC:
@@ -1532,15 +1535,27 @@ def read_glb_parts(path: str) -> list[MeshPart]:
             attrs = prim.get("attributes", {})
             if "POSITION" not in attrs:
                 continue
-            weighted_targets = [(w, t) for w, t in zip(weights, prim.get("targets", ())) if w]
-            posed = {name: _read_posed_attribute(name, attrs, weighted_targets, read_accessor, doc["accessors"])
-                     for name in _MORPH_ATTRIBUTES if name in attrs}
-            positions = posed["POSITION"]
+            positions = [tuple(float(x) for x in p) for p in read_accessor(attrs["POSITION"])]
             if "indices" in prim:
                 raw_idx = [int(i) for i in read_accessor(prim["indices"])]
             else:
                 raw_idx = list(range(len(positions)))
             triangles = _normalize_triangles(raw_idx)
+            normals = (
+                [tuple(float(x) for x in n) for n in read_accessor(attrs["NORMAL"])]
+                if "NORMAL" in attrs else None
+            )
+            uvs = (
+                [tuple(float(x) for x in u) for u in read_accessor(attrs["TEXCOORD_0"])]
+                if "TEXCOORD_0" in attrs else None
+            )
+            colors = None
+            if "COLOR_0" in attrs:
+                raw_c = read_accessor(attrs["COLOR_0"])
+                colors = [
+                    (float(c[0]), float(c[1]), float(c[2]), float(c[3]) if len(c) > 3 else 1.0)
+                    for c in raw_c
+                ]
             joints_0 = (
                 [tuple(int(x) for x in j) for j in read_accessor(attrs["JOINTS_0"])]
                 if "JOINTS_0" in attrs else None
@@ -1558,6 +1573,9 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 if "WEIGHTS_1" in attrs else None
             )
             pname = node_name if len(mesh.get("primitives", [])) == 1 else f"{node_name}_p{pi}"
+            if any(weights):
+                base_rows = {"POSITION": positions, "NORMAL": normals, "TEXCOORD_0": uvs, "COLOR_0": colors}
+                _apply_default_morphs(base_rows, prim["targets"], weights, read_accessor, doc["accessors"])
             has_skin_attrs = joints_0 is not None or joints_1 is not None
             if has_node_skin:
                 part_joint_names = list(node_joint_names) if (has_skin_attrs and node_joint_names is not None) else None
@@ -1600,9 +1618,9 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 triangles=triangles,
                 coord_space="y-up",
                 translation=trans,
-                normals=posed.get("NORMAL"),
-                uvs=posed.get("TEXCOORD_0"),
-                colors=posed.get("COLOR_0"),
+                normals=normals,
+                uvs=uvs,
+                colors=colors,
                 joints_0=joints_0,
                 weights_0=weights_0,
                 joints_1=joints_1,
