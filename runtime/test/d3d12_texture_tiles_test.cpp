@@ -1,5 +1,6 @@
 // D3D-285: compare synthetic sparse RGBA8 texture tiles on the Vulkan shim and native D3D12.
 #include "../shims/d3d12_com.h"
+#include "host_wine.h"
 
 #include <dxgi1_4.h>
 #include <wrl/client.h>
@@ -283,7 +284,9 @@ int main() {
         std::fputs("A texture with multiple mips did not use the committed fallback\n", stderr);
         return 1;
     }
-    auto native = native_device();
+    // Under Wine or Proton the native device is vkd3d(-proton), not Microsoft's runtime; on RADV vkd3d-proton loses the
+    // device (VK_ERROR_DEVICE_LOST) in the 256 x 240 reference run. The layer's own replay and pixel checks still run.
+    auto native = hostwine::host_is_wine() ? ComPtr<ID3D12Device>{} : native_device();
     const auto* info = rt::d3d12::vulkan_device_info(vulkan.Get());
     const bool dedicated_copy = info && !info->copy_queues.empty() && info->copy_family != info->queue_family;
     struct ReplayCase {
