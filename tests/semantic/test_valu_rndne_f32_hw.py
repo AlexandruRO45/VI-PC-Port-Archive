@@ -184,5 +184,110 @@ class TestValuRndneF32Oracle(unittest.TestCase):
         self.assertEqual(ref_rndne_f32(f32_to_bits(0.9), clamp=True), F32_ONE)
 
 
+class Opcode(Enum):
+    V_RNDNE_F32 = auto()
+
+
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL32 = auto()
+    INLINE_FLOAT = auto()
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    kind: OperandKind
+    reg_idx: int = 0
+    raw_bits: int = 0
+
+    @classmethod
+    def vgpr(cls, idx: int) -> ASTOperand:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"VGPR index out of range: {idx}")
+        return cls(kind=OperandKind.VGPR, reg_idx=idx)
+
+    @classmethod
+    def sgpr(cls, idx: int) -> ASTOperand:
+        if not (0 <= idx <= 105):
+            raise ValueError(f"SGPR index out of range: {idx}")
+        return cls(kind=OperandKind.SGPR, reg_idx=idx)
+
+    @classmethod
+    def literal32(cls, bits: int) -> ASTOperand:
+        return cls(kind=OperandKind.LITERAL32, raw_bits=u32(bits))
+
+    @classmethod
+    def inline_float(cls, f: float) -> ASTOperand:
+        return cls(kind=OperandKind.INLINE_FLOAT, raw_bits=f32_to_bits(f))
+
+
+@dataclass
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    clamp: bool = False
+
+    def validate(self) -> None:
+        if self.opcode != Opcode.V_RNDNE_F32:
+            raise ValueError(f"Unsupported opcode: {self.opcode}")
+        if self.dst.kind != OperandKind.VGPR:
+            raise ValueError(f"Destination must be a VGPR, got {self.dst.kind}")
+        if self.src0.kind not in (
+            OperandKind.VGPR,
+            OperandKind.SGPR,
+            OperandKind.LITERAL32,
+            OperandKind.INLINE_FLOAT,
+        ):
+            raise ValueError(f"Invalid src0 operand kind: {self.src0.kind}")
+
+
+class TestValuRndneF32AST(unittest.TestCase):
+    """Test suite for symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_vgpr_to_vgpr(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_RNDNE_F32,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+        )
+        inst.validate()
+        self.assertEqual(inst.dst.reg_idx, 0)
+        self.assertEqual(inst.src0.reg_idx, 1)
+        self.assertFalse(inst.clamp)
+
+    def test_ast_construction_sgpr_source(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_RNDNE_F32,
+            dst=ASTOperand.vgpr(5),
+            src0=ASTOperand.sgpr(2),
+        )
+        inst.validate()
+        self.assertEqual(inst.src0.kind, OperandKind.SGPR)
+        self.assertEqual(inst.src0.reg_idx, 2)
+
+    def test_ast_construction_literal_source(self):
+        bits = f32_to_bits(1.5)
+        inst = ASTInstruction(
+            opcode=Opcode.V_RNDNE_F32,
+            dst=ASTOperand.vgpr(10),
+            src0=ASTOperand.literal32(bits),
+            clamp=True,
+        )
+        inst.validate()
+        self.assertEqual(inst.src0.raw_bits, bits)
+        self.assertTrue(inst.clamp)
+
+    def test_ast_validation_rejects_sgpr_destination(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_RNDNE_F32,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.vgpr(1),
+        )
+        with self.assertRaises(ValueError):
+            inst.validate()
+
+
 if __name__ == "__main__":
     unittest.main()
