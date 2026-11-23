@@ -24,6 +24,7 @@
 // host directly.
 #include <windows.h>
 
+#include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -237,7 +238,11 @@ public:
     ~PendingMarker() {
         if (path_.empty()) return;
         const DWORD error = ::GetLastError();
-        ::DeleteFileW(path_.c_str());
+        if (!::DeleteFileW(path_.c_str())) {
+            const DWORD rollback_error = ::GetLastError();
+            std::fprintf(stderr, "[rt] file_system: cannot roll back deletion marker %ls (error %lu); "
+                                 "original operation error %lu\n", path_.c_str(), rollback_error, error);
+        }
         ::SetLastError(error);
     }
     // Keep another delete/move from adopting a temporary marker that this attempt might roll back.

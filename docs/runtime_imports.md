@@ -125,6 +125,10 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 overlay source or replacing a destination. A marker-creation failure leaves those files intact. If the subsequent
 host operation fails, newly created markers are removed while pre-existing markers are retained. This handles
 reported filesystem failures; it is not a power-loss recovery scheme.
+These operations share a process-wide lock, held through any package-file copy and write-through flush, so a large
+move can delay unrelated `GAME:` deletes and moves. This keeps one operation from adopting a marker another might
+roll back. If marker rollback itself fails, the runtime reports it and retains the original operation's Windows
+error. Empty parent directories created for markers may remain; they do not hide package entries.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 
