@@ -81,9 +81,11 @@ struct PresentPlanes {
 namespace detail {
 
 inline bool blit_presentable(const ResourceBinding* binding) {
-    return binding && binding->image && binding->aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
-           binding->samples == 1 && !binding->volume;
+    return binding && binding->image && binding->aspects == VK_IMAGE_ASPECT_COLOR_BIT;
 }
+
+// vkCmdBlitImage takes a single-sampled 2D source (VUID 00233): MSAA and 3D sources are refused as unsupported.
+inline bool blit_shape_supported(const ResourceBinding& binding) { return binding.samples == 1 && !binding.volume; }
 
 inline bool is_srgb_format(VkFormat format) {
     switch (format) {
@@ -239,8 +241,9 @@ public:
             if (!detail::blit_presentable(found)) return VK_ERROR_UNKNOWN;
             binding = *found;
         }
-        // Integer formats (a UNORM swapchain cannot take them) and anything the GPU cannot blit from are refused.
-        if (detail::blit_unsupported_format(binding.format) ||
+        // Multisampled and 3D sources (no resolve into a temporary yet), integer formats (a UNORM swapchain cannot take
+        // them) and anything the GPU cannot blit from are refused.
+        if (!detail::blit_shape_supported(binding) || detail::blit_unsupported_format(binding.format) ||
             !(format_features(binding.format) & VK_FORMAT_FEATURE_BLIT_SRC_BIT))
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         if (source_rect && (source_rect->left < 0 || source_rect->top < 0 || source_rect->left >= source_rect->right ||
@@ -458,6 +461,7 @@ private:
             return VK_SUCCESS;
         }
         if (binding && !presentable(source)) return VK_ERROR_UNKNOWN;  // checked before an image is acquired for it
+        if (binding && !blit_shape_ok(source)) return VK_ERROR_FORMAT_NOT_SUPPORTED;  // MSAA or 3D: no blit
         if ((binding || planes) && !(format_features(format_) & VK_FORMAT_FEATURE_BLIT_DST_BIT))
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         if (planes && !prepare_compose()) return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -627,6 +631,12 @@ private:
         std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
         const ResourceBinding* binding = context_.resolve(source);
         return detail::blit_presentable(binding);
+    }
+
+    bool blit_shape_ok(ResourceId source) {
+        std::shared_lock lock(context_.resource_mutex_);
+        const ResourceBinding* binding = context_.resolve(source);
+        return !binding || detail::blit_shape_supported(*binding);
     }
 
     // An image was acquired into `frame` but its blit was not submitted. An empty batch waits on the acquire
