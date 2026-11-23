@@ -21,11 +21,11 @@ class BootTraceTests(unittest.TestCase):
         self.startup = "sess\u00e3o sint\u00e9tica.jsonl"
         (self.cwd / self.startup).write_text(
             '{"kind":"trace_open","pid":17}\n{"kind":"exit","code":7}\n',
-            encoding="utf-8",
+            encoding="utf-8", newline="\n",
         )
         self.d3d = "render calls.log"
         (self.cwd / self.d3d).write_text(
-            "[d3d12-trace] #2 Example call unsupported\n", encoding="utf-8",
+            "[d3d12-trace] #2 Example call unsupported\n", encoding="utf-8", newline="\n",
         )
 
     def invoke(self, *args):
