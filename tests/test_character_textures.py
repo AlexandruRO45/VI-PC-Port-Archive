@@ -260,6 +260,21 @@ class CharacterTextureTests(unittest.TestCase):
                         self.assertIn("ERROR:", err.getvalue())
                         self.assertIn("Permission denied", err.getvalue())
 
+    def test_reads_model_and_manifest_json_with_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as td:
+            doc = model([{
+                "Name": "head",
+                "Shader": "a1b2c3d4",
+                "Textures": [{"Param": "0xC8E8C282", "Name": "face_diffusetex"}],
+            }])
+            bom_path = pathlib.Path(td) / "model.json"
+            bom_path.write_bytes(b"\xef\xbb\xbf" + json.dumps(doc).encode("utf-8"))
+            result = run_tool(bom_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = table(result.stdout)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][3], "diffusetex")
+
 
 if __name__ == "__main__":
     unittest.main()

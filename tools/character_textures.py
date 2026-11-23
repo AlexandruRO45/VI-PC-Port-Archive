@@ -202,7 +202,8 @@ def classify_material(material: dict, index: int) -> dict:
 def classify_file(path: str) -> dict:
     """Read one model file and classify every material in it."""
     try:
-        with open(path, encoding="utf-8") as f:
+        # utf-8-sig: a model.json or manifest saved by a Windows editor starts with a BOM, which json.load refuses.
+        with open(path, encoding="utf-8-sig") as f:
             document = json.load(f)
     except json.JSONDecodeError as exc:
         raise ValueError(f"{path}: {exc.msg} at line {exc.lineno} column {exc.colno}") from None
