@@ -325,7 +325,7 @@ class CompareCommand(unittest.TestCase):
                 (folder / "index.json").write_text('{"control":{"stage":"ps"}}', encoding="utf-8", newline="\n")
                 if tag == "clear":
                     ps_sweep.main(["sample", "--spirv", str(folder), "--out", tmp])
-                ps_sweep.main(["run", "--spirv", str(folder), "--out", tmp, "--tag", tag, "--depth",
+                ps_sweep.main(["run", "--spirv", str(folder), "--out", tmp, "--tag", tag, "--two-clear",
                                "--exe", os.environ["PS_SWEEP_TEST_EXE"]])
             pixels = ps_sweep.W * ps_sweep.H
             for tag, differing, written in (("near", pixels, pixels), ("discarded", 0, 0)):
@@ -338,9 +338,15 @@ class CompareCommand(unittest.TestCase):
                 for row in (ordinary, exact):
                     self.assertEqual(row["depth_different_pixels"], differing)
                     self.assertEqual(row["depth_nonclear_pixels"], [0, differing])
-                    self.assertEqual(row["depth_written_pixels"], [pixels, written])
-                self.assertEqual(ordinary["class"], "depth mismatch" if differing else "OK on both")
-                self.assertEqual(exact["class"], "mismatch" if differing else "clear-only exact")
+                    self.assertEqual(row["samples_passed"], [pixels, written])
+                    self.assertEqual(row["depth_clears"], [1, 0])
+                    self.assertEqual(row["zero_depth_different_pixels"], pixels)
+                    self.assertEqual(row["depth_control"], [
+                        {"identical": pixels, "follow_clear": 0, "other": 0},
+                        {"identical": written, "follow_clear": pixels - written, "other": 0},
+                    ])
+                self.assertEqual(ordinary["class"], "depth mismatch")
+                self.assertEqual(exact["class"], "mismatch")
 
     def test_help_warns_about_nvidia_resets(self):
         buf = io.StringIO()

@@ -118,14 +118,18 @@ static double now_s() {
 int main(int argc, char** argv) {
     const double t_start = now_s();
     bool depth = false, occlusion = false;
+    float depth_clear = 1.0f;
     if (argc < 7) {
-        std::fprintf(stderr, "usage: vk_ps_sweep vs.spv ps.spv out.raw width height render-targets [--occlusion] [--depth]\n");
+        std::fprintf(stderr, "usage: vk_ps_sweep vs.spv ps.spv out.raw width height render-targets [--occlusion] [--depth | --depth-zero]\n");
         return 2;
     }
     for (int i = 7; i < argc; ++i) {
         if (std::strcmp(argv[i], "--occlusion") == 0) occlusion = true;
         else if (std::strcmp(argv[i], "--depth") == 0) depth = true;
-        else return 2;
+        else if (std::strcmp(argv[i], "--depth-zero") == 0) {
+            depth = true;
+            depth_clear = 0.0f;
+        } else return 2;
     }
     // Count surviving samples even when their depth equals the attachment clear.
     occlusion |= depth;
@@ -564,7 +568,7 @@ int main(int argc, char** argv) {
         CHECK(vkBindImageMemory(dev, imgs[t], m, 0));
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = imgs[t]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ii.format;
-        vi.subresourceRange = {t == targets ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vi.subresourceRange = {VkImageAspectFlags(t == targets ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &views[t]));
     }
     std::vector<VkAttachmentDescription> ads(attachments);
@@ -718,7 +722,7 @@ int main(int argc, char** argv) {
     if (!set->fallbacks_ready()) set->record_fallback_init(cmd);
     std::vector<VkClearValue> clears(attachments);
     for (auto& c : clears) for (float& f : c.color.float32) f = -1;
-    if (depth) clears[targets].depthStencil = {1.0f, 0};
+    if (depth) clears[targets].depthStencil = {depth_clear, 0};
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rbi.renderPass = rp; rbi.framebuffer = fb; rbi.renderArea = sc; rbi.clearValueCount = attachments; rbi.pClearValues = clears.data();
     LOADD(vkCreateQueryPool); LOADD(vkDestroyQueryPool); LOADD(vkGetQueryPoolResults);
@@ -743,7 +747,7 @@ int main(int argc, char** argv) {
     for (uint32_t t = 0; t < attachments; ++t) {
         VkBufferImageCopy reg{};
         reg.bufferOffset = target_bytes * t;
-        reg.imageSubresource = {t == targets ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        reg.imageSubresource = {VkImageAspectFlags(t == targets ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
         reg.imageExtent = {W, H, 1};
         vkCmdCopyImageToBuffer(cmd, imgs[t], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
     }
