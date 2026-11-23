@@ -114,6 +114,16 @@ class TestRetag(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "end of the file"):
             T.retag(original[:-1], T.tags_packet([]))
 
+    def test_retag_preserves_a_complete_second_logical_stream(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = Path(d) / "first.ogg"
+            second = Path(d) / "second.ogg"
+            make_ogg(first, packets=3, stream_id=1)
+            make_ogg(second, packets=3, stream_id=2)
+            first_bytes, second_bytes = first.read_bytes(), second.read_bytes()
+        tagged = T.retag(first_bytes + second_bytes, T.tags_packet([("TITLE", "new")]))
+        self.assertEqual(tagged, T.retag(first_bytes, T.tags_packet([("TITLE", "new")])) + second_bytes)
+
     def test_rejects_what_it_cannot_rewrite(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "b", "0ABCDEF1.ogg")
@@ -184,6 +194,24 @@ class TestFolder(unittest.TestCase):
                 stats = T.tag_folder(self.opus, names, dry_run=dry_run, ambiguous=ambiguous)
                 self.assertEqual(stats.get("skipped: Ogg checksum mismatch"), 1)
                 self.assertEqual(stats.get("tagged"), 1)  # the other named stream still works
+                self.assertEqual(path.read_bytes(), damaged)
+
+    def test_stream_missing_a_middle_page_is_skipped_unchanged(self):
+        path = Path(self.opus) / "story" / "bank_01" / "0ABCDEF1.ogg"
+        original = path.read_bytes()
+        spans = list(T.pages(original))
+        self.assertGreater(len(spans), 4)
+        start, end = spans[3]
+        damaged = original[:start] + original[end:]
+        self.assertTrue(crc_ok(damaged))
+        self.assertTrue(damaged[list(T.pages(damaged))[-1][0] + 5] & 0x04)
+        path.write_bytes(damaged)
+        names, ambiguous = T.load_names(self.names, "story")
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                stats = T.tag_folder(self.opus, names, dry_run=dry_run, ambiguous=ambiguous)
+                self.assertEqual(stats.get("skipped: Ogg page sequence discontinuity"), 1)
+                self.assertEqual(stats.get("tagged"), 1)
                 self.assertEqual(path.read_bytes(), damaged)
 
     def test_names_and_dialogue(self):

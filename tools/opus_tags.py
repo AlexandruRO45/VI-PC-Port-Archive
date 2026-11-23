@@ -74,13 +74,20 @@ def pages(data: bytes):
 
 
 def checked_pages(data: bytes):
-    """Validate every page checksum before its bytes are used or copied to the output."""
+    """Validate checksums and page sequence continuity within each logical stream."""
+    next_sequence = {}
     for start, end in pages(data):
         page = bytearray(data[start:end])  # bounded by one Ogg page, not the whole stream
         expected, = struct.unpack_from("<I", page, 22)
         page[22:26] = b"\0" * 4
         if ogg_crc(page) != expected:
             raise ValueError(f"Ogg checksum mismatch at byte {start}")
+        serial, sequence = struct.unpack_from("<II", page, 14)
+        expected_sequence = next_sequence.get(serial, sequence)
+        if sequence != expected_sequence:
+            raise ValueError(f"Ogg page sequence discontinuity at byte {start} "
+                             f"(stream {serial}, expected {expected_sequence}, got {sequence})")
+        next_sequence[serial] = (sequence + 1) & 0xFFFFFFFF
         yield start, end
 
 
