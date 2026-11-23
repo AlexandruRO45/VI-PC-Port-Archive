@@ -26,9 +26,11 @@ An ``rpf9dump models`` manifest (``Items[]`` with ``Verts``, ``Tris``, ``IsFragm
 model objects are also accepted. An ``rpf9dump models`` manifest has only ``HasBoneBindings``, not
 a bone count or influence width, so those cells are reported as unknown rather than guessed.
 
-Every model is reported independently. A missing field, a wrong type or an unreadable JSON file
-adds an issue to that row and never stops the run. Only model names, hashes, counts and issue text
-are emitted; no vertex, texture or package bytes are copied.
+Every model in a directory tree is reported independently. A missing field, a wrong type or an
+unreadable model.json adds an issue to that row and never stops the run; a named top-level input
+that is not JSON at all is one ERROR line and exit 2, because it is neither a model.json nor a
+manifest. Only model names, hashes, counts and issue text are emitted; no vertex, texture or
+package bytes are copied.
 
 The report paths are refused when they alias an input (the manifest, a nested ``model.json`` or a
 model referenced by the manifest), so the census cannot overwrite its own source.

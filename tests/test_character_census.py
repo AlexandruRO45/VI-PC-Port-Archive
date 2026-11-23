@@ -481,7 +481,7 @@ class CharacterCensusTest(unittest.TestCase):
 
         folder = self.run_tool(self.root)
         self.assertEqual(folder.returncode, 0, folder.stderr)
-        self.assertIn("broken/model.json: cannot read model.json", folder.stdout)
+        self.assertIn(f"{os.path.join('broken', 'model.json')}: cannot read model.json", folder.stdout)
 
     def test_model_json_saved_with_a_utf8_bom_is_read(self):
         # A model.json saved by a Windows editor starts with a UTF-8 BOM. Read as plain utf-8, json.load refuses it
