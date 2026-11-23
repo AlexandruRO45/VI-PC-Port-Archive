@@ -13,7 +13,8 @@
  * Each kernel gets what the Windows launcher (hw_oracle.c) gives it: s[0:1] points at an 8-byte kernarg holding
  * the address of a <words> dword buffer pre-filled with 0xDEAD0000 (1..16384 words), and it runs as one workgroup
  * of `threads` threads (1..1024), started the way its descriptor says.
- * Output, one line per kernel:  <name> <hex word> ...   The first line is "# device=<name> arch=<gfxNNNN> ...".
+ * Output, one line per kernel:  <name> <hex word> ...   The first line is
+ * "# device=<name> (<asic id>) rev=<external rev> arch=<gfxNNNN> ...".
  * Exit 0 ok, 77 no usable device, 2 usage, 3 failure (a kernel that does not finish within five seconds is one:
  * the kernel driver then resets the GPU).
  *
@@ -89,7 +90,11 @@ static const char *arch_name(const struct amdgpu_gpu_info *gpu) {
         if (rev < 0x32) return "gfx1030";
         if (rev < 0x3C) return "gfx1031";
         if (rev < 0x46) return "gfx1032";
-        return "gfx1034";
+        if (rev < 0x50) return "gfx1034";
+        /* Cyan Skillfish (GC 10.1.3, the BC-250): the kernel's nv.c sets external_rev_id = rev_id + 0x82,
+         * and Mesa's AMDGPU_GFX1013_RANGE is 0x82 <= rev < 0x86. */
+        if (rev >= 0x82 && rev < 0x86) return "gfx1013";
+        return "gfx10xx";
     case 144: return "gfx1033"; /* AMDGPU_FAMILY_VGH */
     case 146: return "gfx1035"; /* AMDGPU_FAMILY_YC */
     case 149: return "gfx1036"; /* AMDGPU_FAMILY_GC_10_3_6 */
@@ -126,8 +131,8 @@ int main(int argc, char **argv) {
         return 77;
     }
     const char *name = amdgpu_get_marketing_name(dev);
-    printf("# device=%s (0x%04x) arch=%s engine=%u.%u\n", name ? name : "AMD GPU", gpu.asic_id, arch_name(&gpu),
-           ip.hw_ip_version_major, ip.hw_ip_version_minor);
+    printf("# device=%s (0x%04x) rev=0x%02x arch=%s engine=%u.%u\n", name ? name : "AMD GPU", gpu.asic_id,
+           gpu.chip_external_rev, arch_name(&gpu), ip.hw_ip_version_major, ip.hw_ip_version_minor);
     fflush(stdout);
 
     FILE *file = fopen(argv[1], "rb");
