@@ -123,7 +123,19 @@ def join_rbf0(dicts, rigs):
     for dictionary in dicts:
         if name := dictionary.get("name"):
             keys[name].update(entry["key"] for entry in dictionary.get("entries", ()))
-    entries = [e for rs in rigs["rbf0"]["rigsets"] for e in rs["entries"]]
+    if not isinstance(rigs, dict) or not isinstance(rigs.get("rbf0"), dict):
+        raise TypeError("invalid rig report structure")
+    rigsets = rigs["rbf0"].get("rigsets")
+    if not isinstance(rigsets, list):
+        raise TypeError("invalid rig report structure")
+    entries = []
+    for rs in rigsets:
+        if not isinstance(rs, dict) or not isinstance(rs.get("entries"), list):
+            raise TypeError("invalid rig report structure")
+        for e in rs["entries"]:
+            if not isinstance(e, dict) or not isinstance(e.get("rig"), str) or not isinstance(e.get("source"), str):
+                raise TypeError("invalid rig report structure")
+            entries.append(e)
     c = collections.Counter()
     for e in entries:
         h = anim_index.joaat32(e["rig"].lower())
@@ -167,7 +179,7 @@ def main():
         try:
             with open(a.rigs, encoding="utf-8") as f:
                 summary["rbf0_join"] = join_rbf0(dicts, json.load(f))
-        except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:
             print(f"ERROR: {a.rigs}: invalid rig report ({getattr(e, 'strerror', None) or e})", file=sys.stderr)
             return 2
     rows = [{k: v for k, v in d.items() if k != "entries"} | {"entries": len(d.get("entries", ()))} for d in dicts]

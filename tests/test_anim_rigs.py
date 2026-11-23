@@ -205,7 +205,16 @@ class ReportPathTests(unittest.TestCase):
 
     def test_incompatible_rig_report_is_a_path_specific_error(self):
         out = os.path.join(self.tmp.name, "output.json")
-        for report in ([], {"summary": {}}, {"rbf0": {"rigsets": [{"entries": [{}]}]}}):
+        for report in (
+            [],
+            {"summary": {}},
+            {"rbf0": {"rigsets": {}}},
+            {"rbf0": {"rigsets": ""}},
+            {"rbf0": {"rigsets": [{"entries": {}}]}},
+            {"rbf0": {"rigsets": [{"entries": [{}]}]}},
+            {"rbf0": {"rigsets": [{"entries": [{"rig": "a", "source": 123}]}]}},
+            {"rbf0": {"rigsets": [{"entries": [{"rig": 123, "source": "x"}]}]}},
+        ):
             with self.subTest(report=report):
                 with open(self.rigs, "w", encoding="utf-8", newline="\n") as f:
                     json.dump(report, f)
@@ -215,6 +224,18 @@ class ReportPathTests(unittest.TestCase):
                 self.assertIn("invalid rig report", result.stderr)
                 self.assertEqual(len(result.stderr.strip().splitlines()), 1)
                 self.assertFalse(os.path.exists(out))
+
+    def test_deeply_nested_rig_report_is_a_path_specific_error(self):
+        out = os.path.join(self.tmp.name, "output.json")
+        with open(self.rigs, "w", encoding="utf-8", newline="\n") as f:
+            f.write("[" * 2000)
+        result = self.run_tool(self.rpf, out, "--rigs", self.rigs)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(self.rigs, result.stderr)
+        self.assertIn("invalid rig report", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertFalse(os.path.exists(out))
 
     def test_out_must_be_a_file(self):
         folder = os.path.join(self.tmp.name, "out")
