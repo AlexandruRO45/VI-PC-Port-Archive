@@ -174,6 +174,7 @@ PASSED_ARCHIVES = [
     ("notes.gz", gzip.compress(b"The RPF9 magic is stored as 9FPR.\n")),
     ("notes.bz2", bz2.compress(b"plain text\n")),
     ("notes.xz", lzma.compress(b"plain text\n")),
+    ("notes.zlib", zlib.compress(b"plain text\n")),
     ("nested_clean.gz", gzip.compress(zipped({"a.txt": b"text\n"}))),
 ]
 
@@ -220,7 +221,10 @@ class CheckNoGameData(unittest.TestCase):
         with zipfile.ZipFile(many, "w", zipfile.ZIP_STORED) as z:
             for i in range(10001):
                 z.writestr(f"{i}.txt", b"")
-        for name, data, kind in [("bomb.gz", bomb.getvalue(), "gzip stream"), ("many.zip", many.getvalue(), "zip archive")]:
+        bomb_zlib = zlib.compress(bytes(65 << 20))   # one stream, 66 KiB on disk
+        for name, data, kind in [("bomb.gz", bomb.getvalue(), "gzip stream"),
+                                 ("bomb.zlib", bomb_zlib, "zlib stream"),
+                                 ("many.zip", many.getvalue(), "zip archive")]:
             with self.subTest(name=name):
                 result = run([self.write(name, data)])
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
