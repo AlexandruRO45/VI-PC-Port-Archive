@@ -1130,7 +1130,15 @@ RuntimeObject& package_object() {
 // IXGameImpl3 : IXGameImpl2 : IXGameImpl (xgameruntime include/xgame.idl); the class id is IXGameImpl's. Three
 // methods after IUnknown: 3 XGameGetXboxTitleId (IXGameImpl), 4 XLaunchNewGame (IXGameImpl2), 5 XLaunchRestartOnCrash
 // (IXGameImpl3). A retail Gen9 title asks QueryApiImpl for this class (Freminet/ScarlettX's README, observed on
-// Concept Destruction); the executable here is not available yet, so its own requests are unmeasured.
+// Concept Destruction).
+//
+// Measured on the retail executable (game_scarlett_master.exe, tools/gdk_runtime_calls.py, read statically): it asks
+// for IXGameImpl3 and links slots 3 and 4; slot 5 has no thunk in the image. XGameGetXboxTitleId has four direct call
+// sites (0x222952a, 0x3dda56d, 0x5614a6a, 0x5b1c996). At the first the out parameter is zeroed before the call and
+// the HRESULT is branched on (test eax, eax / je), so E_FAIL without a <TitleId> takes a fallback instead of ending
+// the title; the other three read the out parameter and do not look at the status. XLaunchNewGame is called from the
+// two branches of one function (0x29306f0) as a plain call whose result is never read, which is the void signature
+// this slot serves.
 
 constexpr GUID kGameClass = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
 constexpr GUID kGame2 = {0x50849859, 0x0ad8, 0x4f81, {0x80, 0xe4, 0x5b, 0xc7, 0x86, 0x26, 0xf8, 0x52}};
