@@ -133,6 +133,17 @@ class TestSLshl1AddU32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 1)
 
+class TestSLshl2AddU32Oracle(unittest.TestCase):
+    def test_basic_operation(self) -> None:
+        self.assertEqual(ref_s_lshl_add_u32(2, 10, 5), (45, 0))
+        self.assertEqual(ref_s_lshl_add_u32(2, 3, 7), (19, 0))
+
+    def test_overflow_and_scc(self) -> None:
+        # 0x40000000 << 2 = 0x100000000 -> scc 1
+        self.assertEqual(ref_s_lshl_add_u32(2, 0x40000000, 0), (0, 1))
+        # 0xC0000000 << 2 = 0x300000000 -> res 0, scc 1
+        self.assertEqual(ref_s_lshl_add_u32(2, 0xC0000000, 0), (0, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
