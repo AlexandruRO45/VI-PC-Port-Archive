@@ -141,6 +141,51 @@ const char* check_private_data(IDXGIObject* object) {
     return nullptr;
 }
 
+// D3D-818: the app may release its device, queue and factory before the swap chain, so the swap chain holds the last
+// device reference. Its Vulkan objects must go before that reference does; on a device that owns its VkDevice, the
+// old order destroyed the VkDevice first and then faulted in the swap chain's member destructor.
+const char* check_release_device_before_swapchain() {
+    ID3D12Device* dev = nullptr;
+    if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&dev))) || !dev)
+        return "create_vulkan_device_standalone";
+    IDXGIFactory4* factory = nullptr;
+    if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&factory))) || !factory) {
+        dev->Release();
+        return "create_dxgi_factory (standalone device)";
+    }
+    D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    ID3D12CommandQueue* queue = nullptr;
+    if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) || !queue) {
+        factory->Release();
+        dev->Release();
+        return "CreateCommandQueue (standalone device)";
+    }
+    HWND hwnd = create_test_window(128, 128);
+    DXGI_SWAP_CHAIN_DESC1 scd{};
+    scd.Width = 128;
+    scd.Height = 128;
+    scd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    scd.SampleDesc.Count = 1;
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.BufferCount = 2;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    IDXGISwapChain1* sc = nullptr;
+    const char* result = nullptr;
+    if (!hwnd) {
+        result = "CreateWindowExW (standalone device)";
+    } else if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &scd, nullptr, nullptr, &sc)) || !sc) {
+        result = "CreateSwapChainForHwnd (standalone device)";
+    } else if (FAILED(sc->Present(0, 0))) {
+        result = "Present (standalone device)";
+    }
+    queue->Release();
+    factory->Release();
+    dev->Release();
+    if (sc) sc->Release();
+    if (hwnd) DestroyWindow(hwnd);
+    return result;
+}
+
 }  // namespace
 
 
@@ -1938,6 +1983,9 @@ int main() {
     destroy_dev(vk_dev, nullptr);
     if (messenger && destroy_dbg) destroy_dbg(instance, messenger, nullptr);
     destroy_inst(instance, nullptr);
+
+    if (const char* what = check_release_device_before_swapchain()) return fail(what);
+    std::printf("release device, queue and factory before the swap chain: ok\n");
 
     if (validation_errors() != 0) {
         std::fprintf(stderr, "FAIL: %u Vulkan validation errors\n", validation_errors());
