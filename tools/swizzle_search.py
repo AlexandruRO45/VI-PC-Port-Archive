@@ -12,10 +12,19 @@ import itertools
 import os
 import sys
 
-import numpy as np
+class _LazyNumpy:
+    """Import numpy on first use: --help and usage errors must work on a machine without it."""
+
+    def __getattr__(self, name):
+        import numpy
+        globals()["np"] = numpy
+        return getattr(numpy, name)
+
+
+np = _LazyNumpy()
 
 sys.path.insert(0, os.path.dirname(__file__))
-from tile_probe import block_feature, score, same_report_path  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 
 def positions(seq, nblocks, tw, th, wblocks):
@@ -38,6 +47,8 @@ def positions(seq, nblocks, tw, th, wblocks):
 
 
 def search(data, bpe, tile_bytes, widths, ntiles):
+    from tile_probe import block_feature, score
+
     raw = np.frombuffer(data[: len(data) // bpe * bpe], np.uint8).reshape(-1, bpe)
     feat = block_feature(raw, bpe)
     bits = int(np.log2(tile_bytes // bpe))
@@ -67,7 +78,13 @@ def search(data, bpe, tile_bytes, widths, ntiles):
 def render(data, bpe, tile_bytes, wpx, seq, out):
     import io
     import struct
-    from PIL import Image
+    try:
+        from PIL import Image
+    except ModuleNotFoundError as e:
+        if e.name not in ("PIL", "PIL.Image"):
+            raise
+        print("ERROR: --out requires Pillow (pip install Pillow)", file=sys.stderr)
+        return 1
     raw = np.frombuffer(data[: len(data) // bpe * bpe], np.uint8).reshape(-1, bpe)
     bits = len(seq)
     xbits = seq.count("x")
@@ -162,7 +179,9 @@ def main(argv=None):
         try:
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            render(data, a.bpe, a.tile, res[0][1], res[0][2], a.out)
+            rc = render(data, a.bpe, a.tile, res[0][1], res[0][2], a.out)
+            if isinstance(rc, int) and rc != 0:
+                return rc
         except (OSError, ValueError) as e:
             detail = getattr(e, "strerror", None) or str(e)
             print(f"ERROR: cannot write {a.out}: {detail}", file=sys.stderr)

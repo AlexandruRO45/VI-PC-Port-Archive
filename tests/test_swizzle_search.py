@@ -651,6 +651,32 @@ class TestSwizzleSearchOutGuard(unittest.TestCase):
             self.assertIn("unknown file extension: .unrecognized", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
 
+    def test_help_works_without_numpy(self):
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", str(TOOL), "--help"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_missing_pillow_reports_error_without_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            blob = root / "blob.bin"
+            blob.write_bytes(bytes(512))
+            out = root / "preview.png"
+            err = io.StringIO()
+            with mock.patch.object(self.mod, "search", return_value=[(1.0, 64, "xyxy")]), \
+                 mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}), \
+                 mock.patch.object(sys, "stderr", err):
+                rc = self.mod.main([str(blob), "--bpe", "8", "--tile", "128", "--widths", "64", "--out", str(out)])
+            self.assertEqual(rc, 1)
+            self.assertIn("ERROR: --out requires Pillow (pip install Pillow)", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            self.assertFalse(out.exists())
+
 
 def test_preview_with_no_fitting_layout_reports_the_problem(tmp_path=None):
     """Module-level compatibility wrapper for pytest with tmp_path fixture."""
