@@ -168,10 +168,18 @@ def read_items(path):
                 pos = end
                 return obj
 
+        def end():
+            # Like json.load: only whitespace may follow the object (no junk, no second JSON value).
+            skip_ws()
+            if pos < len(buf):
+                raise ValueError("%s: extra data after the manifest object, starting with %r" % (path, buf[pos:pos + 20]))
+
         expect("{")
         items = None
         skip_ws()
         if buf[pos:pos + 1] == "}":
+            pos += 1
+            end()
             return []
         while True:
             key = value()
@@ -195,6 +203,7 @@ def read_items(path):
             else:
                 value(complete_scalar=True)
             if expect(",}") == "}":
+                end()
                 return items or []
 
 

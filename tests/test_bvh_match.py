@@ -307,6 +307,20 @@ class TestStreamedManifest(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 M.read_items(self.write(text))
 
+    def test_trailing_data_is_refused_like_json_load(self):
+        # Review of #4310 (Flyander): data after the closing brace used to be ignored; json.load refuses it.
+        self.small_chunks()
+        for text in ('{"Items":[{"Offset":1}]}junk', '{"Items":[{"Offset":1}]} {"Items":[]}', '{}x',
+                     '{"Items":[{"Offset":1}]}\n\n   ]'):
+            with self.subTest(text=text):
+                with self.assertRaises(json.JSONDecodeError):
+                    json.loads(text)
+                with self.assertRaisesRegex(ValueError, "extra data"):
+                    M.read_items(self.write(text))
+        for text in ('{"Items":[{"Offset":1}]}\n', '{"Items":[{"Offset":1}]}  \r\n\t', "{}\n"):
+            with self.subTest(text=text):
+                self.assertEqual(len(M.read_items(self.write(text))), text.count("Offset"))
+
     def test_main_reports_a_broken_manifest_in_one_line(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
         path = self.write('{"Items": [{"Offset": 1}')
