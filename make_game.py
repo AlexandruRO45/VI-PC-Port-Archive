@@ -348,6 +348,15 @@ def match_version(game: str):
     return next((v for v in versions() if not probe_mismatches(game, v)), None)
 
 
+def game_top_level_entries(version: dict) -> list[str]:
+    """The top-level files and folders a version's package consists of: the first component of every manifest path,
+    and of the executable's. These are what a game copy at a drive root protects."""
+    paths = list(version.get("files") or ())
+    if version.get("expected_exe"):
+        paths.append(version["expected_exe"])
+    return sorted({p.replace("\\", "/").split("/", 1)[0] for p in paths if p.replace("\\", "/").split("/", 1)[0]})
+
+
 def load_version(game: str) -> dict:
     reports = []
     for version in versions():
@@ -2587,13 +2596,12 @@ def main() -> int:
     # Resolve existing parents too: a not-yet-created destination can be under a junction or symlink.
     real_game = os.path.normcase(os.path.realpath(game))
     is_game_drive_root = os.path.splitdrive(real_game)[1] in ("\\", "/")
-    game_entries = []
-    if is_game_drive_root:
-        # The dump's own top-level names, from the version manifest: os.listdir(real_game) would also count an
-        # unrelated --out or --work folder on the drive, so the rerun that resumes the build was rejected.
-        top_level = {rel.replace("\\", "/").split("/", 1)[0] for rel in [v["expected_exe"], *v["files"]]}
-        game_entries = [os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
-                        for e in sorted(top_level) if e]
+    # At a drive root the game is the version manifest's top-level files and folders, not everything on the drive:
+    # a listing of the drive would also hold --out and --work themselves once a first run has created them.
+    game_entries = [
+        os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
+        for e in game_top_level_entries(v)
+    ] if is_game_drive_root else []
     for p in (out, work):
         # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
         real_destination = os.path.normcase(os.path.realpath(p))
