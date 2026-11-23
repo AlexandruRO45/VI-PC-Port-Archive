@@ -188,7 +188,17 @@ int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, 
     base.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     base.BufferCount = 2;
     base.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    enum class Pass { queue, null_queue, device, null_window, null_desc, null_out };
+    enum class Pass {
+        queue,
+        null_queue,
+        device,
+        null_window,
+        null_desc,
+        null_out,
+        existing_chain,
+        destroyed_window,
+        garbage_window,
+    };
     struct Case {
         const char* name;
         DXGI_SWAP_CHAIN_DESC1 desc;
@@ -276,6 +286,17 @@ int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, 
         {"null window", base, Pass::null_window},
         {"null description", base, Pass::null_desc},
         {"null output", base, Pass::null_out},
+        {"existing swap chain on window", base, Pass::existing_chain},
+        {"existing swap chain and width 16385", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Width = 16385; }),
+         Pass::existing_chain},
+        {"destroyed window", base, Pass::destroyed_window},
+        {"destroyed window and one buffer", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferCount = 1; }),
+         Pass::destroyed_window},
+        {"destroyed window and width 16385", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.Width = 16385; }),
+         Pass::destroyed_window},
+        {"garbage window", base, Pass::garbage_window},
+        {"garbage window and one buffer", with([](DXGI_SWAP_CHAIN_DESC1& d) { d.BufferCount = 1; }),
+         Pass::garbage_window},
     };
     int mismatches = 0;
     for (const Case& c : cases) {
@@ -285,12 +306,31 @@ int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, 
             IUnknown* queue = side ? static_cast<IUnknown*>(host_queue) : static_cast<IUnknown*>(our_queue);
             if (c.pass == Pass::null_queue) queue = nullptr;
             if (c.pass == Pass::device) queue = side ? static_cast<IUnknown*>(host_device) : our_device;
-            HWND hwnd = create_test_window(64, 64);
+            HWND hwnd = nullptr;
+            HWND target_hwnd = nullptr;
+            IDXGISwapChain1* first_chain = nullptr;
+            if (c.pass == Pass::garbage_window) {
+                target_hwnd = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x123456));
+            } else {
+                hwnd = create_test_window(64, 64);
+                target_hwnd = (c.pass == Pass::null_window) ? nullptr : hwnd;
+                if (c.pass == Pass::existing_chain && hwnd) {
+                    const HRESULT first_hr = create_guarded(factory, queue, hwnd, &base, &first_chain);
+                    if (FAILED(first_hr)) {
+                        std::fprintf(stderr, "CreateSwapChainForHwnd %s: setup failed 0x%08lx\n", c.name,
+                                     static_cast<unsigned long>(first_hr));
+                    }
+                } else if (c.pass == Pass::destroyed_window && hwnd) {
+                    DestroyWindow(hwnd);
+                    hwnd = nullptr;
+                }
+            }
             IDXGISwapChain1* chain = nullptr;
-            result[side] = create_guarded(factory, queue, c.pass == Pass::null_window ? nullptr : hwnd,
+            result[side] = create_guarded(factory, queue, target_hwnd,
                                           c.pass == Pass::null_desc ? nullptr : &c.desc,
                                           c.pass == Pass::null_out ? nullptr : &chain);
             if (chain) chain->Release();
+            if (first_chain) first_chain->Release();
             if (hwnd) DestroyWindow(hwnd);
         }
         if (result[0] != result[1]) {
@@ -1923,6 +1963,109 @@ int main() {
 
         legacy_sc->Release();
         DestroyWindow(hwnd_legacy);
+    }
+
+    // E_ACCESSDENIED when a window already has a live swap chain, was destroyed, or is an invalid HWND;
+    // descriptor validation keeps priority, and releasing the live chain allows creating a new one on that HWND.
+    {
+        HWND hwnd_occ = create_test_window(128, 96);
+        if (!hwnd_occ) return fail("CreateWindowExW (hwnd access denied)");
+        IDXGISwapChain1* first = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd_occ, &scd, nullptr, nullptr, &first)) || !first) {
+            DestroyWindow(hwnd_occ);
+            return fail("CreateSwapChainForHwnd initial chain for E_ACCESSDENIED test");
+        }
+        auto* sentinel = reinterpret_cast<IDXGISwapChain1*>(static_cast<ULONG_PTR>(1));
+        IDXGISwapChain1* second = sentinel;
+        const HRESULT dup_hr = factory->CreateSwapChainForHwnd(queue, hwnd_occ, &scd, nullptr, nullptr, &second);
+        if (dup_hr != E_ACCESSDENIED || second != nullptr) {
+            if (second && second != sentinel) second->Release();
+            first->Release();
+            DestroyWindow(hwnd_occ);
+            return fail("second CreateSwapChainForHwnd on same HWND should return E_ACCESSDENIED with *out == nullptr");
+        }
+
+        // Legacy CreateSwapChain on an occupied HWND also answers E_ACCESSDENIED.
+        DXGI_SWAP_CHAIN_DESC leg_dup{};
+        leg_dup.BufferDesc.Width = 128;
+        leg_dup.BufferDesc.Height = 96;
+        leg_dup.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        leg_dup.SampleDesc.Count = 1;
+        leg_dup.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        leg_dup.BufferCount = 2;
+        leg_dup.OutputWindow = hwnd_occ;
+        leg_dup.Windowed = TRUE;
+        leg_dup.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        auto* leg_sentinel = reinterpret_cast<IDXGISwapChain*>(static_cast<ULONG_PTR>(1));
+        IDXGISwapChain* leg_out = leg_sentinel;
+        if (factory->CreateSwapChain(queue, &leg_dup, &leg_out) != E_ACCESSDENIED || leg_out != nullptr) {
+            if (leg_out && leg_out != leg_sentinel) leg_out->Release();
+            first->Release();
+            DestroyWindow(hwnd_occ);
+            return fail("CreateSwapChain on occupied HWND should return E_ACCESSDENIED with *out == nullptr");
+        }
+
+        // A second factory in the same process also sees the window as occupied.
+        IDXGIFactory4* factory2 = nullptr;
+        if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&factory2))) || !factory2) {
+            first->Release();
+            DestroyWindow(hwnd_occ);
+            return fail("create_dxgi_factory (second factory)");
+        }
+        second = sentinel;
+        if (factory2->CreateSwapChainForHwnd(queue, hwnd_occ, &scd, nullptr, nullptr, &second) != E_ACCESSDENIED ||
+            second != nullptr) {
+            if (second && second != sentinel) second->Release();
+            factory2->Release();
+            first->Release();
+            DestroyWindow(hwnd_occ);
+            return fail("CreateSwapChainForHwnd from a second factory on occupied HWND should return E_ACCESSDENIED");
+        }
+
+        // Releasing the first swap chain frees the HWND for a replacement swap chain.
+        first->Release();
+        IDXGISwapChain1* replacement = nullptr;
+        if (FAILED(factory2->CreateSwapChainForHwnd(queue, hwnd_occ, &scd, nullptr, nullptr, &replacement)) ||
+            !replacement) {
+            factory2->Release();
+            DestroyWindow(hwnd_occ);
+            return fail("CreateSwapChainForHwnd should succeed after prior swap chain on HWND is released");
+        }
+        replacement->Release();
+        factory2->Release();
+
+        // Destroyed HWND -> E_ACCESSDENIED (while descriptor errors still win).
+        DestroyWindow(hwnd_occ);
+        IDXGISwapChain1* destroyed_out = sentinel;
+        if (factory->CreateSwapChainForHwnd(queue, hwnd_occ, &scd, nullptr, nullptr, &destroyed_out) != E_ACCESSDENIED ||
+            destroyed_out != nullptr) {
+            if (destroyed_out && destroyed_out != sentinel) destroyed_out->Release();
+            return fail("CreateSwapChainForHwnd on destroyed HWND should return E_ACCESSDENIED");
+        }
+        leg_out = leg_sentinel;
+        if (factory->CreateSwapChain(queue, &leg_dup, &leg_out) != E_ACCESSDENIED || leg_out != nullptr) {
+            if (leg_out && leg_out != leg_sentinel) leg_out->Release();
+            return fail("CreateSwapChain on destroyed HWND should return E_ACCESSDENIED");
+        }
+        DXGI_SWAP_CHAIN_DESC1 bad_desc = scd;
+        bad_desc.BufferCount = 1;
+        IDXGISwapChain1* prio_out = sentinel;
+        if (factory->CreateSwapChainForHwnd(queue, hwnd_occ, &bad_desc, nullptr, nullptr, &prio_out) !=
+                DXGI_ERROR_INVALID_CALL ||
+            prio_out != nullptr) {
+            if (prio_out && prio_out != sentinel) prio_out->Release();
+            return fail("descriptor error should still beat destroyed HWND");
+        }
+
+        // Non-null invalid/garbage HWND -> E_ACCESSDENIED.
+        HWND garbage_hwnd = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(0x123456));
+        IDXGISwapChain1* garbage_out = sentinel;
+        if (factory->CreateSwapChainForHwnd(queue, garbage_hwnd, &scd, nullptr, nullptr, &garbage_out) !=
+                E_ACCESSDENIED ||
+            garbage_out != nullptr) {
+            if (garbage_out && garbage_out != sentinel) garbage_out->Release();
+            return fail("CreateSwapChainForHwnd on invalid HWND should return E_ACCESSDENIED");
+        }
     }
 
     rtv_heap->Release();

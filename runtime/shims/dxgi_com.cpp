@@ -204,6 +204,42 @@ private:
     D3D12_RESOURCE_DESC desc_{};
 };
 
+// Tracks windows with a live swap chain across all DXGI factories in the process;
+// declared before VulkanSwapchain in SwapChain so teardown releases the HWND only after VkSurfaceKHR destruction.
+class HwndClaim {
+public:
+    HwndClaim() = default;
+    HwndClaim(const HwndClaim&) = delete;
+    HwndClaim& operator=(const HwndClaim&) = delete;
+    ~HwndClaim() { release(); }
+
+    bool acquire(HWND hwnd) {
+        if (!hwnd) return false;
+        std::lock_guard lock(mutex());
+        if (!active().insert(hwnd).second) return false;
+        hwnd_ = hwnd;
+        return true;
+    }
+
+    void release() {
+        if (!hwnd_) return;
+        std::lock_guard lock(mutex());
+        active().erase(hwnd_);
+        hwnd_ = nullptr;
+    }
+
+private:
+    static std::mutex& mutex() {
+        static std::mutex m;
+        return m;
+    }
+    static std::set<HWND>& active() {
+        static std::set<HWND> s;
+        return s;
+    }
+    HWND hwnd_ = nullptr;
+};
+
 class SwapChain final : public IDXGISwapChain3 {
 public:
     SwapChain(IDXGIFactory4* parent, IUnknown* device, leonida::VulkanContext& context,
@@ -224,6 +260,8 @@ public:
         if (device_) device_->Release();
         if (parent_) parent_->Release();
     }
+
+    bool claim_hwnd(HWND hwnd) { return hwnd_claim_.acquire(hwnd); }
 
     bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc, VkFormat vk_fmt) {
         hwnd_ = hwnd;
@@ -614,6 +652,7 @@ private:
     IDXGIFactory4* parent_ = nullptr;
     IUnknown* device_ = nullptr;
     leonida::VulkanContext& context_;
+    HwndClaim hwnd_claim_;
     leonida::VulkanSwapchain swapchain_;
     HWND hwnd_ = nullptr;
     IDXGIOutput* restrict_to_output_ = nullptr;
@@ -1496,8 +1535,13 @@ public:
         if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
         const VkFormat vk_fmt = dxgi_to_vk_format(desc->Format);
         if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
+        if (!IsWindow(hwnd)) return E_ACCESSDENIED;
         auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
         if (restrict_to_output) sc->set_restrict_to_output(restrict_to_output);
+        if (!sc->claim_hwnd(hwnd)) {
+            sc->Release();
+            return E_ACCESSDENIED;
+        }
         if (!sc->init(hwnd, *desc, vk_fmt)) {
             sc->Release();
             return E_FAIL;
