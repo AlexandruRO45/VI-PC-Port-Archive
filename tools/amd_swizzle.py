@@ -11,6 +11,7 @@ tries every pattern table whose name has the --modes part (64K by default; 4K, 2
 for that element size, each with its own block size, scores each by image smoothness, and renders the best. As a
 module, `detile(data, pattern, bpe, wb, hb, block_bytes)` returns linear blocks.
 numpy is imported lazily, so `--help` works on a checkout without it.
+Usage: `python -I tools/amd_swizzle.py --help` lists the options.
 """
 import argparse
 import os
