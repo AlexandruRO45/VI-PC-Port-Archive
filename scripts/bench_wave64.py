@@ -3,8 +3,9 @@
     python -I scripts/bench_wave64.py [--build DIR] [--llvm-mc PATH] [--groups N] [--reps N] [--procs N] [--shader NAME]
 
 Three configurations: AMD with its native 64-wide subgroup (no flag), AMD with --wave64-emulate, NVIDIA with
---wave64-emulate (the GPU is chosen with VK_LOADER_DRIVERS_SELECT='*amd*,*radeon*' / '*nv*'). The benchmark subprocesses
-ignore the inherited single-device filter LEONIDA_VK_DEVICE. Each configuration runs `procs` processes of
+--wave64-emulate (the GPU is chosen with VK_LOADER_DRIVERS_SELECT='*amd*,*radeon*' / '*nv*'). An inherited
+LEONIDA_VK_DEVICE selects a matching GPU. A configuration whose driver cannot see that GPU uses its default device
+and reports the fallback. At least one configuration must complete using the filter. Each runs `procs` processes of
 vk_compute_test with VKC_BENCH=`reps` timed dispatches of `groups` workgroups; the table gives the median over all
 dispatches, the spread of the per-process medians (other programs share the GPU, so look at it), the number of
 translated segments (static: blocks + continuation segments; every continuation segment is one more workgroup barrier
@@ -28,6 +29,7 @@ from check import EXE, pick_build_dir  # noqa: E402
 COMPUTE_TEST = "vk_compute_test" + EXE
 CONFIGS = [("AMD native", "*amd*,*radeon*", False), ("AMD --wave64-emulate", "*amd*,*radeon*", True),
            ("NVIDIA --wave64-emulate", "*nv*", True)]
+DEVICE_FILTER_MISS = re.compile(r"exit 1: LEONIDA_VK_DEVICE=.*: no Vulkan physical device matches")
 
 
 def build(work, name, emulate, llvm_mc):
@@ -54,9 +56,10 @@ def segments(spv: str) -> tuple[int, int] | None:
     return len(cases), len(cases) - blocks
 
 
-def run(tools, spv, groups, reps, driver, emulate):
+def run(tools, spv, groups, reps, driver, emulate, *, use_device_filter=True):
     env = dict(os.environ, VK_LOADER_DRIVERS_SELECT=driver, VKC_BENCH=str(reps))
-    env.pop("LEONIDA_VK_DEVICE", None)
+    if not use_device_filter:
+        env.pop("LEONIDA_VK_DEVICE", None)
     args = [os.path.join(tools, COMPUTE_TEST), spv, str(groups), "dump"]
     if not emulate:
         args.append("--require-wave64")
@@ -100,10 +103,18 @@ def main():
         if seg:
             print(f"emulated: {seg[0]} segments, {seg[1]} of them continuation segments (one extra round each)")
         hashes, rows = {}, []
+        device_filter = os.environ.get("LEONIDA_VK_DEVICE")
+        filter_used = False
         for name, driver, emulate in CONFIGS:
             med, mins, seen, dev = [], [], set(), None
-            for _ in range(a.procs):
-                t, h, dev = run(tools, spv[emulate], a.groups, a.reps, driver, emulate)
+            use_filter = True
+            run_args = (tools, spv[emulate], a.groups, a.reps, driver, emulate)
+            for attempt in range(a.procs):
+                t, h, dev = run(*run_args, use_device_filter=use_filter)
+                if attempt == 0 and device_filter and t is None and DEVICE_FILTER_MISS.fullmatch(h):
+                    print(f"{name}: no match for LEONIDA_VK_DEVICE={device_filter!r}; using the driver's default device")
+                    use_filter = False
+                    t, h, dev = run(*run_args, use_device_filter=False)
                 if t is None:
                     med = None
                     print(f"{name}: failed or unsupported: {h}")
@@ -115,9 +126,13 @@ def main():
                 # Only a configuration whose every process ran counts: the hashes of the processes before a
                 # failed one used to be kept, so the failure passed as a configuration that had run.
                 hashes[name] = seen
+                filter_used = filter_used or use_filter
                 rows.append((name, dev, statistics.median(med), min(mins), min(med), max(med)))
         for name, dev, m, lo, a_, b_ in rows:
             print(f"{name:26} {dev:34} median {m:8.3f} ms   best {lo:8.3f}   process medians {a_:.3f}..{b_:.3f}")
+        if device_filter and not filter_used:
+            print(f"no configuration completed using LEONIDA_VK_DEVICE={device_filter!r}")
+            return 1
         ref_name = CONFIGS[0][0]
         ref = hashes.get(ref_name)
         if not ref or len(ref) != 1:

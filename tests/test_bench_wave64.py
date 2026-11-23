@@ -5,6 +5,7 @@ import fnmatch
 import io
 import os
 from pathlib import Path
+from subprocess import CompletedProcess
 import sys
 import tempfile
 import unittest
@@ -21,7 +22,7 @@ def bench(fail):
     """Run main() with 2 processes per configuration; `fail` maps a configuration name to the process that fails."""
     calls = {}
 
-    def run(tools, spv, groups, reps, driver, emulate):
+    def run(tools, spv, groups, reps, driver, emulate, **kwargs):
         name = next(n for n, d, e in bench_wave64.CONFIGS if d == driver and e == emulate)
         calls[name] = calls.get(name, 0) + 1
         if fail.get(name) == calls[name]:
@@ -102,20 +103,59 @@ class ArgumentValidation(unittest.TestCase):
 
 
 class DriverSelectors(unittest.TestCase):
-    def test_configured_driver_does_not_inherit_the_single_device_filter(self):
-        output = "bench ms: median=1.0 min=0.9 max=1.1\nbench out fnv1a: abc\n0 mismatches\n"
-        for _, driver, emulate in bench_wave64.CONFIGS:
-            with self.subTest(driver=driver, emulate=emulate), \
-                    patch.dict(os.environ, {"LEONIDA_VK_DEVICE": "a single GPU"}, clear=True), \
-                    patch.object(bench_wave64.subprocess, "run") as launch:
-                launch.return_value.stdout = output
-                launch.return_value.stderr = ""
-                launch.return_value.returncode = 0
-                bench_wave64.run("build", "fixture.spv", 1, 1, driver, emulate)
-                env = launch.call_args.kwargs["env"]
-                self.assertEqual(env["VK_LOADER_DRIVERS_SELECT"], driver)
-                self.assertNotIn("LEONIDA_VK_DEVICE", env)
-                self.assertEqual(os.environ["LEONIDA_VK_DEVICE"], "a single GPU")
+    def run_with_device_filter(self, requested, *, amd_error=None):
+        calls = []
+
+        def launch(args, *, env, **kwargs):
+            driver = env["VK_LOADER_DRIVERS_SELECT"]
+            device_filter = env.get("LEONIDA_VK_DEVICE")
+            native = "--require-wave64" in args
+            is_amd = driver == "*amd*,*radeon*"
+            calls.append((driver, native, device_filter))
+            devices = ("AMD discrete", "AMD integrated") if is_amd else ("NVIDIA discrete",)
+            device = device_filter if device_filter else devices[0]
+            if device not in devices:
+                return CompletedProcess(args, 1, "", f"LEONIDA_VK_DEVICE={device.lower()}: no Vulkan physical device matches\n")
+            if amd_error and is_amd:
+                return CompletedProcess(args, 1, "", amd_error + "\n")
+            output = (f"device: {device} (subgroup 32..64)\n"
+                      "bench ms: median=1.0 min=0.9 max=1.1\nbench out fnv1a: abc\n0 mismatches\n")
+            return CompletedProcess(args, 0, output, "")
+
+        out = io.StringIO()
+        with patch.dict(os.environ, {"LEONIDA_VK_DEVICE": requested}, clear=True), \
+                patch.object(bench_wave64, "build", return_value="test.spv"), \
+                patch.object(bench_wave64, "segments", return_value=None), \
+                patch.object(bench_wave64.subprocess, "run", side_effect=launch), \
+                patch.object(sys, "argv", ["bench_wave64.py", "--procs", "2"]), \
+                contextlib.redirect_stdout(out):
+            code = bench_wave64.main()
+            self.assertEqual(os.environ["LEONIDA_VK_DEVICE"], requested)
+        return code, calls, out.getvalue()
+
+    def test_opposite_vendor_retries_without_dropping_valid_same_vendor_filter(self):
+        code, calls, out = self.run_with_device_filter("AMD integrated")
+        self.assertEqual(code, 0, out)
+        amd = "*amd*,*radeon*"
+        self.assertEqual(calls, [(amd, True, "AMD integrated")] * 2
+                         + [(amd, False, "AMD integrated")] * 2
+                         + [("*nv*", False, "AMD integrated"), ("*nv*", False, None), ("*nv*", False, None)])
+        self.assertIn("NVIDIA --wave64-emulate: no match for LEONIDA_VK_DEVICE", out)
+        self.assertIn("AMD native                 AMD integrated", out)
+        self.assertIn("AMD --wave64-emulate       AMD integrated", out)
+        self.assertIn("emulated output equals the reference", out)
+
+    def test_filter_that_matches_no_configuration_is_an_error(self):
+        code, _, out = self.run_with_device_filter("missing device")
+        self.assertEqual(code, 1, out)
+        self.assertIn("no configuration completed using LEONIDA_VK_DEVICE", out)
+        self.assertNotIn("emulated output equals the reference", out)
+
+    def test_other_errors_do_not_retry_without_the_filter(self):
+        code, calls, out = self.run_with_device_filter("AMD integrated", amd_error="device lost")
+        self.assertEqual(code, 1, out)
+        self.assertIn("device lost", out)
+        self.assertEqual([f for d, _, f in calls if d == "*amd*,*radeon*"], ["AMD integrated"] * 2)
 
     @staticmethod
     def _matches(selector, manifest):
