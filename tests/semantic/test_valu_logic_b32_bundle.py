@@ -1155,3 +1155,59 @@ class TestOr3B32Oracle(unittest.TestCase):
             "v_or3_b32 v0, v1, v2, v3",
         ])
         self.assertEqual(val_dom, 0xFFFFFFFF)
+
+
+# ------------------------------------------------------------------------------
+# v_or3_b32 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VOr3B32Instruction:
+    dst: RegisterOperand
+    src0: Union[RegisterOperand, LiteralOperand]
+    src1: Union[RegisterOperand, LiteralOperand]
+    src2: Union[RegisterOperand, LiteralOperand]
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR:
+            raise TypeError("Destination must be a VGPR")
+
+
+def step_or3(machine: ScalarMachineLogic, insn: VOr3B32Instruction):
+    s0 = machine.read_operand(insn.src0)
+    s1 = machine.read_operand(insn.src1)
+    s2 = machine.read_operand(insn.src2)
+    machine.vgprs[insn.dst.index] = ref_or3_b32(s0, s1, s2)
+
+
+class TestOr3B32ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        machine = ScalarMachineLogic()
+        machine.vgprs[1] = 0x01
+        machine.vgprs[2] = 0x02
+        machine.vgprs[3] = 0x04
+        insn = VOr3B32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 3),
+        )
+        step_or3(machine, insn)
+
+        val_hw, _ = run_shader("ps_or3_ast_scalar", [
+            "v_mov_b32 v1, 1",
+            "v_mov_b32 v2, 2",
+            "v_mov_b32 v3, 4",
+            "v_or3_b32 v0, v1, v2, v3",
+        ])
+        self.assertEqual(machine.vgprs[0], val_hw)
+        self.assertEqual(val_hw, 7)
+
+    def test_scalar_in_place_hardware(self):
+        val_inplace, _ = run_shader("ps_or3_inplace", [
+            "v_mov_b32 v0, 0x1000",
+            "v_mov_b32 v1, 0x0100",
+            "v_mov_b32 v2, 0x0010",
+            "v_or3_b32 v0, v0, v1, v2",
+        ])
+        self.assertEqual(val_inplace, 0x1110)
