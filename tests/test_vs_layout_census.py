@@ -190,5 +190,61 @@ class TestSurvey(unittest.TestCase):
         self.assertIn("vs|0|2", document["by_stage_hw"])
 
 
+class TestLimit(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        self.index = os.path.join(tmp.name, "index.json")
+        self.report = os.path.join(tmp.name, "report.json")
+        with open(self.index, "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"file": name, "stage": "vs"} for name in ("z.dxbc", "a.dxbc", "m.dxbc")], f)
+
+    def cli(self, *args):
+        return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "vs_layout_census.py"),
+                               self.root, "--json", self.report, *args], capture_output=True, cwd=self.root)
+
+    def test_valid_limits_keep_empty_partial_and_full_counts(self):
+        for args, count in (((), 3), (("--limit", "0"), 0), (("--limit", "2"), 2), (("--limit", "4"), 3)):
+            with self.subTest(args=args):
+                result = self.cli(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with open(self.report, encoding="utf-8") as f:
+                    census = json.load(f)
+                self.assertEqual((census["containers"], census["payloads"]), (count, 0))
+                os.remove(self.report)
+
+    def test_positive_limit_uses_index_order(self):
+        # Only the first item in index order has a payload; alphabetic selection would miss it.
+        with open(os.path.join(self.root, "z.dxbc"), "wb") as f:
+            f.write(dxbc([xbch(fssm(0, 4))]))
+        os.mkdir(os.path.join(self.root, "disasm"))
+        with open(os.path.join(self.root, "disasm", "z.s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(listing("z", VS_PLAIN))
+        result = self.cli("--limit", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(self.report, encoding="utf-8") as f:
+            census = json.load(f)
+        self.assertEqual((census["containers"], census["by_stage_hw"]), (1, {"vs|0|4": 1}))
+
+    def test_negative_limit_fails_before_reading_or_writing(self):
+        # Invalid arguments must win even if the index is unavailable.
+        for limit, existing in (("-1", False), ("-4", True)):
+            with self.subTest(limit=limit):
+                if existing:
+                    os.remove(self.index)
+                    with open(self.report, "wb") as f:
+                        f.write(b"prior report\n")
+                result = self.cli("--limit", limit)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"--limit", result.stderr)
+                if existing:
+                    with open(self.report, "rb") as f:
+                        self.assertEqual(f.read(), b"prior report\n")
+                else:
+                    self.assertFalse(os.path.exists(self.report))
+
+
 if __name__ == "__main__":
     unittest.main()
