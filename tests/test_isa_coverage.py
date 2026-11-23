@@ -266,11 +266,10 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(json.loads(json.dumps(self.rep))["totals"], self.rep["totals"])
 
     def test_cli(self):
-        import contextlib
-        import io
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out), patch.object(ic.ast, "parse", wraps=ic.ast.parse) as parse:
             self.assertEqual(ic.main(["--isa", self.xml, "--translator", self.src, "--json"]), 0)
+        parse.assert_called_once()
         self.assertEqual(json.loads(out.getvalue())["instructions"], 15)
 
 

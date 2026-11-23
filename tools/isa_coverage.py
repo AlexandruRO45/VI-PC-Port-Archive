@@ -163,10 +163,17 @@ def _mnemonic_collection(node):
     return hits if isinstance(node, ast.Dict) or len(hits) >= 2 else []
 
 
+def _read_translator_ast(path):
+    with open(path, encoding="utf-8") as f:
+        return ast.parse(f.read(), path)
+
+
 def scan_translator(path):
     """Static scan of the translator source. Returns the sets described in the module docstring."""
-    with open(path, encoding="utf-8") as f:
-        tree = ast.parse(f.read(), path)
+    return _scan_translator(_read_translator_ast(path))
+
+
+def _scan_translator(tree):
     exact = collections.defaultdict(set)      # name -> {source kind}
     prefixes = collections.defaultdict(set)   # prefix -> {line}
     suffixes = collections.defaultdict(set)
@@ -276,8 +283,10 @@ def classify(name, scan, handled_elsewhere):
 
 def accepted_names(path):
     """Names compared or tabled anywhere except inside a test whose body only raises Unsupported."""
-    with open(path, encoding="utf-8") as f:
-        tree = ast.parse(f.read(), path)
+    return _accepted_names(_read_translator_ast(path))
+
+
+def _accepted_names(tree):
     skip = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.If) and _unconditional_op_names(node.test) and _only_raises_unsupported(node.body):
@@ -435,7 +444,8 @@ def main(argv=None):
     if "RDNA 2" not in isa["architecture"]:
         print(f"warning: {a.isa} describes {isa['architecture']!r}, not AMD RDNA 2", file=sys.stderr)
     try:
-        scan, accepted = scan_translator(a.translator), accepted_names(a.translator)
+        tree = _read_translator_ast(a.translator)
+        scan, accepted = _scan_translator(tree), _accepted_names(tree)
     except OSError as e:
         ap.error(f"--translator {a.translator}: {e.strerror or e}")
     except UnicodeDecodeError as e:
