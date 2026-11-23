@@ -392,6 +392,18 @@ class Counts(unittest.TestCase):
                 self.assertIn("--start-index", result.stderr)
                 self.assertNotIn("unrecognized arguments", result.stderr)
 
+    def test_translator_only_rejects_a_window_with_no_eligible_wave(self):
+        for start, mode, wave in [(0, "emulate", 32), (1, "native", 64)]:
+            with self.subTest(start=start, mode=mode):
+                result = self.run_tool("--oracle", "translator", "--wave", "both", "--programs", "1",
+                                       "--start-index", str(start), "--modes", mode,
+                                       "--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test"))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                reason = result.stderr.split("error:")[-1]
+                self.assertIn(f"wave{wave}", reason)
+                self.assertIn(mode, reason)
+
     def test_help_width_preserves_replay_arguments(self):
         command = ("python -I tools/crosslane_fuzz.py --seed 7 --ops 24 --wave both "
                    "--dpp --start-index 159 --programs 3")
@@ -657,6 +669,39 @@ class HarnessErrors(unittest.TestCase):
         for (tid, j), v in exp.items():
             words[tid * len(X.OUT_REGS) + j] = v
         return words
+
+    def test_one_program_window_dispatches_to_the_selected_oracles(self):
+        from hw_oracle import runner
+
+        cases = [
+            # start, mode, native wave64 enabled, oracle, expected translator dispatches
+            (0, "native", False, "translator", [(32, False)]),
+            (1, "emulate", False, "translator", [(64, True)]),
+            (1, "native", True, "translator", [(64, False)]),
+            (1, "native", False, "translator,hw", []),
+            (1, "native", False, "hw", []),
+        ]
+        for start, mode, native64, oracle, expected in cases:
+            with self.subTest(start=start, mode=mode, native64=native64, oracle=oracle):
+                dispatches = []
+
+                def run_gpu(exe, spv, prog, work, emulate):
+                    dispatches.append((prog.wave, emulate))
+                    return self._expected_words(prog)
+
+                argv = ["--oracle", oracle, "--wave", "both", "--programs", "1", "--ops", "1",
+                        "--start-index", str(start), "--modes", mode]
+                if native64:
+                    argv.append("--w64-native")
+                with mock.patch.object(runner, "open_oracle"), mock.patch.object(X, "run_hw") as hardware:
+                    code, out = self._main(run_gpu, argv)
+                self.assertEqual(code, 0, out)
+                self.assertEqual(dispatches, expected)
+                if "hw" in oracle.split(","):
+                    hardware.assert_called_once()
+                    self.assertEqual([p.wave for p in hardware.call_args.args[1]], [64])
+                else:
+                    hardware.assert_not_called()
 
     def test_run_goes_on_after_a_hang_and_exits_2(self):
         calls = []
