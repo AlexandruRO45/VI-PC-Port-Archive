@@ -169,20 +169,28 @@ nested archives, so the counts are a floor for the package.
 
 | Layout | Weights (semantic 16/17) | Indices (semantic 20/21) | Meshes | Vertices |
 |---|---|---|---:|---:|
-| 4 influences, 8-bit | 16: `R8G8B8A8_UNORM` | 20: `R8G8B8A8_UINT` | 38,721 | 40,631,019 |
-| 8 influences, 8-bit | 16, 17: `R8G8B8A8_UNORM` | 20, 21: `R8G8B8A8_UINT` | 23,860 | 47,611,935 |
-| 4 influences, packed | 16: `R8G8B8A8_UNORM` | 20: `R32G32B32A32_UINT` | 18,247 | 39,468,907 |
-| 8 influences, packed | 16, 17: `R8G8B8A8_UNORM` | 20, 21: `R32G32B32A32_UINT` | 16,111 | 9,512,230 |
-| rigid, 8-bit | none | 20: `R8_UINT` | 5,364 | 3,606,677 |
-| rigid, 16-bit | none | 20: `R16_UINT` | — | — |
+| 4 influences, 8-bit | 16: `R8G8B8A8_UNORM` | 20: `R8G8B8A8_UINT` | 109,976 | 101,005,691 |
+| 8 influences, 8-bit | 16, 17: `R8G8B8A8_UNORM` | 20, 21: `R8G8B8A8_UINT` | 23,905 | 47,846,956 |
+| 4 influences, packed | 16: `R8G8B8A8_UNORM` | 20: `R32G32B32A32_UINT` | 19,965 | 41,084,484 |
+| 8 influences, packed | 16, 17: `R8G8B8A8_UNORM` | 20, 21: `R32G32B32A32_UINT` | 16,172 | 9,541,838 |
+| 4 influences, 16-bit | 16: `R8G8B8A8_UNORM` | 20: `R16G16B16A16_UINT` | 416 | 6,384,310 |
+| rigid, 8-bit | none | 20: `R8_UINT` | 12,715 | 14,962,258 |
+| rigid, 16-bit | none | 20: `R16_UINT` | 1,244 | 4,159,940 |
 
-Total: 102,303 skin meshes / 140,830,768 vertices. The meshes split by archive: `packs.rpf`
-45,854 meshes / 60,142,591 vertices, `data.rpf` 3,222 / 3,854,484 (all 4-influence 8-bit),
-`levels.rpf` 53,227 / 76,833,693. No 16-bit index form appears in the top-level streams of these
-three archives; the 16-bit forms were measured (over nested-archive recovery) in the independent
-measurement linked below. The format names are the DXGI equivalents of the measured format bytes —
+Total: 184,393 skin meshes / 224,985,477 vertices, measured with `tools/skin_streams.py` at `3faac557`. The
+meshes split by archive: `packs.rpf` 48,375 meshes / 60,205,616 vertices, `data.rpf` 4,026 / 6,113,654 (all
+4-influence 8-bit), `levels.rpf` 131,992 / 158,666,207. Both 16-bit index forms appear in the top-level streams
+of `levels.rpf` only (416 four-influence and 1,244 rigid meshes); `packs.rpf` and `data.rpf` have none.
+
+The first measurement (`e23e2da0`, ASSET-12) gave 102,303 meshes / 140,830,768 vertices (`packs.rpf` 45,854,
+`data.rpf` 3,222, `levels.rpf` 53,227, no 16-bit form). The tool at that commit still gives exactly those numbers
+on the same package; the difference is the resources the walk has recognized since BUILD-173 (`918e8256`,
+fragments whose optional header pointers are null): every revision of the tool with that change gives the
+totals above, and every one without it (`4dd254ab`, `39f0cd70`, `e41dd4f6`) the old ones. The skipped
+candidates are 80 (`data.rpf`), 85 (`packs.rpf`) and 30,016 (`levels.rpf`); no mesh is left unclassified.
+The format names are the DXGI equivalents of the measured format bytes —
 28 for the weight slots, 30 for the 8-bit index slots, 3 for the packed index slots, 62 for the
-rigid 8-bit index slot — anchored on the decoded bytes, not on a name table: the 1.0.2.1 FVF
+rigid 8-bit index slot (the two 16-bit index slots are named the same way by the tool) — anchored on the decoded bytes, not on a name table: the 1.0.2.1 FVF
 format byte is not desktop DXGI numbering (desktop `R32G32B32A32_UINT` is 3 but desktop
 `R8G8B8A8_UNORM` is 24, and here it is 28; `R16_UINT` is 56 in desktop DXGI and 57 here, as
 breadbbbb/rpf9-explorer#10 reads it).
@@ -191,11 +199,13 @@ Rules the bytes support, validated per mesh against the model's own bone count (
 on a deterministic sample (96 meshes per layout per archive; the census itself covers every mesh):
 
 - **The index is into the model's own bone list.** Every component with a non-zero weight has an
-  index below the local bone count — zero violations in every sampled mesh; a zero-weight
+  index below the local bone count — zero violations in every sampled mesh of every layout, the two
+  16-bit forms included (re-measured at `3faac557`); a zero-weight
   component may carry any index, so the check masks by weight.
 - **The weights are the UNORM bytes and sum to 255** over all present weight slots. Every sampled
-  vertex of every layout in `data.rpf` and `levels.rpf`, and of the 8-influence and 8-bit
-  4-influence layouts in `packs.rpf`, sums to exactly 255. The packed 4-influence meshes in
+  vertex of every weighted layout in `data.rpf` and `levels.rpf` (the 16-bit four-influence layout
+  included: 1,586,335 sampled vertices), and of the 8-influence and 8-bit 4-influence layouts in
+  `packs.rpf`, sums to exactly 255. The packed 4-influence meshes in
   `packs.rpf` round: of 50,648 sampled vertices, 31,884 sum to exactly 255, 11,604 to 247–254,
   and 7,160 fall below 247 (as low as 164).
 - **Packed `R32G32B32A32_UINT`: the bone index is bits 0–11 of each u32.** Bits 9–11 were never
