@@ -366,6 +366,99 @@ class TestScalarInterpreter(unittest.TestCase):
         words = run_ps_med3(lines)
         self.assertEqual(words[0], f32_to_u32(20.0))
 
+class WaveSize(Enum):
+    WAVE32 = 32
+    WAVE64 = 64
+
+
+class SIMDWaveState:
+    def __init__(self, size: WaveSize = WaveSize.WAVE32):
+        self.size = size
+        self.num_lanes = size.value
+        self.vgprs = [[0] * 256 for _ in range(self.num_lanes)]
+        self.sgprs = [0] * 106
+        self.exec_mask = (1 << self.num_lanes) - 1
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def read_operand(self, lane: int, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            raw = self.vgprs[lane][op.index]
+        elif op.reg_type == RegType.SGPR:
+            raw = self.sgprs[op.index]
+        else:
+            raw = op.literal_val
+        return apply_src_mods(raw, op.neg, op.abs_)
+
+    def write_vgpr(self, lane: int, idx: int, val: int):
+        self.vgprs[lane][idx] = val & MASK32
+
+
+class SIMDInterpreter:
+    @staticmethod
+    def step(insn: VMed3F32Instruction, wave: SIMDWaveState):
+        for lane in range(wave.num_lanes):
+            if not wave.is_lane_active(lane):
+                continue
+            u0 = wave.read_operand(lane, insn.src0)
+            u1 = wave.read_operand(lane, insn.src1)
+            u2 = wave.read_operand(lane, insn.src2)
+            res = ref_med3_f32(u0, u1, u2, clamp=insn.clamp)
+            wave.write_vgpr(lane, insn.dst.index, res)
+
+
+class TestSIMDDivergence(unittest.TestCase):
+    def test_wave32_divergence_and_exec_masking(self):
+        wave = SIMDWaveState(WaveSize.WAVE32)
+        wave.exec_mask = 0x55555555
+
+        sentinel = 0xDEADBEEF
+        for lane in range(32):
+            wave.vgprs[lane][3] = sentinel
+            wave.vgprs[lane][0] = f32_to_u32(float(lane + 1))
+            wave.vgprs[lane][1] = f32_to_u32(float(lane + 5))
+            wave.vgprs[lane][2] = f32_to_u32(float(lane + 10))
+
+        insn = VMed3F32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        SIMDInterpreter.step(insn, wave)
+
+        for lane in range(32):
+            if lane % 2 == 0:  # Active lane
+                expected = f32_to_u32(float(lane + 5))
+                self.assertEqual(wave.vgprs[lane][3], expected)
+            else:  # Inactive lane preserved
+                self.assertEqual(wave.vgprs[lane][3], sentinel)
+
+    def test_wave64_divergence(self):
+        wave = SIMDWaveState(WaveSize.WAVE64)
+        wave.exec_mask = 0x00000000FFFFFFFF
+
+        sentinel = 0xCAFEBABE
+        for lane in range(64):
+            wave.vgprs[lane][3] = sentinel
+            wave.vgprs[lane][0] = f32_to_u32(1.0)
+            wave.vgprs[lane][1] = f32_to_u32(2.0)
+            wave.vgprs[lane][2] = f32_to_u32(3.0)
+
+        insn = VMed3F32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        SIMDInterpreter.step(insn, wave)
+
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][3], TWO_F32)
+        for lane in range(32, 64):
+            self.assertEqual(wave.vgprs[lane][3], sentinel)
+
 
 if __name__ == "__main__":
     unittest.main()
