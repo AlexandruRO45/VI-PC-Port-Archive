@@ -607,9 +607,14 @@ private:
         if (result == VK_ERROR_OUT_OF_DATE_KHR) {
             stale_ = true;
             result = VK_SUCCESS;
+        } else if (result == VK_SUBOPTIMAL_KHR) {
+            // VK_SUBOPTIMAL_KHR: the present succeeded (image was shown), but the swapchain
+            // is no longer optimal (e.g., after a resize). Return VK_SUCCESS to the caller
+            // since the frame was presented, but do NOT mark stale_ — only OUT_OF_DATE
+            // requires a rebuild. The application will get a new swapchain on the next
+            // acquire if needed.
+            result = VK_SUCCESS;
         }
-        // VK_SUBOPTIMAL_KHR: swapchain is still usable, don't mark stale.
-        // Only VK_ERROR_OUT_OF_DATE_KHR requires a rebuild.
         return result;
     }
 
