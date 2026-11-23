@@ -232,18 +232,25 @@ def _scan_rpf_offsets(path: str, jobs: int = 1) -> tuple[list[int], int, int]:
     return offs, complete_0x7a, incomplete_0x7a
 
 
+def folder_fog_resource(p: str) -> bytes | None:
+    """The bytes of top-level file `p` when a folder scan counts it as a fog-volume resource, else None."""
+    if not os.path.isfile(p):
+        return None
+    with open(p, "rb") as f:
+        data = f.read(WC.CAP + 1)
+    if len(data) >= 0x50 and data[0x10:0x14] == b"0DRP" and data[0x14] == 0x7A:
+        if STRUCT_VOLUME in parse_schema(data)[0]:
+            return data
+    return None
+
+
 def iter_fog_resources(path: str, jobs: int = 1, stats: dict | None = None):
     """Yield (source_id, raw_0x7a_bytes) for every complete 0x7a fog-volume resource in `path`."""
     if os.path.isdir(path):
         for name in sorted(os.listdir(path)):
-            p = os.path.join(path, name)
-            if not os.path.isfile(p):
-                continue
-            with open(p, "rb") as f:
-                data = f.read(WC.CAP + 1)
-            if len(data) >= 0x50 and data[0x10:0x14] == b"0DRP" and data[0x14] == 0x7A:
-                if STRUCT_VOLUME in parse_schema(data)[0]:
-                    yield name, data
+            data = folder_fog_resource(os.path.join(path, name))
+            if data is not None:
+                yield name, data
         return
 
     with open(path, "rb") as f:
@@ -423,15 +430,20 @@ def main(argv=None) -> int:
         if os.path.isfile(a.path) and same_report_path(a.path, a.out):
             ap.error(f"--out would overwrite input: {a.out}")
         if os.path.isdir(a.path):
-            # A folder scan reads every top-level file in it (iter_fog_resources), so a report named like one of
-            # them replaces a carved input with the summary. A new name in the folder is still allowed.
+            # A folder scan counts every top-level fog resource in it (iter_fog_resources), so a report named like
+            # one of them replaces a carved input with the summary. Any other name in the folder is allowed,
+            # including a report from an earlier run.
             try:
                 names = sorted(os.listdir(a.path))
             except OSError:
                 names = []          # summarize() reports the unreadable folder with its own ERROR line
             for name in names:
                 input_file = os.path.join(a.path, name)
-                if os.path.isfile(input_file) and same_report_path(a.out, input_file):
+                try:
+                    scanned = same_report_path(a.out, input_file) and folder_fog_resource(input_file) is not None
+                except OSError:
+                    scanned = False     # an unreadable file is summarize()'s to report
+                if scanned:
                     ap.error(f"--out would overwrite input: {a.out}")
     try:
         doc = summarize(a.path, jobs=a.jobs)

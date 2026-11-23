@@ -274,6 +274,26 @@ class FogVolumesTests(unittest.TestCase):
             with open(carved, "rb") as f:
                 self.assertEqual(f.read(), raw)
 
+    def test_rerunning_onto_the_report_left_in_the_scanned_folder_replaces_it(self):
+        # The folder scan does not count an earlier report (or any other non-fog file) as an input, so the same
+        # --out works a second time; only a file the scan reads as a fog resource is refused.
+        raw = build_synthetic_fog_0x7a([{"IsBox": 1, "ProfileIndex": 12}])
+        with tempfile.TemporaryDirectory() as td:
+            carved = os.path.join(td, "000000001000.bin")
+            with open(carved, "wb") as f:
+                f.write(raw)
+            report = os.path.join(td, "fog.json")
+            for _run in range(2):
+                self.assertEqual(fv.main([td, "--out", report, "--jobs", "1"]), 0)
+                with open(report, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["volumes"], 1)
+            notes = os.path.join(td, "notes.txt")
+            with open(notes, "w", encoding="utf-8", newline="\n") as f:
+                f.write("not a fog resource\n")
+            self.assertEqual(fv.main([td, "--out", notes, "--jobs", "1"]), 0)
+            with open(carved, "rb") as f:
+                self.assertEqual(f.read(), raw)
+
     def test_jobs_below_one_is_a_usage_error(self):
         # A --jobs of 0 used to run with max(1, 0) = one worker and exit 0, so a caller that meant to ask for
         # an impossible worker count got a silent sequential run instead of an error.
