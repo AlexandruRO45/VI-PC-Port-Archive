@@ -8,6 +8,7 @@
 //   slot 62  CreateComputePipelineState
 //   slot 76  resource creation with an Xbox layout word (0x101)
 //   slot 8/36 CreateCommandQueue/CreateFence (return queue and fence proxies that run GPU work)
+//   slot 48  the console's second queue creation (compute queues; console Flags dropped)
 // Slot 9 on the device is CreateCommandAllocator on the PC vtable and must still forward, which proves the handle
 // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
 #include <windows.h>
@@ -495,6 +496,42 @@ int main(int argc, char** argv) {
             check(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()))) && owner.Get() == device.Get(),
                   "the queue proxy's GetDevice is the device the shim returned");
         }
+
+        // Slot 48: the console's second queue creation (PC slot 48 is OpenExistingHeapFromAddress). The retail title
+        // creates its compute queues here with console Flags 1, 2 and 3 (node mask 0) and 0 (node mask 1); 2 and 3
+        // are no PC flag, so the proxy drops them. Every one must give a working queue proxy.
+        check(rt::d3d12_xs::device_slot_overridden(48), "device slot 48 is the console queue-creation override");
+        const D3D12_COMMAND_QUEUE_DESC console_descs[] = {
+            {D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, static_cast<D3D12_COMMAND_QUEUE_FLAGS>(1), 0},
+            {D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, static_cast<D3D12_COMMAND_QUEUE_FLAGS>(2), 0},
+            {D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, static_cast<D3D12_COMMAND_QUEUE_FLAGS>(3), 0},
+            {D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 1},
+        };
+        for (const D3D12_COMMAND_QUEUE_DESC& console_desc : console_descs) {
+            ComPtr<ID3D12CommandQueue> compute;
+            hr = reinterpret_cast<CreateQueueFn>(vtable[48])(device.Get(), &console_desc, &iid_queue,
+                                                             reinterpret_cast<void**>(compute.GetAddressOf()));
+            check(SUCCEEDED(hr) && rt::d3d12_xs::is_queue_proxy(compute.Get()),
+                  "slot 48 returns a queue proxy for a console compute-queue description");
+            if (compute) {
+                const D3D12_COMMAND_QUEUE_DESC got = compute->GetDesc();
+                check(got.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE && got.Flags == D3D12_COMMAND_QUEUE_FLAG_NONE,
+                      "slot 48's queue is a compute queue with the console flags dropped");
+            }
+            if (compute && fence) {
+                HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                const UINT64 value = fence->GetCompletedValue() + 1;
+                check(event && SUCCEEDED(compute->Signal(fence.Get(), value)) &&
+                          SUCCEEDED(fence->SetEventOnCompletion(value, event)) &&
+                          WaitForSingleObject(event, 5000) == 0,
+                      "slot 48's compute queue signals the fence proxy on the GPU");
+                if (event) CloseHandle(event);
+            }
+        }
+        ComPtr<ID3D12CommandQueue> none;
+        hr = reinterpret_cast<CreateQueueFn>(vtable[48])(device.Get(), nullptr, &iid_queue,
+                                                         reinterpret_cast<void**>(none.GetAddressOf()));
+        check(hr == E_INVALIDARG && !none, "slot 48 refuses a null description with a null output");
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.

@@ -223,6 +223,12 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
         ++self->calls[Slot];
         const std::uint64_t words[] = {a1, a2, a3, a4, a5};
         std::memcpy(self->args[Slot], words, sizeof(words));
+        // Device slot 8 (CreateCommandQueue): keep the description as received, since a caller may pass a copy
+        // that does not outlive the call (CreateCommandQueueX drops the console flags into a local).
+        if constexpr (Slot == 8) {
+            if (self->kind == Kind::device && a1)
+                std::memcpy(self->array[8], reinterpret_cast<const void*>(a1), sizeof(D3D12_COMMAND_QUEUE_DESC));
+        }
         return mock_call(self, Slot, words);
     }
 }
@@ -718,7 +724,23 @@ int check_xbox_slots() {
     void* queue = nullptr;
     EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
-    EXPECT(mock->args[8][0] == word(&kQueueDesc));
+    EXPECT(std::memcmp(mock->array[8], &kQueueDesc, sizeof(kQueueDesc)) == 0);
+
+    // The retail title's compute queues carry console Flags (1, 2, 3; 2 and 3 are no PC flag). They are dropped:
+    // the PC path gets the same type, priority and node mask with Flags 0.
+    for (std::uint32_t console_flags : {1u, 2u, 3u}) {
+        D3D12_COMMAND_QUEUE_DESC console_desc{};
+        console_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        console_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(console_flags);
+        void* compute = nullptr;
+        EXPECT(hr_of(raw(device, 48, word(&console_desc), word(&kQueueIid), word(&compute))) == S_OK);
+        EXPECT(xs::is_queue_proxy(compute));
+        D3D12_COMMAND_QUEUE_DESC received{};
+        std::memcpy(&received, mock->array[8], sizeof(received));
+        EXPECT(received.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE && received.Flags == D3D12_COMMAND_QUEUE_FLAG_NONE &&
+               received.NodeMask == 0 && received.Priority == 0);
+        if (compute) release(compute);
+    }
 
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
     // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached.

@@ -1146,6 +1146,31 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
 }
 
+// Device slot 48, CreateCommandQueueX(desc, riid, out). The retail title (game_scarlett_master.exe 1.0.2.1, measured
+// under gta6rt --run) creates its four compute queues here with console Flags: {COMPUTE, priority 0, Flags 1, 2 and 3,
+// node mask 0} and {COMPUTE, 0, Flags 0, node mask 1}. Those Flags read as a console queue selector, not the PC bits:
+// 2 and 3 are no PC queue flag, so the Vulkan device refuses them (E_INVALIDARG) and the title asserts on the second
+// queue, and PC flag 1 (DISABLE_GPU_TIMEOUT) means nothing to it. The flags are dropped (each value logged once) and
+// the rest of the description takes slot 8's path.
+HRESULT proxy_create_command_queue_x(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
+                                     void** out) {
+    if (!desc) {
+        if (out) *out = nullptr;
+        return E_INVALIDARG;
+    }
+    D3D12_COMMAND_QUEUE_DESC pc_desc = *desc;
+    const auto flags = static_cast<std::uint32_t>(pc_desc.Flags);
+    if (flags != 0) {
+        static std::atomic<std::uint32_t> logged{0};
+        const std::uint32_t bit = flags < 32 ? (1u << flags) : 0x80000000u;
+        if ((logged.fetch_or(bit, std::memory_order_relaxed) & bit) == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: CreateCommandQueueX: console queue flags 0x%x dropped (type %d)\n",
+                         flags, static_cast<int>(pc_desc.Type));
+        pc_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    }
+    return proxy_create_command_queue(self, &pc_desc, riid, out);
+}
+
 // Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
 // not used before a presenter exists. The period is a vblank period in microseconds in the public samples (16667 for
 // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
@@ -1549,9 +1574,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         }
         if (Slot == routes.queue_x) {
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
-                                                        reinterpret_cast<const IID*>(a2),
-                                                        reinterpret_cast<void**>(a3)));
+            return hr_to_u64(proxy_create_command_queue_x(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+                                                          reinterpret_cast<const IID*>(a2),
+                                                          reinterpret_cast<void**>(a3)));
         }
         if (Slot == routes.list_x) {
             log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);
