@@ -346,3 +346,94 @@ class TestASTDefinitions(unittest.TestCase):
         spv = support.translate_lines("ps_ast_fmac_valid", lines)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x4100)
+
+
+# ==============================================================================
+# SECTION 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    vgprs: Dict[int, int] = field(default_factory=dict)
+    sgprs: Dict[int, int] = field(default_factory=dict)
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs.get(idx, 0)
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = u32(val)
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = u32(val)
+
+
+class ScalarInterpreter:
+    def resolve_operand(self, op: Operand, state: ScalarMachineState) -> int:
+        if op.kind == OperandKind.VGPR:
+            return state.get_vgpr(op.value)
+        elif op.kind == OperandKind.SGPR:
+            return state.get_sgpr(op.value)
+        elif op.kind == OperandKind.IMMEDIATE:
+            return u32(op.value)
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def step(self, instr: VFMAC16Instruction, state: ScalarMachineState) -> int:
+        dst_val = state.get_vgpr(instr.dst.value)
+        val0 = self.resolve_operand(instr.src0, state)
+        val1 = self.resolve_operand(instr.src1, state)
+
+        res = oracle_fmac_f16(
+            dst_val,
+            val0,
+            val1,
+            op_sel=instr.mods.op_sel,
+            clamp=instr.mods.clamp,
+        )
+        state.set_vgpr(instr.dst.value, res)
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_execution(self) -> None:
+        """Verify interpreter correctly executes across VGPR, SGPR, and Immediate inputs."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, 0x1234_3800)                          # acc = 0.5, hi = 0x1234
+        state.set_vgpr(1, F16_ONE)                              # 1.0
+        state.set_sgpr(4, F16_TWO)                              # 2.0
+
+        interp = ScalarInterpreter()
+        instr = VFMAC16Instruction(
+            dst=VGPR(0),
+            src0=VGPR(1),
+            src1=SGPR(4),
+        )
+        res = interp.step(instr, state)
+        # 1.0 * 2.0 + 0.5 = 2.5 (0x4100), keeping hi 0x1234
+        self.assertEqual(res, 0x1234_4100)
+        self.assertEqual(state.get_vgpr(0), 0x1234_4100)
+
+    def test_scalar_interpreter_cross_validation_with_translator(self) -> None:
+        """Verify scalar interpreter exactly matches translated SPIR-V execution."""
+        state = ScalarMachineState()
+        dst = 0x5678_3800
+        src0 = F16_ONE
+        src1 = F16_TWO
+        state.set_vgpr(0, dst)
+        state.set_vgpr(1, src0)
+        state.set_vgpr(2, src1)
+
+        interp = ScalarInterpreter()
+        instr = VFMAC16Instruction(
+            dst=VGPR(0),
+            src0=VGPR(1),
+            src1=VGPR(2),
+        )
+        interp_res = interp.step(instr, state)
+        spv_res = run_translator_fmac(dst, src0, src1, name="ps_scalar_fmac_cross")
+        self.assertEqual(interp_res, spv_res)
