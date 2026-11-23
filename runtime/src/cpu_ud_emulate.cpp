@@ -25,9 +25,9 @@ bool writable(const void* p, size_t n) {
     return true;
 }
 
-// CLZERO, 0F 01 FC: zero the 64-byte cache line that contains the address in RAX (the low 6 bits are ignored). If
-// that line is not writable the real instruction raises a page fault; here the emulator declines, so the access
-// violation the game would see on real hardware is not turned into a silent success.
+// The line the last write_fault() on this thread reported.
+thread_local uintptr_t t_fault_address = 0;
+
 // Zeroes the line under SEH: another thread may unmap or reprotect it after writable() looked.
 bool zero_line(uint8_t* line) {
     __try {
@@ -38,13 +38,47 @@ bool zero_line(uint8_t* line) {
     }
 }
 
+// Whether `a` is a canonical x64 address (bits 63:47 all equal; Windows does not use 5-level paging).
+bool canonical(uint64_t a) {
+    const uint64_t top = a >> 47;
+    return top == 0 || top == 0x1FFFF;
+}
+
+// The legacy prefixes CLZERO ignores: operand size (66), REP/REPNE (F3/F2) and the segment overrides. LOCK (F0) is
+// not among them: LOCK on CLZERO is a real #UD.
+bool ignored_prefix(uint8_t b) {
+    switch (b) {
+        case 0x66: case 0xF2: case 0xF3:
+        case 0x2E: case 0x36: case 0x3E: case 0x26: case 0x64: case 0x65:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// CLZERO, 0F 01 FC, with any legacy prefixes and a REX that comes last before the 0F: zero the 64-byte cache line
+// that contains the address in RAX (the low 6 bits are ignored). The address-size prefix 67 selects EAX
+// (zero-extended) instead. If the line cannot be written (not writable, not committed, a non-canonical address, or one
+// whose line wraps past the top of memory) the real instruction raises a page fault: the emulator reports it with
+// write_fault(), and the dispatcher turns it into the access violation the game would see on real hardware. A guard
+// page is reported the same way, without consuming the guard.
 size_t emulate_clzero(CONTEXT& ctx, const uint8_t* code, size_t available) {
-    if (available < 3 || code[0] != 0x0F || code[1] != 0x01 || code[2] != 0xFC) return 0;
-    auto* line = reinterpret_cast<uint8_t*>(ctx.Rax & ~static_cast<DWORD64>(kCacheLine - 1));
-    // A line whose end wraps past the top of the address space (RAX near 2^64) cannot be a mapped line.
-    if (reinterpret_cast<uintptr_t>(line) > UINTPTR_MAX - kCacheLine) return 0;
-    if (!writable(line, kCacheLine) || !zero_line(line)) return 0;
-    return 3;
+    size_t at = 0;
+    bool addr32 = false;
+    // A valid instruction is at most 15 bytes: up to 12 prefix bytes (REX included) and the 3 opcode bytes.
+    while (at < available && (ignored_prefix(code[at]) || code[at] == 0x67)) {
+        addr32 |= code[at] == 0x67;
+        if (++at > kMaxInstructionLength - 3) return 0;
+    }
+    if (at < available && (code[at] & 0xF0) == 0x40 && ++at > kMaxInstructionLength - 3) return 0;  // REX
+    if (available < at + 3 || code[at] != 0x0F || code[at + 1] != 0x01 || code[at + 2] != 0xFC) return 0;
+    const uint64_t address = addr32 ? (ctx.Rax & 0xFFFFFFFFull) : ctx.Rax;
+    const uint64_t line_address = address & ~static_cast<uint64_t>(kCacheLine - 1);
+    auto* line = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(line_address));
+    // A line whose end wraps past the top of the address space cannot be a mapped line.
+    if (!canonical(line_address) || line_address > UINT64_MAX - kCacheLine) return write_fault(line_address);
+    if (!writable(line, kCacheLine) || !zero_line(line)) return write_fault(line_address);
+    return at + 3;
 }
 
 const Emulator kTable[] = {
@@ -67,6 +101,11 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* info) { return emulate(info); }
 
 }  // namespace
 
+size_t write_fault(uintptr_t address) {
+    t_fault_address = address;
+    return kFault;
+}
+
 LONG emulate(EXCEPTION_POINTERS* info) {
     if (!info || !info->ExceptionRecord || !info->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
     if (info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
@@ -79,6 +118,15 @@ LONG emulate(EXCEPTION_POINTERS* info) {
         CONTEXT work = ctx;
         const size_t length = e.fn(work, code, available);
         if (!length) continue;
+        if (length == kFault) {
+            // The CPU would have raised a page fault, not a #UD: say so to the handlers after this one.
+            EXCEPTION_RECORD& record = *info->ExceptionRecord;
+            record.ExceptionCode = STATUS_ACCESS_VIOLATION;
+            record.NumberParameters = 2;
+            record.ExceptionInformation[0] = 1;  // a write
+            record.ExceptionInformation[1] = t_fault_address;
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         ctx = work;
         ctx.Rip += length;
         return EXCEPTION_CONTINUE_EXECUTION;
