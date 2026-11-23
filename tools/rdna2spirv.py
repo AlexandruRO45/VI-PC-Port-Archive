@@ -288,6 +288,7 @@ class Gen:
         self.uses_img_offset = False
         self.uses_pops = False
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
+        self.directed_round_mode = False  # all instructions can run under modes 1 and 2
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
@@ -834,8 +835,8 @@ class Gen:
     def f16_res(self, f, exact_tiny=False):
         """f32 ``f`` -> f16 bits (low 16) as a VALU f16 result rounds it: to nearest even (f16_bits), or, when the
         program writes MODE.FP_ROUND[3:2], by the current mode in %mode_r16 (0 nearest even, 3 toward zero with
-        f16_bits(rtz=True); 1 and 2 are refused when the setreg is translated). Shaders that never write the field
-        get exactly f16_bits. Integer ops only either way (SHADER-56)."""
+        f16_bits(rtz=True); directed writes are refused in shaders that use this lowering). Shaders that never
+        write the field get exactly f16_bits. Integer ops only either way (SHADER-56)."""
         if not self.round_mode:
             return self.f16_bits(f, exact_tiny=exact_tiny)
         m, is_z = self.tmp(), self.tmp()
@@ -1107,8 +1108,9 @@ class Gen:
     def mode_write(self, op, a):
         """s_setreg* on HW_REG_MODE. Only FP_ROUND[3:2] (f16/f64 rounding) is modelled, the one MODE field the
         corpus writes (9,417 writes: value 3 = toward zero 6,694, value 0 = nearest even 2,723). A write that
-        reaches another MODE bit or only part of the field, sets directed rounding (+inf/-inf), or takes its value
-        from an SGPR is refused, so nothing changes silently. Other hardware registers (FLAT_SCR, POPS packer) are not MODE: ignored."""
+        reaches another MODE bit or only part of the field, or takes its value from an SGPR, is refused. Directed
+        rounding is supported when the shader uses v_ldexp_f64 and operations independent of the field. Other
+        hardware registers (FLAT_SCR, POPS packer) are ignored."""
         t = a[0].get("t", "") if a and a[0]["k"] == "special" else ""
         m = re.match(r"hwreg\((\w+)(?:,\s*(\d+),\s*(\d+))?\)", t)
         if not m or m.group(1) != "HW_REG_MODE":
@@ -1121,8 +1123,8 @@ class Gen:
         self.write_half_round_mode(op, a[1]["v"] & 3)
 
     def write_half_round_mode(self, op: str, mode: int) -> None:
-        if mode in (1, 2):
-            raise Unsupported(f"{op}: MODE.FP_ROUND[3:2] directed rounding (+inf/-inf)")
+        if mode in (1, 2) and not self.directed_round_mode:
+            raise Unsupported(f"{op}: MODE.FP_ROUND[3:2] directed rounding requires v_ldexp_f64 and mode-independent ops")
         self.emit(f"OpStore %mode_r16 {self.cu(mode)}")
 
     def emit_ne0(self, v):
@@ -10867,13 +10869,12 @@ class Gen:
             # Measured natively on gfx1036 (wave32 & wave64, game MODE: ieee=0, dx10_clamp=1, denorm16_64=3):
             # - +-0, +-inf, and NaNs (both qNaN and sNaN under ieee=0) pass through unchanged (after S0 abs/neg).
             # - Subnormal inputs are normalized before scaling; subnormal outputs shift right by 1 - e2 (1..53)
-            #   and round to nearest even (with carry into bit 52 giving +-min_norm; sh >= 54 flushes to +-0).
+            #   and round to nearest even by default (with carry into bit 52 giving +-min_norm).
             # - VOP3 clamp applies in both denorm16_64=3 and 0 (dx10_clamp=1: NaN/-0/<0 -> +0.0, >1.0 -> 1.0).
             # - VOP3 omod (mul:2/mul:4/div:2) is ignored by hardware when denorm16_64=3 and active when 0, so it is
             #   rejected as MODE-dependent rather than guessed.
-            # After a MODE.FP_ROUND[3:2] (f16/f64 rounding) toward-zero write (%mode_r16 = 3) the result rounds like
-            # v_add_f64's: an overflow gives +-DBL_MAX, not +-inf, and a subnormal result is truncated (RDNA2 ISA,
-            # MODE register; not measured on hardware for this op).
+            # MODE.FP_ROUND[3:2] selects nearest even, +inf, -inf or toward zero. Native gfx1032 tests confirmed
+            # both directed modes for signed overflow, inexact subnormals and values below half the min subnormal.
             if any(m.startswith(("mul:", "div:")) for m in mods):
                 raise Unsupported(op + " output modifier")
             d = a[0]
@@ -10969,20 +10970,24 @@ class Gen:
             self.emit(f"{sig_m} = OpBitwiseAnd %uint {sig_hi} {self.cu(0x000FFFFF)}")
             self.emit(f"{norm_r_hi0} = OpBitwiseOr %uint {sgn} {sig_m}")
             self.emit(f"{norm_r_hi} = OpBitwiseOr %uint {norm_r_hi0} {e2_sh}")
-            rtz = inf_lo = None
+            round_nearest = round_away = inf_lo = tiny_lo = None
             if self.round_mode:
-                # Toward zero, an overflow saturates at the largest finite binary64 (0x7FEFFFFF_FFFFFFFF).
-                md, rtz, big_hi = self.tmp(), self.tmp(), self.tmp()
+                md, negative, away_mode, round_nearest, round_away, to_inf, big_hi, inf_lo, tiny_lo = \
+                    (self.tmp() for _ in range(9))
                 self.emit(f"{md} = OpLoad %uint %mode_r16")
-                self.emit(f"{rtz} = OpIEqual %bool {md} {self.cu(3)}")
-                self.emit(f"{big_hi} = OpSelect %uint {rtz} {self.cu(0x7FEFFFFF)} {self.cu(0x7FF00000)}")
+                self.emit(f"{negative} = OpINotEqual %bool {sgn} {self.cu(0)}")
+                self.emit(f"{away_mode} = OpSelect %uint {negative} {self.cu(2)} {self.cu(1)}")
+                self.emit(f"{round_nearest} = OpIEqual %bool {md} {self.cu(0)}")
+                self.emit(f"{round_away} = OpIEqual %bool {md} {away_mode}")
+                # Overflow goes to infinity when rounding to nearest or away from zero, and saturates otherwise.
+                self.emit(f"{to_inf} = OpLogicalOr %bool {round_nearest} {round_away}")
+                self.emit(f"{big_hi} = OpSelect %uint {to_inf} {self.cu(0x7FF00000)} {self.cu(0x7FEFFFFF)}")
                 self.emit(f"{inf_hi} = OpBitwiseOr %uint {sgn} {big_hi}")
-                inf_lo = self.tmp()
-                self.emit(f"{inf_lo} = OpSelect %uint {rtz} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                self.emit(f"{inf_lo} = OpSelect %uint {to_inf} {self.cu(0)} {self.cu(0xFFFFFFFF)}")
+                self.emit(f"{tiny_lo} = OpSelect %uint {round_away} {self.cu(1)} {self.cu(0)}")
             else:
                 self.emit(f"{inf_hi} = OpBitwiseOr %uint {sgn} {self.cu(0x7FF00000)}")
-            # Subnormal / underflow (e2 <= 0): shift 53-bit significand right by sh = 1 - e2 and round to nearest even
-            # (toward zero: truncate).
+            # Subnormal / underflow (e2 <= 0): shift the 53-bit significand right by sh = 1 - e2 and round.
             sh_i, under, sh_ci, sh_c, sh_lt32, sh_eq32 = (self.tmp() for _ in range(6))
             self.emit(f"{sh_i} = OpISub %int {self.as_int(self.cu(1))} {e2_i}")
             self.emit(f"{under} = OpSGreaterThan %bool {sh_i} {self.as_int(self.cu(53))}")
@@ -11045,10 +11050,16 @@ class Gen:
             self.emit(f"{odd} = OpINotEqual %bool {odd_u} {self.cu(0)}")
             self.emit(f"{tie} = OpLogicalAnd %bool {eq} {odd}")
             self.emit(f"{up} = OpLogicalOr %bool {gt} {tie}")
-            if rtz is not None:
-                not_z, upn = self.tmp(), self.tmp()
-                self.emit(f"{not_z} = OpLogicalNot %bool {rtz}")
-                self.emit(f"{upn} = OpLogicalAnd %bool {up} {not_z}")
+            if round_nearest is not None:
+                nz1, tail3, nz3, nz23, discarded, directed_up, upn = (self.tmp() for _ in range(7))
+                # For directed rounding any discarded bit matters, including the low word in the sh > 32 path.
+                self.emit(f"{nz1} = OpINotEqual %bool {rem1} {self.cu(0)}")
+                self.emit(f"{tail3} = OpBitwiseOr %uint {rem3} {sig_lo}")
+                self.emit(f"{nz3} = OpINotEqual %bool {tail3} {self.cu(0)}")
+                self.emit(f"{nz23} = OpSelect %bool {sh_eq32} {lo_nz} {nz3}")
+                self.emit(f"{discarded} = OpSelect %bool {sh_lt32} {nz1} {nz23}")
+                self.emit(f"{directed_up} = OpLogicalAnd %bool {round_away} {discarded}")
+                self.emit(f"{upn} = OpSelect %bool {round_nearest} {up} {directed_up}")
                 up = upn
             self.emit(f"{inc} = OpSelect %uint {up} {self.cu(1)} {self.cu(0)}")
             self.emit(f"{ql_inc} = OpIAdd %uint {q_lo} {inc}")
@@ -11058,7 +11069,7 @@ class Gen:
             den_hi0, den_hi, den_lo, nv_hi, nv_lo, sc_hi, sc_lo, r_hi, r_lo = (self.tmp() for _ in range(9))
             self.emit(f"{den_hi0} = OpBitwiseOr %uint {sgn} {qh_inc}")
             self.emit(f"{den_hi} = OpSelect %uint {under} {sgn} {den_hi0}")
-            self.emit(f"{den_lo} = OpSelect %uint {under} {self.cu(0)} {ql_inc}")
+            self.emit(f"{den_lo} = OpSelect %uint {under} {tiny_lo or self.cu(0)} {ql_inc}")
             self.emit(f"{nv_hi} = OpSelect %uint {over} {inf_hi} {den_hi}")
             self.emit(f"{nv_lo} = OpSelect %uint {over} {inf_lo or self.cu(0)} {den_lo}")
             self.emit(f"{sc_hi} = OpSelect %uint {valid} {norm_r_hi} {nv_hi}")
@@ -16063,6 +16074,14 @@ def translate(path):
     g.round_mode = any(i["op"] == "s_round_mode" or
                        (i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", ""))
                        for i in insns)
+    if g.round_mode:
+        # Until the other f16/f64 lowerings support modes 1 and 2, allow these writes only in programs
+        # whose other operations are independent of FP_ROUND[3:2], including scalar control flow.
+        ops = {base_op(i["op"]) for i in insns}
+        g.directed_round_mode = "v_ldexp_f64" in ops and all(
+            op.startswith("s_") or op in NOOPS or op in U2 or op in F2 or
+            op in ("v_ldexp_f64", "v_mov_b32", "v_readfirstlane_b32", "v_readlane_b32", "v_writelane_b32", "exp")
+            for op in ops)
     strict_w64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) for i in insns)
     code_w64 = strict_w64 or any(base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc")
                                                                             for x in i["args"]) for i in insns)
