@@ -316,5 +316,60 @@ class TestSaluAndSaveexecB32SIMDDivergence(unittest.TestCase):
         self.assertIn("OpBitwiseAnd", spv)
 
 
+
+
+class TestSaluAndSaveexecB32Aliasing(unittest.TestCase):
+    """Test suite for register aliasing and in-place operand preservation."""
+
+    def test_aliasing_destination_same_as_source(self):
+        # s_and_saveexec_b32 s4, s4
+        old_exec = 0xAAAAAAAA
+        src_init = 0x55555555
+        state = ScalarRegisterState(exec_lo=old_exec)
+        state.set_sgpr(4, src_init)
+
+        inst = ASTInstruction(
+            opcode=Opcode.S_AND_SAVEEXEC_B32,
+            dst=ASTOperand.sgpr(4, 1),
+            src0=ASTOperand.sgpr(4, 1),
+        )
+        state.execute(inst)
+
+        self.assertEqual(state.get_sgpr(4), old_exec)
+        self.assertEqual(state.exec_lo, src_init & old_exec)
+
+    def test_aliasing_source_is_exec_lo(self):
+        # s_and_saveexec_b32 s2, exec_lo
+        old_exec = 0x12345678
+        state = ScalarRegisterState(exec_lo=old_exec)
+        inst = ASTInstruction(
+            opcode=Opcode.S_AND_SAVEEXEC_B32,
+            dst=ASTOperand.sgpr(2, 1),
+            src0=ASTOperand.exec_lo(),
+        )
+        state.execute(inst)
+        self.assertEqual(state.get_sgpr(2), old_exec)
+        self.assertEqual(state.exec_lo, old_exec)
+        self.assertEqual(state.scc, 1)
+
+    def test_untouched_sgprs_preserved(self):
+        state = ScalarRegisterState(exec_lo=0x1234)
+        for i in range(106):
+            state.set_sgpr(i, 0xBEEF0000 + i)
+
+        inst = ASTInstruction(
+            opcode=Opcode.S_AND_SAVEEXEC_B32,
+            dst=ASTOperand.sgpr(10, 1),
+            src0=ASTOperand.sgpr(12, 1),
+        )
+        state.execute(inst)
+
+        for i in range(106):
+            if i == 10:
+                self.assertEqual(state.get_sgpr(i), 0x1234)
+            else:
+                self.assertEqual(state.get_sgpr(i), 0xBEEF0000 + i)
+
+
 if __name__ == "__main__":
     unittest.main()
