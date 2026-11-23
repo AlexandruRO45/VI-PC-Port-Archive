@@ -6,6 +6,8 @@ shader was reported "clean" (and make_game.py translated nothing). The probe now
 
     python -I tests/test_shader_disasm.py
 """
+from pathlib import Path
+
 import json
 import os
 import subprocess
@@ -204,6 +206,61 @@ class DisasmInputTest(unittest.TestCase):
         result = self.run_tool(self.src, "--out", out, "--skip-existing")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("'reused': 3", result.stdout)
+
+    def test_resume_after_case_only_input_rename(self):
+        self.write("PS_Case.fssm", fssm())
+        out = Path(self.dir) / "listings"
+        args = (self.src, "--out", str(out), "--backend", "python")
+        initial = self.run_tool(*args)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        original = out / "PS_Case.s"
+        listing = original.read_bytes()
+        self.assertIn(b"s_endpgm", listing)
+        obsolete = out / "obsolete.s"
+        obsolete.write_bytes(b"; old listing\n")
+
+        src = Path(self.src)
+        (src / "PS_Case.fssm").rename(src / "temporary.fssm").rename(src / "ps_case.fssm")
+        self.assertEqual(os.listdir(src), ["ps_case.fssm"])
+        current = out / "ps_case.s"
+        # The output directory decides whether both spellings already name the listing.
+        aliases_original = current.exists()
+        limited = self.run_tool(*args, "--skip-existing", "--limit", "1")
+        self.assertEqual(limited.returncode, 0, limited.stderr)
+        self.assertIn("'reused': 1" if aliases_original else "'clean': 1", limited.stdout)
+        self.assertEqual(original.read_bytes(), listing)
+        self.assertEqual(obsolete.read_bytes(), b"; old listing\n")
+        expected = listing if aliases_original else current.read_bytes()
+        self.assertIn(b"s_endpgm", expected)
+
+        full = self.run_tool(*args, "--skip-existing")
+        self.assertEqual(full.returncode, 0, full.stderr)
+        self.assertIn("'reused': 1", full.stdout)
+        self.assertTrue(current.is_file(), "full run pruned the listing it reported reusing")
+        self.assertEqual(current.read_bytes(), expected)
+        self.assertFalse(obsolete.exists())
+        if not aliases_original:
+            self.assertFalse(original.exists())
+
+    def test_resume_prunes_an_obsolete_hard_link_to_a_current_listing(self):
+        self.write("strasse.fssm", fssm())
+        out = Path(self.dir) / "listings"
+        args = (self.src, "--out", str(out), "--backend", "python")
+        initial = self.run_tool(*args)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        current = out / "strasse.s"
+        listing = current.read_bytes()
+        # Same Unicode casefold, but separate directory entries on NTFS.
+        obsolete = out / "stra\u00dfe.s"
+        try:
+            os.link(current, obsolete)
+        except OSError as exc:
+            self.skipTest(f"distinct hard-link names unavailable: {exc}")
+        result = self.run_tool(*args, "--skip-existing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("'reused': 1", result.stdout)
+        self.assertEqual(current.read_bytes(), listing)
+        self.assertFalse(obsolete.exists())
 
     def test_code_range_scans_a_blob_shorter_than_the_header(self):
         sys.path.insert(0, os.path.join(ROOT, "tools"))
