@@ -280,6 +280,14 @@ class RuntimePackagingTest(unittest.TestCase):
         result = subprocess.check_output([os.path.join(moved, "gta6rt.sh"), "--dry-run"], cwd=self.root, env=env)
         self.assertEqual(json.loads(result)[2], "Z:" + moved + "/Shader cache '$HOME'/shaders/spirv")
 
+    def test_wine_package_records_filesystem_bytes_for_game_path(self):
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        game = os.path.join(self.game, "package-\udcff")
+        with mock.patch.object(make_game.os, "name", "posix"), mock.patch.object(make_game, "log"):
+            make_game.runtime(game, self.out, {"expected_exe": "game.exe"}, self.build)
+        with open(os.path.join(self.out, "game_path.txt"), "rb") as f:
+            self.assertEqual(f.read(), os.fsencode(game))
+
     def test_runtime_records_shader_work_directory(self):
         self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
         work = os.path.join(self.root, "Shader Work \u03bb")
