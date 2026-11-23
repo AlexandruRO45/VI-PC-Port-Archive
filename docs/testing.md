@@ -392,6 +392,30 @@ specification allows a driver to split GLSL `Fma` into two roundings, which is w
 it `cs_fma_fused` passes on both of those, on an RTX 3050 Laptop (617.42), an RTX 5060 Laptop (621.01), an RTX 5070 Ti
 (621.24) and a Radeon 780M (26.11.2).
 
+## The semantic tests on a GPU (`semantic_on_gpu.py`)
+
+`tests/semantic` checks the translator's SPIR-V on `spirv_mini_interp`, a CPU model of what Vulkan does, so a test
+can pass there and still give other words on a driver. `scripts/semantic_on_gpu.py` replays its pixel-shader runs on
+the GPU. It runs the suite with `run_fragment` wrapped and keeps up to `--per-test` distinct runs per test, counting
+only runs that one pixel can repeat: a translated module with no varyings, push constants within s0..s31 and memory
+below 64 KiB. It then draws each one with `vk_harness` (the run's push constants in `VKH_SGPRS`, its memory in
+`VKH_HEAP`) and compares the four MRT0 words and every heap word with the interpreter's:
+
+```sh
+cmake --build runtime/build/linux --target vk_harness
+python3 -I scripts/semantic_on_gpu.py --build runtime/build/linux --jobs 4
+python3 -I scripts/semantic_on_gpu.py --build runtime/build/linux --files 'test_alu_div_fmas.py'
+```
+
+NaN against NaN counts as equal, since SPIR-V leaves NaN bits to the driver. A module with an approximate
+instruction (`OpFDiv`, `InverseSqrt`, `Exp2` and the like) up to 2 ulp away is listed as `approx`. Anything else is a
+`diff`: the translator relies on something the model does and this driver doesn't, or the model is wrong. The
+script exits 1 on a `diff`. A module that `spirv-as` rejects (a negative control that breaks it on purpose) is
+`invalid`. On an RTX 2060 SUPER (driver 620.70.06, Linux) the whole suite took half an hour with `--jobs 4`. Of
+12,305 runs, 12,295 matched up to NaN bits, 6 were `approx` (`v_rsq_f32`) and 1 `invalid`. The 3 `diff`s are
+`v_div_fmas_f32` with an f32 subnormal input: the hardware keeps it, and NVIDIA flushes it, since the modules
+declare no 32-bit denormal mode.
+
 ## Hardware oracle (optional, AMD)
 
 `valu_fuzz.py`, `lds_fuzz.py`, `f32_fuzz.py` and `image_fuzz.py` take `--oracle hw`: the same programs run as native
