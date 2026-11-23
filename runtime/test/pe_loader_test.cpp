@@ -658,6 +658,21 @@ void test_optional_package() {
     }
 }
 
+void write_minimal_pe64(const fs::path& path, uint64_t image_base, uint32_t size_of_image, bool has_reloc) {
+    std::vector<uint8_t> buf(sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64), 0);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(buf.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = static_cast<LONG>(sizeof(IMAGE_DOS_HEADER));
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(buf.data() + sizeof(IMAGE_DOS_HEADER));
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.ImageBase = image_base;
+    nt->OptionalHeader.SizeOfImage = size_of_image;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    if (has_reloc) nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size = 8;
+    write_file(path, buf.data(), buf.size());
+}
+
 // The child gta6rt relaunches reads its reserved range back from LEONIDA_BASE_RESERVED (base_reservation.h). Only
 // arm64 Wine relaunches, so this is the one place a Windows run parses it.
 void test_inherited_reservation() {
@@ -669,16 +684,128 @@ void test_inherited_reservation() {
     const auto r = br::inherited();
     check(r && r->base == 0x140000000ull && r->size == 0x30000000ull,
           "LEONIDA_BASE_RESERVED=140000000:30000000 is base 0x140000000, size 0x30000000");
+    SetEnvironmentVariableW(br::kVariable, L"140000000:10000A000");
+    const auto ru = br::inherited();
+    check(ru && ru->base == 0x140000000ull && ru->size == 0x10000a000ull,
+          "LEONIDA_BASE_RESERVED accepts mixed-case hex digits");
     SetEnvironmentVariableW(br::kVariable, L"140000000:0");
     check(!br::inherited(), "LEONIDA_BASE_RESERVED with size 0 is no reservation");
     SetEnvironmentVariableW(br::kVariable, L"140000000");
     check(!br::inherited(), "LEONIDA_BASE_RESERVED without a size is no reservation");
     SetEnvironmentVariableW(br::kVariable, L"zz:30000000");
     check(!br::inherited(), "LEONIDA_BASE_RESERVED with a non-hex base is no reservation");
+    SetEnvironmentVariableW(br::kVariable, L"140000000:30000000xyz");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED rejects trailing non-hex characters");
+    SetEnvironmentVariableW(br::kVariable, L" 140000000:10000");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED rejects leading whitespace");
+    SetEnvironmentVariableW(br::kVariable, L"-1:10000");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED rejects leading minus sign");
+    SetEnvironmentVariableW(br::kVariable, L"+140000000:10000");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED rejects leading plus sign");
+    SetEnvironmentVariableW(br::kVariable, L"0x140000000:10000");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED rejects 0x prefix");
+    SetEnvironmentVariableW(br::kVariable, L"0:10000");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED rejects null base address");
+    SetEnvironmentVariableW(br::kVariable, L"10000000000000000:10000");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED rejects >64-bit hex overflow");
+    SetEnvironmentVariableW(br::kVariable, L"ffffffffffff0000:20000");
+    check(!br::inherited(), "LEONIDA_BASE_RESERVED rejects wraparound range");
     SetEnvironmentVariableW(br::kVariable, nullptr);
     check(!br::inherited(), "no LEONIDA_BASE_RESERVED is no reservation");
 
     if (saved_length && saved_length < 64) SetEnvironmentVariableW(br::kVariable, saved);
+}
+
+void test_base_reservation(const fs::path& temp_dir) {
+    namespace br = rt::base_reservation;
+    std::printf("\n-- base reservation --\n");
+    wchar_t saved[64] = {};
+    const DWORD saved_length = GetEnvironmentVariableW(br::kVariable, saved, 64);
+
+    // 1. commit_reserved() must refuse when the reserved span is partially committed or smaller than `size`.
+    void* split = VirtualAlloc(nullptr, 0x20000, MEM_RESERVE, PAGE_NOACCESS);
+    check(split != nullptr, "VirtualAlloc reserves 128 KiB test region");
+    if (split) {
+        const auto base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(split));
+        void* half2 = VirtualAlloc(static_cast<uint8_t*>(split) + 0x10000, 0x10000, MEM_COMMIT, PAGE_READONLY);
+        check(half2 != nullptr, "commit second 64 KiB of test region as PAGE_READONLY");
+        wchar_t marker[64] = {};
+        std::swprintf(marker, 64, L"%llx:20000", static_cast<unsigned long long>(base));
+        SetEnvironmentVariableW(br::kVariable, marker);
+        void* committed = br::commit_reserved(base, 0x20000);
+        check(committed == nullptr, "commit_reserved refuses partially committed reservation span");
+        MEMORY_BASIC_INFORMATION mbi{};
+        const SIZE_T q = VirtualQuery(half2, &mbi, sizeof mbi);
+        check(q != 0 && mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READONLY,
+              "commit_reserved failure leaves second half PAGE_READONLY untouched");
+        VirtualFree(split, 0, MEM_RELEASE);
+    }
+
+    // 2. commit_reserved() rejects size == 0 and commits a clean full MEM_RESERVE region.
+    void* single = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+    check(single != nullptr, "VirtualAlloc reserves 64 KiB test region");
+    if (single) {
+        const auto base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(single));
+        wchar_t marker[64] = {};
+        std::swprintf(marker, 64, L"%llx:10000", static_cast<unsigned long long>(base));
+        SetEnvironmentVariableW(br::kVariable, marker);
+        check(br::commit_reserved(base, 0) == nullptr, "commit_reserved refuses size == 0");
+        void* committed = br::commit_reserved(base, 0x10000);
+        check(committed == single, "commit_reserved commits clean full reservation span");
+        if (committed) {
+            auto* byte_ptr = static_cast<volatile uint8_t*>(committed);
+            *byte_ptr = 0x5Au;
+            check(*byte_ptr == 0x5Au, "committed reservation memory is readable/writable");
+        }
+        VirtualFree(single, 0, MEM_RELEASE);
+    }
+
+    // 3. needed() detects occupied relocation-less ranges and rejects relocatable/malformed/wrapping headers.
+    void* occ = VirtualAlloc(nullptr, 0x20000, MEM_RESERVE, PAGE_NOACCESS);
+    check(occ != nullptr, "VirtualAlloc reserves occupied test range for needed()");
+    if (occ) {
+        const auto occ_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(occ));
+        const fs::path p_occ = temp_dir / "br_occ.exe";
+        const fs::path p_reloc = temp_dir / "br_reloc.exe";
+        const fs::path p_wrap = temp_dir / "br_wrap.exe";
+        const fs::path p_zero = temp_dir / "br_zero.exe";
+        const fs::path p_unalign = temp_dir / "br_unalign.exe";
+
+        write_minimal_pe64(p_occ, occ_addr, 0x10000, false);
+        write_minimal_pe64(p_reloc, occ_addr, 0x10000, true);
+        write_minimal_pe64(p_wrap, 0xFFFFFFFFFFFF0000ull, 0x20000, false);
+        write_minimal_pe64(p_zero, 0, 0x10000, false);
+        write_minimal_pe64(p_unalign, occ_addr + 0x1000, 0x10000, false);
+
+        const auto n_occ = br::needed(p_occ);
+        check(n_occ && n_occ->base == occ_addr && n_occ->size == 0x10000,
+              "needed() returns occupied relocation-less PE64 preferred range");
+        check(!br::needed(p_reloc), "needed() returns nullopt when .reloc directory is non-empty");
+        check(!br::needed(p_wrap), "needed() returns nullopt on wrapping ImageBase + SizeOfImage");
+        check(!br::needed(p_zero), "needed() returns nullopt on null ImageBase");
+        check(!br::needed(p_unalign), "needed() returns nullopt on non-64KiB-aligned ImageBase");
+
+        VirtualFree(occ, 0, MEM_RELEASE);
+    }
+
+    // 4. relaunch() refuses invalid/unaligned/wrapping ranges immediately without modifying LEONIDA_BASE_RESERVED.
+    if (GetEnvironmentVariableW(L"LEONIDA_PE_LOADER_RELAUNCH_GUARD", nullptr, 0) == 0) {
+        SetEnvironmentVariableW(L"LEONIDA_PE_LOADER_RELAUNCH_GUARD", L"1");
+        SetEnvironmentVariableW(br::kVariable, nullptr);
+        wchar_t probe[64] = {};
+        check(br::relaunch({0, 0x10000}) == 1, "relaunch() refuses null base range");
+        check(GetEnvironmentVariableW(br::kVariable, probe, 64) == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND,
+              "relaunch() leaves LEONIDA_BASE_RESERVED unset on null base");
+        check(br::relaunch({0x1000, 0x10000}) == 1, "relaunch() refuses unaligned range");
+        check(GetEnvironmentVariableW(br::kVariable, probe, 64) == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND,
+              "relaunch() leaves LEONIDA_BASE_RESERVED unset on unaligned range");
+        check(br::relaunch({0xFFFFFFFFFFFF0000ull, 0x20000}) == 1, "relaunch() refuses wrapping range");
+        check(GetEnvironmentVariableW(br::kVariable, probe, 64) == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND,
+              "relaunch() leaves LEONIDA_BASE_RESERVED unset on wrapping range");
+        SetEnvironmentVariableW(L"LEONIDA_PE_LOADER_RELAUNCH_GUARD", nullptr);
+    }
+
+    SetEnvironmentVariableW(br::kVariable, (saved_length && saved_length < 64) ? saved : nullptr);
 }
 
 void print_result() {
@@ -715,6 +842,7 @@ int main(int argc, char** argv) {
         test_rejections(dll, temp.path);
         test_unwind(dll);
         test_inherited_reservation();
+        test_base_reservation(temp.path);
         test_optional_package();
         test_optional_package_unwind();
     } catch (const std::exception& e) {
