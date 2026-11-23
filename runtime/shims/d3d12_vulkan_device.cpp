@@ -7682,8 +7682,21 @@ bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UI
     if (mode == D3D12_RESOLVE_MODE_MAX) wanted = VK_RESOLVE_MODE_MAX_BIT;
     else if (mode == D3D12_RESOLVE_MODE_AVERAGE && named_plane == 0) wanted = VK_RESOLVE_MODE_AVERAGE_BIT;
     else if (mode != D3D12_RESOLVE_MODE_MIN) return false;
-    // The rendering scope that replays it resolves pixels in place (vulkan_replay.h).
-    if (rect ? (LONG(x) != rect->left || LONG(y) != rect->top) : (x || y)) return false;
+    // Displaced resolves use a scratch attachment. Refuse an out-of-bounds displacement at Close, as before.
+    if (rect ? (LONG(x) != rect->left || LONG(y) != rect->top) : (x || y)) {
+        if (s->desc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            d->desc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+            return false;
+        const auto extent = [](const D3D12_RESOURCE_DESC& desc, UINT subresource) -> VkExtent2D {
+            const UINT mip = subresource % desc.MipLevels;
+            return {UINT(std::max<UINT64>(1, desc.Width >> mip)), std::max(1u, desc.Height >> mip)};
+        };
+        leonida::ResolveRegion region{x, y, std::nullopt};
+        if (rect) region.src_rect = leonida::Rect{rect->left, rect->top, rect->right, rect->bottom};
+        if (!leonida::detail::resolve_region_fits(region, extent(s->desc(), src_subresource),
+                                                 extent(d->desc(), dst_subresource)))
+            return false;
+    }
     const DeviceState& state = d->device_state();
     return (resolved ? state.stencil_resolve_modes : state.depth_resolve_modes) & wanted;
 }

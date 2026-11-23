@@ -255,8 +255,8 @@ What is implemented (all of it testable without the game):
   slice, the same on both sides) runs in a rendering scope of its own with no draws: the multisampled plane is the
   depth or stencil attachment (load `LOAD`, store `NONE`), the destination its resolve target with the mode, the
   render area the source rectangle. Both move from their resolve layouts to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL` and
-  back around it; the destination's other plane is not attached and keeps its contents. A rectangle smaller than the
-  subresource has the texels around it copied into a scratch buffer before the scope and back after it, on every
+  back around it; the destination's other plane is not attached and keeps its contents. A same-origin rectangle smaller
+  than the subresource has the texels around it copied into a scratch buffer before the scope and back after it, on every
   GPU: Vulkan resolves only inside the render area, but MoltenVK (1.4.2 and 1.4.3, Apple M3 Max) resolves the whole
   destination subresource, because it resolves through Metal's store action, which has no render area. Measured
   with a raw Vulkan program (a 4x D32 attachment, render area (2,1) 5x4 of 8x6, `MIN`, `MAX` and `SAMPLE_ZERO`,
@@ -267,11 +267,13 @@ What is implemented (all of it testable without the game):
   plane by either format, and `AVERAGE` of the depth plane by its own format only (its `Close` fails for `AVERAGE`
   by the depth format or of stencil); the layer accepts the same. WARP is no reference for two of them: a resolve
   with the format `D32_FLOAT` passes its `Close` but removes the device when run (`DXGI_ERROR_DRIVER_INTERNAL_ERROR`),
-  and a one-plane D24S8 resolve writes both planes; the RTX 5070 resolves only the plane named. A scope resolves each pixel in place, so a
-  destination offset other than the source rectangle's corner is refused, as is a mode missing from the device's
-  `supportedDepthResolveModes`/`supportedStencilResolveModes` (queried at device creation; one plane per scope, so
-  `independentResolve` never applies). Refused calls fail `Close` and record nothing. `d3d12_depth_resolve_test`
-  compares D32 and D24S8 resolves (typed and typeless resources, whole and rectangle) with the PC runtime; clears give
+  and a one-plane D24S8 resolve writes both planes; the RTX 5070 resolves only the plane named. For 2D textures with
+  different origins, the scope resolves into a temporary single-sample image at the source coordinates. `vkCmdCopyImage`
+  then copies the selected plane and rectangle to the destination. The queue keeps the temporary image alive until the
+  submission completes. Modes must be in the device's `supportedDepthResolveModes` or `supportedStencilResolveModes`.
+  The layer queries those at device creation and resolves one plane per scope. Refused calls fail `Close` and record
+  nothing. `d3d12_depth_resolve_test` compares D32 and D24S8 resolves (typed and typeless resources, whole and rectangle)
+  with the PC runtime and checks the selected plane and surrounding texels for shifted rectangles. Clears give
   every sample of a pixel one value, so the modes over differing samples are not checked yet. `DECOMPRESS`,
   `ResolveSubresource` of depth (which D3D12 does not offer) and resolves between two formats of one typeless family
   remain open. A multisampled texture copies only to one with the same sample count
@@ -840,8 +842,7 @@ therefore every translated shader that declares bindings; tessellation, geometry
 multisampled pipelines, several viewports, primitive restart; subgroup size for mesh pipelines (the decision covers them, no mesh PSO exists to chain it into), and for wave64 vertex, geometry and, on a GPU that cannot require 64 for pixel shaders (NVIDIA), pixel shaders, which have no emulation (SHADER-10);
 the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what either
 calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do
-not wait on view creation), typeless volume RTVs, depth-stencil resolves to a destination offset other than
-the source rectangle's;
+not wait on view creation), typeless volume RTVs;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); a CPU `Signal` above a queue `Signal` the GPU has not reached
 yet is held until it has (`vkSignalSemaphore` must stay below every pending signal,
@@ -960,7 +961,8 @@ and any validation error fails them.
   `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
   creates only an allocator and a list, so it needs no GPU or Vulkan loader.
 - `d3d12_depth_resolve_test`: depth and stencil `ResolveSubresourceRegion` of a 4x D32 or D24S8 target cleared with
-  three overlapping values, whole and by rectangle, compared with the PC runtime on the layer's own adapter and WARP;
+  three overlapping values, whole and by rectangle (including shifted destinations), compared with the PC runtime on
+  the layer's own adapter and WARP;
   the refused calls must fail `Close` and leave the destination as cleared.
 - `d3d12_vulkan_device_test`: the Vulkan device behind the Xbox-ABI proxy, called the way the game will call it.
   It creates heaps through slot 14 and reads their start handles in RAX, creates a render target through slot 76
@@ -2057,7 +2059,7 @@ The trace will enumerate them.
   `vkCmdCopyBufferToImage`/`vkCmdCopyImageToBuffer`/`vkCmdCopyImage`, using the `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`
   row pitch and height; `CopyResource` → a whole-subresource copy; colour resolves → `vkCmdResolveImage`;
   depth and stencil resolves → a `vkCmdBeginRendering` scope with a resolve attachment (section 3.2).
-  Partial resolve regions to another offset need a shader or a region copy.
+  Shifted depth and stencil resolves copy the rectangle from a temporary image after the rendering scope.
   - A placed footprint must have an `Offset` that is a multiple of 512 and a `RowPitch` that is a multiple of 256
     (`D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT`, `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`). Any other is refused when it is
     recorded, so `Close` returns `E_INVALIDARG` (`CommandList::valid(const CopyLocation&)` in

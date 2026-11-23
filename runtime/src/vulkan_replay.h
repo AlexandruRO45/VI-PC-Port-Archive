@@ -211,7 +211,8 @@ inline VkPipelineStageFlags2 vulkan_sync(std::uint32_t sync) {
         {y::render_target, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
         {y::compute_shading, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
         {y::copy, VK_PIPELINE_STAGE_2_COPY_BIT},
-        {y::resolve, VK_PIPELINE_STAGE_2_RESOLVE_BIT},
+        // Offset depth/stencil resolves finish with an image copy.
+        {y::resolve, VK_PIPELINE_STAGE_2_RESOLVE_BIT | VK_PIPELINE_STAGE_2_COPY_BIT},
         {y::execute_indirect, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT},
         {y::all_shading, pre_raster | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
         {y::non_pixel_shading, pre_raster | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
@@ -886,6 +887,8 @@ struct ReplayFunctions {
     // `bytes` of transfer scratch that stays alive until the submission completes (vulkan_scratch.h): depth <-> colour
     // copies go through it, image to buffer to image. Without it such a copy is unsupported.
     std::function<bool(VkDeviceSize bytes, VkBuffer&, VkDeviceSize&)> copy_scratch;
+    // A one-sample image and a view of one plane. The caller keeps them alive until submission completes.
+    std::function<bool(VkFormat, VkImageAspectFlags, VkExtent2D, VkImage&, VkImageView&)> depth_resolve_scratch;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -952,9 +955,10 @@ struct Prepared {
     std::vector<VkImageCopy> image_copies;
     bool same_copy_subresource = false;
     VkImageResolve resolve{};  // resolves
-    // Depth or stencil resolves: the mode, and the destination view (`view` is the source's).
+    // Depth or stencil resolves render into resolve_view. A displaced resolve uses a scratch image for this view.
     VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
     VkImageView resolve_view = VK_NULL_HANDLE;
+    VkImage resolve_scratch = VK_NULL_HANDLE;
     bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
                                // (or a copy of an rgb96 texture: repacked by the same pass)
     std::uint32_t rgb96_row_words = 0;    // an rgb96 footprint: words between its rows and between its slices
@@ -1796,6 +1800,16 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     return ReplayResult::success;
 }
 
+inline bool resolve_region_fits(const ResolveRegion& region, VkExtent2D from, VkExtent2D to) {
+    if (const auto& rect = region.src_rect) {
+        if (rect->left < 0 || rect->top < 0 || rect->right <= rect->left || rect->bottom <= rect->top ||
+            std::uint32_t(rect->right) > from.width || std::uint32_t(rect->bottom) > from.height)
+            return false;
+        from = {std::uint32_t(rect->right - rect->left), std::uint32_t(rect->bottom - rect->top)};
+    }
+    return within(region.dst_x, from.width, to.width) && within(region.dst_y, from.height, to.height);
+}
+
 // Resolve a multisampled colour image into a single-sampled image of the same format, or (a region) one plane of a
 // depth/stencil image into the same plane of another: MIN or MAX, or AVERAGE of depth.
 inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared& p) {
@@ -1808,15 +1822,12 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
     VkOffset3D src_offset{}, dst_offset{};
     VkExtent3D extent{from.width, from.height, 1};
     if (const auto& region = resolve.region) {
+        if (!resolve_region_fits(*region, from, to)) return ReplayResult::invalid_copy;
         dst_offset = {std::int32_t(region->dst_x), std::int32_t(region->dst_y), 0};
         if (const auto& r = region->src_rect) {
-            if (std::uint32_t(r->right) > from.width || std::uint32_t(r->bottom) > from.height)
-                return ReplayResult::invalid_copy;
             src_offset = {r->left, r->top, 0};
             extent = {std::uint32_t(r->right - r->left), std::uint32_t(r->bottom - r->top), 1};
         }
-        if (!within(region->dst_x, extent.width, to.width) || !within(region->dst_y, extent.height, to.height))
-            return ReplayResult::invalid_copy;
     } else if (from.width != to.width || from.height != to.height) {
         return ReplayResult::invalid_copy;
     }
@@ -1825,9 +1836,7 @@ inline ReplayResult prepare_resolve(const ResolveSubresource& resolve, Prepared&
     if (src.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
         if (region && region->mode != d3d12_resolve_mode::average) return ReplayResult::unsupported;
     } else {
-        // A rendering scope resolves each pixel in place, so the destination offset must be the source's.
-        if (!region || dst_offset.x != src_offset.x || dst_offset.y != src_offset.y ||
-            (region->mode == d3d12_resolve_mode::average && src.aspectMask != VK_IMAGE_ASPECT_DEPTH_BIT))
+        if (!region || (region->mode == d3d12_resolve_mode::average && src.aspectMask != VK_IMAGE_ASPECT_DEPTH_BIT))
             return ReplayResult::unsupported;
         p.resolve_mode = region->mode == d3d12_resolve_mode::minimum   ? VK_RESOLVE_MODE_MIN_BIT
                        : region->mode == d3d12_resolve_mode::maximum   ? VK_RESOLVE_MODE_MAX_BIT
@@ -2656,10 +2665,21 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (p.resolve_mode != VK_RESOLVE_MODE_NONE) {
                 if (!vk.begin_rendering || !vk.end_rendering || !vk.image_view) return ReplayResult::unsupported;
                 p.view = vk.image_view(p.source, p.source_range);
-                p.resolve_view = vk.image_view(p.binding, p.range);
-                if (!p.view || !p.resolve_view) return ReplayResult::unsupported;
-                if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
-                    return result;
+                if (!p.view) return ReplayResult::unsupported;
+                if (p.resolve.srcOffset.x != p.resolve.dstOffset.x || p.resolve.srcOffset.y != p.resolve.dstOffset.y) {
+                    // Dynamic rendering resolves to the same coordinates in both attachments.
+                    if (!vk.copy_image || !vk.depth_resolve_scratch ||
+                        !vk.depth_resolve_scratch(p.source.format, p.source_range.aspectMask,
+                                                  detail::mip_extent(p.source, p.source_range.baseMipLevel),
+                                                  p.resolve_scratch, p.resolve_view) ||
+                        !p.resolve_scratch || !p.resolve_view)
+                        return ReplayResult::unsupported;
+                } else {
+                    p.resolve_view = vk.image_view(p.binding, p.range);
+                    if (!p.resolve_view) return ReplayResult::unsupported;
+                    if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
+                        return result;
+                }
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
@@ -3496,9 +3516,51 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const VulkanAccess dest_state = vulkan_access(d3d12_state::resolve_dest, false);
                 const VkImageLayout source_layout = image_layout(p.source, source_state.layout);
                 const VkImageLayout dest_layout = image_layout(p.binding, dest_state.layout);
-                auto source_pieces = detail::current(
-                    tracker, src_id, detail::planes_for_layout(p.source, p.source_range, separate), source_layout);
+                const auto source_range = detail::planes_for_layout(p.source, p.source_range, separate);
+                auto source_pieces = detail::current(tracker, src_id, source_range, source_layout);
                 detail::initialize(vk, command_buffer, p.source, src_id, source_pieces, source_layout, tracker);
+                const VkImageLayout source_attachment =
+                    image_layout(p.source, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                const auto render_resolve = [&](VkImageLayout resolve_layout) {
+                    VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                    info.imageView = p.view;
+                    info.imageLayout = source_attachment;
+                    info.resolveMode = p.resolve_mode;
+                    info.resolveImageView = p.resolve_view;
+                    info.resolveImageLayout = resolve_layout;
+                    info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                    info.storeOp = VK_ATTACHMENT_STORE_OP_NONE;  // the source is only read
+                    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                    rendering.renderArea = {{p.resolve.srcOffset.x, p.resolve.srcOffset.y},
+                                            {p.resolve.extent.width, p.resolve.extent.height}};
+                    rendering.layerCount = 1;
+                    if (p.range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) rendering.pDepthAttachment = &info;
+                    else rendering.pStencilAttachment = &info;
+                    vk.begin_rendering(command_buffer, &rendering);
+                    vk.end_rendering(command_buffer);
+                };
+                if (p.resolve_scratch) {
+                    constexpr VkImageLayout attachment = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    constexpr VkImageLayout transfer_src = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    ResourceBinding scratch{};
+                    scratch.image = p.resolve_scratch;
+                    const VkImageSubresourceRange scratch_range{source_range.aspectMask, 0, 1, 0, 1};
+                    detail::image_barrier(vk, command_buffer, scratch, scratch_range, VK_IMAGE_LAYOUT_UNDEFINED,
+                                          attachment, 0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                          attachment_access, attachment_stages);
+                    detail::round_trip(vk, command_buffer, p.source, source_pieces, source_attachment, source_state,
+                                       attachment_access, attachment_stages, [&] { render_resolve(attachment); });
+                    detail::image_barrier(vk, command_buffer, scratch, scratch_range, attachment, transfer_src,
+                                          attachment_access, attachment_stages, VK_ACCESS_TRANSFER_READ_BIT,
+                                          VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    const auto layout = detail::copy_layout(
+                        vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    const VkImageCopy region{{p.range.aspectMask, 0, 0, 1}, p.resolve.srcOffset,
+                                             p.resolve.dstSubresource, p.resolve.dstOffset, p.resolve.extent};
+                    vk.copy_image(command_buffer, scratch.image, transfer_src, p.binding.image, layout, 1, &region);
+                    continue;
+                }
                 auto dest_pieces = detail::current(
                     tracker, dst_id, detail::planes_for_layout(p.binding, p.range, separate), dest_layout);
                 detail::initialize(vk, command_buffer, p.binding, dst_id, dest_pieces, dest_layout, tracker);
@@ -3518,32 +3580,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                                            VK_PIPELINE_STAGE_TRANSFER_BIT);
                 }
-                const VkImageLayout source_attachment =
-                    image_layout(p.source, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
                 const VkImageLayout dest_attachment =
                     image_layout(p.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
                 detail::round_trip(vk, command_buffer, p.source, source_pieces, source_attachment, source_state,
                                    attachment_access, attachment_stages, [&] {
                     detail::round_trip(vk, command_buffer, p.binding, dest_pieces, dest_attachment, dest_state,
-                                       attachment_access, attachment_stages, [&] {
-                        VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-                        info.imageView = p.view;
-                        info.imageLayout = source_attachment;
-                        info.resolveMode = p.resolve_mode;
-                        info.resolveImageView = p.resolve_view;
-                        info.resolveImageLayout = dest_attachment;
-                        info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                        info.storeOp = VK_ATTACHMENT_STORE_OP_NONE;  // the source is only read
-                        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-                        rendering.renderArea = {{p.resolve.srcOffset.x, p.resolve.srcOffset.y},
-                                                {p.resolve.extent.width, p.resolve.extent.height}};
-                        rendering.layerCount = 1;
-                        // One plane only, so independentResolve(None) never applies.
-                        if (p.range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) rendering.pDepthAttachment = &info;
-                        else rendering.pStencilAttachment = &info;
-                        vk.begin_rendering(command_buffer, &rendering);
-                        vk.end_rendering(command_buffer);
-                    });
+                                       attachment_access, attachment_stages, [&] { render_resolve(dest_attachment); });
                 });
                 if (p.staged) {
                     keep(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, [&](VkImageLayout layout) {

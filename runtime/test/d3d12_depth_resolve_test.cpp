@@ -3,9 +3,10 @@
 // plane's own format, and AVERAGE of the depth plane by its own format (R32_FLOAT, R24_UNORM_X8_TYPELESS).
 // Clears write whole pixels, so all samples of a pixel are equal and every mode returns that value: these cases
 // check planes, formats, rectangles and layouts, not the reduction over differing samples.
+// Shifted rectangles verify the source-to-destination mapping, including disjoint and overlapping resolves in a
+// list. Every pixel of both destination planes is checked. Successive lists reuse a DIRECT queue after a fence wait.
 // Refused resolves must fail Close and leave the destination as it was. AVERAGE by the depth format or of stencil,
-// and a whole subresource to another offset, the host refuses too (its Close fails); a rectangle to another offset,
-// a plane format naming the other plane, and DECOMPRESS are refused by the layer and not run on the host.
+// and a whole subresource to another offset, the host refuses too (its Close fails).
 // WARP, measured: a resolve with Format D32_FLOAT removes the device (DXGI_ERROR_DRIVER_INTERNAL_ERROR), and a
 // D24S8 resolve of one plane writes both. So WARP skips those and is compared on the plane resolved.
 #include "vk_test_device.h"
@@ -33,7 +34,14 @@ struct Event {
 };
 
 constexpr UINT width = 8, height = 6;
+constexpr D3D12_COMMAND_QUEUE_DESC direct_queue{D3D12_COMMAND_LIST_TYPE_DIRECT};
 constexpr D3D12_RECT clear_a{1, 1, 5, 4}, clear_b{4, 3, 8, 6}, source_rect{2, 1, 7, 5};
+constexpr D3D12_RECT whole{0, 0, LONG(width), LONG(height)};
+
+struct ResolveRegion {
+    D3D12_RECT source;
+    LONG x, y;
+};
 
 struct Case {
     const char* name;
@@ -46,7 +54,14 @@ struct Case {
     bool host_refuses = false;    // refused cases: the host's Close fails as well
     DXGI_FORMAT resource = DXGI_FORMAT_UNKNOWN;  // the resources' format, when not `format`
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;      // the DSV format, when not `format`
+    const ResolveRegion* second = nullptr;      // optional second resolve on the same resources and plane
+    bool enhanced = false;
 };
+
+ResolveRegion first_region(const Case& c) {
+    const auto& source = c.rect ? source_rect : whole;
+    return {source, c.dst_x >= 0 ? c.dst_x : source.left, c.dst_y >= 0 ? c.dst_y : source.top};
+}
 
 struct Planes {
     HRESULT close = E_FAIL;
@@ -56,18 +71,17 @@ struct Planes {
 // Clears a 4x target with three overlapping values and the 1x destination to values none of them have, resolves
 // `c` and reads every plane of the destination back. A list whose Close fails is executed only when `run_invalid`
 // (the layer runs what it recorded; the host runtime must not be given such a list).
-bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run_invalid) {
-    Ref<ID3D12CommandQueue> queue;
+bool resolve_and_read(ID3D12Device* device, ID3D12CommandQueue* queue, const Case& c, Planes& out, bool run_invalid) {
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
     Ref<ID3D12GraphicsCommandList1> list1;
+    Ref<ID3D12GraphicsCommandList7> list7;
     Ref<ID3D12Fence> fence;
-    D3D12_COMMAND_QUEUE_DESC queue_desc{};
-    CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
     CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
     CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                              IID_PPV_ARGS(&list.p))));
     CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+    if (c.enhanced) CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list7.p))));
     CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
     D3D12_HEAP_PROPERTIES heap_properties{};
@@ -116,25 +130,61 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     list->ClearDepthStencilView(source_view, flags, 1.0f, 0x33, 1, &clear_b);
     list->ClearDepthStencilView(target_view, flags, 0.0f, 0x5a, 0, nullptr);
 
-    D3D12_RESOURCE_BARRIER barriers[2]{};
-    for (auto& barrier : barriers) {
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    constexpr D3D12_BARRIER_SUBRESOURCE_RANGE all{D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES};
+    const auto enhanced_barrier = [&](const D3D12_TEXTURE_BARRIER* barriers, UINT count) {
+        D3D12_BARRIER_GROUP group{D3D12_BARRIER_TYPE_TEXTURE, count};
+        group.pTextureBarriers = barriers;
+        list7->Barrier(1, &group);
+    };
+    D3D12_RESOURCE_BARRIER legacy[2]{};
+    if (list7.p) {
+        const D3D12_TEXTURE_BARRIER to_resolve[] = {
+            {D3D12_BARRIER_SYNC_DEPTH_STENCIL, D3D12_BARRIER_SYNC_RESOLVE,
+             D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE, D3D12_BARRIER_ACCESS_RESOLVE_SOURCE,
+             D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE, D3D12_BARRIER_LAYOUT_RESOLVE_SOURCE, source.p, all},
+            {D3D12_BARRIER_SYNC_DEPTH_STENCIL, D3D12_BARRIER_SYNC_RESOLVE,
+             D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE, D3D12_BARRIER_ACCESS_RESOLVE_DEST,
+             D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE, D3D12_BARRIER_LAYOUT_RESOLVE_DEST, target.p, all},
+        };
+        enhanced_barrier(to_resolve, 2);
+    } else {
+        for (auto& barrier : legacy) {
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        }
+        legacy[0].Transition.pResource = source.p;
+        legacy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+        legacy[1].Transition.pResource = target.p;
+        legacy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        list->ResourceBarrier(2, legacy);
     }
-    barriers[0].Transition.pResource = source.p;
-    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
-    barriers[1].Transition.pResource = target.p;
-    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_DEST;
-    list->ResourceBarrier(2, barriers);
-    D3D12_RECT rect = source_rect;
-    const UINT x = c.dst_x >= 0 ? UINT(c.dst_x) : c.rect ? UINT(rect.left) : 0;
-    const UINT y = c.dst_y >= 0 ? UINT(c.dst_y) : c.rect ? UINT(rect.top) : 0;
-    list1->ResolveSubresourceRegion(target.p, c.plane, x, y, source.p, c.plane, c.rect ? &rect : nullptr, c.format,
-                                    c.mode);
-    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
-    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    list->ResourceBarrier(1, &barriers[1]);
+    auto first = first_region(c);
+    list1->ResolveSubresourceRegion(target.p, c.plane, UINT(first.x), UINT(first.y), source.p, c.plane,
+                                    c.rect ? &first.source : nullptr, c.format, c.mode);
+    if (c.second) {
+        if (list7.p) {
+            const D3D12_TEXTURE_BARRIER order{
+                D3D12_BARRIER_SYNC_RESOLVE, D3D12_BARRIER_SYNC_RESOLVE,
+                D3D12_BARRIER_ACCESS_RESOLVE_DEST, D3D12_BARRIER_ACCESS_RESOLVE_DEST,
+                D3D12_BARRIER_LAYOUT_RESOLVE_DEST, D3D12_BARRIER_LAYOUT_RESOLVE_DEST, target.p, all};
+            enhanced_barrier(&order, 1);
+        }
+        auto second = *c.second;
+        list1->ResolveSubresourceRegion(target.p, c.plane, UINT(second.x), UINT(second.y), source.p, c.plane,
+                                        &second.source, c.format, c.mode);
+    }
+    if (list7.p) {
+        const D3D12_TEXTURE_BARRIER to_copy{
+            D3D12_BARRIER_SYNC_RESOLVE, D3D12_BARRIER_SYNC_COPY,
+            D3D12_BARRIER_ACCESS_RESOLVE_DEST, D3D12_BARRIER_ACCESS_COPY_SOURCE,
+            D3D12_BARRIER_LAYOUT_RESOLVE_DEST, D3D12_BARRIER_LAYOUT_COPY_SOURCE, target.p, all};
+        enhanced_barrier(&to_copy, 1);
+    } else {
+        legacy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        legacy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        list->ResourceBarrier(1, &legacy[1]);
+    }
     for (UINT i = 0; i < planes; ++i) {
         D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
         src.pResource = target.p;
@@ -183,17 +233,26 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
 Planes expected_planes(const Case& c, bool resolved = true) {
     Planes out;
     out.close = S_OK;
-    const auto in = [](const D3D12_RECT& r, UINT x, UINT y) {
-        return LONG(x) >= r.left && LONG(x) < r.right && LONG(y) >= r.top && LONG(y) < r.bottom;
+    const auto in = [](const D3D12_RECT& r, LONG x, LONG y) {
+        return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
     };
-    const D3D12_RECT area = c.rect ? source_rect : D3D12_RECT{0, 0, LONG(width), LONG(height)};
-    for (UINT y = 0; y < height; ++y) {
-        for (UINT x = 0; x < width; ++x) {
-            float depth = 0.25f;
-            unsigned char stencil = 0x11;
-            if (in(clear_a, x, y)) depth = 0.75f, stencil = 0x22;
-            if (in(clear_b, x, y)) depth = 1.0f, stencil = 0x33;
-            if (!resolved || !in(area, x, y)) depth = 0.0f, stencil = 0x5a;
+    const auto first = first_region(c);
+    for (LONG y = 0; y < LONG(height); ++y) {
+        for (LONG x = 0; x < LONG(width); ++x) {
+            float depth = 0.0f;
+            unsigned char stencil = 0x5a;
+            if (resolved) {
+                for (const auto* region : {&first, c.second}) {
+                    if (!region) continue;
+                    const LONG sx = x - region->x + region->source.left;
+                    const LONG sy = y - region->y + region->source.top;
+                    if (!in(region->source, sx, sy)) continue;
+                    depth = 0.25f;
+                    stencil = 0x11;
+                    if (in(clear_a, sx, sy)) depth = 0.75f, stencil = 0x22;
+                    if (in(clear_b, sx, sy)) depth = 1.0f, stencil = 0x33;
+                }
+            }
             if (c.plane == 1) depth = 0.0f;
             else stencil = 0x5a;
             std::uint32_t bits = 0;
@@ -257,18 +316,35 @@ int main() {
     cases.push_back({"R32_TYPELESS depth as D32", d32, false, 0, min, false, -1, -1, false, r32_typeless});
     cases.push_back({"R24G8_TYPELESS stencil as D24S8", d24, true, 1, max, true, -1, -1, false, r24g8_typeless});
     cases.push_back({"R24G8_TYPELESS depth as R24_X8", x8, true, 0, average, true, -1, -1, false, r24g8_typeless, d24});
+    cases.push_back({"D32 depth to upper left", d32, false, 0, min, true, 0, 0});
+    cases.push_back({"D32 depth as R32_FLOAT to lower right", r32, false, 0, max, true, 3, 2, false, d32, d32});
+    cases.push_back({"D32 depth as R32_FLOAT to lower left", r32, false, 0, average, true, 0, 2, false, d32, d32});
+    // Consecutive submissions on the same queue request the same temporary format, aspect and extent.
+    cases.push_back({"D24S8 depth to upper right", d24, true, 0, min, true, 3, 0});
+    cases.push_back({"D24S8 depth to lower left", d24, true, 0, min, true, 0, 2});
+    cases.push_back({"D24S8 depth as R24_X8 to lower left", x8, true, 0, max, true, 0, 2, false, d24, d24});
+    cases.push_back({"D24S8 depth as R24_X8 to lower right", x8, true, 0, average, true, 3, 2, false, d24, d24});
+    cases.push_back({"D24S8 stencil to lower right", d24, true, 1, max, true, 3, 2});
+    cases.push_back({"D24S8 stencil as X24_G8 to lower left", g8, true, 1, min, true, 0, 2, false, d24, d24});
+    // Two rectangles in one list. The destinations are disjoint and each ends at the bottom edge.
+    constexpr ResolveRegion second{{5, 0, 8, 2}, 0, 4};
+    cases.push_back({"D24S8 depth, two shifted rectangles", d24, true, 0, min, true, 3, 2, false, d24, d24, &second});
+    // The second resolve covers columns 3 and 4 of rows 2 and 3 again, replacing depth 0.75 with 0.25 there.
+    constexpr ResolveRegion overlapping{{5, 0, 8, 2}, 2, 2};
+    cases.push_back({"D24S8 depth, overlapping shifted rectangles", d24, true, 0, min, true, 3, 2, false, d24, d24,
+                     &overlapping, true});
     const Case refused[] = {
         {"D32 depth", d32, false, 0, average, false, -1, -1, true},
         {"D24S8 depth", d24, true, 0, average, true, -1, -1, true},
         {"D24S8 stencil", d24, true, 1, average, false, -1, -1, true},
         {"D24S8 stencil as X24_G8", g8, true, 1, average, true, -1, -1, true, d24, d24},
         {"D32 depth, whole to another offset", d32, false, 0, max, false, 1, 0, true},
-        {"D32 depth, rectangle to another offset", d32, false, 0, min, true, 0, 0},
-        {"D24S8 stencil, rectangle to another offset", d24, true, 1, max, true, 3, 2},
+        {"D32 depth, rectangle past the right edge", d32, false, 0, min, true, 4, 2},
+        {"D24S8 stencil, rectangle past the bottom edge", d24, true, 1, max, true, 3, 3},
         {"D24S8 stencil subresource as R24_X8", x8, true, 1, min, false, -1, -1, false, d24, d24},
         {"D32 depth", d32, false, 0, D3D12_RESOLVE_MODE_DECOMPRESS, false},
     };
-    unsigned matched = 0, failures = 0, refusals = 0, references = 0, lacking = 0;
+    unsigned shifted = 0, matched = 0, failures = 0, refusals = 0, references = 0, lacking = 0;
     const auto run = [&]() -> int {
         Ref<ID3D12Device> ours;
         rt::d3d12::VulkanDeviceInfo info{};
@@ -279,6 +355,8 @@ int main() {
         info.queue = vk.queue;
         info.queue_family = vk.family;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+        Ref<ID3D12CommandQueue> ours_queue;
+        if (FAILED(ours->CreateCommandQueue(&direct_queue, IID_PPV_ARGS(&ours_queue.p)))) return 1;
 
         std::vector<Planes> results(cases.size());
         for (std::size_t i = 0; i < cases.size(); ++i) {
@@ -288,7 +366,7 @@ int main() {
             const bool can = supported & (c.mode == min   ? VK_RESOLVE_MODE_MIN_BIT
                                           : c.mode == max ? VK_RESOLVE_MODE_MAX_BIT
                                                           : VK_RESOLVE_MODE_AVERAGE_BIT);
-            if (!resolve_and_read(ours.p, c, results[i], true)) return 1;
+            if (!resolve_and_read(ours.p, ours_queue.p, c, results[i], true)) return 1;
             // A mode the device lacks is refused like the cases below.
             const Planes expected = expected_planes(c, can);
             if (results[i].close != (can ? S_OK : E_INVALIDARG) || !same_planes(results[i], expected, false, c.plane)) {
@@ -296,6 +374,8 @@ int main() {
                              mode_name(c.mode), int(c.rect), results[i].close,
                              same_planes(results[i], expected, false, c.plane) ? "matches" : "differs from");
                 ++failures;
+            } else if (can && (c.dst_x >= 0 || c.dst_y >= 0)) {
+                ++shifted;
             }
             if (!can) {
                 results[i] = {};  // not compared with the host
@@ -304,7 +384,7 @@ int main() {
         }
         for (const Case& c : refused) {
             Planes p;
-            if (!resolve_and_read(ours.p, c, p, true)) return 1;
+            if (!resolve_and_read(ours.p, ours_queue.p, c, p, true)) return 1;
             if (p.close != E_INVALIDARG || !same_planes(p, expected_planes(c, false), false, c.plane)) {
                 std::fprintf(stderr, "refused %s %s rect %d: Close 0x%08lx, destination %s\n", c.name,
                              mode_name(c.mode), int(c.rect), p.close,
@@ -326,13 +406,19 @@ int main() {
             std::string adapter_name;
             if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
             if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
+            Ref<ID3D12CommandQueue> host_queue;
+            if (FAILED(host->CreateCommandQueue(&direct_queue, IID_PPV_ARGS(&host_queue.p)))) return 1;
+            D3D12_FEATURE_DATA_D3D12_OPTIONS12 options{};
+            const bool enhanced = SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options,
+                                                                       sizeof options)) &&
+                                  options.EnhancedBarriersSupported;
             const char* name = adapter_name.c_str();
             unsigned same = 0, compared = 0, refused_alike = 0, quirks = 0;
             for (std::size_t i = 0; i < cases.size(); ++i) {
                 const Case& c = cases[i];
-                if (results[i].depth.empty() || (warp && c.format == d32)) continue;  // see the top of the file
+                if (results[i].depth.empty() || (warp && c.format == d32) || (c.enhanced && !enhanced)) continue;
                 Planes expected;
-                if (!resolve_and_read(host.p, c, expected, false)) return 1;
+                if (!resolve_and_read(host.p, host_queue.p, c, expected, false)) return 1;
                 ++compared;
                 // The layer's result was checked against the clears above. A host that differs from the clears is a
                 // host quirk, not a layer bug: report, don't fail. Which D24S8 resolves is the driver's: with stencil
@@ -357,7 +443,7 @@ int main() {
             for (const Case& c : refused) {
                 if (!c.host_refuses) continue;
                 Planes expected;
-                if (!resolve_and_read(host.p, c, expected, false)) return 1;
+                if (!resolve_and_read(host.p, host_queue.p, c, expected, false)) return 1;
                 if (expected.close != E_INVALIDARG) {
                     std::fprintf(stderr, "refused %s %s rect %d: %s's Close 0x%08lx\n", c.name, mode_name(c.mode),
                                  int(c.rect), name, expected.close);
@@ -380,7 +466,8 @@ int main() {
     const bool need_host = !hostwine::host_is_wine();
     if (need_host && !references) std::fprintf(stderr, "no D3D12 reference device (hardware adapter or WARP)\n");
     if (run_failed || failures || validation_errors || (need_host && (!references || !matched))) return 1;
-    std::printf("depth/stencil resolves: %u host comparisons matched, %u refusals kept the destination, %u modes the "
-                "device lacks were refused\n", matched, refusals, lacking);
+    std::printf("depth/stencil resolves: %u shifted cases matched the clears, %u host comparisons matched, "
+                "%u refusals kept the destination, %u modes the device lacks were refused\n", shifted, matched,
+                refusals, lacking);
     return 0;
 }

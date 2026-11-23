@@ -1211,6 +1211,7 @@ public:
     // `allocate`. Without this such a copy is refused as unsupported.
     void enable_copy_scratch(PFN_vkGetDeviceProcAddr get, ScratchBuffers::Allocate allocate) {
         std::unique_lock lock(resource_mutex_);
+        depth_resolve_allocate_ = allocate;
         scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
         if (!scratch_->loaded()) scratch_.reset();
     }
@@ -1392,6 +1393,7 @@ private:
     ReplayFunctions replay_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
+    ScratchBuffers::Allocate depth_resolve_allocate_;
     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
@@ -1761,6 +1763,20 @@ private:
                 return context_.scratch_->get(bytes, buffer, offset);
             };
         }
+        std::uint64_t completed_depth_resolves = 0;
+        std::vector<std::unique_ptr<DepthResolveScratchImage>> depth_resolve_images;
+        if (kind_ == QueueKind::direct && context_.depth_resolve_allocate_) {
+            replay.depth_resolve_scratch = [&, this](VkFormat format, VkImageAspectFlags aspect, VkExtent2D extent,
+                                                     VkImage& image, VkImageView& view) {
+                if (depth_resolve_images.empty()) completed_depth_resolves = completed();
+                auto scratch = take_depth_resolve_image(format, aspect, extent, completed_depth_resolves);
+                if (!scratch) return false;
+                image = scratch->image;
+                view = scratch->view;
+                depth_resolve_images.push_back(std::move(scratch));
+                return true;
+            };
+        }
         if (kind_ != QueueKind::copy && context_.counted_dispatch_) {
             replay.prepare_counted_dispatch = [this, &tracker_lock, &counted_batch](
                 VkBuffer args, VkDeviceSize args_offset, VkBuffer count, VkDeviceSize count_offset,
@@ -2017,8 +2033,13 @@ private:
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
             slot->counted_dispatch = std::move(counted_batch);
+            slot->depth_resolve_images = std::move(depth_resolve_images);
             queries.commit();
             slot->segments = std::move(queries.retained);
+        } else if (ended && context_.is_device_lost() && !depth_resolve_images.empty()) {
+            // VK_ERROR_DEVICE_LOST can leave the command buffer pending. Keep its resolve images in the
+            // unreusable slot until queue teardown has waited for idle.
+            slot->depth_resolve_images = std::move(depth_resolve_images);
         } else {
             discard();
         }
@@ -2165,6 +2186,23 @@ private:
         held_.clear();
     }
 
+    struct DepthResolveScratchImage {
+        const VulkanDeviceFunctions& vk;
+        VkDevice device;
+        VkFormat format;
+        VkImageAspectFlags aspect;
+        VkExtent2D extent;
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+
+        ~DepthResolveScratchImage() {
+            if (view) vk.vkDestroyImageView(device, view, nullptr);
+            if (image) vk.vkDestroyImage(device, image, nullptr);
+            if (memory) vk.vkFreeMemory(device, memory, nullptr);
+        }
+    };
+
     struct CommandSlot {
         VkCommandBuffer buffer;
         std::uint64_t ticket;
@@ -2173,7 +2211,55 @@ private:
         std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_dispatch;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
+        std::vector<std::unique_ptr<DepthResolveScratchImage>> depth_resolve_images;
     };
+
+    std::unique_ptr<DepthResolveScratchImage> take_depth_resolve_image(
+        VkFormat format, VkImageAspectFlags aspect, VkExtent2D extent, std::uint64_t done) {
+        // Each resolve uses its own image within a batch. Only a completed submission on this queue lends one.
+        for (auto& slot : buffers_) {
+            if (slot.ticket > done) continue;
+            auto& images = slot.depth_resolve_images;
+            const auto found = std::find_if(images.begin(), images.end(), [&](const auto& scratch) {
+                return scratch->format == format && scratch->aspect == aspect &&
+                       scratch->extent.width == extent.width && scratch->extent.height == extent.height;
+            });
+            if (found == images.end()) continue;
+            auto scratch = std::move(*found);
+            images.erase(found);
+            return scratch;
+        }
+        const auto& vk = context_.vk;
+        const auto device = context_.device();
+        auto scratch = std::make_unique<DepthResolveScratchImage>(vk, device, format, aspect, extent);
+        VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        create.imageType = VK_IMAGE_TYPE_2D;
+        create.format = format;
+        create.extent = {extent.width, extent.height, 1};
+        create.mipLevels = create.arrayLayers = 1;
+        create.samples = VK_SAMPLE_COUNT_1_BIT;
+        create.tiling = VK_IMAGE_TILING_OPTIMAL;
+        create.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImage image = VK_NULL_HANDLE;
+        if (vk.vkCreateImage(device, &create, nullptr, &image) != VK_SUCCESS) return {};
+        scratch->image = image;
+        VkMemoryRequirements requirements{};
+        vk.vkGetImageMemoryRequirements(device, scratch->image, &requirements);
+        scratch->memory = context_.depth_resolve_allocate_(requirements);
+        if (!scratch->memory || vk.vkBindImageMemory(device, scratch->image, scratch->memory, 0) != VK_SUCCESS)
+            return {};
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image = scratch->image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        view.format = format;
+        view.subresourceRange = {aspect, 0, 1, 0, 1};
+        VkImageView image_view = VK_NULL_HANDLE;
+        if (vk.vkCreateImageView(device, &view, nullptr, &image_view) != VK_SUCCESS) return {};
+        scratch->view = image_view;
+        return scratch;
+    }
 
     struct PendingBindings {
         std::uint64_t ticket = 0;
@@ -2261,8 +2347,7 @@ private:
 
     std::uint64_t completed() const {
         std::uint64_t done = 0;
-        context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
-        return done;
+        return context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done) == VK_SUCCESS ? done : 0;
     }
 
     void collect_bindings(std::uint64_t done) {
@@ -2280,6 +2365,7 @@ private:
         for (auto& slot : buffers_) {
             if (slot.ticket > done) continue;
             slot.segments.clear();
+            slot.depth_resolve_images.clear();
             for (VkEvent event : slot.events)
                 if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
                 else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);

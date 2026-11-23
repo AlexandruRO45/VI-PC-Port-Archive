@@ -2188,6 +2188,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_clear_gate_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_clear_gate COMMAND replay_clear_gate_test)
+    # Shifted depth/stencil resolves need an intermediate and copy only the requested aspect (no GPU).
+    add_executable(replay_depth_resolve_offset_test test/replay_depth_resolve_offset_test.cpp)
+    target_link_libraries(replay_depth_resolve_offset_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_depth_resolve_offset_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_depth_resolve_offset COMMAND replay_depth_resolve_offset_test)
     # WriteBufferImmediate suspends conditional rendering around vkCmdUpdateBuffer so Intel drivers do not drop it.
     add_executable(replay_write_immediate_predication_test test/replay_write_immediate_predication_test.cpp)
     target_link_libraries(replay_write_immediate_predication_test PRIVATE Vulkan::Headers)
