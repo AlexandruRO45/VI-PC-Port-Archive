@@ -58,8 +58,12 @@ This writes `reports/exe/` (JSON plus a readable summary). Check it in this orde
 
 1. **Section entropy.** Sections near 8.0 bits/byte are still encrypted or compressed. If `.text` is one of them,
    nothing else can be done yet.
-2. **Import table.** Each DLL is marked `bundled` (in the game folder), `system` (present on this Windows), or
-   `shim` (needs a reimplementation). The `shim` list is the real to-do list.
+2. **Import table.** Each DLL is marked `bundled` (in the game folder, any case), `system` (present on this Windows),
+   or `shim` (needs a reimplementation). The `shim` list is the real to-do list. On Linux or macOS, `system` is
+   checked in the Wine prefix's `system32` and its `apisetschema.dll` (`$WINEPREFIX`, else `~/.wine`), so the
+   list matches the Windows one. With no prefix, a DLL that is neither bundled nor owned by the runtime's shims
+   is `system (unverified)` (`"where": "unverified"` in the JSON) and is listed after the to-do. The report's
+   `system_dlls` field says where `system` was checked.
 3. **.pdata function count.** This gives function boundaries for patching and later analysis.
 4. **Inline command-list writes.** `python -I tools/inline_scan.py <game>\game_scarlett_master.exe --sites` (a few
    minutes; it streams `dumpbin /disasm`; it exits 2 when it reads no instructions). "UNCHECKED 0" means every
