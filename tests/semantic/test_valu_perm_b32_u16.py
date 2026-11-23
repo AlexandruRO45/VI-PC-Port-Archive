@@ -501,5 +501,45 @@ class TestPermB32U16RegisterAliasing(unittest.TestCase):
         self.interp.execute(instr)
         self.assertEqual(self.rf.get_vgpr(0), pack_halves(0x3333, 0x2222))
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Classifications
+# ==============================================================================
+
+@dataclass
+class U16StatusFlags:
+    zero: bool = False
+    has_max: bool = False
+    has_mid: bool = False
+
+
+def eval_u16_status(val32: int) -> U16StatusFlags:
+    h0 = val32 & MASK16
+    h1 = (val32 >> 16) & MASK16
+
+    both_zero = (h0 == 0) and (h1 == 0)
+    has_max = (h0 == UINT16_MAX) or (h1 == UINT16_MAX)
+    has_mid = (h0 == UINT16_MID) or (h1 == UINT16_MID)
+
+    return U16StatusFlags(
+        zero=both_zero,
+        has_max=has_max,
+        has_mid=has_mid,
+    )
+
+
+class TestPermB32U16ConditionCodesAndStatus(unittest.TestCase):
+    def test_status_flags_zero_result(self):
+        sel = make_selector(SEL_CONST_ZERO, SEL_CONST_ZERO)
+        res = oracle_v_perm_b32_u16(0, 0, sel)
+        flags = eval_u16_status(res)
+        self.assertTrue(flags.zero)
+
+    def test_status_flags_max(self):
+        sel = make_selector(SEL_CONST_MAX, SEL_CONST_MID)
+        res = oracle_v_perm_b32_u16(0, 0, sel)
+        flags = eval_u16_status(res)
+        self.assertTrue(flags.has_max)
+        self.assertTrue(flags.has_mid)
+
 if __name__ == "__main__":
     unittest.main()
