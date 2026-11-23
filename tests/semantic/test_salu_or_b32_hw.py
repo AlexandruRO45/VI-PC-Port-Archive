@@ -333,6 +333,8 @@ class ScalarRegisterState:
     def read_reg(self, name: str) -> int:
         if name.startswith("s") and name[1:].isdigit():
             idx = int(name[1:])
+            if not (0 <= idx < len(self.sgprs)):
+                raise ValueError(f"SGPR index out of range: {name}")
             return self.sgprs[idx] & MASK32
         if name == "exec_lo":
             return self.exec_lo & MASK32
@@ -354,6 +356,8 @@ class ScalarRegisterState:
         v = val & MASK32
         if name.startswith("s") and name[1:].isdigit():
             idx = int(name[1:])
+            if not (0 <= idx < len(self.sgprs)):
+                raise ValueError(f"SGPR index out of range: {name}")
             self.sgprs[idx] = v
         elif name == "exec_lo":
             self.exec_lo = v
@@ -711,6 +715,55 @@ class SaluOrB32FloatBitPatternTests(unittest.TestCase):
         out = mrt0_words(spv)
         expected_neg_one = struct.unpack("<I", struct.pack("<f", -1.0))[0]
         self.assertEqual(out[0], expected_neg_one)
+
+
+class SaluOrB32NegativeControlsTests(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for s_or_b32."""
+
+    def test_mutation_discrimination_matrix(self):
+        """Ensure s_or_b32 is strictly distinguished from AND, XOR, ADD, and NOR."""
+        pairs = [
+            (0x12345678, 0x87654321),
+            (0xFF00FF00, 0x00FF00FF),
+            (0xAAAAAAAA, 0x55555555),
+            (0x0000FFFF, 0xFFFF0000),
+            (0x00000001, 0x00000002),
+        ]
+        for a, b in pairs:
+            or_res = ref_s_or_b32(a, b)
+            and_res = (a & b) & MASK32
+            xor_res = (a ^ b) & MASK32
+            nor_res = (~(a | b)) & MASK32
+            add_res = (a + b) & MASK32
+
+            with self.subTest(a=hex(a), b=hex(b)):
+                self.assertNotEqual(or_res, and_res)
+                self.assertNotEqual(or_res, nor_res)
+                if (a & b) != 0:
+                    self.assertNotEqual(or_res, xor_res)
+                    self.assertNotEqual(or_res, add_res)
+
+    def test_interpreter_invalid_register_rejection(self):
+        """Interpreter must reject invalid register access."""
+        state = ScalarRegisterState()
+        with self.assertRaises(ValueError):
+            state.read_reg("v0")  # Vector register not allowed in SALU scalar state
+        with self.assertRaises(ValueError):
+            state.write_reg("s999", 1)
+        with self.assertRaises(ValueError):
+            state.resolve_src("unknown_symbol")
+
+    def test_syntax_rejection_malformed_instruction(self):
+        """RDNA2 parser / translator must reject malformed scalar instruction syntax."""
+        bad_syntax_programs = [
+            ["s_or_b32 s0, s1"],  # Missing second source operand
+            ["s_or_b32"],          # Missing all operands
+        ]
+        for idx, lines in enumerate(bad_syntax_programs):
+            with self.subTest(idx=idx):
+                with self.assertRaises(Exception):
+                    translate_lines(f"ps_bad_syntax_{idx}", lines)
+
 
 if __name__ == "__main__":
     unittest.main()
