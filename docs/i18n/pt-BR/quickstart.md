@@ -3,7 +3,7 @@
 > [!NOTE]
 > A documentação em inglês ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) e
 > [`docs/README.md`](../../README.md)) é a **referência oficial**. Este guia reúne apenas instruções estáveis de
-> configuração e compilação (sincronizado com o commit `f847748c`). Para o status diário do projeto, consulte o
+> configuração e compilação (sincronizado com o commit `dde82f27`). Para o status diário do projeto, consulte o
 > [`README.md`](../../../README.md).
 
 ## O que é o Leonida
@@ -36,8 +36,12 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
     powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
     ```
 
-    O script requer `git` e as ferramentas C++ do Visual Studio, configura `LLVM_MC` para o seu usuário
-    e pede que você abra um novo terminal para carregar a variável.
+    O script requer `git` e as ferramentas C++ do Visual Studio (sem WSL), configura `LLVM_MC` para o seu
+    usuário e pede que você abra um novo terminal para carregar a variável. Leva cerca de 20-40 minutos.
+  - Caminho mais rápido, se você usa [conda](https://docs.conda.io/): `conda install -c conda-forge llvm-tools`
+    (o build Windows dele inclui o target AMDGPU; o [`docs/testing.md`](../../testing.md) usou a versão 23.1.6).
+    Depois defina `LLVM_MC` com o caminho completo do `llvm-mc.exe` instalado. Com o ambiente ativo,
+    `where.exe llvm-mc` mostra o caminho (no PowerShell, `where` sozinho é o `Where-Object`).
   - Se usar o WSL, instale `llvm-21` no Ubuntu e defina a variável na mesma sessão do PowerShell em que vai
     executar `make_game.py`.
 
@@ -50,12 +54,20 @@ O projeto está em fase inicial: **o jogo ainda não dá boot**.
 - **Visual Studio 2022** com *Desenvolvimento para desktop com C++* e **Windows SDK `10.0.26100` ou mais recente** (necessário para o estágio `runtime`, que usa root signatures 1.2).
 - [ffmpeg](https://ffmpeg.org/download.html) no `PATH` *(opcional: decodifica streams XMA2 e é exigido ao usar `--wav`)*.
 
+**Este PC aguenta?** `python -I tools/pc_checker.py --cli` detecta CPU, GPU e RAM e compara com os perfis de
+referência antes de um build longo: `--profile 1`, o padrão, equivale a um PC no nível do Xbox Series X, e
+`--profile 2` é uma estimativa da comunidade para 1080p no Low. `python -I tools/pc_checker.py --check --json`
+imprime o mesmo veredito em JSON e o devolve como código de saída (0 bom, 1 fraco, 2 desconhecido).
+
 **Pouco espaço em disco:** o valor de ~400 GB refere-se ao build completo. Para *executar* o port,
 `--stages check,shaders,runtime` precisa de cerca de **30 GB**; o estágio `assets` (~370 GB) serve apenas para as
-ferramentas de extração de assets, e `--wav` adiciona várias vezes o tamanho dos arquivos Ogg Opus. `--work` e `--out`
-podem apontar para outro disco; se o pacote do jogo estiver em uma unidade somente leitura, use `--overlay` (no
-`gta6rt`) em um disco gravável. Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm`: apagá-los mantendo a pasta faz
-o estágio parecer concluído com zero shaders, e um link simbólico em `disasm` é recusado.
+ferramentas de extração de assets, e `--wav` adiciona várias vezes o tamanho dos arquivos Ogg Opus (a verificação
+inicial mostra essa escolha quando é o estágio `assets` que não cabe). `--work` e `--out` podem apontar para outro
+disco. O runtime mapeia o pacote no lugar, então um pacote em unidade somente leitura precisa de
+`gta6rt --overlay <pasta gravável>`; `--overlay` é uma opção do `gta6rt`, não do `make_game.py`. Mantenha os
+arquivos `.s` em `work/shaders/dxbc/disasm`: a próxima execução os confere com a lista em `disasm.done`, desmonta de
+novo os que faltarem (todos, se o `disasm.done` for anterior a essa lista) e depois traduz todos os shaders de novo.
+Uma pasta `disasm` que seja link simbólico é recusada quando o estágio precisa limpá-la.
 
 ## Como compilar
 
@@ -72,12 +84,6 @@ O script procura automaticamente sua cópia (Downloads, Desktop, Documentos, Gam
 discos até dois níveis), valida os pré-requisitos e o espaço livre e grava o resultado em `Documents\Leonida`.
 Se o build for interrompido, basta rodar novamente para retomar de onde parou.
 
-**Espaço em disco baixo:** o valor de ~400 GB é para o build completo. Para *rodar* o port, `--stages check,shaders,runtime`
-precisa de cerca de 30 GB; o estágio `assets` (~370 GB) é apenas para as ferramentas de assets, e `--wav` adiciona
-várias vezes o tamanho do Ogg Opus. `--work` e `--out` podem ficar em outro disco; uma unidade de pacote somente leitura
-precisa de `--overlay` em uma gravável. Mantenha os arquivos `.s` em `work/shaders/dxbc/disasm` no lugar: apagá-los
-mantendo a pasta faz o estágio parecer concluído com zero shaders, e um `disasm` com symlink é recusado.
-
 ### Pelo terminal (`make_game.py`)
 
 ```powershell
@@ -91,7 +97,9 @@ python -I make_game.py --game "D:\caminho\do\pacote" --wav  # também decodifica
 python -I make_game.py --wave64-emulate off            # auto (padrão), on ou off; veja abaixo
 ```
 
-Os estágios executam nesta ordem: `check` → `shaders` → `assets` → `runtime` → `pipelines`.
+Estágios: `check` sempre roda primeiro; depois `shaders`, `assets` e `runtime` rodam juntos quando selecionados (um
+não depende do outro). `pipelines` começa quando os shaders traduzidos ficam prontos (e, se a execução inclui
+`runtime`, depois que ele recompila o `vk_pipeline_check`), então pode rodar em paralelo com o resto de `assets`.
 
 - **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação se alguma GPU não tiver subgrupos de 64 lanes ou se o tamanho for desconhecido, verificando também se a GPU do runtime suporta compute e mesh em 64 lanes (com `--mesh-compute`, apenas o suporte em compute é necessário). No driver Windows da AMD, `auto` usa wave64 nativo em GPUs RDNA1 e RDNA2 quando a GPU do runtime suporta (para placas RDNA1 sem suporte a mesh shaders, a decisão usa o estágio compute), mesmo que outra GPU seja de 32 lanes ou que `vulkaninfo` não esteja disponível, pois o compilador desse driver pode falhar em código LDS emulado (#857). O modo escolhido fica salvo junto aos shaders traduzidos; use `--wave64-emulate on` para forçar a emulação ou `--wave64-emulate off` para forçar wave64 nativo.
 - **Flags de fallback do tradutor**: `--no-float-controls` (omite `SignedZeroInfNanPreserve`), `--bary-fallback` (lê baricêntricas de um input interpolado sem `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (incorpora offsets `image_sample*_o` na coordenada sem `VK_KHR_maintenance8`) e `--mesh-compute` (traduz mesh shaders como compute sem `VK_EXT_mesh_shader`) são repassadas ao tradutor e salvas junto aos shaders; alterá-las retraduz os shaders (veja [`docs/design.md`](../../design.md)).
@@ -108,11 +116,7 @@ python -I make_game.py --stages check,shaders,runtime
 
 O estágio `assets` serve às ferramentas de extração e ocupa cerca de 370 GB. A opção `--wav` aumenta ainda mais
 o espaço usado pelos áudios. Você pode apontar `--work` e `--out` para outro disco. Se o disco do pacote for
-somente leitura, passe `--overlay` ao iniciar o runtime e aponte para uma pasta em um disco gravável.
-- **`--wave64-emulate`**: emula shaders compute/mesh wave64 em GPUs com subgrupos de 32 lanes (NVIDIA e Intel). O padrão `auto` consulta `vulkaninfo` e ativa a emulação se alguma GPU não tiver subgrupos de 64 lanes ou se o tamanho for desconhecido, verificando também se a GPU do runtime suporta compute e mesh em 64 lanes (com `--mesh-compute`, apenas o suporte em compute é necessário). No driver Windows da AMD, `auto` usa wave64 nativo em GPUs RDNA1 e RDNA2 quando a GPU do runtime suporta (para placas RDNA1 sem suporte a mesh shaders, a decisão usa o estágio compute), mesmo que outra GPU seja de 32 lanes ou que `vulkaninfo` não esteja disponível, pois o compilador desse driver pode falhar em código LDS emulado (#857). O modo escolhido fica salvo junto aos shaders traduzidos; use `--wave64-emulate on` para forçar a emulação ou `--wave64-emulate off` para forçar wave64 nativo.
-- **Flags de fallback do tradutor**: `--no-float-controls` (omite `SignedZeroInfNanPreserve`), `--bary-fallback` (lê baricêntricas de um input interpolado sem `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (incorpora offsets `image_sample*_o` na coordenada sem `VK_KHR_maintenance8`) e `--mesh-compute` (traduz mesh shaders como compute sem `VK_EXT_mesh_shader`) são repassadas ao tradutor e salvas junto aos shaders; alterá-las retraduz os shaders (veja [`docs/design.md`](../../design.md)).
-- **`--work`**: recomenda-se apontar para um disco com pelo menos 400 GB livres para o build completo (ou ~30 GB com `--stages check,shaders,runtime`); o estágio `shaders` é o mais demorado e usa metade das threads da CPU por padrão (ajustável com `--jobs`).
-- **`--wav`**: fica desativado por padrão porque WAV PCM de 16 bits é várias vezes maior que Ogg Opus; quando ativado, decodifica os streams Ogg Opus para `work\assets\audio\wav` e pula arquivos WAV já existentes ao retomar um build.
+somente leitura, inicie o runtime com `gta6rt --overlay <pasta gravável>` (opção do `gta6rt`, não do `make_game.py`).
 
 ### Diagnóstico do Vulkan no Linux
 
