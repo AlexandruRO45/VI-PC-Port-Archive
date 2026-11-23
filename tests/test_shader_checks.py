@@ -150,6 +150,8 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, check.CVT_PK_U8_WORDS)) + "\n"
             if name == "cs_med3_i16":
                 return 0, "out[0..7] = " + " ".join(map(str, check.MED3_I16_WORDS)) + "\n"
+            if name == "cs_pk_mul_lo_const":
+                return 0, "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n"
             if name == "cs_store":
                 return 0, "out[0..7] = " + " ".join(map(str, (check.CS_STORE + [0] * 8)[:8])) + "\n"
             if name == "cs_smem_soffset_imm":
