@@ -36,7 +36,13 @@ $plan = Replace-ExactlyOnce $plan 'plan.scissor = {conform::kScissorLeft, confor
 $plan = Replace-ExactlyOnce $plan 'conform::kScissorBottom};' 'conform::kSceneHeight};' 'the scissor rectangle bottom edge'
 Set-Content -Path "$scratch\src\scene_plan.cpp" -Value $plan -NoNewline
 
-& $cmake -S $scratch -B "$scratch\build" -G 'Visual Studio 17 2022' -A x64 | Out-Null
+# The throwaway copy sits at native/negative-control/, so CMake's default spec path
+# (../spec) would resolve inside native/, where there is no spec. Name the real one.
+$spec = Join-Path (Split-Path -Parent $source) 'spec'
+& $cmake -S $scratch -B "$scratch\build" -G 'Visual Studio 17 2022' -A x64 -DCONFORM_SPEC_DIR="$spec" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "the negative-control copy did not configure (exit $LASTEXITCODE); the spec path is '$spec'"
+}
 & $cmake --build "$scratch\build" --config Release --parallel | Select-Object -Last 2
 if ($LASTEXITCODE -ne 0) { Write-Output "BUILD FAILED $LASTEXITCODE"; exit 1 }
 

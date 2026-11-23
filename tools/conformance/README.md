@@ -21,7 +21,7 @@ tools/conformance/
 
 ## The scenes
 
-Seven scenes, each chosen to make one failure visible at an exact coordinate:
+Six scenes, each chosen to make one failure visible at an exact coordinate:
 
 | scene | proves |
 |---|---|
@@ -58,23 +58,15 @@ Microsoft Basic Render Driver as well as on hardware.
 
 ## Status today
 
-Against the shim as of `2e5c0f2`, the driver in the pull request reports:
+The shim's draw path has landed since this harness was drafted: `runtime/shims/d3d12_vulkan_device.cpp`
+now parses RTS0 blobs for `CreateRootSignature`, and `runtime/test/d3d12_draw_test.cpp` records indexed
+draws through the Vulkan device and compares the readback pixel by pixel.
 
-```
-clear          OK       3/3 pixel checks matched (row pitch 1024, readback 262144 bytes)
-fullscreen     BLOCKED  ID3D12Device::CreateRootSignature (E_NOTIMPL 0x80004001)
-depth_order    BLOCKED  ID3D12Device::CreateRootSignature (E_NOTIMPL 0x80004001)
-scissor        BLOCKED  ID3D12Device::CreateRootSignature (E_NOTIMPL 0x80004001)
-blend          BLOCKED  ID3D12Device::CreateRootSignature (E_NOTIMPL 0x80004001)
-indexed        BLOCKED  ID3D12Device::CreateRootSignature (E_NOTIMPL 0x80004001)
-```
-
-`clear` already proves the whole resource → clear → barrier → copy → readback chain through
-the Vulkan device. The five drawn scenes stop at the first call the shim genuinely lacks, so
-each one becomes a progress marker as the draw path lands: `CreateRootSignature` →
-`CreateGraphicsPipelineState` → the `SetPipelineState` / root-binding group → viewport and
-scissor → vertex/index buffers → `OMSetRenderTargets` → `DrawInstanced` /
-`DrawIndexedInstanced`.
+What does not exist yet is the step this harness is for: running **the same scenes** through the shim and
+the native reference, and diffing the two image sets. The shim-side driver that does it is not part of
+this pull request, because until the scenes run end to end it can only report which calls are missing.
+The native reference, the scene contract and the comparison tool are the half that has to be right
+first, and they are what this PR adds.
 
 ## The shader format question
 

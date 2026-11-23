@@ -2,6 +2,12 @@
 # Run: powershell -NoProfile -ExecutionPolicy Bypass -File verify.ps1
 # Exit code 0 means every claim held.
 
+param(
+  # Adapter assertions only run when the machine matches these names. Pass -ExpectAdapters
+  # with your own strings, or leave them empty to skip those two checks entirely.
+  [string]$ExpectedDefaultAdapter = '',
+  [string]$ExpectedSecondAdapter = ''
+)
 $ErrorActionPreference = 'Continue'
 $root_dir = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root_dir 'build/Release/conform_native.exe'
@@ -35,10 +41,14 @@ foreach ($name in $names) {
     Check ($hashA -eq $hashB) "identical bytes: $name $hashA"
 }
 
-Write-Output '--- second adapter (index 0 = AMD Radeon iGPU on this machine) ---'
+Write-Output '--- second adapter ---'
 $amdText = (& $exe "$root\amd" --adapter 0 2>&1 | Out-String)
 Check ($LASTEXITCODE -eq 0) 'render on adapter 0 exits 0'
-Check ($amdText -match 'adapter: AMD Radeon') 'adapter 0 is reported as the AMD Radeon'
+if ($ExpectedSecondAdapter) {
+    Check ($amdText -match [regex]::Escape($ExpectedSecondAdapter)) "adapter 0 is reported as $ExpectedSecondAdapter"
+} else {
+    Write-Output 'skip    adapter 0 name (pass -ExpectedSecondAdapter to assert it)'
+}
 Check ($amdText -match 'readback checks: 18 passed, 0 failed') 'adapter 0 passes all 18 readback checks'
 Check ($amdText -match 'png checks:      18 passed, 0 failed') 'adapter 0 passes all 18 PNG checks'
 
@@ -73,7 +83,11 @@ Check ($LASTEXITCODE -eq 2) 'unknown flag exits 2'
 Write-Output '--- manifest ---'
 $manifest = Get-Content "$root\a\manifest.json" -Raw | ConvertFrom-Json
 Check ($manifest.renderer -eq 'native') 'manifest renderer is native'
-Check ($manifest.adapter -match 'RTX 5070 Ti') 'manifest records the chosen adapter'
+if ($ExpectedDefaultAdapter) {
+    Check ($manifest.adapter -match [regex]::Escape($ExpectedDefaultAdapter)) "manifest records the adapter $ExpectedDefaultAdapter"
+} else {
+    Check ([bool]$manifest.adapter) 'manifest records an adapter name'
+}
 Check ($manifest.scenes.Count -eq 6) 'manifest lists 6 scenes'
 $checkCount = 0
 foreach ($scene in $manifest.scenes) { $checkCount += $scene.checks.Count }

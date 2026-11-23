@@ -235,7 +235,7 @@ inline constexpr Scene kScenes[] = {
         {
             {80, 200, 240, 200, 40, 255, "left triangle, from index triple 0,2,5"},
             {176, 200, 40, 120, 240, 255, "right triangle, from index triple 1,3,4"},
-            {128, 240, kClearR, kClearG, kClearB, kClearA, "the gap between the two triangles stays clear"},
+            {128, 200, kClearR, kClearG, kClearB, kClearA, "the gap between the two triangles stays clear: row 200 is inside both triangles' vertical span, so drawing the vertex buffer in order fills it"},
         },
     },
 };
