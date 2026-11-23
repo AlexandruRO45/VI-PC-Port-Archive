@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -126,6 +127,40 @@ class AssetsPoolsTest(unittest.TestCase):
         with open(os.path.join(pool_dir, make_game.DECODER_RECORD), encoding="utf-8") as f:
             self.assertEqual(f.read(), "d2\n")
         self.assertEqual(self.run_assets("d2"), [])
+
+    def _link_folder(self, link, target):
+        """A junction on Windows, a symbolic link elsewhere; skipped when neither is allowed."""
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        if sys.platform == "win32":
+            made = subprocess.run(["cmd", "/d", "/c", "mklink", "/J", link, target], capture_output=True)
+            if made.returncode == 0:
+                return
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"no symlink or junction support here: {exc}")
+
+    def test_a_linked_pool_folder_is_one_error_line_not_a_traceback(self):
+        self.pool("data/ttdb/pool.ttpf")
+        pool_dir = os.path.join(self.out, "ttpf", "pool")
+        target = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(target)
+        self._link_folder(pool_dir, target)
+        with open(os.path.join(pool_dir, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+            f.write("d1\n")
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            self.run_assets("d2")
+
+        self.assertEqual(caught.exception.code, 1)
+        lines = [line for line in err.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, err.getvalue())
+        self.assertIn("ERROR:", lines[0])
+        self.assertIn("symlink or a junction", lines[0])
+        # Nothing was exported and the link's target is untouched.
+        self.assertTrue(os.path.isdir(target))
+        self.assertFalse(os.path.exists(os.path.join(target, "manifest.json")))
 
     def test_a_pool_without_the_record_exports_again(self):
         p = self.pool("data/ttdb/pool.ttpf")

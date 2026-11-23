@@ -2043,6 +2043,13 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         record = os.path.join(pool_dir, DECODER_RECORD)
         if os.path.isdir(pool_dir) and read_shader_setting(record) != decoder:
             log(f"assets: no matching decoder fingerprint for texture pool {os.path.relpath(p, game)}: exporting again")
+            # rmtree refuses a link and the OSError traceback buries the reason; a linked pool folder is never
+            # removed, so say so and stop before anything is written through it.
+            if _linked(pool_dir):
+                fail(f"the texture pool folder {os.path.relpath(pool_dir, out)} is a symlink or a junction and its "
+                     f"decoder fingerprint no longer matches, so the stage has to export the pool from scratch: that "
+                     f"removes the folder, which is never done through a link. Remove it and run again, or point --out "
+                     f"at a folder that is not linked")
             shutil.rmtree(pool_dir)
         pool_jobs.append((p, name, root, pool_dir, record))
 
