@@ -43,11 +43,14 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
-import rdna2spirv  # noqa: E402
+from support import mrt0_words, rdna2spirv, translate_lines  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
+PUSH_VSHARP = [0x1000, 0, 0x1000, 0x31016FAC] + [0] * 28
 
 
 def ref_bcnt0_b32(s0: int) -> tuple[int, int]:
@@ -69,6 +72,14 @@ def ref_bcnt0_b64(s0_64: int) -> tuple[int, int]:
 def ref_ff0_b32(s0: int) -> int:
     """Reference oracle for s_ff0_i32_b32: returns first zero bit from LSB, or -1."""
     val = (s0 & MASK32) ^ MASK32
+    if val == 0:
+        return -1
+    return (val & -val).bit_length() - 1
+
+
+def ref_ff0_b64(s0_64: int) -> int:
+    """Reference oracle for s_ff0_i32_b64: returns first zero bit from LSB in [0, 63], or -1."""
+    val = (s0_64 & MASK64) ^ MASK64
     if val == 0:
         return -1
     return (val & -val).bit_length() - 1
@@ -720,6 +731,287 @@ class TestRdna2SpirvScalarBcntEmission(unittest.TestCase):
         self.assertIn("OpISub %uint %c1f", emitted)
         self.assertIn("OpSelect %uint", emitted)
         self.assertNotIn("OpStore %scc", emitted)
+
+
+def translate_ps_bcnt(lines: list[str]) -> str:
+    """Translate a hand-written pixel shader listing exporting v0..v3 to mrt0."""
+    return translate_lines(
+        "ps_salu_bcnt",
+        [*lines, "exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"],
+    )
+
+
+class EndToEndTranslatorTests(unittest.TestCase):
+    """End-to-end rdna2spirv.translate + spirv_mini_interp execution for s_bcnt0, s_ff0, and s_flbit."""
+
+    def test_runtime_s_bcnt0_i32_b32_counts_and_chained_scc_transitions(self) -> None:
+        # Both operands are loaded from memory at runtime (neither is in sgpr_imm),
+        # exercising s_bcnt0_i32_b32 and chained 0->1, 1->0, 1->1, and 0->0 SCC transitions.
+        spv = translate_ps_bcnt([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # initial SCC = 0
+            "s_bcnt0_i32_b32 s6, s4",     # step 1: transition from SCC = 0
+            "s_cselect_b32 s7, 1, 0",
+            "s_bcnt0_i32_b32 s8, s5",     # step 2: transition directly from step 1's SCC
+            "s_cselect_b32 s9, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s8",
+            "v_mov_b32 v3, s9",
+        ])
+
+        cases = [
+            # 0 -> 1 (all 32 zeros), then 1 -> 0 (0xFFFFFFFF has 0 zeros)
+            (0x00000000, 0xFFFFFFFF),
+            # 0 -> 0 (0xFFFFFFFF has 0 zeros), then 0 -> 1 (single zero at MSB)
+            (0xFFFFFFFF, 0x7FFFFFFF),
+            # 0 -> 1 (single zero at LSB), then 1 -> 1 (alternating 16 zeros)
+            (0xFFFFFFFE, 0x55555555),
+            # 0 -> 0 (0xFFFFFFFF), then 0 -> 0 (0xFFFFFFFF)
+            (0xFFFFFFFF, 0xFFFFFFFF),
+            # Arbitrary mixed patterns
+            (0x0000FFFF, 0xF0F00F0F),
+            (0x80000001, 0x12345678),
+        ]
+
+        for s0_a, s0_b in cases:
+            want_da, want_scca = ref_bcnt0_b32(s0_a)
+            want_db, want_sccb = ref_bcnt0_b32(s0_b)
+            mem = {0x1000: s0_a, 0x1004: s0_b}
+            with self.subTest(s0_a=hex(s0_a), s0_b=hex(s0_b)):
+                got = tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem))
+                self.assertEqual(got, (want_da, want_scca, want_db, want_sccb))
+
+    def test_runtime_s_bcnt0_i32_b64_sgpr_pairs_and_chained_scc_transitions(self) -> None:
+        # Two 64-bit SGPR pairs s[4:5] and s[6:7] loaded from buffer memory at runtime,
+        # verifying that both 32-bit halves are inverted and summed and that SCC is 0
+        # only when all 64 bits are 1.
+        spv = translate_ps_bcnt([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",              # initial SCC = 0
+            "s_bcnt0_i32_b64 s8, s[4:5]",     # step 1
+            "s_cselect_b32 s9, 1, 0",
+            "s_bcnt0_i32_b64 s10, s[6:7]",    # step 2
+            "s_cselect_b32 s11, 1, 0",
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s11",
+        ])
+
+        cases = [
+            # 0 -> 1 (64 zeros), then 1 -> 0 (all 64 bits set)
+            (0x00000000_00000000, 0xFFFFFFFF_FFFFFFFF),
+            # 0 -> 0 (all 64 bits set), then 0 -> 1 (low half all-ones, high half has 1 zero at bit 63)
+            (0xFFFFFFFF_FFFFFFFF, 0x7FFFFFFF_FFFFFFFF),
+            # 0 -> 1 (high half all-ones, low half has 1 zero at bit 0), then 1 -> 1 (32 zeros in high half)
+            (0xFFFFFFFF_FFFFFFFE, 0x00000000_FFFFFFFF),
+            # 0 -> 1 (32 zeros in low half), then 1 -> 1 (alternating 32 zeros across both halves)
+            (0xFFFFFFFF_00000000, 0x55555555_AAAAAAAA),
+            # 0 -> 0 (all 64 bits set), then 0 -> 0 (all 64 bits set)
+            (0xFFFFFFFF_FFFFFFFF, 0xFFFFFFFF_FFFFFFFF),
+        ]
+
+        for s0_a, s0_b in cases:
+            want_da, want_scca = ref_bcnt0_b64(s0_a)
+            want_db, want_sccb = ref_bcnt0_b64(s0_b)
+            mem = {
+                0x1000: s0_a & MASK32,
+                0x1004: (s0_a >> 32) & MASK32,
+                0x1008: s0_b & MASK32,
+                0x100C: (s0_b >> 32) & MASK32,
+            }
+            with self.subTest(s0_a=hex(s0_a), s0_b=hex(s0_b)):
+                got = tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem))
+                self.assertEqual(got, (want_da, want_scca, want_db, want_sccb))
+
+    def test_runtime_s_ff0_and_s_flbit_b32_exhaustive_bits_and_scc_invariance(self) -> None:
+        # s_ff0_i32_b32 and s_flbit_i32_b32 must never modify SCC, whether initial SCC is 0 or 1,
+        # and whether a bit is found or the -1 (0xFFFFFFFF) sentinel is returned.
+        spv = translate_ps_bcnt([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # SCC = 0
+            "s_ff0_i32_b32 s6, s4",       # must preserve SCC = 0
+            "s_cselect_b32 s7, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # SCC = 1
+            "s_flbit_i32_b32 s8, s5",     # must preserve SCC = 1
+            "s_cselect_b32 s9, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s8",
+            "v_mov_b32 v3, s9",
+        ])
+
+        # All 32 single-zero patterns for s_ff0_i32_b32 paired with all 32 single-one patterns for s_flbit_i32_b32
+        for bit in range(32):
+            ff0_in = (~(1 << bit)) & MASK32
+            flbit_in = (1 << bit) | ((1 << bit) - 1)
+            mem = {0x1000: ff0_in, 0x1004: flbit_in}
+            with self.subTest(bit=bit):
+                got = tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem))
+                self.assertEqual(got, (bit, 0, 31 - bit, 1))
+
+        # Sentinel (-1 = 0xFFFFFFFF) inputs: s_ff0 on 0xFFFFFFFF and s_flbit on 0x00000000
+        # Also verify the reverse initial SCC polarity (SCC=1 for s_ff0, SCC=0 for s_flbit).
+        spv_rev = translate_ps_bcnt([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 1, 1",          # SCC = 1
+            "s_ff0_i32_b32 s6, s4",       # must preserve SCC = 1
+            "s_cselect_b32 s7, 1, 0",
+            "s_cmp_eq_u32 0, 1",          # SCC = 0
+            "s_flbit_i32_b32 s8, s5",     # must preserve SCC = 0
+            "s_cselect_b32 s9, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s8",
+            "v_mov_b32 v3, s9",
+        ])
+        for s4, s5 in ((0xFFFFFFFF, 0x00000000), (0x00000000, 0x80000000), (0xAAAAAAA3, 0x00020000)):
+            want_ff0 = ref_ff0_b32(s4) & MASK32
+            want_flbit = ref_flbit_b32(s5) & MASK32
+            mem = {0x1000: s4, 0x1004: s5}
+            self.assertEqual(
+                tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem)),
+                (want_ff0, 0, want_flbit, 1),
+            )
+            self.assertEqual(
+                tuple(mrt0_words(spv_rev, push_constants=PUSH_VSHARP, memory=mem)),
+                (want_ff0, 1, want_flbit, 0),
+            )
+
+    def test_runtime_s_ff0_i32_b64_cross_half_and_sentinel(self) -> None:
+        # s_ff0_i32_b64 across runtime 64-bit SGPR pairs: low-half zero bits [0..31],
+        # high-half zero bits [32..63] when low half is all-ones, and -1 when both halves are all-ones.
+        spv = translate_ps_bcnt([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 1, 1",              # SCC = 1
+            "s_ff0_i32_b64 s8, s[4:5]",       # must preserve SCC = 1
+            "s_cselect_b32 s9, 1, 0",
+            "s_cmp_eq_u32 0, 1",              # SCC = 0
+            "s_ff0_i32_b64 s10, s[6:7]",      # must preserve SCC = 0
+            "s_cselect_b32 s11, 1, 0",
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s11",
+        ])
+
+        cases = [
+            (0x00000000_00000000, 0xFFFFFFFF_FFFFFFFF),
+            (0xFFFFFFFF_FFFFFFFE, 0xFFFFFFFF_7FFFFFFF),
+            (0xFFFFFFFE_FFFFFFFF, 0x7FFFFFFF_FFFFFFFF),
+            (0xFFFFFFFF_FFFF00FF, 0xFFFF00FF_FFFFFFFF),
+        ]
+        for s0_a, s0_b in cases:
+            want_a = ref_ff0_b64(s0_a) & MASK32
+            want_b = ref_ff0_b64(s0_b) & MASK32
+            mem = {
+                0x1000: s0_a & MASK32,
+                0x1004: (s0_a >> 32) & MASK32,
+                0x1008: s0_b & MASK32,
+                0x100C: (s0_b >> 32) & MASK32,
+            }
+            with self.subTest(s0_a=hex(s0_a), s0_b=hex(s0_b)):
+                got = tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem))
+                self.assertEqual(got, (want_a, 1, want_b, 0))
+
+    def test_in_place_aliasing_and_64bit_immediate_extension(self) -> None:
+        # In-place destination aliasing (dst == src for b32, dst == low or high SGPR of pair for b64)
+        # plus 64-bit constant rules: inline -1 sign-extends to 64 ones (0 zeros), whereas a 32-bit
+        # hex literal 0xFFFFFFFF zero-extends to 0x00000000_FFFFFFFF (32 zeros in the high half).
+        spv = translate_ps_bcnt([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_bcnt0_i32_b32 s4, s4",         # in-place b32
+            "s_bcnt0_i32_b64 s6, s[6:7]",     # in-place b64 where dst aliases low half s6
+            "s_bcnt0_i32_b64 s8, -1",         # inline -1 sign-extended to 0xFFFFFFFF_FFFFFFFF -> 0
+            "s_bcnt0_i32_b64 s9, 0xffff0000", # 32-bit literal zero-extended to 64 bits -> 16 + 32 = 48
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s6",
+            "v_mov_b32 v2, s8",
+            "v_mov_b32 v3, s9",
+        ])
+        mem = {
+            0x1000: 0xF0F0F0F0,
+            0x1004: 0,
+            0x1008: 0x0000FFFF,
+            0x100C: 0xFFFFFF00,
+        }
+        got = tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem))
+        self.assertEqual(got, (16, 16 + 8, 0, 48))
+
+
+class TranslatedMutationNegativeControlTests(unittest.TestCase):
+    """Verify that sabotaging the emitted SPIR-V for s_bcnt0, s_ff0, or s_flbit fails execution."""
+
+    def test_translated_spirv_mutations_caught(self) -> None:
+        # 1. s_bcnt0_i32_b32: replacing OpNot with OpCopyObject counts 1-bits instead of 0-bits,
+        #    and redirecting OpStore %scc breaks the SCC write.
+        spv_bcnt32 = translate_ps_bcnt([
+            "s_buffer_load_dword s4, s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",
+            "s_bcnt0_i32_b32 s5, s4",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v0, s5",
+            "v_mov_b32 v1, s6",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ])
+        mem32 = {0x1000: 0x000000FF}  # 8 ones, 24 zeros -> count=24, scc=1
+        self.assertEqual(
+            tuple(mrt0_words(spv_bcnt32, push_constants=PUSH_VSHARP, memory=mem32)[:2]),
+            (24, 1),
+        )
+        bad_no_not = spv_bcnt32.replace("OpNot %uint", "OpCopyObject %uint", 1)
+        self.assertNotEqual(bad_no_not, spv_bcnt32)
+        self.assertNotEqual(
+            mrt0_words(bad_no_not, push_constants=PUSH_VSHARP, memory=mem32)[0],
+            24,
+        )
+        bad_scc = spv_bcnt32.replace("OpStore %scc", "OpStore %vcc_hi")
+        self.assertNotEqual(bad_scc, spv_bcnt32)
+        self.assertNotEqual(
+            mrt0_words(bad_scc, push_constants=PUSH_VSHARP, memory=mem32)[1],
+            1,
+        )
+
+        # 2. s_bcnt0_i32_b64: replacing OpIAdd with OpISub corrupts the 64-bit zero count.
+        spv_bcnt64 = translate_ps_bcnt([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_bcnt0_i32_b64 s6, s[4:5]",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ])
+        mem64 = {0x1000: 0x0000FFFF, 0x1004: 0x000000FF}  # 16 + 24 = 40 zeros
+        self.assertEqual(mrt0_words(spv_bcnt64, push_constants=PUSH_VSHARP, memory=mem64)[0], 40)
+        bad_add = spv_bcnt64.replace("OpIAdd %uint", "OpISub %uint", 1)
+        self.assertNotEqual(bad_add, spv_bcnt64)
+        self.assertNotEqual(mrt0_words(bad_add, push_constants=PUSH_VSHARP, memory=mem64)[0], 40)
+
+        # 3. s_flbit_i32_b32: replacing OpISub %uint %c1f with OpIAdd %uint %c1f corrupts 31 - FindUMsb.
+        spv_flbit = translate_ps_bcnt([
+            "s_buffer_load_dword s4, s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_flbit_i32_b32 s5, s4",
+            "v_mov_b32 v0, s5",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ])
+        mem_flbit = {0x1000: 0x00020000}  # bit 17 -> 31 - 17 = 14
+        self.assertEqual(mrt0_words(spv_flbit, push_constants=PUSH_VSHARP, memory=mem_flbit)[0], 14)
+        bad_flbit = spv_flbit.replace("OpISub %uint %c1f", "OpIAdd %uint %c1f", 1)
+        self.assertNotEqual(bad_flbit, spv_flbit)
+        self.assertNotEqual(mrt0_words(bad_flbit, push_constants=PUSH_VSHARP, memory=mem_flbit)[0], 14)
 
 
 if __name__ == "__main__":
