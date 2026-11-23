@@ -13,6 +13,8 @@ def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
         raise ValueError(f"{path}: invalid UTF-8: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"{path}: invalid JSON: {exc}") from exc
+    except RecursionError as exc:
+        raise ValueError(f"{path}: JSON too deeply nested") from exc
     if not isinstance(rows, list):
         raise ValueError(f"{path}: expected an array of shader entries")
     stems = set()
