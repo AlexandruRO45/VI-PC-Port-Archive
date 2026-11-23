@@ -68,9 +68,9 @@ class MissingInputExitCodeTests(unittest.TestCase):
         missing = os.path.join(HERE, "no-such-input-for-build-1046")
         self.assertFalse(os.path.exists(missing), "the fixture path must not exist")
         for tool in MISSING_INPUT_TOOLS:
-            if tool in NUMPY_TOOLS and not HAVE_NUMPY:
-                continue
             with self.subTest(tool=tool):
+                if tool in NUMPY_TOOLS and not HAVE_NUMPY:
+                    self.skipTest(f"{tool} needs numpy")
                 p = run_tool(tool, missing)
                 self.assertEqual(p.returncode, 2, p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
