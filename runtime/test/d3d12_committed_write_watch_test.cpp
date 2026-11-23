@@ -2,6 +2,7 @@
 // takes the flag on a heap the CPU can write (UPLOAD, READBACK, CUSTOM with a CPU page property), on buffers and
 // textures, keeps it in GetHeapProperties, and refuses it on DEFAULT and on CUSTOM NOT_AVAILABLE. RTX 5070 Ti and WARP
 // answer alike.
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 
@@ -68,6 +69,10 @@ std::string run_case(ID3D12Device* dev, D3D12_HEAP_PROPERTIES hp, D3D12_HEAP_FLA
 }  // namespace
 
 int main() {
+    if (hostwine::host_is_wine()) {
+        std::printf("SKIP: the host comparison is skipped under Wine\n");
+        return 77;
+    }
     Ref<ID3D12Device> ours, host;
     if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&ours.p))) || !ours.p) return 77;
     Ref<IDXGIAdapter> adapter;
