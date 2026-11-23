@@ -90,9 +90,10 @@ def read_ppm(path):
     head = data.split(b"\n", 3)
     if len(head) != 4 or head[0] != b"P6" or head[2] != b"255":
         raise ValueError("expected a P6/255 renderer frame")
-    if len(head[1].split()) != 2:
-        raise ValueError("expected two frame dimensions")
-    w, h = (int(v) for v in head[1].split())
+    dimensions = head[1].split()
+    if len(dimensions) != 2 or any(not value.isdigit() for value in dimensions):
+        raise ValueError("expected two decimal frame dimensions")
+    w, h = (int(v) for v in dimensions)
     if w <= 0 or h <= 0:
         raise ValueError("frame dimensions must be positive")
     if len(head[3]) != w * h * 3:
