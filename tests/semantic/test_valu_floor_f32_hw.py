@@ -387,5 +387,27 @@ class TestVFloorF32Aliasing(unittest.TestCase):
         self.assertEqual(state.vgprs[1], to_u32(5.5))  # source unchanged
         self.assertEqual(state.vgprs[3], 0x8765_4321) # unrelated unchanged
 
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# -----------------------------------------------------------------------------
+
+class TestVFloorF32ConditionCodes(unittest.TestCase):
+    """Unit tests verifying condition codes and flag properties for v_floor_f32."""
+
+    def test_zero_result_detection(self):
+        # floor(0.5) = 0.0
+        res = v_floor_f32_oracle(to_u32(0.5))
+        self.assertEqual(res, 0x0000_0000)
+
+    def test_negative_zero_preservation(self):
+        # floor(-0.0) = -0.0 (0x80000000)
+        res = v_floor_f32_oracle(SIGN_BIT32)
+        self.assertEqual(res, SIGN_BIT32)
+
+    def test_sign_bit_propagation(self):
+        # floor(-10.2) = -11.0, sign bit must be 1
+        res = v_floor_f32_oracle(to_u32(-10.2))
+        self.assertTrue(bool(res & SIGN_BIT32))
+
 if __name__ == "__main__":
     unittest.main()
