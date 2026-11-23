@@ -145,6 +145,10 @@ Die Stufen laufen in dieser Reihenfolge: `check` → `shaders` → `assets` → 
   `gta6rt_tls_host.dll`). In beiden Fällen legt das Skript `gta6rt.sh` an, das das Programm mit `wine` startet (oder
   mit dem Wine aus der Variable `WINE`, etwa von Proton).
 
+Mit dem Vulkan-Backend (`LEONIDA_D3D12=vulkan`) findet die gepackte Runtime die übersetzten Shader in
+`<work>/shaders/spirv` über `shader_path.txt` neben `gta6rt.exe`. `LEONIDA_SHADERS` verweist auf ein anderes
+Verzeichnis.
+
 Zu `--wave64-emulate`: `auto` schaltet die Emulation ein, wenn eine GPU keine 64 breiten Subgroups hat oder ihre
 Größe unbekannt ist. Mit dem Windows-Treiber von AMD bleibt `auto` auf RDNA1 und RDNA2 bei nativem Wave64, wenn die
 GPU der Runtime es kann, denn dieser Treiber kann bei emuliertem LDS-Code abstürzen (#857). Der Modus wird neben den
