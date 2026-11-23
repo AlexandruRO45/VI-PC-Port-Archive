@@ -73,6 +73,10 @@ instruction family per file; the list below describes some of them, not every fi
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
   `test_spirv_wave_interp.py` pins its convergence rules on hand-written modules.
+- `test_wave64_halves_why.py` translates 14 hand-written tier C wave64 listings with `--wave64-why` and compares
+  the `wave64_graphics_why` lines (where each reason comes from, instruction families only) with the lines derived
+  by hand; it also checks that the second analysis run behind them finds the same tier and reasons, that the
+  index is unchanged without the option, and that `wave64_halves.py --census --why` prints counts and no name.
 - `test_global_mem_offset.py` runs the address arithmetic `global_load*`/`global_store*` emit (its own small
   evaluator, since the interpreter refuses 64-bit integers and PhysicalStorageBuffer) and asserts the address
   accessed for the signed 12-bit instruction offset (-4, -2048, 2047, 0) in both addressing modes.

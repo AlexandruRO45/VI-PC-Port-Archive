@@ -54,6 +54,7 @@ WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact o
 # the runtime compares that with the device's limit before it creates the pipeline. spirv-val checks neither.
 MAX_SHARED_BYTES = 65536
 WAVE64_GRAPHICS = "warn"   # --wave64-graphics: tier C wave64 VS/PS/GS (not exact on 32-wide subgroups): warn | error | off
+WAVE64_WHY = False         # --wave64-why: also record where each tier C reason comes from (wave64_graphics_why)
 W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for the summary line
 # --bary-fallback: raw barycentric reads come from an ordinary perspective-interpolated vec3 input (the location is
 # in the metadata as "bary_fallback_input") instead of BuiltIn BaryCoordKHR, for devices without
@@ -14927,7 +14928,7 @@ def halves_analysis(g, blocks, succ):
     if not g.wave64 or g.stage not in ("vs", "ps", "gs") or g.emulate or WAVE64_GRAPHICS == "off":
         return
     try:
-        g.w64g = wave64_halves.analyse(blocks, succ, g.lane_masks, g.stage)
+        g.w64g = wave64_halves.analyse(blocks, succ, g.lane_masks, g.stage, why=WAVE64_WHY)
     except Exception as e:      # the analysis must never cost a translation; what it could not decide is tier C
         g.w64g = {"tier": "C", "reasons": ["analysis-error"], "idioms": [], "uniform_readlane": set(),
                   "scalar_spills": [], "sites": [("analysis-error", None, type(e).__name__)]}
@@ -16839,6 +16840,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["wave64_graphics"] = g.w64g["tier"]
         if g.w64g["reasons"]:
             m["wave64_graphics_reasons"] = g.w64g["reasons"]
+        if g.w64g.get("why"):            # instruction families only: wave64_halves.py --census --why counts them
+            m["wave64_graphics_why"] = g.w64g["why"]
         if g.w64g["idioms"]:
             m["wave64_graphics_idioms"] = g.w64g["idioms"]
     if g.emulate:
@@ -17210,6 +17213,11 @@ def main():
                     help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
                          "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "
                          "error = refuse them (Unsupported), off = skip the analysis")
+    ap.add_argument("--wave64-why", action="store_true",
+                    help="for each tier C wave64 vertex, pixel and geometry shader, also write where its reasons come "
+                         "from to the index (wave64_graphics_why: instruction families only), for "
+                         "tools/wave64_halves.py --census <index> --why; a second analysis run per tier C shader, "
+                         "the emitted SPIR-V is the same")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
@@ -17277,6 +17285,8 @@ def main():
     FLOAT_CONTROLS = not a.no_float_controls
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
+    global WAVE64_WHY
+    WAVE64_WHY = a.wave64_why
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute

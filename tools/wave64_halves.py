@@ -28,6 +28,10 @@ must be clean. Scalar registers are also checked against control dependence: a s
 runs when a wave-wide vote says some lane is on (an s_cbranch_vccz, execz, ...) differs between the halves when
 one half votes yes and the other no, so a read that may see that def or another one is tainted (CTRL).
 
+`analyse(..., why=True)` also gives, for a tier C program, where each reason comes from (WhyAnalysis, the key
+`why`); with --wave64-why the translator writes it to the index as `wave64_graphics_why`, and
+`--census <index> --why` counts it.
+
 The pre-translation opcode scan over a disassembly folder is tools/wave64_graphics_scan.py (#1132): it counts
 candidate cross-half opcodes and decides nothing. This module decides per shader (tier); its --census only totals
 the tiers the translator wrote into an index.json. They answer different questions.
@@ -1671,9 +1675,115 @@ class Analysis:
         return stale
 
 
-def analyse(blocks, succ, masks, stage):
-    """Tier of one wave64 VS/PS/GS program (see the module docstring)."""
-    an = Analysis(blocks, succ, masks, stage)
+# ---- where a tier C reason comes from (--census --why) ----
+WHY_FAMILY = (          # first matching prefix of the base opcode names the family
+    ("buffer_load", "buffer_load"), ("tbuffer_load", "buffer_load"), ("global_load", "global_load"),
+    ("flat_load", "global_load"), ("scratch_load", "scratch_load"), ("ds_read", "lds_read"),
+    ("buffer_atomic", "atomic"), ("global_atomic", "atomic"), ("flat_atomic", "atomic"), ("image_atomic", "atomic"),
+    ("buffer_store", "store"), ("tbuffer_store", "store"), ("global_store", "store"), ("flat_store", "store"),
+    ("scratch_store", "store"), ("image_store", "store"), ("ds_write", "store"), ("ds_store", "store"),
+    ("image_", "image"), ("s_buffer_load", "s_load"), ("s_load", "s_load"), ("v_interp", "v_interp"),
+    ("v_readfirstlane", "v_readfirstlane"), ("v_readlane", "v_readlane"), ("v_writelane", "v_writelane"),
+    ("v_mbcnt", "v_mbcnt"), ("s_bcnt", "s_bcnt"), ("s_ff", "s_ff"), ("s_flbit", "s_ff"), ("v_cmpx", "v_cmpx"),
+    ("v_cmp", "v_cmp"), ("ds_bpermute", "permute"), ("ds_permute", "permute"), ("ds_swizzle", "permute"),
+    ("v_permlane", "permute"), ("v_movrel", "movrel"), ("v_swaprel", "movrel"), ("s_movrel", "movrel"),
+    ("s_cbranch_vcc", "vcc_branch"), ("s_cbranch_exec", "exec_branch"), ("s_cbranch_scc", "scc_branch"),
+    ("exp", "export"), ("ds_", "lds_other"), ("v_", "valu"), ("s_", "salu"),
+)
+
+
+def why_family(ins):
+    """Family name of an instruction for the --why census: what kind of instruction it is, never which one."""
+    op = base_op(ins["op"])
+    if op.startswith(SAVEEXEC):
+        return "saveexec"
+    if op.startswith("s_") and ins["args"] and _regs(ins["args"][0]) == ["exec"]:
+        return "exec_write"
+    if "_dpp" in ins["op"] or any(m.startswith(("row_", "quad_perm", "dpp8:")) for m in ins.get("mods") or []):
+        return "dpp"
+    for prefix, family in WHY_FAMILY:
+        if op.startswith(prefix):
+            return family
+    return "other"
+
+
+class WhyAnalysis(Analysis):
+    """The same analysis, with two side tables per program point that say where a value comes from. They change no
+    taint, tag or violation (the base class does all of that; this class only wraps entry, block, join and step):
+        o  register -> origin of its taint: the first instruction on the way that made the value depend on the
+           partition, as (position, family, EXEC was the launch mask, families that wrote its operands, the EXEC
+           states of those writes, the families that wrote the operands of those writers). A join keeps the
+           earliest origin.
+        w  register -> who wrote it: (families, EXEC states, families that wrote the writers' operands). A join
+           unites them; a register that nothing wrote is "input".
+    Each violation the base class reports gets one line, see why_line."""
+    INPUT = (frozenset({"input"}), frozenset(), frozenset())
+
+    def entry(self):
+        st = super().entry()
+        st["o"], st["w"] = {}, {}
+        return st
+
+    def block(self, n, st, ev):
+        self._o, self._w = dict(st.get("o", {})), dict(st.get("w", {}))
+        out = super().block(n, st, ev)
+        out["o"], out["w"] = self._o, self._w
+        return out
+
+    def join(self, a, b, blk=0):
+        st = super().join(a, b, blk)
+        ao, bo, aw, bw = a.get("o", {}), b.get("o", {}), a.get("w", {}), b.get("w", {})
+        st["o"] = {r: min(x for x in (ao.get(r), bo.get(r)) if x is not None) for r in set(ao) | set(bo)}
+        st["w"] = {}
+        for r in set(aw) | set(bw):
+            x, y = aw.get(r, self.INPUT), bw.get(r, self.INPUT)
+            st["w"][r] = (x[0] | y[0], x[1] | y[1], x[2] | y[2])
+        return st
+
+    def step(self, n, i, ins, st, ev):
+        o, w = self._o, self._w
+        dests, srcs, defs, uses = operands(ins)
+        read = [r for x in srcs for r in _regs(x) if r != "exec"] + [r for r in uses if r != "exec"]
+        family, launch = why_family(ins), bool(st["f"])
+        writers = [w.get(r, self.INPUT) for r in read]
+        here = ((n, i), family, launch,
+                tuple(sorted(frozenset().union(*[x[0] for x in writers]))) or ("const",),
+                tuple(sorted(frozenset().union(*[x[1] for x in writers]))),
+                tuple(sorted(frozenset().union(*[x[2] for x in writers]))))
+        tainted = [o[r] for r in read if r in o and st["t"].get(r, 0)]
+        origin = min(tainted) if tainted else here
+        if origin[0] == (n, i):                 # a value this instruction carries round a loop: the facts of now
+            origin = here
+        seen = len(ev["viol"]) if ev is not None else 0
+        super().step(n, i, ins, st, ev)
+        T = st["t"]
+        for r in [r for d in dests for r in _regs(d) if r != "exec"] + [r for r in defs if r != "exec"]:
+            w[r] = (frozenset({family}), frozenset({launch}), frozenset(here[3]))
+            o.pop(r, None)
+        for r, t in T.items():                  # also the registers a write changed without naming them
+            if t and r not in o:
+                o[r] = origin
+        for r in [r for r in o if not T.get(r, 0)]:
+            del o[r]
+        if ev is not None:
+            for code, pc, _ in ev["viol"][seen:]:
+                ev.setdefault("why", []).append((pc if pc is not None else 1 << 62, why_line(code, family, origin)))
+
+
+def why_line(code, sink, origin):
+    """One violation as text, families only: reason|sink|producer@exec|source@exec|source of the source.
+    `sink` is the family of the instruction where the reason was found, `producer` the family of the instruction that
+    first made the value partition-dependent (the sink itself for a reason that is about the instruction, such as a
+    vote), `source` the families of the instructions that wrote the producer's operands, and the last field the
+    families that wrote the operands of those. `@exec` says if EXEC was the launch mask there: launch, narrowed or
+    both."""
+    _, family, launch, src, src_exec, src2 = origin
+    state = {(): "", (False,): "@narrowed", (True,): "@launch", (False, True): "@both"}[tuple(src_exec)]
+    return "|".join((code, sink, family + ("@launch" if launch else "@narrowed"), "+".join(src) + state,
+                     "+".join(src2) or "-"))
+
+
+def _fixpoint(an):
     stale = set()
     ev = an.run(stale)
     for _ in range(3):
@@ -1682,19 +1792,39 @@ def analyse(blocks, succ, masks, stage):
             break
         stale = new
         ev = an.run(stale)
+    return ev
+
+
+def analyse(blocks, succ, masks, stage, why=False):
+    """Tier of one wave64 VS/PS/GS program (see the module docstring). With `why`, a tier C result also has the key
+    "why": the first why_line of each reason, in program order (so the first entry is the program's first reason).
+    It comes from a second run (WhyAnalysis) that cannot change the tier; if that run fails or does not find the
+    same reasons, the key is absent."""
+    an = Analysis(blocks, succ, masks, stage)
+    ev = _fixpoint(an)
     reasons = sorted({c for c, _, _ in ev["viol"]})
     idioms = sorted(ev["idioms"])
-    if any(an.voted):
-        pass
     tier = "C" if reasons else ("B" if idioms else "A")
-    return {"tier": tier, "reasons": reasons, "idioms": idioms, "uniform_readlane": ev["uniform_readlane"],
-            "scalar_spills": sorted(ev["scalar_spills"]), "sites": ev["viol"][:8]}
+    result = {"tier": tier, "reasons": reasons, "idioms": idioms, "uniform_readlane": ev["uniform_readlane"],
+              "scalar_spills": sorted(ev["scalar_spills"]), "sites": ev["viol"][:8]}
+    if why and reasons:
+        try:
+            ev2 = _fixpoint(WhyAnalysis(blocks, succ, masks, stage))
+        except Exception:               # a report only: never the reason a translation fails
+            ev2 = None
+        if ev2 is not None and sorted({c for c, _, _ in ev2["viol"]}) == reasons:
+            first = {}
+            for _, line in sorted(ev2.get("why", []), key=lambda x: x[0]):
+                first.setdefault(line.split("|", 1)[0], line)
+            result["why"] = list(first.values())
+    return result
 
 
 # ---- census over a shader index ----
 def census(index):
     """Counts only: {stage: {tier: n}} and the reason / idiom counts of the wave64 VS/PS/GS entries of an index.json."""
     tiers, reasons, idioms, unmarked = {}, Counter(), Counter(), 0
+    first, by_reason, tier_c, with_why = Counter(), {}, 0, 0
     for name, m in index.items():
         if not isinstance(m, dict) or not m.get("wave64") or m.get("stage") not in ("vs", "ps", "gs"):
             continue
@@ -1705,14 +1835,53 @@ def census(index):
         tiers.setdefault(m["stage"], Counter())[t] += 1
         reasons.update(m.get("wave64_graphics_reasons", []))
         idioms.update(m.get("wave64_graphics_idioms", []))
+        if t == "C":
+            tier_c += 1
+            lines = [x for x in m.get("wave64_graphics_why", []) if isinstance(x, str) and x.count("|") == 4]
+            if lines:
+                with_why += 1
+                first[lines[0]] += 1
+                for line in lines:
+                    by_reason.setdefault(line.split("|", 1)[0], Counter())[line] += 1
     return {"tiers": {s: dict(sorted(c.items())) for s, c in sorted(tiers.items())},
-            "reasons": dict(reasons.most_common()), "idioms": dict(idioms.most_common()), "no_analysis": unmarked}
+            "reasons": dict(reasons.most_common()), "idioms": dict(idioms.most_common()), "no_analysis": unmarked,
+            "why": {"tier_c": tier_c, "with_why": with_why, "first": dict(first.most_common()),
+                    "by_reason": {r: dict(c.most_common()) for r, c in sorted(by_reason.items())}}}
+
+
+WHY_FIELDS = ("reason", "sink", "producer", "source", "source of the source")
+
+
+def print_why(why, top):
+    """The --why part of the census: counts of why_line texts (instruction families only)."""
+    print(f"why: {why['with_why']} of {why['tier_c']} tier C entries have wave64_graphics_why"
+          + ("" if why["with_why"] == why["tier_c"] else " (translate with rdna2spirv.py --wave64-why to get it)"))
+    if not why["with_why"]:
+        return
+    print("fields: " + " | ".join(WHY_FIELDS) + "; @launch / @narrowed / @both = EXEC was the launch mask there")
+    print(f"first reason of a shader (one line per tier C shader, top {top}):")
+    for line, n in list(why["first"].items())[:top]:
+        print(f"  {n:6d}  {line}")
+    for k, name in ((1, "sink"), (2, "producer"), (3, "source")):
+        marginal = Counter()
+        for line, n in why["first"].items():
+            marginal[line.split("|")[k]] += n
+        print(f"first reason by {name}: " + ", ".join(f"{x} x{n}" for x, n in marginal.most_common(top)))
+    for reason, lines in why["by_reason"].items():
+        print(f"{reason} (first site in each shader that has it, {sum(lines.values())} shaders, top {top}):")
+        for line, n in list(lines.items())[:top]:
+            print(f"  {n:6d}  {line.split('|', 1)[1]}")
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Tier census of the wave64 VS/PS/GS shaders of a translator index.json "
                                              "(counts only, no shader names)")
     ap.add_argument("--census", required=True, metavar="INDEX_JSON", help="<spirv>/index.json from rdna2spirv.py")
+    ap.add_argument("--why", action="store_true",
+                    help="also count where the tier C reasons come from (wave64_graphics_why of the index): the "
+                         "instruction family of the sink, of the producer and of the producer's sources, and if EXEC "
+                         "was the launch mask; counts only")
+    ap.add_argument("--top", type=int, default=20, metavar="N", help="lines per --why table (default 20)")
     args = ap.parse_args(argv)
     # One line per bad input, as everywhere else in tools/: an unreadable path, a folder, a file that is not JSON and a
     # JSON document that is not the index object used to end in a traceback (FileNotFoundError, PermissionError,
@@ -1746,6 +1915,8 @@ def main(argv=None):
         print("tier C reasons: " + ", ".join(f"{k} x{v}" for k, v in c["reasons"].items()))
     if c["idioms"]:
         print("tier B idioms: " + ", ".join(f"{k} x{v}" for k, v in c["idioms"].items()))
+    if args.why:
+        print_why(c["why"], max(1, args.top))
     return 0
 
 
