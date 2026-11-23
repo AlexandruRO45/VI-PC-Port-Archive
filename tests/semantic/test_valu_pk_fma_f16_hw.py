@@ -454,3 +454,127 @@ class TestScalarInterpreter(unittest.TestCase):
         interp_res = interp.step(instr, state)
         spv_res = run_translator_pk_fma(p0, p1, p2, mods="op_sel:[1,0,0] op_sel_hi:[0,1,0]", name="ps_scalar_cross")
         self.assertEqual(interp_res, spv_res)
+
+
+# ==============================================================================
+# SECTION 4: SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    num_lanes: int = 32
+    exec_mask: int = MASK_32
+    vgprs: List[Dict[int, int]] = field(default_factory=list)
+    sgprs: Dict[int, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.num_lanes not in (32, 64):
+            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
+        if not self.vgprs:
+            self.vgprs = [dict() for _ in range(self.num_lanes)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, idx: int) -> int:
+        return self.vgprs[lane].get(idx, 0)
+
+    def set_vgpr(self, lane: int, idx: int, val: int) -> None:
+        self.vgprs[lane][idx] = u32(val)
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = u32(val)
+
+
+class SIMDInterpreter:
+    def resolve_lane_operand(self, op: Operand, lane: int, state: SIMDState) -> int:
+        if op.kind == OperandKind.VGPR:
+            return state.get_vgpr(lane, op.value)
+        elif op.kind == OperandKind.SGPR:
+            return state.get_sgpr(op.value)
+        elif op.kind == OperandKind.IMMEDIATE:
+            return u32(op.value)
+        else:
+            raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def step(self, instr: VPKFMA16Instruction, state: SIMDState) -> List[Optional[int]]:
+        results: List[Optional[int]] = []
+        for lane in range(state.num_lanes):
+            if not state.is_lane_active(lane):
+                results.append(None)
+                continue
+
+            v0 = self.resolve_lane_operand(instr.src0, lane, state)
+            v1 = self.resolve_lane_operand(instr.src1, lane, state)
+            v2 = self.resolve_lane_operand(instr.src2, lane, state)
+
+            res = oracle_pk_fma_f16(
+                v0,
+                v1,
+                v2,
+                op_sel=instr.mods.op_sel,
+                op_sel_hi=instr.mods.op_sel_hi,
+                neg_lo=instr.mods.neg_lo,
+                neg_hi=instr.mods.neg_hi,
+                clamp=instr.mods.clamp,
+            )
+            state.set_vgpr(lane, instr.dst.value, res)
+            results.append(res)
+        return results
+
+
+class TestSIMDDivergence(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_alternating_lanes(self) -> None:
+        """Verify Wave32 alternating even/odd lane execution and inactive preservation."""
+        mask = 0x5555_5555  # Even lanes active
+        state = SIMDState(num_lanes=32, exec_mask=mask)
+        sentinel = 0xDEAD_BEEF
+
+        for lane in range(32):
+            state.set_vgpr(lane, 0, sentinel)
+            state.set_vgpr(lane, 1, pack_f16x2(F16_ONE, F16_ONE))
+            state.set_vgpr(lane, 2, pack_f16x2(F16_TWO, F16_TWO))
+            state.set_vgpr(lane, 3, pack_f16x2(F16_HALF, F16_HALF))
+
+        interp = SIMDInterpreter()
+        instr = VPKFMA16Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+        results = interp.step(instr, state)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], 0x41004100)
+                self.assertEqual(state.get_vgpr(lane, 0), 0x41004100)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+    def test_wave64_divergence(self) -> None:
+        """Verify Wave64 boundary execution across low and high 32-lane words."""
+        # Active: lane 0, lane 31, lane 32, lane 63
+        mask = (1 << 0) | (1 << 31) | (1 << 32) | (1 << 63)
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        sentinel = 0xBAAD_F00D
+
+        for lane in range(64):
+            state.set_vgpr(lane, 0, sentinel)
+            state.set_vgpr(lane, 1, pack_f16x2(F16_ONE, F16_ONE))
+            state.set_vgpr(lane, 2, pack_f16x2(F16_ONE, F16_ONE))
+            state.set_vgpr(lane, 3, pack_f16x2(F16_ONE, F16_ONE))
+
+        interp = SIMDInterpreter()
+        instr = VPKFMA16Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+        results = interp.step(instr, state)
+
+        for lane in range(64):
+            if lane in (0, 31, 32, 63):
+                # 1.0 * 1.0 + 1.0 = 2.0 (0x4000)
+                self.assertEqual(results[lane], 0x40004000)
+                self.assertEqual(state.get_vgpr(lane, 0), 0x40004000)
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
