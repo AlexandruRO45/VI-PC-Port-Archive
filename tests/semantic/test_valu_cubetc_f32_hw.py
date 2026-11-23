@@ -288,5 +288,37 @@ class TestOperandFormsAndAliasing(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0xc0000000)   # -2.0f
 
+class TestSignedZeroAndBoundaries(unittest.TestCase):
+    """Signed zeros, tie-breaking boundary conditions, and extreme values."""
+
+    def _eval_words(self, s0: int, s1: int, s2: int) -> int:
+        prog = [
+            f"v_mov_b32 v1, {s0:#x}",
+            f"v_mov_b32 v2, {s1:#x}",
+            f"v_mov_b32 v3, {s2:#x}",
+            "v_cubetc_f32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_boundary", prog)
+        return support.mrt0_words(spv)[0]
+
+    def test_tie_boundary_evaluations(self):
+        # |x| == |y|: Y wins over X
+        # x=2.0, y=2.0, z=0.5 -> +Y: tc = z = 0.5
+        self.assertEqual(self._eval_words(0x40000000, 0x40000000, 0x3f000000), 0x3f000000)
+        # x=2.0, y=-2.0, z=0.5 -> -Y: tc = -z = -0.5
+        self.assertEqual(self._eval_words(0x40000000, 0xc0000000, 0x3f000000), 0xbf000000)
+
+        # |y| == |z|: Z wins over Y
+        # x=0.5, y=2.0, z=2.0 -> +Z: tc = -y = -2.0
+        self.assertEqual(self._eval_words(0x3f000000, 0x40000000, 0x40000000), 0xc0000000)
+        # x=0.5, y=-2.0, z=-2.0 -> -Z: tc = -y = 2.0
+        self.assertEqual(self._eval_words(0x3f000000, 0xc0000000, 0xc0000000), 0x40000000)
+
+    def test_signed_zeros(self):
+        val = self._eval_words(POS_ZERO_BITS, NEG_ZERO_BITS, POS_ZERO_BITS)
+        self.assertEqual(u32_to_f32(val), 0.0)
+
 if __name__ == "__main__":
     unittest.main()
