@@ -848,25 +848,29 @@ def ensure_submodule() -> None:
          "\"git submodule update --init --recursive\" in this folder and build again.")
 
 
-def check(game: str, full: bool) -> dict:
+def check(game: str, full: bool, sizes: bool = True) -> dict:
+    """The package's version. sizes=False (--stages without check) only matches the probe files, so a package still
+    being downloaded can build the stages that don't read its archives."""
     if not os.path.isdir(game):
         h = xvd_header(game) if os.path.isfile(game) else None
         fail(container_message(game, h) if h else f"Game folder not found: {game}")
     v = load_version(game)
     log(f"check: {v['title']} {v['version']}, {len(v['files'])} files")
-    bad = 0
-    for rel, info in v["files"].items():
-        p = os.path.join(game, rel)
-        if not os.path.isfile(p):
-            print(f"  missing  {rel}"); bad += 1
-        elif os.path.getsize(p) != info["size"]:
-            print(f"  wrong size  {rel}"); bad += 1
-    if bad:
-        fail(f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}.")
-    if full:
-        py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
+    if sizes:
+        bad = 0
+        for rel, info in v["files"].items():
+            p = os.path.join(game, rel)
+            if not os.path.isfile(p):
+                print(f"  missing  {rel}"); bad += 1
+            elif os.path.getsize(p) != info["size"]:
+                print(f"  wrong size  {rel}"); bad += 1
+        if bad:
+            fail(f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}.")
+        if full:
+            py("manifest.py", "verify", game, "--manifest", os.path.join(VERSIONS, f"xbox-{v['version']}.json"))
     exe = os.path.join(game, v["expected_exe"])
-    log(f"check: all files present{' and hashes match' if full else ''}. "
+    log((f"check: all files present{' and hashes match' if full else ''}. " if sizes else
+         "check: left out of --stages, so only the version was checked, not every file. ")
         + ("Executable found." if os.path.isfile(exe) else
            f"{v['expected_exe']} is not in the folder: the runtime stage can be built but not run."))
     return v
@@ -2174,7 +2178,10 @@ def main() -> int:
     work = os.path.abspath(a.work or os.path.join(out, "work"))
     require_folder("--out", out)
     require_folder("--work", work)
-    v = check(game, a.full_check)
+    if "check" in stages or a.check or a.full_check:
+        v = check(game, a.full_check)
+    else:
+        v = check(game, False, sizes=False)
     if a.check:
         return 0
     # Resolve existing parents too: a not-yet-created destination can be under a junction or symlink.

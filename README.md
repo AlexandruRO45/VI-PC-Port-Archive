@@ -145,6 +145,11 @@ python -I make_game.py --game "D:\path\to\your\package" --wav   # also decode Op
 python -I make_game.py --wave64-emulate off            # auto (default), on or off; see below
 ```
 
+A `--stages` list without `check` skips the size check of every file and only identifies the version from
+`MicrosoftGame.Config` and the other small probe files, so `--stages runtime` builds `gta6rt` while the large `.rpf`
+archives are still downloading. The default stages, a list with `check`, `--check` and `--full-check` check every
+file.
+
 `--wave64-emulate` decides whether wave64 compute and mesh shaders are translated to be exact on any subgroup size
 (see "Wave64 emulation" in [docs/design.md](docs/design.md)). NVIDIA and Intel GPUs have 32-wide subgroups and need
 it. The default, `auto`, asks `vulkaninfo` (part of the Vulkan SDK) and turns emulation on if any GPU lacks 64-wide
