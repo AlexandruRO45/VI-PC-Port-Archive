@@ -32,15 +32,20 @@ static std::string contents(const fs::path& path) {
 static int test_checkpoint(const fs::path& dir) {
     const auto cache = dir / "cache.bin";
     const auto partial = dir / "cache.bin.partial";
+    CHECK(read_pipeline_cache_file(cache).empty());
+    CHECK(!write_pipeline_cache_file(cache, "", 0));
+    CHECK(read_pipeline_cache_file(cache).empty());
     std::ofstream(partial, std::ios::binary) << "unrelated";
     const std::string saved("new\0data\r\n", 10);
     CHECK(!write_pipeline_cache_file(cache, "older checkpoint", 16));
     CHECK(contents(cache) == "older checkpoint");
     CHECK(!write_pipeline_cache_file(cache, saved.data(), saved.size()));
     CHECK(contents(cache) == saved);
+    CHECK(read_pipeline_cache_file(cache) == std::vector<char>(saved.begin(), saved.end()));
 
     const auto directory = dir / "empty";
     CHECK(fs::create_directory(directory));
+    CHECK(read_pipeline_cache_file(directory).empty());
     CHECK(write_pipeline_cache_file(directory, "next", 4));
     CHECK(fs::is_directory(directory));
 

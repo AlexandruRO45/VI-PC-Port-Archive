@@ -65,7 +65,6 @@
 #include <cstring>
 #include <type_traits>
 #include <fstream>
-#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -1110,8 +1109,7 @@ int main(int argc, char** argv) {
     VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     std::vector<char> seed;
     if (!cache_path.empty()) {  // resume: pipelines already in the cache compile instantly
-        std::ifstream cf(cache_path, std::ios::binary);
-        seed.assign(std::istreambuf_iterator<char>(cf), {});
+        seed = read_pipeline_cache_file(cache_path);
         if (!seed.empty()) std::fprintf(stderr, "seeded the pipeline cache with %zu bytes from %s\n", seed.size(), cache_path.c_str());
     }
     pci.initialDataSize = seed.size(); pci.pInitialData = seed.empty() ? nullptr : seed.data();

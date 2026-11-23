@@ -1,4 +1,4 @@
-// Publish a checkpoint only after every byte has reached a closed, same-directory staging file.
+// Read complete cache seeds and publish checkpoints through a closed, same-directory staging file.
 #pragma once
 
 #include <algorithm>
@@ -6,13 +6,34 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <thread>
 #include <windows.h>
 #endif
+
+// Keep individual I/O requests small even when the cache is several GiB.
+inline constexpr size_t pipeline_cache_io_chunk_size = size_t{16} << 20;
+
+inline std::vector<char> read_pipeline_cache_file(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const std::streamoff size = file.tellg();
+    std::vector<char> data;
+    if (size <= 0 || std::cmp_greater(size, data.max_size()) || !file.seekg(0)) return {};
+
+    data.resize(static_cast<size_t>(size));
+    for (size_t offset = 0; offset < data.size();) {
+        const size_t chunk = (std::min)(data.size() - offset, pipeline_cache_io_chunk_size);
+        if (!file.read(data.data() + offset, static_cast<std::streamsize>(chunk))) return {};
+        offset += chunk;
+    }
+    return data;
+}
 
 inline std::error_code write_pipeline_cache_file(const std::filesystem::path& destination,
                                                 const char* data, size_t size) {
@@ -33,9 +54,8 @@ inline std::error_code write_pipeline_cache_file(const std::filesystem::path& de
     if (!file) return {errno, std::generic_category()};
 
     std::error_code error;
-    // Keep individual CRT writes small even when the cache is several GiB.
     while (size > 0) {
-        const size_t chunk = (std::min)(size, size_t{16} << 20);
+        const size_t chunk = (std::min)(size, pipeline_cache_io_chunk_size);
         if (std::fwrite(data, 1, chunk, file) != chunk || std::ferror(file)) {
             error = {errno ? errno : EIO, std::generic_category()};
             break;
