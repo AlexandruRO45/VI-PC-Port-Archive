@@ -169,8 +169,16 @@ def one(path, out, mcpu, backend="llvm-mc"):
     else:
         result = disasm(b[start:end], mcpu, backend=backend)
     asm, bad, err = result
-    if not asm.strip():  # a broken toolchain, not a shader: never report this as "clean"
+    dst = output_path(path, out)
+    if not asm.strip():
         reason = (err.strip().splitlines() or ["no output"])[0]
+        # The attempted decode failed; an old listing would look complete to --skip-existing.
+        try:
+            os.unlink(dst)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            reason += f"; could not remove stale listing {dst}: {exc.strerror or exc}. Remove it before resuming"
         FAILED.append((path, reason))
         return "failed"
     name = os.path.splitext(os.path.basename(path))[0]
@@ -183,7 +191,7 @@ def one(path, out, mcpu, backend="llvm-mc"):
             listing.write(asm)
             if err.strip():
                 listing.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
-        os.replace(listing.name, output_path(path, out))
+        os.replace(listing.name, dst)
     finally:
         if os.path.exists(listing.name):
             os.unlink(listing.name)
@@ -260,9 +268,8 @@ def main():
         fail(f"no disassembly produced for {a.src}")
     if os.path.isdir(a.src) and not a.limit:
         # A shader dropped by a re-carve must not keep its old listing: the translator reads every .s in this folder,
-        # so a stale one would still be translated and indexed even though the corpus no longer has it. Prune only
-        # after a successful decode, so a missing llvm-mc or a failed shader never deletes a usable listing. --limit
-        # is a partial run on purpose and leaves the rest of the folder alone.
+        # so a stale one would still be translated and indexed even though the corpus no longer has it. Prune
+        # unrelated listings only after a successful run. --limit leaves the rest of the folder alone.
         # Every input's stem, not just this run's `files`: --skip-existing leaves the reused listings out of `files`,
         # and pruning against that list deleted every listing a resumed run had just reused.
         stems = every_stem
