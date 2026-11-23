@@ -179,13 +179,13 @@ int lose(const char* label, Scene& scene, bool gpu, bool fault_enabled, mock::Fa
         EXPECT(queue.execute({&pb, 1}) == ReplayResult::unsupported);
         EXPECT(context.is_device_lost());
         const unsigned markers = mock::markers, faults = mock::fault_calls;
-        // A's two and B's two around the lists, and one after each of their operations (per-op progress),
-        // recorded before B's submission failed.
+        // Per list: begin, the begin's progress-word clear and end, then one after each operation (per-op
+        // progress); A's and B's, recorded before B's submission failed.
         std::uint32_t op = 0;
         unsigned ops = 0;
         for (const CommandList* list : {pa, pb})
             for (const auto& command : list->commands()) ops += breadcrumb_op_of(command, op);
-        EXPECT(markers == (gpu ? 4u + ops : 0u));
+        EXPECT(markers == (gpu ? 6u + ops : 0u));
         // The mock records no marker, so nothing the GPU did is known: no list may claim an operation completed.
         for (const auto& e : ring->snapshot()) EXPECT(e.completed_ops == 0 && e.state != BreadcrumbState::completed);
         EXPECT(faults == (fault_enabled ? (fault == mock::Fault::fail_counts ? 1u : 2u) : 0u));
@@ -277,8 +277,8 @@ int concurrent(Scene& scene) {
 }
 
 // Level 2 never reuses a slot whose list the GPU has not been seen to finish. The mock records no marker, so no
-// list ever reads finished: after kSlots lists every slot is held, and the next list gets its two list markers but
-// no per-op one, and its progress inside the list is unknown, not "0 completed".
+// list ever reads finished: after kSlots lists every slot is held, and the next list takes none and records no
+// marker at all; its progress is unknown, not "0 completed".
 int busy_slots(Scene& scene) {
     const char* label = "device lost: busy slots";
     mock::reset(mock::Fault::empty);
@@ -299,12 +299,14 @@ int busy_slots(Scene& scene) {
     const CommandList* pa = &scene.a;  // one operation
     for (std::uint32_t i = 0; i < BreadcrumbRing::kSlots; ++i) EXPECT(queue.execute({&pa, 1}) == ReplayResult::success);
     EXPECT(queue.idle());
-    EXPECT(mock::markers == BreadcrumbRing::kSlots * 3u);  // begin, end and one per-op marker each
+    EXPECT(mock::markers == BreadcrumbRing::kSlots * 4u);  // begin, its progress clear, end and one per-op marker
     EXPECT(queue.execute({&pa, 1}) == ReplayResult::success);
     EXPECT(queue.idle());
-    EXPECT(mock::markers == BreadcrumbRing::kSlots * 3u + 2u);  // no free slot: the list markers only
+    EXPECT(mock::markers == BreadcrumbRing::kSlots * 4u);  // no free slot: no marker at all, no slot taken
     const auto entries = ring->snapshot();
-    EXPECT(!entries.empty() && !entries.back().progress_known && entries.back().completed_ops == 0);
+    EXPECT(!entries.empty() && !entries.back().progress_known && entries.back().completed_ops == 0 &&
+           entries.back().no_slot && entries.back().state == BreadcrumbState::unknown);
+    EXPECT(entries.size() == BreadcrumbRing::kSlots + 1);  // the 1024 unfinished lists and the one without a slot
     for (const auto& e : entries) EXPECT(e.completed_ops == 0 && e.state != BreadcrumbState::completed);
     std::printf("device lost: every slot held by an unfinished list: no per-op markers, progress unknown ok\n");
     return 0;

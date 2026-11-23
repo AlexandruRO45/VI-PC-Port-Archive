@@ -2981,12 +2981,26 @@ reports one (D3D-264). `LEONIDA_DRED=2` adds how far the GPU got inside each lis
   - **Slot reuse.** A range check alone can't rule out a foreign value: a list stuck on another queue could write
     long after 2^32 op numbers were handed out, and its value would then fall inside a new range. So at level 2 a
     slot is taken over only once its owner is seen finished (its end word holds its tag). A finished list writes
-    nothing more, so nothing older can land in the new owner's word, however many operations came in between.
-    The guard rests on one assumption: a list's earlier marker writes are visible before its end word.
+    nothing more, so nothing older can land in the new owner's words, however many operations came in between.
+    The new owner's begin marker also clears the progress word.
   - **When every slot is busy.** If all 1024 slots still hold lists the GPU hasn't been seen to finish (a device
-    that stopped making progress), the new list gets its two list markers but no per-op ones. Its progress inside
-    the list is unknown, not 0.
+    that stopped making progress), the new list **takes no slot** (review of #5314):
+    - it records no marker at all and changes no slot's owner;
+    - it stays in the history as CPU knowledge, with its GPU progress unknown: no D3D12 node, and in the report
+      "every breadcrumb slot was busy";
+    - besides the lists that hold a slot, the history keeps up to 64 that don't (lists without a slot, or ones
+      whose slot passed on), dropping the oldest of those first. A list that still holds its slot
+      is never pushed out, so an unfinished list stays in the report.
+    A slot is used again as soon as its owner's end word shows.
   - **Failed submissions.** A list whose submission failed never runs, so its slot is free again at once.
+  - **What the Vulkan spec guarantees.** `vkCmdWriteBufferMarkerAMD` orders a marker write after earlier commands
+    and after earlier marker writes of the same queue (an execution dependency; the memory dependency covers only
+    other marker writes). Two queues have no order between them. The spec does not promise that the host sees
+    marker writes in that order without a fence wait and a host barrier, nor anything after a device loss.
+    Reading the words is therefore best effort, as the extension intends, and so is the slot guard: it relies on
+    the host seeing a list's earlier marker writes no later than its end word. AMD and NVIDIA write markers as
+    ordered writes to coherent memory, so this holds in practice. A late write can only lower the progress
+    shown, never raise it.
   - **Memory.** The command positions are only needed by `emit()` and are dropped when the list is submitted. The
     history keeps one `uint32` per operation, as at level 1.
 - **States, never inferred from the CPU.** *Submitted*: `vkQueueSubmit` succeeded, nothing more; a failed

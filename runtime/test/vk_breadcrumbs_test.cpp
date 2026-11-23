@@ -151,10 +151,177 @@ int synthetic() {
     return 0;
 }
 
+
+void submit_to(BreadcrumbRing& ring, const BreadcrumbRing::Mark& m) {
+    std::vector<BreadcrumbRing::Mark> v{m};
+    ring.submitted(std::move(v), true);
+}
+
+// Slot ownership at level 2 on a ring whose "GPU" is this test: the marker words are a vector the test owns, the
+// marker command writes into it, and the test runs each list's markers itself, in the order a GPU might. No device.
+// The case from the review of #5314 (DoubleD17): every slot held by an unfinished list A..., then B and C.
+namespace fake {
+std::vector<std::uint32_t> words;
+VKAPI_ATTR VkResult VKAPI_CALL create_buffer(VkDevice, const VkBufferCreateInfo*, const VkAllocationCallbacks*, VkBuffer* b) {
+    *b = reinterpret_cast<VkBuffer>(std::uintptr_t(0x1000));
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL destroy_buffer(VkDevice, VkBuffer, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL requirements(VkDevice, VkBuffer, VkMemoryRequirements* r) {
+    *r = {VkDeviceSize(words.size() * 4), 4, 1};
+}
+VKAPI_ATTR VkResult VKAPI_CALL allocate(VkDevice, const VkMemoryAllocateInfo*, const VkAllocationCallbacks*, VkDeviceMemory* m) {
+    *m = reinterpret_cast<VkDeviceMemory>(std::uintptr_t(0x2000));
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL free_memory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
+VKAPI_ATTR VkResult VKAPI_CALL bind(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL map(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void** out) {
+    *out = words.data();
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL unmap(VkDevice, VkDeviceMemory) {}
+VKAPI_ATTR void VKAPI_CALL write_marker(VkCommandBuffer, VkPipelineStageFlagBits, VkBuffer, VkDeviceSize offset,
+                                        std::uint32_t value) {
+    words[offset / 4] = value;  // "recording" a marker runs it at once: the test orders the lists' markers itself
+}
+}  // namespace fake
+
+int slot_ownership() {
+    const std::size_t slots = BreadcrumbRing::kSlots;
+    fake::words.assign(slots * 4, 0xdeadbeefu);  // initialize() must clear them
+    BreadcrumbFunctions fn;
+    fn.create_buffer = fake::create_buffer;
+    fn.destroy_buffer = fake::destroy_buffer;
+    fn.requirements = fake::requirements;
+    fn.allocate = fake::allocate;
+    fn.free = fake::free_memory;
+    fn.bind = fake::bind;
+    fn.map = fake::map;
+    fn.unmap = fake::unmap;
+    fn.write_marker = fake::write_marker;
+    VkPhysicalDeviceMemoryProperties memory{};
+    memory.memoryTypeCount = 1;
+    memory.memoryTypes[0] = {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0};
+    memory.memoryHeapCount = 1;
+    memory.memoryHeaps[0] = {VkDeviceSize(1) << 30, 0};
+    BreadcrumbRing ring;
+    EXPECT(ring.initialize(reinterpret_cast<VkDevice>(std::uintptr_t(0x3000)), memory, fn, true));
+    EXPECT(ring.gpu() && ring.per_op());
+    CommandList one;
+    EXPECT(one.copy_buffer({2, 0, 1, 0, 16}) && one.close());
+    const auto id = [](std::size_t k) { return reinterpret_cast<const CommandList*>(std::uintptr_t(0x10000 + 16 * k)); };
+    const int q1 = 0, q2 = 0;  // two queues, as opaque addresses
+    const void* queue1 = &q1;
+    const void* queue2 = &q2;
+    const VkCommandBuffer cb = VK_NULL_HANDLE;
+    // The GPU part of a list: its begin word, its operation (if it has the per-op marker) and its end word.
+    const auto begin = [&](const BreadcrumbRing::Mark& m) { ring.record_begin(cb, m); };
+    const auto op = [&](const BreadcrumbRing::Mark& m) {
+        if (ring.op_markers_for(m)) fn.write_marker(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ring.marker_buffer(),
+                                                    ring.progress_offset(m), m.first_op);
+    };
+    const auto end = [&](const BreadcrumbRing::Mark& m) { ring.record_end(cb, m); };
+    const auto submit = [&](const BreadcrumbRing::Mark& m, bool ok) {
+        std::vector<BreadcrumbRing::Mark> v{m};
+        ring.submitted(std::move(v), ok);
+    };
+
+    // Every slot is taken by a list the GPU started and has not finished; A is the first, on queue 1.
+    std::vector<BreadcrumbRing::Mark> running;
+    for (std::size_t k = 0; k < slots; ++k) {
+        running.push_back(ring.mark(one, queue1, id(k)));
+        submit(running.back(), true);
+        begin(running.back());
+    }
+    const BreadcrumbRing::Mark a = running[0];
+    const std::vector<std::uint32_t> before = fake::words;
+
+    // B, on queue 2, finds no free slot. It must take none: no word of any slot changes, A keeps its slot.
+    const BreadcrumbRing::Mark b = ring.mark(one, queue2, id(slots));
+    EXPECT(!ring.op_markers_for(b));
+    submit(b, true);
+    begin(b);
+    op(b);
+    end(b);  // B finishes on the GPU
+    EXPECT(fake::words == before);
+    // C comes after B finished: there is still no free slot, so C must not take A's (or any running list's).
+    const BreadcrumbRing::Mark c = ring.mark(one, queue2, id(slots + 1));
+    EXPECT(!ring.op_markers_for(c));
+    submit(c, true);
+    begin(c);
+    op(c);
+    op(a);  // A's late operation marker
+    EXPECT(fake::words == [&] {
+        auto w = before;
+        if (ring.op_markers_for(a)) w[a.slot * 4 + 2] = a.first_op;
+        return w;
+    }());
+    auto entries = ring.snapshot();
+    const auto* ea = find(entries, reinterpret_cast<std::uintptr_t>(id(0)));
+    EXPECT(ea && ea->state == BreadcrumbState::started && ea->progress_known && ea->completed_ops == 1);  // A stays
+    const auto* eb = find(entries, reinterpret_cast<std::uintptr_t>(id(slots)));
+    const auto* ec = find(entries, reinterpret_cast<std::uintptr_t>(id(slots + 1)));
+    EXPECT(eb && ec && eb->state == BreadcrumbState::unknown && ec->state == BreadcrumbState::unknown);
+    EXPECT(!eb->progress_known && !ec->progress_known && eb->completed_ops == 0 && ec->completed_ops == 0);
+    const std::string text = report_of(entries);
+    EXPECT(text.find("no VK_AMD_buffer_marker") == std::string::npos);
+    EXPECT(text.find("every breadcrumb slot was busy") != std::string::npos);
+    EXPECT(text.find("; 2 more not tracked on the GPU") != std::string::npos);  // B and C, not counted as incomplete
+    // A failed submission without a slot frees nothing either.
+    const BreadcrumbRing::Mark f = ring.mark(one, queue2, id(slots + 2));
+    submit(f, false);
+    EXPECT(!ring.op_markers_for(ring.mark(one, queue2, id(slots + 3))));  // marked, never submitted: no slot
+
+    // A finishes: its slot is free, and the next list takes exactly it, with per-op progress.
+    end(a);
+    const BreadcrumbRing::Mark d = ring.mark(one, queue1, id(slots + 4));
+    EXPECT(d.slot == a.slot && ring.op_markers_for(d));
+    submit(d, true);
+    begin(d);
+    EXPECT(fake::words[d.slot * 4 + 2] == 0);  // the begin marker cleared A's old progress word
+    op(d);
+    end(d);
+    // A failed submission gives its slot back at once.
+    const BreadcrumbRing::Mark e = ring.mark(one, queue1, id(slots + 5));
+    EXPECT(e.slot == d.slot && ring.op_markers_for(e));
+    submit(e, false);
+    const BreadcrumbRing::Mark g = ring.mark(one, queue1, id(slots + 6));
+    EXPECT(g.slot == e.slot && ring.op_markers_for(g));
+    submit(g, true);
+    begin(g);
+    op(g);
+    end(g);
+    entries = ring.snapshot();
+    const auto* eg = find(entries, reinterpret_cast<std::uintptr_t>(id(slots + 6)));
+    EXPECT(eg && eg->state == BreadcrumbState::completed && eg->completed_ops == 1);
+    // Unfinished lists stay in the history however many lists without a slot came after them.
+    for (std::size_t k = 0; k < slots + 8; ++k) submit(ring.mark(one, queue2, id(slots + 10 + k)), true);
+    entries = ring.snapshot();
+    EXPECT(entries.size() <= slots + BreadcrumbRing::kNoSlotKept);
+    EXPECT(find(entries, reinterpret_cast<std::uintptr_t>(id(1))) != nullptr);  // the second running list
+    EXPECT(find(entries, reinterpret_cast<std::uintptr_t>(id(slots - 1))) != nullptr);
+    EXPECT(find(entries, reinterpret_cast<std::uintptr_t>(id(slots + 10 + slots + 7))) != nullptr);  // the newest
+
+    // CPU only: no list ever claims GPU progress or gets a marker, however many are submitted.
+    BreadcrumbRing cpu;
+    cpu.initialize_cpu_only();
+    for (std::size_t k = 0; k < slots + 5; ++k) {
+        const BreadcrumbRing::Mark m = cpu.mark(one, queue1, id(k));
+        EXPECT(!cpu.op_markers_for(m));
+        submit_to(cpu, m);
+    }
+    for (const auto& x : cpu.snapshot())
+        EXPECT(x.state == BreadcrumbState::unknown && !x.progress_known && x.completed_ops == 0);
+    std::printf("breadcrumbs: slot ownership with every slot busy (review of #5314: A/B/C), failed submissions, "
+                "history and CPU only ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
-    if (synthetic()) return 1;
+    if (synthetic() || slot_ownership()) return 1;
 
     vktest::Device d;
     d.request_buffer_marker = true;

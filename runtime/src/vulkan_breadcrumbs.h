@@ -1,16 +1,18 @@
 #pragma once
 
 // Device-lost diagnostics for the D3D12 layer: auto-breadcrumbs per command list (DRED-style), off unless
-// LEONIDA_DRED=1. With VK_AMD_buffer_marker the GPU records its progress; without it the ring keeps only what the
-// CPU knows (which lists each queue submitted) and every state is `unknown`.
+// LEONIDA_DRED=1 (per list) or 2 (also per operation). With VK_AMD_buffer_marker the GPU records its progress; without
+// it the ring keeps only what the CPU knows (which lists each queue submitted) and every state is `unknown`.
 //
-// Each command list of an ExecuteCommandLists gets a slot of two 32-bit words in a host-visible, coherent buffer
-// owned by this ring (nothing the replay uses). Around the list's commands the backend records
+// Each command list of an ExecuteCommandLists gets a slot of four 32-bit words (begin, end, progress, padding) in a
+// host-visible, coherent buffer owned by this ring (nothing the replay uses). Around the list's commands the backend
+// records
 //   vkCmdWriteBufferMarkerAMD(TOP_OF_PIPE,    slot.begin, tag)   the GPU reached the list's first command
 //   vkCmdWriteBufferMarkerAMD(BOTTOM_OF_PIPE, slot.end,   tag)   every command of the list completed
-// `tag` is unique per submitted list (never 0) and is what the GPU writes, so a slot needs no CPU clearing: a word
+// `tag` is unique per submitted list (never 0) and is what the GPU writes, so the CPU never clears a slot: a word
 // counts only when it holds this list's own tag, and a late write from an older list that used the slot before can
-// never pass for progress of the current one.
+// never pass for progress of the current one. At level 2 the begin marker also clears the progress word on the GPU,
+// and emit() writes the op numbers into it (breadcrumb_ops_completed; slot reuse in mark()).
 //
 // States, from what is known and nothing more:
 //   recorded   the markers are in a command buffer, which was not (yet) submitted: such entries are not kept
@@ -148,8 +150,8 @@ inline BreadcrumbState breadcrumb_state(std::uint32_t begin_word, std::uint32_t 
 // Per-operation progress (PoC): after its k-th D3D12 operation (0-based) a list's stream writes `first + k` into its
 // slot's progress word, at BOTTOM_OF_PIPE. Op numbers are unique per list and never 0, so a word from the slot's
 // previous owner (an older range) or the initial 0 falls outside [first, first + count) and counts as nothing.
-// Unsigned arithmetic: correct across the 32-bit wrap as long as fewer than 2^31 operations separate two owners of
-// one slot (at most kSlots lists apart).
+// Unsigned arithmetic, so correct across the 32-bit wrap. A slot passes to a new owner only once its previous one
+// finished, and the new owner's begin marker clears the word (BreadcrumbRing::mark, record_begin).
 inline std::uint32_t breadcrumb_ops_completed(std::uint32_t word, std::uint32_t first, std::size_t count) {
     const std::uint32_t k = word - first;
     return k < count ? k + 1 : 0;
@@ -235,10 +237,13 @@ public:
         std::uint64_t queue_id = 0;
         std::wstring list_name, queue_name;
         bool progress_known = false;      // GPU breadcrumbs: completed_ops is what the progress word says
+        bool no_slot = false;             // level 2 with every slot busy: no GPU marker, progress unknown
         std::uint32_t completed_ops = 0;  // operations finished, in order (D3D12's *pLastBreadcrumbValue)
     };
 
     static constexpr std::uint32_t kSlots = 1024;  // lists kept: the newest 1024 submitted
+    static constexpr std::uint32_t kNoSlot = ~0u;  // Mark::slot of a list that got none (CPU history only)
+    static constexpr std::size_t kNoSlotKept = 64;  // such lists kept besides the slots' own: the newest 64
     static constexpr std::size_t kUnknownShown = 16;  // lists the report shows when GPU progress is unknown
 
     BreadcrumbRing() = default;
@@ -339,9 +344,12 @@ public:
             m.slot = next_slot_;
             if (gpu_ && per_op_) {
                 // A slot is taken over only once its owner wrote its end word (or the slot is free): a finished list
-                // writes nothing more, so no older list's progress write can land in this list's word, however many
-                // op numbers were handed out since. If every slot still holds a list the GPU has not finished, this
-                // list gets no per-op markers and its progress inside the list stays unknown.
+                // writes nothing more, so no older list's write can land in this list's words, however many op
+                // numbers were handed out since. This assumes the host sees a list's op markers no later than its
+                // end marker; the spec orders them on the queue but promises the host nothing (docs section 4.11). If every slot still holds a list the GPU has not finished, this
+                // list takes none (review of #5314): no GPU marker at all, the owners stay, and it is kept in the
+                // history with its GPU progress unknown.
+                m.slot = kNoSlot;
                 m.progress_safe = false;
                 for (std::uint32_t i = 0; i < kSlots; ++i) {
                     const std::uint32_t slot = (next_slot_ + i) % kSlots;
@@ -352,11 +360,11 @@ public:
                     }
                 }
             }
-            next_slot_ = (m.slot + 1) % kSlots;
+            if (m.slot != kNoSlot) next_slot_ = (m.slot + 1) % kSlots;
             // The slot is about to carry this list's tag: the list that used it before can no longer be read.
             // Queues submit in their own order, so the history is not sorted by slot; snapshot() skips any
             // entry whose slot has a newer owner.
-            owner_[m.slot] = m.tag;
+            if (m.slot != kNoSlot) owner_[m.slot] = m.tag;
             if (held) {
                 m.list_name = held->list;
                 m.queue_name = held->queue;
@@ -370,9 +378,13 @@ public:
         return m;
     }
 
-    // Nothing is recorded without GPU breadcrumbs.
+    // Nothing is recorded without GPU breadcrumbs, or for a list that got no slot. With per-op markers the begin
+    // marker also clears the progress word, so the previous owner's last op number does not sit there.
     void record_begin(VkCommandBuffer command_buffer, const Mark& m) const {
-        if (gpu_) fn_.write_marker(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, buffer_, offset(m.slot, 0), m.tag);
+        if (!gpu_ || m.slot == kNoSlot) return;
+        fn_.write_marker(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, buffer_, offset(m.slot, 0), m.tag);
+        if (op_markers_for(m))
+            fn_.write_marker(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, buffer_, offset(m.slot, 2), 0);
     }
     // For emit(): where and how the per-op markers of `m` are written; write == nullptr without GPU breadcrumbs.
     PFN_vkCmdWriteBufferMarkerAMD op_marker_function() const { return gpu_ && per_op_ ? fn_.write_marker : nullptr; }
@@ -398,7 +410,7 @@ public:
     VkDeviceSize progress_offset(const Mark& m) const { return offset(m.slot, 2); }
 
     void record_end(VkCommandBuffer command_buffer, const Mark& m) const {
-        if (gpu_)
+        if (gpu_ && m.slot != kNoSlot)
             fn_.write_marker(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, buffer_, offset(m.slot, 1), m.tag);
     }
 
@@ -408,13 +420,20 @@ public:
         if (!ok) {
             // Never ran, so it writes nothing: its slots are free again.
             for (const auto& m : marks)
-                if (owner_[m.slot] == m.tag) owner_[m.slot] = 0;
+                if (m.slot != kNoSlot && owner_[m.slot] == m.tag) owner_[m.slot] = 0;
             return;
         }
         for (auto& m : marks) {
             std::vector<std::uint32_t>().swap(m.positions);  // only emit() needs them: the history keeps ops alone
             history_.push_back(std::move(m));
-            if (history_.size() > kSlots) history_.pop_front();  // its slot is reused from now on
+            if (history_.size() > kSlots + kNoSlotKept) {
+                // The oldest list that no longer holds a slot goes (one whose slot passed on, or one that got none);
+                // a list that still holds its slot, possibly one the GPU never finished, stays. At most kSlots lists
+                // hold a slot, so there is always one to drop, and the newest lists without a slot are kept.
+                auto drop = history_.begin();
+                while (drop != history_.end() && drop->slot != kNoSlot && owner_[drop->slot] == drop->tag) ++drop;
+                history_.erase(drop == history_.end() ? history_.begin() : drop);
+            }
         }
     }
 
@@ -424,19 +443,21 @@ public:
         std::lock_guard lock(mutex_);
         std::vector<const Mark*> kept;
         kept.reserve(history_.size());
-        for (const auto& m : history_)
-            if (owner_[m.slot] == m.tag) kept.push_back(&m);  // else the slot was handed to a later list
+        for (const auto& m : history_)  // a list whose slot was handed to a later one is gone
+            if (m.slot == kNoSlot || owner_[m.slot] == m.tag) kept.push_back(&m);
         std::sort(kept.begin(), kept.end(), [](const Mark* a, const Mark* b) { return a->sequence < b->sequence; });
         std::vector<Entry> out;
         out.reserve(kept.size());
         for (const Mark* m : kept) {
+            const bool words = gpu_ && m->slot != kNoSlot;
             const BreadcrumbState state =
-                gpu_ ? breadcrumb_state(read(m->slot, 0), read(m->slot, 1), m->tag) : BreadcrumbState::unknown;
+                words ? breadcrumb_state(read(m->slot, 0), read(m->slot, 1), m->tag) : BreadcrumbState::unknown;
             Entry e{m->tag, m->list_id, m->ops, state, m->queue_id, m->list_name, m->queue_name};
+            e.no_slot = gpu_ && m->slot == kNoSlot;
             if (state == BreadcrumbState::completed) {
                 e.progress_known = true;  // the end word: every operation finished
                 e.completed_ops = static_cast<std::uint32_t>(m->ops.size());
-            } else if (gpu_ && per_op_ && m->progress_safe) {
+            } else if (gpu_ && per_op_ && m->progress_safe && m->slot != kNoSlot) {
                 // Only a word in this list's own range counts; anything else reads as no operation finished, never
                 // as more. A finished operation also proves the list started, should its begin word not show yet.
                 e.progress_known = true;
@@ -458,7 +479,9 @@ public:
             return;
         }
         std::size_t first = entries.size();
-        if (entries.back().state == BreadcrumbState::unknown) {
+        // CPU only (no marker extension): every entry is unknown. A GPU ring's lists that got no slot are unknown too,
+        // but they are reported among the others.
+        if (entries.back().state == BreadcrumbState::unknown && !entries.back().no_slot) {
             first = entries.size() > kUnknownShown ? entries.size() - kUnknownShown : 0;
             std::fprintf(out, "[rt] d3d12 DRED: GPU progress UNKNOWN (no VK_AMD_buffer_marker); the last %zu of the "
                               "%zu lists submitted, oldest first (CPU knowledge only):\n",
@@ -476,8 +499,13 @@ public:
             return;
         }
         if (first > 0) first -= 1;  // the last completed list before the first that did not, for context
+        std::size_t untracked = 0;
+        for (const auto& e : entries) untracked += e.no_slot;
         std::fprintf(out, "[rt] d3d12 DRED: %zu of the last %zu lists did not complete (GPU writes after a device "
-                          "loss may be incomplete):\n", count_incomplete(entries), entries.size());
+                          "loss may be incomplete)", count_incomplete(entries) - untracked, entries.size());
+        if (untracked)
+            std::fprintf(out, "; %zu more not tracked on the GPU (every breadcrumb slot was busy)", untracked);
+        std::fprintf(out, ":\n");
         for (std::size_t i = first; i < entries.size(); ++i) write_entry(out, entries[i]);
     }
 
@@ -509,7 +537,8 @@ private:
         const std::size_t shown = e.ops.size() < 8 ? e.ops.size() : 8;
         for (std::size_t k = 0; k < shown; ++k)
             std::fprintf(out, "%s%s", k ? ", " : ": ", breadcrumb_op_name(e.ops[k]));
-        std::fprintf(out, "%s\n", e.ops.size() > shown ? ", ..." : "");
+        std::fprintf(out, "%s%s\n", e.ops.size() > shown ? ", ..." : "",
+                     e.no_slot ? " (every breadcrumb slot was busy: not tracked on the GPU)" : "");
     }
     static std::size_t count_incomplete(const std::vector<Entry>& entries) {
         std::size_t n = 0;

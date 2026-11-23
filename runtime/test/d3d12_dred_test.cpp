@@ -244,6 +244,11 @@ int snapshot() {
     progress[0].completed_ops = 2;  // two of four finished
     progress[1].progress_known = true;
     progress[1].completed_ops = 0;  // not started
+    progress.push_back({7, 0x70, {}, BreadcrumbState::started});  // no operations, progress unknown
+    leonida::BreadcrumbRing::Entry untracked{8, 0x80, {op::dispatch}, BreadcrumbState::unknown};
+    untracked.no_slot = true;  // every slot was busy: not tracked on the GPU, so no node
+    untracked.list_name = L"untracked";
+    progress.push_back(untracked);
     s.build(progress, {}, arena);
     n = s.head1();
     EXPECT(n && n->BreadcrumbCount == 4 && n->pLastBreadcrumbValue && *n->pLastBreadcrumbValue == 2);
@@ -255,14 +260,18 @@ int snapshot() {
     EXPECT(n && n->BreadcrumbCount == 2 && *n->pLastBreadcrumbValue == 0 &&
            n->pCommandHistory[0] == D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW);
     n = n->pNext;
-    EXPECT(n && n->BreadcrumbCount == 2 && *n->pLastBreadcrumbValue == 0 && !n->pNext);  // unknown: none claimed
+    EXPECT(n && n->BreadcrumbCount == 2 && *n->pLastBreadcrumbValue == 0);  // unknown: none claimed
+    n = n->pNext;
+    EXPECT(n && n->BreadcrumbCount == 0 && !n->pCommandHistory && *n->pLastBreadcrumbValue == 0 && !n->pNext);
     EXPECT(s.head()->pLastBreadcrumbValue && *s.head()->pLastBreadcrumbValue == 2);  // the same in NODE and NODE1
     int nodes = 0;
     for (auto [a, b] = std::pair{s.head(), s.head1()}; a || b; a = a->pNext, b = b->pNext, ++nodes) {
         EXPECT(a && b && a->BreadcrumbCount == b->BreadcrumbCount && a->pCommandHistory == b->pCommandHistory &&
                a->pLastBreadcrumbValue == b->pLastBreadcrumbValue && *a->pLastBreadcrumbValue <= a->BreadcrumbCount);
     }
-    EXPECT(nodes == 3);
+    EXPECT(nodes == 4);  // the untracked list has none
+    for (auto* a = s.head(); a; a = a->pNext)
+        EXPECT(!a->pCommandListDebugNameW || std::wcscmp(a->pCommandListDebugNameW, L"untracked") != 0);
     std::printf("snapshot: nodes for the lists that did not complete, operations and fault VA ok\n");
     return 0;
 }
