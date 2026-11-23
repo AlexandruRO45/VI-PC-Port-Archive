@@ -25,6 +25,10 @@ MISSING_INPUT_TOOLS = (
     "rtti_scan",
     "shader_disasm",
     "tile_probe",
+    "glb_skinning",
+    "mesh_compute_vs",
+    "spirv_stubs",
+    "gdk_runtime_calls",
 )
 
 # One process per tool; a hung import is a failure, not an infinite test.
