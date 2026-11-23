@@ -278,6 +278,39 @@ class GpuLog(unittest.TestCase):
 
 
 class Github(unittest.TestCase):
+    def test_ci_conclusions_distinguish_failures_from_runs_without_a_verdict(self):
+        expected = {
+            "success": "verified",
+            "failure": "failed",
+            "timed_out": "failed",
+            "startup_failure": "failed",
+            "cancelled": "unknown",
+            "action_required": "unknown",
+            "skipped": "unknown",
+            "neutral": "unknown",
+            "stale": "unknown",
+        }
+        runs = [
+            {"workflowName": conclusion, "status": "completed", "conclusion": conclusion,
+             "headSha": "0123456789abcdef", "createdAt": "2026-11-23T12:00:00Z"}
+            for conclusion in expected
+        ]
+        runs.insert(0, {"workflowName": "cancelled", "status": "queued", "conclusion": "",
+                        "headSha": "abcdef0123456789", "createdAt": "2026-11-23T12:01:00Z"})
+        runs.append({"workflowName": "cancelled", "status": "completed", "conclusion": "success",
+                     "headSha": "ab0123456789cdef", "createdAt": "2026-11-23T11:00:00Z"})
+        col = pd.Collector()
+        with mock.patch.object(pd, "gh_json", side_effect=lambda args, **_: runs if args[:2] == ["run", "list"] else []), \
+                mock.patch.object(pd.shutil, "which", return_value="gh"):
+            pd.collect_github(col, "o/r", None)
+        components = {row["name"]: row for row in col.components if row["panel"] == "ci"}
+        self.assertEqual(set(components), set(expected))
+        for conclusion, status in expected.items():
+            with self.subTest(conclusion=conclusion):
+                self.assertEqual(components[conclusion]["status"], status)
+                self.assertIn(f"{conclusion} on 0123456789", components[conclusion]["detail"])
+        self.assertIn("a newer run is queued", components["cancelled"]["detail"])
+
     def test_d3d_states(self):
         self.assertEqual(pd.d3d_state("@a", "#291 merged, #819, #831 on main", "")[0], "partial")
         self.assertEqual(pd.d3d_state("@a", "#1489 merged, #907 closed", "")[0], "implemented")

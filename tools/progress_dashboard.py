@@ -853,7 +853,13 @@ def collect_github(col, repo, login):
             if r is None:
                 status, what, r = "unknown", f"no completed run in the last 40; one {newer['status']}", newer
             else:
-                status, what = ("verified" if r["conclusion"] == "success" else "failed"), r["conclusion"]
+                what = r["conclusion"] or "no conclusion"
+                if what == "success":
+                    status = "verified"
+                elif what in ("failure", "timed_out", "startup_failure"):
+                    status = "failed"
+                else:
+                    status = "unknown"
             col.add(f"ci.{name}", "ci", "latest completed run per workflow", name, status,
                     detail=f"{what} on {r['headSha'][:10]}" + (f"; a newer run is {newer['status']}" if newer and newer is not r else ""),
                     at=r["createdAt"], url=r.get("url"))
