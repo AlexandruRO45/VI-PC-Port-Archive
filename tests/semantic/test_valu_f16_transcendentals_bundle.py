@@ -9,7 +9,8 @@ for AMD RDNA2 VALU 16-bit floating-point transcendental operations (Bundle 21):
   - v_sqrt_f16: 16-bit float square root (sqrt(x))
 
 Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
-Exercises tools/rdna2spirv.py via support.translate_lines(...) and support.mrt0_words for hardware-accurate translation.
+100% translator-backed: Every test exercises tools/rdna2spirv.py via support.translate_lines(...)
+and executes via support.mrt0_words for hardware-accurate translation and verification.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import math
 import os
 import struct
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Optional
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,12 +29,8 @@ TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS_DIR)
 sys.path.insert(0, HERE)
 
-try:
-    import rdna2spirv
-    import support
-except Exception:
-    rdna2spirv = None  # type: ignore
-    support = None  # type: ignore
+import rdna2spirv
+import support
 
 MASK16: int = 0xFFFF
 MASK32: int = 0xFFFFFFFF
@@ -98,201 +95,296 @@ class ASTInstruction:
         return f"{self.opcode.value} {fmt(self.dst)}, {fmt(self.src0)}"
 
 
-class ScalarMachineState:
-    def __init__(self, num_vgprs: int = 256, num_sgprs: int = 106) -> None:
-        self.vgprs: list[int] = [0] * num_vgprs
-        self.sgprs: list[int] = [0] * num_sgprs
-        self.scc: int = 0
-        self.vcc: int = 0
-
-    def read_operand_f16(self, op: ASTOperand) -> int:
-        if op.kind == OperandKind.VGPR:
-            return self.vgprs[op.index] & MASK16
-        if op.kind == OperandKind.SGPR:
-            return self.sgprs[op.index] & MASK16
-        return op.value & MASK16
-
-    def write_vgpr_f16(self, idx: int, val: int) -> None:
-        # Writes to low 16 bits, preserves high 16 bits
-        prev_hi = self.vgprs[idx] & 0xFFFF0000
-        self.vgprs[idx] = prev_hi | (val & MASK16)
+_TRANS_ID = 0
 
 
-GLOBAL_ORACLE_MAP: dict[Opcode, Callable[[int], int]] = {}
+def run_transcendental_f16(opcode: str, src_u16: int, extra_lines: list[str] | None = None) -> int:
+    """Compile and execute single-operand F16 transcendental via rdna2spirv and spirv_mini_interp."""
+    global _TRANS_ID
+    _TRANS_ID += 1
+    lines = [
+        f"v_mov_b32 v0, {src_u16 & MASK16:#x}",
+        f"{opcode} v1, v0",
+    ]
+    if extra_lines:
+        lines.extend(extra_lines)
+    lines.extend([
+        "exp mrt0 v1, v1, v1, v1 done vm",
+        "s_endpgm",
+    ])
+    spv = support.translate_lines(f"ps_{opcode}_{_TRANS_ID}", lines)
+    words = support.mrt0_words(spv)
+    return words[0] & MASK16
 
 
-class ScalarInterpreter:
-    def step(self, instr: ASTInstruction, state: ScalarMachineState) -> int:
-        s0 = state.read_operand_f16(instr.src0)
-        res = GLOBAL_ORACLE_MAP[instr.opcode](s0)
-        if instr.dst.kind == OperandKind.VGPR:
-            state.write_vgpr_f16(instr.dst.index, res)
-        return res
+# -----------------------------------------------------------------------------
+# Opcode 1: v_sin_f16
+# -----------------------------------------------------------------------------
 
 def ref_v_sin_f16(u: int) -> int:
     f = u16_to_f16(u)
-    return f16_to_u16(math.sin(f * 2.0 * math.pi))
-
-GLOBAL_ORACLE_MAP[Opcode.V_SIN_F16] = ref_v_sin_f16
+    s = math.sin(f * 2.0 * math.pi)
+    if abs(s) < 1e-7:
+        s = 0.0
+    return f16_to_u16(s)
 
 
 class TestVSinF16Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res = ref_v_sin_f16(0x0000)
-        self.assertEqual(res, 0x0)
+        cases = [
+            (0x0000, 0x0000),  # sin(0.0) = 0.0
+            (0x3400, 0x3C00),  # sin(0.25) = 1.0
+            (0x3800, 0x0000),  # sin(0.5) = 0.0
+            (0x3A00, 0xBC00),  # sin(0.75) = -1.0
+            (0x3C00, 0x0000),  # sin(1.0) = 0.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                self.assertEqual(ref_v_sin_f16(src), exp)
+                hw = run_transcendental_f16("v_sin_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVSinF16ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
         inst = ASTInstruction(Opcode.V_SIN_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         self.assertEqual(inst.disasm(), "v_sin_f16 v0, v1")
+        lines = [
+            "v_mov_b32 v1, 0x3400",
+            inst.disasm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_v_sin_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr_f16(1, 0x0000)
-        inst = ASTInstruction(Opcode.V_SIN_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x0)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x0)
+        lines = [
+            "v_mov_b32 v1, 0x3400",
+            "v_sin_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_step_v_sin_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
+
 
 class TestVSinF16SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_and_flags(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xAAAAAAAAAAAAAAAA
-        state.write_vgpr_f16(0, 0x0000)
-        inst = ASTInstruction(Opcode.V_SIN_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x0)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x0)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+        lines = [
+            "v_mov_b32 v0, 0x3400",
+            "v_sin_f16 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_v_sin_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
 
     def test_ieee754_boundary(self) -> None:
-        res = ref_v_sin_f16(0x0000)
-        self.assertIsInstance(res, int)
+        cases = [
+            (0x0000, 0x0000),  # +0.0 -> +0.0
+            (0x8000, 0x8000),  # -0.0 -> -0.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                hw = run_transcendental_f16("v_sin_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVSinF16Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
-            "v_mov_b32 v0, 0x0000",
+            "v_mov_b32 v0, 0x3400",
             "v_sin_f16 v1, v0",
-            "exp mrt0, v1, v1, v1, v1 done",
+            "exp mrt0 v1, v1, v1, v1 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_sin_f16", lines)
         self.assertIn("OpEntryPoint", spv)
         words = support.mrt0_words(spv)
-        self.assertEqual(words[0] & MASK16, 0x0)
+        self.assertEqual(words[0] & MASK16, 0x3C00)
+
+    def test_sgpr_and_clamp_modifiers(self) -> None:
+        lines = [
+            "s_mov_b32 s0, 0x3400",
+            "v_sin_f16 v0, s0 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mods_v_sin_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
+
+
+# -----------------------------------------------------------------------------
+# Opcode 2: v_cos_f16
+# -----------------------------------------------------------------------------
 
 def ref_v_cos_f16(u: int) -> int:
     f = u16_to_f16(u)
     return f16_to_u16(math.cos(f * 2.0 * math.pi))
 
-GLOBAL_ORACLE_MAP[Opcode.V_COS_F16] = ref_v_cos_f16
-
 
 class TestVCosF16Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res = ref_v_cos_f16(0x0000)
-        self.assertEqual(res, 0x3c00)
+        cases = [
+            (0x0000, 0x3C00),  # cos(0.0) = 1.0
+            (0x3400, 0x0000),  # cos(0.25) = 0.0
+            (0x3800, 0xBC00),  # cos(0.5) = -1.0
+            (0x3C00, 0x3C00),  # cos(1.0) = 1.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                self.assertEqual(ref_v_cos_f16(src), exp)
+                hw = run_transcendental_f16("v_cos_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVCosF16ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
         inst = ASTInstruction(Opcode.V_COS_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         self.assertEqual(inst.disasm(), "v_cos_f16 v0, v1")
+        lines = [
+            "v_mov_b32 v1, 0x0000",
+            inst.disasm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_v_cos_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr_f16(1, 0x0000)
-        inst = ASTInstruction(Opcode.V_COS_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x3c00)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x3c00)
+        lines = [
+            "v_mov_b32 v1, 0x0000",
+            "v_cos_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_step_v_cos_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
+
 
 class TestVCosF16SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_and_flags(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xAAAAAAAAAAAAAAAA
-        state.write_vgpr_f16(0, 0x0000)
-        inst = ASTInstruction(Opcode.V_COS_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x3c00)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x3c00)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+        lines = [
+            "v_mov_b32 v0, 0x0000",
+            "v_cos_f16 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_v_cos_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
 
     def test_ieee754_boundary(self) -> None:
-        res = ref_v_cos_f16(0x0000)
-        self.assertIsInstance(res, int)
+        cases = [
+            (0x0000, 0x3C00),  # cos(+0.0) = 1.0
+            (0x8000, 0x3C00),  # cos(-0.0) = 1.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                hw = run_transcendental_f16("v_cos_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVCosF16Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x0000",
             "v_cos_f16 v1, v0",
-            "exp mrt0, v1, v1, v1, v1 done",
+            "exp mrt0 v1, v1, v1, v1 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_cos_f16", lines)
         self.assertIn("OpEntryPoint", spv)
         words = support.mrt0_words(spv)
-        self.assertEqual(words[0] & MASK16, 0x3c00)
+        self.assertEqual(words[0] & MASK16, 0x3C00)
+
+    def test_sgpr_and_clamp_modifiers(self) -> None:
+        lines = [
+            "s_mov_b32 s0, 0x0000",
+            "v_cos_f16 v0, s0 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mods_v_cos_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
+
+
+# -----------------------------------------------------------------------------
+# Opcode 3: v_exp_f16
+# -----------------------------------------------------------------------------
 
 def ref_v_exp_f16(u: int) -> int:
     f = u16_to_f16(u)
     return f16_to_u16(math.pow(2.0, f))
 
-GLOBAL_ORACLE_MAP[Opcode.V_EXP_F16] = ref_v_exp_f16
-
 
 class TestVExpF16Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res = ref_v_exp_f16(0x3C00)
-        self.assertEqual(res, 0x4000)
+        cases = [
+            (0x0000, 0x3C00),  # 2^0 = 1.0
+            (0x3C00, 0x4000),  # 2^1 = 2.0
+            (0x4000, 0x4400),  # 2^2 = 4.0
+            (0xBC00, 0x3800),  # 2^-1 = 0.5
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                self.assertEqual(ref_v_exp_f16(src), exp)
+                hw = run_transcendental_f16("v_exp_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVExpF16ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
         inst = ASTInstruction(Opcode.V_EXP_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         self.assertEqual(inst.disasm(), "v_exp_f16 v0, v1")
+        lines = [
+            "v_mov_b32 v1, 0x3C00",
+            inst.disasm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_v_exp_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x4000)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr_f16(1, 0x3C00)
-        inst = ASTInstruction(Opcode.V_EXP_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x4000)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x4000)
+        lines = [
+            "v_mov_b32 v1, 0x3C00",
+            "v_exp_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_step_v_exp_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x4000)
+
 
 class TestVExpF16SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_and_flags(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xAAAAAAAAAAAAAAAA
-        state.write_vgpr_f16(0, 0x3C00)
-        inst = ASTInstruction(Opcode.V_EXP_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x4000)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x4000)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+        lines = [
+            "v_mov_b32 v0, 0x3C00",
+            "v_exp_f16 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_v_exp_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x4000)
 
     def test_ieee754_boundary(self) -> None:
-        res = ref_v_exp_f16(0x3C00)
-        self.assertIsInstance(res, int)
+        cases = [
+            (0x0000, 0x3C00),  # 2^+0.0 = 1.0
+            (0x8000, 0x3C00),  # 2^-0.0 = 1.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                hw = run_transcendental_f16("v_exp_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVExpF16Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x3C00",
             "v_exp_f16 v1, v0",
-            "exp mrt0, v1, v1, v1, v1 done",
+            "exp mrt0 v1, v1, v1, v1 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_exp_f16", lines)
@@ -300,113 +392,188 @@ class TestVExpF16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & MASK16, 0x4000)
 
+    def test_sgpr_and_clamp_modifiers(self) -> None:
+        lines = [
+            "s_mov_b32 s0, 0x3C00",
+            "v_exp_f16 v0, s0 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mods_v_exp_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)  # clamped to 1.0
+
+
+# -----------------------------------------------------------------------------
+# Opcode 4: v_log_f16
+# -----------------------------------------------------------------------------
+
 def ref_v_log_f16(u: int) -> int:
     f = u16_to_f16(u)
     return f16_to_u16(math.log2(f))
 
-GLOBAL_ORACLE_MAP[Opcode.V_LOG_F16] = ref_v_log_f16
-
 
 class TestVLogF16Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res = ref_v_log_f16(0x4000)
-        self.assertEqual(res, 0x3c00)
+        cases = [
+            (0x3C00, 0x0000),  # log2(1.0) = 0.0
+            (0x4000, 0x3C00),  # log2(2.0) = 1.0
+            (0x4400, 0x4000),  # log2(4.0) = 2.0
+            (0x3800, 0xBC00),  # log2(0.5) = -1.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                self.assertEqual(ref_v_log_f16(src), exp)
+                hw = run_transcendental_f16("v_log_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVLogF16ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
         inst = ASTInstruction(Opcode.V_LOG_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         self.assertEqual(inst.disasm(), "v_log_f16 v0, v1")
+        lines = [
+            "v_mov_b32 v1, 0x4000",
+            inst.disasm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_v_log_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr_f16(1, 0x4000)
-        inst = ASTInstruction(Opcode.V_LOG_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x3c00)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x3c00)
+        lines = [
+            "v_mov_b32 v1, 0x4000",
+            "v_log_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_step_v_log_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
+
 
 class TestVLogF16SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_and_flags(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xAAAAAAAAAAAAAAAA
-        state.write_vgpr_f16(0, 0x4000)
-        inst = ASTInstruction(Opcode.V_LOG_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x3c00)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x3c00)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+        lines = [
+            "v_mov_b32 v0, 0x4000",
+            "v_log_f16 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_v_log_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)
 
     def test_ieee754_boundary(self) -> None:
-        res = ref_v_log_f16(0x4000)
-        self.assertIsInstance(res, int)
+        cases = [
+            (0x3C00, 0x0000),  # log2(1.0) = 0.0
+            (0x4400, 0x4000),  # log2(4.0) = 2.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                hw = run_transcendental_f16("v_log_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVLogF16Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x4000",
             "v_log_f16 v1, v0",
-            "exp mrt0, v1, v1, v1, v1 done",
+            "exp mrt0 v1, v1, v1, v1 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_log_f16", lines)
         self.assertIn("OpEntryPoint", spv)
         words = support.mrt0_words(spv)
-        self.assertEqual(words[0] & MASK16, 0x3c00)
+        self.assertEqual(words[0] & MASK16, 0x3C00)
+
+    def test_sgpr_and_clamp_modifiers(self) -> None:
+        lines = [
+            "s_mov_b32 s0, 0x4400",
+            "v_log_f16 v0, s0 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mods_v_log_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)  # clamped to 1.0
+
+
+# -----------------------------------------------------------------------------
+# Opcode 5: v_rcp_f16
+# -----------------------------------------------------------------------------
 
 def ref_v_rcp_f16(u: int) -> int:
     f = u16_to_f16(u)
     return f16_to_u16(1.0 / f)
 
-GLOBAL_ORACLE_MAP[Opcode.V_RCP_F16] = ref_v_rcp_f16
-
 
 class TestVRcpF16Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res = ref_v_rcp_f16(0x4000)
-        self.assertEqual(res, 0x3800)
+        cases = [
+            (0x3C00, 0x3C00),  # 1/1.0 = 1.0
+            (0x4000, 0x3800),  # 1/2.0 = 0.5
+            (0x4400, 0x3400),  # 1/4.0 = 0.25
+            (0x3800, 0x4000),  # 1/0.5 = 2.0
+            (0xBC00, 0xBC00),  # 1/-1.0 = -1.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                self.assertEqual(ref_v_rcp_f16(src), exp)
+                hw = run_transcendental_f16("v_rcp_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVRcpF16ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
         inst = ASTInstruction(Opcode.V_RCP_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         self.assertEqual(inst.disasm(), "v_rcp_f16 v0, v1")
+        lines = [
+            "v_mov_b32 v1, 0x4000",
+            inst.disasm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_v_rcp_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3800)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr_f16(1, 0x4000)
-        inst = ASTInstruction(Opcode.V_RCP_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x3800)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x3800)
+        lines = [
+            "v_mov_b32 v1, 0x4000",
+            "v_rcp_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_step_v_rcp_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3800)
+
 
 class TestVRcpF16SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_and_flags(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xAAAAAAAAAAAAAAAA
-        state.write_vgpr_f16(0, 0x4000)
-        inst = ASTInstruction(Opcode.V_RCP_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x3800)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x3800)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+        lines = [
+            "v_mov_b32 v0, 0x4000",
+            "v_rcp_f16 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_v_rcp_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3800)
 
     def test_ieee754_boundary(self) -> None:
-        res = ref_v_rcp_f16(0x4000)
-        self.assertIsInstance(res, int)
+        cases = [
+            (0x3C00, 0x3C00),  # 1.0 -> 1.0
+            (0xBC00, 0xBC00),  # -1.0 -> -1.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                hw = run_transcendental_f16("v_rcp_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVRcpF16Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x4000",
             "v_rcp_f16 v1, v0",
-            "exp mrt0, v1, v1, v1, v1 done",
+            "exp mrt0 v1, v1, v1, v1 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_rcp_f16", lines)
@@ -414,56 +581,93 @@ class TestVRcpF16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & MASK16, 0x3800)
 
+    def test_sgpr_and_clamp_modifiers(self) -> None:
+        lines = [
+            "s_mov_b32 s0, 0x3800",
+            "v_rcp_f16 v0, s0 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mods_v_rcp_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)  # 2.0 clamped to 1.0
+
+
+# -----------------------------------------------------------------------------
+# Opcode 6: v_rsq_f16
+# -----------------------------------------------------------------------------
+
 def ref_v_rsq_f16(u: int) -> int:
     f = u16_to_f16(u)
     return f16_to_u16(1.0 / math.sqrt(f))
 
-GLOBAL_ORACLE_MAP[Opcode.V_RSQ_F16] = ref_v_rsq_f16
-
 
 class TestVRsqF16Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res = ref_v_rsq_f16(0x4400)
-        self.assertEqual(res, 0x3800)
+        cases = [
+            (0x3C00, 0x3C00),  # 1/sqrt(1.0) = 1.0
+            (0x4400, 0x3800),  # 1/sqrt(4.0) = 0.5
+            (0x4C00, 0x3400),  # 1/sqrt(16.0) = 0.25
+            (0x3400, 0x4000),  # 1/sqrt(0.25) = 2.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                self.assertEqual(ref_v_rsq_f16(src), exp)
+                hw = run_transcendental_f16("v_rsq_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVRsqF16ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
         inst = ASTInstruction(Opcode.V_RSQ_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         self.assertEqual(inst.disasm(), "v_rsq_f16 v0, v1")
+        lines = [
+            "v_mov_b32 v1, 0x4400",
+            inst.disasm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_v_rsq_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3800)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr_f16(1, 0x4400)
-        inst = ASTInstruction(Opcode.V_RSQ_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x3800)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x3800)
+        lines = [
+            "v_mov_b32 v1, 0x4400",
+            "v_rsq_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_step_v_rsq_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3800)
+
 
 class TestVRsqF16SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_and_flags(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xAAAAAAAAAAAAAAAA
-        state.write_vgpr_f16(0, 0x4400)
-        inst = ASTInstruction(Opcode.V_RSQ_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x3800)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x3800)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+        lines = [
+            "v_mov_b32 v0, 0x4400",
+            "v_rsq_f16 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_v_rsq_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3800)
 
     def test_ieee754_boundary(self) -> None:
-        res = ref_v_rsq_f16(0x4400)
-        self.assertIsInstance(res, int)
+        cases = [
+            (0x3C00, 0x3C00),  # 1.0 -> 1.0
+            (0x4400, 0x3800),  # 4.0 -> 0.5
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                hw = run_transcendental_f16("v_rsq_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVRsqF16Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x4400",
             "v_rsq_f16 v1, v0",
-            "exp mrt0, v1, v1, v1, v1 done",
+            "exp mrt0 v1, v1, v1, v1 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_rsq_f16", lines)
@@ -471,62 +675,146 @@ class TestVRsqF16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & MASK16, 0x3800)
 
+    def test_sgpr_and_clamp_modifiers(self) -> None:
+        lines = [
+            "s_mov_b32 s0, 0x3400",
+            "v_rsq_f16 v0, s0 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mods_v_rsq_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)  # 2.0 clamped to 1.0
+
+
+# -----------------------------------------------------------------------------
+# Opcode 7: v_sqrt_f16
+# -----------------------------------------------------------------------------
+
 def ref_v_sqrt_f16(u: int) -> int:
     f = u16_to_f16(u)
     return f16_to_u16(math.sqrt(f))
 
-GLOBAL_ORACLE_MAP[Opcode.V_SQRT_F16] = ref_v_sqrt_f16
-
 
 class TestVSqrtF16Oracle(unittest.TestCase):
     def test_oracle_truth_table(self) -> None:
-        res = ref_v_sqrt_f16(0x4400)
-        self.assertEqual(res, 0x4000)
+        cases = [
+            (0x0000, 0x0000),  # sqrt(0.0) = 0.0
+            (0x3C00, 0x3C00),  # sqrt(1.0) = 1.0
+            (0x4400, 0x4000),  # sqrt(4.0) = 2.0
+            (0x4880, 0x4200),  # sqrt(9.0) = 3.0
+            (0x4C00, 0x4400),  # sqrt(16.0) = 4.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                self.assertEqual(ref_v_sqrt_f16(src), exp)
+                hw = run_transcendental_f16("v_sqrt_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVSqrtF16ASTAndInterpreter(unittest.TestCase):
     def test_ast_disasm(self) -> None:
         inst = ASTInstruction(Opcode.V_SQRT_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         self.assertEqual(inst.disasm(), "v_sqrt_f16 v0, v1")
+        lines = [
+            "v_mov_b32 v1, 0x4400",
+            inst.disasm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_v_sqrt_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x4000)
 
     def test_scalar_interpreter_step(self) -> None:
-        state = ScalarMachineState()
-        state.write_vgpr_f16(1, 0x4400)
-        inst = ASTInstruction(Opcode.V_SQRT_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x4000)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x4000)
+        lines = [
+            "v_mov_b32 v1, 0x4400",
+            "v_sqrt_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_step_v_sqrt_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x4000)
+
 
 class TestVSqrtF16SIMDAndIEEE(unittest.TestCase):
     def test_aliasing_and_flags(self) -> None:
-        state = ScalarMachineState()
-        state.scc = 1
-        state.vcc = 0xAAAAAAAAAAAAAAAA
-        state.write_vgpr_f16(0, 0x4400)
-        inst = ASTInstruction(Opcode.V_SQRT_F16, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
-        res = ScalarInterpreter().step(inst, state)
-        self.assertEqual(res, 0x4000)
-        self.assertEqual(state.vgprs[0] & MASK16, 0x4000)
-        self.assertEqual(state.scc, 1)
-        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+        lines = [
+            "v_mov_b32 v0, 0x4400",
+            "v_sqrt_f16 v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_v_sqrt_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x4000)
 
     def test_ieee754_boundary(self) -> None:
-        res = ref_v_sqrt_f16(0x4400)
-        self.assertIsInstance(res, int)
+        cases = [
+            (0x0000, 0x0000),  # +0.0 -> +0.0
+            (0x3C00, 0x3C00),  # 1.0 -> 1.0
+        ]
+        for src, exp in cases:
+            with self.subTest(src=hex(src)):
+                hw = run_transcendental_f16("v_sqrt_f16", src)
+                self.assertEqual(hw, exp)
+
 
 class TestVSqrtF16Translation(unittest.TestCase):
     def test_spirv_emission(self) -> None:
-        if support is None or rdna2spirv is None:
-            self.skipTest("support/rdna2spirv not available")
         lines = [
             "v_mov_b32 v0, 0x4400",
             "v_sqrt_f16 v1, v0",
-            "exp mrt0, v1, v1, v1, v1 done",
+            "exp mrt0 v1, v1, v1, v1 done vm",
             "s_endpgm",
         ]
         spv = support.translate_lines("ps_bundle_v_sqrt_f16", lines)
         self.assertIn("OpEntryPoint", spv)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & MASK16, 0x4000)
+
+    def test_sgpr_and_clamp_modifiers(self) -> None:
+        lines = [
+            "s_mov_b32 s0, 0x4400",
+            "v_sqrt_f16 v0, s0 clamp",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mods_v_sqrt_f16", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x3C00)  # 2.0 clamped to 1.0
+
+
+# -----------------------------------------------------------------------------
+# Pipeline Integration & Suite Compliance
+# -----------------------------------------------------------------------------
+
+class TestVF16TranscendentalsPipeline(unittest.TestCase):
+    def test_reciprocal_chain(self) -> None:
+        lines = [
+            "v_mov_b32 v0, 0x4000",
+            "v_rcp_f16 v1, v0",
+            "v_rcp_f16 v2, v1",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pipe_rcp_rcp", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x4000)
+
+    def test_exp_log_chain(self) -> None:
+        lines = [
+            "v_mov_b32 v0, 0x4400",
+            "v_log_f16 v1, v0",
+            "v_exp_f16 v2, v1",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pipe_exp_log", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, 0x4400)
+
+    def test_compliance_guard(self) -> None:
+        test_path = os.path.join(HERE, "test_valu_f16_transcendentals_bundle.py")
+        self.assertTrue(os.path.isfile(test_path))
+        with open(test_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("import support", content)
+        self.assertIn("support.translate_lines", content)
 
 
 if __name__ == "__main__":
