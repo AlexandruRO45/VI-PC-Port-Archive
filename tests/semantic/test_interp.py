@@ -9,7 +9,7 @@ HEADER = """\
 OpCapability Shader
 %glsl = OpExtInstImport "GLSL.std.450"
 OpMemoryModel Logical GLSL450
-OpEntryPoint Fragment %main "main" %out
+OpEntryPoint Fragment %main "main" %out %vout
 %void = OpTypeVoid
 %fn = OpTypeFunction %void
 %uint = OpTypeInt 32 0
@@ -458,8 +458,9 @@ class InterpreterTests(unittest.TestCase):
                 self.assertEqual(memory[4096], after)
 
     def test_inputs_and_push_constants_can_be_seeded(self):
-        text = HEADER.replace('OpEntryPoint Fragment %main "main" %out',
-                              'OpEntryPoint Fragment %main "main" %out %in')
+        text = HEADER.replace('OpEntryPoint Fragment %main "main" %out %vout',
+                              'OpEntryPoint Fragment %main "main" %out %vout %in')
+        self.assertIn('OpEntryPoint Fragment %main "main" %out %vout %in', text)
         decls = ("%v4float = OpTypeVector %float 4\n"
                  "%_ptr_Input_v4 = OpTypePointer Input %v4float\n"
                  "%_ptr_Input_float = OpTypePointer Input %float\n"
