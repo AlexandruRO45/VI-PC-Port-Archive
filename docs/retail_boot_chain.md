@@ -111,7 +111,10 @@ python -I tools/d3d12_device_calls.py <game>/game_scarlett_master.exe --out <wor
 ```
 
 It writes `<exe>.device_calls.txt` (slot numbers and counts only) and `.json` (the same, plus each site's RVA for
-local follow-up; don't paste that part) into the `--out` folder. The method, in its docstring: it finds the
+local follow-up; don't paste that part) into the `--out` folder. It reads the executable only, so a slot called only
+from a bundled DLL is absent from it: slot 76, for one, isn't in the census, yet `docs/d3d12_vulkan.md` (the slot 76
+row of its contract table, and §4.2) records the FidelityFX upscaler DLL creating its resources through it. A slot
+missing from the census is not a slot the title never uses. The method, in its docstring: it finds the
 `D3D12XboxCreateDevice` call sites, follows the out-pointer in `r9` to the global or stack slot it fills and the
 globals the device is copied to, and counts per slot the `mov vtable,[device]` → `call [vtable+disp]` (or
 `call reg`, or a call to a dispatch routine with the method in `rax`) sites, with `disp / 8` as the slot. A
@@ -132,3 +135,15 @@ On the 1.0.2.1 executable it finds one `D3D12XboxCreateDevice` call site writing
 26 and 108 only, and 12 sites it reports as not resolved. Every device slot
 the chain above reached (8, 26, 48, 73, 133) is among them; slots like 49, 55, 57, 61, 70, 71, 74, 81, 86, 101,
 108, 119, 127 and 132 are called but have no name in this repository yet.
+
+For some of the unnamed slots there is a call shape from an independent static read with a different scanner, by
+@TreXito ([#7998](https://github.com/ItsNotRexed/Leonida/pull/7998#issuecomment-7109916450)), with the same site
+counts for 49, 50, 55, 57, 71 and 81. These are their reads, not this tool's:
+
+| Slot | What the call is (TreXito's read) |
+|---:|---|
+| 49 | Only behind an OS-version gate; no run reaches it today |
+| 50 | Only on a fatal path that ends in `int3` |
+| 55 | `CreateDerivedPipelineState(base, n, records, riid, out)`, on a PSO-cache hit (#7759) |
+| 57 | `(desc, IID_ID3D12PipelineState, out)`, the native-record graphics pipeline |
+| 81 | `(object, 0x11100, &count, out)`; the result is used only on success |
