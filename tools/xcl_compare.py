@@ -482,6 +482,9 @@ def main():
         ap.error("--timeout must be finite and greater than zero")
     if args.max_restarts < 0:
         ap.error("--max-restarts must be non-negative")
+    if args.out and os.path.isdir(args.out):
+        print(f"xcl_compare: error: --out is a folder, not a report file: {args.out}", file=sys.stderr)
+        return 2
     if sys.platform != "win32":
         raise SystemExit("Windows only: both runtimes run Windows executables")
     if args.gui:

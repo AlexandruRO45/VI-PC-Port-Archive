@@ -7,13 +7,16 @@ prints the test title's line format in place of a title.
 """
 import argparse
 import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOL = os.path.join(ROOT, "tools", "xcl_compare.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
 import xcl_compare as xc  # noqa: E402
 
 
@@ -183,6 +186,14 @@ class Restart(unittest.TestCase):
         self.assertEqual(attempts, [0, 1])
         self.assertEqual(run.checks["b"]["status"], "HANG")
         self.assertNotIn("c", run.checks)  # run_all marks it NOT RUN
+
+    def test_an_out_that_is_a_folder_is_refused_before_any_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run([sys.executable, "-I", TOOL, "--xcl", tmp, "--out", tmp],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--out is a folder", result.stderr)
+            self.assertNotIn("Windows only", result.stdout + result.stderr)  # refused before every other check
 
 
 class RestartTraces(unittest.TestCase):
