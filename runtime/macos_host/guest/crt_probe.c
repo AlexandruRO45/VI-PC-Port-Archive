@@ -72,5 +72,9 @@ int main(void) {
         GetFileInformationByHandleEx(self, FileStandardInfo, &small, 4) || GetLastError() != ERROR_BAD_LENGTH)
         return 17;
     CloseHandle(self);
+    wchar_t loc[LOCALE_NAME_MAX_LENGTH];
+    if (GetUserDefaultLocaleName(loc, LOCALE_NAME_MAX_LENGTH) != 6 || wcscmp(loc, L"en-US") ||
+        LocaleNameToLCID(loc, 0) != 0x409 || GetUserDefaultLocaleName(loc, 3) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return 18;
     return 0;
 }

@@ -1,6 +1,7 @@
 // The user32 subset a Vulkan guest needs for one window: a Cocoa window whose content view is backed by a
 // CAMetalLayer (vulkan.cpp turns the Win32 surface into a Metal surface on it), and a message pump that runs AppKit.
-// ponytail: no window procedure messages (WM_SIZE, input); closing the window posts WM_QUIT. Main thread only.
+// ponytail: no window procedure messages (WM_SIZE, input); closing the window posts WM_QUIT. AppKit only runs on the
+// process's main thread, so the guest runs on another one (run_main_loop) and every AppKit call is sent to it.
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
 
@@ -14,6 +15,11 @@ struct Window {
     CAMetalLayer* layer;
 };
 bool g_quit = false;
+
+void on_main(void (^block)()) {
+    if (pthread_main_np()) block();
+    else dispatch_sync(dispatch_get_main_queue(), block);
+}
 
 void start_app() {
     static bool started = false;
@@ -32,12 +38,13 @@ std::string narrow(const char16_t* s) {
 }
 
 uint16_t RegisterClassExW(const void*) { return 1; }  // the class only carries the window procedure, unused
-void* CreateWindowExW(uint32_t, const char16_t*, const char16_t* title, uint32_t, int32_t, int32_t, int32_t w,
-                      int32_t h, void*, void*, void*, void*) {
-    @autoreleasepool {
+uint16_t RegisterClassExA(const void*) { return 1; }
+void* create_window(const std::string& title, int32_t w, int32_t h) {
+    if (w <= 0 || w == INT32_MIN) w = 1280;  // CW_USEDEFAULT
+    if (h <= 0 || h == INT32_MIN) h = 720;
+    __block Window* made = nullptr;
+    on_main(^{ @autoreleasepool {
         start_app();
-        if (w <= 0 || w == INT32_MIN) w = 1280;  // CW_USEDEFAULT
-        if (h <= 0 || h == INT32_MIN) h = 720;
         // Win32 sizes are pixels; AppKit's are points, two pixels each on a Retina screen.
         CGFloat pts = [[NSScreen mainScreen] backingScaleFactor];
         NSWindow* win = [[NSWindow alloc] initWithContentRect:NSMakeRect(200, 200, w / pts, h / pts)
@@ -46,7 +53,7 @@ void* CreateWindowExW(uint32_t, const char16_t*, const char16_t* title, uint32_t
                                                       backing:NSBackingStoreBuffered
                                                         defer:NO];
         [win setReleasedWhenClosed:NO];
-        [win setTitle:[NSString stringWithUTF8String:narrow(title).c_str()]];
+        [win setTitle:[NSString stringWithUTF8String:title.c_str()]];
         CAMetalLayer* layer = [CAMetalLayer layer];
         layer.contentsScale = [win backingScaleFactor];
         layer.drawableSize = CGSizeMake(w, h);
@@ -57,16 +64,25 @@ void* CreateWindowExW(uint32_t, const char16_t*, const char16_t* title, uint32_t
                                                           object:win
                                                            queue:nil
                                                       usingBlock:^(NSNotification*) { g_quit = true; }];
-        return new Window{win, layer};
-    }
+        made = new Window{win, layer};
+    }});
+    return made;
+}
+void* CreateWindowExW(uint32_t, const char16_t*, const char16_t* title, uint32_t, int32_t, int32_t, int32_t w,
+                      int32_t h, void*, void*, void*, void*) {
+    return create_window(narrow(title), w, h);
+}
+void* CreateWindowExA(uint32_t, const char*, const char* title, uint32_t, int32_t, int32_t, int32_t w, int32_t h,
+                      void*, void*, void*, void*) {
+    return create_window(title ? title : "", w, h);
 }
 int ShowWindow(void* hwnd, int32_t) {
-    [static_cast<Window*>(hwnd)->window makeKeyAndOrderFront:nil];
+    on_main(^{ [static_cast<Window*>(hwnd)->window makeKeyAndOrderFront:nil]; });
     return 0;
 }
 int DestroyWindow(void* hwnd) {
     auto* w = static_cast<Window*>(hwnd);
-    [w->window orderOut:nil];
+    on_main(^{ [w->window orderOut:nil]; });
     return 1;
 }
 struct Msg {  // MSG
@@ -79,14 +95,14 @@ struct Msg {  // MSG
     uint32_t private_;
 };
 int PeekMessageW(Msg* msg, void*, uint32_t, uint32_t, uint32_t) {
-    @autoreleasepool {
+    on_main(^{ @autoreleasepool {
         start_app();
         while (NSEvent* e = [NSApp nextEventMatchingMask:NSEventMaskAny
                                                untilDate:[NSDate distantPast]
                                                   inMode:NSDefaultRunLoopMode
                                                  dequeue:YES])
             [NSApp sendEvent:e];
-    }
+    }});
     if (!g_quit) return 0;
     *msg = {};
     msg->message = 0x0012;  // WM_QUIT
@@ -96,6 +112,10 @@ void* LoadCursorW(void*, const char16_t*) { return reinterpret_cast<void*>(1); }
 int TranslateMessage(const Msg*) { return 0; }
 int64_t DispatchMessageW(const Msg*) { return 0; }
 int64_t DefWindowProcW(void*, uint32_t, uint64_t, int64_t) { return 0; }
+// The ANSI forms differ only in string arguments, which these never read.
+int PeekMessageA(Msg* msg, void* hwnd, uint32_t lo, uint32_t hi, uint32_t remove) { return PeekMessageW(msg, hwnd, lo, hi, remove); }
+int64_t DispatchMessageA(const Msg*) { return 0; }
+int64_t DefWindowProcA(void*, uint32_t, uint64_t, int64_t) { return 0; }
 int GetClientRect(void* hwnd, int32_t* rect) {
     CGSize px = static_cast<Window*>(hwnd)->layer.drawableSize;  // pixels, as Win32 counts
     rect[0] = rect[1] = 0;
@@ -113,18 +133,22 @@ int AdjustWindowRectEx(int32_t*, uint32_t, int, uint32_t) { return 1; }
 int32_t GetWindowLongW(void*, int32_t index) { return index == -16 ? 0x00CF0000 : 0; }  // GWL_STYLE: WS_OVERLAPPEDWINDOW
 int SetWindowPos(void* hwnd, void*, int32_t, int32_t, int32_t cx, int32_t cy, uint32_t flags) {
     auto* w = static_cast<Window*>(hwnd);
-    @autoreleasepool {
+    on_main(^{ @autoreleasepool {
         if (!(flags & 0x1)) {  // SWP_NOSIZE
             CGFloat scale = [w->window backingScaleFactor];
             [w->window setContentSize:NSMakeSize(cx / scale, cy / scale)];
             w->layer.drawableSize = CGSizeMake(cx, cy);
         }
         if (flags & 0x40) [w->window makeKeyAndOrderFront:nil];  // SWP_SHOWWINDOW
-    }
+    }});
     return 1;
 }
 int UpdateWindow(void*) { return 1; }
-int IsIconic(void* hwnd) { return [static_cast<Window*>(hwnd)->window isMiniaturized]; }
+int IsIconic(void* hwnd) {
+    __block int iconic = 0;
+    on_main(^{ iconic = [static_cast<Window*>(hwnd)->window isMiniaturized]; });
+    return iconic;
+}
 // ponytail: no foreground window, so tests skip reading the screen back through GDI (GetPixel) and DXGI outputs.
 void* GetForegroundWindow() { return nullptr; }
 void* GetProcessWindowStation() { return nullptr; }  // callers treat "unknown" as interactive
@@ -133,6 +157,12 @@ int GetMonitorInfoW(void*, void*) { return 0; }  // no monitor details: the SDR 
 
 }  // namespace
 
+// The main thread waits here for AppKit work from guest threads; the process ends when the guest exits.
+[[noreturn]] void run_main_loop() {
+    CFRunLoopAddTimer(CFRunLoopGetMain(), CFRunLoopTimerCreate(nullptr, 1e18, 0, 0, 0, nullptr, nullptr),
+                      kCFRunLoopCommonModes);  // a run loop with no source returns at once
+    for (;;) CFRunLoopRun();
+}
 void* metal_layer_for_window(void* hwnd) { return hwnd ? (__bridge void*)static_cast<Window*>(hwnd)->layer : nullptr; }
 
 #define U(name) EXPORT("user32.dll", name)
@@ -141,7 +171,8 @@ Exports user32_exports() {
             U(TranslateMessage), U(DispatchMessageW), U(DefWindowProcW), U(GetClientRect), U(LoadCursorW),
             U(RegisterClassW), U(UnregisterClassW), U(AdjustWindowRect), U(AdjustWindowRectEx), U(GetWindowLongW),
             U(SetWindowPos), U(UpdateWindow), U(IsIconic), U(GetForegroundWindow), U(GetProcessWindowStation),
-            U(MonitorFromWindow), U(GetMonitorInfoW)};
+            U(MonitorFromWindow), U(GetMonitorInfoW), U(RegisterClassExA), U(CreateWindowExA), U(PeekMessageA),
+            U(DispatchMessageA), U(DefWindowProcA)};
 }
 
 }  // namespace host

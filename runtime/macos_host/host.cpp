@@ -106,6 +106,7 @@ namespace {
 bool starts(const std::string& s, const char* p) { return s.compare(0, std::strlen(p), p) == 0; }
 std::vector<std::string> api_set_hosts(const std::string& dll) {
     if (starts(dll, "api-ms-win-core-") || dll == "kernelbase.dll") return {"kernel32.dll"};
+    if (starts(dll, "ext-ms-win-rtcore-ntuser-")) return {"user32.dll"};
     if (!starts(dll, "api-ms-win-crt-") && dll != "ucrtbase.dll") return {};
     std::vector<std::string> crt;
     for (auto it = g_exports.lower_bound("api-ms-win-crt-"); it != g_exports.end() && starts(it->first, "api-ms-win-crt-");
@@ -645,9 +646,17 @@ int main(int argc, char** argv) {
     g_image = exe->base;
     auto entry = reinterpret_cast<void(MSABI*)()>(exe->entry);
     std::memcpy(g_peb + 0x10, &g_image, sizeof g_image);  // PEB.ImageBaseAddress
-    uint8_t* teb = make_teb();
-    attach_thread(teb, 1 /* DLL_PROCESS_ATTACH */);
-    call_guest(entry);
-    std::fprintf(stderr, "host: entry point returned\n");
-    return 0;
+    pthread_attr_t attr;  // ponytail: 64 MB reserve for the guest's main thread, not the image's SizeOfStackReserve
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, size_t{64} << 20);
+    pthread_t guest;
+    auto guest_main = [](void* fn) -> void* {
+        uint8_t* teb = make_teb();
+        attach_thread(teb, 1 /* DLL_PROCESS_ATTACH */);
+        call_guest(reinterpret_cast<void(MSABI*)()>(fn));
+        std::fprintf(stderr, "host: entry point returned\n");
+        std::exit(0);
+    };
+    if (pthread_create(&guest, &attr, guest_main, reinterpret_cast<void*>(entry)) != 0) fail("cannot start the guest");
+    run_main_loop();  // AppKit needs the process's main thread
 }

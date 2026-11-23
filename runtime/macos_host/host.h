@@ -123,6 +123,7 @@ Exports crt_exports();
 Exports eh_exports();
 Exports vulkan_exports();
 Exports user32_exports();
+[[noreturn]] void run_main_loop();
 Exports kernel32_crt_exports();
 Exports kernel32_file_exports();
 Exports d3d12_serialize_exports();

@@ -545,6 +545,13 @@ int32_t CompareStringOrdinal(const char16_t* a, int32_t na, const char16_t* b, i
     return compare(ignore_case ? 1 : 0, a, na, b, nb);
 }
 uint32_t GetUserDefaultLCID() { return 0x409; }
+int32_t GetUserDefaultLocaleName(char16_t* name, int32_t count) {  // ponytail: always en-US, like GetUserDefaultLCID
+    static const char16_t en_us[] = u"en-US";
+    if (count < 6) return set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */), 0;
+    std::memcpy(name, en_us, sizeof en_us);
+    return 6;
+}
+uint32_t LocaleNameToLCID(const char16_t*, uint32_t) { return 0x409; }
 int IsValidLocale(uint32_t, uint32_t) { return 1; }
 
 // ---- process environment ---------------------------------------------------------------------------------------
@@ -802,7 +809,7 @@ Exports kernel32_crt_exports() {
         K(GetSystemInfo), K(GetNativeSystemInfo), K(GetCurrentProcessorNumber), K(FlushProcessWriteBuffers),
         K(GetCurrentThread), K(DuplicateHandle), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventA), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
         K(SetEvent), K(ResetEvent), K(AreFileApisANSI), K(FormatMessageA), K(LocalFree), K(GetTempPathW),
-        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), EXPORT_AS("gameinput.dll", "#1", GameInputCreate), K(CreateMutexA), K(ReleaseMutex), K(InitializeCriticalSection), EXPORT_AS("kernel32.dll", "SetThreadPriority", set_ok), EXPORT_AS("kernel32.dll", "SetProcessPriorityBoost", set_ok), EXPORT_AS("kernel32.dll", "GetThreadPriority", thread_priority), EXPORT_AS("kernel32.dll", "ResumeThread", resume_thread), EXPORT_AS("kernel32.dll", "SuspendThread", suspend_thread), K(GetThreadGroupAffinity), K(SetThreadGroupAffinity), K(GetProcessId), K(OpenProcess), K(OpenThread), K(GetUserDefaultGeoName), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "RegisterAppStateChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "UnregisterAppStateChangeNotification", unregister_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "RegisterAppConstrainedChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "UnregisterAppConstrainedChangeNotification", unregister_app_notification), EXPORT_AS("msvcp140.dll", "?_Random_device@std@@YAIXZ", random_device), EXPORT("gameinput.dll", GameInputCreate), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(WaitForMultipleObjects), K(ExitThread), K(FreeLibraryAndExitThread),
+        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), EXPORT_AS("gameinput.dll", "#1", GameInputCreate), K(CreateMutexA), K(ReleaseMutex), K(InitializeCriticalSection), EXPORT_AS("kernel32.dll", "SetThreadPriority", set_ok), EXPORT_AS("kernel32.dll", "SetProcessPriorityBoost", set_ok), EXPORT_AS("kernel32.dll", "GetThreadPriority", thread_priority), EXPORT_AS("kernel32.dll", "ResumeThread", resume_thread), EXPORT_AS("kernel32.dll", "SuspendThread", suspend_thread), K(GetThreadGroupAffinity), K(SetThreadGroupAffinity), K(GetProcessId), K(OpenProcess), K(OpenThread), K(GetUserDefaultGeoName), K(GetUserDefaultLocaleName), K(LocaleNameToLCID), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "RegisterAppStateChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "UnregisterAppStateChangeNotification", unregister_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "RegisterAppConstrainedChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "UnregisterAppConstrainedChangeNotification", unregister_app_notification), EXPORT_AS("msvcp140.dll", "?_Random_device@std@@YAIXZ", random_device), EXPORT("gameinput.dll", GameInputCreate), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(WaitForMultipleObjects), K(ExitThread), K(FreeLibraryAndExitThread),
         K(GetExitCodeThread), EXPORT("advapi32.dll", OpenProcessToken), EXPORT("advapi32.dll", OpenThreadToken), K(DecodePointer),
     };
 }
