@@ -721,7 +721,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             p = pointers[a[1]]
             if p[0] == "pc":
                 w = p[1] // 4
-                values[res] = push_constants[w] if 0 <= w < len(push_constants) else 0
+                word = push_constants[w] if 0 <= w < len(push_constants) else 0
+                # OpLoad's result type is the type of the loaded object, including for PushConstant words.
+                values[res] = bits_f32(word) if types.t.get(a[0]) == ("float", 32) else word
             elif p[0] == "psb":
                 if types.t[a[0]][:2] != ("int", 32):
                     raise UnsupportedConstruct("PhysicalStorageBuffer load of a type that is not a 32-bit integer")

@@ -54,6 +54,7 @@ OpEntryPoint Fragment %main "main" %out
 %_ptr_PC = OpTypePointer PushConstant %ud
 %pc = OpVariable %_ptr_PC PushConstant
 %_ptr_PC_uint = OpTypePointer PushConstant %uint
+%_ptr_PC_float = OpTypePointer PushConstant %float
 %main = OpFunction %void None %fn
 %entry = OpLabel
 """
@@ -131,6 +132,17 @@ class InterpreterTests(unittest.TestCase):
                  "%lo = OpCompositeConstruct %v2uint %c1 %c2\n"
                  "%hi = OpCompositeConstruct %v2uint %c7 %c3\n")
         self.assertEqual(vector_words(clamp, "%r = OpExtInst %v2uint %glsl UClamp %x %lo %hi\n"), (5, 2))
+
+    def test_float_push_constant_load_is_typed(self):
+        # OpLoad's result type is the type of the loaded object: a %float PushConstant member is a float.
+        # Multiplication by two makes the test fail if the load is merely returned as the raw 1.0f word.
+        text = HEADER.replace("%ud = OpTypeStruct %uint", "%ud = OpTypeStruct %float")
+        body = ("%p = OpAccessChain %_ptr_PC_float %pc %c0\n"
+                "%x = OpLoad %float %p\n"
+                "%y = OpFMul %float %x %f2\n"
+                "%res = OpBitcast %uint %y\n")
+        out = si.run_fragment(text + body + "OpStore %out %res\n" + FOOTER, push_constants=[0x3F800000])
+        self.assertEqual(out["%out"], (0x40000000,))
 
     def test_integer_ops_wrap(self):
         self.assertEqual(run_word("%res = OpIAdd %uint %cFF %c2\n"), 1)
