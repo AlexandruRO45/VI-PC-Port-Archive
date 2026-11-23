@@ -84,7 +84,7 @@ def main():
     if bc_bpe(a.fmt) is None:
         ap.error(f"no color scorer for {a.fmt!r}; expected BC1, BC2, or BC3")
     try:
-        with open(a.index, encoding="utf-8") as f:
+        with open(a.index, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (OSError, ValueError) as error:
         ap.error(f"cannot read texture index {a.index}: {error}")

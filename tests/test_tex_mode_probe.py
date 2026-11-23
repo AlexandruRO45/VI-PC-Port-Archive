@@ -895,6 +895,20 @@ class TestTextureModeProbing(unittest.TestCase):
             self.assertEqual(len(lines), 1)
             self.assertIn("probed 1 of 1 textures; 0 skipped", output)
 
+    def test_probe_reads_utf8_bom_index(self):
+        with tempfile.TemporaryDirectory() as td:
+            index_file = os.path.join(td, "textures_index.json")
+            with open(index_file, "w", encoding="utf-8-sig") as f:
+                json.dump([], f)
+
+            with mock.patch.object(tex_mode_probe, "load", return_value=(self.nib, self.tab)), \
+                 mock.patch.object(sys, "argv", ["tex_mode_probe.py", index_file, td, "--fmt", "BC1"]), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+                tex_mode_probe.main()
+
+            output = mock_stdout.getvalue()
+            self.assertEqual(output.strip(), "winners: []\nprobed 0 of 0 textures; 0 skipped")
+
 
 # Maintain compatibility with pytest parameterised runners:
 if pytest is not None:
