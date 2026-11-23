@@ -247,8 +247,16 @@ def main(argv=None) -> int:
             ap.error(f"{args.out} is a directory, not a JSON file")
         if not os.path.isdir(os.path.dirname(os.path.abspath(args.out))):
             ap.error(f"output directory does not exist: {os.path.dirname(os.path.abspath(args.out))}")
-        if os.path.exists(args.out) and any(os.path.samefile(args.out, p) for p in scanned_paths(args.src)):
-            ap.error("output must not overwrite a listing it scans")
+        # the scan reads each listing's FSSM wave-size header too (scan_directory -> rdna2spirv.native_paths),
+        # so the guard must cover those as well, as wave64_graphics_scan.py's does
+        listings = scanned_paths(args.src)
+        metadata = [rdna2spirv.native_paths(p, os.path.splitext(os.path.basename(p))[0])[0] for p in listings]
+        try:
+            if os.path.exists(args.out) and any(os.path.samefile(args.out, p) for p in [*listings, *metadata]
+                                                if os.path.isfile(p)):
+                ap.error("output must not overwrite a listing or FSSM header it scans")
+        except OSError:
+            pass
     r = scan_directory(args.src)
     print("ps: %d shaders, %d wave32; %d with a lane-crossing or width-dependent instruction, %d with quad ops only"
           % (r["ps"], r["ps_wave32"], r["crossing"], r["quad_only"]))
