@@ -1418,6 +1418,9 @@ been done for it yet**.
 Exit codes are 0 for no unexpected
 mismatch, 1 for a mismatch (with instruction-removal shrinking), 2 for CLI/harness errors and 77 for unavailable
 oracles. Skips always include a reason.
+Unexpected translator or comparison-path interpreter exceptions are harness errors, including invalid SPIR-V
+and failures while shrinking a mismatch. They exit 2 instead of being counted as unsupported cases. The explicit
+binary64 interpreter limitations above remain counted skips.
 
 ```
 python -I tools/f64_diff.py --programs 300 --seed 1

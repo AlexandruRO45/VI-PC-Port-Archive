@@ -645,7 +645,9 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
         return ("match", "", expected, actual) if equivalent(expected, actual, output_kind(lines)) else ("mismatch", "word comparison", expected, actual)
     try: actual = run_gpu(lines, name, tmp, gpu) if oracle == "gpu" else translate(lines, name, tmp)
     except (rdna2spirv.Unsupported, UnsupportedConstruct, SkipCase) as exc: return "skip", f"{type(exc).__name__}: {exc}", expected, None
-    except (IndexError, KeyError, ValueError, OverflowError) as exc: return "skip", f"translator/interpreter limitation: {type(exc).__name__}: {exc}", expected, None
+    except (GPUUnavailable, HarnessError): raise
+    except Exception as exc:
+        raise HarnessError(f"{name}: {type(exc).__name__}: {exc}") from exc
     return ("match", "", expected, actual) if equivalent(expected, actual, output_kind(lines)) else ("mismatch", "word comparison", expected, actual)
 
 
@@ -661,7 +663,7 @@ def shrink(lines, expected, oracle="translator", gpu=None, gpu_ctx=None, tmpdir=
                 if status == "mismatch":
                     current[:] = trial
                     continue
-            except GPUUnavailable:
+            except (GPUUnavailable, HarnessError):
                 raise
             except Exception:
                 pass
