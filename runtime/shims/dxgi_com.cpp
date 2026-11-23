@@ -124,8 +124,7 @@ public:
         : parent_(parent),
           device_(device),
           context_(context),
-          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex(),
-                     context.queue_host_mutex(queue)) {
+          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context) {
         if (parent_) parent_->AddRef();
         if (device_) device_->AddRef();
     }

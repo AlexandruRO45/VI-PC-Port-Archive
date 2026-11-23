@@ -1258,6 +1258,33 @@ public:
         return *entry;
     }
 
+    // vkDeviceWaitIdle requires exclusive HOST access to *every* queue in the device. It cannot
+    // safely run under submit_mutex_ now that a blocked vkQueueWaitIdle owns a queue-local lock:
+    // the device-wide wait could overlap that call, or hold the global lock and stop a different
+    // queue from submitting the signal needed to release it. Instead wait each queue this context
+    // has used, under only that queue's host mutex, releasing the lock before moving to the next.
+    // The queue registry owns stable mutex addresses until the context is destroyed. Callers which
+    // retire descriptor generations hold tracker_mutex_ while waiting, so no newly prepared draw
+    // can race that retirement; fence signals on an independent queue remain free to progress.
+    bool wait_managed_queues_idle() {
+        std::vector<std::pair<VkQueue, std::mutex*>> queues;
+        {
+            std::lock_guard lock(queue_host_mutexes_mutex_);
+            queues.reserve(queue_host_mutexes_.size());
+            for (auto& [queue, mutex] : queue_host_mutexes_)
+                queues.emplace_back(queue, mutex.get());
+        }
+        for (const auto& [queue, mutex] : queues) {
+            std::lock_guard lock(*mutex);
+            const VkResult result = vk.vkQueueWaitIdle(queue);
+            if (result != VK_SUCCESS) {
+                if (result == VK_ERROR_DEVICE_LOST) mark_device_lost();
+                return false;
+            }
+        }
+        return true;
+    }
+
     void mark_device_lost() noexcept {
         device_lost_.store(true, std::memory_order_release);
         if (fence_dispatcher_) {

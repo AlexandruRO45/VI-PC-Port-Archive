@@ -40,7 +40,6 @@ struct SwapchainFunctions {
     PFN_vkDestroyFence destroy_fence = nullptr;
     PFN_vkWaitForFences wait_for_fences = nullptr;
     PFN_vkResetFences reset_fences = nullptr;
-    PFN_vkDeviceWaitIdle device_wait_idle = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties mem_props = nullptr;
     PFN_vkCreateImage create_image = nullptr;
     PFN_vkDestroyImage destroy_image = nullptr;
@@ -77,7 +76,6 @@ struct SwapchainFunctions {
         LOAD_D(destroy_fence, vkDestroyFence);
         LOAD_D(wait_for_fences, vkWaitForFences);
         LOAD_D(reset_fences, vkResetFences);
-        LOAD_D(device_wait_idle, vkDeviceWaitIdle);
         LOAD_D(create_image, vkCreateImage);
         LOAD_D(destroy_image, vkDestroyImage);
         LOAD_D(image_mem_req, vkGetImageMemoryRequirements);
@@ -97,7 +95,7 @@ struct SwapchainFunctions {
 #undef LOAD_D
         return create_win32_surface && destroy_surface && surface_support && surface_caps && surface_formats &&
                mem_props && create_swapchain && destroy_swapchain && get_images && acquire_next_image &&
-               queue_present && create_fence && destroy_fence && wait_for_fences && reset_fences && device_wait_idle &&
+               queue_present && create_fence && destroy_fence && wait_for_fences && reset_fences &&
                create_image && destroy_image && image_mem_req && alloc_mem && free_mem && bind_image_mem &&
                create_cmd_pool && destroy_cmd_pool && alloc_cmd_bufs && reset_cmd_buf && begin_cmd_buf &&
                end_cmd_buf && cmd_barrier && cmd_blit && queue_submit;
@@ -108,9 +106,9 @@ class VulkanSwapchain {
 public:
     VulkanSwapchain(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                     PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkQueue queue, std::uint32_t queue_family,
-                    std::mutex& submit_mutex, std::mutex& queue_host_mutex)
+                    VulkanContext& context)
         : instance_(instance), physical_(physical), device_(device), queue_(queue), queue_family_(queue_family),
-          submit_mutex_(submit_mutex), queue_host_mutex_(queue_host_mutex) {
+          context_(context), submit_mutex_(context.submit_mutex()), queue_host_mutex_(context.queue_host_mutex(queue)) {
         loaded_ = fn_.load(gipa, instance, gdpa, device);
         if (loaded_) {
             VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -160,10 +158,7 @@ public:
     bool resize(std::uint32_t width, std::uint32_t height, VkFormat preferred_format = VK_FORMAT_UNDEFINED,
                 std::uint32_t buffer_count = 0, bool allow_tearing = false) {
         if (!loaded_ || !surface_) return false;
-        {
-            std::lock_guard lock(submit_mutex_);
-            fn_.device_wait_idle(device_);
-        }
+        if (!context_.wait_managed_queues_idle()) return false;
         allow_tearing_ = allow_tearing;
         const VkFormat fmt = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : format_;
         const std::uint32_t count = buffer_count ? buffer_count : static_cast<std::uint32_t>(images_.size());
@@ -273,8 +268,9 @@ private:
 
     void destroy_swapchain() {
         if (swapchain_ || !offscreen_images_.empty()) {
-            std::lock_guard lock(submit_mutex_);
-            fn_.device_wait_idle(device_);
+            // As before, release handles even when the device is lost: a failed queue idle
+            // cannot leave the native swapchain and offscreen allocations leaked at teardown.
+            context_.wait_managed_queues_idle();
             destroy_offscreen();
             if (swapchain_) {
                 fn_.destroy_swapchain(device_, swapchain_, nullptr);
@@ -554,6 +550,7 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     std::uint32_t queue_family_ = 0;
+    VulkanContext& context_;
     std::mutex& submit_mutex_;
     std::mutex& queue_host_mutex_;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;

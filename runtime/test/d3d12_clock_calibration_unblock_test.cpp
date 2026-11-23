@@ -24,14 +24,17 @@ struct Hook {
     PFN_vkGetDeviceProcAddr original_device = nullptr;
     PFN_vkQueueWaitIdle original_idle = nullptr;
     PFN_vkQueueSubmit original_submit = nullptr;
+    PFN_vkDeviceWaitIdle original_device_idle = nullptr;
     VkQueue queue1 = VK_NULL_HANDLE;
     VkQueue queue2 = VK_NULL_HANDLE;
     std::atomic<bool> armed{false}, parked{false}, saw_q2{false}, timed_out{false};
-    std::atomic<unsigned> q2_calls{0};
+    std::atomic<unsigned> q2_calls{0}, q1_idle_calls{0};
+    std::atomic<unsigned> device_idle_calls{0}, device_idle_during_calibration{0};
 };
 Hook injected;
 
 VKAPI_ATTR VkResult VKAPI_CALL hooked_idle(VkQueue queue) {
+    if (queue == injected.queue1) ++injected.q1_idle_calls;
     if (queue == injected.queue1 && injected.armed.exchange(false)) {
         injected.parked.store(true);
         const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
@@ -48,11 +51,25 @@ VKAPI_ATTR VkResult VKAPI_CALL hooked_submit(VkQueue queue, std::uint32_t n, con
     return injected.original_submit(queue, n, info, fence);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL hooked_device_idle(VkDevice device) {
+    ++injected.device_idle_calls;
+    if (injected.parked.load()) {
+        // The old bindless flush reaches vkDeviceWaitIdle while another thread owns Q1's host
+        // mutex in vkQueueWaitIdle. Calling a real ICD here violates Vulkan external sync, so
+        // report the unsafe attempt WITHOUT touching the driver. The test must still fail.
+        ++injected.device_idle_during_calibration;
+        return VK_SUCCESS;
+    }
+    return injected.original_device_idle(device);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hooked_get_device(VkDevice device, const char* name) {
     if (std::strcmp(name, "vkQueueWaitIdle") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(hooked_idle);
     if (std::strcmp(name, "vkQueueSubmit") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(hooked_submit);
+    if (std::strcmp(name, "vkDeviceWaitIdle") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(hooked_device_idle);
     return injected.original_device(device, name);
 }
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hooked_get_instance(VkInstance instance, const char* name) {
@@ -110,14 +127,17 @@ int main(int argc, char** argv) {
     injected.original_device=vk.device_proc;
     injected.original_idle=vk.fn<PFN_vkQueueWaitIdle>("vkQueueWaitIdle");
     injected.original_submit=vk.fn<PFN_vkQueueSubmit>("vkQueueSubmit");
+    injected.original_device_idle=vk.fn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle");
     injected.queue1=vk.queues[0]; injected.queue2=vk.queues[1];
-    REQUIRE(injected.original_idle && injected.original_submit);
+    REQUIRE(injected.original_idle && injected.original_submit && injected.original_device_idle);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc=hooked_get_instance;
         info.instance=vk.instance; info.physical=vk.physical; info.device=vk.device;
         info.queue=vk.queue; info.queue_family=vk.family;
         info.command_queues=vk.queues;
+        info.bindless = vk.bindless;
+        info.bindless_partially_bound = vk.partially_bound;
         Ref<ID3D12Device> device;
         REQUIRE(SUCCEEDED(rt::d3d12::create_vulkan_device(info,IID_PPV_ARGS(&device.p))));
         D3D12_COMMAND_QUEUE_DESC desc{};
@@ -144,6 +164,76 @@ int main(int argc, char** argv) {
         std::printf("calibration fallback: independent Q2 submit after %ld ms; watchdog=%d, validation=%u\n",
                     elapsed,int(injected.timed_out.load()),vk.validation_errors());
         REQUIRE(!injected.timed_out.load() && elapsed<600 && injected.q2_calls==1 && vk.validation_errors()==0);
+
+        if (vk.bindless) {
+            // The first submission uploads the initial bindless descriptor table. Inserting
+            // sufficiently many distinct S# keys afterwards forces its hash table to grow;
+            // the next execution must retire the old buffer while Q1 is calibrated.
+            Ref<ID3D12CommandAllocator> allocator;
+            Ref<ID3D12GraphicsCommandList> list;
+            Ref<ID3D12DescriptorHeap> sampler_heap;
+            REQUIRE(SUCCEEDED(device.p->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                              IID_PPV_ARGS(&allocator.p))));
+            REQUIRE(SUCCEEDED(device.p->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.p,
+                                                          nullptr,IID_PPV_ARGS(&list.p))));
+            REQUIRE(SUCCEEDED(list.p->Close()));
+            ID3D12CommandList* lists[]{list.p};
+            q2.p->ExecuteCommandLists(1,lists);  // first bindless table upload
+            REQUIRE(SUCCEEDED(q2.p->Signal(fence.p,2)) && reaches(fence.p,2));
+
+            D3D12_DESCRIPTOR_HEAP_DESC heap{};
+            heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            heap.NumDescriptors=144;
+            REQUIRE(SUCCEEDED(device.p->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&sampler_heap.p))));
+            const auto start=sampler_heap.p->GetCPUDescriptorHandleForHeapStart();
+            const UINT stride=device.p->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+            for(UINT i=0;i<128;++i) {
+                D3D12_SAMPLER_DESC s{};
+                s.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+                s.AddressU=s.AddressV=s.AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+                s.MipLODBias=float(i)/16.0f;
+                s.MaxAnisotropy=1;
+                s.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;
+                s.MaxLOD=D3D12_FLOAT32_MAX;
+                device.p->CreateSampler(&s,{start.ptr+SIZE_T(i)*stride});
+            }
+            injected.parked.store(false);
+            injected.saw_q2.store(false);
+            injected.timed_out.store(false);
+            injected.armed.store(true);
+            injected.device_idle_calls.store(0);
+            injected.device_idle_during_calibration.store(0);
+            injected.q1_idle_calls.store(0);
+            std::atomic<HRESULT> calibration2{E_PENDING};
+            std::thread calibration_thread([&] {
+                UINT64 gpu=0,cpu=0;
+                calibration2.store(q1.p->GetClockCalibration(&gpu,&cpu));
+            });
+            const auto parked_until=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+            while(!injected.parked.load() && std::chrono::steady_clock::now()<parked_until)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const bool park_seen=injected.parked.load();
+            std::thread flush_thread([&] {
+                // Empty list still runs the real device's bindless_prepare callback.
+                q2.p->ExecuteCommandLists(1,lists);
+            });
+            // An artificial gate, not a driver signal: the first phase above already verifies
+            // independent Q2 progress. Release the parked Q1 host call safely in both builds.
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            injected.saw_q2.store(true);
+            calibration_thread.join();
+            flush_thread.join();
+            const HRESULT released=q2.p->Signal(fence.p,3);
+            const unsigned violations=injected.device_idle_during_calibration.load();
+            const unsigned idles=injected.q1_idle_calls.load();
+            std::printf("bindless flush + calibration: parked=%d, global idle overlap=%u, Q1 queue idles=%u, watchdog=%d, validation=%u\n",
+                        int(park_seen),violations,idles,int(injected.timed_out.load()),vk.validation_errors());
+            REQUIRE(park_seen && !injected.timed_out.load() && SUCCEEDED(calibration2.load()) &&
+                    SUCCEEDED(released) && reaches(fence.p,3) && violations==0 && idles>=3 &&
+                    vk.validation_errors()==0);
+        } else {
+            std::puts("SKIP bindless flush race: no descriptor-indexing features on this Vulkan device");
+        }
     }
     return 0;
 }

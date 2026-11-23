@@ -4281,10 +4281,7 @@ public:
             if (state_.bindless->flush_needs_idle()) {
                 // Entries a running shader probes are about to change, or binding 2 is about to name a new buffer:
                 // wait until nothing that uses the set still runs, then free the generations that were retired.
-                {
-                    std::lock_guard submit(state_.context->submit_mutex());
-                    state_.context->vk.vkDeviceWaitIdle(state_.info.device);
-                }
+                if (!state_.context->wait_managed_queues_idle()) return false;
                 state_.bindless->release_retired();
             }
             return state_.bindless->flush(command_buffer);
@@ -4358,10 +4355,7 @@ public:
 
     ~Device() override {
         if (state_.context) {
-            {
-                std::lock_guard lock(state_.context->submit_mutex());
-                state_.context->vk.vkDeviceWaitIdle(state_.info.device);
-            }
+            state_.context->wait_managed_queues_idle();
             state_.context->drain_deleted_resources(UINT64_MAX);
             state_.context->set_bindless_release(nullptr, nullptr);
         }
