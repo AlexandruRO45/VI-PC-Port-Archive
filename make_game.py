@@ -2279,8 +2279,11 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         if not os.path.exists(os.path.join(out, os.path.basename(built))) or \
                 not os.path.samefile(built, os.path.join(out, os.path.basename(built))):
             shutil.copy2(built, out)
-    with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
-        f.write(os.path.abspath(game))
+    game_dir = os.path.abspath(game)
+    # The Wine launcher passes this path to the host shell's cd.
+    encoded_game = game_dir.encode("utf-8") if os.name == "nt" else os.fsencode(game_dir)
+    with open(os.path.join(out, "game_path.txt"), "wb") as f:
+        f.write(encoded_game)
     if work is not None:
         shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
         # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
