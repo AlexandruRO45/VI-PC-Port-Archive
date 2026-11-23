@@ -882,9 +882,11 @@ class NegativeControls(unittest.TestCase):
 
         # 3. Making the destination EXEC mask all ones (the write after the shuffle) overwrites inactive quads.
         at = spv.index("OpGroupNonUniformShuffle %uint %c3")
+        # the select on this lane's EXEC bit; one load of %active may serve several selects in a block
+        active = "|".join(re.findall(r"(%\w+) = OpLoad %bool %active\b", spv))
         tail, n3 = re.subn(
-            r"(%\w+) = OpLoad %bool %active\n(\s*)(%\w+) = OpSelect %uint \1 %cffffffff %c0\b",
-            r"\1 = OpLoad %bool %active\n\2\3 = OpCopyObject %uint %cffffffff",
+            rf"(%\w+) = OpSelect %uint (?:{active}) %cffffffff %c0\b",
+            r"\1 = OpCopyObject %uint %cffffffff",
             spv[at:],
             count=1,
         )

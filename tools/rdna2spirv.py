@@ -443,7 +443,8 @@ class Gen:
             self.sgpr_imm.pop(r, None)
             self.x_tok[("sgpr", r)] = val
             if self.desc_cache:          # every write to the %sgpr array comes through here (see desc_lookup_sgpr)
-                self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
+                for k in [k for k in self.desc_cache if k[0] <= r < k[0] + k[1]]:
+                    del self.desc_cache[k]
         p = self.reg_ptr(kind, r)
         self.emit(f"OpStore {p} {val}")
 
