@@ -29,7 +29,7 @@ class ModuleFeatureGateTest(unittest.TestCase):
         self.assertTrue(create, "expected the worker's Vulkan module creation call")
         self.assertRegex(before_create,
                          r"check_missing_module_feature\(meta\); !miss\.empty\(\)\) \{\s*"
-                         r"(?://[^\n]*\s+)?record_skip\(name, stage, miss\);\s*\+\+done;\s*continue;")
+                         r"(?://[^\n]*\s+)?record_skip\(name, stage, miss\);\s*complete_module\(k\);\s*continue;")
 
 
 def find_binary():
