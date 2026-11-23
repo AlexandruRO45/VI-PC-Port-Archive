@@ -12,6 +12,7 @@ so it should rank first; pass its RVA to `gta6rt --archetype-lookup`.
 
 Standard library only. No game data is written: the report holds RVAs and counts.
 A `--json` path that is a folder, aliases the input image, or cannot be written is one `ERROR:` line with exit 2.
+Usage: `python -I tools/find_hash_lookup.py --help` lists the options.
 """
 import argparse
 import json
