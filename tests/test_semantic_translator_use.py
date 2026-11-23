@@ -38,48 +38,21 @@ ALLOWLIST = {
     "test_alu_ldexp.py": "hand-written SPIR-V run by spirv_mini_interp.py; no translator output",
 }
 
-# Debt from before this guard: files that model the answer instead of running the translator.  They are
-# expected to be replaced, so an entry here never has to be kept in step with another PR: fixing the file,
-# or deleting it, simply removes it from the debt.  Do not move a file here to silence the guard.
+# Debt from before this guard: files that model the answer instead of running the translator. When a file is
+# converted to call the translator, or deleted, its entry is removed from DEBT in the same change.
+# Do not add new files here; write a translator-backed test instead.
 DEBT = {
-    "test_valu_div_fixup.py": "private oracle whose rules RDNA2 disagrees with; TEST-545 replaces it",
-    "test_alu_cndmask_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_int_to_float.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_lds_add_sub_src2_u32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_salu_add_sub_co_u32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_salu_and_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_salu_andn2_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_salu_nand_nor_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_salu_or_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_salu_orn2_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_salu_xnor_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_salu_xor_saveexec_b64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_alignbyte_b32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_cvt_f32_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_dot4_int.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_dot8_int.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
+    "test_valu_div_fixup.py": "private oracle whose rules RDNA2 disagrees with; TEST-545 replaces it",
     "test_valu_fma_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_fract_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_fract_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_frexp_exp_i32_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_frexp_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_frexp_mant_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_lerp_u8.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_minmax_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_mul_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_mul_hi.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_pack_b32_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_perm_b32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_pk_add_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_pk_fma_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_pk_minmax_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_pk_mul_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_rcp_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_rcp_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_rsq_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_rsq_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_sad_u32.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
-    "test_valu_sqrt_f16.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_sqrt_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
     "test_valu_trig_f64.py": "private oracle merged before this guard (2026-11-22); should translate a listing",
 }
@@ -205,6 +178,15 @@ class TranslatorUseTests(unittest.TestCase):
             self.assertTrue(why.strip(), f"ALLOWLIST entry {name} has no reason")
             self.assertFalse(_reaches(path, set(), SEMANTIC),
                              f"{name} now reaches rdna2spirv; remove its ALLOWLIST entry")
+
+    def test_debt_entries_are_real_and_still_needed(self):
+        """A stale entry would mask that a file now calls the translator, or hide a deleted file."""
+        for name, why in DEBT.items():
+            path = os.path.join(SEMANTIC, name)
+            self.assertTrue(os.path.isfile(path), f"DEBT names a missing file: {name}")
+            self.assertTrue(why.strip(), f"DEBT entry {name} has no reason")
+            self.assertFalse(_reaches(path, set(), SEMANTIC),
+                             f"{name} now reaches rdna2spirv; remove its DEBT entry")
 
     def test_detector_on_a_synthetic_tree(self):
         """A guard that accepts everything cannot pass: check direct, helper, process and silent files."""
