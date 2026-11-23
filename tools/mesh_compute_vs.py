@@ -124,8 +124,13 @@ def vs_spvasm(layout, f16_halves=None):
         f"%ahis = OpShiftLeftLogical %ulong %ahi64 {cl(32)}", "%addr = OpBitwiseOr %ulong %ahis %alo64",
         "%wg64 = OpUConvert %ulong %wg", f"%soff = OpIMul %ulong %wg64 {cl(lay['slot_bytes'])}",
         "%slot = OpIAdd %ulong %addr %soff"]
+    vcount = load_word("%slot", 0)
     pcount = load_word("%slot", 4)
-    body += [f"%inrange = OpULessThan %bool %prim {pcount}",
+    body += [f"%primitive_in_range = OpULessThan %bool %prim {pcount}",
+             f"%vertex_written = OpINotEqual %bool {vcount} {c(0xffffffff)}",
+             f"%primitive_written = OpINotEqual %bool {pcount} {c(0xffffffff)}",
+             "%header_written = OpLogicalAnd %bool %vertex_written %primitive_written",
+             "%inrange = OpLogicalAnd %bool %header_written %primitive_in_range",
              f"%pofs = OpIMul %uint %prim {c(lay['primitive_stride'])}", "%pofs64 = OpUConvert %ulong %pofs",
              f"%pbase0 = OpIAdd %ulong %slot {cl(lay['primitives'])}", "%pbase = OpIAdd %ulong %pbase0 %pofs64",
              f"%cofs = OpIMul %uint %corner {c(4)}", "%cofs64 = OpUConvert %ulong %cofs",

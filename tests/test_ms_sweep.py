@@ -201,6 +201,16 @@ class Classify(unittest.TestCase):
                 (self.rec(5), self.rec(77), ("fails in both modes", "5/77"))):
             self.assertEqual(ms_sweep.classify(rn, rc, "x", "y", LAY)[:2], expect)
 
+    def test_missing_header_words(self):
+        missing = 0xffffffff
+        data = slot(missing, missing) + slot(missing, 2) + slot(4, missing) + slot(0, 0)
+        kind, _, facts = self.run_case(self.rec(prims=5), self.rec(), image(), image(), data)
+        self.assertEqual(kind, "missing header writes")
+        for key in ("unwritten_headers", "missing_vertex_only", "missing_primitive_only"):
+            self.assertEqual(facts[key], 1)
+        for key in ("verts", "prims", "groups", "bad_index", "over_max"):
+            self.assertEqual(facts[key], 0)
+
     def test_agree_with_and_without_geometry(self):
         empty = slot(0, 0) * ms_sweep.GROUPS
         self.assertEqual(self.run_case(self.rec(prims=0), self.rec(), image(), image(), empty)[:2],

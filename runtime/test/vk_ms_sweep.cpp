@@ -19,7 +19,7 @@
 //               floats in [0.25, 1). The sweep leaves it zero: the heap holds the shaders' descriptors, so any data
 //               in it is read as a wild address and resets the device
 // Output: the colour target (width * height * 16 bytes of RGBA32F, cleared to -1 so an unwritten pixel is
-// recognisable), then in compute mode the output buffer (groups * slot-bytes), zero before the dispatch.
+// recognisable), then in compute mode the output buffer (groups * slot-bytes), zero except for the two UINT32_MAX count sentinels in each header before dispatch.
 //
 // Exit codes: 0 ran; 77 the device lacks a feature the module needs (stdout says which); 1 a Vulkan call failed
 // (stderr says which); 3 the fence did not signal in VKS_TIMEOUT_S seconds (default 20); 4 the device was lost;
@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
     const uint32_t groups = uint32_t(std::atoi(argv[8]));
     const uint64_t slot = std::strtoull(argv[9], nullptr, 0);
     const uint32_t max_prims = uint32_t(std::atoi(argv[10]));
-    if (!W || !H || !groups || (compute && (!slot || !max_prims || !std::strcmp(argv[4], "-")))) return 2;
+    if (!W || !H || !groups || (compute && (slot < 8 || slot > SIZE_MAX / groups || !max_prims || !std::strcmp(argv[4], "-")))) return 2;
     uint32_t pc[38] = {};
     if (const char* s = std::getenv("VKS_SGPRS"); s && !parse_words(s, pc, 32)) {
         std::fprintf(stderr, "VKS_SGPRS: expected up to 32 comma-separated words\n");
@@ -354,6 +354,9 @@ int main(int argc, char** argv) {
     if (compute) {
         uint64_t out_addr = 0;
         CHECK(host_buffer(out_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, &outbuf, &outp, &out_addr));
+        const uint32_t header[] = {UINT32_MAX, UINT32_MAX};
+        for (uint32_t g = 0; g < groups; ++g)
+            std::memcpy(static_cast<char*>(outp) + g * slot, header, sizeof(header));
         pc[36] = uint32_t(out_addr); pc[37] = uint32_t(out_addr >> 32);
     }
 

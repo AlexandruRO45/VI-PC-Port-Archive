@@ -250,11 +250,20 @@ def analyse_slots(data, lay, groups=GROUPS):
     for (the translator clamps to the maxima, so a count above them is a shader the clamp saved)."""
     slot = lay["slot_bytes"]
     res = {"verts": 0, "prims": 0, "culled": 0, "bad_pos": 0, "bad_index": 0, "over_max": 0, "groups": 0}
+    res.update(unwritten_headers=0, missing_vertex_only=0, missing_primitive_only=0)
     for g in range(groups):
         base = g * slot
         if base + slot > len(data):
             return None
         nv, npr = struct.unpack_from("<II", data, base)
+        if nv == 0xffffffff or npr == 0xffffffff:
+            if nv == npr:
+                res["unwritten_headers"] += 1
+            elif nv == 0xffffffff:
+                res["missing_vertex_only"] += 1
+            else:
+                res["missing_primitive_only"] += 1
+            continue
         if nv > lay["max_vertices"] or npr > lay["max_primitives"]:
             res["over_max"] += 1
             nv, npr = min(nv, lay["max_vertices"]), min(npr, lay["max_primitives"])
@@ -321,6 +330,8 @@ def classify(rec_n, rec_c, raw_n, raw_c, lay):
         return "fails in one mode", "fallback: short output", {}
     cov_n, cov_c, bad = compare_images(img_n, img_c)
     facts = dict(slots, cov_native=cov_n, cov_fallback=cov_c, diff_px=bad, native_prims=rec_n.get("prims"))
+    if slots["unwritten_headers"] or slots["missing_vertex_only"] or slots["missing_primitive_only"]:
+        return "missing header writes", "", facts
     np_ = rec_n.get("prims")
     prim_ok = np_ is None or np_ in (slots["prims"], slots["prims"] - slots["culled"])
     if not prim_ok:
@@ -354,7 +365,8 @@ def cmd_compare(a):
         fb = json.load(f)
     rn, rc = load_results(a, "native"), load_results(a, "compute")
     counts, sub, rows = {}, {}, []
-    totals = {"verts": 0, "prims": 0, "bad_pos": 0, "bad_index": 0, "over_max": 0}
+    totals = {"verts": 0, "prims": 0, "bad_pos": 0, "bad_index": 0, "over_max": 0,
+              "unwritten_headers": 0, "missing_vertex_only": 0, "missing_primitive_only": 0}
     for i, s in enumerate(sample):
         if i not in rn or i not in rc:
             raise SystemExit(f"shader {i} has no result in both modes")
