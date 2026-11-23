@@ -408,6 +408,24 @@ class TestLdsDecU32Reference(unittest.TestCase):
         self.assertEqual(rtns, [0xDEAD])
         self.assertEqual(fin[0x40], 4)
 
+class TestLdsDecU32Offset(unittest.TestCase):
+    def test_byte_offset_decrement(self):
+        init = {0x40: 10, 0x44: 5, 0x48: 0}
+        rtns, fin = L.run_chain([("ds_dec_u32", 0x20, 0x24, (10,))], init)
+        self.assertEqual(fin[0x44], 4)
+
+    def test_multiple_offsets_same_base(self):
+        init = {0x40: 5, 0x44: 0, 0x48: 15}
+        ops = [
+            ("ds_dec_u32", 0x40, 0, (10,)),
+            ("ds_dec_u32", 0x40, 4, (10,)),
+            ("ds_dec_u32", 0x40, 8, (10,)),
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x40], 4)
+        self.assertEqual(fin[0x44], 10)
+        self.assertEqual(fin[0x48], 10)
+
 
 if __name__ == "__main__":
     unittest.main()
