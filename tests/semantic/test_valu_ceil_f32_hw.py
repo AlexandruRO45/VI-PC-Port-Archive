@@ -333,5 +333,22 @@ class TestCeilBoundaryAndExtremes(unittest.TestCase):
                 self.assertEqual(words[0], expected)
 
 
-if __name__ == '__main__':
+class TestCeilNegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: negative controls, syntax rejection, and mutation detection for v_ceil_f32."""
+
+    def test_syntax_rejection_missing_operands(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_ceil_bad_nop", ["v_ceil_f32", "s_endpgm"])
+
+    def test_syntax_rejection_invalid_opcode(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_ceil_bad_op", ["v_ceil_f32_nonexistent v0, v1", "s_endpgm"])
+
+    def test_mutation_detection_floor_instead_of_ceil(self):
+        # Oracle catches mutation if floor is used instead of ceil (e.g. floor(1.5) = 1.0 != ceil(1.5) = 2.0)
+        floor_oracle = lambda u: f32_to_u32(math.floor(u32_to_f32(u)))
+        self.assertNotEqual(v_ceil_f32_oracle(0x3FC00000), floor_oracle(0x3FC00000))
+
+
+if __name__ == "__main__":
     unittest.main()
