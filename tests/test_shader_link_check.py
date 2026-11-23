@@ -525,6 +525,17 @@ class CommandLineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "report would overwrite an input file"):
             link.ensure_report_is_separate(self.report, [self.report])
 
+    def test_uses_shared_same_report_path_and_catches_folding_volume_case_alias(self):
+        import report_paths
+        self.assertIs(link.same_report_path, report_paths.same_report_path)
+        folded_alias = self.directory / "VERTEX.SPV"
+        with (patch.object(report_paths, "path_key", side_effect=str),
+              patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
+              patch.object(report_paths, "same_name_on_folding_volume", return_value=True) as probe):
+            with self.assertRaisesRegex(ValueError, "report would overwrite an input file"):
+                link.ensure_report_is_separate(folded_alias, [self.vs])
+        probe.assert_called_once()
+
     def test_inspect_keeps_types_and_components(self):
         shader = self.module("with_component", input(location=3, component=2, components=2))
         result = self.command("inspect", shader)
