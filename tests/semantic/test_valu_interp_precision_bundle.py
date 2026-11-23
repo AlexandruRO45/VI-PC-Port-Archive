@@ -89,6 +89,19 @@ class TestInterpP1F32MultiChannel(unittest.TestCase):
             words = support.mrt0_words(spv)
             self.assertEqual(len(words), 4)
 
+class TestInterpP1F32Translator(unittest.TestCase):
+    def test_p1_f32_mutation_guard(self):
+        code = [
+            "v_interp_p1_f32 v5, v0, attr3.x",
+            "v_interp_p2_f32 v5, v1, attr3.x",
+            "exp mrt0, v5, v5, v5, v5 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p1_f32_trans", code)
+        self.assertIn("OpEntryPoint Fragment", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
