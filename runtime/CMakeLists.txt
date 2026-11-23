@@ -236,6 +236,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
   target_link_libraries(process_cmdline_test PRIVATE shell32)
 
+  add_executable(cpu_affinity_test test/cpu_affinity_test.cpp)
+  target_compile_definitions(cpu_affinity_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(cpu_affinity_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(cpu_affinity_test PRIVATE /OPT:NOREF)
+
   # Console paths (GAME:) and the write overlay: the file shims resolved through the registry, over temporary folders.
   add_executable(file_system_test
     test/file_system_test.cpp
@@ -1015,6 +1020,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
+  endif()
+  if(WIN32 AND TARGET cpu_affinity_test)
+    add_test(NAME cpu_affinity COMMAND cpu_affinity_test)
   endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)

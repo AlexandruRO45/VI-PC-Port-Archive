@@ -29,6 +29,7 @@
 
 #include "base_reservation.h"
 #include "code_hooks.h"
+#include "cpu_affinity.h"
 #include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
@@ -50,9 +51,9 @@ const char* binding_name(rt::Binding b) {
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
-                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--affinity MASK|physical] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
+                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--affinity MASK|physical] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--affinity MASK|physical] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
     return 2;
 }
 
@@ -65,7 +66,7 @@ int wmain(int argc, wchar_t** argv) {
     uint32_t view_mode_getter_rva = 0;  // --view-mode-getter RVA: the game's view mode of a camera context
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
-    std::wstring trace_file;
+    std::wstring trace_file, affinity_arg;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--") {
@@ -80,6 +81,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
         else if (a == L"--mods" && i + 1 < argc) mods_dir = argv[++i];
+        else if (a == L"--affinity" && i + 1 < argc) affinity_arg = argv[++i];
         else if (a == L"--view-mode-getter" && i + 1 < argc) {
             wchar_t* end = nullptr;
             const unsigned long rva = std::wcstoul(argv[++i], &end, 16);
@@ -101,6 +103,7 @@ int wmain(int argc, wchar_t** argv) {
     if (image.empty()) return usage();
     // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
     if (dry_run + init + run != 1) return usage();
+    leonida::configure_process_affinity(affinity_arg);
     // The console folders are fixed once, as absolute paths. A bare image name (`gta6rt --run game.exe` from the
     // game folder) has an empty parent path, which left GAME: with no root; and a relative --game-dir or --overlay
     // would follow the title's later SetCurrentDirectory. If absolute() fails the path stays as given.
