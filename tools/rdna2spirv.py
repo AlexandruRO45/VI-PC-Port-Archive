@@ -1676,9 +1676,15 @@ class Gen:
         bm = _re.search(r'swizzle\(BITMASK_PERM,\s*"([01pi]{5})"\)', text)
         m = _re.search(r"swizzle\((\w+)((?:,\s*\d+)*)\)", text)
         if not m and not bm:
-            raise Unsupported("ds_swizzle pattern")
-        kind = "BITMASK_PERM" if bm else m.group(1)
-        args = [int(x) for x in m.group(2).split(",")[1:]] if m and m.group(2) else []
+            # LLVM omits offset:swizzle(...) when offset == 0, which is QUAD_PERM(0, 0, 0, 0).
+            off_m = _re.search(r"\boffset:([^\s,]+)", text)
+            if off_m is None or off_m.group(1) in ("0", "0x0"):
+                kind, args = "QUAD_PERM", [0, 0, 0, 0]
+            else:
+                raise Unsupported("ds_swizzle pattern")
+        else:
+            kind = "BITMASK_PERM" if bm else m.group(1)
+            args = [int(x) for x in m.group(2).split(",")[1:]] if m and m.group(2) else []
         self.uses_subgroup = True
         lane = self.tmp()
         self.sub_lane(lane)
