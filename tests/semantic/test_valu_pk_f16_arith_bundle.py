@@ -87,6 +87,39 @@ def ref_pk_min_f16(w_a: int, w_b: int, *, clamp: bool = False,
     if clamp: r_hi = clamp_f16(r_hi)
     return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
 
+class MachineState:
+    def __init__(self, num_lanes: int = 64):
+        self.num_lanes = num_lanes
+        self.exec_mask: int = (1 << num_lanes) - 1
+        self.vgpr: dict[int, list[int]] = {i: [0] * num_lanes for i in range(256)}
+
+    def lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+class InstructionAST:
+    def __init__(self, op: str, dst: int, srcs: list[int], *, clamp: bool = False,
+                 op_sel: tuple[int, ...] = (), op_sel_hi: tuple[int, ...] = (),
+                 neg_lo: tuple[int, ...] = (), neg_hi: tuple[int, ...] = ()):
+        self.op = op
+        self.dst = dst
+        self.srcs = srcs
+        self.clamp = clamp
+        self.op_sel = op_sel
+        self.op_sel_hi = op_sel_hi
+        self.neg_lo = neg_lo
+        self.neg_hi = neg_hi
+
+    def eval_scalar(self, *src_vals: int, acc: int = 0) -> int:
+        if self.op == "v_pk_min_f16":
+            return ref_pk_min_f16(src_vals[0], src_vals[1], clamp=self.clamp, op_sel=self.op_sel or (0, 0), op_sel_hi=self.op_sel_hi or (1, 1), neg_lo=self.neg_lo or (0, 0), neg_hi=self.neg_hi or (0, 0))
+        raise NotImplementedError(f"Unsupported op: {self.op}")
+
+    def execute_simd(self, state: MachineState) -> None:
+        for lane in range(state.num_lanes):
+            if state.lane_active(lane):
+                vals = [state.vgpr[s][lane] for s in self.srcs]
+                acc = state.vgpr[self.dst][lane]
+                state.vgpr[self.dst][lane] = self.eval_scalar(*vals, acc=acc)
+
 class TestValuPkF16ArithBundle(unittest.TestCase):
 
     def test_v_pk_min_f16_reference_oracle(self):
@@ -104,6 +137,13 @@ class TestValuPkF16ArithBundle(unittest.TestCase):
         c_lo, c_hi = unpack_f16x2(res_clamp)
         self.assertEqual(c_lo, 0x0000)
         self.assertEqual(c_hi, 0x3c00) # 2.0 clamped to 1.0
+
+    def test_v_pk_min_f16_ast_and_scalar_interpreter(self):
+        ast = InstructionAST("v_pk_min_f16", dst=0, srcs=[1, 2])
+        w1 = pack_f16x2(0x3c00, 0x4000)
+        w2 = pack_f16x2(0x4000, 0x4200)
+        val = ast.eval_scalar(w1, w2)
+        self.assertEqual(val, pack_f16x2(0x3c00, 0x4000))
 
 if __name__ == '__main__':
     unittest.main()
