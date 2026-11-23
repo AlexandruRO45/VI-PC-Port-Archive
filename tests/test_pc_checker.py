@@ -157,7 +157,6 @@ class Api(unittest.TestCase):
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
 
 
-
 class WindowsPowerShell(unittest.TestCase):
     """detect_gpus on Windows starts PowerShell by its full path. CreateProcess doesn't search
     System32\\WindowsPowerShell\\v1.0, and _run turns a program it can't start into no output, so with that folder
