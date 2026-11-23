@@ -750,5 +750,32 @@ class TestVDot2F32F16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x40400000)
 
+def ref_v_dot2c_f32_f16(s0: int, s1: int, old_dst: int = 0) -> int:
+    a0 = bits_to_f16(s0 & 0xFFFF)
+    a1 = bits_to_f16((s0 >> 16) & 0xFFFF)
+    b0 = bits_to_f16(s1 & 0xFFFF)
+    b1 = bits_to_f16((s1 >> 16) & 0xFFFF)
+    acc = bits_to_f32(old_dst)
+    r = (a0 * b0) + (a1 * b1) + acc
+    if math.isnan(r):
+        return 0x7FC00000
+    if math.isinf(r):
+        return 0x7F800000 if r > 0 else 0xFF800000
+    return f32_to_bits(r) & MASK32
+
+GLOBAL_ORACLE_MAP[Opcode.V_DOT2C_F32_F16] = ref_v_dot2c_f32_f16
+
+
+class TestVDot2cF32F16Oracle(unittest.TestCase):
+    def test_basic_arithmetic(self) -> None:
+        # (1.0*1.0) + (1.0*1.0) + old_dst(1.0) = 3.0f (0x40400000)
+        res = ref_v_dot2c_f32_f16(0x3C003C00, 0x3C003C00, old_dst=0x3F800000)
+        self.assertEqual(res, 0x40400000)
+
+    def test_zero_accumulator(self) -> None:
+        # (2.0*0.5) + (1.0*3.0) + 0.0 = 4.0f (0x40800000)
+        res = ref_v_dot2c_f32_f16(0x3C004000, 0x42003800, old_dst=0x00000000)
+        self.assertEqual(res, 0x40800000)
+
 if __name__ == "__main__":
     unittest.main()
