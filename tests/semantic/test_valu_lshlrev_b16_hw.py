@@ -348,3 +348,137 @@ class TestValuLshlrevB16BitwiseEdgeCases(unittest.TestCase):
             for shift in (0, 1, 4, 8, 12, 15):
                 res = ref_lshlrev_b16(shift, cb)
                 self.assertEqual(res, (cb << shift) & MASK16)
+
+
+def parse_v_lshlrev_b16_asm(asm_line: str) -> ASTInstruction:
+    """Parse a single assembly instruction line for v_lshlrev_b16."""
+    clean = asm_line.strip()
+    if not clean:
+        raise ValueError("Empty assembly line")
+    parts = clean.split(None, 1)
+    mnemonic = parts[0].lower()
+    if mnemonic not in ("v_lshlrev_b16", "v_lshlrev_b16_e32", "v_lshlrev_b16_e64"):
+        raise ValueError(f"Expected mnemonic v_lshlrev_b16, got {mnemonic}")
+    if len(parts) < 2:
+        raise ValueError("Missing operands")
+    operands_str = [op.strip() for op in parts[1].split(",")]
+    if len(operands_str) != 3:
+        raise ValueError(f"Expected 3 operands (dst, src0, src1), got {len(operands_str)}")
+
+    def parse_op(op_str: str) -> ASTOperand:
+        op_lower = op_str.lower()
+        if op_lower.startswith("v") and op_lower[1:].isdigit():
+            return ASTOperand.vgpr(int(op_lower[1:]))
+        elif op_lower.startswith("s") and op_lower[1:].isdigit():
+            return ASTOperand.sgpr(int(op_lower[1:]))
+        elif op_str.startswith("0x") or op_str.startswith("-") or op_str.isdigit():
+            val = int(op_str, 0)
+            return ASTOperand.literal16(val)
+        else:
+            raise ValueError(f"Invalid operand: {op_str}")
+
+    dst = parse_op(operands_str[0])
+    src0 = parse_op(operands_str[1])
+    src1 = parse_op(operands_str[2])
+
+    inst = ASTInstruction(Opcode.V_LSHLREV_B16, dst, src0, src1)
+    inst.validate()
+    return inst
+
+
+# Mutant functions for mutation testing
+def mutant_lshr(src0: int, src1: int) -> int:
+    """Mutant 1: uses right shift instead of left shift."""
+    shift = src0 & SHIFT_MASK
+    val = u16(src1)
+    return (val >> shift) & MASK16
+
+
+def mutant_no_mask(src0: int, src1: int) -> int:
+    """Mutant 2: does not mask shift count by 0xF."""
+    return (u16(src1) << src0) & MASK16
+
+
+def mutant_swapped_operands(src0: int, src1: int) -> int:
+    """Mutant 3: treats src1 as shift count and src0 as value."""
+    shift = src1 & SHIFT_MASK
+    val = u16(src0)
+    return (val << shift) & MASK16
+
+
+def mutant_no_truncation(src0: int, src1: int) -> int:
+    """Mutant 4: fails to truncate to 16 bits."""
+    shift = src0 & SHIFT_MASK
+    val = u16(src1)
+    return val << shift
+
+
+class TestValuLshlrevB16NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, mutation detection, and translator execution."""
+
+    def test_syntax_rejection_malformed_syntax(self):
+        with self.assertRaises(ValueError):
+            parse_v_lshlrev_b16_asm("")
+
+        with self.assertRaises(ValueError):
+            parse_v_lshlrev_b16_asm("v_add_u16 v0, v1, v2")
+
+        with self.assertRaises(ValueError):
+            parse_v_lshlrev_b16_asm("v_lshlrev_b16 v0, v1")
+
+        with self.assertRaises(TypeError):
+            parse_v_lshlrev_b16_asm("v_lshlrev_b16 s0, v1, v2")
+
+    def test_mutation_detection_lshr(self):
+        correct = ref_lshlrev_b16(2, 4)
+        mutated = mutant_lshr(2, 4)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_no_mask(self):
+        correct = ref_lshlrev_b16(16, 1)  # 16 & 0xF = 0 -> 1 << 0 = 1
+        mutated = mutant_no_mask(16, 1)   # 1 << 16 & 0xFFFF = 0
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_swapped_operands(self):
+        correct = ref_lshlrev_b16(1, 4)  # 4 << 1 = 8
+        mutated = mutant_swapped_operands(1, 4)  # 1 << 4 = 16
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_no_truncation(self):
+        correct = ref_lshlrev_b16(1, 0x8000)  # 0
+        mutated = mutant_no_truncation(1, 0x8000)  # 0x10000
+        self.assertNotEqual(correct, mutated)
+
+    def test_lshlrev_spirv_emission(self):
+        """Verify that support.translate_lines emits OpShiftLeftLogical and OpBitwiseAnd."""
+        lines = [
+            "v_mov_b32_e32 v1, 3",
+            "v_mov_b32_e32 v2, 0x12",
+            "v_lshlrev_b16 v0, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_lshlrev_b16_emit", lines)
+        self.assertIn("OpShiftLeftLogical", spv)
+        self.assertIn("OpBitwiseAnd", spv)
+
+    def test_lshlrev_hardware_execution(self):
+        """Verify hardware-accurate execution of v_lshlrev_b16 through support.mrt0_words."""
+        lines = [
+            "v_mov_b32_e32 v1, 3",
+            "v_mov_b32_e32 v2, 0x12",
+            "v_lshlrev_b16 v0, v1, v2",
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_lshlrev_b16_hw", lines)
+        words = support.mrt0_words(spv)
+        # 0x12 << 3 = 0x90
+        self.assertEqual(words[0], 0x90)
+        self.assertEqual(words[1], 0x90)
+        self.assertEqual(words[2], 0x90)
+        self.assertEqual(words[3], 0x90)
+
+
+if __name__ == "__main__":
+    unittest.main()
