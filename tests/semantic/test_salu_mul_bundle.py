@@ -244,5 +244,23 @@ class TestSMulI32SIMDAndWaveDivergence(unittest.TestCase):
         self.assertEqual(len(lanes), 64)
         self.assertTrue(all(l == u32(-10) for l in lanes))
 
+class TestSMulI32IntegerOverflowExtremes(unittest.TestCase):
+    def test_int32_min_multiplied(self) -> None:
+        int32_min = 0x80000000
+        # -2147483648 * 2 = -4294967296 -> low 32 bits = 0
+        self.assertEqual(ref_s_mul_i32(int32_min, 2), 0)
+        # -2147483648 * -1 = 2147483648 -> low 32 bits = 0x80000000
+        self.assertEqual(ref_s_mul_i32(int32_min, u32(-1)), int32_min)
+
+    def test_all_ones_squared(self) -> None:
+        # (-1) * (-1) = 1 in 32-bit wrap
+        self.assertEqual(ref_s_mul_i32(0xFFFFFFFF, 0xFFFFFFFF), 1)
+
+    def test_large_prime_wrapping(self) -> None:
+        a = 0xDEADBEEF
+        b = 0xCAFEBABE
+        expected = (0xDEADBEEF * 0xCAFEBABE) & MASK32
+        self.assertEqual(ref_s_mul_i32(a, b), expected)
+
 if __name__ == "__main__":
     unittest.main()
