@@ -270,9 +270,9 @@ public:
         return emit(code, op_select, tf, {zero, f32(0.0f), value});
     }
 
-    // Splices everything into the module.
-    void apply(std::vector<Inst> entry_code, std::vector<Inst> (*at_return)(Patch&, void*), void* ctx,
-               bool drop_conservative_modes) {
+    // Splices everything into the module. Returns false with `why` set if the module lacks a required section.
+    bool apply(std::vector<Inst> entry_code, std::vector<Inst> (*at_return)(Patch&, void*), void* ctx,
+               bool drop_conservative_modes, std::string& why) {
         auto& in = m_.insts();
         std::size_t last_entry_point = 0;
         for (std::size_t k = 0; k < in.size(); ++k)
@@ -280,7 +280,8 @@ public:
         std::vector<Inst> out;
         out.reserve(in.size() + globals_.size() + entry_code.size() + 16);
         bool imported = import_.empty(), decorated = false, declared = false;
-        bool in_main = false, entry_done = false;
+        bool in_main = false, entry_found = false, entry_done = false;
+        std::size_t returns_patched = 0;
         for (std::size_t k = 0; k < in.size(); ++k) {
             Inst& i = in[k];
             const std::uint32_t op = opcode(i);
@@ -309,21 +310,42 @@ public:
                 for (const Inst& g : globals_) out.push_back(g);  // copies: type() may still read them
                 declared = true;
             }
-            if (op == op_function && i.size() > 2 && i[2] == entry_) in_main = true;
-            if (in_main && !entry_done && op != op_function && op != op_label && op != op_variable &&
-                op != op_line && op != op_no_line && op != 55 /* OpFunctionParameter */) {
+            if (op == op_function && i.size() > 2 && i[2] == entry_) {
+                in_main = true;
+                entry_found = true;
+            }
+            if (in_main && !entry_done && op != op_function && op != op_function_end && op != op_label &&
+                op != op_variable && op != op_line && op != op_no_line && op != 55 /* OpFunctionParameter */) {
                 for (Inst& c : entry_code) out.push_back(std::move(c));
                 entry_done = true;
             }
             if (in_main && op == op_return && at_return) {
                 for (Inst& c : at_return(*this, ctx)) out.push_back(std::move(c));
+                ++returns_patched;
             }
             if (op == op_function_end) in_main = false;
             out.push_back(std::move(i));
             if (k == last_entry_point)  // execution modes follow the entry points
                 for (Inst& mo : modes_) out.push_back(std::move(mo));
         }
+        if (!imported) {
+            why = "fragment shader has no OpMemoryModel";
+            return false;
+        }
+        if (!entry_found) {
+            why = "fragment entry point has no OpFunction body";
+            return false;
+        }
+        if (!entry_code.empty() && !entry_done) {
+            why = "fragment entry point has no body instruction";
+            return false;
+        }
+        if (at_return && returns_patched == 0) {
+            why = "depth-writing fragment entry point has no OpReturn";
+            return false;
+        }
         in = std::move(out);
+        return true;
     }
 
 private:
@@ -403,16 +425,16 @@ inline std::vector<std::uint32_t> depth24_patch_fragment(const std::vector<std::
         }
         const std::uint32_t q = p.quantise(entry_code, z);
         entry_code.push_back(make(op_store, {frag_depth, q}));
-        p.apply(std::move(entry_code), nullptr, nullptr, true);
+        if (!p.apply(std::move(entry_code), nullptr, nullptr, true, why)) return {};
     } else {
         struct Ctx { std::uint32_t var, tf; } ctx{frag_depth, tf};
-        p.apply({}, [](Patch& patch, void* c) {
+        if (!p.apply({}, [](Patch& patch, void* c) {
             const auto& x = *static_cast<Ctx*>(c);
             std::vector<Inst> code;
             const std::uint32_t written = patch.emit(code, op_load, x.tf, {x.var});
             code.push_back(make(op_store, {x.var, patch.quantise(code, written)}));
             return code;
-        }, &ctx, true);
+        }, &ctx, true, why)) return {};
     }
     return m.words();
 }
