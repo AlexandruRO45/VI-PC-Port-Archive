@@ -6161,7 +6161,7 @@ public:
                 const auto& arr = desc->Texture2DArray;
                 if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || arr.MipSlice >= rd.MipLevels ||
                     arr.PlaneSlice != 0 || arr.FirstArraySlice >= rd.DepthOrArraySize || arr.ArraySize == 0 ||
-                    (arr.ArraySize != UINT_MAX && arr.ArraySize > UINT(rd.DepthOrArraySize) - arr.FirstArraySlice)) {
+                    arr.ArraySize > UINT(rd.DepthOrArraySize) - arr.FirstArraySlice) {
                     log_once("invalid Texture2DArray unordered-access view; array size", int(arr.ArraySize));
                     return;
                 }
@@ -7669,6 +7669,12 @@ private:
     // shown leaves the slot a null descriptor and returns false.
     bool write_image_descriptor(const Resource& resource, const TextureView& view,
                                 D3D12_CPU_DESCRIPTOR_HANDLE destination, bool storage) {
+        if (storage) {
+            const D3D12_RESOURCE_DESC& rd = resource.desc();
+            const UINT layers = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1u : UINT(rd.DepthOrArraySize);
+            if (view.first_layer >= layers || view.layer_count == 0 || view.layer_count > layers - view.first_layer)
+                return false;
+        }
         leonida::gfx10::Image image{};
         if (!image_descriptor(resource, view, image)) return false;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
