@@ -473,5 +473,78 @@ class TestValuAndOrB32Oracle(unittest.TestCase):
         res = ref_and_or_b32(orig, clear_mask, insert_val)
         self.assertEqual(res, 0x1234AB78)
 
+class TestValuAndOrB32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_dst_equals_src0_aliasing(self) -> None:
+        # v0 = (v0 & v1) | v2
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0xF0F0F0F0)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x00FF00FF)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0x0000000F)
+
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Register(RegKind.VGPR, 2),
+        )
+        res = self.interp.step(inst)
+        # (0xF0F0F0F0 & 0x00FF00FF) | 0xF = 0x00F000F0 | 0xF = 0x00F000FF
+        self.assertEqual(res, 0x00F000FF)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0x00F000FF)
+
+    def test_dst_equals_src1_aliasing(self) -> None:
+        # v1 = (v0 & v1) | v2
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0xFFFF0000)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x00FFFF00)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0x00000005)
+
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 1),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Register(RegKind.VGPR, 2),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 0x00FF0005)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 1), 0x00FF0005)
+
+    def test_dst_equals_src2_aliasing(self) -> None:
+        # v2 = (v0 & v1) | v2
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x11111111)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x33333333)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0x44444444)
+
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 2),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 1),
+            src2=Register(RegKind.VGPR, 2),
+        )
+        res = self.interp.step(inst)
+        # (0x11111111 & 0x33333333) | 0x44444444 = 0x11111111 | 0x44444444 = 0x55555555
+        self.assertEqual(res, 0x55555555)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 2), 0x55555555)
+
+    def test_all_operands_same_register(self) -> None:
+        # v0 = (v0 & v0) | v0 == v0
+        self.interp.write_reg_u32(RegKind.VGPR, 0, 0x12345678)
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 0),
+            src1=Register(RegKind.VGPR, 0),
+            src2=Register(RegKind.VGPR, 0),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 0x12345678)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0x12345678)
+
 if __name__ == "__main__":
     unittest.main()
