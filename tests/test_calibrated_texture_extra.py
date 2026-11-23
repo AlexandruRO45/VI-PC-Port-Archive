@@ -958,6 +958,7 @@ def _load_calibrated_texture():
     mod = importlib.util.module_from_spec(spec)
     with mock.patch.dict(sys.modules, {"numpy": fake_np}):
         spec.loader.exec_module(mod)
+    mod.np = fake_np  # the lazy proxy resolves on first use, after the fake numpy is gone
     return mod, True
 
 
