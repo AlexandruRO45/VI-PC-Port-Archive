@@ -365,5 +365,43 @@ class TestLdsXorB32SIMD(unittest.TestCase):
         # Final result must be bitwise OR/XOR of all 1 << lane = 0xFFFFFFFF
         self.assertEqual(simd.storage.read_dword(0), 0xFFFFFFFF)
 
+class TestLdsXorB32RegisterAliasing(unittest.TestCase):
+    """Unit tests for register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter()
+
+    def test_vdst_aliases_vaddr(self) -> None:
+        # vdst and vaddr both use v1
+        self.interp.storage.write_dword(10, 0xCAFEBABE)
+        self.interp.write_vgpr(1, 40)            # vaddr = 40 (dword 10)
+        self.interp.write_vgpr(2, 0x0000000F)    # vdata = 0xF
+        inst = Instruction(
+            Opcode.DS_XOR_RTN_B32,
+            vdst=Register(RegKind.VGPR, 1),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        self.interp.execute(inst)
+        # v1 should now contain old memory value 0xCAFEBABE
+        self.assertEqual(self.interp.read_vgpr(1), 0xCAFEBABE)
+        self.assertEqual(self.interp.storage.read_dword(10), 0xCAFEBAB1)
+
+    def test_vdst_aliases_vdata(self) -> None:
+        # vdst and vdata both use v2
+        self.interp.storage.write_dword(10, 0x12345678)
+        self.interp.write_vgpr(1, 40)
+        self.interp.write_vgpr(2, 0x00FF00FF)
+        inst = Instruction(
+            Opcode.DS_XOR_RTN_B32,
+            vdst=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        self.interp.execute(inst)
+        # v2 should now contain old memory value 0x12345678
+        self.assertEqual(self.interp.read_vgpr(2), 0x12345678)
+        self.assertEqual(self.interp.storage.read_dword(10), 0x12CB5687)
+
 if __name__ == "__main__":
     unittest.main()
