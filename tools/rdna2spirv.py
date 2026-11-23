@@ -5820,6 +5820,35 @@ class Gen:
             return None
         return halves.pop() if halves else "lo"
 
+    def wqm_src_half(self, a):
+        """The half of the wave whose word a 32-bit s_wqm of a lane mask reads: its source's (vcc_hi, exec_hi, an
+        SGPR lane_masks.py found holding MASK_HI: 'hi'). A source that names no half (a single SGPR that is a mask
+        of unknown half) is read as the destination's, else as lanes 0-31, as Gen.wqm does."""
+        if not self.wave64:
+            return "lo"
+        return self.mask_half(a[1]) or self.mask_half(a[0]) or "lo"
+
+    def wqm_src_words(self, a):
+        """(low word, high word) of the 64-bit lane-mask source of s_wqm_b64 as real bits. EXEC, VCC and an SGPR
+        pair written as one mask have lanes 0-31 in the low word (wave_mask). A wave64 pair put together from 32-bit
+        copies need not: s12 = vcc_hi, s13 = vcc_lo is the mask with its halves swapped, s12 = vcc_hi, s13 = 0 its
+        high half moved down. Each word of such a pair is gathered from its own register's half; a word that is no
+        mask is the constant 0 / -1 holds_lane_mask allows there, the same bits in every invocation."""
+        if not (self.wave64 and a["k"] == "sgpr" and a.get("n") == 2):
+            return self.wave_mask(a)
+        kinds = [self.cur_masks.get(a["r"] + i) for i in range(2)]
+        if kinds[0] != lane_masks.MASK_HI and kinds[1] != lane_masks.MASK_LO:
+            return self.wave_mask(a)
+        words = []
+        for i, k in enumerate(kinds):
+            if k is None:
+                words.append(self.load_reg("sgpr", a["r"] + i))
+                continue
+            lo, hi = self.wave_mask({"k": "sgpr", "r": a["r"] + i, "n": 1})
+            # a mask of unknown half (MASK) is taken by its place in the pair, as wave_mask does
+            words.append(hi if k == lane_masks.MASK_HI or (k == lane_masks.MASK and i) else lo)
+        return tuple(words)
+
     def shadow_pre(self, ins):
         """Before a SALU instruction in a partial-wave module: read what the step after it needs (the sources'
         shadows, before the destination may overwrite one of them). Returns that step, or None."""
@@ -5840,13 +5869,20 @@ class Gen:
                 # one), and the shadow's don't-care bits at launched positions must not spread into them. So the
                 # whole word is gathered (launched bits and shadow at the never-launched positions) and the result
                 # taken from it: each lane's bit, the shadow and SCC (shadow_post_op, in place of the instruction).
-                lo, hi = self.wave_mask(srcs[0])
-                sh = [(lo, hi) if wide else ((hi, hi) if self.shadow_half(a) == "hi" else (lo, lo))]
+                # The source's word is its own half of the wave, whatever half the destination is: s_wqm_b32
+                # vcc_lo, vcc_hi reads lanes 32-63 and writes lanes 0-31.
+                if wide:
+                    sh = [self.wqm_src_words(srcs[0])]
+                else:
+                    lo, hi = self.wave_mask(srcs[0])
+                    sh = [(hi, hi) if self.wqm_src_half(a) == "hi" else (lo, lo)]
             scc = None
             if kind == "csel":
                 scc = self.tmp()
                 self.emit(f"{scc} = OpLoad %uint %scc")
             half = None if wide else self.shadow_half(a)
+            if exact and not wide:
+                half = self.mask_half(a[0])      # only the destination's own lanes take the result (put_mask)
             post = lambda: self.shadow_post_op(kind, wide, a[0], sh, scc, half, exact)  # noqa: E731
             post.replaces = bool(exact)          # the whole instruction (quad_any would read absent invocations)
             return post

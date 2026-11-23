@@ -276,6 +276,100 @@ class PartialWaveWholeQuadMode(unittest.TestCase):
                 self.assertEqual([mem.get(4 * (first + k)) for k in range(len(want))], want)
 
 
+def mask_words(src):
+    """out[0] SCC, then the 64-bit mask `src`: its bit count (1) and those of its low (2) and high (3) words."""
+    return (store_scc(0) + f"s_bcnt1_i32_b64 s21, {src}\n" + store(1, "s21") + f"s_mov_b64 s[24:25], {src}\n"
+            + "s_bcnt1_i32_b32 s22, s24\n" + store(2, "s22") + "s_bcnt1_i32_b32 s23, s25\n" + store(3, "s23"))
+
+
+def words_of(scc_word, value):
+    """The model of mask_words: SCC is s_wqm's (its result != 0, as `scc_word`), `value` the mask read back."""
+    return [int(scc_word != 0), popcount(value), popcount(value & M32), popcount(value >> 32)]
+
+
+def lo(L):
+    return L & M32
+
+
+def hi(L):
+    return L >> 32
+
+
+class PartialWaveWqmHalves(unittest.TestCase):
+    """s_wqm of a lane mask whose source is not the half, or the pair, its destination is. A 32-bit s_wqm reads the
+    word its source names and writes the lanes its destination names: s_wqm_b32 vcc_lo, vcc_hi fills lanes 0-31
+    from lanes 32-63. A 64-bit s_wqm of an SGPR pair put together from 32-bit copies reads each word from its own
+    register, so s12 = vcc_hi, s13 = vcc_lo is the mask with its halves swapped. In a partial-wave module the
+    result is taken from the gathered words (PartialWaveWholeQuadMode), which at first read the low word whenever
+    source and destination named different halves and took every pair as (lanes 0-31, lanes 32-63): in a 40-thread
+    wave64 s_wqm_b32 vcc_lo, vcc_hi left vcc_lo = 0xffffffff (0xff by the ISA definition), and in a 20-thread one
+    it gave SCC 1 for vcc_hi = 0. Only partial-wave modules: a group of whole waves goes through Gen.wqm."""
+
+    # (name, body, model of a wave whose launched lanes are L)
+    CASES = [
+        ("b32_vcc_lo_from_vcc_hi", "s_wqm_b32 vcc_lo, vcc_hi\n" + mask_words("vcc"),
+         lambda L: words_of(wqm(hi(L)), wqm(hi(L)) | hi(L) << 32)),
+        ("b32_vcc_lo_from_copy_of_hi", "s_mov_b32 s15, vcc_hi\ns_wqm_b32 vcc_lo, s15\n" + mask_words("vcc"),
+         lambda L: words_of(wqm(hi(L)), wqm(hi(L)) | hi(L) << 32)),
+        ("b32_vcc_hi_from_vcc_lo", "s_wqm_b32 vcc_hi, vcc_lo\n" + mask_words("vcc"),
+         lambda L: words_of(wqm(lo(L)), lo(L) | wqm(lo(L)) << 32)),
+        ("b32_vcc_hi_from_copy_of_lo", "s_mov_b32 s14, vcc_lo\ns_wqm_b32 vcc_hi, s14\n" + mask_words("vcc"),
+         lambda L: words_of(wqm(lo(L)), lo(L) | wqm(lo(L)) << 32)),
+        ("b32_exec_lo_from_vcc_hi", "s_mov_b64 s[30:31], exec\ns_wqm_b32 exec_lo, vcc_hi\ns_cselect_b32 s20, 1, 0\n"
+         "s_bcnt1_i32_b64 s21, exec\ns_bcnt1_i32_b32 s22, exec_lo\ns_bcnt1_i32_b32 s23, exec_hi\n"
+         "s_mov_b64 exec, s[30:31]\n" + store(0, "s20") + store(1, "s21") + store(2, "s22") + store(3, "s23"),
+         lambda L: words_of(wqm(hi(L)), wqm(hi(L)) | hi(L) << 32)),
+        ("b32_vcc_lo_from_not_of_hi", "s_not_b64 s[12:13], vcc\ns_wqm_b32 vcc_lo, s13\n" + mask_words("vcc"),
+         lambda L: words_of(wqm(~hi(L) & M32), wqm(~hi(L) & M32) | hi(L) << 32)),
+        ("b32_same_half", "s_wqm_b32 vcc_hi, vcc_hi\n" + mask_words("vcc"),
+         lambda L: words_of(wqm(hi(L)), lo(L) | wqm(hi(L)) << 32)),
+        ("b64_swapped_halves", "s_mov_b32 s12, vcc_hi\ns_mov_b32 s13, vcc_lo\ns_wqm_b64 s[14:15], s[12:13]\n"
+         + mask_words("s[14:15]"), lambda L: words_of(L, wqm(hi(L) | lo(L) << 32))),
+        ("b64_hi_and_zero", "s_mov_b32 s12, vcc_hi\ns_mov_b32 s13, 0\ns_wqm_b64 s[14:15], s[12:13]\n"
+         + mask_words("s[14:15]"), lambda L: words_of(hi(L), wqm(hi(L)))),
+        ("b64_zero_and_lo", "s_mov_b32 s12, 0\ns_mov_b32 s13, vcc_lo\ns_wqm_b64 s[14:15], s[12:13]\n"
+         + mask_words("s[14:15]"), lambda L: words_of(lo(L), wqm(lo(L) << 32))),
+        ("b64_lo_twice", "s_mov_b32 s12, vcc_lo\ns_mov_b32 s13, vcc_lo\ns_wqm_b64 s[14:15], s[12:13]\n"
+         + mask_words("s[14:15]"), lambda L: words_of(lo(L), wqm(lo(L) | lo(L) << 32))),
+        ("b64_lo_and_minus1", "s_mov_b32 s12, vcc_lo\ns_mov_b32 s13, -1\ns_wqm_b64 s[14:15], s[12:13]\n"
+         + mask_words("s[14:15]"), lambda L: words_of(1, wqm(lo(L) | M32 << 32))),
+    ]
+    # a partial wave ending in the high half (on a quad edge, and inside a quad) and in the low half; a full wave
+    # then a partial one
+    GROUPS = (40, 42, 20, 10, 96)
+
+    def run_case(self, name, body, threads, emulate):
+        spv = translate(f"cs_pwm_{name}", prologue(64) + body + "s_endpgm\n", threads, emulate)
+        if emulate:
+            return lbb.run_compute_workgroup(spv, threads, 32, push_constants=h.VSHARP + [0] * 28, memory={})
+        self.assertNotIn("OpGroupNonUniformQuad", spv)
+        return run_waves(spv, threads, 64)
+
+    def test_cases(self):
+        for emulate in (False, True):
+            for name, body, model in self.CASES:
+                for threads in self.GROUPS:
+                    mem = self.run_case(name, body, threads, emulate)
+                    for w, L in enumerate(launched(threads, 64)):
+                        with self.subTest(case=name, threads=threads, wave=w, emulate=emulate):
+                            self.assertEqual([mem.get(w * 64 + 4 * k) for k in range(4)], model(L))
+
+    def test_values(self):
+        """The same words spelled out, not taken from the model. Group 40: vcc_hi = 0xff, so s_wqm_b32 vcc_lo,
+        vcc_hi gives vcc_lo = 0xff (SCC 1, 16 bits in VCC); group 20: vcc_hi = 0, so vcc_lo = 0 and SCC 0."""
+        by_name = {name: body for name, body, _model in self.CASES}
+        for name, threads, want in (
+                ("b32_vcc_lo_from_vcc_hi", 40, [1, 16, 8, 8]), ("b32_vcc_lo_from_vcc_hi", 20, [0, 0, 0, 0]),
+                ("b32_vcc_lo_from_copy_of_hi", 40, [1, 16, 8, 8]), ("b32_vcc_lo_from_copy_of_hi", 20, [0, 0, 0, 0]),
+                ("b32_vcc_hi_from_vcc_lo", 40, [1, 64, 32, 32]), ("b32_vcc_hi_from_vcc_lo", 20, [1, 40, 20, 20]),
+                ("b64_swapped_halves", 40, [1, 40, 8, 32]), ("b64_swapped_halves", 20, [1, 20, 0, 20]),
+                ("b64_hi_and_zero", 40, [1, 8, 8, 0]), ("b64_hi_and_zero", 20, [0, 0, 0, 0])):
+            for emulate in (False, True):
+                mem = self.run_case(name, by_name[name], threads, emulate)
+                with self.subTest(case=name, threads=threads, emulate=emulate):
+                    self.assertEqual([mem.get(4 * k) for k in range(4)], want)
+
+
 class PartialWaveControlFlow(unittest.TestCase):
     def test_join_and_loop(self):
         """The shadow is stored next to the register, so it follows each path through a join and a loop."""
