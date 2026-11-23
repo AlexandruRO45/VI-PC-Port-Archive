@@ -726,3 +726,31 @@ class TestNotB32SIMDAndProperties(unittest.TestCase):
             "v_not_b32 v0, v0",
         ])
         self.assertEqual(val_involution, 0x87654321)
+
+
+# ------------------------------------------------------------------------------
+# v_not_b32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestNotB32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(TypeError):
+            VNotB32Instruction(
+                dst=RegisterOperand(OperandType.SGPR, 5),
+                src0=RegisterOperand(OperandType.VGPR, 0),
+            )
+
+    def test_boundary_extremes_hardware(self):
+        val_sign, _ = run_shader("ps_not_sign", [
+            "v_mov_b32 v1, 0x80000000",
+            "v_not_b32 v0, v1",
+        ])
+        self.assertEqual(val_sign, 0x7FFFFFFF)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        val, spv = run_shader("ps_not_lowering", [
+            "v_mov_b32 v1, 0x000000FF",
+            "v_not_b32 v0, v1",
+        ])
+        self.assertIn("OpNot", spv)
+        self.assertEqual(val, 0xFFFFFF00)
