@@ -511,5 +511,15 @@ class VFrexpMantF64OracleTests(unittest.TestCase):
         self.assertEqual(oracle_frexp_mant_f64(0x7FF0000000000000), 0x7FF0000000000000)
         self.assertEqual(oracle_frexp_mant_f64(0x7FF8000000000000), 0x7FF8000000000000)
 
+class VFrexpMantF64AstInterpreterTests(unittest.TestCase):
+    def test_frexp_mant_f64_ast_construction(self):
+        ast = ValuInstructionAST("v_frexp_mant_f64", Operand(RegKind.VGPR, 2), Operand(RegKind.VGPR, 0))
+        self.assertEqual(ast.mnemonic, "v_frexp_mant_f64")
+
+    def test_frexp_mant_f64_scalar_execution(self):
+        # 2.0d (0x4000000000000000) -> 0.5d (0x3FE0000000000000)
+        res = oracle_frexp_mant_f64(0x4000000000000000)
+        self.assertEqual(res, 0x3FE0000000000000)
+
 if __name__ == "__main__":
     unittest.main()
