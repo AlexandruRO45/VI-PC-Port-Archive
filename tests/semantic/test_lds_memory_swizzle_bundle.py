@@ -223,6 +223,44 @@ class TestDsSwizzleB32Translator(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported):
             support.translate_lines("cs_swizzle_bad", ["ds_swizzle_b32 v1, v2 offset:99999", "s_endpgm"], fssm=FSSM)
 
+def ref_ds_permute_b32(
+    addrs: list[int],
+    datas: list[int],
+    offset: int = 0,
+    exec_mask: int = MASK32,
+    old_dst: list[int] | None = None,
+) -> list[int]:
+    """Reference mathematical oracle for forward (scatter) permute ds_permute_b32."""
+    out = [0] * 32
+    if old_dst is not None:
+        for l in range(32):
+            if not (exec_mask & (1 << l)):
+                out[l] = old_dst[l]
+    # Every active source lane writes to destination lane ((addr + offset) // 4) % 32
+    for s in range(32):
+        if exec_mask & (1 << s):
+            d = ((addrs[s] + offset) // 4) % 32
+            if exec_mask & (1 << d):
+                out[d] = datas[s]
+    return out
+
+
+class TestDsPermuteB32Oracle(unittest.TestCase):
+    def test_permute_rotate_by_one(self) -> None:
+        # Addr = lane * 4; offset = 4; datas = lane * 10
+        addrs = [l * 4 for l in range(32)]
+        datas = [l * 10 for l in range(32)]
+        out = ref_ds_permute_b32(addrs, datas, offset=4)
+        for s in range(32):
+            d = (s + 1) % 32
+            self.assertEqual(out[d], datas[s])
+
+    def test_permute_identity(self) -> None:
+        addrs = [l * 4 for l in range(32)]
+        datas = [100 + l for l in range(32)]
+        out = ref_ds_permute_b32(addrs, datas, offset=0)
+        self.assertEqual(out, datas)
+
 
 if __name__ == "__main__":
     unittest.main()
