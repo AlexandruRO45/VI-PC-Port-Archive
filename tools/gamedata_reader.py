@@ -41,6 +41,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+from report_paths import same_report_path  # noqa: E402
+
 BOM = b"\xef\xbb\xbf"
 VECTOR_KEYS = ("x", "y", "z", "w")
 BASE_CONVENTION_KEYS = frozenset(("type", "content", "value", "ref", "key"))
@@ -306,6 +308,11 @@ def main(argv=None):
     if a.out and os.path.exists(a.out) and not os.path.isdir(a.out):
         print(f"ERROR: --out {a.out} exists and is not a directory", file=sys.stderr)
         return 2
+    if a.out:
+        for target in a.targets:
+            if same_report_path(target, a.out):
+                print(f"ERROR: --out {a.out} would overwrite input {target}", file=sys.stderr)
+                return 2
     try:
         s = run(a.targets, a.root, a.out)
     except FileNotFoundError as e:

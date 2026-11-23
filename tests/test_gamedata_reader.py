@@ -397,6 +397,14 @@ class Run(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn("not a directory", r.stderr)
 
+    def test_cli_out_matching_target_is_refused(self):
+        d = os.path.join(self.tmp.name, "carve")
+        os.makedirs(d)
+        r = self._cli(d, "--out", d)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("would overwrite input", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
