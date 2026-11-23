@@ -364,8 +364,10 @@ class CMakeFixtureTest(unittest.TestCase):
             "-DTEST_DIR=" + WINDOWS_ROOT + "/runtime/build/pipeline inputs",
             "-P", WINDOWS_ROOT + "/runtime/test/check_vk_pipeline_cli.cmake",
         ], {"TIMEOUT": 3})
-        result = rwt.subprocess.CompletedProcess([], 0, stdout=b"ok")
-        with mock.patch.object(rwt.subprocess, "run", return_value=result) as launch:
+        with mock.patch.object(rwt.subprocess, "Popen") as launch:
+            proc = launch.return_value.__enter__.return_value
+            proc.communicate.return_value = (b"ok", None)
+            proc.poll.return_value = proc.returncode = 0
             status, detail = rwt.run_test(entry, self.args, ["wine"])
         self.assertEqual(status, "pass", detail)
         self.assertEqual(launch.call_args.args[0], [
@@ -373,7 +375,7 @@ class CMakeFixtureTest(unittest.TestCase):
             "-DRUNNER=wine", "-P", str(script),
         ])
         self.assertEqual(launch.call_args.kwargs["cwd"], str(self.build))
-        self.assertEqual(launch.call_args.kwargs["timeout"], 3)
+        self.assertEqual(proc.communicate.call_args.kwargs["timeout"], 3)
 
     @unittest.skipUnless(shutil.which("cmake"), "native CMake not on PATH")
     def test_local_cmake_runs_wine_command_with_spaces_and_semicolons(self):
