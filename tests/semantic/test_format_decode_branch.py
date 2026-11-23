@@ -1,4 +1,4 @@
-"""The run-time FORMAT decode of buffer_load_format (Gen.decode_any_format) branches to one format's decode.
+"""The run-time FORMAT decode of buffer_load_format (Gen.decode_any_format): table-driven fields, then one branch per kind.
 
 Every code goes through the translator and the mini interpreter, which follows the branches, and is compared with a
 reference decoded here from the raw bits with exact quotients. A code outside FORMATS gives zeros.
@@ -66,18 +66,28 @@ class FormatDecodeBranchTests(unittest.TestCase):
                 self.assertEqual(load(code), want, f"format {code}")
 
     def test_only_the_chosen_decode_runs(self):
+        # The table-driven decode reads each channel's field once (4 unsigned and 4 signed extracts from the table's
+        # offset and width), then branches on the format's kind: every conversion (the exact UNORM/SNORM quotient's
+        # 64-bit multiply, the float conversions, the f16 widening) runs only in the kind's own case.
         gen = rdna2spirv.Gen("ps")
         gen.decode_any_format("%fmt", ["%w0", "%w1", "%w2", "%w3"])
         lines = [ln.strip() for ln in gen.body]
+        switch = next(i for i, ln in enumerate(lines) if ln.startswith("OpSwitch"))
+        self.assertIn("DontFlatten", lines[switch - 1])
+        before = lines[:switch]
+        self.assertEqual(sum("OpBitFieldUExtract" in ln for ln in before), 4)
+        for ln in before:
+            for op in ("OpIMul", "OpConvertUToF", "OpConvertSToF", "UnpackHalf2x16", "FindUMsb"):
+                self.assertNotIn(op, ln, f"decode work outside the kind's case: {ln}")
         merges = []
-        for ln in lines:
+        for ln in lines[switch - 1:]:
             if ln.startswith("OpSelectionMerge"):
                 self.assertIn("DontFlatten", ln)
                 merges.append(ln.split()[1])
             elif merges and ln == f"{merges[-1]} = OpLabel":
                 merges.pop()
-            elif "OpBitFieldUExtract" in ln or "OpIMul" in ln:
-                self.assertTrue(merges, f"decode work outside every branch: {ln}")
+            elif "OpIMul" in ln or "OpConvert" in ln:
+                self.assertTrue(merges, f"decode work outside the kind's case: {ln}")
 
 
 if __name__ == "__main__":

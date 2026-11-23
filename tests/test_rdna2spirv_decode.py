@@ -236,8 +236,11 @@ class TestFormatDecoderBoundary(unittest.TestCase):
         comps = self.gen.decode_any_format("%run_fmt", words)
         self.assertEqual(len(comps), 4)
         emitted = "\n".join(self.gen.body[initial_lines:])
-        self.assertIn("OpIEqual %bool %run_fmt", emitted)
-        self.assertIn("OpSelect %uint", emitted)
+        # The format indexes the kind table and the channel table (format * 4 + c), then one switch on the kind.
+        self.assertIn("OpAccessChain %_ptr_Private_uint %fmt_kind_tab %run_fmt", emitted)
+        self.assertIn("OpShiftLeftLogical %uint %run_fmt", emitted)
+        self.assertIn("OpSwitch", emitted)
+        self.assertTrue(self.gen.uses_fmt_tables)
 
     def test_format_decode_call_builds_and_caches_function(self):
         words = ["%w0", "%w1", "%w2", "%w3"]
