@@ -550,5 +550,38 @@ class TestFloorF16SIMDAndIEEE(unittest.TestCase):
         self.assertEqual(ref_floor_f16(SNAN16), SNAN16)
 
 
+# ------------------------------------------------------------------------------
+# v_floor_f16 Rejection & Hardware Translator
+# ------------------------------------------------------------------------------
+
+class TestFloorF16HardwareTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            LiteralOperand(0x1_0000_0000)
+
+    def test_hardware_translator_execution(self):
+        cases = [
+            (f16_to_bits(1.5), f16_to_bits(1.0)),
+            (f16_to_bits(-1.5), f16_to_bits(-2.0)),
+            (f16_to_bits(3.0), f16_to_bits(3.0)),
+            (POS_ZERO16, POS_ZERO16),
+            (NEG_ZERO16, NEG_ZERO16),
+            (POS_INF16, POS_INF16),
+            (NEG_INF16, NEG_INF16),
+            (QNAN16, QNAN16),
+        ]
+        for src_val, expected in cases:
+            prog = [
+                "v_mov_b32 v0, 0",
+                f"v_mov_b32 v1, {src_val:#x}",
+                "v_floor_f16 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines("ps_floor_f16_hw", prog)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on floor_f16({src_val:#x})")
+
+
 if __name__ == '__main__':
     unittest.main()
