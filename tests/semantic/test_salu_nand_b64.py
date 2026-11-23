@@ -418,6 +418,78 @@ class SaluNandB64SimdDivergenceTests(unittest.TestCase):
         self.assertEqual(state.exec, MASK64)
         self.assertEqual(state.scc, 1)
 
+class SaluNandB64RegisterAliasingTests(unittest.TestCase):
+    """Register aliasing and in-place operand preservation tests for s_nand_b64."""
+
+    def test_alias_dst_equals_src0(self):
+        state = ScalarState()
+        a = 0x11223344_55667788
+        b = 0x88776655_44332211
+        state.write_sgpr64(0, a)
+        state.write_sgpr64(2, b)
+
+        state.execute_nand_b64("s[0:1]", "s[0:1]", "s[2:3]")
+        self.assertEqual(state.read_sgpr64(0), ref_nand_b64(a, b))
+        self.assertEqual(state.read_sgpr64(2), b)
+
+    def test_alias_dst_equals_src1(self):
+        state = ScalarState()
+        a = 0x11223344_55667788
+        b = 0x88776655_44332211
+        state.write_sgpr64(0, a)
+        state.write_sgpr64(2, b)
+
+        state.execute_nand_b64("s[2:3]", "s[0:1]", "s[2:3]")
+        self.assertEqual(state.read_sgpr64(2), ref_nand_b64(a, b))
+        self.assertEqual(state.read_sgpr64(0), a)
+
+    def test_alias_dst_equals_both_srcs(self):
+        state = ScalarState()
+        a = 0x0F0F0F0F_F0F0F0F0
+        state.write_sgpr64(0, a)
+
+        # In-place NOT
+        state.execute_nand_b64("s[0:1]", "s[0:1]", "s[0:1]")
+        self.assertEqual(state.read_sgpr64(0), (~a) & MASK64)
+        self.assertEqual(state.scc, 1)
+
+    def test_alias_overlapping_window_partial(self):
+        state = ScalarState()
+        state.sgprs[0] = 0x12345678
+        state.sgprs[1] = 0x9ABCDEF0
+        state.sgprs[2] = 0x0FEDCBA9
+        state.sgprs[3] = 0x87654321
+
+        s0_val = state.read_sgpr64(0)
+        s1_val = state.read_sgpr64(2)
+        expected = ref_nand_b64(s0_val, s1_val)
+
+        # s_nand_b64 s[1:2], s[0:1], s[2:3]
+        state.execute_nand_b64("s[1:2]", "s[0:1]", "s[2:3]")
+
+        # s0 and s3 must be preserved
+        self.assertEqual(state.sgprs[0], 0x12345678)
+        self.assertEqual(state.read_sgpr64(1), expected)
+        self.assertEqual(state.sgprs[3], 0x87654321)
+
+    def test_alias_overlapping_shift_down(self):
+        state = ScalarState()
+        state.sgprs[0] = 0x00000000
+        state.sgprs[1] = 0xAAAAAAAA
+        state.sgprs[2] = 0x55555555
+        state.sgprs[3] = 0x33333333
+        state.sgprs[4] = 0xCCCCCCCC
+
+        s0_val = state.read_sgpr64(1)
+        s1_val = state.read_sgpr64(3)
+        expected = ref_nand_b64(s0_val, s1_val)
+
+        # s_nand_b64 s[0:1], s[1:2], s[3:4]
+        state.execute_nand_b64("s[0:1]", "s[1:2]", "s[3:4]")
+        self.assertEqual(state.read_sgpr64(0), expected)
+        self.assertEqual(state.sgprs[2], 0x55555555)
+        self.assertEqual(state.read_sgpr64(3), s1_val)
+
 
 if __name__ == "__main__":
     unittest.main()
