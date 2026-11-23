@@ -13,6 +13,13 @@
 #include <system_error>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <process.h>
 #else
 #include <unistd.h>
@@ -56,9 +63,16 @@ private:
 // Copies `from` (a file the build compiled into the test, LEONIDA_TEST_*_SPV) to `to`, overwriting it. Returns false
 // and says why when it can't: std::filesystem::copy_file would throw instead, and the uncaught exception ends the
 // test without a message (abort; exit code 3 under Wine), which reads as a crash rather than a missing file.
+// On Windows the copy is CopyFileW: MSVC's std::filesystem::copy_file calls CopyFile2, which Wine 9 does not have, so
+// the CI artifact run under Wine failed every test that stages a module this way (TEST-1126; the runtime's
+// file_system shim made the same move in #3655).
 inline bool copy_file(const std::filesystem::path& from, const std::filesystem::path& to) {
     std::error_code ec;
+#ifdef _WIN32
+    if (!::CopyFileW(from.c_str(), to.c_str(), FALSE)) ec.assign(int(::GetLastError()), std::system_category());
+#else
     std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+#endif
     if (ec) std::fprintf(stderr, "cannot copy %s to %s: %s\n", from.string().c_str(), to.string().c_str(),
                          ec.message().c_str());
     return !ec;

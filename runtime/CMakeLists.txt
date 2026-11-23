@@ -1265,6 +1265,11 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_device_pick COMMAND vk_device_pick_test)
   endif()
+  # The scratch-folder and copy helper the module-staging tests share (test_temp_dir.h); CPU only.
+  add_executable(test_temp_dir_test test/test_temp_dir_test.cpp)
+  if(BUILD_TESTING)
+    add_test(NAME test_temp_dir COMMAND test_temp_dir_test)
+  endif()
   # Committed BC* texture zero-initialization via vk.zero_buffer or vk.copy_scratch (D3D-220).
   add_executable(vk_bc_zero_init_test test/vk_bc_zero_init_test.cpp)
   target_link_libraries(vk_bc_zero_init_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
