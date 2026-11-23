@@ -362,8 +362,8 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     if not os.path.exists(a.target):
-        print(f"ERROR: cannot read {a.target}: no such file or folder", file=sys.stderr)
-        return 2
+        print(f"error: cannot read {a.target}: no such file or folder", file=sys.stderr)
+        return 1
     try:
         if a.json:
             check_report_path(a.json, a.target, a.shaders)
