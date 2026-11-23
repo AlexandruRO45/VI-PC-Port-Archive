@@ -23,6 +23,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "test_temp_dir.h"
 
 namespace {
 
@@ -852,20 +853,17 @@ void check_run_time_load() {
             using TitleId = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t*);
             using LaunchNew = void(STDMETHODCALLTYPE*)(void*, const char*, const char*, void*);
             using Restart = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t);
-            char tmp[MAX_PATH] = {};
-            GetTempPathA(sizeof(tmp), tmp);
-            const std::string game = std::string(tmp) + "leonida_xgame_title_test";
-            CreateDirectoryA(game.c_str(), nullptr);
-            SetEnvironmentVariableA("LEONIDA_GAME_DIR", game.c_str());
-            const std::string config = game + "\\MicrosoftGame.Config";
+            const testfiles::ScratchDir game("leonida_xgame_title_test");
+            SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", game.path().c_str());
+            const auto config = game.path() / L"MicrosoftGame.Config";
             auto write_config = [&](const char* text) {
-                if (FILE* f = std::fopen(config.c_str(), "wb")) {
+                if (FILE* f = _wfopen(config.c_str(), L"wb")) {
                     std::fputs(text, f);
                     std::fclose(f);
                 }
             };
             uint32_t id = 0x5a5a5a5a;
-            DeleteFileA(config.c_str());
+            DeleteFileW(config.c_str());
             check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == E_FAIL && id == 0x5a5a5a5a,
                   "slot 3 (XGameGetXboxTitleId) without a config: E_FAIL, nothing written");
             write_config("<Game configVersion=\"1\">\n  <TitleId> 1a2B3c4D </TitleId>\n</Game>\n");
@@ -879,9 +877,7 @@ void check_run_time_load() {
                   "slot 3 refuses a <TitleId> that is not hex");
             write_config("<Game><TitleId>123456789</TitleId></Game>");
             check(reinterpret_cast<TitleId>(slot(g, 3))(g, &id) == E_FAIL, "slot 3 refuses more than 8 hex digits");
-            DeleteFileA(config.c_str());
-            RemoveDirectoryA(game.c_str());
-            SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+            SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", nullptr);
             reinterpret_cast<LaunchNew>(slot(g, 4))(g, "other.exe", "", nullptr);
             check(true, "slot 4 (void XLaunchNewGame) returns offline");
             check(reinterpret_cast<Restart>(slot(g, 5))(g, "--restarted", 0) == S_OK,
