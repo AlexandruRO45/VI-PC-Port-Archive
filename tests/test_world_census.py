@@ -782,6 +782,41 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("error: --out reports would overwrite input archive", err)
 
+    def test_later_shard_matching_archive_is_rejected_before_any_writes(self):
+        archive = Path(self.dir, "shard_001_32_48.json")
+        content = struct.pack("<4sI", b"9FPR", 16) + bytes(40)
+        archive.write_bytes(content)
+        before = sorted(os.listdir(self.dir))
+
+        code, out, err = self.run_main(str(archive), "--out", self.dir, "--jobs", "1", "--shard-size", "16")
+
+        self.assertEqual(archive.read_bytes(), content)
+        self.assertEqual(sorted(os.listdir(self.dir)), before)
+        self.assertEqual(code, 2, err)
+        self.assertEqual(out, "")
+        self.assertIn("shard report would overwrite input archive", err)
+        self.assertIn(archive.name, err)
+
+    def test_shard_hard_link_to_archive_is_rejected(self):
+        os.mkdir(self.out)
+        archive = Path(self.arc)
+        content = archive.read_bytes()
+        shard = Path(self.out, f"shard_000_64_{len(content)}.json")
+        try:
+            os.link(archive, shard)
+        except OSError as exc:
+            self.skipTest(f"cannot create a hard link: {exc}")
+
+        code, out, err = self.run_main(self.arc, "--out", self.out, "--jobs", "1", "--resume")
+
+        self.assertTrue(archive.samefile(shard))
+        self.assertEqual(archive.read_bytes(), content)
+        self.assertEqual(list(Path(self.out).iterdir()), [shard])
+        self.assertEqual(code, 2, err)
+        self.assertEqual(out, "")
+        self.assertIn("shard report would overwrite input archive", err)
+        self.assertIn(shard.name, err)
+
     def test_out_as_existing_file_is_rejected(self):
         file_out = os.path.join(self.dir, "existing_file.txt")
         with open(file_out, "w") as f:

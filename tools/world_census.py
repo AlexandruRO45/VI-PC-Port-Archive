@@ -451,7 +451,7 @@ def scan_shard(job, source_id=None):
            "intervals": intervals, "raw_pages": raw_pages, "raw_system": raw_system,
            "map_first": rows[0]["offset"] if rows else None,
            "map_last": rows[-1]["offset"] if rows else None}
-    path = os.path.join(outdir, "shard_%03d_%d_%d.json" % (index, start, end))
+    path = _shard_path(outdir, doc)
     with _staged_json(path, doc, separators=(",", ":")) as tmp:
         os.replace(tmp, path)
     return {"index": index, "start": start, "end": end, "elapsed": doc["elapsed"],
@@ -826,12 +826,18 @@ def main(argv=None):
         if same_report_path(a.archive, os.path.join(a.out, report)):
             print(f"error: --out reports would overwrite input archive: {a.archive}", file=sys.stderr)
             return 2
+    expected = _expected_shards(start, end, a.shard_size)
+    if not a.merge_only:
+        for shard in expected:
+            path = _shard_path(a.out, shard)
+            if same_report_path(a.archive, path):
+                print(f"error: shard report would overwrite input archive: {path}", file=sys.stderr)
+                return 2
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:
         print(f"error: cannot create output directory {a.out}: {e.strerror or e}", file=sys.stderr)
         return 2
-    expected = _expected_shards(start, end, a.shard_size)
     t0 = time.time()
     docs = _load_shards(a.out, expected, source_id) if a.resume or a.merge_only else {}
     if not a.merge_only:
