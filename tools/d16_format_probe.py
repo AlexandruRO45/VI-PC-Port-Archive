@@ -343,7 +343,7 @@ def main(argv=None):
                 for o in s["first_off"][:3]:
                     print(f"    value {o['value']}: hw {o['hw']}, rule {o['rule']}, fits {','.join(o['fits']) or '-'}")
     except RuntimeError as e:
-        print(f"harness error: {e}")
+        print(f"harness error: {e}", file=sys.stderr)
         return 2
     finally:
         oracle.close()

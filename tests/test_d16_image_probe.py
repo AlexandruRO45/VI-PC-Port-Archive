@@ -4,7 +4,7 @@ when the oracle tools are present and the GPU is GFX10, and is skipped otherwise
 import io
 import json
 import os
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import re
 import struct
@@ -118,9 +118,10 @@ class FakeOracle:
         pass
 
 
-def run_main(oracle, *args):
+def run_main(oracle, *args, capture_err=False):
     buf = io.StringIO()
-    with mock.patch.object(runner, "open_oracle", return_value=oracle), redirect_stdout(buf):
+    stream = redirect_stderr(buf) if capture_err else redirect_stdout(buf)
+    with mock.patch.object(runner, "open_oracle", return_value=oracle), stream:
         rc = ip.main(list(args))
     return rc, buf.getvalue()
 
@@ -172,7 +173,7 @@ class Compare(unittest.TestCase):
             return full(kernels, words)[:-1]
 
         short.run = truncated
-        rc, out = run_main(short, "--formats", "unorm16", "--waves", "32")
+        rc, out = run_main(short, "--formats", "unorm16", "--waves", "32", capture_err=True)
         self.assertEqual(rc, 2, out)
         self.assertIn("returned 63 results for 64 kernels", out)
 
@@ -223,6 +224,23 @@ class OnHardware(unittest.TestCase):
         self.assertEqual(hw["load"][255], 0x3F800000)
         self.assertEqual(hw["load_d16"][255] & 0xFFFF, 0x3C00)
 
+
+class HarnessErrorStream(unittest.TestCase):
+    """A harness error is one stderr line (tools/div_fixup_diff.py:1007, tools/sad_diff.py:592), not stdout."""
+
+    def test_harness_error_goes_to_stderr(self):
+        fake = mock.Mock()
+        fake.arch = "gfx1030"
+        fake.device = "fake oracle"
+        with (mock.patch.object(runner, "open_oracle", return_value=fake),
+              mock.patch.object(asm, "family", return_value="gfx10"),
+              mock.patch.object(ip, "sweep", side_effect=RuntimeError("synthetic harness failure"))):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = ip.main([])
+        self.assertEqual(rc, 2)
+        self.assertIn("harness error: synthetic harness failure", err.getvalue())
+        self.assertNotIn("harness error", out.getvalue())
 
 if __name__ == "__main__":
     unittest.main()

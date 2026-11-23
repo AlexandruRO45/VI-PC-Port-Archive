@@ -450,7 +450,7 @@ def main(argv=None) -> int:
         raw_results = oracle.run(kernels)
         summary = evaluate_results(modes, waves, meta, raw_results)
     except RuntimeError as e:
-        print(f"harness error: {e}")
+        print(f"harness error: {e}", file=sys.stderr)
         return 2
     finally:
         oracle.close()

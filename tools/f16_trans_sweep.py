@@ -497,7 +497,7 @@ def main(argv=None):
             print(f"{op} specials (hw, mode {modes[0]}): " + ", ".join(
                 f"{h} -> {v}" for h, v in report["ops"][op][modes[0]]["specials"].items()))
     except RuntimeError as e:
-        print(f"harness error: {e}")
+        print(f"harness error: {e}", file=sys.stderr)
         return 2
     finally:
         oracle.close()

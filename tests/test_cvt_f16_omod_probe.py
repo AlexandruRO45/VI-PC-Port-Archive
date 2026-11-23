@@ -272,5 +272,22 @@ class ProbeCliTests(unittest.TestCase):
         self.assertIn("unavailable", buf.getvalue())
 
 
+class HarnessErrorStream(unittest.TestCase):
+    """A harness error is one stderr line (tools/div_fixup_diff.py:1007, tools/sad_diff.py:592), not stdout."""
+
+    def test_harness_error_goes_to_stderr(self):
+        fake = mock.Mock()
+        fake.arch = "gfx1030"
+        fake.device = "fake oracle"
+        with (mock.patch.object(runner, "open_oracle", return_value=fake),
+              mock.patch.object(asm, "family", return_value="gfx10"),
+              mock.patch.object(pr, "build_jobs", side_effect=RuntimeError("synthetic harness failure"))):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = pr.main([])
+        self.assertEqual(rc, 2)
+        self.assertIn("harness error: synthetic harness failure", err.getvalue())
+        self.assertNotIn("harness error", out.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

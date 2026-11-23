@@ -170,9 +170,10 @@ class FakeOracle:
         pass
 
 
-def run_main(oracle, *args):
+def run_main(oracle, *args, capture_err=False):
     buf = io.StringIO()
-    with mock.patch.object(runner, "open_oracle", return_value=oracle), redirect_stdout(buf):
+    stream = redirect_stderr(buf) if capture_err else redirect_stdout(buf)
+    with mock.patch.object(runner, "open_oracle", return_value=oracle), stream:
         rc = pr.main(["--formats", "unorm8,float16", *args])
     return rc, buf.getvalue()
 
@@ -212,12 +213,12 @@ class Compare(unittest.TestCase):
         # BUILD-733: fewer results than kernels used to be zipped away, leaving values unchecked and exit 0.
         for drop in (1, 10_000):   # one kernel missing, then every result (an empty list)
             with self.subTest(drop=drop):
-                rc, out = run_main(FakeOracle(drop=drop))
+                rc, out = run_main(FakeOracle(drop=drop), capture_err=True)
                 self.assertEqual(rc, 2)
                 self.assertRegex(out, r"harness error: \w+ wave32: the oracle returned \d+ results for \d+ kernels")
 
     def test_a_missing_result_is_a_harness_error(self):
-        rc, out = run_main(FakeOracle(none_at=0))
+        rc, out = run_main(FakeOracle(none_at=0), capture_err=True)
         self.assertEqual(rc, 2)
         self.assertIn("base 0: no result", out)
 
@@ -303,6 +304,23 @@ class ReportPathTests(unittest.TestCase):
             with open(blocker, "rb") as f:
                 self.assertEqual(f.read(), b"keep me")
 
+
+class HarnessErrorStream(unittest.TestCase):
+    """A harness error is one stderr line (tools/div_fixup_diff.py:1007, tools/sad_diff.py:592), not stdout."""
+
+    def test_harness_error_goes_to_stderr(self):
+        fake = mock.Mock()
+        fake.arch = "gfx1030"
+        fake.device = "fake oracle"
+        with (mock.patch.object(runner, "open_oracle", return_value=fake),
+              mock.patch.object(asm, "family", return_value="gfx10"),
+              mock.patch.object(pr, "sweep", side_effect=RuntimeError("synthetic harness failure"))):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = pr.main([])
+        self.assertEqual(rc, 2)
+        self.assertIn("harness error: synthetic harness failure", err.getvalue())
+        self.assertNotIn("harness error", out.getvalue())
 
 if __name__ == "__main__":
     unittest.main()
