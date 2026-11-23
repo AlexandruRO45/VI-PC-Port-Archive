@@ -1317,6 +1317,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    exe_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
@@ -1524,6 +1525,86 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
         fail(f"shaders: none of the {BVH_DLL} programs translated, so their index is not kept. Run the shaders "
              "stage again; if it happens again, the tool output above is why.")
     bvh_report(programs)
+    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
+
+
+# The retail executable, whose own DXBC containers exe_shaders() translates (docs/embedded_shaders.md, "Retail
+# executable"). shortcut: the name is the one every game/xbox-*.json has as expected_exe today, not read from the
+# manifest; pass it down from check() when a version names another.
+GAME_EXE = "game_scarlett_master.exe"
+
+
+def exe_settings(exe: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
+    """What the executable's outputs depend on, as one line: as bvh_settings, without the workgroup-memory cap
+    (the programs are vertex and pixel shaders)."""
+    return json.dumps({"exe": file_sha256(exe), "tools": sources_digest(TOOLS, BVH_TOOLS),
+                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
+
+
+def exe_report(programs: "tuple[list[str], list[str]]") -> None:
+    """As bvh_report: the counts, and every program left without a module, on every run."""
+    extracted, missing = programs
+    log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {GAME_EXE} programs translated")
+    if missing:
+        log(f"shaders: NOT translated: {', '.join(missing)}. The runtime has no module for "
+            f"{'it' if len(missing) == 1 else 'them'}, so a pipeline the game creates with "
+            f"{'it' if len(missing) == 1 else 'one of them'} is refused. When the step runs, rdna2spirv.py prints "
+            "the instruction each one stops at (docs/embedded_shaders.md, \"Retail executable\")")
+
+
+def exe_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
+                fallbacks: tuple[str, ...] = ()) -> None:
+    """The retail executable's own vertex and pixel programs (docs/embedded_shaders.md, "Retail executable"): the
+    steps of bvh_shaders() on game_scarlett_master.exe, into <work>/shaders/exe and <work>/shaders/spirv/exe, where
+    the runtime's shader library finds them by fssm_sha256 under the stage pe_shader_containers.py reads from each
+    container's PSV0. The game's own shaders neither feed nor depend on this step.
+
+    The 10 programs take seconds, so the step runs whole. Reuse requires both indexes, the translated modules and a
+    matching exe_build.json (exe_settings)."""
+    exe = os.path.join(game, GAME_EXE)
+    unpacked = os.path.join(work, "shaders", "exe")
+    spirv = os.path.join(work, "shaders", "spirv", "exe")
+    extracted = os.path.join(unpacked, "index.json")
+    unpack_index = os.path.join(unpacked, "fssm_index.json")
+    translated = os.path.join(spirv, "index.json")
+    settings_file = os.path.join(spirv, "exe_build.json")
+    if not os.path.isfile(exe):
+        # As for the builder's DLL: the runtime loads <shaders>/exe/index.json whenever it is there, so the index of
+        # a run that had the executable must not stay.
+        drop(translated, settings_file)
+        log(f"shaders: no {GAME_EXE} in the game folder, so none of its own programs to translate")
+        return
+    settings = exe_settings(exe, mc_signature, emulate, fallbacks)
+    programs = bvh_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None
+    if programs:
+        exe_report(programs)
+        return
+    log(f"shaders: extracting and translating the programs of {GAME_EXE}")
+    drop(translated, settings_file, extracted, unpack_index)
+    # As in bvh_shaders(): pe_shader_containers.py never overwrites a container, and a program that no longer
+    # translates must not keep a module from the run before.
+    for folder, suffixes in ((unpacked, (".dxbc",)), (os.path.join(unpacked, "fssm"), (".fssm",)),
+                             (os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(folder):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+    py("pe_shader_containers.py", exe, "--extract", unpacked)
+    py("fssm_unpack.py", unpacked, "--carve-index", extracted)
+    disasm = os.path.join(unpacked, "disasm")
+    py("shader_disasm.py", os.path.join(unpacked, "fssm"), "--unpack-index", unpack_index, "--out", disasm,
+       "--mcpu", "gfx1013", "--jobs", jobs)
+    extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
+    py("rdna2spirv.py", disasm, "--out", spirv, "--no-asm", *extra)
+    programs = bvh_programs(unpacked, spirv)
+    if not programs or len(programs[1]) == len(programs[0]):
+        drop(translated)   # an empty or unreadable index would read as a finished step
+        fail(f"shaders: none of the {GAME_EXE} programs translated, so their index is not kept. Run the shaders "
+             "stage again; if it happens again, the tool output above is why.")
+    exe_report(programs)
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
 

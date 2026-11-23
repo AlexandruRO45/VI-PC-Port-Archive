@@ -529,6 +529,24 @@ int main() {
         write(dir / "fspx" / "index.json", "{broken");
         CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 1 && bvh.fspx_size() == 0 &&
               bvh.program_candidates("cs", program).size() == 1);
+        // The retail executable's own programs (docs/embedded_shaders.md, "Retail executable"): <dir>/exe, entries
+        // named "exe/<name>", found by (stage, fssm_sha256) like a game shader of that stage and counted apart.
+        std::filesystem::create_directories(dir / "exe");
+        write(dir / "exe" / "index.json",
+              "{\"container_00\": {\"stage\": \"vs\", \"fssm_sha256\": \"" + builder_hash +
+                  "\"},\n \"container_01\": {\"stage\": \"ps\", \"fssm_sha256\": \"" + builder_hash + "\"}}");
+        {
+            std::ofstream spv(dir / "exe" / "container_00.spv", std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 4 && bvh.exe_size() == 2 && bvh.bvh_size() == 1);
+        CHECK(bvh.find("vs", builder_hash) && bvh.find("vs", builder_hash)->name == "exe/container_00" &&
+              bvh.spirv(*bvh.find("vs", builder_hash)).size() == 5);
+        CHECK(bvh.find("ps", builder_hash) && bvh.find("ps", builder_hash)->name == "exe/container_01");
+        CHECK(bvh.candidates("cs", builder_hash).size() == 1 && bvh.find("cs", hash));
+        write(dir / "exe" / "index.json", "{broken");
+        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.exe_size() == 0 && bvh.bvh_size() == 1 &&
+              !bvh.find("vs", builder_hash));
         std::filesystem::remove_all(dir);
     }
 

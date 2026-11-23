@@ -53,6 +53,10 @@ with `tools/pe_shader_containers.py` finds **10** valid DXBC containers (9,520 b
   unpack via `tools/fssm_unpack.py` (10/10 `FSSM`, 1,245–4,176 bytes), disassemble cleanly via `tools/shader_disasm.py --backend python`
   (10/10 clean), translate via `tools/rdna2spirv.py` (10/10 translated, all wave64 tier A), and pass `vk_pipeline_check`
   on an NVIDIA GeForce RTX 5060 Laptop GPU (driver `617.14`, Windows 11): **10/10 modules and 10/10 pipelines OK** (1 VS, 9 PS, 0 failed, 0 skipped).
+* **Build step and lookup:** `make_game.py`'s `shaders` stage now does this itself (`exe_shaders()`, section 7), and
+  the runtime's shader library loads the result. Before that, the executable's programs were in no index the runtime
+  reads, and a boot of the retail executable under `gta6rt` logged `no translated vs for FSSM sha256 …` for six
+  graphics `CreatePipelineState` calls.
 
 **Every one of the 52 containers carries two representations of its program:**
 
@@ -290,13 +294,27 @@ The last line also gets `--wave64-emulate` and the fallback flags of the build, 
   emulated modules made at the default cap, `RadixAlloc` is refused (`declares 37084 bytes of workgroup memory`,
   `0x80004001`) after 28 creations.
 
+**The executable's own programs.** The stage then runs `exe_shaders()` on `game_scarlett_master.exe`: the same four
+commands into `<work>/shaders/exe` and `<work>/shaders/spirv/exe`, without `--max-shared-memory` (the programs are
+vertex and pixel shaders), with `exe_build.json` as the settings file and the same rules for reuse, for a second run
+and for a program without a rule. The containers carry no `ILDN` name, so the programs are named `container_00` to
+`container_09`, and each index entry gets the stage `pe_shader_containers.py` read from `PSV0`. A package without the
+executable skips the step and removes an index left by a run that had it. Measured on 1.0.2.1 with
+`--wave64-emulate` (llvm-mc 23.1.6, Linux): 10 containers extracted (1 `DXBC` hit rejected), 10/10 `FSSM` unpacked,
+10/10 listings clean, 10/10 translated and `spirv-val`-valid, 1 `vs` and 9 `ps` entries, each with an `fssm_sha256`;
+a second run only reports `10 of 10`. None of the 10 `(stage, fssm_sha256)` keys is among the 26,503 entries of that
+work folder's main index.
+
 **Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json`, then
-`<dir>/fspx/index.json` and `<dir>/bvh/index.json` when they are there. The builder's entries are named
+`<dir>/fspx/index.json`, `<dir>/bvh/index.json` and `<dir>/exe/index.json` when they are there. The
+builder's entries are named
 `bvh/<name>`, the path of their module below `<dir>`, and go into the table of the game's shaders, so
 `create_compute` finds them through the lookup it already had (`compute_program()` gives an `FSSM` program, looked up
 by `(cs, fssm_sha256)`). A missing or unreadable `bvh/index.json` leaves the other indexes loaded, and the main
 index is still required. `bvh_size()` counts the entries, which `shader_library_corpus_test` leaves out of the
-entries a carved container must reach, like the FSPX ones.
+entries a carved container must reach, like the FSPX ones. The executable's entries are named `exe/<name>` and go
+into the same table, so a graphics `CreatePipelineState` finds them by `(vs, fssm_sha256)` or `(ps, fssm_sha256)`
+through the lookup of the game's shaders; `exe_size()` counts them, and the corpus test leaves them out too.
 
 **Measured: `LEONIDA_BVH_DEVICE=vulkan bvh_builder_test`** (package 1.0.2.1, `LEONIDA_BVH_RECORD62=1`,
 `LEONIDA_SHADERS` on a folder holding this step's output and an empty main index, since only this step was run).
@@ -393,3 +411,7 @@ reason to run again, a second run that leaves no duplicate containers, the repor
 every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` index (found by the
 container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
 creates a pipeline through slot 62 whose only translation is in `<shaders>/bvh/index.json`.
+`tests/test_exe_shaders_stage.py` does the same for the executable's step on synthetic unnamed containers with a
+`PSV0` part (the stage in the index, reuse, the reasons to run again, a missing executable, the report and the
+failure), and `shader_library_test` covers the `exe/` index (found by stage and program hash, counted apart, a
+broken index beside the others).
