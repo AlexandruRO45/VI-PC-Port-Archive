@@ -198,5 +198,14 @@ class SCbranchExeczOracleTests(unittest.TestCase):
         self.assertFalse(ref_oracle_execz(1))
         self.assertFalse(ref_oracle_execz(0xFFFFFFFFFFFFFFFF))
 
+class SCbranchExeczAstTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = BranchInstructionAST(
+            mnemonic="s_cbranch_execz",
+            target_offset=-2,
+        )
+        self.assertEqual(ast.mnemonic, "s_cbranch_execz")
+        self.assertEqual(ast.target_offset, -2)
+
 if __name__ == '__main__':
     unittest.main()
