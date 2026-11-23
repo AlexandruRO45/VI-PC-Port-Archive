@@ -205,6 +205,43 @@ test('a WebGL startup error replaces the fly prompt and preserves the original e
     assert.equal(attributes.get('role'), 'alert');
 });
 
+test('initial viewport sizes the renderer and camera before the first resize', async t => {
+    const startup = viewerModule.split('// ---------- freecam ----------')[0];
+    for (const [width, height, initialSize] of [
+        [0, 0, [1, 1]], [800, 0, [1, 1]], [0, 600, [1, 1]], [800, 600, [800, 600]],
+    ]) {
+        await t.test(`${width}x${height}`, () => {
+            const events = new EventTarget();
+            let size, initialAspect, updatedAspect;
+            const context = {
+                innerWidth: width, innerHeight: height, devicePixelRatio: 1,
+                addEventListener: events.addEventListener.bind(events),
+                document: { body: { prepend() {} } },
+                THREE: {
+                    WebGLRenderer: class {
+                        setPixelRatio() {}
+                        setSize(w, h) { size = [w, h]; }
+                    },
+                    PerspectiveCamera: class {
+                        constructor(_fov, aspect) { this.aspect = aspect; initialAspect = aspect; }
+                        updateProjectionMatrix() { updatedAspect = this.aspect; }
+                    },
+                    Scene: class { add() {} }, Color: class {}, Fog: class {}, HemisphereLight: class {},
+                    DirectionalLight: class { position = { set() {} }; },
+                },
+            };
+            vm.runInNewContext(startup, context);
+            assert.deepEqual({ size, aspect: initialAspect },
+                { size: initialSize, aspect: initialSize[0] / initialSize[1] });
+
+            context.innerWidth = 1280;
+            context.innerHeight = 720;
+            events.dispatchEvent(new Event('resize'));
+            assert.deepEqual({ size, aspect: updatedAspect }, { size: [1280, 720], aspect: 1280 / 720 });
+        });
+    }
+});
+
 async function freecamFixture(requestPointerLock = async () => { throw new Error('pointer lock unavailable'); }) {
     const windowEvents = new Map(), canvasEvents = new Map(), documentEvents = new Map();
     const helpMessages = [];
