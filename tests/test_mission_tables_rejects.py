@@ -47,8 +47,9 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(M.decode_record(record(col_b=9, band=5), 0),
                          {"offset": 0, "key": KEY, "colB": 9, "kind": 3, "poolOffset": 0x780, "band": 5, "count": 2})
         self.assertEqual(M.decode_record(b"\0" * 4 + record(), 4)["offset"], 4)
-        for label, data in (("lowest key", record(key=0x10000)), ("highest count", record(count=4096)),
-                            ("no entities", record(count=0))):
+        for label, data in (("lowest key", record(key=0x10000)), ("highest key", record(key=0xFFFFFFFF)),
+                            ("highest count", record(count=4096)), ("no entities", record(count=0)),
+                            ("kind 0, offset 0", record(kind=0, offset=0))):
             with self.subTest(label):
                 self.assertIsNotNone(M.decode_record(data, 0))
 
@@ -105,6 +106,7 @@ class ElementTests(unittest.TestCase):
     def test_scan_stops_at_the_end_and_steps_by_four(self):
         blob = b"\0" * 4 + element()
         self.assertEqual(list(M.scan_elements(blob, 68)), [4])
+        self.assertEqual(list(M.scan_elements(element() * 2, 128)), [0, 64])
         self.assertEqual(M.scan_elements(blob, 67), {})
         self.assertEqual(M.scan_elements(element(), 63), {})
         self.assertEqual(M.scan_elements(element(), 0), {})
@@ -137,6 +139,8 @@ class ChunkStrideTests(unittest.TestCase):
         self.assertEqual(self.stride(row(0), row(128), size=256), 64, "the last slice may end at the block's end")
         self.assertEqual(self.stride(row(0), row(128, 3), size=320), 64)
         self.assertEqual(self.stride(row(0), row(128, 1), size=192), 64)
+        self.assertEqual(self.stride(row(0xF80), row(0, band=1), size=0x1080), 64, "the next slice carries into band")
+        self.assertEqual(M.chunk_stride([row(0), row(128)], [(0x11, 0, 0x1000)]), 64, "a block may start at 0")
 
     def test_rejects(self):
         for label, rows, size in (
@@ -167,6 +171,8 @@ class FindChunksTests(unittest.TestCase):
     def test_a_run_is_two_or_more_records_of_one_kind(self):
         self.assertEqual(self.chunks(record() * 2), [(0, [0, 32])])
         self.assertEqual(self.chunks(b"\0" * 4 + record() * 3), [(4, [4, 36, 68])])
+        self.assertEqual(self.chunks(record(key=0x10000) * 2), [(0, [0, 32])], "the lone-record limits do not apply")
+        self.assertEqual(self.chunks(record(col_b=9) * 2), [(0, [0, 32])], "the lone-record limits do not apply")
         self.assertEqual(self.chunks(record(kind=1) * 2 + record(kind=2) * 2), [(0, [0, 32]), (64, [64, 96])])
         self.assertEqual(self.chunks(record(kind=1) + record(kind=2) * 2), [(32, [32, 64])])
         self.assertEqual(self.chunks(record() * 2 + b"\0" * 8 + record() * 2), [(0, [0, 32]), (72, [72, 104])])
@@ -181,6 +187,7 @@ class FindChunksTests(unittest.TestCase):
     def test_a_lone_record_must_name_an_element(self):
         accepted = record(key=0x1000000, col_b=4, offset=0x780)
         self.assertEqual(self.chunks(accepted, elements=[0x780]), [(0, [0])])
+        self.assertEqual(self.chunks(record(offset=0), elements=[0]), [(0, [0])])
         for label, data, elements in (
             ("no element there", accepted, [0x784]),
             ("key too small for a lone record", record(key=0xFFFFFF, col_b=4), [0x780]),
@@ -201,6 +208,7 @@ class RecordBlocksTests(unittest.TestCase):
             ("first is no record", bytes(32) + record(), 64, []),
             ("last is no record", two + bytes(32), 96, []),
             ("two kinds", mixed, 64, []),
+            ("block past the blob", two, 96, []),
         ):
             with self.subTest(label):
                 self.assertEqual(M.record_blocks(data, [(0x11, 0, size)]), want)
@@ -242,7 +250,7 @@ class LinkedPoolTests(unittest.TestCase):
 
 
 class ResolveTests(unittest.TestCase):
-    """Absolute addresses are 0x400+, the pool is at 0x2000, block 1 is at 0x3000 with room for two slots."""
+    """Unless a case says otherwise, the pool is at 0x2000 and block 1 at 0x3000 has room for two slots."""
 
     BLOCKS = [(0x11, 0x3000, 128)]
 
@@ -265,6 +273,18 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(self.resolve([0x3040]), ([0x3040], "block", 1))
         self.assertEqual(self.resolve([0x3040, 0x3080], at, blocks=[(0x11, 0x3000, 192)]),
                          ([0x3040, 0x3080], "block", 0))
+
+    def test_a_pool_or_block_may_start_at_zero(self):
+        at = row(0x40)
+        self.assertEqual(self.resolve([0x40, 0x80], at, pool=0, blocks=None), ([0x40, 0x80], "pool", 0))
+        self.assertEqual(self.resolve([0x40, 0x80], at, pool=None, blocks=[(0x11, 0, 192)]),
+                         ([0x40, 0x80], "block", 0))
+
+    def test_band_moves_only_the_block_reading(self):
+        at, blocks = row(0x40, band=1), [(0x11, 0x3000, 0x10C0)]
+        self.assertEqual(self.resolve([0x400, 0x440], at, blocks=blocks), ([0x400, 0x440], "absolute", 0))
+        self.assertEqual(self.resolve([0x2040, 0x2080], at, blocks=blocks), ([0x2040, 0x2080], "pool", 0))
+        self.assertEqual(self.resolve([0x4040, 0x4080], at, blocks=blocks), ([0x4040, 0x4080], "block", 0))
 
     def test_a_tie_keeps_the_earlier_reading_and_more_slots_win(self):
         self.assertEqual(self.resolve([0, 0x2000, 0x3000])[1], "absolute")
