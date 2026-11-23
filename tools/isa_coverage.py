@@ -30,6 +30,7 @@ It cannot see: a branch that accepts an instruction and then rejects some operan
 emitted code is right. "handled" means "has a rule", not "is correct". A broad prefix such as ds_ marks every
 ds_* instruction handled-family even where a sub-dispatch then refuses it; the exact names found inside the
 sub-dispatch still count as handled-exact, so read handled-family as an upper bound.
+Usage: `python -I tools/isa_coverage.py --help` lists the options.
 """
 import argparse
 import ast
@@ -298,15 +299,21 @@ def _in_skipped(node, skip):
     return any(id(x) in skip for x in ast.walk(node) if isinstance(x, ast.expr))
 
 
+PROBE_TIMEOUT = 30    # seconds llvm-mc gets for one mnemonic
+
+
 def probe_llvm_mc(llvm_mc, names, mcpu="gfx1013"):
     """Ask llvm-mc about each mnemonic without operands and distinguish tool failures from opcode diagnostics."""
     out = {}
     for n in names:
         try:
             r = subprocess.run([llvm_mc, "-arch=amdgcn", f"-mcpu={mcpu}"], input=n + "\n", capture_output=True,
-                               text=True, timeout=30)
+                               text=True, timeout=PROBE_TIMEOUT)
         except OSError as e:
             return {"error": str(e)}
+        except subprocess.TimeoutExpired:
+            # A stalled llvm-mc would stall every remaining name for as long again: give up with one message.
+            return {"error": f"llvm-mc did not answer within {PROBE_TIMEOUT} s for {n!r}"}
         text = r.stderr + "\n" + r.stdout
         if "error: invalid instruction" in text:
             out[n] = "unknown to LLVM"
