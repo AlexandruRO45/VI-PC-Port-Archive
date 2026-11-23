@@ -70,12 +70,40 @@ def strip_ps_comments(src):
     return "\n".join(lines)
 
 
+def strip_ps_strings(s):
+    """Replace content of single and double quoted strings with whitespace, preserving length."""
+    out = []
+    in_sgl = in_dbl = False
+    for ch in s:
+        if ch == "'" and not in_dbl:
+            in_sgl = not in_sgl
+            out.append(" ")
+        elif ch == '"' and not in_sgl:
+            in_dbl = not in_dbl
+            out.append(" ")
+        elif in_sgl or in_dbl:
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def extract_ps1_params(content):
-    """Set of lowercase parameter names from the first param(...) block in a PowerShell script."""
+    """Set of lowercase parameter names from a PowerShell script's top-level param(...) block."""
+    if content.startswith("\ufeff"):
+        content = content[1:]
+    if content.startswith("\ufeff"):  # multiple BOMs
+        return set()
     cleaned = strip_ps_comments(content)
     m = re.search(r"\bparam\s*\(", cleaned, re.IGNORECASE)
     if not m:
         return set()
+    prefix = cleaned[:m.start()]
+    prefix = re.sub(r"(?i)\busing\s+(?:namespace|module)?\s*[^;\n]+[;\n]?", "", prefix)
+    prefix = re.sub(r"\[[^\]]*\]", "", prefix)
+    if prefix.strip():
+        return set()
+
     start = m.end()
     depth = 1
     i = start
@@ -188,9 +216,14 @@ def ps1_flag_mismatches(pages, sources):
                 tool = m.group(1).replace("\\", "/")
                 if tool not in param_cache:
                     continue
-                tail = cmd[m.end():].split("#", 1)[0]
+                rest = cmd[m.end():]
+                clean_rest = strip_ps_strings(rest)
+                delim_match = re.search(r"[;\n|]|&&|\|\|", clean_rest)
+                tail = rest[:delim_match.start()] if delim_match else rest
+                tail = tail.split("#", 1)[0]
+                unquoted = strip_ps_strings(tail)
                 allowed = param_cache[tool]
-                for flag in sorted(set(PS1_FLAG.findall(tail))):
+                for flag in sorted(set(PS1_FLAG.findall(unquoted))):
                     flag_name = flag.lstrip("-").lower()
                     if flag_name not in allowed:
                         out.append((f"{page}:{n}", tool, flag))
@@ -207,9 +240,21 @@ class DocsCliFlags(unittest.TestCase):
         sources["tools/x.py"] += ' "--" + name'
         self.assertEqual(tool_flag_mismatches(pages, sources), [])
 
-        ps1_pages = {"docs/b.md": "```\n.\\scripts\\test.ps1 -ValidParam -BadParam\n```\n"}
+        ps1_pages = {
+            "docs/b.md": "```\n.\\scripts\\test.ps1 -ValidParam -BadParam\n"
+                         "./scripts/test.ps1 -ValidParam '-NotAFlag' -OtherBad\n"
+                         "./scripts/test.ps1 -ValidParam; ./scripts/test.ps1 -BadChained\n```\n"
+        }
         ps1_sources = {"scripts/test.ps1": "param([string]$ValidParam)"}
-        self.assertEqual(ps1_flag_mismatches(ps1_pages, ps1_sources), [("docs/b.md:2", "scripts/test.ps1", "-BadParam")])
+        self.assertEqual(ps1_flag_mismatches(ps1_pages, ps1_sources), [
+            ("docs/b.md:2", "scripts/test.ps1", "-BadParam"),
+            ("docs/b.md:3", "scripts/test.ps1", "-OtherBad"),
+            ("docs/b.md:4", "scripts/test.ps1", "-BadChained"),
+        ])
+        self.assertEqual(extract_ps1_params("\ufeff\ufeffparam([string]$x)"), set())
+        self.assertEqual(extract_ps1_params("$a = 1\nparam([string]$x)"), set())
+        self.assertEqual(extract_ps1_params("function f { param([string]$x) }"), set())
+        self.assertEqual(extract_ps1_params("[CmdletBinding()]\nparam([string]$x)"), {"x"})
 
     def test_docs_name_existing_flags(self):
         files = tracked_files()
