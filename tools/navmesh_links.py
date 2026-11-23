@@ -379,7 +379,7 @@ def verify_tile(b, stats):
                             endpoints_ok = False
                             break
                         p0, p1, s0, s1 = struct.unpack_from("<HHII", b, la + 32 * li + 12)
-                        if not ((p0 == gpi or p1 == gpi) and (s0 == c8 or s1 == c8)):
+                        if not ((s0 == c8 and p0 == gpi) or (s1 == c8 and p1 == gpi)):
                             endpoints_ok = False
                             break
                         by_li.setdefault(li, set()).add(gpi)

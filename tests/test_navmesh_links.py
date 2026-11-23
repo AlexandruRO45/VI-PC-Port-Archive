@@ -422,6 +422,26 @@ class NavmeshLinksTest(unittest.TestCase):
             link_indices=[0, 1, 0],
             poly_link_counts=(1, 1, 1),
         )[0]
+        # Counterexamples where a cross-tile link IS listed by its true local endpoint,
+        # AND ALSO falsely listed by another local polygon whose index matches the remote endpoint.
+        remote_p0_spoof = build_tile(
+            sector=sector,
+            links=[
+                (100, 200, 300, 400, 500, 600, 0, 2, sector, sector, 0x0200, 0x0050, 63, 0),
+                (110, 210, 310, 410, 510, 610, 1, 2, sector + 1, sector, 0x0400, 0x0040, 127, 0),
+            ],
+            link_indices=[0, 1, 0, 1],
+            poly_link_counts=(1, 1, 2),
+        )[0]
+        remote_p1_spoof = build_tile(
+            sector=sector,
+            links=[
+                (100, 200, 300, 400, 500, 600, 0, 2, sector, sector, 0x0200, 0x0050, 63, 0),
+                (110, 210, 310, 410, 510, 610, 0, 1, sector, sector + 1, 0x0400, 0x0040, 127, 0),
+            ],
+            link_indices=[0, 1, 1, 0],
+            poly_link_counts=(2, 1, 1),
+        )[0]
         cases = [
             ("edges_valid", build_tile(corrupt_edge_oob=True)[0]),
             ("edges_valid", build_tile(corrupt_edge_sector=True)[0]),
@@ -434,6 +454,8 @@ class NavmeshLinksTest(unittest.TestCase):
             ("poly_link_chain", build_tile(corrupt_chain_total=True)[0]),
             ("link_indices_endpoints", build_tile(corrupt_b0_endpoint=True)[0]),
             ("link_indices_endpoints", unlisted_local_end),
+            ("link_indices_endpoints", remote_p0_spoof),
+            ("link_indices_endpoints", remote_p1_spoof),
         ]
         for failed_check, blob in cases:
             with self.subTest(failed_check=failed_check):
