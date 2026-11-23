@@ -758,6 +758,12 @@ int main() {
         check(full_a("GAME:\\nested\\deeper\\c.bin", 5, narrow, &narrow_part) == 26,
               "GetFullPathNameA with a small buffer answers the size with the NUL");
 
+        // A NULL buffer is a size query, however long the length says it is: the size with the NUL, nothing written.
+        wchar_t* query_part = reinterpret_cast<wchar_t*>(1);
+        check(full_w(L"GAME:\\nested\\deeper\\c.bin", MAX_PATH, nullptr, &query_part) == 26 && query_part == nullptr,
+              "GetFullPathNameW with a NULL buffer is a size query");
+        check(full_a("GAME:\\nested\\deeper\\c.bin", MAX_PATH, nullptr, nullptr) == 26, "GetFullPathNameA with a NULL buffer is a size query");
+
         // lpFilePart is NULL when the buffer is too small and when the name is refused, not left as the caller had it
         // (Wine's GetFullPathNameW, which the Windows function follows here).
         wchar_t* sentinel_w = reinterpret_cast<wchar_t*>(1);

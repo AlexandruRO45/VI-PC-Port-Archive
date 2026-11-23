@@ -615,7 +615,7 @@ DWORD WINAPI get_full_path_name_w(LPCWSTR name, DWORD length, LPWSTR buffer, LPW
         SetLastError(ERROR_INVALID_NAME);
         return 0;
     }
-    if (full.size() + 1 > length) return static_cast<DWORD>(full.size() + 1);  // too small: the size with the NUL
+    if (!buffer || full.size() + 1 > length) return static_cast<DWORD>(full.size() + 1);  // size query or too small: the size with the NUL
     std::wmemcpy(buffer, full.c_str(), full.size() + 1);
     if (file_part) *file_part = has_file_part ? buffer + full.rfind(L'\\') + 1 : nullptr;
     return static_cast<DWORD>(full.size());
@@ -632,8 +632,11 @@ DWORD WINAPI get_full_path_name_a(LPCSTR name, DWORD length, LPSTR buffer, LPSTR
         return 0;
     }
     const int needed = WideCharToMultiByte(CP_ACP, 0, full.c_str(), -1, nullptr, 0, nullptr, nullptr);  // with the NUL
-    if (needed <= 0) return 0;
-    if (static_cast<DWORD>(needed) > length) return static_cast<DWORD>(needed);
+    if (needed <= 0) {
+        if (GetLastError() == ERROR_SUCCESS) SetLastError(ERROR_NO_UNICODE_TRANSLATION);  // never fail with a stale or zero error
+        return 0;
+    }
+    if (!buffer || static_cast<DWORD>(needed) > length) return static_cast<DWORD>(needed);  // size query or too small
     WideCharToMultiByte(CP_ACP, 0, full.c_str(), -1, buffer, needed, nullptr, nullptr);
     if (file_part) *file_part = has_file_part ? std::strrchr(buffer, '\\') + 1 : nullptr;
     return static_cast<DWORD>(needed - 1);
