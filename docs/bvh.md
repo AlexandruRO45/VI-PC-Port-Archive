@@ -1040,10 +1040,10 @@ MoltenVK: `xdxr_build_check` found about 130 of 200 rays wrong in `blas_three_so
 KosmicKrisp and on llvmpipe. A pointer from `OpConvertUToPtr`, which the translator uses, kept its load before the
 store in the same test.
 
-**BOX16 nodes.** A bottom-level build with `MINIMIZE_MEMORY` writes BOX16 inner nodes: 64 bytes, not 128, so a BLAS
+**BOX16 nodes.** BOX16 is the 64-byte inner-node form of BOX32's 128 bytes, so a BLAS
 is about a fifth smaller (39,040 bytes against 48,768 for the 428-triangle BLAS of `d3d12_xdxr_rt_test`). The tree
 is the same; only the node records and their offsets change, and
-`GetRaytracingAccelerationStructurePrebuildInfo` gives the smaller size when it gets the same flag. Each child box
+`GetRaytracingAccelerationStructurePrebuildInfo` gives the smaller size when its build asks for it the same way. Each child box
 is rounded outward to halves (min toward -inf, max toward +inf) from the exact box, which the builder keeps in its
 accumulators, so the rounding does not add up from level to level. The rounding is integer code, because `packHalf2x16`
 rounds in an implementation-defined way (AMD's driver rounds toward zero). Beyond the half range a bound becomes
@@ -1053,12 +1053,23 @@ side, never a half denormal: a decoder that flushes those to zero would make the
 `half_round` does the same, and `check-build` compares every BOX16 word bit for bit with `encode_box16` of the exact
 box of the triangles under that child. Top-level builds keep BOX32 whatever the flags, because they are in world
 space, where a half's step reaches 2 m at 2,048 m and 4 m at 4,096 m. An update must pass the same flags as its
-build (D3D12 requires it), so a refit keeps the node type. **ASSUMPTION:** that `MINIMIZE_MEMORY` is the console's
-switch for BOX16. The offline BLASes in the `*_bvh4.rpf` packs have BOX16 roots (§3.1), but `XboxBvhBuilder.dll`'s
-choice between the two at run time is not traced. The one traced datum points at a finer rule: `docs/xdxr.md` §3
-finds a different bottom-level path that needs `MINIMIZE_MEMORY` and a stream setting (type 0, `+0x08`) above 10.0,
-so the flag alone may not be the switch. A bottom-level structure authored in world coordinates gets looser boxes
-from BOX16 the same way a top-level one would: slower to trace, never wrong. A BOX16 build ends with one spare,
+build (D3D12 requires it), so a refit keeps the node type. **What selects it**, measured on `XboxBvhBuilder.dll`
+1.0.2.1 (the build-info setup at RVA `0xcc00`, the prebuild-info path at `0x11b80` and the layout function at
+`0xe4c0`; image base `0x180000000`): a bottom-level build takes the 64-byte form only when `Inputs.Flags` has
+`MINIMIZE_MEMORY` (`0x10`) **and** the stream descriptor's type-0 record `+0x08` float is greater than 10.0.
+`MINIMIZE_MEMORY` alone is not the switch: with no type-0 record that float defaults to 0.0 (`PREFER_FAST_TRACE`
+without `MINIMIZE_MEMORY`), 1.005 (both set, or neither) or 1.01 (`MINIMIZE_MEMORY` alone) — all at or below the
+10.0 test — so a title that sets the flag and passes no stream request gets the 128-byte layout, and a top-level
+build never takes the shorter form. The decision is bit 9 of the per-build flags word (record `+0x98` of the
+0xa0-byte build-info record); the layout function counts one inner node as 2 units of 64 bytes with the 128-byte
+form and 1 unit with the 64-byte form, and the prebuild-info path applies the same test to return `units << 6`
+bytes, rounded up to 1 KiB. One `.data` byte (`0x1800d7b4d`, 0 in the shipped file) bypasses the flag and the 10.0 test.
+
+Leonida's builder instead writes BOX16 whenever a bottom-level build sets `MINIMIZE_MEMORY` (`xdxr_box16` in
+`runtime/src/vulkan_backend.h`), which matches the offline packs' BOX16 roots (§3.1) but not this runtime rule; the
+game's own stream desc is still unmeasured (`docs/xdxr.md` §5), so whether its runtime builds are BOX16 is open. A
+bottom-level structure authored in world coordinates gets looser boxes from BOX16 the same way a top-level one
+would: slower to trace, never wrong. A BOX16 build ends with one spare,
 zeroed 64-byte unit after the last node it wrote, and the header's size counts it: the translator's
 `image_bvh_intersect_ray` loads a box node's 112 bytes of BOX32 bounds before it checks the type, so the last
 64-byte node would otherwise be read past the structure, or past a compacted copy of it.

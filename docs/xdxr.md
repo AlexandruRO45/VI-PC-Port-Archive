@@ -69,7 +69,7 @@ offsets, types, defaults and the conditions under which they are read are.
 | Type | Offset | Type of value | Default | Read when | Observed use |
 |---|---|---|---|---|---|
 | 0 | `0x04` | `float` | -1.0 | always | copied into the per-build info |
-| 0 | `0x08` | `float` | -1.0 | always | negative means a default from `Inputs.Flags` (below); above 10.0 selects a different bottom-level path when `MINIMIZE_MEMORY` is set |
+| 0 | `0x08` | `float` | -1.0 | always | negative means a default from `Inputs.Flags` (below); above 10.0 selects the 64-byte inner-node (BOX16) layout of a bottom-level build, and only together with `MINIMIZE_MEMORY`: every default is at most 1.01, so the flag alone does not (`bvh.md`, "BOX16 nodes") |
 | 0 | `0x0c` | 4 × `u8` | 0 | always | copied into the per-build info byte by byte |
 | 1 | `0x0d` | `u8` | a global | bottom level (`Type` 1) only | 0 keeps the default; otherwise clamped to 15 (N), reserves `N * N * 0x90` extra bytes and is stored as a 4-bit field |
 | 1 | `0x0e` | `u8` (bool) | 0 | top level (`Type` 0) only | nonzero clears one bit of the internal build flags |
@@ -115,6 +115,8 @@ None of the 15 other DLLs in the package names the type or an offline builder.
 ## 5. What is still open
 
 - The names of the stream record types and of their values.
+- Whether the game asks for the 64-byte inner-node layout: that needs a type-0 `+0x08` above 10.0 together with
+  `MINIMIZE_MEMORY` (`bvh.md`, "BOX16 nodes"), so it would show up in the stream desc this runtime reads.
 - The offline statistics layout (§4). It is not in the package: the one DLL that knows the type only rejects or
   skips it (RT-155). A runtime doesn't need it, because the shipped builder refuses the request.
 - Whether the game passes a non-empty stream desc at all. That needs the executable's call sites (RT-5).
