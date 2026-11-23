@@ -161,6 +161,10 @@ def _vs_a_skip(i):
     return (7 * y + x if x % 4 == 1 else 1000 + x, int(x % 4 == 1), 2000 + y + (9 if y % 4 == 2 else 0), x % 4 + 1)
 
 
+def _vs_a_bpermute(i):
+    return (i ^ 1, 3 * (i ^ 1) + 7, i, i >> 1)                 # ds_bpermute from lane ^ 1: the pair's other vertex
+
+
 def _vs_b_readlane_uniform(i):
     return (_x(i) + 123, 200, _x(i) + 123, 277)
 
@@ -203,6 +207,7 @@ FIXTURES = {
     "ps_w64_c_scc_vote": ("C", _c_scc_vote, {}),
     "ps_w64_c_execz_sgpr": ("C", _c_execz_sgpr, {}),
     "vs_w64_a_skip": ("A", _vs_a_skip, VS_ENV),
+    "vs_w64_a_bpermute": ("A", _vs_a_bpermute, VS_ENV),
     "vs_w64_b_waterfall": ("B", _b_waterfall, VS_ENV),
     "vs_w64_b_readlane_uniform": ("B", _vs_b_readlane_uniform, dict(VS_ENV, VKH_SGPRS=VS_ENV["VKH_SGPRS"] + ",123")),
     "vs_w64_b_ballot_atomic": ("B", _b_ballot, VS_ENV),
