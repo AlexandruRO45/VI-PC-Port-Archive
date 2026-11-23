@@ -54,8 +54,12 @@ public class Loader { public static void Main(string[] args) { System.Console.Wr
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             out = repo / "reports/exe" / image.stem
             self.assertIn(hashlib.sha256(image.read_bytes()).hexdigest(), (out / "hash.txt").read_text("utf-16"))
-            self.assertEqual((out / "dryrun.txt").read_text("utf-16").splitlines(),
-                             ["--dry-run", str(image), "--game-dir", str(game)])
+            dry_run, image_arg, game_dir, dir_arg = (out / "dryrun.txt").read_text("utf-16").splitlines()
+            self.assertEqual((dry_run, game_dir), ("--dry-run", "--game-dir"))
+            # PowerShell can expand an 8.3 TEMP path before passing it to the loader.
+            for arg, expected in ((image_arg, image), (dir_arg, game)):
+                self.assertTrue(Path(arg).is_absolute(), arg)
+                self.assertTrue(expected.samefile(arg), (arg, expected))
             imports = json.loads((out / (image.name + ".json")).read_text("utf-8"))["imports"]
             self.assertTrue(any(d["dll"].lower() == "xmem.dll" and d["where"] == "bundled" for d in imports))
             self.assertIn("fake_lib.dll", (out / "shim-todo.txt").read_text())
