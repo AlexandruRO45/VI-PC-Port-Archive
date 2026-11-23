@@ -1,7 +1,9 @@
 """Check the boot-trace entry point against the standalone producer."""
 import json
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -71,6 +73,23 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(result.stdout, b"")
         self.assertIn(b"absent.jsonl", result.stderr)
         self.assertIn(b"absent.log", result.stderr)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal exit status")
+    def test_signal_exit_uses_shell_status(self):
+        checkout = self.cwd / "synthetic checkout"
+        cli = checkout / "scripts" / "dev.py"
+        producer = checkout / "tools" / "boot_trace.py"
+        cli.parent.mkdir(parents=True)
+        producer.parent.mkdir()
+        shutil.copyfile(CLI, cli)
+        producer.write_text(
+            "import os, signal\nos.kill(os.getpid(), signal.SIGTERM)\n",
+            encoding="utf-8", newline="\n",
+        )
+        direct = self.invoke(producer)
+        self.assertEqual(direct.returncode, -signal.SIGTERM, direct.stderr)
+        routed = self.invoke(cli, "boot-trace")
+        self.assertEqual(routed.returncode, 128 + signal.SIGTERM, routed.stderr)
 
     def test_missing_producer(self):
         isolated_cli = self.cwd / "empty checkout" / "scripts" / "dev.py"
