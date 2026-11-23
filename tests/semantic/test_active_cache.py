@@ -283,6 +283,63 @@ class ActiveCacheTests(unittest.TestCase):
         self.assertFalse(rdna2spirv.writes_exec({"op": "s_mov_b32", "args": [sgpr(0), ex]}))
         self.assertFalse(rdna2spirv.writes_exec({"op": "s_and_b32", "args": [sgpr(0), ex, sgpr(1)]}))
 
+    def test_no_exec_write_reads_exec_as_data(self):
+        """A shader that never writes EXEC still returns all-ones when reading exec_lo as data."""
+        lines = [
+            "v_mov_b32 v0, 0x11",
+            "v_mov_b32 v1, 0x22",
+            "s_mov_b32 s4, exec_lo",
+            "v_mov_b32 v3, s4",
+            "v_cndmask_b32_e64 v2, v0, v1, exec_lo",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spvasm = support.translate_lines("ps_no_exec_read", lines)
+        _validate_spirv(spvasm)
+        self.assertNotIn("OpLoad %bool %active", spvasm)
+        res = run_wave(spvasm, wave=32)
+        for lane in range(32):
+            self.assertEqual(tuple(res["outputs"][lane]["%out_mrt0"]), (0x11, 0x22, 0x22, 0xFFFFFFFF))
+
+    def test_vcmpx_only_and_saveexec_only_disable_static_true(self):
+        """Shaders whose ONLY EXEC writer is v_cmpx or s_*_saveexec must disable exec_static_true."""
+        # Case 1: only v_cmpx writes EXEC (no s_or/s_mov restore).
+        lines_vcmpx = [
+            "v_mov_b32 v0, 10",
+            "v_mov_b32 v1, 0",
+            "v_writelane_b32 v1, 1, 4",
+            "v_cmpx_eq_u32 v1, 0",
+            "v_add_nc_u32 v0, v0, 5",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv_vcmpx = support.translate_lines("ps_vcmpx_only", lines_vcmpx)
+        _validate_spirv(spv_vcmpx)
+        self.assertIn("OpStore %active ", spv_vcmpx)
+        res_vcmpx = run_wave(spv_vcmpx, wave=32)
+        for lane in range(32):
+            if lane != 4:
+                self.assertEqual(tuple(res_vcmpx["outputs"][lane]["%out_mrt0"]), (15, 0, 15, 0))
+
+        # Case 2: only s_and_saveexec_b32 writes EXEC (no s_or/s_mov restore).
+        lines_save = [
+            "v_mov_b32 v0, 20",
+            "v_mov_b32 v1, 0",
+            "v_writelane_b32 v1, 1, 6",
+            "v_cmp_eq_u32 vcc_lo, v1, 0",
+            "s_and_saveexec_b32 s4, vcc_lo",
+            "v_add_nc_u32 v0, v0, 7",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv_save = support.translate_lines("ps_saveexec_only", lines_save)
+        _validate_spirv(spv_save)
+        self.assertIn("OpStore %active ", spv_save)
+        res_save = run_wave(spv_save, wave=32)
+        for lane in range(32):
+            if lane != 6:
+                self.assertEqual(tuple(res_save["outputs"][lane]["%out_mrt0"]), (27, 0, 27, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
