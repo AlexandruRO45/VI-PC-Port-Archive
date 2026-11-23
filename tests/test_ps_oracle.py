@@ -274,7 +274,10 @@ class Cli(unittest.TestCase):
                         report = protected
                         if linked:
                             report = os.path.join(directory, "alias.json")
-                            os.link(protected, report)
+                            try:
+                                os.link(protected, report)
+                            except (OSError, NotImplementedError) as error:
+                                self.skipTest(f"hard links unavailable: {error}")
                         oracle = mock.Mock(device="synthetic", wave64=False)
                         oracle.run.return_value = [[0, 0, 0, 0]]
                         args = ["--build", ".", "--asm", asm, "--size", "1", "1", "--json", report]
