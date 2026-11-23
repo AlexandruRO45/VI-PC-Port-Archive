@@ -576,6 +576,15 @@ class TestDsWriteB16AST(unittest.TestCase):
         expr.eval(lds, 0x10, 0x4321)
         self.assertEqual(lds.read_u16(0x14), 0x4321)
 
+class TestDsWriteB16SIMD(unittest.TestCase):
+    def test_simd_write_b16_multi_lane(self) -> None:
+        lds = LdsModel()
+        expr = LdsWriteB16Expr(offset=0)
+        for l in range(32):
+            expr.eval(lds, l * 4, 0xA000 + l)
+        for l in range(32):
+            self.assertEqual(lds.read_u16(l * 4), 0xA000 + l)
+
 
 if __name__ == "__main__":
     unittest.main()
