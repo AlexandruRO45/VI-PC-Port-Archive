@@ -111,7 +111,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Count the direct calls to chosen imports of an x86-64 PE image.")
     ap.add_argument("image")
     ap.add_argument("--import", dest="imports", action="append", default=[], metavar="DLL!NAME",
-                    help="an import to look for (repeatable); '#N' names an ordinal import")
+                    help="an import to look for (repeatable); DLL is case-insensitive, NAME is case-sensitive; "
+                         "'#N' names an ordinal import")
     ap.add_argument("--dll", dest="dlls", action="append", default=[], metavar="DLL",
                     help="every import of this DLL (repeatable)")
     ap.add_argument("--json", action="store_true", help="print JSON (RVAs in hex) instead of the table")
