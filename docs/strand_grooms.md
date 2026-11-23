@@ -158,8 +158,8 @@ from the start of the GPU buffer (`0` means the optional array is absent). Eleme
 | `+0x48` | `tri_count` | 4 B | T | Four `u8` per-triangle strand counts by class; byte 0 = class 0 (`smh_gen_1`), byte 3 / bytes 1+3 (`smh_gen_2`/`_4`) |
 | `+0x4c` | `tri_region` | 1 B | T | Optional `u8` region ID (`0` = none), tested against a 256-bit style mask (`smh_gen`) |
 | `+0x50` | `flags` | — | — | `u32` feature/layout flags |
-| `+0x54` | `nodes_packed` | — | — | `(nodes << 8) | low_byte`; `nodes = guides * nodes_per_guide` (`smh_sim`) |
-| `+0x58` | `counts` | — | — | `guides | (triangles << 16)` (`smh_pose`, `smh_gen`) |
+| `+0x54` | `nodes_packed` | — | — | `(nodes << 8) \| low_byte`; `nodes = guides * nodes_per_guide` (`smh_sim`) |
+| `+0x58` | `counts` | — | — | `guides \| (triangles << 16)` (`smh_pose`, `smh_gen`) |
 | `+0x5c` | `nodes_per_guide` | — | — | Low byte = nodes per guide (`smh_pose`) |
 | `+0x60` | `length_random` | — | — | Two IEEE 754 `float16` values: `(amount, min_factor)` (`smh_gen`) |
 | `+0x64`, `+0x70` | class 1 params | — | — | Additional placement parameters read by class 1 variants (`smh_gen_2`, `_4`, `_8`, `_16`) |
