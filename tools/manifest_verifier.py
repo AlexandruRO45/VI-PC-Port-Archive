@@ -8,7 +8,6 @@ Usage:
     python -I manifest_verifier.py <target_dir> [--manifest FILE] [--jobs N]
                                    [--quiet] [--verbose] [--json] [--strict]
     python -I manifest_verifier.py verify <target_dir> [--manifest FILE] [--jobs N]
-Usage: `python -I tools/manifest_verifier.py --help` lists the options.
 """
 from __future__ import annotations
 

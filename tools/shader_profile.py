@@ -15,7 +15,6 @@ version, target and input range, which can include embedded data.
 
 The terminal prints warning totals. The JSON report includes the bytes, so keep reports from real shaders local
 (see CONTRIBUTING.md).
-Usage: `python -I tools/shader_profile.py --help` lists the options.
 """
 import argparse
 import json

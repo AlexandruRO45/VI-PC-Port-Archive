@@ -80,7 +80,6 @@ Usage:
 
 Text output prints one line per file and one line per entity; `--json` writes `{files, summary}` with the
 same numbers and the entity list (hashes as eight lowercase hex digits).
-Usage: `python -I tools/mission_tables.py --help` lists the options.
 """
 import argparse
 import collections

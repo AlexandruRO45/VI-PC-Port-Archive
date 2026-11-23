@@ -41,7 +41,6 @@ a zlib block boundary is still found. JSON `offset` is then the joined byte posi
 `file_offset` the position inside `file`, the part holding the record's `0c` marker byte; text
 output prints `file:file_offset`. The joined scan holds at most two read blocks of input
 (`JOIN_BLOCK_BYTES`, 1 MiB) plus a 24-byte carry, one name and start per part, and the records.
-Usage: `python -I tools/audio_config.py --help` lists the options.
 """
 import argparse
 from bisect import bisect_right

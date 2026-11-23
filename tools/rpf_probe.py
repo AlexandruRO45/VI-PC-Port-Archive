@@ -6,7 +6,6 @@ Usage:
 Reads the first 64 KiB of each archive only. It doesn't decrypt or extract anything.
 A directory scan or archive read error stops the survey before it writes the report.
 The report destination must not name an input archive or an alias of one.
-Usage: `python -I tools/rpf_probe.py --help` lists the options.
 """
 import argparse
 import json

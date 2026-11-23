@@ -9,7 +9,6 @@ Usage:
     python -I hashdict.py <carve dir> --out hashes.json [--archives a,b] [--extra f1 f2 ...] [--min 3]
       <carve dir> holds one folder per archive (<work>/carve), or is one archive's folder (<work>/carve/common).
     python -I hashdict.py --lookup <hashes.json> 0x28cca8df ...
-Usage: `python -I tools/hashdict.py --help` lists the options.
 """
 import argparse
 import json

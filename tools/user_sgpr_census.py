@@ -33,7 +33,6 @@ Usage:
 
 An index that cannot be read, is not JSON or is not the shape tools/shader_meta.py writes, and a --json path that
 cannot be written, each give one ERROR line and exit 2.
-Usage: `python -I tools/user_sgpr_census.py --help` lists the options.
 """
 import argparse
 import json
