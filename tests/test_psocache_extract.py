@@ -12,9 +12,13 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "psocache_extract.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+
+import psocache_extract  # noqa: E402
 
 HEADER = 0x80
 GRAPHICS = 1
@@ -154,6 +158,30 @@ class PsocacheExtractTest(unittest.TestCase):
         p = run(os.path.join(self.tmp.name, "absent.rpf"), self.out)
         self.assertEqual(p.returncode, 2)
         self.assertNotIn("Traceback", p.stderr)
+
+    def test_stream_limit_stops_opening_archives_after_the_last_stream(self):
+        folder = os.path.join(self.tmp.name, "archives")
+        os.mkdir(folder)
+        first = os.path.join(folder, "01.rpf")
+        second = os.path.join(folder, "02.rpf")
+        archive = build_archive(self.cache)
+        with open(first, "wb") as f:
+            f.write(archive[:0x40] + zlib.compress(b"not a cache"))
+        with open(second, "wb") as f:
+            f.write(archive)
+
+        with patch.object(psocache_extract, "open", wraps=open, create=True) as opened:
+            with self.assertRaisesRegex(psocache_extract.NotFound, "1 streams"):
+                psocache_extract.extract(folder, self.out, max_streams=1, quiet=True)
+        opened.assert_called_once_with(first, "rb")
+        self.assertFalse(os.path.exists(self.out))
+
+        with patch.object(psocache_extract, "open", wraps=open, create=True) as opened:
+            index, _, _ = psocache_extract.extract(folder, self.out, max_streams=3, quiet=True)
+        self.assertEqual(index, 2)
+        opened.assert_any_call(second, "rb")
+        with open(self.out, "rb") as f:
+            self.assertEqual(f.read(), self.cache)
 
 
 if __name__ == "__main__":

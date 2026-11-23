@@ -190,7 +190,7 @@ def extract(
     spent = 0
     streams = 0
     for index, path in enumerate(paths, 1):
-        if left <= 0:
+        if left <= 0 or streams >= max_streams:
             break
         try:
             fh = open(path, "rb")
