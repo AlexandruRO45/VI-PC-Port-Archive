@@ -31,6 +31,18 @@ class FirstLookExitTest(unittest.TestCase):
                 "\"functions\":[\"Example\"]}],\"sections\":[]}', encoding='utf-8', newline='\\n')\n",
                 encoding="utf-8", newline="\n",
             )
+            (tools / "find_hash_lookup.py").write_text(
+                "import os\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "report = Path(sys.argv[-1])\n"
+                "mode = os.environ.get('LEONIDA_TEST_HASH_MODE')\n"
+                "if mode == 'fail-before-write':\n"
+                "    sys.exit(2)\n"
+                "report.write_text('{' if mode == 'fail-after-write' else '{}', encoding='utf-8', newline='\\n')\n"
+                "sys.exit(2 if mode == 'fail-after-write' else 0)\n",
+                encoding="utf-8", newline="\n",
+            )
             compile_loader = (
                 "$ErrorActionPreference = 'Stop'; "
                 "Add-Type -OutputAssembly gta6rt.exe -OutputType ConsoleApplication -TypeDefinition @'\n"
@@ -109,6 +121,30 @@ class FirstLookExitTest(unittest.TestCase):
                         env={**env, "LEONIDA_TEST_LOADER_EXIT": str(code)}, capture_output=True, text=True, timeout=30,
                     )
                     report = root / "reports" / "exe" / image.stem
+                    hash_report = report / "hash_lookup.json"
+                    self.assertEqual(hash_report.read_text("utf-8"), "{}")
+                    if layout == "Debug":
+                        for mode in ("fail-before-write", "fail-after-write"):
+                            with self.subTest(hash_mode=mode):
+                                retry = subprocess.run(
+                                    [*POWERSHELL, "-File", str(wrapper), "-Exe", str(image)],
+                                    env={**env, "LEONIDA_TEST_LOADER_EXIT": "0", "LEONIDA_TEST_HASH_MODE": mode},
+                                    capture_output=True, text=True, timeout=30,
+                                )
+                                self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+                                self.assertIn("find_hash_lookup could not scan", retry.stdout)
+                                self.assertFalse(hash_report.exists(), retry.stdout + retry.stderr)
+                        # A PE image can have the same name and path as the generated report.
+                        colliding_input = root / "reports/exe/hash_lookup/hash_lookup.json"
+                        colliding_input.parent.mkdir()
+                        colliding_input.write_bytes(b"MZ")
+                        retry = subprocess.run(
+                            [*POWERSHELL, "-File", str(wrapper), "-Exe", str(colliding_input)],
+                            env={**env, "LEONIDA_TEST_LOADER_EXIT": "0", "LEONIDA_TEST_HASH_MODE": "fail-before-write"},
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+                        self.assertEqual(colliding_input.read_bytes(), b"MZ", retry.stdout + retry.stderr)
                     self.assertEqual(marker.exists(), should_build, result.stdout + result.stderr)
                     if layout in vs_configs:
                         self.assertEqual(marker.read_text(encoding="ascii").strip(), expected_dir)

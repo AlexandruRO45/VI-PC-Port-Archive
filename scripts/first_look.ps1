@@ -32,8 +32,19 @@ python -I (Join-Path $root "tools\gdk_runtime_calls.py") $Exe --out $out
 if ($LASTEXITCODE -ne 0) { Write-Warning "gdk_runtime_calls could not read all of $Exe; its report may be incomplete" }
 
 Write-Host "`n== Archetype lookup candidates for mods (docs/modding.md; pass the top RVA to gta6rt --archetype-lookup)"
-python -I (Join-Path $root "tools\find_hash_lookup.py") $Exe --json (Join-Path $out "hash_lookup.json")
-if ($LASTEXITCODE -ne 0) { Write-Warning "find_hash_lookup could not scan $Exe" }
+$hashReport = Join-Path $out "hash_lookup.json"
+python -I (Join-Path $root "tools\find_hash_lookup.py") $Exe --json $hashReport
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "find_hash_lookup could not scan $Exe; $hashReport is invalid for this attempt"
+    # The scanner refuses to overwrite its input when the report points to it.
+    if ($image.Name -ne "hash_lookup.json" -and (Test-Path -LiteralPath $hashReport -PathType Leaf)) {
+        try {
+            Remove-Item -LiteralPath $hashReport -ErrorAction Stop
+        } catch {
+            Write-Warning "Could not remove the invalid hash report: $_"
+        }
+    }
+}
 
 Write-Host "`n== What to confirm against this executable (every ASSUMPTION / UNVERIFIED / VERIFY note; called ones first)"
 $calls = Join-Path $out ((Split-Path $Exe -Leaf) + ".gdk_calls.json")
