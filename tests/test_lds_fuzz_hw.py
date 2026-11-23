@@ -468,13 +468,31 @@ class Main(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("hardware oracle unavailable: no AMD clang", out)
 
-    def test_exit_77_on_an_rdna4_gpu(self):
+    def test_exit_77_on_a_gfx1170_gpu(self):
+        # GFX11.7 is not measured; GFX12 is, and runs (test_rdna4_runs_its_kernels).
         oracle = FakeOracle([])
-        oracle.arch = "gfx1201"
+        oracle.arch = "gfx1170"
         with patch.object(runner, "open_oracle", return_value=oracle):
             rc, out = self.main("--oracle", "hw", "--programs", "2")
         self.assertEqual(rc, 77)
-        self.assertIn("hardware oracle unavailable: gfx1201", out)
+        self.assertIn("hardware oracle unavailable: gfx1170", out)
+
+    def test_rdna4_runs_its_kernels(self):
+        # #4519 respelled the kernels for GFX12; the gfx1170+ exit of TEST-873 must not turn that off again.
+        for arch in ("gfx1200", "gfx1201"):
+            with self.subTest(arch=arch):
+                self.assertIsNone(f.hw_arch_skip_reason(arch))
+                oracle = FakeOracle([])
+                oracle.arch = arch
+                oracle.by_text = {tuple(p.hw_lines(arch)): p for p in f.programs(1, 2, (32,))}
+                with patch.object(runner, "open_oracle", return_value=oracle):
+                    rc, out = self.main("--oracle", "hw", "--programs", "2", "--wave", "32")
+                self.assertEqual(rc, 0, out)
+                self.assertNotIn("hardware oracle unavailable", out)
+        for arch in ("gfx1170", "gfx1171"):
+            self.assertIn(arch, f.hw_arch_skip_reason(arch))
+        for arch in ("gfx1030", "gfx1150"):
+            self.assertIsNone(f.hw_arch_skip_reason(arch))
 
     def test_exit_77_with_a_missing_compiler(self):
         with patch.dict(os.environ, {"LEONIDA_AMD_CLANG": str(TOOLS / "no-such-clang.exe")}):
@@ -525,7 +543,7 @@ class OnHardware(unittest.TestCase):
             cls.oracle = runner.open_oracle()
         except runner.Unavailable as e:
             raise unittest.SkipTest(f"no hardware oracle: {e}")
-        why = asm.rdna23_skip_reason(cls.oracle.arch)
+        why = f.hw_arch_skip_reason(cls.oracle.arch)
         if why:
             cls.oracle.close()
             raise unittest.SkipTest(why)

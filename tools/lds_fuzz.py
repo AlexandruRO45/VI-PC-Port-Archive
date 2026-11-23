@@ -924,6 +924,16 @@ def run_translator(progs, a, work, tally):
 
 # ---- the hardware oracle ----
 
+def hw_arch_skip_reason(arch):
+    """Why this fuzzer's hardware kernels cannot run on the GPU at all, or None. asm.rdna23_skip_reason covers gfx1170+
+    (TEST-873), but the kernels here are respelled for GFX12 (asm.ds_line, asm.sync_lines) and measured there (gfx1200,
+    gfx1201), so GFX12 runs; GFX11.7 has not been measured and keeps the skip."""
+    from hw_oracle import asm
+    if asm.family(arch) == "gfx12":
+        return None
+    return asm.rdna23_skip_reason(arch)
+
+
 def hw_skip_reason(p, arch):
     """Why a program cannot run natively on this GPU, or None. GFX11 renamed the ds_* loads and stores, which
     asm.ds_line respells, and swaps ds_cmpstore's data operands (measured on gfx1150 and on gfx1201); GFX12 also
@@ -1212,8 +1222,7 @@ def main():
         except runner.Unavailable as e:
             print(f"hardware oracle unavailable: {e}")
             return 77
-        from hw_oracle import asm
-        why = asm.rdna23_skip_reason(oracle.arch)
+        why = hw_arch_skip_reason(oracle.arch)
         if why:
             oracle.close()
             print(f"hardware oracle unavailable: {why}")
