@@ -84,16 +84,28 @@ def find_tool(build):
 
 
 def read_ppm(path):
+    """Read the P6/255 format emitted by vk_sandbox, rejecting incomplete readbacks."""
     with open(path, "rb") as f:
         data = f.read()
     head = data.split(b"\n", 3)
+    if len(head) != 4 or head[0] != b"P6" or head[2] != b"255":
+        raise ValueError("expected a P6/255 renderer frame")
+    if len(head[1].split()) != 2:
+        raise ValueError("expected two frame dimensions")
     w, h = (int(v) for v in head[1].split())
+    if w <= 0 or h <= 0:
+        raise ValueError("frame dimensions must be positive")
+    if len(head[3]) != w * h * 3:
+        raise ValueError("frame pixel data does not match its dimensions")
     return w, h, head[3]
 
 
 def check_frame(path, textured):
     """(ok, message) from the rendered frame: coverage and, with textures, colour variety."""
-    w, h, px = read_ppm(path)
+    try:
+        w, h, px = read_ppm(path)
+    except (OSError, ValueError) as error:
+        return False, f"cannot read renderer frame: {error}"
     sky = SKY
     covered, colours = 0, set()
     for i in range(0, len(px), 3):
@@ -101,7 +113,7 @@ def check_frame(path, textured):
         if abs(p[0] - sky[0]) > 1 or abs(p[1] - sky[1]) > 1 or abs(p[2] - sky[2]) > 1:
             covered += 1
             colours.add(p)
-    ok = covered >= w * h // 100 and (not textured or len(colours) >= 256)
+    ok = covered * 100 >= w * h and (not textured or len(colours) >= 256)
     return ok, f"{covered} of {w * h} pixels covered, {len(colours)} distinct colours"
 
 
