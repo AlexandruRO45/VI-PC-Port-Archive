@@ -1,0 +1,21 @@
+# Who reviews the files that decide what CI runs, what a build or a test session executes, and what coding agents are
+# told. GitHub requests a review from the owner for a pull request that touches them; with "Require review from Code
+# Owners" in the branch rules, one is required. scripts/check_pr_security.py lists the same kinds of file as `review`.
+
+# CI, and the checks that back it
+/.github/                          @ItsNotRexed
+/scripts/check_pr_security.py      @ItsNotRexed
+/scripts/check_no_game_data.py     @ItsNotRexed
+/tests/test_check_pr_security.py   @ItsNotRexed
+
+# Fetched or run by the build and the tests
+/.gitmodules                       @ItsNotRexed
+/.gitattributes                    @ItsNotRexed
+/third_party/                      @ItsNotRexed
+/tests/requirements.txt            @ItsNotRexed
+conftest.py                        @ItsNotRexed
+*.ps1                              @ItsNotRexed
+
+# What coding agents and contributors are told to do
+/AGENTS.md                         @ItsNotRexed
+/CONTRIBUTING.md                   @ItsNotRexed

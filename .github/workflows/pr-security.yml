@@ -1,0 +1,59 @@
+name: PR security
+
+# Scans the lines each pull request adds with scripts/check_pr_security.py: hidden Unicode, downloads piped into a
+# shell, unpinned actions, workflows that get secrets or write access, compiled executables, credentials, and (as
+# warnings for the reviewer) network calls, changed submodules and edits to the files coding agents follow.
+#
+# This is the one workflow here on pull_request_target, and it is safe only as long as it never runs the pull
+# request: pull_request_target checks out the base branch, so the workflow and the scanner are the reviewed copies on
+# main, and the pull request's commits are fetched as git objects and read, never checked out, imported, built or
+# executed. Keep it that way: no `ref:` on the checkout, no `run:` that calls a file from the pull request, no secrets
+# and no write permission. scripts/check_pr_security.py flags pull_request_target in any pull request that adds it,
+# and tests/test_check_pr_security.py checks these properties of this file.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: pr-security-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Fetch the pull request as data
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}.git"
+          fetch() { git -c protocol.version=2 fetch --quiet --no-tags --no-recurse-submodules "$@"; }
+          # The test merge GitHub keeps for the pull request: first parent the base, second the head. Two commits
+          # deep is all the scan needs. A pull request that conflicts has none, and one that was just pushed can
+          # still have the previous one; then fetch the history without file contents and use the merge base.
+          if fetch --depth=2 "$url" "+refs/pull/${PR_NUMBER}/merge:refs/pr/merge" &&
+             [ "$(git rev-parse refs/pr/merge^2)" = "$HEAD_SHA" ]; then
+            echo "SCAN_BASE=$(git rev-parse refs/pr/merge^1)" >> "$GITHUB_ENV"
+            echo "SCAN_HEAD=$(git rev-parse refs/pr/merge)" >> "$GITHUB_ENV"
+          else
+            fetch --unshallow --filter=blob:none "$url" "$BASE_SHA" "+refs/pull/${PR_NUMBER}/head:refs/pr/head"
+            if [ "$(git rev-parse refs/pr/head)" != "$HEAD_SHA" ]; then
+              echo "::error::the pull request moved while it was being fetched; the run for the new head checks it"
+              exit 1
+            fi
+            echo "SCAN_BASE=$BASE_SHA" >> "$GITHUB_ENV"
+            echo "SCAN_HEAD=$HEAD_SHA" >> "$GITHUB_ENV"
+          fi
+      - name: Scan what the pull request adds
+        run: python3 -I scripts/check_pr_security.py --github "$SCAN_BASE" "$SCAN_HEAD"
