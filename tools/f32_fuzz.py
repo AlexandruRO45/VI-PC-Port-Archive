@@ -1491,8 +1491,10 @@ def negative_control(rep):
     return out
 
 
-def hw_print(rep, show=2, translator_check=None, quiet=False):
-    """Tables and mismatch details. Returns the number of mismatches."""
+def hw_print(rep, show=2, verdicts=None, quiet=False):
+    """Tables and mismatch details; `show` limits the details printed per op. `verdicts`, when given, is the
+    translator's verdict for each of rep.mismatches (main computes them all first, so --show decides only what is
+    printed, never which programs reach the translator). Returns the number of mismatches."""
     n_mis = len(rep.mismatches)
     if quiet:
         return n_mis
@@ -1533,7 +1535,7 @@ def hw_print(rep, show=2, translator_check=None, quiet=False):
     for reason, n in sorted(rep.skips.items(), key=lambda t: -t[1]):
         print(f"  skip x{n}: {reason}")
     shown = {}
-    for c, want, got in rep.mismatches:
+    for k, (c, want, got) in enumerate(rep.mismatches):
         if shown.get(c.op, 0) >= show:
             continue
         shown[c.op] = shown.get(c.op, 0) + 1
@@ -1543,8 +1545,8 @@ def hw_print(rep, show=2, translator_check=None, quiet=False):
               "".join(f" literal={fdesc(s[1])}" for s in c.srcs if s[0] == "k"))
         print("    model v8/vcc:    " + " ".join(fdesc(w) for w in want))
         print("    hardware v8/vcc: " + " ".join(fdesc(w) for w in got))
-        if translator_check:
-            print("    translator: " + translator_check(c, want, got))
+        if verdicts is not None:
+            print("    translator: " + verdicts[k])
     return n_mis
 
 
@@ -1778,7 +1780,9 @@ def main(argv=None):
                   f"{len(cases)} programs, mode {HW_PRIMARY} (MODE 0x{words[HW_PRIMARY]:x}), seed {a.seed}:")
             tr_bad = {"invalid": 0, "error": 0}
             tr = counting_verdict(tr_bad) if "translator" in backends else None
-            n_mis = hw_print(rep, show=a.show, translator_check=tr)
+            # Every mismatch gets its verdict (and so reaches tr_bad and the exit code), not only the --show printed.
+            verdicts = [tr(c, want, got) for c, want, got in rep.mismatches] if tr else None
+            n_mis = hw_print(rep, show=a.show, verdicts=verdicts)
             if any(r["asm"] for r in rep.per_op.values()):
                 harness = True
             if tr and rep.deviations:

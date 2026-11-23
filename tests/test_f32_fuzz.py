@@ -225,6 +225,42 @@ class InterpreterVerdicts(unittest.TestCase):
                 self.assertEqual(tally, {"invalid": int(kind == "invalid"), "error": int(kind == "error")},
                                  verdict)
 
+    def test_hardware_mismatch_verdict_does_not_depend_on_show(self):
+        # --oracle translator,hw with a mocked hardware report (no GPU): one probe the hardware disagrees with the model
+        # on, and a translator whose interpreter crashes on it. Until 2026-11-23 hw_print asked the translator only
+        # for the mismatches it printed, so --show 0 never ran it and the run exited 1 instead of 2.
+        from hw_oracle import runner
+        probe = ff.Case("v_add_f32", [ff.bits(1.0), ff.bits(2.0)] + [0] * 7, [(0, {}), (1, {})], False, [],
+                        group="probe", index=0)
+        oracle = mock.Mock(device="mock gpu", arch="gfx1150")
+        clean = ({"match": 1, "mismatch": 0, "undefined": 0, "skip": {}, "invalid": {}, "error": {}}, {}, {})
+
+        def report(*_args, **_kwargs):
+            rep = ff.HwReport()
+            row = rep.row(probe.op)
+            row["programs"] += 1
+            row["mismatch"] += 1
+            rep.groups["probe"] = {"programs": 1, "match": 0, "mismatch": 1, "dev": 0, "skip": 0}
+            rep.mismatches.append((probe, [ff.bits(3.0), 0], [ff.bits(4.0), 0]))
+            rep.results.append((probe, [ff.bits(4.0), 0]))
+            return rep
+
+        argv = ["--oracle", "translator,hw", "--programs", "1", "--ops", "v_add_f32", "--probes", "0", "--no-info"]
+        for show, rc_want in (("0", 2), ("2", 2)):
+            translated = mock.Mock(return_value=("error", "interpreter: KeyError: 'x'"))
+            with self.subTest(show=show), \
+                    mock.patch.object(runner, "open_oracle", return_value=oracle), \
+                    mock.patch.object(ff, "hw_probe_modes",
+                                      return_value={n: ff.mode_word(m) for n, m in ff.HW_MODES.items()}), \
+                    mock.patch.object(ff, "hw_suite", side_effect=report), \
+                    mock.patch.object(ff, "translate_cases", return_value=clean), \
+                    mock.patch.object(ff, "run_translated", translated):
+                rc, out = self.quiet_main(argv + ["--show", show])
+                self.assertEqual(translated.call_count, 1, out)
+                self.assertEqual(rc, rc_want, out)
+                self.assertIn("1 harness errors", out)
+                self.assertEqual("translator: error:" in out, show != "0", out)
+
 
 class CliTests(unittest.TestCase):
     TOOL = os.path.join(ROOT, "tools", "f32_fuzz.py")
