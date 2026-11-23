@@ -321,6 +321,27 @@ class VCvtF64I32TranslatorTests(unittest.TestCase):
         with self.assertRaises(Exception):
             translate_lines("ps_bad_cvt_f64_i32", ["v_cvt_f64_i32"])
 
+# -----------------------------------------------------------------------------
+# Opcode 3: v_cvt_f64_u32
+# -----------------------------------------------------------------------------
+def oracle_cvt_f64_u32(u32_bits: int) -> int:
+    """Reference mathematical oracle for v_cvt_f64_u32 (unsigned uint32 to double)."""
+    u_val = u32_bits & MASK32
+    return f64_to_u64(float(u_val))
+
+
+class VCvtF64U32OracleTests(unittest.TestCase):
+    def test_cvt_f64_u32_basic(self):
+        self.assertEqual(oracle_cvt_f64_u32(0), F64_POS_ZERO)
+        self.assertEqual(oracle_cvt_f64_u32(1), F64_POS_ONE)
+        self.assertEqual(oracle_cvt_f64_u32(100), f64_to_u64(100.0))
+
+    def test_cvt_f64_u32_large_unsigned(self):
+        # 0xFFFFFFFF = 4294967295.0
+        self.assertEqual(oracle_cvt_f64_u32(0xFFFFFFFF), f64_to_u64(4294967295.0))
+        # 0x80000000 = 2147483648.0
+        self.assertEqual(oracle_cvt_f64_u32(0x80000000), f64_to_u64(2147483648.0))
+
 
 if __name__ == "__main__":
     unittest.main()
