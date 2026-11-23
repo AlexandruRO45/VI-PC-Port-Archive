@@ -173,25 +173,36 @@ void __stdcall game_exit_process(UINT code) { end_run(static_cast<int>(code)); }
 // The console has cores a PC may lack, and a title pins its threads to them with masks the host rejects: Windows
 // answers a mask with no CPU of the process (or one outside it) with 0 and ERROR_INVALID_PARAMETER, and a title that
 // checks the previous mask then aborts. The call succeeds on the console, so it does here: the thread stays where it
-// is and the answer is the process mask (the mask a thread starts with). A bad handle still fails. The fact (answer with the
-// process mask when the host call returns 0) is from sammwyy/xvalkyrie src/runtime/modules/kernel.cpp (commit
+// is and the answer is the mask the thread had (the process mask for a thread never pinned). A bad handle and an empty
+// mask still fail, as on Windows. The fact (answer instead of failing when the host call returns 0) is from sammwyy/xvalkyrie src/runtime/modules/kernel.cpp (commit
 // 53af7df77c10, GPL-3.0), reimplemented here in our own words and checked against the Win32 behaviour.
 DWORD_PTR __stdcall game_set_thread_affinity_mask(HANDLE thread, DWORD_PTR mask) {
     DWORD_PTR previous = SetThreadAffinityMask(thread, mask);
     if (previous != 0) return previous;
-    DWORD_PTR process = 0, system = 0;
-    if (GetLastError() == ERROR_INVALID_PARAMETER && GetProcessAffinityMask(GetCurrentProcess(), &process, &system)) {
-        SetLastError(ERROR_SUCCESS);
-        // The first boot shows which masks the title asks for: the first few are named, the rest only counted.
-        static std::atomic<int> substituted{0};
-        const int n = ++substituted;
-        if (n <= 8)
-            std::fprintf(stderr, "[rt] process: SetThreadAffinityMask(0x%llx) names cores the host lacks; the thread stays, "
-                                 "answered the process mask 0x%llx (call %d)\n",
-                         static_cast<unsigned long long>(mask), static_cast<unsigned long long>(process), n);
-        return process;
+    // An empty mask names no CPU on any machine: it fails as on Windows (the host's own answer, ERROR_INVALID_PARAMETER).
+    if (mask == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
     }
-    return 0;
+    DWORD_PTR process = 0, system = 0;
+    if (GetLastError() != ERROR_INVALID_PARAMETER || !GetProcessAffinityMask(GetCurrentProcess(), &process, &system))
+        return 0;
+    // The caller expects the mask the thread had, which may be narrower than the process mask (it may restore it
+    // later). The host reports it only on a successful call, so widen the thread to the process mask, read the old
+    // mask from that call, and put the old mask back: the thread ends where it started.
+    const DWORD_PTR actual = SetThreadAffinityMask(thread, process);
+    if (actual == 0) return 0;  // the host's error stands (a bad handle)
+    if (actual != process) SetThreadAffinityMask(thread, actual);
+    // The first boot shows which masks the title asks for: the first few are named, the rest only counted.
+    static std::atomic<int> substituted{0};
+    const int n = ++substituted;
+    if (n <= 8)
+        std::fprintf(stderr, "[rt] process: SetThreadAffinityMask(0x%llx) names cores the host lacks; the thread stays, "
+                             "answered its mask 0x%llx (call %d)\n",
+                     static_cast<unsigned long long>(mask), static_cast<unsigned long long>(actual), n);
+    // The log may have failed (a closed stderr pipe leaves ERROR_NO_DATA); the call itself succeeded.
+    SetLastError(ERROR_SUCCESS);
+    return actual;
 }
 // A console-only kernel32 export that pins a thread pool to cores. The host has no such call, and a pool with the
 // host's own affinity runs the same work, so it succeeds and changes nothing.
@@ -407,6 +418,9 @@ SHIM_TABLE(process,
     THREAD_AFFINITY("kernel32.dll"),
     THREAD_AFFINITY("kernelbase.dll"),
     THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-0.dll"),
+    THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-1.dll"),
+    THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-2.dll"),
+    THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-3.dll"),
     POOL_AFFINITY("kernel32.dll"),
     POOL_AFFINITY("kernelbase.dll"),
     COMMAND_LINE("kernel32.dll"),

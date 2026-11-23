@@ -6,6 +6,9 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <fcntl.h>
+#include <io.h>
+
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -214,7 +217,7 @@ int main() {
         const auto set_pool = reinterpret_cast<SetPool>(rt::shims::find("kernel32.dll", "SetThreadpoolAffinityMask"));
         DWORD_PTR process_mask = 0, system_mask = 0;
         GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
-        const DWORD_PTR missing = ~system_mask & (system_mask + 1);  // the lowest core the machine lacks, 0 if none
+        const DWORD_PTR missing = ~process_mask & (process_mask + 1);  // the lowest core outside the process mask, 0 if none
         const DWORD_PTR lowest = process_mask & (~process_mask + 1);
         if (!set_mask || !set_pool) {
             std::fprintf(stderr, "FAIL SetThreadAffinityMask or SetThreadpoolAffinityMask is not served\n");
@@ -245,6 +248,63 @@ int main() {
             if (!set_pool(nullptr, ~DWORD_PTR{0})) {
                 std::fprintf(stderr, "FAIL SetThreadpoolAffinityMask did not succeed\n");
                 ++failures;
+            }
+
+            // Every name a title can import it under reaches the shim (a missing alias falls through to the host).
+            for (const char* dll : {"kernelbase.dll", "api-ms-win-core-processthreads-l1-1-0.dll",
+                                    "api-ms-win-core-processthreads-l1-1-1.dll", "api-ms-win-core-processthreads-l1-1-2.dll",
+                                    "api-ms-win-core-processthreads-l1-1-3.dll"})
+                if (rt::shims::find(dll, "SetThreadAffinityMask") != reinterpret_cast<void*>(set_mask)) {
+                    std::fprintf(stderr, "FAIL SetThreadAffinityMask is not served under %s\n", dll);
+                    ++failures;
+                }
+            if (rt::shims::find("kernelbase.dll", "SetThreadpoolAffinityMask") != reinterpret_cast<void*>(set_pool)) {
+                std::fprintf(stderr, "FAIL SetThreadpoolAffinityMask is not served under kernelbase.dll\n");
+                ++failures;
+            }
+
+            // An empty mask names no CPU: it fails with ERROR_INVALID_PARAMETER, as on Windows.
+            SetLastError(ERROR_SUCCESS);
+            if (set_mask(self, 0) != 0 || GetLastError() != ERROR_INVALID_PARAMETER) {
+                std::fprintf(stderr, "FAIL SetThreadAffinityMask with an empty mask did not fail with ERROR_INVALID_PARAMETER\n");
+                ++failures;
+            }
+
+            if (missing) {
+                // The substituted answer is the thread's own mask, so a caller that restores it leaves the thread
+                // pinned (with one allowed CPU the two masks are the same and this passes either way).
+                set_mask(self, lowest);
+                const DWORD_PTR answered = set_mask(self, missing);
+                const DWORD_PTR still = set_mask(self, process_mask);  // answers the mask the thread has now
+                if (answered != lowest || still != lowest) {
+                    std::fprintf(stderr,
+                                 "FAIL a pinned thread asking for absent cores answered 0x%llx and was left on 0x%llx, want 0x%llx twice\n",
+                                 static_cast<unsigned long long>(answered), static_cast<unsigned long long>(still),
+                                 static_cast<unsigned long long>(lowest));
+                    ++failures;
+                }
+
+                // The note about the substitution goes to stderr; when that pipe is closed the write fails and leaves
+                // its error behind, but the call succeeded, so the last error is clear.
+                std::fflush(stderr);
+                int fds[2];
+                const int saved = _dup(2);
+                if (_pipe(fds, 4096, _O_BINARY) == 0 && saved >= 0) {
+                    _close(fds[0]);  // no reader
+                    _dup2(fds[1], 2);
+                    _close(fds[1]);
+                    setvbuf(stderr, nullptr, _IONBF, 0);
+                    SetLastError(ERROR_GEN_FAILURE);
+                    set_mask(self, missing);
+                    const DWORD error = GetLastError();
+                    std::fflush(stderr);
+                    _dup2(saved, 2);
+                    if (error != ERROR_SUCCESS) {
+                        std::fprintf(stderr, "FAIL a substituted answer left last error %lu with stderr closed, want 0\n", error);
+                        ++failures;
+                    }
+                }
+                if (saved >= 0) _close(saved);
             }
         }
     }
