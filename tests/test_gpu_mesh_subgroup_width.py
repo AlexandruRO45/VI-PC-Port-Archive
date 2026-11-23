@@ -27,15 +27,18 @@ def gradient(blue=0.5):
 class MeshWidthRequirement(unittest.TestCase):
     """mesh_w64x_test with a fake vk_harness that writes that picture and reports one subgroup width."""
 
-    def run_mesh(self, name, stderr, pixels=None):
+    def run_mesh(self, name, stderr, pixels=None, emulated=False):
         def harness(cmd, **_kw):
             Path(cmd[3]).write_bytes(gradient() if pixels is None else pixels)
             return subprocess.CompletedProcess(cmd, 0, "", stderr)
 
+        # check.py reads LEONIDA_W64_EMULATE once, at import (check.py:294), so pin the flag rather than inherit
+        # whatever the shell running this test happens to have set.
         with tempfile.TemporaryDirectory() as tmp:
             for spv in (f"{name}.spv", "fs_passthru.spv"):
                 (Path(tmp) / spv).touch()
-            with patch.object(check.subprocess, "run", side_effect=harness):
+            with (patch.object(check.subprocess, "run", side_effect=harness),
+                  patch.object(check, "W64_EMULATED", emulated)):
                 return check.mesh_w64x_test(tmp, tmp, name)
 
     def test_wave_info_s3_is_checked_on_a_32_wide_subgroup(self):
@@ -56,6 +59,11 @@ class MeshWidthRequirement(unittest.TestCase):
 
     def test_wave_info_s3_is_checked_on_a_64_wide_subgroup(self):
         self.assertEqual(self.run_mesh("ms_wave_info_s3", "device: fake (subgroup 64..64)\n"), "")
+
+    def test_emulation_drops_the_width_requirement(self):
+        """LEONIDA_W64_EMULATE=1: neither fixture needs a native 64-wide subgroup."""
+        self.assertEqual(self.run_mesh("ms_w64x_ballot", "device: fake (subgroup 32..32)\n", emulated=True), "")
+        self.assertEqual(self.run_mesh("ms_wave_info_s3", "device: fake (subgroup 32..32)\n", emulated=True), "")
 
 
 if __name__ == "__main__":
