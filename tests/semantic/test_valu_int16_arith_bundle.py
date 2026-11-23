@@ -311,6 +311,23 @@ class TestVSubU16EdgeCases(unittest.TestCase):
         res = [ref_v_sub_u16(a, b) for a, b in zip(lanes_a, lanes_b)]
         self.assertTrue(all(r == 1000 for r in res))
 
+class TestVSubU16Translator(unittest.TestCase):
+    def test_translate_v_sub_u16(self):
+        lines = [
+            "v_mov_b32 v1, 500",
+            "v_mov_b32 v2, 200",
+            "v_sub_u16 v0, v1, v2",
+            "v_mov_b32 v3, 100",
+            "v_mov_b32 v4, 200",
+            "v_sub_u16 v1, v3, v4 clamp",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_sub_u16", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = mrt0_words(spv)
+        self.assertEqual(words, [300, 0, 300, 0])
+
 
 if __name__ == "__main__":
     unittest.main()
