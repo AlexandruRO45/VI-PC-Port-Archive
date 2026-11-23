@@ -18,9 +18,9 @@ dataflow over the reachable basic blocks, tagging every SGPR with where its valu
 The analysis also tracks a known scalar carry/borrow bit (SCC) through unsigned arithmetic. A join keeps it
 only when every incoming path agrees. Instructions with unmodelled SCC effects discard the bit.
 
-Each descriptor-width scalar load (s_load_dwordx4/x8/x16 from an SGPR pair) is then classified by its base: a
-64-bit pointer from an input pair, a 32-bit pointer from one input SGPR with the high word a constant 0, a pointer
-that was itself loaded from memory, or something else. Its offset is static (immediate or a known constant) or
+Each descriptor-width scalar load (s_load_dwordx4/x8/x16 from an SGPR pair) is classified by its base before the
+load adds its own offset: a 64-bit pointer from an input pair, a 32-bit pointer from one input SGPR with a constant
+high word of 0, a pointer loaded from memory, or something else. Its offset is static (immediate or known) or
 dynamic, and the result's role (T#, S#, V#) comes from the instruction that consumes it. The census groups the
 loads per stage and SFI0 class, so the heap base shows up as the input SGPR the loads of heap-indexing shaders
 start from, and as the difference to the shaders that use only descriptor tables.

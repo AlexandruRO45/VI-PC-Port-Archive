@@ -208,6 +208,50 @@ class HeapIndexCensus(unittest.TestCase):
         g = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]
         self.assertEqual(g["loads"][0]["ptr"], "ptr64_lo_only")
 
+    def test_shift_add_scc_reaches_the_descriptor_high_word(self):
+        for shift in (1, 2, 3, 4):
+            # Crossing the dword boundary by the shift alone must set SCC.
+            for src, expected in (((1 << (32 - shift)) - 1, "ptr32"),
+                                  (1 << (32 - shift), "ptr64_lo_only")):
+                with self.subTest(shift=shift, src=hex(src)):
+                    self.work.add("ps_shift", "ps", SFI0_RES, [
+                        (f"s_lshl{shift}_add_u32 s10, {src:#x}, 0", 8),
+                        ("s_addc_u32 s9, 0, 0", 4),
+                        ("s_load_dwordx4 s[20:23], s[8:9], 0", 8),
+                        ("s_endpgm", 4),
+                    ])
+                    group = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]
+                    self.assertEqual(group["loads"][0]["ptr"], expected)
+
+    def test_vector_and_scalar_memory_ops_preserve_scalar_carry(self):
+        for intervening in (("v_mov_b32 v0, 4", 4), ("s_load_dword s12, s[20:21], 0", 8)):
+            with self.subTest(intervening=intervening):
+                self.work.add("ps_preserve", "ps", SFI0_RES, [
+                    ("s_add_u32 s10, 0, 0", 4),
+                    intervening,
+                    ("s_addc_u32 s9, 0, 0", 4),
+                    ("s_load_dwordx4 s[20:23], s[8:9], 0", 8),
+                    ("s_endpgm", 4),
+                ])
+                group = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]
+                self.assertEqual(group["loads"][0]["ptr"], "ptr32")
+
+    def test_unknown_carry_alone_makes_the_low_pointer_offset_dynamic(self):
+        for args in ("s8, 4", "4, s8"):
+            for producer, expected in (("s_add_u32 s12, -1, 1", "static"),
+                                       ("s_cmp_eq_u32 s12, 0", "dynamic")):
+                with self.subTest(args=args, producer=producer):
+                    self.work.add("ps_offset", "ps", SFI0_RES, [
+                        ("s_mov_b32 s11, 0", 4),
+                        (producer, 4),
+                        (f"s_addc_u32 s10, {args}", 4),
+                        ("s_load_dwordx4 s[20:23], s[10:11], 0", 8),
+                        ("s_endpgm", 4),
+                    ])
+                    group = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]
+                    loads = [(load["base"], load["ptr"], load["offset"]) for load in group["loads"]]
+                    self.assertEqual(loads, [("user s8", "ptr32", expected)])
+
     def test_branch_past_the_last_instruction_is_skipped(self):
         # 0x104 s_cbranch_scc0 0 targets 0x108 = the end of the code: counted, not a KeyError.
         self.work.add("ps_end", "ps", SFI0_RES, [
