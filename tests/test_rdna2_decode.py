@@ -429,5 +429,26 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(parsed[3]["args"][1]["v"], 1.0)
 
 
+    def test_small_f64_literal_prints_in_hex_like_llvm(self):
+        # SHADER-890: an f64 source's literal dword is bits 63:32, an inline integer is the whole value, and LLVM
+        # keeps them apart in the text (0x1 vs 1). The decoder printed a literal below 100 in decimal, so
+        # shader_ir read the literal 1 as the inline 1.
+        # v_add_f64 v[4:5], 0x1, 1: VOP3 0x164, src0 = literal (255), src1 = inline 1 (129), literal dword 1.
+        asm, bad = rdna2_decode.disasm_bytes(bytes.fromhex("040064d5ff02010001000000"))
+        self.assertEqual(bad, 0)
+        line = asm.splitlines()[0]
+        self.assertRegex(line, r"v_add_f64 v\[4:5\], 0x1, 1\s")
+        ins = shader_ir.parse_line(line)
+        self.assertTrue(ins["args"][1].get("f64_literal"))
+        self.assertFalse(ins["args"][2].get("f64_literal"))
+        # A 32-bit source's literal is the whole value, the same as the inline constant: it stays decimal,
+        # and the literal operand dict is unchanged.
+        asm, bad = rdna2_decode.disasm_bytes(bytes.fromhex("040003d5ff02010001000000"))
+        self.assertEqual(bad, 0)
+        self.assertRegex(asm.splitlines()[0], r"v_add_f32_e64 v4, 1, 1\s")
+        info = rdna2_decode.decode_bytes(bytes.fromhex("040003d5ff02010001000000"))
+        self.assertEqual(info["insns"][0]["args"][1], {"k": "imm", "v": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -223,6 +223,10 @@ def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = 
         op = {"k": "special", "t": "src_lds_direct", "neg": False, "abs": False}
     elif code == 255:
         op = {"k": "imm", "v": 0 if lit is None else lit}
+        if n == 2:
+            # A 64-bit operand's literal dword: an f64 source takes it as bits 63:32, so format_insn prints it
+            # in hex the way LLVM does, keeping it apart from an inline integer of the same value (0x1 vs 1).
+            op["lit64"] = True
     elif 256 <= code <= 511:
         op = _vreg(code - 256, n)
     else:
@@ -1349,7 +1353,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
     return None, 4
 
 
-def _format_operand(a: dict, hex_imm: bool = False) -> str:
+def _format_operand(a: dict, hex_imm: bool = False, f64: bool = False) -> str:
     k = a["k"]
     if k in ("vgpr", "sgpr"):
         p = "v" if k == "vgpr" else "s"
@@ -1365,7 +1369,7 @@ def _format_operand(a: dict, hex_imm: bool = False) -> str:
         s = a["t"]
     elif k == "imm":
         v = a["v"]
-        s = f"0x{v:x}" if hex_imm or v >= 100 else str(v)
+        s = f"0x{v:x}" if hex_imm or v >= 100 or (f64 and a.get("lit64")) else str(v)
     elif k == "fimm":
         v = a["v"]
         s = next((txt for code, txt in _INLINE_FLOAT_STR.items() if _INLINE_FLOAT[code] == v), repr(v))
@@ -1390,11 +1394,12 @@ def format_insn(ins: dict) -> str:
     args = ins["args"]
     mods = ins["mods"]
     hex_imm = op == "s_ttracedata_imm"
+    f64 = "_f64" in op      # an f64 source's literal is its high dword: LLVM prints it in hex (shader_ir reads 0x1 as one)
     if op == "exp" and args:
         head = f"{op} {_format_operand(args[0], hex_imm)} " + ", ".join(
             _format_operand(x, hex_imm) for x in args[1:])
     elif args:
-        head = f"{op} " + ", ".join(_format_operand(x, hex_imm) for x in args)
+        head = f"{op} " + ", ".join(_format_operand(x, hex_imm, f64) for x in args)
     else:
         head = op
     if mods:
