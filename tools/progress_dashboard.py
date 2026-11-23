@@ -517,6 +517,23 @@ def parse_gpu_log(text):
     return rows, summary
 
 
+def split_gpu_log_spec(spec):
+    """Resolve an existing log path before treating an equals sign as a label separator."""
+    if os.path.isfile(spec):
+        return spec, ""
+    path, separator, label = spec.partition("=")
+    if not separator or os.path.isfile(path):
+        return path, label
+    # A filename or its directory can contain additional equals signs.
+    boundary = spec.rfind("=")
+    while boundary > len(path):
+        candidate = spec[:boundary]
+        if os.path.isfile(candidate):
+            return candidate, spec[boundary + 1:]
+        boundary = spec.rfind("=", 0, boundary)
+    return path, label
+
+
 def collect_gpu(col, logs):
     col.panel("gpu", "GPU tests (hand-written RDNA2 programs)", "test programs")
     if not logs:
@@ -524,7 +541,7 @@ def collect_gpu(col, logs):
         return
     changed = max(t for t in (last_commit_time("runtime/test/shaders"), last_commit_time("tools/rdna2spirv.py"), 0) if t is not None)
     for spec in logs:
-        path, _, label = spec.partition("=")
+        path, label = split_gpu_log_spec(spec)
         if not os.path.isfile(path):
             col.source("gpu_log", path, "missing")
             continue

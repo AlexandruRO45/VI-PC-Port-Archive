@@ -268,11 +268,25 @@ class GpuLog(unittest.TestCase):
             with open(log, "w", encoding="utf-8", newline="\n") as f:
                 f.write(self.LOG + "\n")
             col = pd.Collector()
-            pd.collect_gpu(col, [log + "=RTX 4060, 576.02, Windows 11"])
-            self.assertEqual({c["group"] for c in col.components}, {"RTX 4060, 576.02, Windows 11"})
+            pd.collect_gpu(col, [log + "=RTX 4060, driver=576.02, Windows 11"])
+            self.assertEqual({c["group"] for c in col.components}, {"RTX 4060, driver=576.02, Windows 11"})
             self.assertEqual(sorted(c["status"] for c in col.components)[0], "failed")
             m = next(m for m in col.metrics if m["id"] == "gpu.current")
             self.assertEqual(m["denominator"], 2)                     # the skip is not counted
+
+    def test_log_path_with_equals_signs_accepts_an_optional_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "gpu=results")
+            os.mkdir(directory)
+            log = os.path.join(directory, "driver=next.log")
+            with open(log, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self.LOG + "\n")
+            for spec, label in ((log, "driver=next"), (log + "=RADV=next", "RADV=next")):
+                with self.subTest(spec=spec):
+                    col = pd.Collector()
+                    pd.collect_gpu(col, [spec])
+                    self.assertEqual(col.sources[0]["status"], "ok")
+                    self.assertEqual({c["group"] for c in col.components}, {label})
 
 
 class Github(unittest.TestCase):
