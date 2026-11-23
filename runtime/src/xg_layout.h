@@ -17,8 +17,9 @@
 // Scope / simplifications of the current layout model:
 // - Mips are placed largest-first with each tiled mip rounded up to whole tiles (no GFX10 mip-tail packing; console
 //   mip-tail layout remains open per docs/d3d12_vulkan.md).
-// - Subresource copy supports 1D/2D/2D-array/3D linear textures and 2D/2D-array swizzled textures via TiledSurface2D.
-//   Swizzled 3D subresource copy is refused (returns false) until 3D tile swizzle addressing is implemented.
+// - Subresource copy supports single-sample (sample_count == 1) 1D/2D/2D-array/3D linear textures and 2D/2D-array
+//   swizzled textures via TiledSurface2D. Swizzled 3D and multisampled (sample_count > 1) subresource copies are
+//   refused (return false) without modifying caller buffers until 3D/MSAA sample transfers are implemented.
 // - Unknown desc.layout words are rejected rather than defaulted.
 
 #include "gfx10_tiling.h"
@@ -566,6 +567,8 @@ inline bool transfer_subresource(const XgResourceDesc& desc, const XgResourceLay
     const XgMipLevelLayout& ml = plane.mip_layout[mip];
     const std::uint32_t bpe = plane.bytes_per_element;
     if (bpe == 0 || ml.width_elements == 0 || ml.height_elements == 0) return false;
+    // Multisampled subresource transfers require per-sample addressing; refuse before touching any buffer.
+    if (desc.sample_count > 1u || ml.sample_count > 1u) return false;
 
     const std::uint32_t z_slices = is_3d ? ml.depth_or_array : 1u;
     if (z_slices == 0) return false;

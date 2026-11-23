@@ -244,6 +244,36 @@ int main() {
         XgResourceLayout msaa4{};
         CHECK(compute_resource_layout(msaa, msaa4));
         CHECK(msaa4.plane[0].mip_layout[0].size_bytes == 4u * kTileAlignment);  // 64x64 tile -> 2x2 tiles
+        // 1x controls round-trip every byte, while 4x MSAA copies (linear and 64 KiB tiled, both directions) must
+        // return false without modifying either buffer.
+        for (const std::uint32_t lay : {kLayoutLinear, kLayoutSw64KbD}) {
+            const auto d1x = make_2d(128, 128, 1, 1, 28, lay);
+            XgResourceLayout l1x{};
+            CHECK(compute_resource_layout(d1x, l1x));
+            std::vector<std::byte> res1x(static_cast<std::size_t>(l1x.size_bytes), std::byte{0xA5});
+            std::vector<std::byte> src1x(128u * 128u * 4u, std::byte{0x5A});
+            std::vector<std::byte> dst1x(128u * 128u * 4u, std::byte{0xC3});
+            CHECK(copy_into_subresource(d1x, l1x, res1x.data(), 0, 0, src1x.data(), 128u * 4u, 128u * 128u * 4u));
+            CHECK(copy_from_subresource(d1x, l1x, dst1x.data(), 0, 0, res1x.data(), 128u * 4u, 128u * 128u * 4u));
+            CHECK(dst1x == src1x);
+
+            auto d4x = d1x;
+            d4x.sample_count = 4;
+            XgResourceLayout l4x{};
+            CHECK(compute_resource_layout(d4x, l4x));
+            CHECK(l4x.size_bytes == 4u * kTileAlignment);
+            const std::vector<std::byte> res_sentinel(static_cast<std::size_t>(l4x.size_bytes), std::byte{0xA5});
+            const std::vector<std::byte> src4x(128u * 128u * 4u * 4u, std::byte{0x5A});
+            const std::vector<std::byte> dst_sentinel(128u * 128u * 4u * 4u, std::byte{0xC3});
+            std::vector<std::byte> res4x = res_sentinel;
+            std::vector<std::byte> dst4x = dst_sentinel;
+            CHECK(!copy_into_subresource(d4x, l4x, res4x.data(), 0, 0, src4x.data(), 128u * 4u * 4u,
+                                         128u * 128u * 4u * 4u));
+            CHECK(res4x == res_sentinel);
+            CHECK(!copy_from_subresource(d4x, l4x, dst4x.data(), 0, 0, res4x.data(), 128u * 4u * 4u,
+                                         128u * 128u * 4u * 4u));
+            CHECK(dst4x == dst_sentinel);
+        }
         msaa.sample_count = 2;
         CHECK(!compute_resource_layout(msaa, msaa4));
         msaa.sample_count = 8;

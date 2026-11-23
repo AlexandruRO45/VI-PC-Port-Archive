@@ -169,8 +169,9 @@ portable model in `runtime/src/xg_layout.h` implement both exports and slots 0 (
 `XGSuggestSwizzleMode` returns `0x101` (`SW_64KB_D`) for tiled 2D/3D textures and `0x100` for 1D/linear textures, and
 `XGCreateTextureComputer` returns a reference-counted computer backed by `gfx10_tiling.h` and `resource_tiling.h`.
 Mips are laid out largest-first with whole-tile alignment (no console mip-tail packing yet, matching the open status in
-`docs/d3d12_vulkan.md`), unknown layout words are rejected with `E_INVALIDARG`, and swizzled 3D subresource copies are
-refused until 3D tile swizzle addressing is implemented. Two of the four `XGCreateTextureComputer` callers ignore the
+`docs/d3d12_vulkan.md`), unknown layout words are rejected with `E_INVALIDARG`, and swizzled 3D or multisampled
+(`sample_count > 1`) subresource copies are refused without modifying caller buffers until 3D/MSAA transfers are
+implemented. Two of the four `XGCreateTextureComputer` callers ignore the
 HRESULT and call through the object at once, so on invalid descriptions the shim still stores a static fallback object
 in the out pointer whose unimplemented slots log once and return `E_NOTIMPL` without writing caller buffers.
 `xg_layout_test` and `xg_xs_test` cover the layout math, swizzle round-trips, tiling and fallback paths.
