@@ -479,6 +479,38 @@ class TestBuildForIndex(unittest.TestCase):
                 self.assertFalse(staged.parent.exists())
                 self.assertEqual(Path(spv).read_bytes(), b"synthetic binary")
 
+    def test_late_tool_failure_preserves_batch_until_successful_retry(self):
+        entry = {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}
+        for tool in ("spirv-as", "spirv-val"):
+            for seeded in (False, True):
+                with self.subTest(tool=tool, seeded=seeded), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self._write_index(tmp, {"ps_b": entry, "ps_a": entry})
+                    if seeded:
+                        for name in ("ps_a", "ps_b"):
+                            for ext in ("spvasm", "spv"):
+                                path = root / f"{name}.bary_gs.{ext}"
+                                path.write_bytes(path.name.encode())
+                    original = {p: p.read_bytes() for p in root.iterdir()}
+
+                    def fail_second(cmd, **kwargs):
+                        result = _successful_spirv_tools(cmd, **kwargs)
+                        if cmd[0] == tool and Path(cmd[-1]).name.startswith("ps_b."):
+                            return subprocess.CompletedProcess(cmd, 1, "", "synthetic failure")
+                        return result
+
+                    with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=fail_second):
+                        with self.assertRaisesRegex(RuntimeError, f"{tool} failed"):
+                            bary_fallback_gs.build_for_index(tmp)
+                    self.assertEqual({p: p.read_bytes() for p in root.iterdir()}, original)
+
+                    with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=_successful_spirv_tools):
+                        paths = bary_fallback_gs.build_for_index(tmp)
+                    self.assertEqual(paths, [str(root / f"ps_{n}.bary_gs.spv") for n in ("a", "b")])
+                    for path in map(Path, paths):
+                        self.assertEqual(path.read_bytes(), b"synthetic binary")
+                        self.assertIn("OpEmitVertex", path.with_suffix(".spvasm").read_text(encoding="utf-8"))
+
     def test_build_pair_forwards_suffix(self):
         index = {
             "vs_clip": {"stage": "vs", "capabilities": ["ClipDistance"], "clip_distance_count": 3},
