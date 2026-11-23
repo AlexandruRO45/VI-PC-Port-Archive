@@ -587,5 +587,34 @@ class TestVLogF32HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_log_f32(float("inf")), float("inf"))
 
 
+def ref_rcp_f32(src: float) -> float:
+    """Bit-accurate reference oracle for RDNA2 v_rcp_f32 (1.0 / x)."""
+    if math.isnan(src):
+        return float("nan")
+    if src == 0.0:
+        return float("-inf") if math.copysign(1.0, src) < 0 else float("inf")
+    if math.isinf(src):
+        return -0.0 if src < 0 else 0.0
+    return 1.0 / src
+
+
+class TestVRcpF32Reference(unittest.TestCase):
+    """Reference mathematical oracle verification for v_rcp_f32."""
+
+    def test_reference_fractions(self):
+        self.assertEqual(ref_rcp_f32(1.0), 1.0)
+        self.assertEqual(ref_rcp_f32(2.0), 0.5)
+        self.assertEqual(ref_rcp_f32(4.0), 0.25)
+        self.assertEqual(ref_rcp_f32(-2.0), -0.5)
+        self.assertEqual(ref_rcp_f32(0.5), 2.0)
+
+    def test_reference_zeros_and_infs(self):
+        self.assertEqual(ref_rcp_f32(0.0), float("inf"))
+        self.assertEqual(ref_rcp_f32(-0.0), float("-inf"))
+        self.assertEqual(ref_rcp_f32(float("inf")), 0.0)
+        self.assertEqual(ref_rcp_f32(float("-inf")), -0.0)
+        self.assertTrue(math.isnan(ref_rcp_f32(float("nan"))))
+
+
 if __name__ == "__main__":
     unittest.main()
