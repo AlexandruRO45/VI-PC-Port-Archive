@@ -154,6 +154,12 @@ private:
 // skips the atexit table. Call it when no mapped code can run again: it unmaps the helper images.
 void cleanup_tls_clones();
 
+#ifdef LEONIDA_LOADER_TEST_HOOKS
+// Makes the next existing-thread TLS record fail after its block has been installed. The loader_test target alone
+// enables this, to exercise rollback at the last allocation boundary without changing production behaviour.
+void fail_next_existing_thread_tls_record_for_test();
+#endif
+
 std::string lower(std::string s);
 
 }  // namespace rt

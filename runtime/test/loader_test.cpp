@@ -306,6 +306,59 @@ void test_failed_map_can_be_retried() {
     }
 }
 
+void test_failed_reserved_map_preserves_reservation() {
+    const char* what = "a failed reserved map preserves the preferred range for a corrected retry";
+    auto valid = make_image();
+    auto bad = valid;
+    IMAGE_FIRST_SECTION(nt_of(bad))->PointerToRawData = 0x3F0;
+    const uint64_t preferred = nt_of(valid)->OptionalHeader.ImageBase;
+    constexpr SIZE_T reservation_size = 0x10000;
+    void* reservation = VirtualAlloc(reinterpret_cast<void*>(preferred), reservation_size, MEM_RESERVE, PAGE_NOACCESS);
+    if (reservation != reinterpret_cast<void*>(preferred)) {
+        if (reservation) VirtualFree(reservation, 0, MEM_RELEASE);
+        return failed(what, "the synthetic preferred range could not be reserved");
+    }
+
+    wchar_t old_value[64] = {};
+    const DWORD old_length = GetEnvironmentVariableW(L"LEONIDA_BASE_RESERVED", old_value, 64);
+    wchar_t marker[64] = {};
+    std::swprintf(marker, 64, L"%llx:%llx", static_cast<unsigned long long>(preferred),
+                  static_cast<unsigned long long>(reservation_size));
+    SetEnvironmentVariableW(L"LEONIDA_BASE_RESERVED", marker);
+
+    struct Restore {
+        uint64_t base;
+        DWORD old_length;
+        wchar_t* old_value;
+        ~Restore() {
+            SetEnvironmentVariableW(L"LEONIDA_BASE_RESERVED", old_length && old_length < 64 ? old_value : nullptr);
+            VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
+        }
+    } restore{preferred, old_length, old_value};
+    const auto path = write_image_as(bad, "reserved_map_retry.dll");
+    try {
+        rt::Loader loader(g_dir);
+        try {
+            loader.load(path);
+            return failed(what, "the malformed first image loaded");
+        } catch (const std::exception&) {
+        }
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(preferred), &info, sizeof(info)) || info.State != MEM_RESERVE ||
+            info.AllocationBase != reinterpret_cast<void*>(preferred)) {
+            return failed(what, "the inherited reservation was released");
+        }
+        write_image_as(valid, "reserved_map_retry.dll");
+        rt::Module& retried = loader.load(path);
+        if (reinterpret_cast<uint64_t>(retried.base) != preferred) {
+            return failed(what, "the corrected image did not recommit the inherited reservation");
+        }
+        pass(what);
+    } catch (const std::exception& e) {
+        failed(what, e.what());
+    }
+}
+
 void test_truncation() {
     // Every length of a valid image: no length below the full one may load, and none may crash.
     auto full = make_image();
@@ -618,6 +671,51 @@ std::vector<uint8_t> make_init_image() {
     dir.VirtualAddress = 0x10B0;
     dir.Size = sizeof(IMAGE_TLS_DIRECTORY64);
     return img;
+}
+
+void test_failed_existing_thread_tls_record_rolls_back() {
+    const char* what = "a failed existing-thread TLS record rolls the map back for retry";
+    std::atomic<bool> ready{false};
+    std::atomic<bool> stop{false};
+    std::thread worker([&] {
+        ready.store(true, std::memory_order_release);
+        while (!stop.load(std::memory_order_acquire)) Sleep(1);
+    });
+    while (!ready.load(std::memory_order_acquire)) Sleep(0);
+
+    auto image = make_init_image();
+    const uint64_t preferred = nt_of(image)->OptionalHeader.ImageBase;
+    const auto path = write_image_as(image, "tls_record_retry.dll");
+    bool ok = false;
+    std::string why;
+    try {
+        rt::Loader loader(g_dir);
+        rt::fail_next_existing_thread_tls_record_for_test();
+        try {
+            loader.load(path);
+            why = "the injected record failure did not reject the first map";
+        } catch (const std::bad_alloc&) {
+            std::string module;
+            uint32_t rva = 0;
+            if (!loader.modules().empty())
+                why = "the failed TLS image remained in modules()";
+            else if (loader.find_address(preferred, module, rva))
+                why = "find_address retained the failed TLS image";
+            else {
+                rt::Module& retried = loader.load(path);
+                ok = retried.tls_index != rt::kNoTlsIndex;
+                if (!ok) why = "the corrected retry did not install TLS";
+            }
+        }
+    } catch (const std::exception& e) {
+        why = e.what();
+    }
+    stop.store(true, std::memory_order_release);
+    worker.join();
+    if (ok)
+        pass(what);
+    else
+        failed(what, why.empty() ? "the retry failed" : why);
 }
 
 void expect_init_rejects(const char* what, const std::vector<uint8_t>& bytes) {
@@ -1326,6 +1424,7 @@ int main() {
         test_header_bounds();
         test_section_bounds();
         test_failed_map_can_be_retried();
+        test_failed_reserved_map_preserves_reservation();
         test_truncation();
         test_relocations();
         test_exports();
@@ -1334,6 +1433,7 @@ int main() {
         test_import_name_rvas();
         test_delay_imports();
         test_initialise();
+        test_failed_existing_thread_tls_record_rolls_back();
         test_initialise_rejects();
         test_process_detach();
         test_process_detach_invalid_tls();

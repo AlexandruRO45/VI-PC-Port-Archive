@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <vector>
 
@@ -358,6 +359,9 @@ ExistingThreads& existing_threads() {
     static auto* state = new ExistingThreads;
     return *state;
 }
+#ifdef LEONIDA_LOADER_TEST_HOOKS
+std::atomic<bool> g_fail_next_existing_thread_tls_record{false};
+#endif
 struct ExistingThreadsLock {
     ExistingThreadsLock() { AcquireSRWLockExclusive(&existing_threads().lock); }
     ~ExistingThreadsLock() { ReleaseSRWLockExclusive(&existing_threads().lock); }
@@ -635,7 +639,18 @@ void install_on_existing_threads(Module& m) {
                                  m.name.c_str());
                 continue;
             }
-            state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block});
+            try {
+#ifdef LEONIDA_LOADER_TEST_HOOKS
+                if (g_fail_next_existing_thread_tls_record.exchange(false)) throw std::bad_alloc();
+#endif
+                state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block});
+            } catch (...) {
+                // Without a record neither thread detach nor ~Loader can find this block. Put the helper's block
+                // back before propagating, so initialize_tls can roll back the state it does own.
+                restore_thread_slot(vector, m.tls_index, block, saved);
+                VirtualFree(block, 0, MEM_RELEASE);
+                throw;
+            }
         }
     }
 }
@@ -848,6 +863,10 @@ void redirect_pc_to_file_header_at(const void* resolved) {
 
 // Declared in pe_loader.h; the body needs the internal clone registry above.
 void cleanup_tls_clones() { cleanup_tls_clones_internal(); }
+
+#ifdef LEONIDA_LOADER_TEST_HOOKS
+void fail_next_existing_thread_tls_record_for_test() { g_fail_next_existing_thread_tls_record.store(true); }
+#endif
 
 namespace {
 bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t& rva) {
@@ -1162,9 +1181,11 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
+    bool committed_reservation = false;
     try {
         // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.
         m->base = static_cast<uint8_t*>(base_reservation::commit_reserved(oh.ImageBase, oh.SizeOfImage));
+        committed_reservation = m->base != nullptr;
         if (!m->base)
             m->base = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage,
                                                          MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -1262,7 +1283,14 @@ Module& Loader::map_image(const std::filesystem::path& path) {
         }
         return *m;
     } catch (...) {
-        if (m->base) VirtualFree(m->base, 0, MEM_RELEASE);
+        if (m->base) {
+            // A reserved-base commit is only part of the inherited allocation. Restore it to MEM_RESERVE so a
+            // corrected non-relocatable retry retains the guarantee the suspended-parent reservation provided.
+            if (committed_reservation)
+                VirtualFree(m->base, m->size, MEM_DECOMMIT);
+            else
+                VirtualFree(m->base, 0, MEM_RELEASE);
+        }
         delete m;
         throw;
     }
@@ -1355,7 +1383,28 @@ void Loader::initialize_tls(Module& m) {
     }
     // Threads started from here on get their copy from the helper DLL's DLL_THREAD_ATTACH; the ones already running
     // get it now.
-    install_on_existing_threads(m);
+    try {
+        install_on_existing_threads(m);
+    } catch (...) {
+        // Candidate-list allocation and recording a block for another thread can throw after this module owns a
+        // global slot and the loading thread has its copy. Retire every published piece before map_image deletes m.
+        {
+            ExclusiveTlsLock lock;
+            Module* owner = &m;
+            if (g_tls_slot_owners[slot].compare_exchange_strong(owner, nullptr))
+                g_tls_slot_generations[slot].store(0);
+            remove_from_existing_threads(m);
+        }
+        uninstall_thread_block(m);
+        m.tls_index = kNoTlsIndex;
+        m.tls_slot = kNoTlsIndex;
+        m.tls_generation = 0;
+        m.tls_template = nullptr;
+        m.tls_raw_size = 0;
+        m.tls_zero_fill = 0;
+        m.tls_block_size = 0;
+        throw;
+    }
 }
 
 void Loader::install_tls_for_thread(Module& m) { install_thread_block(m); }

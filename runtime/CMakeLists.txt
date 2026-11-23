@@ -462,7 +462,8 @@ if(BUILD_TESTING)
       src/pe_loader.cpp
       shims/registry.cpp
     )
-    target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
+                                                   LEONIDA_LOADER_TEST_HOOKS)
     target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
     target_link_options(loader_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
     add_dependencies(loader_test gta6rt_tls_host)
