@@ -8402,6 +8402,7 @@ bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UI
     DXGI_FORMAT family = format;
     int named_plane = -1;  // -1: any plane of the depth format
     switch (format) {
+    case DXGI_FORMAT_R16_UNORM: family = DXGI_FORMAT_D16_UNORM, named_plane = 0; break;
     case DXGI_FORMAT_R32_FLOAT: family = DXGI_FORMAT_D32_FLOAT, named_plane = 0; break;
     case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 0; break;
     case DXGI_FORMAT_X24_TYPELESS_G8_UINT: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 1; break;

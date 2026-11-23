@@ -279,8 +279,8 @@ What is implemented (all of it testable without the game):
   with a raw Vulkan program (a 4x D32 attachment, render area (2,1) 5x4 of 8x6, `MIN`, `MAX` and `SAMPLE_ZERO`,
   store `NONE` or `STORE`): MoltenVK writes all 48 destination texels, KosmicKrisp only the 20 inside. No device
   property reports it, so nothing is gated. The format is the depth
-  format or the plane's own (`R32_FLOAT`, `R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`, and for D32S8
-  `R32_FLOAT_X8X24_TYPELESS` and `X32_TYPELESS_G8X24_UINT`; all compared with the PC runtime, TEST-847). A depth-only source above array layer 0 is resolved in a
+  format or the plane's own (`R16_UNORM`, `R32_FLOAT`, `R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`, and for D32S8
+  `R32_FLOAT_X8X24_TYPELESS` and `X32_TYPELESS_G8X24_UINT`; all compared with the PC runtime, TEST-847 and `d3d12_d16_depth_resolve_test`). A depth-only source above array layer 0 is resolved in a
   `VkRenderPass` with a framebuffer of the same two views instead of the rendering scope, on every GPU (D3D-417, a
   driver workaround): AMD's Windows driver (32.0.21042.62, Ryzen 7 9700X iGPU) resolves a dynamic-rendering depth
   attachment from layer 0 of the image when the multisampled view starts at another layer, while it honours the
