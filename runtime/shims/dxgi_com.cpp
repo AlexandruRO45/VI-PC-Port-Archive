@@ -219,6 +219,9 @@ public:
 
     ~SwapChain() {
         unregister_buffers();
+        // swapchain_ is a member and would otherwise be destroyed after this body, once device_ below may have
+        // dropped the last reference to the VkDevice it uses (D3D-818).
+        swapchain_.release();
         if (restrict_to_output_) restrict_to_output_->Release();
         if (waitable_) CloseHandle(waitable_);
         if (device_) device_->Release();
