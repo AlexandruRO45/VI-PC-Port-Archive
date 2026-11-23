@@ -11,7 +11,12 @@
 // registry doesn't serve returns NULL with ERROR_PROC_NOT_FOUND, as a real module would, and is logged once. Every
 // other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
 // loader see these: they are bound through the registry, the runtime's own code calls the host directly.
+#define WIN32_NO_STATUS
 #include <windows.h>
+#include <winternl.h>
+#undef WIN32_NO_STATUS
+#include <ntstatus.h>
+#include <delayloadhandler.h>
 
 #include <cstdio>
 #include <deque>
@@ -242,6 +247,74 @@ BOOL WINAPI free_library(HMODULE module) {
     return FreeLibrary(module);
 }
 
+using DelayLoadSystemHook = FARPROC(WINAPI*)(LPCSTR, LPCSTR);
+
+// An explicit call from a mapped image has to see the same DLLs and exports as its LoadLibrary/GetProcAddress
+// calls. The loader's eager delay-import binding is independent of this entry point.
+void* WINAPI resolve_delay_loaded_api(void* parent, PCIMAGE_DELAYLOAD_DESCRIPTOR descriptor,
+                                     PDELAYLOAD_FAILURE_DLL_CALLBACK dll_hook, DelayLoadSystemHook system_hook,
+                                     PIMAGE_THUNK_DATA thunk, ULONG flags) {
+    if (!owns_bundled_module_handle(parent)) {
+        using Resolve = decltype(&resolve_delay_loaded_api);
+        const auto host = reinterpret_cast<Resolve>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ResolveDelayLoadedAPI"));
+        return host ? host(parent, descriptor, dll_hook, system_hook, thunk, flags) : nullptr;
+    }
+
+    if (flags || !descriptor || !descriptor->Attributes.RvaBased || !descriptor->DllNameRVA ||
+        !descriptor->ModuleHandleRVA || !descriptor->ImportAddressTableRVA || !descriptor->ImportNameTableRVA) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    auto* base = static_cast<unsigned char*>(parent);
+    const auto table = reinterpret_cast<uintptr_t>(base + descriptor->ImportAddressTableRVA);
+    const auto entry = reinterpret_cast<uintptr_t>(thunk);
+    if (entry < table || (entry - table) % sizeof(IMAGE_THUNK_DATA)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA*>(base + descriptor->ImportNameTableRVA);
+    const auto& name = names[(entry - table) / sizeof(IMAGE_THUNK_DATA)];
+    const bool by_ordinal = IMAGE_SNAP_BY_ORDINAL(name.u1.Ordinal);
+    const auto ordinal = static_cast<WORD>(IMAGE_ORDINAL(name.u1.Ordinal));
+    const auto* symbol = by_ordinal ? MAKEINTRESOURCEA(ordinal) :
+        reinterpret_cast<const char*>(reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + name.u1.AddressOfData)->Name);
+    const auto* dll = reinterpret_cast<const char*>(base + descriptor->DllNameRVA);
+    auto* handle = reinterpret_cast<void* volatile*>(base + descriptor->ModuleHandleRVA);
+    auto module = static_cast<HMODULE>(InterlockedCompareExchangePointer(handle, nullptr, nullptr));
+    if (!module) {
+        module = load_library_a(dll);
+        if (module) {
+            const auto previous = static_cast<HMODULE>(InterlockedCompareExchangePointer(handle, module, nullptr));
+            if (previous) {
+                free_library(module);
+                module = previous;
+            }
+        }
+    }
+
+    auto* result = module ? reinterpret_cast<void*>(get_proc_address(module, symbol)) : nullptr;
+    if (result) {
+        InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&thunk->u1.Function), result);
+        return result;
+    }
+    if (dll_hook) {
+        DELAYLOAD_INFO info{};
+        info.Size = sizeof(info);
+        info.DelayloadDescriptor = descriptor;
+        info.ThunkAddress = thunk;
+        info.TargetDllName = dll;
+        info.TargetApiDescriptor.ImportDescribedByName = !by_ordinal;
+        if (by_ordinal) info.TargetApiDescriptor.Description.Ordinal = ordinal;
+        else info.TargetApiDescriptor.Description.Name = symbol;
+        info.TargetModuleBase = module;
+        info.LastError = static_cast<ULONG>(module ? STATUS_ENTRYPOINT_NOT_FOUND : STATUS_DLL_NOT_FOUND);
+        return dll_hook(DELAYLOAD_GPA_FAILURE, &info);
+    }
+    if (system_hook) return reinterpret_cast<void*>(system_hook(dll, symbol));
+    return nullptr;
+}
+
 // DisableThreadLibraryCalls(hinstance) from a mapped image's DllMain. The real function only accepts a module the
 // Windows loader mapped, so for ours it fails, and a DllMain that returns its result (the MSVC runtime's satellite
 // DLLs do) fails Loader::initialise() with "DllMain returned FALSE". Owned and mapped modules answer TRUE. The loader
@@ -261,6 +334,7 @@ BOOL WINAPI disable_thread_calls(HMODULE module) {
     {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
+    {dll, "ResolveDelayLoadedAPI", reinterpret_cast<void*>(&rt::shims::library_loader::resolve_delay_loaded_api)},     \
     {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)},                           \
     {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)}
 

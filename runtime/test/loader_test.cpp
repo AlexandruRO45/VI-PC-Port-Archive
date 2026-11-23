@@ -5,6 +5,7 @@
 // What it pins down: a valid image maps exactly as its headers say, and a truncated or corrupt one is rejected with
 // a message instead of being followed out of bounds. The truncation case covers every length of a valid image.
 #include <windows.h>
+#include <delayloadhandler.h>
 #include <intrin.h>
 
 #include <algorithm>
@@ -505,6 +506,47 @@ void test_import_name_rvas() {
             failed(invalid, error);
         else
             pass(invalid);
+    }
+}
+
+void test_resolve_delay_loaded_api() {
+    auto img = make_import_image("kernel32.dll", "ResolveDelayLoadedAPI");
+    IMAGE_FIRST_SECTION(nt_of(img))->Characteristics |= IMAGE_SCN_MEM_WRITE;
+    // Model a caller invoking the helper explicitly. Omitting the delay directory keeps the loader's eager
+    // binding pass from resolving this descriptor before the call.
+    auto* descriptor = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x280);
+    descriptor->Attributes.RvaBased = 1;
+    descriptor->DllNameRVA = 0x10A0;
+    descriptor->ModuleHandleRVA = 0x10B0;
+    descriptor->ImportAddressTableRVA = 0x10C0;
+    descriptor->ImportNameTableRVA = 0x10D0;
+    std::memcpy(img.data() + 0x2A0, "testshim.dll", sizeof("testshim.dll"));
+    *reinterpret_cast<uint64_t*>(img.data() + 0x2D0) = 0x10E0;
+    std::memcpy(img.data() + 0x2E2, "F", sizeof("F"));
+
+    rt::Loader loader(g_dir);
+    auto& module = loader.load(write_image(img));
+    const char* binding = "ResolveDelayLoadedAPI binds to the loader shim";
+    if (module.imports.size() != 1 || module.imports.front().binding != rt::Binding::Shim) {
+        failed(binding, "the mapped image's import did not reach the shim");
+        return;
+    }
+    pass(binding);
+
+    using SystemHook = FARPROC(WINAPI*)(LPCSTR, LPCSTR);
+    using Resolve = void*(WINAPI*)(void*, PCIMAGE_DELAYLOAD_DESCRIPTOR, PDELAYLOAD_FAILURE_DLL_CALLBACK,
+                                   SystemHook, PIMAGE_THUNK_DATA, ULONG);
+    const auto resolve = reinterpret_cast<Resolve>(reinterpret_cast<IMAGE_THUNK_DATA*>(module.base + 0x1180)->u1.Function);
+    descriptor = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(module.base + 0x1080);
+    auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(module.base + 0x10C0);
+    auto* result = resolve(module.base, descriptor, nullptr, nullptr, thunk, 0);
+    const char* resolution = "ResolveDelayLoadedAPI returns and stores the shim address";
+    if (result == reinterpret_cast<void*>(&test_shim_function) &&
+        thunk->u1.Function == reinterpret_cast<ULONG_PTR>(result) &&
+        *reinterpret_cast<HMODULE*>(module.base + 0x10B0)) {
+        pass(resolution);
+    } else {
+        failed(resolution, "wrong target, IAT entry, or cached module handle");
     }
 }
 
@@ -1298,6 +1340,7 @@ int main() {
         test_imports();
         test_import_name_rvas();
         test_delay_imports();
+        test_resolve_delay_loaded_api();
         test_initialise();
         test_initialise_rejects();
         test_process_detach();
