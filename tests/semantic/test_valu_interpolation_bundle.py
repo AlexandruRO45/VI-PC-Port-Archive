@@ -599,5 +599,23 @@ class TestInterpP1llF16HardwareTranslator(unittest.TestCase):
         self.assertEqual(len(words), 4)
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p1lv_f16 Reference Oracle
+# ------------------------------------------------------------------------------
+
+def ref_interp_p1lv_f16(i_coord: float, p0: float, p1: float) -> int:
+    """Computes D = P0 + i * (P1 - P0) in f32 intermediate precision."""
+    d1 = f32_round(p1 - p0)
+    m1 = f32_round(d1 * i_coord)
+    res = f32_round(p0 + m1)
+    return f32_to_bits(res)
+
+
+class TestInterpP1lvF16Oracle(unittest.TestCase):
+    def test_evaluation(self):
+        res = ref_interp_p1lv_f16(0.75, 2.0, 6.0)
+        self.assertEqual(res, f32_to_bits(5.0))
+
+
 if __name__ == '__main__':
     unittest.main()
