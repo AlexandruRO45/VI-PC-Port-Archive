@@ -1450,6 +1450,12 @@ def _nonnegative_index(text):
     return value
 
 
+def translator_supports_wave(wave, mode, w64_native):
+    if mode == "emulate":
+        return wave == 64
+    return wave == 32 or w64_native
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
@@ -1527,6 +1533,15 @@ def main():
         # this combination was empty in the same silent way. With the default modes emulate runs them.
         ap.error("--wave 64 --modes native runs nothing without --w64-native; pass it to run the documented "
                  "cross-half approximation, or use --modes emulate")
+    waves = (32, 64) if args.wave == "both" else (int(args.wave),)
+    modes = args.modes
+    # With both waves, any window of two or more programs contains both.
+    if backends == ("translator",) and not args.dpp_sweep and args.wave == "both" and args.programs == 1:
+        wave = waves[args.start_index % len(waves)]
+        if not any(translator_supports_wave(wave, mode, args.w64_native) for mode in modes):
+            ap.error(f"--start-index {args.start_index} --programs 1 selects only wave{wave}, "
+                     f"which cannot run with --modes {','.join(modes)}"
+                     + (" without --w64-native" if wave == 64 else ""))
     if "translator" in backends and not os.path.isfile(args.exe):   # before any program is generated or run
         sys.exit(f"vk_compute_test not found at {args.exe} or in its RelWithDebInfo/Release folder; build it first "
                  "(cmake --build <build dir> --target vk_compute_test) or give its path with --exe")
@@ -1539,8 +1554,6 @@ def main():
             print(f"hardware oracle unavailable: {e}")
             return 77
         print(f"hardware oracle: {oracle.device}")
-    waves = (32, 64) if args.wave == "both" else (int(args.wave),)
-    modes = args.modes
     progs = []
     if args.dpp_sweep:
         for wave in waves:
@@ -1702,9 +1715,7 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
                 continue
             spdir, log = translate(work, mode == "emulate")
             for p in progs:
-                if mode == "emulate" and p.wave != 64:
-                    continue
-                if mode == "native" and p.wave == 64 and not args.w64_native:
+                if not translator_supports_wave(p.wave, mode, args.w64_native):
                     continue
                 key = f"wave{p.wave} {mode}"
                 st = stats.setdefault(key, {"programs": 0, "match": 0, "mismatch": 0, "hyp_only": 0,
