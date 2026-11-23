@@ -145,8 +145,11 @@ class MaterialSpec:
     alpha_cutoff: float | None = None
     double_sided: bool = False
     base_color_png: bytes | None = None
+    base_color_texcoord: int = 0
     normal_png: bytes | None = None
+    normal_texcoord: int = 0
     metallic_roughness_png: bytes | None = None
+    metallic_roughness_texcoord: int = 0
 
 
 @dataclass
@@ -916,6 +919,14 @@ def _read_png_spec(val: object, base_dir: str) -> bytes | None:
     raise PedAssembleError(f"Unsupported PNG texture spec: {type(val).__name__}")
 
 
+def _texcoord(raw: dict, snake: str, camel: str) -> int:
+    """The UV set index a material texture samples; glTF defaults to TEXCOORD_0."""
+    value = raw.get(snake, raw.get(camel, 0))
+    if type(value) is not int or value < 0:
+        raise PedAssembleError(f"{snake} must be a non-negative integer")
+    return value
+
+
 def _parse_material_dict(raw: dict | None, base_dir: str) -> MaterialSpec | None:
     if raw is None:
         return None
@@ -937,8 +948,11 @@ def _parse_material_dict(raw: dict | None, base_dir: str) -> MaterialSpec | None
         alpha_cutoff=float(raw["alpha_cutoff"]) if "alpha_cutoff" in raw and raw["alpha_cutoff"] is not None else None,
         double_sided=bool(raw.get("double_sided", raw.get("doubleSided", False))),
         base_color_png=_read_png_spec(raw.get("base_color_png", raw.get("baseColorPng")), base_dir),
+        base_color_texcoord=_texcoord(raw, "base_color_texcoord", "baseColorTexCoord"),
         normal_png=_read_png_spec(raw.get("normal_png", raw.get("normalPng")), base_dir),
+        normal_texcoord=_texcoord(raw, "normal_texcoord", "normalTexCoord"),
         metallic_roughness_png=_read_png_spec(raw.get("metallic_roughness_png", raw.get("metallicRoughnessPng")), base_dir),
+        metallic_roughness_texcoord=_texcoord(raw, "metallic_roughness_texcoord", "metallicRoughnessTexCoord"),
     )
 
 
@@ -1086,10 +1100,13 @@ def part_to_dict(part: MeshPart) -> dict:
         }
         if part.material.alpha_cutoff is not None:
             mat["alpha_cutoff"] = part.material.alpha_cutoff
-        for slot in ("base_color_png", "normal_png", "metallic_roughness_png"):
+        for slot, uv_slot in (("base_color_png", "base_color_texcoord"),
+                              ("normal_png", "normal_texcoord"),
+                              ("metallic_roughness_png", "metallic_roughness_texcoord")):
             payload = getattr(part.material, slot)
             if payload is not None:
                 mat[slot] = "base64:" + base64.b64encode(payload).decode("ascii")
+                mat[uv_slot] = getattr(part.material, uv_slot)
         out["material"] = mat
     return out
 
@@ -1910,12 +1927,21 @@ def build_assembled_glb(
             "roughnessFactor": float(ms.roughness_factor),
         }
         if ms.base_color_png is not None:
-            pbr["baseColorTexture"] = {"index": _add_png_texture(ms.base_color_png)}
+            texture = {"index": _add_png_texture(ms.base_color_png)}
+            if ms.base_color_texcoord:
+                texture["texCoord"] = ms.base_color_texcoord
+            pbr["baseColorTexture"] = texture
         if ms.metallic_roughness_png is not None:
-            pbr["metallicRoughnessTexture"] = {"index": _add_png_texture(ms.metallic_roughness_png)}
+            texture = {"index": _add_png_texture(ms.metallic_roughness_png)}
+            if ms.metallic_roughness_texcoord:
+                texture["texCoord"] = ms.metallic_roughness_texcoord
+            pbr["metallicRoughnessTexture"] = texture
         mat_obj: dict = {"name": ms.name, "pbrMetallicRoughness": pbr}
         if ms.normal_png is not None:
-            mat_obj["normalTexture"] = {"index": _add_png_texture(ms.normal_png)}
+            texture = {"index": _add_png_texture(ms.normal_png)}
+            if ms.normal_texcoord:
+                texture["texCoord"] = ms.normal_texcoord
+            mat_obj["normalTexture"] = texture
         if ms.alpha_mode and ms.alpha_mode != "OPAQUE":
             mat_obj["alphaMode"] = ms.alpha_mode
             if ms.alpha_mode == "MASK" and ms.alpha_cutoff is not None:
