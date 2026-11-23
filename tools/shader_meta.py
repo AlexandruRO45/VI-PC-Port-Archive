@@ -57,11 +57,24 @@ KIND_PRIORITY = {
 }
 
 
+# The same opcode string is stripped many times per shader; see the note on rdna2spirv.base_op. The limit keeps a
+# process that translates a whole corpus from growing the cache without bound.
+_BASE_OP_CACHE = {}
+_BASE_OP_CACHE_LIMIT = 1 << 16
+
+
 def base_op(op):
-    for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
-        if op.endswith(suffix):
-            return op[:-len(suffix)]
-    return op
+    cached = _BASE_OP_CACHE.get(op)
+    if cached is None:
+        cached = op
+        for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
+            if op.endswith(suffix):
+                cached = op[:-len(suffix)]
+                break
+        if len(_BASE_OP_CACHE) >= _BASE_OP_CACHE_LIMIT:
+            _BASE_OP_CACHE.clear()
+        _BASE_OP_CACHE[op] = cached
+    return cached
 
 
 def _imm_u32(a):
