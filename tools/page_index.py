@@ -38,10 +38,12 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import zlib
 
 # -I omits the script directory from sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 # zlib stream start. Kept in step with rpf9_carve.py.
@@ -370,13 +372,33 @@ def summarise(pages, mode, source):
     }
 
 
+def _atomic_write(path, newline, writer):
+    folder = os.path.dirname(os.path.abspath(path))
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", dir=folder, prefix=".page-index-", suffix=".tmp",
+            encoding="utf-8", newline=newline, delete=False,
+        ) as f:
+            staged = f.name
+            writer(f)
+        os.chmod(staged, published_mode(path))
+        os.replace(staged, path)
+        staged = None
+    finally:
+        if staged is not None:
+            try:
+                os.remove(staged)
+            except OSError:
+                pass
+
+
 def write_json(path, pages, summary):
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "pages": pages}, f, indent=1)
+    _atomic_write(path, "\n", lambda f: json.dump({"summary": summary, "pages": pages}, f, indent=1))
 
 
 def write_csv(path, pages):
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    def _write(f):
         w = csv.DictWriter(f, fieldnames=COLUMNS, lineterminator="\n")
         w.writeheader()
         for page in pages:
@@ -399,6 +421,8 @@ def write_csv(path, pages):
             for i, r in enumerate(records):
                 w.writerow(dict(base, record_index=i, hash="0x%08x" % r["hash"], size=r["size"],
                                 target="0x%x" % r["target"], target_stream=r["target_stream"]))
+
+    _atomic_write(path, "", _write)
 
 
 def byte_count(text):
