@@ -7,6 +7,8 @@ no real asset names, and no retail hashes are used.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import struct
@@ -14,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -668,6 +671,50 @@ class PedCataloguesTests(unittest.TestCase):
             )
             self.assertEqual(r6.returncode, 0, r6.stderr.decode("utf-8", "replace"))
             self.assertNotIn("UnicodeEncodeError", r6.stderr.decode("utf-8", "replace"))
+
+    def test_unlistable_subfolder_is_an_error_not_a_silent_undercount(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the census used to report
+        # the remaining catalogues and exit 0, hiding the incomplete carved directory.
+        py = [sys.executable, "-I", os.path.join(TOOLS, "ped_catalogues.py")]
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "static")
+            os.mkdir(sub)
+            try:
+                os.chmod(sub, 0o000)
+                try:
+                    os.listdir(sub)
+                    self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+                except OSError:
+                    pass
+                r = subprocess.run(py + ["census", tmp], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("ERROR", r.stderr)
+                self.assertIn("static", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+            finally:
+                os.chmod(sub, 0o755)
+
+    def test_unlistable_subfolder_is_an_error_when_chmod_is_not_enough(self):
+        # The chmod case above self-skips on Windows and as root; forcing os.scandir to raise for one
+        # folder gives the same PermissionError os.walk hits for real, on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "static")
+            os.mkdir(sub)
+            real_scandir = os.scandir
+            locked = os.path.normcase(os.path.abspath(sub))
+
+            def scandir(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(str(path))) == locked:
+                    raise PermissionError(13, "Access is denied", str(path))
+                return real_scandir(path, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch.object(pc.os, "scandir", scandir), contextlib.redirect_stderr(err):
+                rc = pc.main(["census", tmp])
+            self.assertEqual(rc, 2, err.getvalue())
+            self.assertIn("ERROR", err.getvalue())
+            self.assertIn("Access is denied", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
     def test_cli_out_path_guards_directory_inputs(self):
         blocks, _ = build_rich_catalogue_blocks()

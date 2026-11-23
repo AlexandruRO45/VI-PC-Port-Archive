@@ -1077,6 +1077,12 @@ def iter_catalogues_in_file(path: str, *, max_inflate: int = MAX_INFLATE) -> Ite
                 yield cat
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a census must not report an
+    # incomplete carved directory as complete. The subcommands turn the OSError into one ERROR line.
+    raise exc
+
+
 def iter_catalogues_in_dir(path: str, *, max_inflate: int = MAX_INFLATE) -> Iterator[CatalogueContainer]:
     """Yield all `0x8dcb4cf5` catalogues in a carved directory (joining contiguous streams when `index.json` exists)."""
     manifest = os.path.join(path, "index.json")
@@ -1140,7 +1146,7 @@ def iter_catalogues_in_dir(path: str, *, max_inflate: int = MAX_INFLATE) -> Iter
                 i = j + 1
             return
 
-    for root, dirs, files in os.walk(path):
+    for root, dirs, files in os.walk(path, onerror=_walk_error):
         dirs.sort()
         for name in sorted(files):
             fpath = os.path.join(root, name)
