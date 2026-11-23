@@ -41,6 +41,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import psocache_inspect  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 MAGIC = psocache_inspect.MAGIC
@@ -164,9 +165,30 @@ def assemble(m, size, first, total):
 
 
 def inside_tempdir(path):
-    root = os.path.realpath(tempfile.gettempdir())
-    target = os.path.realpath(os.path.abspath(path))
-    return target.startswith(root + os.sep)
+    if not path:
+        return False
+    root = os.path.normcase(os.path.realpath(tempfile.gettempdir()))
+    target = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    try:
+        return target != root and os.path.commonpath([root, target]) == root
+    except ValueError:
+        return False
+
+
+def _validate_output(out, paths):
+    """Refuse an output path that is a directory, lacks its parent, or aliases any input archive."""
+    if (
+        os.path.isdir(out)
+        or out.endswith(os.sep)
+        or (os.altsep and out.endswith(os.altsep))
+    ):
+        raise ValueError("output path is a directory, not a file")
+    parent = os.path.dirname(os.path.realpath(os.path.abspath(out)))
+    if not os.path.isdir(parent):
+        raise ValueError("output parent directory does not exist")
+    for path in paths:
+        if same_report_path(out, path):
+            raise ValueError("output path must not overwrite an input archive")
 
 
 def archives(source):
@@ -186,6 +208,7 @@ def extract(
     if not inside_tempdir(out):
         raise ValueError("--out must be a file inside the temporary directory")
     paths = archives(source)
+    _validate_output(out, paths)
     left = budget
     spent = 0
     streams = 0
