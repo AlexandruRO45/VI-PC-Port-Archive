@@ -619,5 +619,163 @@ class SaluNandB32EdgeCasesTests(unittest.TestCase):
             self.assertEqual(xor_xy, (x ^ y) & MASK32)
 
 
+class SaluNandB32TranslatorExecutionTests(unittest.TestCase):
+    """Translator lowering and fragment execution via tools/rdna2spirv.py and spirv_mini_interp."""
+
+    def setUp(self):
+        if TRANSLATOR_ERROR:
+            self.skipTest(f"rdna2spirv not importable on this environment: {TRANSLATOR_ERROR}")
+
+    def test_translator_reg_reg_execution(self):
+        """Translate and execute s_nand_b32 across various operand pairs."""
+        test_cases = [
+            (0x0F0F0F0F, 0x33333333),
+            (0x12345678, 0x9ABCDEF0),
+            (0xFFFFFFFF, 0x00000000),
+            (0x55555555, 0xAAAAAAAA),
+            (0xCAFEBABE, 0xDEADBEEF),
+        ]
+        for idx, (v0, v1) in enumerate(test_cases):
+            with self.subTest(idx=idx, v0=hex(v0), v1=hex(v1)):
+                lines = [
+                    f"s_mov_b32 s0, {v0:#x}",
+                    f"s_mov_b32 s1, {v1:#x}",
+                    "s_nand_b32 s2, s0, s1",
+                    "v_mov_b32 v0, s2",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = translate_lines(f"ps_nand_reg_{idx}", lines)
+                out = mrt0_words(spv)
+                expected = ref_nand_b32(v0, v1)
+                self.assertEqual(out[0], expected)
+
+    def test_translator_literal_immediate(self):
+        """Translate and execute s_nand_b32 with a literal constant operand."""
+        v0 = 0x55555555
+        imm = 0x12345678
+        lines = [
+            f"s_mov_b32 s0, {v0:#x}",
+            f"s_nand_b32 s1, s0, {imm:#x}",
+            "v_mov_b32 v0, s1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_nand_imm", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], ref_nand_b32(v0, imm))
+
+    def test_translator_constant_folding(self):
+        """Verify constant folding when both operands are immediates."""
+        c0 = 0x0F0F0F0F
+        c1 = 0x33333333
+        lines = [
+            f"s_nand_b32 s0, {c0:#x}, {c1:#x}",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_nand_fold", lines)
+        out = mrt0_words(spv)
+        expected = ref_nand_b32(c0, c1)
+        self.assertEqual(out[0], expected)
+        self.assertIn("OpStore %scc", spv)
+
+    def test_translator_scc_conditional_select(self):
+        """Verify SCC propagation to s_cselect_b32 for both zero and nonzero results."""
+        lines_zero = [
+            "s_mov_b32 s0, 0xFFFFFFFF",
+            "s_mov_b32 s1, 0xFFFFFFFF",
+            "s_nand_b32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, s3",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv_zero = translate_lines("ps_nand_scc_0", lines_zero)
+        out_zero = mrt0_words(spv_zero)
+        self.assertEqual(out_zero[0], 0)
+        self.assertEqual(out_zero[1], 0)
+
+        lines_nonzero = [
+            "s_mov_b32 s0, 0xAAAAAAAA",
+            "s_mov_b32 s1, 0x55555555",
+            "s_nand_b32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, s3",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv_nonzero = translate_lines("ps_nand_scc_1", lines_nonzero)
+        out_nonzero = mrt0_words(spv_nonzero)
+        self.assertEqual(out_nonzero[0], 0xFFFFFFFF)
+        self.assertEqual(out_nonzero[1], 1)
+
+    def test_translator_aliased_destination(self):
+        """Verify translator preserves operands when destination aliases source 0."""
+        v0 = 0xCAFEBABE
+        v1 = 0x12345678
+        lines = [
+            f"s_mov_b32 s0, {v0:#x}",
+            f"s_mov_b32 s1, {v1:#x}",
+            "s_nand_b32 s0, s0, s1",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_nand_alias", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], ref_nand_b32(v0, v1))
+
+    def test_translator_null_destination(self):
+        """Verify s_nand_b32 null, s0, s1 updates SCC without writing a register."""
+        lines = [
+            "s_mov_b32 s0, 0xFFFFFFFF",
+            "s_mov_b32 s1, 0xFFFFFFFF",
+            "s_nand_b32 null, s0, s1",
+            "s_cselect_b32 s2, 100, 200",
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_nand_null", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 200)
+
+    def test_translator_emitted_spirv_instructions(self):
+        """Verify emitted SPIR-V contains OpBitwiseAnd, OpNot, and scc handling."""
+        lines = [
+            "s_nand_b32 s2, s0, s1",
+            "v_mov_b32 v0, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_nand_asm", lines)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpNot", spv)
+        self.assertIn("%scc", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
