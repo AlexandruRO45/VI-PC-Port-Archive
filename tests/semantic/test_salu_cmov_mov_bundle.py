@@ -171,6 +171,34 @@ class TestSCmovB64Oracle(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x55667788)
 
+class SCmovB64Expr(ASTNode):
+    def __init__(self, s0: int, old_dst: int) -> None:
+        self.s0 = s0
+        self.old_dst = old_dst
+
+    def eval(self, scc: int) -> int:
+        return ref_s_cmov_b64(scc, self.s0, self.old_dst)
+
+
+class TestSCmovB64AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SCmovB64Expr(0x1000000020000000, 0x3000000040000000)
+        self.assertEqual(expr.eval(1), 0x1000000020000000)
+        self.assertEqual(expr.eval(0), 0x3000000040000000)
+
+    def test_ast_translator_execution(self) -> None:
+        body = [
+            "s_cmp_eq_u32 1, 0",          # SCC = 0
+            "s_mov_b64 s[4:5], 0x3000000040000000",
+            "s_mov_b64 s[6:7], 0x1000000020000000",
+            "s_cmov_b64 s[4:5], s[6:7]",
+            "v_mov_b32_e32 v1, s5",       # upper dword
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_cmov_b64_ast")
+        for l in range(32):
+            self.assertEqual(results[l], 0x30000000)
+
 
 if __name__ == "__main__":
     unittest.main()
