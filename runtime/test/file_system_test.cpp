@@ -492,8 +492,8 @@ void run_checks(const std::filesystem::path& root) {
         check(delete_w(L"GAME:\\data\\bye.txt") == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
               "deleting an already hidden file reports ERROR_FILE_NOT_FOUND");
         SetLastError(0);
-        check(delete_w(L"GAME:\\nope\\missing.txt") == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
-              "deleting a file that never existed reports ERROR_FILE_NOT_FOUND");
+        check(delete_w(L"GAME:\\nope\\missing.txt") == FALSE && GetLastError() == ERROR_PATH_NOT_FOUND,
+              "deleting a file in a folder that never existed reports ERROR_PATH_NOT_FOUND");
 
         // Deleting a nested package file creates parent directories inside .gta6rt-deleted/; those marker parent
         // directories must not hide the corresponding ancestor directories in the package.
