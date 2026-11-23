@@ -1077,10 +1077,26 @@ inline double round_half_even(double x) {
     return r - x == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
 }
 
+// D3D multiplies a clear value by the channel's largest value in float (WARP: a D16 depth of 0.681063533 is 44633.5
+// in float, a tie that goes to the even 44634, but 44633.4999... in double, which rounds down). The product is exact
+// in a double; this returns the float nearest to it, ties to even, whatever the thread's rounding mode (a cast to
+// float follows the mode).
+inline double nearest_float(double x) {
+    const float cast = static_cast<float>(x);
+    const float lo = double(cast) <= x ? cast : std::nextafter(cast, -HUGE_VALF);
+    if (double(lo) == x) return lo;
+    const float hi = std::nextafter(lo, HUGE_VALF);
+    const double below = x - double(lo), above = double(hi) - x;
+    if (below != above) return below < above ? lo : hi;
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &lo, sizeof bits);
+    return (bits & 1u) ? hi : lo;
+}
+
 inline float quantize_unorm(float value, double maximum) {
     if (!(value > 0.0f)) return 0.0f;
     if (value >= 1.0f) return 1.0f;
-    return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
+    return static_cast<float>(round_half_even(nearest_float(double(value) * maximum)) / maximum);
 }
 
 // The same for a signed normalised format: -1..1 on a scale of 127 (8 bits) or 32767 (16 bits), where D3D writes -1.0
@@ -1088,8 +1104,9 @@ inline float quantize_unorm(float value, double maximum) {
 inline float quantize_snorm(float value, double maximum) {
     if (!(value > -1.0f)) return value != value ? 0.0f : -1.0f;
     if (value >= 1.0f) return 1.0f;
-    return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
+    return static_cast<float>(round_half_even(nearest_float(double(value) * maximum)) / maximum);
 }
+
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
 // component range and truncates fractions. Vulkan instead interprets the matching union member as an integer
@@ -1143,14 +1160,23 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     case VK_FORMAT_R16_UNORM:
     case VK_FORMAT_R16G16_UNORM:
     case VK_FORMAT_R16G16B16A16_UNORM: is_integer = false; unorm = {65535, 65535, 65535, 65535}; break;
+    // B5G6R5, B5G5R5A1, B4G4R4A4: NVIDIA (621.14) converts 4-, 5- and 6-bit channels through 8 bits, so B5G6R5 green
+    // 0.3739 clears to 23 where WARP writes 24; the exact fraction comes through.
+    case VK_FORMAT_R5G6B5_UNORM_PACK16: is_integer = false; unorm = {31, 63, 31, 0}; break;
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: is_integer = false; unorm = {31, 31, 31, 1}; break;
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16: is_integer = false; unorm = {15, 15, 15, 15}; break;
     default: is_integer = false; break;
     }
     if (format != VK_FORMAT_A2B10G10R10_UINT_PACK32) alpha_high = high;
     VkClearColorValue value{};
     for (std::size_t i = 0; i < input.size(); ++i) {
         if (!is_integer) {
+            const bool srgb_colour = (format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB) && i < 3;
             if (snorm != 0) value.float32[i] = quantize_snorm(input[i], snorm);
-            else value.float32[i] = unorm[i] != 0.0 ? quantize_unorm(input[i], unorm[i]) : input[i];
+            else if (unorm[i] != 0.0) value.float32[i] = quantize_unorm(input[i], unorm[i]);
+            else if (srgb_colour) value.float32[i] = input[i];  // the GPU's sRGB curve
+            else  // a float format: D3D12 flushes a denormal to a zero of its sign (WARP); Vulkan keeps it in R32_SFLOAT
+                value.float32[i] = std::fpclassify(input[i]) == FP_SUBNORMAL ? std::copysign(0.0f, input[i]) : input[i];
             continue;
         }
         const double maximum = i == 3 ? alpha_high : high;
@@ -2690,14 +2716,24 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!image_layout || image_layout->bytes != p.element.size)
                 return ReplayResult::unsupported;
             const bool attachment = p.binding.color_attachment && !p.binding.volume;
-            const bool view_attachable = vk.color_attachment_format
-                                             ? vk.color_attachment_format(view_format)
-                                             : view_format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
-            const bool reinterpret = view_format != p.binding.format && attachment && view_attachable;
-            const VkFormat clear_format = reinterpret ? view_format : p.binding.format;
+            const auto attachable = [&](VkFormat format) {
+                return vk.color_attachment_format ? vk.color_attachment_format(format)
+                                                  : format != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+            };
+            // A Uint clear writes raw bits. Through a float, UNORM or SNORM format they become a float that the driver
+            // encodes again: a NaN loses its payload and SNORM 0x80 becomes 0x81 (uav_clear.h). A typeless image
+            // (mutable, no format list) is cleared through its family's UINT format of the same layout instead, which
+            // writes the bits as they are.
+            VkFormat write_format = view_format;
+            if (!uav->is_float && p.binding.typeless) {
+                const VkFormat twin = uav_clear::uint_twin(view_format);
+                if (twin != VK_FORMAT_UNDEFINED && attachable(twin)) write_format = twin;
+            }
+            const bool reinterpret = write_format != p.binding.format && attachment && attachable(write_format);
+            const VkFormat clear_format = reinterpret ? write_format : p.binding.format;
             if (!uav_clear::decode(clear_format, p.element, p.clear_color))
                 return ReplayResult::unsupported;
-            if (reinterpret) p.clear_format = view_format;
+            if (reinterpret) p.clear_format = write_format;
             if (!uav->rects.empty() && !attachment)
                 return ReplayResult::unsupported;
             // Under a predicate a whole view is cleared as one rectangle where the image can be an attachment, as
@@ -3321,8 +3357,27 @@ inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& 
 // `open_labels` counts the debug labels begun and not yet ended in this command buffer: an EndEvent with none open
 // is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
 // (close_labels). Without it, the list's own events are balanced at its end.
+// LEONIDA_DRED per-operation breadcrumbs (vulkan_breadcrumbs.h): after the command at positions[k], write
+// first + k into `buffer` at `offset`, at BOTTOM_OF_PIPE. Written between commands, where no rendering scope is open.
+struct OpMarkers {
+    PFN_vkCmdWriteBufferMarkerAMD write = nullptr;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    std::uint32_t first = 0;
+    const std::uint32_t* positions = nullptr;
+    std::size_t count = 0;
+};
+
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
-                 LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr) {
+                 LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr,
+                 const OpMarkers* op_markers = nullptr) {
+    std::size_t next_op = 0;
+    // The ops whose command is before `end` are finished recording: their progress markers go in now.
+    const auto mark_ops_before = [&](std::size_t end) {
+        for (; next_op < op_markers->count && op_markers->positions[next_op] < end; ++next_op)
+            op_markers->write(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, op_markers->buffer,
+                              op_markers->offset, op_markers->first + static_cast<std::uint32_t>(next_op));
+    };
     std::uint32_t own_labels = 0;
     std::uint32_t& labels = open_labels ? *open_labels : own_labels;
     const auto commands = prepared.list->commands();
@@ -3341,6 +3396,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
+        if (op_markers) mark_ops_before(i);
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
@@ -3529,7 +3585,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
                                 : p.binding.format == VK_FORMAT_D16_UNORM
                                     ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
-                                    : depth_clear->depth;
+                                    : depth_clear_value(depth_clear->depth);  // a denormal clears to 0
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
@@ -4072,6 +4128,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.end_rendering(command_buffer);
         }
     }
+    if (op_markers) mark_ops_before(commands.size());
     // Predication does not carry over to the next command list.
     if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
     if (!open_labels) close_labels(command_buffer, vk, own_labels);

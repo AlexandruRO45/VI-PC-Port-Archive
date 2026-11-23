@@ -168,6 +168,11 @@ struct VulkanDeviceInfo {
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
+    // LEONIDA_DRED=1 enabled device-lost diagnostics (vulkan_breadcrumbs.h): VK_AMD_buffer_marker for the
+    // breadcrumbs, and VK_EXT_device_fault with its deviceFault feature for the fault addresses, each when the GPU
+    // has it.
+    bool buffer_marker = false;
+    bool device_fault = false;
     // Vulkan 1.2 bufferDeviceAddress is enabled: buffers and shader-visible heaps then live in the GPU address
     // arena and have console VAs (docs section 3.3), and GetGPUVirtualAddress returns those addresses; ray tracing
     // needs it too. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
@@ -204,8 +209,10 @@ struct VulkanDeviceInfo {
 // the device and every object it created. Wrap it in rt::d3d12_xs::create_device_proxy for the Xbox ABI.
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out);
 
-// The same, on a Vulkan instance and device of its own (destroyed with the D3D12 device). Picks the first discrete
-// GPU with the features above. LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation.
+// The same, on a Vulkan device of its own (destroyed with the D3D12 device), made on the process's one Vulkan
+// instance: the first call creates it and it is kept until the process ends, so hooks that cached its handles stay
+// valid (#5144). Picks the first discrete GPU with the features above. LEONIDA_VK_VALIDATION=1 (read by the first
+// call) enables VK_LAYER_KHRONOS_validation.
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out);
 
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's

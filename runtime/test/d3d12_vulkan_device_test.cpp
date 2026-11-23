@@ -3889,6 +3889,15 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"descriptor heap: 0 descriptors", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 0});
          }},
+        {"descriptor heap: 0 samplers", [](ID3D12Device* d) {
+             return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 0});
+         }},
+        {"descriptor heap: 0 RTVs", [](ID3D12Device* d) {
+             return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 0});
+         }},
+        {"descriptor heap: 0 DSVs", [](ID3D12Device* d) {
+             return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 0});
+         }},
         {"descriptor heap: shader-visible RTV", [](ID3D12Device* d) {
              return descriptor_heap(d, {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE});
          }},
@@ -7295,6 +7304,18 @@ int main() {
                 std::printf("CreatePlacedResource/CreateReservedResource arguments: no host D3D12 device to compare "
                             "with, skipped\n");
             EXPECT(placed_mismatches <= 0);
+        }
+
+        // D3D-434: a shader-visible heap with zero descriptors is refused with E_INVALIDARG, not E_OUTOFMEMORY from
+        // an empty arena request on this device with the GPU address arena. Not compared with the host: WARP removes
+        // its device on it, the RTX 3060 faults.
+        for (const auto type : {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER}) {
+            const D3D12_DESCRIPTOR_HEAP_DESC empty{type, 0, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+            void* out = reinterpret_cast<void*>(0x1111);
+            const HRESULT hr = standalone->CreateDescriptorHeap(&empty, __uuidof(ID3D12DescriptorHeap), &out);
+            std::printf("descriptor heap: shader-visible type %d, 0 descriptors: 0x%08lx\n", int(type),
+                        (unsigned long)hr);
+            EXPECT(hr == E_INVALIDARG && out == nullptr);
         }
 
         auto tiled_2d = [&](UINT w, UINT h, DXGI_FORMAT fmt, UINT16 mips, D3D12_RESOURCE_FLAGS flags,

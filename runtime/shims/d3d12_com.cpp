@@ -2,6 +2,7 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "d3d12_dred.h"
 #include "d3d12_fence_waiter.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
@@ -1454,6 +1455,11 @@ public:
             }
             recorded.push_back(&list->commands());
             graphics.push_back(list);
+        }
+        if (auto* ring = context_.breadcrumbs()) {  // LEONIDA_DRED: the SetName names as they are now, copied
+            ring->label_queue(&queue_, dred_debug_name(this));
+            for (UINT i = 0; i < count; ++i)
+                ring->label_list(recorded[i], dred_debug_name(GraphicsCommandList::from(lists[i])));
         }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");

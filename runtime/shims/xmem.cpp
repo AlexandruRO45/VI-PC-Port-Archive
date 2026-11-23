@@ -9,6 +9,10 @@
 // ASSUMPTION: the attribute word is not decoded by the measured call sites (one passes 0x5e50000). Until a call
 // site shows the alignment/type fields, every block is 64-byte aligned (covers cache lines and SIMD) and a size of
 // zero is rounded up to one byte so the result is a stable, non-null pointer that XMemFree can release.
+//
+// The remaining exports (the default routines and their hooks, XMemMakeTag, XMemSetOption and the heap queries) follow
+// the public GDK XMem reference. The physical-page family has no public description and is left to the loader's
+// unimplemented-import stub, so a run reports it if the title calls it.
 #include <windows.h>
 #include <intrin.h>
 #include <malloc.h>
@@ -50,14 +54,44 @@ void note_attributes(bool is_alloc, uint64_t attributes, size_t size, const void
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
+void* __stdcall XMemAllocDefault(size_t size, uint64_t /*attributes*/) {
+    return _aligned_malloc(size ? size : 1, kAlign);
+}
+
+void __stdcall XMemFreeDefault(void* p, uint64_t /*attributes*/) { _aligned_free(p); }
+
+// XMemSetAllocationHooks replaces the routines XMemAlloc and XMemFree call. Titles install them once at startup, before
+// allocating, so the pair is two atomics rather than a lock on every allocation. The free hook is published first: a
+// block that comes from a new alloc hook always meets its matching free hook.
+using AllocRoutine = void*(__stdcall*)(size_t, uint64_t);
+using FreeRoutine = void(__stdcall*)(void*, uint64_t);
+std::atomic<AllocRoutine> g_alloc_hook{nullptr};
+std::atomic<FreeRoutine> g_free_hook{nullptr};
+
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes(true, attributes, size, _ReturnAddress());
-    return _aligned_malloc(size ? size : 1, kAlign);
+    const AllocRoutine hook = g_alloc_hook.load(std::memory_order_acquire);
+    return hook ? hook(size, attributes) : XMemAllocDefault(size, attributes);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
     note_attributes(false, attributes, 0, _ReturnAddress());
-    _aligned_free(p);
+    const FreeRoutine hook = g_free_hook.load(std::memory_order_acquire);
+    if (hook)
+        hook(p, attributes);
+    else
+        XMemFreeDefault(p, attributes);
+}
+
+// Both routines or neither: the GDK documents hooking only one of them as an error, and a lone hook would hand out
+// blocks the other side cannot release. Two nulls restore the defaults.
+void __stdcall XMemSetAllocationHooks(AllocRoutine alloc, FreeRoutine free_routine) {
+    if ((alloc == nullptr) != (free_routine == nullptr)) {
+        std::fprintf(stderr, "[rt] xmem: XMemSetAllocationHooks with only one routine ignored\n");
+        return;
+    }
+    g_free_hook.store(free_routine, std::memory_order_release);
+    g_alloc_hook.store(alloc, std::memory_order_release);
 }
 
 // Measured call sites pass a zeroed 64-byte structure. Only the MEMORY_BASIC_INFORMATION-compatible prefix is
@@ -233,6 +267,51 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
     return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), protect);
 }
 
+// XMemMakeTag packs a four-character code into the top 24 bits of an XMem flags word, six bits per character from the
+// documented alphabet (a-z, A-Z, 0-9 and '$'). ASSUMPTION: the console's order inside that alphabet is not public. The
+// tag only travels back into XMem calls, which ignore it here, so any stable packing is enough.
+uint64_t tag_code(uint32_t c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + (c - 'a');
+    if (c >= '0' && c <= '9') return 52 + (c - '0');
+    return c == '$' ? 62 : 63;
+}
+
+ULONGLONG __stdcall XMemMakeTag(uint32_t tag) {
+    uint64_t code = 0;
+    for (int i = 0; i < 4; ++i) code = (code << 6) | tag_code((tag >> (8 * i)) & 0xff);
+    return code << 40;
+}
+
+// The XMEM_OPTION settings all configure the console's heap manager (tag tree, page-size demotion, use-after-free
+// traps, file-mapping rules). There is no such manager behind XMemAllocDefault, so the call is recorded and ignored.
+// The argument is not read: the structure's layout is not public.
+void __stdcall XMemSetOption(uint64_t option) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xmem: XMemSetOption(0x%llx) ignored: no console heap manager on the host\n",
+                     static_cast<unsigned long long>(option));
+}
+
+// The hooks fire when the console's memory manager services HeapAlloc, HeapReAlloc and HeapFree. Those calls go to the
+// host heap here, so the registration succeeds and the hooks never run.
+void __stdcall XMemSetWin32HeapTrackingHooks(void* alloc, void* realloc, void* free_routine) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xmem: XMemSetWin32HeapTrackingHooks(%p, %p, %p) accepted; the host heap never calls "
+                             "them\n", alloc, realloc, free_routine);
+}
+
+// The tools partition exists only on a development kit in profiling mode.
+BOOL __stdcall XMemIsToolsMemAvailable() { return FALSE; }
+
+// NULL is the documented answer when the title partition has no heap. Returning the host process heap instead would
+// let a title free title-heap blocks into a heap it does not own.
+HANDLE __stdcall XMemGetTitleHeap() { return nullptr; }
+
+// Grows a console heap to its hysteresis size ahead of time. The defaults commit on demand: nothing to grow.
+BOOL __stdcall XMemPreallocateFreeSpace(DWORD /*memory_type*/, BOOL /*large_heap*/) { return TRUE; }
+
 }  // namespace
 
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
@@ -258,4 +337,13 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},
     {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
     {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
+    {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAllocDefault)},
+    {"xmem.dll", "XMemFreeDefault", reinterpret_cast<void*>(&XMemFreeDefault)},
+    {"xmem.dll", "XMemSetAllocationHooks", reinterpret_cast<void*>(&XMemSetAllocationHooks)},
+    {"xmem.dll", "XMemMakeTag", reinterpret_cast<void*>(&XMemMakeTag)},
+    {"xmem.dll", "XMemSetOption", reinterpret_cast<void*>(&XMemSetOption)},
+    {"xmem.dll", "XMemSetWin32HeapTrackingHooks", reinterpret_cast<void*>(&XMemSetWin32HeapTrackingHooks)},
+    {"xmem.dll", "XMemIsToolsMemAvailable", reinterpret_cast<void*>(&XMemIsToolsMemAvailable)},
+    {"xmem.dll", "XMemGetTitleHeap", reinterpret_cast<void*>(&XMemGetTitleHeap)},
+    {"xmem.dll", "XMemPreallocateFreeSpace", reinterpret_cast<void*>(&XMemPreallocateFreeSpace)},
 );
