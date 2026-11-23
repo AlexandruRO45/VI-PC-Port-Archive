@@ -68,10 +68,14 @@ Usage: `python -I tools/image_bvh_census.py --help` lists the options.
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import rdna2spirv  # noqa: E402  (base_op, BRANCHES, fold_far_branches, reachable_code, native_blob, stage_of)
 from shader_ir import parse_file  # noqa: E402
 from wave64_graphics_scan import scanned_paths  # noqa: E402
@@ -934,13 +938,45 @@ def main(argv=None) -> int:
     print_summary(summary)
     if args.out:
         try:
-            with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(summary, f, indent=1)
+            write_json_report(args.out, summary)
         except OSError as e:
             print(f"ERROR: cannot write {args.out}: {e.strerror or e}", file=sys.stderr)
             return 2
         print(f"wrote {args.out}")
     return 0
+
+
+def write_json_report(path, payload):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".image_bvh_census-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
