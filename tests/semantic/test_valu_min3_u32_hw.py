@@ -195,5 +195,92 @@ class TestValuMin3U32AST(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 50)
 
+class ScalarMachineState:
+    """Architectural state for executing VALU scalar instructions."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def read_operand(self, op: Union[Register, int]) -> int:
+        if isinstance(op, int):
+            return op & MASK32
+        if op.kind == RegKind.VGPR:
+            return self.vgprs[op.index]
+        return self.sgprs[op.index]
+
+    def write_reg(self, reg: Register, val: int) -> None:
+        val &= MASK32
+        if reg.kind == RegKind.VGPR:
+            self.vgprs[reg.index] = val
+        else:
+            self.sgprs[reg.index] = val
+
+    def step(self, inst: VOP3Instruction) -> int:
+        val0 = self.read_operand(inst.src0)
+        val1 = self.read_operand(inst.src1)
+        val2 = self.read_operand(inst.src2)
+        res = oracle_min3_u32(val0, val1, val2)
+        self.write_reg(inst.dst, res)
+        return res
+
+
+class TestValuMin3U32ScalarInterpreter(unittest.TestCase):
+    """Stage 3: Deterministic scalar instruction interpreter for v_min3_u32."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+
+    def test_scalar_step_basic(self) -> None:
+        self.state.vgprs[1] = 50
+        self.state.vgprs[2] = 20
+        self.state.vgprs[3] = 80
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        res = self.state.step(inst)
+        self.assertEqual(res, 20)
+        self.assertEqual(self.state.vgprs[0], 20)
+
+    def test_scalar_step_sgpr_and_imm(self) -> None:
+        self.state.sgprs[4] = 100
+        self.state.vgprs[1] = 50
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.SGPR, 4),
+            25,
+            Register(RegKind.VGPR, 1),
+        )
+        res = self.state.step(inst)
+        self.assertEqual(res, 25)
+        self.assertEqual(self.state.vgprs[0], 25)
+
+    def test_scalar_matches_translated_shader(self) -> None:
+        test_cases = [
+            (10, 20, 30),
+            (100, 20, 300),
+            (0xFFFF_0000, 0x0000_FFFF, 0x1234),
+            (0x8000_0000, 0x4000_0000, 0x7000_0000),
+        ]
+        for a, b, c in test_cases:
+            self.state.vgprs[1] = a
+            self.state.vgprs[2] = b
+            self.state.vgprs[3] = c
+            inst = VOP3Instruction(
+                Opcode.V_MIN3_U32,
+                Register(RegKind.VGPR, 0),
+                Register(RegKind.VGPR, 1),
+                Register(RegKind.VGPR, 2),
+                Register(RegKind.VGPR, 3),
+            )
+            scalar_res = self.state.step(inst)
+            trans_res = run_translated_min3_u32(a, b, c)
+            self.assertEqual(scalar_res, trans_res)
+
 if __name__ == "__main__":
     unittest.main()
