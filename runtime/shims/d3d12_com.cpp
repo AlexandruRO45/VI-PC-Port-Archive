@@ -656,6 +656,14 @@ public:
                                                      DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) override {
         d3d12_trace::record("ID3D12GraphicsCommandList1::ResolveSubresourceRegion");
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
+        // The host (NVIDIA, WARP) refuses a region that runs past the destination's top level at Close. Replay would
+        // refuse it too, but then the whole list is dropped after Close said S_OK.
+        if (dst && src) {
+            const auto dst_desc = dst->GetDesc(), src_desc = src->GetDesc();
+            const UINT64 w = rect ? UINT64(std::max<LONG>(rect->right - rect->left, 0)) : src_desc.Width;
+            const UINT64 h = rect ? UINT64(std::max<LONG>(rect->bottom - rect->top, 0)) : src_desc.Height;
+            if (x + w > dst_desc.Width || y + h > dst_desc.Height) return check(false);
+        }
         leonida::ResolveRegion region{x, y, std::nullopt};
         if (mode != D3D12_RESOLVE_MODE_AVERAGE || !color_resolve_format_matches(format, dst, src)) {
             if (!depth_stencil_resolve_supported(format, dst, dst_subresource, x, y, src, src_subresource, rect,

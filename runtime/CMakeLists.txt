@@ -1681,6 +1681,17 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_placed_dimensions PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
+    # ResolveSubresourceRegion past the destination's edge, against the host's D3D12 (and WARP).
+    add_executable(d3d12_resolve_region_clip_test test/d3d12_resolve_region_clip_test.cpp)
+    target_link_libraries(d3d12_resolve_region_clip_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_resolve_region_clip_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_resolve_region_clip_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_resolve_region_clip COMMAND d3d12_resolve_region_clip_test)
+    set_tests_properties(d3d12_resolve_region_clip PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    add_test(NAME d3d12_resolve_region_clip_warp COMMAND d3d12_resolve_region_clip_test)
+    set_tests_properties(d3d12_resolve_region_clip_warp PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT PROBE_WARP=1
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)
     target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com)
