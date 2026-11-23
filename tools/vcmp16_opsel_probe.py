@@ -12,7 +12,10 @@ it: the compares are written here as raw words. Their encodings are llvm-mc's (g
 
 Each row loads v1 and v2 with two halves, runs one compare and stores bit 0 of s10 (lane 0's result). The rows'
 values are chosen so that honouring op_sel and ignoring it (reading the low halves) give different answers on most
-of them. Standard library only, no game files.
+of them. The same question is asked of other source forms (from llvm-mc's encodings of the same compares): src0 in
+an SGPR (s16), a 32-bit literal, an inline constant (f16 1.0, integer 5: low half the value, high half 0), and
+`v_cmpx_<op>_e64` (opcode + 0x10, sdst exec_lo), whose lane-0 EXEC bit is saved and restored around it. Standard
+library only, no game files.
 
 Exit codes: 0 every row matches op_sel being ignored (the gfx1036 measurement), 1 a row differs, 2 harness error, 77 no hardware oracle.
 """
@@ -32,14 +35,22 @@ SDST = 10                 # s10 (s[10:11] in wave64); lane 0 is bit 0 either way
 SRC0, SRC1 = 0x101, 0x102  # v1, v2
 OPSEL_SRC0, OPSEL_SRC1 = 1 << 11, 1 << 12
 NEG_SRC0 = 1 << 29
+SGPR_SRC0 = 16                              # s16 (the oracle's programs may use s4..s19)
+LITERAL = 0xFF
+INLINE = {"f16": (0xF2, 0x3C00), "u16": (0x85, 5), "i16": (0x85, 5)}   # source field, value read: 1.0 / 5
+EXEC_LO = 0x7E
+CMPX = 0x10                                 # v_cmpx_<op>_e64 opcode = v_cmp_<op>_e64 + 0x10 (llvm-mc, gfx1036)
 
 
-def words(op, kind, opsel, neg0=False):
-    """The two dwords of v_cmp_<op>_<kind>_e64 s10, v1, v2 with op_sel:[s0, s1] and neg on src0."""
-    w0 = 0xD4000000 | OPCODES[(op, kind)] << 16 | SDST
+def words(op, kind, opsel, neg0=False, form="v", lit=0):
+    """The dwords of v_cmp_<op>_<kind>_e64 s10, <src0>, v2 (or v_cmpx_..., exec) with op_sel:[s0, s1] and neg on
+    src0. form: v (v1), s (s16), lit (a trailing literal dword `lit`), inline (INLINE[kind]), cmpx (v1, writes EXEC)."""
+    opcode = OPCODES[(op, kind)] + (CMPX if form == "cmpx" else 0)
+    w0 = 0xD4000000 | opcode << 16 | (EXEC_LO if form == "cmpx" else SDST)
     w0 |= (OPSEL_SRC0 if opsel[0] else 0) | (OPSEL_SRC1 if opsel[1] else 0)
-    w1 = SRC0 | SRC1 << 9 | (NEG_SRC0 if neg0 else 0)
-    return w0, w1
+    src0 = {"s": SGPR_SRC0, "lit": LITERAL, "inline": INLINE[kind][0]}.get(form, SRC0)
+    w1 = src0 | SRC1 << 9 | (NEG_SRC0 if neg0 else 0)
+    return (w0, w1, lit) if form == "lit" else (w0, w1)
 
 
 def half_value(bits, kind):
@@ -56,7 +67,7 @@ def compare(op, a, b):
 
 def answer(row, honour_opsel):
     """Lane 0's result if op_sel is honoured, or if the low halves are read whatever it says."""
-    _name, op, kind, (v1, v2), opsel, neg0 = row
+    _name, op, kind, (v1, v2), opsel, neg0, _form = row
     s0 = (v1 >> 16 if honour_opsel and opsel[0] else v1) & 0xFFFF
     s1 = (v2 >> 16 if honour_opsel and opsel[1] else v2) & 0xFFFF
     a, b = half_value(s0, kind), half_value(s1, kind)
@@ -72,7 +83,7 @@ def pack(hi, lo):
 F1, F2, F3, F4, FH = 0x3C00, 0x4000, 0x4200, 0x4400, 0x3800   # 1.0 2.0 3.0 4.0 0.5
 
 
-# (name, op, kind, (v1, v2), op_sel (src0, src1), neg on src0)
+# (name, op, kind, (v1, v2), op_sel (src0, src1), neg on src0, form); v1 is src0's 32-bit value in every form
 def rows():
     out = []
     # f16, set A: v1 = (hi 3.0, lo 1.0), v2 = (hi 1.0, lo 2.0); set B: v2 = (hi 2.0, lo 4.0)
@@ -95,6 +106,19 @@ def rows():
     for opsel in ((1, 0), (1, 1)):
         for op in ("lt", "gt"):
             out.append((f"i16B_{op}_opsel{opsel[0]}{opsel[1]}", op, "i16", (pack(0x8000, 9), pack(3, 7)), opsel, False))
+    out = [r + ("v",) for r in out]
+    # The other source forms: f16 (hi 3.0, lo 1.0) vs (hi 1.0, lo 2.0), u16 (hi 0x8000, lo 5) vs (hi 3, lo 7), i16
+    # (hi -32768, lo 9) vs (hi 10, lo 7), so every op_sel setting tells the two readings apart. An inline constant has
+    # a zero high half, so it is compared with (hi 1.0, lo 0.5) / (hi 9, lo 3).
+    values = {"f16": (pack(F3, F1), pack(F1, F2)), "u16": (pack(0x8000, 5), pack(3, 7)), "i16": (pack(0x8000, 9), pack(10, 7))}
+    for form in ("s", "lit", "inline", "cmpx"):
+        for kind in ("f16", "u16", "i16"):
+            v1, v2 = values[kind]
+            if form == "inline":
+                v1, v2 = INLINE[kind][1], (pack(F1, FH) if kind == "f16" else pack(9, 3))
+            for opsel in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                for op in ("lt", "gt"):
+                    out.append((f"{form}_{kind}_{op}_opsel{opsel[0]}{opsel[1]}", op, kind, (v1, v2), opsel, False, form))
     return out
 
 
@@ -128,11 +152,16 @@ def control_kernel(start):
 
 def kernel(table):
     out = control_kernel(len(table))
-    for i, (_name, op, kind, (v1, v2), opsel, neg0) in enumerate(table):
-        w0, w1 = words(op, kind, opsel, neg0)
+    for i, (_name, op, kind, (v1, v2), opsel, neg0, form) in enumerate(table):
+        raw = ", ".join(f"0x{w:08x}" for w in words(op, kind, opsel, neg0, form, v1))
         out += [f"v_mov_b32 v1, 0x{v1:08x}", f"v_mov_b32 v2, 0x{v2:08x}", "s_mov_b32 s10, 0", "s_mov_b32 s11, 0",
-                f".long 0x{w0:08x}, 0x{w1:08x}",
-                "v_mov_b32 v8, s10", "v_and_b32 v8, 1, v8",
+                f"s_mov_b32 s16, 0x{v1:08x}"]
+        if form == "cmpx":   # lane 0's EXEC bit is the result; put EXEC back so the store below runs
+            out += ["s_mov_b32 s18, exec_lo", "s_mov_b32 s19, exec_hi", f".long {raw}",
+                    "s_mov_b32 s10, exec_lo", "s_mov_b32 exec_lo, s18", "s_mov_b32 exec_hi, s19"]
+        else:
+            out.append(f".long {raw}")
+        out += ["v_mov_b32 v8, s10", "v_and_b32 v8, 1, v8",
                 f"v_mov_b32 v5, {4 * i}", "global_store_b32 v5, v8, s[2:3]"]
     return out + ["s_waitcnt vmcnt(0)", "s_endpgm"]
 
