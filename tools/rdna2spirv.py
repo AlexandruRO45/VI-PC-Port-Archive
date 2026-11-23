@@ -384,6 +384,7 @@ class Gen:
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
         self.block_label = "%entry"   # label of the SPIR-V block the current instruction starts in
         self.build_meta = {}          # runtime build metadata from tools/shader_meta.py
+        self.user_sgpr_preload = None   # None = all USER_SGPRS (direct Gen() callers); tuple of live-in indices from translate()
 
     def tmp(self):
         self.n += 1
@@ -15185,14 +15186,17 @@ def assemble(gen):
         if gen.bar_counts_in_lds():
             fn.append("%xb_save = OpVariable %_ptr_Function_uint Function %c0")
         fn += [f"{var} = OpVariable {ptr} Function" for var, ptr in gen.x_spills]
-    # User data: s0..s31 are loaded at entry from a push-constant block (the driver's user-SGPR setup).
+    # User data: translate() preloads only live-in user SGPRs (s0..s31 that may be read before write, or all
+    # non-system s0..s31 when s_movrels_* is present) from the push-constant block, while %sgpr starts
+    # zero-initialized (%null_s) and %UserData keeps all 32 slots. Direct Gen() callers preload all 32.
     if gen.uses_heap:
         gen.consts.setdefault(1, "%c1")
         gen.consts.setdefault(2, "%c2")
         fn += [pc_tail_chain("%ud_base_lo_p", 1, gen.cu), pc_tail_chain("%ud_base_hi_p", 2, gen.cu)] + HEAP_BASE_ENTRY
     if gen.uses_codebase:
         fn += [pc_tail_chain("%ud_code_lo_p", 3, gen.cu), pc_tail_chain("%ud_code_hi_p", 4, gen.cu)]
-    for i in range(USER_SGPRS):
+    preload = range(USER_SGPRS) if gen.user_sgpr_preload is None else gen.user_sgpr_preload
+    for i in preload:
         fn += [f"%ud{i}p = OpAccessChain %_ptr_PC_uint %user_data %c0 {gen.cu(i)}",
                f"%ud{i} = OpLoad %uint %ud{i}p",
                f"%ud{i}s = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(i)}",
@@ -16723,6 +16727,10 @@ def translate(path):
         insns = [i for i in insns if base_op(i["op"]) != "s_swappc_b64"]
     user_limit = g.cs["user"] if g.cs else USER_SGPRS
     sys_sgprs = (3,) if stage in ("ms", "gs") else ()
+    entry_sys_sgprs = (
+        tuple(g.cs["user"] + k for k in range(len(g.cs["tgid"])))
+        if g.cs else sys_sgprs
+    )
     if WAVE64_EMULATE and g.wave64 and stage in ("cs", "ms"):
         g.emulate = True
         size = (g.cs or g.ms)["size"]
@@ -16758,6 +16766,8 @@ def translate(path):
         halves_analysis(g, [insns], [[]])
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
                                             user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
+        g.user_sgpr_preload = _shader_meta.live_in_user_sgprs(
+            [insns], [[]], user_sgpr_limit=USER_SGPRS, system_sgprs=entry_sys_sgprs)
         g.fit_shared_memory()
         end = next((k for k, ins in enumerate(insns) if base_op(ins["op"]) == "s_endpgm"), len(insns))
         g.exec_changes = any(g.may_write_exec(ins) for ins in insns[:end])
@@ -16831,6 +16841,8 @@ def translate(path):
     halves_analysis(g, blocks, succ)
     g.build_meta = _shader_meta.collect(path, info["name"], blocks, succ,
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
+    g.user_sgpr_preload = _shader_meta.live_in_user_sgprs(
+        blocks, succ, user_sgpr_limit=USER_SGPRS, system_sgprs=entry_sys_sgprs)
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
     folds, fold_chain, absorbed = {}, {}, set()

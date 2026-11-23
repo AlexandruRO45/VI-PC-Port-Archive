@@ -623,6 +623,72 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     }
 
 
+def _preload_rw(ins):
+    """Return (read_sgprs, must_write_sgprs) for entry user-SGPR preload analysis.
+
+    Matches rdna2spirv.py's actual SGPR writes: v_cmpx_* updates EXEC only (compare_x ignores any
+    sgpr operand in a[0] and reads only the last two source operands).
+    """
+    op = base_op(ins["op"])
+    a = ins["args"]
+    if not a:
+        return [], []
+    if op.startswith("v_cmpx_"):
+        return [r for x in a[-2:] for r in _sgpr_regs(x)], []
+    return _split_operands(ins)
+
+
+def live_in_user_sgprs(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
+    """Return sorted SGPR indices in range(user_sgpr_limit) \\ system_sgprs that may be read before
+    being definitely written on every path from entry (block 0).
+
+    Conservatively returns every non-system SGPR in range(user_sgpr_limit) if any reachable
+    instruction performs dynamic SGPR indexing (s_movrels_b32 / s_movrels_b64).
+    """
+    nblk = len(blocks)
+    sys_set = frozenset(system_sgprs)
+    user_range = {r for r in range(user_sgpr_limit) if r not in sys_set}
+    if nblk == 0 or not user_range:
+        return ()
+
+    entry_written = [None] * nblk
+    entry_written[0] = frozenset()
+    work = [0]
+    while work:
+        b = work.pop()
+        written = set(entry_written[b])
+        for ins in blocks[b]:
+            op = base_op(ins["op"])
+            if op == "s_endpgm":
+                break
+            if op.startswith("s_movrel"):
+                return tuple(sorted(user_range))
+            _, writes = _preload_rw(ins)
+            written.update(writes)
+        out_w = frozenset(written)
+        for s in succ[b]:
+            mw = out_w if entry_written[s] is None else (entry_written[s] & out_w)
+            if mw != entry_written[s]:
+                entry_written[s] = mw
+                work.append(s)
+
+    rbw = set()
+    for b in range(nblk):
+        if entry_written[b] is None:
+            continue
+        written = set(entry_written[b])
+        for ins in blocks[b]:
+            op = base_op(ins["op"])
+            if op == "s_endpgm":
+                break
+            reads, writes = _preload_rw(ins)
+            for r in reads:
+                if r in user_range and r not in written:
+                    rbw.add(r)
+            written.update(writes)
+    return tuple(sorted(rbw))
+
+
 def read_dxbc_meta(data):
     """Parse ISG1 full input signature and SFI0 descriptor-heap indexing flags from a DXBC container."""
     if not data or len(data) < 32 or data[:4] != b"DXBC":
