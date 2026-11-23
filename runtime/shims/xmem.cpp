@@ -65,6 +65,19 @@ void __stdcall XMemFree(void* p, uint64_t attributes) {
     _aligned_free(p);
 }
 
+// XMemAllocDefault / XMemFreeDefault: the GDK's own allocator, which a title's allocation hooks (the executable's
+// __XMemAllocationHooks__ export) fall back to. The retail executable's default hook node for every allocator id
+// tail-calls XMemAllocDefault (RVA 0x4deb540 -> import thunk 0x5f3fd40). Same block as XMemAlloc.
+void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
+    note_attributes(true, attributes, size, _ReturnAddress());
+    return _aligned_malloc(size ? size : 1, kAlign);
+}
+
+void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
+    note_attributes(false, attributes, 0, _ReturnAddress());
+    _aligned_free(p);
+}
+
 // Measured call sites pass a zeroed 64-byte structure. Only the MEMORY_BASIC_INFORMATION-compatible prefix is
 // known: callers read at least the base and size fields. Fill that prefix from VirtualQueryEx and zero the rest.
 constexpr size_t kVirtualQueryOutSize = 64;
@@ -845,6 +858,8 @@ SHIM_TABLE(title_memory,
 SHIM_TABLE(xmem,
     {"xmem.dll", "XMemAlloc", reinterpret_cast<void*>(&XMemAlloc)},
     {"xmem.dll", "XMemFree", reinterpret_cast<void*>(&XMemFree)},
+    {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAllocDefault)},
+    {"xmem.dll", "XMemFreeDefault", reinterpret_cast<void*>(&XMemFreeDefault)},
     {"xmem.dll", "XMemVirtualQuery", reinterpret_cast<void*>(&XMemVirtualQuery)},
     {"xmem.dll", "XMemGetWorkingSetStatistics", reinterpret_cast<void*>(&XMemGetWorkingSetStatistics)},
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},

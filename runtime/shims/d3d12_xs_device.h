@@ -144,4 +144,8 @@ std::uint64_t heap_slot_hits(unsigned slot);
 bool heap_slot_first_call_seen(unsigned slot);
 void reset_device_proxy_stats();
 
+// A function the Xbox queue proxy calls in ExecuteCommandLists before submitting (gta6rt sets it to
+// rt::d3d12::sync_placed_descriptor_heaps). Null by default.
+void set_before_execute_hook(void (*hook)());
+
 }  // namespace rt::d3d12_xs

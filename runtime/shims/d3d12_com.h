@@ -252,6 +252,16 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
 
+// Title-placed shader-visible descriptor heaps (Xbox). On the console a shader-visible heap's memory comes from
+// XMemAlloc, which a title may hook to put the heap at an address of its own and then checks that
+// GetCPUDescriptorHandleForHeapStart returns it (the retail executable, RVA 0x1cf336a). When a placement function is
+// set, a shader-visible heap asks it for its CPU storage (NumDescriptors * descriptor size bytes); a null result keeps
+// the heap in the arena as before. Such a heap keeps its GPU half in the arena, and sync_placed_descriptor_heaps()
+// copies every placed heap's CPU bytes there: call it before work that reads descriptors is submitted.
+using DescriptorHeapPlacement = void* (*)(std::size_t bytes);
+void set_descriptor_heap_placement(DescriptorHeapPlacement placement);
+void sync_placed_descriptor_heaps();
+
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
 // brought up to date at every ExecuteCommandLists.

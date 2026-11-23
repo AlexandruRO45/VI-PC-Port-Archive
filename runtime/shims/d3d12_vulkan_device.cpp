@@ -1619,6 +1619,16 @@ const char* barrier_layout_refusal(const D3D12_RESOURCE_DESC& desc, D3D12_BARRIE
     }
 }
 
+// Title-placed shader-visible heaps (set_descriptor_heap_placement): CPU bytes in title memory, mirrored to the arena.
+struct PlacedHeap {
+    const std::uint8_t* cpu;
+    std::uint8_t* arena;
+    std::size_t bytes;
+};
+std::atomic<DescriptorHeapPlacement> g_heap_placement{nullptr};
+std::mutex g_placed_heaps_mutex;
+std::vector<PlacedHeap> g_placed_heaps;
+
 class DescriptorHeap final
     : public Child<DescriptorHeap, ID3D12DescriptorHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12DescriptorHeap> {
@@ -1642,6 +1652,14 @@ public:
             in_arena_ = true;
             cpu_ = device.arena.mapped + arena_offset_;
             std::memset(cpu_, 0, std::size_t(bytes));
+            if (const DescriptorHeapPlacement place = g_heap_placement.load(std::memory_order_acquire)) {
+                if (auto* title = static_cast<std::uint8_t*>(place(std::size_t(bytes)))) {
+                    placed_ = true;
+                    cpu_ = title;
+                    std::lock_guard lock(g_placed_heaps_mutex);
+                    g_placed_heaps.push_back({title, device.arena.mapped + arena_offset_, std::size_t(bytes)});
+                }
+            }
         } else {
             storage_.reset(new std::byte[std::size_t(bytes)]());
             cpu_ = reinterpret_cast<std::uint8_t*>(storage_.get());
@@ -1649,6 +1667,10 @@ public:
     }
 
     ~DescriptorHeap() override {
+        if (placed_) {
+            std::lock_guard lock(g_placed_heaps_mutex);
+            std::erase_if(g_placed_heaps, [this](const PlacedHeap& h) { return h.cpu == cpu_; });
+        }
         if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
                                             DeviceState::arena_descriptor_heap);
     }
@@ -1677,6 +1699,7 @@ private:
     std::uint8_t* cpu_ = nullptr;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    bool placed_ = false;  // cpu_ is title memory (set_descriptor_heap_placement), mirrored to the arena range
 };
 
 class Resource final
@@ -8141,6 +8164,15 @@ bool device_upload_in_vram(ID3D12Device* device) {
 bool device_sparse_buffer_tiles(ID3D12Device* device) {
     const Device* d = Device::from<Device>(device);
     return d && d->state().sparse_buffer_memory_types != 0;
+}
+
+void set_descriptor_heap_placement(DescriptorHeapPlacement placement) {
+    g_heap_placement.store(placement, std::memory_order_release);
+}
+
+void sync_placed_descriptor_heaps() {
+    std::lock_guard lock(g_placed_heaps_mutex);
+    for (const PlacedHeap& h : g_placed_heaps) std::memcpy(h.arena, h.cpu, h.bytes);
 }
 
 std::uint64_t device_arena_size(ID3D12Device* device) {

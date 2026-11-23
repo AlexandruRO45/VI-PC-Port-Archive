@@ -35,6 +35,10 @@
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "../shims/d3d12_com.h"
+#include "../shims/d3d12_xs_device.h"
+#endif
 
 namespace {
 
@@ -66,6 +70,48 @@ int usage() {
 }
 
 }  // namespace
+
+
+// Xbox titles may hook XMemAlloc through an exported table, __XMemAllocationHooks__ ({alloc, free, ...}; the retail
+// executable exports it at RVA 0x6844380). The console's D3D12 takes a shader-visible descriptor heap's memory from
+// XMemAlloc, and the title uses its hook to place the heap at an address of its own (registered per thread right
+// before CreateDescriptorHeap, matched by allocator id 0x80 in attribute bits 16..23, object type 4 in bits 0..13 and
+// the size), then checks that GetCPUDescriptorHandleForHeapStart returns that address. ASSUMPTION: the remaining
+// attribute bits the console's D3D12 sets are unknown and passed as 0; the hook reads only these.
+#ifdef LEONIDA_VULKAN_DEVICE
+namespace {
+using TitleXMemAlloc = void*(__stdcall*)(SIZE_T, unsigned long long);
+TitleXMemAlloc g_title_xmem_alloc = nullptr;
+
+void* place_descriptor_heap(std::size_t bytes) {
+    constexpr unsigned long long kD3dHeapAttributes = (0x80ull << 16) | 4;
+    void* const p = g_title_xmem_alloc(bytes, kD3dHeapAttributes);
+    static int logged = 0;
+    if (logged < 8) {
+        ++logged;
+        std::fprintf(stderr, "[rt] d3d12: shader-visible descriptor heap of %zu bytes placed by the title's XMemAlloc "
+                     "hook at %p\n", bytes, p);
+    }
+    return p;
+}
+}  // namespace
+#endif
+
+void install_title_heap_placement(const rt::Module& module) {
+#ifdef LEONIDA_VULKAN_DEVICE
+    const auto it = module.exports.find("__XMemAllocationHooks__");
+    if (it == module.exports.end() || !it->second) return;
+    auto* const table = static_cast<void* const*>(it->second);
+    if (!table[0]) return;
+    g_title_xmem_alloc = reinterpret_cast<TitleXMemAlloc>(table[0]);
+    rt::d3d12::set_descriptor_heap_placement(&place_descriptor_heap);
+    rt::d3d12_xs::set_before_execute_hook(&rt::d3d12::sync_placed_descriptor_heaps);
+    std::fprintf(stderr, "[rt] d3d12: %s exports __XMemAllocationHooks__; shader-visible descriptor heaps take their "
+                 "memory from its XMemAlloc hook\n", module.name.c_str());
+#else
+    (void)module;
+#endif
+}
 
 int wmain(int argc, wchar_t** argv) {
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
@@ -165,6 +211,7 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        install_title_heap_placement(main_module);
         // An executable with TLS that did not get index 0: its /GA code would read and write the TLS in slot 0, which
         // is gta6rt's own (or another executable's), so no code of it may run.
         const auto* main_nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(

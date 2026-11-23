@@ -35,8 +35,10 @@
 #include <iterator>
 #include <new>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace rt::d3d12_xs {
 namespace {
@@ -883,6 +885,9 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+// Called by queue slot 10 before anything is submitted (set_before_execute_hook).
+std::atomic<void (*)()> g_before_execute{nullptr};
+
 // ---- Frame events on the device (measured slots) ---------------------------------------------------------------
 //
 // Device slot 78 is SetFrameIntervalX(output, interval, latency, flags): the retail executable (RVA 0x247abd8) passes
@@ -1136,6 +1141,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         // ExecuteCommandLists(count, lists): command-list probes never reach the real queue.
         std::uint64_t kept[64];
         if constexpr (K == ChildKind::queue && Slot == 10) {
+            if (const auto hook = g_before_execute.load(std::memory_order_acquire)) hook();  // placed heaps -> arena
             const auto count = static_cast<std::uint32_t>(a1);
             const auto* lists = reinterpret_cast<void* const*>(a2);
             if (lists && count) {
@@ -1593,6 +1599,27 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
 // of the same size, so boot can go on, and says so. What the title writes through the CPU range never reaches it.
 // TODO: alias the physical pages (VK_EXT_external_memory_host or the arena's mapping) and make GetGPUVirtualAddress
 // return the CPU VA the title expects.
+// Title VA ranges made by slot 133 and the layer resource that stands for each (held: the title may release its
+// reference, the range stays valid for views made from addresses in it).
+struct PlacedRange {
+    std::uint64_t base;
+    std::uint64_t size;
+    ID3D12Resource* resource;
+};
+std::mutex g_placed_ranges_mutex;
+std::vector<PlacedRange> g_placed_ranges;
+
+bool find_placed_range(std::uint64_t va, PlacedRange& out) {
+    std::lock_guard lock(g_placed_ranges_mutex);
+    for (const PlacedRange& r : g_placed_ranges) {
+        if (va >= r.base && va - r.base < r.size) {
+            out = r;
+            return true;
+        }
+    }
+    return false;
+}
+
 HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t gpu_va, const D3D12_RESOURCE_DESC* xbox_desc,
                                        std::uint32_t initial_state, const D3D12_CLEAR_VALUE* clear_value,
                                        const IID* riid, void** out) {
@@ -1612,6 +1639,12 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t gpu_va, 
                                      D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
     const HRESULT hr = self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc, state,
                                                            clear_value, *riid, out);
+    if (SUCCEEDED(hr) && *out && pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        auto* const resource = static_cast<ID3D12Resource*>(*out);  // riid is IID_ID3D12Resource at the call site
+        resource->AddRef();
+        std::lock_guard lock(g_placed_ranges_mutex);
+        g_placed_ranges.push_back({gpu_va, pc_desc.Width, resource});
+    }
     static std::atomic<unsigned> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || FAILED(hr)) {
         std::fprintf(stderr,
@@ -1622,6 +1655,74 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t gpu_va, 
                      static_cast<unsigned>(pc_desc.Flags), console_flags, initial_state, static_cast<unsigned long>(hr));
     }
     return hr;
+}
+
+// Bytes per element of a buffer view: the stride for structured views, 4 for raw (R32_TYPELESS) views, else the
+// format's size for the formats a typed buffer view commonly uses; 0 when unknown.
+std::uint32_t buffer_view_element_size(const D3D12_SHADER_RESOURCE_VIEW_DESC& v) {
+    if (v.Buffer.StructureByteStride) return v.Buffer.StructureByteStride;
+    switch (v.Format) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_UINT:
+    case DXGI_FORMAT_R32G32B32A32_SINT: return 16;
+    case DXGI_FORMAT_R32G32B32_TYPELESS: case DXGI_FORMAT_R32G32B32_FLOAT: case DXGI_FORMAT_R32G32B32_UINT:
+    case DXGI_FORMAT_R32G32B32_SINT: return 12;
+    case DXGI_FORMAT_R32G32_TYPELESS: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SNORM:
+    case DXGI_FORMAT_R16G16B16A16_SINT: return 8;
+    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R11G11B10_FLOAT: return 4;
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT:
+    case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_UINT: return 2;
+    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT: return 1;
+    default: return 0;
+    }
+}
+
+// Device slot 70: a shader-resource view of a buffer named by address, with no resource object (measured: the retail
+// executable's wrapper at RVA 0x4ecc800, called from 0x5bdba67 and five other sites, passes RCX = a buffer
+// D3D12_RESOURCE_DESC {BUFFER, width = stride * count}, RDX = a 0x40-byte view description that is a
+// D3D12_SHADER_RESOURCE_VIEW_DESC (copied field by field by 0x4ecc890; format R32_TYPELESS, BUFFER, mapping 0x1688 at
+// that site) followed at +0x28 by the buffer's GPU address, and R8 = the destination CPU descriptor handle).
+// An address inside a slot-133 range is made a view of that range's resource, FirstElement moved by the offset; any
+// other address gets a null view (logged), since the layer has no buffer there.
+void proxy_buffer_view_at_address(DeviceProxy* self, const D3D12_RESOURCE_DESC* resource_desc,
+                                  const std::uint8_t* view, std::uint64_t handle) {
+    note_slot(70);
+    if (!view || !handle) return;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    std::memcpy(&srv, view, sizeof(srv));
+    std::uint64_t va = 0;
+    std::memcpy(&va, view + 0x28, sizeof(va));
+    static std::atomic<unsigned> logged{0};
+    const bool log = logged.fetch_add(1, std::memory_order_relaxed) < 12;
+    PlacedRange range{};
+    const std::uint32_t element = buffer_view_element_size(srv);
+    if (srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && va && find_placed_range(va, range) && element &&
+        (va - range.base) % element == 0) {
+        srv.Buffer.FirstElement += (va - range.base) / element;
+        self->real->CreateShaderResourceView(range.resource, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(handle)});
+        if (log)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 70 buffer view at 0x%llx (+0x%llx in a slot-133 range), format "
+                         "%u, %u elements of %u bytes\n", static_cast<unsigned long long>(va),
+                         static_cast<unsigned long long>(va - range.base), static_cast<unsigned>(srv.Format),
+                         srv.Buffer.NumElements, element);
+        return;
+    }
+    // Not a buffer the layer has: a null view of the same kind keeps the slot defined.
+    D3D12_SHADER_RESOURCE_VIEW_DESC null_desc = srv;
+    null_desc.Buffer.FirstElement = 0;
+    if (null_desc.Format == DXGI_FORMAT_UNKNOWN && !null_desc.Buffer.StructureByteStride)
+        null_desc.Format = DXGI_FORMAT_R32_UINT;
+    self->real->CreateShaderResourceView(nullptr, &null_desc, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(handle)});
+    if (log)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 70 view at 0x%llx (dimension %u, format %u, width %llu): not in a "
+                     "slot-133 range, null view written\n", static_cast<unsigned long long>(va),
+                     static_cast<unsigned>(srv.ViewDimension), static_cast<unsigned>(srv.Format),
+                     resource_desc ? static_cast<unsigned long long>(resource_desc->Width) : 0ull);
 }
 
 void** get_vtable();
@@ -1814,6 +1915,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 70) {
+        proxy_buffer_view_at_address(self, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a1),
+                                     reinterpret_cast<const std::uint8_t*>(a2), a3);
+        return 0;
     } else if constexpr (Slot == 133) {
         return hr_to_u64(proxy_create_placed_resource_x(
             self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2), static_cast<std::uint32_t>(a3),
@@ -2130,5 +2235,7 @@ void reset_device_proxy_stats() {
     reset_child_stats<ChildKind::fence>();
     reset_child_stats<ChildKind::allocator>();
 }
+
+void set_before_execute_hook(void (*hook)()) { g_before_execute.store(hook, std::memory_order_release); }
 
 }  // namespace rt::d3d12_xs
