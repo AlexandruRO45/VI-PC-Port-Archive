@@ -746,3 +746,45 @@ class TestDsSwizzleB32NegativeAndTranslator(unittest.TestCase):
         ]
         _, spv = run_workgroup_lanes("ps_swiz_lowering", lines, lanes=4)
         self.assertIn("OpGroupNonUniformShuffle", spv)
+
+
+# ------------------------------------------------------------------------------
+# ds_bpermute_b32 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+def ref_ds_bpermute_b32(lanes_data: List[int], lane_addrs: List[int], offset: int = 0) -> List[int]:
+    out = []
+    for i in range(len(lane_addrs)):
+        src_lane = ((lane_addrs[i] + offset) // 4) % 32
+        val = lanes_data[src_lane] if src_lane < len(lanes_data) else 0
+        out.append(val)
+    return out
+
+
+class TestDsBpermuteB32Oracle(unittest.TestCase):
+    def test_oracle_gather_hardware(self):
+        # Reverse gather: lane i reads lane 3 - i
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_sub_nc_u32 v1, 3, v0",
+            "v_lshlrev_b32 v1, 2, v1",
+            "v_add_nc_u32 v2, v0, 100",
+            "ds_bpermute_b32 v4, v1, v2",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_bperm_oracle", lines, lanes=4)
+        self.assertEqual(res, [103, 102, 101, 100])
+
+    def test_oracle_offset_addressing_hardware(self):
+        # Lane i specifies address 0 with offset 4 (lane 1)
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_mov_b32 v1, 0",
+            "v_add_nc_u32 v2, v0, 10",
+            "ds_bpermute_b32 v4, v1, v2 offset:4",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_bperm_offset", lines, lanes=4)
+        self.assertEqual(res, [11, 11, 11, 11])
