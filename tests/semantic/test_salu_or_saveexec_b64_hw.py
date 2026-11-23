@@ -538,5 +538,45 @@ class TestSOrSaveExecConditionCodes(unittest.TestCase):
         ScalarInterpreter.step(instr, state)
         self.assertEqual(state.scc, 0)
 
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
+
+class TestSOrSaveExecIEEE754Bitwise(unittest.TestCase):
+    """Unit tests verifying that IEEE 754 float bit patterns are preserved as pure raw integers."""
+
+    FLOAT64_PATTERNS = {
+        "pos_zero": 0x0000_0000_0000_0000,
+        "neg_zero": 0x8000_0000_0000_0000,
+        "pos_inf": 0x7FF0_0000_0000_0000,
+        "neg_inf": 0xFFF0_0000_0000_0000,
+        "qnan": 0x7FF8_0000_0000_0000,
+        "snan": 0x7FF0_0000_0000_0001,
+        "min_subnormal": 0x0000_0000_0000_0001,
+        "max_subnormal": 0x000F_FFFF_FFFF_FFFF,
+        "min_normal": 0x0010_0000_0000_0000,
+        "max_normal": 0x7FEF_FFFF_FFFF_FFFF,
+        "one_point_zero": 0x3FF0_0000_0000_0000,
+    }
+
+    def test_float64_bit_exact_pass_through(self):
+        """Verify SALU bitwise OR never canonicalizes or flushes float64 NaN or subnormals."""
+        for name, pattern in self.FLOAT64_PATTERNS.items():
+            with self.subTest(pattern_name=name):
+                # OR with zero leaves bit pattern bit-exact
+                new_exec, d, scc = s_or_saveexec_b64_oracle(pattern, 0)
+                self.assertEqual(new_exec, pattern)
+                self.assertEqual(d, 0)
+                expected_scc = 1 if pattern != 0 else 0
+                self.assertEqual(scc, expected_scc)
+
+    def test_float64_nan_and_sign_bit_merging(self):
+        """Verify combining sign bit with infinity produces negative infinity bit pattern."""
+        neg_zero = self.FLOAT64_PATTERNS["neg_zero"]
+        pos_inf = self.FLOAT64_PATTERNS["pos_inf"]
+        new_exec, _, scc = s_or_saveexec_b64_oracle(neg_zero, pos_inf)
+        self.assertEqual(new_exec, self.FLOAT64_PATTERNS["neg_inf"])
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
