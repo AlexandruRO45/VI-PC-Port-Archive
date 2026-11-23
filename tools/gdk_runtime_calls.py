@@ -452,9 +452,10 @@ class Code:
                 self.sections.append((s["rva"], data[:span]))
         self.begins, self.ends = [], []
         rva, size = img.directory(DIR_EXCEPTION)
-        at = img.offset(rva) if rva and size >= 12 else None
-        if at is not None:
-            count = min(size, len(img.data) - at) // 12
+        bounds = img._range(rva) if rva and size >= 12 else None
+        if bounds is not None:
+            at, end = bounds
+            count = min(size, end - at) // 12
             entries = sorted((b, e) for b, e, _ in struct.iter_unpack("<III", img.data[at:at + count * 12]) if e > b)
             self.begins = [b for b, _ in entries]
             self.ends = [e for _, e in entries]
@@ -490,8 +491,8 @@ class Code:
 
 
 def guid_at(img: PeImage, rva: int) -> str | None:
-    at = img.offset(rva)
-    if at is None or at + 16 > len(img.data):
+    at = img.offset(rva, 16)
+    if at is None:
         return None
     return str(uuid.UUID(bytes_le=bytes(img.data[at:at + 16])))
 
@@ -584,7 +585,7 @@ def references(img: PeImage, code: Code, starts: set[int]) -> dict[int, int]:
     for s in img.sections:
         if s["exec"]:
             continue
-        data = img.section_data(s)
+        data = img.section_data(s)[:s["vsize"] or s["rawsize"]]
         for value in memoryview(data[:len(data) // 8 * 8]).cast("Q"):
             func = by_va.get(value)
             if func is not None:

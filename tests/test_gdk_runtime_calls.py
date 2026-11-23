@@ -447,6 +447,41 @@ class ImageTest(unittest.TestCase):
         self.assertIn("incomplete", stderr.getvalue())
         self.assertIn("not a readable PE image", stderr.getvalue())
 
+    def test_guid_at_does_not_read_past_section_end(self):
+        buf = bytearray(build_image())
+        rdata_vsize = 0x58 + 240 + 40 + 8
+        # Shrink .rdata VirtualSize to 0x78 so UNKNOWN_CLASS (0x3060..0x3070) fits,
+        # while UNKNOWN_IFACE (0x3070..0x3080) crosses VirtualSize into raw padding.
+        struct.pack_into("<I", buf, rdata_vsize, 0x78)
+        img = grc.PeImage(bytes(buf))
+        self.assertEqual(grc.guid_at(img, GUIDS[UNKNOWN_CLASS]), UNKNOWN_CLASS)
+        self.assertIsNone(grc.guid_at(img, GUIDS[UNKNOWN_IFACE]))
+
+    def test_pdata_does_not_read_past_section_span(self):
+        buf = bytearray(build_image())
+        rdata_vsize = 0x58 + 240 + 40 + 8
+        # .pdata starts at offset 0x800 inside .rdata; allow only one 12-byte entry inside VirtualSize
+        # while the exception directory header still declares all entries in the raw tail.
+        struct.pack_into("<I", buf, rdata_vsize, 0x80C)
+        code = grc.Code(grc.PeImage(bytes(buf)))
+        self.assertEqual(len(code.begins), 1)
+
+    def test_references_ignores_pointers_in_raw_padding_past_virtual_size(self):
+        buf = bytearray(build_image())
+        rdata_vsize = 0x58 + 240 + 40 + 8
+        # Place an 8-byte pointer to unreferenced thunk4 at .rdata offset 0x900 (past GUIDs and .pdata).
+        struct.pack_into("<Q", buf, RDATA_RAW + 0x900, IMAGE_BASE + LABELS["thunk4"])
+        struct.pack_into("<I", buf, rdata_vsize, 0x900)
+        r = grc.report(self.write("pad_ref.dll", bytes(buf)), self.table, self.served)
+        self.assertEqual(by_class(r)[UNKNOWN_CLASS]["referenced_thunks"], 0)
+        self.assertEqual(r["referenced_thunks"], 3)
+
+        # Once VirtualSize covers the pointer, thunk4 (and thunkA it calls) become referenced.
+        struct.pack_into("<I", buf, rdata_vsize, 0x908)
+        r2 = grc.report(self.write("live_ref.dll", bytes(buf)), self.table, self.served)
+        self.assertEqual(by_class(r2)[UNKNOWN_CLASS]["referenced_thunks"], 1)
+        self.assertEqual(r2["referenced_thunks"], 5)
+
 
 class DecoderTest(unittest.TestCase):
     def test_lengths(self):
