@@ -2,7 +2,9 @@
 ; Raw MUBUF with FORMAT=INVALID (0) issues no memory access. FORMAT=32_FLOAT (22) is the control.
 ; Both descriptors start at byte 64, and every access is within bounds.
 ; out[0..3]: literal OOB_SELECT 3, each load reads offset 0 of its V#. Stores target offsets 4 and 8.
-; out[4..7]: run-time OOB_SELECT 1, same loads and stores at offsets 12 and 16.
+; out[4..7]: run-time OOB_SELECT 1 (FORMAT=0), same loads and stores at offsets 12 and 16.
+; The run-time group forms word3 with s_or_b32 rather than s_xor_b32: the translator folds s_xor_b32 of two
+; literals into sgpr_imm (making the FORMAT gate constant), while s_or_b32 leaves the descriptor run-time.
 ; In each group the words are: invalid load 0, valid load 0xeeeeeeee (heap fill),
 ; invalid store target still 0xeeeeeeee, valid store target 0x12345678.
 v_cmpx_eq_u32_e32 0, v0
@@ -19,9 +21,11 @@ buffer_load_dword v2, off, s[4:7], 0
 buffer_load_dword v3, off, s[8:11], 0
 buffer_store_dword v1, off, s[4:7], 0 offset:4
 buffer_store_dword v1, off, s[8:11], 0 offset:8
-s_mov_b32 s12, 0x20000000
-s_xor_b32 s7, s7, s12
-s_xor_b32 s11, s11, s12
+s_mov_b32 s12, 0x10000000
+s_mov_b32 s7, 0x01000fac
+s_or_b32 s7, s7, s12
+s_mov_b32 s11, 0x01016fac
+s_or_b32 s11, s11, s12
 buffer_load_dword v6, off, s[4:7], 0
 buffer_load_dword v7, off, s[8:11], 0
 buffer_store_dword v1, off, s[4:7], 0 offset:12

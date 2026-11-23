@@ -13,9 +13,11 @@
 	buffer_load_dword v3, off, s[8:11], 0
 	buffer_store_dword v1, off, s[4:7], 0 offset:4
 	buffer_store_dword v1, off, s[8:11], 0 offset:8
-	s_mov_b32 s12, 0x20000000
-	s_xor_b32 s7, s7, s12
-	s_xor_b32 s11, s11, s12
+	s_mov_b32 s12, 0x10000000
+	s_mov_b32 s7, 0x01000fac
+	s_or_b32 s7, s7, s12
+	s_mov_b32 s11, 0x01016fac
+	s_or_b32 s11, s11, s12
 	buffer_load_dword v6, off, s[4:7], 0
 	buffer_load_dword v7, off, s[8:11], 0
 	buffer_store_dword v1, off, s[4:7], 0 offset:12
