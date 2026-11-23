@@ -95,7 +95,17 @@ def main(argv=None) -> int:
     except OSError as e:  # a regular file where a parent folder is expected
         ap.error(f"cannot create {out}: {e.strerror or e}")
     index, seen, used, bad = [], {}, set(), 0
-    with open(src, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+    try:
+        fh = open(src, "rb")
+        try:
+            m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except OSError:
+            fh.close()
+            raise
+    except OSError as e:
+        print(f"ERROR: cannot read {src}: {e.strerror or e}", file=sys.stderr)
+        return 1
+    with fh, m:
         pos = 0
         while (mt := ENTRY.search(m, pos)) is not None:
             # A rejected header is rescanned past its name (a real entry can start inside it); a carved
