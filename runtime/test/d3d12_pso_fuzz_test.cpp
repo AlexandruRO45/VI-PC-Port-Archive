@@ -1,7 +1,7 @@
 // Differential graphics-state fuzzer: one seeded random program clears a colour target and an optional depth-stencil
 // target, then draws triangles through PSOs with random blend state (factors, ops, write masks, OMSetBlendFactor),
 // depth-stencil state (functions, stencil ops, masks, front and back faces, OMSetStencilRef), a second render target
-// with IndependentBlendEnable some of the time, and rasterizer state
+// with IndependentBlendEnable some of the time, UINT targets with logic ops, and rasterizer state
 // (cull mode, winding, constant depth bias, depth clip), under a random viewport (offset, size, depth range) and
 // scissor, on the layer and on the host's D3D12 on the same GPU. Every byte of the colour target
 // and of every depth-stencil plane is read back and compared.
@@ -15,6 +15,7 @@
 // --seeds N --start S choose the programs (default 40 from 1); the reference is the host's D3D12 on the layer's own
 // GPU (by LUID), or WARP with --warp;
 // --reduce SEED drops draws and triangles while the layer still differs and prints the smallest program left;
+// --all also generates a nonzero DepthBias, which the default leaves out until D3D-325 (#2718) lands.
 // --verbose prints every program. The layer is the device the runtime makes (create_vulkan_device_standalone);
 // LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation. Needs a Vulkan GPU (exit 77 otherwise, and
 // under Wine). No game data.
@@ -39,8 +40,9 @@
 #include <string>
 #include <vector>
 
-#if !defined(LEONIDA_PSO_VS_SPV) || !defined(LEONIDA_PSO_PS_SPV) || !defined(LEONIDA_PSO_PS_MRT_SPV)
-#error "LEONIDA_PSO_VS_SPV, LEONIDA_PSO_PS_SPV and LEONIDA_PSO_PS_MRT_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_PSO_VS_SPV) || !defined(LEONIDA_PSO_PS_SPV) || !defined(LEONIDA_PSO_PS_MRT_SPV) || \
+    !defined(LEONIDA_PSO_PS_UINT_SPV)
+#error "LEONIDA_PSO_VS_SPV, LEONIDA_PSO_PS_SPV, LEONIDA_PSO_PS_MRT_SPV and LEONIDA_PSO_PS_UINT_SPV must name the compiled test shaders"
 #endif
 
 using d3d12test::Ref;
@@ -54,6 +56,8 @@ constexpr char kHostVs[] =
     "O main(float4 p : POSITION, float4 c : COLOR) { O o; o.pos = p; o.color = c; return o; }\n";
 constexpr char kHostPs[] =
     "float4 main(float4 pos : SV_Position, nointerpolation float4 c : COLOR) : SV_Target { return c; }\n";
+constexpr char kHostPsUint[] =
+    "uint4 main(float4 pos : SV_Position, nointerpolation float4 c : COLOR) : SV_Target { return asuint(c); }\n";
 constexpr char kHostPsMrt[] =
     "struct O { float4 t0 : SV_Target0; float4 t1 : SV_Target1; };\n"
     "O main(float4 pos : SV_Position, nointerpolation float4 c : COLOR) { O o; o.t0 = c; o.t1 = c.zyxw; return o; }\n";
@@ -78,7 +82,7 @@ bool compile_hlsl(pD3DCompile compile, const char* source, const char* target, s
 struct ColorFormat {
     DXGI_FORMAT format;
     const char* name;
-    enum Kind { unorm8, unorm10_2, half, single, r11g11b10 } kind;
+    enum Kind { unorm8, unorm10_2, half, single, r11g11b10, uint } kind;
     UINT bytes;
 };
 constexpr ColorFormat kColorFormats[] = {
@@ -89,6 +93,10 @@ constexpr ColorFormat kColorFormats[] = {
     {DXGI_FORMAT_R16G16B16A16_FLOAT, "R16G16B16A16_FLOAT", ColorFormat::half, 8},
     {DXGI_FORMAT_R32G32B32A32_FLOAT, "R32G32B32A32_FLOAT", ColorFormat::single, 16},
     {DXGI_FORMAT_R11G11B10_FLOAT, "R11G11B10_FLOAT", ColorFormat::r11g11b10, 4},
+    {DXGI_FORMAT_R8G8B8A8_UINT, "R8G8B8A8_UINT", ColorFormat::uint, 4},
+    {DXGI_FORMAT_R16G16B16A16_UINT, "R16G16B16A16_UINT", ColorFormat::uint, 8},
+    {DXGI_FORMAT_R32G32B32A32_UINT, "R32G32B32A32_UINT", ColorFormat::uint, 16},
+    {DXGI_FORMAT_R32_UINT, "R32_UINT", ColorFormat::uint, 4},
 };
 
 struct DepthFormat {
@@ -139,6 +147,7 @@ struct Program {
 
 // The formats both devices can render (and blend) and the depth formats both can use.
 struct Support {
+    bool logic_op = false;  // D3D12_FEATURE_DATA_D3D12_OPTIONS::OutputMergerLogicOp on both
     std::vector<const ColorFormat*> colors;
     std::vector<bool> blendable;  // by colors index
     std::vector<const DepthFormat*> depths;
@@ -152,6 +161,10 @@ bool format_support(ID3D12Device* device, DXGI_FORMAT format, UINT need1) {
 
 Support support(ID3D12Device* a, ID3D12Device* b) {
     Support s;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS oa{}, ob{};
+    s.logic_op = SUCCEEDED(a->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &oa, sizeof oa)) &&
+                 SUCCEEDED(b->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &ob, sizeof ob)) &&
+                 oa.OutputMergerLogicOp && ob.OutputMergerLogicOp;
     for (const ColorFormat& c : kColorFormats) {
         if (!format_support(a, c.format, D3D12_FORMAT_SUPPORT1_RENDER_TARGET) ||
             !format_support(b, c.format, D3D12_FORMAT_SUPPORT1_RENDER_TARGET))
@@ -174,6 +187,11 @@ float color_value(std::mt19937_64& rng) {
     return values[rng() % std::size(values)];
 }
 
+// Known differences the default programs leave out; --all puts them back.
+// - A nonzero DepthBias: the layer applies about twice D3D12's constant bias on NVIDIA (D3D-325, fixed by #2718 through
+//   VK_EXT_depth_bias_control). Without it every PSO gets DepthBias 0. The random draws are the same either way.
+bool with_depth_bias = false;
+
 Program generate(std::uint64_t seed, const Support& sup) {
     std::mt19937_64 rng(seed * 0x9e3779b97f4a7c15ull + 0x5bd1e995);
     const auto pick = [&](UINT n) { return UINT(rng() % n); };
@@ -183,8 +201,10 @@ Program generate(std::uint64_t seed, const Support& sup) {
     p.blendable = sup.blendable[c];
     p.depth = sup.depths[pick(UINT(sup.depths.size()))];
     for (float& v : p.clear_color) v = color_value(rng);
-    if (pick(3) == 0) {  // two render targets
-        const UINT c2 = pick(UINT(sup.colors.size()));
+    const bool uint_target = p.color->kind == ColorFormat::uint;
+    if (!uint_target && pick(3) == 0) {  // two render targets (float, UNORM; a UINT one needs its own shader)
+        UINT c2 = pick(UINT(sup.colors.size()));
+        while (sup.colors[c2]->kind == ColorFormat::uint) c2 = (c2 + 1) % UINT(sup.colors.size());
         p.color2 = sup.colors[c2];
         p.blendable2 = sup.blendable[c2];
         for (float& v : p.clear_color2) v = color_value(rng);
@@ -214,12 +234,17 @@ Program generate(std::uint64_t seed, const Support& sup) {
             rt.LogicOp = D3D12_LOGIC_OP_NOOP;
             rt.RenderTargetWriteMask = UINT8(pick(3) ? D3D12_COLOR_WRITE_ENABLE_ALL : pick(16));
         };
+        // A UINT target can't blend; it gets a logic op (all sixteen) half the time where both devices have them.
         // With two targets, RenderTarget[0] serves both unless IndependentBlendEnable gives the second its own.
         const bool independent = p.color2 && pick(2);
         make_target(draw.blend.RenderTarget[0], p.blendable && (!p.color2 || independent || p.blendable2));
         if (independent) {
             draw.blend.IndependentBlendEnable = TRUE;
             make_target(draw.blend.RenderTarget[1], p.blendable2);
+        }
+        if (uint_target && sup.logic_op && pick(2)) {
+            draw.blend.RenderTarget[0].LogicOpEnable = TRUE;
+            draw.blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP(pick(16));
         }
         for (float& v : draw.blend_factor) v = color_value(rng);
         D3D12_DEPTH_STENCIL_DESC& ds = draw.depth;
@@ -254,6 +279,7 @@ Program generate(std::uint64_t seed, const Support& sup) {
         rs.CullMode = D3D12_CULL_MODE(1 + pick(3));
         rs.FrontCounterClockwise = pick(2);
         rs.DepthBias = pick(3) ? 0 : int(pick(41)) - 20;
+        if (!with_depth_bias) rs.DepthBias = 0;
         rs.DepthBiasClamp = 0.0f;
         rs.SlopeScaledDepthBias = 0.0f;
         rs.DepthClipEnable = pick(4) != 0;
@@ -309,6 +335,7 @@ void print_program(const Program& p) {
         const Draw& d = p.draws[i];
         const D3D12_RENDER_TARGET_BLEND_DESC& b = d.blend.RenderTarget[0];
         std::printf("  draw %zu: blend %s", i, b.BlendEnable ? "on" : "off");
+        if (b.LogicOpEnable) std::printf(" logic op %d", int(b.LogicOp));
         if (b.BlendEnable)
             std::printf(" (%s*src %s %s*dst; alpha %s %s %s)", blend_name(b.SrcBlend), ops[b.BlendOp],
                         blend_name(b.DestBlend), blend_name(b.SrcBlendAlpha), ops[b.BlendOpAlpha],
@@ -348,7 +375,8 @@ struct Pass {
     const std::vector<std::uint8_t>* root;
     const std::vector<std::uint8_t>* vs;
     const std::vector<std::uint8_t>* ps;
-    const std::vector<std::uint8_t>* ps_mrt;  // two targets
+    const std::vector<std::uint8_t>* ps_mrt;   // two targets
+    const std::vector<std::uint8_t>* ps_uint;  // a UINT target
 };
 
 // A plane of the readback, rows without padding.
@@ -398,7 +426,8 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = root.p;
         desc.VS = {pass.vs->data(), pass.vs->size()};
-        const std::vector<std::uint8_t>& ps = p.color2 ? *pass.ps_mrt : *pass.ps;
+        const std::vector<std::uint8_t>& ps =
+            p.color->kind == ColorFormat::uint ? *pass.ps_uint : p.color2 ? *pass.ps_mrt : *pass.ps;
         desc.PS = {ps.data(), ps.size()};
         desc.BlendState = p.draws[i].blend;
         desc.SampleMask = 0xffffffff;
@@ -633,6 +662,9 @@ Comparison compare(const Program& p, const Result& layer, const Result& ref) {
                 for (UINT k = 0; k < 4; ++k)
                     within = within && ulps32(load(mine_bytes, at + 4 * k, 4), load(ref_bytes, at + 4 * k, 4)) <= 2;
                 break;
+            case ColorFormat::uint:
+                within = false;  // integers write exactly
+                break;
             case ColorFormat::r11g11b10: {
                 const std::uint32_t a = load(mine_bytes, at, 4), b = load(ref_bytes, at, 4);
                 constexpr UINT shift[3] = {0, 11, 22}, bits[3] = {11, 11, 10};
@@ -704,6 +736,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--start")) number(start);
         else if (!std::strcmp(argv[i], "--reduce")) { number(reduce); reducing = true; }
         else if (!std::strcmp(argv[i], "--warp")) warp = true;
+        else if (!std::strcmp(argv[i], "--all")) with_depth_bias = true;
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
         else {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
@@ -727,11 +760,14 @@ int main(int argc, char** argv) {
     const auto ps_container = d3d12test::shader_container(ps_program);
     const auto ps_mrt_program = d3d12test::fssm_program({0x50530502, 0xbf810000});
     const auto ps_mrt_container = d3d12test::shader_container(ps_mrt_program);
+    const auto ps_uint_program = d3d12test::fssm_program({0x50530503, 0xbf810000});
+    const auto ps_uint_container = d3d12test::shader_container(ps_uint_program);
     const testfiles::ScratchDir scratch("leonida_pso_fuzz_test");
     const auto& library = scratch.path();
     if (!testfiles::copy_file(LEONIDA_PSO_VS_SPV, library / "vs.spv") ||
         !testfiles::copy_file(LEONIDA_PSO_PS_SPV, library / "ps.spv") ||
-        !testfiles::copy_file(LEONIDA_PSO_PS_MRT_SPV, library / "ps_mrt.spv"))
+        !testfiles::copy_file(LEONIDA_PSO_PS_MRT_SPV, library / "ps_mrt.spv") ||
+        !testfiles::copy_file(LEONIDA_PSO_PS_UINT_SPV, library / "ps_uint.spv"))
         return 1;
     {
         std::ofstream index(library / "index.json", std::ios::binary);
@@ -744,7 +780,9 @@ int main(int argc, char** argv) {
                  " \"ps\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]},\n"
                  " \"ps_mrt\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_mrt_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0, 1]}}";
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0, 1]},\n"
+                 " \"ps_uint\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_uint_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
     }
     // The device the runtime itself makes (its features, depthClamp among them), reading the shaders from
     // LEONIDA_SHADERS.
@@ -793,9 +831,10 @@ int main(int argc, char** argv) {
     const auto compile = compiler ? reinterpret_cast<pD3DCompile>(reinterpret_cast<void*>(
                                         GetProcAddress(compiler, "D3DCompile")))
                                   : nullptr;
-    std::vector<std::uint8_t> host_vs, host_ps, host_ps_mrt;
+    std::vector<std::uint8_t> host_vs, host_ps, host_ps_mrt, host_ps_uint;
     if (!compile || !compile_hlsl(compile, kHostVs, "vs_5_0", host_vs) || !compile_hlsl(compile, kHostPs, "ps_5_0", host_ps) ||
-        !compile_hlsl(compile, kHostPsMrt, "ps_5_0", host_ps_mrt)) {
+        !compile_hlsl(compile, kHostPsMrt, "ps_5_0", host_ps_mrt) ||
+        !compile_hlsl(compile, kHostPsUint, "ps_5_0", host_ps_uint)) {
         std::puts("SKIP: d3dcompiler_47 could not compile the reference's shaders");
         return 77;
     }
@@ -804,13 +843,16 @@ int main(int argc, char** argv) {
     root_desc.Desc_1_0.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     const auto root_blob = d3d12test::serialize_root_signature(root_desc);
     if (root_blob.empty()) return 1;
-    const Pass layer_pass{&root_blob, &vs_container, &ps_container, &ps_mrt_container};
-    const Pass ref_pass{&root_blob, &host_vs, &host_ps, &host_ps_mrt};
+    const Pass layer_pass{&root_blob, &vs_container, &ps_container, &ps_mrt_container, &ps_uint_container};
+    const Pass ref_pass{&root_blob, &host_vs, &host_ps, &host_ps_mrt, &host_ps_uint};
     const Support sup = support(layer.p, ref.p);
     if (sup.colors.empty()) {
         std::puts("SKIP: no colour format both devices render");
         return 77;
     }
+    if (verbose)
+        std::printf("%zu colour and %zu depth formats on both devices; logic ops %s\n", sup.colors.size(),
+                    sup.depths.size(), sup.logic_op ? "on both" : "not on both (UINT targets draw without them)");
 
     const auto differs = [&](const Program& q, std::uint64_t, Comparison& c) {
         const Result b = run(ref.p, q, ref_pass);
