@@ -26,6 +26,10 @@ Requirements: Windows x64, Visual Studio 2022 with the C++ desktop workload. The
 Vulkan SDK; the runtime and CPU tests do not. The loader is x64-only and the PE mapper rejects any
 other machine.
 
+A mapped title creates its window in `gta6rt.exe`; `src/gta6rt.manifest` makes it per-monitor DPI aware
+(PerMonitorV2), so on a scaled display the title sees its monitor and client area in physical pixels instead of a
+smaller logical size that Windows stretches.
+
 ## Dry run
 
 ```powershell

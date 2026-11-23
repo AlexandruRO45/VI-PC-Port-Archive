@@ -391,7 +391,19 @@ public:
         RECT frame{0, 0, static_cast<LONG>(mode->Width), static_cast<LONG>(mode->Height)};
         const auto style = static_cast<DWORD>(GetWindowLongW(hwnd_, GWL_STYLE));
         const auto ex_style = static_cast<DWORD>(GetWindowLongW(hwnd_, GWL_EXSTYLE));
-        if (!AdjustWindowRectEx(&frame, style, FALSE, ex_style)) return E_INVALIDARG;
+        // gta6rt is per-monitor DPI aware, so the window's DPI can differ from the system DPI AdjustWindowRectEx uses.
+        // Both functions are Windows 10 1607+; without them (older Windows, Wine) the system DPI is all there is.
+        using AdjustForDpiFn = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+        using DpiForWindowFn = UINT(WINAPI*)(HWND);
+        static const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        static const auto adjust_for_dpi =
+            user32 ? reinterpret_cast<AdjustForDpiFn>(GetProcAddress(user32, "AdjustWindowRectExForDpi")) : nullptr;
+        static const auto dpi_for_window =
+            user32 ? reinterpret_cast<DpiForWindowFn>(GetProcAddress(user32, "GetDpiForWindow")) : nullptr;
+        const UINT dpi = dpi_for_window ? dpi_for_window(hwnd_) : 0;
+        const BOOL adjusted = adjust_for_dpi && dpi ? adjust_for_dpi(&frame, style, FALSE, ex_style, dpi)
+                                                    : AdjustWindowRectEx(&frame, style, FALSE, ex_style);
+        if (!adjusted) return E_INVALIDARG;
         if (!SetWindowPos(hwnd_, nullptr, 0, 0, frame.right - frame.left, frame.bottom - frame.top,
                           SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
             return DXGI_ERROR_INVALID_CALL;
