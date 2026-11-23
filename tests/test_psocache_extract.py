@@ -147,7 +147,10 @@ class PsocacheExtractTest(unittest.TestCase):
         outside = os.path.join(ROOT, "psocache_should_not_exist.bin")
         p = run(self.archive, outside)
         self.assertEqual(p.returncode, 2)
-        self.assertIn("temporary directory", p.stderr)
+        self.assertIn("the out path must be inside the temporary directory", p.stderr)
+        # The output is the second positional, so a message that names a --out flag sends the user to a flag
+        # argparse rejects ("unrecognized arguments: --out").
+        self.assertNotIn("--out", p.stderr)
         self.assertFalse(os.path.exists(outside))
 
     def test_missing_input_exits_two(self):
