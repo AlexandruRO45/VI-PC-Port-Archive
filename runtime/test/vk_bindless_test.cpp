@@ -575,6 +575,7 @@ int main(int argc, char** argv) {
     };
 
     BindlessFeatures configurations[2] = {device_flags, {}};
+    bool atomic_ran = false, atomic_failed = false;
     const int configuration_count = (device_flags.update_after_bind || device_flags.partially_bound) ? 2 : 1;
     for (int configuration = 0; configuration < configuration_count; ++configuration) {
         BindlessFeatures flags = configurations[configuration];
@@ -869,11 +870,16 @@ int main(int argc, char** argv) {
                         "%u of %u render-target pixels wrong (odd columns discarded)\n",
                         wrong, want.size(), bad_rt, W * H);
             vkDeviceWaitIdle(dev);
-            if (g_validation_errors) {
-                std::printf("ps_imgatomic: %u validation errors\n", g_validation_errors);
-                return 1;
+            vkDestroyBuffer(dev, atomic_readback, nullptr);
+            for (int k = 0; k < 4; ++k) {
+                vkDestroyImageView(dev, views[k], nullptr);
+                vkDestroyImage(dev, images[k], nullptr);
             }
-            return wrong || bad_rt ? 1 : 0;
+            vkDestroyPipeline(dev, pipeline, nullptr);
+            vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
+            atomic_ran = true;
+            atomic_failed = wrong || bad_rt;
+            break;
         }
 
         // A view that comes and goes before the set is flushed is never written: a texture created and destroyed
@@ -1064,6 +1070,18 @@ int main(int argc, char** argv) {
     }
     LI(vkDestroyInstance);
     vkDestroyInstance(inst, nullptr);
+
+    if (atomic_mode) {
+        if (!atomic_ran) {
+            std::printf("unsupported: the bindless set does not fit this device's descriptor limits\n");
+            return unsupported;
+        }
+        if (g_validation_errors) {
+            std::printf("ps_imgatomic: %u validation errors\n", g_validation_errors);
+            return 1;
+        }
+        return atomic_failed ? 1 : 0;
+    }
 
     if (!runs) {
         std::printf("unsupported: the bindless set does not fit this device's descriptor limits\n");
