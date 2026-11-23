@@ -547,5 +547,50 @@ class TestValuFrexpMantF64SIMD(unittest.TestCase):
             else:
                 self.assertEqual(state.get_vgpr64(lane, 0), 0)
 
+# ---------------------------------------------------------------------------
+# Phase 5: Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestValuFrexpMantF64Aliasing(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_alias_inplace_dst_equals_src(self) -> None:
+        """In-place execution: v_frexp_mant_f64 v[0:1], v[0:1]."""
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        state.set_vgpr64(0, f64_to_u64(2.0))
+        inst = ValuFrexpMantF64Instruction.parse("v_frexp_mant_f64 v[0:1], v[0:1]")
+        res = interp.step(inst, state)
+
+        self.assertEqual(res, f64_to_u64(0.5))
+        self.assertEqual(state.get_vgpr64(0), f64_to_u64(0.5))
+
+    def test_alias_partial_overlap_high_to_low(self) -> None:
+        """Partial overlap: vdst is v[0:1], vsrc is v[1:2]."""
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        state.set_vgpr64(1, f64_to_u64(2.0))
+        inst = ValuFrexpMantF64Instruction.parse("v_frexp_mant_f64 v[0:1], v[1:2]")
+        res = interp.step(inst, state)
+
+        self.assertEqual(res, f64_to_u64(0.5))
+        self.assertEqual(state.get_vgpr64(0), f64_to_u64(0.5))
+
+    def test_translator_aliased_inplace_execution(self) -> None:
+        """Verify support.translate_lines and mrt0_words execution for in-place aliasing."""
+        lines = [
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 0x40000000",  # 2.0
+            "v_frexp_mant_f64 v[0:1], v[0:1]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_frexp_mant_alias", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[1], 0x3FE00000)
+        self.assertEqual(words[0], 0x0)
+
 if __name__ == "__main__":
     unittest.main()
