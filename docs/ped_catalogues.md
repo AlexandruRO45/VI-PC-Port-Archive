@@ -48,7 +48,7 @@ Uses the standard `PSIN` header, `0xaa`-filled 16-byte block table, `0x70` table
 
 ## Schema and record layouts
 
-All offsets below were read directly from `LSCH` and verified across every `0x8dcb4cf5` catalogue in `packs.rpf`.
+The layouts below follow the `LSCH` schema. The corpus counts later in this document cover presets, drawable and texture states, and cull links.
 
 ### Root catalogue — `0x8dcb4cf5` (192 bytes)
 
@@ -56,6 +56,17 @@ All offsets below were read directly from `LSCH` and verified across every `0x8d
 |---:|---:|---|---|---|
 | `+0x00` | 96 B | `0x05269a03` | `0x50` (`0x60bcb6f3[2]`) | Two 48-byte preset buckets; each holds a `0x5c` array (`0x593bc9c3` at `+0x08`) of `0xf795e8ba` presets |
 | `+0x60` | 96 B | `0x9bcf5f90` | `0x50` (`0x4c70a132[2]`) | Two 48-byte secondary buckets; each holds a `0x5c` array (`0x593bc9c3` at `+0x08`) of `0xa9d57751` records |
+
+### Outfit kit and member records
+
+The array headers at root offsets `+0x68` and `+0x98` point to 80-byte kit records of type `0xa9d57751`. Two fields identify each kit and its members.
+
+| Offset | Type | Meaning |
+|---:|---|---|
+| `+0x00` | `u32` | Kit ID within this catalogue |
+| `+0x38` | `u32 count, u32 capacity, u64 ptr` | Array of 8-byte `0x67e54cb2` members in authored order |
+
+Each member holds a `u32` child ID at `+0x00` and a `u32` state ID at `+0x04`. The child ID can refer to another kit or to a preset in the same catalogue. A reference to a nested kit uses a zero state ID. A reference to a preset selects its state **by ID**, including when the state is supplied by a parent preset.
 
 ### Preset record — `0xf795e8ba` (88 bytes)
 
@@ -136,6 +147,14 @@ Within a single catalogue, `0xf795e8ba` presets form a forest keyed by `preset_i
 4. **State drawable hash**: direct `murmur64` `drawable_hash` (`h0` at `0x37e52277 + 0x08`).
 5. **`cull_drawable` target**: resolved through `0x147fdab5` -> `0xb70a22c1` (`0x46e1a048`) -> `0x3d780b74 + 0x08` (`murmur64`), attached to every resolved state binding and searchable directly.
 
+## Resolve one outfit kit
+
+`kit` reads one standalone catalogue. Starting at the requested kit, it visits members in file order and expands each nested kit before continuing with the next member. Each distinct `(preset_id, state_id)` appears once, at its first visit. Two selectors for the same preset give two selections.
+
+For each selection the reader visits the preset and then its parents, looking up the same state ID at every level. It takes the nearest nonzero value independently for the drawable, albedo, normal and extra resource hashes. A field with no value anywhere in the chain stays zero. For example, if a synthetic child's selected state supplies an albedo and its parent supplies the drawable and normal, the result contains all three. A different state on that parent contributes nothing.
+
+The JSON report writes kit, preset and state IDs as `0x` followed by eight hex digits. It writes each 64-bit resource hash as a string of sixteen hex digits so consumers can preserve every bit. A missing state leaves the selected member in the report with zero hashes and a warning. A missing parent preserves any fields already found. An unknown child ID, a nested-kit cycle, or a nonzero selector on a nested kit skips that edge with a warning. A missing root kit or ambiguous definition is an error.
+
 ---
 
 ## Verified corpus counts (Xbox package `1.0.2.1`, `packs.rpf`)
@@ -169,4 +188,5 @@ Measured read-only with `tools/ped_catalogues.py` (0 parse errors, 0 warnings):
 python -I tools/ped_catalogues.py census  <file|dir|archive.rpf> --json
 python -I tools/ped_catalogues.py inspect <catalogue.pso|catalogue.0drp> --limit 10
 python -I tools/ped_catalogues.py resolve <file|dir|archive.rpf> --name <drawable_name> --cull-only --json
+python -I tools/ped_catalogues.py kit example.pso --id 0x00000001 --json
 ```
