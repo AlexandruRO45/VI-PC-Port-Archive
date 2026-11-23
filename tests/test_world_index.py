@@ -380,6 +380,21 @@ class WorldIndexTest(unittest.TestCase):
         self.assertIn("ERROR:", err.getvalue())
         self.assertFalse(os.path.exists(out))
 
+    def test_without_out_writes_no_report_in_the_current_folder(self):
+        path = os.path.join(self.dir, "resource.bin")
+        with open(path, "wb") as f:
+            f.write(make_resource())
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(WI.main([path]), 0)
+            self.assertFalse(os.path.exists(os.path.join(self.dir, "reports")),
+                             "a run without --out must not write a report into the current folder")
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(json.loads(out.getvalue())["resources"], 1)
+
     def test_rpf_scan_survives_a_damaged_candidate_continuation(self):
         blob = make_resource()
         partial = blob[:0x150]
