@@ -276,3 +276,57 @@ class TestDsSwizzleB32ScalarInterpreter(unittest.TestCase):
         step_swizzle_instruction(ast, state1)
         step_swizzle_instruction(ast, state2)
         self.assertEqual(state1.vgprs[0], state2.vgprs[0])
+
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
+# -----------------------------------------------------------------------------
+class TestDsSwizzleB32SIMD(unittest.TestCase):
+    def test_inactive_destination_preservation(self) -> None:
+        # Inactive destination lanes (exec_mask bit = 0) must preserve old vdst
+        exec_mask = 0x55555555  # Even lanes active, odd lanes inactive
+        state = SwizzleSimdState.create(32, exec_mask)
+        state.vgprs[1] = [100 + i for i in range(32)]
+        state.vgprs[0] = [0xDEADBEEF] * 32
+
+        ast = DsSwizzleB32AST(0, 1, SwizzleKind.SWAP, encode_swap(1), (1,))
+        step_swizzle_instruction(ast, state)
+
+        for i in range(32):
+            if i % 2 == 0:
+                # Even lane: active dest, but source is odd (which is inactive in EXEC)!
+                # RDNA2 rule: inactive source lane returns 0
+                self.assertEqual(state.vgprs[0][i], 0)
+            else:
+                # Odd lane: inactive destination, preserved
+                self.assertEqual(state.vgprs[0][i], 0xDEADBEEF)
+
+    def test_inactive_source_returns_zero(self) -> None:
+        # Only lane 0 active. When other lanes read lane 0, they would read lane 0, but they're inactive.
+        # When lane 0 reads lane 1 (which is inactive), lane 0 receives 0!
+        exec_mask = 0x00000001
+        state = SwizzleSimdState.create(32, exec_mask)
+        state.vgprs[1] = [999] * 32
+        state.vgprs[0] = [0xFEEDC0DE] * 32
+
+        ast = DsSwizzleB32AST(0, 1, SwizzleKind.SWAP, encode_swap(1), (1,))
+        step_swizzle_instruction(ast, state)
+
+        # Lane 0 attempted to read lane 1, which is inactive -> returns 0
+        self.assertEqual(state.vgprs[0][0], 0)
+        # Other lanes preserved
+        for i in range(1, 32):
+            self.assertEqual(state.vgprs[0][i], 0xFEEDC0DE)
+
+    def test_wave64_independent_halves(self) -> None:
+        # In wave64, swizzle operates within each 32-lane group independently (0..31 and 32..63)
+        state = SwizzleSimdState.create(64, 0xFFFFFFFFFFFFFFFF)
+        state.vgprs[1] = [i for i in range(64)]
+        ast = DsSwizzleB32AST(0, 1, SwizzleKind.BROADCAST, encode_broadcast(32, 0), (32, 0))
+        step_swizzle_instruction(ast, state)
+
+        # Lanes 0..31 broadcast lane 0
+        for i in range(32):
+            self.assertEqual(state.vgprs[0][i], 0)
+        # Lanes 32..63 broadcast lane 32 (not lane 0!)
+        for i in range(32, 64):
+            self.assertEqual(state.vgprs[0][i], 32)
