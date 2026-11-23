@@ -28,20 +28,26 @@ def _strip_comments(text):
 def outside_sources(text):
     """The compiled sources of the targets in ``text`` (a runtime/CMakeLists.txt) that resolve outside runtime/."""
     text = _strip_comments(text)
+    # Every value a variable is given anywhere in the file: each entry of a set() list and of list(APPEND ...).
     values = {}
-    for m in re.finditer(r"\bset\s*\(\s*(\w+)\s+([^\s)]+)", text):
-        values.setdefault(m.group(1), m.group(2).strip('"'))
+    for m in re.finditer(r"\b(?:set\s*\(\s*(\w+)|list\s*\(\s*APPEND\s+(\w+))\s+([^)]*)\)", text):
+        name = m.group(1) or m.group(2)
+        words = [w.strip('"') for w in m.group(3).split() if w not in ("CACHE", "PARENT_SCOPE", "FORCE")]
+        values.setdefault(name, []).extend(words)
 
     def expand(word, depth=0):
-        if depth > 10:
-            return word
-        out = re.sub(r"\$\{(\w+)\}", lambda v: values.get(v.group(1), v.group(0)) if v.group(1) != "CMAKE_CURRENT_SOURCE_DIR" else v.group(0), word)
-        return out if out == word else expand(out, depth + 1)
+        """Every word ``word`` can stand for; a ``${VAR}`` with several values gives one result per value."""
+        m = next((v for v in re.finditer(r"\$\{(\w+)\}", word) if v.group(1) in values), None)
+        if depth > 10 or not m:
+            return [word]
+        out = []
+        for value in values[m.group(1)]:
+            out.extend(expand(word[:m.start()] + value + word[m.end():], depth + 1))
+        return out
 
     bad = []
     for m in re.finditer(r"\b(add_library|add_executable|target_sources)\s*\(([^)]*)\)", text):
-        for word in m.group(2).split()[1:]:
-            word = expand(word.strip('"'))
+        for word in (w for raw in m.group(2).split()[1:] for w in expand(raw.strip('"'))):
             if not word.lower().endswith(COMPILED) or word.startswith(BUILD_DIRS):
                 continue
             rel = word.replace("${CMAKE_CURRENT_SOURCE_DIR}", ".")
@@ -75,6 +81,20 @@ class RuntimeSourcesInTree(unittest.TestCase):
             "add_library: ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/xtaskqueue/Source/Task/TaskQueue.cpp",
             "add_executable: ../tools/x.cpp",
             "add_executable: C:/abs/y.cpp",
+        ])
+
+    def test_every_entry_of_a_list_variable_is_checked(self):
+        # Found by DoubleD17 in #6246: only the first value of a set() list was expanded.
+        lists = (
+            "set(PROBE_SOURCES probe.cpp ../outside/helper.cpp)\n"
+            "add_executable(scope_probe ${PROBE_SOURCES})\n"
+            "set(MORE\n  in/a.cpp\n  in/b.cpp\n)\n"
+            "list(APPEND MORE ${CMAKE_CURRENT_SOURCE_DIR}/../vendored/c.cpp)\n"
+            "add_library(more STATIC ${MORE})\n"
+        )
+        self.assertEqual(outside_sources(lists), [
+            "add_executable: ../outside/helper.cpp",
+            "add_library: ${CMAKE_CURRENT_SOURCE_DIR}/../vendored/c.cpp",
         ])
 
     def test_generated_and_in_tree_sources_pass(self):
