@@ -130,5 +130,50 @@ class BuildDestinationTest(unittest.TestCase):
                                os.path.join(other_root, "Scratch"), rejected=False)
 
 
+class DriveRootManifestTest(unittest.TestCase):
+    """A drive-root game is protected by the dump's own paths, not by whatever else exists on the drive."""
+
+    def run_build(self, root, out, rejected):
+        v = {"files": {"Content/shaders.rpf": {"size": 1}}, "expected_exe": "Content/game.exe"}
+        argv = ["make_game.py", "--game", root + os.sep, "--out", out,
+                "--work", os.path.join(root, "work"), "--stages", "runtime"]
+        original = os.path.splitdrive
+
+        real_root = os.path.normcase(os.path.realpath(root))
+
+        def fake_splitdrive(path):
+            if os.path.normcase(os.path.realpath(path)) == real_root:
+                return root, os.sep
+            return original(path)
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(sys, "argv", argv))
+            stack.enter_context(patch("make_game.below_normal"))
+            stack.enter_context(patch("make_game.check", return_value=v))
+            stack.enter_context(patch("make_game.log"))
+            stack.enter_context(patch("os.path.splitdrive", side_effect=fake_splitdrive))
+            preflight = stack.enter_context(patch("make_game.preflight"))
+            stack.enter_context(patch("make_game.runtime"))
+            stderr = stack.enter_context(patch("sys.stderr", new_callable=io.StringIO))
+            if rejected:
+                with self.assertRaises(SystemExit):
+                    make_game.main()
+                self.assertIn("--out and --work must be outside the game folder", stderr.getvalue())
+                preflight.assert_not_called()
+            else:
+                self.assertEqual(make_game.main(), 0)
+                preflight.assert_called_once()
+
+    def test_resume_with_output_on_the_same_drive_is_allowed(self):
+        with tempfile.TemporaryDirectory() as root:
+            out = os.path.join(root, "Leonida_Port")
+            os.makedirs(out)          # a previous run created it, so os.listdir would now show it
+            self.run_build(root, out, rejected=False)
+
+    def test_output_inside_the_dumps_own_top_level_folder_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.run_build(root, os.path.join(root, "Content", "out"), rejected=True)
+
+
 if __name__ == "__main__":
     unittest.main()

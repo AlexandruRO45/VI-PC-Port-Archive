@@ -2182,13 +2182,17 @@ def main() -> int:
     is_game_drive_root = os.path.splitdrive(real_game)[1] in ("\\", "/")
     game_entries = []
     if is_game_drive_root:
-        try:
-            game_entries = [
-                os.path.normcase(os.path.realpath(os.path.join(real_game, e)))
-                for e in os.listdir(real_game)
-            ]
-        except OSError:
-            game_entries = []
+        # Only the dump's own top-level paths are protected. os.listdir() would also include --out/--work
+        # once a first run created them on the same drive, so resuming would refuse its own output folder.
+        tops = set()
+        for rel in list(v.get("files", {})) + [v.get("expected_exe", "")]:
+            part = rel.replace("\\", "/").split("/")[0]
+            if part:
+                tops.add(part)
+        game_entries = [
+            os.path.normcase(os.path.realpath(os.path.join(real_game, part)))
+            for part in sorted(tops)
+        ]
     for p in (out, work):
         # normcase: Windows paths compare without case, so C:\Games\X and c:\games\x\out are inside.
         real_destination = os.path.normcase(os.path.realpath(p))
