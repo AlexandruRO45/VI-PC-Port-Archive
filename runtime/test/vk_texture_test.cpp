@@ -5,9 +5,10 @@
 // registers that T# -> image index 1 and the shader's literal S# -> sampler index 1, binds an 8x8 gradient at
 // index 1 and a magenta fallback at index 0, draws a full-screen triangle and dumps the RGBA32F result.
 //
-//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint|--two-mip-uint]   (S# words as hex)
+//   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint|--two-mip-uint|--two-mip-index]   (S# words as hex)
 //   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw; the SINT and UINT
 //   forms bind the same image as a signed or unsigned integer view instead of the default UNORM one.
+//   --two-mip-index: the same, with mip 1 texel (x, y) = (4x, 4y, 0x80, 0xFF) instead of solid cyan (ps_texoff_cl).
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
 //   translator's view of a cube array); every pixel must be the texel a cube sample of its direction reads.
 //   vk_texture_test dref [out.raw]: ps_sample_c_lz against an 8x8 D32 texture at index 1 (texel x holds depth
@@ -88,7 +89,10 @@ int main(int argc, char** argv) {
     const uint32_t W = 64, H = 64, TW = 8;
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
     const bool uint_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-uint") == 0;
-    const bool two_mip = signed_mips || uint_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
+    // --two-mip-index: the same two-mip texture, but every mip 1 texel differs, so a test sees where on mip 1 a
+    // sample lands (ps_texoff_cl: a texel offset on a min-LOD-clamped sample).
+    const bool index_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-index") == 0;
+    const bool two_mip = signed_mips || uint_mips || index_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
     // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
     const uint32_t texture_side = two_mip ? 2 * W : TW;
     const uint32_t levels = two_mip ? 2 : 1;
@@ -143,7 +147,7 @@ int main(int argc, char** argv) {
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint|--two-mip-index]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
@@ -368,6 +372,14 @@ int main(int argc, char** argv) {
         }
     }
     if (fetch) texels[0] = 0x4df82282u;
+    // --two-mip-index: mip 1 texel (x, y) is R = 4x, G = 4y, B = 0x80, A = 0xFF (x, y in 0..63), so each is unique.
+    if (index_mips) {
+        const uint32_t mip1_side = texture_side / 2;
+        uint32_t* mip1 = texels.data() + texture_side * texture_side;
+        for (uint32_t y = 0; y < mip1_side; y++)
+            for (uint32_t x = 0; x < mip1_side; x++)
+                mip1[y * mip1_side + x] = (4u * x) | ((4u * y) << 8) | (0x80u << 16) | (0xFFu << 24);
+    }
     // The signed two-mip fixture uses 0 or -128 in each channel, including the alpha channel.
     if (signed_mips)
         for (auto& texel : texels) texel &= 0x80808080u;

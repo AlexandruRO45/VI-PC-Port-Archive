@@ -38,6 +38,7 @@ from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
+from check import TEXOFF_CL_ARGS, TEXOFF_CL_TEST, texoff_cl_problem   # ps_texoff_cl: offset on a clamped sample
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import failure   # "exit <status>: <last lines>", check.py's detail for a program that exited non-zero
 from check import run_readback
@@ -647,6 +648,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
               SIGNED_MIP_TEST: "vs_ids.asm", UINT_MIP_TEST: "vs_ids.asm",
+              TEXOFF_CL_TEST: "vs_ids.asm",
               "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
@@ -1348,6 +1350,21 @@ def run_suite(a, work: str) -> int:
                 with open(raw, "rb") as f:
                     problem, covered = texoff_problem(f.read(), msg, name=name)
                 results.append((name, not problem, problem or f"4096/4096 pixels exact ({covered})"))
+        elif name == TEXOFF_CL_TEST:
+            # image_sample_cl_o on vk_texture_test --two-mip-index, drawn with vs_ids (the coordinates the expected
+            # texels assume). Exit 77: no VK_KHR_maintenance8 (unless the fallback) or no shaderResourceMinLod.
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            rc, msg = run_readback(raw, run_cmd, [os.path.join(a.build, "vk_texture_test" + ext),
+                                                os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, *TEXOFF_CL_ARGS],
+                                   env=texoff_env())
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, msg))
+            else:
+                with open(raw, "rb") as f:
+                    problem = texoff_cl_problem(f.read())
+                results.append((name, not problem, problem or "4096/4096 pixels exact (mip 1 texel the offset reached)"))
         elif name in OTHER_HARNESS:
             results.append((name, None, f"SKIP (run by {OTHER_HARNESS[name]})"))
         elif name.startswith("ps_"):

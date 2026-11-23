@@ -519,7 +519,7 @@ NAN_PAYLOAD_TEST = "ps_nan_payload"
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
 PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_persp_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff",
-                      "ps_texoff_implicit", "ps_texoff_forms",
+                      "ps_texoff_implicit", "ps_texoff_forms", "ps_texoff_cl",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
                       "ps_mandelbrot", NAN_PAYLOAD_TEST))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
@@ -1386,6 +1386,53 @@ def texoff_test(tools, spirv, name):
         return texoff_problem(raw.read_bytes(), out, name=name)[0]
 
 
+# ps_texoff_cl: image_sample_cl_o, a texel offset on a min-LOD-clamped sample, on vk_texture_test's --two-mip-index
+# texture (mip 1 texel (x, y) = (4x, 4y, 0x80, 0xFF)), so the right half shows which mip 1 texel the offset reached.
+TEXOFF_CL_TEST = "ps_texoff_cl"
+TEXOFF_CL_ARGS = ("0", "92", "c00000", "14500000", "0", "--two-mip-index")
+
+
+def texoff_cl_pixel(x, y):
+    """ps_texoff_cl's RGBA at pixel (x, y), derived in ps_texoff_cl.asm: left of x = 32 the clamp is 0 and the offset
+    (+3, -2) stays in mip 0's red quadrant; from x = 32 the clamp is 1 and mip 1 texel
+    (floor((x + 0.5) / 4) + 3, max(floor((y + 0.5) / 4) - 2, 0)) is read."""
+    if x < 32:
+        return (1.0, 0.0, 0.0, 1.0)
+    tx = (2 * x + 1) // 8 + 3
+    ty = max((2 * y + 1) // 8 - 2, 0)
+    return (4 * tx / 255, 4 * ty / 255, 128 / 255, 1.0)
+
+
+def texoff_cl_problem(data):
+    """Judge ps_texoff_cl's 64x64 RGBA32F dump: "" or the count of wrong pixels and the first one."""
+    if len(data) != 64 * 64 * 16:
+        return f"vk_texture_test returned {len(data)} bytes, not 64x64 RGBA32F"
+    wrong, first = 0, ""
+    for index, pixel in enumerate(struct.iter_unpack("<4f", data)):
+        x, y = index % 64, index // 64
+        want = texoff_cl_pixel(x, y)
+        if any(not math.isclose(a, b, rel_tol=0, abs_tol=1e-6) for a, b in zip(pixel, want)):
+            if not wrong:
+                first = f"at ({x},{y}): got {tuple(round(c, 4) for c in pixel)}, expected {tuple(round(c, 4) for c in want)}"
+            wrong += 1
+    return f"{wrong} of 4096 pixels differ; first {first}" if wrong else ""
+
+
+def texoff_cl_test(tools, spirv):
+    """ps_texoff_cl on vk_texture_test --two-mip-index. It needs VK_KHR_maintenance8 for the Offset unless translated
+    with the fallback, and shaderResourceMinLod for the clamp; the tool exits 77 without either."""
+    with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        code, out = run(os.path.join(tools, "vk_texture_test" + EXE), os.path.join(spirv, "vs_ids.spv"),
+                        os.path.join(spirv, TEXOFF_CL_TEST + ".spv"), raw, *TEXOFF_CL_ARGS, env=texoff_env())
+        if code == UNSUPPORTED:
+            m = re.search(r"unsupported: .*", out)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+        if code or not raw.is_file():
+            return failure(code, out, 2)
+        return texoff_cl_problem(raw.read_bytes())
+
+
 def store_words(name):
     """The 64 words STORE_WORDS[name] expects in each of STORE_IMAGES: its changes over the tool's fill."""
     return tuple([changed.get(i, fill(i)) for i in range(64)] for changed, fill in zip(STORE_WORDS[name], STORE_FILL))
@@ -1648,6 +1695,8 @@ def pixel_test(tools, spirv, name):
         return f"missing {name}.spv"
     if name in ("ps_texoff", "ps_texoff_implicit", "ps_texoff_forms"):
         return texoff_test(tools, spirv, name)
+    if name == TEXOFF_CL_TEST:
+        return texoff_cl_test(tools, spirv)
     if name == "ps_interp_f16_high" and BARY_FALLBACK and not F16_HALVES:   # with F16_HALVES it reads decoded halves
         return Skip("SKIP (per-vertex interpolants need VK_KHR_fragment_shader_barycentric)")
     fmt = "<4f" if name in ("ps_bary", "ps_persp_bary") else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I"

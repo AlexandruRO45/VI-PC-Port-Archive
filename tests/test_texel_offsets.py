@@ -266,3 +266,67 @@ def test_fallback_literal_mip_filter_emits_one_rounding(tmp_path, fallback):
     assert "Floor" in linear and "OpFOrdGreaterThanEqual" not in linear
     none = _sample_l_o(tmp_path, MIP_NONE << 26)
     assert "Floor" not in none and "OpFOrdGreaterThanEqual" not in none
+
+
+# ---- the _cl min-LOD clamp picks the level the fallback shifts by ----
+
+def _fold_level_source(spv):
+    """The float the fallback's level comes from: OpImageQuerySizeLod <- SClamp <- (the MIP_FILTER rounding) <- Floor
+    <- this."""
+    defs = {m[1]: m[2] for m in re.finditer(r"^\s*(%\w+) = (.+)$", spv, re.M)}
+    size = re.search(r"= OpImageQuerySizeLod %\w+ %\w+ (%\w+)", spv)
+    assert size, "no OpImageQuerySizeLod"
+    clamp = re.fullmatch(r"OpExtInst %int %\w+ SClamp (%\w+) %\w+ %\w+", defs[size[1]])
+    assert clamp, "the level is not clamped to the image's levels"
+    floors, todo, seen = set(), [clamp[1]], set()
+    while todo:                                       # walk the rounding chain back to the Floor of the LOD
+        x = todo.pop()
+        if x in seen or x not in defs:
+            continue
+        seen.add(x)
+        floor = re.fullmatch(r"OpExtInst %float %\w+ Floor (%\w+)", defs[x])
+        if floor:
+            floors.add(floor[1])
+        else:
+            todo += re.findall(r"%\w+", defs[x].split(None, 2)[-1])
+    assert len(floors) == 1, f"the level does not come from one Floor: {floors}"
+    return floors.pop(), defs
+
+
+@pytest.mark.parametrize("asm", [f[0] for f in SAMPLES if "_cl_o " in f[0]],
+                         ids=lambda a: a.split()[0])
+def test_fallback_level_takes_the_clamp(asm, tmp_path, fallback):
+    """A clamp above the computed LOD makes the sample read a coarser level; the shift must be in its texels.
+
+    The level the offset is divided by must be max(computed LOD, clamp), with the same clamp value the sample takes
+    as MinLod. Before the fix the fold floored OpImageQueryLod's LOD (plus bias) alone, so a clamp of 1 with a
+    computed LOD of -1 shifted by mip-0 texels while mip 1 was sampled: twice the offset.
+    """
+    spv = translate_listing(tmp_path, PROLOGUE + "\n" + asm)
+    sample = next(ln for ln in spv.splitlines() if "OpImageSample" in ln)
+    minlod = re.search(r"Grad\|MinLod %\w+ %\w+ (%\w+)$", sample)
+    assert minlod, sample
+    src, defs = _fold_level_source(spv)
+    fmax = re.fullmatch(r"OpExtInst %float %\w+ FMax (%\w+) (%\w+)", defs[src])
+    assert fmax and fmax[2] == minlod[1], f"level source {defs[src]!r} does not take the clamp {minlod[1]}"
+    computed = defs[fmax[1]]
+    if asm.startswith("image_sample_c_b_cl_o"):
+        assert computed.startswith("OpFAdd %float"), computed      # OpImageQueryLod's LOD + bias, then the clamp
+    else:
+        assert computed.startswith("OpCompositeExtract %float"), computed  # OpImageQueryLod's LOD, then the clamp
+
+
+def test_fallback_level_takes_the_clamp_outside_the_ps(tmp_path, fallback, monkeypatch):
+    """Outside the PS there are no derivatives: the sample reads LOD max(0, clamp), so the shift uses that level."""
+    import listing
+    monkeypatch.setattr(listing, "EPILOGUE", "s_endpgm")   # a vertex shader has no colour export
+    asm = f"image_sample_cl_o v[4:5], v[10:13], {DESC} dmask:0x3 dim:SQ_RSRC_IMG_2D"
+    spv = translate_listing(tmp_path, PROLOGUE + "\n" + asm, name="vs_listing")
+    sample = next(ln for ln in spv.splitlines() if "OpImageSample" in ln)
+    lod = re.search(r"OpImageSampleExplicitLod %v4float %\w+ %\w+ Lod (%\w+)$", sample)
+    assert lod, sample
+    defs = {m[1]: m[2] for m in re.finditer(r"^\s*(%\w+) = (.+)$", spv, re.M)}
+    sample_lod = re.fullmatch(r"OpExtInst %float %\w+ FMax %f0 (%\w+)", defs[lod[1]])
+    assert sample_lod, defs[lod[1]]                                  # the sample: Lod max(0, clamp)
+    src, defs = _fold_level_source(spv)
+    assert re.fullmatch(rf"OpExtInst %float %\w+ FMax %f0 {re.escape(sample_lod[1])}", defs[src]), defs[src]

@@ -459,10 +459,10 @@ on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`.
 
 ## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
 
-`ps_texoff` and `ps_texoff_implicit` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;
+`ps_texoff`, `ps_texoff_implicit`, `ps_texoff_forms` and `ps_texoff_cl` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;
 without it they're skipped, which is expected, not a failure. To test the fallback, set `LEONIDA_TEXOFF_FALLBACK=1`
 **for both `build.py` and `check.py`** (or for `run_gpu_tests.py`): the offset is then folded into the coordinate
-(`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device.
+(`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device. `ps_texoff_cl` (a min-LOD clamp with an offset, on `vk_texture_test --two-mip-index`) also needs `shaderResourceMinLod`, and is skipped without it.
 
 ## Fused multiply-add: GLSL Fma or OpFmaKHR
 

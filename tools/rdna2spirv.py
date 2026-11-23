@@ -12506,7 +12506,7 @@ class Gen:
             if off is not None and TEXEL_OFFSET_FALLBACK:
                 fb_lod = bias_lod if (not implicit and kind in ("_b", "_c_b")) else lod
                 uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, fb_lod, bias,
-                                                       a[3])
+                                                       a[3], minlod)
                 off = None
 
             def opnd(mask, args):
@@ -13302,11 +13302,13 @@ class Gen:
         self.emit(f"{r} = OpFAdd %float {s} {m2}")
         return r
 
-    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, s_op):
+    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, s_op, minlod=None):
         """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
 
         The level is 0 for _lz / _c_lz (and for implicit samples outside the PS, which sample LOD 0), the given LOD
-        for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), rounded the way the S#'s
+        for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), raised to a _cl form's min-LOD
+        clamp `minlod` (OpImageQueryLod leaves the MinLod operand out; outside the PS the sample's LOD is
+        max(0, clamp)), then rounded the way the S#'s
         MIP_FILTER (word 2 [27:26]) selects a level and clamped to the image's levels: floored for linear, nearest
         with a tie rounding up (floor(lod + 0.5), as an RTX 5070 samples LOD 0.5 at mip 1 and image_query_probe.py
         records for RDNA2) for point and for the value 3, which the runtime also samples as nearest, and 0 for
@@ -13342,6 +13344,13 @@ class Gen:
                 level_f = qb
         elif kind in ("_b", "_c_b"):
             level_f = lod if lod is not None else bias
+        if minlod is not None and (implicit or kind not in ("_b", "_c_b")):
+            # A _cl clamp raises the LOD the sample reads at (an implicit sample's computed LOD, or LOD 0 outside the
+            # PS), so the offset is in texels of that coarser level. Outside the PS a _b / _c_b LOD already is
+            # max(bias, clamp).
+            raised = self.tmp()
+            self.emit(f"{raised} = OpExtInst %float %glsl FMax {level_f if level_f is not None else '%f0'} {minlod}")
+            level_f = raised
         mip = None
         if level_f is not None:
             lit = self.sgpr_imm.get(s_op["r"] + 2)

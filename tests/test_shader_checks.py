@@ -3,6 +3,7 @@ import ast
 import contextlib
 import io
 import json
+import math
 import re
 import struct
 from pathlib import Path
@@ -1106,10 +1107,63 @@ class TexelOffsetFormsChecks(unittest.TestCase):
                 self.assertIn("pixels differ", problem)
 
 
+class TexoffClJudge(unittest.TestCase):
+    """ps_texoff_cl (image_sample_cl_o): the judgement of a 64x64 RGBA32F dump."""
+
+    @staticmethod
+    def dump(pixel):
+        return b"".join(struct.pack("<4f", *pixel(i % 64, i // 64)) for i in range(64 * 64))
+
+    @staticmethod
+    def right_half(tx, ty):
+        return (4 * tx / 255, 4 * ty / 255, 128 / 255, 1.0)
+
+    def test_the_rule_passes(self):
+        self.assertEqual(check.texoff_cl_problem(self.dump(check.texoff_cl_pixel)), "")
+
+    def test_the_pre_fix_translation_fails(self):
+        # The offset folded at the wrong level: tx = floor((x + 0.5) / 4 + 1.5), ty = max(floor((y + 0.5) / 4 - 1), 0).
+        def pre_fix(x, y):
+            if x < 32:
+                return check.texoff_cl_pixel(x, y)
+            return self.right_half(math.floor((x + 0.5) / 4 + 1.5), max(math.floor((y + 0.5) / 4 - 1), 0))
+        problem = check.texoff_cl_problem(self.dump(pre_fix))
+        self.assertIn("2048 of 4096 pixels differ", problem)
+        self.assertIn("(32,0)", problem)
+
+    def test_a_dropped_offset_fails(self):
+        def dropped(x, y):
+            if x < 32:
+                return check.texoff_cl_pixel(x, y)
+            return self.right_half((2 * x + 1) // 8, (2 * y + 1) // 8)
+        self.assertIn("pixels differ", check.texoff_cl_problem(self.dump(dropped)))
+
+    def test_an_ignored_clamp_fails(self):
+        def red(x, y):
+            return (1.0, 0.0, 0.0, 1.0)
+        self.assertIn("pixels differ", check.texoff_cl_problem(self.dump(red)))
+
+    def test_a_short_dump_is_reported(self):
+        self.assertIn("bytes", check.texoff_cl_problem(self.dump(check.texoff_cl_pixel)[:-16]))
+        self.assertIn("bytes", check.texoff_cl_problem(b""))
+
+    def test_the_expected_pixels(self):
+        self.assertEqual(check.texoff_cl_pixel(0, 0), (1.0, 0.0, 0.0, 1.0))
+        self.assertEqual(check.texoff_cl_pixel(32, 0), (44 / 255, 0.0, 128 / 255, 1.0))
+        self.assertEqual(check.texoff_cl_pixel(63, 63), (4 * 18 / 255, 4 * 13 / 255, 128 / 255, 1.0))
+
+    def test_pixel_test_dispatches_to_the_judge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ps_texoff_cl.spv").touch()
+            with patch.object(check, "texoff_cl_test", return_value="") as judge:
+                self.assertEqual(check.pixel_test("tools", tmp, "ps_texoff_cl"), "")
+            self.assertEqual(judge.call_count, 1)
+
+
 class PixelTestRegistry(unittest.TestCase):
     def test_pixel_tests_include_every_pixel_fixture(self):
         # A repeated PIXEL_TESTS assignment silently dropped ps_texoff once; keep the registry explicit.
-        for name in ("ps_texoff", "ps_texoff_forms", "ps_wqm", "ps_scc_mask32"):
+        for name in ("ps_texoff", "ps_texoff_forms", "ps_texoff_cl", "ps_wqm", "ps_scc_mask32"):
             with self.subTest(name=name):
                 self.assertIn(name, check.PIXEL_TESTS)
         self.assertEqual(len(check.PIXEL_TESTS), len(set(check.PIXEL_TESTS)))
