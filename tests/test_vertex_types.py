@@ -381,7 +381,7 @@ class ArchiveTests(unittest.TestCase):
 
     def test_directory_scan_uses_stable_archive_order(self):
         with tempfile.TemporaryDirectory() as root:
-            def walk(path):
+            def walk(path, **_kwargs):
                 directories = ["z", "a"]
                 yield path, directories, []
                 for directory in directories:
@@ -397,6 +397,26 @@ class ArchiveTests(unittest.TestCase):
                 mock.call(os.path.join(root, "a", "one.rpf"), 0),
                 mock.call(os.path.join(root, "z", "one.rpf"), 0),
             ])
+
+    def test_an_unreadable_directory_is_an_error_not_a_skip(self):
+        with tempfile.TemporaryDirectory() as root:
+            bad = os.path.join(root, "locked")
+            os.mkdir(bad)
+            real = os.scandir
+
+            def scandir(path):
+                if os.fspath(path) == bad:
+                    raise PermissionError(13, "Permission denied", bad)
+                return real(path)
+
+            err = io.StringIO()
+            with (mock.patch("os.scandir", side_effect=scandir),
+                  contextlib.redirect_stderr(err)):
+                self.assertEqual(vt.main([bad]), 2)
+            lines = err.getvalue().strip().splitlines()
+            self.assertEqual(len(lines), 1, err.getvalue())
+            self.assertTrue(lines[0].startswith("error: "), err.getvalue())
+            self.assertIn(bad, lines[0])
 
     def test_negative_limit_is_an_error(self):
         r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "-1"], capture_output=True, text=True)
