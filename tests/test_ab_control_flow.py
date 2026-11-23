@@ -605,6 +605,18 @@ class OutputAndVertexShaderTest(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "shader_a\tidentical\nshader_b\tDIFFERENT\n")
 
+    def test_outcomes_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = "keep\tidentical\n"
+            path = os.path.join(tmp, "outcomes.tsv")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with patch.object(AB, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    AB.write_text_report(path, "new\tDIFFERENT\n")
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
     def test_vertex_shader_generation_assembles_and_validates_all_locations(self):
         with tempfile.TemporaryDirectory() as tmp:
             calls = []

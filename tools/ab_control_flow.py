@@ -24,9 +24,15 @@ import argparse
 import collections
 import os
 import re
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 # Left out: anything that writes memory or images, LDS, and the rare instructions the harness has no setup for.
 # Loads are fine: with empty user data they read zeros from the start of the harness's heap, the same for both.
@@ -118,12 +124,44 @@ def classify_result(translation_valid, dispatch_runs, structured_runs):
     return "identical" if dispatch == structured else "DIFFERENT"
 
 
+def write_text_report(path, text):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".ab_control_flow-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            staged.write(text)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
 def write_outcomes(out_dir, outcomes):
     """Write (shader name, outcome) pairs to the harness's tab-separated report."""
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "outcomes.tsv")
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("".join(f"{name}\t{outcome}\n" for name, outcome in outcomes))
+    write_text_report(path, "".join(f"{name}\t{outcome}\n" for name, outcome in outcomes))
     return path
 
 
