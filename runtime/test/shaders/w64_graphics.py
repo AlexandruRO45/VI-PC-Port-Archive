@@ -30,8 +30,13 @@ The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a ver
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
 Each draws 960 vertices with zero area (VKH_VERTICES) and stores four words per vertex to the heap; vs_w64_c_lane_id
 doubles as the probe that the wave size really changed, and without RADV only the default-size checks run. RADV packs
-62 or 64 vertices into a wave64 and 30 or 32 into a wave32, so the 32-lane run is a repacking, not the two halves of
-the 64-lane waves: a stricter test of tiers A and B, which key every word on the vertex index.
+62 or 64 vertices into a wave64 and 30 or 32 into a wave32, and each wave32 wave is one half of a wave64 wave, not a
+repacking (measured with vs_w64_c_lane_id over 960 vertices on gfx1036, Mesa 26.3.1, and GFX1201, Mesa 26.2.6: wave64
+waves of 64, 62, 64, 62 ... from vertices 0, 64, 126, 190; wave32 waves of 32, 32, 32, 30 ... from 0, 32, 64, 96, 126;
+every wave32 wave inside one half of a wave64 wave). So the 32-lane run tests tiers A and B as the pixel fixtures'
+halves do, not more strictly. A wave of 62 does not start on a multiple of 64, so a fixture that reads another lane
+must not assume groups of four consecutive vertices: `lane ^ 1` stays inside the wave, `^ 2`, `^ 3` and `^ 16` can
+cross it.
 
 The gs_w64_* fixtures are legacy geometry shaders, switched the same way (gewave32 covers the whole NGG stage). Each is
 drawn after vs_ids with VKH_GS, finds its triangle from the vertex number vs_ids passes in TEXCOORD0, and stores four
