@@ -902,7 +902,9 @@ def llvm_mc_signature() -> str:
         fallback = f"exit code {result.returncode}" if result.returncode else "no version printed"
         detail = (result.stderr.strip().splitlines() or [fallback])[0]
         fail(f"Could not read the llvm-mc version. Check LLVM_MC: {detail}")
-    return json.dumps([command, version])
+    # The listings also depend on tools/shader_disasm.py (its code range), so a work folder built with another
+    # version of it disassembles again.
+    return json.dumps([command, version, file_sha256(os.path.join(TOOLS, "shader_disasm.py"))])
 
 
 def unpacked_shader_stems(dxbc: str) -> set[str] | None:
