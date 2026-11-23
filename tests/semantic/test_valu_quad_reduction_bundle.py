@@ -535,3 +535,34 @@ class TestPermB32ASTAndScalar(unittest.TestCase):
             "v_perm_b32 v0, v1, v0, v2",
         ])
         self.assertEqual(val_inplace, 0x12345678)
+
+
+# ------------------------------------------------------------------------------
+# v_perm_b32 SIMD Divergence & Byte Permutation Properties
+# ------------------------------------------------------------------------------
+
+class TestPermB32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        # Permutation with constant selector vs register selector
+        val_reg, _ = run_shader_words("ps_perm_reg", [
+            "v_mov_b32 v1, 0x12345678",
+            "v_mov_b32 v2, 0x9ABCDEF0",
+            "v_mov_b32 v3, 0x07050301",
+            "v_perm_b32 v0, v1, v2, v3",
+        ])
+        val_imm, _ = run_shader_words("ps_perm_imm", [
+            "v_mov_b32 v1, 0x12345678",
+            "v_mov_b32 v2, 0x9ABCDEF0",
+            "v_perm_b32 v0, v1, v2, 0x07050301",
+        ])
+        self.assertEqual(val_reg, val_imm)
+        self.assertEqual(val_imm, 0x12569ADE)
+
+    def test_algebraic_reversal_hardware(self):
+        # Endianness swap via v_perm_b32
+        val_swap, _ = run_shader_words("ps_perm_endian", [
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0xA1B2C3D4",
+            "v_perm_b32 v0, v1, v2, 0x00010203",
+        ])
+        self.assertEqual(val_swap, 0xD4C3B2A1)
