@@ -412,10 +412,12 @@ def main(argv=None) -> int:
     ap.add_argument("path", help="RPF9 archive, carved 0x7a file, or folder of carved files")
     ap.add_argument("--out", help="optional JSON summary output path")
     ap.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 4),
-                    help="worker processes for RPF9 scanning")
+                    help="worker processes for RPF9 scanning (at least 1)")
     a = ap.parse_args(argv)
     if not os.path.exists(a.path):
         ap.error(f"no such file or folder: {a.path}")
+    if a.jobs < 1:
+        ap.error(f"--jobs must be at least 1: {a.jobs}")
     if a.out:
         if os.path.isdir(a.out):
             ap.error(f"--out is a directory: {a.out}")
