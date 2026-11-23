@@ -485,8 +485,8 @@ cross-half code on 32-wide subgroups.
 
 ## Disassembling shaders
 
-The AMDGPU disassembler needs LLVM 22+ built with the AMDGPU target (`llvm-mc`; on Linux the `llvm-22` package
-installs it at `/usr/lib/llvm-22/bin/llvm-mc`). The official Windows LLVM build has no AMDGPU target and ships no
+The AMDGPU disassembler needs LLVM 23.1.0+ built with the AMDGPU target (`llvm-mc`; on Linux the `llvm-23` package
+installs it at `/usr/lib/llvm-23/bin/llvm-mc`). The official Windows LLVM build has no AMDGPU target and ships no
 `llvm-mc.exe`. On Windows, either build a native one or run it from WSL.
 
 Native: `scripts\build_llvm_mc.ps1` fetches the LLVM sources the tool needs (sparse, shallow), builds `llvm-mc` alone
@@ -504,10 +504,10 @@ powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
 python -I make_game.py --game "D:\path\to\your\package" --stages shaders
 ```
 
-WSL: install `llvm-22` and give `LLVM_MC` the whole command:
+WSL: install `llvm-23` and give `LLVM_MC` the whole command:
 
 ```
-set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc
+set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc
 python -I make_game.py --game "D:\path\to\your\package" --stages shaders
 ```
 
@@ -516,16 +516,32 @@ the tests, `runtime/test/shaders/build.py` and `scripts/run_gpu_tests.py`; the a
 on stdin, so a WSL command never receives a Windows file path.
 
 `shader_disasm.py` disassembles one `s_endpgm` before starting, so a missing tool or AMDGPU target stops the run
-with that reason instead of writing empty `.s` files. It then disassembles one packed-math instruction with a 32-bit
-literal (`v_pk_mul_f16 v0, v1, 0xfbff3c00`), once per run (`fspx_unpack.py --disasm` does the same), and stops naming the
-LLVM version if that comes out as an invalid word. LLVM 21.1.8 prints `v_pk_*` (and some `v_fma_mix*`) with a literal as
-`invalid instruction encoding` and decodes the instruction's second word and the literal as other instructions: a literal
-whose top byte is 0xF8..0xFB, such as the f16 pair `0xfbff3c00` (-65504 in the high half), comes out as `exp mrt0 off,
-... done compr vm`. That was the one `exp` in FidelityFX FSPX programs 05, 06, 08, 09 and 28 ("reachable instruction with
-normalized encoding"). LLVM 22.1.8 and 23.1.6 decode them, so the minimum is LLVM 22 (SHADER-804). To disassemble by hand inside WSL:
+with that reason instead of writing empty `.s` files. It then disassembles three instructions in the encoding the
+FidelityFX FSPX programs use, where an unused VALU source field holds 0x80 (inline 0) rather than 0, as LLVM 23's
+assembler also writes it. This runs once per run (`fspx_unpack.py --disasm` does the same), and the tool stops, naming the LLVM
+version and each family it misreads, unless every instruction comes back as one instruction whose printed encoding is its input:
+
+| Family | Instruction (bytes) | LLVM 21.1.8, 22.1.0 | LLVM 22.1.1 to 22.1.8 |
+|---|---|---|---|
+| VOP3P with a literal, unused SRC2 = 0x80 | `v_pk_mul_f16 v0, v1, 0xfbff3c00` (`00 40 10 cc 01 ff 01 1a 00 3c ff fb`) | invalid word; the literal decodes as `exp mrt0 off, ... done compr vm` | decoded, printed with SRC2 = 0 (`... 01 18 ...`) |
+| VOP3, unused SRC2 = 0x80 | `v_mul_f32_e64 v0, v1, v2` (`00 00 08 d5 01 05 02 02`) | invalid word | decoded, printed with SRC2 = 0 |
+| float inline constant in a 16-bit integer operand | `v_add_nc_u16 v0, 0.5, v2` (`00 00 03 d7 f0 04 02 02`) | printed as a 12-byte `v_add_nc_u16 v0, 0x3800, v2` | the same |
+
+An invalid word loses the instruction and misreads the words after it; that was the one `exp` in FSPX programs 05, 06,
+08, 09 and 28 ("reachable instruction with normalized encoding"). A printed encoding that differs from the bytes is refused
+by the printed-encoding check ("Printed encodings" in the translator table), and a 12-byte encoding for 8 bytes of code shifts every later offset. LLVM
+23.1.0 decodes all three exactly. The fixes are llvm-project `ef0680ba54f7` (#175753, unused VALU source fields encoded
+and printed as inline 0, on top of `8099e127cde2`, #175182, which ignores them when decoding and is the one 22.1.1 got, as
+`fef02d48c08d`) and `d7ee01c0fa31` (#200944, float inline constants in i16 operands). Neither is in a 22.x release, so
+the minimum is LLVM 23.1.0 (SHADER-804). Measured with conda-forge `llvm-tools` 21.1.8, 22.1.0, 22.1.2, 22.1.8, 23.1.0 and
+23.1.6 (and 22.1.1 on the unused-field cases): every gfx1010 and gfx1030 VOP3P and VOP3 opcode with a literal in each
+source slot under each modifier and with unused fields of 0 and 0x80, every gfx1030 one with each inline constant in each
+slot, and 200,000 random words (about 580,000 encodings). 22.1.8 and 23.1.x differ only in these families and in a 64-bit
+float operand given a literal 0, which compilers encode as inline 0.
+To disassemble by hand inside WSL:
 
 ```
-LLVM_MC=/usr/lib/llvm-22/bin/llvm-mc python3 -I <repo>/tools/shader_disasm.py <work>/shaders/fssm
+LLVM_MC=/usr/lib/llvm-23/bin/llvm-mc python3 -I <repo>/tools/shader_disasm.py <work>/shaders/fssm
 ```
 
 Code starts at the u32 at FSSM offset 0xC0 (the code-section offset) plus 0x28 bytes into that section, and ends at the

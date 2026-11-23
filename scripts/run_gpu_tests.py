@@ -3,7 +3,7 @@
 Usage:
     python -I scripts/run_gpu_tests.py [--llvm-mc CMD] [--build DIR] [--work DIR] [--filter SUBSTR] [--require-pass]
 
---llvm-mc (or LLVM_MC) is a path or a whole command, e.g. "wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc".
+--llvm-mc (or LLVM_MC) is a path or a whole command, e.g. "wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc".
 """
 import argparse
 import json
@@ -646,7 +646,7 @@ def native_folder(path: str, ansi: str = "mbcs") -> str | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
-                    help="llvm-mc path, or a whole command such as 'wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc'")
+                    help="llvm-mc path, or a whole command such as 'wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc'")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"),
                     help="CMake build folder; with the Visual Studio generator the RelWithDebInfo/Release/... "
                          "subfolder that has the test programs is found by itself")

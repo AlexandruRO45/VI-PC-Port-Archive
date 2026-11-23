@@ -25,11 +25,11 @@ Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 
 - [Python 3.12+](https://www.python.org/downloads/)（勾选 “Add python.exe to PATH”）。
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)。
 - [Vulkan SDK](https://vulkan.lunarg.com/)（`spirv-as`、`spirv-val`、`vulkaninfo`）。
-- [LLVM 22+](https://github.com/llvm/llvm-project/releases)，需要 **AMDGPU target**（`llvm-mc`）：
+- [LLVM 23+](https://github.com/llvm/llvm-project/releases)，需要 **AMDGPU target**（`llvm-mc`）：
   - Windows 官方 LLVM 发行版**不含** AMDGPU target。
   - Windows 上运行 `scripts\build_llvm_mc.ps1` 构建原生 `llvm-mc.exe`（需要 `git` 和 Visual Studio 的 C++ 工具）
-    并设置 `LLVM_MC`；**或**在 WSL 里安装 `llvm-22` 并设置
-    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc"`（见 [`docs/design.md`](../../design.md#disassembling-shaders)）。
+    并设置 `LLVM_MC`；**或**在 WSL 里安装 `llvm-23` 并设置
+    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc"`（见 [`docs/design.md`](../../design.md#disassembling-shaders)）。
   - Linux 上 `PATH` 里有 `llvm-mc` 即可。
 - **Visual Studio 2022**，勾选“使用 C++ 的桌面开发”和 **Windows SDK `10.0.26100` 或更新**
   （`runtime` 阶段需要，它使用 root signature 1.2）。
@@ -99,7 +99,7 @@ python -I make_game.py --wave64-emulate auto              # auto（默认）、o
 - **用 GitHub 的 “Download ZIP” 下载**：ZIP 不含 `third_party/rpf9-explorer` 子模块。请用
   `git clone --recursive`，或在仓库目录里执行 `git submodule update --init --recursive`。
 - **`llvm-mc` 拒绝 `gfx1013` / AMDGPU**：多半是用了 Windows 官方 LLVM 安装包。改用
-  `scripts\build_llvm_mc.ps1`，或把 `LLVM_MC` 指向 WSL 里的 `llvm-mc`（`llvm-22`）。
+  `scripts\build_llvm_mc.ps1`，或把 `LLVM_MC` 指向 WSL 里的 `llvm-mc`（`llvm-23`）。
 - **构建 runtime 时报 `D3D12_ROOT_SIGNATURE_DESC2` 错误**：把 Windows SDK 升级到 `10.0.26100` 或更新
   （可在 Visual Studio Installer 或 `winget install Microsoft.WindowsSDK.10.0.26100` 中安装），
   删除构建目录后重新配置。

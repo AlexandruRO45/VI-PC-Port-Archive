@@ -125,19 +125,19 @@ jobs:
           python-version: "3.12"
           cache: "pip"
           cache-dependency-path: tests/requirements.txt
-      - name: Install llvm-mc (LLVM 22) and spirv-tools
+      - name: Install llvm-mc (LLVM 23) and spirv-tools
         shell: bash
         run: |
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends llvm-22 spirv-tools
+          sudo apt-get install -y --no-install-recommends llvm-23 spirv-tools
           pip install -r tests/requirements.txt
-          LLVM_MC=/usr/lib/llvm-22/bin/llvm-mc
+          LLVM_MC=/usr/lib/llvm-23/bin/llvm-mc
           echo "LLVM_MC=$LLVM_MC" >> "$GITHUB_ENV"
           version_out=$("$LLVM_MC" --version)
           printf '%s\n' "$version_out"
-          grep -q 'LLVM version 22\.' <<< "$version_out"
+          grep -q 'LLVM version 23\.' <<< "$version_out"
           grep -q 'amdgcn' <<< "$version_out"
       - name: Translator tests
         shell: bash
@@ -147,8 +147,8 @@ jobs:
             if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               pytest_files+=("$t")
             elif [[ "$t" == tests/test_shader_disasm.py ]]; then
-              # unittest file; this job has the llvm-22 llvm-mc, so the packed-literal decode test really runs
-              pytest_files+=("$t::PackedLiteralTest")
+              # unittest file; this job has the llvm-23 llvm-mc, so the decoding check test really runs
+              pytest_files+=("$t::DecoderCheckTest")
             elif [[ "$t" == tests/test_tex_headers.py ]]; then
               pytest_files+=("$t::TestTextureDescriptorParsing::test_stdlib_qword_scanner_edge_cases_and_parity")
             fi

@@ -17,7 +17,9 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
 
+import fake_llvm_mc  # noqa: E402
 import fspx_unpack  # noqa: E402
 
 ENDPGM = struct.pack("<I", 0xBF810000)
@@ -178,7 +180,9 @@ class Cli(unittest.TestCase):
             code = fspx_unpack.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
-    def disassemble(self, body):
+    def disassemble(self, body, decoder=fake_llvm_mc.GOOD):
+        """fspx_unpack.py --disasm with a fake llvm-mc: `decoder` (a fake_llvm_mc preamble) answers the decoding
+        check, `body` the program."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         src = os.path.join(tmp.name, "one.fspx")
@@ -186,7 +190,7 @@ class Cli(unittest.TestCase):
             f.write(make_fspx([(0, kind0()), (6, program())]))
         mc = os.path.join(tmp.name, "fake_mc.py")
         with open(mc, "w", encoding="utf-8", newline="\n") as f:
-            f.write(body)
+            f.write(decoder + body)
         out = os.path.join(tmp.name, "out")
         env = dict(os.environ, LLVM_MC=f'"{sys.executable}" "{mc}"')
         result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "fspx_unpack.py"),
@@ -206,18 +210,12 @@ class Cli(unittest.TestCase):
         with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f), [])
 
-    def test_llvm_21_losing_packed_literals_stops_before_any_listing(self):
-        # LLVM 21.1.8 on v_pk_mul_f16 v0, v1, 0xfbff3c00: an invalid word, then the literal read as an exp.
-        result, out = self.disassemble("import sys\n"
-                                       "if '--version' in sys.argv:\n"
-                                       "    print('Ubuntu LLVM version 21.1.8')\n"
-                                       "    sys.exit(0)\n"
-                                       "sys.stdin.read()\n"
-                                       "sys.stderr.write('<stdin>:1:1: warning: invalid instruction encoding\\n')\n"
-                                       "print('\\texp mrt0 off, off, off, off done compr vm')\n")
+    def test_llvm_22_1_2_misprinting_fspx_encodings_stops_before_any_listing(self):
+        result, out = self.disassemble("print('\\ts_endpgm')\n",
+                                       fake_llvm_mc.preamble("22.1.2", fake_llvm_mc.LLVM_22_1_2))
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("LLVM 21.1.8", result.stderr)
-        self.assertIn("LLVM 22 or newer", result.stderr)
+        self.assertIn("LLVM 22.1.2", result.stderr)
+        self.assertIn("LLVM 23.1.0 or newer", result.stderr)
         self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
         self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
 
@@ -230,9 +228,6 @@ class Cli(unittest.TestCase):
 
     def test_disassembly_with_invalid_words_keeps_listing(self):
         result, out = self.disassemble("import sys\n"
-                                       "if sys.stdin.read().startswith('0x00 0x40'):  # the packed-literal check\n"
-                                       "    print('\\tv_pk_mul_f16 v0, v1, 0xfbff3c00')\n"
-                                       "    sys.exit(0)\n"
                                        "print('\\ts_endpgm')\n"
                                        "sys.stderr.write('warning: invalid instruction encoding\\n')\n")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

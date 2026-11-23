@@ -9,6 +9,7 @@ shader was reported "clean" (and make_game.py translated nothing). The probe now
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -18,6 +19,8 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "shader_disasm.py")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fake_llvm_mc  # noqa: E402
 
 # Two instructions: s_nop 0 then s_endpgm. The probe sends only the s_endpgm, so a fake tool can tell the
 # one-instruction probe from the real shader by the input it receives.
@@ -26,19 +29,8 @@ PROBE = "0x00 0x00 0x81 0xbf"
 ASM = "\ts_nop 0 ; encoding: [0x00,0x00,0x80,0xbf]\n\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]\n"
 
 
-# v_pk_mul_f16 v0, v1, 0xfbff3c00 then s_endpgm: packed math with a 32-bit literal, as the FidelityFX programs use.
-PACKED_LITERAL_CODE = bytes.fromhex("004010cc01ff011a003cfffb") + b"\x00\x00\x81\xbf"
-
-# What LLVM 21.1.8 does with it (measured): an invalid word, then the literal read as an exp.
-LLVM21 = ("import sys\n"
-          "if '--version' in sys.argv:\n"
-          "    print('Ubuntu LLVM version 21.1.8')\n"
-          "    sys.exit(0)\n"
-          "if sys.stdin.read().strip() == %r:\n"
-          "    print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n"
-          "else:\n"
-          "    sys.stderr.write('<stdin>:1:1: warning: invalid instruction encoding\\n')\n"
-          "    print('\\texp mrt0 off, off, off, off done compr vm')\n" % PROBE)
+# The decoding check's three instructions, then s_endpgm: the encodings the FidelityFX FSPX programs use.
+DECODER_CHECK_CODE = bytes.fromhex("004010cc01ff011a003cfffb" "000008d501050202" "000003d7f0040202" "000081bf")
 
 
 def fssm(code: bytes = CODE) -> bytes:
@@ -82,10 +74,11 @@ class DisasmFailureTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, self.fssm, "--out", out, "--jobs", "1"],
                               capture_output=True, text=True, env=env)
 
-    def fake(self, body: str) -> str:
+    def fake(self, body: str, decoder: str = fake_llvm_mc.GOOD) -> str:
+        """A fake llvm-mc running `body`, after `decoder` (a fake_llvm_mc preamble) has answered the decoding check."""
         path = os.path.join(self.dir, "fake_mc.py")
         with open(path, "w", encoding="utf-8") as f:
-            f.write(body)
+            f.write(decoder + body)
         return f'"{sys.executable}" "{path}"'  # a command line, not just a path: LLVM_MC must accept both
 
     def test_missing_tool(self):
@@ -161,31 +154,58 @@ class DisasmFailureTest(unittest.TestCase):
         self.assertIn("0 invalid words", body)
 
 
-class PackedLiteralTest(DisasmFailureTest):
-    """LLVM 21 loses packed-math instructions with a literal (SHADER-804): refuse it, name the version."""
+def llvm_version(command: str):
+    """(major, minor, patch) from `llvm-mc --version`."""
+    cmd = [command] if os.path.exists(command) else shlex.split(command)
+    out = subprocess.run(cmd + ["--version"], capture_output=True, text=True).stdout
+    return tuple(int(x) for x in re.search(r"LLVM version (\d+)\.(\d+)\.(\d+)", out).groups())
 
-    def test_llvm_21_is_refused_with_its_version_and_the_fix(self):
+
+class DecoderCheckTest(DisasmFailureTest):
+    """LLVM before 23.1.0 misreads the FSPX programs' encodings (SHADER-804): refuse it, naming version and family."""
+
+    def refused(self, decoder: str) -> str:
         out = os.path.join(self.dir, "out")
-        p = self.run_tool(self.fake(LLVM21), out)
+        p = self.run_tool(self.fake("print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n", decoder), out)
         self.assertEqual(p.returncode, 1, p.stdout)
-        self.assertIn("LLVM 21.1.8", p.stderr)
-        self.assertIn("LLVM 22 or newer", p.stderr)
+        self.assertIn("LLVM 23.1.0 or newer", p.stderr)
         self.assertEqual(sorted(os.listdir(out)), [])
+        return p.stderr
 
-    def test_the_packed_literal_is_decoded_by_the_llvm_mc_on_this_machine(self):
+    def test_llvm_21_is_refused_with_its_version_and_the_first_family(self):
+        err = self.refused(fake_llvm_mc.preamble("21.1.8", fake_llvm_mc.LLVM_21_1_8, fake_llvm_mc.LLVM_21_1_8_WARNINGS))
+        self.assertIn("LLVM 21.1.8", err)
+        self.assertIn("packed math (VOP3P) with a 32-bit literal", err)
+        self.assertIn("came out as exp mrt0", err)
+
+    def test_llvm_22_1_2_is_refused_naming_each_family_it_misprints(self):
+        err = self.refused(fake_llvm_mc.preamble("22.1.2", fake_llvm_mc.LLVM_22_1_2))
+        self.assertIn("LLVM 22.1.2", err)
+        self.assertIn("came out as v_pk_mul_f16 v0, v1, 0xfbff3c00 [00 40 10 cc 01 ff 01 18 00 3c ff fb]", err)
+        self.assertIn("VOP3 with an unused source field set to inline 0", err)
+        self.assertIn("a float inline constant in a 16-bit integer operand: v_add_nc_u16 v0, 0.5, v2 came out as "
+                      "v_add_nc_u16 v0, 0x3800, v2", err)
+
+    def test_the_llvm_mc_on_this_machine_is_used_from_23_1_0_and_refused_before(self):
         mc = real_llvm_mc()
         if mc is None:
             self.skipTest("no llvm-mc with the AMDGPU target")
         with open(self.fssm, "wb") as f:
-            f.write(fssm(PACKED_LITERAL_CODE))
+            f.write(fssm(DECODER_CHECK_CODE))
         out = os.path.join(self.dir, "out")
         p = self.run_tool(mc, out)
+        if llvm_version(mc) < (23, 1, 0):
+            self.assertEqual(p.returncode, 1, p.stdout)
+            self.assertIn("LLVM 23.1.0 or newer", p.stderr)
+            self.assertFalse(os.path.exists(os.path.join(out, "one.s")))
+            return
         self.assertEqual(p.returncode, 0, p.stderr)
         with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
             listing = f.read()
-        self.assertIn("v_pk_mul_f16 v0, v1, 0xfbff3c00", listing)
         self.assertIn("0 invalid words", listing)
-        self.assertNotIn("\texp", listing)
+        for insn in ("v_pk_mul_f16 v0, v1, 0xfbff3c00", "v_mul_f32_e64 v0, v1, v2", "v_add_nc_u16 v0, 0.5, v2"):
+            self.assertIn(insn, listing)
+        self.assertIn("encoding: [0x00,0x00,0x03,0xd7,0xf0,0x04,0x02,0x02]", listing)   # 8 bytes, no literal
 
 
 class DisasmInputTest(unittest.TestCase):
@@ -198,7 +218,8 @@ class DisasmInputTest(unittest.TestCase):
         os.makedirs(self.src)
         mc = os.path.join(self.dir, "fake_mc.py")
         with open(mc, "w", encoding="utf-8") as f:
-            f.write("import sys\n"
+            f.write(fake_llvm_mc.GOOD +
+                    "import sys\n"
                     "probe = sys.stdin.read().strip() == %r\n"
                     "print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]' if probe else %r)\n" % (PROBE, ASM))
         self.mc = f'"{sys.executable}" "{mc}"'

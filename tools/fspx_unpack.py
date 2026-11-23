@@ -188,7 +188,7 @@ def main(argv=None) -> int:
         except OSError as error:
             print(f"cannot create output directory {disasm_dir}: {error}", file=sys.stderr)
             return 2
-        disasm.require_packed_literals(a.mcpu)   # LLVM 21 loses packed-math literals (see there)
+        disasm.require_exact_decoding(a.mcpu)   # LLVM before 23.1.0 misreads FSPX code (see there)
     index, bad = [], 0
     used_names = set()
     for path in a.files:

@@ -13,14 +13,17 @@ This page collects the setup steps and the problems testers have run into so far
 ## What you need
 
 - **Python 3.11+.** `scripts/run_gpu_tests.py` needs at least 3.10.
-- **`llvm-mc` with the AMDGPU target** (LLVM 22+). The official LLVM Windows release has no AMDGPU target. On
+- **`llvm-mc` with the AMDGPU target** (LLVM 23+). The official LLVM Windows release has no AMDGPU target. On
   Windows, use one of:
   - `scripts\build_llvm_mc.ps1`, which builds a native `llvm-mc.exe` (needs git and the Visual Studio C++ tools);
   - conda-forge's `llvm-tools` package, whose Windows build includes the AMDGPU target;
-  - `llvm-22` in WSL, with `LLVM_MC` set to the whole command:
-    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc"`.
+  - `llvm-23` in WSL, with `LLVM_MC` set to the whole command:
+    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc"`.
 
-  On Linux and macOS, the distribution's or Homebrew's `llvm-mc` on `PATH` is enough, if it is 22 or newer. LLVM 21 cannot decode a packed-math instruction with a literal (`v_pk_*` with `0xFBFF3C00` shows up as `exp`), so the tools refuse it.
+  On Linux and macOS, the distribution's or Homebrew's `llvm-mc` on `PATH` is enough, if it is 23.1.0 or newer. Older
+  ones misread code the FidelityFX FSPX programs contain (LLVM 21 and 22.1.0 lose it, 22.1.1 to 22.1.8 print a different
+  encoding), so the disassembly tools refuse them, naming the instruction family
+  ([docs/design.md](design.md#disassembling-shaders)).
 
   An older `llvm-mc` is not enough for everything. Ubuntu 24.04's `llvm-18` (18.1.3) runs `run_gpu_tests.py`,
   `valu_fuzz.py --family mem` and `lds_fuzz.py`, but rejects `op_sel` on the 16-bit integer VOP3 forms that

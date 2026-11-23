@@ -21,13 +21,13 @@ Leonida مشروع لإعادة ترجمة إصدار Xbox Series من Grand The
 - Git و[Python 3.12 أو أحدث](https://www.python.org/downloads/) و[حزمة .NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
   عند تثبيت Python على Windows، اختر إضافة `python.exe` إلى `PATH`.
 - [حزمة Vulkan SDK](https://vulkan.lunarg.com/) لتوفير `spirv-as` و`spirv-val` و`vulkaninfo`.
-- [LLVM 22 أو أحدث](https://github.com/llvm/llvm-project/releases) مع دعم AMDGPU في `llvm-mc`.
+- [LLVM 23 أو أحدث](https://github.com/llvm/llvm-project/releases) مع دعم AMDGPU في `llvm-mc`.
   نسخة LLVM الرسمية لـWindows لا تتضمن هذا الدعم. من جذر المستودع، شغّل `scripts/build_llvm_mc.ps1` من PowerShell لبناء `llvm-mc.exe`.
   يتطلب السكربت Git وأدوات C++ في Visual Studio ويضبط `LLVM_MC`. افتح نافذة PowerShell جديدة بعد انتهائه.
-  إذا ثبّتَّ `llvm-22` على Ubuntu داخل WSL، اضبط `LLVM_MC` في نافذة PowerShell التي ستشغّل منها البناء.
+  إذا ثبّتَّ `llvm-23` على Ubuntu داخل WSL، اضبط `LLVM_MC` في نافذة PowerShell التي ستشغّل منها البناء.
 
   ```powershell
-  $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc'
+  $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc'
   ```
 
 - Visual Studio 2022 مع حزمة **Desktop development with C++** وWindows SDK بالإصدار `10.0.26100` أو أحدث لبناء مكوّن التشغيل.

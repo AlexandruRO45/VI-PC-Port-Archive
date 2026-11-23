@@ -29,16 +29,16 @@ Projekt jest na wczesnym etapie: **gra jeszcze się nie uruchamia**.
 - [Python 3.12+](https://www.python.org/downloads/) (zaznacz *„Add python.exe to PATH”*).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` i `vulkaninfo`).
-- [LLVM 22+](https://github.com/llvm/llvm-project/releases) z **targetem AMDGPU** (`llvm-mc`):
+- [LLVM 23+](https://github.com/llvm/llvm-project/releases) z **targetem AMDGPU** (`llvm-mc`):
   - Oficjalna wersja LLVM dla Windowsa **nie** zawiera targetu AMDGPU.
   - Aby zbudować natywny `llvm-mc.exe` z AMDGPU, uruchom `.\scripts\build_llvm_mc.ps1` w PowerShellu w głównym
     folderze repozytorium. Skrypt wymaga `git` i narzędzi C++ z Visual Studio, ustawia zmienną `LLVM_MC` dla
     Twojego użytkownika i prosi o otwarcie nowego terminala, żeby zmienna była widoczna.
-  - Jeśli używasz WSL, zainstaluj `llvm-22` w Ubuntu i ustaw zmienną w tej samej sesji PowerShella, w której
+  - Jeśli używasz WSL, zainstaluj `llvm-23` w Ubuntu i ustaw zmienną w tej samej sesji PowerShella, w której
     uruchamiasz `make_game.py`:
 
     ```powershell
-    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc'
+    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc'
     ```
 
     Więcej szczegółów w [`docs/design.md`](../../design.md#disassembling-shaders).
@@ -83,7 +83,7 @@ Etapy wykonują się w tej kolejności: `check` → `shaders` → `assets` → `
 ## Częste problemy
 
 - **Pobrałeś repozytorium przyciskiem „Download ZIP” na GitHubie**: archiwum ZIP nie zawiera submodułu `third_party/rpf9-explorer`. Użyj `git clone --recursive` albo uruchom `git submodule update --init --recursive` w folderze repozytorium.
-- **`llvm-mc` odrzuca `gfx1013` / AMDGPU**: najpewniej masz oficjalny instalator LLVM dla Windowsa. Użyj `scripts\build_llvm_mc.ps1` albo ustaw `LLVM_MC` na `llvm-mc` z WSL (`llvm-22`).
+- **`llvm-mc` odrzuca `gfx1013` / AMDGPU**: najpewniej masz oficjalny instalator LLVM dla Windowsa. Użyj `scripts\build_llvm_mc.ps1` albo ustaw `LLVM_MC` na `llvm-mc` z WSL (`llvm-23`).
 - **Błąd `D3D12_ROOT_SIGNATURE_DESC2` przy budowaniu runtime**: zaktualizuj Windows SDK do `10.0.26100` lub nowszego przez Visual Studio Installer albo `winget install Microsoft.WindowsSDK.10.0.26100`, usuń folder builda i skonfiguruj go ponownie.
 - **Brak miejsca na dysku `C:`**: podaj `--work "D:\leonida-work"`, aby przenieść pliki robocze na inną partycję.
 

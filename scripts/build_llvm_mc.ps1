@@ -11,7 +11,7 @@
 # in WindowsApps) doesn't see folders that other programs create under %LOCALAPPDATA% or %APPDATA%, so an llvm-mc.exe
 # there looks missing to make_game.py and the tools, although LLVM_MC names it.
 param(
-    [string]$Version = "22.1.8",
+    [string]$Version = "23.1.6",
     [string]$Dest = (Join-Path $env:USERPROFILE ".leonida\llvm-mc"),
     [string]$Temp = (Join-Path $env:TEMP "leonida-llvm-mc"),
     [switch]$NoEnv,   # don't set LLVM_MC for the current user

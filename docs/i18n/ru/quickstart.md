@@ -30,16 +30,16 @@ Windows. Процессор консоли x86-64, как у ПК, поэтом�
 - [Python 3.12+](https://www.python.org/downloads/) (при установке отметьте *«Add python.exe to PATH»*).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/) для `spirv-as` и `spirv-val`.
-- [LLVM 22+](https://github.com/llvm/llvm-project/releases) с **целью AMDGPU** для `llvm-mc`:
+- [LLVM 23+](https://github.com/llvm/llvm-project/releases) с **целью AMDGPU** для `llvm-mc`:
   - в официальной сборке LLVM для Windows цели AMDGPU нет;
   - на Windows `scripts\build_llvm_mc.ps1` собирает свой `llvm-mc.exe` с этой целью (без WSL, нужны `git` и
     инструменты C++ из Visual Studio ниже) и прописывает `LLVM_MC`; после этого откройте новый терминал, чтобы
     переменная подхватилась;
-  - если ставите `llvm-22` в WSL, передайте `LLVM_MC` целой командой в той же сессии PowerShell, откуда
+  - если ставите `llvm-23` в WSL, передайте `LLVM_MC` целой командой в той же сессии PowerShell, откуда
     запускаете `make_game.py`:
 
     ```powershell
-    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc'
+    $env:LLVM_MC = 'wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc'
     ```
 
     Подробности в [`docs/design.md`](../../design.md#disassembling-shaders);
@@ -132,7 +132,7 @@ Windows этот же флаг пропускает сборку.
 - **Скачали ZIP с GitHub**: в архиве нет подмодуля `third_party/rpf9-explorer`. Используйте
   `git clone --recursive` или выполните `git submodule update --init --recursive` в папке репозитория.
 - **`llvm-mc` не знает `gfx1013` или цель AMDGPU**: скорее всего установлен официальный LLVM для Windows.
-  Соберите свой через `scripts\build_llvm_mc.ps1` или укажите в `LLVM_MC` путь к `llvm-mc` из WSL (`llvm-22`).
+  Соберите свой через `scripts\build_llvm_mc.ps1` или укажите в `LLVM_MC` путь к `llvm-mc` из WSL (`llvm-23`).
 - **CMake пишет «needs the Windows SDK 10.0.26100 or newer»** или MSVC не находит `Desc_1_2` в
   `D3D12_VERSIONED_ROOT_SIGNATURE_DESC`: поставьте Windows SDK `10.0.26100` или новее через Visual Studio
   Installer либо `winget install Microsoft.WindowsSDK.10.0.26100`, удалите `runtime/build` и настройте заново.

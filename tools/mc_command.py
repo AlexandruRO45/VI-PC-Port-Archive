@@ -4,7 +4,7 @@ LLVM_MC may be one executable (a path, spaces and all, with or without its .exe)
 needs the command-line form when llvm-mc runs inside WSL, because the official Windows LLVM build has no AMDGPU
 target:
 
-    set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc
+    set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc
 
 On Windows, arguments follow the MSVC C runtime's quoting rules. Double a trailing backslash in a quoted
 argument before the closing quote.
@@ -77,7 +77,7 @@ def split_command(raw: str) -> list[str]:
 
 
 def mc_command(raw: str | None = None) -> list:
-    """LLVM_MC is a path, or a command line: 'wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc'."""
+    """LLVM_MC is a path, or a command line: 'wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc'."""
     if raw is None:
         raw = os.environ.get("LLVM_MC", "llvm-mc")
     return split_command(raw) or ["llvm-mc"]
@@ -89,7 +89,7 @@ def not_found(exe: str, error: OSError, flag: str | None = None) -> str:
     where = f"set LLVM_MC (or pass {flag})" if flag else "set LLVM_MC"
     return (f"'{exe}' could not be started: {error}. Put llvm-mc on PATH or {where} to it\n"
             f"(on Windows, scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
-            f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc")
+            f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc")
 
 
 def run(cmd: list, flag: str | None = None, **kwargs) -> subprocess.CompletedProcess:

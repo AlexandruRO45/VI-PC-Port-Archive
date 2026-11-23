@@ -9,7 +9,7 @@ Usage:
     python -I shader_disasm.py <fssm dir or file> [--unpack-index FILE] [--out DIR] [--mcpu gfx1013] [--limit N] [--skip-existing]
 Writes <out>/<name>.s and prints a summary (decoded cleanly / with invalid words / failed).
 Set LLVM_MC to llvm-mc's path, or to a whole command such as
-'wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc' when the tool is not on PATH.
+'wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc' when the tool is not on PATH.
 """
 import argparse
 import functools
@@ -29,10 +29,21 @@ import rdna2_decode  # noqa: E402
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
-# v_pk_mul_f16 v0, v1, 0xfbff3c00: a packed-math (VOP3P) instruction with a 32-bit literal, as the FidelityFX FSPX
-# programs use. LLVM 21 reads it as an invalid word and the literal as an exp; LLVM 22 and later decode it.
-PROBE_PACKED_LITERAL = "0x00 0x40 0x10 0xcc 0x01 0xff 0x01 0x1a 0x00 0x3c 0xff 0xfb"
-MIN_LLVM = 22
+# Instructions that LLVM before 23.1.0 decodes wrongly, in the encoding the FidelityFX FSPX programs use (and LLVM
+# 23's assembler writes): an unused VALU source field holds 0x80, inline 0, not 0. Each must come back as one
+# instruction whose printed encoding is its input, or rdna2spirv.py's printed-encoding check refuses the listing
+# (SHADER-804; docs/design.md, 'Disassembling shaders').
+# (family, instruction, input bytes, first LLVM release that decodes it exactly, llvm-project commit)
+DECODER_CHECKS = (
+    ("packed math (VOP3P) with a 32-bit literal and an unused source field set to inline 0",
+     "v_pk_mul_f16 v0, v1, 0xfbff3c00", "004010cc01ff011a003cfffb", "23.1.0", "ef0680ba54f7"),
+    ("VOP3 with an unused source field set to inline 0",
+     "v_mul_f32_e64 v0, v1, v2", "000008d501050202", "23.1.0", "ef0680ba54f7"),
+    ("a float inline constant in a 16-bit integer operand",
+     "v_add_nc_u16 v0, 0.5, v2", "000003d7f0040202", "23.1.0", "d7ee01c0fa31"),
+)
+MIN_LLVM = "23.1.0"
+ENCODED = re.compile(r"^\s*(\S.*?)\s*;\s*encoding:\s*\[([^\]]*)\]", re.M)
 FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
 
 
@@ -56,7 +67,7 @@ def positive_int(text: str) -> int:
 
 
 def llvm_version(command: list) -> str:
-    """'21.1.8' from `llvm-mc --version`, or 'unknown'. Only asked once the packed-literal check has failed."""
+    """'22.1.8' from `llvm-mc --version`, or 'unknown'. Only asked once the decoding check has failed."""
     try:
         p = subprocess.run(command + ["--version"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
                            timeout=30)
@@ -66,27 +77,52 @@ def llvm_version(command: list) -> str:
     return m.group(1) if m else "unknown"
 
 
-@functools.cache
-def require_packed_literals(mcpu: str) -> None:
-    """Stop now, naming the llvm-mc version, if this llvm-mc cannot decode a packed-math instruction with a literal.
+def decoder_faults(stdout: str, stderr: str) -> list:
+    """(family, instruction, what was printed, fixed in, commit) for each DECODER_CHECKS entry this output misreads.
 
-    LLVM 21 prints such an instruction (v_pk_mul_f16, v_pk_add_f16, v_pk_max_f16, ... with a 32-bit constant) as an
-    invalid word and decodes its second word and the literal as unrelated instructions: a literal whose top byte is
-    0xF8..0xFB, such as the f16 pair 0xfbff3c00, becomes an `exp`. The translator cannot recover the lost
-    instruction, so the listing has to come from LLVM 22 or later. Checked once per process. A llvm-mc that fails
-    for another reason is left to the callers, which report it with the shader."""
+    The checks are decoded in one run, so an entry printed with a different length leaves the rest misaligned: the
+    entries after it are not judged."""
+    got = [(m.group(1), bytes(int(x, 16) for x in m.group(2).split(",") if x.strip()))
+           for m in ENCODED.finditer(stdout)]
+    faults = []
+    for i, (family, insn, want, fixed, commit) in enumerate(DECODER_CHECKS):
+        text, enc = got[i] if i < len(got) else ("nothing", b"")
+        if enc != bytes.fromhex(want):
+            faults.append((family, insn, f"{text} [{enc.hex(' ')}]" if enc else text, fixed, commit))
+            if len(enc) != len(want) // 2:
+                break
+    if not faults and ("invalid instruction" in stderr or len(got) != len(DECODER_CHECKS)):
+        family, insn, _, fixed, commit = DECODER_CHECKS[0]
+        faults.append((family, insn, (stderr.strip().splitlines() or ["extra output"])[0], fixed, commit))
+    return faults
+
+
+@functools.cache
+def require_exact_decoding(mcpu: str) -> None:
+    """Stop now, naming the llvm-mc version and the instruction families, unless this llvm-mc decodes DECODER_CHECKS.
+
+    LLVM 21 and 22.1.0 read an instruction whose unused source field is 0x80 as an invalid word and decode the words
+    after it as other instructions (the literal 0xfbff3c00 becomes an `exp`). 22.1.1 to 22.1.8 decode it but print
+    the unused field as 0, and print a 16-bit integer operand's float inline constant (0.5) as a 32-bit literal (a
+    12-byte encoding for 8 bytes of code). Either way the translator refuses the program or reads it at the wrong
+    offsets, so the listing has to come from LLVM 23.1.0 or later. Checked once per process. A llvm-mc that cannot
+    be started is left to the callers, which report it with the shader."""
+    text = " ".join(f"0x{b:02x}" for check in DECODER_CHECKS for b in bytes.fromhex(check[2]))
     try:
-        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}"],
-                           input=PROBE_PACKED_LITERAL, capture_output=True, text=True,
+        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
+                           input=text, capture_output=True, text=True,
                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError:
         return
-    if "invalid instruction" in p.stderr or re.search(r"^\s*exp\b", p.stdout, re.M):
-        fail(f"'{' '.join(MC)}' is LLVM {llvm_version(MC)}: it cannot decode a packed-math (VOP3P) instruction with a "
-             f"32-bit literal (v_pk_mul_f16 v0, v1, 0xfbff3c00), and its listing would lose such instructions and "
-             f"show their literals as other instructions (an exp, for the FidelityFX FSPX programs).\n"
+    faults = decoder_faults(p.stdout, p.stderr)
+    if faults:
+        lines = "\n".join(f"  - {family}: {insn} came out as {got} (decoded exactly from LLVM {fixed}, "
+                          f"llvm-project {commit})" for family, insn, got, fixed, commit in faults)
+        fail(f"'{' '.join(MC)}' is LLVM {llvm_version(MC)}, whose AMDGPU disassembler misreads:\n{lines}\n"
+             f"Listings from it lose or shift such instructions, and the translator refuses the programs that use "
+             f"them (the FidelityFX FSPX programs do).\n"
              f"Use LLVM {MIN_LLVM} or newer with the AMDGPU target and point LLVM_MC at its llvm-mc, e.g.\n"
-             f"  LLVM_MC=/usr/lib/llvm-{MIN_LLVM}/bin/llvm-mc   (docs/design.md, 'Disassembling shaders')")
+             f"  LLVM_MC=/usr/lib/llvm-23/bin/llvm-mc   (docs/design.md, 'Disassembling shaders')")
 
 
 def probe(mcpu: str) -> None:
@@ -98,15 +134,15 @@ def probe(mcpu: str) -> None:
     except OSError as e:
         fail(f"'{MC[0]}' could not be started: {e}. Put llvm-mc on PATH or set LLVM_MC to it (on Windows,\n"
              f"scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
-             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc")
+             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc")
     if p.returncode != 0 or "s_endpgm" not in p.stdout:
         why = (p.stderr.strip().splitlines() or [f"exit code {p.returncode}"])[0]
         fail(f"'{' '.join(MC)}' did not disassemble an s_endpgm: {why}\n"
-             f"The disassembler needs LLVM 22+ with the AMDGPU target. The official Windows LLVM build has no\n"
-             f"AMDGPU target: build a native one with scripts\\build_llvm_mc.ps1, or run it from WSL\n"
+             f"The disassembler needs LLVM {MIN_LLVM}+ with the AMDGPU target. The official Windows LLVM build has\n"
+             f"no AMDGPU target: build a native one with scripts\\build_llvm_mc.ps1, or run it from WSL\n"
              f"(docs/design.md, 'Disassembling shaders'), e.g.\n"
-             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc")
-    require_packed_literals(mcpu)
+             f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc")
+    require_exact_decoding(mcpu)
 
 
 def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):

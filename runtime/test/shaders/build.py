@@ -2,7 +2,7 @@
 
     python3 -I runtime/test/shaders/build.py <out dir> [name ...]
 
-Each .asm is RDNA2 assembly. It is assembled with llvm-mc (LLVM 22+ with the AMDGPU target; set LLVM_MC to its
+Each .asm is RDNA2 assembly. It is assembled with llvm-mc (LLVM 23+ with the AMDGPU target; set LLVM_MC to its
 path or to a whole command, as for the shaders stage). Listings, synthetic FSSM headers and DXBC containers are
 staged in a temporary directory. After validation, the build writes <out>/spirv/<name>.spv and the translator
 metadata.
