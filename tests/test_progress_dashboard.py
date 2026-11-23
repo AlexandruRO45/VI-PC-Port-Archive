@@ -164,6 +164,25 @@ class Github(unittest.TestCase):
         self.assertEqual(pd.item_ids("hash with SHA-256, write UTF-8, read OPTIONS2-1 and D3D12-3"), [])
         self.assertEqual(pd.item_ids(None), [])
 
+    def test_d3d_items_count_done_items_that_left_the_table(self):
+        table = {"D3D-3": ("partial", "pull request open"), "D3D-461": ("unknown", "claimed, no code yet")}
+        merged = [{"title": "D3D-86: answer D3D12_OPTIONS1"}, {"title": "heaps (D3D-16)"},
+                  {"title": "compute path (D3D-3)"}, {"title": "follow-up for D3D-20"}, {"title": "SHADER-4 only"}]
+        open_prs = [{"title": "D3D-20: the rest"}, {"title": "D3D-500 new"}]
+        items = pd.d3d_items(table, merged, open_prs)
+        self.assertEqual(set(items), {"D3D-3", "D3D-461", "D3D-86", "D3D-16", "D3D-20", "D3D-500"})
+        self.assertEqual(items["D3D-86"][0], "implemented")        # merged, gone from the table
+        self.assertEqual(items["D3D-16"][0], "implemented")
+        self.assertEqual(items["D3D-20"][0], "partial")            # a PR naming it is still open
+        self.assertEqual(items["D3D-500"][0], "partial")
+        self.assertEqual(items["D3D-3"][0], "partial")             # a table row keeps the table's state
+        self.assertEqual(items["D3D-461"][0], "unknown")
+        self.assertEqual(sum(s == "implemented" for s, _ in items.values()), 2)
+
+    def test_d3d_items_without_the_pull_request_lists(self):
+        table = {"D3D-3": ("implemented", "merged on main")}
+        self.assertEqual(pd.d3d_items(table, None, None), table)
+
     def test_merged_pull_requests_are_implemented(self):
         merged = [{"number": 10, "title": "D3D-1: a", "mergedAt": "2026-11-22T10:00:00Z", "author": {"login": "x"}},
                   {"number": 12, "title": "docs: b", "mergedAt": "2026-11-22T12:00:00Z", "author": {"login": "y"}}]
