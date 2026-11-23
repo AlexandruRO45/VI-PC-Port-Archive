@@ -14,6 +14,8 @@
 //   1.0 or 0.0 the reference 0.5 gives against the texel each pixel reads.
 //   vk_texture_test dref_a16 [out.raw]: the same with ps_sample_c_lz_a16 (16-bit coordinates).
 //   vk_texture_test dref_c / dref_c_b [out.raw]: the same with ps_sample_c (implicit LOD) / ps_sample_c_b (LOD bias).
+//   vk_texture_test dref_c_cl / dref_c_b_cl [out.raw]: the same with ps_sample_c_cl / ps_sample_c_b_cl on a two-mip
+//   D32 texture (128x128 level 0 of depth 0.25, 64x64 level 1 of depth 0.75): the min-LOD clamp picks the level.
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 //   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
 //   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
@@ -67,9 +69,12 @@ int main(int argc, char** argv) {
     const uint32_t W = 64, H = 64, TW = 8;
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
     const bool two_mip = signed_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
+    // The min-LOD clamp of a depth compare needs two mips as well: level 0 fails the 0.5 reference, level 1 passes.
+    const bool clamp_mips = argc >= 2 && (!std::strcmp(argv[1], "dref_c_cl") || !std::strcmp(argv[1], "dref_c_b_cl"));
+    const bool mip_texture = two_mip || clamp_mips;
     // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
-    const uint32_t texture_side = two_mip ? 2 * W : TW;
-    const uint32_t levels = two_mip ? 2 : 1;
+    const uint32_t texture_side = mip_texture ? 2 * W : TW;
+    const uint32_t levels = mip_texture ? 2 : 1;
     std::string vs_path, fs_path, out_path;
     int ptr_sgpr = 0;
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
@@ -80,6 +85,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[1], "dref_a16")) dref_ps = "ps_sample_c_lz_a16.spv";
         else if (!std::strcmp(argv[1], "dref_c")) dref_ps = "ps_sample_c.spv";
         else if (!std::strcmp(argv[1], "dref_c_b")) dref_ps = "ps_sample_c_b.spv";
+        else if (!std::strcmp(argv[1], "dref_c_cl")) dref_ps = "ps_sample_c_cl.spv";
+        else if (!std::strcmp(argv[1], "dref_c_b_cl")) dref_ps = "ps_sample_c_b_cl.spv";
     }
     const bool dref = dref_ps != nullptr;
     bool autonomous = false;
@@ -117,7 +124,7 @@ int main(int argc, char** argv) {
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|dref_c_cl|dref_c_b_cl] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
@@ -229,7 +236,7 @@ int main(int argc, char** argv) {
     dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
     VkDevice dev;
     VkResult created = vkCreateDevice(pd, &dci, nullptr, &dev);
-    if (two_mip && created == VK_ERROR_FEATURE_NOT_PRESENT) {
+    if (mip_texture && created == VK_ERROR_FEATURE_NOT_PRESENT) {
         std::fprintf(stderr, "unsupported: device lacks a requested texture test feature\n");
         return 77;
     }
@@ -273,7 +280,7 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(heap_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
     std::memset(heapp, 0, size_t(heap_bytes));
     std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
-    if (two_mip)  // The gather test loads its S# from the four words just after the T#.
+    if (mip_texture)  // The gather test loads its S# from the four words just after the T#.
         std::memcpy(static_cast<char*>(heapp) + tsharp_va + 32, ssharp, 16);
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;
     VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &bdai);
@@ -312,17 +319,22 @@ int main(int argc, char** argv) {
     const uint32_t magenta = 0xFFFF00FFu;
     // R8G8B8A8 in memory: red, green, blue, transparent yellow, then solid cyan in mip 1.
     const uint32_t quadrants[2][2] = {{0xFF0000FFu, 0xFF00FF00u}, {0xFFFF0000u, 0x0000FFFFu}};
-    std::vector<uint32_t> texels(texture_side * texture_side + (two_mip ? (texture_side / 2) * (texture_side / 2) : 0), 0xFFFFFF00u);
+    std::vector<uint32_t> texels(texture_side * texture_side + (mip_texture ? (texture_side / 2) * (texture_side / 2) : 0), 0xFFFFFF00u);
     for (uint32_t y = 0; y < texture_side; y++) {
         for (uint32_t x = 0; x < texture_side; x++) {
-            texels[y * texture_side + x] = two_mip ? quadrants[y >= texture_side / 2][x >= texture_side / 2]
+            texels[y * texture_side + x] = mip_texture ? quadrants[y >= texture_side / 2][x >= texture_side / 2]
                                          : (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
         }
     }
     // The signed two-mip fixture uses 0 or -128 in each channel, including the alpha channel.
     if (signed_mips)
         for (auto& texel : texels) texel &= 0x80808080u;
-    if (dref) {   // same size as the 8x8 gradient: one 32-bit word a texel
+    if (dref && mip_texture) {   // level 0 fails the 0.5 reference, level 1 passes it
+        const float near_depth = 0.25f, far_depth = 0.75f;
+        const size_t base_level = size_t(texture_side) * texture_side;
+        for (size_t i = 0; i < base_level; i++) std::memcpy(&texels[i], &near_depth, sizeof(float));
+        for (size_t i = base_level; i < texels.size(); i++) std::memcpy(&texels[i], &far_depth, sizeof(float));
+    } else if (dref) {   // same size as the 8x8 gradient: one 32-bit word a texel
         for (uint32_t y = 0; y < TW; y++)
             for (uint32_t x = 0; x < TW; x++) {
                 const float depth = (x + 0.5f) / TW;
@@ -357,7 +369,7 @@ int main(int argc, char** argv) {
     sci.maxLod = float(levels - 1);
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VkSamplerCreateInfo sci1 = sci;            // index 1: the S# the shader names
-    if (two_mip) {
+    if (mip_texture) {
         const leonida::gfx10::SamplerWords words{ssharp[0], ssharp[1], ssharp[2], ssharp[3]};
         const auto sampler = leonida::gfx10::decode(words);
         sci1.minLod = sampler.min_lod;
@@ -570,13 +582,20 @@ int main(int argc, char** argv) {
     if (autonomous && dref) {
         // Expected: pixel column px reads texel x = floor(8u) at u = (px + 0.5) / 64 (never on a texel edge), whose
         // depth (x + 0.5) / 8 passes the reference 0.5 under LESS_OR_EQUAL from x = 4 on. Both results, the f32 one
-        // and the d16 one widened back to f32, are exactly that 1.0 or 0.0.
+        // and the d16 one widened back to f32, are exactly that 1.0 or 0.0. With two mips the shader's min-LOD clamp
+        // is 0.0 left of x = 32 and 1.0 from there on, so the left half reads level 0 (0.25, fails) and the right
+        // half level 1 (0.75, passes) whatever the derivatives say.
         const float* pixels = static_cast<const float*>(rbp);
         int wrong_f32 = 0, wrong_d16 = 0;
         for (uint32_t py = 0; py < H; py++)
             for (uint32_t px = 0; px < W; px++) {
-                const uint32_t tx = std::min(TW - 1, uint32_t((px + 0.5f) / W * TW));
-                const float want = 0.5f <= (tx + 0.5f) / TW ? 1.0f : 0.0f;
+                float want;
+                if (clamp_mips) {
+                    want = px >= W / 2 ? 1.0f : 0.0f;
+                } else {
+                    const uint32_t tx = std::min(TW - 1, uint32_t((px + 0.5f) / W * TW));
+                    want = 0.5f <= (tx + 0.5f) / TW ? 1.0f : 0.0f;
+                }
                 const float* p = pixels + (py * W + px) * 4;
                 wrong_f32 += p[0] != want;
                 wrong_d16 += p[1] != want;
