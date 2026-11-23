@@ -20,7 +20,8 @@ error classes from a real run, not its trace (AGENTS.md, "No game data").
 
 Standard library only; reads files, never runs them. A truncated last line (the expected shape after a crash) is
 counted, not fatal; a file with no valid event is an error (exit 2). When one of two requested traces fails to
-parse, the report still includes the other trace.
+parse, the report still includes the other trace. D3D12 records require a line terminator; an unterminated final
+line is counted with the other ignored lines.
 """
 
 from __future__ import annotations
@@ -187,7 +188,8 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
     }
     with _open_text(path) as fh:
         for line in fh:
-            match = D3D12_LINE.match(line.rstrip("\n"))
+            # The writer always ends each record with a newline. A crash can cut a record mid-outcome.
+            match = D3D12_LINE.match(line) if line.endswith("\n") else None
             if not match:
                 if line.strip():
                     trace["ignored_lines"] += 1
