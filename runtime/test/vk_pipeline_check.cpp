@@ -472,6 +472,7 @@ struct StageStats {
     uint32_t pipes_bad = 0;
     uint32_t pipes_skipped = 0;
     uint32_t crash_skipped = 0;  // --skip-file: counted in pipes_bad, not compiled
+    uint32_t duplicates = 0;     // --duplicates-file: an earlier entry's pipeline, not compiled or counted again
     uint32_t w32_ok = 0;
     uint32_t w32_bad = 0;
     uint32_t w32_unforced = 0;
@@ -790,11 +791,11 @@ int main(int argc, char** argv) {
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
             "[--max-bytes N] [--large-module-bytes N] [--large-parallel N] [--stage all|cs|graphics | --compute-only | --graphics-only] "
             "[--stats FILE] [--cache-feedback] [--isolate [--isolate-batch N]] [--inflight-file F] "
-            "[--skip-file F] [--merge-cache F ...]\n");
+            "[--skip-file F] [--merge-cache F ...] [--duplicates-file F]\n");
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
-    std::string dir = argv[1], cache_path, stats_path, inflight_path, skip_path;
+    std::string dir = argv[1], cache_path, stats_path, inflight_path, skip_path, duplicates_path;
     bool cache_given = false;   // an empty cache_path alone can't tell "not given" from an empty argument
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
@@ -846,6 +847,7 @@ int main(int argc, char** argv) {
         else if (a == "--stats") valid = !(stats_path = value()).empty();
         else if (a == "--inflight-file") valid = !(inflight_path = value()).empty();
         else if (a == "--skip-file") valid = !(skip_path = value()).empty();
+        else if (a == "--duplicates-file") valid = !(duplicates_path = value()).empty();
         else if (a == "--merge-cache") {
             const auto path = value();
             valid = !path.empty();
@@ -908,6 +910,7 @@ int main(int argc, char** argv) {
         const char* input = nullptr;
         if (same_file(*output, index_path)) input = "index.json";
         else if (!skip_path.empty() && same_file(*output, skip_path)) input = "--skip-file";
+        else if (!duplicates_path.empty() && same_file(*output, duplicates_path)) input = "--duplicates-file";
         // The cache is written only after every --merge-cache file is read; the reports are opened while they are.
         else if (output != &cache_path) {
             for (const auto& merge : merge_paths)
@@ -929,6 +932,22 @@ int main(int argc, char** argv) {
         for (std::string line; std::getline(sf, line);) {
             while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
             if (!line.empty()) skip_names.insert(line);
+        }
+    }
+    // --duplicates-file: "name<TAB>first entry" lines for index entries whose pipeline (SPIR-V bytes and every field
+    // the pipeline is built from) equals an earlier entry's. That entry is checked and cached once, under its own name.
+    std::map<std::string, std::string> duplicate_of;
+    if (!duplicates_path.empty()) {
+        std::ifstream df(duplicates_path);
+        if (!df) {
+            std::fprintf(stderr, "error: cannot read --duplicates-file %s\n", duplicates_path.c_str());
+            return 2;
+        }
+        for (std::string line; std::getline(df, line);) {
+            while (!line.empty() && line.back() == '\r') line.pop_back();
+            const size_t tab = line.find('\t');
+            if (tab == std::string::npos || tab == 0 || tab + 1 == line.size()) continue;
+            duplicate_of[line.substr(0, tab)] = line.substr(tab + 1);
         }
     }
 
@@ -969,6 +988,7 @@ int main(int argc, char** argv) {
         if (cache_feedback) pass.push_back("--cache-feedback");
         if (!inflight_path.empty()) pass.insert(pass.end(), {"--inflight-file", inflight_path});
         if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
+        if (!duplicates_path.empty()) pass.insert(pass.end(), {"--duplicates-file", duplicates_path});
         struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, fb[3] = {}; };
         std::map<std::string, Agg> agg;
         std::vector<std::string> crashes;
@@ -1634,6 +1654,14 @@ int main(int argc, char** argv) {
                 ++done;
                 continue;
             }
+            if (duplicate_of.count(name)) {
+                {
+                    std::lock_guard<std::mutex> g(mu);
+                    stats[stage].duplicates++;
+                }
+                ++done;
+                continue;
+            }
             std::ifstream f(dir + "/" + name + ".spv", std::ios::binary | std::ios::ate);
             const std::streamoff file_size = f.tellg();
             if (max_bytes && std::cmp_greater(file_size, max_bytes)) {   // multi-MB ray-tracing shaders (#108)
@@ -2004,6 +2032,9 @@ int main(int argc, char** argv) {
             if (s.crash_skipped)
                 std::printf("  %s not retried after killing the driver (--skip-file): %u (counted as failed)\n",
                             st.c_str(), s.crash_skipped);
+            if (s.duplicates)
+                std::printf("  %s duplicates of an earlier entry's pipeline, not compiled (--duplicates-file): %u\n",
+                            st.c_str(), s.duplicates);
             if (!s.skip_reasons.empty()) {
                 for (const auto& [reason, cnt] : s.skip_reasons)
                     std::printf("  %s skipped (%s): %u\n", st.c_str(), reason.c_str(), cnt);

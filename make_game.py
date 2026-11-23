@@ -2382,7 +2382,23 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
     # exceed available memory, without starting the entire corpus again (BUILD-1030).
     names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
+    done = os.path.join(out, "pipelines.done")
+    fingerprint = pipelines_fingerprint(exe, spirv, out, len(names)) if names else ""
+    if fingerprint and read_shader_setting(done) == fingerprint and os.path.isfile(cache):
+        log("pipelines: every pipeline was already checked with these modules, this checker and this GPU driver; "
+            "skipping (delete pipelines.done to check again)")
+        return
+    drop(done)
     crashed: "list[str]" = []
+    duplicates = os.path.join(out, "pipeline_duplicates.txt")
+    drop(duplicates)
+    if names and checker_supports(exe, "--duplicates-file"):
+        log("pipelines: looking for index entries that build the same pipeline")
+        repeated = write_pipeline_duplicates(spirv, names, duplicates)
+        if repeated:
+            base += ["--duplicates-file", duplicates]
+            log(f"pipelines: {repeated} of {len(names)} index entries build the same pipeline as an earlier one; "
+                "each pipeline is checked once")
     ranges = [(s, min(PIPELINE_BATCH_SIZE, len(names) - s))
               for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names else [(0, None)]
     # With several batches, each range keeps its own cache part, seeded from the same part on the next run, and the
@@ -2491,6 +2507,9 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             if crashed else ""
         checked = f"vk_pipeline_check exited with {exit_label(code)}{why}" if code else ""
         fail("; ".join(m for m in (merge_error, checked) if m))
+    if fingerprint:
+        with open(done, "w", encoding="utf-8", newline="\n") as f:
+            f.write(fingerprint + "\n")
     log("pipelines: done")
 
 
@@ -2564,6 +2583,67 @@ def pipeline_names(spirv: str) -> "list[str]":
     if not isinstance(index, dict):
         fail(f"pipelines: {path} must contain a JSON object")
     return sorted(index, key=lambda n: n.encode("utf-8"))
+
+
+def pipelines_fingerprint(exe: str, spirv: str, out: str, entries: int) -> str:
+    """What a complete pipelines run depends on: the translated modules (index.json, each module's size and time),
+    the checker build, and the device's pipeline-cache identity (vendor, device and the driver's cache UUID, which a
+    driver update changes). "" when the device cannot be asked."""
+    probe = os.path.join(out, "pipeline_probe.bin")
+    drop(probe)
+    try:
+        # A range past the index checks nothing; the checker still creates the device and saves the cache header.
+        subprocess.run([exe, spirv, probe, "--jobs", "1", "--start", str(entries), "--count", "1"],
+                       capture_output=True, timeout=300)
+        with open(probe, "rb") as f:
+            header = f.read(32)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    finally:
+        drop(probe)
+    if len(header) < 32:
+        return ""
+    h = hashlib.sha256()
+    h.update(b"device\0" + header[8:32])
+    st = os.stat(exe)
+    h.update(f"checker\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+    with open(os.path.join(spirv, "index.json"), "rb") as f:
+        h.update(f.read())
+    with os.scandir(spirv) as it:
+        for entry in sorted((e for e in it if e.name.endswith(".spv")), key=lambda e: e.name):
+            info = entry.stat()
+            h.update(f"{entry.name}\0{info.st_size}\0{info.st_mtime_ns}\n".encode("utf-8"))
+    return h.hexdigest()
+
+
+PIPELINE_PROVENANCE_FIELDS = ("src_sha256", "fssm_sha256")   # where a module came from, not how it is built
+
+
+def write_pipeline_duplicates(spirv: str, names: "list[str]", path: str) -> int:
+    """Write "name<TAB>first entry" for each index entry whose pipeline equals an earlier entry's in `names` order:
+    the same SPIR-V bytes and the same index fields apart from PIPELINE_PROVENANCE_FIELDS. Returns how many."""
+    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    first: "dict[tuple[str, str], str]" = {}
+    lines = []
+    for name in names:
+        entry = index.get(name)
+        if not isinstance(entry, dict):
+            continue
+        try:
+            with open(os.path.join(spirv, name + ".spv"), "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            continue   # the checker reports a missing module itself
+        fields = json.dumps({k: v for k, v in entry.items() if k not in PIPELINE_PROVENANCE_FIELDS}, sort_keys=True)
+        key = (digest, fields)
+        if key in first:
+            lines.append(f"{name}\t{first[key]}\n")
+        else:
+            first[key] = name
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("".join(lines))
+    return len(lines)
 
 
 def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None) -> bool:

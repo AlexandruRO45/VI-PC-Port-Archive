@@ -37,7 +37,10 @@ count = int(option("--count", len(names)))
 selected = names[start:start + count]
 skip_path = option("--skip-file")
 skipped = Path(skip_path).read_text(encoding="utf-8").splitlines() if skip_path else []
-active = [name for name in selected if name not in skipped]
+dup_path = option("--duplicates-file")
+duplicates = {line.split("\t")[0] for line in Path(dup_path).read_text(encoding="utf-8").splitlines()} \
+    if dup_path else set()
+active = [name for name in selected if name not in skipped and name not in duplicates]
 inflight = option("--inflight-file")
 def record(event):
     with (spirv / "calls.jsonl").open("a", encoding="utf-8", newline="\n") as f:
@@ -103,7 +106,7 @@ class PipelineBatchesTest(unittest.TestCase):
         (self.spirv / "index.json").write_text(json.dumps({n: {} for n in reversed(names)}),
                                                 encoding="utf-8", newline="\n")
 
-    def invoke(self, control=None, range_support=True, merge_support=True):
+    def invoke(self, control=None, range_support=True, merge_support=True, duplicates_support=True):
         (self.spirv / "control.json").write_text(json.dumps(control or {}), encoding="utf-8", newline="\n")
         def run(args, hint="", check=True, **kwargs):
             args = [str(a) for a in args]
@@ -114,7 +117,8 @@ class PipelineBatchesTest(unittest.TestCase):
                 raise SystemExit(1)
             return done.returncode
         def supports(exe, *options):
-            return (range_support or "--start" not in options) and (merge_support or "--merge-cache" not in options)
+            return ((range_support or "--start" not in options) and (merge_support or "--merge-cache" not in options)
+                    and (duplicates_support or "--duplicates-file" not in options))
         logs, err = [], io.StringIO()
         # create=True keeps the regression runnable on the old implementation, which lacks this constant.
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="synthetic-checker"), \
@@ -336,6 +340,84 @@ class PipelineBatchesTest(unittest.TestCase):
         self.assertEqual(len(list((self.out / "pipeline_cache.parts").glob("*.bin"))), 3)   # kept for the next run
         self.assertFalse((self.out / "pipeline_cache.bin.merging").exists())
         self.assertFalse((self.out / "pipeline_cache.bin").exists())
+
+    def write_modules(self, modules):
+        """{name: (SPIR-V bytes, index entry)}"""
+        (self.spirv / "index.json").write_text(json.dumps({n: e for n, (_, e) in modules.items()}),
+                                                encoding="utf-8", newline="\n")
+        for name, (spirv, _) in modules.items():
+            (self.spirv / f"{name}.spv").write_bytes(spirv)
+
+    def duplicate_corpus(self):
+        same = {"stage": "ps"}
+        self.write_modules({
+            "m_00": (b"A", dict(same, src_sha256="1")),
+            "m_01": (b"B", same),
+            "m_02": (b"A", dict(same, src_sha256="2", fssm_sha256="9")),   # only where it came from differs
+            "m_03": (b"A", {"stage": "vs"}),                               # the same bytes, built differently
+            "m_04": (b"C", same),
+            "m_05": (b"A", same),
+            "m_06": (b"D", same),
+        })
+
+    def test_entries_that_build_the_same_pipeline_are_checked_once(self):
+        self.duplicate_corpus()
+        code, logs, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.out / "pipeline_duplicates.txt").read_text(encoding="utf-8"), "m_02\tm_00\nm_05\tm_00\n")
+        checked = [n for row in self.calls("completed") for n in row["active"]]
+        self.assertEqual(sorted(checked), ["m_00", "m_01", "m_03", "m_04", "m_06"])
+        batches, merges = self.batch_and_merge_commands()
+        self.assertTrue(all("--duplicates-file" in c for c in batches), batches)
+        self.assertTrue(any("2 of 7 index entries" in m for m in logs), logs)
+
+    def test_a_checker_without_duplicates_file_checks_every_entry(self):
+        self.duplicate_corpus()
+        code, _, err = self.invoke(duplicates_support=False)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(any("--duplicates-file" in c for c in self.commands))
+        self.assertEqual(sorted(n for row in self.calls("completed") for n in row["active"]), self.names)
+
+    def invoke_as(self, fingerprint, control=None):
+        with mock.patch.object(make_game, "pipelines_fingerprint", return_value=fingerprint):
+            return self.invoke(control)
+
+    def test_an_unchanged_run_is_skipped_until_something_changes(self):
+        self.assertEqual(self.invoke_as("fp1")[0], 0)
+        self.assertEqual((self.out / "pipelines.done").read_text(encoding="utf-8"), "fp1\n")
+        self.commands.clear()
+        code, logs, _ = self.invoke_as("fp1")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.commands, [])
+        self.assertTrue(any("skipping" in m for m in logs), logs)
+        code, _, _ = self.invoke_as("fp2")   # a new translation, checker or driver
+        self.assertEqual(code, 0)
+        self.assertNotEqual(self.commands, [])
+        self.assertEqual((self.out / "pipelines.done").read_text(encoding="utf-8"), "fp2\n")
+
+    def test_a_missing_cache_runs_the_stage_again(self):
+        self.assertEqual(self.invoke_as("fp1")[0], 0)
+        (self.out / "pipeline_cache.bin").unlink()
+        self.commands.clear()
+        self.assertEqual(self.invoke_as("fp1")[0], 0)
+        self.assertNotEqual(self.commands, [])
+        self.assertTrue((self.out / "pipeline_cache.bin").exists())
+
+    def test_a_run_with_failures_leaves_no_marker(self):
+        self.assertEqual(self.invoke_as("fp1")[0], 0)
+        code, _, _ = self.invoke_as("fp2", {"invalid": "m_01"})
+        self.assertNotEqual(code, 0)
+        self.assertFalse((self.out / "pipelines.done").exists())
+
+    def test_no_fingerprint_means_no_marker_and_no_skip(self):
+        self.assertEqual(self.invoke_as("")[0], 0)
+        self.assertFalse((self.out / "pipelines.done").exists())
+
+    def test_a_corpus_without_duplicates_passes_no_file(self):
+        self.write_modules({n: (n.encode(), {"stage": "ps"}) for n in self.names})
+        code, _, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertFalse(any("--duplicates-file" in c for c in self.commands))
 
 
 if __name__ == "__main__":

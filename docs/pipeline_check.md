@@ -356,6 +356,18 @@ every batch with the whole cache instead reads and rewrites it once per batch: o
 one-shader run takes 0.9 s with an empty cache and 36-51 s with the 5.1 GB cache of the full corpus. A checker
 without `--merge-cache` keeps that single shared cache.
 
+After a run in which every pipeline passed, the stage writes `pipelines.done`: a fingerprint of `index.json`, each
+module's size and modification time, the checker build, and the device's pipeline-cache identity (vendor, device and
+the driver's cache UUID, read from a run that checks no shader, about a second). The next run skips the stage while
+the fingerprint is unchanged. A new translation, a rebuilt checker or a driver update runs it again, and deleting
+`pipelines.done` forces it.
+
+Index entries whose SPIR-V bytes and pipeline fields (everything but `src_sha256` and `fssm_sha256`) equal an earlier
+entry's are listed in `pipeline_duplicates.txt` and skipped through `--duplicates-file`, counted per stage as
+duplicates: 10,614 of the 1.0.2.1 corpus's 26,503. Within one checker process the shared cache already turns them
+into hits, so the time saved is in the 1,953 whose first entry falls in another batch, which that batch's cache part
+does not hold.
+
 This bounds each invocation to a range that can be split further if concurrent heavy compiles exceed available
 memory. A work folder with at most 500 entries keeps the single invocation and `pipeline_cache.bin` directly. An
 older checker without the range options keeps the older invocation; rebuild the runtime to get batching.
