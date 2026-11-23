@@ -167,7 +167,7 @@ public:
 private:
     bool admits_locked(uint64_t estimate) const {
         if (inflight_ == 0) return true;
-        return inflight_ < max_inflight_ && used_ + estimate <= budget_;
+        return inflight_ < max_inflight_ && used_ <= budget_ && estimate <= budget_ - used_;
     }
 
     const uint64_t budget_;
