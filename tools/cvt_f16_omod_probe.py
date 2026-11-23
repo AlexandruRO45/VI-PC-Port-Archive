@@ -268,9 +268,29 @@ def evaluate_results(modes: list[str], waves: list[int], meta, raw_results) -> d
     """Compare hardware outputs against expected_cvt_f16_omod and check wave32 vs wave64 parity."""
     by_key: dict[tuple[int, str, str], list[int]] = {}
     harness_errors: list[dict] = []
+    if len(raw_results) != len(meta):
+        harness_errors.append({
+            "error": f"the hardware runner returned {len(raw_results)} results for {len(meta)} kernels",
+        })
+        return {
+            "total_cases": len(meta) * len(INPUTS),
+            "lo_mismatches": 0,
+            "hi_mismatches": 0,
+            "wave_diffs": 0,
+            "dyn_rtz_diffs": 0,
+            "harness_errors": harness_errors,
+            "first_mismatches": [],
+            "first_wave_diffs": [],
+        }
+
     for (wave, mode_name, mod), res in zip(meta, raw_results):
-        if isinstance(res, str):
-            harness_errors.append({"wave": wave, "mode": mode_name, "mod": mod, "error": res})
+        if res is None or isinstance(res, str):
+            harness_errors.append({
+                "wave": wave,
+                "mode": mode_name,
+                "mod": mod,
+                "error": "no result" if res is None else res,
+            })
             continue
         if len(res) != len(INPUTS):
             harness_errors.append({
@@ -469,7 +489,10 @@ def main(argv=None) -> int:
 
     if summary["harness_errors"]:
         for err in summary["harness_errors"][:5]:
-            print(f"harness error: wave{err['wave']} {err['mode']} {err['mod']!r}: {err['error']}")
+            if "wave" in err:
+                print(f"harness error: wave{err['wave']} {err['mode']} {err['mod']!r}: {err['error']}")
+            else:
+                print(f"harness error: {err['error']}")
         return 2
 
     print(

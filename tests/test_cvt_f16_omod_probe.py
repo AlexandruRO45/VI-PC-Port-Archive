@@ -245,6 +245,39 @@ class ProbeCliTests(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertIn("harness error", out)
 
+    def test_wrong_result_count_or_none_entry_is_harness_error(self):
+        class ShortResultOracle(FakeOracle):
+            def run(self, kernels):
+                return super().run(kernels)[:-1]
+
+        class ExtraResultOracle(FakeOracle):
+            def run(self, kernels):
+                res = super().run(kernels)
+                return res + [res[-1]]
+
+        class NoneEntryOracle(FakeOracle):
+            def run(self, kernels):
+                res = super().run(kernels)
+                res[0] = None
+                return res
+
+        for oracle, expected_msg in (
+            (ShortResultOracle(), "the hardware runner returned 7 results for 8 kernels"),
+            (ExtraResultOracle(), "the hardware runner returned 9 results for 8 kernels"),
+            (NoneEntryOracle(), "wave32 rne_d0_i0 '': no result"),
+        ):
+            with self.subTest(msg=expected_msg):
+                with tempfile.TemporaryDirectory() as d:
+                    report = os.path.join(d, "err.json")
+                    rc, out, err = _run_main(oracle, "--modes", "rne_d0_i0", "--waves", "32", "--json", report)
+                    self.assertEqual(rc, 2, out + err)
+                    self.assertTrue(oracle.closed)
+                    self.assertIn(f"harness error: {expected_msg}", out)
+                    with open(report, encoding="utf-8") as f:
+                        doc = json.load(f)
+                    self.assertEqual(len(doc["harness_errors"]), 1)
+                    self.assertIn(expected_msg.split(": ")[-1], doc["harness_errors"][0]["error"])
+
     def test_json_directory_refused_and_unwritable_path_exits_2(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(SystemExit):
