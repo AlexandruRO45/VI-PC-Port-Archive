@@ -338,6 +338,25 @@ struct PhysicalApi {
     XMemMapPhysicalPagesScatterFn scatter;
 };
 
+// The descriptor-pool window is reserved PAGE_READWRITE | PAGE_WRITECOMBINE. MapViewOfFile3 on Wine rejects that
+// cache modifier with ERROR_INVALID_PARAMETER, so the first map into the pool fails and device init returns false.
+void test_writecombine_window_maps_readable(const PhysicalApi& api) {
+    auto* const window = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x27, PAGE_READWRITE | PAGE_WRITECOMBINE));
+    check(window != nullptr, "a write-combined 64 KiB window reserves");
+    if (!window) return;
+    uint64_t page = 0;
+    uint64_t count = 1;
+    check(api.allocate(0x280, &count, &page) == TRUE && count == 1, "one page for the write-combined window");
+    check(api.map(window, 1, &page) == window, "mapping into a write-combined window succeeds");
+    MEMORY_BASIC_INFORMATION info{};
+    const bool queried = VirtualQuery(window, &info, sizeof(info)) != 0;
+    check(queried && info.State == MEM_COMMIT && (info.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) == 0 &&
+              (info.Protect & PAGE_READWRITE) == PAGE_READWRITE,
+          "the view is read-write without PAGE_WRITECOMBINE or PAGE_NOCACHE");
+    api.free_pages(1, &page);
+}
+
 // Physical pages in a 64 KiB-page window, as the measured callers use them: reserve a window, allocate pages, map them,
 // remap them elsewhere and in another order, unmap, free.
 void test_physical_pages(const PhysicalApi& api) {
@@ -719,6 +738,7 @@ int main() {
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
         test_placeholders(physical);
+        test_writecombine_window_maps_readable(physical);
     }
 
     print_result();
