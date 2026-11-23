@@ -35,6 +35,19 @@ __declspec(noinline) void site_b(int& reached) {
     ++reached;
 }
 
+// The case that matters for a boot: the first int3 arrives on a thread the loader created, not on the thread that
+// opened the trace. The flag is read in open(), so this thread must see it too.
+struct ThreadCase {
+    int reached = 0;
+};
+
+DWORD WINAPI thread_site(void* parameter) {
+    auto* state = static_cast<ThreadCase*>(parameter);
+    __debugbreak();
+    ++state->reached;
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -45,10 +58,23 @@ int main() {
     DeleteFileW(path.c_str());
     check(rt::startup_trace::open(path.c_str()), "open the startup trace file");
 
+    // First, the case a boot hits: the flag must be honoured when the first exception of the process arrives on a
+    // thread created after open(), not on this one.
+
+    ThreadCase guest;
+    HANDLE thread = CreateThread(nullptr, 0, &thread_site, &guest, 0, nullptr);
+    if (thread) {
+        WaitForSingleObject(thread, 10000);
+        CloseHandle(thread);
+    }
+    check(thread != nullptr, "create the thread the loader would run the title on");
+    check(guest.reached == 1, "an int3 on a thread started after open() is skipped too");
+
     int reached = 0;
     for (int i = 0; i < 2; ++i) site_a(reached);  // the same site twice: one event
     site_b(reached);                              // another site
     check(reached == 3, "execution continues past every int3");
+
     rt::startup_trace::close();
 
     std::ifstream in(path);
@@ -57,7 +83,7 @@ int main() {
     const std::string log = text.str();
     in.close();
     DeleteFileW(path.c_str());
-    check(count(log, "\"kind\":\"int3_skipped\"") == 2, "exactly two int3_skipped events (one per address)");
+    check(count(log, "\"kind\":\"int3_skipped\"") == 3, "one int3_skipped event per address, the thread's included");
     check(count(log, "\"kind\":\"exception\"") == 0, "a skipped int3 is not also logged as an exception");
     check(log.find("\"at\":\"host:") != std::string::npos, "the event names the address");
     std::printf("%s\n", g_failed ? "FAILED" : "all checks passed");

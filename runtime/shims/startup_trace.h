@@ -38,12 +38,16 @@ namespace rt::startup_trace {
 
 namespace detail {
 inline std::atomic<bool> on{false};
+// Read once, in open(), on the thread that opens the trace. A block-scope static here is initialised on whichever
+// thread first raises an exception, and in this runtime that has been observed not to happen at all (the flag read
+// false forever, so every guest int3 stayed fatal). Same reason the seen set and its mutex live at namespace scope.
+inline bool int3_skip = false;
+inline bool int3_debug = false;
+inline std::mutex int3_mutex;
+inline std::set<const void*> int3_seen;
 // Intentionally immortal: vectored exception handlers or late teardown paths can still run after normal statics would
 // have been destroyed.
-inline std::mutex& mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+inline std::mutex& mutex() { return int3_mutex; }
 inline FILE* file = nullptr;
 inline unsigned long long seq = 0;
 inline std::chrono::steady_clock::time_point start;
@@ -195,19 +199,32 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
 // so a boot can be followed past the title's soft asserts (an int3 followed by code that carries on). Off by default:
 // a console title never reaches one in a correct run, so each skipped address is a finding, not a fix.
 inline bool skip_int3(EXCEPTION_POINTERS* info) {
-    static const bool skip = GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0;
-    if (!skip || info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT || !info->ContextRecord) return false;
-    const auto* at = static_cast<const unsigned char*>(info->ExceptionRecord->ExceptionAddress);
-    if (!at || *at != 0xCC || info->ContextRecord->Rip != reinterpret_cast<DWORD64>(at)) return false;
-    static std::mutex m;
-    static std::set<const void*> seen;
+    if (!int3_skip || !info || !info->ExceptionRecord || !info->ContextRecord) return false;
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) return false;
+    // Windows reports the int3 in ExceptionAddress with Rip at it; wine reports ExceptionAddress one byte past the
+    // 0xCC and Rip already advanced. Resolve the int3 from either, and always leave Rip after the instruction.
+    const DWORD64 reported = reinterpret_cast<DWORD64>(info->ExceptionRecord->ExceptionAddress);
+    const DWORD64 rip = info->ContextRecord->Rip;
+    DWORD64 at = 0;
+    for (const DWORD64 candidate : {reported, reported ? reported - 1 : 0, rip, rip ? rip - 1 : 0}) {
+        if (!candidate) continue;
+        if (*reinterpret_cast<const unsigned char*>(candidate) == 0xCC && (rip == candidate || rip == candidate + 1)) {
+            at = candidate;
+            break;
+        }
+    }
+    if (int3_debug) {
+        std::fprintf(stderr, "[trace] int3 reported=%p rip=%p resolved=%p\n", reinterpret_cast<void*>(reported),
+                     reinterpret_cast<void*>(rip), reinterpret_cast<void*>(at));
+    }
+    if (!at) return false;
     bool first = false;
     {
-        const std::lock_guard lock(m);
-        first = seen.insert(at).second;
+        const std::lock_guard lock(int3_mutex);
+        first = int3_seen.insert(reinterpret_cast<const void*>(at)).second;
     }
-    if (first) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
-    info->ContextRecord->Rip += 1;
+    if (first) event("int3_skipped", "\"at\":" + quote(where(at)));
+    info->ContextRecord->Rip = at + 1;
     return true;
 }
 
@@ -248,6 +265,8 @@ inline bool open(const wchar_t* path, int* error = nullptr) {
             if (error) *error = e ? e : EINVAL;
             return false;
         }
+        detail::int3_skip = GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0;
+        detail::int3_debug = GetEnvironmentVariableW(L"LEONIDA_INT3_DEBUG", nullptr, 0) != 0;
         detail::start = std::chrono::steady_clock::now();
         detail::seq = 0;
         static const int atexit_registered = std::atexit(&close);
