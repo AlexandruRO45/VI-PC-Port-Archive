@@ -218,15 +218,59 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     }
     out.close = list->Close();
     if (FAILED(out.close) && !run_invalid) return true;
-    ID3D12CommandList* lists[] = {list.p};
-    queue->ExecuteCommandLists(1, lists);
-    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
     Event event;
     CHECK(event.handle);
-    CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
-    // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
-    // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
-    CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+    UINT64 fence_value = 0;
+    const auto execute = [&](ID3D12CommandList* submitted) {
+        ID3D12CommandList* lists[] = {submitted};
+        queue->ExecuteCommandLists(1, lists);
+        ++fence_value;
+        CHECK(SUCCEEDED(queue->Signal(fence.p, fence_value)));
+        CHECK(SUCCEEDED(fence->SetEventOnCompletion(fence_value, event.handle)));
+        // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
+        // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
+        CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+        return true;
+    };
+    if (SUCCEEDED(out.close)) {
+        CHECK(execute(list.p));
+    } else {
+        // A list whose Close failed is refused whole by ExecuteCommandLists: its clears and its copy into the
+        // readback buffer never run either, so reading that buffer would compare whatever memory it was given with
+        // the clears (a result that changes from run to run). To see whether the refusal kept the destination, clear
+        // the destination in a list of its own first, submit the refused list, then copy the destination out in a
+        // third list.
+        Ref<ID3D12CommandAllocator> before_allocator, after_allocator;
+        Ref<ID3D12GraphicsCommandList> before, after;
+        CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       IID_PPV_ARGS(&before_allocator.p))));
+        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, before_allocator.p, nullptr,
+                                                 IID_PPV_ARGS(&before.p))));
+        before->ClearDepthStencilView(target_view, flags, 0.0f, 0x5a, 0, nullptr);
+        CHECK(SUCCEEDED(before->Close()));
+        CHECK(execute(before.p));
+        CHECK(execute(list.p));
+        CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       IID_PPV_ARGS(&after_allocator.p))));
+        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, after_allocator.p, nullptr,
+                                                 IID_PPV_ARGS(&after.p))));
+        // The refused list's barriers did not run either: the destination is still in DEPTH_WRITE.
+        D3D12_RESOURCE_BARRIER to_copy = barriers[1];
+        to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        after->ResourceBarrier(1, &to_copy);
+        for (UINT i = 0; i < planes; ++i) {
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = target.p;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = i;
+            dst.pResource = readback.p;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = placed[i];
+            after->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        CHECK(SUCCEEDED(after->Close()));
+        CHECK(execute(after.p));
+    }
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
