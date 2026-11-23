@@ -638,7 +638,8 @@ def _shard_path(outdir, want):
 
 def _read_shard(outdir, want, source_id):
     try:
-        with open(_shard_path(outdir, want), encoding="utf-8") as f:
+        # utf-8-sig: accept shard JSON re-saved with a UTF-8 BOM on Windows.
+        with open(_shard_path(outdir, want), encoding="utf-8-sig") as f:
             doc = json.load(f)
     except (OSError, ValueError):
         return None

@@ -1026,6 +1026,18 @@ class CensusSourceTest(unittest.TestCase):
         self.assertTrue(rebuilt["census_exact"])
         self.assertEqual(new_rows, rows)
 
+    def test_shard_saved_with_utf8_bom_is_read(self):
+        original, rows = self.scan(self.arc)
+        shard = original["shards"][0]
+        path = WC._shard_path(self.out, shard)
+        with open(path, "rb") as f:
+            raw = f.read()
+        with open(path, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + raw)
+        resumed, new_rows = self.scan(self.arc, "--merge-only")
+        self.assertTrue(resumed["census_exact"])
+        self.assertEqual(new_rows, rows)
+
 
 def setUpModule():
     # The tools' main() prints its summary JSON; keep it out of the test log (tests that check it redirect again).
