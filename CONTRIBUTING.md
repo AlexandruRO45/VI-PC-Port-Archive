@@ -10,6 +10,13 @@ Thanks for helping. A few rules keep the project safe to host:
 - Short excerpts needed to explain a format (a few header bytes, one instruction sequence) are fine in docs and
   comments.
 
+## Conduct
+
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) has the details. In short: be kind and disagree with the work, not the
+person; keep issues for bug reports, concrete requests and findings (questions and chat go on
+[Discord](https://discord.gg/rexed)); no spam, joke issues, insults or links to leaked files; and if an agent posts
+for you, its posts are yours. Report a problem with GitHub's **Report content → Report to repository admins**.
+
 ## Before you start
 
 Claim the work in [the coordination issue][claims] first: the open issue titled "Coordinating who works on what" (it
