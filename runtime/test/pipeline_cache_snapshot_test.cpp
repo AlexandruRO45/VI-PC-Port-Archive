@@ -3,6 +3,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <limits>
+
 
 #define CHECK(condition) do {                                            \
     if (!(condition)) {                                                  \
@@ -111,5 +113,9 @@ int main() {
     CHECK(rejected(VK_SUCCESS, 32, VK_SUCCESS, 16) == 2);
     CHECK(rejected(VK_SUCCESS, 32, VK_SUCCESS, 32 + 32 / 16 + 1) == 2);  // more than the buffer it was given
     CHECK(rejected(VK_SUCCESS, 32, VK_INCOMPLETE, 32) == 8);
+    // 2^32 - 1 and 2^64 - 1 are multiples of 17 (16 + 1), so wrap_size + (wrap_size >> 4) wraps to 50 bytes in size_t.
+    constexpr size_t wrap_size = (std::numeric_limits<size_t>::max() / 17 + 1) * 16 + 32;
+    CHECK(rejected(VK_SUCCESS, wrap_size, VK_SUCCESS, 32) == 1);
+    CHECK(rejected(VK_SUCCESS, std::numeric_limits<size_t>::max(), VK_SUCCESS, 32) == 1);
     return 0;
 }
