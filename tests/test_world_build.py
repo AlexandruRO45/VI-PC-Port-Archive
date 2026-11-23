@@ -11,9 +11,11 @@ Covers:
 
 Every texture, mesh, manifest, and archive layout is generated synthetically in memory or a temporary directory.
 """
+import contextlib
 import functools
 import http.client
 import importlib.util
+import io
 import json
 import math
 import os
@@ -1811,6 +1813,47 @@ class WorldBuildTest(unittest.TestCase):
                 world_build.build_world(missing, out_dir)
             p = self._run_cli(missing, out_dir)
             self.assertNotEqual(p.returncode, 0)
+
+
+class UnlistableFolderTest(unittest.TestCase):
+    """A sub-folder that cannot be listed fails the build; it must not pass for one without models or textures."""
+
+    def deny(self, blocked):
+        real = os.scandir
+
+        def scandir(path="."):
+            if os.path.abspath(os.fspath(path)) == os.path.abspath(blocked):
+                raise PermissionError(13, "Permission denied", os.fspath(path))   # chmod does not deny root
+            return real(path)
+
+        return unittest.mock.patch.object(os, "scandir", scandir)
+
+    def test_discovery_and_texture_index_fail_on_an_unlistable_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets_dir = os.path.join(tmp, "assets")
+            _write_synthetic_assets(assets_dir)
+            blocked = os.path.join(assets_dir, "blocked")
+            os.mkdir(blocked)
+            with self.deny(blocked):
+                with self.assertRaises(PermissionError):
+                    world_build.discover_model_manifests(assets_dir)
+                with self.assertRaises(PermissionError):
+                    world_build.index_ttpf_textures(assets_dir)
+
+    def test_cli_reports_the_unlistable_folder_and_builds_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets_dir = os.path.join(tmp, "assets")
+            _write_synthetic_assets(assets_dir)
+            blocked = os.path.join(assets_dir, "blocked")
+            os.mkdir(blocked)
+            out = os.path.join(tmp, "out")
+            err = io.StringIO()
+            with self.deny(blocked), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = world_build.main([assets_dir, "--out", out])
+            self.assertEqual(rc, 1)
+            self.assertIn("blocked", err.getvalue())
+            self.assertIn("Permission denied", err.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(out, "world.json")))
 
 
 class WorldBuildStagingTest(unittest.TestCase):

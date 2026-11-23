@@ -495,7 +495,10 @@ def assets_exported(work: str) -> bool:
                     return False
         except (OSError, UnicodeError):
             return False
-    return not (shutil.which("ffmpeg") and pending_xma(os.path.join(audio, "xma")))
+    try:
+        return not (shutil.which("ffmpeg") and pending_xma(os.path.join(audio, "xma")))
+    except OSError:
+        return False   # unknown: the assets stage runs and decode_xma names the folder it cannot list
 
 
 def _linked(path: str) -> bool:
@@ -1481,8 +1484,11 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     # Texture pools: data/ttdb/** and each pack's own pack/<name>/data/ttdb/** (pool names repeat across packs,
     # so pack pools go under ttpf_pack/<pack>/).
     pools = []
-    for root, _, files in os.walk(game):
-        pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
+    try:
+        for root, _, files in os.walk(game, onerror=scan_failed) if os.path.isdir(game) else ():
+            pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
+    except OSError as error:
+        fail(f"assets: cannot list {error.filename or game} to find the texture pools: {error.strerror or error}")
     settings = ttpf_assets.load_profile(work) if pools else None
     # rpf9dump names each pool's output folder after the source basename. Pools with the same basename
     # in one destination namespace would share that folder and its manifest, so the second pool would
@@ -1552,10 +1558,18 @@ def mark(path: str, what: str) -> None:
         f.write(f"{what} finished\n")
 
 
+def scan_failed(error: OSError) -> None:
+    """os.walk onerror: a folder that cannot be listed must not pass for an empty one."""
+    raise error
+
+
 def pending_xma(xma_dir: str) -> list:
-    """The XMA2 streams (.xma.wav) under xma_dir that have no decoded .wav next to them yet."""
+    """The XMA2 streams (.xma.wav) under xma_dir that have no decoded .wav next to them yet.
+    Raises OSError when a sub-folder cannot be listed: an incomplete list would pass for a finished decode."""
     todo = []
-    for root, _, files in os.walk(xma_dir):
+    if not os.path.isdir(xma_dir):
+        return todo
+    for root, _, files in os.walk(xma_dir, onerror=scan_failed):
         for f in files:
             if f.endswith(".xma.wav") and not os.path.isfile(os.path.join(root, f[:-8] + ".wav")):
                 todo.append(os.path.join(root, f))
@@ -1565,7 +1579,10 @@ def pending_xma(xma_dir: str) -> list:
 def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
     """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
     temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
-    todo = pending_xma(xma_dir)
+    try:
+        todo = pending_xma(xma_dir)
+    except OSError as error:
+        fail(f"assets: cannot list {error.filename or xma_dir} to find the XMA2 streams: {error.strerror or error}")
     if not todo:
         return
     log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")

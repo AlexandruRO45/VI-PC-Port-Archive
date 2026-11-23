@@ -4,6 +4,8 @@
 
 Every byte here is built by the test. No game file, value or name is used.
 """
+import contextlib
+import io
 import json
 import math
 import os
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -881,6 +884,28 @@ class CliTests(unittest.TestCase):
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("would overwrite the input", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
+
+
+    def test_unreadable_subfolder_fails_instead_of_dropping_its_pages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocked = os.path.join(tmp, "blocked")
+            os.mkdir(blocked)
+            with open(os.path.join(tmp, "0000.bin"), "wb") as fh:
+                fh.write(page(block(20), group([(20, 18)])))
+            real = os.scandir
+
+            def scandir(path="."):
+                if os.path.abspath(os.fspath(path)) == os.path.abspath(blocked):
+                    raise PermissionError(13, "Permission denied", os.fspath(path))   # chmod does not deny root
+                return real(path)
+
+            err = io.StringIO()
+            with unittest.mock.patch.object(os, "scandir", scandir), contextlib.redirect_stderr(err), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = mp.main([tmp, "--quiet"])
+            self.assertEqual(rc, 2)
+            self.assertIn("blocked", err.getvalue())
+            self.assertIn("Permission denied", err.getvalue())
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@ import json
 import os
 import sys
 import tempfile
+import io
+import contextlib
 import unittest
 from unittest import mock
 
@@ -15,6 +17,19 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import make_game  # noqa: E402
 import ttpf_assets  # noqa: E402
+
+
+def deny_listing(blocked):
+    """Patch os.scandir so listing `blocked` raises PermissionError, as an unreadable folder does (chmod does not
+    deny root, so the test does not rely on it)."""
+    real = os.scandir
+
+    def scandir(path="."):
+        if os.path.abspath(os.fspath(path)) == os.path.abspath(blocked):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real(path)
+
+    return mock.patch.object(os, "scandir", scandir)
 
 
 class AssetsPoolsTest(unittest.TestCase):
@@ -101,6 +116,42 @@ class AssetsPoolsTest(unittest.TestCase):
             os.path.join(self.out, "ttpf_pack", "a", "pool"),
         ])
         self.assertEqual(len({loose, packed}), 2)
+
+    def test_unlistable_folder_fails_the_pool_scan(self):
+        blocked = os.path.join(self.game, "data", "ttdb", "blocked")
+        os.makedirs(blocked)
+        self.pool("data/ttdb/A/pool.ttpf")
+        err = io.StringIO()
+        with deny_listing(blocked), mock.patch.object(make_game, "log", lambda *a: None), \
+                mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+                mock.patch.object(make_game, "run") as run, \
+                mock.patch.object(make_game.shutil, "which", lambda n: None), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            make_game.assets(self.game, self.work, False, 1)
+        self.assertNotEqual(caught.exception.code, 0)
+        self.assertIn("blocked", err.getvalue())
+        self.assertIn("Permission denied", err.getvalue())
+        run.assert_not_called()   # no export ran on a partial list of pools
+
+
+class UnlistableFolderTest(unittest.TestCase):
+    """A sub-folder that cannot be listed fails the stage; it must not pass for one without pools or streams."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_xma_decode_fails_on_unlistable_folder_instead_of_finishing(self):
+        xma = os.path.join(self.tmp.name, "xma")
+        blocked = os.path.join(xma, "bank0")
+        os.makedirs(blocked)
+        err = io.StringIO()
+        with deny_listing(blocked), mock.patch.object(make_game, "run") as run, \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            make_game.decode_xma("ffmpeg", xma, 1)
+        self.assertNotEqual(caught.exception.code, 0)
+        self.assertIn("bank0", err.getvalue())
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

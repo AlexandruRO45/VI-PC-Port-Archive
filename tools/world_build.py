@@ -777,6 +777,10 @@ def _is_model_manifest(path: str) -> bool:
     return True
 
 
+def _scan_failed(error: OSError) -> None:
+    raise error   # an unreadable sub-folder must not pass for "no manifests there"
+
+
 def discover_model_manifests(assets_dir: str) -> list[str]:
     """Find all rpf9dump model manifest.json files under assets_dir.
 
@@ -804,7 +808,7 @@ def discover_model_manifests(assets_dir: str) -> list[str]:
         found[os.path.normcase(abs_direct)] = abs_direct
 
     # 2. Archive directory (models/manifest.json) or whole assets tree.
-    for dirpath, dirnames, filenames in os.walk(abs_root):
+    for dirpath, dirnames, filenames in os.walk(abs_root, onerror=_scan_failed):
         dirnames.sort()
         if "manifest.json" in filenames and os.path.basename(dirpath).lower() == "models":
             cand = os.path.abspath(os.path.join(dirpath, "manifest.json"))
@@ -826,7 +830,7 @@ def index_ttpf_textures(assets_dir: str) -> dict[str, str]:
     if not os.path.isdir(abs_root):
         return index
 
-    for dirpath, dirnames, filenames in os.walk(abs_root):
+    for dirpath, dirnames, filenames in os.walk(abs_root, onerror=_scan_failed):
         dirnames.sort()
         if "manifest.json" not in filenames:
             continue
