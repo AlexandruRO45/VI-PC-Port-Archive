@@ -535,8 +535,9 @@ const GUID kAccessibilityInterfaces[] = {
     {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}},   // IXAccessibilityImpl2
 };
 
-// 5: HRESULT XHighContrastGetMode(XHighContrastMode* mode): Off, the first enumerator. ASSUMPTION: the signature and
-// that Off is 0 (GDK reference, not re-checked for this file).
+// 5: HRESULT XHighContrastGetMode(XHighContrastMode* mode): Off, the first enumerator (from the GDK reference). The
+// retail executable never calls this slot (its XAccessibilityImpl thunks are slots 8-16 and 21), so nothing measured
+// depends on the answer.
 HRESULT STDMETHODCALLTYPE accessibility_high_contrast(void*, uint32_t* mode) {
     if (!mode) return E_POINTER;
     *mode = 0;
@@ -546,9 +547,10 @@ HRESULT STDMETHODCALLTYPE accessibility_high_contrast(void*, uint32_t* mode) {
 // 4: HRESULT XClosedCaptionSetEnabled(bool enabled): there are no captions to show; accepted and dropped.
 HRESULT STDMETHODCALLTYPE accessibility_captions_set_enabled(void*, bool) { return S_OK; }
 
-// 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(callback, void* context): no voice is installed, so the
-// callback runs zero times. ASSUMPTION: the argument order (GDK reference), only the count (2) was measured.
-HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* callback, void*) {
+// 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(void* context, callback): no voice is installed, so the
+// callback runs zero times. The order is measured at the retail executable's one call site: the context first, then
+// a callback that takes (voice entry, context) and returns true to go on. Its result is only tested for success.
+HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void*, void* callback) {
     return callback ? S_OK : E_INVALIDARG;
 }
 

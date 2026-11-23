@@ -208,9 +208,11 @@ int main() {
           "XHighContrastGetMode reports Off");
     check(at<SetEnabled>(acc, 4)(acc, true) == S_OK, "XClosedCaptionSetEnabled is accepted");
     check(FAILED(at<NoArgs>(acc, 3)(acc)), "the closed-caption properties are not available offline");
-    check(at<EnumVoices>(acc, 8)(acc, reinterpret_cast<void*>(&on_state), nullptr) == S_OK &&
-              at<EnumVoices>(acc, 8)(acc, nullptr, nullptr) == E_INVALIDARG,
-          "XSpeechSynthesizerEnumerateInstalledVoices: no voices, S_OK (a callback is required)");
+    int voice_context = 0;
+    check(at<EnumVoices>(acc, 8)(acc, &voice_context, reinterpret_cast<void*>(&on_state)) == S_OK &&
+              at<EnumVoices>(acc, 8)(acc, nullptr, reinterpret_cast<void*>(&on_state)) == S_OK &&
+              at<EnumVoices>(acc, 8)(acc, &voice_context, nullptr) == E_INVALIDARG,
+          "XSpeechSynthesizerEnumerateInstalledVoices(context, callback): no voices, S_OK (the callback, second, is required)");
     void* synth = reinterpret_cast<void*>(1);
     check(at<SpeechCreate>(acc, 9)(acc, &synth) == E_FAIL && synth == nullptr,
           "XSpeechSynthesizerCreate fails offline and nulls the handle");
