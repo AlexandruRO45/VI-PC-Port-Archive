@@ -1363,8 +1363,18 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
 // when a zero page or transfer scratch is available) and moved to `layout`, the layout the operation about to run
 // expects; with not_zeroed, it is only moved. The tracker records it.
 inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
-                       ResourceId id, LayoutPieces& pieces, VkImageLayout layout, LayoutTracker* tracker) {
+                       ResourceId id, LayoutPieces& pieces, VkImageLayout layout, LayoutTracker* tracker,
+                       const VkConditionalRenderingBeginInfoEXT* predicate = nullptr) {
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    // Lazy committed-resource zero-fill must run unconditionally even inside SetPredication; Intel's Windows Vulkan
+    // driver suppresses transfer clears and fills inside active conditional rendering after PredicateReducer::capture.
+    bool suspended = false;
+    const auto suspend = [&] {
+        if (predicate && predicate->buffer && !suspended) {
+            vk.end_conditional_rendering(command_buffer);
+            suspended = true;
+        }
+    };
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1379,6 +1389,7 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
                 vk.copy_buffer_to_image &&
                 ((vk.zero_buffer && vk.zero_size >= fmt.bytes) || (vk.copy_scratch && vk.fill_buffer));
             if (can_zero) {
+                suspend();
                 const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1393,6 +1404,7 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             }
         } else {
+            suspend();
             const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1410,6 +1422,7 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
         piece.layout = layout;
         if (tracker) tracker->set(id, piece.range, layout);
     }
+    if (suspended) vk.begin_conditional_rendering(command_buffer, predicate);
 }
 
 inline bool within(std::uint64_t offset, std::uint64_t size, std::uint64_t total) {
@@ -1849,10 +1862,11 @@ inline ReplayResult keep_around_resolve(const ReplayFunctions& vk, Prepared& p) 
 // promotion lets the copy run in place. Anything else is moved to `wanted` and tracked.
 inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
                                  const ResourceBinding& resource, ResourceId id, const VkImageSubresourceRange& range,
-                                 VkImageLayout wanted, VkAccessFlags access, LayoutTracker* tracker) {
+                                 VkImageLayout wanted, VkAccessFlags access, LayoutTracker* tracker,
+                                 const VkConditionalRenderingBeginInfoEXT* predicate = nullptr) {
     const VkImageLayout target = image_layout(resource, wanted);
     auto pieces = current(tracker, id, range, target);
-    initialize(vk, command_buffer, resource, id, pieces, target, tracker);
+    initialize(vk, command_buffer, resource, id, pieces, target, tracker, predicate);
     // D3D12 orders back-to-back copies and resolves on a resource that stays in COPY_DEST or COPY_SOURCE without a
     // barrier from the application; Vulkan does not. A piece already in the transfer layout gets no layout
     // transition, so an earlier transfer write to it is ordered here instead (write-after-write and read-after-write,
@@ -2050,10 +2064,11 @@ inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
 // Moves an attachment's tracked pieces to `layout` before rendering (first use zero-fills, as everywhere).
 inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const PreparedDraw::Attachment& a,
                           VkImageLayout layout, VkAccessFlags access, VkPipelineStageFlags stages,
-                          LayoutTracker* tracker, bool separate) {
+                          LayoutTracker* tracker, bool separate,
+                          const VkConditionalRenderingBeginInfoEXT* predicate = nullptr) {
     const VkImageSubresourceRange range = planes_for_layout(a.binding, a.range, separate);
     auto pieces = current(tracker, a.id, range, layout);
-    initialize(vk, command_buffer, a.binding, a.id, pieces, layout, tracker);
+    initialize(vk, command_buffer, a.binding, a.id, pieces, layout, tracker, predicate);
     for (const auto& piece : pieces) {
         if (piece.layout == layout) {
             // Attachment writes of an earlier rendering scope are not ordered with this one without a barrier.
@@ -3047,13 +3062,17 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const bool predicates = vk.begin_conditional_rendering != nullptr;
     VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
     std::size_t next_query = 0;
-    // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
-    // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
-    const auto run_depth24 = [&](const Depth24Job& job) {
+    const auto active_predicate = [&]() -> const VkConditionalRenderingBeginInfoEXT* {
+        return predicate.buffer ? &predicate : nullptr;
+    };
+    const auto unpredicated = [&](auto&& fn) {
         if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
-        vk.depth24_run(command_buffer, job);
+        fn();
         if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
     };
+    // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
+    // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
+    const auto run_depth24 = [&](const Depth24Job& job) { unpredicated([&] { vk.depth24_run(command_buffer, job); }); };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -3114,7 +3133,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const VkImageLayout new_layout = image_layout(p.binding, to.layout);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, from.layout));
-            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, from.layout), tracker);
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, from.layout), tracker,
+                               active_predicate());
             for (const auto& piece : pieces)
                 detail::image_barrier(vk, command_buffer, p.binding, piece.range, piece.layout, new_layout,
                                       from.access, from.stages, to.access, to.stages);
@@ -3170,7 +3190,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const VkImageLayout before =
                     image_layout(p.binding, vulkan_layout(texture->layout_before, p.binding.presentable));
                 pieces = detail::current(tracker, id, range, before);
-                detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker);
+                detail::initialize(vk, command_buffer, p.binding, id, pieces, before, tracker, active_predicate());
             }
             const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before, predicates);
             const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after, predicates);
@@ -3200,7 +3220,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (p.skip) continue;
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
-            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker,
+                               active_predicate());
             const VkClearColorValue color = detail::render_target_clear_color(p.clear_format, color_clear->color);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
@@ -3235,7 +3256,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
-            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker,
+                               active_predicate());
             const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
                                                            : depth_clear->depth;
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
@@ -3291,7 +3313,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // Cleared in place in GENERAL, the UAV layout, which transfer clears and attachments both accept.
             const VkImageLayout layout = image_layout(p.binding, state.layout);
             auto pieces = detail::current(tracker, id, p.range, layout);
-            detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker);
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, layout, tracker, active_predicate());
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, layout, state,
                                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, [&] {
@@ -3335,23 +3357,23 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 // synchronization-validation run).
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker, active_predicate());
                 vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staged,
                                         std::uint32_t(p.staged_reads.size()), p.staged_reads.data());
                 detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker, active_predicate());
                 vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, dst_layout,
                                         std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
             } else if (!p.image_copies.empty()) {
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker, active_predicate());
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker, active_predicate());
                 const auto count = std::uint32_t(p.image_copies.size());
                 const auto depth_stencil = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
                 if (std::holds_alternative<CopyResource>(command) &&
@@ -3396,13 +3418,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 }
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker, active_predicate());
                 vk.copy_buffer_to_image(command_buffer, source, p.binding.image, dst_layout,
                                         std::uint32_t(regions->size()), regions->data());
             } else {
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker, active_predicate());
                 if (!p.has_depth24) {
                     vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.binding.buffer,
                                             std::uint32_t(p.buffer_image_copies.size()), p.buffer_image_copies.data());
@@ -3443,10 +3465,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const VkImageLayout dest_layout = image_layout(p.binding, dest_state.layout);
                 auto source_pieces = detail::current(
                     tracker, src_id, detail::planes_for_layout(p.source, p.source_range, separate), source_layout);
-                detail::initialize(vk, command_buffer, p.source, src_id, source_pieces, source_layout, tracker);
+                detail::initialize(vk, command_buffer, p.source, src_id, source_pieces, source_layout, tracker,
+                                   active_predicate());
                 auto dest_pieces = detail::current(
                     tracker, dst_id, detail::planes_for_layout(p.binding, p.range, separate), dest_layout);
-                detail::initialize(vk, command_buffer, p.binding, dst_id, dest_pieces, dest_layout, tracker);
+                detail::initialize(vk, command_buffer, p.binding, dst_id, dest_pieces, dest_layout, tracker,
+                                   active_predicate());
                 // The texels around the rectangle, kept in `staged` across the resolve (keep_around_resolve).
                 const auto keep = [&](VkImageLayout wanted, VkAccessFlags access, auto&& copy) {
                     const VkImageLayout layout = image_layout(p.binding, wanted);
@@ -3500,10 +3524,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             const VkImageLayout src_layout = detail::copy_layout(
                 vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker, active_predicate());
             const VkImageLayout dst_layout = detail::copy_layout(
                 vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker, active_predicate());
             vk.resolve_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout, 1, &p.resolve);
         } else if (const auto* marker = std::get_if<DebugMarker>(&command)) {
             if (!vk.insert_label || !vk.begin_label || !vk.end_label) continue;
@@ -3597,13 +3621,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
-            vk.xdxr_record(command_buffer, *xdxr_build);
+            // XDXR build/copy/postbuild are unconditional in D3D12 (and execute via vkCmdDispatch here); suspend
+            // conditional rendering around them so SetPredication cannot suppress AS maintenance.
+            unpredicated([&] { vk.xdxr_record(command_buffer, *xdxr_build); });
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
-            vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
+            unpredicated([&] { vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes); });
         } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command);
                    postbuild && !p.skip) {
-            for (std::size_t s = 0; s < postbuild->sources.size(); ++s)
-                vk.xdxr_postbuild(command_buffer, postbuild->sources[s], postbuild->dest_va + 8 * s);
+            if (!postbuild->sources.empty()) {
+                unpredicated([&] {
+                    for (std::size_t s = 0; s < postbuild->sources.size(); ++s)
+                        vk.xdxr_postbuild(command_buffer, postbuild->sources[s], postbuild->dest_va + 8 * s);
+                });
+            }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             // The build's addresses are console VAs into the GPU address arena (heap_base is its device address).
             // A null VA (no index buffer, no transform) stays null: heap_base + 0 would name the arena's zero page.
@@ -3683,7 +3713,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 if (!a.id) continue;  // an unbound slot: no image view, writes are dropped
                 const VkImageLayout layout = image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                 detail::to_attachment(vk, command_buffer, a, layout, color_access,
-                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);
+                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate,
+                                      active_predicate());
                 colors[slot].imageView = a.view;
                 colors[slot].imageLayout = layout;
                 colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -3693,7 +3724,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (d.depth.id) {
                 const VkImageLayout layout = image_layout(d.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
                 detail::to_attachment(vk, command_buffer, d.depth, layout, depth_access, depth_stages, tracker,
-                                      separate);
+                                      separate, active_predicate());
                 depth.imageView = d.depth.view;
                 depth.imageLayout = layout;
                 depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
