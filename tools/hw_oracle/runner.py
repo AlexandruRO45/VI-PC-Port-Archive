@@ -55,7 +55,7 @@ def _installed_clang(clang):
     if os.path.isfile(os.path.join(os.path.dirname(clang), _exe("ld.lld"))):
         return clang
     try:
-        out = subprocess.run([clang, "--version"], capture_output=True, text=True, timeout=60).stdout
+        out = subprocess.run([clang, "--version"], capture_output=True, text=True, errors="replace", timeout=60).stdout
     except (OSError, subprocess.SubprocessError):
         return clang
     for line in out.splitlines():

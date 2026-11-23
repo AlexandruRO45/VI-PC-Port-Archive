@@ -434,7 +434,7 @@ def prepare_gpu(exe, tmpdir):
     if not os.path.isfile(vertex): raise HarnessError(f"full-screen vertex shader is missing: {vertex}")
     vs_spv = os.path.join(tmpdir, "f64_diff_vs.spv")
     try:
-        r = subprocess.run([glslc, vertex, "-o", vs_spv], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([glslc, vertex, "-o", vs_spv], capture_output=True, text=True, errors="replace", timeout=30)
     except subprocess.TimeoutExpired: raise HarnessError("glslc timed out while compiling the full-screen vertex shader") from None
     if r.returncode: raise HarnessError(f"glslc failed: {(r.stdout + r.stderr).strip()}")
     return {"exe": exe, "glslc": glslc, "spirv_as": spirv_as, "vs_spv": vs_spv}
@@ -448,12 +448,12 @@ def run_gpu(lines, name, tmpdir, gpu):
     with open(asm_path, "w", encoding="utf-8", newline="\n") as f: f.write(asm)
     try:
         r = subprocess.run([gpu["spirv_as"], "--target-env", "vulkan1.2", asm_path, "-o", fs_spv],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, errors="replace", timeout=30)
     except subprocess.TimeoutExpired: raise HarnessError("spirv-as timed out while assembling the translated shader") from None
     if r.returncode: raise HarnessError(f"spirv-as failed: {(r.stdout + r.stderr).strip()}")
     try:
         r = subprocess.run([gpu["exe"], gpu["vs_spv"], fs_spv, raw, "1", "1"],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, errors="replace", timeout=60)
     except subprocess.TimeoutExpired: raise HarnessError("vk_harness timed out after 60 s") from None
     detail = " ".join((r.stdout + r.stderr).split())
     if r.returncode == 77: raise GPUUnavailable(detail or "vk_harness reports that the Vulkan device cannot run this shader")

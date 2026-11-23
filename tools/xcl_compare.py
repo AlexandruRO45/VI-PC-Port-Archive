@@ -313,7 +313,7 @@ def run_with_restarts(cmd_for, env, cwd, run, known, timeout, cdb, events, skip,
 def git_head(path):
     try:
         return subprocess.run(["git", "-C", str(path), "rev-parse", "--short", "HEAD"], capture_output=True,
-                              text=True).stdout.strip()
+                              text=True, errors="replace").stdout.strip()
     except OSError:
         return ""
 

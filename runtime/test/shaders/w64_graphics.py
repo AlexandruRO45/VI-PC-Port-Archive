@@ -287,7 +287,7 @@ def live_width(tools, spirv, tmp):
            os.path.join(spirv, "ps_live_width.spv"), str(raw)]
     env = dict(os.environ)
     env.pop("VKH_SUBGROUP_SIZE", None)
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+    r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", env=env, timeout=120)
     if r.returncode or not raw.is_file() or raw.stat().st_size != W * H * 16:
         return None
     return max(struct.unpack("<%dI" % (W * H * 4), raw.read_bytes()))

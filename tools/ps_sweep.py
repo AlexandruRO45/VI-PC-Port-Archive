@@ -164,7 +164,7 @@ def make_vs(glslang, meta, cache_dir):
         src = spv[:-4] + ".vert"
         with open(src, "w", encoding="utf-8", newline="\n") as f:
             f.write(vs_glsl(locs, flats, halves))
-        r = subprocess.run([glslang, "-V", "-S", "vert", src, "-o", spv], capture_output=True, text=True)
+        r = subprocess.run([glslang, "-V", "-S", "vert", src, "-o", spv], capture_output=True, text=True, errors="replace")
         if r.returncode:
             raise SystemExit("glslangValidator failed: " + r.stdout[-300:])
     return spv
@@ -245,7 +245,7 @@ def cmd_run(a):
                     if os.path.exists(path):
                         os.unlink(path)
             try:
-                r = subprocess.run(draw, env=env, capture_output=True, text=True, timeout=a.timeout + 15,
+                r = subprocess.run(draw, env=env, capture_output=True, text=True, errors="replace", timeout=a.timeout + 15,
                                    stdin=subprocess.DEVNULL)
                 code, out, err = r.returncode, r.stdout, r.stderr
             except subprocess.TimeoutExpired:
