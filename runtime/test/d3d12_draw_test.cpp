@@ -1039,6 +1039,7 @@ int main() {
             list->ResolveQueryData(queries.p, D3D12_QUERY_TYPE_OCCLUSION, 0, std::size(views), readback.p, 0);
             EXPECT(SUCCEEDED(list->Close()));
             queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
             EXPECT(SUCCEEDED(queue->Signal(fence.p, 100)) && SUCCEEDED(fence->SetEventOnCompletion(100, nullptr)));
             const std::array<UINT64, std::size(views)> expected{4, 4, 6, 1, 0};
             std::array<UINT64, std::size(views)> samples{};
