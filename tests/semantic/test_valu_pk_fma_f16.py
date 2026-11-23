@@ -134,6 +134,22 @@ class PkFmaF16(unittest.TestCase):
                     got = run(f"{op} v0, {regs(len(srcs))}{mods}", {f"v{i}": s for i, s in enumerate(srcs, 1)})
                     self.assertTrue(same_pk(got, want), hex(got))
 
+    def test_in_place_negated_addend(self):
+        # v0 starts at (0.25, -1). Low always computes 3 * 0.5 - 0.25 = 1.25.
+        instr = "v_pk_fma_f16 v0, v1, v2, v0 op_sel:[1,0,0] neg_lo:[0,0,1] neg_hi:[0,0,1]"
+        for sel_hi, want_hi in [
+            ("[0,1,1]", 0x3A00),  # 1 * -0.25 - (-1) = 0.75
+            ("[0,1,0]", 0xB800),  # 1 * -0.25 - 0.25 = -0.5
+        ]:
+            with self.subTest(op_sel_hi=sel_hi):
+                got = run(f"{instr} op_sel_hi:{sel_hi}", {"v1": S0, "v2": S1}, old=S2)
+                self.assertEqual(got, P(0x3D00, want_hi))
+
+        # Negative control: seed the new low result in place of the old low addend.
+        # Reading it too early would give 1 * -0.25 - 1.25 = -1.5 in the high half.
+        got = run(f"{instr} op_sel_hi:[0,1,0]", {"v1": S0, "v2": S1}, old=P(0x3D00, 0xBC00))
+        self.assertEqual(got, P(QUARTER, 0xBE00))
+
     def test_every_op_sel_and_op_sel_hi_combination(self):
         a, b, c = P(0x3E00, 0xC400), P(0x4900, 0x3A00), P(0xB800, 0x4D00)       # distinct halves: 1.5/-4, 10/.75, -.5/20
         for op, (n, fn) in OPS.items():
