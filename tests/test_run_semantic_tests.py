@@ -19,6 +19,10 @@ PASS = "import unittest\nimport helper\nclass T(unittest.TestCase):\n    def tes
        "    def test_b(self): pass\n"
 FAIL = "import unittest\nclass T(unittest.TestCase):\n    def test_a(self): self.assertEqual(1, 2, 'boom-msg')\n"
 BROKEN = "import no_such_module_anywhere\n"
+NESTED = ("import os, sys, unittest\nclass Inner(unittest.TestCase):\n    def test_i(self): pass\n"
+          "class T(unittest.TestCase):\n    def test_a(self):\n"
+          "        unittest.TextTestRunner(stream=sys.stdout).run(unittest.defaultTestLoader.loadTestsFromTestCase(Inner))\n"
+          "        sys.stdout.flush()\n        os._exit(0)\n")
 
 
 def suite(tmp, files):
@@ -70,6 +74,33 @@ class RunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS})
             self.assertEqual(run(tmp, "-j", "1")[0], 0)
+
+    def test_an_early_exit_with_status_0_fails_the_run(self):
+        # os._exit(0) at import, inside a test, and after a nested runner printed its own passing summary: the
+        # process exits 0 but unittest never finished (TEST-1844).
+        cases = {
+            "import": "import os\nos._exit(0)\n",
+            "in_test": "import os, unittest\nclass T(unittest.TestCase):\n    def test_a(self): os._exit(0)\n",
+            "nested": NESTED,
+        }
+        for name, text in cases.items():
+            for jobs in ("1", "2"):
+                with self.subTest(name, jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                    suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS, "test_x.py": text})
+                    code, out = run(tmp, "-j", jobs)
+                    self.assertEqual(code, 1, out)
+                    self.assertIn("before unittest reported completing", out)
+                    if jobs == "2":
+                        self.assertIn("==== FAILED: test_x", out)
+                        self.assertIn("2 files, 2 tests, 1 files failed", out)
+
+    def test_the_completion_line_is_not_shown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS})
+            code, ran, out = r.run_module(tmp, "test_p", False)
+            self.assertEqual((code, ran), (0, 2), out)
+            self.assertNotIn("leonida-semantic-done-", out)
+            self.assertIn("OK", out)
 
     def test_an_empty_suite_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

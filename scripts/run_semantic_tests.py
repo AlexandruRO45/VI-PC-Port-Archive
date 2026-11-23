@@ -9,12 +9,18 @@ It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.
 run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
 or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
 line, and exits 1 if a file fails or none is found. Standard library only.
+
+A file passes only when unittest itself finished: each run goes through a small bootstrap that prints a random
+token, made fresh for every run, with the outer runner's test count after `unittest.main` returns. A worker that
+exits 0 before that (os._exit, an interpreter crash reported as 0, or a nested runner that printed its own passing
+summary and then exited) has no token and fails.
 """
 import argparse
 import concurrent.futures
 import fnmatch
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -32,13 +38,67 @@ def test_modules(directory):
     return names
 
 
+# Runs unittest with the given arguments and reports completion itself, after unittest.main returns: a line
+# "<token> <tests run> <1 if successful else 0>". The token is argv[1], so a test cannot know it in advance by name.
+BOOTSTRAP = r"""import sys, unittest
+token = sys.argv[1]
+result = unittest.main(module=None, argv=["python -m unittest", *sys.argv[2:]], exit=False).result
+sys.stderr.flush()
+print("\n" + f"{token} {result.testsRun} {int(result.wasSuccessful())}", flush=True)
+sys.exit(0 if result.wasSuccessful() else 1)
+"""
+
+
+def unittest_command(args):
+    """(token, command) running `python -m unittest <args>` through BOOTSTRAP."""
+    token = "leonida-semantic-done-" + secrets.token_hex(16)
+    return token, [sys.executable, "-c", BOOTSTRAP, token, *args]
+
+
+def completion(token, line):
+    """(tests run, successful) if `line` is the bootstrap's completion line for `token`, else None."""
+    m = re.fullmatch(re.escape(token) + r" (\d+) ([01])", line.strip())
+    return (int(m.group(1)), m.group(2) == "1") if m else None
+
+
 def run_module(directory, module, verbose):
-    """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
-    cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
+    """(return code, tests run, output) of `python -m unittest <module>` run from `directory`. The code is 1 when
+    unittest did not report completing, whatever the process's exit status."""
+    token, cmd = unittest_command([*(["-v"] if verbose else []), module])
     p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        errors="replace")
-    ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
-    return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
+    done, kept = None, []
+    for line in p.stdout.splitlines(keepends=True):
+        seen = completion(token, line)
+        if seen is None:
+            kept.append(line)
+        else:
+            done = seen
+    out = "".join(kept)
+    if done is None:
+        out += f"\n(the test process exited with {p.returncode} before unittest reported completing)\n"
+        return p.returncode or 1, 0, out
+    ran, ok = done
+    return (p.returncode or (0 if ok else 1)), ran, out
+
+
+def run_discover(directory, verbose):
+    """Exit code of `python -m unittest discover -s <directory>`, output streamed; 1 when unittest did not report
+    completing."""
+    token, cmd = unittest_command(["discover", "-s", directory, *(["-v"] if verbose else [])])
+    done = None
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, errors="replace") as p:
+        for line in p.stdout:
+            seen = completion(token, line)
+            if seen is None:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            else:
+                done = seen
+    if done is None:
+        print(f"the test process exited with {p.returncode} before unittest reported completing")
+        return p.returncode or 1
+    return p.returncode or (0 if done[1] else 1)
 
 
 def main(argv=None):
@@ -49,8 +109,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     directory = os.path.abspath(a.directory)
     if a.jobs <= 1:
-        return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
-                                *(["-v"] if a.verbose else [])])
+        return run_discover(directory, a.verbose)
     modules = test_modules(directory)
     if not modules:
         print(f"no test*.py files in {directory}")
