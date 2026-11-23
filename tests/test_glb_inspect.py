@@ -173,6 +173,17 @@ class GlbInspectTests(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, *args],
                               capture_output=True, text=True, timeout=60, errors="replace")
 
+    def inspect_animations(self, gltf):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "animated.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                return json.load(handle)["animations"]
+
     def run_bytes(self, data):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "input.glb")
@@ -575,6 +586,73 @@ class GlbInspectTests(unittest.TestCase):
             self.assertTrue(any("unknown target path 'bogus'" in issue for issue in issues))
             self.assertTrue(any("output accessor is missing" in issue for issue in issues))
             self.assertEqual(report["animations"][0]["target_node_count"], 1)
+
+    def test_animation_duplicate_core_targets_are_reported(self):
+        for path, output_type in (("translation", "VEC3"), ("rotation", "VEC4"),
+                                  ("scale", "VEC3"), ("weights", "SCALAR")):
+            with self.subTest(path=path):
+                gltf = animated_gltf()
+                gltf["accessors"][3]["type"] = output_type
+                if path == "weights":
+                    gltf["accessors"].append({"componentType": 5126, "count": 3, "type": "VEC3"})
+                    gltf["meshes"][0]["primitives"][0]["targets"] = [{"POSITION": 4}]
+                animation = gltf["animations"][0]
+                animation["samplers"].append({"input": 2, "output": 3, "interpolation": "STEP"})
+                animation["channels"] = [
+                    {"sampler": 0, "target": {"node": 0, "path": path}},
+                    {"sampler": 1, "target": {"node": 0, "path": path}},
+                    {"sampler": 0, "target": {"node": 0, "path": path}},
+                ]
+
+                report, = self.inspect_animations(gltf)
+                self.assertEqual(report["channel_count"], 3)
+                self.assertEqual(report["paths"], {path: 3})
+                self.assertEqual(report["issues"], [
+                    f"channel[1] duplicates channel[0] target node 0 path {path!r}",
+                    f"channel[2] duplicates channel[0] target node 0 path {path!r}",
+                ])
+
+    def test_animation_distinct_targets_and_reuse_across_animations(self):
+        gltf = animated_gltf()
+        gltf["nodes"].append({})
+        first = gltf["animations"][0]
+        gltf["animations"].append({
+            "samplers": first["samplers"],
+            "channels": [first["channels"][0]],
+        })
+        first["channels"].extend([
+            {"sampler": 0, "target": {"node": 1, "path": "translation"}},
+            {"sampler": 0, "target": {"node": 0, "path": "scale"}},
+        ])
+
+        first_report, second_report = self.inspect_animations(gltf)
+        self.assertEqual(first_report["issues"], [])
+        self.assertEqual(second_report["issues"], [])
+
+    def test_animation_unresolved_targets_keep_existing_diagnostics(self):
+        gltf = animated_gltf()
+        gltf["nodes"].append(None)
+        targets = [
+            {"node": 1, "path": "translation"},
+            {"node": 99, "path": "translation"},
+            {"path": "translation"},
+            {"node": 0},
+            {"node": 0, "path": "bogus"},
+            {"path": "pointer", "extensions": {
+                "KHR_animation_pointer": {"pointer": "/nodes/0/translation"},
+            }},
+        ]
+        gltf["animations"][0]["channels"] = [{"sampler": 0, "target": target} for target in targets * 2]
+
+        report, = self.inspect_animations(gltf)
+
+        def channel_issues(index):
+            prefix = f"channel[{index}] "
+            return [issue[len(prefix):] for issue in report["issues"] if issue.startswith(prefix)]
+
+        for index, target in enumerate(targets):
+            with self.subTest(target=target):
+                self.assertEqual(channel_issues(index + len(targets)), channel_issues(index))
 
     def test_animation_type_mismatches_are_reported(self):
         gltf = animated_gltf()

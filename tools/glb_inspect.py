@@ -237,7 +237,7 @@ def _accessor_type(gltf: dict, index: object) -> str | None:
 
 
 def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
-    """Summarize an animation and flag references that cannot be resolved."""
+    """Summarize an animation and flag invalid references and repeated targets."""
     issues: list[str] = []
     raw_samplers_value = animation.get("samplers")
     if raw_samplers_value is not None and not isinstance(raw_samplers_value, list):
@@ -299,6 +299,7 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             "duration": duration,
         })
 
+    first_target_channel: dict[tuple[int, str], int] = {}
     channels: list[dict] = []
     paths: dict[str, int] = {}
     target_nodes: set[int] = set()
@@ -327,6 +328,13 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             issues.append(f"channel[{channel_index}] has unknown target path {path!r}")
         else:
             paths[path] = paths.get(path, 0) + 1
+            if node_index is not None and node is not None:
+                first_channel = first_target_channel.setdefault((node_index, path), channel_index)
+                if first_channel != channel_index:
+                    issues.append(
+                        f"channel[{channel_index}] duplicates channel[{first_channel}] "
+                        f"target node {node_index} path {path!r}"
+                    )
             expected_type = {"translation": "VEC3", "rotation": "VEC4",
                              "scale": "VEC3", "weights": "SCALAR"}[path]
             sampler = samplers[sampler_index] if sampler_index is not None and sampler_index < len(samplers) else None
