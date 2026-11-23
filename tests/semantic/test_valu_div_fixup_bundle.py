@@ -381,5 +381,28 @@ class TestVDivFixupF32Reference(unittest.TestCase):
         self.assertEqual(res, 0.0)
 
 
+def step_scalar_div_fixup_f32(state: ValuDivState, instr: Instruction) -> None:
+    if instr.opcode != "v_div_fixup_f32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    s0 = state.read_f32(instr.src0)
+    s1 = state.read_f32(instr.src1)
+    s2 = state.read_f32(instr.src2)
+    res = ref_div_fixup_f32(s0, s1, s2)
+    state.write_f32(int(instr.dst.index_or_val), res)
+
+
+class TestVDivFixupF32ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for v_div_fixup_f32."""
+
+    def test_scalar_interpreter_execution(self):
+        state = ValuDivState()
+        state.write_f32(1, 2.5)
+        state.write_f32(2, 2.0)
+        state.write_f32(3, 5.0)
+        instr = Instruction("v_div_fixup_f32", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        step_scalar_div_fixup_f32(state, instr)
+        self.assertEqual(bits_to_f32(state.vgprs[0]), 2.5)
+
+
 if __name__ == "__main__":
     unittest.main()
