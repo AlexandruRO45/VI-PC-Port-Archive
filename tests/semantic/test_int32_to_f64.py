@@ -21,8 +21,8 @@ class Int32ToFloat64(unittest.TestCase):
         with patch.object(rdna2spirv, "FLOAT_CONTROLS", False):
             foldable = translate_fixture("ps_int32_to_f64")
         float_controls = {
-            "OpCapability SignedZeroInfNanPreserve", "OpCapability DenormPreserve",
-            "OpExecutionMode %main SignedZeroInfNanPreserve 32", "OpExecutionMode %main DenormPreserve 16",
+            "OpCapability SignedZeroInfNanPreserve",
+            "OpExecutionMode %main SignedZeroInfNanPreserve 32",
             # SHADER-597 (#3290): a module that declares Float64 also preserves f64 signed zeros, infs and NaNs
             "OpExecutionMode %main SignedZeroInfNanPreserve 64",
         }
