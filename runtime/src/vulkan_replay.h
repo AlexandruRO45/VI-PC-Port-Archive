@@ -64,6 +64,7 @@ struct ResourceBinding {
     std::uint32_t height = 1;
     std::uint32_t mip_levels = 1;
     std::uint32_t array_layers = 1;
+    std::uint32_t mips_dropped = 0;
     bool presentable = false;          // a swapchain image: common/present maps to PRESENT_SRC_KHR
     bool simultaneous_access = false;  // D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS: always GENERAL
     bool not_zeroed = false;           // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: first use skips the zero fill
@@ -1641,9 +1642,35 @@ inline bool copy_subresource(const ResourceBinding& resource, std::uint32_t subr
 // Block-compressed footprints are padded to whole blocks; the Vulkan extent stops at the mip edge.
 inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     if (!copy.dst.footprint && !copy.src.footprint) {
+        std::uint32_t dst_sub = copy.dst.subresource;
+        std::uint32_t src_sub = copy.src.subresource;
+        if (p.binding.mips_dropped > 0) {
+            const std::uint32_t orig_mips = p.binding.mip_levels + p.binding.mips_dropped;
+            const std::uint32_t total = orig_mips * p.binding.array_layers;
+            if (dst_sub == all_subresources || dst_sub >= total) return ReplayResult::invalid_subresource;
+            const std::uint32_t mip = dst_sub % orig_mips;
+            const std::uint32_t slice = dst_sub / orig_mips;
+            if (mip < p.binding.mips_dropped) {
+                p.skip = true;
+                return ReplayResult::success;
+            }
+            dst_sub = slice * p.binding.mip_levels + (mip - p.binding.mips_dropped);
+        }
+        if (p.source.mips_dropped > 0) {
+            const std::uint32_t orig_mips = p.source.mip_levels + p.source.mips_dropped;
+            const std::uint32_t total = orig_mips * p.source.array_layers;
+            if (src_sub == all_subresources || src_sub >= total) return ReplayResult::invalid_subresource;
+            const std::uint32_t mip = src_sub % orig_mips;
+            const std::uint32_t slice = src_sub / orig_mips;
+            if (mip < p.source.mips_dropped) {
+                p.skip = true;
+                return ReplayResult::success;
+            }
+            src_sub = slice * p.source.mip_levels + (mip - p.source.mips_dropped);
+        }
         VkImageSubresourceRange dst{}, src{};
-        if (!copy_subresource(p.binding, copy.dst.subresource, dst) ||
-            !copy_subresource(p.source, copy.src.subresource, src))
+        if (!copy_subresource(p.binding, dst_sub, dst) ||
+            !copy_subresource(p.source, src_sub, src))
             return ReplayResult::invalid_subresource;
         if ((dst.aspectMask != src.aspectMask && !depth_colour_pair(p.binding, p.source)) ||
             p.binding.volume != p.source.volume || p.binding.samples != p.source.samples ||
@@ -1768,8 +1795,23 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     const CopyLocation& texture = upload ? copy.dst : copy.src;
     const CopyLocation& placed = upload ? copy.src : copy.dst;
     if (!buffer.buffer) return ReplayResult::invalid_copy;
+
+    std::uint32_t tex_sub = texture.subresource;
+    if (image.mips_dropped > 0) {
+        const std::uint32_t orig_mips = image.mip_levels + image.mips_dropped;
+        const std::uint32_t total = orig_mips * image.array_layers;
+        if (tex_sub == all_subresources || tex_sub >= total) return ReplayResult::invalid_subresource;
+        const std::uint32_t mip = tex_sub % orig_mips;
+        const std::uint32_t slice = tex_sub / orig_mips;
+        if (mip < image.mips_dropped) {
+            p.skip = true;
+            return ReplayResult::success;
+        }
+        tex_sub = slice * image.mip_levels + (mip - image.mips_dropped);
+    }
+
     VkImageSubresourceRange range{};
-    if (!copy_subresource(image, texture.subresource, range)) return ReplayResult::invalid_subresource;
+    if (!copy_subresource(image, tex_sub, range)) return ReplayResult::invalid_subresource;
     if (image.samples != 1) return ReplayResult::invalid_copy;  // multisampled textures have no footprint
     const BlockFormat format = copy_block_format(image, range.aspectMask);
     // A 12-byte texel does not divide D3D12's 256-byte pitches; an rgb96 copy hands Vulkan the scratch buffer of
@@ -1883,6 +1925,10 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     const bool same_shape = sb == db ? dst.width == src.width && dst.height == src.height
                                      : blocks(dst.width, db) == blocks(src.width, sb) &&
                                            blocks(dst.height, db) == blocks(src.height, sb);
+    if ((dst.mips_dropped > 0 || src.mips_dropped > 0) && dst.mip_levels != src.mip_levels) {
+        p.skip = true;
+        return ReplayResult::success;
+    }
     if (!dst.image || !src.image || !same_shape ||
         dst.depth != src.depth || dst.volume != src.volume || dst.mip_levels != src.mip_levels ||
         dst.array_layers != src.array_layers || (dst.aspects != src.aspects && !depth_colour_pair(dst, src)) ||
@@ -3523,6 +3569,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             });
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
+            if (p.skip) continue;
             const auto [dst_id, src_id] = copy_ids(command);
             if (!p.predicated_copy.empty()) {
                 end_statistics();

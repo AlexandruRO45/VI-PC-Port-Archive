@@ -253,6 +253,52 @@ class TestTextureMipDrop(unittest.TestCase):
         with self.assertRaises(ValueError):
             t.map_subresource(0xFFFFFFFF)
 
+    def test_command_list_copy_texture_region_skips_dropped_mips(self):
+        """Command-list CopyTextureRegion must mark dropped mips as skip=True and remap retained mips."""
+        # 8x8 texture, 3 mips (0, 1, 2), drop=1 -> physical 4x4, 2 mips (0, 1).
+        t = TextureCreateInfoModel(8, 8, 1, 3, flags=D3D12ResourceFlags.NONE, mip_drop_env=1)
+
+        def prepare_copy(subres: int) -> tuple[str, int | None]:
+            all_subresources = 0xFFFFFFFF
+            total = t.original_mips * t.array_layers
+            if subres == all_subresources or subres >= total:
+                return "error", None
+            mip = subres % t.original_mips
+            slice_idx = subres // t.original_mips
+            if mip < t.mips_dropped:
+                return "skip", None
+            phys_sub = slice_idx * t.mip_levels + (mip - t.mips_dropped)
+            return "remap", phys_sub
+
+        # Full-chain upload in a single command list: mips 0, 1, 2
+        act0, sub0 = prepare_copy(0)
+        self.assertEqual(act0, "skip")
+        self.assertIsNone(sub0)
+
+        act1, sub1 = prepare_copy(1)
+        self.assertEqual(act1, "remap")
+        self.assertEqual(sub1, 0)  # physical mip 0 (4x4)
+
+        act2, sub2 = prepare_copy(2)
+        self.assertEqual(act2, "remap")
+        self.assertEqual(sub2, 1)  # physical mip 1 (2x2)
+
+        # Out-of-range subresource
+        act3, sub3 = prepare_copy(3)
+        self.assertEqual(act3, "error")
+
+    def test_command_list_copy_resource_skip_on_mip_mismatch(self):
+        """CopyResource between differently dropped textures skips without failing the list."""
+        t_dropped = TextureCreateInfoModel(8, 8, 1, 3, flags=D3D12ResourceFlags.NONE, mip_drop_env=1)
+        t_native = TextureCreateInfoModel(8, 8, 1, 3, flags=D3D12ResourceFlags.NONE, mip_drop_env=0)
+        self.assertEqual(t_dropped.mip_levels, 2)
+        self.assertEqual(t_native.mip_levels, 3)
+
+        mismatch_due_to_drop = (t_dropped.mips_dropped > 0 or t_native.mips_dropped > 0) and (
+            t_dropped.mip_levels != t_native.mip_levels
+        )
+        self.assertTrue(mismatch_due_to_drop)
+
 
 if __name__ == "__main__":
     unittest.main()

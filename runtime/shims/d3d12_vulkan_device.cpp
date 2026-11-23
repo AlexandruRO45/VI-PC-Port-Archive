@@ -2028,6 +2028,7 @@ public:
         binding.mip_levels = info.mipLevels;
         binding.array_layers = info.arrayLayers;
         binding.depth = info.extent.depth;
+        binding.mips_dropped = mips_dropped_;
         binding.volume = volume;
         binding.line = one_d;
         binding.samples = samples;
