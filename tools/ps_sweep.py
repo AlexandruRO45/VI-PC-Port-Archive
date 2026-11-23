@@ -349,14 +349,20 @@ def load_results(a, tag):
     for folder in (d, d + "_re"):   # re-runs override the first pass
         if not os.path.isdir(folder):
             continue
-        for name in sorted(os.listdir(folder)):
-            if name.startswith("results_") and name.endswith(".jsonl"):
-                with open(os.path.join(folder, name), encoding="utf-8") as f:
-                    for line in f:
-                        if line.strip():
-                            r = json.loads(line)
-                            r["dir"] = folder
-                            recs[r["i"]] = r
+        try:
+            names = sorted(os.listdir(folder))
+            for name in names:
+                if name.startswith("results_") and name.endswith(".jsonl"):
+                    with open(os.path.join(folder, name), encoding="utf-8") as f:
+                        for line in f:
+                            if line.strip():
+                                r = json.loads(line)
+                                r["dir"] = folder
+                                recs[r["i"]] = r
+        except OSError as e:
+            # A folder in place of a results log, or a permission failure: a tag that cannot be read is one
+            # line and exit 1, like the readback classes, not a traceback.
+            raise SystemExit(f"{tag}: cannot read {folder}: {e.strerror or e}") from None
     return recs
 
 

@@ -244,6 +244,22 @@ class CompareCommand(unittest.TestCase):
             rows = json.loads((out / "classes_z.json").read_text(encoding="utf-8"))
             self.assertEqual([(r["class"], r["sub"]) for r in rows], [case[-2:] for case in cases])
 
+    def test_unreadable_results_log_is_one_line(self):
+        # A folder where a results log should be (or a permission failure: both raise OSError, not
+        # FileNotFoundError) is a tag the tool cannot read: one line and exit 1, not a traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "sample.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("[]")
+            os.makedirs(os.path.join(tmp, "a_z"))
+            os.mkdir(os.path.join(tmp, "a_z", "results_0.jsonl"))
+            os.makedirs(os.path.join(tmp, "b_z"))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as raised:
+                ps_sweep.main(["compare", "--out", tmp, "--tags", "a", "b"])
+            message = str(raised.exception.code)
+            self.assertIn("a: cannot read " + os.path.join(tmp, "a_z"), message)
+            self.assertNotIn("\n", message)
+
     def test_rerun_overrides_and_counts(self):
         with tempfile.TemporaryDirectory() as out:
             with open(os.path.join(out, "sample.json"), "w", encoding="utf-8", newline="\n") as f:
