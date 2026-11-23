@@ -878,6 +878,15 @@ class Wave32LaneDumps(unittest.TestCase):
         self.assertTrue(problem)
         self.assertNotIsInstance(problem, check.Skip)
 
+    def test_exit_zero_without_a_result_line_says_stdout_was_lost(self):
+        out = "device: RTX 5080 (subgroup 32..64)\n"
+        with patch.object(check, "run", return_value=(0, out)):
+            problem = check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
+        self.assertIn("exit 0:", problem)
+        self.assertIn("no result line from vk_compute_test", problem)
+        self.assertIn("stdout may have been lost", problem)
+        self.assertIn("device: RTX 5080", problem)
+
     def test_lane_dumps_request_32_lanes(self):
         # #774: like run_gpu_tests.py, so an 8..32 device (Intel ANV) doesn't judge the dump at a narrower size.
         for name in check.WAVE32_LANE_DUMPS:

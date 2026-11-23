@@ -945,6 +945,10 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         m = re.search(r"(\d+) mismatches", out)
         if m and m.group(1) == "0":
             return ""
+    # An exit-0 run with no result line used to print only the last stderr line ("device: ..."),
+    # which looks like a test failure rather than a lost stdout. Say so explicitly (#166).
+    if code == 0 and not re.search(r"^(?:out\[0\.\.7\]|\d+ mismatches|compute subgroup size:)", out, re.MULTILINE):
+        return failure(code, out.rstrip() + "\n(no result line from vk_compute_test; stdout may have been lost)", 3)
     return failure(code, out, 2)
 
 
