@@ -72,6 +72,10 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
                 return 0, ""
+            if name == "cs_fmt_store_round":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
+                Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_STORE_ROUND_WORDS))
+                return 0, ""
             if name == "cs_fmt_d16_xyz":
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "80"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<80I", *check.FMT_D16_XYZ_WORDS))

@@ -230,6 +230,10 @@ FMT_INT_NARROW_WORDS = [
     0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
     0x7F01FF80, 0x8000FFFF, 0x12345678, 0x9ABCDEF0, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE,
 ]
+# cs_fmt_store_round.asm: UNORM16/SNORM2 store rounding and 2-component DST_SEL (SHADER-917). Derivation in the header.
+FMT_STORE_ROUND_WORDS = [
+    0xEEEE4CCD, 0x40000000, 0xC0000000, 0xEEEEEEEE, 0x00000011, 0x00000022, 0x00000022, 0x00000011,
+    0x00000011, 0x00000000, 0x00000000, 0x00000011, 0x00000011, 0x00000022] + [0xEEEEEEEE] * 50
 # cs_fmt_sint32.asm: hand-derived full-width and D16 load results, inputs, stores, and untouched words.
 FMT_SINT32_WORDS = [
     0x80000000, 0x7FFFFFFF, 0x80000000, 1,
@@ -718,6 +722,10 @@ def fmt_1010102_test(tools, spirv, env=None):
 
 def fmt_int_narrow_test(tools, spirv, env=None):
     return dump_test(tools, spirv, "cs_fmt_int_narrow", FMT_INT_NARROW_WORDS, len(FMT_INT_NARROW_WORDS), env)
+
+
+def fmt_store_round_test(tools, spirv, env=None):
+    return dump_test(tools, spirv, "cs_fmt_store_round", FMT_STORE_ROUND_WORDS, len(FMT_STORE_ROUND_WORDS), env)
 
 
 def fmt_sint32_test(tools, spirv, env=None):
@@ -1785,6 +1793,7 @@ def main():
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
+    results.append(("cs_fmt_store_round", fmt_store_round_test(tools, spirv)))
     results.append(("cs_fmt_int_narrow", fmt_int_narrow_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_fmt_all", fmt_all_test(tools, spirv)))
