@@ -72,6 +72,46 @@ class HarnessErrorExit(unittest.TestCase):
         self.assertIn("0 skipped, 1 harness errors", out.getvalue())
         self.assertIn("RuntimeError: broken interpreter", out.getvalue())
 
+    def test_unexpected_interpreter_outputs_next_to_pass_exit_2(self):
+        run_fragment = sd.run_fragment
+        for names in ((), ("%out_mrt1",), ("%out_mrt0", "%out_mrt1")):
+            with self.subTest(outputs=names):
+                calls = 0
+
+                def corrupt_second_output(spvasm):
+                    nonlocal calls
+                    outputs = run_fragment(spvasm)
+                    calls += 1
+                    if calls == 2:
+                        return {name: outputs["%out_mrt0"] for name in names}
+                    return outputs
+
+                out = io.StringIO()
+                with mock.patch.object(sd, "run_fragment", side_effect=corrupt_second_output), \
+                        contextlib.redirect_stdout(out):
+                    code = sd.main(["--programs", "2", "--seed", "17", "--max-ops", "1"])
+                self.assertEqual(code, 2, out.getvalue())
+                self.assertEqual(calls, 2)
+                self.assertIn("1 pass, 0 mismatch, 0 skipped, 1 harness errors", out.getvalue())
+                self.assertIn(f"mini_interp gave outputs {list(names)}, want [%out_mrt0]", out.getvalue())
+                self.assertIn("Replay: --seed 17 --max-ops 1 --program-index 1", out.getvalue())
+
+    def test_missing_shader_export_exits_2(self):
+        write_listing = sd._write_listing
+
+        def omit_second_export(path, lines, with_export):
+            if os.path.basename(path) == "ps_diff_0001.s":
+                with_export = False
+            write_listing(path, lines, with_export)
+
+        out = io.StringIO()
+        with mock.patch.object(sd, "_write_listing", side_effect=omit_second_export), \
+                contextlib.redirect_stdout(out):
+            code = sd.main(["--programs", "2", "--seed", "17", "--max-ops", "1"])
+        self.assertEqual(code, 2, out.getvalue())
+        self.assertIn("1 pass, 0 mismatch, 0 skipped, 1 harness errors", out.getvalue())
+        self.assertIn("mini_interp gave outputs [], want [%out_mrt0]", out.getvalue())
+
     def test_unsupported_interpreter_construct_is_a_skip(self):
         out = io.StringIO()
         with mock.patch.object(sd, "run_fragment", side_effect=UnsupportedConstruct("test construct")):

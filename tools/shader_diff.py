@@ -253,7 +253,7 @@ def run_one(name, lines, writers):
         except UnsupportedConstruct as e:
             return ("skip", f"mini_interp unsupported: {type(e).__name__}: {e}")
         if list(out) != ["%out_mrt0"]:
-            return ("skip", f"mini_interp gave outputs {sorted(out)}, want [%out_mrt0]")
+            raise RuntimeError(f"mini_interp gave outputs {sorted(out)}, want [%out_mrt0]")
         regs = cpu_res["registers"]["vgpr"]
         cpu_words = [regs.get(r, [0])[0] if isinstance(regs.get(r), list) else regs.get(r, 0)
                      for r in EXPORT_REGS]
