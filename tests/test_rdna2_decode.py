@@ -283,6 +283,8 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                                  f"{path}: {li['op']}")
                 self.assertEqual(sorted(di["mods"]), sorted(li["mods"]), f"{path}: {li['op']}")
                 checked += 1
+            # Every assembled byte is accounted for: a short last encoding would otherwise pass unnoticed.
+            self.assertEqual(at, len(raw), path)
         self.assertGreater(checked, 5000)
         self.assertLess(renormalized, 5)   # a handful at most: more would mean the comparison stopped meaning much
 
