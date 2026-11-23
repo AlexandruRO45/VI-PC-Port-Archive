@@ -408,7 +408,7 @@ class TestCommandLine(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(bink.main([path, "--out", out]), 2)
-        self.assertIn("not a Bink 2 stream or an RPF archive", err.getvalue())
+        self.assertIn("not a Bink 2 stream (KB2) or an RPF archive", err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
         self.assertFalse(os.path.exists(out))
 
@@ -424,6 +424,17 @@ class TestCommandLine(unittest.TestCase):
             self.assertEqual(bink.main([folder]), 0)
         self.assertIn("0 Bink 2 streams", err.getvalue())
         self.assertTrue(out.getvalue().splitlines())
+
+    def test_a_kb2_header_that_parses_to_no_stream_is_refused_with_the_same_message(self):
+        # Starts like a stream (passes target_problem) but holds none: the second guard must word it alike.
+        path = os.path.join(self.tmp.name, "truncated.bin")
+        with open(path, "wb") as fh:
+            fh.write(b"KB2a" + bytes(8))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([path]), 2)
+        self.assertEqual(err.getvalue().splitlines(),
+                         [f"bink_index: error: {path}: not a Bink 2 stream (KB2) or an RPF archive"])
 
     def test_an_rpf_archive_with_no_stream_is_still_indexed(self):
         # A named file with an RPF header is an archive, even if it holds no Bink 2 stream.

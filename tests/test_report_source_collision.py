@@ -20,7 +20,8 @@ SENTINEL = b"SYNTHETIC-SOURCE-DO-NOT-OVERWRITE\n" * 4
 
 
 def make_bink():
-    return SENTINEL
+    # A stream header bink_index accepts (KB2 + revision), then the sentinel bytes.
+    return struct.pack("<4s10I", b"KB2a", 40, 1, 0, 1, 16, 16, 30, 1, 0, 1) + bytes(4) + SENTINEL
 
 
 def make_rpf(payload, head_size=0x40):
