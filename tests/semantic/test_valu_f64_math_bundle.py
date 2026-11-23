@@ -571,5 +571,18 @@ class VLdexpF64SimdIeeeTests(unittest.TestCase):
         # 1.0 * 2^2000 -> overflow to inf
         self.assertEqual(oracle_ldexp_f64(F64_POS_ONE, 2000), F64_POS_INF)
 
+class VLdexpF64TranslatorTests(unittest.TestCase):
+    def test_ldexp_f64_translation(self):
+        lines = [
+            f"v_mov_b32 v0, {F64_POS_ONE & MASK32:#010x}",
+            f"v_mov_b32 v1, {(F64_POS_ONE >> 32) & MASK32:#010x}",
+            "v_mov_b32 v2, 4",
+            "v_ldexp_f64 v[0:1], v[0:1], v2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_ldexp_f64_test", lines)
+        self.assertIn("OpCapability", spv)
+
 if __name__ == "__main__":
     unittest.main()
