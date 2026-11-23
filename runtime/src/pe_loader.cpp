@@ -924,48 +924,71 @@ Loader::~Loader() {
     // Importers must release their resources before their dependencies. Keep every mapping, unwind table and TLS
     // block alive throughout the notifications: a detach handler can still call an imported function or free an
     // FLS slot whose destructor lives in another mapped image.
-    for (auto it = init_order_.rbegin(); it != init_order_.rend(); ++it) {
-        Module& m = **it;
-        if (!m.initialised) continue;  // a map-only load never opts in to running image code
+    while (!init_order_.empty()) {
+        Module& m = *init_order_.back();
+        init_order_.pop_back();
         {
             ExclusiveTlsLock lock;
             m.initialised = false;  // drain thread callbacks before process detach
         }
-        try {
-            run_tls_callbacks(m, DLL_PROCESS_DETACH);
-        } catch (const std::exception& e) {
-            // A module may have changed its callback table since attach. A destructor cannot propagate the validation
-            // error; report it and still let DllMain release resources before the image is freed.
-            std::fprintf(stderr, "[rt] TLS process detach failed for %s: %s\n", m.name.c_str(), e.what());
-        }
-        auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-        if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
-            auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
-            entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
-        }
+        m.attaching = true;  // a reentrant load must not attach it again during teardown
+        detach(m);
     }
     shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
-        // TLS state must go away before the image and its TLS block are unmapped.
-        if (m->tls_index != kNoTlsIndex && m->tls_slot < kMaxMappedTlsModules) {
-            // Retired first, under the lock: no thread event installs it or runs its callbacks after this, and a
-            // thread that still holds a copy frees it when it ends (on_host_thread_event).
-            {
-                ExclusiveTlsLock lock;
-                Module* owner = m;
-                if (g_tls_slot_owners[m->tls_slot].compare_exchange_strong(owner, nullptr))
-                    g_tls_slot_generations[m->tls_slot].store(0);
-                remove_from_existing_threads(*m);
-            }
-            uninstall_tls_for_thread(*m);
-        }
-        // Before the image is freed: a stale table would let a later stack walk read unmapped memory.
-        if (m->function_table) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(m->function_table));
-        if (m->tls_block) VirtualFree(m->tls_block, 0, MEM_RELEASE);
-        if (m->base) VirtualFree(m->base, 0, MEM_RELEASE);
+        release_mapping(*m);
         delete m;
     }
+    for (auto* m : rejected_) delete m;
+}
+
+void Loader::detach(Module& m) {
+    try {
+        run_tls_callbacks(m, DLL_PROCESS_DETACH);
+    } catch (const std::exception& e) {
+        // An image can change its TLS callback table after attach. Still let DllMain release its resources.
+        std::fprintf(stderr, "[rt] TLS process detach failed for %s: %s\n", m.name.c_str(), e.what());
+    }
+    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+    if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
+        auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
+        entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
+    }
+}
+
+void Loader::release_mapping(Module& m) {
+    // Retire TLS before freeing the mapping. Other threads' own copies are freed by their slot records.
+    if (m.tls_index != kNoTlsIndex && m.tls_slot < kMaxMappedTlsModules) {
+        {
+            ExclusiveTlsLock lock;
+            Module* owner = &m;
+            if (g_tls_slot_owners[m.tls_slot].compare_exchange_strong(owner, nullptr))
+                g_tls_slot_generations[m.tls_slot].store(0);
+            remove_from_existing_threads(m);
+        }
+        uninstall_tls_for_thread(m);
+    }
+    // Before the image is freed: a stale table would let a later stack walk read unmapped memory.
+    if (m.function_table) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(m.function_table));
+    if (m.base) VirtualFree(m.base, 0, MEM_RELEASE);
+    m.base = nullptr;
+}
+
+void Loader::reject_attach(Module& m) {
+    detach(m);
+    forget_module(m.path);
+    {
+        std::unique_lock lock(ranges_mutex_);
+        const auto base = reinterpret_cast<uint64_t>(m.base);
+        ranges_.erase(std::remove_if(ranges_.begin(), ranges_.end(),
+                                     [base](const MappedRange& r) { return r.base == base; }),
+                      ranges_.end());
+    }
+    // Bound imports and the startup queue can still refer to this Module. Keep the record with a null base.
+    rejected_.push_back(&m);
+    order_.erase(std::find(order_.begin(), order_.end(), &m));
+    release_mapping(m);
 }
 
 Module& Loader::load(const std::filesystem::path& image) {
@@ -978,7 +1001,7 @@ Module& Loader::load(const std::filesystem::path& image) {
     try {
         mapped = &map_image(image, narrow_key);
         mapped->dynamic_load = runtime_loads_ > 0;  // before bind_imports: its dependencies are marked the same way
-        bind_imports(*mapped);  // loads every bundled module m imports first, so they land in init_order_ before m
+        bind_imports(*mapped);  // loads every bundled module m imports first, so they land in attach_queue_ before m
         protect_sections(*mapped);
         register_unwind(*mapped);
     } catch (...) {
@@ -988,7 +1011,7 @@ Module& Loader::load(const std::filesystem::path& image) {
         throw;
     }
     Module& m = *mapped;
-    init_order_.push_back(&m);
+    attach_queue_.push_back(&m);
     if (startup_trace::enabled())
         startup_trace::event("map", "\"module\":" + startup_trace::quote(m.name) +
                                         ",\"base\":" + startup_trace::quote(startup_trace::hex(reinterpret_cast<uint64_t>(m.base))) +
@@ -1052,7 +1075,7 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
         }
     }
 
-    const size_t first_new = init_order_.size();
+    const size_t first_new = attach_queue_.size();
     try {
         Module& m = load(candidate);
         initialise(m);
@@ -1061,12 +1084,12 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
     } catch (const std::exception& e) {
         // Keep completed modules for detach, including successful nested loads. Pending modules from
         // this load must neither remain visible by name nor be attached by the outer startup walk.
-        auto first_pending = std::remove_if(init_order_.begin() + first_new, init_order_.end(), [&](Module* m) {
+        auto first_pending = std::remove_if(attach_queue_.begin() + first_new, attach_queue_.end(), [&](Module* m) {
             if (m->initialised) return false;
-            forget_module(m->path);
+            if (m->base) forget_module(m->path);
             return true;
         });
-        init_order_.erase(first_pending, init_order_.end());
+        attach_queue_.erase(first_pending, attach_queue_.end());
         std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
         SetLastError(ERROR_DLL_INIT_FAILED);
         return nullptr;
@@ -1164,14 +1187,14 @@ void Loader::register_unwind(Module& m) {
 
 void Loader::initialise() {
     std::lock_guard lock(mutex_);
-    // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
-    // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.
-    // The mapping walk already breaks static import cycles. Keep that order here.
-    // A nested LoadLibrary can change the tail of init_order_ and invalidate its iterators.
-    for (size_t i = 0; i < init_order_.size(); ++i) initialise(*init_order_[i], false);
+    // Dependencies enter the queue when binding finishes, which also breaks static import cycles.
+    // A nested LoadLibrary can change the tail. Rejected entries remain as tombstones for this walk.
+    for (size_t i = 0; i < attach_queue_.size(); ++i)
+        if (auto* m = attach_queue_[i]; m->base) initialise(*m, false);
 }
 
 void Loader::initialise(Module& m, bool attach_dependencies) {
+    if (!m.base) throw std::runtime_error(m.name + ": process attach failed");
     if (m.attaching || m.initialised) return;
 
     // TLS callbacks and DllMain can both re-enter initialise() through LoadLibrary.
@@ -1182,8 +1205,10 @@ void Loader::initialise(Module& m, bool attach_dependencies) {
     } reset_attaching{m.attaching};
 
     // A nested load attaches only its requested graph. The outer walk resumes after this module finishes.
-    if (attach_dependencies)
-        for (auto* dep : m.dependencies) initialise(*dep);
+    for (auto* dep : m.dependencies) {
+        if (!dep->base) throw std::runtime_error(dep->name + ": process attach failed");
+        if (attach_dependencies) initialise(*dep);
+    }
 
     // TLS was installed by load(); initialise() only delivers the events, so no slot is allocated or written twice.
     run_tls_callbacks(m, DLL_PROCESS_ATTACH);
@@ -1201,11 +1226,11 @@ void Loader::initialise(Module& m, bool attach_dependencies) {
             startup_trace::event("dllmain", "\"module\":" + startup_trace::quote(m.name) +
                                                 ",\"result\":" + std::to_string(ok));
         if (!ok) {
-            if (m.dynamic_load) forget_module(m.path);
-            m.initialised = true;  // it ran: a second DLL_PROCESS_ATTACH would be wrong
+            reject_attach(m);
             throw std::runtime_error(m.name + ": DllMain returned FALSE");
         }
     }
+    init_order_.push_back(&m);
     // Publish completed attach to thread callbacks without waiting for the TLS lock under mutex_.
     m.initialised = true;
 }
@@ -1259,8 +1284,7 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
         if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
     }
     {
-        // From here an address inside the image names it. The memory stays until ~Loader, which unregisters the
-        // lookup first.
+        // From here an address inside the image names it, until attach rejection or loader destruction.
         std::unique_lock lock(ranges_mutex_);
         ranges_.push_back({reinterpret_cast<uint64_t>(m->base), m->size, m->name});
     }

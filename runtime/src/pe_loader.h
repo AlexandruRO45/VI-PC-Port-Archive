@@ -78,7 +78,7 @@ public:
     explicit Loader(std::filesystem::path game_dir);
     Loader(const Loader&) = delete;
     Loader& operator=(const Loader&) = delete;
-    // Delivers process detach to initialised modules in reverse dependency order before freeing any mappings or TLS.
+    // Delivers process detach to initialised modules in reverse attach completion order before freeing any mappings or TLS.
     // Restores the TLS slot for the calling thread. Destroy the Loader on the thread that called load() while any
     // mapped TLS module is still live; all other threads executing mapped code must have finished first.
     ~Loader();
@@ -96,7 +96,7 @@ public:
 
     // The order initialise() runs modules in: each module after every module it imports (a cycle is broken at the
     // module that closed it). modules() is mapping order, which puts an importer before its imports.
-    const std::vector<Module*>& initialisation_order() const { return init_order_; }
+    const std::vector<Module*>& initialisation_order() const { return attach_queue_; }
 
     // Runs each loaded module's TLS callbacks and then its DllMain(DLL_PROCESS_ATTACH), dependencies first.
     // Only DLLs get DllMain called: an EXE's entry point is the caller's to run. Throws on a corrupt TLS
@@ -129,6 +129,9 @@ public:
 
 private:
     void initialise(Module& m, bool attach_dependencies = true);
+    void detach(Module& m);
+    void release_mapping(Module& m);
+    void reject_attach(Module& m);
     Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_ or names_mutex_
     void forget_module(const std::filesystem::path& path);
     Module& map_image(const std::filesystem::path& path, const std::string& narrow_key);
@@ -146,7 +149,9 @@ private:
     mutable std::shared_mutex names_mutex_;  // leaf lock, acquired for writes under mutex_
     std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
-    std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
+    std::vector<Module*> attach_queue_;  // dependencies first, see initialisation_order()
+    std::vector<Module*> init_order_;    // successful attach completion order
+    std::vector<Module*> rejected_;     // owns unloaded Module records still referenced by bound dependencies
     int runtime_loads_ = 0;  // > 0 while a run-time load or forwarder maps modules (under mutex_): they are dynamic
 
     // What find_address reads: one entry per mapped image, added once its memory exists. Under ranges_mutex_, a leaf

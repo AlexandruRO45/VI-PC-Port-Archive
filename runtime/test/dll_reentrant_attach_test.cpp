@@ -64,6 +64,47 @@ bool failed_dependency(const std::filesystem::path& dir) {
     std::printf("%s: nested load failed and startup never attached B\n", ok ? "PASS" : "FAIL");
     return ok;
 }
+
+bool failed_retry(const std::filesystem::path& dir) {
+    rt::Loader loader(dir);
+    auto& root = loader.load(dir / "dll_attach_failure_root.dll");
+    const auto original = loader.load(dir / "dll_attach_failure_c.dll").base;
+    // Root's nested load of B reaches the already mapped C before startup would attach C.
+    SetEnvironmentVariableW(L"LEONIDA_TEST_ATTACH_RETRY", nullptr);
+    loader.initialise();
+    using FailureChecked = int(WINAPI*)();
+    MEMORY_BASIC_INFORMATION info{};
+    const bool unloaded = reinterpret_cast<FailureChecked>(root.exports.at("failure_checked"))() &&
+                          !loader.find_loaded_module("dll_attach_failure_c.dll") &&
+                          !loader.owns_module_handle(original) &&
+                          VirtualQuery(original, &info, sizeof info) && info.State == MEM_FREE;
+    if (!SetEnvironmentVariableW(L"LEONIDA_TEST_ATTACH_RETRY", L"1")) return false;
+    bool handled = false;
+    const auto retry = loader.load_runtime_module("dll_attach_failure_c.dll", 0, handled);
+    SetEnvironmentVariableW(L"LEONIDA_TEST_ATTACH_RETRY", nullptr);
+    const bool ok = unloaded && handled && retry && retry == loader.find_loaded_module("dll_attach_failure_c.dll");
+    std::printf("%s: failed pre-mapped DLL was unloaded and a fresh load succeeded\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool nested_detach(const std::filesystem::path& dir) {
+    int log = 0;
+    {
+        rt::Loader loader(dir);
+        auto& a = loader.load(dir / "dll_attach_a.dll");
+        loader.initialise();
+        // B completes attach within A's attach, so A must detach before B.
+        using SetDetachLog = void(WINAPI*)(int*);
+        bool owns_b = false;
+        auto set_b = reinterpret_cast<SetDetachLog>(loader.resolve_module_export(
+            loader.find_loaded_module("dll_attach_b.dll"), "set_detach_log", owns_b));
+        if (!set_b) return false;
+        reinterpret_cast<SetDetachLog>(a.exports.at("set_detach_log"))(&log);
+        set_b(&log);
+    }
+    std::printf("%s: nested detach order %d (expected 12)\n", log == 12 ? "PASS" : "FAIL", log);
+    return log == 12;
+}
 }
 
 int main() {
@@ -72,7 +113,9 @@ int main() {
         const bool mutual_ok = mutual_load(dir);
         const bool cycle_ok = static_cycle(dir);
         const bool failure_ok = failed_dependency(dir);
-        return mutual_ok && cycle_ok && failure_ok ? 0 : 9;
+        const bool retry_ok = failed_retry(dir);
+        const bool detach_ok = nested_detach(dir);
+        return mutual_ok && cycle_ok && failure_ok && retry_ok && detach_ok ? 0 : 9;
     } catch (const std::exception& e) {
         std::printf("FAIL: %s\n", e.what());
         return 1;

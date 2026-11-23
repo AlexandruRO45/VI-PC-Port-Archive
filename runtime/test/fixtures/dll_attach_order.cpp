@@ -62,7 +62,7 @@ extern "C" BOOL WINAPI dll_attach_main(HINSTANCE, DWORD reason, LPVOID) {
 
 extern "C" __declspec(dllexport) void WINAPI failing_dependency() {}
 extern "C" BOOL WINAPI dll_attach_main(HINSTANCE, DWORD reason, LPVOID) {
-    return reason != DLL_PROCESS_ATTACH;
+    return reason != DLL_PROCESS_ATTACH || GetEnvironmentVariableW(L"LEONIDA_TEST_ATTACH_RETRY", nullptr, 0) != 0;
 }
 
 #endif
