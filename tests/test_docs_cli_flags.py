@@ -249,6 +249,21 @@ class DocsCliFlags(unittest.TestCase):
         ps1_sources = {"scripts/test.ps1": "param([string]$ValidParam)"}
         self.assertEqual(ps1_flag_mismatches(ps1_pages, ps1_sources), [("docs/b.md:2", "scripts/test.ps1", "-BadParam")])
 
+    def test_a_longer_fence_keeps_the_commands_it_quotes(self):
+        page = "````\n```\npython -I tools/x.py --old\n```\n````\n"
+        self.assertEqual([cmd.strip() for _, cmd in fenced_commands(page)],
+                         ["```", "python -I tools/x.py --old", "```"])
+        self.assertEqual(tool_flag_mismatches({"docs/a.md": page}, {"tools/x.py": 'add("--real")'}),
+                         [("docs/a.md:3", "tools/x.py", "--old")])
+        # A block closes at its own length, a longer closer ends a shorter block, and a fence nobody closes keeps
+        # the rest of the page as code, which is how it renders.
+        self.assertEqual([cmd.strip() for _, cmd in fenced_commands("```\npython -I tools/x.py --old\n```\n")],
+                         ["python -I tools/x.py --old"])
+        self.assertEqual([cmd.strip() for _, cmd in fenced_commands("```\npython -I tools/x.py\n````\n")],
+                         ["python -I tools/x.py"])
+        self.assertEqual([cmd.strip() for _, cmd in fenced_commands("````\n```\npython -I tools/x.py")],
+                         ["```", "python -I tools/x.py"])
+
     def test_docs_name_existing_flags(self):
         files = tracked_files()
         code = "\n".join(read(p) for p in files if p.endswith(SOURCE_SUFFIXES) and not p.startswith("docs/"))
