@@ -331,6 +331,18 @@ class TestInterpP2F16Accumulator(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP2F16HighHalf(unittest.TestCase):
+    def test_p2_f16_high_destination(self):
+        code = [
+            "v_interp_p1ll_f16 v9, v0, attr6.x high",
+            "v_interp_p2_f16 v9, v1, attr6.x, v9 high",
+            "exp mrt0, v9, v9, v9, v9 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p2_f16_high", code)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
