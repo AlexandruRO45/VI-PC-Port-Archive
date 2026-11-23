@@ -30,17 +30,26 @@ class AssetsDecoderTest(unittest.TestCase):
         for name in ("audio_manifest.json", "ogg.done", "xma.done"):
             with open(os.path.join(audio, name), "w"):
                 pass
+        xma_dir = os.path.join(audio, "xma")
+        os.makedirs(xma_dir, exist_ok=True)
+        with open(os.path.join(xma_dir, make_game.DECODER_RECORD), "w") as f:
+            f.write("d1\n")
 
     def export(self, digest):
         """Run assets() with a fake exporter and the given decoder digest; returns the modes it exported."""
         ran = []
 
         def fake_run(cmd, *a, **k):
-            folder = os.path.join(cmd[3], "scene", cmd[1])
-            os.makedirs(folder, exist_ok=True)
-            with open(os.path.join(folder, "manifest.json"), "w") as f:
-                f.write("{}")
-            ran.append(cmd[1])
+            mode = cmd[1]
+            if mode in ("models", "textures"):
+                folder = os.path.join(cmd[3], "scene", mode)
+                os.makedirs(folder, exist_ok=True)
+                with open(os.path.join(folder, "manifest.json"), "w") as f:
+                    f.write("{}")
+            elif mode == "xma":
+                xma = os.path.join(cmd[3], "audio", "xma")
+                os.makedirs(xma, exist_ok=True)
+            ran.append(mode)
         with mock.patch.object(make_game, "MODEL_ARCHIVES", ["scene.rpf"]), \
                 mock.patch.object(make_game, "decoder_digest", lambda: digest), \
                 mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
@@ -58,7 +67,7 @@ class AssetsDecoderTest(unittest.TestCase):
         # A file of the old decoder must not survive: rpf9dump keeps the files it finds.
         with open(os.path.join(self.models, "old.bin"), "w"):
             pass
-        self.assertEqual(self.export("d2"), ["models", "textures"])
+        self.assertEqual(self.export("d2"), ["models", "textures", "xma"])
         self.assertFalse(os.path.exists(os.path.join(self.models, "old.bin")))
         self.assertEqual(self.export("d2"), [])
 
@@ -78,7 +87,69 @@ class AssetsDecoderTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.models, "manifest.json")))
         with open(os.path.join(self.models, make_game.DECODER_RECORD), encoding="utf-8") as f:
             self.assertEqual(f.read(), "d1\n")
-        self.assertEqual(self.export("d2"), ["models", "textures"])
+        self.assertEqual(self.export("d2"), ["models", "textures", "xma"])
+
+    def test_xma_exports_again_when_decoder_changed(self):
+        # Initial export with d1 writes decoder record into xma folder
+        ran_modes = []
+
+        def fake_dump(cmd, *a, **k):
+            mode = cmd[1]
+            ran_modes.append(mode)
+            if mode == "xma":
+                os.makedirs(os.path.join(cmd[3], "audio", "xma", "bank"), exist_ok=True)
+                with open(os.path.join(cmd[3], "audio", "xma", "bank", "sample.xma.wav"), "w") as f:
+                    f.write("data")
+
+        audio = os.path.join(self.work, "assets", "audio")
+        xma_dir = os.path.join(audio, "xma")
+        xma_done = os.path.join(audio, "xma.done")
+        xma_record = os.path.join(xma_dir, make_game.DECODER_RECORD)
+        # Clear existing xma done marker
+        if os.path.isfile(xma_done):
+            os.remove(xma_done)
+        shutil.rmtree(xma_dir, ignore_errors=True)
+
+        with mock.patch.object(make_game, "MODEL_ARCHIVES", ()), \
+                mock.patch.object(make_game, "decoder_digest", lambda: "d1"), \
+                mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+                mock.patch.object(make_game, "run", fake_dump), \
+                mock.patch.object(make_game.shutil, "which", lambda n: None), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            make_game.assets(os.path.join(self.work, "game"), self.work, False, 1)
+
+        self.assertIn("xma", ran_modes)
+        self.assertTrue(os.path.isfile(xma_done))
+        self.assertTrue(os.path.isfile(xma_record))
+        with open(xma_record, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "d1")
+
+        # Rerun with same decoder (d1) skips xma export
+        ran_modes.clear()
+        with mock.patch.object(make_game, "MODEL_ARCHIVES", ()), \
+                mock.patch.object(make_game, "decoder_digest", lambda: "d1"), \
+                mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+                mock.patch.object(make_game, "run", fake_dump), \
+                mock.patch.object(make_game.shutil, "which", lambda n: None), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            make_game.assets(os.path.join(self.work, "game"), self.work, False, 1)
+
+        self.assertNotIn("xma", ran_modes)
+
+        # Rerun with changed decoder (d2) re-exports xma and updates decoder record
+        ran_modes.clear()
+        with mock.patch.object(make_game, "MODEL_ARCHIVES", ()), \
+                mock.patch.object(make_game, "decoder_digest", lambda: "d2"), \
+                mock.patch.object(make_game, "rpf9dump", lambda w: "rpf9dump"), \
+                mock.patch.object(make_game, "run", fake_dump), \
+                mock.patch.object(make_game.shutil, "which", lambda n: None), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            make_game.assets(os.path.join(self.work, "game"), self.work, False, 1)
+
+        self.assertIn("xma", ran_modes)
+        self.assertTrue(os.path.isfile(xma_done))
+        with open(xma_record, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "d2")
 
     def test_the_digest_follows_the_exporter_sources(self):
         with tempfile.TemporaryDirectory() as tools:

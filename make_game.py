@@ -2056,6 +2056,13 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     need_wav = bool(wav)
     xma_dir = os.path.join(out, "audio", "xma")
     xma_done = os.path.join(out, "audio", "xma.done")
+    xma_record = os.path.join(xma_dir, DECODER_RECORD)
+    if os.path.isdir(xma_dir) and (read_shader_setting(xma_record) != decoder or not os.path.isfile(xma_done)):
+        if os.path.isfile(xma_done) and read_shader_setting(xma_record) != decoder:
+            log("assets: no matching decoder fingerprint for XMA2 streams: exporting again")
+            if os.path.isfile(xma_done):
+                os.remove(xma_done)
+        shutil.rmtree(xma_dir)
     need_xma = not os.path.isfile(xma_done)
     ff = shutil.which("ffmpeg")
     need_xma_decode = bool(ff)  # decode_xma no-ops when nothing is pending
@@ -2109,6 +2116,9 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     if need_xma:
         log("assets: XMA2 streams")
         dump("xma", os.path.join(game, "audio.rpf"), out)
+        os.makedirs(xma_dir, exist_ok=True)
+        with open(xma_record, "w", encoding="utf-8", newline="\n") as f:
+            f.write(decoder + "\n")
         mark(xma_done, "rpf9dump xma")
         progress.tick(force=True)
     # Every run: decodes what a stopped or failed run left, and everything once ffmpeg is installed later.
