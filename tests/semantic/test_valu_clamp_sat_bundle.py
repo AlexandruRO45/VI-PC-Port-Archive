@@ -364,6 +364,19 @@ class TestValuSubF32SIMDDivergence(unittest.TestCase):
         self.assertAlmostEqual(res_ba, 0.0, places=6)
         self.assertNotEqual(res_ab, res_ba)
 
+class TestValuSubF32BoundaryExtremes(unittest.TestCase):
+    """Stage 11: IEEE 754 boundary extremes and saturation for v_sub_f32."""
+
+    def test_sub_inf_boundaries(self):
+        # 1.0 - inf = -inf -> clamped to 0.0
+        hw = run_binary_f32("v_sub_f32", 1.0, float("inf"), clamp=True)
+        self.assertEqual(hw, 0.0)
+
+    def test_sub_neg_inf_boundaries(self):
+        # 1.0 - (-inf) = +inf -> clamped to 1.0
+        hw = run_binary_f32("v_sub_f32", 1.0, float("-inf"), clamp=True)
+        self.assertEqual(hw, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
