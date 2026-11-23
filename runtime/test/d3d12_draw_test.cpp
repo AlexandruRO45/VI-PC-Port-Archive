@@ -124,6 +124,7 @@ int main() {
         info.shader_dir = library.string();
         // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
         info.features.logicOp = d.enabled.logicOp;
+        info.occlusion_query_precise = d.occlusion_query_precise;
         info.vertex_attribute_divisor = d.vertex_attribute_divisor;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
@@ -1007,6 +1008,45 @@ int main() {
             }
             std::printf("castable RTVs: %u draws stored in the view's channel order and encoding\n",
                         unsigned(std::size(casts)));
+        }
+
+        // With no RTV or DSV, an occlusion query still counts every covered sample.
+        if (d.occlusion_query_precise) {
+            Ref<ID3D12QueryHeap> queries;
+            const D3D12_VIEWPORT views[] = {
+                {0, 0, 2, 2, 0, 1}, {0, 0, 1.75f, 1.75f, 0, 1}, {0.25f, 0.25f, 2.5f, 1.5f, 0, 1},
+                {0, 0, 0.75f, 0.75f, 0, 1}, {-4, -4, 1, 1, 0, 1},
+            };
+            const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, UINT(std::size(views)), 0};
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&queries.p))));
+            auto no_targets = fullscreen_desc;
+            no_targets.NumRenderTargets = 0;
+            no_targets.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+            Ref<ID3D12PipelineState> occlusion_pso;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&no_targets, IID_PPV_ARGS(&occlusion_pso.p))));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, occlusion_pso.p)));
+            list->SetGraphicsRootSignature(root.p);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
+            for (UINT i = 0; i < std::size(views); ++i) {
+                list->RSSetViewports(1, &views[i]);
+                list->BeginQuery(queries.p, D3D12_QUERY_TYPE_OCCLUSION, i);
+                list->DrawInstanced(3, 1, 0, 0);
+                list->EndQuery(queries.p, D3D12_QUERY_TYPE_OCCLUSION, i);
+            }
+            list->ResolveQueryData(queries.p, D3D12_QUERY_TYPE_OCCLUSION, 0, std::size(views), readback.p, 0);
+            EXPECT(SUCCEEDED(list->Close()));
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 100)) && SUCCEEDED(fence->SetEventOnCompletion(100, nullptr)));
+            const std::array<UINT64, std::size(views)> expected{4, 4, 6, 1, 0};
+            std::array<UINT64, std::size(views)> samples{};
+            std::memcpy(samples.data(), mapped, sizeof(samples));
+            for (UINT i = 0; i < samples.size(); ++i) {
+                std::printf("attachmentless viewport %u: %llu samples (expected %llu)\n", i, samples[i], expected[i]);
+                EXPECT(samples[i] == expected[i]);
+            }
         }
 
         // A draw without a topology is invalid; Close reports it.

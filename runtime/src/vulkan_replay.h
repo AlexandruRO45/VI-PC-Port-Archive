@@ -2156,8 +2156,10 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         shrink(a.binding, draw.depth, a.range);
     }
     if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
-        p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
-                  std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
+        // A fractional edge can still cover a sample in the last pixel. Vulkan also requires
+        // a nonempty area when the viewport lies entirely outside the framebuffer.
+        p.area = {std::uint32_t(std::ceil(std::max(1.0f, draw.viewport.x + draw.viewport.width))),
+                  std::uint32_t(std::ceil(std::max(1.0f, draw.viewport.y + draw.viewport.height)))};
     }
     p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
 
