@@ -288,5 +288,32 @@ class TestSBfeI32HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_bfe_i32(0x000000F0, 4 | (4 << 16)), MASK32)
 
 
+def ref_bfe_u64(src0: int, ctl: int) -> tuple[int, int]:
+    """Reference mathematical oracle for RDNA2 s_bfe_u64. Returns (dst, scc)."""
+    offset = ctl & 63
+    width = (ctl >> 16) & 0x7F
+    w = min(width, 64 - offset)
+    if w == 0:
+        val = 0
+    else:
+        val = ((src0 & MASK64) >> offset) & ((1 << w) - 1)
+    scc = 1 if val != 0 else 0
+    return val, scc
+
+
+class TestSBfeU64Reference(unittest.TestCase):
+    """Reference oracle unit tests for s_bfe_u64."""
+
+    def test_reference_64bit_field(self):
+        val, scc = ref_bfe_u64(0x12345678_9ABCDEF0, 32 | (16 << 16))
+        self.assertEqual(val, 0x5678)
+        self.assertEqual(scc, 1)
+
+    def test_reference_cross_dword(self):
+        val, scc = ref_bfe_u64(0x0000000F_F0000000, 28 | (8 << 16))
+        self.assertEqual(val, 0xFF)
+        self.assertEqual(scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
