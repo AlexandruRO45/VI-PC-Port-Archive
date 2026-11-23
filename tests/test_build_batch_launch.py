@@ -73,6 +73,15 @@ class BatchLaunchTest(unittest.TestCase):
                 self.assertEqual(self.check(*launch_call(script)), [],
                                  f"{script}'s launch line does not run the batch in these folders")
 
+    def test_each_script_starts_its_batch_through_ComSpec(self):
+        # Where cmd.exe on PATH is a launcher that rejects these arguments (this machine has one), the folder test
+        # above fails. Where it is not, only this pins the program: a revert to a bare `cmd.exe` still passes there.
+        for script in SCRIPTS:
+            with self.subTest(script=script):
+                program, _ = launch_call(script)
+                self.assertEqual(program, "$env:ComSpec",
+                                 f"{script}: start the batch through $env:ComSpec, not a cmd.exe from PATH")
+
     def test_the_check_catches_a_launch_line_that_drops_the_quotes(self):
         # The form both scripts used before: cmd.exe /c "path" loses the quotes around a path holding & or ^.
         broken = self.check("$env:ComSpec", '"/c", "`"$bat`""')
