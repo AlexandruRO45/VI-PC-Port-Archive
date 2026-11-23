@@ -29,5 +29,13 @@ class BufferBoundsProbeTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr or proc.stdout)
 
 
+    def test_a_json_that_names_a_folder_is_refused_without_a_gpu(self):
+        proc = subprocess.run([sys.executable, "-I", PROBE, "--json", REPO],
+                              capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("--json is a directory", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
