@@ -265,6 +265,27 @@ class ShortsTest(unittest.TestCase):
             rows = list(csv.DictReader(f))
         self.assertEqual([(r["bank"], r["stream"]) for r in rows], [("good", "00001234")])
 
+    def test_named_file_that_is_not_a_bank_is_refused(self):
+        # awc_manifest.py refuses the same input (exit 2, "holds no AWC bank"): a wrong path or format must not
+        # read as an empty export. A directory with no bank in it stays a valid, empty answer.
+        path = os.path.join(self.tmp.name, "notes.bin")
+        with open(path, "wb") as f:
+            f.write(b"not an AWC bank")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            result = shorts.main([path, self.out, "--jobs", "1"])
+        self.assertEqual(result, 2)
+        self.assertIn("holds no AWC bank", stderr.getvalue())
+        self.assertIn(path, stderr.getvalue())
+        self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+        self.assertFalse(os.path.exists(self.out), "a refused run must not create the output folder")
+
+        empty = os.path.join(self.tmp.name, "empty")
+        os.makedirs(empty)
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(shorts.main([empty, self.out, "--jobs", "1"]), 0)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "shorts.csv")))
+
     def test_truncated_bank_skipped_serial(self):
         self.check_truncated_bank_skipped(shorts, 1)
 
