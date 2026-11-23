@@ -30,8 +30,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from file_mode import published_mode  # noqa: E402
 from spirv_asm_tables import BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, VALUE_ENUMS  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 SPIRV_MAGIC = 0x07230203
 
