@@ -169,7 +169,8 @@ python -I runtime/test/shaders/mullit_readback.py <out-dir> <harness-directory>
 
 `cs_w32_swap_x2_contend` has 2,048 invocations swap their own pair into one 64-bit element with
 `global_atomic_swap_x2 ... glc`. The suite dispatches it once and requires every dword to be handed out exactly
-once; its PASS line also says how many pairs were torn, which the one-atomic-per-dword translation allows
+once, in an order a run can have had; its PASS line also says how many pairs were torn, which the
+one-atomic-per-dword translation allows
 (`docs/design.md`, global atomics). To count torn pairs over many dispatches on your GPU, or to fail on them
 (`--strict`):
 

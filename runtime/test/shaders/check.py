@@ -727,12 +727,15 @@ def swap_x2_replacement(i):
 
 
 def swap_x2_contend_words(words, invocations=SWAP_X2_INVOCATIONS):
-    """What one dispatch's heap says: (problem, torn). The 32-bit exchange of each dword is atomic, so whatever order
-    the invocations ran in, the returned low dwords plus the element's final low dword are the fill plus every
-    replacement low, each once, and the same for the high dwords: problem names what is missing otherwise, and is ""
-    when both sets hold. torn counts the pairs, returned or final, whose halves don't belong together: the translator
-    swaps the two dwords with one atomic each (docs/design.md, global atomics), so a pair can tear where the console
-    swaps the element whole. That is reported, not failed."""
+    """What one dispatch's heap says: (problem, torn). The 32-bit exchange of each dword is atomic, so the exchanges of
+    one half happened in some order, each invocation getting back what the one before it put in. Two things follow,
+    for the low dwords and for the high ones: the returned dwords plus the element's final one are the fill plus every
+    replacement, each once; and going back from the final value, each writer's returned value names the writer before
+    it, through all of them to the fill. A set that holds with a chain that doesn't is an order no run can have had
+    (two invocations each holding the other's value). problem names what is wrong, and is "" when both hold for both
+    halves, whose orders may differ. torn counts the pairs, returned or final, whose halves don't belong together: the
+    translator swaps the two dwords with one atomic each (docs/design.md, global atomics), so a pair can tear where
+    the console swaps the element whole. That is reported, not failed."""
     if len(words) < 2 * invocations + 2:
         return f"the dump has {len(words)} words, expected at least {2 * invocations + 2}", 0
     pairs = [(words[2 * i], words[2 * i + 1]) for i in range(invocations + 1)]   # the element itself is last
@@ -745,6 +748,15 @@ def swap_x2_contend_words(words, invocations=SWAP_X2_INVOCATIONS):
             problems.append(f"{label} dwords: {sum((want - got).values())} never handed out, "
                             f"{sum((got - want).values())} handed out twice or unknown"
                             + (" (e.g. " + ", ".join(f"{v:#010x}" for v in extra) + ")" if extra else ""))
+            continue
+        # The sets hold, so every value below is the fill or one writer's replacement, and each occurs once.
+        writer = {swap_x2_replacement(i)[half]: i for i in range(invocations)}
+        value, steps = pairs[invocations][half], 0
+        while value != SWAP_X2_FILL and steps <= invocations:
+            value, steps = pairs[writer[value]][half], steps + 1
+        if steps != invocations:
+            problems.append(f"{label} dwords: the exchanges are not one order: going back from the final value reaches "
+                            f"the fill after {steps} of {invocations} writers")
     whole = {(SWAP_X2_FILL, SWAP_X2_FILL)} | {swap_x2_replacement(i) for i in range(invocations)}
     return "; ".join(problems), sum(pair not in whole for pair in pairs)
 

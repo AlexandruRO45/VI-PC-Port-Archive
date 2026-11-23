@@ -7,7 +7,9 @@
 ;   out[2 * i], out[2 * i + 1]: the pair invocation i got back
 ; With 64 groups (2048 invocations) the returned pairs fill words 0..4095 and the element is words 4096..4097.
 ; What must hold whatever the order: each dword is one 32-bit atomic exchange, so the 2048 returned low dwords plus the
-; element's final low dword are exactly the fill plus the 2048 replacement lows, and the same for the high dwords.
+; element's final low dword are exactly the fill plus the 2048 replacement lows, and going back from the final value
+; each invocation's returned low names the invocation before it, through all 2048 to the fill. The same for the high
+; dwords, in an order of their own.
 ; What may not hold: tools/rdna2spirv.py translates the swap as one atomic per dword, so two invocations swapping at
 ; once can tear a pair (A's low with B's high). swap_x2_contend.py counts those; hardware swaps the element whole.
 ; Run: VKC_OUT_WORDS=4104 VKC_DUMP=<file> vk_compute_test cs_w32_swap_x2_contend.spv 64 dump, then check the file

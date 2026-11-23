@@ -1070,11 +1070,12 @@ def run_suite(a, work: str) -> int:
             ok, detail = judge_cs_dump(rc, msg, want, wave64=False, partial=False, emulated=False, hexwords=True)
             results.append((name, ok, detail))
         elif name == "cs_w32_swap_x2_contend":
-            # TEST-561: 2048 invocations swap their own pair into one 64-bit element (global_atomic_swap_x2 glc). Both
-            # dword sets must be exact; pairs torn by the one-atomic-per-dword translation are counted, not failed.
+            # TEST-561: 2048 invocations swap their own pair into one 64-bit element (global_atomic_swap_x2 glc). Each
+            # half's dwords must be exact and one exchange order; pairs torn by the one-atomic-per-dword translation
+            # are counted, not failed.
             problem, torn = swap_x2_contend_test(a.build, spirv_dir, cs_env)
             results.append((name, None if isinstance(problem, Skip) else not problem,
-                            problem or f"both dword sets exact; {torn} of {SWAP_X2_PAIRS} pairs torn"))
+                            problem or f"both dword orders exact; {torn} of {SWAP_X2_PAIRS} pairs torn"))
         elif name == "cs_heap_init":
             # vk_compute_test copies VKC_HEAP_INIT's file into the heap; the shader copies its words at 0x100 to 0.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **heap_init_env()))

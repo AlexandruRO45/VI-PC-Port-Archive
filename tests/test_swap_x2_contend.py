@@ -64,6 +64,27 @@ class Words(unittest.TestCase):
         problem, _ = check.swap_x2_contend_words(words)
         self.assertIn("high dwords: 1 never handed out, 1 handed out twice or unknown (e.g. 0x12345678)", problem)
 
+    def test_two_invocations_holding_each_others_value_is_no_order_at_all(self):
+        # Reported on the pull request: invocation 0 returns invocation 1's pair and 1 returns 0's, with the others a
+        # valid chain from the fill to the final value. Every dword occurs once, but neither of the two can have been
+        # the earlier exchange.
+        pairs = [check.swap_x2_replacement(i) for i in range(N)]
+        fill = (check.SWAP_X2_FILL, check.SWAP_X2_FILL)
+        words = [w for pair in [pairs[1], pairs[0], fill, *pairs[2:]] for w in pair]
+        problem, torn = check.swap_x2_contend_words(words)
+        self.assertEqual(torn, 0)
+        for label in ("low", "high"):
+            self.assertIn(f"{label} dwords: the exchanges are not one order: going back from the final value reaches "
+                          f"the fill after {N - 2} of {N} writers", problem)
+
+    def test_a_cycle_in_one_half_only_names_that_half(self):
+        words = heap()
+        words[2 * 0 + 1], words[2 * 1 + 1], words[2 * 2 + 1] = (check.swap_x2_replacement(1)[1],
+                                                               check.swap_x2_replacement(0)[1], check.SWAP_X2_FILL)
+        problem, _ = check.swap_x2_contend_words(words)
+        self.assertRegex(problem, r"^high dwords: the exchanges are not one order")
+        self.assertNotIn("low dwords", problem)
+
     def test_an_untouched_heap_fails_both_halves(self):
         problem, _ = check.swap_x2_contend_words([check.SWAP_X2_FILL] * (2 * N + 8))
         self.assertIn("low dwords: %d never handed out" % N, problem)

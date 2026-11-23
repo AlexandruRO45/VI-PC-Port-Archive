@@ -9,8 +9,9 @@ swaps its own pair (low = 0x51000000 | i, high = ~low) into one shared 64-bit el
 (the .asm has the layout). Whatever order the invocations ran in:
 
   - per dword: the returned low dwords plus the element's final low dword are exactly the 0xEEEEEEEE fill plus every
-    replacement low, each once, and the same for the high dwords. A value handed out twice or never is a lost or
-    duplicated exchange, and fails the run.
+    replacement low, each once, and they are one order: going back from the final value, each invocation's returned
+    low names the invocation before it, through all of them to the fill. The same for the high dwords. A value handed
+    out twice or never, or an order no run can have had, fails the run.
   - per pair: a returned pair (or the final element) whose halves don't belong together is a torn element. The
     translator swaps the two dwords with one 32-bit atomic each (docs/design.md, global atomics), so this can happen
     where the console swaps the element whole. Torn pairs are counted, and fail the run only with --strict.
@@ -49,7 +50,7 @@ def main():
         bad_runs += bool(problem)
         torn_runs += bool(torn)
         torn_total += torn
-    print(f"{args.runs} runs of {SWAP_X2_INVOCATIONS} invocations: {args.runs - bad_runs} kept both dword sets; "
+    print(f"{args.runs} runs of {SWAP_X2_INVOCATIONS} invocations: {args.runs - bad_runs} kept both dword orders; "
           f"{torn_runs} runs had torn pairs ({torn_total} of {SWAP_X2_PAIRS * args.runs} pairs)")
     return 1 if bad_runs or (args.strict and torn_total) else 0
 
