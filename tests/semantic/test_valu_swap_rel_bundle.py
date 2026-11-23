@@ -212,6 +212,19 @@ class TestSwapPCAST(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported):
             support.translate_lines("cs_swappc_ast", prog, fssm=saveexec_run.fssm())
 
+class TestSwapPCPair(unittest.TestCase):
+    def test_64bit_pc_swap(self):
+        pc = 0x00000001_80000000
+        target = 0x00000002_40000000
+        new_pc, link = model_swappc(pc, target)
+        self.assertEqual(new_pc, 0x00000002_40000000)
+        self.assertEqual(link, 0x00000001_80000004)
+
+    def test_translator_swappc_rejection_unsupported(self):
+        prog = ["s_swappc_b64 s[8:9], s[10:11]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("cs_swappc_pair", prog, fssm=saveexec_run.fssm())
+
 
 if __name__ == "__main__":
     unittest.main()
