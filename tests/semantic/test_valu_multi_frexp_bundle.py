@@ -385,5 +385,15 @@ class VFrexpMantF32OracleTests(unittest.TestCase):
         self.assertEqual(oracle_frexp_mant_f32(0x7F800000), 0x7F800000)
         self.assertEqual(oracle_frexp_mant_f32(0x7FC00000), 0x7FC00000)
 
+class VFrexpMantF32AstInterpreterTests(unittest.TestCase):
+    def test_frexp_mant_f32_ast_construction(self):
+        ast = ValuInstructionAST("v_frexp_mant_f32", Operand(RegKind.VGPR, 0), Operand(RegKind.VGPR, 1))
+        self.assertEqual(ast.mnemonic, "v_frexp_mant_f32")
+
+    def test_frexp_mant_f32_scalar_execution(self):
+        # 4.0f (0x40800000) -> 0.5f (0x3F000000)
+        res = oracle_frexp_mant_f32(0x40800000)
+        self.assertEqual(res, 0x3F000000)
+
 if __name__ == "__main__":
     unittest.main()
