@@ -78,6 +78,31 @@ def read_json(path):
     """The JSON value in the file at path, with parse_json's checks."""
     return parse_json(read(path), path)
 
+
+def json_kind(value):
+    """What a decoded JSON value is, in JSON's own words, for error messages."""
+    if value is None:
+        return 'null'
+    if isinstance(value, bool):
+        return 'a boolean'
+    if isinstance(value, (int, float)):
+        return 'a number'
+    if isinstance(value, str):
+        return 'a string'
+    return 'an array' if isinstance(value, list) else 'an object'
+
+
+def read_chives(path):
+    """The object in a save folder's chives.json. Anything else there, or a save_directory that is neither a string
+    nor null, is a ValueError naming the file: info and import read save_directory as the folder's label."""
+    meta = read_json(path)
+    if not isinstance(meta, dict):
+        raise ValueError(f'{path}: chives.json must hold a JSON object, not {json_kind(meta)}')
+    label = meta.get('save_directory')
+    if label is not None and not isinstance(label, str):
+        raise ValueError(f'{path}: save_directory must be a string, not {json_kind(label)}')
+    return meta
+
 # ---------------------------------------------------------------------------------------------- ASAV
 ASAV_HDR = 0x170          # header size seen on every plain ASAV file
 ASAV_TITLE = (0x28, 0x128)  # UTF-16LE display title, 128 code units
@@ -354,7 +379,7 @@ def info(paths):
         if os.path.isdir(p):
             cj = os.path.join(p, 'chives.json')
             if os.path.exists(cj):
-                meta = read_json(cj)
+                meta = read_chives(cj)
                 print(f'{p}: save folder, dir {meta.get("save_directory")}')
             for name in sorted(os.listdir(p)):
                 fp = os.path.join(p, name)
@@ -599,7 +624,7 @@ def xgs_encode(name):
 def save_slot(folder):
     """Return (folder label, payload filename, slot name, title) for one save folder."""
     meta_path = os.path.join(folder, 'chives.json')
-    meta = read_json(meta_path) if os.path.isfile(meta_path) else {}
+    meta = read_chives(meta_path) if os.path.isfile(meta_path) else {}
     found = []
     for name in sorted(os.listdir(folder)):
         fp = os.path.join(folder, name)

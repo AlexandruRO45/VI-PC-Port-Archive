@@ -1020,9 +1020,8 @@ class JsonDepthTest(unittest.TestCase):
             self.assertEqual(saves.json_depth(rd_json(os.path.join(out, "payload.json"))), saves.MAX_JSON_DEPTH)
 
 
-class ChivesJsonDepthTest(unittest.TestCase):
-    """tedin7 on #5240: info on a save folder and import read chives.json with no depth limit, so 100,000 nested
-    arrays gave a RecursionError traceback on 3.13 and were accepted from 3.14 on."""
+class ChivesFolderTestCase(unittest.TestCase):
+    """A save folder named "story" holding one JSAV payload; each test writes its own chives.json."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1033,6 +1032,11 @@ class ChivesJsonDepthTest(unittest.TestCase):
 
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, timeout=60)
+
+
+class ChivesJsonDepthTest(ChivesFolderTestCase):
+    """tedin7 on #5240: info on a save folder and import read chives.json with no depth limit, so 100,000 nested
+    arrays gave a RecursionError traceback on 3.13 and were accepted from 3.14 on."""
 
     def nest(self, levels):
         # {"save_directory": "story", "x": [[...]]}: levels deep counting the top object.
@@ -1069,6 +1073,51 @@ class ChivesJsonDepthTest(unittest.TestCase):
         self.assertIn(self.chives, result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertFalse(os.path.exists(out))
+
+
+class ChivesShapeTest(ChivesFolderTestCase):
+    """cynbun on #5240: a chives.json that is JSON but not an object gave an AttributeError traceback from info and
+    import, and a save_directory array a TypeError traceback from import."""
+
+    def assert_one_error_line(self, kind):
+        with self.assertRaises(ValueError) as error:
+            saves.save_slot(self.folder)
+        self.assertIn(self.chives, str(error.exception))
+        self.assertIn(kind, str(error.exception))
+        out = os.path.join(self.tmp.name, "saves")
+        for args in (("info", self.folder), ("import", self.folder, "--out", out)):
+            result = self.run_tool(*args)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("ERROR:", result.stderr)
+            self.assertIn(self.chives, result.stderr)
+            self.assertIn(kind, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_chives_that_is_not_an_object_is_one_error_line(self):
+        for body, kind in ((b"[]", "an array"), (b'"story"', "a string"), (b"5", "a number"), (b"null", "null"),
+                           (b"true", "a boolean")):
+            with self.subTest(body=body):
+                write(self.chives, body)
+                self.assert_one_error_line(f"must hold a JSON object, not {kind}")
+
+    def test_save_directory_that_is_not_a_string_is_one_error_line(self):
+        for value, kind in ((b"5", "a number"), (b'["a"]', "an array"), (b"{}", "an object"),
+                            (b"false", "a boolean")):
+            with self.subTest(value=value):
+                write(self.chives, b'{"save_directory":' + value + b"}")
+                self.assert_one_error_line(f"save_directory must be a string, not {kind}")
+
+    def test_missing_null_or_empty_save_directory_is_the_folder_name(self):
+        for body in (b"{}", b'{"save_directory":null}', b'{"save_directory":""}'):
+            with self.subTest(body=body):
+                write(self.chives, body)
+                self.assertEqual(saves.save_slot(self.folder)[0], "story")
+                out = os.path.join(self.tmp.name, "saves")
+                result = self.run_tool("import", self.folder, "--out", out, "--dry-run")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(result.stdout.startswith("story "), result.stdout)
+                self.assertFalse(os.path.exists(out))
 
 
 class PackIndexValidationTest(unittest.TestCase):
