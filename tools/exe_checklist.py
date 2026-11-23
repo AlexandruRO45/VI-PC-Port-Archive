@@ -120,10 +120,19 @@ def called_classes(paths: list[str]) -> set[str]:
     for p in paths:
         with open(p, encoding="utf-8") as f:
             doc = json.load(f)
-        for image in doc.get("images", [doc]):
-            for c in image.get("classes", []):
-                if c.get("class_id"):
-                    ids.add(str(c["class_id"]).lower())
+        if not isinstance(doc, dict):
+            raise ValueError(f"{p}: expected a report object")
+        images = doc.get("images", [doc])
+        if not isinstance(images, list):
+            raise ValueError(f"{p}: expected an images array")
+        for index, image in enumerate(images):
+            location = f"{p}: image {index + 1}"
+            if not isinstance(image, dict) or not isinstance(image.get("classes"), list):
+                raise ValueError(f"{location}: expected an object with a classes array")
+            for c in image["classes"]:
+                if not isinstance(c, dict) or not isinstance(c.get("class_id"), str) or not c["class_id"]:
+                    raise ValueError(f"{location}: expected each class to have a nonempty class_id string")
+                ids.add(c["class_id"].lower())
     return ids
 
 
@@ -165,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.gdk_calls:
         try:
             called = called_classes(a.gdk_calls)
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, RecursionError) as e:
             print(f"cannot read the gdk_runtime_calls report: {e}", file=sys.stderr)
             return 1
     text = render(collect(a.root), called)

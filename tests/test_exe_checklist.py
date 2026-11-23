@@ -100,6 +100,27 @@ class ExeChecklist(unittest.TestCase):
             self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", os.path.join(self.root, "missing.json")]), 1)
         self.assertIn("cannot read", stderr.getvalue())
 
+    def test_malformed_reports_fail_without_publishing_a_checklist(self):
+        report = os.path.join(self.root, "malformed.json")
+        out = os.path.join(self.root, "checklist.md")
+        for payload, reason in (
+            (None, "report object"),
+            ({"images": None}, "images array"),
+            ({"images": [None]}, "classes array"),
+            ({"images": [{"classes": 1}]}, "classes array"),
+            ({}, "classes array"),
+            ({"classes": [{"class_id": 42}]}, "class_id string"),
+        ):
+            with self.subTest(payload=payload):
+                with open(report, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(payload, f)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", report, "--out", out]), 1)
+                self.assertIn(report, stderr.getvalue())
+                self.assertIn(reason, stderr.getvalue())
+                self.assertFalse(os.path.exists(out))
+
     def test_this_repository(self):
         notes = ec.collect(ROOT)
         self.assertTrue(notes)
