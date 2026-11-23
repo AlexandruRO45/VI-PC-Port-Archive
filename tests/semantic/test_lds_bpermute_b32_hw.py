@@ -432,8 +432,32 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(results[lane], lane * 4)
 
 
+class TestConditionCodesAndStatus(unittest.TestCase):
+    def test_vcc_and_scc_invariance(self):
+        state = ScalarThreadState()
+        state.sgprs[0] = 0xCAFEBABE
+        state.vgprs[1] = 0
+        state.vgprs[2] = 42
+
+        interp = ScalarDSBPermuteInterpreter([42] * 32)
+        insn = DSBPermuteB32Instruction(Operand.vgpr(3), Operand.vgpr(1), Operand.vgpr(2))
+        interp.step(insn, state)
+
+        self.assertEqual(state.sgprs[0], 0xCAFEBABE)
+        self.assertEqual(state.lgkm_cnt, 1)
+
+    def test_lgkmcnt_counter_tracking(self):
+        state = ScalarThreadState()
+        interp = ScalarDSBPermuteInterpreter([42] * 32)
+        for i in range(5):
+            insn = DSBPermuteB32Instruction(Operand.vgpr(3), Operand.vgpr(1), Operand.vgpr(2), offset=i * 4)
+            interp.step(insn, state)
+        self.assertEqual(state.lgkm_cnt, 5)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
