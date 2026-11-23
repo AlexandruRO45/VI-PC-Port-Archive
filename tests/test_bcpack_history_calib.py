@@ -15,7 +15,7 @@ import tempfile
 import unittest
 import zlib
 from contextlib import redirect_stderr, redirect_stdout
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -448,6 +448,118 @@ class PrefixDecoderAndCliTest(unittest.TestCase):
             for k in (1, 7, 16, nsym):
                 got = calib.decode_lanes_prefix(raw, codec, nsym * 8, k)
                 self.assertEqual(got, [row[:k] for row in lanes])
+
+    def test_decode_lanes_prefix_rejects_non_terminating_streams(self):
+        """Malformed streams that previously looped forever in decode_lanes_prefix raise BcpackError."""
+        def interleave_bc1(lane_bytes):
+            return b"".join(bytes([b]) * 8 for b in lane_bytes) + b"".join(bytes([b]) * 4 for b in lane_bytes)
+
+        cases = [
+            # Flushed fragment ending below RANS_L at state 0 (36 bytes for 12 BC1 lanes).
+            ("flushed_state_zero", interleave_bc1((0x10, 0x00, 0x00)), 16, 1),
+            # Flushed fragment exhausting MAX_VIRTUAL_ZEROS with st != 0 (36 bytes).
+            ("flushed_virtual_zeros", interleave_bc1((0x10, 0x00, 0x02)), 128, 8),
+            # Fragment reaching st == RANS_L while input bytes remain (in_rem > 0, 84 bytes).
+            ("home_state_with_in_rem", interleave_bc1((0x10, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00)), 16, 1),
+            # Non-final (flush=0) fragment ending at st == RANS_L with symbols still owed (72 bytes).
+            ("non_final_home_state", interleave_bc1((0x00, 0x03, 0x01, 0x00, 0x00, 0x00)), 16, 1),
+        ]
+        child = (
+            "import json, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import bcpack, bcpack_history_calib as calib\n"
+            "cases = json.loads(sys.argv[2])\n"
+            "for name, hex_raw, out_size, max_sym in cases:\n"
+            "    raw = bytes.fromhex(hex_raw)\n"
+            "    try:\n"
+            "        calib.decode_lanes_prefix(raw, 1, out_size, max_sym)\n"
+            "    except bcpack.BcpackError as exc:\n"
+            "        print(f'{name}: BcpackError: {exc}')\n"
+            "    else:\n"
+            "        print(f'{name}: NO_ERROR')\n"
+        )
+        payload = json.dumps([[name, raw.hex(), out_size, max_sym] for name, raw, out_size, max_sym in cases])
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-I", "-c", child, os.path.join(ROOT, "tools"), payload],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("decode_lanes_prefix hung on malformed stream(s)")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        self.assertEqual(len(lines), len(cases), proc.stdout)
+        for (name, _raw, _out_size, _max_sym), line in zip(cases, lines):
+            self.assertTrue(line.startswith(f"{name}: BcpackError:"), line)
+            self.assertIn("home state", line)
+
+    def test_decode_lanes_prefix_validates_codec_size_width_model_and_symbols(self):
+        def interleave_bc1(lane_bytes):
+            return b"".join(bytes([b]) * 8 for b in lane_bytes) + b"".join(bytes([b]) * 4 for b in lane_bytes)
+
+        with self.assertRaisesRegex(bcpack.BcpackError, "unsupported BCPack codec"):
+            calib.decode_lanes_prefix(b"", 99, 16, 1)
+        with self.assertRaisesRegex(bcpack.BcpackError, "whole number"):
+            calib.decode_lanes_prefix(b"", 7, 24, 1)
+        with self.assertRaisesRegex(bcpack.BcpackError, "whole number"):
+            calib.decode_lanes_prefix(b"", 1, -8, 1)
+
+        # Symbol width out of range (w <= 0 and w > MAX_WIDTH) raises BcpackError, not AttributeError.
+        raw_shrink2 = interleave_bc1((0x80, 0x00, 0x00))
+        with patch.dict(bcpack.LANE_WIDTHS, {1: (2,) + bcpack.LANE_WIDTHS[1][1:]}):
+            with self.assertRaisesRegex(bcpack.BcpackError, "symbol width out of range"):
+                calib.decode_lanes_prefix(raw_shrink2, 1, 16, 1)
+
+        raw_hdr0 = interleave_bc1((0x00, 0x00, 0x00))
+        with patch.dict(bcpack.LANE_WIDTHS, {1: (bcpack.MAX_WIDTH + 1,) + bcpack.LANE_WIDTHS[1][1:]}):
+            with self.assertRaisesRegex(bcpack.BcpackError, "symbol width out of range"):
+                calib.decode_lanes_prefix(raw_hdr0, 1, 16, 1)
+
+        # Missing probability table raises BcpackError rather than crashing on None.lookup.
+        with patch.object(bcpack, "_get_model", return_value=None):
+            with self.assertRaisesRegex(bcpack.BcpackError, "probability table"):
+                calib.decode_lanes_prefix(raw_hdr0, 1, 16, 1)
+
+        # Symbol outside its width raises BcpackError.
+        bad_model = Mock()
+        bad_model.lookup.return_value = 1 << 8
+        bad_model.advance.return_value = bcpack.RANS_L
+        raw_emit = interleave_bc1((0x10, 0x00, 0x02))
+        with patch.object(bcpack, "_get_model", return_value=bad_model):
+            with self.assertRaisesRegex(bcpack.BcpackError, "symbol outside its width"):
+                calib.decode_lanes_prefix(raw_emit, 1, 16, 1)
+
+    def test_ref_pairs_cli_rejects_flushed_zero_prefix_chunk_cleanly(self):
+        script = os.path.join(ROOT, "tools", "bcpack_history_calib.py")
+        raw = bytes([0x10] * 8 + [0x00] * 16 + [0x10] * 4 + [0x00] * 8)
+        self.assertEqual(len(raw), 36)
+        with tempfile.TemporaryDirectory() as tmp:
+            pairs_path = os.path.join(tmp, "pairs.json")
+            out_dir = os.path.join(tmp, "out")
+            # 257 BC1 blocks -> max_b = 256 < nblocks = 257 so apply_ref_pairs_file runs the prefix path.
+            out_size = 257 * 8
+            with open(pairs_path, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(
+                    [{"codec": "bc1", "chunk_hex": raw.hex(), "ref_hex": (b"\x00" * out_size).hex()}],
+                    fh,
+                )
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-I", script, "--codec", "bc1", "--ref-pairs", pairs_path, "--out", out_dir],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("CLI hung on 36-byte corrupt chunk in --ref-pairs")
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("ERROR:", proc.stderr)
+            self.assertIn("home state", proc.stderr)
+            self.assertNotIn("Traceback", proc.stderr)
 
     def test_cli_clean_errors_without_tracebacks(self):
         with tempfile.TemporaryDirectory() as tmp:

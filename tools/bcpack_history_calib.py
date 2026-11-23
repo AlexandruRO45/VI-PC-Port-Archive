@@ -120,13 +120,21 @@ def decode_lanes_prefix(raw, codec, out_size, max_sym):
     blocks `0..255`, stopping the forward rANS scheduler after a short prefix
     avoids decoding tens of thousands of trailing blocks per chunk.
     """
-    nsym = out_size // 8
+    if codec not in bcpack.LANE_WIDTHS:
+        raise bcpack.BcpackError(f"unsupported BCPack codec id: {codec}")
+    if out_size < 0 or out_size % bcpack.BLOCK_BYTES[codec] != 0:
+        raise bcpack.BcpackError(
+            f"decoded size {out_size} is not a whole number of {bcpack.CODEC_NAMES[codec]} blocks"
+        )
+    nsym = out_size // bcpack.ELEMENT_BYTES
     if max_sym <= 0 or max_sym >= nsym:
         return bcpack.decode_lanes(raw, codec, out_size)[0]
     widths = bcpack.LANE_WIDTHS[codec]
     nl = len(widths)
     HDR0, HDR1, HDR2, PROC = 0, 1, 2, 3
     L = bcpack.RANS_L
+    max_width = bcpack.MAX_WIDTH
+    max_vz = bcpack.MAX_VIRTUAL_ZEROS
     ctrl = [HDR0] * nl
     out_rem = [nsym] * nl
     w = [0] * nl
@@ -151,6 +159,12 @@ def decode_lanes_prefix(raw, codec, out_size, max_sym):
     nraw = len(raw)
     data = memoryview(raw)
     emitted = 0
+
+    def fail(msg, lane):
+        raise bcpack.BcpackError(
+            f"lane {lane} (width {w[lane]}, q {q[lane]}) at input byte {pos}: {msg}"
+        )
+
     while emitted < max_sym:
         left = 8
         for i in range(nl):
@@ -193,7 +207,13 @@ def decode_lanes_prefix(raw, codec, out_size, max_sym):
                 if not full[i]:
                     continue
                 full[i] = False
-                model[i] = bcpack._get_model(w[i], q[i])
+                wi = w[i]
+                if not 1 <= wi <= max_width:
+                    fail("symbol width out of range", i)
+                m = bcpack._get_model(wi, q[i])
+                if m is None:
+                    fail("probability table for this width and q is not known", i)
+                model[i] = m
                 if h3[i]:
                     in_rem[i] = inbuf[i]
                     ctrl[i] = HDR2
@@ -215,11 +235,13 @@ def decode_lanes_prefix(raw, codec, out_size, max_sym):
                             in_rem[i] -= 1
                             full[i] = False
                             if in_rem[i] == 0 and flush[i]:
-                                while st < L and st != 0 and vz[i] < 8:
+                                while st < L and st != 0 and vz[i] < max_vz:
                                     st <<= 8
                                     vz[i] += 1
                     elif flush[i]:
-                        while st < L and st != 0 and vz[i] < 8:
+                        if st == 0 or vz[i] >= max_vz:
+                            fail("fragment did not end at its home state", i)
+                        while st < L and st != 0 and vz[i] < max_vz:
                             st <<= 8
                             vz[i] += 1
                     else:
@@ -231,8 +253,11 @@ def decode_lanes_prefix(raw, codec, out_size, max_sym):
                         continue
                 nxt = st > L and out_rem[i] > 0
                 if nxt:
-                    sym[i] = model[i].lookup(st & 0xFFFF)
+                    s = model[i].lookup(st & 0xFFFF)
+                    sym[i] = s
                     out_rem[i] -= 1
+                    if s >> w[i]:
+                        fail("symbol outside its width", i)
                 held[i] = nxt
                 p1[i] = st
                 if in_rem[i] == 0:
@@ -244,8 +269,14 @@ def decode_lanes_prefix(raw, codec, out_size, max_sym):
                                 p1[i] = 0
                             else:
                                 done[i] = True
+                        elif st > L and not nxt:
+                            fail("fragment did not end at its home state", i)
                     elif out_rem[i] == 0 and not nxt:
                         done[i] = True
+                    elif st == L:
+                        fail("fragment ended at its home state with symbols still to decode", i)
+                elif st == L or (out_rem[i] == 0 and not nxt and st > L):
+                    fail("fragment did not end at its home state", i)
         ready = True
         anyfull = False
         for i in range(nl):
