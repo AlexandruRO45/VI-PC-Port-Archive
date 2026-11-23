@@ -14,6 +14,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cwchar>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -53,8 +54,12 @@ std::string lower_ascii(std::string s) {
 }
 
 std::string narrow(const wchar_t* w) {
-    std::string s;
-    for (; w && *w; ++w) s += (*w < 0x80) ? static_cast<char>(*w) : '?';
+    if (!w || !*w) return {};
+    const int wlen = static_cast<int>(std::wcslen(w));
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w, wlen, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, wlen, s.data(), n, nullptr, nullptr);
     return s;
 }
 
