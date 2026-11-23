@@ -529,6 +529,11 @@ def check_image(data: bytes, manifest: dict) -> dict:
             f"raw is {len(data)} bytes, expected {width * height * 16}"
         )
     pixels = struct.unpack(f"<{len(data) // 4}f", data)
+    for i, value in enumerate(pixels):
+        if not math.isfinite(value):
+            y, x = divmod(i // 4, width)
+            channel = "RGBA"[i % 4]
+            raise AssertionError(f"non-finite {channel} channel at pixel ({x}, {y}): {value}")
     clear_val = manifest.get("clear", CLEAR)
     textured = (
         manifest.get("texture") is not None

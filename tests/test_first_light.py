@@ -649,6 +649,23 @@ class TexturedOracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             fl.check_image(magenta_img, magenta_manifest)
 
+    def test_nonfinite_pixel_outside_probes_cannot_satisfy_coverage(self):
+        manifest = {"width": 2, "height": 2, "min_coverage": 0.5, "clear_pixel": [0, 0]}
+        for oracle, valid in (
+            ({"centre_rgba": [0.2, 0.4, 0.6, 1.0]}, (0.2, 0.4, 0.6, 1.0)),
+            ({"centre_uv": [0.2, 0.4]}, (0.2, 0.4, 0.0, 1.0)),
+        ):
+            with self.subTest(oracle=oracle):
+                frame = {**manifest, **oracle}
+                valid_readback = self._make_raw(2, 2, {(1, 1): valid, (1, 0): valid})
+                self.assertEqual(check_image(valid_readback, frame)["covered"], 2)
+                for value in (float("nan"), float("inf"), float("-inf")):
+                    with self.subTest(value=value):
+                        bad_pixel = (value, *valid[1:])
+                        bad_readback = self._make_raw(2, 2, {(1, 1): valid, (1, 0): bad_pixel})
+                        with self.assertRaisesRegex(AssertionError, r"non-finite.*\(1, 0\)"):
+                            check_image(bad_readback, frame)
+
     def test_nan_channels_rejected(self):
         nan = float("nan")
         # NaN in centre_rgba must fail (abs(NaN) > tol is False without an explicit finiteness check).
