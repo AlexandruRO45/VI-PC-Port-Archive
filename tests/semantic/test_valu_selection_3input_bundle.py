@@ -504,5 +504,18 @@ class VMed3I32OracleTests(unittest.TestCase):
         self.assertEqual(ref_med3_i32(5, 5, 10), 5)
         self.assertEqual(ref_med3_i32(10, 5, 10), 10)
 
+class VMed3I32AstInterpreterTests(unittest.TestCase):
+    """AST modeling and interpreter simulation for v_med3_i32."""
+
+    def test_ast_emission(self):
+        node = Valu3AstNode("v_med3_i32", "v0", "v1", "v2", "v3")
+        self.assertEqual(node.emit_asm(), "v_med3_i32 v0, v1, v2, v3")
+
+    def test_interpreter_scalar_simulation(self):
+        regs = {"v1": 100, "v2": 5, "v3": 42}
+        res = ref_med3_i32(regs["v1"], regs["v2"], regs["v3"])
+        regs["v0"] = res
+        self.assertEqual(regs["v0"], 42)
+
 if __name__ == "__main__":
     unittest.main()
