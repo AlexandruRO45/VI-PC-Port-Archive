@@ -319,6 +319,36 @@ class ManifestTest(unittest.TestCase):
         with open(out, "rb") as f:
             self.assertEqual(f.read(), previous)
 
+    def test_unreadable_bank_directory_reports_rc_1_and_keeps_the_previous_manifest(self):
+        # os.walk's default skips a directory it cannot list, so collect() wrote an incomplete manifest at rc 0
+        # even though its docstring promises that I/O errors propagate.
+        banks = os.path.join(self.tmp.name, "banks")
+        blocked = os.path.join(banks, "blocked")
+        os.makedirs(blocked)
+        self.write_bank(os.path.join(banks, "good.awc"), with_music=False)
+        out = os.path.join(self.tmp.name, "manifest.json")
+        previous = b'{"previous": true}\n'
+        with open(out, "wb") as f:
+            f.write(previous)
+        scandir = os.scandir
+
+        def list_directory(path):
+            if os.path.normcase(path) == os.path.normcase(blocked):
+                raise PermissionError(13, "permission denied", path)
+            return scandir(path)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(os, "scandir", list_directory), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(awc_manifest.main([banks, "--out", out]), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue().count("\n"), 1, stderr.getvalue())
+        self.assertIn("awc_manifest: error: cannot read", stderr.getvalue())
+        self.assertIn("blocked", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), previous)
+
     def test_failed_write_keeps_the_previous_manifest(self):
         out = os.path.join(self.tmp.name, "manifest.json")
         with open(out, "w", encoding="utf-8") as f:

@@ -146,6 +146,11 @@ def _bank_rows(path: str, bank: str) -> list:
     return rows
 
 
+def _scan_failed(error: OSError) -> None:
+    """An unreadable bank directory is an error: collect() promises that I/O errors propagate."""
+    raise error
+
+
 def collect(src: str, *, out: str | None = None):
     """(parsed bank count, rows, streamed-music row count); one warning per skipped bank.
 
@@ -156,7 +161,7 @@ def collect(src: str, *, out: str | None = None):
     recursive = os.path.isdir(src)
     if recursive:
         banks = []
-        for root, dirs, files in os.walk(src):
+        for root, dirs, files in os.walk(src, onerror=_scan_failed):
             dirs.sort()
             banks += [os.path.join(root, f) for f in files if f.lower().endswith(".awc")]
         banks.sort(key=lambda p: (os.path.basename(p).lower(), p.lower()))
