@@ -5235,15 +5235,22 @@ class Gen:
         a subnormal operand or result
         reads as signed zero, whatever the MODE register says. LLVM's SITargetLowering::isFMADLegal forms
         v_mad_f32/v_mac_f32 only when f32 denormals are flushed (SIISelLowering.cpp, llvm-project 1922c0c);
-        v_mad_legacy_f32 is the same VALU. Emulated as |x| < FLT_MIN -> copysign(0, x): inf and NaN compare
-        false and pass through, and 0 keeps its sign. Counted over the corpus before writing this (SHADER-118):
-        9,297 of the 26,503 shaders use at least one of the three, 440,858 occurrences (0.99% of the corpus)."""
-        a, small, sign, z, r = (self.tmp() for _ in range(5))
-        self.emit(f"{a} = OpExtInst %float %glsl FAbs {f}")
-        self.emit(f"{small} = OpFOrdLessThan %bool {a} {self.fconst(2.0 ** -126)}")
-        self.emit(f"{sign} = OpBitwiseAnd %uint {self.tou(f)} {self.cu(0x80000000)}")
-        self.emit(f"{z} = OpBitcast %float {sign}")
-        self.emit(f"{r} = OpSelect %float {small} {z} {f}")
+        v_mad_legacy_f32 is the same VALU. Emulated on the bits (flush_u): a zero exponent field -> the sign bit
+        alone, so inf and NaN pass through and 0 keeps its sign. Counted over the corpus before writing this
+        (SHADER-118): 9,297 of the 26,503 shaders use at least one of the three, 440,858 occurrences (0.99% of the
+        corpus)."""
+        return self.tof(self.flush_u(self.tou(f)))
+
+    def flush_u(self, u):
+        """flush_f32 on the bits of an f32, as a %uint: (u & 0x7F800000) == 0 ? u & 0x80000000 : u. A zero exponent
+        field is a zero or a subnormal, and both become the zero of their sign. It was |x| < FLT_MIN on the float
+        (FAbs, a compare with the FLT_MIN constant, the sign mask, a bitcast back and a float select): integer ops
+        only now, so the driver's own f32 denormal handling, which Vulkan leaves open, can't touch the test either."""
+        e, den, sign, r = (self.tmp() for _ in range(4))
+        self.emit(f"{e} = OpBitwiseAnd %uint {u} {self.cu(0x7F800000)}")
+        self.emit(f"{den} = OpIEqual %bool {e} {self.cu(0)}")
+        self.emit(f"{sign} = OpBitwiseAnd %uint {u} {self.cu(0x80000000)}")
+        self.emit(f"{r} = OpSelect %uint {den} {sign} {u}")
         return r
 
     def flush_f32_mods(self, v, mods):

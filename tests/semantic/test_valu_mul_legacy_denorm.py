@@ -7,6 +7,7 @@ the scaled result is flushed again.
 """
 
 import os
+import re
 import sys
 import unittest
 
@@ -75,7 +76,7 @@ class LegacyMulDenormalTests(unittest.TestCase):
     def test_emits_explicit_f32_flushes_instead_of_a_driver_mode(self):
         _, spv = run_mul(0x00800000, 0x3F000000, "mul:2")
         # One check for each input, plus the product and final result.
-        self.assertGreaterEqual(spv.count("OpFOrdLessThan %bool"), 4)
+        self.assertGreaterEqual(len(re.findall(r"= OpBitwiseAnd %uint %\w+ %c7f800000\n", spv)), 4)
         self.assertIn("OpFMul %float", spv)
         self.assertIn("OpSelect %float", spv)
         # The software rule does not demand a vendor-specific float control.

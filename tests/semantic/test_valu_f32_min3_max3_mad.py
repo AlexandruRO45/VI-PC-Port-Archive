@@ -769,8 +769,12 @@ class DenormalFlushTests(unittest.TestCase):
                              f"v_mov_b32 v3, {c:#x}", f"{op} v0, v1, v2, v3"]
                 spv = translate_ps(lines)
                 self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], want)
-                unflushed, count = re.subn(r"(%\w+) = OpSelect %float (%\w+) (%\w+) (%\w+)",
-                                           r"\1 = OpCopyObject %float \4", spv)
+                # A flush selects on (u & 0x7F800000) == 0 (Gen.flush_u); keep its operand u instead.
+                exps = set(re.findall(r"(%\w+) = OpBitwiseAnd %uint %\w+ %c7f800000\n", spv))
+                dens = {d for d, e in re.findall(r"(%\w+) = OpIEqual %bool (%\w+) %c0\n", spv) if e in exps}
+                sel = r"(%\w+) = OpSelect %uint (%\w+) (%\w+) (%\w+)"
+                count = sum(m[2] in dens for m in re.finditer(sel, spv))
+                unflushed = re.sub(sel, lambda m: f"{m[1]} = OpCopyObject %uint {m[4]}" if m[2] in dens else m[0], spv)
                 self.assertGreaterEqual(count, 3)
                 self.assertNotEqual(si.run_fragment(unflushed)["%out_mrt0"][0], want)
 
