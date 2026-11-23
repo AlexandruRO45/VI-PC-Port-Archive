@@ -332,9 +332,17 @@ def main(argv=None) -> int:
         index.append(entry)
         written += 1
 
+    stopped = []                   # why llvm-mc did not answer, once a call has run out of time
     def one(job):
         entry, name, code, start, end = job
-        asm, invalid, err = disasm.disasm(code, a.mcpu)
+        if stopped:
+            raise LibraryError(stopped[0])
+        try:
+            asm, invalid, err = disasm.disasm(code, a.mcpu)
+        except disasm.McTimeout as error:
+            # The programs queued after one that got no answer would each wait as long again: fail them at once.
+            stopped.append(str(error))
+            raise LibraryError(str(error)) from None
         entry["invalid_words"] = invalid
         with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
             f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")

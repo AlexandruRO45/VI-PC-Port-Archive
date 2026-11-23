@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -179,7 +180,9 @@ class Cli(unittest.TestCase):
             code = fspx_unpack.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
-    def disassemble(self, body):
+    def disassemble(self, body, timeout=None):
+        """The tool over one synthetic payload, --disasm on, with `body` as llvm-mc; `timeout` is
+        LEONIDA_MC_TIMEOUT in seconds."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         src = os.path.join(tmp.name, "one.fspx")
@@ -190,6 +193,8 @@ class Cli(unittest.TestCase):
             f.write(body)
         out = os.path.join(tmp.name, "out")
         env = dict(os.environ, LLVM_MC=f'"{sys.executable}" "{mc}"')
+        if timeout is not None:
+            env["LEONIDA_MC_TIMEOUT"] = str(timeout)
         result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "fspx_unpack.py"),
                                  src, "--out", out, "--disasm"], capture_output=True, text=True, env=env)
         return result, out
@@ -213,6 +218,14 @@ class Cli(unittest.TestCase):
         self.assertEqual(result.stderr.splitlines(), ["one: no output"])
         self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
         self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
+
+    def test_an_llvm_mc_that_does_not_answer_ends_the_run_with_one_line(self):
+        started = time.monotonic()
+        result, out = self.disassemble("import time\ntime.sleep(60)\n", timeout=1)
+        self.assertLess(time.monotonic() - started, 25, "the 1 s limit was not kept")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines(), ["ERROR: llvm-mc did not answer within 1 s"])
+        self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
 
     def test_disassembly_with_invalid_words_keeps_listing(self):
         result, out = self.disassemble("import sys\n"

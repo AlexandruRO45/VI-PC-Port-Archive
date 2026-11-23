@@ -9,8 +9,10 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zlib
 
@@ -192,6 +194,27 @@ class Main(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             rc = sl.main(list(args))
         return rc, out.getvalue()
+
+    def test_an_llvm_mc_that_does_not_answer_ends_the_run_with_one_line(self):
+        """--disasm runs disasm() on worker threads: a disassembler that stops answering is one line, not a
+        traceback from a thread, and the programs still queued do not each wait for the time limit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "shaders.rpf")
+            with open(src, "wb") as f:
+                f.write(archive(sample()))
+            mc = os.path.join(tmp, "fake_mc.py")
+            with open(mc, "w", encoding="utf-8", newline="\n") as f:
+                f.write("import time\ntime.sleep(60)\n")
+            out = os.path.join(tmp, "out")
+            env = dict(os.environ, LLVM_MC=f'"{sys.executable}" "{mc}"', LEONIDA_MC_TIMEOUT="1")
+            started = time.monotonic()
+            result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "shader_library.py"), src,
+                                     "--out", out, "--disasm"], capture_output=True, text=True, errors="replace",
+                                    env=env)
+            self.assertLess(time.monotonic() - started, 25, "the 1 s limit was not kept")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(result.stderr.splitlines(), ["error: llvm-mc did not answer within 1 s"])
+            self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
 
     def test_unpack_layout(self):
         with tempfile.TemporaryDirectory() as tmp:

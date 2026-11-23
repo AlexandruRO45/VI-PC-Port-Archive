@@ -69,7 +69,8 @@ MC_TIMEOUT = mc_timeout()
 
 
 class McTimeout(Exception):
-    """llvm-mc did not answer within MC_TIMEOUT seconds."""
+    """llvm-mc did not answer within MC_TIMEOUT seconds. tools/fspx_unpack.py and tools/shader_library.py call
+    disasm() too, and turn it into their own one-line failure."""
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
@@ -161,7 +162,7 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
     try:
         p = run_mc(["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"], text)
     except subprocess.TimeoutExpired:
-        raise McTimeout from None
+        raise McTimeout(f"llvm-mc did not answer within {MC_TIMEOUT:g} s") from None
     except OSError as e:
         return "", 0, str(e)
     bad = p.stderr.count("invalid instruction encoding")
@@ -251,8 +252,8 @@ def one(path, out, mcpu, backend="llvm-mc"):
                 return "scan failed"
             start = best
         asm, bad, err = disasm(b[start:end], mcpu, backend=backend)
-    except McTimeout:
-        no_disassembly(path, f"llvm-mc did not answer within {MC_TIMEOUT:g} s")
+    except McTimeout as error:
+        no_disassembly(path, str(error))
         return "failed"
     if not asm.strip():  # a broken toolchain, not a shader: never report this as "clean"
         reason = (err.strip().splitlines() or ["no output"])[0]
