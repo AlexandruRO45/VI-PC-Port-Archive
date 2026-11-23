@@ -93,6 +93,27 @@ def test_sdk_discovery_sorts_versions_numerically():
             os.path.join(include, "10.0.100000.0", "shared")), got_shared
 
 
+def test_sdk_discovery_skips_a_newer_partial_kit():
+    # A Windows Driver Kit can install a newer Include/<version> with km/ and a few um/ headers but no D3D headers
+    # (10.0.28000.0 next to a full 10.0.26100.0 SDK, measured). Discovery must take the SDK that has d3d12.h.
+    with tempfile.TemporaryDirectory() as tmp:
+        include = os.path.join(tmp, "Windows Kits", "10", "Include")
+        full, partial = os.path.join(include, "10.0.26100.0"), os.path.join(include, "10.0.28000.0")
+        for vdir in (full, partial):
+            os.makedirs(os.path.join(vdir, "um"))
+            os.makedirs(os.path.join(vdir, "shared"))
+        os.makedirs(os.path.join(partial, "km"))
+        with open(os.path.join(full, "um", "d3d12.h"), "w", encoding="utf-8", newline="\n"):
+            pass
+        with mock.patch.dict(os.environ, {"ProgramFiles(x86)": tmp, "ProgramFiles": tmp}, clear=False):
+            os.environ.pop("WINDOWS_SDK_INCLUDE", None)
+            os.environ.pop("SDK_INCLUDE", None)
+            got_um, got_shared = S.find_sdk_include()
+        assert got_um is not None
+        assert os.path.normcase(got_um) == os.path.normcase(os.path.join(full, "um")), got_um
+        assert os.path.normcase(got_shared) == os.path.normcase(os.path.join(full, "shared")), got_shared
+
+
 def test_scarab_cross_check():
     root = os.environ.get("SCARAB_REF")
     if not root:
@@ -109,6 +130,7 @@ if __name__ == "__main__":
     test_unrecovered_console_iids_stay_outside_the_table()
     test_sdk_include_override_accepts_a_trailing_separator()
     test_sdk_discovery_sorts_versions_numerically()
+    test_sdk_discovery_skips_a_newer_partial_kit()
     # Call the two optional checks through their real definitions so this runner cannot drift from them; both
     # raise unittest.SkipTest when their inputs (SDK headers, SCARAB_REF) are absent.
     for optional in (test_standard_iids_match_sdk, test_scarab_cross_check):
