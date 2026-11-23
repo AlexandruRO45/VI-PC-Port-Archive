@@ -80,6 +80,25 @@ class MaskChannelTests(unittest.TestCase):
                         sys.stderr = saved_err
                 self.assertEqual(cm.exception.code, 2)
 
+    def test_unreadable_texture_is_a_message(self):
+        """A missing, empty or non-DDS texture is one ERROR line and exit 2, not a traceback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            empty, garbage = os.path.join(tmp, "empty.dds"), os.path.join(tmp, "garbage.dds")
+            open(empty, "wb").close()
+            with open(garbage, "wb") as fh:
+                fh.write(b"MZ" + bytes(0x100))
+            for path in (os.path.join(tmp, "no-such.dds"), empty, garbage):
+                with self.subTest(path=os.path.basename(path)), redirect_stdout(io.StringIO()):
+                    err = io.StringIO()
+                    sys.stderr, saved_err = err, sys.stderr
+                    try:
+                        rc = mc.main([path])
+                    finally:
+                        sys.stderr = saved_err
+                    self.assertEqual(rc, 2)
+                    self.assertIn("ERROR:", err.getvalue())
+                    self.assertIn(path, err.getvalue())
+
     def test_json_cannot_replace_the_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "m.dds")
