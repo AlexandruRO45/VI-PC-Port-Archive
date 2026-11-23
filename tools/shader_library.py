@@ -296,7 +296,11 @@ def main(argv=None) -> int:
     names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
     sources = carve_digests(a.carve) if a.carve else None
     cs_state = {c["program"]: c["state"] for c in lib["compute"]}
-    index, written, work = [], 0, []
+    for stale in ("index.json", "library.json"):
+        p = os.path.join(a.out, stale)
+        if os.path.exists(p):
+            os.remove(p)
+    index, written, work, pending = [], 0, [], []
     for i in range(lib["header"]["programs"]):
         stages = lib["stage"].get(i, set())
         st = "+".join(sorted(stages)) if stages else "unused"
@@ -312,6 +316,7 @@ def main(argv=None) -> int:
         entry = {"file": name + ".dxbc", "stage": st, "program": i}
         digests = sorted(lib["digest"].get(i, ()))
         meta["digest"] = [d.hex() for d in digests]
+        container = None
         if sources is not None:
             found = sorted({src for d in digests for src in sources.get(d, ())})
             entry["source"] = meta["source"] = sorted({n for n, _ in found})
@@ -320,17 +325,16 @@ def main(argv=None) -> int:
                 # pipeline build keeps; the translator reads them from <name>.dxbc next to its folder.
                 with open(found[0][1], "rb") as f:
                     container = f.read()
-                with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
-                    f.write(container)
         for k in ("threads", "wave32"):
             if k in meta:
                 entry[k] = meta[k]
-        with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
-            f.write(code)
-        with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
-            json.dump(meta, f, indent=1)
-        if disasm and end:
-            work.append((entry, name, code[start:end], start, end))
+        if disasm:
+            stale_s = os.path.join(a.out, "disasm", name + ".s")
+            if os.path.exists(stale_s):
+                os.remove(stale_s)
+            if end:
+                work.append((entry, name, code[start:end], start, end))
+        pending.append((name, code, meta, container))
         index.append(entry)
         written += 1
 
@@ -346,15 +350,27 @@ def main(argv=None) -> int:
             reason = (err.strip().splitlines() or ["no output"])[0]
             raise LibraryError(f"{name}: {reason}")
         entry["invalid_words"] = invalid
-        with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
-            f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
-            f.write(asm)
-            if err.strip():
-                f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
+        text = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
+        if err.strip():
+            text += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
+        return name, text
 
+    listings = []
     if work:
         with ThreadPoolExecutor(a.jobs) as ex:   # each job waits on its own llvm-mc process
-            list(ex.map(one, work))
+            listings = list(ex.map(one, work))
+
+    for name, code, meta, container in pending:
+        if container is not None:
+            with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
+                f.write(container)
+        with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
+            f.write(code)
+        with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(meta, f, indent=1)
+    for name, text in listings:
+        with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
 
     def named(stages):
         return {k: names[v["program"]] for k, v in stages.items()}

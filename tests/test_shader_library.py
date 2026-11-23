@@ -357,6 +357,16 @@ class Main(unittest.TestCase):
                 with self.assertRaisesRegex(sl.LibraryError, "lib_cs_00003: llvm-mc failed"):
                     self.run_main(src, "--out", out_fail, "--stages", "cs", "--disasm", "--jobs", "1")
                 self.assertEqual(os.listdir(os.path.join(out_fail, "disasm")), [])
+                self.assertFalse(os.path.exists(os.path.join(out_fail, "index.json")))
+                self.assertFalse(os.path.exists(os.path.join(out_fail, "library.json")))
+
+                # Reusing an existing output directory on a subsequent decoder failure invalidates old completion
+                # index/listings and does not publish partial artifacts.
+                with self.assertRaisesRegex(sl.LibraryError, "lib_cs_00003: llvm-mc failed"):
+                    self.run_main(src, "--out", out, "--stages", "cs", "--disasm", "--jobs", "1")
+                self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
+                self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
+                self.assertFalse(os.path.exists(os.path.join(out, "library.json")))
             finally:
                 shader_disasm.disasm = old
 
