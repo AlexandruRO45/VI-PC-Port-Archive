@@ -28,7 +28,11 @@ ProcessExit process_terminate;
 Abort abort_terminate;
 int quick_order = 0;
 void __cdecl quick_first() { quick_order = quick_order * 10 + 1; }
-void __cdecl quick_second() { quick_order = quick_order * 10 + 2; }
+void __cdecl quick_late() { quick_order = quick_order * 10 + 3; }
+void __cdecl quick_second() {
+    quick_order = quick_order * 10 + 2;
+    if (quick_register(quick_late)) quick_order = -100;
+}
 DWORD WINAPI quick_entry(void*) {
     if (quick_register(quick_first) || quick_register(quick_second)) return 99;
     quick_terminate(23);
@@ -62,7 +66,7 @@ void check_quick_exit() {
                 }
                 quick_order = 0;
                 int code = rt::process::run_entry(reinterpret_cast<void*>(quick_entry), 0);
-                int expected = std::strcmp(exit_name, "quick_exit") == 0 ? 21 : 0;
+                int expected = std::strcmp(exit_name, "quick_exit") == 0 ? 231 : 0;
                 if (code != 23 || quick_order != expected) {
                     std::fprintf(stderr, "FAIL %s!%s via %s: code %d order %d, expected 23 and %d\n",
                                  dll, name, exit_name, code, quick_order, expected);
