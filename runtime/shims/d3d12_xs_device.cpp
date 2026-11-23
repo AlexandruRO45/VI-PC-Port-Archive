@@ -19,6 +19,7 @@
 #include "d3d12_xs_device.h"
 #include "d3d12_console_feature.h"
 #include "d3d12_trace.h"
+#include "presentx_capture.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -898,6 +899,51 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                              reinterpret_cast<void**>(a2)));
     } else {
         note_child_slot<K>(Slot);
+        if constexpr (K == ChildKind::queue && Slot >= kQueuePublicSlots) {
+            // Opt-in: only the slot named by the environment variable is routed; every other tail slot keeps the
+            // refusal below. PresentX/SuspendX/ResumeX slots are not measured (docs section 4.5), so on exe day the
+            // first trace names the slot and the next run sets LEONIDA_PRESENTX_SLOT to it without a code change.
+            const rt::d3d12::PresentXRouteConfig& route = rt::d3d12::presentx_route_config();
+            if (route.present_slot == Slot) {
+                static std::atomic<bool> logged{false};
+                bool expected = false;
+                if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: queue slot %u routed to PresentX (args 0x%llx 0x%llx 0x%llx)\n",
+                                 Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                                 static_cast<unsigned long long>(a3));
+                }
+                d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the routed result is not inspected
+                return hr_to_u64(rt::d3d12::presentx_capture_present(
+                    self->device ? self->device->real : nullptr, reinterpret_cast<ID3D12CommandQueue*>(self->real),
+                    static_cast<UINT>(a1),
+                    reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(a2)));
+            }
+            if (route.suspend_slot == Slot) {
+                static std::atomic<bool> logged{false};
+                bool expected = false;
+                if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: queue slot %u routed to SuspendX (args 0x%llx 0x%llx 0x%llx)\n",
+                                 Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                                 static_cast<unsigned long long>(a3));
+                }
+                d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the routed result is not inspected
+                return hr_to_u64(S_OK);  // no frame events, no pacing: nothing to suspend
+            }
+            if (route.resume_slot == Slot) {
+                static std::atomic<bool> logged{false};
+                bool expected = false;
+                if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: queue slot %u routed to ResumeX (args 0x%llx 0x%llx 0x%llx)\n",
+                                 Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                                 static_cast<unsigned long long>(a3));
+                }
+                d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the routed result is not inspected
+                return hr_to_u64(S_OK);
+            }
+        }
         if (Slot >= self->slot_count) {
             bool expected = false;
             if (ChildStats<K>::beyond_warned[Slot].compare_exchange_strong(expected, true,
