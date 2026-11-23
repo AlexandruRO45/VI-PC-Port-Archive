@@ -267,6 +267,17 @@ class TestGalleryServer(unittest.TestCase):
             self.assertEqual(r.status, 200)
             self.assertIn(b"console.log", r.read())
 
+    def test_dds_preview_is_not_cached_across_reexports(self) -> None:
+        # The preview of inside.dds is always /textures/inside.png: a long max-age kept the old picture in the
+        # browser after the .dds was exported again. It is sent no-cache, like the files themselves.
+        base = f"http://127.0.0.1:{self.port}"
+        with urllib.request.urlopen(f"{base}/textures/inside.png", timeout=3) as r:
+            self.assertEqual(r.status, 200)
+            self.assertTrue(r.read().startswith(b"\x89PNG"))
+            self.assertEqual(r.headers.get("Cache-Control"), "no-cache")
+        with urllib.request.urlopen(f"{base}/textures/test_tex.png", timeout=3) as r:
+            self.assertEqual(r.headers.get("Cache-Control"), "no-cache")
+
     def test_traversal_and_sibling_prefix_escapes_are_forbidden(self) -> None:
         host = f"127.0.0.1:{self.port}"
         cases = (

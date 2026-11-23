@@ -218,7 +218,9 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
                         self.send_response(200)
                         self.send_header("Content-Type", "image/png")
                         self.send_header("Content-Length", str(len(png_bytes)))
-                        self.send_header("Cache-Control", "max-age=86400")
+                        # The preview URL never changes (always <stem>.png), so a cached copy would outlive a
+                        # re-export of the .dds; revalidate like every other response (_send_file).
+                        self.send_header("Cache-Control", "no-cache")
                         self.end_headers()
                         self.wfile.write(png_bytes)
                         return
