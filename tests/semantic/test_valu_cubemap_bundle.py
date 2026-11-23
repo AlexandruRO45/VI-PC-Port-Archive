@@ -207,5 +207,23 @@ class VCubeIdEdgeCasesTests(unittest.TestCase):
         # Negative tie (-1, -1, -1): -Z takes priority -> face 5.0 (-Z)
         self.assertEqual(oracle_cubeid_f32(-1.0, -1.0, -1.0), 5.0)
 
+class VCubeIdTranslatorTests(unittest.TestCase):
+    def test_cubeid_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v0, 1.0",
+            "v_mov_b32 v1, 2.0",
+            "v_mov_b32 v2, 3.0",
+            "v_cubeid_f32 v3, v0, v1, v2",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_cubeid_exec", lines)
+        val = u32_to_f32(mrt0_words(spv)[0])
+        self.assertEqual(val, 4.0)  # +Z face
+
+    def test_cubeid_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_cubeid", ["v_cubeid_f32"])
+
 if __name__ == "__main__":
     unittest.main()
