@@ -253,5 +253,42 @@ class TestMulkSimdInteraction(unittest.TestCase):
         self.assertEqual(words[1], (-400) & MASK32)
 
 
+class TestMulkRegisterPreservation(unittest.TestCase):
+    """Commit 5: register aliasing and in-place operand preservation for s_mulk_i32."""
+
+    def test_in_place_mutation_preserves_adjacent_sgprs(self):
+        lines = [
+            "s_mov_b32 s0, 11",
+            "s_mov_b32 s1, 22",
+            "s_mov_b32 s2, 33",
+            "s_mov_b32 s3, 44",
+            "s_mulk_i32 s1, 7",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, s2",
+            "v_mov_b32 v3, s3",
+        ]
+        words = run_mulk_ps(lines, "ps_mulk_reg_preservation")
+        self.assertEqual(words[0], 11)
+        self.assertEqual(words[1], 154)
+        self.assertEqual(words[2], 33)
+        self.assertEqual(words[3], 44)
+
+    def test_high_sgpr_register_indices(self):
+        lines = [
+            "s_mov_b32 s8, 50",
+            "s_mulk_i32 s8, 12",
+            "s_mov_b32 s12, 70",
+            "s_mulk_i32 s12, -4",
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s12",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_mulk_ps(lines, "ps_mulk_high_sgpr")
+        self.assertEqual(words[0], 600)
+        self.assertEqual(words[1], (-280) & MASK32)
+
+
 if __name__ == '__main__':
     unittest.main()
