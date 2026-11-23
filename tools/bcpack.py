@@ -305,11 +305,64 @@ def _decode_lanes_raw(raw, widths, nsym):
                 held[i] = False
 
 
+_NATIVE = []
+
+
+def _native_unpack():
+    """The `unpack` entry of the optional Rust lane decoder, or None.
+
+    `tools/bcpack_calibration` (built with Cargo, see its README.md) exports
+    `unpack`, which runs `third_party/bcpack-rs`. It is about 60 times faster
+    than `_decode_lanes_raw`. Set `LEONIDA_BCPACK_NATIVE=0` to use Python only.
+    """
+    if not _NATIVE:
+        fn = None
+        if os.environ.get("LEONIDA_BCPACK_NATIVE", "1") != "0":
+            import ctypes
+            name = {"win32": "bcpack_calibration.dll",
+                    "darwin": "libbcpack_calibration.dylib"}.get(sys.platform, "libbcpack_calibration.so")
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "bcpack_calibration", "target", "release", name)
+            if os.path.isfile(path):
+                try:
+                    fn = ctypes.CDLL(path).unpack
+                except (OSError, AttributeError):
+                    fn = None
+                else:
+                    fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p,
+                                   ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p]
+                    fn.restype = ctypes.c_ssize_t
+        _NATIVE.append(fn)
+    return _NATIVE[0]
+
+
+def _decode_lanes_native(raw, widths, nsym):
+    """`(lanes, bytes_used)` from the Rust decoder, or None where it refuses the stream.
+
+    The Rust decoder refuses some streams the Python model accepts; where both
+    accept one they give the same symbols and byte count
+    (`tests/test_bcpack_native.py`). So a refusal only means: ask Python.
+    """
+    fn = _native_unpack()
+    if fn is None or nsym <= 0 or max(widths) > 8:
+        return None
+    import ctypes
+    nl = len(widths)
+    data = bytes(raw)
+    out = ctypes.create_string_buffer(nsym * nl)
+    used = fn(data, len(data), bytes(w - 1 for w in widths), nl, nsym, out)
+    if used < 0:
+        return None
+    flat = out.raw
+    return [list(flat[i::nl]) for i in range(nl)], used
+
+
 def decode_lanes(raw, codec, out_size):
     """Entropy layer: decode `raw` into per-lane symbol lists and bytes consumed.
 
     Works for all six active codecs (`1, 3, 4, 5, 6, 7`). Trailing non-zero
-    bytes after the last lane finishes are rejected.
+    bytes after the last lane finishes are rejected. Uses the Rust decoder when
+    it is built (`_native_unpack`) and Python for the streams it refuses.
     """
     if codec not in LANE_WIDTHS:
         raise BcpackError(f"unsupported BCPack codec id: {codec}")
@@ -318,6 +371,9 @@ def decode_lanes(raw, codec, out_size):
             f"decoded size {out_size} is not a whole number of {CODEC_NAMES[codec]} blocks"
         )
     nsym = out_size // ELEMENT_BYTES
+    fast = _decode_lanes_native(raw, LANE_WIDTHS[codec], nsym)
+    if fast is not None:
+        return fast
     data = memoryview(raw)
     lanes, used = _decode_lanes_raw(data, LANE_WIDTHS[codec], nsym)
     if any(data[used:]):

@@ -13,6 +13,10 @@ python -I tools/ttpf_mips.py export path/to/pool.ttpf 0 output.dds --calibration
 
 The synthetic test constructs its own BC1 pool and profile, runs the CLI and compares the full mip payload with known blocks. A real profile requires the caller's calibrated tables. The exporter does not derive the tables automatically. A matching file hash verifies reproduction of a previous fitted export. Original pixel fidelity needs independent reference pixels.
 
+## Faster strict decoding
+
+Once built, the same library also speeds up the default strict path: `tools/bcpack.py` decodes the lane symbols with its `unpack` export (about 60 times faster than the Python model on synthetic chunks, about 12 times end to end for BC1) and uses Python for the streams the Rust reader refuses, so the output does not change. NumPy is not needed for this. `python -I tests/test_bcpack_native.py` checks that the two agree; `LEONIDA_BCPACK_NATIVE=0` turns it off.
+
 ## Automatic asset export
 
 Run the ordinary build or `python -I make_game.py --game <package> --work <work> --stages assets`. The assets stage runs the C# exporter on each new pool and revisits existing pool manifests. It attempts full mip chains for missing and partial BCn entries whose allocation includes BCPack. With no profile, it uses the Python strict decoder. For calibrated 2D textures and arrays, install NumPy, build the library as above and place a matching profile at `<work>/bcpack-calibration.json` before running the stage.
