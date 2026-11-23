@@ -32,6 +32,7 @@ Windows (from the repository root):
 
 ```powershell
 $env:LEONIDA_D3D12 = 'vulkan'
+$env:LEONIDA_SHADERS = "C:\path\to\work\shaders\spirv"
 $exe = "C:\path\to\game_scarlett_master.exe"
 $pkg = "C:\path\to\the\package"
 $trace = Join-Path $env:TEMP boot.jsonl
@@ -49,6 +50,7 @@ Linux under Wine (a cross build made with xwin, or the `runtime-windows` artifac
 
 ```sh
 export LEONIDA_D3D12=vulkan
+export LEONIDA_SHADERS='Z:\path\to\work\shaders\spirv'
 wine runtime/build/windows/gta6rt.exe --run /path/to/game_scarlett_master.exe \
      --game-dir "Z:\\path\\to\\the\\package" \
      --trace "Z:\\tmp\\boot.jsonl" --trace-d3d12 2> /tmp/d3d12.log
@@ -58,7 +60,10 @@ python3 -I tools/boot_trace.py /tmp/boot.jsonl --d3d12 /tmp/d3d12.log
 `--trace FILE` **refuses an existing file** (exit 2): it is created before the loader reads anything, so use a
 fresh name or delete the old one. `LEONIDA_D3D12=vulkan` selects the Vulkan-backed device, the only backend that
 writes the `[d3d12-trace]` lines; without it the layer uses the Windows D3D12 device and the trace has nothing to
-read. Keep the traces out of the repository: they can quote whatever the game prints.
+read. `LEONIDA_SHADERS` names the translated shaders that device builds its pipelines from, `<work>/shaders/spirv`
+from `make_game.py`'s shaders stage. Without it the device logs `no translated shaders` once and fails every
+graphics and compute pipeline state with `E_FAIL`, so the game cannot build its first frame. Keep the traces out of
+the repository: they can quote whatever the game prints.
 
 Useful switches:
 
