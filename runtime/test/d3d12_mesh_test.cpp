@@ -54,6 +54,7 @@ using DepthStencil1Subobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEP
 using DepthStencilSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC>;
 using RasterizerSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC>;
 using Rasterizer2Subobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2, D3D12_RASTERIZER_DESC2>;
+using CacheSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, D3D12_CACHED_PIPELINE_STATE>;
 using MaskSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT>;
 
 // Subobjects appended one after another: each is pointer-aligned and a multiple of the pointer size, so the bytes
@@ -210,6 +211,21 @@ int main() {
         vs_stream.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
         vs_stream.add(TargetsSubobject{.inner = one_target()});
         EXPECT(SUCCEEDED(create(device.p, vs_stream, vs_pso)));
+
+        // A stream cache blob is tied to the complete mesh description.
+        Ref<ID3DBlob> blob;
+        EXPECT(mesh_pso->GetCachedBlob(&blob.p) == S_OK && blob.p && blob->GetBufferSize());
+        const D3D12_CACHED_PIPELINE_STATE cached{blob->GetBufferPointer(), blob->GetBufferSize()};
+        Stream cached_stream = mesh_stream;
+        cached_stream.add(CacheSubobject{.inner = cached});
+        Ref<ID3D12PipelineState> cached_pso;
+        EXPECT(create(device.p, cached_stream, cached_pso) == S_OK && cached_pso.p);
+        Stream changed = cached_stream;
+        changed.add(MaskSubobject{.inner = 0});
+        EXPECT(create(device.p, changed, refused) == D3D12_ERROR_DRIVER_VERSION_MISMATCH && !refused.p);
+        Stream empty_cache = mesh_stream;
+        empty_cache.add(CacheSubobject{.inner = {blob->GetBufferPointer(), 0}});
+        EXPECT(create(device.p, empty_cache, refused) == E_INVALIDARG && !refused.p);
 
         // Streams the PC runtime refuses.
         Stream bad = mesh_stream;

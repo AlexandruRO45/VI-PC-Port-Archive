@@ -2836,7 +2836,8 @@ leonida::cached_pso::Key pipeline_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& 
 
 // CachedPSO as the PC runtime checks it before creating the PSO (src/cached_pso.h has the measured answers).
 HRESULT check_cached_pso(const leonida::cached_pso::Identity& identity, const leonida::cached_pso::Key& key,
-                         const D3D12_CACHED_PIPELINE_STATE& cached) {
+                         const D3D12_CACHED_PIPELINE_STATE& cached,
+                         HRESULT description_mismatch = E_INVALIDARG) {
     if (!cached.pCachedBlob) return S_OK;
     if (!cached.CachedBlobSizeInBytes) return E_INVALIDARG;
     using leonida::cached_pso::Check;
@@ -2845,6 +2846,7 @@ HRESULT check_cached_pso(const leonida::cached_pso::Identity& identity, const le
     case Check::accepted: return S_OK;
     case Check::other_adapter: return D3D12_ERROR_ADAPTER_NOT_FOUND;
     case Check::other_driver: return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    case Check::other_description: return description_mismatch;
     default: return E_INVALIDARG;
     }
 }
@@ -2877,6 +2879,16 @@ struct PipelineStream {
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
+
+leonida::cached_pso::Key pipeline_key(const PipelineStream& stream) {
+    if (stream.has_cs) return pipeline_key(stream.compute);
+    if (!stream.ms.pShaderBytecode && !stream.as.pShaderBytecode) return pipeline_key(stream.graphics);
+    leonida::cached_pso::KeyBuilder key;
+    key.tag("mesh").tag(pipeline_key(stream.graphics).c_str());
+    key_shader(key, "ms", stream.ms);
+    key_shader(key, "as", stream.as);
+    return leonida::sha256_hex(key.data());
+}
 
 HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out) {
     if (!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes) return E_INVALIDARG;
@@ -5887,6 +5899,10 @@ public:
         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         PipelineStream stream;
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
+        leonida::cached_pso::Key key = pipeline_key(stream);
+        if (const HRESULT hr = check_cached_pso(state_.pso_identity, key, stream.graphics.CachedPSO,
+                                                D3D12_ERROR_DRIVER_VERSION_MISMATCH); FAILED(hr))
+            return d3d12_trace::result(method, hr);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
@@ -5895,6 +5911,7 @@ public:
             pipeline->Release();
             return d3d12_trace::result(method, hr);
         }
+        pipeline->set_cache_key(std::move(key));
         return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
 
