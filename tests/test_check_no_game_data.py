@@ -65,7 +65,7 @@ def run(args, cwd=None):
 class CheckNoGameData(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.dir)
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
 
     def write(self, name, data):
         path = os.path.join(self.dir, name)
