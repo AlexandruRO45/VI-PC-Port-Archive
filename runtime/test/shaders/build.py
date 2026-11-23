@@ -66,7 +66,7 @@ def barycentric_fallback():
         return override
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, errors="replace", timeout=60)
         answer = json.loads(r.stdout.strip().splitlines()[-1])
         return answer.get("barycentric_fallback") is True
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
