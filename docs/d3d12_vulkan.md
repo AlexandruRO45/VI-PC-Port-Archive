@@ -2754,11 +2754,13 @@ Not implemented yet:
   `vkCmdDrawMeshTasksIndirectEXT`; use the `*Count` variants (`VK_KHR_draw_indirect_count`, core 1.2) when the
   `ExecuteIndirect` call supplies a count buffer.
 - For now `CreateCommandSignature` refuses every valid signature with an argument before its draw or dispatch
-  with `E_NOTIMPL` (logged once), until the next item (#2077) executes them. Before that refusal the layer
-  accepted them, kept only the final argument and read it at the start of each record: `[CONSTANT, DISPATCH]`
-  with the record `{7, 1, 1, 1}` ran 7 groups with the constant left at its earlier value, and `[CONSTANT, DRAW]`
-  passed the record's start to `vkCmdDrawIndirect`, so Vulkan reads the constant as the vertex count
-  (`d3d12_indirect_signature_test`).
+  with `E_NOTIMPL`, until the next item (#2077) executes them. It logs one line per distinct argument count. Before
+  that refusal the layer accepted them, kept only the final argument and read it at the start of each record:
+  `[CONSTANT, DISPATCH]` with the record `{7, 1, 1, 1}` ran 7 groups with the constant left at its earlier value
+  (`d3d12_indirect_signature_test`), and `[CONSTANT, DRAW]` passed the record's start to `vkCmdDrawIndirect`, so
+  Vulkan reads the constant as the vertex count (seen in an API dump). That test runs only the dispatch. It
+  creates the draw signatures but doesn't run them, because an `ExecuteIndirect` draw is replayed without the list's
+  pipeline, render targets and root arguments until #1865. Once #1865 lands, the draws should run there too.
 - Signatures that change root constants, vertex/index buffers or descriptors per argument cannot be expressed by
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which

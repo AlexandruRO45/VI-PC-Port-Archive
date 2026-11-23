@@ -1511,26 +1511,18 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_indirect_dispatch_count_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_indirect_dispatch_count COMMAND d3d12_indirect_dispatch_count_test)
       set_tests_properties(d3d12_indirect_dispatch_count PROPERTIES SKIP_RETURN_CODE 77)
-      # ExecuteIndirect signatures with a root constant before the draw or dispatch: refused, or run as D3D12 says.
-      set(_indirect_signature_spv)
-      foreach(_shader cs_indirect_constant.comp vs_indirect_points.vert ps_indirect_constant.frag)
-        get_filename_component(_name ${_shader} NAME_WE)
-        set(_out ${CMAKE_CURRENT_BINARY_DIR}/generated/${_name}.spv)
-        add_custom_command(OUTPUT ${_out}
-          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2
-            -o ${_out} ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${_shader}
-          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${_shader}
-          COMMENT "Compiling the indirect signature test shader ${_shader}" VERBATIM)
-        list(APPEND _indirect_signature_spv ${_out})
-      endforeach()
-      list(GET _indirect_signature_spv 0 _indirect_cs)
-      list(GET _indirect_signature_spv 1 _indirect_vs)
-      list(GET _indirect_signature_spv 2 _indirect_ps)
+      # ExecuteIndirect signatures with a root constant before the draw or dispatch: refused, or (dispatch) run as D3D12
+      # says. Draw signatures are only created until #1865 replays ExecuteIndirect draws with the list's state.
+      set(_indirect_signature_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_indirect_constant.spv)
+      add_custom_command(OUTPUT ${_indirect_signature_spv}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2
+          -o ${_indirect_signature_spv} ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_constant.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_constant.comp
+        COMMENT "Compiling the indirect signature test shader" VERBATIM)
       add_executable(d3d12_indirect_signature_test test/d3d12_indirect_signature_test.cpp ${_indirect_signature_spv})
       target_link_libraries(d3d12_indirect_signature_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_indirect_signature_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
-        LEONIDA_TEST_INDIRECT_CS_SPV="${_indirect_cs}" LEONIDA_TEST_INDIRECT_VS_SPV="${_indirect_vs}"
-        LEONIDA_TEST_INDIRECT_PS_SPV="${_indirect_ps}")
+        LEONIDA_TEST_INDIRECT_CS_SPV="${_indirect_signature_spv}")
       target_compile_options(d3d12_indirect_signature_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_indirect_signature COMMAND d3d12_indirect_signature_test)
       set_tests_properties(d3d12_indirect_signature PROPERTIES SKIP_RETURN_CODE 77)
