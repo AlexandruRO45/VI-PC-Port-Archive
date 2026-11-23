@@ -99,12 +99,25 @@ def stop_and_say(command, env=None):
     return note
 
 
+def kill_group(process):
+    """SIGKILL for the process group the run started (everything it started that is still in it); on Windows only the
+    process itself."""
+    try:
+        if os.name != "nt":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:  # nothing of it is left
+        pass
+
+
 def run(command, timeout, cwd=None, env=None):
     """Runs `command` and returns (exit code, or None when it timed out, and its output with stderr after stdout
     lines as they came). The output goes to a file, not a pipe, and the wait is on the process itself: a wineserver
     or explorer.exe the run leaves behind keeps a pipe open long after the program exits, so reading a pipe to its end
     would wait for them. A command that starts its own X server (xvfb-run) gets the prefix stopped before and after
-    (stop_wineserver); a timed-out command is killed with everything it started."""
+    (stop_wineserver); the program and whatever it started that stays in its process group (not a wineserver, which has
+    a session of its own) are killed when it times out, on Ctrl-C, and when the program has exited."""
     fresh_display = starts_x_server(command)
     if fresh_display:
         stop_and_say(command, env)
@@ -114,19 +127,17 @@ def run(command, timeout, cwd=None, env=None):
                                    stderr=subprocess.STDOUT, **group)
         try:
             code = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                if os.name != "nt":
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
-            except ProcessLookupError:  # it ended meanwhile
-                pass
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as stopped:
+            kill_group(process)
             try:
                 process.wait(timeout=TIMEOUT)
             except subprocess.TimeoutExpired:
                 pass  # a process SIGKILL does not end (stuck in the kernel) is left, not waited for
+            if isinstance(stopped, KeyboardInterrupt):
+                raise
             code = None
+        else:
+            kill_group(process)  # a helper the program left running does not outlive its test (wineserver has its own session)
         if fresh_display:
             stop_and_say(command, env)
         output.seek(0)

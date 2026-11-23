@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -170,6 +171,37 @@ class RunTest(Dummies):
         code, _ = session.run([program], timeout=1)
         self.assertLess(time.monotonic() - started, 20)
         self.assertIsNone(code)
+
+    def test_ctrl_c_kills_the_run_with_its_children_and_still_interrupts(self):
+        pids = self.dir / "pids.txt"
+        program = self.script(self.bin / "waits.py", (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            f"open({str(pids)!r}, 'w').write(str(child.pid))\n"
+            "time.sleep(60)\n"))
+        harness = ("import importlib.util, sys\n"
+                   f"spec = importlib.util.spec_from_file_location('wine_session', {str(TEST_DIR / 'wine_session.py')!r})\n"
+                   "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                   f"m.run([{program!r}], timeout=60)\n")
+        runner = subprocess.Popen([sys.executable, "-I", "-c", harness], stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 20
+            while not (pids.exists() and pids.read_text()) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            child = int(pids.read_text())
+            runner.send_signal(signal.SIGINT)
+            self.assertNotEqual(runner.wait(timeout=30), 0)
+            for _ in range(100):  # SIGKILL has been sent; give the kernel a moment to end the child
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("the program's child survived Ctrl-C")
+        finally:
+            runner.kill()
+            runner.wait()
 
 
 class CheckTinyFrameTest(Dummies):
