@@ -60,7 +60,15 @@ def stages_of(index_path):
         index = json.load(f)
     if not isinstance(index, list) or not all(isinstance(e, dict) for e in index):
         raise ValueError("index.json is not a list of shader entries")
-    return {os.path.splitext(e["file"])[0]: e.get("stage") for e in index if isinstance(e.get("file"), str)}
+    stages = {}
+    for number, entry in enumerate(index, 1):
+        if not isinstance(entry.get("file"), str):
+            continue
+        stage = entry.get("stage")
+        if stage is not None and not isinstance(stage, str):
+            raise ValueError(f"index.json entry {number}: stage must be a string or null")
+        stages[os.path.splitext(entry["file"])[0]] = stage
+    return stages
 
 
 def waves_of(fssm_dir, stems):

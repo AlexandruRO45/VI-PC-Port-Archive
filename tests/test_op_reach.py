@@ -126,6 +126,32 @@ class OpReachTests(unittest.TestCase):
         self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_invalid_index_stage_is_a_usage_error_without_touching_report(self):
+        out = os.path.join(self._tmp.name, "out.json")
+        for stage in ([], ["ps"], {}, {"stage": "ps"}, False, True, 0, 1, 1.5):
+            with self.subTest(stage=stage):
+                with open(self.index, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump([{"file": "b_vs.dxbc", "stage": "vs"},
+                               {"file": "a_ps.dxbc", "stage": stage}], f)
+                with open(out, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("previous report\n")
+                p = run(self.disasm, "--index", self.index, "--json", out)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertIn("index.json entry 2: stage must be a string or null", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                with open(out, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "previous report\n")
+
+    def test_missing_null_and_empty_stages_remain_unindexed(self):
+        with open(self.index, "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"file": "a_ps.dxbc"},
+                       {"file": "b_vs.dxbc", "stage": None},
+                       {"file": "c_cs.dxbc", "stage": ""},
+                       {"file": "d_cs.dxbc", "stage": "custom"}], f)
+        r = op_reach.census(self.disasm, op_reach.stages_of(self.index))
+        self.assertEqual(r["listings_by_stage"], {"custom": 1, "unindexed": 4})
+
     def test_empty_folder_fails(self):
         empty = os.path.join(self._tmp.name, "empty")
         os.makedirs(empty)
