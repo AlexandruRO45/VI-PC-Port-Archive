@@ -1222,6 +1222,7 @@ int main() {
 
         IDXGIOutput* out0 = nullptr;
         if (FAILED(adapter1->EnumOutputs(0, &out0)) || !out0) return fail("EnumOutputs(0) failed");
+        if (const char* step = check_private_data(out0)) return fail(step);
 
         IDXGIAdapter* out_parent = nullptr;
         if (FAILED(out0->GetParent(IID_PPV_ARGS(&out_parent))) || out_parent != static_cast<IDXGIAdapter*>(adapter1))
