@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -324,6 +325,25 @@ int main() {
             EXPECT(mapper.unregister_page_pool(listed));
         }
         EXPECT(mapper.stats().submits == submits);
+        EXPECT(!mapper.clear_page_mappings(kScratch * kPageSize, 1, SubmitBinds{}));  // no way to submit
+    }
+
+    // Calls a pool or arena refuses instead of crashing on.
+    {
+        const auto in_use = pool.pages_in_use();
+        const PageId garbage[]{PageId(0x00ffffff), kNoPage, PageId(UINT32_MAX)};
+        pool.release(garbage);
+        EXPECT(pool.pages_in_use() == in_use);
+        EXPECT(pool.memory(garbage[0]) == VK_NULL_HANDLE && !pool.allocated(garbage[0]));
+        pool.set_priority_hint(std::nanf(""));
+        PagePool unusable(d.device, d.device_proc, UINT32_MAX);
+        std::vector<PageId> none;
+        EXPECT(!unusable.ok() && !unusable.allocate(1, none) && none.empty());
+        EXPECT(!region.create(d.device, d.device_proc, kPageSize));  // already created
+        PagedRegion empty, huge;
+        EXPECT(!empty.create(d.device, d.device_proc, 0));
+        EXPECT(!huge.create(d.device, d.device_proc, ~VkDeviceSize(0)));
+        EXPECT(address_now() == arena_address);
     }
 
     // Coalescing and bind cost.

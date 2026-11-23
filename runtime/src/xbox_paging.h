@@ -17,6 +17,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -74,7 +75,7 @@ public:
     // Driven by the device's budget policy; ignored without VK_EXT_memory_priority.
     void set_priority_hint(float priority) {
         std::lock_guard lock(mutex_);
-        priority_ = std::clamp(priority, 0.0f, 1.0f);
+        priority_ = std::isnan(priority) ? 0.5f : std::clamp(priority, 0.0f, 1.0f);
     }
 
     // `count` pages, as one contiguous run inside one chunk where possible (so their binds coalesce: about 2 us a page
@@ -83,6 +84,7 @@ public:
     // being scattered. All or nothing.
     bool allocate(std::uint32_t count, std::vector<PageId>& out) {
         if (!count) return true;
+        if (!ok()) return false;
         std::lock_guard lock(mutex_);
         const std::size_t base = out.size();
         if (count <= kPagesPerChunk) {
@@ -134,6 +136,7 @@ public:
     // The arena maps (or unmaps) a page with a bind that completes at `ticket` on the bind queue's timeline.
     void note_mapped(PageId id, int delta, std::uint64_t ticket) {
         std::lock_guard lock(mutex_);
+        if (!known(id)) return;
         auto& chunk = chunks_[page_chunk(id)];
         chunk.mapped += delta;
         chunk.last_bind = std::max(chunk.last_bind, ticket);
@@ -157,14 +160,12 @@ public:
     // Whether `id` is a page allocate() handed out and release() has not taken back.
     bool allocated(PageId id) const {
         std::lock_guard lock(mutex_);
-        if (id == kNoPage || page_chunk(id) >= chunks_.size()) return false;
-        const auto& chunk = chunks_[page_chunk(id)];
-        return chunk.memory && chunk.used[page_index(id)];
+        return known(id) && chunks_[page_chunk(id)].used[page_index(id)];
     }
 
     VkDeviceMemory memory(PageId id) const {
         std::lock_guard lock(mutex_);
-        return chunks_[page_chunk(id)].memory;
+        return known(id) ? chunks_[page_chunk(id)].memory : VK_NULL_HANDLE;
     }
     static VkDeviceSize offset(PageId id) { return VkDeviceSize(page_index(id)) * kPageSize; }
     VkDeviceSize bytes_reserved() const {
@@ -210,12 +211,17 @@ private:
         in_use_ += count;
     }
 
+    // A page of a chunk that is allocated now (its pages may be free).
+    bool known(PageId id) const {
+        return id != kNoPage && page_chunk(id) < chunks_.size() && chunks_[page_chunk(id)].memory;
+    }
+
     void release_locked(std::span<const PageId> pages) {
         for (PageId id : pages) {
-            if (id == kNoPage) continue;
+            if (!known(id)) continue;
             auto& chunk = chunks_[page_chunk(id)];
             const std::uint32_t i = page_index(id);
-            if (!chunk.memory || !chunk.used[i]) continue;
+            if (!chunk.used[i]) continue;
             chunk.used[i] = false;
             ++chunk.free_count;
             --in_use_;
@@ -278,6 +284,7 @@ public:
     // indirect and device-address usage.
     bool create(VkDevice device, PFN_vkGetDeviceProcAddr get, VkDeviceSize virtual_bytes,
                 VkBufferUsageFlags extra_usage = 0) {
+        if (buffer_ || !virtual_bytes || virtual_bytes > ~VkDeviceSize(0) - kPageSize) return false;
         device_ = device;
         destroy_ = reinterpret_cast<PFN_vkDestroyBuffer>(get(device, "vkDestroyBuffer"));
         const auto create_buffer = reinterpret_cast<PFN_vkCreateBuffer>(get(device, "vkCreateBuffer"));
@@ -455,6 +462,7 @@ public:
 
 private:
     bool commit(std::vector<PagedRegion::Change>& changes, const SubmitBinds& submit) {
+        if (!submit) return false;
         ++stats_.calls;
         auto binds = region_.binds_for(changes, pool_);
         if (binds.empty()) return true;  // nothing changes: no bind, as on the console's no-op remap
