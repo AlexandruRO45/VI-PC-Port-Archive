@@ -530,5 +530,61 @@ class TestRegisterAliasing(unittest.TestCase):
             self.assertEqual(words[0], 0xFFFFFFFF)
             self.assertEqual(words[1], 1)
 
+
+# ==============================================================================
+# SECTION 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_scc_set_to_zero_when_result_zero(self) -> None:
+        """Verify SCC is cleared to 0 when s_xnor_b32 produces 0."""
+        res, scc = ref_s_xnor_b32(0x00000000, 0xFFFFFFFF)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+
+        res_t, scc_t = run_translator_salu_xnor(0x00000000, 0xFFFFFFFF, name="ps_scc_zero")
+        self.assertEqual(res_t, 0)
+        self.assertEqual(scc_t, 0)
+
+    def test_scc_set_to_one_when_result_nonzero(self) -> None:
+        """Verify SCC is set to 1 when s_xnor_b32 produces non-zero (even single-bit)."""
+        s0 = 0x00000001
+        s1 = 0xFFFFFFFD
+        res, scc = ref_s_xnor_b32(s0, s1)
+        self.assertNotEqual(res, 0)
+        self.assertEqual(scc, 1)
+
+        res_t, scc_t = run_translator_salu_xnor(s0, s1, name="ps_scc_one")
+        self.assertEqual(res_t, res)
+        self.assertEqual(scc_t, 1)
+
+    def test_scc_conditional_branch_selection(self) -> None:
+        """Verify SCC interacts correctly with conditional selection s_cselect_b32."""
+        lines_true = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x12345678",
+            "s_xnor_b32 s2, s0, s1",            # Result 0xFFFFFFFF -> SCC = 1
+            "s_cselect_b32 s3, 0xCAFE, 0xBABE", # Selects 0xCAFE
+            "v_mov_b32 v0, s3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv_true = support.translate_lines("ps_scc_cselect_true", lines_true)
+        self.assertEqual(support.mrt0_words(spv_true)[0], 0xCAFE)
+
+        lines_false = [
+            "s_mov_b32 s0, 0x55555555",
+            "s_mov_b32 s1, 0xAAAAAAAA",
+            "s_xnor_b32 s2, s0, s1",            # Result 0x00000000 -> SCC = 0
+            "s_cselect_b32 s3, 0xCAFE, 0xBABE", # Selects 0xBABE
+            "v_mov_b32 v0, s3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv_false = support.translate_lines("ps_scc_cselect_false", lines_false)
+        self.assertEqual(support.mrt0_words(spv_false)[0], 0xBABE)
+
 if __name__ == "__main__":
     unittest.main()
