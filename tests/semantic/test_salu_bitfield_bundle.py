@@ -339,5 +339,19 @@ class TestSBfeU64ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.scc, 1)
 
 
+class TestSBfeU64Bounds(unittest.TestCase):
+    """Status flags and 64-bit boundary handling for s_bfe_u64."""
+
+    def test_extract_at_bit_63(self):
+        val, scc = ref_bfe_u64(0x80000000_00000000, 63 | (1 << 16))
+        self.assertEqual(val, 1)
+        self.assertEqual(scc, 1)
+
+    def test_zero_width_64bit(self):
+        val, scc = ref_bfe_u64(MASK64, 16 | (0 << 16))
+        self.assertEqual(val, 0)
+        self.assertEqual(scc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
