@@ -149,12 +149,15 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         }
     }
 
+    // Once per run, the device that goes behind the proxy: logged where the backend is chosen, so a first-boot log
+    // names the device the title gets.
     static std::atomic<bool> proxy_logged{false};
-    if (!proxy_logged.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
-                     "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
-    }
+    const auto log_proxy = [](const char* device) {
+        if (!proxy_logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the %s in the Xbox-ABI proxy "
+                         "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n", device);
+    };
 
 #ifdef LEONIDA_VULKAN_DEVICE
     // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
@@ -162,6 +165,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     char backend[16] = {};
     size_t backend_length = 0;
     if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0) {
+        log_proxy("Vulkan-backed ID3D12Device");
         ID3D12Device* vulkan = nullptr;
         HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(__uuidof(ID3D12Device),
                                                                  reinterpret_cast<void**>(&vulkan));
@@ -185,6 +189,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     }
 #endif
 
+    log_proxy("PC ID3D12Device");
     static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
     if (!create) return result(method, E_NOTIMPL);
 

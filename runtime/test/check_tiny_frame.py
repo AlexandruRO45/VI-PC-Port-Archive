@@ -3,8 +3,8 @@
     python -I check_tiny_frame.py <gta6rt.exe> <tiny_frame.exe> [--probe d3d12_com_test.exe] [--runner wine ...]
 
 Checks the guest's verdict and exit code, that the loader's report binds d3d12_xs.dll!D3D12XboxCreateDevice to the
-shim, and that the D3D12 trace is a gapless numbered sequence in which the calls a first frame needs appear in
-order. Exits 77 (ctest: skipped) when --probe, one of the Vulkan device tests, says
+shim, that the shim says it wraps the Vulkan-backed device (not the PC one), and that the D3D12 trace is a gapless
+numbered sequence in which the calls a first frame needs appear in order. Exits 77 (ctest: skipped) when --probe, one of the Vulkan device tests, says
 there is no usable Vulkan device on this machine.
 """
 
@@ -15,6 +15,9 @@ import subprocess
 import sys
 
 SKIP = 77
+
+# The shim's one-time line naming the device it puts behind the Xbox-ABI proxy; this run asks for the Vulkan one.
+PROXY_LINE = "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the Vulkan-backed ID3D12Device in the Xbox-ABI proxy"
 
 # The first frame, in the order the fixture makes the calls, as the trace words them (`called` for a method that
 # returns nothing). Other traced calls, such as the queue and fence proxies' own entries, may sit between them.
@@ -76,6 +79,10 @@ def check_output(code, output):
         problems.append("gta6rt did not report `game exited with code 0`")
     if not any(re.fullmatch(r" +shim +d3d12_xs\.dll!D3D12XboxCreateDevice", line) for line in lines):
         problems.append("d3d12_xs.dll!D3D12XboxCreateDevice was not bound to the shim")
+    wrapped = [line for line in lines if line.startswith("[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the ")]
+    if not any(line.startswith(PROXY_LINE) for line in wrapped):
+        problems.append("the shim did not log that it wraps the Vulkan-backed device"
+                        + (f" (it logged `{wrapped[0]}`)" if wrapped else ""))
     try:
         entries = parse_trace(lines)
     except ValueError as error:

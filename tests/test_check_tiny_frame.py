@@ -9,13 +9,19 @@ check = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(check)
 
 
-def good_output(extra_trace=(), drop=None, binding="shim"):
-    """What a passing run prints: the binding report, the numbered trace and the guest's verdict."""
+VULKAN_PROXY = ("[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the Vulkan-backed ID3D12Device in the Xbox-ABI "
+                "proxy (slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).")
+
+
+def good_output(extra_trace=(), drop=None, binding="shim", proxy=VULKAN_PROXY):
+    """What a passing run prints: the binding report, the shim's proxy line, the numbered trace and the verdict."""
     calls = [call for call in list(check.EXPECTED) if call != drop]
     calls[10:10] = extra_trace  # between the views and the list's commands
     lines = ["tiny_frame.exe  base=0000000140000000 size=61440 entry=+0x1000  shim=7 host=40 module=0 unimplemented=0",
              f"    {binding:<13} d3d12_xs.dll!D3D12XboxCreateDevice",
              "running tiny_frame.exe"]
+    if proxy:
+        lines.append(proxy)
     lines += [f"[d3d12-trace] #{number} {call}" for number, call in enumerate(calls, 1)]
     lines += ["tiny_frame: PASS all 32 pixels are the clear colour (64, 128, 191, 255)", "tiny_frame: OK",
               "game exited with code 0", ""]
@@ -46,6 +52,13 @@ class CheckOutputTest(unittest.TestCase):
     def test_host_binding_is_reported(self):
         problems = check.check_output(0, good_output(binding="host"))
         self.assertEqual(problems, ["d3d12_xs.dll!D3D12XboxCreateDevice was not bound to the shim"])
+
+    def test_the_proxy_line_must_name_the_vulkan_device(self):
+        pc = VULKAN_PROXY.replace("Vulkan-backed ID3D12Device", "PC ID3D12Device")
+        self.assertEqual(check.check_output(0, good_output(proxy=pc)),
+                         [f"the shim did not log that it wraps the Vulkan-backed device (it logged `{pc}`)"])
+        self.assertEqual(check.check_output(0, good_output(proxy=None)),
+                         ["the shim did not log that it wraps the Vulkan-backed device"])
 
     def test_missing_call_names_the_first_one_out_of_order(self):
         problems = check.check_output(0, good_output(drop="ID3D12CommandQueue::Signal ok"))
