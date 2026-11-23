@@ -220,6 +220,14 @@ def main():
     unknown = sorted(set(names) - set(available) - {"ps_mullit"})
     if unknown:
         sys.exit("Unknown test shaders: " + ", ".join(unknown))
+    # A name this accepts can still have no source in the tree (ps_mullit's is tests/semantic/fixtures/ps_mullit.asm,
+    # which build.py does not ship): one line naming the file, before the output folder is made, not a traceback.
+    sources = [(n, os.path.abspath(os.path.join(HERE, shader_source(n) + ".asm"))) for n in names]
+    missing_source = [(n, path) for n, path in sources if not os.path.isfile(path)]
+    if missing_source:
+        root = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+        sys.exit("No test shader source for: "
+                 + ", ".join(f"{n} ({os.path.relpath(path, root)})" for n, path in missing_source))
     skipped = [n for n in names if n.startswith("ms_")]
     if skipped:
         print("not built (need a DXBC container with signatures):", ", ".join(skipped))
