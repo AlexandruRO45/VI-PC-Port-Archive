@@ -218,6 +218,10 @@ the path.
 python -I tools/psocache_extract.py <archive.rpf|folder> <cache-in-tmp>
 ```
 
+It exits 0 when the file was written and the model holds, 1 when a problem was reported for the file it wrote, and
+2 when no cache was found within the bounds, an input could not be read, or `<cache-in-tmp>` is not inside the
+system temporary directory.
+
 `tools/psocache_inspect.py` reads the cache file only:
 
 ```
