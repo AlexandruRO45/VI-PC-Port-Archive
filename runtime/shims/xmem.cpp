@@ -154,11 +154,15 @@ constexpr DWORD kXmemHostAllocationTypeMask = kVirtualAllocOperations | MEM_TOP_
 // Console-only allocation annotations (#3390). Preserve the caller's ordinary Win32 protection bits.
 constexpr DWORD kConsoleAllocationTags = 0x10000000 | 0x40000000;  // MEM_GRAPHICS | MEM_TITLE
 constexpr DWORD kConsoleProtectionTag = 0x04000000;
-// 0x4000 next to MEM_RESERVE in a 64 KiB reservation (measured: allocation type 0x20406000 at the retail
-// executable's RVA 0x1e86622, a range that XMemMapPhysicalPages fills right after). On Win32 it is MEM_DECOMMIT,
-// which makes no sense with MEM_RESERVE. ASSUMPTION: a console hint for a range that receives physical pages; the
-// physical-page mapper below converts any reserve-only range on first use, so the bit is dropped.
-constexpr DWORD kConsoleReserveHint = 0x00004000;
+// The Win32 placeholder bits, as the retail executable uses them (measured, RVA 0x1e86440, the descriptor-heap pool):
+//   XMemVirtualAlloc(null, 185 MiB, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER (0x42000), attributes 0x7, PAGE_NOACCESS);
+//   VirtualFree(part, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER (0x8002)) four times: split into five placeholders;
+//   XMemVirtualAlloc(part, size, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER (0x4000) | 64 KiB pages, 0x27, 0x1004 ...);
+//   XMemAllocatePhysicalPages + XMemMapPhysicalPages into the parts.
+// VirtualFree is the host's, so the split is real; the reservation that replaces a placeholder is left a placeholder
+// here (the physical-page mapper maps its views over placeholders). MEM_REPLACE_PLACEHOLDER outside a placeholder made
+// by this shim is dropped, as before: the mapper converts a reserve-only range on first use.
+constexpr DWORD kConsoleReserveHint = MEM_REPLACE_PLACEHOLDER;
 // PAGE_GRAPHICS_NOACCESS (0x800) through PAGE_GRAPHICS_NOCACHE (0x40000): the GPU half of a console protection word.
 constexpr DWORD kGraphicsProtectionMask = 0x0007F800;
 constexpr DWORD kCpuProtectionMask = 0xFF;  // PAGE_NOACCESS .. PAGE_EXECUTE_WRITECOPY
@@ -290,7 +294,7 @@ void* console_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, D
     }
     allocation_type &= ~kConsoleAllocationTags;
     if ((allocation_type & kConsoleReserveHint) && (allocation_type & MEM_RESERVE) &&
-        (allocation_type & kXmemPageModeMask)) {
+        ((allocation_type & kXmemPageModeMask) || !(allocation_type & MEM_COMMIT))) {
         allocation_type &= ~kConsoleReserveHint;
     }
     SIZE_T guest_page = 0;
@@ -383,6 +387,11 @@ void note_virtual_alloc(ULONGLONG attributes, DWORD allocation_type, DWORD prote
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
+namespace physical {
+void* reserve_placeholder(void* address, SIZE_T size, DWORD allocation_type);
+bool inside_placeholder(uintptr_t va, SIZE_T size);
+}  // namespace physical
+
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     // Host-backed support covers ordinary, 64 KiB, 2 MiB and 4 MiB guest pages (#4531). The attribute word (memory
     // type, GPU access; measured 0x3, 0x21, 0x23, 0x27, 0x181, 0x183, 0x283) has no host meaning: the host has one
@@ -393,6 +402,16 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
     note_virtual_alloc(attributes, allocation_type, protect, size, _ReturnAddress());
+    const DWORD operation = allocation_type & ~(kConsoleAllocationTags | kXmemPageModeMask);
+    if ((operation & MEM_RESERVE_PLACEHOLDER) && (operation & MEM_RESERVE) && !(operation & MEM_COMMIT)) {
+        return physical::reserve_placeholder(address, size, allocation_type);
+    }
+    if ((operation & MEM_REPLACE_PLACEHOLDER) && (operation & MEM_RESERVE) && !(operation & MEM_COMMIT) && address &&
+        physical::inside_placeholder(reinterpret_cast<uintptr_t>(address), size)) {
+        // A reservation that replaces (part of) a placeholder: the range stays a placeholder, which is what the
+        // physical-page views are mapped over.
+        return address;
+    }
     return console_virtual_alloc(address, size, allocation_type, host_protection(protect), true);
 }
 
@@ -636,6 +655,38 @@ void note_physical(const char* api, ULONG64 attributes, ULONG_PTR count, const v
             rt::startup_trace::quote(rt::startup_trace::hex(attributes)) +
             ",\"count\":" + std::to_string(static_cast<uint64_t>(count)) + ",\"caller\":" +
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
+}
+
+// XMemVirtualAlloc(MEM_RESERVE | MEM_RESERVE_PLACEHOLDER): a real placeholder, aligned to 64 KiB (the host's
+// allocation granularity), recorded as a region so mapping into it needs no conversion.
+void* reserve_placeholder(void* address, SIZE_T size, DWORD allocation_type) {
+    const VirtualAlloc2Fn alloc2 = placeholder_alloc2();
+    if (!alloc2 || !map_view_of_file3() || !unmap_view_of_file2()) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+    if ((reinterpret_cast<uintptr_t>(address) & (kPage - 1)) != 0) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return nullptr;
+    }
+    const SIZE_T rounded = (size + kPage - 1) & ~(kPage - 1);
+    const ULONG top_down = (allocation_type & MEM_TOP_DOWN) ? MEM_TOP_DOWN : 0;
+    void* const p = alloc2(GetCurrentProcess(), address, rounded, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER | top_down,
+                           PAGE_NOACCESS, nullptr, 0);
+    if (!p) return nullptr;
+    State& s = state();
+    const std::lock_guard lock(s.mutex);
+    s.regions[reinterpret_cast<uintptr_t>(p)] = reinterpret_cast<uintptr_t>(p) + rounded;
+    return p;
+}
+
+bool inside_placeholder(uintptr_t va, SIZE_T size) {
+    State& s = state();
+    const std::lock_guard lock(s.mutex);
+    auto it = s.regions.upper_bound(va);
+    if (it == s.regions.begin()) return false;
+    --it;
+    return va >= it->first && va + size <= it->second;
 }
 
 }  // namespace physical

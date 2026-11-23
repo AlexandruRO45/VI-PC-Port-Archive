@@ -23,6 +23,8 @@
 #include <windows.h>
 #include <dxgi1_4.h>
 
+#include "../src/frame_pacer.h"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -39,7 +41,7 @@
 namespace rt::d3d12_xs {
 namespace {
 
-constexpr unsigned kMaxSlots = 128;
+constexpr unsigned kMaxSlots = 160;  // the console device reaches at least slot 133 (CreatePlacedResourceX)
 static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
@@ -881,6 +883,50 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+// ---- Frame events on the device (measured slots) ---------------------------------------------------------------
+//
+// Device slot 78 is SetFrameIntervalX(output, interval, latency, flags): the retail executable (RVA 0x247abd8) passes
+// a null output, 0x8235 (33333 us, a 30 Hz period, from a table indexed by the display mode), latency 3 (or 2) and 0.
+// Slot 79 is ScheduleFrameEventX(event, offset, reserved pointer, flags): event 0 with an offset (RVA 0x247abfc,
+// right after slot 78) and event 2 with offset 0 (RVA 0x2478dea); four arguments as in docs/d3d12_vulkan.md 4.5.
+// Both go to one device-wide FramePacer, the model the Xbox presentation core uses. The pacer only models the origin
+// event (0); other events are recorded and accepted, logged once per value.
+leonida::FramePacer& device_pacer() {
+    static leonida::SteadyFrameClock clock;
+    static leonida::FramePacer pacer(clock);
+    return pacer;
+}
+
+HRESULT xs_set_frame_interval(std::uint64_t output, std::uint32_t period_us, std::uint32_t latency,
+                              std::uint32_t flags) {
+    const HRESULT hr = HRESULT(device_pacer().set_frame_interval(period_us, latency, flags));
+    static std::atomic<bool> shown{false};
+    if (!shown.exchange(true)) {
+        std::fprintf(stderr, "[rt] d3d12_xs: SetFrameIntervalX (slot 78) output 0x%llx period %u us latency %u flags "
+                     "0x%x -> 0x%08lx\n", static_cast<unsigned long long>(output), period_us, latency, flags,
+                     static_cast<unsigned long>(hr));
+    }
+    return hr;
+}
+
+HRESULT xs_schedule_frame_event(std::uint32_t event, std::uint32_t offset_us, std::uint64_t reserved,
+                                std::uint32_t flags) {
+    static std::atomic<std::uint32_t> seen{0};  // bit per event value below 32
+    const std::uint32_t bit = event < 32 ? (1u << event) : 0u;
+    const bool first = bit && !(seen.fetch_or(bit) & bit);
+    HRESULT hr = S_OK;
+    if (event == leonida::frame_event_origin) {
+        hr = HRESULT(device_pacer().schedule_frame_event(event, offset_us, flags));
+    }
+    if (first || FAILED(hr)) {
+        std::fprintf(stderr, "[rt] d3d12_xs: ScheduleFrameEventX (slot 79) event %u offset %u us reserved 0x%llx flags "
+                     "0x%x -> 0x%08lx%s\n", event, offset_us, static_cast<unsigned long long>(reserved), flags,
+                     static_cast<unsigned long>(hr),
+                     event == leonida::frame_event_origin ? "" : " (not the origin event: recorded, not paced)");
+    }
+    return hr;
+}
+
 // ---- Console command-list probe (measurement only) -------------------------------------------------------------
 //
 // Device slot 73 with IID {c3827890-4024-474c-98cf-645b51dc4874} creates the console's command list (retail
@@ -1538,6 +1584,46 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// Device slot 133: CreatePlacedResourceX(gpu VA, desc, initial state, clear value, riid, out) (measured: the retail
+// executable's RVA 0x1e8684c, inside the descriptor-heap pool setup at 0x1e86440: RDX = the base of a range it reserved
+// with MEM_REPLACE_PLACEHOLDER and filled with XMemMapPhysicalPages, R8 = a 56-byte buffer description {BUFFER, width,
+// 1, 1, 1, UNKNOWN, 1/0, ROW_MAJOR, flags 0x20004}, R9 = 0xffffffff, then null, IID_ID3D12Resource and the out pointer).
+// On the console the CPU and GPU share addresses, so the resource IS that memory. Here the layer's buffers live in its
+// own GPU address arena (docs/d3d12_vulkan.md 3.3), and nothing aliases host pages yet: this makes a committed buffer
+// of the same size, so boot can go on, and says so. What the title writes through the CPU range never reaches it.
+// TODO: alias the physical pages (VK_EXT_external_memory_host or the arena's mapping) and make GetGPUVirtualAddress
+// return the CPU VA the title expects.
+HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t gpu_va, const D3D12_RESOURCE_DESC* xbox_desc,
+                                       std::uint32_t initial_state, const D3D12_CLEAR_VALUE* clear_value,
+                                       const IID* riid, void** out) {
+    note_slot(133);
+    if (!out || !xbox_desc || !riid) return E_POINTER;
+    *out = nullptr;
+    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    constexpr std::uint32_t kPcResourceFlags = 0x3FF;  // D3D12_RESOURCE_FLAG_* through RAYTRACING_ACCELERATION_STRUCTURE
+    const auto console_flags = static_cast<std::uint32_t>(pc_desc.Flags) & ~kPcResourceFlags;
+    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(pc_desc.Flags) & kPcResourceFlags);
+    // 0xffffffff is not a PC state; a buffer starts in COMMON.
+    const auto state = initial_state == 0xffffffffu ? D3D12_RESOURCE_STATE_COMMON
+                                                    : static_cast<D3D12_RESOURCE_STATES>(initial_state);
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                     D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+    const HRESULT hr = self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc, state,
+                                                           clear_value, *riid, out);
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || FAILED(hr)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: CreatePlacedResourceX (slot 133) at 0x%llx: dimension %d, %llu x %u, format %u, "
+                     "flags 0x%x (console 0x%x dropped), state 0x%x -> 0x%08lx; NOT aliased to the CPU range\n",
+                     static_cast<unsigned long long>(gpu_va), static_cast<int>(pc_desc.Dimension),
+                     static_cast<unsigned long long>(pc_desc.Width), pc_desc.Height, static_cast<unsigned>(pc_desc.Format),
+                     static_cast<unsigned>(pc_desc.Flags), console_flags, initial_state, static_cast<unsigned long>(hr));
+    }
+    return hr;
+}
+
 void** get_vtable();
 
 // Device methods that return a struct larger than 8 bytes (slot 25 GetResourceAllocationInfo, 16 bytes; slot 26
@@ -1622,6 +1708,14 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t);
         return reinterpret_cast<ForwardFn>(self->real_vtable[Slot])(self->real, a1, a2, a3, a4, a5);
+    } else if constexpr (Slot == 78) {
+        note_slot(Slot);
+        return hr_to_u64(xs_set_frame_interval(a1, static_cast<std::uint32_t>(a2), static_cast<std::uint32_t>(a3),
+                                               static_cast<std::uint32_t>(a4)));
+    } else if constexpr (Slot == 79) {
+        note_slot(Slot);
+        return hr_to_u64(xs_schedule_frame_event(static_cast<std::uint32_t>(a1), static_cast<std::uint32_t>(a2), a3,
+                                                 static_cast<std::uint32_t>(a4)));
     } else if constexpr (Slot == 73) {
         // The console command list (see list_probe): RDX desc, R8 allocator, R9 0, then riid and out on the stack.
         const auto* const riid = reinterpret_cast<const IID*>(a4);
@@ -1720,6 +1814,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 133) {
+        return hr_to_u64(proxy_create_placed_resource_x(
+            self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2), static_cast<std::uint32_t>(a3),
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4), reinterpret_cast<const IID*>(a5),
+            reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -1730,6 +1829,21 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             reinterpret_cast<void**>(a7)));
     } else {
         note_slot(Slot);
+        {
+            // First call of a generically forwarded slot: its argument words and caller, so a console slot that
+            // lands on the wrong PC method can be told apart from the right one.
+            static std::atomic<bool> shown{false};
+            if (!shown.exchange(true, std::memory_order_relaxed)) {
+                char where[48];
+                list_probe::format_caller(_ReturnAddress(), where, sizeof(where));
+                std::fprintf(stderr, "[rt] d3d12_xs: device slot %u forwarded, from %s, rcx %p args 0x%llx 0x%llx "
+                             "0x%llx | stack 0x%llx 0x%llx 0x%llx 0x%llx\n", Slot, where, static_cast<void*>(self),
+                             static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                             static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6),
+                             static_cast<unsigned long long>(a7));
+            }
+        }
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
