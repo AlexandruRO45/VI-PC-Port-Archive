@@ -190,13 +190,61 @@ class HeapIndexCensus(unittest.TestCase):
         out = hic.census(self.work.disasm)
         self.assertEqual(out["skipped"], {"branch target outside code": 1})
 
-    def test_embedded_data_is_counted_as_skipped(self):
+    def test_embedded_data_without_blob_is_counted_as_skipped(self):
         self.work.add("ps_heap", "ps", SFI0_RES, PS_HEAP)
         path = os.path.join(self.work.disasm, "ps_heap.s")
         with open(path, "a", encoding="utf-8", newline="\n") as f:
             f.write("\t; invalid instruction encoding\n")
         out = hic.census(self.work.disasm)
-        self.assertEqual(out["skipped"], {"embedded data words": 1})
+        self.assertEqual(out["skipped"], {"missing embedded-data blob": 1})
+        self.assertEqual(out["groups"], {})
+
+    def embedded_listing(self, first, first_encoding, column=21, stored=None):
+        # One unprinted dword after the first instruction. The following PS reads one sampler.
+        name = "ps_embedded"
+        self.work.add(name, "ps", SFI0_SMP, PS_HEAP)
+        path = os.path.join(self.work.disasm, name + ".s")
+        with open(path, encoding="utf-8") as f:
+            _, body = f.read().split("\n", 1)
+        raw = bytes.fromhex(first_encoding)
+        payload = (raw if stored is None else bytes.fromhex(stored)) + b"\xff" * 4 + bytes(sum(width for _, width in PS_HEAP))
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"; {name}.fssm code 0x100..0x{0x100 + len(payload):x}\n")
+            f.write(f"\t{first} ; encoding: [" + ",".join(hex(b) for b in raw) + "]\n")
+            f.write(body + f"; --- llvm-mc messages ---\n; <stdin>:1:{column}: warning: invalid instruction encoding\n")
+        with open(os.path.join(self.work.root, "fssm", name + ".fssm"), "wb") as f:
+            f.write(bytes(0x100) + payload)
+        return hic.census(self.work.disasm)
+
+    def test_branch_over_embedded_word_preserves_load_roles_and_sampler_words(self):
+        out = self.embedded_listing("s_branch 1", "010082bf")
+        self.assertEqual(out["skipped"], {})
+        group = out["groups"]["ps sfi0=smp"]
+        self.assertEqual({row["role"] for row in group["loads"]}, {"T#", "S#"})
+        self.assertEqual(group["sampler_load_provenance"], {"complete": 1})
+        self.assertEqual(group["sampler_loaded_words"], [1, 1, 1, 1])
+
+    def test_fallthrough_into_unknown_word(self):
+        out = self.embedded_listing("s_nop 0", "000080bf")
+        self.assertEqual(out["skipped"], {"fall-through into undecodable words": 1})
+        self.assertEqual(out["groups"], {})
+
+    def test_branch_to_unknown_word(self):
+        out = self.embedded_listing("s_branch 0", "000082bf")
+        self.assertEqual(out["skipped"], {"branch into data": 1})
+        self.assertEqual(out["groups"], {})
+
+    def test_unaligned_diagnostic_column(self):
+        out = self.embedded_listing("s_branch 1", "010082bf", column=22)
+        self.assertEqual(out["skipped"], {"unlocated undecodable words": 1})
+
+    def test_reachable_encoding_mismatch(self):
+        out = self.embedded_listing("s_branch 1", "010082bf", stored="020082bf")
+        self.assertEqual(out["skipped"], {"reachable instruction with normalized encoding": 1})
+
+    def test_indirect_transfer_cannot_prove_embedded_data_unreachable(self):
+        out = self.embedded_listing("s_setpc_b64 s[0:1]", "002080be")
+        self.assertEqual(out["skipped"], {"uncertain control flow": 1})
         self.assertEqual(out["groups"], {})
 
     def test_cli_json_and_missing_folder(self):

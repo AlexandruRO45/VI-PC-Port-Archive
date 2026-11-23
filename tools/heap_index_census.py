@@ -28,7 +28,10 @@ known loaded word and evidence against a contiguous origin. non_load means every
 or entry SGPR. All remaining cases, including inconclusive control-flow joins, are unknown.
 sampler_loaded_words counts instructions with a direct load tag at each of the four operand positions.
 
-It reads only the listings, the DXBC containers next to them (`<disasm>/../<name>.dxbc`), the carve index
+For listings with embedded data, LLVM diagnostic columns locate the missing dwords. Reachable encodings must
+match the FSSM blob, and every reachable transfer must have known successors. Refusals are counted by reason.
+
+It reads the listings, the DXBC containers next to them (`<disasm>/../<name>.dxbc`), the carve index
 (`<disasm>/../index.json`, for the stage) and, for compute shaders, COMPUTE_PGM_RSRC2 at FSSM header word 0x138
 (`<disasm>/../fssm/<name>.fssm`, as tools/rdna2spirv.py does). It prints counts only, no shader bytes.
 
@@ -45,6 +48,7 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rdna2spirv  # noqa: E402
 import shader_ir  # noqa: E402
 import shader_meta  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
@@ -52,8 +56,7 @@ from report_paths import same_report_path  # noqa: E402
 USER_SGPRS = 32          # graphics stages: user data s0..s31 (tools/rdna2spirv.py USER_SGPRS)
 SYSTEM_SGPRS = {"ms": (3,), "gs": (3,)}   # NGG wave info in s3 (tools/rdna2spirv.py sys_sgprs)
 DESC_LOADS = {"s_load_dwordx4": 4, "s_load_dwordx8": 8, "s_load_dwordx16": 16}
-BRANCHES = {"s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz",
-            "s_cbranch_execz", "s_cbranch_execnz"}
+BRANCHES = rdna2spirv.BRANCHES
 ADDS = {"s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32", "s_addc_u32", "s_subb_u32"}
 
 
@@ -100,6 +103,60 @@ def cs_user_count(disasm_dir, name):
 
 # ---- control flow -------------------------------------------------------------------------------------------
 
+def embedded_code(info, disasm_dir, name):
+    """Verify the reachable instructions against the declared native code range."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(disasm_dir)), "fssm", name + ".fssm"), "rb") as f:
+            blob = f.read()
+    except OSError:
+        raise Skip("missing embedded-data blob")
+    start, end = info["code_start"], info["code_end"]
+    if end is None or not 0 <= start < end <= len(blob):
+        raise Skip("invalid embedded code range")
+    if any(not ins["enc"] or len(ins["enc"]) % 8 for ins in info["insns"]):
+        raise Skip("invalid instruction width")
+    gaps = set(info["invalid_pcs"])
+    if len(gaps) != info["invalid"]:
+        raise Skip("unlocated undecodable words")
+    if start in gaps:
+        raise Skip("undecodable entry")
+    pc = start
+    for ins in info["insns"]:
+        while pc in gaps:
+            gaps.remove(pc)
+            pc += 4
+        ins["pc"] = pc
+        pc += len(ins["enc"]) // 2
+    while pc in gaps:
+        gaps.remove(pc)
+        pc += 4
+    if pc != end or gaps:
+        raise Skip("ambiguous instruction boundaries")
+    try:
+        code = rdna2spirv.reachable_code(info["insns"], end)
+    except rdna2spirv.Unsupported as e:
+        raise Skip(str(e)) from e
+    for ins in code:
+        enc = bytes.fromhex(ins["enc"])
+        raw = blob[ins["pc"]:ins["pc"] + len(enc)]
+        if not rdna2spirv.same_encoding(raw, enc, ins["op"], len(ins["args"])):
+            literal = rdna2spirv.mix_literal(raw, enc, shader_meta.base_op(ins["op"]))
+            if literal is None:
+                raise Skip("reachable instruction with normalized encoding")
+            rdna2spirv.restore_mix_literal(ins, raw, literal)
+        op = shader_meta.base_op(ins["op"])
+        if op in BRANCHES:
+            if len(ins["args"]) != 1 or ins["args"][0]["k"] != "imm":
+                raise Skip("branch without offset")
+        elif op.startswith(("s_cbranch", "s_branch", "s_call", "s_setpc", "s_swappc", "s_rfe",
+                            "s_trap", "s_sethalt", "s_sendmsghalt", "s_code_end",
+                            "s_subvector_loop", "s_endpgm_")):
+            raise Skip("uncertain control flow")
+        if op not in ("s_endpgm", "s_branch") and ins["pc"] + len(ins["enc"]) // 2 == end:
+            raise Skip("fall-through past code range")
+    return code
+
+
 def blocks_of(insns):
     """Basic blocks and successor lists, split at branches as tools/rdna2spirv.py does."""
     def next_pc(ins):
@@ -115,10 +172,14 @@ def blocks_of(insns):
     if any(shader_meta.base_op(i["op"]) in BRANCHES and not i.get("enc") for i in insns):
         raise Skip("branch without encoding")
     leaders = {insns[0]["pc"]}
-    for ins in insns:
+    for n, ins in enumerate(insns):
         if shader_meta.base_op(ins["op"]) in BRANCHES:
             leaders.add(target(ins))
-            leaders.add(next_pc(ins))
+            if shader_meta.base_op(ins["op"]) == "s_branch":
+                if n + 1 < len(insns):
+                    leaders.add(insns[n + 1]["pc"])
+            else:
+                leaders.add(next_pc(ins))
     pcs = {i["pc"] for i in insns}
     if any(p not in pcs for p in leaders if p != next_pc(insns[-1])):
         raise Skip("branch target outside code")
@@ -365,12 +426,9 @@ def census(disasm_dir, limit=None, progress=None, stages=None):
         if stage is None or sfi0 is None:
             skipped["no stage or SFI0"] += 1
             continue
-        info = shader_ir.parse_file(os.path.join(disasm_dir, name + ".s"))
+        info = shader_ir.parse_file(os.path.join(disasm_dir, name + ".s"), locate_invalid=True)
         if not info["insns"]:
             skipped["no instructions"] += 1
-            continue
-        if info["invalid"]:
-            skipped["embedded data words"] += 1
             continue
         user = USER_SGPRS
         if stage == "cs":
@@ -379,7 +437,8 @@ def census(disasm_dir, limit=None, progress=None, stages=None):
                 skipped["no FSSM header"] += 1
                 continue
         try:
-            loads = analyse(info["insns"], stage, user, sampler_counts[(stage, sfi0)])
+            insns = embedded_code(info, disasm_dir, name) if info["invalid"] else info["insns"]
+            loads = analyse(insns, stage, user, sampler_counts[(stage, sfi0)])
         except Skip as e:
             skipped[str(e)] += 1
             continue

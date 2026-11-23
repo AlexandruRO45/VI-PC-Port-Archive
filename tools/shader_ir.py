@@ -203,7 +203,7 @@ def parse_line(line):
     return {"op": op, "args": args, "mods": mods, "enc": enc.hex() if enc else None}
 
 
-def parse_file(path):
+def parse_file(path, *, locate_invalid=False):
     with open(path, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
     info = {"name": os.path.splitext(os.path.basename(path))[0], "insns": [], "invalid": 0}
@@ -228,6 +228,17 @@ def parse_file(path):
         info["insns"].append(ins)
     tail = "\n".join(lines)
     info["invalid"] = tail.count("invalid instruction encoding")
+    if locate_invalid and info["invalid"]:
+        # shader_disasm sends llvm-mc a single line of space-separated 0xNN tokens.
+        # A dword therefore starts at a one-based column congruent to 1 modulo 20.
+        offsets = set()
+        for ln in lines:
+            m = re.fullmatch(r"; <stdin>:1:([1-9][0-9]{0,9}): warning: invalid instruction encoding", ln)
+            if m:
+                column = int(m[1]) - 1
+                if column % 20 == 0:
+                    offsets.add(info["code_start"] + column // 5)
+        info["invalid_pcs"] = offsets
     return info
 
 
