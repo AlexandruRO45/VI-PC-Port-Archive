@@ -161,8 +161,22 @@ wave size is the FSSM header flag read by `fssm_header.wave_size()`. The 1.0.2.1
 | Geometry | 195 | 195 | 0 |
 | **Total** | **26,503** | **23,841 (90.0%)** | **2,662** |
 
-`docs/design.md`'s Coverage row records a full-corpus translation of all 26,503; the table above adds the stage and
-wave split, measured on the package. What remains before a frame is runtime support, not translation:
+A full translation at `3faac557b` (8 shards, `--no-asm --assembler python`) translates **26,503/26,503** and
+passes `spirv-val` on every module. The wave64 graphics tiers (`tools/wave64_halves.py --census`) are:
+
+| Stage | wave64 | tier A | tier B | tier C |
+|---|---:|---:|---:|---:|
+| Pixel | 10,974 | 3,404 | 27 | 7,543 |
+| Vertex | 2,236 | 1,455 | 79 | 702 |
+| Geometry | 195 | 195 | 0 | 0 |
+| **Graphics total** | **13,405** | **5,054** | **106** | **8,245** |
+
+The 11,971 wave64 compute and mesh shaders translate with `--wave64-emulate` as well: 11,971/11,971, 0 refused,
+all marked `wave64_emulated`. Tier C is a fidelity gap on a 32-wide subgroup, not a refusal. `docs/design.md`'s
+census at `f847748c` predates four analyzer fixes, so its PS split (2,383 / 6 / 8,585) is stale; at `3faac557b`
+it is 3,404 / 27 / 7,543 (tier A up 1,021, tier C down 1,042).
+
+What remains before a frame is runtime support, not translation:
 
 * **Mesh.** All 9,282 are wave64, 128x1x1 with 128/128 outputs. On `main` (`3faac557b`) the layer answers
   `MeshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED` and has no `DispatchMesh` replay path, so any mesh
