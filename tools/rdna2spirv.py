@@ -10076,8 +10076,8 @@ class Gen:
             # an f32. Until 2026-11-21 those were unpacked as pairs too, and the coordinates after them were read a
             # half early. A texel offset comes first and keeps its full dword under a16.
             extras = op[len("image_sample"):] if op.startswith("image_sample") else ""
-            w_off = 1 if extras.endswith("_o") else 0
-            extras = extras[:-2] if w_off else extras
+            w_off = 1 if op.endswith("_o") else 0
+            extras = extras[:-2] if extras.endswith("_o") else extras
             w_bias = 1 if extras in ("_b", "_c_b") else 0
             w_grad = 2 * grad_width if extras in ("_d", "_d_cl") else 0
             whole = w_off + w_bias + (1 if extras.startswith("_c") else 0) + w_grad
@@ -10132,9 +10132,7 @@ class Gen:
             f = [self.tof(c) for c in coords]
             goff = None
             if op in ("image_gather4_lz_o", "image_gather4_l_o"):
-                # first address dword: signed 6-bit texel offsets x [5:0], y [13:8]
-                if a16:
-                    raise Unsupported(op + " a16")
+                # first address dword: signed 6-bit texel offsets x [5:0], y [13:8] (kept whole under a16)
                 parts = []
                 for k in range(2):
                     u, i = self.tmp(), self.tmp()
@@ -10145,7 +10143,8 @@ class Gen:
                 self.emit(f"{goff} = OpCompositeConstruct %v2int {parts[0]} {parts[1]}")
                 f = f[1:]
                 op = op[:-2]
-                self.uses_img_offset = True
+                if op == "image_gather4_lz":
+                    self.uses_img_offset = True
             if op == "image_gather4_l":
                 # Gather at an explicit LOD: Vulkan gathers have no Lod operand without an AMD extension, so fetch
                 # the 2x2 footprint at mip round(lod) (clamped to the mip range) in gather order
