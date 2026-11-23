@@ -406,6 +406,69 @@ class SamplerTimeTest(unittest.TestCase):
             anim_glb.build(joints, [], [("sample", {(0, "translation"): keys})])
 
 
+def malformed_fragment_resource():
+    buf = bytearray(192)
+    struct.pack_into("<Q", buf, 8, SYSTEM + 0x80)
+    buf[0x80 + 8] = 1
+    struct.pack_into("<Q", buf, 24, SYSTEM + 0x1000)
+    struct.pack_into("<H", buf, 48, 1)
+    struct.pack_into("<Q", buf, 168, SYSTEM + 0x80)
+    return bytes(buf)
+
+
+def malformed_dictionary_resource(bad_child=False):
+    buf = bytearray(0x200 if bad_child else 192)
+    struct.pack_into("<Q", buf, 8, SYSTEM + 0x80)
+    buf[0x80 + 8] = 1
+    struct.pack_into("<Q", buf, 32, SYSTEM + 0x80)
+    struct.pack_into("<HH", buf, 40, 1, 1)
+    struct.pack_into("<Q", buf, 48, SYSTEM + (0xC0 if bad_child else 0x1000))
+    struct.pack_into("<HH", buf, 56, 1, 1)
+    if bad_child:
+        struct.pack_into("<Q", buf, 0xC0, SYSTEM + 0x100)
+        struct.pack_into("<Q", buf, 0x100, 1)
+    return bytes(buf)
+
+
+def overrunning_cluster_part_resource(*, over_vertices=False, over_tris=False):
+    p_bytes, g_bytes = part_resource([joaat32("skel_a")])
+    g = bytearray(g_bytes)
+    header = struct.pack("<III", 0x80000001, len(TRIANGLES), len(POSITIONS))
+    iat = g.index(header)
+    n_verts = 9 if over_vertices else (len(POSITIONS) - 1)
+    n_tris = len(TRIANGLES) if over_tris else (len(TRIANGLES) - 1)
+    struct.pack_into("<I", g, iat + 12, n_verts | (n_tris << 7))
+    if over_vertices:
+        struct.pack_into("<I", g, iat + 28, 5 | (1 << 7) | (2 << 14))
+    return p_bytes, bytes(g)
+
+
+class MalformedResourceErrorTest(unittest.TestCase):
+    def test_malformed_fragment_raises_export_error(self):
+        sys_pages = malformed_fragment_resource()
+        self.assertEqual(anim_glb.skin_streams.resource_kind(sys_pages), "fragment")
+        with self.assertRaisesRegex(anim_glb.ExportError, "malformed fragment drawable table"):
+            anim_glb.drawable_at(sys_pages, None)
+
+    def test_malformed_dictionary_raises_export_error(self):
+        for bad_child in (False, True):
+            with self.subTest(bad_child=bad_child):
+                sys_pages = malformed_dictionary_resource(bad_child=bad_child)
+                self.assertEqual(anim_glb.skin_streams.resource_kind(sys_pages), "dictionary")
+                with self.assertRaisesRegex(anim_glb.ExportError, "malformed dictionary drawable table"):
+                    anim_glb.drawable_at(sys_pages, None)
+
+    def test_overrunning_cluster_vertex_count_raises_export_error(self):
+        p_bytes, g_bytes = overrunning_cluster_part_resource(over_vertices=True)
+        with self.assertRaisesRegex(anim_glb.ExportError, "cluster runs past the index buffer"):
+            anim_glb.read_part(p_bytes, g_bytes, anim_glb.drawable_at(p_bytes, None))
+
+    def test_overrunning_cluster_triangle_count_raises_export_error(self):
+        p_bytes, g_bytes = overrunning_cluster_part_resource(over_tris=True)
+        with self.assertRaisesRegex(anim_glb.ExportError, "cluster runs past the index buffer"):
+            anim_glb.read_part(p_bytes, g_bytes, anim_glb.drawable_at(p_bytes, None))
+
+
 class ExportTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -708,6 +771,35 @@ class ExportTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertEqual(r.stderr.strip(), f"ERROR: {missing}: {os.strerror(2)}")
         self.assertEqual(r.stdout, "")
+
+    def test_malformed_fragment_cli_is_one_error_line(self):
+        bad_packs = os.path.join(self.tmp.name, "bad_frag.rpf")
+        offsets = write_archive(bad_packs, [[skeleton_resource()], [malformed_fragment_resource()]])
+        out = os.path.join(self.tmp.name, "bad_frag.glb")
+        r = self.run_tool(bad_packs, out, "--skeleton", hex(offsets[0]), "--part", hex(offsets[1]))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+        self.assertTrue(r.stderr.startswith("ERROR:"), r.stderr)
+        self.assertIn("malformed fragment drawable table", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+    def test_overrunning_cluster_cli_is_one_error_line(self):
+        bad_packs = os.path.join(self.tmp.name, "bad_cluster.rpf")
+        offsets = write_archive(
+            bad_packs,
+            [[skeleton_resource()], list(overrunning_cluster_part_resource(over_vertices=True))],
+        )
+        out = os.path.join(self.tmp.name, "bad_cluster.glb")
+        r = self.run_tool(bad_packs, out, "--skeleton", hex(offsets[0]), "--part", hex(offsets[1]))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+        self.assertTrue(r.stderr.startswith("ERROR:"), r.stderr)
+        self.assertIn("cluster runs past the index buffer", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.stdout, "")
+        self.assertFalse(os.path.exists(out))
 
 
 if __name__ == "__main__":

@@ -151,7 +151,10 @@ def drawable_at(sys, child):
     """System offset of the drawable to read: a dictionary child, a fragment's drawable or the drawable itself."""
     kind = skin_streams.resource_kind(sys)
     require(kind is not None, "not a drawable, fragment or drawable dictionary")
-    found = list(skin_streams.drawable_offsets(sys, kind))
+    try:
+        found = list(skin_streams.drawable_offsets(sys, kind))
+    except skin_streams.Skip as e:
+        raise ExportError(str(e) or f"malformed {kind} drawable table") from None
     if child is None:
         require(len(found) == 1, f"{kind} with {len(found)} drawables: pick one with :<child>")
         child = 0
@@ -276,6 +279,7 @@ def read_triangles(sys, gfx, geometry, vertices):
         n_vertices, n_tris = (packed & 127) + 1, ((packed >> 7) & 255) + 1
         v_start, t_start = offsets & 0xFFFF, offsets >> 16
         require(v_start == seen_refs and t_start == seen_tris, "cluster starts (meshes over 65,535 are not read)")
+        require(v_start + n_vertices <= refs and t_start + n_tris <= triangles, "cluster runs past the index buffer")
         for t in range(t_start, t_start + n_tris):
             word = u32(data, tri_at + 4 * t)
             require(word >> 21 == c, "triangle cluster tag")
