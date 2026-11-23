@@ -260,6 +260,15 @@ class CharacterTextureTests(unittest.TestCase):
                         self.assertIn("ERROR:", err.getvalue())
                         self.assertIn("Permission denied", err.getvalue())
 
+    def test_deeply_nested_json_exits_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as td:
+            bad = pathlib.Path(td) / "model.json"
+            bad.write_text("[" * 50_000 + "]" * 50_000, encoding="utf-8")
+            result = run_tool(bad)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("ERROR:", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

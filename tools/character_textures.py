@@ -206,6 +206,8 @@ def classify_file(path: str) -> dict:
             document = json.load(f)
     except json.JSONDecodeError as exc:
         raise ValueError(f"{path}: {exc.msg} at line {exc.lineno} column {exc.colno}") from None
+    except RecursionError as exc:
+        raise ValueError(f"{path}: {exc}") from None
     return classify_document(path, document)
 
 
