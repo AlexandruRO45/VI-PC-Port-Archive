@@ -1441,6 +1441,94 @@ def store_words_test(tools, spirv, name):
     return store_words_problem(out, name) if code == 0 else failure(code, out, 3)
 
 
+def pack_rgb9e5_rtz(r_bits, g_bits, b_bits):
+    """Pack three IEEE-754 binary32 uint32 bit patterns into E5B9G9R9 with RDNA2 round-toward-zero semantics."""
+    def clamp_bits(u):
+        return min(u, 0x477F8000) if u <= 0x7F800000 else 0
+
+    rc, gc, bc = clamp_bits(r_bits), clamp_bits(g_bits), clamp_bits(b_bits)
+    m = max(rc, gc, bc)
+    e = ((m >> 23) - 111) if m >= 0x38000000 else 0
+
+    def quant(c):
+        csig = (c & 0x7FFFFF) | 0x800000
+        return csig >> min(126 + e - (c >> 23), 24)
+
+    return (e << 27) | (quant(bc) << 18) | (quant(gc) << 9) | quant(rc)
+
+
+def _imgstore_r9g9b9e5_words():
+    """Expected 64 words in img_e5 for runtime/test/shaders/cs_imgstore_r9g9b9e5.asm."""
+    f32 = lambda u: struct.unpack("<f", struct.pack("<I", u))[0]
+    f32b = lambda x: struct.unpack("<I", struct.pack("<f", x))[0]
+    f16b = lambda bits16: f32b(struct.unpack("<e", struct.pack("<H", bits16 & 0xFFFF))[0])
+    words = []
+    for tid in range(32):
+        r = f32b(f32(0x3EA00000) * (tid - 8))
+        g = f32b(f32(0x3A03126F) + ((tid * 3) & 15) * 0.125)
+        b = (102 + tid) << 23
+        words.append(pack_rgb9e5_rtz(r, g, b))
+    row4 = (
+        (0x3F800000, 0x40000000, 0x40800000),  # 32: normal (1.0, 2.0, 4.0)
+        (0x3F7F8000, 0x3F7FA000, 0x3F7FC000),  # 33: RTZ mantissa boundaries
+        (0xBF800000, 0x80000000, 0x3F000000),  # 34: negative and -0.0 clamp to 0
+        (0x7F800000, 0xFF800000, 0x7FC00001),  # 35: +Inf, -Inf, +qNaN
+        (0x7F800001, 0x3F800000, 0x40000000),  # 36: +sNaN must not pollute shared exponent
+        (0x477F4000, 0x477F7F00, 0x477F8000),  # 37: max exponent / max 65408.0
+        (0x477FE000, 0x477F8100, 0x60AD78EC),  # 38: overflow >= 65408 clamps to 65408.0
+        (0x33000000, 0x33C00000, 0x37FF8000),  # 39: shared-exp subnormal range (E=0)
+    )
+    words.extend(pack_rgb9e5_rtz(r, g, b) for r, g, b in row4)
+    w40 = pack_rgb9e5_rtz(0x3F800000, 0, 0x40800000)         # dmask:0x5 (R=1, B=4; G=0)
+    w44 = pack_rgb9e5_rtz(f16b(0x3E00), f16b(0xC080), f16b(0x4400))  # glc a16 d16 (1.5, -2.25, 4.0)
+    w46 = pack_rgb9e5_rtz(0x3E800000, 0x3F000000, 0x3F800000)  # glc coherent (0.25, 0.5, 1.0)
+    w48 = pack_rgb9e5_rtz(0x3F800000, 0x40000000, 0x40800000)  # masked EXEC (1.0, 2.0, 4.0)
+    words.extend([w40, w40, 0, 0, w44, w44, w46, w46, w48, 0xDEADBEEF, w48, 0xDEADBEEF])
+    words.extend([0xDEADBEEF] * 12)
+    return words
+
+
+R9G9B9E5_WORDS = _imgstore_r9g9b9e5_words()
+R9G9B9E5_CONTROL_RGBA = (128, 64, 191, 255)   # tid 0 control store (0.5, 0.25, 0.75, 1.0) to RGBA8_UNORM
+
+
+def imgstore_r9g9b9e5_problem(output):
+    """Judge vk_store_test r9g9b9e5 output: 64 exact E5B9G9R9 words plus RGBA8_UNORM control store at tid 0."""
+    m = re.search(r"^r9g9b9e5 words:((?: 0x[0-9a-f]{8}){64})$", output, re.MULTILINE)
+    if not m:
+        return "vk_store_test printed no r9g9b9e5 words"
+    got = [int(word, 16) for word in m.group(1).split()]
+    bad = [i for i in range(64) if got[i] != R9G9B9E5_WORDS[i]]
+    if bad:
+        i = bad[0]
+        return (f"{len(bad)} of 64 r9g9b9e5 words differ; first word {i}: got {got[i]:#010x}, "
+                f"expected {R9G9B9E5_WORDS[i]:#010x}")
+    cm = re.search(r"^rgba8 words:((?: 0x[0-9a-f]{8}){64})$", output, re.MULTILINE)
+    if not cm:
+        return "vk_store_test printed no rgba8 words"
+    cgot = [int(word, 16) for word in cm.group(1).split()]
+    ch = tuple((cgot[0] >> (8 * k)) & 0xFF for k in range(4))
+    if any(abs(a - b) > 1 for a, b in zip(ch, R9G9B9E5_CONTROL_RGBA)):
+        return f"rgba8 control word 0 got {cgot[0]:#010x} {ch}, expected ~{R9G9B9E5_CONTROL_RGBA}"
+    cbad = [i for i in range(1, 64) if cgot[i] != 0]
+    if cbad:
+        i = cbad[0]
+        return f"{len(cbad)} of 63 untouched rgba8 control words non-zero; first word {i}: got {cgot[i]:#010x}"
+    return ""
+
+
+def imgstore_r9g9b9e5_test(tools, spirv):
+    """cs_imgstore_r9g9b9e5 via vk_store_test r9g9b9e5 (native E5B9G9R9 or emulated R32_UINT)."""
+    shader = os.path.join(spirv, "cs_imgstore_r9g9b9e5.spv")
+    if not os.path.isfile(shader):
+        return "missing cs_imgstore_r9g9b9e5.spv"
+    code, out = run(os.path.join(tools, "vk_store_test" + EXE), shader, "r9g9b9e5")
+    if code == UNSUPPORTED:
+        m = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+    return imgstore_r9g9b9e5_problem(out) if code == 0 else failure(code, out, 3)
+
+
 def get_lod_problem(data, want):
     """Judge one image_get_lod frame: "" when all 4096 RGBA32F pixels are within GET_LOD_TOLERANCE of `want`."""
     if len(data) != 64 * 64 * 16:
@@ -1822,6 +1910,7 @@ def main():
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
     for name in STORE_WORDS:   # TEST-184: image atomics and image_get_resinfo
         results.append((name, store_words_test(tools, spirv, name)))
+    results.append(("cs_imgstore_r9g9b9e5", imgstore_r9g9b9e5_test(tools, spirv)))
     for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array
         results.append((name, get_lod_test(tools, spirv, name)))
     for name in CLIP_TESTS:

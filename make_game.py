@@ -1533,7 +1533,8 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--r9g9b9e5-uav-emulate", "r9g9b9e5_uav_emulate"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -1698,6 +1699,22 @@ def runtime_gpu_max_push_constants():
     """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
     v = runtime_gpu_info().get("max_push_constants_size")
     return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+
+def runtime_gpu_r9g9b9e5_uav_emulate():
+    """Whether the runtime's GPU lacks native E5B9G9R9 STORAGE_IMAGE support (needs --r9g9b9e5-uav-emulate), or None."""
+    v = runtime_gpu_info().get("r9g9b9e5_uav_emulate")
+    return v if isinstance(v, bool) else None
+
+
+def r9g9b9e5_uav_emulate_override():
+    """LEONIDA_R9G9B9E5_UAV_EMULATE=1/0 forces R9G9B9E5 UAV image_store packing; None leaves it automatic."""
+    v = (os.environ.get("LEONIDA_R9G9B9E5_UAV_EMULATE") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
 
 
 # Source and data files that produce the translated modules, metadata and partner stubs.
@@ -2713,6 +2730,9 @@ def main() -> int:
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
+    ap.add_argument("--r9g9b9e5-uav-emulate", action="store_true",
+                    help="pack R9G9B9E5_SHAREDEXP (FORMAT 132) image_store into R32_UINT on %%stv1; on by itself "
+                         "when the runtime's GPU lacks native E5B9G9R9 STORAGE_IMAGE support (e.g. NVIDIA)")
     ap.add_argument("--no-tui", action="store_true",
                     help="plain console logs (default when stdout is not a TTY); skip the LEONIDA setup screen "
                          "and per-stage log view")
@@ -2823,6 +2843,22 @@ def main() -> int:
             log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True
+    if "shaders" in stages and not a.r9g9b9e5_uav_emulate:
+        override = r9g9b9e5_uav_emulate_override()
+        if override is True:
+            log("shaders: LEONIDA_R9G9B9E5_UAV_EMULATE=1 forces --r9g9b9e5-uav-emulate")
+            a.r9g9b9e5_uav_emulate = True
+        elif override is False:
+            log("shaders: LEONIDA_R9G9B9E5_UAV_EMULATE=0 forces native E5B9G9R9 UAV stores")
+            a.r9g9b9e5_uav_emulate = False
+        else:
+            r9_emul = runtime_gpu_r9g9b9e5_uav_emulate()
+            if r9_emul is True:
+                log("shaders: this GPU lacks native E5B9G9R9 STORAGE_IMAGE support: translating with "
+                    "--r9g9b9e5-uav-emulate")
+                a.r9g9b9e5_uav_emulate = True
+            elif r9_emul is None:
+                a.r9g9b9e5_uav_emulate = keep_recorded_fallback("--r9g9b9e5-uav-emulate", work)
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     overlap = True
     a.jobs = leonida_tui.clamp_jobs(a.jobs)

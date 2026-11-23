@@ -35,7 +35,7 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 15)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
+         + len(check.TEXTURE_CONSTANTS) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures, cs_imgstore_r9g9b9e5,
          # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
@@ -163,13 +163,17 @@ class Wave64Checks(unittest.TestCase):
             if name in check.STORE_WORDS:     # vk_store_test "words": the three images, judged by check.py
                 self.assertEqual(args, ("words",))
                 return 0, words_output(name)
+            if name == "cs_imgstore_r9g9b9e5":
+                self.assertEqual(args, ("r9g9b9e5",))
+                return 0, ("r9g9b9e5 words: " + " ".join(f"{w:#010x}" for w in check.R9G9B9E5_WORDS) + "\n"
+                           "rgba8 words: " + " ".join(["0xffbf407f"] + ["0x00000000"] * 63) + "\n")
             return 0, "0 mismatches\n"
 
         with tempfile.TemporaryDirectory() as tmp:
             spirv = Path(tmp) / "spirv"
             spirv.mkdir()
             (spirv / "cs_wavemask.spv").touch()
-            for name in (*WAVE64_DUMPS, *check.STORE_WORDS):
+            for name in (*WAVE64_DUMPS, *check.STORE_WORDS, "cs_imgstore_r9g9b9e5"):
                 (spirv / f"{name}.spv").touch()
             if not missing_ballot:
                 (spirv / "cs_wave64_ballot.spv").touch()

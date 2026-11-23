@@ -726,7 +726,7 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
     extension line, or nothing, so the FAIL line must carry the exit status to say what happened."""
     DIED = {   # one row each: what its program had printed when it died
         "cs_lds": "device: X\n", "cs_exec64": "device: X\n", "cs_bvh": "device: X\n", "cs_wavemask": "device: X\n",
-        "cs_imgstore": "device: X\n", "cs_imgload": "device: X\n", "cs_sample_lz_int_d16": "device: X\n",
+        "cs_imgstore": "device: X\n", "cs_imgstore_r9g9b9e5": "device: X\n", "cs_imgload": "device: X\n", "cs_sample_lz_int_d16": "device: X\n",
         "ps_texture_sample": "device: X\nenabled VK_KHR_maintenance8\n",
         "ps_texture_sample_d16": "device: X\nenabled VK_KHR_maintenance8\n",
         "ps_cube_sample": "device: X\n", "ps_gather_wrap": "device: X\n",
@@ -838,6 +838,68 @@ class FmaFusedSuite(unittest.TestCase):
         rc, out = self.run_fma(77, "unsupported: no VK_KHR_shader_fma", fma_env="khr")
         self.assertEqual(rc, 0, out)
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
+
+
+class R9G9B9E5StoreFixture(unittest.TestCase):
+    """run_gpu_tests.py and check.py handle cs_imgstore_r9g9b9e5 and LEONIDA_R9G9B9E5_UAV_EMULATE."""
+
+    def setUp(self):
+        rgt._R9G9B9E5_UAV_EMULATE.clear()
+
+    def test_probe_and_env_override(self):
+        proc = SimpleNamespace(stdout='{"r9g9b9e5_uav_emulate": true}\n')
+        with patch.object(rgt.subprocess, "run", return_value=proc) as run:
+            with patch.dict(os.environ, {"LEONIDA_R9G9B9E5_UAV_EMULATE": "0"}, clear=False):
+                self.assertIs(rgt.r9g9b9e5_uav_emulate(), False)
+            with patch.dict(os.environ, {"LEONIDA_R9G9B9E5_UAV_EMULATE": "1"}, clear=False):
+                self.assertIs(rgt.r9g9b9e5_uav_emulate(), True)
+            run.assert_not_called()
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("LEONIDA_R9G9B9E5_UAV_EMULATE", None)
+                self.assertIs(rgt.r9g9b9e5_uav_emulate(), True)
+            run.assert_called_once()
+
+    def _run_e5(self, rc, msg, emulate="1"):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter="cs_imgstore_r9g9b9e5.asm", build=tmp, llvm_mc="unused")
+            seen_cmds = []
+
+            def fake_run(cmd, env=None, gpu=True):
+                seen_cmds.append(cmd)
+                if Path(cmd[0]).stem == "vk_store_test":
+                    return rc, msg
+                (Path(tmp) / "spirv" / "cs_imgstore_r9g9b9e5.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.dict(rgt.os.environ, {"LEONIDA_R9G9B9E5_UAV_EMULATE": emulate}, clear=False),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=fake_run),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                code = rgt.run_suite(args, tmp)
+            return code, output.getvalue(), seen_cmds
+
+    def test_pass_fail_skip_and_translator_flag(self):
+        e5_hex = " ".join(f"{w:#010x}" for w in check.R9G9B9E5_WORDS)
+        rgba_ok = " ".join(["0xffbf407f"] + ["0x00000000"] * 63)
+        ok_msg = f"r9g9b9e5 mode: emulated R32_UINT\nr9g9b9e5 words: {e5_hex}\nrgba8 words: {rgba_ok}\n"
+        rc, out, cmds = self._run_e5(0, ok_msg, emulate="1")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS  cs_imgstore_r9g9b9e5", out)
+        translator_cmd = next(c for c in cmds if c[2] == rgt.TRANSLATOR)
+        self.assertIn("--r9g9b9e5-uav-emulate", translator_cmd)
+
+        bad_hex = " ".join(["0xdeadbeef"] * 64)
+        rc, out, cmds = self._run_e5(0, f"r9g9b9e5 mode: emulated R32_UINT\nr9g9b9e5 words: {bad_hex}\nrgba8 words: {rgba_ok}\n", emulate="0")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL  cs_imgstore_r9g9b9e5", out)
+        translator_cmd = next(c for c in cmds if c[2] == rgt.TRANSLATOR)
+        self.assertNotIn("--r9g9b9e5-uav-emulate", translator_cmd)
+
+        rc, out, _ = self._run_e5(77, "unsupported: no E5B9G9R9 storage or mutable R32_UINT view", emulate="0")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SKIP (unsupported: no E5B9G9R9 storage or mutable R32_UINT view)", out)
 
 
 if __name__ == "__main__":

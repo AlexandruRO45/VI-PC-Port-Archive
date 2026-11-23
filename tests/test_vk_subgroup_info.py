@@ -73,6 +73,9 @@ class FakeDevice:
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
     device_id: int = 0
+    e5b9g9r9_sampled: bool = True
+    e5b9g9r9_storage: bool = True
+    r32_uint_storage: bool = True
 
 
 class FakeVulkan:
@@ -100,6 +103,7 @@ class FakeVulkan:
         self.vkGetPhysicalDeviceProperties2 = _VkProc(self._get_physical_device_properties2)
         self.vkGetPhysicalDeviceFeatures2 = _VkProc(self._get_physical_device_features2)
         self.vkGetPhysicalDeviceQueueFamilyProperties = _VkProc(self._get_queue_family_properties)
+        self.vkGetPhysicalDeviceFormatProperties = _VkProc(self._get_physical_device_format_properties)
         self.vkDestroyInstance = _VkProc(self._destroy_instance)
 
     @staticmethod
@@ -278,6 +282,22 @@ class FakeVulkan:
             ctypes.c_uint32.from_address(entry).value = dev.queue_flags[i]
             ctypes.c_uint32.from_address(entry + 4).value = 1
         count_ptr.value = written
+
+    def _get_physical_device_format_properties(self, phys_dev, fmt, p_props):
+        dev = self._devices[_ptr(phys_dev)]
+        addr = _ptr(p_props)
+        opt = 0
+        if fmt == 123:  # VK_FORMAT_E5B9G9R9_UFLOAT_PACK32
+            if dev.e5b9g9r9_sampled:
+                opt |= 0x1  # VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+            if dev.e5b9g9r9_storage:
+                opt |= 0x2  # VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT
+        elif fmt == 98:  # VK_FORMAT_R32_UINT
+            if dev.r32_uint_storage:
+                opt |= 0x2  # VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT
+        ctypes.c_uint32.from_address(addr + 0).value = 0
+        ctypes.c_uint32.from_address(addr + 4).value = opt
+        ctypes.c_uint32.from_address(addr + 8).value = 0
 
 
 class StructHelpersTest(unittest.TestCase):
@@ -798,6 +818,7 @@ class QueryTest(unittest.TestCase):
                     "native64": want_native64,
                     "per_vertex_inputs": True,
                     "barycentric_fallback": False,
+                    "r9g9b9e5_uav_emulate": False,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
                     "device_id": 0,
@@ -828,6 +849,20 @@ class QueryTest(unittest.TestCase):
                 res, _vk = self._run_query(FakeDevice(driver_id=driver))
                 self.assertIs(res["barycentric_fallback"], want)
         self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
+
+    def test_r9g9b9e5_uav_emulate(self):
+        cases = (
+            ("native_amd", True, True, True, False),
+            ("emulated_nvidia", True, False, True, True),
+            ("missing_sampled_e5", False, False, True, False),
+            ("missing_r32ui_storage", True, False, False, False),
+        )
+        for label, e5_s, e5_st, r32_st, want in cases:
+            with self.subTest(case=label):
+                res, _vk = self._run_query(
+                    FakeDevice(e5b9g9r9_sampled=e5_s, e5b9g9r9_storage=e5_st, r32_uint_storage=r32_st)
+                )
+                self.assertIs(res["r9g9b9e5_uav_emulate"], want)
 
     def test_barycentric_fallback_rejects_an_intel_windows_fake(self):
         """Intel Windows uses its Windows driver ID, not ANV; the fake must carry Intel's vendor ID."""

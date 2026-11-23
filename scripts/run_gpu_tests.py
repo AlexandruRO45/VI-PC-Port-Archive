@@ -47,7 +47,7 @@ from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip,
 from check import PIXEL_VERTEX, VINT_ENV, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import barycentric_problem
 from check import NAN_PAYLOAD_TEST, nan_payload_problem
-from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
+from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, imgstore_r9g9b9e5_problem, store_words_problem   # image ops & R9G9B9E5
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
 from check import FMA_FUSED_ENV, judge_fma_fused   # cs_fma_fused: strict under LEONIDA_FMA=khr, fused/split under glsl
 from check import bary_persp_problem   # ps_persp_bary's perspective-correct reference
@@ -329,35 +329,48 @@ def f16_interp_fallback() -> bool:
 
 _PER_VERTEX = []
 _BARYCENTRIC_FALLBACK = []
+_R9G9B9E5_UAV_EMULATE = []
 
 
-def _device_per_vertex():
-    """per_vertex_inputs from tools/vk_subgroup_info.py for the device the tests run on (cached), or None."""
-    if not _PER_VERTEX:
+def r9g9b9e5_uav_emulate() -> bool:
+    """LEONIDA_R9G9B9E5_UAV_EMULATE=1 (or 0): pack R9G9B9E5_SHAREDEXP image_store into R32_UINT on %stv1. Unset, it
+    is on where tools/vk_subgroup_info.py reports r9g9b9e5_uav_emulate (devices without native E5B9G9R9 storage)."""
+    v = (os.environ.get("LEONIDA_R9G9B9E5_UAV_EMULATE") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return _device_r9g9b9e5_uav_emulate() is True
+
+
+def _vk_probe_flag(cache: list, key: str):
+    """Query `key` from tools/vk_subgroup_info.py once and memoize in `cache`, or None on probe failure."""
+    if not cache:
         answer = None
         try:
             r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
                                capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
+            answer = json.loads(r.stdout.strip().splitlines()[-1]).get(key)
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass
-        _PER_VERTEX.append(answer)
-    return _PER_VERTEX[0]
+        cache.append(answer)
+    return cache[0]
+
+
+def _device_per_vertex():
+    """per_vertex_inputs from tools/vk_subgroup_info.py for the device the tests run on (cached), or None."""
+    return _vk_probe_flag(_PER_VERTEX, "per_vertex_inputs")
 
 
 def _device_barycentric_fallback():
     """barycentric_fallback from tools/vk_subgroup_info.py (Mesa ANV, SHADER-925; AMD Windows on gfx90c, #5933),
     cached per suite."""
-    if not _BARYCENTRIC_FALLBACK:
-        answer = None
-        try:
-            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
-                               capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("barycentric_fallback")
-        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-            pass
-        _BARYCENTRIC_FALLBACK.append(answer)
-    return _BARYCENTRIC_FALLBACK[0]
+    return _vk_probe_flag(_BARYCENTRIC_FALLBACK, "barycentric_fallback")
+
+
+def _device_r9g9b9e5_uav_emulate():
+    """r9g9b9e5_uav_emulate from tools/vk_subgroup_info.py (no VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 storage bit)."""
+    return _vk_probe_flag(_R9G9B9E5_UAV_EMULATE, "r9g9b9e5_uav_emulate")
 
 
 def w64_emulated() -> bool:
@@ -915,6 +928,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--mesh-compute")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
             cmd.append("--pc-tail-ubo")
+        if r9g9b9e5_uav_emulate():   # pack FORMAT 132 (R9G9B9E5_SHAREDEXP) image_store into R32_UINT on %stv1
+            cmd.append("--r9g9b9e5-uav-emulate")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
             cmd += ["--fma", os.environ["LEONIDA_FMA"]]
         rc, out = run_cmd(cmd, gpu=False)
@@ -1308,6 +1323,16 @@ def run_suite(a, work: str) -> int:
         elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load" if name == "cs_imgload" else "load-d16"])
             results.append((name, *helper_result(rc, msg)))
+        elif name == "cs_imgstore_r9g9b9e5":
+            rc, msg = run_cmd([vk_store, spv, "r9g9b9e5"])
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            elif rc != 0:
+                results.append((name, False, failure(rc, msg, 3)))
+            else:
+                problem = imgstore_r9g9b9e5_problem(msg)
+                mode = next((ln for ln in msg.splitlines() if ln.startswith("r9g9b9e5 mode:")), "")
+                results.append((name, not problem, problem or mode or "64 E5B9G9R9 words + control exact"))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem

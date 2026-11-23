@@ -249,6 +249,10 @@ def query(*, stage_caps=False) -> dict:
     vk.vkGetPhysicalDeviceProperties2.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceFeatures2.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceQueueFamilyProperties.argtypes = [vp, vp, vp]
+    fmt_props_fn = getattr(vk, "vkGetPhysicalDeviceFormatProperties", None)
+    if fmt_props_fn is not None:
+        fmt_props_fn.argtypes = [vp, ctypes.c_uint32, vp]
+        fmt_props_fn.restype = None
     vk.vkDestroyInstance.argtypes = [vp, vp]
     app = AppInfo(VK_STRUCTURE_TYPE_APPLICATION_INFO, None, b"leonida-subgroup-info", 1, None, 0, VK_API_VERSION_1_3)
     info = InstanceInfo(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, None, 0, ctypes.pointer(app), 0, None, 0, None)
@@ -316,6 +320,15 @@ def query(*, stage_caps=False) -> dict:
             rank = device_rank(dtype, vendor_id)
             if rank > chosen_rank:
                 chosen_rank = rank
+                r9_emul = False
+                if fmt_props_fn is not None:
+                    e5_buf = (ctypes.c_uint32 * 3)()
+                    r32_buf = (ctypes.c_uint32 * 3)()
+                    fmt_props_fn(d, 123, e5_buf)   # VK_FORMAT_E5B9G9R9_UFLOAT_PACK32
+                    fmt_props_fn(d, 98, r32_buf)   # VK_FORMAT_R32_UINT
+                    e5_opt, r32_opt = e5_buf[1], r32_buf[1]
+                    # VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT = 0x1, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT = 0x2
+                    r9_emul = (not (e5_opt & 0x2)) and bool(e5_opt & 0x1) and bool(r32_opt & 0x2)
                 chosen = (dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
@@ -323,7 +336,7 @@ def query(*, stage_caps=False) -> dict:
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16), r9_emul)
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -332,7 +345,7 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, max_push_constants_size, vendor, device, driver, r9g9b9e5_uav_emulate) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -355,6 +368,7 @@ def query(*, stage_caps=False) -> dict:
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
             "barycentric_fallback": barycentric_fallback(vendor, device, driver),
+            "r9g9b9e5_uav_emulate": r9g9b9e5_uav_emulate,
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,
             "device_id": device,

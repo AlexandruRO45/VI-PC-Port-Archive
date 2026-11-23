@@ -184,7 +184,7 @@ class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
     def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
-                 mesh_crash=False):
+                 mesh_crash=False, r9g9b9e5_uav_emulate=None):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
@@ -199,6 +199,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=barycentric_fallback), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
+                mock.patch("make_game.runtime_gpu_r9g9b9e5_uav_emulate", return_value=r9g9b9e5_uav_emulate), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -303,6 +304,20 @@ class MainWiringTest(unittest.TestCase):
             with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
                 self.assertEqual(make_game.runtime_gpu_max_push_constants(), want)
 
+    def test_r9g9b9e5_uav_emulate_follows_device_and_override(self):
+        self.assertEqual(self.run_main(r9g9b9e5_uav_emulate=True), (("--r9g9b9e5-uav-emulate",),) * 2)
+        self.assertEqual(self.run_main(r9g9b9e5_uav_emulate=False), ((), ()))
+        self.assertEqual(self.run_main("--r9g9b9e5-uav-emulate", r9g9b9e5_uav_emulate=False),
+                         (("--r9g9b9e5-uav-emulate",),) * 2)
+        with mock.patch.dict(os.environ, {"LEONIDA_R9G9B9E5_UAV_EMULATE": "1"}, clear=False):
+            self.assertEqual(self.run_main(r9g9b9e5_uav_emulate=False), (("--r9g9b9e5-uav-emulate",),) * 2)
+        with mock.patch.dict(os.environ, {"LEONIDA_R9G9B9E5_UAV_EMULATE": "0"}, clear=False):
+            self.assertEqual(self.run_main(r9g9b9e5_uav_emulate=True), ((), ()))
+        with mock.patch("make_game.runtime_gpu_info", return_value={"r9g9b9e5_uav_emulate": True}):
+            self.assertIs(make_game.runtime_gpu_r9g9b9e5_uav_emulate(), True)
+        with mock.patch("make_game.runtime_gpu_info", return_value={"r9g9b9e5_uav_emulate": "true"}):
+            self.assertIs(make_game.runtime_gpu_r9g9b9e5_uav_emulate(), None)
+
 
 class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
     """A GPU probe that can't tell must not change the flags a finished translation was made with: one failed or
@@ -338,6 +353,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
+                mock.patch("make_game.runtime_gpu_r9g9b9e5_uav_emulate", return_value=None), \
                 mock.patch("make_game.preflight"), \
                 mock.patch.object(make_game, "py", fake_py), \
                 mock.patch.object(make_game, "need", lambda *a: None), \

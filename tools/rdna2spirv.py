@@ -98,6 +98,9 @@ PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
 # the validation layer counts it too (VUID-RuntimeSpirv-Location-06272), so (29 + 1) * 4 + 4 = 124 is the most a VS
 # can use there.
 F16_HALVES = False
+# --r9g9b9e5-uav-emulate: pack GFX10_FORMAT_5_9_9_9_FLOAT (132) image_store floats into R32_UINT on %stv1
+# (as_uint), for devices whose VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks STORAGE_IMAGE_BIT (d3d12_vulkan_device.cpp).
+R9G9B9E5_UAV_EMULATE = False
 F16_HALF_TOP = 29
 OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pass on emitted SPIR-V (#884)
 
@@ -377,6 +380,7 @@ class Gen:
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
         self.fmt_enc_fn = None    # lines of the format-encode and element-size functions, once a typed store needs them
+        self.rgb9e5_pack_fn = None  # lines of the R9G9B9E5_SHAREDEXP (FORMAT 132) uint32 packing helper
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
@@ -12964,8 +12968,10 @@ class Gen:
             flags.append(nz)
         return flags
 
-    def fmt_int_flags(self, word1):
-        """(is UINT format, is SINT format) for a T# word1 (FORMAT [28:20]), from the 512-bit tables."""
+    FMT_5_9_9_9_FLOAT = 132     # GFX10_FORMAT_5_9_9_9_FLOAT (R9G9B9E5_SHAREDEXP -> packed R32_UINT on store)
+
+    def _tsharp_format_flags(self, word1):
+        """Extract FORMAT [28:20] from T# word1 and return (fmt_id, is_uint, is_sint)."""
         for w in [16] + sum(self.int_format_masks(), []):
             self.cu(w)
         fmt, word, bit = self.tmp(), self.tmp(), self.tmp()
@@ -12980,7 +12986,66 @@ class Gen:
             self.emit(f"{b} = OpBitFieldUExtract %uint {w} {bit} {self.cu(1)}")
             self.emit(f"{nz} = OpINotEqual %bool {b} {self.cu(0)}")
             flags.append(nz)
-        return flags
+        return fmt, flags[0], flags[1]
+
+    def fmt_int_flags(self, word1):
+        """(is UINT format, is SINT format) for a T# word1 (FORMAT [28:20]), from the 512-bit tables."""
+        _, is_u, is_s = self._tsharp_format_flags(word1)
+        return [is_u, is_s]
+
+    def ensure_rgb9e5_pack_fn(self):
+        """Build once per module: pack 3 f32 channels (r, g, b) into E5B9G9R9 uint32 (round toward zero)."""
+        if self.rgb9e5_pack_fn is None:
+            for c in (0, 9, 18, 23, 24, 27, 111, 126, 0x7FFFFF, 0x800000, 0x38000000, 0x477F8000, 0x7F800000):
+                self.cu(c)
+            params = ["%r9_r", "%r9_g", "%r9_b"]
+            saved, self.body = self.body, []
+            # Bitwise clamp to [0, 65408.0]: non-negative <= +Inf maps monotonically in uint order <= 0x477F8000;
+            # negatives (-0.0 included) and NaNs (> 0x7F800000 as uint) become 0 cleanly regardless of float controls.
+            clamped = []
+            for p in params:
+                u, ok, um, c = (self.tmp() for _ in range(4))
+                self.emit(f"{u} = OpBitcast %uint {p}")
+                self.emit(f"{ok} = OpULessThanEqual %bool {u} {self.cu(0x7F800000)}")
+                self.emit(f"{um} = OpExtInst %uint %glsl UMin {u} {self.cu(0x477F8000)}")
+                self.emit(f"{c} = OpSelect %uint {ok} {um} {self.cu(0)}")
+                clamped.append(c)
+            m01, m, me, esub, ge, e = (self.tmp() for _ in range(6))
+            self.emit(f"{m01} = OpExtInst %uint %glsl UMax {clamped[0]} {clamped[1]}")
+            self.emit(f"{m} = OpExtInst %uint %glsl UMax {m01} {clamped[2]}")
+            self.emit(f"{me} = OpShiftRightLogical %uint {m} {self.cu(23)}")
+            self.emit(f"{esub} = OpISub %uint {me} {self.cu(111)}")
+            self.emit(f"{ge} = OpUGreaterThanEqual %bool {m} {self.cu(0x38000000)}")
+            self.emit(f"{e} = OpSelect %uint {ge} {esub} {self.cu(0)}")
+            # Truncate toward zero (matching native RDNA2 5_9_9_9_FLOAT / gfx1036): shift = min(126 + E - c_exp, 24)
+            # lies in [15, 24], keeping quant in [0, 511] without ever shifting by >= 32 (c_sig < 2^24).
+            e126 = self.tmp()
+            self.emit(f"{e126} = OpIAdd %uint {e} {self.cu(126)}")
+            quants = []
+            for c in clamped:
+                ce, cm, csig, sh0, sh, q = (self.tmp() for _ in range(6))
+                self.emit(f"{ce} = OpShiftRightLogical %uint {c} {self.cu(23)}")
+                self.emit(f"{cm} = OpBitwiseAnd %uint {c} {self.cu(0x7FFFFF)}")
+                self.emit(f"{csig} = OpBitwiseOr %uint {cm} {self.cu(0x800000)}")
+                self.emit(f"{sh0} = OpISub %uint {e126} {ce}")
+                self.emit(f"{sh} = OpExtInst %uint %glsl UMin {sh0} {self.cu(24)}")
+                self.emit(f"{q} = OpShiftRightLogical %uint {csig} {sh}")
+                quants.append(q)
+            sg, sb, se, p0, p1, packed = (self.tmp() for _ in range(6))
+            self.emit(f"{sg} = OpShiftLeftLogical %uint {quants[1]} {self.cu(9)}")
+            self.emit(f"{sb} = OpShiftLeftLogical %uint {quants[2]} {self.cu(18)}")
+            self.emit(f"{se} = OpShiftLeftLogical %uint {e} {self.cu(27)}")
+            self.emit(f"{p0} = OpBitwiseOr %uint {quants[0]} {sg}")
+            self.emit(f"{p1} = OpBitwiseOr %uint {sb} {se}")
+            self.emit(f"{packed} = OpBitwiseOr %uint {p0} {p1}")
+            lines, self.body = self.body, saved
+            self.rgb9e5_pack_fn = (
+                ["%rgb9e5_pack_fn = OpFunction %uint None %fn_rgb9e5_pack"] +
+                [f"{p} = OpFunctionParameter %float" for p in params] +
+                ["%r9_entry = OpLabel"] + lines +
+                [f"OpReturnValue {packed}", "OpFunctionEnd"]
+            )
+        return "%rgb9e5_pack_fn"
 
     def saturate_int16(self, bits: str, signed: bool) -> str:
         """Return the saturated integer as 16 bits in the low half of a uint."""
@@ -13191,20 +13256,29 @@ class Gen:
         idx = self.desc_lookup_sgpr(a[2], 8)
         t1 = self.sgpr_word(a[2], 1)
         self.uses_store_views.add(di)
-        for w in [16] + sum(self.int_format_masks(), []):      # constants used by assemble's format masks
+        for w in [16] + ([self.FMT_5_9_9_9_FLOAT] if R9G9B9E5_UAV_EMULATE else []) + sum(self.int_format_masks(), []):
             self.cu(w)
         if nc == 1:
             iv = coords[0]
         else:
             iv = self.tmp()
             self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if nc == 2 else '%v3int'} {' '.join(coords)}")
-        is_u, is_s = self.fmt_int_flags(t1)
+        if R9G9B9E5_UAV_EMULATE:
+            fmt_id, is_u, is_s = self._tsharp_format_flags(t1)
+            is_e5, is_u_or_e5 = self.tmp(), self.tmp()
+            self.emit(f"{is_e5} = OpIEqual %bool {fmt_id} {self.cu(self.FMT_5_9_9_9_FLOAT)}")
+            self.emit(f"{is_u_or_e5} = OpLogicalOr %bool {is_u} {is_e5}")
+            pack_fn = self.ensure_rgb9e5_pack_fn()
+        else:
+            is_u, is_s = self.fmt_int_flags(t1)
         v4f, v4u, v4s = self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{v4f} = OpCompositeConstruct %v4float {' '.join(fv)}")
         self.emit(f"{v4u} = OpCompositeConstruct %v4uint_st {' '.join(uv)}")
         self.emit(f"{v4s} = OpCompositeConstruct %v4int_st {' '.join(sv)}")
         act = self.active_b()
-        L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3")}
+        keys = ("do", "end", "s", "rest", "e2", "u", "e5", "um", "f", "e3") if R9G9B9E5_UAV_EMULATE else (
+            "do", "end", "s", "rest", "e2", "u", "f", "e3")
+        L = {k: self.tmp() + "_" + k for k in keys}
 
         def write(cls, texel):
             ip, img = self.tmp(), self.tmp()
@@ -13222,9 +13296,28 @@ class Gen:
         self.emit(f"OpBranch {L['e2']}")
         self.emit(f"{L['rest']} = OpLabel")
         self.emit(f"OpSelectionMerge {L['e3']} None")
-        self.emit(f"OpBranchConditional {is_u} {L['u']} {L['f']}")
+        self.emit(f"OpBranchConditional {is_u_or_e5 if R9G9B9E5_UAV_EMULATE else is_u} {L['u']} {L['f']}")
         self.emit(f"{L['u']} = OpLabel")
-        write(1, v4u)
+        if R9G9B9E5_UAV_EMULATE:
+            # Route GFX10_FORMAT_5_9_9_9_FLOAT (132) through the single %stv1 OpImageWrite via packed R32_UINT,
+            # matching the runtime's mutable R32_UINT UAV view while skipping the pack helper for integer T#s.
+            self.emit(f"OpSelectionMerge {L['um']} None")
+            self.emit(f"OpBranchConditional {is_e5} {L['e5']} {L['um']}")
+            self.emit(f"{L['e5']} = OpLabel")
+            p9 = self.tmp()
+            self.emit(f"{p9} = OpFunctionCall %uint {pack_fn} {fv[0]} {fv[1]} {fv[2]}")
+            self.emit(f"OpBranch {L['um']}")
+            self.emit(f"{L['um']} = OpLabel")
+            phi_c = []
+            for u_c, e5_c in zip(uv, (p9, self.cu(0), self.cu(0), self.cu(0))):
+                ph = self.tmp()
+                self.emit(f"{ph} = OpPhi %uint {e5_c} {L['e5']} {u_c} {L['u']}")
+                phi_c.append(ph)
+            v4u_sel = self.tmp()
+            self.emit(f"{v4u_sel} = OpCompositeConstruct %v4uint_st {' '.join(phi_c)}")
+            write(1, v4u_sel)
+        else:
+            write(1, v4u)
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['f']} = OpLabel")
         write(0, v4f)
@@ -14914,6 +15007,8 @@ def assemble(gen):
         types.append("%fn_fmt_decode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 5))
     if gen.fmt_enc_fn:
         types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 29))
+    if gen.rgb9e5_pack_fn:
+        types.append("%fn_rgb9e5_pack = OpTypeFunction %uint %float %float %float")
     for arity, fn_type in sorted(gen.x_round_fn_types.items()):
         types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
     # dedupe_types keeps the first uvec4 it meets: when the typed-image types follow, declare the ballot type after
@@ -15284,7 +15379,7 @@ def assemble(gen):
         fn.append(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {gen.cu(r)}")
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
-    helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])
+    helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or []) + (gen.rgb9e5_pack_fn or [])
     for function in gen.tbuffer_norm_fns.values():
         helpers.extend(function)
     for function in gen.x_round_fns.values():
@@ -18016,6 +18111,9 @@ def main():
                     help="keep only s0..s31 (128 bytes) in push constants and read the heap base, code base and "
                          "--mesh-compute output address from a uniform block at set 1, binding 0 (metadata: pc_tail), "
                          "for devices whose maxPushConstantsSize is below 144")
+    ap.add_argument("--r9g9b9e5-uav-emulate", action="store_true",
+                    help="emulate R9G9B9E5_SHAREDEXP (GFX10 FORMAT 132) image_store by packing RGB floats into R32_UINT "
+                         "on %%stv1 (as_uint), for devices whose VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks STORAGE_IMAGE_BIT")
     ap.add_argument("--max-structured-depth", type=_depth_arg, default=MAX_STRUCTURED_DEPTH, metavar="N",
                     help="a shader whose structured control flow nests deeper than N is emitted in the dispatch-loop "
                          "form instead (default %(default)s; 0 = never): that form validates faster at great depth "
@@ -18041,7 +18139,7 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
+    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, R9G9B9E5_UAV_EMULATE, OPT_SPIRV
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
     global FMA_EXACT
@@ -18057,6 +18155,7 @@ def main():
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
+    R9G9B9E5_UAV_EMULATE = a.r9g9b9e5_uav_emulate
     OPT_SPIRV = a.opt
     if a.merge:
         try:

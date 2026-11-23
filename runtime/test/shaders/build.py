@@ -51,6 +51,22 @@ sys.path.insert(0, HERE)  # this script is also run with python -I
 from compute_fixture import compute_header, shift_user_data, user_data_shift  # noqa: E402
 
 
+def r9g9b9e5_uav_emulate_override():
+    v = (os.environ.get("LEONIDA_R9G9B9E5_UAV_EMULATE") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def r9g9b9e5_uav_emulate():
+    override = r9g9b9e5_uav_emulate_override()
+    if override is not None:
+        return override
+    return _vk_probe().get("r9g9b9e5_uav_emulate") is True
+
+
 def barycentric_fallback_override():
     v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
     if v in ("1", "true", "yes", "on"):
@@ -60,17 +76,20 @@ def barycentric_fallback_override():
     return None
 
 
+def _vk_probe():
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return {}
+
+
 def barycentric_fallback():
     override = barycentric_fallback_override()
     if override is not None:
         return override
-    try:
-        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
-                           capture_output=True, text=True, timeout=60)
-        answer = json.loads(r.stdout.strip().splitlines()[-1])
-        return answer.get("barycentric_fallback") is True
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-        return False
+    return _vk_probe().get("barycentric_fallback") is True
 
 
 def asm_mattr(path):
@@ -197,6 +216,8 @@ def translate_tests(work, names):
         cmd.append("--f16-interp-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
+    if r9g9b9e5_uav_emulate():   # R9G9B9E5_SHAREDEXP image_store packed to R32_UINT on GPUs without E5B9G9R9 storage
+        cmd.append("--r9g9b9e5-uav-emulate")
     # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).
     if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--pc-tail-ubo")

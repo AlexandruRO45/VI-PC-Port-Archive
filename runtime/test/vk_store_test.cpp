@@ -1,6 +1,6 @@
 // Headless Vulkan test for translated typed image stores and loads (runtime/test/shaders/cs_imgstore.asm and
 // cs_imgload.asm).
-// Usage: vk_store_test cs.spv [load|load-d16|words|signed-zero]
+// Usage: vk_store_test cs.spv [load|load-d16|words|signed-zero|r9g9b9e5]
 // The shader builds three T#s (word1 FORMAT = 56 rgba8 unorm, 20 r32 uint, 21 r32 sint) and stores to three 8x8
 // images. The translator picks the float / uint / sint view (set 0, bindings 8 / 9 / 10 for 2D) from the FORMAT
 // field, and the bindless index from the descriptor hash table (binding 2). As in the runtime, each image has its
@@ -23,12 +23,24 @@
 #include "spirv_capability.h"
 #include "../src/gfx10_descriptors.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
+
+static bool r9g9b9e5_emulate_env() {
+    const char* v = std::getenv("LEONIDA_R9G9B9E5_UAV_EMULATE");
+    std::string s = v ? v : "";
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+    for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return s == "1" || s == "true" || s == "yes" || s == "on";
+}
 
 static PFN_vkGetInstanceProcAddr gipa;
 #define CHECK(x)                                                                         \
@@ -60,7 +72,7 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|signed-zero]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|signed-zero|r9g9b9e5]\n"); return 2; }
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -74,6 +86,7 @@ int main(int argc, char** argv) {
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetDeviceProcAddr);
     LOADI(vkGetPhysicalDeviceMemoryProperties); LOADI(vkGetPhysicalDeviceFeatures);
+    LOADI(vkGetPhysicalDeviceFormatProperties);
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(inst, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
@@ -116,6 +129,7 @@ int main(int argc, char** argv) {
     const bool load_mode = packed_load || (argc > 2 && !std::strcmp(argv[2], "load"));
     // "words" mode: the two images filled as for "load"; the shader's results are whatever it leaves in them.
     const bool words_mode = argc > 2 && !std::strcmp(argv[2], "words");
+    const bool r9g9b9e5_mode = argc > 2 && !std::strcmp(argv[2], "r9g9b9e5");
     const bool signed_zero = argc > 2 && !std::strcmp(argv[2], "signed-zero");
     if (signed_zero) {
         LOADI(vkGetPhysicalDeviceProperties2);
@@ -230,6 +244,10 @@ int main(int argc, char** argv) {
         uint32_t t[8] = {0x5000, fmts[1] << 20, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55};
         table_insert(table, t, 1);
     }
+    if (r9g9b9e5_mode) {
+        uint32_t t[8] = {0x6000, 132u << 20, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66};
+        table_insert(table, t, 5);
+    }
     VkBuffer tb; void* tbp;
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbp));
     std::memcpy(tbp, table.data(), table.size() * 4);
@@ -252,6 +270,52 @@ int main(int argc, char** argv) {
         vi.image = img[k]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = vkf[k];
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &view[k]));
+    }
+    bool native_e5_storage = false;
+    VkImage img_e5{}; VkImageView e5_store_view{}, e5_sampled_view{};
+    if (r9g9b9e5_mode) {
+        VkFormatProperties e5_fp{}, r32_fp{};
+        vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, &e5_fp);
+        vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_R32_UINT, &r32_fp);
+        native_e5_storage = !r9g9b9e5_emulate_env() &&
+                            ((e5_fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0);
+        if (!native_e5_storage && (!(e5_fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ||
+                                   !(r32_fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))) {
+            std::printf("unsupported: device lacks E5B9G9R9 sampled or R32_UINT storage support\n");
+            return 77;
+        }
+        const VkFormat fmt_list[2] = {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32};
+        VkImageFormatListCreateInfo fli{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+        fli.viewFormatCount = 2; fli.pViewFormats = fmt_list;
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.format = native_e5_storage ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : VK_FORMAT_R32_UINT;
+        ii.flags = native_e5_storage ? 0 : (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
+        ii.pNext = native_e5_storage ? nullptr : &fli;
+        ii.extent = {W, W, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                   VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        CHECK(vkCreateImage(dev, &ii, nullptr, &img_e5));
+        VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, img_e5, &mr);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory m; CHECK(vkAllocateMemory(dev, &mai, nullptr, &m));
+        CHECK(vkBindImageMemory(dev, img_e5, m, 0));
+        VkImageViewUsageCreateInfo vu{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = img_e5; vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (native_e5_storage) {
+            vi.format = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+            CHECK(vkCreateImageView(dev, &vi, nullptr, &e5_store_view));
+            e5_sampled_view = e5_store_view;
+        } else {
+            vu.usage = VK_IMAGE_USAGE_STORAGE_BIT; vi.pNext = &vu; vi.format = VK_FORMAT_R32_UINT;
+            CHECK(vkCreateImageView(dev, &vi, nullptr, &e5_store_view));
+            vu.usage = VK_IMAGE_USAGE_SAMPLED_BIT; vi.pNext = &vu; vi.format = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+            CHECK(vkCreateImageView(dev, &vi, nullptr, &e5_sampled_view));
+        }
     }
     VkImage wide; VkImageView wide_view;
     {
@@ -295,7 +359,7 @@ int main(int argc, char** argv) {
     // through integer aliases); every element of a storage array holds the image of its class, so all of them are
     // valid descriptors. Bindings 4 and 7 = the 2D and 3D r32ui storage images of the image atomics: the uint image
     // and the volume, in every element.
-    constexpr uint32_t N = 5;
+    constexpr uint32_t N = 6;
     VkDescriptorSetLayoutBinding b[8]{};
     b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -323,7 +387,8 @@ int main(int argc, char** argv) {
                                     {VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL},
                                     {VK_NULL_HANDLE, view[1], VK_IMAGE_LAYOUT_GENERAL},
                                     {VK_NULL_HANDLE, view[2], VK_IMAGE_LAYOUT_GENERAL},
-                                    {VK_NULL_HANDLE, wide_view, VK_IMAGE_LAYOUT_GENERAL}};
+                                    {VK_NULL_HANDLE, wide_view, VK_IMAGE_LAYOUT_GENERAL},
+                                    {VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorImageInfo smpi{sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkDescriptorImageInfo dii[3][N];
     VkDescriptorImageInfo r32ui[N], r32ui_3d[N];
@@ -344,6 +409,15 @@ int main(int argc, char** argv) {
     for (uint32_t e = 0; e < N; e++) r32ui_3d[e] = {VK_NULL_HANDLE, vol_view, VK_IMAGE_LAYOUT_GENERAL};
     wr[7].dstBinding = 7; wr[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     wr[7].pImageInfo = r32ui_3d; wr[7].descriptorCount = N;
+    if (r9g9b9e5_mode) {
+        sii[5] = {VK_NULL_HANDLE, e5_sampled_view, VK_IMAGE_LAYOUT_GENERAL};
+        if (native_e5_storage) {
+            dii[0][5] = {VK_NULL_HANDLE, e5_store_view, VK_IMAGE_LAYOUT_GENERAL};
+        } else {
+            dii[1][5] = {VK_NULL_HANDLE, e5_store_view, VK_IMAGE_LAYOUT_GENERAL};
+            r32ui[5] = {VK_NULL_HANDLE, e5_store_view, VK_IMAGE_LAYOUT_GENERAL};
+        }
+    }
     vkUpdateDescriptorSets(dev, 8, wr, 0, nullptr);
 
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -384,8 +458,8 @@ int main(int argc, char** argv) {
         {0, 32768, 32767}, {0, -32768, -32768}, {0, -32769, -32768}, {65536, -32769, 32767},
     };
     static_assert(sizeof(boundary) / sizeof(boundary[0]) == W);
-    // Load/words modes seed the integer images. The signed-zero probe seeds every component of all three images.
-    const int first_fill = signed_zero ? 0 : filled ? 1 : 3;
+    // Load/words/r9g9b9e5 modes seed images before dispatch (zero-filled here so untouched rgba8 control texels stay 0).
+    const int first_fill = (signed_zero || r9g9b9e5_mode) ? 0 : filled ? 1 : 3;
     VkBuffer fill[3]{};
     for (int k = first_fill; k < 3; ++k) {
         void* mapped;
@@ -394,6 +468,7 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < image_words; ++i) {
             const bool edge = packed_load && i / W == W - 1;
             if (signed_zero) words[i] = 0x39000000u + k * image_words + i;
+            else if (r9g9b9e5_mode) words[i] = 0;
             else if (k == 1) words[i] = edge ? boundary[i % W].u : 100 + i;
             else words[i] = static_cast<uint32_t>(edge ? boundary[i % W].s : -2 * int32_t(i));
         }
@@ -405,6 +480,12 @@ int main(int argc, char** argv) {
         CHECK(make_buffer(vol_texels * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &vol_fill, &vol_fillp));
         CHECK(make_buffer(vol_texels * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &vol_rb, &vol_rbp));
         for (uint32_t i = 0; i < vol_texels; i++) static_cast<uint32_t*>(vol_fillp)[i] = 200 + i;
+    }
+    VkBuffer e5_fill{}, e5_rb{}; void* e5_fillp = nullptr; void* e5_rbp = nullptr;
+    if (r9g9b9e5_mode) {
+        CHECK(make_buffer(W * W * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &e5_fill, &e5_fillp));
+        CHECK(make_buffer(W * W * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &e5_rb, &e5_rbp));
+        for (uint32_t i = 0; i < W * W; i++) static_cast<uint32_t*>(e5_fillp)[i] = 0xdeadbeefu;
     }
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cpci.queueFamilyIndex = qi;
     VkCommandPool pool; CHECK(vkCreateCommandPool(dev, &cpci, nullptr, &pool));
@@ -452,6 +533,22 @@ int main(int argc, char** argv) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
                              0, nullptr, 1, &vol_ib);
     }
+    VkImageMemoryBarrier e5_ib = ib[0];
+    if (r9g9b9e5_mode) {
+        e5_ib.image = img_e5;
+        e5_ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; e5_ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        e5_ib.srcAccessMask = 0; e5_ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &e5_ib);
+        VkBufferImageCopy bic{};
+        bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bic.imageExtent = {W, W, 1};
+        vkCmdCopyBufferToImage(cmd, e5_fill, img_e5, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+        e5_ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; e5_ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        e5_ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        e5_ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &e5_ib);
+    }
     if (first_fill < 3) {
         for (int k = first_fill; k < 3; k++) {
             VkBufferImageCopy bic{};
@@ -496,6 +593,16 @@ int main(int argc, char** argv) {
         bic.imageSubresource = vol_layers; bic.imageExtent = {VOL, VOL, VOL};
         vkCmdCopyImageToBuffer(cmd, vol, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vol_rb, 1, &bic);
     }
+    if (r9g9b9e5_mode) {
+        e5_ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL; e5_ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        e5_ib.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        e5_ib.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &e5_ib);
+        VkBufferImageCopy bic{};
+        bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bic.imageExtent = {W, W, 1};
+        vkCmdCopyImageToBuffer(cmd, img_e5, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, e5_rb, 1, &bic);
+    }
     // Make every copy's readback writes visible to the host before it reads the mapped buffers.
     VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -532,6 +639,16 @@ int main(int argc, char** argv) {
             for (uint32_t i = 0; i < W * W; i++) std::printf(" 0x%08x", static_cast<const uint32_t*>(words[k])[i]);
             std::printf("\n");
         }
+        return 0;
+    }
+    if (r9g9b9e5_mode) {
+        std::printf("r9g9b9e5 mode: %s\n", native_e5_storage ? "native E5B9G9R9" : "emulated R32_UINT");
+        std::printf("r9g9b9e5 words:");
+        for (uint32_t i = 0; i < W * W; i++) std::printf(" 0x%08x", static_cast<const uint32_t*>(e5_rbp)[i]);
+        std::printf("\n");
+        std::printf("rgba8 words:");
+        for (uint32_t i = 0; i < W * W; i++) std::printf(" 0x%08x", static_cast<const uint32_t*>(rbp[0])[i]);
+        std::printf("\n");
         return 0;
     }
     uint32_t bad[3] = {};
