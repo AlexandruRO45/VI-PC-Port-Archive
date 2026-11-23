@@ -259,11 +259,25 @@ int main() {
     check(at<GetInfo>(save, 13)(save, provider, "slots/SAVE_00.sav-1", &wi, waiting_container) == S_OK &&
               wi.status == S_OK && wi.seen.names == info.names,
           "container info permits async quota and preserves records");
+    Handle other = nullptr, other_update = nullptr;
+    check(at<Create>(save, 16)(save, provider, "other", &other) == S_OK && other &&
+              at<Create>(save, 23)(save, other, "Other", &other_update) == S_OK && other_update &&
+              at<Submit>(save, 27)(save, other_update) == S_OK,
+          "create a non-matching container for filtered enumeration");
+    Seen both;
+    check(at<EnumContainers>(save, 14)(save, provider, &both, on_container) == S_OK && both.names.size() == 2,
+          "unfiltered enumeration sees both containers");
     using EnumContainersByName = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, void*, ContainerCb);
     CallbackWait wp{save, provider};
     check(at<EnumContainersByName>(save, 15)(save, provider, "slots/", &wp, waiting_container) == S_OK &&
-              wp.status == S_OK && wp.seen.names == containers.names,
+              wp.status == S_OK && wp.seen.names.size() == 1 && wp.seen.names[0] == "slots/SAVE_00.sav-1",
           "filtered container enumeration permits async quota and preserves order");
+    at<Close>(save, 24)(save, other_update);
+    at<Close>(save, 17)(save, other);
+    XAsyncBlock delete_other{};
+    check(at<ByNameAsync>(save, 11)(save, provider, "other", &delete_other) == S_OK && finished(&delete_other) &&
+              at<AsyncOnly>(save, 12)(save, &delete_other) == S_OK,
+          "delete the non-matching container");
     CallbackWait wb{save, provider};
     check(at<EnumBlobs>(save, 18)(save, container, &wb, waiting_blob) == S_OK &&
               wb.status == S_OK && wb.seen.names == blobs.names && wb.seen.sizes == blobs.sizes,
