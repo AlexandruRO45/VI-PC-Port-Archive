@@ -552,6 +552,29 @@ class TestDSSubU32ConditionCodesAndStatusFlags(unittest.TestCase):
 
         self.assertEqual(state.lgkm_cnt, 4)
 
+class TestDSSubU32BoundaryExtremes(unittest.TestCase):
+    """Part 7: Boundary extremes, underflow wrapping, and address wrap."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_bytes=4096)
+        self.interp = ScalarDSInterpreter(self.lds)
+        self.state = ScalarThreadState(self.lds)
+
+    def test_extrema_subtractions(self) -> None:
+        self.assertEqual(ref_ds_sub_u32(0, 0), 0)
+        self.assertEqual(ref_ds_sub_u32(0, 1), 0xFFFFFFFF)
+        self.assertEqual(ref_ds_sub_u32(0xFFFFFFFF, 0xFFFFFFFF), 0)
+        self.assertEqual(ref_ds_sub_u32(0xFFFFFFFF, 1), 0xFFFFFFFE)
+        self.assertEqual(ref_ds_sub_u32(0x80000000, 0x80000000), 0)
+        self.assertEqual(ref_ds_sub_u32(0x80000000, 1), 0x7FFFFFFF)
+        self.assertEqual(ref_ds_sub_u32(0x7FFFFFFF, 0xFFFFFFFF), 0x80000000)
+
+    def test_memory_address_wrapping_boundaries(self) -> None:
+        idx = self.lds.resolve_dword_index(0xFFFFFFFC, offset=4)
+        self.assertEqual(idx, 0)
+        idx2 = self.lds.resolve_dword_index(4096)
+        self.assertEqual(idx2, 0)
+
 
 if __name__ == '__main__':
     unittest.main()
