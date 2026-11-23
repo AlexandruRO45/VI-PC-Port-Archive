@@ -316,6 +316,13 @@ class TestSBcnt0I32B32TranslatorAndControls(unittest.TestCase):
         with self.assertRaises(Exception):
             support.translate_lines("ps_neg_s_bcnt0_i32_b32", ["s_bcnt0_i32_b32", "s_endpgm"])
 
+class TestSBcnt0I32B64ReferenceOracle(unittest.TestCase):
+    """Stage 1 for s_bcnt0_i32_b64: reference mathematical oracle validation."""
+
+    def test_s_bcnt0_i32_b64_oracle_identity(self):
+        res = oracle_s_bcnt0_i32_b64(0xfffffffe, 0xffffffff)
+        self.assertEqual(res, 0x1)
+
 
 if __name__ == '__main__':
     unittest.main()
