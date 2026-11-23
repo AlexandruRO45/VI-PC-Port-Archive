@@ -18,6 +18,7 @@ import rdna2spirv  # noqa: E402
 from test_wave64_halves import (  # noqa: E402
     AGG_HEAD,
     AGG_RANK,
+    LANE_ID,
     meta_of,
     out_param,
     ps,
@@ -63,6 +64,19 @@ class SoundnessRegressions(unittest.TestCase):
             "s_addk_i32 s6, 1",
             "v_mov_b32_e32 v6, s6",
         ], contains=["lane-count"])
+
+    def test_sdwa_preserve_keeps_lane_id_in_high_word(self):
+        body = LANE_ID + [
+            "v_lshlrev_b32_e32 v6, 16, v10",
+            "v_mov_b32_sdwa v6, v0 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD",
+            "v_lshrrev_b32_e32 v6, 16, v6",
+        ]
+        self.assert_tier_c_and_diverges("vs_sdwa_preserve", body, contains=["lane-id"])
+
+        zero_pad = [line.replace("UNUSED_PRESERVE", "UNUSED_PAD") for line in body]
+        (tier, reasons, _), asm = meta_of("vs_sdwa_pad", vs(zero_pad))
+        self.assertEqual((tier, reasons), ("A", []))
+        self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)))
 
     def test_s_mulk_i32_preserves_lane_count_taint(self):
         self.assert_tier_c_and_diverges("vs_rmw_mulk", [
