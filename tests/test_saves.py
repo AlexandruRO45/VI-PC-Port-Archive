@@ -1143,6 +1143,45 @@ class PackIndexValidationTest(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(rd(self.index_path), before)
 
+    def block_path(self):
+        return os.path.join(self.extracted, self.index["entries"][0]["file"])
+
+    def test_block_at_the_body_limit_packs_and_reads_back(self):
+        # King1565 on #5240: pack wrote a 600-level block that info then refused. The body adds two levels.
+        levels = saves.MAX_JSON_DEPTH - saves.JSAV_BLOCK_NESTING
+        write(self.block_path(), b"[" * levels + b"0" + b"]" * levels)
+        data = saves.pack_from_dir(self.extracted)
+        self.assertEqual(jsav_body_depth(data), saves.MAX_JSON_DEPTH)
+        saves.parse_jsav(data)
+
+    def test_block_that_would_nest_the_body_too_deep_names_the_block(self):
+        # 100,000 levels: past the decoder on 3.12 (RecursionError), measured by json_depth from 3.14 on.
+        for levels in (saves.MAX_JSON_DEPTH - saves.JSAV_BLOCK_NESTING + 1, 100_000):
+            with self.subTest(levels=levels):
+                write(self.block_path(), b"[" * levels + b"0" + b"]" * levels)
+                with self.assertRaises(ValueError) as error:
+                    saves.pack_from_dir(self.extracted)
+                self.assertIn(self.block_path(), str(error.exception))
+                self.assertIn(f"at most {saves.MAX_JSON_DEPTH}", str(error.exception))
+
+    def test_cli_too_deep_block_preserves_existing_output(self):
+        levels = saves.MAX_JSON_DEPTH - saves.JSAV_BLOCK_NESTING + 1
+        write(self.block_path(), b"[" * levels + b"0" + b"]" * levels)
+        out = os.path.join(self.tmp.name, "packed.jsav")
+        write(out, b"previous complete output")
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, out],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR:", result.stderr)
+        self.assertIn(self.block_path(), result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(rd(out), b"previous complete output")
+
+    def test_block_that_is_not_json_is_still_copied_verbatim(self):
+        write(self.block_path(), b"not json {")
+        data = saves.pack_from_dir(self.extracted)
+        self.assertIn(b"not json {", data)
+
     def test_valid_editable_metadata_still_round_trips(self):
         self.index["header"]["note"] = "extra metadata is ignored"
         self.index["entries"][0]["hash"] = "0X" + self.index["entries"][0]["hash"]

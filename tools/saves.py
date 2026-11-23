@@ -33,11 +33,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
-# The deepest a JSAV body or an ASAV JSON payload may nest arrays and objects. extract writes both back indented, and
-# Python's indenting encoder recurses once per level: it stops at 994 levels under the default recursion limit
-# (3.12, 3.14 and 3.15 alike). The C decoder in front of it takes 9,996 levels on 3.12 and over 100,000 from 3.14
-# on, so decoding alone is no guard. One explicit limit gives every command and Python version the same answer.
+# The deepest a JSAV body or an ASAV JSON payload may nest arrays and objects. How deep json goes depends on the
+# Python release: on 3.12 the C decoder takes 9,996 levels and extract's indenting encoder (json.dump(indent=1))
+# 994; from 3.14 on both go tens of thousands of levels (the decoder 40,071 on 3.14.6 and 116,219 on 3.14.10). So
+# neither the decoder nor a RecursionError is a guard. One explicit limit, below the encoder's on every release,
+# gives every command and Python version the same answer.
 MAX_JSON_DEPTH = 512
+# build_jsav puts each block two levels down in the body: in the top object, then in its block array.
+JSAV_BLOCK_NESTING = 2
 
 
 def json_depth(value):
@@ -454,7 +457,22 @@ def pack_from_dir(src, refuse=None):
         if not 0 <= hashed <= 0xFFFFFFFF:
             invalid(prefix + '.hash', 'a hexadecimal uint32 string')
         hashes.append(hashed)
-    blocks = [source(e['file']) for e in es]
+    blocks = []
+    for e in es:
+        block_path = os.path.join(src, e['file'])
+        blocks.append(source(e['file']))
+        # Every read command refuses a body deeper than MAX_JSON_DEPTH, so refuse a block that would make one instead
+        # of writing a save this tool can't read back. A block that isn't JSON at all is still copied verbatim.
+        try:
+            depth = json_depth(json.loads(blocks[-1]))
+        except RecursionError:
+            depth = None
+        except ValueError:
+            continue
+        if depth is None or depth > MAX_JSON_DEPTH - JSAV_BLOCK_NESTING:
+            nests = 'deeper than this Python\'s JSON decoder reads' if depth is None else f'{depth} levels deep'
+            raise ValueError(f'{block_path}: the block nests {nests}; the save body adds {JSAV_BLOCK_NESTING} '
+                             f'levels and this tool reads at most {MAX_JSON_DEPTH}')
     return build_jsav(h['version'], h['code_blocks'], hashes, [e['flags'] for e in es], blocks)
 
 

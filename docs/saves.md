@@ -176,5 +176,10 @@ python -I tools/save_keys.py collect <save file or extract folder>...           
 python -I tools/save_keys.py resolve <saves>... --dict <files>... [--compose N] [--out FILE]
 ```
 
+Every command reads JSON nested at most 512 levels deep (`MAX_JSON_DEPTH` in `tools/saves.py`), whatever the Python
+release's own `json` limits. A deeper JSAV body is an invalid save. `extract` keeps a deeper ASAV payload as
+`payload.bin` only. `pack` refuses a block nested more than 510 levels, because the body puts every block two levels
+down and `info` would refuse the file.
+
 `tests/test_saves.py` and `tests/test_save_keys.py` cover all of it on synthetic containers and names built in the
 tests.
