@@ -609,3 +609,35 @@ class TestXorB32NegativeAndTranslator(unittest.TestCase):
         ])
         self.assertIn("OpBitwiseXor", spv)
         self.assertEqual(val, 0xF0F0)
+
+
+# ------------------------------------------------------------------------------
+# v_not_b32 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+def ref_not_b32(s0: int) -> int:
+    return (~s0) & MASK32
+
+
+class TestNotB32Oracle(unittest.TestCase):
+    def test_oracle_matches_hardware(self):
+        vectors = [0, 0xFFFFFFFF, 0x00FF_00FF, 0x1234_5678, 0xAAAA_AAAA]
+        for idx, a in enumerate(vectors):
+            val, _ = run_shader(f"ps_not_oracle_{idx}", [
+                f"v_mov_b32 v1, {hex(a)}",
+                "v_not_b32 v0, v1",
+            ])
+            self.assertEqual(val, ref_not_b32(a))
+
+    def test_oracle_identities_hardware(self):
+        val_zero, _ = run_shader("ps_not_zero", [
+            "v_mov_b32 v1, 0",
+            "v_not_b32 v0, v1",
+        ])
+        self.assertEqual(val_zero, 0xFFFFFFFF)
+
+        val_all1, _ = run_shader("ps_not_all1", [
+            "v_mov_b32 v1, 0xFFFFFFFF",
+            "v_not_b32 v0, v1",
+        ])
+        self.assertEqual(val_all1, 0)
