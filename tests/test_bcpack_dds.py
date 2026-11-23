@@ -11,11 +11,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "tools")]
 
 from bcpack_tables import BC1_HISTORY_CONFIRMED
+import ttpf_assets
 import ttpf_mips as ttpf
 import test_ttpf_mips as fixtures
 from test_bcpack import encode_bc7_mode6_blocks, encode_lanes
@@ -94,6 +96,53 @@ class RustBatchExport(unittest.TestCase):
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["reason"], "BC1 block 0 has a nonzero reserved lane")
         self.assertFalse((self.out / "tex_00000.dds").exists())
+
+    def test_mixed_publication_report(self):
+        records = [fixtures.pack_etpf_record(4, 4, 0, 1, 71, 1, 1, 4, i * 4096)
+                   for i in range(1, 4)]
+        fixtures.write_rds5_pool(self.source, records, [bytes(4096)] * 3)
+        pool = bytearray(self.source.read_bytes()[:4352])
+        lanes = [bytes(512) for _ in range(12)]
+        good = encode_lanes(lanes, 1)
+        for i, data in enumerate((good, good, good[:1])):
+            pad = -len(data) % 256
+            entry = len(pool) // 256 | (1 << 26) | ((1 + i) << 30) | (pad << 52)
+            struct.pack_into("<Q", pool, 24 + 8 * i, entry)
+            pool.extend(data + bytes(pad))
+        struct.pack_into("<Q", pool, 48, len(pool) // 256 | (4 << 30))
+        self.source.write_bytes(pool)
+
+        def run(directory, report):
+            directory.mkdir()
+            manifest = {"Textures": [{"Index": i, "DxgiFormat": 71, "File": None} for i in range(3)]}
+            result = ttpf_assets.complete_pool(self.source, directory, manifest, ("v1-strict", None),
+                                               os.environ["LEONIDA_BCPACK_DDS"], report=report)
+            self.assertEqual(result, (2, 1), manifest)
+            return {p.name: p.read_bytes() for p in directory.iterdir()}
+
+        invoke = subprocess.run
+
+        def refuse_second(command, **kwargs):
+            result = invoke(command, **kwargs)
+            result.check_returncode()
+            catalog = Path(command[2], "manifest.json")
+            rows = json.loads(catalog.read_bytes())
+            rows[1] = {"index": 1, "status": "failed", "reason": "controlled batch refusal"}
+            catalog.write_text(json.dumps(rows), encoding="utf-8", newline="\n")
+            return result
+
+        with mock.patch.object(subprocess, "run", side_effect=refuse_second):
+            ordinary = run(self.root / "ordinary", False)
+            outputs = run(self.out, True)
+        entries = json.loads(outputs.pop("bcpack-export-report.json"))["entries"]
+        self.assertEqual(outputs, ordinary)
+        self.assertEqual([e["index"] for e in entries], [0, 1, 2])
+        self.assertEqual([(e["publisher"], e["outcome"]) for e in entries],
+                         [("rust", "published"), ("python", "published"), (None, "blocked")])
+        self.assertEqual(entries[1]["rust"]["reason"], "controlled batch refusal")
+        self.assertEqual(entries[1]["decoder"], "v1-strict")
+        self.assertTrue(entries[2]["rust"]["reason"])
+        self.assertTrue(entries[2]["reason"])
 
     def test_fitted_bc7_signature(self):
         block = bytes.fromhex("40317204a56819be023456789abcdef0")

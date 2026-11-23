@@ -99,12 +99,17 @@ class TextureAssets(unittest.TestCase):
             bcpack.decode(stream[:1], 7, len(expected))
 
     @unittest.skipUnless(os.environ.get("LEONIDA_BCPACK_DDS"), "set LEONIDA_BCPACK_DDS to the built CLI")
+    @mock.patch.dict(os.environ, {"LEONIDA_BCPACK_EXPORT_REPORT": "1"})
     def test_assets_complete_pool_through_rust_batch(self):
         _, linear, _ = build_bc1_bcpack_pool(self.pool)
         self.legacy()
         with mock.patch.object(ttpf_assets.ttpf, "Pool", side_effect=AssertionError("expected Rust batch")):
             self.build()
+            report = self.folder / "bcpack-export-report.json"
+            original = report.read_bytes()
             self.build()
+        self.assertEqual(report.read_bytes(), original)
+        self.assertEqual(json.loads(original)["entries"][0]["publisher"], "rust")
         row = self.row_after_export()
         self.assertEqual(row["BCPackDecoder"], "v1-strict")
         self.assertEqual((self.folder / row["File"]).read_bytes()[148:], b"".join(linear.values()))

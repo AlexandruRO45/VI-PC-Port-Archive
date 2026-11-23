@@ -71,7 +71,7 @@ def candidate(row, profile):
             or row.get("Mips", 0) < row.get("SourceMips", 0))
 
 
-def complete_pool(source, directory, manifest, settings, rust_exporter=None, jobs=1):
+def complete_pool(source, directory, manifest, settings, rust_exporter=None, jobs=1, *, report=False):
     """Publish full chains next to ordinary DDS files, then switch the catalog to them."""
     stamp, profile = settings
     pass_stamp = stamp if rust_exporter is None else f"{stamp}-rust-batch-v2"
@@ -81,6 +81,17 @@ def complete_pool(source, directory, manifest, settings, rust_exporter=None, job
     if not rows:
         return 0, 0
     directory = Path(directory)
+    entries = {row["Index"]: {"index": row["Index"], "rust": None, "publisher": None,
+                               "outcome": "skipped"} for row in rows} if report else {}
+
+    def finish():
+        if report:
+            summary = {"pass": pass_stamp, "entries": list(entries.values())}
+            publish(directory / "bcpack-export-report.json", json.dumps(summary, indent=2).encode("utf-8"))
+        manifest["BCPackPass"] = pass_stamp
+        publish(directory / "manifest.json", json.dumps(manifest, indent=2).encode("utf-8"))
+        return written, blocked
+
     written = blocked = 0
     if rust_exporter is not None:
         with tempfile.TemporaryDirectory(prefix=".bcpack-", dir=directory) as temp:
@@ -98,6 +109,9 @@ def complete_pool(source, directory, manifest, settings, rust_exporter=None, job
                 command += ["--calibration", str(profile_path)]
             result = subprocess.run(command, capture_output=True, encoding="utf-8")
             if result.returncode:
+                for item in entries.values():
+                    item["rust"] = {"status": "batch_failed", "exit_code": result.returncode,
+                                    "reason": result.stderr.strip()}
                 print(f"Rust BCPack export failed for {source}: {result.stderr.strip()}", file=sys.stderr)
             else:
                 exported = {row["index"]: row for row in json.loads((staging / "manifest.json").read_bytes())}
@@ -105,6 +119,11 @@ def complete_pool(source, directory, manifest, settings, rust_exporter=None, job
                 for row in rows:
                     index = row["Index"]
                     entry = exported.get(index, {})
+                    if report:
+                        attempt = {"status": entry.get("status", "missing")}
+                        if "reason" in entry:
+                            attempt["reason"] = entry["reason"]
+                        entries[index]["rust"] = attempt
                     if entry.get("status") == "skipped":
                         continue
                     if entry.get("status") != "success":
@@ -118,12 +137,12 @@ def complete_pool(source, directory, manifest, settings, rust_exporter=None, job
                     os.replace(staged, directory / name)
                     row.update(File=name, Mips=entry["mips"], BaseMipLevel=0, Limitation=None, BCPackDecoder=method)
                     row.pop("BCPackLimitation", None)
+                    if report:
+                        entries[index].update(publisher="rust", outcome="published", decoder=method)
                     written += 1
                 rows = remaining
     if not rows:
-        manifest["BCPackPass"] = pass_stamp
-        publish(directory / "manifest.json", json.dumps(manifest, indent=2).encode("utf-8"))
-        return written, blocked
+        return finish()
 
     with closing(ttpf.Pool(source)) as pool:
         decoder = None
@@ -155,6 +174,8 @@ def complete_pool(source, directory, manifest, settings, rust_exporter=None, job
                 except (ValueError, KeyError, IndexError, ttpf.BcpackRequired,
                         bcpack.BcpackUnsupportedCodec, zlib.error) as exc:
                     row["BCPackLimitation"] = str(exc)
+                    if report:
+                        entries[index].update(outcome="blocked", reason=str(exc))
                     blocked += 1
                     continue
                 # A distinct name keeps an existing lower-mip DDS usable until the manifest switches.
@@ -162,10 +183,10 @@ def complete_pool(source, directory, manifest, settings, rust_exporter=None, job
                 publish(directory / name, blob)
                 row.update(File=name, Mips=desc["mips"], BaseMipLevel=0, Limitation=None, BCPackDecoder=method)
                 row.pop("BCPackLimitation", None)
+                if report:
+                    entries[index].update(publisher="python", outcome="published", decoder=method)
                 written += 1
         finally:
             if decoder:
                 decoder.read_chunk.cache_clear()
-    manifest["BCPackPass"] = pass_stamp
-    publish(directory / "manifest.json", json.dumps(manifest, indent=2).encode("utf-8"))
-    return written, blocked
+    return finish()

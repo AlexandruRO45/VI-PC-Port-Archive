@@ -44,3 +44,5 @@ python -IB tests/test_bcpack_dds.py -q
 ```
 
 The ordinary `assets` stage attempts an offline build when Cargo and the cached dependencies are available. It also accepts a prebuilt executable via `LEONIDA_BCPACK_DDS`. The native batch processes eligible texture completion and the reference readers handle rejected entries. The assets stage publishes the existing catalog used by material lookups.
+
+Set `LEONIDA_BCPACK_EXPORT_REPORT=1` before an assets pass to record each candidate in `bcpack-export-report.json` beside its pool catalog. Entries identify the pool index, original Rust status and diagnostic (when supplied), final outcome, and publisher and decoder for a written DDS. A blocked retry also carries its final diagnostic. The report describes the last instrumented pass. A cached pass does no work and cannot reconstruct earlier attempts. Keep these per-entry reports local.

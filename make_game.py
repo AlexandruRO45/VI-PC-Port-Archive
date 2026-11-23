@@ -1610,7 +1610,9 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
             manifest = ttpf_manifest(pool_dir)
             if manifest is None:
                 fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
-        written, blocked = ttpf_assets.complete_pool(p, pool_dir, manifest, settings, rust_exporter, jobs)
+        written, blocked = ttpf_assets.complete_pool(
+            p, pool_dir, manifest, settings, rust_exporter, jobs,
+            report=os.environ.get("LEONIDA_BCPACK_EXPORT_REPORT") == "1")
         if written or blocked:
             log(f"assets: {name}: {written} full BCPack DDS written, {blocked} limited (see manifest.json)")
     if not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json")):
