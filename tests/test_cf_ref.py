@@ -840,7 +840,7 @@ class ExportHaltStepAndErrorTests(CfRefTestCase):
             (["s_quadmask_b32 s0, vcc_lo", "s_endpgm"], 32),   # wrexec is modelled since FUZZ-8 vccloop/cmpxloop
             (["s_cmp_eq_u64 s[0:1], s[2:3]", "s_endpgm"], 32),   # modelled in wave64 only (FUZZ-8)
             (["s_cmp_eq_u32 v0, 0", "s_endpgm"], 32),
-            (["v_cmp_eq_f32_e32 vcc, v0, v1", "s_endpgm"], 32),
+            (["v_cmp_eq_f16_e32 vcc, v0, v1", "s_endpgm"], 32),
             (["v_cmpx_eq_u32_e64 s[0:1], v0, v1", "s_endpgm"], 64),
             (["exp pos0 v0, v1, v2, v3 done", "s_endpgm"], 32),
             (["exp mrt0 off, off, off, off done vm", "s_endpgm"], 32),

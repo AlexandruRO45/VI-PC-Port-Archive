@@ -32,6 +32,7 @@ API:
     }
 """
 import os
+import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +51,46 @@ _CMP = {
     "eq": lambda a, b: a == b, "ne": lambda a, b: a != b, "lg": lambda a, b: a != b,
     "lt": lambda a, b: a < b, "le": lambda a, b: a <= b, "gt": lambda a, b: a > b, "ge": lambda a, b: a >= b,
 }
+
+
+def _f32(bits):
+    """The value of f32 bits, or None for a NaN (any NaN compares unordered)."""
+    if bits & 0x7F800000 == 0x7F800000 and bits & 0x7FFFFF:
+        return None
+    return struct.unpack("<f", struct.pack("<I", bits & MASK32))[0]
+
+
+def _fcmp(cc, x, y):
+    """VOPC f32 compare (RDNA2 ISA): the ordered forms are false and the n forms true when either side is a NaN;
+    -0 equals +0. f/tru are constant, o/u test for NaNs."""
+    a, b = _f32(x), _f32(y)
+    unordered = a is None or b is None
+    if cc in ("f", "tru"):
+        return cc == "tru"
+    if cc in ("o", "u"):
+        return unordered == (cc == "u")
+    base = {"lt": "lt", "eq": "eq", "le": "le", "gt": "gt", "lg": "lg", "ge": "ge",
+            "nge": "ge", "nlg": "lg", "ngt": "gt", "nle": "le", "neq": "eq", "nlt": "lt"}[cc]
+    if unordered:
+        return cc.startswith("n")
+    r = {"lt": a < b, "eq": a == b, "le": a <= b, "gt": a > b, "lg": a != b, "ge": a >= b}[base]
+    return not r if cc.startswith("n") else r
+
+
+def _fclass(x, mask):
+    """v_cmp_class_f32: bit of S1 for S0's class. 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0,
+    7 +denormal, 8 +normal, 9 +inf."""
+    exp, man, neg = (x >> 23) & 0xFF, x & 0x7FFFFF, x >> 31 & 1
+    if exp == 0xFF:
+        bit = (1 if man >> 22 & 1 else 0) if man else (2 if neg else 9)
+    elif exp == 0:
+        bit = (4 if neg else 7) if man else (5 if neg else 6)
+    else:
+        bit = 3 if neg else 8
+    return mask >> bit & 1
+
+
+_FCMP_CCS = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru")
 _SOP2_LOGIC = {
     "and": lambda a, b, m: a & b, "or": lambda a, b, m: a | b, "xor": lambda a, b, m: a ^ b,
     "andn2": lambda a, b, m: a & ~b & m, "orn2": lambda a, b, m: (a | ~b) & m,
@@ -450,7 +491,10 @@ class WaveMachine(cpu_ref.Machine):
         cmpx = base.startswith("v_cmpx_")
         body = base[len("v_cmpx_"):] if cmpx else base[len("v_cmp_"):]
         cc, _, ty = body.partition("_")
-        if cc not in _CMP or ty not in ("u32", "i32"):
+        if ty == "f32":
+            if cc not in _FCMP_CCS and cc != "class":
+                raise Unsupported(op, self.pc, "compare is not modelled")
+        elif cc not in _CMP or ty not in ("u32", "i32"):
             raise Unsupported(op, self.pc, "compare is not modelled")
         srcs = a if cmpx else a[1:]
         if cmpx and len(a) == 3:
@@ -460,9 +504,13 @@ class WaveMachine(cpu_ref.Machine):
         mask = 0
         for lane in self._active_lanes():
             x, y = self._int_src(srcs[0], lane), self._int_src(srcs[1], lane)
-            if ty == "i32":
-                x, y = _signed(x), _signed(y)
-            if _CMP[cc](x, y):
+            if ty == "f32":
+                hit = _fclass(x, y) if cc == "class" else _fcmp(cc, x, y)
+            else:
+                if ty == "i32":
+                    x, y = _signed(x), _signed(y)
+                hit = _CMP[cc](x, y)
+            if hit:
                 mask |= 1 << lane
         if cmpx:
             self.exec = mask if self.wave == 64 else (self.exec & ~MASK32) | mask

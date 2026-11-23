@@ -205,6 +205,68 @@ def test_wrexec_cases_catch_a_swapped_complement(case, wave, monkeypatch):
     assert status == "mismatch"
 
 
+# Float compares into EXEC. v1 = lane & 7 gives normals only; v3 = lane * 5 & 15 adds -1.x (bit 3); v8 = 9 ^ lane
+# reaches bits 4-5 too, so its lanes hold NaNs, +-inf and +-0 as well (see Emitter.fvalue).
+FCMP_CASES = {
+    f"{mn} {cc} {k} on v{v}": [(mn, (cc, k, v), skip, [("probe", 11), ("op", "v_add_nc_u32 v9, 1, v9")])]
+    for mn, cc, k, v, skip in (
+        ("fif", "lt", "1.0", 8, True), ("fif", "nge", "1.0", 8, False), ("fif", "u", "0", 8, True),
+        ("fif", "o", "0x7fc00000", 8, False), ("fif", "eq", "0x80000000", 8, True),
+        ("fif", "neq", "0x7f800000", 8, False), ("fif", "lg", "-4.0", 3, True),
+        ("fcmpx", "nlg", "0", 8, True), ("fcmpx", "ge", "0xff800000", 8, False),
+        ("fcmpx", "ngt", "-1.0", 8, True), ("fcmpx", "tru", "2.0", 1, False), ("fcmpx", "f", "0.5", 1, True),
+        ("fif", "class", 0x003, 8, True), ("fcmpx", "class", 0x22C, 8, False),
+        ("fcmpx", "class", 0x160, 8, True))
+}
+
+
+@pytest.mark.parametrize("case", sorted(FCMP_CASES))
+@pytest.mark.parametrize("wave", (32, 64))
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_float_compares_into_exec_match(case, wave, structured):
+    status, detail = cf_diff.run_case("ps_fcmp", FCMP_CASES[case], wave, structured)
+    assert status == "match", detail
+
+
+def _ord_unord_swapped(cc, x, y, real=cf_ref._fcmp):
+    """The OpFOrd / OpFUnord slip: on a NaN the ordered forms answer true and the n forms false."""
+    r = real(cc, x, y)
+    nan = cf_ref._f32(x) is None or cf_ref._f32(y) is None
+    return (not r) if nan and cc not in ("f", "tru") else r
+
+
+@pytest.mark.parametrize("case", sorted(c for c in FCMP_CASES if "class" not in c and " f " not in c
+                                        and "tru" not in c and " lg -4.0" not in c))
+def test_float_cases_catch_an_ordered_unordered_swap(case, monkeypatch):
+    """The compare cases are sensitive to NaN handling: with ordered and unordered swapped they mismatch."""
+    monkeypatch.setattr(cf_ref, "_fcmp", _ord_unord_swapped)
+    assert cf_diff.run_case("ps_fcmp", FCMP_CASES[case], 32)[0] == "mismatch"
+
+
+@pytest.mark.parametrize("case", sorted(c for c in FCMP_CASES if "class" in c and "0x3 " not in c
+                                        and " 3 on" not in c))
+def test_class_cases_catch_a_sign_slip(case, monkeypatch):
+    """The class cases are sensitive: with the sign ignored (every value classed as positive) they mismatch."""
+    real = cf_ref._fclass
+    monkeypatch.setattr(cf_ref, "_fclass", lambda x, mask: real(x & 0x7FFFFFFF, mask))
+    assert cf_diff.run_case("ps_fcmp", FCMP_CASES[case], 32)[0] == "mismatch"
+
+
+@pytest.mark.parametrize("bits, cc, k, want", [
+    (0x7FC00000, "lt", 0x3F800000, False), (0x7FC00000, "nge", 0x3F800000, True), (0x80000000, "eq", 0, True),
+    (0x80000000, "lg", 0, False), (0x7F800000, "gt", 0x3F800000, True), (0x7FC00000, "u", 0, True),
+    (0x3F800000, "o", 0, True), (0x7FC00000, "neq", 0x7FC00000, True), (0x7FC00000, "eq", 0x7FC00000, False)])
+def test_reference_float_compare(bits, cc, k, want):
+    assert cf_ref._fcmp(cc, bits, k) is want
+
+
+@pytest.mark.parametrize("bits, cls", [(0x7F800001, 0), (0x7FC00000, 1), (0xFF800000, 2), (0xBF800000, 3),
+                                       (0x80000001, 4), (0x80000000, 5), (0, 6), (1, 7), (0x3F800000, 8),
+                                       (0x7F800000, 9)])
+def test_reference_float_class(bits, cls):
+    assert [cf_ref._fclass(bits, 1 << b) for b in range(10)] == [int(b == cls) for b in range(10)]
+
+
 @pytest.mark.parametrize("count", ["0", "-1"])
 def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
     def unexpected_suite(*args, **kwargs):
@@ -340,7 +402,7 @@ def test_generator_covers_every_shape():
         walk(cf_diff.generate(random.Random(i), 32))
     assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe",
             "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall", "wqm", "lanes", "far",
-            "wrelse", "wrloop"} <= kinds
+            "wrelse", "wrloop", "fif", "fcmpx"} <= kinds
 
 
 @pytest.mark.parametrize("op_name", ("andn1", "andn2", "orn1", "orn2", "xor", "nand", "nor", "xnor"))

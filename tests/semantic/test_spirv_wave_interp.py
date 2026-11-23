@@ -193,6 +193,35 @@ OpBranch %merge
             outs(body, 32)
 
 
+class FloatClassTests(unittest.TestCase):
+    """OpIsNan / OpIsInf on f32 (the translator's unordered and class compares use them): NaN, +inf, -inf, 1.0."""
+    HEAD_F = HEAD.replace("%bool = OpTypeBool\n", "%bool = OpTypeBool\n%float = OpTypeFloat 32\n").replace(
+        "%c32 = OpConstant %uint 32\n", "%c32 = OpConstant %uint 32\n%bnan = OpConstant %uint 0x7fc00000\n"
+        "%binf = OpConstant %uint 0x7f800000\n%bninf = OpConstant %uint 0xff800000\n%bone = OpConstant %uint 0x3f800000\n")
+
+    def run_body(self, body):
+        return [o["%out"] for o in run_wave(self.HEAD_F + body + TAIL, wave=32)["outputs"]]
+
+    def test_nan_and_inf(self):
+        lines = []
+        for i, c in enumerate(("%bnan", "%binf", "%bninf", "%bone")):
+            lines.append(f"%f{i} = OpBitcast %float {c}")
+            lines.append(f"%n{i} = OpIsNan %bool %f{i}")
+            lines.append(f"%i{i} = OpIsInf %bool %f{i}")
+            lines.append(f"%s{i} = OpSelect %uint %n{i} %c1 %c0")
+            lines.append(f"%t{i} = OpSelect %uint %i{i} %c2 %c0")
+            lines.append(f"%r{i} = OpBitwiseOr %uint %s{i} %t{i}")
+        lines.append("%v = OpCompositeConstruct %v4uint %r0 %r1 %r2 %r3")
+        lines.append("OpStore %out %v")
+        for got in self.run_body("\n".join(lines) + "\n"):
+            self.assertEqual(got, (1, 2, 2, 0))       # NaN: IsNan; +-inf: IsInf; 1.0: neither
+
+    def test_an_integer_operand_is_rejected(self):
+        with self.assertRaises(UnsupportedConstruct):
+            self.run_body("%n = OpIsNan %bool %c1\n%s = OpSelect %uint %n %c1 %c0\n"
+                          "%v = OpCompositeConstruct %v4uint %s %c0 %c0 %c0\nOpStore %out %v\n")
+
+
 class Kill(unittest.TestCase):
     BODY = """%hi = OpUGreaterThanEqual %bool %l %c16
 OpSelectionMerge %merge None

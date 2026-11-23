@@ -18,6 +18,11 @@ Shapes (each nests, up to --depth):
   irr       two-entry cycle on uniform SCC branches                                   (irreducible graph)
   sccmask   s_and/andn2/or/xor of VCC and EXEC, or s_not of VCC -> s_cbranch_scc0/1 (SCC = whole mask != 0)
   csel      the same SCC read by s_cselect_b32 into a uniform SGPR
+  fif       v_cmp_<cc>_f32 / v_cmp_class_f32 -> s_and_saveexec -> [s_cbranch_execz] -> body -> s_or exec
+  fcmpx     s_mov save, exec -> v_cmpx_<cc>_f32 / v_cmpx_class_f32 -> [s_cbranch_execz] -> body -> s_mov exec
+            (both compare a per-lane f32 built in v12 from a data VGPR: +-1.0..1.875, +-0, +-inf or a NaN, never a
+            denormal, against a float constant, one of those specials or a class mask in v13; all 16 conditions,
+            so NaNs exercise the ordered, unordered and n forms)
   wrelse    s_and_saveexec -> then -> s_andn2_wrexec D, save (EXEC = save & ~EXEC: the else lanes) ->
             [s_cbranch_execz/scc0] -> else -> s_mov exec, save
   wrloop    per-lane trip counts closed by s_andn1_wrexec D, vcc (EXEC = ~done & EXEC), back edge
@@ -88,6 +93,9 @@ STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 DATA = (1, 2, 3, 8, 9)            # VGPRs the bodies compute on (v0 = lane id is kept intact)
 SREGS = (10, 11, 12, 13)          # uniform SGPRs the bodies compute on
 CCS = ("eq", "ne", "lt", "le", "gt", "ge")
+FCCS = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru")
+# Float compare operands: inline float constants, and literals for -0, +-inf and a quiet NaN.
+FCONSTS = ("0", "1.0", "-1.0", "0.5", "2.0", "-4.0", "0x80000000", "0x7f800000", "0xff800000", "0x7fc00000")
 VOP3 = ("v_mul_lo_u32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32", "v_readlane_b32", "v_writelane_b32")
 
 
@@ -106,6 +114,14 @@ class Gen:
         r = self.r
         k = r.choice((0, 1, 2, 3, 4, 5, 7, 8, 12, 16, 31, 32, 63, 64, -1, -16))
         return (r.choice(CCS), r.choice(("u32", "u32", "i32")), k, r.choice((0, 0, 1, 2, 3, 8, 9)))
+
+    def fcond(self):
+        """A per-lane float condition: (cc, operand, source VGPR). cc is one of the 16 f32 conditions or "class";
+        the operand is a float constant or special (as a literal), or a 10-bit class mask."""
+        r = self.r
+        if r.random() < 0.25:
+            return ("class", r.randrange(1, 1024), r.choice(DATA))
+        return (r.choice(FCCS), r.choice(FCONSTS), r.choice(DATA))
 
     def half(self):
         """Which 32-bit half of a mask a _b32 op works on: always the low (whole) one in wave32."""
@@ -158,7 +174,9 @@ class Gen:
         kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
                          "vloop", "irr", "sccmask", "csel", "ifs", "ifs", "cexec", "halfexec", "halfscc", "scmpmask",
                          "cselmask", "vccloop", "cmpxloop", "mread", "mread", "waterfall",
-                         "waterfall", "wqm", "wqm", "lanes", "lanes", "far", "wrelse", "wrloop"))
+                         "waterfall", "wqm", "wqm", "lanes", "lanes", "far", "wrelse", "wrloop", "fif", "fcmpx"))
+        if kind in ("fif", "fcmpx"):
+            return (kind, self.fcond(), r.random() < 0.6, [self.probe()] + self.block(depth))
         if kind == "far":
             if r.random() < 0.5:
                 return ("far", "fwd", 0, [self.probe()] + self.block(depth))
@@ -290,6 +308,33 @@ class Emitter:
         if logic == "not":
             return f"s_not_{self.b()} {dst}, {self.vcc()}"
         return f"s_{logic}_{self.b()} {dst}, {self.vcc()}, {self.exec_()}"
+
+    def fvalue(self, src):
+        """v12 = a per-lane f32 from data VGPR `src`: bits 0-2 pick a mantissa (1.0..1.875), bits 4-5 swap in a
+        quiet NaN, +inf or +0, bit 3 sets the sign (so -inf, -0 and negative NaNs occur too). Never a denormal, so
+        the compare does not depend on the denorm mode. Clobbers VCC and v13."""
+        self.ins(f"v_and_b32 v12, 7, v{src}")
+        self.ins("v_lshlrev_b32 v12, 20, v12")
+        self.ins("v_or_b32 v12, 0x3f800000, v12")
+        self.ins(f"v_and_b32 v13, 48, v{src}")
+        for sel, special in ((16, "0x7fc00000"), (32, "0x7f800000"), (48, "0")):
+            self.ins(f"v_cmp_ne_u32_e32 {self.vcc()}, {sel}, v13")
+            self.ins(f"v_cndmask_b32_e32 v12, {special}, v12, {self.vcc()}")
+        self.ins(f"v_and_b32 v13, 8, v{src}")
+        self.ins("v_lshlrev_b32 v13, 28, v13")
+        self.ins("v_xor_b32 v12, v12, v13")
+
+    def fcompare(self, fc, cmpx):
+        """The float compare of fc on v12: into VCC (v_cmp) or EXEC (v_cmpx)."""
+        cc, operand, src = fc
+        self.fvalue(src)
+        dst = "" if cmpx else f"{self.vcc()}, "
+        mn = "v_cmpx" if cmpx else "v_cmp"
+        if cc == "class":
+            self.ins(f"v_mov_b32 v13, {operand}")
+            self.ins(f"{mn}_class_f32_e32 {dst}v12, v13")
+        else:
+            self.ins(f"{mn}_{cc}_f32_e32 {dst}{operand}, v12")
 
     def vcmp(self, c, dst=None):
         cc, ty, k, v = c
@@ -668,6 +713,30 @@ class Emitter:
             # Loop again while any lane is left: EXECNZ, or SCC of the s_andn2 (= new EXEC != 0).
             self.br("s_cbranch_scc1" if scc_exit else "s_cbranch_execnz", head)
             self.ins(f"s_or_{w} {ex}, {ex}, {brk_mask}")
+        elif kind == "fif":
+            _, fc, skip, body = n
+            save, end = self.sreg(20), self.label()
+            self.fcompare(fc, cmpx=False)
+            self.ins(f"s_and_saveexec_{w} {save}, {self.vcc()}")
+            if skip:
+                self.br("s_cbranch_execz", end)
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.place(end)
+            self.ins(f"s_or_{w} {ex}, {ex}, {save}")
+        elif kind == "fcmpx":
+            _, fc, skip, body = n
+            save, end = self.sreg(20), self.label()
+            self.ins(f"s_mov_{w} {save}, {ex}")
+            self.fcompare(fc, cmpx=True)
+            if skip:
+                self.br("s_cbranch_execz", end)
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.place(end)
+            self.ins(f"s_mov_{w} {ex}, {save}")
         elif kind == "wrelse":
             # The else switch through s_andn2_wrexec: EXEC = save & ~EXEC is the lanes of `save` the then side did
             # not run, and D gets the same mask (D is scratch, as for sccmask: nothing reads it).

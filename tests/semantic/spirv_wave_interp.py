@@ -871,6 +871,12 @@ class _Wave:
             cmp_name = op.removeprefix("OpFUnord").removeprefix("OpFOrd")
             return {"Equal": x == y, "NotEqual": x != y, "LessThan": x < y, "GreaterThan": x > y,
                     "LessThanEqual": x <= y, "GreaterThanEqual": x >= y}[cmp_name]
+        if op in ("OpIsNan", "OpIsInf"):
+            # f32 class tests (the translator's unordered and class compares use them).
+            if m.types.get(m.id_type.get(a[1]), ("",))[0] != "float":
+                raise UnsupportedConstruct(f"{op} on a non-float operand")
+            x = _f32_unpack(self.val(lane, a[1]))
+            return math.isnan(x) if op == "OpIsNan" else math.isinf(x)
         if op in ("OpConvertFToU", "OpConvertFToS"):
             if m.types.get(a[0], ("",))[0] != "int":
                 raise UnsupportedConstruct(f"{op} with result type {a[0]}")
