@@ -123,9 +123,18 @@ fs::path test_dir() {
     return dir;
 }
 
+// Each call writes a new file, in a folder of its own under `dir` named for this process and call, never over one an
+// earlier call or the parent process wrote. A real-time antivirus opens a file as it is closed and can hold it without
+// write sharing for a moment, so rewriting the same path straight after (the parent writes the image, then the first
+// child writes it again) failed the child with "cannot write" in about one run in five. Every process needs its own
+// image anyway: make_image() picks an ImageBase that is free in the calling process. The file name stays kImageName,
+// which the stop children's module+RVA check expects; the parent's remove_all(dir) takes the folders away.
 fs::path write_image(const fs::path& dir) {
+    static int calls = 0;
     const auto bytes = make_image();
-    const fs::path p = dir / kImageName;
+    const fs::path own = dir / ("image_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(calls++));
+    fs::create_directories(own);
+    const fs::path p = own / kImageName;
     std::ofstream out(p, std::ios::binary);
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (!out) throw std::runtime_error("cannot write " + p.string());
@@ -450,6 +459,7 @@ void test_env_and_default(const fs::path& dir) {
         const ChildResult r = run_child(args, c.env);
         const std::string tag = std::string("LEONIDA_UNIMPLEMENTED ") + c.label + ": ";
         check(r.exit_code == 0, tag + "child exits 0 (" + std::to_string(r.exit_code) + ")");
+        if (r.exit_code != 0) std::printf("      child output: %s\n", r.output.c_str());
         check(contains(r.output, c.expect), tag + "results '" + c.expect + "'");
         check(contains(r.output, "out=5a5a5a5a5a5a5a5a"), tag + "out-parameter untouched");
         check(contains(r.output, "expected log, fail or stop") == c.warns, tag + (c.warns ? "warns" : "does not warn"));
@@ -462,6 +472,7 @@ void test_stop(const fs::path& dir) {
         const ChildResult r = run_child(L"--stop-child \"" + dir.wstring() + L"\" " + std::to_wstring(i), L"stop");
         const std::string import = std::string(kImports[i].dll) + "!" + kImports[i].name;
         check(r.exit_code == 3, tag + "the process ends with exit code 3 (" + std::to_string(r.exit_code) + ")");
+        if (r.exit_code != 3) std::printf("      child output: %s\n", r.output.c_str());
         check(!contains(r.output, "RETURNED"), tag + "the call does not return");
         check(contains(r.output, "unimplemented import " + import + " called"), tag + "names the import");
         check(contains(r.output, std::string(" = ") + kImageName + "+0x" + hex(return_rva(i))),
