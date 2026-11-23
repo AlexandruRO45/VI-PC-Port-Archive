@@ -226,5 +226,33 @@ class TestMul24SimdInteraction(unittest.TestCase):
         self.assertEqual(words[1], (-50) & MASK32)
 
 
+class TestMul24RegisterPreservation(unittest.TestCase):
+    """Commit 5: register aliasing and in-place operand preservation for v_mul_i32_i24."""
+
+    def test_in_place_aliasing_destination_equals_source(self):
+        lines = [
+            "v_mov_b32 v0, 12",
+            "v_mov_b32 v1, 7",
+            "v_mul_i32_i24 v0, v0, v1",  # 84
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_mul24_ps(lines, "ps_mul24_alias")
+        self.assertEqual(words[0], 84)
+        self.assertEqual(words[1], 7)
+
+    def test_preservation_of_adjacent_registers(self):
+        lines = [
+            "v_mov_b32 v0, 0x1111",
+            "v_mov_b32 v1, 0x2222",
+            "v_mov_b32 v2, 0x3333",
+            "v_mov_b32 v3, 0x4444",
+            "v_mul_i32_i24 v0, v0, v1",
+        ]
+        words = run_mul24_ps(lines, "ps_mul24_preserve")
+        self.assertEqual(words[2], 0x3333)
+        self.assertEqual(words[3], 0x4444)
+
+
 if __name__ == '__main__':
     unittest.main()
