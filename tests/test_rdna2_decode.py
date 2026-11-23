@@ -121,7 +121,7 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(info["invalid"], 0)
         self.assertEqual([i["op"] for i in info["insns"]],
                          ["s_mov_b32", "s_add_u32", "s_cmp_eq_u32", "s_setreg_imm32_b32"])
-        self.assertEqual(info["insns"][0]["args"][1], {"k": "imm", "v": 0x12345678})
+        self.assertEqual(info["insns"][0]["args"][1], {"k": "imm", "v": 0x12345678, "literal": True})
         self.assertEqual(info["insns"][3]["args"], [{"k": "special", "t": "hwreg(HW_REG_MODE, 2, 2)"},
                                                     {"k": "imm", "v": 3}])
 
@@ -385,6 +385,11 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(parsed[3]["args"][1]["k"], "fimm")
         self.assertEqual(parsed[3]["args"][1]["v"], 1.0)
 
+
+    def test_f64_literal_printed_as_hex(self):
+        raw = bytes.fromhex('040064d5ff02010001000000')
+        lines = rdna2_decode.disasm_bytes(raw, wave32=True)
+        self.assertIn('0x1', lines[0])
 
 if __name__ == "__main__":
     unittest.main()

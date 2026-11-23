@@ -220,7 +220,7 @@ def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = 
     elif code == 254:
         op = {"k": "special", "t": "src_lds_direct", "neg": False, "abs": False}
     elif code == 255:
-        op = {"k": "imm", "v": 0 if lit is None else lit}
+        op = {"k": "imm", "v": 0 if lit is None else lit, "literal": True}
     elif 256 <= code <= 511:
         op = _vreg(code - 256, n)
     else:
@@ -1362,7 +1362,10 @@ def _format_operand(a: dict) -> str:
         s = a["t"]
     elif k == "imm":
         v = a["v"]
-        s = f"0x{v:x}" if v >= 100 else str(v)
+        if a.get("literal"):
+            s = f"0x{v:x}"
+        else:
+            s = f"0x{v:x}" if v >= 100 else str(v)
     elif k == "fimm":
         v = a["v"]
         s = next((txt for code, txt in _INLINE_FLOAT_STR.items() if _INLINE_FLOAT[code] == v), repr(v))
