@@ -52,16 +52,119 @@ SGPR_REL_DST = ("s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32")
 VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_and_or_b32",
                   "v_xor_b32", "v_xor3_b32", "v_xnor_b32", "v_bfi_b32", "v_not_b32")
 
+_BASE_OP_CACHE = {}
+_OP_INFO_CACHE = {}
+_VCC_OPERAND = {"k": "special", "t": "vcc"}
+
+_OP_NO_DST = 0
+_OP_BUF_LOAD = 1
+_OP_ATOMIC = 2
+_OP_V_READFIRSTLANE = 3
+_OP_V_WRITELANE = 4
+_OP_V_READLANE = 5
+_OP_VCMP = 6
+_OP_VSWAP = 7
+_OP_VGPR_REL = 8
+_OP_SGPR_REL = 9
+_OP_GENERAL = 10
+
+_SALU_OTHER = 0
+_SALU_SAVEEXEC = 1
+_SALU_SAVEEXEC_B32 = 2
+_SALU_COPY = 3
+_SALU_BITWISE = 4
+_SALU_BFM = 5
+
 
 def base_op(op):
+    cached = _BASE_OP_CACHE.get(op)
+    if cached is not None:
+        return cached
+    res = op
     for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
         if op.endswith(suffix):
-            return op[:-len(suffix)]
-    return op
+            res = op[:-len(suffix)]
+            break
+    _BASE_OP_CACHE[op] = res
+    return res
+
+
+def _op_info(raw_op):
+    cached = _OP_INFO_CACHE.get(raw_op)
+    if cached is not None:
+        return cached
+    op = base_op(raw_op)
+    if op.startswith(NO_DESTINATION):
+        info = (_OP_NO_DST, op, False, False, _SALU_OTHER, False, False, False)
+    elif op.startswith(("buffer_load", "tbuffer_load")):
+        info = (_OP_BUF_LOAD, op, False, False, _SALU_OTHER, False, False, False)
+    elif op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic",
+                        "s_atomic", "s_buffer_atomic")):
+        info = (_OP_ATOMIC, op, False, False, _SALU_OTHER, False, False, False)
+    elif op.startswith("ds_") and not op.startswith(DS_HAS_DST) and "_rtn" not in op:
+        info = (_OP_NO_DST, op, False, False, _SALU_OTHER, False, False, False)
+    elif op == "v_readfirstlane_b32":
+        info = (_OP_V_READFIRSTLANE, op, False, False, _SALU_OTHER, False, False, False)
+    elif op == "v_writelane_b32":
+        info = (_OP_V_WRITELANE, op, False, False, _SALU_OTHER, False, False, False)
+    elif op == "v_readlane_b32":
+        info = (_OP_V_READLANE, op, False, False, _SALU_OTHER, False, False, False)
+    elif op.startswith("v_cmp"):
+        info = (_OP_VCMP, op, False, False, _SALU_OTHER, False, False, False)
+    elif op == "v_swap_b32":
+        info = (_OP_VSWAP, op, False, False, _SALU_OTHER, False, False, False)
+    elif op in VGPR_REL_DST:
+        info = (_OP_VGPR_REL, op, False, False, _SALU_OTHER, False, False, False)
+    elif op in SGPR_REL_DST:
+        info = (_OP_SGPR_REL, op, False, False, _SALU_OTHER, False, False, False)
+    else:
+        vec_bitwise_ok = op in VECTOR_BITWISE and not raw_op.endswith(("_sdwa", "_dpp", "_dpp8"))
+        is_v_mov = op == "v_mov_b32"
+        if "_saveexec_b" in op or "_wrexec_b" in op:
+            salu_kind = _SALU_SAVEEXEC_B32 if op.endswith("_b32") else _SALU_SAVEEXEC
+        elif op == "s_bfm_b64":
+            salu_kind = _SALU_BFM
+        elif op.startswith(COPIES):
+            salu_kind = _SALU_COPY
+        elif op.startswith(BITWISE):
+            salu_kind = _SALU_BITWISE
+        else:
+            salu_kind = _SALU_OTHER
+        is_b64 = op.endswith("b64")
+        is_b32 = op.endswith("b32")
+        is_vop3b_mask = ((op.startswith("v_") and "_co_" in op)
+                         or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64"))
+        info = (_OP_GENERAL, op, vec_bitwise_ok, is_v_mov, salu_kind, is_b64, is_b32, is_vop3b_mask)
+    _OP_INFO_CACHE[raw_op] = info
+    return info
 
 
 def kind(state, a):
-    if a["k"] == "special":
+    ak = a["k"]
+    if ak == "sgpr":
+        r = a["r"]
+        n = a.get("n", 1)
+        if n == 1:
+            return state.get(r)
+        if n == 2:
+            k0 = state.get(r)
+            if k0 is None:
+                return None
+            k1 = state.get(r + 1)
+            if k1 is None:
+                return None
+            if k0 in MASK_KINDS or k1 in MASK_KINDS:
+                return MASK
+            return k0 if k0 == k1 else None
+        ks = [state.get(r + i) for i in range(n)]
+        if None in ks:
+            return None
+        return ks[0] if len(set(ks)) == 1 else None
+    if ak == "vgpr":
+        return state.get(("v", a["r"])) if a.get("n", 1) == 1 else None
+    if ak == "imm":
+        return EITHER if a["v"] in (0, -1) else None
+    if ak == "special":
         t = a.get("t", "")
         if t == "exec_lo":
             return MASK_LO
@@ -77,50 +180,81 @@ def kind(state, a):
                 return MASK_LO if t == "vcc_lo" else MASK_HI
             return vk if t == "vcc_lo" else None
         return None
-    if a["k"] == "sgpr":
-        n = a.get("n", 1)
-        ks = [state.get(a["r"] + i) for i in range(n)]
-        if None in ks:
-            return None
-        if n == 2 and any(k in MASK_KINDS for k in ks):
-            return MASK
-        return ks[0] if len(set(ks)) == 1 else None
-    if a["k"] == "vgpr" and a.get("n", 1) == 1:
-        return state.get(("v", a["r"]))
-    if a["k"] == "imm" and a["v"] in (0, -1):
-        return EITHER
     return None
 
 
-def put(state, a, k):
-    if a["k"] == "sgpr":
+def _put(state, a, k):
+    """Write `k` (or clear when None) to register operand `a` in `state`. Returns True if `state` changed."""
+    ak = a["k"]
+    if ak == "sgpr":
+        r = a["r"]
         n = a.get("n", 1)
-        if k == MASK and n == 2:
-            state[a["r"]] = MASK_LO
-            state[a["r"] + 1] = MASK_HI
-            return
-        regs = [a["r"] + i for i in range(n)]
-    elif a["k"] == "slist":
-        regs = [r if isinstance(r, int) else "vcc" for r in a["r"]]
-    elif a["k"] == "special" and a.get("t") == "vcc":
-        regs = ["vcc"]
-    elif a["k"] == "special" and a.get("t") in ("vcc_lo", "vcc_hi"):
-        # A mask / 0 / -1 half-write updates that half of %vcc in wave64 (put_mask), keeping VCC a lane mask;
-        # a plain-data half-write (k is None) ends VCC's life as one lane mask.
-        if k is not None and state.get("vcc") in MASK_KINDS:
-            state["vcc"] = MASK
-        elif a.get("t") == "vcc_lo" and k is not None:
-            state["vcc"] = k
-        else:
-            state.pop("vcc", None)
-        return
-    else:
-        return
-    for r in regs:
-        if k is None:
-            state.pop(r, None)
-        else:
+        if n == 1:
+            if k is None:
+                return state.pop(r, None) is not None
+            if state.get(r) == k:
+                return False
             state[r] = k
+            return True
+        if k == MASK and n == 2:
+            if state.get(r) == MASK_LO and state.get(r + 1) == MASK_HI:
+                return False
+            state[r] = MASK_LO
+            state[r + 1] = MASK_HI
+            return True
+        changed = False
+        if k is None:
+            for i in range(n):
+                if state.pop(r + i, None) is not None:
+                    changed = True
+        else:
+            for i in range(n):
+                ri = r + i
+                if state.get(ri) != k:
+                    state[ri] = k
+                    changed = True
+        return changed
+    if ak == "slist":
+        changed = False
+        for r in a["r"]:
+            key = r if isinstance(r, int) else "vcc"
+            if k is None:
+                if state.pop(key, None) is not None:
+                    changed = True
+            else:
+                if state.get(key) != k:
+                    state[key] = k
+                    changed = True
+        return changed
+    if ak == "special":
+        t = a.get("t")
+        if t == "vcc":
+            if k is None:
+                return state.pop("vcc", None) is not None
+            if state.get("vcc") == k:
+                return False
+            state["vcc"] = k
+            return True
+        if t in ("vcc_lo", "vcc_hi"):
+            # A mask / 0 / -1 half-write updates that half of %vcc in wave64 (put_mask), keeping VCC a lane mask;
+            # a plain-data half-write (k is None) ends VCC's life as one lane mask.
+            vk = state.get("vcc")
+            if k is not None and vk in MASK_KINDS:
+                if vk == MASK:
+                    return False
+                state["vcc"] = MASK
+                return True
+            if t == "vcc_lo" and k is not None:
+                if vk == k:
+                    return False
+                state["vcc"] = k
+                return True
+            return state.pop("vcc", None) is not None
+    return False
+
+
+def put(state, a, k):
+    _put(state, a, k)
 
 
 def _maskable_b32(x):
@@ -136,119 +270,197 @@ def lane_slot(vgpr, lane):
     return ("lane", vgpr["r"], lane["v"] & 63)
 
 
-def step(state, ins, wave64=True):
-    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR.
+def _step_tracked(state, ins, vgpr_keys, wave64=True):
+    """Update `state` (and optional `vgpr_keys` set of tuple keys in `state`) for one instruction.
 
-    `wave64` False: the program runs in 32-lane waves, where a 64-bit s_bfm_b64 result can't be a lane mask."""
-    op, a = base_op(ins["op"]), ins["args"]
-    if not a or op.startswith(NO_DESTINATION):
-        return
+    Returns `(wrote_vgpr_mask, state_changed)`. `wave64` False: the program runs in 32-lane waves, where a 64-bit
+    s_bfm_b64 result can't be a lane mask.
+    """
+    a = ins["args"]
+    if not a:
+        return (False, False)
+    tag, op, vec_bitwise_ok, is_v_mov, salu_kind, is_b64, is_b32, is_vop3b_mask = _op_info(ins["op"])
+    if tag == _OP_NO_DST:
+        return (False, False)
     mods = ins.get("mods", ())
-    if op.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods:
-        return
-    if op.startswith(("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic",
-                      "s_atomic", "s_buffer_atomic")) and "glc" not in mods:
-        return
-    if op.startswith("ds_") and not op.startswith(DS_HAS_DST) and "_rtn" not in op:
-        return
-    if op == "v_readfirstlane_b32" and len(a) == 2:                             # sD = vS, the same in every lane
-        put(state, a[0], kind(state, a[1]))
-        return
-    if op == "v_writelane_b32" and len(a) == 3 and lane_slot(a[0], a[2]):       # vD[lane] = sS
-        state.pop(("v", a[0]["r"]), None)
-        k = kind(state, a[1])
-        if k is None:
-            state.pop(lane_slot(a[0], a[2]), None)
-        else:
-            state[lane_slot(a[0], a[2])] = k
-        return
-    if op == "v_readlane_b32" and len(a) == 3:                                  # sD = vS[lane]
-        put(state, a[0], state.get(lane_slot(a[1], a[2])))
-        return
-    if op.startswith("v_cmp"):
+    if tag == _OP_BUF_LOAD:
+        if "lds" in mods:
+            return (False, False)
+    elif tag == _OP_ATOMIC:
+        if "glc" not in mods:
+            return (False, False)
+    elif tag == _OP_V_READFIRSTLANE:
+        if len(a) == 2:                                                         # sD = vS, the same in every lane
+            return (False, _put(state, a[0], kind(state, a[1])))
+    elif tag == _OP_V_WRITELANE:
+        if len(a) == 3:
+            slot = lane_slot(a[0], a[2])
+            if slot:                                                            # vD[lane] = sS
+                vkey = ("v", a[0]["r"])
+                changed = state.pop(vkey, None) is not None
+                if changed and vgpr_keys is not None:
+                    vgpr_keys.discard(vkey)
+                k = kind(state, a[1])
+                if k is None:
+                    if state.pop(slot, None) is not None:
+                        changed = True
+                        if vgpr_keys is not None:
+                            vgpr_keys.discard(slot)
+                else:
+                    if state.get(slot) != k:
+                        state[slot] = k
+                        changed = True
+                    if vgpr_keys is not None:
+                        vgpr_keys.add(slot)
+                return (False, changed)
+    elif tag == _OP_V_READLANE:
+        if len(a) == 3:                                                         # sD = vS[lane]
+            return (False, _put(state, a[0], state.get(lane_slot(a[1], a[2]))))
+    elif tag == _OP_VCMP:
         # Handle v_cmp before VGPR clobber (defensive for 2-operand forms with implicit vcc).
-        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else a[0], MASK)
-        return
-    if op == "v_swap_b32":
+        return (False, _put(state, _VCC_OPERAND if len(a) == 2 else a[0], MASK))
+    elif tag == _OP_VSWAP:
+        if vgpr_keys is not None:
+            if not vgpr_keys:
+                return (False, False)
+            keys_iter = vgpr_keys
+        elif not state:
+            return (False, False)
+        else:
+            keys_iter = state
         written = set()
         for x in a[:2]:
             if x["k"] == "vgpr":
                 written.update(range(x["r"], x["r"] + x.get("n", 1)))
-        for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
+        to_del = [k for k in keys_iter if isinstance(k, tuple) and k[1] in written]
+        for key in to_del:
             del state[key]
-        return
-    if op in VGPR_REL_DST:
+            if vgpr_keys is not None:
+                vgpr_keys.discard(key)
+        return (False, bool(to_del))
+    elif tag == _OP_VGPR_REL:
+        if vgpr_keys is not None:
+            if not vgpr_keys:
+                return (False, False)
+            keys_iter = vgpr_keys
+        elif not state:
+            return (False, False)
+        else:
+            keys_iter = state
         bases = [x["r"] for x in (a[:2] if op == "v_swaprel_b32" else a[:1]) if x["k"] == "vgpr"]
         if bases:
             lo = min(bases)
-            for key in [k for k in state if isinstance(k, tuple) and k[1] >= lo]:
+            to_del = [k for k in keys_iter if isinstance(k, tuple) and k[1] >= lo]
+            for key in to_del:
                 del state[key]
-        return
-    if op in SGPR_REL_DST:
-        if a[0]["k"] == "sgpr":
+                if vgpr_keys is not None:
+                    vgpr_keys.discard(key)
+            return (False, bool(to_del))
+        return (False, False)
+    elif tag == _OP_SGPR_REL:
+        if a[0]["k"] == "sgpr" and state:
             lo = a[0]["r"]
-            for key in [k for k in state if isinstance(k, int) and k >= lo]:
+            to_del = [k for k in state if isinstance(k, int) and k >= lo]
+            for key in to_del:
                 del state[key]
-        return
-    if a[0]["k"] == "vgpr":                             # any other write to a VGPR ends what was parked in it
+            return (False, bool(to_del))
+        return (False, False)
+
+    a0 = a[0]
+    if a0["k"] == "vgpr":                               # any other write to a VGPR ends what was parked in it
         # A mask only when every source is one (or a constant 0 / -1) on every path: no EITHER for VGPRs, whose
         # plain writes skip inactive lanes. The sources are looked at first: the destination can be one of them.
         # SDWA/DPP or modified forms alter sub-dwords or read other lanes, so they are never plain mask ops.
-        plain_valu = (op in VECTOR_BITWISE and a[0].get("n", 1) == 1
-                      and not ins["op"].endswith(("_sdwa", "_dpp", "_dpp8"))
-                      and not mods
+        changed = False
+        r0 = a0["r"]
+        n0 = a0.get("n", 1)
+        plain_valu = (vec_bitwise_ok and n0 == 1 and not mods
                       and not any(x.get("neg") or x.get("abs") or x.get("sext") for x in a[1:]))
-        kinds = [kind(state, x) for x in a[1:]] if plain_valu else [None]
-        written = range(a[0]["r"], a[0]["r"] + a[0].get("n", 1))
-        for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
-            del state[key]
-        if None not in kinds and any(k in MASK_KINDS for k in kinds):
+        kinds = [kind(state, x) for x in a[1:]] if plain_valu else None
+        if vgpr_keys is not None:
+            if vgpr_keys:
+                hi0 = r0 + n0
+                to_del = [k for k in vgpr_keys if r0 <= k[1] < hi0]
+                for key in to_del:
+                    del state[key]
+                    vgpr_keys.discard(key)
+                if to_del:
+                    changed = True
+        elif state:
+            hi0 = r0 + n0
+            to_del = [k for k in state if isinstance(k, tuple) and r0 <= k[1] < hi0]
+            for key in to_del:
+                del state[key]
+            if to_del:
+                changed = True
+        if kinds is not None and None not in kinds and any(k in MASK_KINDS for k in kinds):
             ms = {k for k in kinds if k in MASK_KINDS}
-            state[("v", a[0]["r"])] = ms.pop() if len(ms) == 1 else MASK
+            vkey = ("v", r0)
+            new_k = ms.pop() if len(ms) == 1 else MASK
+            state[vkey] = new_k
+            if vgpr_keys is not None:
+                vgpr_keys.add(vkey)
             # A plain copy (v_mov_b32) is an ordinary VALU write: inactive lanes keep the old
             # VGPR (SHADER-21 part 2). Only per-lane mask computations take the all-lanes store,
             # because whole-wave readers (wave_mask, v_readfirstlane) read every lane's bit.
-            return op != "v_mov_b32"
-    if "_saveexec_b" in op or "_wrexec_b" in op:
-        put(state, a[0], MASK_LO if op.endswith("_b32") else MASK)
-    elif op == "s_bfm_b64":
+            return (not is_v_mov, True)
+        if is_vop3b_mask and len(a) > 1:
+            if _put(state, a[1], MASK):
+                changed = True
+        return (False, changed)
+
+    if salu_kind == _SALU_SAVEEXEC:
+        return (False, _put(state, a0, MASK))
+    if salu_kind == _SALU_SAVEEXEC_B32:
+        return (False, _put(state, a0, MASK_LO))
+    if salu_kind == _SALU_BFM:
         # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
         # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.
-        put(state, a[0], MASK if wave64 else None)
-    elif op.startswith(COPIES) and len(a) > 1:
+        return (False, _put(state, a0, MASK if wave64 else None))
+    if salu_kind == _SALU_COPY and len(a) > 1:
         k = kind(state, a[1])
-        dst_t = a[0].get("t") if a[0]["k"] == "special" else None
-        if k in (None, EITHER) and op.endswith("b64") and dst_t in ("vcc", "vcc_lo") and a[1]["k"] == "imm":
+        dst_t = a0.get("t") if a0["k"] == "special" else None
+        if k in (None, EITHER) and is_b64 and dst_t in ("vcc", "vcc_lo") and a[1]["k"] == "imm":
             k = MASK
         elif op == "s_not_b32" and dst_t in ("vcc", "vcc_lo") and _maskable_b32(a[1]):
             k = MASK
         elif op == "s_not_b32" and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and _maskable_b32(a[1]):
-            return
-        put(state, a[0], k)
-    elif op.startswith(BITWISE):
+            return (False, False)
+        return (False, _put(state, a0, k))
+    if salu_kind == _SALU_BITWISE:
         kinds = [kind(state, x) for x in a[1:]]
         ms = {k for k in kinds if k in MASK_KINDS}
-        dst_t = a[0].get("t") if a[0]["k"] == "special" else None
+        dst_t = a0.get("t") if a0["k"] == "special" else None
         if None not in kinds:
-            if op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS:
-                return
-            fallback = MASK if op.endswith("b64") and dst_t in ("vcc", "vcc_lo") else EITHER
-            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else fallback)
-        elif op.endswith("b64") and (ms or dst_t in ("vcc", "vcc_lo")) and \
+            if is_b32 and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS:
+                return (False, False)
+            fallback = MASK if is_b64 and dst_t in ("vcc", "vcc_lo") else EITHER
+            return (False, _put(state, a0, (ms.pop() if len(ms) == 1 else MASK) if ms else fallback))
+        if is_b64 and (ms or dst_t in ("vcc", "vcc_lo")) and \
                 all(k is not None or x["k"] == "imm" for k, x in zip(kinds, a[1:])):
-            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else MASK)
-        elif op.endswith("b32") and dst_t in ("vcc", "vcc_lo") and all(_maskable_b32(x) for x in a[1:]):
-            put(state, a[0], MASK)
-        elif op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and \
+            return (False, _put(state, a0, (ms.pop() if len(ms) == 1 else MASK) if ms else MASK))
+        if is_b32 and dst_t in ("vcc", "vcc_lo") and all(_maskable_b32(x) for x in a[1:]):
+            return (False, _put(state, a0, MASK))
+        if is_b32 and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and \
                 all(_maskable_b32(x) for x in a[1:]):
-            return
-        else:
-            put(state, a[0], None)
-    else:
-        put(state, a[0], None)
-        if ((op.startswith("v_") and "_co_" in op)
-                or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) and len(a) > 1:
-            put(state, a[1], MASK)                      # carry/sign/scale lane mask of VOP3b ops
+            return (False, False)
+        return (False, _put(state, a0, None))
+    changed = _put(state, a0, None)
+    if is_vop3b_mask and len(a) > 1:
+        if _put(state, a[1], MASK):                      # carry/sign/scale lane mask of VOP3b ops
+            changed = True
+    return (False, changed)
+
+
+def step(state, ins, wave64=True):
+    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR.
+
+    `wave64` False: the program runs in 32-lane waves, where a 64-bit s_bfm_b64 result can't be a lane mask."""
+    wrote, _ = _step_tracked(state, ins, None, wave64)
+    return True if wrote else None
+
+
+_DEFAULT_STEP = step
 
 
 def parked(blocks, masks):
@@ -265,40 +477,73 @@ def parked(blocks, masks):
 
 
 def analyse(blocks, succ, *, include_either=False, wave64=True):
-    entry = [None] * len(blocks)                        # None: not reached yet
-    if blocks:
+    n_blocks = len(blocks)
+    entry = [None] * n_blocks                           # None: not reached yet
+    if n_blocks:
         entry[0] = {}
-    work = [0] if blocks else []
-    while work:
-        n = work.pop()
-        state = dict(entry[n])
-        for ins in blocks[n]:
-            step(state, ins, wave64)
-        for s in succ[n]:
-            if entry[s] is None:
-                merged = dict(state)
-            else:                                       # a mask on both paths, or a mask on one and 0 / -1 on the other
-                merged = {}
-                for r in entry[s].keys() & state.keys():
-                    a_k, b_k = entry[s][r], state[r]
-                    if a_k == b_k:
-                        merged[r] = a_k
-                    elif a_k == EITHER:
-                        merged[r] = b_k
-                    elif b_k == EITHER:
-                        merged[r] = a_k
-                    else:
-                        merged[r] = MASK
-            if merged != entry[s]:
-                entry[s] = merged
-                work.append(s)
+    use_fast = step is _DEFAULT_STEP
+    if n_blocks > 1 or (n_blocks == 1 and succ[0]):
+        work = [0]
+        while work:
+            n = work.pop()
+            sn = succ[n]
+            if not sn:
+                continue
+            state = dict(entry[n])
+            if use_fast:
+                vkeys = {k for k in state if isinstance(k, tuple)}
+                for ins in blocks[n]:
+                    _step_tracked(state, ins, vkeys, wave64)
+            else:
+                for ins in blocks[n]:
+                    step(state, ins, wave64)
+            for s in sn:
+                es = entry[s]
+                if es is None:
+                    merged = dict(state)
+                else:                                   # a mask on both paths, or a mask on one and 0 / -1 on the other
+                    merged = {}
+                    for r in es.keys() & state.keys():
+                        a_k, b_k = es[r], state[r]
+                        if a_k == b_k:
+                            merged[r] = a_k
+                        elif a_k == EITHER:
+                            merged[r] = b_k
+                        elif b_k == EITHER:
+                            merged[r] = a_k
+                        else:
+                            merged[r] = MASK
+                if merged != es:
+                    entry[s] = merged
+                    work.append(s)
     out, writes, either = {}, set(), {}
     for n, blk in enumerate(blocks):
         state = dict(entry[n] or {})
-        for ins in blk:
-            out[id(ins)] = {r: k for r, k in state.items() if k in MASK_KINDS}
-            if include_either:
-                either[id(ins)] = {r for r, k in state.items() if k == EITHER}
-            if step(state, ins, wave64):
-                writes.add(id(ins))
+        if use_fast:
+            vkeys = {k for k in state if isinstance(k, tuple)}
+            mask_snap = None
+            either_snap = None
+            for ins in blk:
+                if mask_snap is None:
+                    mask_snap = {r: k for r, k in state.items() if k in MASK_KINDS}
+                ins_id = id(ins)
+                out[ins_id] = mask_snap
+                if include_either:
+                    if either_snap is None:
+                        either_snap = {r for r, k in state.items() if k == EITHER}
+                    either[ins_id] = either_snap
+                wrote, changed = _step_tracked(state, ins, vkeys, wave64)
+                if wrote:
+                    writes.add(ins_id)
+                if changed:
+                    mask_snap = None
+                    either_snap = None
+        else:
+            for ins in blk:
+                ins_id = id(ins)
+                out[ins_id] = {r: k for r, k in state.items() if k in MASK_KINDS}
+                if include_either:
+                    either[ins_id] = {r for r, k in state.items() if k == EITHER}
+                if step(state, ins, wave64):
+                    writes.add(ins_id)
     return (out, writes, either) if include_either else (out, writes)

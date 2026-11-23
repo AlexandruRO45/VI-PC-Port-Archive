@@ -145,6 +145,12 @@ def test_bfm64_and_half_kinds():
     use = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
     got = L.analyse([[ins("s_bfm_b64", s(6, 2), imm(16), imm(8)), use]], [[]])[0][id(use)]
     assert got == {6: L.MASK_LO, 7: L.MASK_HI}
+    # In wave32 code it is 64-bit data, on the fast path and through step() alike.
+    blk = [ins("s_bfm_b64", s(6, 2), imm(16), imm(8)), use]
+    assert L.analyse([blk], [[]], wave64=False)[0][id(use)] == {}
+    state = {}
+    L.step(state, blk[0], False)
+    assert state == {}
     # exec_lo / exec_hi preserve half identity on 32-bit copies.
     got2 = L.analyse([[ins("s_mov_b32", s(6), sp("exec_lo")), ins("s_mov_b32", s(7), sp("exec_hi")), use]], [[]])[0][id(use)]
     assert got2 == {6: L.MASK_LO, 7: L.MASK_HI}
@@ -318,6 +324,44 @@ def test_v_and_or_xnor_bfi_track_vector_masks():
         assert id(bad) not in writes, bad["op"]
         assert 7 not in out[id(bad_use)] and ("v", 6) not in out[id(bad_use)], bad["op"]
 
+def test_single_block_and_step_monkeypatch_and_snapshot_stability():
+    # Straight-line single-block shaders step each instruction once (skipping the fixpoint pass),
+    # and monkey-patching lane_masks.step must still be honoured by analyse().
+    blk = [
+        ins("s_mov_b64", s(6, 2), sp("exec")),
+        ins("v_add_f32_e32", v(0), v(1), v(2)),
+        ins("v_mul_f32_e32", v(0), v(0), v(3)),
+        ins("s_mov_b32", s(9), imm(0)),
+        ins("v_sub_f32_e32", v(1), v(0), v(2)),
+        ins("s_bcnt1_i32_b64", s(8), s(6, 2)),
+    ]
+    out, writes, either = L.analyse([blk], [[]], include_either=True)
+    assert out[id(blk[0])] == {}
+    assert out[id(blk[1])] == {6: L.MASK_LO, 7: L.MASK_HI}
+    assert out[id(blk[2])] == {6: L.MASK_LO, 7: L.MASK_HI}
+    assert out[id(blk[4])] == {6: L.MASK_LO, 7: L.MASK_HI}
+    assert either[id(blk[3])] == set()
+    assert either[id(blk[4])] == {9}
+    assert either[id(blk[5])] == {9}
+    assert writes == set()
+
+    # Monkey-patching lane_masks.step falls back to calling the wrapper once per instruction on a single block.
+    calls = []
+    orig_step = L.step
+
+    def wrapped_step(state, inst, wave64=True):
+        calls.append(inst["op"])
+        return orig_step(state, inst, wave64)
+
+    L.step = wrapped_step
+    try:
+        out_w, writes_w, either_w = L.analyse([blk], [[]], include_either=True)
+    finally:
+        L.step = orig_step
+    assert out_w == out and writes_w == writes and either_w == either
+    assert len(calls) == len(blk)
+
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
@@ -328,4 +372,5 @@ if __name__ == "__main__":
     test_b64_mask_imm_and_include_either()
     test_writelane_sdwa_dpp_swaps_stores_and_div_scale()
     test_v_and_or_xnor_bfi_track_vector_masks()
+    test_single_block_and_step_monkeypatch_and_snapshot_stability()
     print("ok")
