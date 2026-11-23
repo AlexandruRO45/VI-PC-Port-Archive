@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import stat
 import struct
 import tempfile
 import unittest
@@ -1071,6 +1072,23 @@ class PngTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires named pipes")
+    def test_cli_preserves_existing_named_pipe(self):
+        original = dds_buffer(4, 4, bc1_block(0xFFFF, 0, [0, 0, 0, 0]),
+                              flags=DDPF_FOURCC, fourcc=b"DXT1")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.dds")
+            dst = os.path.join(tmp, "out.png")
+            with open(src, "wb") as f:
+                f.write(original)
+            os.mkfifo(dst)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                result = dds.main([src, dst])
+            self.assertTrue(stat.S_ISFIFO(os.stat(dst).st_mode))
+            self.assertEqual(result, 1)
+            self.assertIn("output must be a regular file", stderr.getvalue())
+
     def test_cli_writes_png(self):
         payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
         with tempfile.TemporaryDirectory() as tmp:

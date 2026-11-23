@@ -31,6 +31,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import struct
 import sys
 import tempfile
@@ -1536,7 +1537,13 @@ def main(argv: list[str] | None = None) -> int:
             pending = os.path.join(staging, "preview.png")
             with open(pending, "wb") as f:
                 f.write(png)
-            if os.path.isfile(output):
+            try:
+                output_mode = os.stat(output).st_mode
+            except FileNotFoundError:
+                output_mode = None
+            if output_mode is not None:
+                if not stat.S_ISREG(output_mode):
+                    raise DdsError("output must be a regular file")
                 shutil.copymode(output, pending)
             os.replace(pending, output)
     except (DdsError, OSError) as exc:
