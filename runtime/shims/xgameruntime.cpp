@@ -255,6 +255,14 @@ void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* 
 // void XErrorSetOptions(XErrorOptions, XErrorOptions), as Microsoft documents it: nothing to configure offline.
 void STDMETHODCALLTYPE error_set_options(void*, uint32_t, uint32_t) {}
 
+// The flat export xgameruntime.lib looks up on the error leg of XGameRuntimeInitialize (HRESULT, const char*).
+HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) {
+    std::fprintf(stderr, "[rt] xgameruntime: XErrorReport(0x%08lx, %s)\n", static_cast<unsigned long>(hr),
+                 message ? message : "(null)");
+    if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
+    return S_OK;
+}
+
 const void* const kErrorVtable[] = {
     reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
     reinterpret_cast<const void*>(&object_release),
@@ -1323,6 +1331,7 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
+    XGR(XErrorReport),
     // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
     {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
