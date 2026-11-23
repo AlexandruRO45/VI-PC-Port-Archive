@@ -23,19 +23,49 @@ def run(cmd, env=None):
     return p.returncode, p.stdout + p.stderr
 
 
+def probe_status(code, output):
+    if code == 0 and "device probe available:" in output:
+        return "available"
+    if code == UNSUPPORTED and "device probe unavailable:" in output:
+        return "unavailable"
+    return "failure"
+
+
+def self_test_probe_status():
+    # Exercise the subprocess boundary: a real unavailable result skips, but arbitrary nonzero child failures do not.
+    child = "import sys; print(sys.argv[2]); raise SystemExit(int(sys.argv[1]))\n"
+    cases = ((0, "device probe available: 2 Vulkan physical device(s)", "available"),
+             (UNSUPPORTED, "device probe unavailable: no Vulkan physical devices found", "unavailable"),
+             (23, "synthetic unexpected enumeration error", "failure"),
+             (UNSUPPORTED, "synthetic unexpected enumeration error", "failure"))
+    for code, message, want in cases:
+        actual_code, output = run([sys.executable, "-c", child, str(code), message])
+        if actual_code != code or probe_status(actual_code, output) != want:
+            print(f"FAIL: child status {code} with {message!r}: got {actual_code}, {output.strip()}")
+            return 1
+    print("ok: device probe child distinguishes available, explicit unavailable, and unexpected failures")
+    return 0
+
+
 def main(argv):
+    if argv[1:] == ["--self-test-probe-status"]:
+        return self_test_probe_status()
     if len(argv) != 4:
         print(__doc__, file=sys.stderr)
         return 2
     bench, sandbox, work = argv[1:]
     os.makedirs(work, exist_ok=True)
 
-    # The device list ignores the filter, so it shows whether there is any device to choose from.
+    # Probe ignores the filter and distinguishes no device from startup/enumeration errors.
     plain = {k: v for k, v in os.environ.items() if k != "LEONIDA_VK_DEVICE"}
-    code, out = run([bench, "--list-devices"], env=plain)
-    if code != 0 or not any(line.startswith("[") for line in out.splitlines()):
-        print(f"SKIP: no Vulkan device to choose from ({bench} --list-devices exit {code})")
+    code, out = run([bench, "--probe-device"], env=plain)
+    status = probe_status(code, out)
+    if status == "unavailable":
+        print(f"SKIP: {out.strip()}")
         return UNSUPPORTED
+    if status != "available":
+        print(f"FAIL: {bench} --probe-device exited {code} without a recognized status:\n{out.strip()}")
+        return 1
 
     # The smallest scene vk_sandbox reads: magic, version 1, no textures, meshes or draws, and a centre.
     scene = os.path.join(work, "empty_scene.bin")

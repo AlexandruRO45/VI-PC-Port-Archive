@@ -9,7 +9,7 @@
 // Usage:
 //   vk_descriptor_bench [--sizes 1000,10000,100000] [--groups 4096] [--iters 64] [--reps 25] [--warmup 5] [--warmup-ms 300]
 //                       [--memory all|device|host|rebar] [--device N] [--list-devices] [--quick] [--csv]
-//                       [--dump-spv PREFIX] [--self-test]
+//                       [--dump-spv PREFIX] [--probe-device] [--self-test]
 //   LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation; any validation error fails the run.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
@@ -973,6 +973,7 @@ struct Options {
     std::optional<std::uint32_t> device_index;
     MemoryFilter mem_filter = MemoryFilter::All;
     bool list_devices = false;
+    bool probe_device = false;
     bool csv = false;
     bool self_test = false;
     std::string dump_spv_prefix;
@@ -992,6 +993,7 @@ void print_usage() {
         "  --memory MODE        all|device|host|rebar (default: all)\n"
         "  --device N           select physical device index from --list-devices\n"
         "  --list-devices       list Vulkan physical devices and exit\n"
+        "  --probe-device       preflight Vulkan availability (77 only when no loader, ICD, or physical device exists)\n"
         "  --quick              fast check profile (sizes 1000,10000; groups 16; iters 4; reps 3)\n"
         "  --csv                emit CSV with timing_status and empty fields for unavailable measurements\n"
         "  --dump-spv PREFIX    write the 3 SPIR-V compute modules to PREFIX_*.spv and exit\n"
@@ -1027,6 +1029,8 @@ bool parse_args(int argc, const char* const* argv, Options& opt, bool& show_help
             opt.self_test = true;
         } else if (arg == "--list-devices") {
             opt.list_devices = true;
+        } else if (arg == "--probe-device") {
+            opt.probe_device = true;
         } else if (arg == "--csv") {
             opt.csv = true;
         } else if (arg == "--quick") {
@@ -1266,7 +1270,13 @@ int main(int argc, char** argv) {
     if (!opt.dump_spv_prefix.empty()) return run_dump_spv(opt.dump_spv_prefix);
 
     const PFN_vkGetInstanceProcAddr gipa = load_vulkan();
-    if (!gipa) return 1;
+    if (!gipa) {
+        if (opt.probe_device) {
+            std::fprintf(stderr, "device probe unavailable: Vulkan loader not found\n");
+            return kUnsupportedExit;
+        }
+        return 1;
+    }
 
 #define LI(n) const auto n = reinterpret_cast<PFN_##n>(gipa(inst, #n))
     VkInstance inst = VK_NULL_HANDLE;
@@ -1311,7 +1321,15 @@ int main(int argc, char** argv) {
         ici.enabledExtensionCount = 1;
         ici.ppEnabledExtensionNames = &debug_utils;
     }
-    CHECK_VK(vkCreateInstance(&ici, nullptr, &inst));
+    const VkResult instance_result = vkCreateInstance(&ici, nullptr, &inst);
+    if (instance_result != VK_SUCCESS) {
+        if (opt.probe_device && instance_result == VK_ERROR_INCOMPATIBLE_DRIVER) {
+            std::fprintf(stderr, "device probe unavailable: vkCreateInstance found no compatible Vulkan ICD\n");
+            return kUnsupportedExit;
+        }
+        std::fprintf(stderr, "FAILED vkCreateInstance -> %d (line %d)\n", int(instance_result), __LINE__);
+        return 1;
+    }
 
     LI(vkDestroyInstance);
     LI(vkEnumeratePhysicalDevices);
@@ -1337,6 +1355,29 @@ int main(int argc, char** argv) {
         }
         if (inst && vkDestroyInstance) vkDestroyInstance(inst, nullptr);
     };
+
+    if (opt.probe_device) {
+        std::uint32_t count = 0;
+        const VkResult result = vkEnumeratePhysicalDevices(inst, &count, nullptr);
+        if (result == VK_ERROR_INCOMPATIBLE_DRIVER) {
+            std::fprintf(stderr, "device probe unavailable: physical-device enumeration found no compatible Vulkan ICD\n");
+            destroy_instance();
+            return kUnsupportedExit;
+        }
+        if (result != VK_SUCCESS) {
+            std::fprintf(stderr, "device probe failed: vkEnumeratePhysicalDevices -> %d\n", int(result));
+            destroy_instance();
+            return 1;
+        }
+        if (count == 0) {
+            std::fprintf(stderr, "device probe unavailable: no Vulkan physical devices found\n");
+            destroy_instance();
+            return kUnsupportedExit;
+        }
+        std::printf("device probe available: %u Vulkan physical device(s)\n", count);
+        destroy_instance();
+        return 0;
+    }
 
     std::uint32_t pd_count = 0;
     vkEnumeratePhysicalDevices(inst, &pd_count, nullptr);

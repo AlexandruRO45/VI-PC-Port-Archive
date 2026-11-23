@@ -1249,6 +1249,8 @@ if(TARGET Vulkan::Headers)
              "${CMAKE_CURRENT_SOURCE_DIR}/test/check_device_filter_tools.py" "$<TARGET_FILE:vk_descriptor_bench>"
              "$<TARGET_FILE:vk_sandbox>" "${CMAKE_CURRENT_BINARY_DIR}/vk_device_filter_tools")
     set_tests_properties(vk_device_filter_tools PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME vk_device_filter_probe_status COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_device_filter_tools.py" --self-test-probe-status)
   endif()
   if(MSVC)
     # Keep the checker and its worker threads on the toolchain's C++ runtime under Wine.
