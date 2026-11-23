@@ -497,5 +497,23 @@ class TestLshlOrB32SIMDBoundaries(unittest.TestCase):
         self.assertEqual(oracle_lshl_or_b32(1, 31, 0), 0x8000_0000)
         self.assertEqual(oracle_lshl_or_b32(1, 32, 0), 1)
 
+# ---------------------------------------------------------------------------
+# Opcode 4: v_lshl_or_b32 - Translator Integration
+# ---------------------------------------------------------------------------
+
+class TestLshlOrB32Translator(unittest.TestCase):
+    def test_translated_execution(self) -> None:
+        triples = [
+            (1, 4, 5),
+            (0x1234, 16, 0x5678),
+            (0xFF, 8, 0xAA),
+            (0, 0, 0),
+            (MASK32, 0, 0),
+        ]
+        for a, b, c in triples:
+            expected = oracle_lshl_or_b32(a, b, c)
+            actual = run_translated_triop("v_lshl_or_b32", a, b, c)
+            self.assertEqual(actual, expected)
+
 if __name__ == "__main__":
     unittest.main()
