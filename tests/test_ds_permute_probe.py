@@ -113,7 +113,8 @@ class DsPermuteProbeTests(unittest.TestCase):
     def test_write_json_report_and_main_catch_oserror_cleanly(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_path = os.path.join(tmp, "out.json")
-            with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            with mock.patch.object(ds_permute_probe, "replace_retry",
+                                   side_effect=PermissionError("denied")):
                 err = ds_permute_probe.write_json_report(out_path, {"ok": True})
             self.assertIsNotNone(err)
             self.assertIn("cannot write --json", err)
@@ -124,13 +125,28 @@ class DsPermuteProbeTests(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"hw_oracle": pkg, "hw_oracle.asm": asm_mod,
                                                "hw_oracle.runner": runner_mod}), \
                  mock.patch.object(ds_permute_probe, "probe_wave", return_value=fake_probe), \
-                 mock.patch("builtins.open", side_effect=OSError("disk full")):
+                 mock.patch.object(ds_permute_probe, "replace_retry",
+                                   side_effect=OSError("disk full")):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
                     rc = ds_permute_probe.main(["--waves", "32", "--json", out_path])
             self.assertEqual(rc, 1)
             self.assertIn("error:", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(ds_permute_probe, "replace_retry",
+                                   side_effect=OSError(13, "Permission denied")):
+                err = ds_permute_probe.write_json_report(path, {"new": True})
+            self.assertIsNotNone(err)
+            self.assertIn("Permission denied", err)
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":
