@@ -59,6 +59,11 @@ def main(argv=None):
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     # Start packages before standalone files because a package can contain several test files.
     modules.sort(key=lambda m: (m.endswith(".py"), -os.path.getsize(os.path.join(directory, m))))
+    scheduled = set(modules)
+    shadowed = sorted(name for name in modules if name.endswith(".py") and name.removesuffix(".py") in scheduled)
+    if shadowed:
+        print(f"test files shadowed by packages in {directory}: {', '.join(shadowed)}", file=sys.stderr)
+        return 1
     start, total, failed = time.monotonic(), 0, []
     empty = 0
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:

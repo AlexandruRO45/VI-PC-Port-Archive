@@ -104,6 +104,16 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual(code, 1, out)
             self.assertIn("no tests discovered", out)
 
+    def test_file_shadowed_by_package_fails_discovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_shared.py": FAIL, "test_shared/__init__.py": PASS})
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = r.main([tmp, "-j", "2"])
+            self.assertEqual(code, 1, stdout.getvalue())
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("test_shared.py", stderr.getvalue())
+
     def test_package_with_only_explicit_skips_succeeds(self):
         module_skip = "\ndef setUpModule():\n    raise unittest.SkipTest('optional runtime unavailable')\n"
         with tempfile.TemporaryDirectory() as tmp:
