@@ -435,6 +435,20 @@ private:
             surface_lost_ = false;
             stale_ = true;  // the old swapchain is gone: rebuild on the new surface below
         }
+        // The window was resized but the driver has not said so yet: some (NVIDIA on Win32) keep returning VK_SUCCESS
+        // for a few presents, which shows frames at the old size. The client area is cheap to read; the surface is
+        // asked only when it differs, and the swapchain is rebuilt only when the surface agrees, so a window whose
+        // client size never matches the surface (DPI virtualisation) does not rebuild on every present.
+        if (swapchain_ && !stale_ && extent_fn_) {
+            const VkExtent2D client = extent_fn_();
+            if (client.width && client.height && (client.width != extent_.width || client.height != extent_.height)) {
+                VkSurfaceCapabilitiesKHR caps{};
+                if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) == VK_SUCCESS &&
+                    (caps.currentExtent.width == 0xFFFFFFFF ||
+                     caps.currentExtent.width != extent_.width || caps.currentExtent.height != extent_.height))
+                    stale_ = true;
+            }
+        }
         // The swapchain's HDR10 format is only for composed planes that ask for it; a blit of an SDR source or a blank
         // frame keeps whatever the swapchain has (black is black), except that a blit needs the SDR one.
         bool want_hdr = swapchain_hdr_req_;
