@@ -7,6 +7,8 @@
 //     values. The cases: 1x1 by default and after Reset and ClearState, each per-draw rate, the first combiner
 //     against the 1x1 per-primitive rate, a shading-rate image of four quadrants with different rates under each
 //     second combiner, an unbound image, and a pixel shader that writes depth, which D3D12 shades per pixel;
+//     The bundle cases: a rate or image a bundle sets is the executing list's afterwards, and a bundle's draw
+//     takes the executing list's rate, as the other state calls a bundle makes do (docs section 3.2);
 //   - without the extension, the rate and the image are ignored and every pixel is shaded;
 //   - with the extension, Close must return what the host PC D3D12 runtime returns after the VRS calls: for a
 //     rate or combiner outside its enum, for each call on direct, bundle, compute and copy lists, and for two
@@ -359,11 +361,13 @@ int run(const std::filesystem::path& library, const std::vector<std::uint8_t>& v
     EXPECT(list->Close() == S_OK);
     EXPECT(submit());
 
-    // One draw over the whole target. `first` runs right after Reset; `vrs` right before the draw.
+    // One draw over the whole target. `first` runs right after Reset; `vrs` right before the draw; `draw`, when
+    // given, makes the draw in place of DrawInstanced (an ExecuteBundle).
     using Step = std::function<void(ID3D12GraphicsCommandList5*)>;
     const D3D12_VIEWPORT viewport{0, 0, float(kSize), float(kSize), 0, 1};
     const D3D12_RECT scissor{0, 0, LONG(kSize), LONG(kSize)};
-    const auto render = [&](ID3D12PipelineState* state, const Step& first, const Step& vrs) {
+    const auto render = [&](ID3D12PipelineState* state, const Step& first, const Step& vrs,
+                            const Step& draw = nullptr) {
         if (FAILED(list->Reset(allocator.p, state))) return false;
         if (first) first(list5.p);
         list->SetGraphicsRootSignature(root.p);
@@ -374,7 +378,10 @@ int run(const std::filesystem::path& library, const std::vector<std::uint8_t>& v
         const FLOAT unset[4] = {1, 1, 1, 0};  // alpha 0: not drawn
         list->ClearRenderTargetView(rtv, unset, 0, nullptr);
         if (vrs) vrs(list5.p);
-        list->DrawInstanced(3, 1, 0, 0);
+        if (draw)
+            draw(list5.p);
+        else
+            list->DrawInstanced(3, 1, 0, 0);
         D3D12_RESOURCE_BARRIER barrier =
             transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1, &barrier);
@@ -472,6 +479,36 @@ int run(const std::filesystem::path& library, const std::vector<std::uint8_t>& v
         EXPECT(render(pso_depth.p, nullptr, rate(D3D12_SHADING_RATE_2X2)));
         check("2x2, pixel shader writes depth: 1x1", everywhere(fine));
 
+        // Closed bundles, executed by the direct list: the rate one sets stays on the list, and one that draws
+        // takes the list's rate.
+        Ref<ID3D12CommandAllocator> bundle_allocator;
+        EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                        IID_PPV_ARGS(&bundle_allocator.p))));
+        Ref<ID3D12GraphicsCommandList> sets_2x2, draws, sets_image;
+        const auto record_bundle = [&](Ref<ID3D12GraphicsCommandList>& bundle, const Step& record) {
+            Ref<ID3D12GraphicsCommandList5> bundle5;
+            if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p, pso.p,
+                                                 IID_PPV_ARGS(&bundle.p))) ||
+                FAILED(bundle->QueryInterface(IID_PPV_ARGS(&bundle5.p))))
+                return false;
+            record(bundle5.p);
+            return bundle->Close() == S_OK;
+        };
+        const auto execute = [](const Ref<ID3D12GraphicsCommandList>& bundle) {
+            return [b = bundle.p](ID3D12GraphicsCommandList5* l) { l->ExecuteBundle(b); };
+        };
+        EXPECT(record_bundle(sets_2x2, rate(D3D12_SHADING_RATE_2X2)));
+        EXPECT(record_bundle(draws, [](ID3D12GraphicsCommandList5* b) {
+            b->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            b->DrawInstanced(3, 1, 0, 0);
+        }));
+        EXPECT(render(pso.p, nullptr, execute(sets_2x2)));
+        check("2x2 set in a bundle, list draws: 2x2", everywhere({2, 2}));
+        EXPECT(render(pso.p, nullptr, rate(D3D12_SHADING_RATE_2X1), execute(draws)));
+        check("2x1 on the list, bundle draws: 2x1", everywhere({2, 1}));
+        EXPECT(render(pso.p, nullptr, nullptr, execute(draws)));
+        check("bundle draws after Reset: 1x1", everywhere(fine));
+
         if (tile) {
             const auto with_image = [&](D3D12_SHADING_RATE r, D3D12_SHADING_RATE_COMBINER c1) {
                 return [&, r, c1](ID3D12GraphicsCommandList5* l) {
@@ -509,7 +546,16 @@ int run(const std::filesystem::path& library, const std::vector<std::uint8_t>& v
                 l->ClearState(pso.p);
             }, nullptr));
             check("image, override, then ClearState: 1x1", everywhere(fine));
+            // A tile size means tier 2, where bundles take RSSetShadingRateImage.
+            EXPECT(record_bundle(sets_image, with_image(D3D12_SHADING_RATE_4X4, D3D12_SHADING_RATE_COMBINER_OVERRIDE)));
+            EXPECT(render(pso.p, nullptr, execute(sets_image)));
+            check("image set in a bundle, override: the quadrants' rates", quadrants);
+            EXPECT(render(pso.p, nullptr, with_image(D3D12_SHADING_RATE_4X4, D3D12_SHADING_RATE_COMBINER_OVERRIDE),
+                          execute(draws)));
+            check("image on the list, override, bundle draws: the quadrants' rates", quadrants);
         }
+        for (auto* bundle : {&sets_2x2, &draws, &sets_image}) bundle->reset();
+        bundle_allocator.reset();
     }
 
     for (auto* r : {&target, &readback, &upload, &rate_image}) r->reset();
