@@ -8,6 +8,8 @@ against `--main` (default `origin/main`), using one history scan for the whole b
 - `merges`: first-parent commits on main whose subject is "Merge pull request #PR" or ends with " (#PR)" (squash
   merges; "Revert ..." subjects are ignored), newest first. A number that is already there is the case the repeated
   merges come from: a rebased copy merged again keeps both copies of what it added.
+- `reverted`: earlier merges of the PR that a later commit on main reverted ("Revert #PR: ...", or git's
+  `Revert "<the merge's subject>"`), as [merge, revert] pairs, newest first. `merges` leaves those out.
 - `commits`: the PR's commits (merge base..REF) and how many `git cherry` finds on main already (same patch).
 - `duplicates`: runs of three or more consecutive lines the merge would add (each at least `--min-length`
   characters once stripped) that already stand in the same order in the same file on main. This is what a second
@@ -17,7 +19,9 @@ against `--main` (default `origin/main`), using one history scan for the whole b
 - `conflict`: whether `git merge-tree` reports a conflict (the duplicate check is then on the conflicted tree).
 
 Verdict per PR: `already-merged` (a prior merge exists and either every commit is on main or the conflict-free merged
-tree matches main, as after a multi-commit squash merge), `duplicates`, `conflict` or `clean`.
+tree matches main, as after a multi-commit squash merge), `reverted` (a merge of it was reverted, and the branch is
+still in main's history, so merging it again changes nothing: a re-land takes reverting the revert, or new
+commits), `duplicates`, `conflict` or `clean`.
 Exit 0 when every PR is clean, 1 when any is not, 2 on a usage or git error. Read-only: `merge-tree --write-tree`
 writes only objects, no refs. Standard library only; needs git 2.38 or newer for `merge-tree --write-tree`.
 """
@@ -32,6 +36,9 @@ from collections import Counter
 MERGE_SUBJECT = re.compile(r"^Merge pull request #(\d+)\b")
 SQUASH_SUBJECT = re.compile(r"(?:^|\s)\(#(\d+)\)\s*$")
 REVERT_SUBJECT = re.compile(r"^Revert\b", re.IGNORECASE)
+# What a revert commit on main undoes: the maintainer's "Revert #N: why", or git's own `Revert "<the merge's subject>"`.
+REVERTED_NUMBER = re.compile(r"^Revert #(\d+)\b")
+REVERTED_SUBJECT = re.compile(r'^Revert "(.*)"\s*$')
 # Where a doubled block is the repeated-merge damage. In code, three equal lines in two functions are ordinary, so a
 # block there is listed but does not change the verdict.
 TEXT_SUFFIXES = (".md", ".txt", ".rst")
@@ -61,15 +68,30 @@ def _merged_pr_number(subject):
     return int(m.group(1)) if m else None
 
 
+def _reverted_pr_number(subject):
+    """The PR whose merge a revert commit undoes, or None (a revert of a revert, or one that names no PR)."""
+    m = REVERTED_NUMBER.match(subject)
+    if m:
+        return int(m.group(1))
+    m = REVERTED_SUBJECT.match(subject)
+    return _merged_pr_number(m.group(1)) if m else None
+
+
 def prior_merges(repo, main, numbers, depth):
     out = git(repo, "log", main, "--first-parent", f"-n{depth}", "--format=%H%x09%s").stdout
     hits = {number: [] for number in numbers}
-    for line in out.splitlines():
+    reverted = {number: [] for number in hits}
+    # Oldest first, so that a revert undoes the latest merge of its PR before it; a merge it undoes no longer counts.
+    for line in reversed(out.splitlines()):
         sha, _, subject = line.partition("\t")
         number = _merged_pr_number(subject)
         if number in hits:
             hits[number].append(sha[:12])
-    return hits
+            continue
+        number = _reverted_pr_number(subject)
+        if number in hits and hits[number]:
+            reverted[number].append([hits[number].pop(), sha[:12]])
+    return {number: (hits[number][::-1], reverted[number][::-1]) for number in hits}
 
 
 def cherry(repo, main, ref):
@@ -146,7 +168,7 @@ def duplicates(repo, main, tree, min_length, block=3):
     return found
 
 
-def check(repo, main, number, ref, min_length, merges):
+def check(repo, main, number, ref, min_length, merges, reverted=()):
     total, on_main = cherry(repo, main, ref)
     tree, conflict = merged_tree(repo, main, ref)
     unchanged = not conflict and tree == rev_tree(repo, main)
@@ -154,6 +176,9 @@ def check(repo, main, number, ref, min_length, merges):
     text_dups = {p: v for p, v in dups.items() if p.lower().endswith(TEXT_SUFFIXES)}
     if merges and (total == on_main or unchanged):
         verdict = "already-merged"
+    elif reverted and unchanged:
+        # The branch is in main's history already, so git merges nothing: the reverted code stays out.
+        verdict = "reverted"
     elif text_dups:
         verdict = "duplicates"
     elif conflict:
@@ -161,6 +186,7 @@ def check(repo, main, number, ref, min_length, merges):
     else:
         verdict = "clean"
     return {"pr": number, "ref": ref, "verdict": verdict, "merges": merges,
+            "reverted": [list(pair) for pair in reverted],
             "commits": {"total": total, "on_main": on_main}, "conflict": conflict,
             "duplicates": {p: len(v) for p, v in dups.items()},
             "duplicate_samples": {p: v[:3] for p, v in dups.items()}}
@@ -184,7 +210,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     try:
         history = prior_merges(args.repo, args.main, (n for n, _ in args.pairs), args.depth)
-        results = [check(args.repo, args.main, n, ref, args.min_length, history[n]) for n, ref in args.pairs]
+        results = [check(args.repo, args.main, n, ref, args.min_length, *history[n]) for n, ref in args.pairs]
     except GitError as e:
         print(f"merge_check: {e}", file=sys.stderr)
         return 2
@@ -197,6 +223,7 @@ def main(argv=None):
                   + (", merged tree matches main"
                      if r["verdict"] == "already-merged" and c["on_main"] != c["total"] else "")
                   + (f", merged before at {', '.join(r['merges'])}" if r["merges"] else "")
+                  + "".join(f", merged at {m} and reverted at {v}" for m, v in r["reverted"])
                   + (", conflicts" if r["conflict"] else ""))
             for path, n in sorted(r["duplicates"].items()):
                 note = "" if path.lower().endswith(TEXT_SUFFIXES) else " (code: listed, not counted)"

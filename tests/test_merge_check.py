@@ -315,6 +315,69 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(r["verdict"], "clean")
         self.assertEqual(r["merges"], [])
 
+    def test_a_squash_merge_that_was_reverted_is_not_already_merged(self):
+        # Squash-merged, then reverted: the code is off main again and the branch still adds it, so the same branch
+        # proposed again is a merge to make, not an `already-merged` one to skip.
+        base = self.git("rev-parse", "main")
+        self.pr_branch("rv1", base, "\n" + PARAGRAPH)
+        self.squash_merge(70, "rv1")
+        merge = self.git("rev-parse", "HEAD")[:12]
+        self.git("revert", "--no-edit", "HEAD")
+        revert = self.git("rev-parse", "HEAD")[:12]
+        code, [r] = self.run_check("70=rv1")
+        self.assertEqual(code, 0)
+        self.assertEqual(r["verdict"], "clean")
+        self.assertEqual(r["merges"], [])
+        self.assertEqual(r["reverted"], [[merge, revert]])
+        _, text = self.run_text("70=rv1")
+        self.assertIn(f"merged at {merge} and reverted at {revert}", text)
+
+    def test_a_merge_commit_that_was_reverted_reads_reverted(self):
+        # Merged with a merge commit, then reverted: the branch is in main's history, so merging it again changes
+        # nothing and the reverted code stays out.
+        base = self.git("rev-parse", "main")
+        self.pr_branch("rv2", base, "\n" + PARAGRAPH)
+        self.merge(71, "rv2")
+        merge = self.git("rev-parse", "HEAD")[:12]
+        self.git("revert", "--no-edit", "-m", "1", "HEAD")
+        revert = self.git("rev-parse", "HEAD")[:12]
+        code, [r] = self.run_check("71=rv2")
+        self.assertEqual(code, 1)
+        self.assertEqual(r["verdict"], "reverted")
+        self.assertEqual(r["merges"], [])
+        self.assertEqual(r["reverted"], [[merge, revert]])
+
+    def test_a_revert_pairs_with_the_merge_before_it_and_a_later_merge_stands(self):
+        # The maintainer's subject, "Revert #N: why", then the PR merged again with the change it was missing.
+        base = self.git("rev-parse", "main")
+        self.pr_branch("rv3", base, "\n" + PARAGRAPH)
+        self.merge(72, "rv3")
+        first = self.git("rev-parse", "HEAD")[:12]
+        self.git("revert", "--no-edit", "-m", "1", "HEAD")
+        self.git("commit", "-q", "--amend", "-m", "Revert #72: its test needs a change the branch does not carry")
+        revert = self.git("rev-parse", "HEAD")[:12]
+        self.git("checkout", "-q", "rv3")
+        self.write("docs/reland.md", "The re-land carries the change the reverted merge was missing, so it goes in.\n")
+        self.commit("rv3: the missing change")
+        self.git("checkout", "-q", "main")
+        self.merge(72, "rv3")
+        second = self.git("rev-parse", "HEAD")[:12]
+        code, [r] = self.run_check("72=rv3")
+        self.assertEqual(code, 1)
+        self.assertEqual(r["verdict"], "already-merged")
+        self.assertEqual(r["merges"], [second])
+        self.assertEqual(r["reverted"], [[first, revert]])
+
+    def test_reverted_pr_number_subject_parsing(self):
+        # Subjects as they stand on main.
+        self.assertEqual(mc._reverted_pr_number("Revert #4247: its tail-scheduler tests need a mini scheduler"), 4247)
+        self.assertEqual(mc._reverted_pr_number("Revert #3920 (held for the maintainer): it makes design.md"), 3920)
+        self.assertEqual(mc._reverted_pr_number('Revert "Merge pull request #3006 from p3n1cillin"'), 3006)
+        self.assertEqual(mc._reverted_pr_number('Revert "docs: fix wording (#5523)"'), 5523)
+        self.assertIsNone(mc._reverted_pr_number("Revert 33 oracle-only semantic tests merged this round"))
+        self.assertIsNone(mc._reverted_pr_number('Revert "Revert "docs: fix wording (#5523)""'))
+        self.assertIsNone(mc._reverted_pr_number("Merge pull request #7 from someone/first"))
+
     def test_merged_pr_number_subject_parsing(self):
         self.assertEqual(mc._merged_pr_number("Merge pull request #7 from someone/first"), 7)
         self.assertEqual(mc._merged_pr_number("Merge pull request #7 from someone/fix (#99)"), 7)
