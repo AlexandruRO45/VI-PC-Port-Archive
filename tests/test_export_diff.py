@@ -197,7 +197,23 @@ class HarnessTest(unittest.TestCase):
         self.assertIn(export_diff.main(["--programs", "5", "--seed", "1"]), (0, 1))
 
     def test_all_skipped_is_harness_error(self):
-        self.assertEqual(export_diff.main(["--programs", "0", "--seed", "1"]), 2)
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = export_diff.main(["--programs", "0", "--seed", "1"])
+        self.assertEqual(code, 2)
+        self.assertIn("--programs must be at least 1", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+
+    def test_no_arguments_prints_usage(self):
+        # As tests/test_cf_diff.py: a bare invocation is a usage error, never the start of a long run.
+        import subprocess
+        proc = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "export_diff.py")],
+                              capture_output=True, text=True, timeout=5)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("usage:", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
 
     def test_calibration_sparse_targets(self):
         for targets in ([0, 2], [1, 3], [0, 7]):

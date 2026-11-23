@@ -19,8 +19,8 @@ Usage:
     python -I tools/export_diff.py --list-ops
 
 Exit code 0 when every program matches, 1 on the first mismatch (case, seed, program, the listing, and the expected
-against the actual structure), 2 on a harness error or when no program was compared. Skips are counted with reasons:
-a refusal the model predicts is a skip, one it does not is a mismatch.
+against the actual structure), 2 on a harness error, a bare invocation or when no program was compared. Skips are
+counted with reasons: a refusal the model predicts is a skip, one it does not is a mismatch.
 
 A mismatch is a finding to post in the coordination issue before anything is fixed: the model is wrong until the
 contract row proves otherwise, and then the translator is.
@@ -378,13 +378,19 @@ def describe(case):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Differential fuzzer for VS/PS export shapes.")
-    parser.add_argument("--programs", type=int, default=200, help="how many programs of the seed to run")
+    parser.add_argument("--programs", type=int, help="how many programs of the seed to run")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--program", type=int, metavar="K", help="with --show: the program to print")
     parser.add_argument("--show", action="store_true", help="print one program, its prediction and the module")
     parser.add_argument("--self-test", action="store_true", help="run the comparator canaries")
     parser.add_argument("--list-ops", action="store_true", help="list the export forms the generator emits")
     args = parser.parse_args(argv)
+    if args.programs is None and not (args.self_test or args.list_ops or args.show):
+        parser.print_usage(sys.stderr)      # a bare invocation is a usage error, never the start of a long run
+        return 2
+    if args.programs is not None and args.programs < 1:
+        print("--programs must be at least 1", file=sys.stderr)
+        return 2
     if args.self_test:
         missed = self_test()
         for name in missed:
@@ -416,11 +422,11 @@ def main(argv=None):
             skipped += 1
             reasons[detail] += 1
         else:
-            print("MISMATCH\n" + describe(case) + f"\n  {detail}")
-            print(f"seed {args.seed}, program {index}: mismatch")
+            print("MISMATCH\n" + describe(case) + f"\n  {detail}", file=sys.stderr)
+            print(f"seed {args.seed}, program {index}: mismatch", file=sys.stderr)
             return 1
     if not matched:
-        print("no program ran: every one was skipped")
+        print("no program ran: every one was skipped", file=sys.stderr)
         return 2
     summary = f"seed {args.seed}: {matched} programs matched the model, {skipped} skipped"
     print(summary + (": " + "; ".join(f"{n} x {why}" for why, n in reasons.items()) if skipped else ""))
