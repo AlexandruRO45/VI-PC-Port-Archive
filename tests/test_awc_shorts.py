@@ -155,6 +155,50 @@ class ShortsTest(unittest.TestCase):
             with open(catalog, "rb") as f:
                 self.assertEqual(f.read(), b"previous catalog\n")
 
+    def test_catalog_cannot_replace_the_input_bank(self):
+        os.makedirs(self.out)
+        path = self.write(os.path.join("out", "shorts.csv"), 0x78, 480000)
+        self.assert_catalog_collision_refused(path)
+
+    def test_catalog_cannot_alias_a_discovered_bank(self):
+        path = self.write("input.awc", 0x78, 480000)
+        os.makedirs(self.out)
+        catalog = os.path.join(self.out, "shorts.csv")
+        try:
+            os.link(path, catalog)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        self.assert_catalog_collision_refused(path, source=self.tmp.name)
+
+    def test_catalog_cannot_replace_a_symlinked_bank_target(self):
+        os.makedirs(self.out)
+        catalog = self.write(os.path.join("out", "shorts.csv"), 0x78, 480000)
+        path = os.path.join(self.tmp.name, "input.awc")
+        try:
+            os.symlink(catalog, path)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        self.assert_catalog_collision_refused(path, source=self.tmp.name)
+
+    def assert_catalog_collision_refused(self, path, *, source=None):
+        catalog = os.path.join(self.out, "shorts.csv")
+        with open(path, "rb") as f:
+            original = f.read()
+        tool = os.path.join(ROOT, "tools", "awc_shorts.py")
+        for jobs in ("1", "2"):
+            with self.subTest(jobs=jobs):
+                result = subprocess.run(
+                    [sys.executable, "-I", tool, source or path, self.out, "--jobs", jobs],
+                    capture_output=True, text=True, errors="replace", timeout=60)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(catalog, result.stderr)
+                self.assertIn(path, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(os.listdir(self.out), ["shorts.csv"])
+                for preserved in (path, catalog):
+                    with open(preserved, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
     def test_rejects_nonpositive_job_counts(self):
         for jobs in ("0", "-1"):
             with self.subTest(jobs=jobs):

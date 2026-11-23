@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus as awc  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
-from report_paths import path_key  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 
 FIELDS = ("bank", "stream", "duration_s", "channels", "packets", "file")
 
@@ -117,6 +117,11 @@ def main(argv=None) -> int:
     except OSError as e:
         print(f"awc_shorts: cannot list {e.filename or a.src}: {e.strerror or e}", file=sys.stderr)
         return 2
+    catalog = os.path.join(a.out, "shorts.csv")
+    for path, _bank in banks:
+        if same_report_path(catalog, path):
+            print(f"awc_shorts: error: catalog {catalog} must not overwrite input bank {path}", file=sys.stderr)
+            return 2
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:
@@ -163,7 +168,6 @@ def main(argv=None) -> int:
     if io_failed:
         return 1
     rows.sort(key=lambda r: (r["bank"].lower(), r["stream"]))
-    catalog = os.path.join(a.out, "shorts.csv")
     try:
         with tempfile.TemporaryDirectory(dir=a.out, prefix=".shorts-") as staging:
             staged = os.path.join(staging, "shorts.csv")
