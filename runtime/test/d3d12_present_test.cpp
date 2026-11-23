@@ -10,6 +10,7 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../src/vulkan_present.h"
 
 #include <dxgi1_6.h>
 
@@ -175,6 +176,7 @@ bool observe_next_swapchain = false;
 bool report_undefined_extent = false;    // armed: surface capabilities reports undefined extent (0xFFFFFFFF)
 bool undefined_extent_queried = false;
 VkExtent2D last_swapchain_extent{};
+VkCompositeAlphaFlagBitsKHR last_swapchain_alpha{};
 VkSwapchainKHR last_created_swapchain = VK_NULL_HANDLE;
 VkSwapchainKHR observed_old_swapchain = VK_NULL_HANDLE;
 unsigned out_of_date = 0;                // presents the real driver reported out of date
@@ -230,7 +232,10 @@ VKAPI_ATTR VkResult VKAPI_CALL surface_formats(VkPhysicalDevice physical, VkSurf
 
 VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
                                                 const VkAllocationCallbacks* allocator, VkSwapchainKHR* out) {
-    if (info) last_swapchain_extent = info->imageExtent;
+    if (info) {
+        last_swapchain_extent = info->imageExtent;
+        last_swapchain_alpha = info->compositeAlpha;
+    }
     if (observe_next_swapchain) {
         observed_old_swapchain = info->oldSwapchain;
         observe_next_swapchain = false;
@@ -286,9 +291,106 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
 }
 }  // namespace driver
 
+int check_swapchain_composite_alpha() {
+    // Exercise the presenter through the same caps/create hooks without a window, a Vulkan loader or a GPU.
+    static VkCompositeAlphaFlagsKHR supported_alpha;
+    driver::real_get_caps = [](VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR* caps) {
+        *caps = {};
+        caps->currentExtent = {64, 64};
+        caps->minImageCount = 2;
+        caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        caps->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        caps->supportedCompositeAlpha = supported_alpha;
+        return VK_SUCCESS;
+    };
+    driver::real_surface_formats = [](VkPhysicalDevice, VkSurfaceKHR, std::uint32_t* count, VkSurfaceFormatKHR* formats) {
+        *count = 1;
+        if (formats) formats[0] = {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+        return VK_SUCCESS;
+    };
+    // The create hook records the argument before the stub ends the attempt.
+    driver::real_create_swapchain = [](VkDevice, const VkSwapchainCreateInfoKHR*, const VkAllocationCallbacks*, VkSwapchainKHR*) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    driver::real_get_instance = [](VkInstance, const char* name) -> PFN_vkVoidFunction {
+        const std::string_view entry = name;
+        if (entry == "vkGetPhysicalDeviceSurfaceSupportKHR") {
+            PFN_vkGetPhysicalDeviceSurfaceSupportKHR support =
+                [](VkPhysicalDevice, std::uint32_t, VkSurfaceKHR, VkBool32* out) { *out = VK_TRUE; return VK_SUCCESS; };
+            return reinterpret_cast<PFN_vkVoidFunction>(support);
+        }
+        if (entry == "vkGetPhysicalDeviceSurfacePresentModesKHR") {
+            PFN_vkGetPhysicalDeviceSurfacePresentModesKHR modes =
+                [](VkPhysicalDevice, VkSurfaceKHR, std::uint32_t* count, VkPresentModeKHR* out) {
+                    *count = 1;
+                    if (out) out[0] = VK_PRESENT_MODE_FIFO_KHR;
+                    return VK_SUCCESS;
+                };
+            return reinterpret_cast<PFN_vkVoidFunction>(modes);
+        }
+        if (entry == "vkDestroySurfaceKHR") {
+            PFN_vkDestroySurfaceKHR destroy = [](VkInstance, VkSurfaceKHR, const VkAllocationCallbacks*) {};
+            return reinterpret_cast<PFN_vkVoidFunction>(destroy);
+        }
+        return nullptr;
+    };
+    driver::real_get_device = [](VkDevice, const char* name) -> PFN_vkVoidFunction {
+        const std::string_view entry = name;
+        if (entry == "vkCreateFence") {
+            PFN_vkCreateFence create = [](VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence*) {
+                return VK_SUCCESS;
+            };
+            return reinterpret_cast<PFN_vkVoidFunction>(create);
+        }
+        if (entry == "vkCmdBlitImage") {
+            PFN_vkCmdBlitImage blit = [](VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, std::uint32_t,
+                                         const VkImageBlit*, VkFilter) {};
+            return reinterpret_cast<PFN_vkVoidFunction>(blit);
+        }
+        return nullptr;
+    };
+    // The stub stops before there is a swapchain, so these setup calls don't need to allocate Vulkan objects.
+    leonida::VulkanContext context(driver::real_get_device, VK_NULL_HANDLE, false);
+    context.vk.vkCreateCommandPool = [](VkDevice, const VkCommandPoolCreateInfo*, const VkAllocationCallbacks*,
+                                        VkCommandPool*) { return VK_SUCCESS; };
+    context.vk.vkAllocateCommandBuffers = [](VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer*) {
+        return VK_SUCCESS;
+    };
+    context.vk.vkCreateSemaphore = [](VkDevice, const VkSemaphoreCreateInfo*, const VkAllocationCallbacks*,
+                                      VkSemaphore*) { return VK_SUCCESS; };
+    context.vk.vkQueueWaitIdle = [](VkQueue) { return VK_SUCCESS; };
+
+    constexpr auto opaque = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    constexpr auto inherit = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    constexpr auto pre = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+    constexpr auto post = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+    constexpr struct {
+        VkCompositeAlphaFlagsKHR supported;
+        VkCompositeAlphaFlagBitsKHR expected;
+    } cases[] = {
+        {opaque, opaque}, {inherit, inherit}, {pre, pre}, {post, post},
+        {opaque | inherit | pre | post, opaque}, {inherit | pre | post, inherit}, {pre | post, pre},
+    };
+    bool ok = true;
+    for (const auto& test : cases) {
+        supported_alpha = test.supported;
+        driver::last_swapchain_alpha = {};
+        leonida::VulkanPresenter presenter(context, driver::get_instance, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                           0, VK_NULL_HANDLE);
+        if (driver::last_swapchain_alpha != test.expected) {
+            std::fprintf(stderr, "swapchain alpha mask 0x%x: got 0x%x, expected 0x%x\n", unsigned(test.supported),
+                         unsigned(driver::last_swapchain_alpha), unsigned(test.expected));
+            ok = false;
+        }
+    }
+    return ok ? 0 : 1;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--composite-alpha-only") return check_swapchain_composite_alpha();
+
     vktest::Device d;
     const auto device_status = d.initialize(true);
     if (device_status == vktest::DeviceStatus::unavailable) {

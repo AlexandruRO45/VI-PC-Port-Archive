@@ -27,6 +27,7 @@
 
 #include "vulkan_backend.h"
 #include "vulkan_present_compose.h"
+#include "vulkan_swapchain_alpha.h"
 
 // Use the original EXT spellings. They are aliases of the promoted KHR types and are available in older headers.
 #if defined(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
@@ -1081,8 +1082,8 @@ private:
         info.imageUsage = usage;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         info.preTransform = caps.currentTransform;
-        info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        if (!(caps.supportedCompositeAlpha & info.compositeAlpha)) info.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+        info.compositeAlpha = pick_composite_alpha(caps.supportedCompositeAlpha);
+        if (!info.compositeAlpha) return false;
         info.presentMode = mode;
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
         // A vsync swapchain that can also be presented in IMMEDIATE (or FIFO_RELAXED), switched per present.

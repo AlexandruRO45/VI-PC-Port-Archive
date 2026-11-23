@@ -1882,6 +1882,7 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_present_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_present COMMAND d3d12_present_test)
     set_tests_properties(d3d12_present PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME d3d12_present_composite_alpha COMMAND d3d12_present_test --composite-alpha-only)
 
     # Per-pipeline --f16-interp-fallback linking (SHADER-378): 16-param VS + colliding PS rendered on Vulkan.
     add_executable(d3d12_f16_halves_test test/d3d12_f16_halves_test.cpp shims/d3d12_xs_device.cpp)

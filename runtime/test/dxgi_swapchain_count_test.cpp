@@ -29,6 +29,8 @@ struct Fake {
     std::uint32_t max_image_count = 0;
     std::uint32_t returned_images = 2;
     std::uint32_t create_min_image_count = 0;
+    VkCompositeAlphaFlagsKHR supported_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    VkCompositeAlphaFlagBitsKHR create_alpha{};
     std::uint32_t acquire_cursor = 0;
     std::uint32_t last_acquired = 0;
     std::uint32_t presented_image = UINT32_MAX;
@@ -69,6 +71,7 @@ VKAPI_ATTR VkResult VKAPI_CALL surface_caps(VkPhysicalDevice, VkSurfaceKHR, VkSu
     caps->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    caps->supportedCompositeAlpha = g.supported_alpha;
     return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL surface_formats(VkPhysicalDevice, VkSurfaceKHR, std::uint32_t* count,
@@ -100,6 +103,7 @@ VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice, const VkSwapchainCreat
                                                 const VkAllocationCallbacks*, VkSwapchainKHR* out) {
     if (!info || !out) return VK_ERROR_INITIALIZATION_FAILED;
     g.create_min_image_count = info->minImageCount;
+    g.create_alpha = info->compositeAlpha;
     *out = reinterpret_cast<VkSwapchainKHR>(kSwapchain);
     return VK_SUCCESS;
 }
@@ -242,10 +246,11 @@ int fail(const char* what) {
 
 // Requests `requested` buffers while faking `native` images and a surface minimum of `minimum`.
 int run_case(const char* label, std::uint32_t requested, std::uint32_t native, std::uint32_t minimum,
-             bool expect_offscreen) {
+             bool expect_offscreen, VkCompositeAlphaFlagBitsKHR alpha) {
     g = Fake{};
     g.min_image_count = minimum;
     g.returned_images = native;
+    g.supported_alpha = alpha;
     std::mutex mutex;
     leonida::VulkanSwapchain swapchain(get_instance_proc, reinterpret_cast<VkInstance>(1),
                                       reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
@@ -253,6 +258,11 @@ int run_case(const char* label, std::uint32_t requested, std::uint32_t native, s
     if (!swapchain.create(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)), 64, 64,
                           VK_FORMAT_B8G8R8A8_UNORM, requested))
         return fail("VulkanSwapchain::create");
+    if (g.create_alpha != alpha) {
+        std::fprintf(stderr, "DXGI swapchain alpha mask 0x%x: got 0x%x, expected 0x%x\n",
+                     unsigned(g.supported_alpha), unsigned(g.create_alpha), unsigned(alpha));
+        return 1;
+    }
 
     // GetDesc/GetDesc1 read image_count(): the app's request, never the native count.
     if (swapchain.image_count() != requested) {
@@ -332,6 +342,7 @@ struct Case {
     std::uint32_t native;
     std::uint32_t minimum;
     bool offscreen;
+    VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 };
 
 }  // namespace
@@ -344,11 +355,12 @@ int main() {
         {"minImageCount 3 for BufferCount 2", 2, 3, 3, true},
         // Control: the app asks for more than minImageCount; native and exposed counts agree, no blit.
         {"BufferCount 3 above minImageCount 2", 3, 3, 2, false},
+        {"premultiplied-only surface", 2, 2, 2, false, VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR},
     };
     for (const Case& c : cases) {
-        if (const int result = run_case(c.label, c.requested, c.native, c.minimum, c.offscreen)) return result;
+        if (const int result = run_case(c.label, c.requested, c.native, c.minimum, c.offscreen, c.alpha)) return result;
     }
-    std::printf("dxgi_swapchain_count_test: PASS (3 cases: extra native images, min above request, "
-                "request above min)\n");
+    std::printf("dxgi_swapchain_count_test: PASS (extra native images, min above request, request above min, "
+                "premultiplied-only surface)\n");
     return 0;
 }

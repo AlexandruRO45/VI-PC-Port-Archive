@@ -16,6 +16,7 @@
 #include <vulkan/vulkan.h>
 
 #include "../src/vulkan_backend.h"
+#include "../src/vulkan_swapchain_alpha.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -534,7 +535,8 @@ private:
             ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ci.preTransform = caps.currentTransform;
-        ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        ci.compositeAlpha = pick_composite_alpha(caps.supportedCompositeAlpha);
+        if (!ci.compositeAlpha) return false;
         ci.presentMode = chosen_present_mode;
         ci.clipped = VK_TRUE;
         ci.oldSwapchain = swapchain_;
