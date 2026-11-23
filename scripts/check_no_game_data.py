@@ -246,8 +246,18 @@ def tracked_files(root):
 
 def commit_blobs(root, rev_range):
     """[(blob id, path)] of every file version reachable from the end of `rev_range` and not from its start."""
-    objects = subprocess.run(["git", "rev-list", "--objects", rev_range], cwd=root, check=True,
-                             capture_output=True).stdout
+    def rev_list(*extra):
+        return subprocess.run(["git", "rev-list", "--objects", *extra, rev_range], cwd=root, check=True,
+                              capture_output=True).stdout
+
+    objects = rev_list("--missing=print")
+    missing = [line[1:] + b"\n" for line in objects.splitlines() if line.startswith(b"?")]
+    if missing:
+        # A blob:none clone (the workflow's) would fetch each missing version on its own, one round trip each.
+        subprocess.run(["git", "-c", "fetch.negotiationAlgorithm=noop", "fetch", "-q", "--no-tags",
+                        "--no-write-fetch-head", "--filter=blob:none", "--stdin", "origin"], cwd=root, check=True,
+                       input=b"".join(missing))
+        objects = rev_list()
     listing = subprocess.run(["git", "cat-file", "--batch-check=%(objecttype) %(objectname) %(rest)"], cwd=root,
                              input=objects, check=True, capture_output=True).stdout
     blobs = []

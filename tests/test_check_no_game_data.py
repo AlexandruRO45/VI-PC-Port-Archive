@@ -11,6 +11,7 @@ import gzip
 import io
 import lzma
 import os
+import pathlib
 import shutil
 import stat
 import subprocess
@@ -278,6 +279,42 @@ class CheckNoGameData(unittest.TestCase):
         result = run(["--commits", "HEAD^1..HEAD^1"], cwd=self.dir)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(run(["--commits"], cwd=self.dir).returncode, 2)
+
+
+    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    def test_commits_mode_fetches_the_missing_versions_of_a_partial_clone_at_once(self):
+        # The workflow checks out with filter: blob:none; fetching each deleted version on its own took a round trip
+        # per version, which on a long pull request can run past the job's timeout.
+        server = os.path.join(self.dir, "server")
+        clone = os.path.join(self.dir, "clone")
+
+        def git(*args, cwd=server):
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                            "-c", "init.defaultBranch=main", *args], cwd=cwd, check=True, capture_output=True)
+
+        git("init", "-q", server, cwd=self.dir)
+        git("config", "uploadpack.allowFilter", "true")
+        git("config", "uploadpack.allowAnySHA1InWant", "true")
+        git("commit", "-q", "--allow-empty", "-m", "base")
+        git("switch", "-q", "-c", "topic")
+        for i in range(3):
+            self.write(f"server/texture{i}.bin", b"DDS " + bytes([i]) * 12)
+            git("add", ".")
+            git("commit", "-q", "-m", "add")
+            git("rm", "-q", f"texture{i}.bin")
+            git("commit", "-q", "-m", "remove")
+        git("switch", "-q", "main")
+        git("merge", "-q", "--no-ff", "-m", "merge", "topic")
+        git("clone", "-q", "--filter=blob:none", pathlib.Path(server).as_uri(), clone, cwd=self.dir)
+
+        trace = os.path.join(self.dir, "trace.txt")
+        result = subprocess.run([sys.executable, "-I", SCRIPT, "--commits", "HEAD^1..HEAD"], cwd=clone,
+                                capture_output=True, text=True, env={**os.environ, "GIT_TRACE": trace})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("DDS texture"), 3, result.stdout)
+        with open(trace, encoding="utf-8", errors="replace") as f:
+            lazy = [line for line in f if "run_command:" in line and " fetch " in line]
+        self.assertEqual(lazy, [])  # git starts a lazy fetch per missing blob; the script's one fetch is not one
 
 
 if __name__ == "__main__":
