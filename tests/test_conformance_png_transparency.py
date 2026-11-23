@@ -73,6 +73,12 @@ class TransparencyTest(unittest.TestCase):
                 self.assertIn("RGBA", errors.getvalue())
                 self.assertEqual(before, {p.name: p.read_bytes() for p in self.root.iterdir()})
 
+    def test_load_manifest_rejects_deeply_nested_json(self):
+        path = self.root / "manifest.json"
+        path.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+        with self.assertRaisesRegex(C.ToolError, "nesting is too deep"):
+            C.load_manifest(str(path))
+
 
 if __name__ == "__main__":
     unittest.main()

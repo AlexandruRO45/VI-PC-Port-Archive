@@ -638,6 +638,8 @@ def load_manifest(path):
             f"{error.lineno} column {error.colno}. Check for a missing comma or "
             f"trailing text"
         )
+    except RecursionError:
+        raise ToolError(f"manifest '{manifest_path}' is not valid JSON: nesting is too deep")
     if not isinstance(document, dict):
         raise ToolError(
             f"manifest '{manifest_path}': top level must be an object, got "
