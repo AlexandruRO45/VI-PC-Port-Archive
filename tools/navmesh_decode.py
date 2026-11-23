@@ -58,6 +58,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from zero_span import gap_split  # noqa: E402
+import _navmesh_native as native  # noqa: E402  optional Rust kernels; every call returns None to fall back
 
 BASE = 0x50000000
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -502,6 +503,9 @@ def _walk_quadtree(b, root, n_polys):
     """Validate the 96-byte node / 32-byte leaf quadtree. Returns (ok, nodes, leaves, max_depth)."""
     if root is None:
         return False, 0, 0, 0
+    fast = native.walk_quadtree(b, root, n_polys, MAX_QT_DEPTH, MAX_QT_NODES)
+    if fast is not None:
+        return fast
     stack = [(root, 0)]
     seen = set()
     seen_leaves = set()
@@ -619,6 +623,9 @@ def decode_navmesh(b, nstreams, stats, deep):
 
 def _poly_chain(b, blocks, owner, pool):
     """Every polygon's +0 is the tile id; +4 is (first index << 4) | count and the runs tile the index pool."""
+    fast = native.poly_chain(b, blocks, owner, pool, 0x80000)
+    if fast is not None:
+        return fast
     nxt = 0
     has_water = False
     for o, n in blocks:
@@ -637,6 +644,14 @@ def _walk_volumes(b, vol, dc, stats):
         return vol is None
     if vol is None or dc % 2 != 0 or vol + 96 * dc > len(b):
         return False
+    fast = native.walk_volumes(b, vol, dc)
+    if fast is not None:
+        ok, pairs, flag_counts, vertex_counts = fast
+        if ok:
+            stats["volumes"]["pairs"] += pairs
+            stats["volumes"]["flags"].update(dict(flag_counts))
+            stats["volumes"]["vertex_counts"].update(dict(vertex_counts))
+        return ok
     flags = Counter()
     vertex_counts = Counter()
     for p in range(dc // 2):
@@ -690,7 +705,7 @@ def decode_grid(b, nstreams, stats, deep):
         used = len(ctrl) - empty if valid_ctrl else -1
         chk["control_bytes"] = valid_ctrl
         chk["occupied_equals_entries"] = valid_ctrl and used == entries
-        if deep:
+        if deep and not (chk["occupied_equals_entries"] and _grid_deep_native(b, groups, entries, payload, chk, stats)):
             chk["values_bijective"] = chk["occupied_equals_entries"] and _grid_values(b, groups, entries)
             if chk["values_bijective"] and chk["payload_in_bounds"]:
                 keys = _grid_slots(b, groups)
@@ -705,6 +720,23 @@ def decode_grid(b, nstreams, stats, deep):
     stats["entries_total"] += entries
     stats["entries_max"] = max(stats["entries_max"], entries)
     return {"sector": sector, "groups": groups, "entries": entries, "extent": ex[0]}, chk
+
+
+def _grid_deep_native(b, groups, entries, payload, chk, stats):
+    """The --deep grid checks through the native kernel; False when it is unavailable or declines."""
+    fast = native.grid_deep(b, groups, entries, payload if chk["payload_in_bounds"] else None)
+    if fast is None:
+        return False
+    chk["values_bijective"], octree, inner_ok, inner, depths, kinds = fast
+    if octree is not None:
+        chk["keys_octree"] = octree
+    if inner_ok is not None:
+        chk["inner_payload_ff00"] = inner_ok
+        if inner_ok:
+            stats["inner_nodes"] += inner
+            stats["key_depth"].update(dict(depths))
+            stats["leaf_payload"].update(dict(kinds))
+    return True
 
 
 def _grid_values(b, groups, entries):
