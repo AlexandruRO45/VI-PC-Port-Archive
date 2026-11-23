@@ -561,6 +561,21 @@ class TestDsWriteB16Oracle(unittest.TestCase):
         # Bytes 0 and 1 (0x3344) preserved, bytes 2 and 3 replaced by 0xAAAA
         self.assertEqual(lds.read_u32(0x50), 0xAAAA3344)
 
+class LdsWriteB16Expr(ASTNode):
+    def __init__(self, offset: int = 0) -> None:
+        self.offset = offset
+
+    def eval(self, lds: LdsModel, addr: int, val: int) -> None:
+        ref_ds_write_b16(lds, addr, val, self.offset)
+
+
+class TestDsWriteB16AST(unittest.TestCase):
+    def test_write_b16_ast_eval(self) -> None:
+        lds = LdsModel()
+        expr = LdsWriteB16Expr(offset=4)
+        expr.eval(lds, 0x10, 0x4321)
+        self.assertEqual(lds.read_u16(0x14), 0x4321)
+
 
 if __name__ == "__main__":
     unittest.main()
