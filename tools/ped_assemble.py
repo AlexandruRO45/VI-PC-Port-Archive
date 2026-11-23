@@ -43,11 +43,13 @@ import argparse
 import base64
 import json
 import math
+import mmap
 import os
 import re
 import struct
 import sys
 from collections import defaultdict
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -1089,7 +1091,7 @@ _GLB_ATTRIBUTE_TYPES = {
 }
 
 
-def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
+def _check_glb_document(doc: object, bin_chunk: bytes | memoryview, path: str) -> None:
     """Refuse a GLB document `read_glb_parts` cannot walk, with one message instead of a traceback.
 
     Checks only what the reader dereferences: the tables it indexes, the accessors its primitives name (their
@@ -1283,7 +1285,7 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
             number(value, f"nodes[{i}].translation")
 
 
-def _read_glb_accessor(doc: dict, bin_chunk: bytes, acc_idx: int) -> list:
+def _read_glb_accessor(doc: dict, bin_chunk: bytes | memoryview, acc_idx: int) -> list:
     acc = doc["accessors"][acc_idx]
     ctype = acc["componentType"]
     atype = acc["type"]
@@ -1382,7 +1384,7 @@ def _extract_glb_skin_joint_names(
     return joint_names
 
 
-def _read_glb_png(doc: dict, bin_chunk: bytes, info: object, cache: dict[tuple[int, int], bytes],
+def _read_glb_png(doc: dict, bin_chunk: bytes | memoryview, info: object, cache: dict[tuple[int, int], bytes],
                   *, path: str, slot: str) -> bytes | None:
     """Recover a supported material slot's embedded PNG, without opening image or buffer URIs."""
     if info is None:
@@ -1423,7 +1425,8 @@ def _read_glb_png(doc: dict, bin_chunk: bytes, info: object, cache: dict[tuple[i
     # Validate every reference before reusing immutable data from this import's buffer 0.
     span = (start, length)
     if span not in cache:
-        cache[span] = bin_chunk[start:start + length]
+        with memoryview(bin_chunk) as view, view[start:start + length] as payload:
+            cache[span] = payload.tobytes()
     return cache[span]
 
 
@@ -1432,10 +1435,19 @@ def read_glb_parts(path: str) -> list[MeshPart]:
 
     Embedded PNGs require TEXCOORD_0. Source sampler settings are not retained;
     the writer uses repeat wrapping and linear filtering with mipmaps.
+    Returned geometry and PNG bytes own their data after the read-only mapping closes.
     """
     with open(path, "rb") as f:
-        data = f.read()
-    if len(data) < 20 or data[:4] != GLB_MAGIC:
+        if os.fstat(f.fileno()).st_size == 0:
+            raise PedAssembleError(f"{path}: not a valid GLB container")
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+            with memoryview(mapped) as data, ExitStack() as views:
+                return _read_glb_parts_buffer(path, data, views)
+
+
+def _read_glb_parts_buffer(path: str, data: memoryview, views: ExitStack) -> list[MeshPart]:
+    # The caller releases every view before closing the mapping, including on held exception tracebacks.
+    if len(data) < 20 or struct.unpack_from("<4s", data)[0] != GLB_MAGIC:
         raise PedAssembleError(f"{path}: not a valid GLB container")
     version, total_len = struct.unpack_from("<II", data, 4)
     if version != GLB_VERSION or total_len > len(data):
@@ -1443,19 +1455,21 @@ def read_glb_parts(path: str) -> list[MeshPart]:
 
     pos = 12
     doc = None
-    bin_chunk = b""
+    bin_span = (0, 0)
     while pos + 8 <= total_len:
         chunk_len, chunk_type = struct.unpack_from("<II", data, pos)
         pos += 8
-        payload = data[pos:pos + chunk_len]
+        start = pos
         pos += chunk_len
         if chunk_type == CHUNK_TYPE_JSON:
-            try:
-                doc = json.loads(payload.decode("utf-8"))
-            except ValueError as exc:                       # UnicodeDecodeError and JSONDecodeError
-                raise PedAssembleError(f"{path}: malformed GLB: the JSON chunk does not parse ({exc})") from None
+            with data[start:pos] as payload:
+                try:
+                    doc = json.loads(payload.tobytes().decode("utf-8"))
+                except ValueError as exc:                   # UnicodeDecodeError and JSONDecodeError
+                    raise PedAssembleError(f"{path}: malformed GLB: the JSON chunk does not parse ({exc})") from None
         elif chunk_type == CHUNK_TYPE_BIN:
-            bin_chunk = payload
+            bin_span = (start, pos)
+    bin_chunk = views.enter_context(data[bin_span[0]:bin_span[1]])
     if doc is None:
         raise PedAssembleError(f"{path}: GLB has no JSON chunk")
     _check_glb_document(doc, bin_chunk, path)
