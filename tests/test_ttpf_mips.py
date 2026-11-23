@@ -2258,6 +2258,67 @@ class SyntheticVolumePoolTest(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             self.assertEqual(ttpf.export(pool_bc, 0, os.path.join(self.tmp.name, "bad_vol.dds")), 2)
 
+    def test_volume_check_does_not_retain_complete_decoded_volumes(self):
+        for fmt, width, expected in ((10, 32, (0.012526, 0.261939)),
+                                     (54, 64, (0.050004, 1.187096))):
+            with self.subTest(fmt=fmt):
+                path = os.path.join(self.tmp.name, f"volume_memory_{fmt}.ttpf")
+                self._build_volume_pool(path, width, 32, 32, fmt)
+                captured = io.StringIO()
+                with closing(ttpf.Pool(path)) as pool, redirect_stdout(captured):
+                    tracemalloc.start()
+                    try:
+                        code = ttpf.check(pool, 0)
+                        _, peak = tracemalloc.get_traced_memory()
+                    finally:
+                        tracemalloc.stop()
+                self.assertEqual(code, 0, captured.getvalue())
+                report = json.loads(captured.getvalue())
+                self.assertEqual((report["volume_3d_z_diff"],
+                                  report["volume_2d_control_z_diff"]), expected)
+                # The tiled input is <=256 KiB; decoded voxel arrays need >11 MiB.
+                self.assertLess(peak, 4 * 1024 * 1024)
+
+    def test_volume_z_diff_skips_nonfinite_samples_in_both_formats(self):
+        cases = [
+            (54, [(1, math.nan, math.inf), (4, 7, 9), (10, math.inf, 3)], 5.0),
+            (10, [
+                (1, math.nan, math.inf, -math.inf, 0, -0.0, 65504, -2),
+                (4, 7, 9, -math.inf, -0.0, 0, -65504, -1),
+                (10, math.inf, 3, 2, 0, -0.0, 65504, 1),
+            ], 262034.0 / 11),
+        ]
+        for fmt, planes, expected in cases:
+            with self.subTest(fmt=fmt):
+                slices = (struct.pack(f"<{len(p)}e", *p) for p in planes)
+                self.assertEqual(ttpf._volume_z_diff(slices), expected)
+
+    def test_volume_z_diff_without_finite_neighbor_pairs(self):
+        nonfinite = struct.pack("<2e", math.nan, math.inf)
+        for slices in ([], [b"\0\0"], [nonfinite, nonfinite]):
+            with self.subTest(slices=slices):
+                self.assertIsNone(ttpf._volume_z_diff(iter(slices)))
+
+    def test_volume_z_diff_rejects_partial_or_unequal_slices(self):
+        with self.assertRaises(struct.error):
+            ttpf._volume_z_diff(iter([b"\0\0", b"\0"]))
+        with self.assertRaises(ValueError):
+            ttpf._volume_z_diff(iter([b"\0\0", b"\0\0\0\0"]))
+
+    def test_volume_check_odd_dimensions_preserve_zero_filled_control(self):
+        for fmt, expected in ((10, (0.012488, 1.033356)),
+                              (54, (0.050001, 1.630759))):
+            with self.subTest(fmt=fmt):
+                path = os.path.join(self.tmp.name, f"volume_odd_{fmt}.ttpf")
+                self._build_volume_pool(path, 9, 17, 19, fmt)
+                captured = io.StringIO()
+                with closing(ttpf.Pool(path)) as pool, redirect_stdout(captured):
+                    self.assertEqual(ttpf.check(pool, 0), 0)
+                report = json.loads(captured.getvalue())
+                self.assertEqual((report["volume_3d_z_diff"],
+                                  report["volume_2d_control_z_diff"]), expected)
+
+
 
 class Uncompressed2DTest(unittest.TestCase):
     def setUp(self):

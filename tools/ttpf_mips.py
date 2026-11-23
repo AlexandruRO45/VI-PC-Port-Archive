@@ -1279,33 +1279,19 @@ def _mip_range_codecs(pool, base, offset, region, slices=1, slice_stride=0):
     return codecs
 
 
-def _decode_volume_voxels(fmt, data, width, height, depth):
-    """Decode float16 volume bytes into a flat list of per-voxel float tuples."""
-    channels = VOLUME_FLOAT_FORMATS.get(fmt)
-    if channels is None:
-        return None
-    n = width * height * depth * channels
-    vals = struct.unpack_from(f"<{n}e", data, 0)
-    if channels == 1:
-        return [(v,) for v in vals]
-    return [vals[i:i + channels] for i in range(0, n, channels)]
-
-
-def _volume_z_diff(voxels, width, height, depth):
-    """Mean absolute difference between adjacent Z slices (finite voxels only)."""
-    plane = width * height
+def _volume_z_diff(slices):
+    """Mean adjacent-Z difference of float16 samples, retaining two slices only."""
     total = 0.0
     count = 0
-    for z in range(depth - 1):
-        a0 = z * plane
-        b0 = (z + 1) * plane
-        for p in range(plane):
-            va = voxels[a0 + p]
-            vb = voxels[b0 + p]
-            for ca, cb in zip(va, vb):
+    previous = None
+    for current in slices:
+        if previous is not None:
+            for (ca,), (cb,) in zip(struct.iter_unpack("<e", previous),
+                                   struct.iter_unpack("<e", current), strict=True):
                 if math.isfinite(ca) and math.isfinite(cb):
                     total += abs(ca - cb)
                     count += 1
+        previous = current
     return (total / count) if count else None
 
 
@@ -1899,22 +1885,22 @@ def _check_texture(pool, index, *, allow_provisional=False, history=None):
                                      shape, history)
         if tiled is None:
             return 2
-        linear_3d = detile_volume(layout, tiled)
-        vox_3d = _decode_volume_voxels(d["format"], linear_3d, d["width"], d["height"], d["depth"])
-        z_diff_3d = _volume_z_diff(vox_3d, d["width"], d["height"], d["depth"])
+        z_diff_3d = _volume_z_diff(detile_volume_slice(layout, tiled, z)
+                                 for z in range(d["depth"]))
         # Negative control: treat the buffer as stacked 2D SW_4KB_S planes.
         lay_2d = compact_surface_layout(d["width"], d["height"], 1, layout["element_bytes"], 1, 4096)
         mip_2d = lay_2d["mips"][0]
         plane_bytes = lay_2d["size"]
-        buf_2d = bytearray()
-        for z in range(d["depth"]):
-            off = z * plane_bytes
-            if off + plane_bytes <= len(tiled):
-                buf_2d += detile(lay_2d, mip_2d, tiled[off:off + plane_bytes])
-            else:
-                buf_2d += bytes(d["width"] * d["height"] * layout["element_bytes"])
-        vox_2d = _decode_volume_voxels(d["format"], bytes(buf_2d), d["width"], d["height"], d["depth"])
-        z_diff_2d = _volume_z_diff(vox_2d, d["width"], d["height"], d["depth"])
+
+        def control_slices():
+            for z in range(d["depth"]):
+                off = z * plane_bytes
+                if off + plane_bytes <= len(tiled):
+                    yield detile(lay_2d, mip_2d, tiled[off:off + plane_bytes])
+                else:
+                    yield bytes(d["width"] * d["height"] * layout["element_bytes"])
+
+        z_diff_2d = _volume_z_diff(control_slices())
         result = dict(index=index, shape=shape, width=d["width"], height=d["height"],
                       depth=d["depth"], format=d["format"], mips=d["mips"], tile=layout["tile"],
                       block_d=layout["block_d"], padded_d=layout["padded_d"],
