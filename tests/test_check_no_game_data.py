@@ -240,6 +240,32 @@ class CheckNoGameData(unittest.TestCase):
         self.assertEqual(len(result.stdout.splitlines()), 2, result.stdout)
         self.assertIn("2 file(s)", result.stderr)
 
+    def test_hash_named_listings_are_caught_and_fixtures_pass(self):
+        # Shader disassembly is text with no magic: a listing is caught by the hash name it keeps from its shader.
+        text = b"; hand-written\n  v_add_f32 v0, v1, v2\n  s_endpgm\n"
+        listings = ["9f3a1c2b4d5e6f70.s", "9F3A1C2B4D5E6F70A1.asm", "0123456789abcdef.vs.s", "0123456789abcdef~1.s",
+                    "fedcba9876543210_01.asm"]
+        fixtures = ["v_add_f32.s", "cs_exec_const.asm", "deadbeef.s", "0123456789abcdef.txt", "abc_0123456789abcdef.s"]
+        result = run([self.write(name, text) for name in fixtures])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        result = run([self.write(name, text) for name in listings])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for name in listings:
+            self.assertIn(f"{name}: shader disassembly listing (hash-named)", result.stdout)
+
+    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    def test_default_mode_catches_a_tracked_hash_named_listing(self):
+        git = ["git", "-c", "init.defaultBranch=main"]
+        subprocess.run([*git, "init", "-q", self.dir], check=True)
+        self.write("v_add_f32.s", b"  s_endpgm\n")
+        self.write("9f3a1c2b4d5e6f70.s", b"")
+        subprocess.run(["git", "add", "v_add_f32.s", "9f3a1c2b4d5e6f70.s"], cwd=self.dir, check=True)
+        result = run([], cwd=self.dir)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("9f3a1c2b4d5e6f70.s: shader disassembly listing (hash-named)", result.stdout)
+        self.assertNotIn("v_add_f32.s", result.stdout)
+
     def test_directories_and_missing_paths_are_skipped(self):
         os.mkdir(os.path.join(self.dir, "sub"))
         result = run([os.path.join(self.dir, "sub"), os.path.join(self.dir, "missing.bin")])

@@ -58,6 +58,7 @@ class ExtensionCheck(unittest.TestCase):
             git = ["git", "-c", "core.quotePath=true", "-c", "user.name=t", "-c", "user.email=t@t"]
             subprocess.run(git + ["init", "-q", repo], check=True)
             for name in names:
+                os.makedirs(os.path.dirname(os.path.join(repo, name)), exist_ok=True)
                 with open(os.path.join(repo, name), "wb"):
                     pass
             subprocess.run(git + ["-C", repo, "add", "--", *names], check=True)
@@ -85,6 +86,20 @@ class ExtensionCheck(unittest.TestCase):
         self.assertIn("ünï.spvasm", result.stdout)
         self.assertIn("café.obj", result.stdout)
         self.assertNotIn("README.md", result.stdout)
+
+    def test_a_hash_named_listing_is_caught(self):
+        # Empty files with the names a disassembled shader gets; a readable fixture name passes.
+        listings = ["9f3a1c2b4d5e6f70.s", "9F3A1C2B4D5E6F70A1.asm", "0123456789abcdef.vs.s", "0123456789abcdef~1.s",
+                    "disasm/fedcba9876543210_01.asm"]
+        names = ["README.md", "v_add_f32.s", "cs_exec_const.asm", "deadbeef.s", "0123456789abcdef.txt"]
+        result = self.run_step(names)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.run_step(names + listings)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for name in listings:
+            self.assertIn(name, result.stdout)
+        for name in names:
+            self.assertNotIn(name, result.stdout)
 
 
 if __name__ == "__main__":

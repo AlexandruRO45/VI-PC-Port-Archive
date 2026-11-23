@@ -25,9 +25,14 @@ jobs:
           fetch-depth: 1
       - name: No game data tracked
         run: |
-          bad=$(git ls-files -z | grep -ziE '\.(rpf|ttpf|xvd|msixvc|dxbc|fssm|spv|spvasm|dds|bk2|awc|r9modeldata|obj|glb|ogg|wav|exe|dll)$' | tr '\0' '\n' || true)
+          ext='\.(rpf|ttpf|xvd|msixvc|dxbc|fssm|spv|spvasm|dds|bk2|awc|r9modeldata|obj|glb|ogg|wav|exe|dll)$'
+          # A shader disassembly listing keeps its shader's name: 16 or more hex digits, then the extension or a
+          # suffix after '.', '~' (tools/shader_carve.py) or '_' (tools/fspx_unpack.py). Hand-written fixtures
+          # have readable names.
+          listing='(^|/)[0-9a-f]{16,}([._~][^/]*)?\.(s|asm)$'
+          bad=$(git ls-files -z | grep -ziE "$ext|$listing" | tr '\0' '\n' || true)
           if [ -n "$bad" ]; then
-            echo "Game or binary files tracked:"
+            echo "Game or binary files or shader listings tracked:"
             echo "$bad"
             exit 1
           fi

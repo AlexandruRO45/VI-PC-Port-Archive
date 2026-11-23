@@ -9,8 +9,10 @@ files the build extracts from it: RPF9 archives, TTPF texture pools, RAGE resour
 containers, SPIR-V, DDS, AWC audio, PSIN/PAMH/MHIU/SPS1/SGD5/RDS5 containers, YSC/SCRP compiled scripts, the
 animation MoVE container and SKEL_ bone table, Ogg, RIFF WAVE, Bink, glTF binaries, PE executables and XVD
 images. The magics are
-the ones docs/ measures (docs/gamedata.md and the shader and audio notes). Text formats (disassembly, .obj, .spvasm)
-have no magic and stay with the extension check.
+the ones docs/ measures (docs/gamedata.md and the shader and audio notes). Text formats (.obj, .spvasm) have no magic
+and stay with the extension check. Shader disassembly (.s, .asm) has none either, and hand-written fixtures share
+its extensions, so a listing is matched by name, here and in the workflow: 16 or more hex digits (the shader's
+hash name, which tools/shader_disasm.py keeps) followed by the extension or by a suffix after '.', '~' or '_'.
 
 A compressed file hides those magics from both checks, so the script looks inside what the standard library opens:
 each member of a zip (found by its central directory too, so with bytes in front of it) or a tar, and the stream of
@@ -27,6 +29,7 @@ import gzip
 import io
 import lzma
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -251,13 +254,27 @@ def tracked_files(root):
     return [os.path.join(root, p) for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
+# A shader disassembly listing named like the shader it came from: 16 or more hex digits, then the extension or a
+# suffix after '.', '~' (a repeated name, tools/shader_carve.py) or '_' (tools/fspx_unpack.py). The workflow's
+# extension check uses the same pattern.
+LISTING = re.compile(r"[0-9a-f]{16,}(?:[._~].*)?\.(?:s|asm)", re.IGNORECASE | re.DOTALL)
+
+
+def listing_name(path):
+    """"shader disassembly listing (hash-named)" if the base name of `path` is one, else None."""
+    if LISTING.fullmatch(os.path.basename(path)):
+        return "shader disassembly listing (hash-named)"
+    return None
+
+
 def check(paths):
-    """[(path, format)] for every regular file in `paths` that starts like game data."""
+    """[(path, format)] for every regular file in `paths` that starts like game data or is named like a shader
+    disassembly listing."""
     found = []
     for path in paths:
         if os.path.islink(path) or not os.path.isfile(path):
             continue  # submodules, symlinks, files deleted in the working tree
-        name = classify_file(path)
+        name = classify_file(path) or listing_name(path)
         if name:
             found.append((path, name))
     return found
