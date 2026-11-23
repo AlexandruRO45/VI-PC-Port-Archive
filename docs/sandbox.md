@@ -80,7 +80,8 @@ Esc quit. `--center` is in RAGE world metres; without it the densest 50 m cell o
 
 * One pair, one forward pass. The world's own material shaders pull vertices (`SV_VertexID` only) and write the
   G-buffer; drawing those needs their vertex fetch tables and the lighting passes that read the G-buffer.
-* The scene stores mip 0 box-scaled to 256 px (`--tex-size`), so the sampler's LOD range is clamped to 0.
+* The scene stores mip 0 box-scaled to 256 px, so the sampler's LOD range is clamped to 0. `tools/sandbox.py` fixes
+  that size; `--tex-size` (default 256) is an option of `tools/sandbox_scene.py`, which writes the scene.
 * Ground following uses the scene's own triangles; there is no collision against walls.
 * Draws are not culled or sorted, and every frame waits for the GPU; a large `--max-props` gets slow (each prop is
   one draw per mesh: 150 props gave 446 draws).
