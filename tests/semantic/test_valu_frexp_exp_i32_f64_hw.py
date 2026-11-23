@@ -222,5 +222,29 @@ class TestFrexpExpF64RegisterAliasing(unittest.TestCase):
         self.assertEqual(run_frexp_exp(0, operands="s[0:1]", setup=setup), -2)
 
 
+class TestFrexpExpF64ModifiersAndSigns(unittest.TestCase):
+    def test_negative_normals_have_identical_exponent(self):
+        cases = [-1.0, -2.0, -4.0, -0.5, -0.25, -100.0]
+        for val in cases:
+            with self.subTest(val=val):
+                pos_exp = run_frexp_exp(f64_to_bits(abs(val)))
+                neg_exp = run_frexp_exp(f64_to_bits(val))
+                self.assertEqual(neg_exp, pos_exp)
+
+    def test_abs_modifier(self):
+        cases = [-1.0, -4.0, -0.25]
+        for val in cases:
+            with self.subTest(val=val):
+                got = run_frexp_exp(f64_to_bits(val), operands="|v[0:1]|")
+                self.assertEqual(got, run_frexp_exp(f64_to_bits(abs(val))))
+
+    def test_neg_modifier(self):
+        cases = [1.0, 4.0, 0.25]
+        for val in cases:
+            with self.subTest(val=val):
+                got = run_frexp_exp(f64_to_bits(val), operands="-v[0:1]")
+                self.assertEqual(got, run_frexp_exp(f64_to_bits(val)))
+
+
 if __name__ == "__main__":
     unittest.main()
