@@ -157,10 +157,14 @@ class CountsAreStoredAtomically(unittest.TestCase):
         self.assertIn("%ms_counts = OpVariable %_ptr_WG_uint_ms Workgroup", declared)
         consts = dict(re.match(r"(%\w+) = OpConstant %uint (\d+)$", ln).groups()
                       for ln in lines if re.match(r"%\w+ = OpConstant %uint \d+$", ln))
-        for _, ln in stores:
+        for i, ln in stores:
             _, _, scope, semantics, value = ln.split()
             self.assertEqual((consts[scope], consts[semantics]), ("2", "0"), ln)       # Workgroup scope, relaxed
             self.assertIn(f"{value} = OpLoad %uint %m0", lines, "the stored value is M0")
+            # Every invocation that runs the send stores. A store behind a branch of its own (only in invocation 0,
+            # say) is never run when that invocation's wave is not the one that sends, and the counts stay unwritten.
+            load = lines.index(f"{value} = OpLoad %uint %m0")
+            self.assertFalse([x for x in lines[load:i] if x.endswith("= OpLabel")], "the store is behind a branch")
         # The load is the epilogue's: the barrier before it comes after every store, so no store is unordered with it.
         barriers = [i for i, ln in enumerate(lines) if ln.startswith("OpControlBarrier ") and i < loads[0][0]]
         self.assertTrue(barriers, "no barrier before the load of the counts")
@@ -188,6 +192,16 @@ class CountsAreStoredAtomically(unittest.TestCase):
         self.assertNotEqual(plain, spv)
         with self.assertRaises(AssertionError):
             self.check(plain, 1)
+
+    def test_the_check_reports_an_atomic_store_behind_a_branch(self):
+        """The store kept atomic but run only by invocation 0: what ms_wave_info_s3 failed with on 32-wide GPUs."""
+        spv = translate(MESH_PROGRAM, 128, True, True)
+        gated = re.sub(r"( *)(OpAtomicStore %ms_counts %\w+ %\w+ %\w+)",
+                       r"\1OpSelectionMerge %gate_end None\n\1OpBranchConditional %gate_lead %gate_do %gate_end\n"
+                       r"\1%gate_do = OpLabel\n\1\2\n\1OpBranch %gate_end\n\1%gate_end = OpLabel", spv)
+        self.assertNotEqual(gated, spv)
+        with self.assertRaisesRegex(AssertionError, "behind a branch"):
+            self.check(gated, 1)
 
 
 if __name__ == "__main__":
