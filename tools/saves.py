@@ -366,9 +366,19 @@ def extract(p, out):
 def pack_from_dir(src, refuse=None):
     """The JSAV bytes for an extracted folder. `refuse` is the --out path: a source file it names is refused."""
     index_path = os.path.join(src, 'index.json')
+    src_real = os.path.realpath(src)
 
     def invalid(field, expected):
         raise ValueError(f'{index_path}: {field} must be {expected}')
+
+    def inside_src(name):
+        if os.path.isabs(name) or os.path.splitdrive(name)[0]:
+            return False
+        resolved = os.path.realpath(os.path.join(src_real, name))
+        try:
+            return os.path.commonpath([src_real, resolved]) == src_real and resolved != src_real
+        except ValueError:
+            return False
 
     def source(name):
         path = os.path.join(src, name)
@@ -401,6 +411,8 @@ def pack_from_dir(src, refuse=None):
             invalid(prefix, 'an object')
         if not isinstance(entry.get('file'), str) or not entry['file']:
             invalid(prefix + '.file', 'a nonempty path string')
+        if not inside_src(entry['file']):
+            invalid(prefix + '.file', f'a relative path inside {src}')
         flags = entry.get('flags')
         if type(flags) is not int or not 0 <= flags <= 0xFFFFFFFF:
             invalid(prefix + '.flags', 'a uint32 integer')
