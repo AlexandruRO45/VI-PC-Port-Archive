@@ -418,7 +418,26 @@ int main() {
             EXPECT(attempt(resealed(blob_bytes, 16)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);
             EXPECT(attempt(resealed(blob_bytes, 20)) == D3D12_ERROR_DRIVER_VERSION_MISMATCH);  // pipelineCacheUUID
             EXPECT(attempt(resealed(blob_bytes, 4)) == E_INVALIDARG);  // version
+
+            const leonida::cached_pso::Identity test_id{0x1002u, 0x73bfu, 0x00800161u, {1, 2, 3, 4}};
+            const std::string valid_key(leonida::cached_pso::key_bytes, 'a');
+            const auto encoded = leonida::cached_pso::encode(test_id, valid_key);
+            EXPECT(leonida::cached_pso::check(test_id, valid_key, encoded) == leonida::cached_pso::Check::accepted);
+            EXPECT(leonida::cached_pso::check(test_id, valid_key + "b", encoded) ==
+                   leonida::cached_pso::Check::other_description);
+            EXPECT(leonida::cached_pso::check(test_id, "", leonida::cached_pso::encode(test_id, "")) ==
+                   leonida::cached_pso::Check::invalid);
+            EXPECT(leonida::cached_pso::check(
+                       test_id, valid_key,
+                       std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(nullptr),
+                                                     leonida::cached_pso::blob_bytes)) ==
+                   leonida::cached_pso::Check::invalid);
+            EXPECT(leonida::cached_pso::fnv1a(nullptr, 16) == leonida::cached_pso::fnv1a(nullptr, 0));
+            leonida::cached_pso::KeyBuilder kb;
+            kb.tag(nullptr).bytes(nullptr, 16);
+            EXPECT(kb.data().size() == 8);
         }
+
 
         // A device whose maxPushConstantsSize is the Vulkan minimum (128 bytes) cannot hold the 144-byte block, so
         // its PSOs are refused instead of creating a pipeline layout the spec forbids (#224's fallback flag).

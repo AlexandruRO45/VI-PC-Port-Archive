@@ -42,9 +42,11 @@ inline constexpr std::size_t blob_bytes = 4 + 4 + 12 + 16 + key_bytes + 4;
 
 inline std::uint32_t fnv1a(const std::uint8_t* data, std::size_t size) {
     std::uint32_t h = 0x811c9dc5u;
+    if (!data) return h;
     for (std::size_t i = 0; i < size; ++i) h = (h ^ data[i]) * 0x01000193u;
     return h;
 }
+
 
 inline void put32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) out.push_back(std::uint8_t(v >> (8 * i)));
@@ -73,13 +75,14 @@ inline std::vector<std::uint8_t> encode(const Identity& identity, const Key& key
 }
 
 inline Check check(const Identity& identity, const Key& key, std::span<const std::uint8_t> blob) {
-    if (blob.size() != blob_bytes) return Check::invalid;
+    if (blob.size() != blob_bytes || !blob.data() || key.empty()) return Check::invalid;
     const std::uint8_t* p = blob.data();
     if (get32(p + blob_bytes - 4) != fnv1a(p, blob_bytes - 4)) return Check::invalid;
     if (get32(p) != magic || get32(p + 4) != version) return Check::invalid;
     if (get32(p + 8) != identity.vendor || get32(p + 12) != identity.device) return Check::other_adapter;
     if (get32(p + 16) != identity.driver || std::memcmp(p + 20, identity.cache_uuid, 16) != 0)
         return Check::other_driver;
+    if (key.size() > key_bytes) return Check::other_description;
     std::string padded = key;
     padded.resize(key_bytes, '\0');
     if (std::memcmp(p + 36, padded.data(), key_bytes) != 0) return Check::other_description;
@@ -90,18 +93,22 @@ inline Check check(const Identity& identity, const Key& key, std::span<const std
 // descriptions give the same bytes only when those fields are equal.
 class KeyBuilder {
 public:
-    KeyBuilder& tag(const char* name) { return bytes(name, std::strlen(name)); }
+    KeyBuilder& tag(const char* name) { return bytes(name, name ? std::strlen(name) : 0); }
     KeyBuilder& u32(std::uint32_t v) {
         put32(data_, v);
         return *this;
     }
     KeyBuilder& bytes(const void* p, std::size_t n) {
-        put32(data_, std::uint32_t(n));
-        if (n) data_.insert(data_.end(), static_cast<const std::uint8_t*>(p), static_cast<const std::uint8_t*>(p) + n);
+        const std::size_t count = p ? n : 0;
+        put32(data_, std::uint32_t(count));
+        if (count)
+            data_.insert(data_.end(), static_cast<const std::uint8_t*>(p),
+                         static_cast<const std::uint8_t*>(p) + count);
         return *this;
     }
     KeyBuilder& text(const char* s) { return s ? bytes(s, std::strlen(s)) : u32(0xffffffffu); }
     const std::vector<std::uint8_t>& data() const { return data_; }
+
 
 private:
     std::vector<std::uint8_t> data_;
