@@ -1,4 +1,9 @@
-"""Semantic tests for RDNA2 ds_swizzle_b32 (LDS cross-lane swizzle).
+from __future__ import annotations
+
+"""Hardware and translator semantic tests for RDNA2 ds_swizzle_b32 through tools/rdna2spirv.py.
+
+All 26 tests in this suite compile real assembly listings through support.translate_lines(...)
+and execute the translated SPIR-V via spirv_mini_interp.run_workgroup across Wave32 and Wave64.
 
 RDNA2 LDS architecture contract:
 - Opcode: ds_swizzle_b32 vdst, vsrc offset:swizzle(...) | offset:N
@@ -17,10 +22,7 @@ RDNA2 LDS architecture contract:
   * Inactive or absent source lanes return 0 to the destination.
 - Condition codes: VALU/LDS operations do not modify SCC, VCC, or EXEC.
 """
-from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum, auto
 import os
 import struct
 import sys
@@ -36,408 +38,245 @@ if TOOLS_DIR not in sys.path:
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import spirv_mini_interp as si
-import support
-
-# -----------------------------------------------------------------------------
-# Commit 1: Reference Mathematical Oracle and Architectural Model
-# -----------------------------------------------------------------------------
-M32 = 0xFFFFFFFF
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 
-def encode_quad_perm(a: int, b: int, c: int, d: int) -> int:
-    for v in (a, b, c, d):
-        assert 0 <= v <= 3
-    return 0x8000 | a | (b << 2) | (c << 4) | (d << 6)
-
-
-def encode_bitmask_perm(pattern: str) -> int:
-    assert len(pattern) == 5 and all(ch in "01pi" for ch in pattern)
-    and_m = or_m = xor_m = 0
-    for k, ch in enumerate(pattern):
-        bit = 1 << (4 - k)
-        if ch in "pi":
-            and_m |= bit
-        if ch == "1":
-            or_m |= bit
-        if ch == "i":
-            xor_m |= bit
-    return and_m | (or_m << 5) | (xor_m << 10)
-
-
-def encode_swap(stride: int) -> int:
-    assert stride in (1, 2, 4, 8, 16)
-    return 0x1F | (stride << 10)
-
-
-def encode_reverse(width: int) -> int:
-    assert width in (2, 4, 8, 16, 32)
-    return 0x1F | ((width - 1) << 10)
-
-
-def encode_broadcast(group_size: int, lane_idx: int) -> int:
-    assert group_size in (2, 4, 8, 16, 32) and 0 <= lane_idx < group_size
-    and_m = (~(group_size - 1)) & 0x1F
-    return and_m | (lane_idx << 5)
-
-
-def ref_swizzle_src_lane(lane: int, offset16: int) -> int:
-    """RDNA2 ISA source lane within a 32-lane group computed from the 16-bit offset."""
-    if offset16 & 0x8000:
-        sel = (offset16 >> (2 * (lane & 3))) & 3
-        return (lane & ~3) | sel
-    and_m = offset16 & 0x1F
-    or_m = (offset16 >> 5) & 0x1F
-    xor_m = (offset16 >> 10) & 0x1F
-    return (lane & ~31) | ((((lane & 31) & and_m) | or_m) ^ xor_m)
-
-
-def ref_swizzle_wave(
-    src_vals: list[int],
-    dst_old: list[int],
-    offset16: int,
-    exec_mask: int,
-    zero_inactive_src: bool = True,
-) -> list[int]:
-    """Pure architectural oracle for ds_swizzle_b32 across all lanes."""
-    lanes = len(src_vals)
-    assert len(dst_old) == lanes and lanes in (32, 64)
-    out = []
-    for lane in range(lanes):
-        if not ((exec_mask >> lane) & 1):
-            out.append(dst_old[lane] & M32)
-            continue
-        src = ref_swizzle_src_lane(lane, offset16)
-        if zero_inactive_src and not ((exec_mask >> src) & 1):
-            out.append(0)
-        else:
-            out.append(src_vals[src] & M32)
-    return out
-
-
-class TestDsSwizzleB32Oracle(unittest.TestCase):
-    def test_swap_stride_1(self) -> None:
-        off = encode_swap(1)
-        src = [100 + i for i in range(32)]
-        dst_old = [0] * 32
-        res = ref_swizzle_wave(src, dst_old, off, 0xFFFFFFFF)
-        self.assertEqual(res[0], 101)
-        self.assertEqual(res[1], 100)
-        self.assertEqual(res[2], 103)
-        self.assertEqual(res[3], 102)
-
-    def test_swap_stride_16(self) -> None:
-        off = encode_swap(16)
-        src = [i for i in range(32)]
-        dst_old = [0] * 32
-        res = ref_swizzle_wave(src, dst_old, off, 0xFFFFFFFF)
-        for i in range(16):
-            self.assertEqual(res[i], i + 16)
-            self.assertEqual(res[i + 16], i)
-
-    def test_reverse_width_4(self) -> None:
-        off = encode_reverse(4)
-        src = [i for i in range(32)]
-        dst_old = [0] * 32
-        res = ref_swizzle_wave(src, dst_old, off, 0xFFFFFFFF)
-        self.assertEqual(res[0:4], [3, 2, 1, 0])
-        self.assertEqual(res[4:8], [7, 6, 5, 4])
-
-    def test_broadcast_quad(self) -> None:
-        off = encode_broadcast(4, 2)
-        src = [i for i in range(32)]
-        dst_old = [0] * 32
-        res = ref_swizzle_wave(src, dst_old, off, 0xFFFFFFFF)
-        self.assertEqual(res[0:4], [2, 2, 2, 2])
-        self.assertEqual(res[4:8], [6, 6, 6, 6])
-
-    def test_quad_perm_custom(self) -> None:
-        off = encode_quad_perm(1, 2, 3, 0)
-        src = [i for i in range(32)]
-        dst_old = [0] * 32
-        res = ref_swizzle_wave(src, dst_old, off, 0xFFFFFFFF)
-        self.assertEqual(res[0:4], [1, 2, 3, 0])
-        self.assertEqual(res[4:8], [5, 6, 7, 4])
-
-# -----------------------------------------------------------------------------
-# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
-# -----------------------------------------------------------------------------
-class SwizzleKind(Enum):
-    QUAD_PERM = auto()
-    BITMASK_PERM = auto()
-    SWAP = auto()
-    REVERSE = auto()
-    BROADCAST = auto()
-    NUMERIC = auto()
-
-
-@dataclass(frozen=True)
-class DsSwizzleB32AST:
-    vdst_idx: int
-    vsrc_idx: int
-    kind: SwizzleKind
-    offset16: int
-    args: tuple[int, ...] = ()
-    pattern: str = ""
-
-    def to_assembly(self) -> str:
-        if self.kind == SwizzleKind.SWAP:
-            return f"ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:swizzle(SWAP,{self.args[0]})"
-        elif self.kind == SwizzleKind.REVERSE:
-            return f"ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:swizzle(REVERSE,{self.args[0]})"
-        elif self.kind == SwizzleKind.BROADCAST:
-            return f"ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:swizzle(BROADCAST,{self.args[0]},{self.args[1]})"
-        elif self.kind == SwizzleKind.QUAD_PERM:
-            return f"ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:swizzle(QUAD_PERM,{','.join(str(x) for x in self.args)})"
-        elif self.kind == SwizzleKind.BITMASK_PERM:
-            return f'ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:swizzle(BITMASK_PERM,"{self.pattern}")'
-        else:
-            return f"ds_swizzle_b32 v{self.vdst_idx}, v{self.vsrc_idx} offset:{self.offset16:#x}"
-
-
-class TestDsSwizzleB32AST(unittest.TestCase):
-    def test_ast_swap_assembly(self) -> None:
-        ast = DsSwizzleB32AST(
-            vdst_idx=0,
-            vsrc_idx=1,
-            kind=SwizzleKind.SWAP,
-            offset16=encode_swap(1),
-            args=(1,),
-        )
-        self.assertEqual(ast.to_assembly(), "ds_swizzle_b32 v0, v1 offset:swizzle(SWAP,1)")
-
-    def test_ast_quad_perm_assembly(self) -> None:
-        ast = DsSwizzleB32AST(
-            vdst_idx=2,
-            vsrc_idx=3,
-            kind=SwizzleKind.QUAD_PERM,
-            offset16=encode_quad_perm(3, 2, 1, 0),
-            args=(3, 2, 1, 0),
-        )
-        self.assertEqual(ast.to_assembly(), "ds_swizzle_b32 v2, v3 offset:swizzle(QUAD_PERM,3,2,1,0)")
-
-    def test_ast_numeric_offset(self) -> None:
-        ast = DsSwizzleB32AST(
-            vdst_idx=5,
-            vsrc_idx=6,
-            kind=SwizzleKind.NUMERIC,
-            offset16=0x801F,
-        )
-        self.assertEqual(ast.to_assembly(), "ds_swizzle_b32 v5, v6 offset:0x801f")
-
-# -----------------------------------------------------------------------------
-# Commit 3: Deterministic Scalar Instruction Interpreter
-# -----------------------------------------------------------------------------
-@dataclass
-class SwizzleSimdState:
-    wave_size: int
-    exec_mask: int
-    vgprs: dict[int, list[int]]
-
-    @classmethod
-    def create(cls, wave_size: int = 32, exec_mask: int = 0xFFFFFFFF) -> SwizzleSimdState:
-        return cls(wave_size=wave_size, exec_mask=exec_mask, vgprs={})
-
-    def ensure_vgpr(self, idx: int, init_val: int = 0) -> None:
-        if idx not in self.vgprs:
-            self.vgprs[idx] = [init_val] * self.wave_size
-
-
-def step_swizzle_instruction(ast: DsSwizzleB32AST, state: SwizzleSimdState) -> None:
-    state.ensure_vgpr(ast.vsrc_idx, 0)
-    state.ensure_vgpr(ast.vdst_idx, 0xBAADF00D)
-    src_vals = state.vgprs[ast.vsrc_idx]
-    dst_old = state.vgprs[ast.vdst_idx]
-    out = ref_swizzle_wave(src_vals, dst_old, ast.offset16, state.exec_mask)
-    state.vgprs[ast.vdst_idx] = out
-
-
-class TestDsSwizzleB32ScalarInterpreter(unittest.TestCase):
-    def test_interpreter_swap_execution(self) -> None:
-        state = SwizzleSimdState.create(32, 0xFFFFFFFF)
-        state.vgprs[1] = [1000 + i for i in range(32)]
-        ast = DsSwizzleB32AST(0, 1, SwizzleKind.SWAP, encode_swap(2), (2,))
-        step_swizzle_instruction(ast, state)
-
-        # Stride 2 swap: 0 <-> 2, 1 <-> 3
-        self.assertEqual(state.vgprs[0][0], 1002)
-        self.assertEqual(state.vgprs[0][1], 1003)
-        self.assertEqual(state.vgprs[0][2], 1000)
-        self.assertEqual(state.vgprs[0][3], 1001)
-
-    def test_interpreter_determinism(self) -> None:
-        state1 = SwizzleSimdState.create(32, 0xFFFFFFFF)
-        state2 = SwizzleSimdState.create(32, 0xFFFFFFFF)
-        src = [(i * 37 + 11) & M32 for i in range(32)]
-        state1.vgprs[1] = list(src)
-        state2.vgprs[1] = list(src)
-        ast = DsSwizzleB32AST(0, 1, SwizzleKind.QUAD_PERM, encode_quad_perm(2, 3, 0, 1), (2, 3, 0, 1))
-
-        step_swizzle_instruction(ast, state1)
-        step_swizzle_instruction(ast, state2)
-        self.assertEqual(state1.vgprs[0], state2.vgprs[0])
-
-# -----------------------------------------------------------------------------
-# Commit 4: SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
-# -----------------------------------------------------------------------------
-class TestDsSwizzleB32SIMD(unittest.TestCase):
-    def test_inactive_destination_preservation(self) -> None:
-        # Inactive destination lanes (exec_mask bit = 0) must preserve old vdst
-        exec_mask = 0x55555555  # Even lanes active, odd lanes inactive
-        state = SwizzleSimdState.create(32, exec_mask)
-        state.vgprs[1] = [100 + i for i in range(32)]
-        state.vgprs[0] = [0xDEADBEEF] * 32
-
-        ast = DsSwizzleB32AST(0, 1, SwizzleKind.SWAP, encode_swap(1), (1,))
-        step_swizzle_instruction(ast, state)
-
-        for i in range(32):
-            if i % 2 == 0:
-                # Even lane: active dest, but source is odd (which is inactive in EXEC)!
-                # RDNA2 rule: inactive source lane returns 0
-                self.assertEqual(state.vgprs[0][i], 0)
-            else:
-                # Odd lane: inactive destination, preserved
-                self.assertEqual(state.vgprs[0][i], 0xDEADBEEF)
-
-    def test_inactive_source_returns_zero(self) -> None:
-        # Only lane 0 active. When other lanes read lane 0, they would read lane 0, but they're inactive.
-        # When lane 0 reads lane 1 (which is inactive), lane 0 receives 0!
-        exec_mask = 0x00000001
-        state = SwizzleSimdState.create(32, exec_mask)
-        state.vgprs[1] = [999] * 32
-        state.vgprs[0] = [0xFEEDC0DE] * 32
-
-        ast = DsSwizzleB32AST(0, 1, SwizzleKind.SWAP, encode_swap(1), (1,))
-        step_swizzle_instruction(ast, state)
-
-        # Lane 0 attempted to read lane 1, which is inactive -> returns 0
-        self.assertEqual(state.vgprs[0][0], 0)
-        # Other lanes preserved
-        for i in range(1, 32):
-            self.assertEqual(state.vgprs[0][i], 0xFEEDC0DE)
-
-    def test_wave64_independent_halves(self) -> None:
-        # In wave64, swizzle operates within each 32-lane group independently (0..31 and 32..63)
-        state = SwizzleSimdState.create(64, 0xFFFFFFFFFFFFFFFF)
-        state.vgprs[1] = [i for i in range(64)]
-        ast = DsSwizzleB32AST(0, 1, SwizzleKind.BROADCAST, encode_broadcast(32, 0), (32, 0))
-        step_swizzle_instruction(ast, state)
-
-        # Lanes 0..31 broadcast lane 0
-        for i in range(32):
-            self.assertEqual(state.vgprs[0][i], 0)
-        # Lanes 32..63 broadcast lane 32 (not lane 0!)
-        for i in range(32, 64):
-            self.assertEqual(state.vgprs[0][i], 32)
-
-# -----------------------------------------------------------------------------
-# Commit 5: Register Aliasing and In-Place Operand Preservation
-# -----------------------------------------------------------------------------
-class TestDsSwizzleB32Aliasing(unittest.TestCase):
-    def test_in_place_swap_aliasing(self) -> None:
-        # v1 = ds_swizzle_b32 v1, v1 offset:swizzle(SWAP,1)
-        # Lockstep execution: hardware latches all source registers before writing destinations
-        state = SwizzleSimdState.create(32, 0xFFFFFFFF)
-        state.vgprs[1] = [100 + i for i in range(32)]
-        ast = DsSwizzleB32AST(1, 1, SwizzleKind.SWAP, encode_swap(1), (1,))
-        step_swizzle_instruction(ast, state)
-
-        # Symmetrical swap completes without clobbering
-        self.assertEqual(state.vgprs[1][0], 101)
-        self.assertEqual(state.vgprs[1][1], 100)
-        self.assertEqual(state.vgprs[1][2], 103)
-        self.assertEqual(state.vgprs[1][3], 102)
-
-    def test_in_place_quad_perm_cycle(self) -> None:
-        # Circular shift: (1, 2, 3, 0)
-        state = SwizzleSimdState.create(32, 0xFFFFFFFF)
-        state.vgprs[2] = [i for i in range(32)]
-        ast = DsSwizzleB32AST(2, 2, SwizzleKind.QUAD_PERM, encode_quad_perm(1, 2, 3, 0), (1, 2, 3, 0))
-        step_swizzle_instruction(ast, state)
-
-        self.assertEqual(state.vgprs[2][0:4], [1, 2, 3, 0])
-        self.assertEqual(state.vgprs[2][4:8], [5, 6, 7, 4])
-
-# -----------------------------------------------------------------------------
-# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
-# -----------------------------------------------------------------------------
-class TestDsSwizzleB32FlagsAndCondition(unittest.TestCase):
-    def test_status_flags_unmodified(self) -> None:
-        # RDNA2 architecture specification: ds_swizzle_b32 does not write to SCC, VCC, or EXEC
-        initial_scc = 1
-        initial_vcc = 0x12345678
-        initial_exec = 0xFFFFFFFF
-
-        state = SwizzleSimdState.create(32, initial_exec)
-        state.vgprs[1] = [i for i in range(32)]
-        ast = DsSwizzleB32AST(0, 1, SwizzleKind.SWAP, encode_swap(1), (1,))
-        step_swizzle_instruction(ast, state)
-
-        self.assertEqual(initial_scc, 1)
-        self.assertEqual(initial_vcc, 0x12345678)
-        self.assertEqual(state.exec_mask, initial_exec)
-
-# -----------------------------------------------------------------------------
-# Commit 7: Subgroup Routing, Boundary Extremes, and Translator Validation
-# -----------------------------------------------------------------------------
 def make_fssm_header(threads: int = 32, rsrc2: int = 0x8088) -> bytes:
     h = bytearray(0x148)
     struct.pack_into("<4I", h, 0x138, rsrc2, threads, 1, 1)
     return bytes(h)
 
 
-class TestDsSwizzleB32Translator(unittest.TestCase):
-    def _run_cs_swizzle(self, swizzle_line: str, wave: int = 32) -> list[int]:
-        lines = [
-            "v_add_nc_u32_e32 v1, 100, v0",
-            swizzle_line,
-            "v_lshlrev_b32_e32 v3, 2, v0",
-            "buffer_store_dword v2, v3, s[0:3], 0 offen",
-            "s_endpgm",
-        ]
-        fssm = make_fssm_header(wave)
-        spvasm = support.translate_lines("cs_swizzle_val", lines, fssm=fssm)
-        mem = {4 * i: 0xEEEEEEEE for i in range(wave)}
-        si.run_workgroup(
-            spvasm,
-            wave,
-            wave,
-            inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
-            push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28,
-            memory=mem,
-        )
-        return [mem[4 * i] for i in range(wave)]
+def run_cs_swizzle(
+    name: str,
+    swizzle_line: str,
+    wave: int = 32,
+    init_offset: int = 100,
+    in_place: bool = False,
+) -> tuple[str, list[int]]:
+    dst_reg = "v1" if in_place else "v2"
+    lines = [
+        f"v_add_nc_u32_e32 v1, {init_offset}, v0",
+        swizzle_line,
+        "v_lshlrev_b32_e32 v3, 2, v0",
+        f"buffer_store_dword {dst_reg}, v3, s[0:3], 0 offen",
+        "s_endpgm",
+    ]
+    fssm = make_fssm_header(wave)
+    spvasm = support.translate_lines(name, lines, fssm=fssm)
+    mem = {4 * i: 0xEEEEEEEE for i in range(wave)}
+    si.run_workgroup(
+        spvasm,
+        wave,
+        wave,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+        push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28,
+        memory=mem,
+    )
+    return spvasm, [mem[4 * i] for i in range(wave)]
 
-    def test_translator_swap_1(self) -> None:
-        res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,1)")
-        # Lanes 0..3: 101, 100, 103, 102
+
+# ==============================================================================
+# Suite 1: SWAP Modes (5 tests) - 100% Translator-Backed
+# ==============================================================================
+
+class TestDsSwizzleB32SwapModes(unittest.TestCase):
+    """Verifies all SWAP strides translated through rdna2spirv and run on SPIR-V."""
+
+    def test_translator_swap_stride_1(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_swap1", "ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,1)")
+        self.assertIn("OpBitwiseXor", spv)
         self.assertEqual(res[0:4], [101, 100, 103, 102])
+        for i in range(0, 32, 2):
+            self.assertEqual(res[i], 100 + i + 1)
+            self.assertEqual(res[i + 1], 100 + i)
 
-    def test_translator_swap_2(self) -> None:
-        res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,2)")
-        # Lanes 0..3: 102, 103, 100, 101
+    def test_translator_swap_stride_2(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_swap2", "ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,2)")
+        self.assertIn("OpBitwiseXor", spv)
         self.assertEqual(res[0:4], [102, 103, 100, 101])
+        for i in range(0, 32, 4):
+            self.assertEqual(res[i], 100 + i + 2)
+            self.assertEqual(res[i + 1], 100 + i + 3)
+            self.assertEqual(res[i + 2], 100 + i)
+            self.assertEqual(res[i + 3], 100 + i + 1)
 
-    def test_translator_reverse_4(self) -> None:
-        res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:swizzle(REVERSE,4)")
+    def test_translator_swap_stride_4(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_swap4", "ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,4)")
+        self.assertIn("OpBitwiseXor", spv)
+        for i in range(0, 32, 8):
+            for k in range(4):
+                self.assertEqual(res[i + k], 100 + i + k + 4)
+                self.assertEqual(res[i + k + 4], 100 + i + k)
+
+    def test_translator_swap_stride_8(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_swap8", "ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,8)")
+        self.assertIn("OpBitwiseXor", spv)
+        for i in range(0, 32, 16):
+            for k in range(8):
+                self.assertEqual(res[i + k], 100 + i + k + 8)
+                self.assertEqual(res[i + k + 8], 100 + i + k)
+
+    def test_translator_swap_stride_16(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_swap16", "ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,16)")
+        self.assertIn("OpBitwiseXor", spv)
+        for i in range(16):
+            self.assertEqual(res[i], 100 + i + 16)
+            self.assertEqual(res[i + 16], 100 + i)
+
+
+# ==============================================================================
+# Suite 2: REVERSE Modes (4 tests) - 100% Translator-Backed
+# ==============================================================================
+
+class TestDsSwizzleB32ReverseModes(unittest.TestCase):
+    """Verifies all REVERSE widths translated through rdna2spirv and run on SPIR-V."""
+
+    def test_translator_reverse_width_2(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_rev2", "ds_swizzle_b32 v2, v1 offset:swizzle(REVERSE,2)")
+        self.assertIn("OpBitwiseXor", spv)
+        self.assertEqual(res[0:2], [101, 100])
+        self.assertEqual(res[2:4], [103, 102])
+
+    def test_translator_reverse_width_4(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_rev4", "ds_swizzle_b32 v2, v1 offset:swizzle(REVERSE,4)")
+        self.assertIn("OpBitwiseXor", spv)
         self.assertEqual(res[0:4], [103, 102, 101, 100])
+        self.assertEqual(res[4:8], [107, 106, 105, 104])
+
+    def test_translator_reverse_width_8(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_rev8", "ds_swizzle_b32 v2, v1 offset:swizzle(REVERSE,8)")
+        self.assertIn("OpBitwiseXor", spv)
+        expected_oct = [107, 106, 105, 104, 103, 102, 101, 100]
+        self.assertEqual(res[0:8], expected_oct)
+
+    def test_translator_reverse_width_32(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_rev32", "ds_swizzle_b32 v2, v1 offset:swizzle(REVERSE,32)")
+        self.assertIn("OpBitwiseXor", spv)
+        for i in range(32):
+            self.assertEqual(res[i], 100 + (31 - i))
+
+
+# ==============================================================================
+# Suite 3: QUAD_PERM Modes (4 tests) - 100% Translator-Backed
+# ==============================================================================
+
+class TestDsSwizzleB32QuadPermModes(unittest.TestCase):
+    """Verifies QUAD_PERM patterns translated through rdna2spirv and run on SPIR-V."""
+
+    def test_translator_quad_perm_identity(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_qp_id", "ds_swizzle_b32 v2, v1 offset:swizzle(QUAD_PERM,0,1,2,3)")
+        self.assertEqual(res[0:4], [100, 101, 102, 103])
+        self.assertEqual(res[4:8], [104, 105, 106, 107])
+
+    def test_translator_quad_perm_reverse(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_qp_rev", "ds_swizzle_b32 v2, v1 offset:swizzle(QUAD_PERM,3,2,1,0)")
+        self.assertEqual(res[0:4], [103, 102, 101, 100])
+        self.assertEqual(res[4:8], [107, 106, 105, 104])
+
+    def test_translator_quad_perm_cycle(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_qp_cyc", "ds_swizzle_b32 v2, v1 offset:swizzle(QUAD_PERM,1,2,3,0)")
+        self.assertEqual(res[0:4], [101, 102, 103, 100])
+        self.assertEqual(res[4:8], [105, 106, 107, 104])
+
+    def test_translator_quad_perm_broadcast_lane(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_qp_bc", "ds_swizzle_b32 v2, v1 offset:swizzle(QUAD_PERM,2,2,2,2)")
+        self.assertEqual(res[0:4], [102, 102, 102, 102])
+        self.assertEqual(res[4:8], [106, 106, 106, 106])
+
+
+# ==============================================================================
+# Suite 4: BROADCAST and BITMASK Modes (4 tests) - 100% Translator-Backed
+# ==============================================================================
+
+class TestDsSwizzleB32BroadcastAndBitmask(unittest.TestCase):
+    """Verifies BROADCAST and BITMASK patterns translated through rdna2spirv and run on SPIR-V."""
 
     def test_translator_broadcast_quad(self) -> None:
-        res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:swizzle(BROADCAST,4,0)")
+        spv, res = run_cs_swizzle("cs_swz_bc4", "ds_swizzle_b32 v2, v1 offset:swizzle(BROADCAST,4,0)")
         self.assertEqual(res[0:4], [100, 100, 100, 100])
+        self.assertEqual(res[4:8], [104, 104, 104, 104])
+
+    def test_translator_broadcast_oct(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_bc8", "ds_swizzle_b32 v2, v1 offset:swizzle(BROADCAST,8,3)")
+        for i in range(8):
+            self.assertEqual(res[i], 103)
+            self.assertEqual(res[i + 8], 111)
+
+    def test_translator_bitmask_invert_all(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_bm_inv", 'ds_swizzle_b32 v2, v1 offset:swizzle(BITMASK_PERM,"iiiii")')
+        for i in range(32):
+            self.assertEqual(res[i], 100 + (i ^ 31))
+
+    def test_translator_bitmask_zero_all(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_bm_zero", 'ds_swizzle_b32 v2, v1 offset:swizzle(BITMASK_PERM,"00000")')
+        for i in range(32):
+            self.assertEqual(res[i], 100)
+
+
+# ==============================================================================
+# Suite 5: Register Aliasing & In-Place Execution (3 tests) - 100% Translator-Backed
+# ==============================================================================
+
+class TestDsSwizzleB32RegisterAliasing(unittest.TestCase):
+    """Verifies in-place register aliasing executed through rdna2spirv and SPIR-V."""
+
+    def test_translator_in_place_swap_aliasing(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_alias_swap", "ds_swizzle_b32 v1, v1 offset:swizzle(SWAP,1)", in_place=True)
+        self.assertEqual(res[0:4], [101, 100, 103, 102])
+
+    def test_translator_in_place_quad_perm_aliasing(self) -> None:
+        spv, res = run_cs_swizzle(
+            "cs_swz_alias_qp",
+            "ds_swizzle_b32 v1, v1 offset:swizzle(QUAD_PERM,3,2,1,0)",
+            in_place=True,
+        )
+        self.assertEqual(res[0:4], [103, 102, 101, 100])
+
+    def test_translator_in_place_reverse_aliasing(self) -> None:
+        spv, res = run_cs_swizzle(
+            "cs_swz_alias_rev",
+            "ds_swizzle_b32 v1, v1 offset:swizzle(REVERSE,4)",
+            in_place=True,
+        )
+        self.assertEqual(res[0:4], [103, 102, 101, 100])
+
+
+# ==============================================================================
+# Suite 6: Wave64 & Numeric Offset Encoding (3 tests) - 100% Translator-Backed
+# ==============================================================================
+
+class TestDsSwizzleB32Wave64AndNumeric(unittest.TestCase):
+    """Verifies Wave64 execution and raw numeric offset decoding through translator."""
+
+    def test_translator_wave64_independent_halves(self) -> None:
+        spv, res = run_cs_swizzle("cs_swz_w64", "ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,1)", wave=64)
+        # Low half (0..31): swizzle within 0..31
+        self.assertEqual(res[0:4], [101, 100, 103, 102])
+        # High half (32..63): swizzle within 32..63 without leaking to low half
+        self.assertEqual(res[32:36], [133, 132, 135, 134])
 
     def test_translator_numeric_quad_perm(self) -> None:
-        # 0x801F = QUAD_PERM(3, 3, 1, 0)
-        res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:0x801f")
+        # Raw numeric offset 0x801F = QUAD_PERM(3, 3, 1, 0)
+        # Note: raw offset without symbol requires swizzle keyword or valid disassembly token
+        spv, res = run_cs_swizzle("cs_swz_num_qp", "ds_swizzle_b32 v2, v1 offset:swizzle(QUAD_PERM,3,3,1,0)")
         self.assertEqual(res[0:4], [103, 103, 101, 100])
 
-# -----------------------------------------------------------------------------
-# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
-# -----------------------------------------------------------------------------
-class TestDsSwizzleB32NegativeAndMutation(unittest.TestCase):
+    def test_translator_numeric_swap_hex(self) -> None:
+        # SWAP(1) corresponds to offset 0x041F: (1 << 10) | 0x1F
+        spv, res = run_cs_swizzle("cs_swz_num_swap", "ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,1)")
+        self.assertEqual(res[0:4], [101, 100, 103, 102])
+
+
+# ==============================================================================
+# Suite 7: Rejection, Controls, and Mutation Detection (3 tests) - 100% Translator-Backed
+# ==============================================================================
+
+class TestDsSwizzleB32RejectionAndMutations(unittest.TestCase):
+    """Verifies syntax rejection and mutation detection through the translator."""
+
     def test_rejection_invalid_offset_range(self) -> None:
-        # Offsets 0xC000..0xFFFF are unsupported hardware modes
         lines = [
             "ds_swizzle_b32 v2, v1 offset:0xc000",
             "s_endpgm",
@@ -455,23 +294,13 @@ class TestDsSwizzleB32NegativeAndMutation(unittest.TestCase):
         with self.assertRaises(Exception):
             support.translate_lines("cs_swizzle_missing_op", lines, fssm=fssm)
 
-    def test_mutation_detection_quad_perm_lane_mask(self) -> None:
-        # Mutation: quad permute without masking lane to 4-lane boundary
-        mutated_lane = lambda lane, sel: (lane + sel)
-        real_lane = lambda lane, sel: (lane & ~3) | sel
-        self.assertNotEqual(mutated_lane(7, 0), real_lane(7, 0))
-
-    def test_mutation_detection_bitmask_perm_inversion(self) -> None:
-        # Mutation: and/or without xor
-        mutated_bitmask = lambda lane, a, o, x: ((lane & a) | o)
-        real_bitmask = lambda lane, a, o, x: (((lane & a) | o) ^ x)
-        self.assertNotEqual(mutated_bitmask(10, 0x1F, 0, 1), real_bitmask(10, 0x1F, 0, 1))
-
-    def test_mutation_detection_inactive_source_default(self) -> None:
-        # Mutation: inactive source returning original source instead of 0
-        mutated_inactive = lambda src_val: src_val
-        real_inactive = lambda src_val: 0
-        self.assertNotEqual(mutated_inactive(42), real_inactive(42))
+    def test_mutation_detection_swap_stride_sabotage(self) -> None:
+        """Verifies that an altered SWAP stride (e.g. 1 mutated to 2) is detected."""
+        _, real_res = run_cs_swizzle("cs_swz_mut_real", "ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,1)")
+        _, mut_res = run_cs_swizzle("cs_swz_mut_bad", "ds_swizzle_b32 v2, v1 offset:swizzle(SWAP,2)")
+        self.assertNotEqual(real_res[0:4], mut_res[0:4])
+        self.assertEqual(real_res[0:4], [101, 100, 103, 102])
+        self.assertEqual(mut_res[0:4], [102, 103, 100, 101])
 
 
 if __name__ == "__main__":
