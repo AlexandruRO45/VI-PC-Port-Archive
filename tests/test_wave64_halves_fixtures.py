@@ -42,6 +42,7 @@ EXPECT = {
     "ps_w64_b_readfirstlane": ("B", [], ["readfirstlane-uniform"]),
     "ps_w64_b_readlane_uniform": ("B", [], ["readlane-uniform"]),
     "ps_w64_b_readlane_uniform_lane": ("B", [], ["readlane-uniform"]),
+    "ps_w64_b_spill_sgpr": ("B", [], ["lane-spill"]),
     "ps_w64_b_ballot_atomic": ("B", [], ["aggregated-atomic", "elected-lane"]),
     "ps_w64_c_waterfall_count": ("C", ["stale-scalar"], None),
     "ps_w64_c_bcnt_export": ("C", ["lane-count"], None),

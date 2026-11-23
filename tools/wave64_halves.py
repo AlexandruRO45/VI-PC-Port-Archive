@@ -269,41 +269,46 @@ class Analysis:
         self.stale = set()
         self.voted = {}                              # block -> mask register key the terminating branch votes on
         self.branch_class = {}
+        self.spill_sites = {}
         self.pure_spill_vgprs = self._find_pure_spill_vgprs()
 
     def _find_pure_spill_vgprs(self):
-        """VGPRs used ONLY as constant-lane scalar spill storage (v_writelane_b32 / v_readlane_b32 with immediate
-        lane 0..63 and non-VGPR source, never read/written as a vector operand, never aliased by v_movrel*, and
+        """VGPRs used ONLY as constant-lane scalar spill storage (v_writelane_b32 / v_readlane_b32 with an immediate or locally folded
+        scalar lane selector and non-VGPR source, never read/written as a vector operand, never aliased by v_movrel*, and
         never holding a lane mask). Every constant lane 0..63 of such a VGPR can be lowered to a parked scalar slot
         in rdna2spirv.py so SGPR spills past lane 31 stay exact on 32-wide (and narrower) subgroups."""
         candidates = set()
         disqualified = set()
         movrel_min = None
-        for blk in self.blocks:
-            for ins in blk:
+        for n, blk in enumerate(self.blocks):
+            for i, ins in enumerate(blk):
                 op = base_op(ins["op"])
                 a = ins["args"]
+                lane = self.operand_literal(n, i, a[2]) if op in ("v_writelane_b32", "v_readlane_b32") \
+                    and len(a) == 3 else None
                 if op in ("v_movrels_b32", "v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32"):
                     for x in a:
                         if x.get("k") == "vgpr":
                             movrel_min = x["r"] if movrel_min is None else min(movrel_min, x["r"])
                 if op == "v_writelane_b32" and len(a) == 3 and a[0].get("k") == "vgpr" and a[0].get("n", 1) == 1 \
-                        and a[2].get("k") == "imm" and a[1].get("k") != "vgpr":
+                        and lane is not None and a[1].get("k") != "vgpr":
                     vr = a[0]["r"]
-                    slot = lane_masks.lane_slot(a[0], a[2])
+                    slot = lane_masks.lane_slot(a[0], {"k": "imm", "v": lane})
                     if slot and (slot in self.masks.get(id(ins), {}) or self.is_mask(ins, a[1])):
                         disqualified.add(vr)
                     else:
                         candidates.add(vr)
+                        self.spill_sites[id(ins)] = slot[1:]
                     continue
                 if op == "v_readlane_b32" and len(a) == 3 and a[1].get("k") == "vgpr" and a[1].get("n", 1) == 1 \
-                        and a[2].get("k") == "imm":
+                        and lane is not None:
                     vr = a[1]["r"]
-                    slot = lane_masks.lane_slot(a[1], a[2])
+                    slot = lane_masks.lane_slot(a[1], {"k": "imm", "v": lane})
                     if slot and slot in self.masks.get(id(ins), {}):
                         disqualified.add(vr)
                     else:
                         candidates.add(vr)
+                        self.spill_sites[id(ins)] = slot[1:]
                     continue
                 for x in a:
                     for r in _regs(x):
@@ -311,7 +316,9 @@ class Analysis:
                             disqualified.add(r[1])
         if movrel_min is not None:
             candidates = {vr for vr in candidates if vr < movrel_min}
-        return frozenset(candidates - disqualified)
+        pure = frozenset(candidates - disqualified)
+        self.spill_sites = {site: slot for site, slot in self.spill_sites.items() if slot[0] in pure}
+        return pure
 
     # ---- helpers ----
     def is_mask(self, ins, a):
@@ -794,6 +801,9 @@ class Analysis:
         if op == "v_readlane_b32" and len(a) == 3:
             vr = a[1]["r"] if a[1].get("k") == "vgpr" else None
             tl = self.rd(st, ins, a[2])
+            slot = self.spill_sites.get(id(ins))
+            if slot is None and vr is not None and a[2].get("k") == "imm":
+                slot = (vr, a[2]["v"] & 63)
             if vr is not None and vr in st["u"]:
                 # Every lane holds the same value in v[vr], so the selected lane index (even if derived from
                 # first-lane, lane-count, or lane-id) cannot change the result across 32-lane halves.
@@ -801,9 +811,8 @@ class Analysis:
                 if ev is not None:
                     ev["uniform_readlane"].add(id(ins))
                 put(a[0], self.rd(st, ins, a[1]))
-            elif vr is not None and a[2].get("k") == "imm" and (vr, a[2]["v"] & 63) in st["l"] \
-                    and ((a[2]["v"] & 63) < 32 or vr in self.pure_spill_vgprs):
-                lane = a[2]["v"] & 63
+            elif slot in st["l"] and (slot[1] < 32 or vr in self.pure_spill_vgprs):
+                lane = slot[1]
                 spill_t = st["l"][(vr, lane)]
                 if (id(ins), ("spill", vr, lane)) in self.stale:
                     spill_t |= CTRL
@@ -820,8 +829,11 @@ class Analysis:
             T[("v", vr)] = T.get(("v", vr), 0) | X
             st["u"] = st["u"] - {vr}
             st["ua"] = st["ua"] - {vr}
-            if a[2].get("k") == "imm" and not tl and ((a[2]["v"] & 63) < 32 or vr in self.pure_spill_vgprs):
-                lane = a[2]["v"] & 63
+            slot = self.spill_sites.get(id(ins))
+            if slot is None and a[2].get("k") == "imm":
+                slot = (vr, a[2]["v"] & 63)
+            if slot is not None and not tl and (slot[1] < 32 or vr in self.pure_spill_vgprs):
+                lane = slot[1]
                 st["l"][(vr, lane)] = tv
                 if ev is not None and vr in self.pure_spill_vgprs:
                     ev["scalar_spills"].add((vr, lane))
@@ -1607,10 +1619,9 @@ class Analysis:
                 regs += [r for r in d2 if r not in ("exec",)]
                 if any(_half(d) and d["t"].startswith("vcc") for d in dests):
                     regs.append("vcc")
-                if base_op(ins["op"]) == "v_writelane_b32" and len(ins["args"]) == 3 \
-                        and ins["args"][0].get("k") == "vgpr" and ins["args"][0]["r"] in self.pure_spill_vgprs \
-                        and ins["args"][2].get("k") == "imm":
-                    regs.append(("spill", ins["args"][0]["r"], ins["args"][2]["v"] & 63))
+                slot = self.spill_sites.get(id(ins))
+                if base_op(ins["op"]) == "v_writelane_b32" and slot is not None:
+                    regs.append(("spill", *slot))
                 defs_of[(b, i)] = regs
 
         def sregs(x):
@@ -1654,10 +1665,9 @@ class Analysis:
                 read = {r for x in srcs for r in sregs(x)} | {r for r in uses if r != "exec"}
                 if base_op(ins["op"]).startswith(("buffer_atomic", "global_atomic")) or dests and False:
                     read |= {r for x in ins["args"] for r in sregs(x)}
-                if base_op(ins["op"]) == "v_readlane_b32" and len(ins["args"]) == 3 \
-                        and ins["args"][1].get("k") == "vgpr" and ins["args"][1]["r"] in self.pure_spill_vgprs \
-                        and ins["args"][2].get("k") == "imm":
-                    read.add(("spill", ins["args"][1]["r"], ins["args"][2]["v"] & 63))
+                slot = self.spill_sites.get(id(ins))
+                if base_op(ins["op"]) == "v_readlane_b32" and slot is not None:
+                    read.add(("spill", *slot))
                 for r in read:
                     rd = st.get(r, frozenset({(-1, 0)}))
                     if len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd):
@@ -1688,7 +1698,9 @@ def analyse(blocks, succ, masks, stage):
         pass
     tier = "C" if reasons else ("B" if idioms else "A")
     return {"tier": tier, "reasons": reasons, "idioms": idioms, "uniform_readlane": ev["uniform_readlane"],
-            "scalar_spills": sorted(ev["scalar_spills"]), "sites": ev["viol"][:8]}
+            "scalar_spills": sorted(ev["scalar_spills"]),
+            "scalar_spill_sites": {site: slot for site, slot in an.spill_sites.items()
+                                   if slot in ev["scalar_spills"]}, "sites": ev["viol"][:8]}
 
 
 # ---- census over a shader index ----
