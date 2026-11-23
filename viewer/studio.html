@@ -555,6 +555,7 @@ function applyTranslations() {
 
 let allModels = [];
 let selectedModel = null;
+const modelPages = new Map();
 let allTextures = [];
 let activeCategory = 'ALL';
 let modelSearchQuery = '';
@@ -785,6 +786,7 @@ async function loadModels() {
     const data = await res.json();
     allModels = data.models || [];
     selectedModel = allModels[0] || null;
+    modelPages.clear();
     document.getElementById('badge-models').innerText = allModels.length;
 
     renderCategoryChips(data.categories || {});
@@ -819,6 +821,7 @@ function renderCategoryChips(categories) {
 }
 
 function selectCategory(cat, chipElem) {
+  if (activeCategory !== cat) modelPages.clear();
   activeCategory = cat;
   document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
   chipElem.classList.add('active');
@@ -826,7 +829,10 @@ function selectCategory(cat, chipElem) {
 }
 
 function onModelSearch() {
-  modelSearchQuery = document.getElementById('model-search').value.toLowerCase().trim();
+  const query = document.getElementById('model-search').value.toLowerCase().trim();
+  if (query === modelSearchQuery) return;
+  modelSearchQuery = query;
+  modelPages.clear();
   renderAccordionList();
 }
 
@@ -874,7 +880,7 @@ function renderAccordionList() {
     const pageSize = 100;
     const pageRows = document.createElement('div');
     pageRows.className = 'model-page';
-    let page = 0;
+    let page = modelPages.get(cat) ?? 0;
 
     function renderPage() {
       const start = page * pageSize;
@@ -921,6 +927,7 @@ function renderAccordionList() {
         button.innerText = label;
         button.onclick = () => {
           page += step;
+          modelPages.set(cat, page);
           renderPage();
           if (button.disabled) (step < 0 ? next : previous).focus();
         };

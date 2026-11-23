@@ -9,7 +9,7 @@ const script = html.match(/<script>\n([\s\S]*?)<\/script>/)[1];
 
 function fakeElement() {
     return {
-        children: [], style: {}, markup: '', innerText: '', value: '', className: '',
+        children: [], childNodes: [{ nodeValue: '' }], style: {}, markup: '', innerText: '', value: '', className: '',
         get innerHTML() { return this.markup; },
         set innerHTML(markup) { this.markup = markup; this.children = []; },
         get classList() {
@@ -38,7 +38,7 @@ function loadStudio() {
         querySelectorAll: () => [],
     };
     const context = vm.createContext({
-        document, localStorage: { getItem: () => null }, window: {}, setTimeout() {},
+        document, localStorage: { getItem: () => null, setItem() {} }, window: {}, setTimeout() {},
         alert: message => alerts.push(message), console: { error() {} },
         THREE: {
             MeshStandardMaterial: Disposable, MeshNormalMaterial: Disposable, Vector3,
@@ -175,4 +175,34 @@ test('each model category pages independently, including a partial last page', (
     assert.equal(next.disabled, true);
     assert.equal(previous.focused, true);
     assert.match(vehicles.children[1].children[1].children[0].innerHTML, /Vehicles-0\.glb/);
+});
+
+test('language and equivalent search text preserve model pages and the selected row', () => {
+    const studio = loadStudio();
+    studio.context.models = ['Props', 'Vehicles'].flatMap(category => Array.from({ length: 201 }, (_, i) => ({
+        name: `${category}-${i}.glb`, category, folder: 'Synthetic', size: 4, url: `/${category}/${i}.glb`,
+    })));
+    studio.run(`allModels = models;
+        document.getElementById('model-search').value = 'synthetic'; onModelSearch();`);
+    const groups = () => studio.elements.get('model-list').children.map(group => group.children[1]);
+    const [props, vehicles] = groups();
+    props.children[0].children[2].onclick();
+    vehicles.children[0].children[2].onclick();
+    vehicles.children[0].children[2].onclick();
+    props.children.at(-1).children[0].onclick();
+
+    studio.run(`setLanguage('eu');`);
+    const [translatedProps, translatedVehicles] = groups();
+    assert.equal(translatedProps.children[0].children[1].innerText, '101–200 / 201');
+    assert.equal(translatedVehicles.children[0].children[1].innerText, '201–201 / 201');
+    assert.equal(translatedProps.children[0].children[2].innerText, 'Next');
+    assert.match(translatedProps.children.at(-1).children[0].className, /\bactive\b/);
+
+    studio.run(`document.getElementById('model-search').value = ' SYNTHETIC '; onModelSearch();`);
+    assert.equal(groups()[0], translatedProps);
+    assert.deepEqual(studio.loads.map(load => load.url), ['/Props/100.glb']);
+
+    studio.run(`document.getElementById('model-search').value = 'Props'; onModelSearch();`);
+    assert.equal(groups().length, 1);
+    assert.equal(groups()[0].children[0].children[1].innerText, '1–100 / 201');
 });
