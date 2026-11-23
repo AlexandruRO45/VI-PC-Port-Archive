@@ -733,5 +733,22 @@ class TestVDot2F32F16SIMDAndIEEE(unittest.TestCase):
         res_inf = ref_v_dot2_f32_f16(0x7C003C00, 0x3C003C00, 0x3F800000)
         self.assertEqual(res_inf, 0x7F800000)
 
+class TestVDot2F32F16Translation(unittest.TestCase):
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available")
+        lines = [
+            "v_mov_b32 v0, 0x3c003c00",
+            "v_mov_b32 v1, 0x3c003c00",
+            "v_mov_b32 v2, 0x3f800000",
+            "v_dot2_f32_f16 v3, v0, v1, v2",
+            "exp mrt0, v3, v3, v3, v3 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bundle_v_dot2_f32_f16", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x40400000)
+
 if __name__ == "__main__":
     unittest.main()
