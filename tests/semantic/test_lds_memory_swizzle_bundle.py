@@ -489,6 +489,21 @@ class TestDsReadU16Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x9876)
 
+def ref_ds_read_i16(lds: LdsModel, addr: int, offset: int = 0) -> int:
+    """Reference mathematical oracle for ds_read_i16 (sign-extended to 32 bits)."""
+    return lds.read_i16(addr + offset)
+
+
+class TestDsReadI16Oracle(unittest.TestCase):
+    def test_read_i16_sign_extension(self) -> None:
+        lds = LdsModel()
+        # 0x8001 has bit 15 set -> negative: sign-extends to 0xFFFF8001
+        lds.write_u16(0x200, 0x8001)
+        self.assertEqual(ref_ds_read_i16(lds, 0x200), 0xFFFF8001)
+        # 0x7FFF is positive -> 0x00007FFF
+        lds.write_u16(0x202, 0x7FFF)
+        self.assertEqual(ref_ds_read_i16(lds, 0x200, offset=2), 0x7FFF)
+
 
 if __name__ == "__main__":
     unittest.main()
