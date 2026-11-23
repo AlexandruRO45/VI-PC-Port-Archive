@@ -465,6 +465,72 @@ class AsavTest(unittest.TestCase):
             saves.parse_asav(b"JSAV" + bytes(0x200))
 
 
+def with_checksum(d):
+    """A synthetic ASAV with its +0x160 field set to the computed checksum."""
+    d = bytearray(d)
+    struct.pack_into("<I", d, saves.ASAV_CHECKSUM, saves.asav_checksum(bytes(d)))
+    return bytes(d)
+
+
+class AsavChecksumTest(unittest.TestCase):
+    def test_joaat_signed_equals_joaat_below_0x80(self):
+        # Published one-at-a-time values (seed 0); ASCII input is the same signed or unsigned.
+        self.assertEqual(saves.joaat_signed(b""), 0)
+        self.assertEqual(saves.joaat_signed(b"a"), 0xCA2E9442)
+        self.assertEqual(saves.joaat_signed(b"The quick brown fox jumps over the lazy dog"), 0x519E91F5)
+
+    def test_joaat_signed_sign_extends_high_bytes(self):
+        # Hand-computed: unsigned joaat("\x80") would add 0x80, the signed form adds 0xffffff80.
+        def one_byte(added):
+            h = added
+            h = (h + (h << 10)) & 0xFFFFFFFF
+            h ^= h >> 6
+            h = (h + (h << 3)) & 0xFFFFFFFF
+            h ^= h >> 11
+            return (h + (h << 15)) & 0xFFFFFFFF
+        self.assertEqual(saves.joaat_signed(b"\x80"), one_byte(0xFFFFFF80))
+        self.assertNotEqual(saves.joaat_signed(b"\x80"), one_byte(0x80))    # what unsigned joaat would give
+
+    def test_seed_is_applied(self):
+        self.assertNotEqual(saves.joaat_signed(b"ASAV", saves.ASAV_CHECKSUM_SEED), saves.joaat_signed(b"ASAV"))
+
+    def test_checksum_covers_the_header_without_its_own_field(self):
+        d = bytearray(make_asav(kind=2, title="Réglages", slot="SettingsX", payload=b"{}"))
+        a = saves.asav_checksum(bytes(d))
+        struct.pack_into("<I", d, saves.ASAV_CHECKSUM, 0xDEADBEEF)
+        self.assertEqual(saves.asav_checksum(bytes(d)), a)            # the stored value is not hashed
+        d[saves.ASAV_HDR:] = b'{"x": 1}'
+        self.assertEqual(saves.asav_checksum(bytes(d)), a)            # nor is the payload
+        d[0x28] ^= 1
+        self.assertNotEqual(saves.asav_checksum(bytes(d)), a)         # a title byte is
+
+    def test_parse_reports_match_and_mismatch(self):
+        d = with_checksum(make_asav(kind=2, title="Profile", slot="SettingsX", payload=b"{}"))
+        h = saves.parse_asav(d)
+        self.assertTrue(h["checksum_match"])
+        self.assertEqual(h["checksum_160"], h["checksum_calc"])
+        bad = bytearray(d)
+        bad[0x128] ^= 1                                               # change the slot name, keep the old checksum
+        h = saves.parse_asav(bytes(bad))
+        self.assertFalse(h["checksum_match"])
+        self.assertNotEqual(h["checksum_160"], h["checksum_calc"])
+
+    def test_info_prints_the_comparison(self):
+        d = with_checksum(make_asav(kind=2, payload=b"{}"))
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "Settings")
+            write(p, d)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                saves.info([p])
+        self.assertIn("checksum_calc", out.getvalue())
+        self.assertRegex(out.getvalue(), r"checksum_match\s+True")
+
+    def test_short_header_is_a_value_error(self):
+        with self.assertRaises(ValueError):
+            saves.asav_checksum(b"ASAV" + bytes(0x20))
+
+
 class ProfileRecordTest(unittest.TestCase):
     def test_parse_synthetic_profile(self):
         # 1644-byte profile record: first 112 bytes non-zero starting u32 10, u32 3

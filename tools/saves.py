@@ -37,6 +37,32 @@ from report_paths import same_report_path  # noqa: E402
 ASAV_HDR = 0x170          # header size seen on every plain ASAV file
 ASAV_TITLE = (0x28, 0x128)  # UTF-16LE display title, 128 code units
 ASAV_NAME = (0x128, 0x160)  # ASCII slot name, 56 bytes
+ASAV_CHECKSUM = 0x160       # u32 over the header, see asav_checksum()
+# Seed of the header checksum, as the executable's ASAV writer passes it (docs/saves.md, "The header checksum").
+ASAV_CHECKSUM_SEED = 0x4BF672ED
+
+
+def joaat_signed(data, seed=0):
+    """Jenkins one-at-a-time with a seed, each byte sign-extended before it is added (the executable loads the
+    bytes with movsx). Equal to the usual joaat for bytes below 0x80; it differs once a byte is 0x80 or more."""
+    h = seed & 0xFFFFFFFF
+    for b in data:
+        h = (h + (b - 0x100 if b & 0x80 else b)) & 0xFFFFFFFF
+        h = (h + (h << 10)) & 0xFFFFFFFF
+        h ^= h >> 6
+    h = (h + (h << 3)) & 0xFFFFFFFF
+    h ^= h >> 11
+    return (h + (h << 15)) & 0xFFFFFFFF
+
+
+def asav_checksum(d):
+    """The +0x160 checksum: joaat_signed over the 0x170-byte header with the checksum field zeroed, seeded with
+    ASAV_CHECKSUM_SEED. Recovered from the executable; not yet confirmed on a retail sample (docs/saves.md)."""
+    if len(d) < ASAV_HDR:
+        raise ValueError(f'header is only {len(d)} bytes, an ASAV header is {ASAV_HDR}')
+    hdr = bytearray(d[:ASAV_HDR])
+    hdr[ASAV_CHECKSUM:ASAV_CHECKSUM + 4] = bytes(4)
+    return joaat_signed(hdr, ASAV_CHECKSUM_SEED)
 
 
 def ts(v):
@@ -66,12 +92,14 @@ def parse_asav(d):
         'timestamp': struct.unpack_from('<Q', d, 0x20)[0],
         'title': d[ASAV_TITLE[0]:ASAV_TITLE[1]].decode('utf-16le', 'replace').split('\0', 1)[0],
         'slot_name': d[ASAV_NAME[0]:ASAV_NAME[1]].split(b'\0', 1)[0].decode('ascii', 'replace'),
-        'checksum_160': '%08x' % struct.unpack_from('<I', d, 0x160)[0],   # algorithm unknown
+        'checksum_160': '%08x' % struct.unpack_from('<I', d, ASAV_CHECKSUM)[0],
+        'checksum_calc': '%08x' % asav_checksum(d),   # unconfirmed on a retail sample, see asav_checksum()
         'field_164': struct.unpack_from('<I', d, 0x164)[0],
         'size_168': struct.unpack_from('<Q', d, 0x168)[0],
         'file_size': len(d),
     }
     h['timestamp_utc'] = ts(h['timestamp'])
+    h['checksum_match'] = h['checksum_160'] == h['checksum_calc']
     if h['payload_offset'] > len(d):
         raise ValueError(f"payload offset {h['payload_offset']:#x} is past the end of a {len(d)}-byte file")
     return h

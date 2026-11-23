@@ -68,17 +68,33 @@ Block conventions:
 0x020 u64      unix time, seconds, UTC                                     confirmed
 0x028 u16[128] display title, UTF-16LE                                     confirmed
 0x128 char[56] slot name, ASCII                                            confirmed
-0x160 u32      checksum: algorithm unknown
+0x160 u32      header checksum, see below                                  hypothesis (from the executable)
 0x164 u32      0
 0x168 u64      file size again (plain)
 0x170          payload
 ```
 
-The checksum at 0x160 matched none of these:
+### The header checksum
+
+Brute force on the samples matched none of these:
 - CRC-32, CRC-32C, Adler-32, FNV-1/1a, joaat (seeds 0, `0x3fac7125`, `0xffffffff`), byte sum, MD5, SHA-1 or SHA-256 (truncated to 32 bits)
 - tried over every 4-aligned sub-range, with the field zeroed and raw, in both byte orders
 
-It's left as **open**. Copy the header verbatim whenever the payload is unchanged.
+Read statically from `game_scarlett_master.exe` 1.0.2.1 (nothing executed), the ASAV writer computes it this way **(hypothesis: not yet
+checked against a retail sample)**:
+
+```
+checksum = joaat_signed(header[0x000..0x170] with the u32 at 0x160 zeroed, seed = 0x4bf672ed)
+joaat_signed: one-at-a-time with that seed, each byte sign-extended before it is added (movsx), then the usual finish
+```
+
+The two things the brute force did not cover are the seed and the sign extension: the result equals the usual joaat
+only while every byte is below 0x80, and the UTF-16 title and the time field easily hold larger ones. The same writer
+clears the byte at 0x153 and the u32 at 0x16c before hashing; it creates headers with 2 in the version field, while
+the samples here show 1.
+
+`tools/saves.py` computes it as `checksum_calc` and prints `checksum_match` in `info` (and in `header.json` from
+`extract`). Until a sample shows `True`, keep copying the header verbatim whenever the payload is unchanged.
 
 Payloads: settings (kind 2) are hash-keyed JSON text with tabs and CRLF **(confirmed)**. The profile record (kind 3)
 is 1,644 bytes (first 112 bytes non-zero, starting `u32 10, u32 3`, followed by 1,532 bytes of zero padding) **(confirmed)**.
