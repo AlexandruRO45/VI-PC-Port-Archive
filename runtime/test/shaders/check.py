@@ -1821,9 +1821,12 @@ def main():
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"
+        elif isinstance(problem, Skip) and not problem:   # an empty Skip is still a skip, not "ok"
+            problem = "SKIP (no reason given)"
         print(f"{name:20} {'ok' if not problem else problem}")
     skipped = sum(p is None or isinstance(p, Skip) for _, p in results)
-    failed = sum(bool(p) for _, p in results) - sum(isinstance(p, Skip) for _, p in results)
+    # By type: an empty Skip is falsy, and subtracting every Skip from the truthy results took one failure off.
+    failed = sum(bool(p) and not isinstance(p, Skip) for _, p in results)
     print(f"{len(results) - failed - skipped} of {len(results)} pass, {skipped} skipped")
     return 1 if failed else 0
 
