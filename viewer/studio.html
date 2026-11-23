@@ -172,8 +172,8 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
 .cat-content { padding-left: 6px; margin-top: 4px; display: flex; flex-direction: column; gap: 3px; }
 .cat-header.collapsed + .cat-content { display: none; }
 .model-page { display: flex; flex-direction: column; gap: 3px; }
-.model-pagination { display: flex; align-items: center; justify-content: space-between; gap: 4px; font-size: 11px; }
-.model-pagination button:disabled { opacity: 0.5; cursor: default; }
+.model-pagination, #tex-pagination:not([hidden]) { display: flex; align-items: center; justify-content: space-between; gap: 4px; font-size: 11px; }
+.model-pagination button:disabled, #tex-pagination button:disabled { opacity: 0.5; cursor: default; }
 
 .model-item {
   padding: 8px 10px;
@@ -431,6 +431,11 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
         <h2 style="font-size: 16px; font-weight: 700; color: var(--accent-pink);">Галерея текстур (DDS & PNG)</h2>
         <span id="tex-count" style="font-size: 12px; color: var(--text-muted);">Загрузка...</span>
       </div>
+      <nav id="tex-pagination" aria-labelledby="tab-btn-textures" hidden>
+        <button type="button" class="tool-btn" id="tex-page-prev"></button>
+        <span id="tex-page-range" aria-live="polite"></span>
+        <button type="button" class="tool-btn" id="tex-page-next"></button>
+      </nav>
       <div class="tex-search">
         <input type="text" id="tex-search-input" class="search-input" placeholder="Фильтр текстур..." oninput="onTextureSearch()">
       </div>
@@ -480,8 +485,8 @@ const I18N = {
     texCountSuffix: "текстур найдено",
     texNotFound: "Текстуры не найдены",
     modelsNotFound: "Ничего не найдено",
-    previousModelPage: "Назад",
-    nextModelPage: "Далее",
+    previousPage: "Назад",
+    nextPage: "Далее",
     modalTitle: "Просмотр текстуры",
     catNames: {
       "Оружие (Weapons)": "Оружие",
@@ -515,8 +520,8 @@ const I18N = {
     texCountSuffix: "textures found",
     texNotFound: "No textures found",
     modelsNotFound: "No models found",
-    previousModelPage: "Previous",
-    nextModelPage: "Next",
+    previousPage: "Previous",
+    nextPage: "Next",
     modalTitle: "Texture Preview",
     catNames: {
       "Оружие (Weapons)": "Weapons",
@@ -560,6 +565,7 @@ let allModels = [];
 let selectedModel = null;
 const modelPages = new Map();
 let allTextures = [];
+let texturePage = 0;
 let activeCategory = 'ALL';
 let modelSearchQuery = '';
 let texSearchQuery = '';
@@ -924,7 +930,7 @@ function renderAccordionList() {
       pager.setAttribute('aria-label', cat);
       range.setAttribute('aria-live', 'polite');
       const labels = I18N[currentLang] || I18N.ru;
-      for (const [button, label, step] of [[previous, labels.previousModelPage, -1], [next, labels.nextModelPage, 1]]) {
+      for (const [button, label, step] of [[previous, labels.previousPage, -1], [next, labels.nextPage, 1]]) {
         button.type = 'button';
         button.className = 'tool-btn';
         button.innerText = label;
@@ -969,71 +975,64 @@ async function loadTextures() {
 }
 
 function onTextureSearch() {
-  texSearchQuery = document.getElementById('tex-search-input').value.toLowerCase().trim();
+  const query = document.getElementById('tex-search-input').value.toLowerCase().trim();
+  if (query === texSearchQuery) return;
+  texSearchQuery = query;
+  texturePage = 0;
   renderTexturesGrid();
 }
 
 function renderTexturesGrid() {
   const grid = document.getElementById('textures-grid');
-  grid.innerHTML = '';
+  const previous = document.getElementById('tex-page-prev');
+  const next = document.getElementById('tex-page-next');
+  const range = document.getElementById('tex-page-range');
+  const labels = I18N[currentLang] || I18N.ru;
+  const filtered = texSearchQuery ? allTextures.filter(t => t.name.toLowerCase().includes(texSearchQuery)) : allTextures;
+  const pageSize = 80;
+  const lastPage = Math.max(0, Math.ceil(filtered.length / pageSize) - 1);
+  document.getElementById('tex-pagination').hidden = lastPage === 0;
 
-  const filtered = allTextures.filter(t => !texSearchQuery || t.name.toLowerCase().includes(texSearchQuery));
-
-  if (filtered.length === 0) {
-    grid.innerHTML = '<div style="grid-column: 1/-1; padding: 30px; text-align: center; color: var(--text-muted);">Текстуры не найдены</div>';
-    return;
-  }
-
-  // Render initial batch (up to 80 for speed)
-  const batch = filtered.slice(0, 80);
-  batch.forEach(t => {
-    const card = document.createElement('div');
-    card.className = 'tex-card';
-    card.innerHTML = `
-      <div class="tex-preview">
-        <img src="${t.preview}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
-      </div>
-      <div class="tex-info">
-        <div class="tex-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
-        <div class="tex-meta">
-          <span>${t.format}</span>
-          <span>${formatBytes(t.size)}</span>
+  function showPage(page) {
+    texturePage = page;
+    previous.disabled = page === 0;
+    next.disabled = page === lastPage;
+    if (!filtered.length) {
+      range.textContent = '';
+      grid.innerHTML = `<div style="grid-column: 1/-1; padding: 30px; text-align: center; color: var(--text-muted);">${labels.texNotFound}</div>`;
+      return;
+    }
+    const start = page * pageSize;
+    const end = Math.min(start + pageSize, filtered.length);
+    range.textContent = `${start + 1}–${end} / ${filtered.length}`;
+    grid.replaceChildren(...filtered.slice(start, end).map(t => {
+      const card = document.createElement('div');
+      card.className = 'tex-card';
+      card.innerHTML = `
+        <div class="tex-preview">
+          <img src="${t.preview}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
         </div>
-      </div>
-    `;
-    card.onclick = () => openModal(t);
-    grid.appendChild(card);
-  });
-
-  if (filtered.length > 80) {
-    const loadMore = document.createElement('div');
-    loadMore.style.gridColumn = '1 / -1';
-    loadMore.style.textAlign = 'center';
-    loadMore.style.padding = '20px';
-    loadMore.innerHTML = `<button class="tab-btn" style="margin: 0 auto;">Показать все (${filtered.length - 80} ещё)</button>`;
-    loadMore.onclick = () => {
-      loadMore.remove();
-      filtered.slice(80).forEach(t => {
-        const card = document.createElement('div');
-        card.className = 'tex-card';
-        card.innerHTML = `
-          <div class="tex-preview">
-            <img src="${t.preview}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
+        <div class="tex-info">
+          <div class="tex-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
+          <div class="tex-meta">
+            <span>${t.format}</span>
+            <span>${formatBytes(t.size)}</span>
           </div>
-          <div class="tex-info">
-            <div class="tex-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
-            <div class="tex-meta">
-              <span>${t.format}</span>
-              <span>${formatBytes(t.size)}</span>
-            </div>
-          </div>
-        `;
-        card.onclick = () => openModal(t);
-        grid.appendChild(card);
-      });
-    };
-    grid.appendChild(loadMore);
+        </div>
+      `;
+      card.onclick = () => openModal(t);
+      return card;
+    }));
   }
+
+  for (const [button, label, step] of [[previous, labels.previousPage, -1], [next, labels.nextPage, 1]]) {
+    button.textContent = label;
+    button.onclick = () => {
+      showPage(texturePage + step);
+      if (button.disabled) (step < 0 ? next : previous).focus();
+    };
+  }
+  showPage(Math.min(texturePage, lastPage));
 }
 
 let modalVersion = 0;

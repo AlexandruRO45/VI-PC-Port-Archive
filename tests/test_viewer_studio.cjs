@@ -84,10 +84,11 @@ function renderTextureGrid(name) {
         () => ({ name: name + '.png', format: 'PNG Image', size: 4, preview: '/textures/x.png' }));
     studio.run('allTextures = textures; renderTexturesGrid();');
     const grid = studio.elements.get('textures-grid');
-    grid.children.at(-1).onclick();
-    const cards = grid.children.filter(child => child.className === 'tex-card');
-    assert.equal(cards.length, 81);
-    return cards[0].innerHTML + cards[80].innerHTML;
+    assert.equal(grid.children.length, 80);
+    const first = grid.children[0].innerHTML;
+    studio.elements.get('tex-page-next').onclick();
+    assert.equal(grid.children.length, 1);
+    return first + grid.children[0].innerHTML;
 }
 
 test('hostile model and texture file names render as text, not as elements or attributes', () => {
@@ -101,7 +102,7 @@ test('hostile model and texture file names render as text, not as elements or at
 test('a texture preview that fails to load fires its error handler once, not in a loop', () => {
     // Chromium fires "error" again for every src='' it is given, so a handler that sets src='' without clearing
     // itself first runs forever (about 424,000 times in 3 s for one card in Chromium 156). This fake image fires the
-    // handler again on every src write, as that browser does, and both card paths (first 80, "show all") are used.
+    // handler again on every src write, as that browser does, and checks the first and second pages.
     const cards = renderTextureGrid('plain name');
     const handlers = [...cards.matchAll(/<img\b[^>]*\sonerror="([^"]*)"/g)].map(m => m[1]);
     assert.equal(handlers.length, 2);
@@ -228,6 +229,70 @@ test('language and equivalent search text preserve model pages and the selected 
     studio.run(`document.getElementById('model-search').value = 'Props'; onModelSearch();`);
     assert.equal(groups().length, 1);
     assert.equal(groups()[0].children[0].children[1].innerText, '1–100 / 201');
+});
+
+test('large texture catalogues keep one page of previews and open the texture on that page', () => {
+    const { context, elements, run } = loadStudio();
+    context.textures = Array.from({ length: 10001 }, (_, i) => ({
+        name: `texture-${i}.png`, format: 'PNG', size: 4, preview: `/textures/${i}.png`,
+    }));
+    run('allTextures = textures; renderTexturesGrid();');
+    const grid = elements.get('textures-grid');
+    const previous = elements.get('tex-page-prev'), next = elements.get('tex-page-next');
+    const range = elements.get('tex-page-range');
+    assert.equal(previous.disabled, true);
+    assert.equal(elements.get('tex-pagination').hidden, false);
+    for (let start = 0; start < context.textures.length; start += 80) {
+        if (start) next.onclick();
+        const end = Math.min(start + 80, context.textures.length);
+        assert.equal(grid.children.length, end - start);
+        assert.equal(range.textContent, `${start + 1}–${end} / 10001`);
+        assert.ok(grid.children[0].innerHTML.includes(`texture-${start}.png`));
+        assert.ok(grid.children.at(-1).innerHTML.includes(`texture-${end - 1}.png`));
+        assert.equal(next.disabled, end === 10001);
+    }
+    grid.children[0].onclick();
+    assert.equal(elements.get('modal-title').innerText, 'texture-10000.png');
+    assert.equal(elements.get('modal-img').src, '/textures/10000.png');
+    assert.equal(previous.focused, true);
+    previous.onclick();
+    assert.equal(range.textContent, '9921–10000 / 10001');
+});
+
+test('texture search resets the page on a new filter and language changes keep the current page', () => {
+    const { context, elements, run } = loadStudio();
+    context.textures = Array.from({ length: 160 }, (_, i) => ({
+        name: `texture-${i}.png`, format: 'PNG', size: 4, preview: `/textures/${i}.png`,
+    }));
+    run('allTextures = textures; renderTexturesGrid();');
+    const grid = elements.get('textures-grid'), pager = elements.get('tex-pagination');
+    const search = run("document.getElementById('tex-search-input')");
+    const next = elements.get('tex-page-next'), previous = elements.get('tex-page-prev');
+    search.value = 'Texture';
+    run('onTextureSearch();');
+    next.onclick();
+    assert.equal(grid.children.length, 80);
+    assert.equal(next.disabled, true);
+    run("setLanguage('eu');");
+    search.value = ' TEXTURE ';
+    run('onTextureSearch();');
+    assert.equal(elements.get('tex-page-range').textContent, '81–160 / 160');
+    assert.equal(previous.textContent, 'Previous');
+    assert.equal(next.textContent, 'Next');
+    search.value = 'texture-159.png';
+    run('onTextureSearch();');
+    assert.equal(pager.hidden, true);
+    assert.equal(grid.children.length, 1);
+    assert.ok(grid.children[0].innerHTML.includes('texture-159.png'));
+    search.value = 'missing';
+    run('onTextureSearch();');
+    assert.equal(pager.hidden, true);
+    assert.equal(grid.children.length, 0);
+    search.value = '';
+    run('onTextureSearch();');
+    assert.equal(pager.hidden, false);
+    assert.equal(previous.disabled, true);
+    assert.equal(elements.get('tex-page-range').textContent, '1–80 / 160');
 });
 
 test('DDS inspector selects a mip and layer and clears controls for ordinary images', async () => {
