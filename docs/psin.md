@@ -319,13 +319,14 @@ a record is:
 | Type | Element block | Record |
 |---:|---|---|
 | `0x76` | a type-`0x4a` block | one `u32` hash; `entries <= slots` and the unused records are `0` |
-| `0x77` | an anonymous `0x100` block | the block's struct, a bucket of 16 `u64` hashes behind a 16-byte bit set; `entries` counts the hashes in the buckets and may exceed `slots` |
+| `0x77` | an anonymous `0x100` block | the block's `LSCH` struct (`hash = 0x100`), a bucket of 16 `u64` hashes behind a 16-byte bit set; `entries` counts the hashes in the buckets and may exceed `slots` |
 
 Measured on the two `data.rpf` containers these types left partly reached: `2 * 32 slots * 4 bytes = 256` and
 `1 * 4 slots * 144 bytes = 576` are exactly the bytes each had unreached, and both then hold `bytes == bytes
 reached`. In the `0x76` windows exactly `entries` of the `slots` u32s are non-zero (`1` and `2`), and the four
-`0x77` buckets hold exactly the declared `35` hashes (`12 + 10 + 10 + 3`). Reading `slots` as the *second* word
-would overrun both blocks, so its position is measured, not assumed. Whole-corpus figures are not claimed yet: the
+`0x77` buckets hold exactly the declared `35` hashes (`12 + 10 + 10 + 3`). Reading the *second* word as `slots`
+would under-read the 32-slot `0x76` scalar sets (where `entries` is `1` or `2`) and overrun the 4-bucket `0x77` set
+(where `entries` is `35`), so its position is measured, not assumed. Whole-corpus figures are not claimed yet: the
 other `0x76`/`0x77` members sit in archives whose carve this change was not checked against.
 
 ### f32 grids (`0x5a`)

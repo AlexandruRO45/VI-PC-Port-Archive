@@ -67,6 +67,27 @@ class TestMemberTypes(unittest.TestCase):
         self.assertEqual((counts_only["blocks reached"], counts_only["bytes reached"], counts_only["structs"]),
                          (3, 28, 3))
 
+    def test_hash_set_anonymous_0x100_lsch_struct(self):
+        # In retail data.rpf, 0x77 points to block type 0x100 and LSCH defines struct hash 0x100 (144 bytes).
+        r = joaat("Root")
+        schema = [
+            (r, 1, 16, 3, [(1, 0, 0x77, 0, 0, 0)]),
+            (0x100, 2, 16, 3, [(2, 0, 0x4F, 0, 0, 0), (3, 8, 0x4F, 0, 0, 0)]),
+        ]
+        blocks = [
+            (r, struct.pack("<IIQ", 2, 3, 2)),
+            (0x100, struct.pack("<4Q", 0x11, 0x22, 0x33, 0x44)),
+        ]
+        c = D.Container(make_container(blocks, schema))
+        stats = collections.Counter()
+        tree = D.Walker(c, stats, keep=True).run()
+        self.assertEqual((stats["bytes"], stats["bytes reached"], stats["blocks reached"]), (48, 48, 2))
+        self.assertEqual((stats["set 77 slots"], stats["set 77 entries"]), (2, 3))
+        self.assertEqual(tree[f"{1:08x}"], [
+            {f"{2:08x}": f"{0x11:016x}", f"{3:08x}": f"{0x22:016x}"},
+            {f"{2:08x}": f"{0x33:016x}", f"{3:08x}": f"{0x44:016x}"},
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()
