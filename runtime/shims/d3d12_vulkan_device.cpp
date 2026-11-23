@@ -3093,6 +3093,21 @@ public:
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
+        if (gs_fallback_.input_id) device_.context->remove_pipeline(gs_fallback_.input_id);
+        if (gs_fallback_.capture_id) device_.context->remove_pipeline(gs_fallback_.capture_id);
+        if (gs_input_layout_) vk.vkDestroyPipelineLayout(dev, gs_input_layout_, nullptr);
+        if (gs_capture_layout_) vk.vkDestroyPipelineLayout(dev, gs_capture_layout_, nullptr);
+        for (std::size_t i = 0; i < 2; ++i)
+            if (gs_code_bytes_[i])
+                device_.arena_release(gs_code_base_[i], gs_code_bytes_[i], DeviceState::arena_shader);
+        if (gs_fallback_.params_bytes)
+            device_.arena_release(gs_fallback_.params_va, gs_fallback_.params_bytes, DeviceState::arena_buffer);
+        if (gs_fallback_.input_capacity)
+            device_.arena_release(gs_fallback_.input_va, gs_fallback_.input_capacity, DeviceState::arena_buffer);
+        if (gs_fallback_.record_capacity)
+            device_.arena_release(gs_fallback_.record_va, gs_fallback_.record_capacity, DeviceState::arena_buffer);
+        if (gs_fallback_.meta_capacity)
+            device_.arena_release(gs_fallback_.meta_va, gs_fallback_.meta_capacity, DeviceState::arena_buffer);
     }
 
     // Pipeline layouts declare the whole 144-byte block as one push-constant range. A device whose
@@ -3157,6 +3172,89 @@ public:
     bool compute() const { return registered_ && !is_graphics_; }
     bool graphics() const { return registered_ && is_graphics_; }
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const { return subgroup_requests_; }
+
+    bool gs_active() const { return gs_fallback_.input_id != 0; }
+
+    // What one draw through the geometry fallback records (SHADER-1092): the fused pass's and the capture
+    // pass's push-constant tails and grids, and the record-driven draw's own tail. The three buffers the
+    // passes share grow to the draw's size and stay allocated for the next one. False, with a log, for a
+    // draw outside the fallback's scope; true with a zero draw_count for one that rasterizes nothing, which
+    // the caller records as D3D12 does: nothing.
+    bool gs_prepare(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance,
+                    const std::array<leonida::VertexBufferView, 32>& buffers, const leonida::IndexBufferView& index,
+                    leonida::GsDrawCommands& out) {
+        if (instances != 1 || first_instance) {
+            log_once("the geometry fallback draws one instance; instances", int(instances));
+            return false;
+        }
+        const GsFallback& f = gs_fallback_;
+        const std::uint32_t prims = count / f.verts_in;
+        if (prims == 0) return true;  // a no-op draw: the caller records nothing
+        std::uint32_t kind = 2;  // non-indexed: the fused pass derives every vertex id from its slot
+        std::uint64_t index_va = f.input_va;  // readable: the index loads always run, their results go unused
+        if (indexed) {
+            if (index.format != DXGI_FORMAT_R16_UINT && index.format != DXGI_FORMAT_R32_UINT) {
+                log_once("the geometry fallback reads R16_UINT or R32_UINT index buffers; format",
+                         int(index.format));
+                return false;
+            }
+            kind = index.format == DXGI_FORMAT_R16_UINT ? 0 : 1;
+            index_va = index.va + std::uint64_t(first) * (kind == 0 ? 2 : 4);  // first: StartIndexLocation
+        }
+        const std::uint64_t input_bytes = 16 + 16 * std::uint64_t(prims) * f.verts_in * (f.num_inputs + 1);
+        const std::uint64_t record_bytes = 16 * std::uint64_t(prims) * f.max_verts * f.num_outputs;
+        const std::uint64_t meta_bytes = 4 * std::uint64_t(prims) * (f.max_verts + 1);
+        auto grow = [this](std::uint64_t& va, std::uint64_t& capacity, std::uint64_t bytes) {
+            if (capacity >= bytes) return true;
+            if (capacity) device_.arena_release(va, capacity, DeviceState::arena_buffer);
+            if (!device_.arena_allocate(bytes, 16, va, DeviceState::arena_buffer)) {
+                capacity = 0;
+                return false;
+            }
+            capacity = bytes;
+            return true;
+        };
+        if (!grow(gs_fallback_.input_va, gs_fallback_.input_capacity, input_bytes) ||
+            !grow(gs_fallback_.record_va, gs_fallback_.record_capacity, record_bytes) ||
+            !grow(gs_fallback_.meta_va, gs_fallback_.meta_capacity, meta_bytes))
+            return false;
+        out.input_id = f.input_id;
+        out.capture_id = f.capture_id;
+        out.slots = prims * f.verts_in;
+        out.prims = prims;
+        // the fused pass's tail: the parameters, input and index VAs, the count, the kind, the base, then the
+        // per-slot vertex-buffer table
+        out.input_tail[0] = std::uint32_t(f.params_va);
+        out.input_tail[1] = std::uint32_t(f.params_va >> 32);
+        out.input_tail[2] = std::uint32_t(gs_fallback_.input_va);
+        out.input_tail[3] = std::uint32_t(gs_fallback_.input_va >> 32);
+        out.input_tail[4] = std::uint32_t(index_va);
+        out.input_tail[5] = std::uint32_t(index_va >> 32);
+        out.input_tail[6] = count;
+        out.input_tail[7] = kind;
+        out.input_tail[8] = indexed ? std::uint32_t(base_vertex) : first;  // base vertex, or the first vertex
+        for (UINT s = 0; s < 6; ++s) {
+            const leonida::VertexBufferView& view = buffers[s];
+            out.input_tail[9 + 3 * s + 0] = std::uint32_t(view.va);
+            out.input_tail[9 + 3 * s + 1] = std::uint32_t(view.va >> 32);
+            out.input_tail[9 + 3 * s + 2] = view.stride;
+        }
+        // the capture pass's tail: the input, record and meta VAs
+        out.capture_tail[0] = out.input_tail[2];
+        out.capture_tail[1] = out.input_tail[3];
+        out.capture_tail[2] = std::uint32_t(gs_fallback_.record_va);
+        out.capture_tail[3] = std::uint32_t(gs_fallback_.record_va >> 32);
+        out.capture_tail[4] = std::uint32_t(gs_fallback_.meta_va);
+        out.capture_tail[5] = std::uint32_t(gs_fallback_.meta_va >> 32);
+        // the draw's tail: the record and meta VAs, and the primitive count
+        out.draw_tail[0] = out.capture_tail[2];
+        out.draw_tail[1] = out.capture_tail[3];
+        out.draw_tail[2] = out.capture_tail[4];
+        out.draw_tail[3] = out.capture_tail[5];
+        out.draw_tail[4] = prims;
+        out.draw_count = prims * f.per_prim;
+        return true;
+    }
 
     // A VS (+ GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
     // VS's input signature by semantic name and index: location = the element's register, the translator's rule
@@ -3233,13 +3331,12 @@ public:
             return E_NOTIMPL;
         }
         // A geometry shader is the translator's Vulkan geometry stage (docs/design.md, "Geometry shaders"): it takes
-        // triangles and emits a triangle strip. It needs the geometryShader feature, and the PSO's topology type must
-        // be its input primitive, as D3D12 requires.
+        // triangles and emits a triangle strip. With the stage it needs the geometryShader feature, and the PSO's
+        // topology type must be its input primitive, as D3D12 requires. Without the stage (Apple GPUs) the PSO
+        // draws through the capture path instead (SHADER-1092): the geometry shader's own --gs-compute lowering,
+        // with the game's vertex shader fused into the pass that feeds it.
         const bool geometry = desc.GS.pShaderBytecode && desc.GS.BytecodeLength;
-        if (geometry && !device_.info.features.geometryShader) {
-            log_once("geometry shaders need the Vulkan geometryShader feature; stage", 0);
-            return E_NOTIMPL;
-        }
+        const bool gs_fallback = geometry && !device_.info.features.geometryShader;
         if (geometry && desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
             log_once("a translated geometry shader takes triangles; topology type", desc.PrimitiveTopologyType);
             return E_INVALIDARG;
@@ -3402,6 +3499,92 @@ public:
                          pixel ? "fragmentStoresAndAtomics" : "vertexPipelineStoresAndAtomics");
             return E_NOTIMPL;
         }
+        // -- the geometry fallback (SHADER-1092) --
+        // Without the Vulkan geometry stage the PSO draws through the capture path: the graphics pipeline's
+        // vertex stage becomes the record-driven draw VS generated from the geometry shader
+        // (<gs>.gs_vs.spv -- the same module the vk_harness path draws with), and two compute passes run before
+        // every draw: the game's vertex shader fused with its fetch (<vs>.gs_input.spv, one invocation per
+        // input-primitive vertex slot) and the geometry shader's capture pass (<gs>.gs_compute_bda.spv, one
+        // workgroup per primitive). The passes address every buffer through push constants, so the draw binds
+        // nothing; the pairing facts ride a parameters block in the arena, written at the end of this function.
+        const leonida::ShaderEntry* gs_entry = nullptr;
+        std::vector<std::uint32_t> gs_input_words, gs_capture_words;
+        std::vector<std::array<std::uint32_t, 2>> gs_loc_slot_offset;  // per VS input location: slot, byte offset
+        if (gs_fallback) {
+            gs_entry = gs_stage.entry;
+            if (!gs_entry->gs_capture()) {
+                std::fprintf(stderr, "[rt] d3d12: %s was translated without --gs-compute, which the geometry "
+                                      "fallback needs\n", gs_entry->name.c_str());
+                return E_NOTIMPL;
+            }
+            if (device_.info.max_push_constants_size &&
+                device_.info.max_push_constants_size < sizeof(leonida::ShaderUserData) + 108) {
+                log_once("the fused pass needs 252 bytes of push constants; maxPushConstantsSize",
+                         int(device_.info.max_push_constants_size));
+                return E_NOTIMPL;
+            }
+            // Scope of what the generated passes fetch: one vertex format (the fetch loads four dwords), the
+            // per-slot table's six slots, per-vertex data only, and offsets its dword loads can read.
+            UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+            std::vector<std::pair<std::uint32_t, std::array<std::uint32_t, 2>>> fed;  // location -> slot, offset
+            for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+                const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
+                const UINT offset = element.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
+                                        ? (slot_end[element.InputSlot] + 3) / 4 * 4
+                                        : element.AlignedByteOffset;
+                slot_end[element.InputSlot] = offset + 16;
+                const leonida::SignatureElement* input = nullptr;
+                for (const auto& e : vs_stage.entry->input_signature)
+                    if (e.system_value == 0 && e.semantic_index == element.SemanticIndex &&
+                        equal_semantic(e.semantic, element.SemanticName))
+                        input = &e;
+                if (!input) continue;  // the shader does not read this element
+                if (element.Format != DXGI_FORMAT_R32G32B32A32_FLOAT) {
+                    log_once("the geometry fallback fetches R32G32B32A_FLOAT attributes only; format",
+                             int(element.Format));
+                    return E_NOTIMPL;
+                }
+                if (element.InputSlot >= 6) {
+                    log_once("the geometry fallback reads at most six vertex-buffer slots; slot",
+                             int(element.InputSlot));
+                    return E_NOTIMPL;
+                }
+                if (element.InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA) {
+                    log_once("the geometry fallback fetches per-vertex data only; classification",
+                             int(element.InputSlotClass));
+                    return E_NOTIMPL;
+                }
+                if (offset % 4) {
+                    log_once("the geometry fallback needs 4-byte-aligned attribute offsets; offset", int(offset));
+                    return E_NOTIMPL;
+                }
+                fed.push_back({input->register_index, {element.InputSlot, offset}});
+            }
+            for (const auto& e : vs_stage.entry->input_signature) {
+                if (e.system_value) continue;
+                const auto it = std::find_if(fed.begin(), fed.end(),
+                                             [&](const auto& pair) { return pair.first == e.register_index; });
+                if (it == fed.end()) {  // layout_feeds already refused an input layout like this at the entry pick
+                    std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
+                                 e.semantic.c_str(), e.semantic_index, e.register_index);
+                    return E_INVALIDARG;
+                }
+                gs_loc_slot_offset.push_back(it->second);
+            }
+            vs_stage.words = library->spirv_sidecar(*gs_entry, ".gs_vs.spv");
+            gs_input_words = library->spirv_sidecar(*vs_stage.entry, ".gs_input.spv");
+            gs_capture_words = library->spirv_sidecar(*gs_entry, ".gs_compute_bda.spv");
+            if (vs_stage.words.empty() || gs_input_words.empty() || gs_capture_words.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: the geometry fallback stages of %s / %s are missing (build them "
+                                      "with tools/gs_compute_stages.py and its --vs-input)\n",
+                             vs_stage.entry->name.c_str(), gs_entry->name.c_str());
+                return E_NOTIMPL;
+            }
+            // The graphics pipeline's vertex stage is the generated draw VS, which reads no code base: the vertex
+            // and geometry shaders' own code moves to their compute pipelines, at the end of this function.
+            if (code_stage == &vs_stage || code_stage == &gs_stage) code_stage = nullptr;
+            gs_stage.entry = nullptr;  // no Vulkan geometry stage in the pipeline; the loops below skip it
+        }
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
             // After the f16 link above, which can also edit the pixel shader's words.
@@ -3426,7 +3609,10 @@ public:
             info.stage = stage.bit;
             info.module = module;
             info.pName = "main";
-            subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
+            // The geometry fallback's vertex stage is a generated draw VS (SHADER-1092), which asks for no
+            // subgroup size; the game's own vertex shader runs in the fused compute pass instead.
+            if (stage.bit != VK_SHADER_STAGE_VERTEX_BIT || !gs_fallback)
+                subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
         }
         if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
@@ -3451,55 +3637,59 @@ public:
         std::vector<VkVertexInputBindingDivisorDescriptionEXT> divisors;
         std::uint32_t divisor_slots = 0;
         UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
-        for (UINT i = 0; !mesh && i < desc.InputLayout.NumElements; ++i) {
-            const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
-            if (element.InputSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
-            VkFormat format;
-            UINT bytes;
-            if (!vertex_format(element.Format, format, bytes)) {
-                log_once("vertex attribute format not supported yet:", element.Format);
-                return E_INVALIDARG;
-            }
-            const UINT alignment = std::min(bytes, 4u);
-            const UINT offset = element.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
-                                    ? (slot_end[element.InputSlot] + alignment - 1) / alignment * alignment
-                                    : element.AlignedByteOffset;
-            slot_end[element.InputSlot] = offset + bytes;
-            const leonida::SignatureElement* input = nullptr;
-            for (const auto& e : stages[0].entry->input_signature)
-                if (e.system_value == 0 && e.semantic_index == element.SemanticIndex &&
-                    equal_semantic(e.semantic, element.SemanticName))
-                    input = &e;
-            if (!input) continue;  // the shader does not read this element
-            attributes.push_back({input->register_index, element.InputSlot, format, offset});
-            const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
-            // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
-            if (instance && element.InstanceDataStepRate == 0) graphics_.zero_step_slots |= 1u << element.InputSlot;
-            if (instance && element.InstanceDataStepRate > 1) {
-                if (!device_.info.vertex_attribute_divisor) {
-                    log_once("instance step rates above 1 need vertexAttributeInstanceRateDivisor; rate",
-                             int(element.InstanceDataStepRate));
-                    return E_NOTIMPL;
+        // The geometry fallback's draw VS reads no vertex buffers (SHADER-1092): the fused pass fetched them
+        // ahead of the draw, so its pipeline has no vertex input at all. A mesh pipeline has none either.
+        if (!gs_fallback) {
+            for (UINT i = 0; !mesh && i < desc.InputLayout.NumElements; ++i) {
+                const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
+                if (element.InputSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
+                VkFormat format;
+                UINT bytes;
+                if (!vertex_format(element.Format, format, bytes)) {
+                    log_once("vertex attribute format not supported yet:", element.Format);
+                    return E_INVALIDARG;
                 }
-                if (!(divisor_slots & (1u << element.InputSlot))) {
-                    divisor_slots |= 1u << element.InputSlot;
-                    divisors.push_back({element.InputSlot, element.InstanceDataStepRate});
+                const UINT alignment = std::min(bytes, 4u);
+                const UINT offset = element.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
+                                        ? (slot_end[element.InputSlot] + alignment - 1) / alignment * alignment
+                                        : element.AlignedByteOffset;
+                slot_end[element.InputSlot] = offset + bytes;
+                const leonida::SignatureElement* input = nullptr;
+                for (const auto& e : stages[0].entry->input_signature)
+                    if (e.system_value == 0 && e.semantic_index == element.SemanticIndex &&
+                        equal_semantic(e.semantic, element.SemanticName))
+                        input = &e;
+                if (!input) continue;  // the shader does not read this element
+                attributes.push_back({input->register_index, element.InputSlot, format, offset});
+                const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+                // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
+                if (instance && element.InstanceDataStepRate == 0) graphics_.zero_step_slots |= 1u << element.InputSlot;
+                if (instance && element.InstanceDataStepRate > 1) {
+                    if (!device_.info.vertex_attribute_divisor) {
+                        log_once("instance step rates above 1 need vertexAttributeInstanceRateDivisor; rate",
+                                 int(element.InstanceDataStepRate));
+                        return E_NOTIMPL;
+                    }
+                    if (!(divisor_slots & (1u << element.InputSlot))) {
+                        divisor_slots |= 1u << element.InputSlot;
+                        divisors.push_back({element.InputSlot, element.InstanceDataStepRate});
+                    }
+                }
+                if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
+                    graphics_.vertex_slots |= 1u << element.InputSlot;
+                    bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
+                                        instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
                 }
             }
-            if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
-                graphics_.vertex_slots |= 1u << element.InputSlot;
-                bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
-                                    instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
-            }
-        }
-        for (const auto& e : stages[0].entry->input_signature) {
-            if (e.system_value) continue;
-            const bool fed = std::any_of(attributes.begin(), attributes.end(),
-                                         [&](const auto& a) { return a.location == e.register_index; });
-            if (!fed) {  // D3D12 rejects an input layout that leaves a shader input unfed
-                std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
-                             e.semantic.c_str(), e.semantic_index, e.register_index);
-                return E_INVALIDARG;
+            for (const auto& e : stages[0].entry->input_signature) {
+                if (e.system_value) continue;
+                const bool fed = std::any_of(attributes.begin(), attributes.end(),
+                                             [&](const auto& a) { return a.location == e.register_index; });
+                if (!fed) {  // D3D12 rejects an input layout that leaves a shader input unfed
+                    std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
+                                 e.semantic.c_str(), e.semantic_index, e.register_index);
+                    return E_INVALIDARG;
+                }
             }
         }
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -3710,7 +3900,10 @@ public:
         for (const Stage& stage : stages)
             if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
                 graphics_.push_stages |= stage.bit;
-        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
+        // The geometry fallback's draw VS reads its record, meta and primitive count past the block (SHADER-1092);
+        // the range must name exactly what is pushed.
+        const std::uint32_t push_bytes = sizeof(leonida::ShaderUserData) + (gs_fallback ? 20 : 0);
+        const VkPushConstantRange push{graphics_.push_stages, 0, push_bytes};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
@@ -3742,6 +3935,11 @@ public:
         graphics_.pipeline = build(0);
         if (!graphics_.pipeline) return E_FAIL;
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
+        if (gs_fallback) {
+            const HRESULT gs = build_gs_fallback(*vs_stage.entry, *gs_entry, gs_loc_slot_offset, gs_input_words,
+                                                 gs_capture_words, vs_stage.fssm, gs_stage.fssm);
+            if (gs != S_OK) return gs;
+        }
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -3754,6 +3952,110 @@ public:
         device_.context->add_graphics_pipeline(id(), graphics_);
         registered_ = true;
         is_graphics_ = true;
+        return S_OK;
+    }
+
+    // The geometry fallback's two compute pipelines and its parameters block (SHADER-1092), built once the
+    // graphics pipeline is. The pipelines take no descriptor sets: the passes read everything through the
+    // 144-byte block plus their own tail words. The parameters block is written once; the three buffers the
+    // passes share are grown per draw.
+    HRESULT build_gs_fallback(const leonida::ShaderEntry& vs, const leonida::ShaderEntry& gs,
+                              const std::vector<std::array<std::uint32_t, 2>>& loc_slot_offset,
+                              const std::vector<std::uint32_t>& input_words,
+                              const std::vector<std::uint32_t>& capture_words,
+                              const std::vector<std::uint8_t>& vs_code, const std::vector<std::uint8_t>& gs_code) {
+        auto& vk = device_.context->vk;
+        const VkDevice dev = device_.info.device;
+        GsFallback& f = gs_fallback_;
+        f.verts_in = gs.gs_verts_in;
+        f.max_verts = gs.gs_max_verts;
+        f.num_inputs = gs.gs_num_inputs;
+        f.num_outputs = gs.gs_num_outputs;
+        f.per_prim = gs.gs_max_verts >= 3 ? 3 * (gs.gs_max_verts - 2) : 1;
+        // The parameters block: [the geometry shader's input slots, its verts_in, the vertex shader's output
+        // slots], then per output slot (the position first, then locations ascending) the geometry shader input
+        // slot that consumes it -- 0xffffffff for one none does, whose store goes to a scratch vec4 the capture
+        // pass never reads -- then per input location, ascending, its input layout slot and byte offset.
+        std::vector<std::uint32_t> params;
+        params.reserve(3 + vs.outputs.size() + 1 + 2 * loc_slot_offset.size());
+        params.push_back(f.num_inputs);
+        params.push_back(f.verts_in);
+        params.push_back(std::uint32_t(vs.outputs.size() + 1));
+        std::vector<std::uint32_t> fed_slots;  // the geometry shader input slots some output feeds
+        for (std::uint32_t j = 0; j <= vs.outputs.size(); ++j) {
+            const std::uint32_t want = j == 0 ? leonida::ShaderEntry::kGsPositionSlot : vs.outputs[j - 1];
+            std::uint32_t slot = 0xFFFFFFFF;
+            for (std::uint32_t s = 0; s < gs.gs_input_locations.size(); ++s)
+                if (gs.gs_input_locations[s] == want) {
+                    slot = s;
+                    break;
+                }
+            if (slot != 0xFFFFFFFF) fed_slots.push_back(slot);
+            params.push_back(slot);
+        }
+        if (fed_slots.size() != f.num_inputs) {
+            // An input slot nothing feeds would keep the previous draw's row between draws; D3D12 reads
+            // undefined there, but the fallback refuses instead of feeding stale geometry.
+            std::fprintf(stderr, "[rt] d3d12: %s does not feed every input of %s\n", vs.name.c_str(),
+                         gs.name.c_str());
+            return E_NOTIMPL;
+        }
+        for (const auto& slot_offset : loc_slot_offset) {
+            params.push_back(slot_offset[0]);
+            params.push_back(slot_offset[1]);
+        }
+        f.params_bytes = params.size() * 4;
+        if (!device_.arena_allocate(f.params_bytes, 16, f.params_va, DeviceState::arena_buffer))
+            return E_OUTOFMEMORY;
+        std::memcpy(device_.arena.mapped + f.params_va, params.data(), f.params_bytes);
+        // Internal ids: addresses of members of this object, which no other pipeline's id() -- its own
+        // address -- can equal while both live.
+        f.input_id = reinterpret_cast<std::uintptr_t>(&f.num_inputs);
+        f.capture_id = reinterpret_cast<std::uintptr_t>(&f.num_outputs);
+        const auto build = [&](const std::vector<std::uint32_t>& words, std::uint32_t tail_words,
+                               const leonida::ShaderEntry& entry, const std::vector<std::uint8_t>& code,
+                               std::uint32_t code_index, VkPipelineLayout& layout, VkPipeline& pipeline,
+                               std::uint64_t& code_base) {
+            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            module_info.codeSize = words.size() * 4;
+            module_info.pCode = words.data();
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
+            modules_.push_back(module);
+            const VkPushConstantRange push{
+                VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                std::uint32_t(sizeof(leonida::ShaderUserData) + 4 * tail_words)};
+            VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layout_info.pushConstantRangeCount = 1;
+            layout_info.pPushConstantRanges = &push;
+            if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &layout) != VK_SUCCESS) return E_FAIL;
+            VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipeline_info.stage.module = module;
+            pipeline_info.stage.pName = "main";
+            pipeline_info.layout = layout;
+            if (entry.uses_code_base) {
+                VkDeviceSize offset = 0;
+                if (!device_.arena_allocate(code.size(), 256, offset, DeviceState::arena_shader))
+                    return E_OUTOFMEMORY;
+                std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
+                gs_code_base_[code_index] = offset;
+                gs_code_bytes_[code_index] = code.size();
+                code_base = offset;
+            }
+            if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
+                                            &pipeline) != VK_SUCCESS)
+                return E_FAIL;
+            return S_OK;
+        };
+        leonida::ComputePipeline input{}, capture{};
+        HRESULT hr = build(input_words, 27, vs, vs_code, 0, gs_input_layout_, input.pipeline, input.code_base);
+        if (hr == S_OK)
+            hr = build(capture_words, 6, gs, gs_code, 1, gs_capture_layout_, capture.pipeline, capture.code_base);
+        if (hr != S_OK) return hr;
+        device_.context->add_pipeline(f.input_id, input);
+        device_.context->add_pipeline(f.capture_id, capture);
         return S_OK;
     }
 
@@ -3998,6 +4300,23 @@ private:
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
+    // The geometry fallback's state (SHADER-1092): the two compute pipelines a draw dispatches, the pairing
+    // facts block, and the three buffers the passes share (grown per draw, released with the pipeline).
+    struct GsFallback {
+        std::uintptr_t input_id = 0, capture_id = 0;  // the pipelines, registered in the context
+        std::uint32_t verts_in = 0;   // the geometry shader's input primitive vertices (3: triangles)
+        std::uint32_t max_verts = 0;  // its OutputVertices
+        std::uint32_t num_inputs = 0;   // its input slots: the capture input's vec4s per primitive-vertex
+        std::uint32_t num_outputs = 0;  // its output slots: the record's vec4s per emitted vertex
+        std::uint32_t per_prim = 0;     // vertices the record-driven draw emits per primitive (a strip, clipped)
+        std::uint64_t params_va = 0, params_bytes = 0;  // the pairing facts block (arena)
+        std::uint64_t input_va = 0, input_capacity = 0;    // the fused pass's output, the capture pass's input
+        std::uint64_t record_va = 0, record_capacity = 0;  // the capture pass's records, the draw VS's input
+        std::uint64_t meta_va = 0, meta_capacity = 0;       // emitted counts and strip end flags, per primitive
+    };
+    GsFallback gs_fallback_{};
+    VkPipelineLayout gs_input_layout_ = VK_NULL_HANDLE, gs_capture_layout_ = VK_NULL_HANDLE;
+    std::uint64_t gs_code_base_[2] = {}, gs_code_bytes_[2] = {};
     bool registered_ = false;
     bool is_graphics_ = false;
     std::vector<leonida::SubgroupRequest> subgroup_requests_;  // one per stage, in creation order
@@ -8387,6 +8706,23 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline) {
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && p->graphics() ? p->id() : 0;
+}
+
+// The geometry fallback (SHADER-1092): the pipeline is a PSO whose geometry shader draws through the capture
+// path, so a draw records the two passes before its own. Null when the PSO draws normally.
+ID3D12PipelineState* gs_fallback_pipeline(ID3D12PipelineState* pipeline) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && p->gs_active() ? pipeline : nullptr;
+}
+
+// One draw's commands through the geometry fallback: the passes' tails and grids, and the draw's own tail.
+bool gs_fallback_prepare(ID3D12PipelineState* pipeline, bool indexed, UINT count, UINT instances, UINT first,
+                         INT base_vertex, UINT first_instance,
+                         const std::array<leonida::VertexBufferView, 32>& buffers,
+                         const leonida::IndexBufferView& index, leonida::GsDrawCommands* out) {
+    PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    return p && out && p->gs_prepare(indexed, count, instances, first, base_vertex, first_instance, buffers,
+                                     index, *out);
 }
 
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {

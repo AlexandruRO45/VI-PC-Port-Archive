@@ -1257,6 +1257,7 @@ private:
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
     D3D12_GPU_VIRTUAL_ADDRESS sampler_base_ = 0;
+    ID3D12PipelineState* gs_fallback_ = nullptr;  // a PSO whose geometry shader draws through the capture path
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
@@ -1317,6 +1318,7 @@ private:
         hold(state);
         compute_pipeline_ = compute_pipeline_id(state);
         graphics_pipeline_ = graphics_pipeline_id(state);
+        gs_fallback_ = gs_fallback_pipeline(state);
         if (state && !compute_pipeline_ && !graphics_pipeline_)
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
     }
@@ -1388,7 +1390,13 @@ private:
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         note_direct_heap_indexing(compute_.layout);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        leonida::Dispatch dispatch{};
+        dispatch.pipeline = compute_pipeline_;
+        dispatch.user_data = compute_.data;
+        dispatch.x = x;
+        dispatch.y = y;
+        dispatch.z = z;
+        check(list_.dispatch(std::move(dispatch)));
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
@@ -1411,6 +1419,45 @@ private:
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+        // A draw on the geometry fallback's pipeline (SHADER-1092) records the two passes before its own draw:
+        // the fused fetch + vertex + regroup pass, then the capture pass -- both reading the game's root
+        // arguments from their usual s registers -- then the record-driven triangle-list draw, whose own tail
+        // carries what its generated vertex shader reads.
+        if (gs_fallback_) {
+            leonida::GsDrawCommands gs{};
+            if (!gs_fallback_prepare(gs_fallback_, indexed, count, instances, first, base_vertex, first_instance,
+                                     vertex_buffers_, index_, &gs))
+                return check(false);
+            if (!gs.draw_count) return;  // D3D12 rasterizes nothing
+            leonida::Dispatch input{};
+            input.pipeline = gs.input_id;
+            input.user_data = graphics_.data;
+            input.tail = gs.input_tail;
+            input.tail_words = 27;
+            input.x = gs.slots;
+            input.y = input.z = 1;
+            check(list_.dispatch(std::move(input)));
+            check(list_.barrier(leonida::GlobalBarrier{leonida::d3d12_sync::compute_shading,
+                                                       leonida::d3d12_sync::compute_shading,
+                                                       leonida::d3d12_access::common, leonida::d3d12_access::common}));
+            leonida::Dispatch capture{};
+            capture.pipeline = gs.capture_id;
+            capture.user_data = graphics_.data;
+            capture.tail = gs.capture_tail;
+            capture.tail_words = 6;
+            capture.x = gs.prims;
+            capture.y = capture.z = 1;
+            check(list_.dispatch(std::move(capture)));
+            check(list_.barrier(leonida::GlobalBarrier{leonida::d3d12_sync::compute_shading,
+                                                       leonida::d3d12_sync::vertex_shading,
+                                                       leonida::d3d12_access::common, leonida::d3d12_access::common}));
+            leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, leonida::IndexBufferView{},
+                               D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, viewport_, scissor_, blend_factor_,
+                               front_stencil_ref_, back_stencil_ref_, false, gs.draw_count, 1, 0, 0, 0,
+                               gs.draw_tail, 5};
+            check(list_.draw(std::move(draw)));
+            return;
+        }
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};

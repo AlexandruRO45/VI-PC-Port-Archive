@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "../src/gfx10_descriptors.h"
+#include "../src/command_list.h"
 #include "../src/vulkan_backend.h"
 
 #include <functional>
@@ -375,6 +376,13 @@ struct RootArgumentLayout {
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+// The geometry fallback (SHADER-1092): gs_fallback_pipeline names a PSO whose geometry shader draws through the
+// capture path, so a draw on it records the two passes first (null: the PSO draws normally);
+// gs_fallback_prepare fills one draw's commands.
+ID3D12PipelineState* gs_fallback_pipeline(ID3D12PipelineState* pipeline);
+bool gs_fallback_prepare(ID3D12PipelineState* pipeline, bool indexed, UINT count, UINT instances, UINT first,
+                         INT base_vertex, UINT first_instance, const std::array<leonida::VertexBufferView, 32>& buffers,
+                         const leonida::IndexBufferView& index, leonida::GsDrawCommands* out);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 
