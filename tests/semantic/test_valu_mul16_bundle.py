@@ -387,5 +387,18 @@ class VMadU32U16AstInterpreterTests(unittest.TestCase):
         regs["v3"] = res
         self.assertEqual(regs["v3"], 160000)
 
+class VMadU32U16SimdBoundaryTests(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_mad_u32_u16."""
+
+    def test_simd_divergent_lanes(self):
+        lanes = 64
+        src0 = [i * 10 for i in range(lanes)]
+        src1 = [100 for _ in range(lanes)]
+        src2 = [1000 for _ in range(lanes)]
+        out = [ref_mad_u32_u16(s0, s1, s2) for s0, s1, s2 in zip(src0, src1, src2)]
+        for i in range(lanes):
+            expected = (i * 10) * 100 + 1000
+            self.assertEqual(out[i], expected)
+
 if __name__ == "__main__":
     unittest.main()
