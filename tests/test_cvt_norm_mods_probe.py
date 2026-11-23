@@ -24,6 +24,15 @@ import cvt_norm_mods_probe as pr  # noqa: E402
 from hw_oracle import asm, runner  # noqa: E402
 
 
+_SWEEP_CACHE: dict[str, list[int]] = {}
+
+
+def _sweep_words(op: str) -> list[int]:
+    if op not in _SWEEP_CACHE:
+        _SWEEP_CACHE[op] = pr.expected_sweep_words(op)
+    return _SWEEP_CACHE[op]
+
+
 def _eval_f32_src_mod(bits: int, expr: str) -> int:
     if "|" in expr:
         bits &= 0x7FFFFFFF
@@ -67,7 +76,7 @@ class FakeOracle:
                 base_word = int(m_sweep.group(1))
                 m_op = re.search(r"(v_cvt_norm_[iu]16_f16)_e64", joined)
                 assert m_op is not None, joined
-                res = pr.expected_sweep_words(m_op.group(1))[base_word : base_word + 16384]
+                res = _sweep_words(m_op.group(1))[base_word : base_word + k.words]
                 if self.bad_word:
                     res[0] ^= 1
                 if self.wave64_diff and k.wave == 64:
@@ -169,6 +178,20 @@ class ReferenceModelTests(unittest.TestCase):
         self.assertEqual(pr.expected_pknorm_f32("v_cvt_pknorm_u16_f32", 0x37C000C0, 0x40000000), 0xFFFF0001)
         self.assertEqual(pr.expected_pknorm_f32("v_cvt_pknorm_u16_f32", 0x3B008081, 0xBF800000), 0x00000081)
         self.assertEqual(pr.expected_pknorm_f32("v_cvt_pknorm_i16_f32", 0x7F800001, 0xFF800000), 0x80010000)
+
+    def test_sweep_kernels_fit_the_launcher_word_limit(self):
+        # hw_oracle_drm.c refuses a launch with more than 4096 output words.
+        kernels, _ = pr.build_jobs(list(pr.OPS), [32, 64])
+        self.assertLessEqual(max(k.words for k in kernels), 4096)
+
+    def test_sweep_kernels_cover_every_input_word_once(self):
+        _, meta = pr.build_jobs(["v_cvt_norm_u16_f16"], [32])
+        covered = set()
+        for kind, _, _, variant, _, expected in meta:
+            if kind == "sweep":
+                base = int(variant.split("_p")[1]) * len(expected)
+                covered.update(range(base, base + len(expected)))
+        self.assertEqual(sorted(covered), list(range(32768)))
 
     def test_kernel_builders_have_unique_labels_and_endpgm(self):
         kernels, meta = pr.build_jobs(list(pr.OPS), [32, 64])
