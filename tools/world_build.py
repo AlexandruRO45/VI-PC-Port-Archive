@@ -172,7 +172,7 @@ def iter_placements(path: str, counts: dict, lod_levels=DEFAULT_LOD_LEVELS, regi
     The row checks are the same as ``load_placements``'; keep the two in step.
     """
     levels = set(lod_levels)
-    with open(path, encoding="utf-8-sig") as handle:
+    with _decoded_lines(path) as handle:
         for line in handle:
             line = line.strip()
             if not line:
