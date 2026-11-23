@@ -115,6 +115,15 @@ jobs:
           python -I -c "import sys; sys.path.insert(0, 'tools'); import calibrated_texture; calibrated_texture.native()"
           python -I tests/test_calibrated_texture.py
           python -I tests/test_ttpf_assets.py
+      # The standard-library loop runs this file before the library is built, where its comparisons skip.
+      - name: Build the native BC7 decoder and compare it with the Python one
+        shell: bash
+        run: |
+          CARGO_HOME="$(mktemp -d)" cargo build --release --locked --offline --manifest-path tools/bc7_native/Cargo.toml
+          CARGO_HOME="$(mktemp -d)" cargo test --release --locked --offline --manifest-path tools/bc7_native/Cargo.toml
+          python -I -c "import sys; sys.path.insert(0, 'tools'); import dds_png; assert dds_png._native_bc7()"
+          python -I tests/test_bc7_native.py
+          python -I tests/test_dds_png.py
       - name: Test rpf9dump diagnostics
         run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release
   translator-tests:
