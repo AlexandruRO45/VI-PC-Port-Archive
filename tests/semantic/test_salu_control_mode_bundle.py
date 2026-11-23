@@ -174,6 +174,15 @@ class TestDenormModeBitfields(unittest.TestCase):
             with self.assertRaises(rdna2spirv.Unsupported):
                 support.translate_lines(f"cs_denorm_{imm}", prog, fssm=saveexec_run.fssm())
 
+class TestDenormModeSyntax(unittest.TestCase):
+    def test_syntax_rejection_behavior(self):
+        prog = ["s_denorm_mode 0", "s_endpgm"]
+        try:
+            support.translate_lines("cs_denorm_syntax", prog, fssm=saveexec_run.fssm())
+            self.fail("Should have raised Unsupported")
+        except rdna2spirv.Unsupported as e:
+            self.assertIn("denormal mode writes are not modelled", str(e))
+
 
 if __name__ == "__main__":
     unittest.main()
