@@ -1379,6 +1379,18 @@ class RenderBucketAlphaTest(unittest.TestCase):
                               world_build._assign_materials([{"uvs": [0.0]}], [0], {0: "x"}, True,
                                                             {0: m} if m else None)}), 3)
 
+    def test_unreadable_dds_counts_once_per_chunk_across_alpha_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, out = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            models, _ = _write_bucket_fixture(assets, [0, 1, 3])
+            with open(os.path.join(models, "cubes_tex", "000_shared.dds"), "wb") as f:
+                f.write(b"synthetic unsupported DDS")
+            world = world_build.build_world(assets, out)
+            self.assertEqual(world["stats"]["textures_skipped"], 1)
+            with open(_chunk_disk_path(out, world["chunks"][0]["url"]), "rb") as f:
+                gltf, _ = parse_and_validate_glb(f.read())
+            self.assertEqual(gltf.get("images", []), [])  # every material keeps the clay fallback
+
     def test_baked_world_keeps_modes_separate_for_one_dds(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets, out = os.path.join(tmp, "assets"), os.path.join(tmp, "world")

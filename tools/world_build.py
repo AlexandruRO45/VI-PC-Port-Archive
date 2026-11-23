@@ -499,14 +499,15 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
         meshes.append({"name": f"m{model_id}{'_mirror' if mirrored else ''}", "primitives": prims,
                        "instances": instances})
     materials: dict[str, dict] = {}
-    skipped = 0
+    failed: set[str] = set()  # DDS paths, so a texture used by several alpha modes counts once per chunk
     if textures:
         keys = sorted({p["material"] for m in meshes for p in m["primitives"] if p["material"]})
         for key in keys:
             dds = mat_to_dds.get(key)
             png = _png_for(staging_dir, dds, max_tex_size) if dds else None
             if png is None:
-                skipped += 1
+                if dds:
+                    failed.add(os.path.normcase(os.path.abspath(dds)))
                 continue
             materials[key] = _material_spec(key, dds, png)
     path = os.path.join(staging_dir, f"{chunk_id}.glb")
@@ -521,7 +522,7 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
         "distinct_models": info["meshes"],
         "stored_triangles": info["stored_triangles"],
     }
-    return rec, int(info.get("textures", 0)), skipped, int(info["bytes"])
+    return rec, int(info.get("textures", 0)), len(failed), int(info["bytes"])
 
 
 def _run_jobs(fn, jobs, workers: int):
@@ -1737,14 +1738,14 @@ def _build_staged_world(
 
         materials: dict[str, dict] = {}
         skipped_keys: set[str] = set()
-        cell_skipped = 0
+        failed_dds: set[str] = set()  # one count per DDS path in the chunk, whatever its alpha modes
 
         if textures and cell_dds:
             for mat_key in sorted(cell_dds):
                 dds_path = cell_dds[mat_key]
                 png_bytes = decode_dds_cached(dds_path)
                 if png_bytes is None:
-                    cell_skipped += 1
+                    failed_dds.add(os.path.normcase(os.path.abspath(dds_path)))
                     skipped_keys.add(mat_key)
                 else:
                     materials[mat_key] = _material_spec(mat_key, dds_path, png_bytes)
@@ -1764,7 +1765,7 @@ def _build_staged_world(
             "models": len(cell_models),
             "triangles": info["triangles"],
         }
-        return chunk_rec, int(info.get("textures", 0)), cell_skipped, int(info["bytes"])
+        return chunk_rec, int(info.get("textures", 0)), len(failed_dds), int(info["bytes"])
 
     sorted_cells = sorted(cells.items(), key=lambda kv: kv[0])
     chunks: list[dict] = []

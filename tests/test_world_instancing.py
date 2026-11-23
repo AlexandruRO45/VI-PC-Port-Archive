@@ -349,6 +349,21 @@ class InstancedBuildTest(unittest.TestCase):
                 self.assertEqual(len(gltf["meshes"]), 1)
                 twb.assert_bucket_materials(self, gltf)
 
+    def test_unreadable_dds_counts_once_per_chunk_across_alpha_modes(self):
+        for mode in ("gpu", "nodes"):
+            with self.subTest(mode=mode):
+                assets = os.path.join(self.tmp, f"bad_assets_{mode}")
+                models, _ = twb._write_bucket_fixture(assets, [0, 1, 3])
+                with open(os.path.join(models, "cubes_tex", "000_shared.dds"), "wb") as f:
+                    f.write(b"synthetic unsupported DDS")
+                ents = os.path.join(self.tmp, f"bad_{mode}.jsonl")
+                twp.write_entities(ents, [twp.entity("cubes", (10 + 300 * i, 10, 0)) for i in range(2)])
+                doc = world_build.build_world(assets, os.path.join(self.tmp, f"bad_world_{mode}"),
+                                              placements=ents, instancing=mode)
+                self.assertEqual(len(doc["chunks"]), 2)
+                self.assertEqual(doc["stats"]["textures_skipped"], 2)  # once per chunk, not per mode
+                self.assertEqual(doc["stats"]["textures_embedded"], 0)
+
     def test_texture_cache_respects_each_build_size(self) -> None:
         assets = os.path.join(self.tmp, "tex_assets")
         twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])
