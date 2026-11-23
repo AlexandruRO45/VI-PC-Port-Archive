@@ -51,6 +51,7 @@ import hashlib
 import json
 import ntpath
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -390,7 +391,9 @@ def _unescape_mount_point(text: str) -> str:
 
 
 def network_mounts_from_mounts_text(text: str) -> tuple:
-    """Normalized mount points of network file systems in /proc/self/mounts text (one path per line, fields 2 and 3)."""
+    """Normalized POSIX mount points of network file systems in /proc/self/mounts text (one path per line, fields 2
+    and 3). posixpath, not os.path: the table is Linux-only, and a Windows cross-check must not rewrite the
+    separators."""
     found = set()
     for line in text.splitlines():
         fields = line.split()
@@ -398,7 +401,7 @@ def network_mounts_from_mounts_text(text: str) -> tuple:
             continue
         mount, fstype = _unescape_mount_point(fields[1]), fields[2]
         if fstype in NETWORK_FSTYPES:
-            found.add(os.path.normcase(os.path.normpath(mount)))
+            found.add(posixpath.normpath(mount))
     return tuple(sorted(found))
 
 
@@ -414,12 +417,15 @@ def network_mounts() -> tuple:
 
 
 def under_network_mount(path: str, mounts: tuple) -> bool:
-    """Lexical only: realpath()/isdir()/stat() on a dead mount point would block in D-state."""
+    """Lexical only: realpath()/isdir()/stat() on a dead mount point would block in D-state. Both sides are POSIX
+    paths from /proc/self/mounts, so normalize with posixpath rather than os.path (Windows would rewrite the
+    separators)."""
     if not mounts:
         return False
-    candidate = os.path.normcase(os.path.normpath(path))
+    candidate = posixpath.normpath(path)
     for mount in mounts:
-        if candidate == mount or candidate.startswith(mount.rstrip(os.sep) + os.sep):
+        mount = posixpath.normpath(mount)
+        if candidate == mount or candidate.startswith(mount.rstrip("/") + "/"):
             return True
     return False
 
