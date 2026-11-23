@@ -280,6 +280,51 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
     return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), protect);
 }
 
+// ---- The default-allocator pair and the physical-page set ----
+//
+// The executable imports these seven and nothing else of xmem that was not already served (gta6rt --dry-run, 30
+// unimplemented imports in all). The console's title memory is one physical space the GPU and CPU share; a PC has
+// already one virtual space per process, so the physical-page calls have nothing to translate and the default
+// allocator is the same aligned heap as XMemAlloc. Shapes below are the measured call sites' (same registers as
+// XMemAlloc/XMemFree); the attribute word stays undecoded exactly as it is there.
+//
+// ASSUMPTION: the exact return types of the page calls are not measured. BOOL-returning ones are logged once and
+// answer TRUE (a title stops at startup if its page setup fails, while doing nothing changes nothing here); void
+// ones do the same silently. The page bookkeeping only records what a mapping asked for, for the trace.
+
+void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) { return XMemAlloc(size, attributes); }
+
+void __stdcall XMemFreeDefault(void* p, uint64_t attributes) { XMemFree(p, attributes); }
+
+// XMEM_WORKING_SET_API kind 0x20000001 is the only one measured (the FSR sites). Nothing here answers a query, so
+// "tools memory" is always present: FALSE would make a title fall back to a path that does not exist on a PC.
+BOOL __stdcall XMemIsToolsMemAvailable(uint32_t /*kind*/) { return TRUE; }
+
+// BOOL XMemAllocatePhysicalPages(size, attributes) / BOOL XMemFreePhysicalPages(size, attributes): a PC has no
+// physical page arena of its own; the host commits on first touch.
+BOOL __stdcall XMemAllocatePhysicalPages(size_t size, uint64_t attributes) {
+    note_attributes(true, attributes, size, _ReturnAddress());
+    return TRUE;
+}
+
+BOOL __stdcall XMemFreePhysicalPages(size_t size, uint64_t attributes) {
+    note_attributes(false, attributes, size, _ReturnAddress());
+    return TRUE;
+}
+
+// XMemMapPhysicalPages / XMemMapPhysicalPagesScatter: a mapping of consecutive (or scattered) 64 KiB pages into a
+// reservation. Recorded once per shape and answered TRUE without an actual map, since a PC address is usable the
+// moment it is committed.
+BOOL __stdcall XMemMapPhysicalPages(void* address, size_t size, uint64_t attributes) {
+    note_attributes(true, attributes, size, _ReturnAddress());
+    return address != nullptr;
+}
+
+BOOL __stdcall XMemMapPhysicalPagesScatter(const void* const* addresses, size_t count, uint64_t attributes) {
+    note_attributes(true, attributes, count, _ReturnAddress());
+    return addresses != nullptr && count != 0;
+}
+
 }  // namespace
 
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
@@ -306,4 +351,11 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
     {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
     {"xmem.dll", "XMemTransferMemory", reinterpret_cast<void*>(&XMemTransferMemory)},
+    {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAllocDefault)},
+    {"xmem.dll", "XMemFreeDefault", reinterpret_cast<void*>(&XMemFreeDefault)},
+    {"xmem.dll", "XMemIsToolsMemAvailable", reinterpret_cast<void*>(&XMemIsToolsMemAvailable)},
+    {"xmem.dll", "XMemAllocatePhysicalPages", reinterpret_cast<void*>(&XMemAllocatePhysicalPages)},
+    {"xmem.dll", "XMemFreePhysicalPages", reinterpret_cast<void*>(&XMemFreePhysicalPages)},
+    {"xmem.dll", "XMemMapPhysicalPages", reinterpret_cast<void*>(&XMemMapPhysicalPages)},
+    {"xmem.dll", "XMemMapPhysicalPagesScatter", reinterpret_cast<void*>(&XMemMapPhysicalPagesScatter)},
 );

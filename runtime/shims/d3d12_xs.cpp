@@ -217,6 +217,28 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
+// D3D12ConfigureVirtualMemoryX: the console's knob for the title's GPU/CPU memory split before the device exists.
+// The measured call site passes one 24-word block (gta6rt --dry-run names the import; the block shape follows
+// D3D12XboxCreateDevice's params above). A PC has one pool with no split to configure, so the block is recorded once in
+// the same hex form D3D12XboxCreateDevice prints and S_OK is returned; a title that reads a value back is not served.
+HRESULT WINAPI D3D12ConfigureVirtualMemoryX(const uint64_t* params) {
+    constexpr auto method = "D3D12ConfigureVirtualMemoryX";
+    using rt::d3d12_trace::result;
+    if (!params) {
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX params = null\n");
+        return result(method, S_OK);
+    }
+    char line[24 * 17 + 1];
+    size_t used = 0;
+    for (int i = 0; i < 24; ++i) {
+        used += static_cast<size_t>(std::snprintf(line + used, sizeof(line) - used, "%016llx ",
+                                                  static_cast<unsigned long long>(params[i])));
+        if (used >= sizeof(line)) break;
+    }
+    std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX params[24] = %s\n", line);
+    return result(method, S_OK);
+}
+
 }  // namespace
 
 SHIM_TABLE(d3d12_xs,
@@ -225,4 +247,5 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
+    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&D3D12ConfigureVirtualMemoryX)},
 );
