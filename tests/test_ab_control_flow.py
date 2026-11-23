@@ -898,7 +898,32 @@ class PipelineExecutionTest(unittest.TestCase):
                                      "identical MRT0 clear-difference mask: empty; unobserved MRT1",
                                      targets=(1,), pixel=AB.CLEAR)
 
-    def assert_pipeline_outcome(self, mock_run, image_size: int, expected: str, targets=(0,), pixel=bytes(16)) -> None:
+    @patch("subprocess.run")
+    def test_all_attachments_detects_mrt1_difference(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, 2 * AB.READBACK_BYTES, "identical MRT0: non-clear; MRT1: DIFFERENT",
+                                     targets=(0, 1), all_attachments=True, divergent=True)
+
+    @patch("subprocess.run")
+    def test_sparse_outputs_preserve_mask_and_ignore_gap(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, 3 * AB.READBACK_BYTES,
+                                     "identical MRT0 clear-difference mask: empty; identical MRT2: clear-only",
+                                     targets=(2,), all_attachments=True, pixel=AB.CLEAR, divergent=True)
+
+    @patch("subprocess.run")
+    def test_missing_plane(self, mock_run):
+        self.assert_pipeline_outcome(mock_run, AB.READBACK_BYTES,
+                                     "MRT0: dispatch form failed to run; MRT1: dispatch form failed to run",
+                                     targets=(0, 1), all_attachments=True)
+
+    @patch("subprocess.run")
+    def test_duplicate_or_missing_cached_target(self, mock_run):
+        for cached in ([0, 1, 1], [0]):
+            self.assert_pipeline_outcome(mock_run, AB.READBACK_BYTES,
+                                         "cached outputs disagree with translated colour targets",
+                                         targets=(0, 1), all_attachments=True, cached=cached)
+
+    def assert_pipeline_outcome(self, mock_run, image_size: int, expected: str, targets=(0,), pixel=bytes(16),
+                                all_attachments=False, divergent=False, cached=None) -> None:
         import json
 
         # Prepare synthetic index
@@ -909,6 +934,7 @@ class PipelineExecutionTest(unittest.TestCase):
                 "features": ["bufferDeviceAddress"],
             }
         }
+        index["ps_test"]["outputs"] = list(targets) if cached is None else cached
         with open(os.path.join(self.shaders, "spirv", "index.json"), "w", encoding="utf-8") as f:
             json.dump(index, f)
 
@@ -949,7 +975,12 @@ class PipelineExecutionTest(unittest.TestCase):
                 # Harness call
                 raw_path = args[3]
                 with open(raw_path, "wb") as f:
-                    f.write(pixel * (image_size // len(pixel)))
+                    data = bytearray(pixel * (image_size // len(pixel)))
+                    if all_attachments:
+                        self.assertEqual(args[4:], ["64", "64", str(max(targets) + 1)])
+                    if divergent and "dispatch" in args[2]:
+                        data[AB.READBACK_BYTES] ^= 1
+                    f.write(data)
                 return SimpleNamespace(returncode=0, stdout="OK")
 
         mock_run.side_effect = side_effect
@@ -964,6 +995,7 @@ class PipelineExecutionTest(unittest.TestCase):
                     "--count", "1",
                     "--runs", "1",
                     "--harness", "dummy_harness.exe",
+                    *(["--all-attachments"] if all_attachments else []),
                 ])
         self.assertEqual(ret, 0)
         outcomes_file = os.path.join(self.out, "outcomes.tsv")
