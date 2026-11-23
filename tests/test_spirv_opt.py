@@ -399,6 +399,41 @@ class SpirvOptTests(unittest.TestCase):
         # Dead OpFAdd must be gone along with its decoration.
         self.assertNotIn("OpFAdd", opt)
 
+    def test_boolean_constant_folding_is_stable_across_hash_seeds(self):
+        module = """\
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%true_z = OpConstantTrue %bool
+%true_a = OpConstantTrue %bool
+%false_z = OpConstantFalse %bool
+%false_a = OpConstantFalse %bool
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%condition = OpLogicalNot %bool %true_z
+OpSelectionMerge %exit None
+OpBranchConditional %condition %branch %exit
+%branch = OpLabel
+OpBranch %exit
+%exit = OpLabel
+OpReturn
+OpFunctionEnd
+"""
+        code = "import sys; sys.path.insert(0, sys.argv[1]); from spirv_opt import optimize; print(optimize(sys.stdin.read()), end='')"
+        results = set()
+        for seed in range(6):
+            result = subprocess.run([sys.executable, "-S", "-c", code, TOOLS], input=module, text=True,
+                                    capture_output=True, check=True, env=dict(os.environ, PYTHONHASHSEED=str(seed)))
+            results.add(result.stdout)
+        self.assertEqual(len(results), 1, "boolean folding changed identifier across hash seeds")
+        optimized = results.pop()
+        self.assertIn("OpBranchConditional %false_a %branch %exit", optimized)
+        _validate(optimized)
+
     def test_cli_round_trip(self):
         raw = support.translate_lines("ps_opt_cli", [
             "v_mov_b32_e32 v1, 42",

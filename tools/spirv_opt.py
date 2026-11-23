@@ -398,8 +398,8 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
             insts.append([res, op, args, raw])
 
     deleted_ids: set[str] = set()
-    const_true_id = next(iter(const_true)) if const_true else None
-    const_false_id = next(iter(const_false)) if const_false else None
+    const_true_id = min(const_true, default=None)
+    const_false_id = min(const_false, default=None)
 
     for _pass in range(max_passes):
         changed = False
