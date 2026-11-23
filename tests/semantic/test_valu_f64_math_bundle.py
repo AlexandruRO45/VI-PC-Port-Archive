@@ -612,5 +612,17 @@ class VFrexpExpI32F64OracleTests(unittest.TestCase):
     def test_frexp_exp_zero(self):
         self.assertEqual(oracle_frexp_exp_i32_f64(F64_POS_ZERO), 0)
 
+class VFrexpExpI32F64AstInterpreterTests(unittest.TestCase):
+    def test_frexp_exp_ast_construction(self):
+        ast = Instruction64AST("v_frexp_exp_i32_f64", Operand64(RegKind.VGPR_SINGLE, 2), Operand64(RegKind.VGPR_PAIR, 0))
+        self.assertEqual(ast.mnemonic, "v_frexp_exp_i32_f64")
+
+    def test_frexp_exp_scalar_execution(self):
+        wave = SimdWaveState64(lane_count=1)
+        wave.set_f64(0, 0, f64_to_u64(16.0))
+        res = oracle_frexp_exp_i32_f64(wave.get_f64(0, 0))
+        wave.vgprs[0][2] = res
+        self.assertEqual(wave.vgprs[0][2], 5)  # 16.0 = 0.5 * 2^5
+
 if __name__ == "__main__":
     unittest.main()
