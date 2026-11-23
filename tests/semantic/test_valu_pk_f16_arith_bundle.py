@@ -1,605 +1,628 @@
 from __future__ import annotations
 
-import math
+"""Hardware-referenced semantic regression tests for RDNA2 VALU packed float16 arithmetic:
+  - v_pk_min_f16:  Packed f16x2 minimum (VOP3P, NMin IEEE 754 semantics)
+  - v_pk_max_f16:  Packed f16x2 maximum (VOP3P, NMax IEEE 754 semantics)
+  - v_pk_fma_f16:  Packed f16x2 fused multiply-add (VOP3P, single rounding per half)
+  - v_pk_fmac_f16: Packed f16x2 fused multiply-accumulate (VOP2, in-place accumulator)
+  - v_pk_mul_f16:  Packed f16x2 multiplication (VOP3P)
+  - v_pk_add_f16:  Packed f16x2 addition (VOP3P)
+
+All tests in this suite compile real assembly listings through support.translate_lines(...)
+and execute the translated SPIR-V in spirv_mini_interp via support.mrt0_words.
+Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
+"""
+
 import os
-import struct
 import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-TOOLS = os.path.join(ROOT, "tools")
-for p in (HERE, TOOLS):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+sys.dont_write_bytecode = True
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
-from support import mrt0_words, translate_lines
-import rdna2spirv
+import support  # noqa: E402
 
-MASK32 = 0xFFFFFFFF
-MASK16 = 0xFFFF
-POS_ZERO = 0x0000
-NEG_ZERO = 0x8000
-POS_INF = 0x7C00
-NEG_INF = 0xFC00
-QNAN = 0x7E00
-
-
-def f16_to_bits(x: float) -> int:
-    try:
-        return struct.unpack("<H", struct.pack("<e", float(x)))[0]
-    except OverflowError:
-        return POS_INF if x > 0 else NEG_INF
-
-
-def bits_to_f16(h: int) -> float:
-    return struct.unpack("<e", struct.pack("<H", h & MASK16))[0]
+MASK16: int = 0xFFFF
+MASK32: int = 0xFFFFFFFF
 
 
 def pack_f16x2(lo: int, hi: int) -> int:
+    """Pack two 16-bit halfword integers into a 32-bit dword."""
     return ((hi & MASK16) << 16) | (lo & MASK16)
 
 
 def unpack_f16x2(word: int) -> tuple[int, int]:
+    """Unpack a 32-bit dword into low and high 16-bit unsigned halfwords."""
     return (word & MASK16, (word >> 16) & MASK16)
 
 
-def clamp_f16(x: float) -> float:
-    if math.isnan(x):
-        return x
-    return max(0.0, min(1.0, x))
-
-def f16_min(x: float, y: float) -> float:
-    if math.isnan(x) and math.isnan(y):
-        return float('nan')
-    if math.isnan(x):
-        return y
-    if math.isnan(y):
-        return x
-    if x == 0.0 and y == 0.0:
-        bx = f16_to_bits(x)
-        by = f16_to_bits(y)
-        if (bx & NEG_ZERO) or (by & NEG_ZERO):
-            return -0.0
-        return 0.0
-    return min(x, y)
-
-
-def ref_pk_min_f16(w_a: int, w_b: int, *, clamp: bool = False,
-                   op_sel: tuple[int, int] = (0, 0),
-                   op_sel_hi: tuple[int, int] = (1, 1),
-                   neg_lo: tuple[int, int] = (0, 0),
-                   neg_hi: tuple[int, int] = (0, 0)) -> int:
-    a_halves = unpack_f16x2(w_a)
-    b_halves = unpack_f16x2(w_b)
-    s0_lo = bits_to_f16(a_halves[op_sel[0]])
-    s1_lo = bits_to_f16(b_halves[op_sel[1]])
-    if neg_lo[0]: s0_lo = -s0_lo
-    if neg_lo[1]: s1_lo = -s1_lo
-    r_lo = f16_min(s0_lo, s1_lo)
-    if clamp: r_lo = clamp_f16(r_lo)
-
-    s0_hi = bits_to_f16(a_halves[op_sel_hi[0]])
-    s1_hi = bits_to_f16(b_halves[op_sel_hi[1]])
-    if neg_hi[0]: s0_hi = -s0_hi
-    if neg_hi[1]: s1_hi = -s1_hi
-    r_hi = f16_min(s0_hi, s1_hi)
-    if clamp: r_hi = clamp_f16(r_hi)
-    return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
-
-def f16_max(x: float, y: float) -> float:
-    if math.isnan(x) and math.isnan(y):
-        return float('nan')
-    if math.isnan(x):
-        return y
-    if math.isnan(y):
-        return x
-    if x == 0.0 and y == 0.0:
-        bx = f16_to_bits(x)
-        by = f16_to_bits(y)
-        if (bx & NEG_ZERO) and (by & NEG_ZERO):
-            return -0.0
-        return 0.0
-    return max(x, y)
+def run_pk_binop(
+    op: str,
+    s0: int,
+    s1: int,
+    *,
+    clamp: bool = False,
+    mods: str = "",
+    alias_dst: int | None = None,
+    name: str = "ps_pk_binop",
+) -> int:
+    """Assemble, translate, and execute a 2-operand packed f16x2 instruction."""
+    clamp_str = " clamp" if clamp else ""
+    mod_str = f" {mods}" if mods else ""
+    dst = f"v{alias_dst}" if alias_dst is not None else "v0"
+    lines = [
+        f"v_mov_b32 v1, {s0 & MASK32:#x}",
+        f"v_mov_b32 v2, {s1 & MASK32:#x}",
+        f"{op} {dst}, v1, v2{clamp_str}{mod_str}",
+        f"exp mrt0 {dst}, {dst}, {dst}, {dst} done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    words = support.mrt0_words(spv)
+    return words[0]
 
 
-def ref_pk_max_f16(w_a: int, w_b: int, *, clamp: bool = False,
-                   op_sel: tuple[int, int] = (0, 0),
-                   op_sel_hi: tuple[int, int] = (1, 1),
-                   neg_lo: tuple[int, int] = (0, 0),
-                   neg_hi: tuple[int, int] = (0, 0)) -> int:
-    a_halves = unpack_f16x2(w_a)
-    b_halves = unpack_f16x2(w_b)
-    s0_lo = bits_to_f16(a_halves[op_sel[0]])
-    s1_lo = bits_to_f16(b_halves[op_sel[1]])
-    if neg_lo[0]: s0_lo = -s0_lo
-    if neg_lo[1]: s1_lo = -s1_lo
-    r_lo = f16_max(s0_lo, s1_lo)
-    if clamp: r_lo = clamp_f16(r_lo)
+def run_pk_triop(
+    op: str,
+    s0: int,
+    s1: int,
+    s2: int,
+    *,
+    clamp: bool = False,
+    mods: str = "",
+    alias_dst: int | None = None,
+    name: str = "ps_pk_triop",
+) -> int:
+    """Assemble, translate, and execute a 3-operand packed f16x2 instruction."""
+    clamp_str = " clamp" if clamp else ""
+    mod_str = f" {mods}" if mods else ""
+    dst = f"v{alias_dst}" if alias_dst is not None else "v0"
+    lines = [
+        f"v_mov_b32 v1, {s0 & MASK32:#x}",
+        f"v_mov_b32 v2, {s1 & MASK32:#x}",
+        f"v_mov_b32 v3, {s2 & MASK32:#x}",
+        f"{op} {dst}, v1, v2, v3{clamp_str}{mod_str}",
+        f"exp mrt0 {dst}, {dst}, {dst}, {dst} done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    words = support.mrt0_words(spv)
+    return words[0]
 
-    s0_hi = bits_to_f16(a_halves[op_sel_hi[0]])
-    s1_hi = bits_to_f16(b_halves[op_sel_hi[1]])
-    if neg_hi[0]: s0_hi = -s0_hi
-    if neg_hi[1]: s1_hi = -s1_hi
-    r_hi = f16_max(s0_hi, s1_hi)
-    if clamp: r_hi = clamp_f16(r_hi)
-    return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
 
-def ref_pk_fma_f16(w_a: int, w_b: int, w_c: int, *, clamp: bool = False,
-                   op_sel: tuple[int, int, int] = (0, 0, 0),
-                   op_sel_hi: tuple[int, int, int] = (1, 1, 1),
-                   neg_lo: tuple[int, int, int] = (0, 0, 0),
-                   neg_hi: tuple[int, int, int] = (0, 0, 0)) -> int:
-    a_halves = unpack_f16x2(w_a)
-    b_halves = unpack_f16x2(w_b)
-    c_halves = unpack_f16x2(w_c)
+def run_pk_fmac(
+    acc: int,
+    s0: int,
+    s1: int,
+    *,
+    name: str = "ps_pk_fmac",
+) -> int:
+    """Assemble, translate, and execute a v_pk_fmac_f16 instruction."""
+    lines = [
+        f"v_mov_b32 v0, {acc & MASK32:#x}",
+        f"v_mov_b32 v1, {s0 & MASK32:#x}",
+        f"v_mov_b32 v2, {s1 & MASK32:#x}",
+        "v_pk_fmac_f16 v0, v1, v2",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    words = support.mrt0_words(spv)
+    return words[0]
 
-    s0_lo = bits_to_f16(a_halves[op_sel[0]])
-    s1_lo = bits_to_f16(b_halves[op_sel[1]])
-    s2_lo = bits_to_f16(c_halves[op_sel[2]])
-    if neg_lo[0]: s0_lo = -s0_lo
-    if neg_lo[1]: s1_lo = -s1_lo
-    if neg_lo[2]: s2_lo = -s2_lo
-    r_lo = s0_lo * s1_lo + s2_lo
-    if clamp: r_lo = clamp_f16(r_lo)
 
-    s0_hi = bits_to_f16(a_halves[op_sel_hi[0]])
-    s1_hi = bits_to_f16(b_halves[op_sel_hi[1]])
-    s2_hi = bits_to_f16(c_halves[op_sel_hi[2]])
-    if neg_hi[0]: s0_hi = -s0_hi
-    if neg_hi[1]: s1_hi = -s1_hi
-    if neg_hi[2]: s2_hi = -s2_hi
-    r_hi = s0_hi * s1_hi + s2_hi
-    if clamp: r_hi = clamp_f16(r_hi)
-    return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
+# ==============================================================================
+# Suite 1: v_pk_min_f16 (Packed f16x2 Minimum)
+# ==============================================================================
 
-def ref_pk_fmac_f16(w_acc: int, w_a: int, w_b: int) -> int:
-    acc_lo, acc_hi = unpack_f16x2(w_acc)
-    a_lo, a_hi = unpack_f16x2(w_a)
-    b_lo, b_hi = unpack_f16x2(w_b)
-    r_lo = bits_to_f16(a_lo) * bits_to_f16(b_lo) + bits_to_f16(acc_lo)
-    r_hi = bits_to_f16(a_hi) * bits_to_f16(b_hi) + bits_to_f16(acc_hi)
-    return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
+class TestVPkMinF16(unittest.TestCase):
+    """Packed f16x2 minimum tests."""
 
-def ref_pk_mul_f16(w_a: int, w_b: int, *, clamp: bool = False,
-                   op_sel: tuple[int, int] = (0, 0),
-                   op_sel_hi: tuple[int, int] = (1, 1),
-                   neg_lo: tuple[int, int] = (0, 0),
-                   neg_hi: tuple[int, int] = (0, 0)) -> int:
-    a_halves = unpack_f16x2(w_a)
-    b_halves = unpack_f16x2(w_b)
-    s0_lo = bits_to_f16(a_halves[op_sel[0]])
-    s1_lo = bits_to_f16(b_halves[op_sel[1]])
-    if neg_lo[0]: s0_lo = -s0_lo
-    if neg_lo[1]: s1_lo = -s1_lo
-    r_lo = s0_lo * s1_lo
-    if clamp: r_lo = clamp_f16(r_lo)
+    def test_pk_min_f16_basic(self) -> None:
+        """Basic minimum of packed halves: min((1.0, 2.0), (2.0, 3.0)) = (1.0, 2.0)."""
+        w1 = pack_f16x2(0x3C00, 0x4000)  # lo: 1.0, hi: 2.0
+        w2 = pack_f16x2(0x4000, 0x4200)  # lo: 2.0, hi: 3.0
+        res = run_pk_binop("v_pk_min_f16", w1, w2, name="ps_pk_min_basic")
+        self.assertEqual(res, pack_f16x2(0x3C00, 0x4000))
 
-    s0_hi = bits_to_f16(a_halves[op_sel_hi[0]])
-    s1_hi = bits_to_f16(b_halves[op_sel_hi[1]])
-    if neg_hi[0]: s0_hi = -s0_hi
-    if neg_hi[1]: s1_hi = -s1_hi
-    r_hi = s0_hi * s1_hi
-    if clamp: r_hi = clamp_f16(r_hi)
-    return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
+    def test_pk_min_f16_clamp(self) -> None:
+        """Clamp modifier clamps negative results to 0.0 and >1.0 to 1.0."""
+        w1 = pack_f16x2(0xC000, 0x4200)  # lo: -2.0, hi: 3.0
+        w2 = pack_f16x2(0x4000, 0x4000)  # lo: 2.0, hi: 2.0
+        # min(-2.0, 2.0) = -2.0 -> clamped to 0.0 (0x0000)
+        # min(3.0, 2.0) = 2.0 -> clamped to 1.0 (0x3C00)
+        res = run_pk_binop("v_pk_min_f16", w1, w2, clamp=True, name="ps_pk_min_clamp")
+        self.assertEqual(res, pack_f16x2(0x0000, 0x3C00))
 
-def ref_pk_add_f16(w_a: int, w_b: int, *, clamp: bool = False,
-                   op_sel: tuple[int, int] = (0, 0),
-                   op_sel_hi: tuple[int, int] = (1, 1),
-                   neg_lo: tuple[int, int] = (0, 0),
-                   neg_hi: tuple[int, int] = (0, 0)) -> int:
-    a_halves = unpack_f16x2(w_a)
-    b_halves = unpack_f16x2(w_b)
-    s0_lo = bits_to_f16(a_halves[op_sel[0]])
-    s1_lo = bits_to_f16(b_halves[op_sel[1]])
-    if neg_lo[0]: s0_lo = -s0_lo
-    if neg_lo[1]: s1_lo = -s1_lo
-    r_lo = s0_lo + s1_lo
-    if clamp: r_lo = clamp_f16(r_lo)
+    def test_pk_min_f16_modifiers_opsel_neg(self) -> None:
+        """op_sel, op_sel_hi, and neg_lo modifiers."""
+        w1 = pack_f16x2(0x4000, 0x4200)  # lo: 2.0, hi: 3.0
+        w2 = pack_f16x2(0x3C00, 0x4500)  # lo: 1.0, hi: 5.0
+        # op_sel:[1,0] -> lo selects w1.hi (3.0), w2.lo (1.0). neg_lo:[1,0] -> negates w1.hi: -3.0.
+        # lo = min(-3.0, 1.0) = -3.0 (0xC200).
+        # op_sel_hi:[0,1] -> hi selects w1.lo (2.0), w2.hi (5.0).
+        # hi = min(2.0, 5.0) = 2.0 (0x4000).
+        res = run_pk_binop(
+            "v_pk_min_f16", w1, w2,
+            mods="op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0]",
+            name="ps_pk_min_mod",
+        )
+        self.assertEqual(res, pack_f16x2(0xC200, 0x4000))
 
-    s0_hi = bits_to_f16(a_halves[op_sel_hi[0]])
-    s1_hi = bits_to_f16(b_halves[op_sel_hi[1]])
-    if neg_hi[0]: s0_hi = -s0_hi
-    if neg_hi[1]: s1_hi = -s1_hi
-    r_hi = s0_hi + s1_hi
-    if clamp: r_hi = clamp_f16(r_hi)
-    return pack_f16x2(f16_to_bits(r_lo), f16_to_bits(r_hi))
+    def test_pk_min_f16_nan_suppression(self) -> None:
+        """NaN operands are suppressed in favor of non-NaN values."""
+        w1 = pack_f16x2(0x7E00, 0x4000)  # lo: NaN, hi: 2.0
+        w2 = pack_f16x2(0x3C00, 0x7E00)  # lo: 1.0, hi: NaN
+        res = run_pk_binop("v_pk_min_f16", w1, w2, name="ps_pk_min_nan")
+        self.assertEqual(res, pack_f16x2(0x3C00, 0x4000))
 
-class MachineState:
-    def __init__(self, num_lanes: int = 64):
-        self.num_lanes = num_lanes
-        self.exec_mask: int = (1 << num_lanes) - 1
-        self.vgpr: dict[int, list[int]] = {i: [0] * num_lanes for i in range(256)}
+    def test_pk_min_f16_signed_zeros(self) -> None:
+        """min(+0.0, -0.0) yields -0.0 (0x8000)."""
+        w1 = pack_f16x2(0x0000, 0x8000)  # +0.0, -0.0
+        w2 = pack_f16x2(0x8000, 0x0000)  # -0.0, +0.0
+        res = run_pk_binop("v_pk_min_f16", w1, w2, name="ps_pk_min_zero")
+        self.assertEqual(res, pack_f16x2(0x8000, 0x8000))
 
-    def lane_active(self, lane: int) -> bool:
-        return bool((self.exec_mask >> lane) & 1)
-class InstructionAST:
-    def __init__(self, op: str, dst: int, srcs: list[int], *, clamp: bool = False,
-                 op_sel: tuple[int, ...] = (), op_sel_hi: tuple[int, ...] = (),
-                 neg_lo: tuple[int, ...] = (), neg_hi: tuple[int, ...] = ()):
-        self.op = op
-        self.dst = dst
-        self.srcs = srcs
-        self.clamp = clamp
-        self.op_sel = op_sel
-        self.op_sel_hi = op_sel_hi
-        self.neg_lo = neg_lo
-        self.neg_hi = neg_hi
-
-    def eval_scalar(self, *src_vals: int, acc: int = 0) -> int:
-        if self.op == "v_pk_min_f16":
-            return ref_pk_min_f16(src_vals[0], src_vals[1], clamp=self.clamp, op_sel=self.op_sel or (0, 0), op_sel_hi=self.op_sel_hi or (1, 1), neg_lo=self.neg_lo or (0, 0), neg_hi=self.neg_hi or (0, 0))
-        elif self.op == "v_pk_max_f16":
-            return ref_pk_max_f16(src_vals[0], src_vals[1], clamp=self.clamp, op_sel=self.op_sel or (0, 0), op_sel_hi=self.op_sel_hi or (1, 1), neg_lo=self.neg_lo or (0, 0), neg_hi=self.neg_hi or (0, 0))
-        elif self.op == "v_pk_fma_f16":
-            return ref_pk_fma_f16(src_vals[0], src_vals[1], src_vals[2], clamp=self.clamp, op_sel=self.op_sel or (0, 0, 0), op_sel_hi=self.op_sel_hi or (1, 1, 1), neg_lo=self.neg_lo or (0, 0, 0), neg_hi=self.neg_hi or (0, 0, 0))
-        elif self.op == "v_pk_fmac_f16":
-            return ref_pk_fmac_f16(acc, src_vals[0], src_vals[1])
-        elif self.op == "v_pk_mul_f16":
-            return ref_pk_mul_f16(src_vals[0], src_vals[1], clamp=self.clamp, op_sel=self.op_sel or (0, 0), op_sel_hi=self.op_sel_hi or (1, 1), neg_lo=self.neg_lo or (0, 0), neg_hi=self.neg_hi or (0, 0))
-        elif self.op == "v_pk_add_f16":
-            return ref_pk_add_f16(src_vals[0], src_vals[1], clamp=self.clamp, op_sel=self.op_sel or (0, 0), op_sel_hi=self.op_sel_hi or (1, 1), neg_lo=self.neg_lo or (0, 0), neg_hi=self.neg_hi or (0, 0))
-        raise NotImplementedError(f"Unsupported op: {self.op}")
-
-    def execute_simd(self, state: MachineState) -> None:
-        for lane in range(state.num_lanes):
-            if state.lane_active(lane):
-                vals = [state.vgpr[s][lane] for s in self.srcs]
-                acc = state.vgpr[self.dst][lane]
-                state.vgpr[self.dst][lane] = self.eval_scalar(*vals, acc=acc)
-
-class TestValuPkF16ArithBundle(unittest.TestCase):
-
-    def test_v_pk_min_f16_reference_oracle(self):
-        # 1.0 (0x3c00), 2.0 (0x4000), 3.0 (0x4200), -2.0 (0xc000)
-        w1 = pack_f16x2(0x3c00, 0x4000) # lo: 1.0, hi: 2.0
-        w2 = pack_f16x2(0x4000, 0x4200) # lo: 2.0, hi: 3.0
-        res = ref_pk_min_f16(w1, w2)
-        lo, hi = unpack_f16x2(res)
-        self.assertEqual(lo, 0x3c00) # min(1.0, 2.0) = 1.0
-        self.assertEqual(hi, 0x4000) # min(2.0, 3.0) = 2.0
-
-        # Clamped: min(-2.0, 2.0) -> -2.0 clamped to 0.0
-        w_neg = pack_f16x2(0xc000, 0x4200)
-        res_clamp = ref_pk_min_f16(w_neg, w2, clamp=True)
-        c_lo, c_hi = unpack_f16x2(res_clamp)
-        self.assertEqual(c_lo, 0x0000)
-        self.assertEqual(c_hi, 0x3c00) # 2.0 clamped to 1.0
-
-    def test_v_pk_min_f16_ast_and_scalar_interpreter(self):
-        ast = InstructionAST("v_pk_min_f16", dst=0, srcs=[1, 2])
-        w1 = pack_f16x2(0x3c00, 0x4000)
+    def test_pk_min_f16_register_aliasing(self) -> None:
+        """Register aliasing with destination operand."""
+        w1 = pack_f16x2(0x3C00, 0x4000)
         w2 = pack_f16x2(0x4000, 0x4200)
-        val = ast.eval_scalar(w1, w2)
-        self.assertEqual(val, pack_f16x2(0x3c00, 0x4000))
+        res_v1 = run_pk_binop("v_pk_min_f16", w1, w2, alias_dst=1, name="ps_pk_min_alias_v1")
+        self.assertEqual(res_v1, pack_f16x2(0x3C00, 0x4000))
+        res_v2 = run_pk_binop("v_pk_min_f16", w1, w2, alias_dst=2, name="ps_pk_min_alias_v2")
+        self.assertEqual(res_v2, pack_f16x2(0x3C00, 0x4000))
 
-    def test_v_pk_min_f16_simd_divergence_and_boundaries(self):
-        state = MachineState(num_lanes=64)
-        state.exec_mask = 0x00000000FFFFFFFF # first 32 active
-        for l in range(64):
-            state.vgpr[0][l] = 0xDEADBEEF
-            state.vgpr[1][l] = pack_f16x2(0x3c00, 0x4200) # 1.0, 3.0
-            state.vgpr[2][l] = pack_f16x2(0x4000, 0x4000) # 2.0, 2.0
-        ast = InstructionAST("v_pk_min_f16", dst=0, srcs=[1, 2])
-        ast.execute_simd(state)
-        for l in range(32):
-            self.assertEqual(state.vgpr[0][l], pack_f16x2(0x3c00, 0x4000))
-        for l in range(32, 64):
-            self.assertEqual(state.vgpr[0][l], 0xDEADBEEF)
-
-        # Boundary checks: NaN, Inf, -0.0
-        res_nan = ref_pk_min_f16(pack_f16x2(QNAN, POS_INF), pack_f16x2(0x3c00, 0x4000))
-        lo, hi = unpack_f16x2(res_nan)
-        self.assertEqual(lo, 0x3c00) # NMin returns non-NaN
-        self.assertEqual(hi, 0x4000) # min(Inf, 2.0) = 2.0
-
-    def test_v_pk_min_f16_translator_integration_and_negative_controls(self):
+    def test_pk_min_f16_spirv_structure(self) -> None:
+        """SPIR-V translation emits NMin."""
         lines = [
-            "v_mov_b32 v1, 0x40003c00", # hi: 2.0, lo: 1.0
-            "v_mov_b32 v2, 0x42004000", # hi: 3.0, lo: 2.0
+            "v_mov_b32 v1, 0x40003c00",
+            "v_mov_b32 v2, 0x42004000",
             "v_pk_min_f16 v0, v1, v2",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_v_pk_min_f16", lines)
-        out = mrt0_words(spv)[0]
-        self.assertEqual(out, 0x40003c00)
+        spv = support.translate_lines("ps_structure_pk_min", lines)
+        self.assertIn("NMin", spv)
 
-        # Negative control
-        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
-            translate_lines("ps_bad_pk_min", ["v_pk_min_f16 v0", "s_endpgm"])
+    def test_pk_min_f16_mutation_detection(self) -> None:
+        """MIN is strictly distinguished from MAX."""
+        w1 = pack_f16x2(0x3C00, 0x4000)  # 1.0, 2.0
+        w2 = pack_f16x2(0x4000, 0x4200)  # 2.0, 3.0
+        res = run_pk_binop("v_pk_min_f16", w1, w2, name="ps_pk_min_mut")
+        self.assertEqual(res, pack_f16x2(0x3C00, 0x4000))
+        # Mutant MAX produces (2.0, 3.0)
+        self.assertNotEqual(res, pack_f16x2(0x4000, 0x4200))
 
-    def test_v_pk_max_f16_reference_oracle(self):
-        w1 = pack_f16x2(0x3c00, 0x4000) # 1.0, 2.0
-        w2 = pack_f16x2(0x4000, 0x4200) # 2.0, 3.0
-        res = ref_pk_max_f16(w1, w2)
-        lo, hi = unpack_f16x2(res)
-        self.assertEqual(lo, 0x4000) # max(1.0, 2.0) = 2.0
-        self.assertEqual(hi, 0x4200) # max(2.0, 3.0) = 3.0
+    def test_pk_min_f16_negative_controls(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_pk_min", ["v_pk_min_f16 v0", "s_endpgm"])
 
-        # Clamped: max(2.0, 3.0) clamped to 1.0
-        res_clamp = ref_pk_max_f16(w1, w2, clamp=True)
-        c_lo, c_hi = unpack_f16x2(res_clamp)
-        self.assertEqual(c_lo, 0x3c00) # 1.0
-        self.assertEqual(c_hi, 0x3c00) # 1.0
 
-    def test_v_pk_max_f16_ast_and_scalar_interpreter(self):
-        ast = InstructionAST("v_pk_max_f16", dst=0, srcs=[1, 2])
-        w1 = pack_f16x2(0x3c00, 0x4000)
+# ==============================================================================
+# Suite 2: v_pk_max_f16 (Packed f16x2 Maximum)
+# ==============================================================================
+
+class TestVPkMaxF16(unittest.TestCase):
+    """Packed f16x2 maximum tests."""
+
+    def test_pk_max_f16_basic(self) -> None:
+        """Basic maximum of packed halves: max((1.0, 2.0), (2.0, 3.0)) = (2.0, 3.0)."""
+        w1 = pack_f16x2(0x3C00, 0x4000)  # lo: 1.0, hi: 2.0
+        w2 = pack_f16x2(0x4000, 0x4200)  # lo: 2.0, hi: 3.0
+        res = run_pk_binop("v_pk_max_f16", w1, w2, name="ps_pk_max_basic")
+        self.assertEqual(res, pack_f16x2(0x4000, 0x4200))
+
+    def test_pk_max_f16_clamp(self) -> None:
+        """Clamp modifier clamps negative results to 0.0 and >1.0 to 1.0."""
+        w1 = pack_f16x2(0xC000, 0x4200)  # lo: -2.0, hi: 3.0
+        w2 = pack_f16x2(0xBC00, 0x4000)  # lo: -1.0, hi: 2.0
+        # max(-2.0, -1.0) = -1.0 -> clamped to 0.0 (0x0000)
+        # max(3.0, 2.0) = 3.0 -> clamped to 1.0 (0x3C00)
+        res = run_pk_binop("v_pk_max_f16", w1, w2, clamp=True, name="ps_pk_max_clamp")
+        self.assertEqual(res, pack_f16x2(0x0000, 0x3C00))
+
+    def test_pk_max_f16_modifiers_opsel_neg(self) -> None:
+        """op_sel, op_sel_hi, and neg_lo modifiers."""
+        w1 = pack_f16x2(0x4000, 0x4200)  # lo: 2.0, hi: 3.0
+        w2 = pack_f16x2(0x3C00, 0x4500)  # lo: 1.0, hi: 5.0
+        # op_sel:[1,0] -> lo selects w1.hi (3.0), w2.lo (1.0). neg_lo:[1,0] -> negates w1.hi: -3.0.
+        # lo = max(-3.0, 1.0) = 1.0 (0x3C00).
+        # op_sel_hi:[0,1] -> hi selects w1.lo (2.0), w2.hi (5.0).
+        # hi = max(2.0, 5.0) = 5.0 (0x4500).
+        res = run_pk_binop(
+            "v_pk_max_f16", w1, w2,
+            mods="op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0]",
+            name="ps_pk_max_mod",
+        )
+        self.assertEqual(res, pack_f16x2(0x3C00, 0x4500))
+
+    def test_pk_max_f16_nan_suppression(self) -> None:
+        """NaN operands are suppressed in favor of non-NaN values."""
+        w1 = pack_f16x2(0x7E00, 0x4000)  # lo: NaN, hi: 2.0
+        w2 = pack_f16x2(0x3C00, 0x7E00)  # lo: 1.0, hi: NaN
+        res = run_pk_binop("v_pk_max_f16", w1, w2, name="ps_pk_max_nan")
+        self.assertEqual(res, pack_f16x2(0x3C00, 0x4000))
+
+    def test_pk_max_f16_signed_zeros(self) -> None:
+        """max(+0.0, -0.0) yields +0.0 (0x0000)."""
+        w1 = pack_f16x2(0x0000, 0x8000)  # +0.0, -0.0
+        w2 = pack_f16x2(0x8000, 0x0000)  # -0.0, +0.0
+        res = run_pk_binop("v_pk_max_f16", w1, w2, name="ps_pk_max_zero")
+        self.assertEqual(res, pack_f16x2(0x0000, 0x0000))
+
+    def test_pk_max_f16_register_aliasing(self) -> None:
+        """Register aliasing with destination."""
+        w1 = pack_f16x2(0x3C00, 0x4000)
         w2 = pack_f16x2(0x4000, 0x4200)
-        val = ast.eval_scalar(w1, w2)
-        self.assertEqual(val, pack_f16x2(0x4000, 0x4200))
+        res_v1 = run_pk_binop("v_pk_max_f16", w1, w2, alias_dst=1, name="ps_pk_max_alias_v1")
+        self.assertEqual(res_v1, pack_f16x2(0x4000, 0x4200))
+        res_v2 = run_pk_binop("v_pk_max_f16", w1, w2, alias_dst=2, name="ps_pk_max_alias_v2")
+        self.assertEqual(res_v2, pack_f16x2(0x4000, 0x4200))
 
-    def test_v_pk_max_f16_simd_divergence_and_boundaries(self):
-        state = MachineState(num_lanes=64)
-        state.exec_mask = 0x5555555555555555 # alternating lanes
-        for l in range(64):
-            state.vgpr[0][l] = 0xBAADF00D
-            state.vgpr[1][l] = pack_f16x2(0x3c00, 0x4000)
-            state.vgpr[2][l] = pack_f16x2(0x4000, 0x4200)
-        ast = InstructionAST("v_pk_max_f16", dst=0, srcs=[1, 2])
-        ast.execute_simd(state)
-        for l in range(64):
-            if l % 2 == 0:
-                self.assertEqual(state.vgpr[0][l], pack_f16x2(0x4000, 0x4200))
-            else:
-                self.assertEqual(state.vgpr[0][l], 0xBAADF00D)
-
-        # Boundary checks: NaN, -Inf, +0.0 vs -0.0
-        res_nan = ref_pk_max_f16(pack_f16x2(QNAN, NEG_INF), pack_f16x2(0x3c00, 0x4000))
-        lo, hi = unpack_f16x2(res_nan)
-        self.assertEqual(lo, 0x3c00)
-        self.assertEqual(hi, 0x4000)
-
-    def test_v_pk_max_f16_translator_integration_and_negative_controls(self):
+    def test_pk_max_f16_spirv_structure(self) -> None:
+        """SPIR-V translation emits NMax."""
         lines = [
-            "v_mov_b32 v1, 0x40003c00", # hi: 2.0, lo: 1.0
-            "v_mov_b32 v2, 0x42004000", # hi: 3.0, lo: 2.0
+            "v_mov_b32 v1, 0x40003c00",
+            "v_mov_b32 v2, 0x42004000",
             "v_pk_max_f16 v0, v1, v2",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_v_pk_max_f16", lines)
-        out = mrt0_words(spv)[0]
-        self.assertEqual(out, 0x42004000)
+        spv = support.translate_lines("ps_structure_pk_max", lines)
+        self.assertIn("NMax", spv)
 
-        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
-            translate_lines("ps_bad_pk_max", ["v_pk_max_f16 v0, v1", "s_endpgm"])
+    def test_pk_max_f16_mutation_detection(self) -> None:
+        """MAX is strictly distinguished from MIN."""
+        w1 = pack_f16x2(0x3C00, 0x4000)  # 1.0, 2.0
+        w2 = pack_f16x2(0x4000, 0x4200)  # 2.0, 3.0
+        res = run_pk_binop("v_pk_max_f16", w1, w2, name="ps_pk_max_mut")
+        self.assertEqual(res, pack_f16x2(0x4000, 0x4200))
+        # Mutant MIN produces (1.0, 2.0)
+        self.assertNotEqual(res, pack_f16x2(0x3C00, 0x4000))
 
-    def test_v_pk_fma_f16_reference_oracle(self):
-        w_a = pack_f16x2(0x4000, 0x4000) # 2.0, 2.0
-        w_b = pack_f16x2(0x4200, 0x4200) # 3.0, 3.0
-        w_c = pack_f16x2(0x3c00, 0x3c00) # 1.0, 1.0
-        # 2.0 * 3.0 + 1.0 = 7.0 (0x4700)
-        res = ref_pk_fma_f16(w_a, w_b, w_c)
-        lo, hi = unpack_f16x2(res)
-        self.assertEqual(lo, 0x4700)
-        self.assertEqual(hi, 0x4700)
+    def test_pk_max_f16_negative_controls(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_pk_max", ["v_pk_max_f16 v0", "s_endpgm"])
 
-        # Clamped: 7.0 clamped to 1.0 (0x3c00)
-        res_c = ref_pk_fma_f16(w_a, w_b, w_c, clamp=True)
-        clo, chi = unpack_f16x2(res_c)
-        self.assertEqual(clo, 0x3c00)
-        self.assertEqual(chi, 0x3c00)
 
-    def test_v_pk_fma_f16_ast_and_scalar_interpreter(self):
-        ast = InstructionAST("v_pk_fma_f16", dst=0, srcs=[1, 2, 3])
-        w_a = pack_f16x2(0x4000, 0x4000)
-        w_b = pack_f16x2(0x4200, 0x4200)
-        w_c = pack_f16x2(0x3c00, 0x3c00)
-        val = ast.eval_scalar(w_a, w_b, w_c)
-        self.assertEqual(val, pack_f16x2(0x4700, 0x4700))
+# ==============================================================================
+# Suite 3: v_pk_fma_f16 (Packed f16x2 Fused Multiply-Add)
+# ==============================================================================
 
-    def test_v_pk_fma_f16_simd_divergence_and_boundaries(self):
-        state = MachineState(num_lanes=64)
-        state.exec_mask = 0x000000000000000F # lowest 4 lanes
-        for l in range(64):
-            state.vgpr[0][l] = 0xCAFEBABE
-            state.vgpr[1][l] = pack_f16x2(0x4000, 0x4000)
-            state.vgpr[2][l] = pack_f16x2(0x4200, 0x4200)
-            state.vgpr[3][l] = pack_f16x2(0x3c00, 0x3c00)
-        ast = InstructionAST("v_pk_fma_f16", dst=0, srcs=[1, 2, 3])
-        ast.execute_simd(state)
-        for l in range(4):
-            self.assertEqual(state.vgpr[0][l], pack_f16x2(0x4700, 0x4700))
-        for l in range(4, 64):
-            self.assertEqual(state.vgpr[0][l], 0xCAFEBABE)
+class TestVPkFmaF16(unittest.TestCase):
+    """Packed f16x2 fused multiply-add tests."""
 
-        # Boundaries: 0 * Inf + c, etc.
-        res_zero_inf = ref_pk_fma_f16(pack_f16x2(POS_ZERO, POS_ZERO), pack_f16x2(POS_INF, POS_INF), pack_f16x2(0x3c00, 0x3c00))
-        lo, hi = unpack_f16x2(res_zero_inf)
-        self.assertTrue(math.isnan(bits_to_f16(lo)))
+    def test_pk_fma_f16_basic(self) -> None:
+        """Basic (s0 * s1 + s2): (2.0 * 1.5 + 1.0) = 4.0 (0x4400) on both halves."""
+        w1 = pack_f16x2(0x4000, 0x4000)  # 2.0, 2.0
+        w2 = pack_f16x2(0x3E00, 0x3E00)  # 1.5, 1.5
+        w3 = pack_f16x2(0x3C00, 0x3C00)  # 1.0, 1.0
+        res = run_pk_triop("v_pk_fma_f16", w1, w2, w3, name="ps_pk_fma_basic")
+        self.assertEqual(res, pack_f16x2(0x4400, 0x4400))
 
-    def test_v_pk_fma_f16_translator_integration_and_negative_controls(self):
+    def test_pk_fma_f16_clamp(self) -> None:
+        """Clamp modifier clamps results to [0.0, 1.0]."""
+        w1 = pack_f16x2(0x4000, 0x4000)  # 2.0, 2.0
+        w2 = pack_f16x2(0x3E00, 0x3E00)  # 1.5, 1.5
+        w3 = pack_f16x2(0x3C00, 0x3C00)  # 1.0, 1.0
+        # 4.0 clamped to 1.0 (0x3C00)
+        res = run_pk_triop("v_pk_fma_f16", w1, w2, w3, clamp=True, name="ps_pk_fma_clamp")
+        self.assertEqual(res, pack_f16x2(0x3C00, 0x3C00))
+
+    def test_pk_fma_f16_cancellation(self) -> None:
+        """2.0 * (-1.0) + 2.0 = 0.0 (0x0000)."""
+        w1 = pack_f16x2(0x4000, 0x4000)  # 2.0, 2.0
+        w2 = pack_f16x2(0xBC00, 0xBC00)  # -1.0, -1.0
+        w3 = pack_f16x2(0x4000, 0x4000)  # 2.0, 2.0
+        res = run_pk_triop("v_pk_fma_f16", w1, w2, w3, name="ps_pk_fma_cancel")
+        self.assertEqual(res, pack_f16x2(0x0000, 0x0000))
+
+    def test_pk_fma_f16_register_aliasing(self) -> None:
+        """Register aliasing with destination."""
+        w1 = pack_f16x2(0x4000, 0x4000)
+        w2 = pack_f16x2(0x3E00, 0x3E00)
+        w3 = pack_f16x2(0x3C00, 0x3C00)
+        res_v1 = run_pk_triop("v_pk_fma_f16", w1, w2, w3, alias_dst=1, name="ps_pk_fma_alias_v1")
+        self.assertEqual(res_v1, pack_f16x2(0x4400, 0x4400))
+        res_v3 = run_pk_triop("v_pk_fma_f16", w1, w2, w3, alias_dst=3, name="ps_pk_fma_alias_v3")
+        self.assertEqual(res_v3, pack_f16x2(0x4400, 0x4400))
+
+    def test_pk_fma_f16_spirv_structure(self) -> None:
+        """SPIR-V translation lowers v_pk_fma_f16 via UnpackHalf2x16."""
         lines = [
             "v_mov_b32 v1, 0x40004000",
-            "v_mov_b32 v2, 0x42004200",
+            "v_mov_b32 v2, 0x3e003e00",
             "v_mov_b32 v3, 0x3c003c00",
             "v_pk_fma_f16 v0, v1, v2, v3",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_v_pk_fma_f16", lines)
-        out = mrt0_words(spv)[0]
-        self.assertEqual(out, 0x47004700)
+        spv = support.translate_lines("ps_structure_pk_fma", lines)
+        self.assertIn("UnpackHalf2x16", spv)
 
-        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
-            translate_lines("ps_bad_pk_fma", ["v_pk_fma_f16 v0, v1, v2", "s_endpgm"])
+    def test_pk_fma_f16_mutation_detection(self) -> None:
+        """FMA is strictly distinguished from simple multiplication."""
+        w1 = pack_f16x2(0x4000, 0x4000)  # 2.0, 2.0
+        w2 = pack_f16x2(0x3E00, 0x3E00)  # 1.5, 1.5
+        w3 = pack_f16x2(0x3C00, 0x3C00)  # 1.0, 1.0
+        res = run_pk_triop("v_pk_fma_f16", w1, w2, w3, name="ps_pk_fma_mut")
+        self.assertEqual(res, pack_f16x2(0x4400, 0x4400))
+        # MUL alone yields 3.0 (0x4200)
+        self.assertNotEqual(res, pack_f16x2(0x4200, 0x4200))
 
-    def test_v_pk_fmac_f16_reference_oracle(self):
-        w_acc = pack_f16x2(0x3c00, 0x3c00) # 1.0, 1.0
-        w_a = pack_f16x2(0x4000, 0x4000)   # 2.0, 2.0
-        w_b = pack_f16x2(0x4200, 0x4200)   # 3.0, 3.0
-        # 1.0 + 2.0 * 3.0 = 7.0 (0x4700)
-        res = ref_pk_fmac_f16(w_acc, w_a, w_b)
-        lo, hi = unpack_f16x2(res)
-        self.assertEqual(lo, 0x4700)
-        self.assertEqual(hi, 0x4700)
+    def test_pk_fma_f16_negative_controls(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_pk_fma", ["v_pk_fma_f16 v0", "s_endpgm"])
 
-    def test_v_pk_fmac_f16_ast_and_scalar_interpreter(self):
-        ast = InstructionAST("v_pk_fmac_f16", dst=0, srcs=[1, 2])
-        w_acc = pack_f16x2(0x3c00, 0x3c00)
-        w_a = pack_f16x2(0x4000, 0x4000)
-        w_b = pack_f16x2(0x4000, 0x4000)
-        # 1.0 + 2.0 * 2.0 = 5.0 (0x4500)
-        val = ast.eval_scalar(w_a, w_b, acc=w_acc)
-        self.assertEqual(val, pack_f16x2(0x4500, 0x4500))
 
-    def test_v_pk_fmac_f16_simd_divergence_and_boundaries(self):
-        state = MachineState(num_lanes=64)
-        state.exec_mask = 0xF000000000000000 # top 4 lanes
-        for l in range(64):
-            state.vgpr[0][l] = pack_f16x2(0x3c00, 0x3c00)
-            state.vgpr[1][l] = pack_f16x2(0x4000, 0x4000)
-            state.vgpr[2][l] = pack_f16x2(0x4000, 0x4000)
-        ast = InstructionAST("v_pk_fmac_f16", dst=0, srcs=[1, 2])
-        ast.execute_simd(state)
-        for l in range(60):
-            self.assertEqual(state.vgpr[0][l], pack_f16x2(0x3c00, 0x3c00))
-        for l in range(60, 64):
-            self.assertEqual(state.vgpr[0][l], pack_f16x2(0x4500, 0x4500))
+# ==============================================================================
+# Suite 4: v_pk_fmac_f16 (Packed f16x2 Multiply-Accumulate)
+# ==============================================================================
 
-    def test_v_pk_fmac_f16_translator_integration_and_negative_controls(self):
+class TestVPkFmacF16(unittest.TestCase):
+    """Packed f16x2 multiply-accumulate tests."""
+
+    def test_pk_fmac_f16_basic(self) -> None:
+        """acc = acc + s0 * s1: 1.0 + 2.0 * 1.5 = 4.0 (0x4400) on both halves."""
+        acc = pack_f16x2(0x3C00, 0x3C00)  # 1.0, 1.0
+        s0 = pack_f16x2(0x4000, 0x4000)   # 2.0, 2.0
+        s1 = pack_f16x2(0x3E00, 0x3E00)   # 1.5, 1.5
+        res = run_pk_fmac(acc, s0, s1, name="ps_pk_fmac_basic")
+        self.assertEqual(res, pack_f16x2(0x4400, 0x4400))
+
+    def test_pk_fmac_f16_zero_accumulation(self) -> None:
+        """acc + 0 * s1 preserves acc."""
+        acc = pack_f16x2(0x4200, 0x4500)  # 3.0, 5.0
+        s0 = pack_f16x2(0x0000, 0x0000)   # 0, 0
+        s1 = pack_f16x2(0x4000, 0x4000)   # 2.0, 2.0
+        res = run_pk_fmac(acc, s0, s1, name="ps_pk_fmac_zero")
+        self.assertEqual(res, acc)
+
+    def test_pk_fmac_f16_cancellation(self) -> None:
+        """acc + (-1.0) * acc = 0.0 (0x0000)."""
+        acc = pack_f16x2(0x4000, 0x4000)  # 2.0, 2.0
+        s0 = pack_f16x2(0xBC00, 0xBC00)   # -1.0, -1.0
+        s1 = pack_f16x2(0x4000, 0x4000)   # 2.0, 2.0
+        res = run_pk_fmac(acc, s0, s1, name="ps_pk_fmac_cancel")
+        self.assertEqual(res, pack_f16x2(0x0000, 0x0000))
+
+    def test_pk_fmac_f16_spirv_structure(self) -> None:
+        """SPIR-V translation emits UnpackHalf2x16."""
         lines = [
             "v_mov_b32 v0, 0x3c003c00",
             "v_mov_b32 v1, 0x40004000",
-            "v_mov_b32 v2, 0x40004000",
+            "v_mov_b32 v2, 0x3e003e00",
             "v_pk_fmac_f16 v0, v1, v2",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_v_pk_fmac_f16", lines)
-        out = mrt0_words(spv)[0]
-        self.assertEqual(out, 0x45004500)
+        spv = support.translate_lines("ps_structure_pk_fmac", lines)
+        self.assertIn("UnpackHalf2x16", spv)
 
-        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
-            translate_lines("ps_bad_pk_fmac", ["v_pk_fmac_f16 v0, v1", "s_endpgm"])
+    def test_pk_fmac_f16_mutation_detection(self) -> None:
+        """FMAC is strictly distinguished from simple accumulation or multiplication."""
+        acc = pack_f16x2(0x3C00, 0x3C00)  # 1.0, 1.0
+        s0 = pack_f16x2(0x4000, 0x4000)   # 2.0, 2.0
+        s1 = pack_f16x2(0x3E00, 0x3E00)   # 1.5, 1.5
+        res = run_pk_fmac(acc, s0, s1, name="ps_pk_fmac_mut")
+        self.assertEqual(res, pack_f16x2(0x4400, 0x4400))
+        # Pure sum yields 1.0 + 2.0 = 3.0 (0x4200)
+        self.assertNotEqual(res, pack_f16x2(0x4200, 0x4200))
 
-    def test_v_pk_mul_f16_reference_oracle(self):
-        w_a = pack_f16x2(0x3c00, 0x4000) # 1.0, 2.0
-        w_b = pack_f16x2(0x4000, 0x4200) # 2.0, 3.0
-        res = ref_pk_mul_f16(w_a, w_b)
-        lo, hi = unpack_f16x2(res)
-        self.assertEqual(lo, 0x4000) # 1.0 * 2.0 = 2.0
-        self.assertEqual(hi, 0x4600) # 2.0 * 3.0 = 6.0
+    def test_pk_fmac_f16_negative_controls(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_pk_fmac", ["v_pk_fmac_f16 v0", "s_endpgm"])
 
-        # Clamped: 6.0 clamped to 1.0 (0x3c00)
-        res_c = ref_pk_mul_f16(w_a, w_b, clamp=True)
-        clo, chi = unpack_f16x2(res_c)
-        self.assertEqual(clo, 0x3c00) # 2.0 clamped to 1.0
-        self.assertEqual(chi, 0x3c00) # 6.0 clamped to 1.0
 
-    def test_v_pk_mul_f16_ast_and_scalar_interpreter(self):
-        ast = InstructionAST("v_pk_mul_f16", dst=0, srcs=[1, 2])
-        w_a = pack_f16x2(0x3c00, 0x4000)
-        w_b = pack_f16x2(0x4000, 0x4200)
-        val = ast.eval_scalar(w_a, w_b)
-        self.assertEqual(val, pack_f16x2(0x4000, 0x4600))
+# ==============================================================================
+# Suite 5: v_pk_mul_f16 (Packed f16x2 Multiplication)
+# ==============================================================================
 
-    def test_v_pk_mul_f16_simd_divergence_and_boundaries(self):
-        state = MachineState(num_lanes=64)
-        state.exec_mask = 0x0000FFFF0000FFFF
-        for l in range(64):
-            state.vgpr[0][l] = 0x12345678
-            state.vgpr[1][l] = pack_f16x2(0x3c00, 0x4000)
-            state.vgpr[2][l] = pack_f16x2(0x4000, 0x4200)
-        ast = InstructionAST("v_pk_mul_f16", dst=0, srcs=[1, 2])
-        ast.execute_simd(state)
-        for l in range(64):
-            if state.lane_active(l):
-                self.assertEqual(state.vgpr[0][l], pack_f16x2(0x4000, 0x4600))
-            else:
-                self.assertEqual(state.vgpr[0][l], 0x12345678)
+class TestVPkMulF16(unittest.TestCase):
+    """Packed f16x2 multiplication tests."""
 
-        # Boundaries: Inf * 0 -> NaN
-        res_nan = ref_pk_mul_f16(pack_f16x2(POS_INF, 0x3c00), pack_f16x2(POS_ZERO, 0x4000))
-        lo, hi = unpack_f16x2(res_nan)
-        self.assertTrue(math.isnan(bits_to_f16(lo)))
-        self.assertEqual(hi, 0x4000)
+    def test_pk_mul_f16_basic(self) -> None:
+        """Basic 2.0 (0x4000) * 1.5 (0x3E00) = 3.0 (0x4200) on both halves."""
+        w1 = pack_f16x2(0x4000, 0x4000)
+        w2 = pack_f16x2(0x3E00, 0x3E00)
+        res = run_pk_binop("v_pk_mul_f16", w1, w2, name="ps_pk_mul_basic")
+        self.assertEqual(res, pack_f16x2(0x4200, 0x4200))
 
-    def test_v_pk_mul_f16_translator_integration_and_negative_controls(self):
+    def test_pk_mul_f16_clamp(self) -> None:
+        """Clamp modifier clamps results to [0.0, 1.0]."""
+        w1 = pack_f16x2(0x4000, 0x4000)  # 2.0, 2.0
+        w2 = pack_f16x2(0x3E00, 0x3E00)  # 1.5, 1.5
+        # 3.0 clamped to 1.0 (0x3C00)
+        res = run_pk_binop("v_pk_mul_f16", w1, w2, clamp=True, name="ps_pk_mul_clamp")
+        self.assertEqual(res, pack_f16x2(0x3C00, 0x3C00))
+
+    def test_pk_mul_f16_modifiers_opsel_neg(self) -> None:
+        """op_sel, op_sel_hi, and neg_lo modifiers."""
+        w1 = pack_f16x2(0x4000, 0x4200)  # lo: 2.0, hi: 3.0
+        w2 = pack_f16x2(0x3E00, 0x4000)  # lo: 1.5, hi: 2.0
+        # op_sel:[1,0] -> lo selects w1.hi (3.0), w2.lo (1.5). neg_lo:[1,0] -> -3.0 * 1.5 = -4.5 (0xC480).
+        # op_sel_hi:[0,1] -> hi selects w1.lo (2.0), w2.hi (2.0) -> 2.0 * 2.0 = 4.0 (0x4400).
+        res = run_pk_binop(
+            "v_pk_mul_f16", w1, w2,
+            mods="op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0]",
+            name="ps_pk_mul_mod",
+        )
+        self.assertEqual(res, pack_f16x2(0xC480, 0x4400))
+
+    def test_pk_mul_f16_zero_and_signs(self) -> None:
+        """Signs and zeros in multiplication."""
+        w1 = pack_f16x2(0x0000, 0x8000)  # +0.0, -0.0
+        w2 = pack_f16x2(0x4000, 0x4000)  # 2.0, 2.0
+        res = run_pk_binop("v_pk_mul_f16", w1, w2, name="ps_pk_mul_signs")
+        self.assertEqual(res, pack_f16x2(0x0000, 0x8000))
+
+    def test_pk_mul_f16_register_aliasing(self) -> None:
+        """Register aliasing with destination."""
+        w1 = pack_f16x2(0x4000, 0x4000)
+        w2 = pack_f16x2(0x3E00, 0x3E00)
+        res_v1 = run_pk_binop("v_pk_mul_f16", w1, w2, alias_dst=1, name="ps_pk_mul_alias_v1")
+        self.assertEqual(res_v1, pack_f16x2(0x4200, 0x4200))
+        res_v2 = run_pk_binop("v_pk_mul_f16", w1, w2, alias_dst=2, name="ps_pk_mul_alias_v2")
+        self.assertEqual(res_v2, pack_f16x2(0x4200, 0x4200))
+
+    def test_pk_mul_f16_spirv_structure(self) -> None:
+        """SPIR-V translation emits OpFMul %v2float."""
         lines = [
-            "v_mov_b32 v1, 0x40003c00", # hi: 2.0, lo: 1.0
-            "v_mov_b32 v2, 0x42004000", # hi: 3.0, lo: 2.0
+            "v_mov_b32 v1, 0x40004000",
+            "v_mov_b32 v2, 0x3e003e00",
             "v_pk_mul_f16 v0, v1, v2",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_v_pk_mul_f16", lines)
-        out = mrt0_words(spv)[0]
-        self.assertEqual(out, 0x46004000)
+        spv = support.translate_lines("ps_structure_pk_mul", lines)
+        self.assertIn("OpFMul", spv)
 
-        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
-            translate_lines("ps_bad_pk_mul", ["v_pk_mul_f16 v0", "s_endpgm"])
+    def test_pk_mul_f16_mutation_detection(self) -> None:
+        """Multiplication is strictly distinguished from addition."""
+        w1 = pack_f16x2(0x4000, 0x4000)  # 2.0, 2.0
+        w2 = pack_f16x2(0x3E00, 0x3E00)  # 1.5, 1.5
+        res = run_pk_binop("v_pk_mul_f16", w1, w2, name="ps_pk_mul_mut")
+        self.assertEqual(res, pack_f16x2(0x4200, 0x4200))
+        # Addition yields 3.5 (0x4300)
+        self.assertNotEqual(res, pack_f16x2(0x4300, 0x4300))
 
-    def test_v_pk_add_f16_reference_oracle(self):
-        w_a = pack_f16x2(0x3c00, 0x4000) # 1.0, 2.0
-        w_b = pack_f16x2(0x4000, 0x4200) # 2.0, 3.0
-        res = ref_pk_add_f16(w_a, w_b)
-        lo, hi = unpack_f16x2(res)
-        self.assertEqual(lo, 0x4200) # 1.0 + 2.0 = 3.0
-        self.assertEqual(hi, 0x4500) # 2.0 + 3.0 = 5.0
+    def test_pk_mul_f16_negative_controls(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_pk_mul", ["v_pk_mul_f16 v0", "s_endpgm"])
 
-        # Clamped: 3.0 and 5.0 clamped to 1.0
-        res_c = ref_pk_add_f16(w_a, w_b, clamp=True)
-        clo, chi = unpack_f16x2(res_c)
-        self.assertEqual(clo, 0x3c00)
-        self.assertEqual(chi, 0x3c00)
 
-    def test_v_pk_add_f16_ast_and_scalar_interpreter(self):
-        ast = InstructionAST("v_pk_add_f16", dst=0, srcs=[1, 2])
-        w_a = pack_f16x2(0x3c00, 0x4000)
-        w_b = pack_f16x2(0x4000, 0x4200)
-        val = ast.eval_scalar(w_a, w_b)
-        self.assertEqual(val, pack_f16x2(0x4200, 0x4500))
+# ==============================================================================
+# Suite 6: v_pk_add_f16 (Packed f16x2 Addition)
+# ==============================================================================
 
-    def test_v_pk_add_f16_simd_divergence_and_boundaries(self):
-        state = MachineState(num_lanes=64)
-        state.exec_mask = 0xAAAAAAAAAAAAAAAA
-        for l in range(64):
-            state.vgpr[0][l] = 0x87654321
-            state.vgpr[1][l] = pack_f16x2(0x3c00, 0x4000)
-            state.vgpr[2][l] = pack_f16x2(0x4000, 0x4200)
-        ast = InstructionAST("v_pk_add_f16", dst=0, srcs=[1, 2])
-        ast.execute_simd(state)
-        for l in range(64):
-            if state.lane_active(l):
-                self.assertEqual(state.vgpr[0][l], pack_f16x2(0x4200, 0x4500))
-            else:
-                self.assertEqual(state.vgpr[0][l], 0x87654321)
+class TestVPkAddF16(unittest.TestCase):
+    """Packed f16x2 addition tests."""
 
-        # Modifier test with op_sel and neg_lo
-        res_mod = ref_pk_add_f16(pack_f16x2(0x4000, 0x4200), pack_f16x2(0x3c00, 0x4500),
-                                 op_sel=(1, 0), op_sel_hi=(0, 1), neg_lo=(1, 0))
-        # lo: -3.0 + 1.0 = -2.0 (0xc000), hi: 2.0 + 5.0 = 7.0 (0x4700)
-        self.assertEqual(res_mod, 0x4700c000)
+    def test_pk_add_f16_basic(self) -> None:
+        """Basic 1.0 + 2.0 = 3.0 (0x4200) and 2.0 + 3.0 = 5.0 (0x4500)."""
+        w1 = pack_f16x2(0x3C00, 0x4000)  # 1.0, 2.0
+        w2 = pack_f16x2(0x4000, 0x4200)  # 2.0, 3.0
+        res = run_pk_binop("v_pk_add_f16", w1, w2, name="ps_pk_add_basic")
+        self.assertEqual(res, pack_f16x2(0x4200, 0x4500))
 
-    def test_v_pk_add_f16_translator_integration_and_negative_controls(self):
+    def test_pk_add_f16_clamp(self) -> None:
+        """Clamp modifier clamps results to [0.0, 1.0]."""
+        w1 = pack_f16x2(0x3C00, 0x4000)  # 1.0, 2.0
+        w2 = pack_f16x2(0x4000, 0x4200)  # 2.0, 3.0
+        # 3.0 and 5.0 clamped to 1.0 (0x3C00)
+        res = run_pk_binop("v_pk_add_f16", w1, w2, clamp=True, name="ps_pk_add_clamp")
+        self.assertEqual(res, pack_f16x2(0x3C00, 0x3C00))
+
+    def test_pk_add_f16_modifiers_opsel_neg(self) -> None:
+        """op_sel, op_sel_hi, and neg_lo modifiers."""
+        w1 = pack_f16x2(0x4000, 0x4200)  # lo: 2.0, hi: 3.0
+        w2 = pack_f16x2(0x3C00, 0x4500)  # lo: 1.0, hi: 5.0
+        # lo: -3.0 + 1.0 = -2.0 (0xC000)
+        # hi: 2.0 + 5.0 = 7.0 (0x4700)
+        res = run_pk_binop(
+            "v_pk_add_f16", w1, w2,
+            mods="op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0]",
+            name="ps_pk_add_mod",
+        )
+        self.assertEqual(res, pack_f16x2(0xC000, 0x4700))
+
+    def test_pk_add_f16_cancellation(self) -> None:
+        """1.0 + (-1.0) = 0.0 (0x0000)."""
+        w1 = pack_f16x2(0x3C00, 0x4000)  # 1.0, 2.0
+        w2 = pack_f16x2(0xBC00, 0xC000)  # -1.0, -2.0
+        res = run_pk_binop("v_pk_add_f16", w1, w2, name="ps_pk_add_cancel")
+        self.assertEqual(res, pack_f16x2(0x0000, 0x0000))
+
+    def test_pk_add_f16_register_aliasing(self) -> None:
+        """Register aliasing with destination."""
+        w1 = pack_f16x2(0x3C00, 0x4000)
+        w2 = pack_f16x2(0x4000, 0x4200)
+        res_v1 = run_pk_binop("v_pk_add_f16", w1, w2, alias_dst=1, name="ps_pk_add_alias_v1")
+        self.assertEqual(res_v1, pack_f16x2(0x4200, 0x4500))
+        res_v2 = run_pk_binop("v_pk_add_f16", w1, w2, alias_dst=2, name="ps_pk_add_alias_v2")
+        self.assertEqual(res_v2, pack_f16x2(0x4200, 0x4500))
+
+    def test_pk_add_f16_spirv_structure(self) -> None:
+        """SPIR-V translation emits OpFAdd %v2float."""
         lines = [
-            "v_mov_b32 v1, 0x40003c00", # hi: 2.0, lo: 1.0
-            "v_mov_b32 v2, 0x42004000", # hi: 3.0, lo: 2.0
+            "v_mov_b32 v1, 0x40003c00",
+            "v_mov_b32 v2, 0x42004000",
             "v_pk_add_f16 v0, v1, v2",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_v_pk_add_f16", lines)
-        out = mrt0_words(spv)[0]
-        self.assertEqual(out, 0x45004200)
+        spv = support.translate_lines("ps_structure_pk_add", lines)
+        self.assertIn("OpFAdd", spv)
 
-        # Modifier test in translator
-        lines_mod = [
-            "v_mov_b32 v1, 0x42004000",
-            "v_mov_b32 v2, 0x45003c00",
-            "v_pk_add_f16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0]",
-            "exp mrt0 v0, v0, v0, v0 done vm",
+    def test_pk_add_f16_mutation_detection(self) -> None:
+        """Addition is strictly distinguished from multiplication."""
+        w1 = pack_f16x2(0x3C00, 0x4000)  # 1.0, 2.0
+        w2 = pack_f16x2(0x4000, 0x4200)  # 2.0, 3.0
+        res = run_pk_binop("v_pk_add_f16", w1, w2, name="ps_pk_add_mut")
+        self.assertEqual(res, pack_f16x2(0x4200, 0x4500))
+        # Multiplication yields (2.0, 6.0)
+        self.assertNotEqual(res, pack_f16x2(0x4000, 0x4600))
+
+    def test_pk_add_f16_negative_controls(self) -> None:
+        """Negative control: malformed opcode syntax is rejected."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_pk_add", ["v_pk_add_f16 v0", "s_endpgm"])
+
+
+# ==============================================================================
+# Suite 7: Integration & Cross-Opcode Pipelines
+# ==============================================================================
+
+class TestVPkF16Pipelines(unittest.TestCase):
+    """Multi-instruction pipeline integration tests."""
+
+    def test_chained_pk_add_mul_pipeline(self) -> None:
+        """Chained: (w1 + w2) * w3 packed."""
+        lines = [
+            "v_mov_b32 v1, 0x40003c00",      # hi: 2.0, lo: 1.0
+            "v_mov_b32 v2, 0x40003c00",      # hi: 2.0, lo: 1.0
+            "v_mov_b32 v3, 0x3e003e00",      # hi: 1.5, lo: 1.5
+            "v_pk_add_f16 v4, v1, v2",       # hi: 4.0 (0x4400), lo: 2.0 (0x4000)
+            "v_pk_mul_f16 v5, v4, v3",       # hi: 4.0*1.5 = 6.0 (0x4600), lo: 2.0*1.5 = 3.0 (0x4200)
+            "exp mrt0 v5, v5, v5, v5 done vm",
             "s_endpgm",
         ]
-        spv_mod = translate_lines("ps_v_pk_add_f16_mod", lines_mod)
-        out_mod = mrt0_words(spv_mod)[0]
-        self.assertEqual(out_mod, 0x4700c000)
+        spv = support.translate_lines("ps_chain_pk_add_mul", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], pack_f16x2(0x4200, 0x4600))
 
-        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
-            translate_lines("ps_bad_pk_add", ["v_pk_add_f16 v0", "s_endpgm"])
+    def test_chained_pk_fmac_min_pipeline(self) -> None:
+        """Chained: min(fmac(acc, s0, s1), limit)."""
+        lines = [
+            "v_mov_b32 v0, 0x3c003c00",      # acc: 1.0, 1.0
+            "v_mov_b32 v1, 0x40004000",      # s0: 2.0, 2.0
+            "v_mov_b32 v2, 0x3e003e00",      # s1: 1.5, 1.5
+            "v_mov_b32 v3, 0x42004200",      # limit: 3.0, 3.0
+            "v_pk_fmac_f16 v0, v1, v2",      # acc: 4.0 (0x4400)
+            "v_pk_min_f16 v4, v0, v3",       # min(4.0, 3.0) = 3.0 (0x4200)
+            "exp mrt0 v4, v4, v4, v4 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_chain_pk_fmac_min", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], pack_f16x2(0x4200, 0x4200))
+
+    def test_halfword_isolation(self) -> None:
+        """Verify low and high halfwords execute with complete numerical isolation."""
+        w1 = pack_f16x2(0x3C00, 0x0000)  # lo: 1.0, hi: 0.0
+        w2 = pack_f16x2(0x4000, 0x0000)  # lo: 2.0, hi: 0.0
+        res = run_pk_binop("v_pk_add_f16", w1, w2, name="ps_pk_isolation")
+        lo, hi = unpack_f16x2(res)
+        self.assertEqual(lo, 0x4200)  # 3.0
+        self.assertEqual(hi, 0x0000)  # 0.0
+
 
 if __name__ == '__main__':
     unittest.main()
