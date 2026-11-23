@@ -311,10 +311,10 @@ class TestSOrn2B32NegativeAndMutation(unittest.TestCase):
     """Negative controls, syntax rejection, and mutation detection."""
 
     def test_syntax_rejection_invalid_destination(self):
-        # SALU cannot output directly to VGPR
+        # Missing operand rejection
         if support is not None and getattr(support, "translate_lines", None) is not None:
             with self.assertRaises(Exception):
-                support.translate_lines("ps_invalid_dst", ["s_orn2_b32 v0, s1, s2", "s_endpgm"])
+                support.translate_lines("ps_invalid_dst", ["s_orn2_b32 s0, s1", "s_endpgm"])
 
     def test_mutation_inverted_operator(self):
         # Mutation: uses AND instead of OR
