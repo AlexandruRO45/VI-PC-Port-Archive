@@ -42,11 +42,12 @@ _M2R_ID_RE = re.compile(r"%m2r_\d+")
 
 
 def _parse_inst_for_header(line: str):
-    """Parse one header line for module-level metadata; preserves quoted strings safely."""
+    """Parse one header line for module-level metadata; handles tabs and quoted strings safely."""
     stripped = line.lstrip()
     if not stripped or stripped.startswith(";"):
         return None
-    if stripped.startswith(("OpDecorateString ", "OpDecorateStringGOOGLE ")):
+    op_tok = stripped.split(None, 1)[0]
+    if op_tok in ("OpDecorateString", "OpDecorateStringGOOGLE"):
         q = stripped.find('"')
         prefix = (stripped[:q] if q >= 0 else stripped).split()
         if len(prefix) >= 2:
@@ -729,8 +730,7 @@ def collapse_trivial_phis(insts: list[list], build_cfg_and_dom, decorated_ids: s
 
 def mark_and_sweep_dce(insts: list[list], trackable: set[str], readonly_global_vars: set[str],
                        ptr_root: dict[str, str], glsl_sets: set[str], pure_ops: frozenset[str],
-                       pure_glsl_ext: frozenset[str], deleted_ids: set[str],
-                       protected_ids: set[str] | frozenset[str] = frozenset()) -> tuple[list[list], bool]:
+                       pure_glsl_ext: frozenset[str], deleted_ids: set[str]) -> tuple[list[list], bool]:
     """Mark-and-sweep pure DCE over a function body; eliminates dead OpPhi cycles as well."""
     n = len(insts)
     def_idx: dict[str, int] = {}
@@ -739,7 +739,7 @@ def mark_and_sweep_dce(insts: list[list], trackable: set[str], readonly_global_v
             def_idx[res] = idx
 
     def is_pure_removable(res: str | None, op: str | None, args: list[str] | None) -> bool:
-        if res is None or op is None or args is None or res in protected_ids:
+        if res is None or op is None or args is None:
             return False
         if op in pure_ops or op == "OpPhi":
             return True

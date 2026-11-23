@@ -43,12 +43,13 @@ def _assert_valid_spirv(spvasm: str) -> None:
         if fn_start is None:
             if p is None:
                 s = raw.lstrip()
+                op_tok = s.split(None, 1)[0] if s else ""
                 if "OpExtInstImport" in s and "=" in s:
                     global_defs.add(s.split("=", 1)[0].strip())
-                elif s.startswith(("OpName ", "OpDecorateString ", "OpDecorateStringGOOGLE ")):
+                elif op_tok in ("OpName", "OpDecorateString", "OpDecorateStringGOOGLE"):
                     toks = s.split(None, 2)
                     if len(toks) >= 2 and toks[1].startswith("%"):
-                        decor_targets.append((toks[0], toks[1]))
+                        decor_targets.append((op_tok, toks[1]))
                 continue
             res, op, args = p
             if op == "OpFunction":
@@ -769,8 +770,9 @@ class SpirvMem2RegTests(unittest.TestCase):
         self.assertEqual(list(run_fragment(opt_dup, inputs={"%in0": 11})["%out0"]), [11, 3, 0, 0])
 
     def test_group_decorate_id_and_string_on_unused_pure_and_foldable_select(self):
-        # OpGroupDecorate, OpDecorateId, and OpDecorateString targeting unused pure ops (OpIAdd)
-        # and foldable OpSelect instructions must never leave dangling decoration targets.
+        # Live foldable OpSelects targeted by OpGroupDecorate / OpDecorateId / OpDecorateString must NOT fold away;
+        # dead unused pure ops targeted by any decoration form are removed by DCE and their decorations/group members
+        # are stripped consistently so zero dangling IDs remain.
         spvasm = """               OpCapability Shader
                OpExtension "SPV_GOOGLE_decorate_string"
                OpExtension "SPV_GOOGLE_hlsl_functionality1"
@@ -785,8 +787,8 @@ class SpirvMem2RegTests(unittest.TestCase):
                OpGroupDecorate %dg %dead_grp %sel_grp
                OpDecorateId %dead_id UniformId %scope_sub
                OpDecorateId %sel_id UniformId %scope_sub
-               OpDecorateString %dead_str UserSemantic "unused_add"
-               OpDecorateString %sel_str UserSemantic "kept_sel"
+               OpDecorateString\t%dead_str UserSemantic "unused_add"
+               OpDecorateString\t%sel_str UserSemantic "kept_sel"
        %void = OpTypeVoid
          %fn = OpTypeFunction %void
        %bool = OpTypeBool
@@ -819,18 +821,15 @@ class SpirvMem2RegTests(unittest.TestCase):
         _assert_valid_spirv(spvasm)
         opt = spirv_opt.optimize(spvasm)
         _assert_valid_spirv(opt)
-        # Undecorated unused OpIAdd and foldable OpSelect still optimize away.
-        self.assertNotIn("%dead_plain = OpIAdd", opt)
-        self.assertNotIn("%sel_plain = OpSelect", opt)
-        # All OpGroupDecorate / OpDecorateId / OpDecorateString targets remain defined and decorated.
-        for sym in ("%dead_grp = OpIAdd", "%dead_id = OpIAdd", "%dead_str = OpIAdd",
-                    "%sel_grp = OpSelect", "%sel_id = OpSelect", "%sel_str = OpSelect"):
+        # Unused pure ops (decorated or undecorated) and undecorated foldable OpSelect optimize away with zero dangling headers.
+        for dead in ("%dead_plain", "%dead_grp", "%dead_id", "%dead_str", "%sel_plain = OpSelect"):
+            self.assertNotIn(dead, opt)
+        # Live decorated OpSelects stay un-aliased with their decorations intact.
+        for sym in ("%sel_grp = OpSelect", "%sel_id = OpSelect", "%sel_str = OpSelect"):
             self.assertIn(sym, opt)
-        self.assertIn("OpGroupDecorate %dg %dead_grp %sel_grp", opt)
-        self.assertIn("OpDecorateId %dead_id UniformId %scope_sub", opt)
+        self.assertIn("OpGroupDecorate %dg %sel_grp", opt)
         self.assertIn("OpDecorateId %sel_id UniformId %scope_sub", opt)
-        self.assertIn('OpDecorateString %dead_str UserSemantic "unused_add"', opt)
-        self.assertIn('OpDecorateString %sel_str UserSemantic "kept_sel"', opt)
+        self.assertIn('OpDecorateString\t%sel_str UserSemantic "kept_sel"', opt)
 
     def test_unreachable_block_uses_promoted_and_aliased_values_stay_valid(self):
         # An unreachable block referencing values eliminated by Mem2Reg (%v), OpSelect folding (%s),
