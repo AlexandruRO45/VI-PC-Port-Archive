@@ -145,6 +145,7 @@ const char* slot_name(unsigned slot) {
         case 34: return "MakeResident (proxies unwrapped)";
         case 35: return "Evict (proxies unwrapped)";
         case 36: return "CreateFence -> fence proxy";
+        case 41: return "CreateCommandSignature (Xbox argument type 105 as DISPATCH)";
         case 43: return "GetAdapterLuid";
         case 45: return "SetEventOnMultipleFenceCompletion (fence proxies unwrapped)";
         case 46: return "SetResidencyPriority (proxies unwrapped)";
@@ -1336,31 +1337,9 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
 }
 
-// Device slot 41: CreateCommandSignature. The retail exe asks for the console signature IID
-// {c36a797c-ec80-4f0a-8985-a7b2475082d1}; the PC runtime does not know it. The signature object is a marker for
-// ExecuteIndirect, so create the PC object with the PC IID for the base-compatible pointer.
-HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
-                                       ID3D12RootSignature* root, const IID* riid, void** out) {
-    note_slot(41);
-    if (out) *out = nullptr;
-    if (!riid) return E_POINTER;
-    // A null output goes to the real device: its answer is the one Windows gives (E_UNEXPECTED), and the
-    // validation suite compares it. The console IID still maps to the PC signature IID.
-    const IID& create_iid =
-        IsEqualIID(*riid, kXboxCommandSignatureIid) ? __uuidof(ID3D12CommandSignature) : *riid;
-#pragma warning(suppress : 6387)
-    if (!out) return self->real->CreateCommandSignature(desc, root, create_iid, nullptr);
-    const HRESULT hr = self->real->CreateCommandSignature(desc, root, create_iid, out);
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: device slot 41 CreateCommandSignature desc=%p root=%p console_iid=%d -> "
-                     "0x%08lx\n",
-                     reinterpret_cast<const void*>(desc), reinterpret_cast<void*>(root),
-                     IsEqualIID(*riid, kXboxCommandSignatureIid) ? 1 : 0, static_cast<unsigned long>(hr));
-    }
-    return hr;
-}
+// Device slot 41 is handled in the early dispatch chain: it maps the console signature IID and, for a console
+// argument type 105, creates the signature as DISPATCH (see proxy_create_command_signature below).
+
 
 // Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
 // not used before a presenter exists. The period is a vblank period in microseconds in the public samples (16667 for
@@ -1649,6 +1628,71 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
     *out = nullptr;
     if (!riid) return E_POINTER;
     return self->real->CreateComputePipelineState(desc, *riid, out);
+}
+
+// The Xbox slot 41 is CreateCommandSignature at its PC position, (desc, root signature, riid, out), but a console
+// description can hold an argument type the PC does not have. The retail title creates five one-argument signatures
+// with no root signature at startup; one has type 105 (0x69) and a 12-byte stride, next to a DISPATCH and a
+// DISPATCH_MESH of 12 bytes. Read statically from its call sites (counts and shapes only): its two ExecuteIndirect
+// sites pass MaxCommandCount 1 and an argument offset into the same upload buffer as the DISPATCH ones, and set the
+// compute state (pipeline, compute root signature, tables, constants, SRV/UAV) right before, as the DISPATCH path
+// does; they record on a second command list of the title's context. So type 105 is taken as a dispatch whose
+// arguments are a D3D12_DISPATCH_ARGUMENTS. HYPOTHESIS: what the console does differently for it (which command
+// stream it feeds) is not known; the PC layer has one compute path. Other descriptions are forwarded unchanged.
+//
+// The retail exe also asks for the console signature IID {c36a797c-ec80-4f0a-8985-a7b2475082d1}; the PC runtime does
+// not know it, so the call is made with the PC IID. A null output goes to the real device: its answer is the one
+// Windows gives (E_UNEXPECTED), and the validation suite compares it.
+constexpr D3D12_INDIRECT_ARGUMENT_TYPE kXboxIndirectArgumentDispatch105 = static_cast<D3D12_INDIRECT_ARGUMENT_TYPE>(105);
+
+HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                       std::uint64_t root_signature, const IID* riid, void** out) {
+    note_slot(41);
+    if (out) *out = nullptr;
+    if (!riid) return E_POINTER;
+    const IID& create_iid =
+        IsEqualIID(*riid, kXboxCommandSignatureIid) ? __uuidof(ID3D12CommandSignature) : *riid;
+    auto* const root = reinterpret_cast<ID3D12RootSignature*>(root_signature);
+
+    bool console = false;
+    if (desc && desc->pArgumentDescs)
+        for (UINT i = 0; i < desc->NumArgumentDescs && !console; ++i)
+            console = static_cast<std::uint32_t>(desc->pArgumentDescs[i].Type) ==
+                      static_cast<std::uint32_t>(kXboxIndirectArgumentDispatch105);
+
+    std::unique_ptr<D3D12_INDIRECT_ARGUMENT_DESC[]> args;
+    D3D12_COMMAND_SIGNATURE_DESC pc{};
+    const D3D12_COMMAND_SIGNATURE_DESC* pass = desc;
+    if (console) {
+        args.reset(new (std::nothrow) D3D12_INDIRECT_ARGUMENT_DESC[desc->NumArgumentDescs]);
+        if (!args) return E_OUTOFMEMORY;
+        for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
+            args[i] = desc->pArgumentDescs[i];
+            if (static_cast<std::uint32_t>(args[i].Type) ==
+                static_cast<std::uint32_t>(kXboxIndirectArgumentDispatch105))
+                args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        }
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 41 argument type 105 (stride %u) created as DISPATCH\n",
+                         desc->ByteStride);
+        pc = *desc;
+        pc.pArgumentDescs = args.get();
+        pass = &pc;
+    }
+
+#pragma warning(suppress : 6387)
+    if (!out) return self->real->CreateCommandSignature(pass, root, create_iid, nullptr);
+    const HRESULT hr = self->real->CreateCommandSignature(pass, root, create_iid, out);
+    static std::atomic<bool> logged_console_iid{false};
+    if (!logged_console_iid.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: device slot 41 CreateCommandSignature desc=%p root=%p console_iid=%d -> "
+                     "0x%08lx\n",
+                     reinterpret_cast<const void*>(desc), reinterpret_cast<void*>(root),
+                     IsEqualIID(*riid, kXboxCommandSignatureIid) ? 1 : 0, static_cast<unsigned long>(hr));
+    }
+    return hr;
 }
 
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
@@ -1945,6 +1989,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
             reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
+    } else if constexpr (Slot == 41) {
+        return hr_to_u64(proxy_create_command_signature(
+            self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1), a2, reinterpret_cast<const IID*>(a3),
+            reinterpret_cast<void**>(a4)));
     } else if constexpr (Slot == 67) {
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
@@ -1987,12 +2035,6 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
-        if constexpr (Slot == 41) {
-            return hr_to_u64(proxy_create_command_signature(
-                self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1),
-                reinterpret_cast<ID3D12RootSignature*>(a2), reinterpret_cast<const IID*>(a3),
-                reinterpret_cast<void**>(a4)));
-        }
         const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
         if (Slot == routes.frame_interval) {
             log_xbox_route_once(Slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
@@ -2164,8 +2206,8 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 13 || slot == 14 || slot == 26 || slot == 31 || slot == 32 ||
-        slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == 133)
+        slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 62 ||
+        slot == 67 || slot == 75 || slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
