@@ -41,16 +41,114 @@ ENTROPY_SAMPLE = 1 << 20   # bytes of an unread range used for its entropy
 GAP_CHUNK = 1 << 20        # a gap is checked this many bytes at a time: one can be gigabytes long
 
 
+ZERO_CHUNK = bytes(GAP_CHUNK)   # compared with a gap piece: a memcmp is faster than counting its zero bytes
+
+
 def all_zero(buf, a, b, chunk=GAP_CHUNK):
     """Whether buf[a:b] is all zero bytes, reading at most `chunk` bytes at a time.
 
     Slicing a whole gap of a multi-gigabyte archive at once ran out of memory (a 20 GB archive in this package).
     """
+    zeros = ZERO_CHUNK if chunk == GAP_CHUNK else bytes(chunk)
     for p in range(a, b, chunk):
         piece = buf[p:min(p + chunk, b)]
-        if piece.count(0) != len(piece):
+        if piece != (zeros if len(piece) == chunk else zeros[:len(piece)]):
             return False
     return True
+
+
+INFLATE_FIRST = 1 << 13    # a candidate is first fed this many bytes, then twice as many each time ...
+INFLATE_BLOCK = 1 << 20    # ... up to this many
+HEADER_WINDOW = 1 << 16    # HeaderScan looks this far ahead for a start it has no hit of, ...
+HEADER_WINDOW_MAX = 1 << 24   # ... twice as far each time over a gap without one, up to this
+
+
+def inflate_window(buf, s, end):
+    """Inflate the zlib stream that starts at buf[s], reading no input at or past `end`.
+
+    Returns (data, used) when the stream ends inside the window (used = stored bytes it consumed), or (None, 0)
+    when the window ends first. Raises zlib.error for bytes that are not a zlib stream. The result does not depend
+    on how the input is cut into blocks; blocks start small and double so that a false candidate, which fails in
+    its first bytes, and a stream of a few KiB do not each copy a 1 MiB block of the archive (and of its unused
+    tail into `unused_data`).
+    """
+    d = zlib.decompressobj()
+    chunks, p, step = [], s, INFLATE_FIRST
+    while not d.eof and p < end:
+        chunk = buf[p:min(p + step, end)]
+        if not chunk:
+            break
+        chunks.append(d.decompress(chunk))
+        p += len(chunk)   # the slice can be short at EOF; advancing by a whole block overran it
+        if d.unused_data or d.eof:
+            break
+        if step < INFLATE_BLOCK:
+            step <<= 1
+    if not d.eof:
+        return None, 0
+    chunks.append(d.flush())
+    return b"".join(chunks), p - s - len(d.unused_data)
+
+
+class HeaderScan:
+    """Finds the next zlib / Bink 2 header in buf[pos:end] like ZHDR.search(buf, pos, end), faster.
+
+    The regex tests every byte against its first-byte set (about 220 MB/s over zero padding); `find` of the
+    five literal starts (`78 01`, `78 5e`, `78 9c`, `78 da`, `KB2`) is several times faster. Each start's next
+    hit is remembered, so it is searched for again only once the scan has moved past it, and a start is searched
+    for in windows (the first of HEADER_WINDOW bytes, doubling over a long gap) and no further than the earliest
+    hit known, so an archive of long streams that are skipped over is not read ahead of the scan. `pos` must not
+    go backwards between calls (a call with a smaller one searches afresh).
+    """
+    STARTS = (b"\x78\x01", b"\x78\x5e", b"\x78\x9c", b"\x78\xda", b"KB2")
+
+    def __init__(self, buf, end):
+        self.buf, self.end = buf, end
+        self.reset()
+
+    def reset(self):
+        self.next = [-1] * len(self.STARTS)      # offset of the start's first hit found so far (stale below pos)
+        self.scanned = [0] * len(self.STARTS)    # no hit of it before this offset, except the one in `next`
+        self.floor = 0
+
+    def _find(self, i, pos, bound):
+        """First hit of start `i` in buf[pos:] that begins before `bound`, or -1; remembers what it learns."""
+        buf, end, start = self.buf, self.end, self.STARTS[i]
+        stop = min(end, bound + len(start) - 1)
+        while True:
+            at = buf.find(start, pos, stop)
+            if at < 0:
+                self.scanned[i] = bound
+                return -1
+            if i == 4 and not (at + 4 <= end and 0x61 <= buf[at + 3] <= 0x7A):   # `KB2` + a lowercase letter
+                pos = at + 1
+                continue
+            self.next[i], self.scanned[i] = at, at + 1
+            return at
+
+    def search(self, pos):
+        """Offset of the first header at or after `pos`, or -1."""
+        if pos < self.floor:
+            self.reset()
+        self.floor = pos
+        end, nxt, scanned = self.end, self.next, self.scanned
+        window = HEADER_WINDOW
+        bound = min(end, pos + window)
+        while True:
+            best = end
+            for i in range(len(nxt)):
+                at = nxt[i]
+                if at < pos and scanned[i] < bound:
+                    at = self._find(i, max(pos, scanned[i]), bound)
+                if pos <= at < best:
+                    best = at
+            if best < bound or bound >= end:
+                return best if best < end else -1
+            if best < end:        # the earliest known hit is beyond the window: look for an earlier one up to it
+                bound = best + 1
+            else:
+                window = min(window << 1, HEADER_WINDOW_MAX)
+                bound = min(end, bound + window)
 
 
 def entropy(sample):
@@ -184,11 +282,11 @@ def main(argv=None) -> int:
                                   "sampled": len(sample)})
 
         t0 = time.time()
+        headers = HeaderScan(m, end)
         while pos < end:
-            mt = ZHDR.search(m, pos, end)
-            if not mt:
+            s = headers.search(pos)
+            if s < 0:
                 break
-            s = mt.start()
             if m[s:s + 3] == b"KB2":
                 if s + 0x1C > end:   # header cut off by the end of the file or of --limit's window: not a video
                     pos = s + 1
@@ -211,28 +309,17 @@ def main(argv=None) -> int:
                 last = pos = s + blen
                 system_pages.reset()
                 continue
-            d = zlib.decompressobj()
             try:
-                chunks, p = [], s
                 # Inflate only inside the scan window (all of the file without --limit): a stream that runs past
                 # its end is left out, so readable + zero + unread add up to the span, as in story_index (#712).
-                while not d.eof and p < end:
-                    chunk = m[p:min(p + (1 << 20), end)]
-                    if not chunk:
-                        break
-                    chunks.append(d.decompress(chunk))
-                    p += len(chunk)   # the slice can be short at EOF; advancing by 1 MiB overran it
-                    if d.unused_data or d.eof:
-                        break
-                out = b"".join(chunks) + d.flush()
+                out, used = inflate_window(m, s, end)
             except zlib.error:
                 pos = s + 1
                 continue
             adjacent = s == ((last + 15) & ~15) and not any(m[last:s])
-            if not d.eof or len(out) < system_pages.minimum_size(adjacent):
+            if out is None or len(out) < system_pages.minimum_size(adjacent):
                 pos = s + 1
                 continue
-            used = p - s - len(d.unused_data)
             system_pages.accept(out, adjacent=adjacent,
                                 root_framed=(s & 0xFFF) == 0x10 and s >= 16 and m[s - 16:s] == b"\0" * 16)
             account(last, s)
