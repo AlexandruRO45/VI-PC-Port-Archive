@@ -560,6 +560,26 @@ class TestManifestVerifier(unittest.TestCase):
             "2 problem(s)",
         ])
 
+    @unittest.skipIf(os.name == "nt", "Windows filenames cannot contain line breaks")
+    def test_cli_keeps_filename_with_crlf_on_one_report_line(self) -> None:
+        name = "two\r\nlines.bin"
+        with open(os.path.join(self.game_dir, name), "wb") as f:
+            f.write(b"synthetic")
+
+        args = (self.game_dir, "--manifest", self.manifest_path, "--quiet", "--strict")
+        structured = self.run_cli(*args, "--json")
+        self.assertEqual(structured.returncode, 1, structured.stderr)
+        report = json.loads(structured.stdout)
+        self.assertEqual(report["untracked"], [name])
+        self.assertEqual(report["problem_count"], 1)
+
+        plain = self.run_cli(*args)
+        self.assertEqual(plain.returncode, 1, plain.stderr)
+        self.assertEqual(plain.stdout.splitlines(), [
+            r"NEW       two\r\nlines.bin",
+            "1 problem(s)",
+        ])
+
     def test_cli_tampered_returns_exit_code_1(self) -> None:
         delta_p = os.path.join(self.game_dir, "delta.bin")
         with open(delta_p, "r+b") as f:

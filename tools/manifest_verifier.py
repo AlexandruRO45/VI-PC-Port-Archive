@@ -373,8 +373,8 @@ def print_report(
     strict: Optional[bool] = None,
 ) -> None:
     def write_result(kind: str, rel: str) -> None:
-        # Keep literal backslashes distinct from escapes added by stdout.
-        display_path = rel.replace("\\", "\\\\")
+        # Escape literal backslashes before escaping line breaks or encoding stdout.
+        display_path = rel.replace("\\", "\\\\").replace("\r", r"\r").replace("\n", r"\n")
         out.write(f"{kind:<10}{display_path}\n")
 
     for rel in sorted(report.problems.keys()):
