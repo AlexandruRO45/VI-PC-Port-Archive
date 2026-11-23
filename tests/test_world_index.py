@@ -160,6 +160,32 @@ class WorldIndexTest(unittest.TestCase):
         self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 0, 0x32)))
         self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 7, 0x34)))
 
+    def test_a_float_archetype_name_keeps_the_valid_sibling(self):
+        # Kev-Ball's review of #5655: a float archetypeName passed the set-based aggregate and both optional
+        # writers died formatting it as hex (exit 2, no report at all). Rejecting the declaration, as for the
+        # vector case, keeps the valid sibling in the export.
+        maps = os.path.join(self.dir, "maps")
+        os.makedirs(maps)
+        with open(os.path.join(maps, "bad.bin"), "wb") as f:
+            f.write(retype_member(make_resource(), 0, 0x21))
+        with open(os.path.join(maps, "good.bin"), "wb") as f:
+            f.write(make_resource())
+        out = os.path.join(self.dir, "out.json")
+        arch = os.path.join(self.dir, "archetypes.json")
+        entities = os.path.join(self.dir, "entities.jsonl")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(WI.main([maps, "--out", out, "--archetypes-out", arch,
+                                      "--entities-out", entities]), 0)
+        self.assertNotIn("Traceback", err.getvalue())
+        with open(arch, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["archetypes"], {"deadbeef": 1})
+        with open(entities, encoding="utf-8") as f:
+            self.assertEqual([json.loads(line)["archetype"] for line in f], ["deadbeef"])
+        with open(out, encoding="utf-8") as f:
+            summary = json.load(f)["summary"]
+        self.assertEqual((summary["resources"], summary["maps"], summary["entities"]), (1, 1, 1))
+
     def test_a_scalar_map_extent_is_rejected(self):
         # An extent goes through _r4(), which iterates the value.
         self.assertIsNone(WI.parse_resource(retype_member(make_resource(), 3, 0x21, table=0x3A0)))
