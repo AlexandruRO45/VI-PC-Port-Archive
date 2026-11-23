@@ -23,9 +23,10 @@ Stages (each skips work that is already done, so a stopped build continues where
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
               BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
-    runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
-              clang-cl and an xwin SDK (docs/testing.md) and gta6rt.sh starts it with Wine; --runtime-build DIR
-              takes a Windows build of runtime/ instead (the runtime-windows artifact of the Runtime workflow)
+    runtime   build the loader (needs the game's executable to run, not to build); gta6rt.cmd starts it on the
+              package. On Linux it is cross-built with clang-cl and an xwin SDK (docs/testing.md) and gta6rt.sh
+              starts it with Wine; --runtime-build DIR takes a Windows build of runtime/ instead (the
+              runtime-windows artifact of the Runtime workflow)
     pipelines create every translated shader on your GPU's driver as a pipeline, report anything the driver
               rejects or that has to be skipped, and save the pipeline cache next to the port (the runtime doesn't
               load that cache yet)
@@ -2071,6 +2072,62 @@ exec "${{WINE:-wine}}" "$here/gta6rt.exe" "$@"
 """
 
 
+def windows_launcher(out: str, work: str, image: str) -> str:
+    """gta6rt.cmd: what gta6rt.sh does under Wine, for Windows. --dry-run, --init or --run alone starts gta6rt.exe on
+    the package in game_path.txt with the port's overlay and the Vulkan backend; other arguments pass through as given.
+
+    cmd decodes a batch file and set /p input in the console's code page, so game_path.txt (UTF-8) and the folder
+    names written here are read in code page 65001, which is then put back; the other lines are ASCII. Values are
+    quoted wherever they are expanded, so &, ^, ( and ) in a path stay literal; % is doubled in the names written."""
+    def literal(text: str) -> str:
+        return text.replace("%", "%%")
+
+    shaders = os.path.abspath(os.path.join(work, "shaders", "spirv"))
+    # The runtime reads shader_path.txt. Its absolute path needs updating only if the whole port moved.
+    moved_catalog = ""
+    if os.path.commonpath([os.path.abspath(out), shaders]) == os.path.abspath(out):
+        recorded = literal(os.path.join(os.path.abspath(out), ""))
+        relative = literal(os.path.relpath(shaders, out))
+        moved_catalog = (f'if /i not "%here%"=="{recorded}" if not defined LEONIDA_SHADERS '
+                         f'set "LEONIDA_SHADERS=%here%{relative}"\n')
+    return f"""@echo off
+rem Starts gta6rt.exe, as gta6rt.sh does under Wine. --dry-run, --init or --run on its own uses the package in
+rem game_path.txt, the port's overlay for writes and the Vulkan backend; other arguments go to gta6rt.exe as given.
+setlocal EnableExtensions DisableDelayedExpansion
+set "here=%~dp0"
+if not "%~2"=="" goto pass
+if "%~1"=="--dry-run" goto package
+if "%~1"=="--init" goto package
+if "%~1"=="--run" goto package
+goto pass
+:package
+rem game_path.txt and the names below are UTF-8: read them in code page 65001, then put the console's back.
+set "cp="
+for /f "tokens=2 delims=:." %%C in ('chcp') do set "cp=%%C"
+if defined cp chcp 65001 >nul
+set "game="
+set /p game=<"%here%game_path.txt"
+set "image={literal(image)}"
+{moved_catalog}if defined cp chcp %cp% >nul
+if not defined game goto no_game
+cd /d "%game%" || exit /b 1
+if not exist ".\\%image%" goto no_image
+rem The game reads from its package and writes to the port's overlay.
+if not defined LEONIDA_D3D12 set "LEONIDA_D3D12=vulkan"
+"%here%gta6rt.exe" %~1 ".\\%image%" --overlay "%here%overlay"
+exit /b %ERRORLEVEL%
+:no_game
+>&2 echo Cannot read the game folder from "%here%game_path.txt"
+exit /b 1
+:no_image
+>&2 echo Missing game executable: "%CD%\\%image%"
+exit /b 1
+:pass
+"%here%gta6rt.exe" %*
+exit /b %ERRORLEVEL%
+"""
+
+
 def cmake_configure(build: str, *config: str, hint: str = "") -> None:
     """Configure runtime/ in build; the generator and build type are chosen only for a new build folder."""
     fresh = [] if os.path.isfile(os.path.join(build, "CMakeCache.txt")) else [
@@ -2164,8 +2221,12 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         finally:
             if os.path.exists(pending.name):
                 os.unlink(pending.name)
-    start = os.path.join(out, "gta6rt.exe")
-    if os.name != "nt":
+    if os.name == "nt":
+        start = os.path.join(out, "gta6rt.cmd")
+        # cmd needs CRLF line ends (.gitattributes keeps *.cmd that way too).
+        with open(start, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write(windows_launcher(out, work or os.path.join(out, "work"), v["expected_exe"]))
+    else:
         start = os.path.join(out, "gta6rt.sh")
         with open(start, "w", encoding="utf-8", newline="\n") as f:
             f.write(wine_launcher(out, work or os.path.join(out, "work"), v["expected_exe"]))
@@ -2179,7 +2240,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
             return "'" + re.sub(r"['\u2018-\u201b]", r"\g<0>\g<0>", path) + "'"
 
         log("runtime: built. Inspect the game's imports in PowerShell:\n"
-            f"  & {ps_literal(start)} --dry-run {ps_literal(image)}")
+            f"  & {ps_literal(start)} --dry-run")
     else:
         log(f"runtime: built. Inspect the game's imports with Wine:\n  {shlex.join([start, '--dry-run'])}")
 

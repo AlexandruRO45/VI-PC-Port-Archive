@@ -193,6 +193,11 @@ On an interactive terminal, a LEONIDA setup screen lets you set jobs and whether
 per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed; full stage logs go under `work/logs/`. Use
 `--no-tui` (or redirect stdout) for the plain console.
 
+The `runtime` stage puts `gta6rt.exe` in `--out` with `gta6rt.cmd` next to it. Run `<out>\gta6rt.cmd --dry-run` to
+inspect the game's imports, `<out>\gta6rt.cmd --init` to check TLS callbacks and DLL initialization, and
+`<out>\gta6rt.cmd --run` for startup. Like `gta6rt.sh` on Linux, these use the package in `game_path.txt`, the
+port's `overlay` for writes, and Vulkan by default; any other arguments go to `gta6rt.exe` unchanged.
+
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
 Opus streams to `work\assets\audio\wav` after the audio bank step; existing WAV files are skipped when a build resumes.
 

@@ -1111,6 +1111,18 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game_dir COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_game_dir.cmake")
+    # make_game's runtime stage installs this build with gta6rt.cmd, which starts it on the package in game_path.txt
+    # with the port's overlay. A Windows host only: under Wine the stage writes gta6rt.sh instead.
+    if(CMAKE_HOST_WIN32)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_test(NAME run_packaged_launcher COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_packaged_launcher.py"
+          "--loader=$<TARGET_FILE:gta6rt>" "--tls-host=$<TARGET_FILE:gta6rt_tls_host>"
+          "--guest=$<TARGET_FILE:tiny_game>" "--work-dir=${CMAKE_CURRENT_BINARY_DIR}")
+        set_tests_properties(run_packaged_launcher PROPERTIES TIMEOUT 180)
+      endif()
+    endif()
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)

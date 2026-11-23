@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -221,7 +222,7 @@ class RuntimePackagingTest(unittest.TestCase):
     def test_first_load_hint(self):
         self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
         image = "Player's Test.exe"
-        out = os.path.join(self.root, "Port Files")
+        out = os.path.join(self.root, "Player's Port")
         for platform in ("nt", "posix"):
             with self.subTest(platform=platform), mock.patch.object(make_game.os, "name", platform), \
                     mock.patch.object(make_game, "log") as log:
@@ -231,9 +232,9 @@ class RuntimePackagingTest(unittest.TestCase):
                 make_game.runtime(self.game, out, {"expected_exe": image}, self.build)
                 command = log.call_args.args[0].splitlines()[-1].strip()
                 if platform == "nt":
-                    self.assertIn("--dry-run", command)
-                    self.assertIn("gta6rt.exe'", command)
-                    self.assertIn("Player''s Test.exe'", command)
+                    # The packaged launcher, as on Linux: it finds the package and the executable itself.
+                    quoted = "'" + os.path.join(out, "gta6rt.cmd").replace("'", "''") + "'"
+                    self.assertEqual(command, f"& {quoted} --dry-run")
                 else:
                     self.assertEqual(shlex.split(command), [os.path.join(out, "gta6rt.sh"), "--dry-run"])
                 os.remove(path)
@@ -279,6 +280,87 @@ class RuntimePackagingTest(unittest.TestCase):
         env.pop("LEONIDA_SHADERS")
         result = subprocess.check_output([os.path.join(moved, "gta6rt.sh"), "--dry-run"], cwd=self.root, env=env)
         self.assertEqual(json.loads(result)[2], "Z:" + moved + "/Shader cache '$HOME'/shaders/spirv")
+
+    @unittest.skipUnless(os.name == "nt", "executes the generated cmd launcher")
+    def test_windows_first_boot_uses_the_packaged_game_and_shader_paths(self):
+        # gta6rt.exe is a copy of cmd.exe here. Started with gta6rt's arguments it ignores them and runs the commands
+        # on its stdin, which print its command line, working directory and LEONIDA_* variables, then exit 7.
+        import ctypes
+        from ctypes import wintypes
+
+        def argv(command_line):
+            shell32 = ctypes.WinDLL("shell32")
+            shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+            shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+            count = ctypes.c_int()
+            parsed = shell32.CommandLineToArgvW(command_line, ctypes.byref(count))
+            try:
+                return [parsed[i] for i in range(count.value)]
+            finally:
+                ctypes.WinDLL("kernel32").LocalFree(ctypes.cast(parsed, ctypes.c_void_p))
+
+        probe = ("@echo off\r\nchcp 65001 >nul\r\necho [[cmdline]]%CMDCMDLINE%\r\necho [[cwd]]\"%CD%\"\r\n"
+                 "set LEONIDA_\r\nexit 7\r\n")
+
+        def start(launcher, *args, extra=None):
+            env = {k: v for k, v in os.environ.items() if not k.upper().startswith("LEONIDA_")}
+            env.update(extra or {})
+            # A console of its own, in the system's OEM code page: the launcher reads game_path.txt (UTF-8)
+            # anyway, and neither its code page switch nor the probe's reaches the console running this test.
+            r = subprocess.run([launcher, *args], cwd=root, env=env, input=probe.encode(), capture_output=True,
+                               timeout=60, creationflags=subprocess.CREATE_NO_WINDOW)
+            lines = (r.stdout + r.stderr).decode("utf-8", "replace").splitlines()
+            seen = {"code": r.returncode, "text": "\n".join(lines), "env": {}}
+            for line in lines:
+                if line.startswith("[[cmdline]]"):
+                    seen["argv"] = argv(line[len("[[cmdline]]"):])[1:]
+                elif line.startswith("[[cwd]]"):
+                    seen["cwd"] = line[len("[[cwd]]"):].strip('"')
+                elif line.startswith("LEONIDA_") and "=" in line:
+                    name, value = line.split("=", 1)
+                    seen["env"][name] = value
+            return seen
+
+        root = os.path.realpath(self.root)
+        image = "Player's test.exe"
+        game = os.path.join(root, "G\u00e4me \u03bb 100% & (x86) !")
+        out = os.path.join(root, "Port \u00dc (x86) & co")
+        os.makedirs(game)
+        self.write_artifact("gta6rt_tls_host.dll", b"")
+        shutil.copyfile(os.path.join(os.environ["SystemRoot"], "System32", "cmd.exe"),
+                        os.path.join(self.build, "gta6rt.exe"))
+        with mock.patch.object(make_game, "log"):
+            make_game.runtime(game, out, {"expected_exe": image}, self.build, work=os.path.join(root, "work"))
+        launcher = os.path.join(out, "gta6rt.cmd")
+        missing = start(launcher, "--run")
+        self.assertEqual(missing["code"], 1, missing["text"])
+        self.assertIn(image, missing["text"])
+        self.assertNotIn("argv", missing)
+        with open(os.path.join(game, image), "wb"):
+            pass
+        for mode in ("--dry-run", "--init", "--run"):
+            with self.subTest(mode=mode):
+                seen = start(launcher, mode)
+                self.assertEqual(seen["code"], 7, seen["text"])
+                self.assertEqual(seen.get("argv"), [mode, ".\\" + image, "--overlay", os.path.join(out, "overlay")])
+                self.assertEqual(seen.get("cwd"), game)
+                self.assertEqual(seen["env"], {"LEONIDA_D3D12": "vulkan"})
+        seen = start(launcher, "--run", extra={"LEONIDA_SHADERS": "D:\\custom", "LEONIDA_D3D12": "trace"})
+        self.assertEqual(seen["env"], {"LEONIDA_SHADERS": "D:\\custom", "LEONIDA_D3D12": "trace"})
+        # Anything but a mode on its own goes to gta6rt.exe as given, from where the launcher was started.
+        seen = start(launcher, "--run", "other.exe", "--", "two words")
+        self.assertEqual((seen["code"], seen.get("argv"), seen.get("cwd"), seen["env"]),
+                         (7, ["--run", "other.exe", "--", "two words"], root, {}))
+
+        work = os.path.join(out, "Shader cache 100% '$HOME'")
+        with mock.patch.object(make_game, "log"):
+            make_game.runtime(game, out, {"expected_exe": image}, self.build, work=work)
+        self.assertEqual(start(launcher, "--dry-run")["env"], {"LEONIDA_D3D12": "vulkan"})
+        moved = out + " moved"
+        os.rename(out, moved)
+        seen = start(os.path.join(moved, "gta6rt.cmd"), "--dry-run")
+        self.assertEqual(seen["env"].get("LEONIDA_SHADERS"),
+                         os.path.join(moved, "Shader cache 100% '$HOME'", "shaders", "spirv"))
 
     def test_runtime_records_shader_work_directory(self):
         self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
@@ -478,6 +560,30 @@ class RuntimeBuildPackagingTest(unittest.TestCase):
             self.assertIn('"${WINE:-wine}" "$here/gta6rt.exe" "$@"', text)
             if os.name != "nt":
                 self.assertTrue(os.access(launcher, os.X_OK))
+
+    def test_on_windows_the_build_gets_a_cmd_launcher_for_game_path_txt(self):
+        # game_path.txt was written on Windows too, but only gta6rt.sh read it: gta6rt.exe started without an
+        # image prints its usage and exits 2.
+        with tempfile.TemporaryDirectory() as root:
+            build, game, out = (os.path.join(root, n) for n in ("build", "game", "out"))
+            os.makedirs(build)
+            os.makedirs(game)
+            for name in make_game.RUNTIME_FILES:
+                with open(os.path.join(build, name), "wb") as f:
+                    f.write(name.encode())
+            with mock.patch.object(make_game.os, "name", "nt"), mock.patch.object(make_game, "log"):
+                make_game.runtime(game, out, {"expected_exe": "100% game.exe"}, build)
+            self.assertFalse(os.path.exists(os.path.join(out, "gta6rt.sh")))
+            with open(os.path.join(out, "gta6rt.cmd"), "rb") as f:
+                data = f.read()
+            # No BOM (cmd would read it as part of the first command), and CRLF: cmd's goto and labels misread LF.
+            self.assertTrue(data.startswith(b"@echo off\r\n"))
+            self.assertEqual(data.count(b"\n"), data.count(b"\r\n"))
+            text = data.decode("utf-8")
+            self.assertIn('set /p game=<"%here%game_path.txt"', text)
+            self.assertIn('set "image=100%% game.exe"', text)
+            self.assertIn('"%here%gta6rt.exe" %~1 ".\\%image%" --overlay "%here%overlay"', text)
+            self.assertIn('"%here%gta6rt.exe" %*', text)
 
 
 class PipelineCheckExeTest(unittest.TestCase):
