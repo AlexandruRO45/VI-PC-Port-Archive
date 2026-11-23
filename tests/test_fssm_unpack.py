@@ -669,14 +669,15 @@ class TestMainDirectoryProcessing(unittest.TestCase):
                          ["fssm", "fssm_index.json", "fssm_index.json.tmp", "shader_a.dxbc"])
 
 
-    def test_main_records_read_oserror_and_continues(self):
+    def test_main_read_oserror_withholds_index_until_retry_succeeds(self):
         fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
+        fssm_2 = make_fssm(version=0x0101, instructions=[(0x20, S_ENDPGM)])
         good_path = os.path.join(self.src, "good.dxbc")
         bad_path = os.path.join(self.src, "bad.dxbc")
         with open(good_path, "wb") as f:
             f.write(make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1)}))]))
         with open(bad_path, "wb") as f:
-            f.write(b"unreadable")
+            f.write(make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_2)}))]))
 
         real_open = open
 
@@ -685,15 +686,21 @@ class TestMainDirectoryProcessing(unittest.TestCase):
                 raise PermissionError(errno.EACCES, "Permission denied", path)
             return real_open(path, mode, *args, **kwargs)
 
-        buf = io.StringIO()
+        out_buf, err_buf = io.StringIO(), io.StringIO()
         with mock.patch("builtins.open", side_effect=failing_open):
-            with mock.patch("sys.stdout", buf):
+            with mock.patch("sys.stdout", out_buf), mock.patch("sys.stderr", err_buf):
                 rc = fssm_unpack.main([self.src])
-        self.assertEqual(rc, 0)
-        self.assertIn("1 FSSM blobs", buf.getvalue())
-        self.assertIn("PermissionError", buf.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertIn("1 FSSM blobs", out_buf.getvalue())
+        self.assertIn("PermissionError", out_buf.getvalue())
+        self.assertIn("bad.dxbc", err_buf.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.src, "fssm_index.json")))
+
+        with mock.patch("sys.stdout", io.StringIO()):
+            rc_retry = fssm_unpack.main([self.src])
+        self.assertEqual(rc_retry, 0)
         with open(os.path.join(self.src, "fssm_index.json"), encoding="utf-8") as f:
-            self.assertEqual([row["name"] for row in json.load(f)], ["good"])
+            self.assertEqual([row["name"] for row in json.load(f)], ["bad", "good"])
 
 
 if __name__ == "__main__":

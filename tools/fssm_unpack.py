@@ -163,11 +163,16 @@ def main(argv=None) -> int:
     except OSError as e:
         print(f"ERROR: cannot create output directory {out}: {e.strerror or e}", file=sys.stderr)
         return 2
-    rows, problems = [], Counter()
+    rows, problems, read_errors = [], Counter(), []
     for shader in shaders:
         try:
             with open(shader, "rb") as f:
                 d = f.read()
+        except OSError as e:
+            problems[type(e).__name__] += 1
+            read_errors.append((shader, e.strerror or str(e)))
+            continue
+        try:
             fssm, ents = unpack(d, payload=a.payload)
         except Exception as e:  # noqa: BLE001
             problems[type(e).__name__] += 1
@@ -184,6 +189,11 @@ def main(argv=None) -> int:
                      "version": struct.unpack_from("<H", fssm, 4)[0], "endpgm": ends,
                      "tags": sorted(hex(t) for t in ents), "xbch_payloads": payloads})
     print(f"{len(rows)} FSSM blobs, problems: {dict(problems)}")
+    if read_errors:
+        first_path, first_msg = read_errors[0]
+        print(f"ERROR: {len(read_errors)} shader file(s) could not be read (first: {first_path}: {first_msg}); "
+              "not writing fssm_index.json so the next run retries.", file=sys.stderr)
+        return 1
     if not rows:
         # No index: make_game.py takes fssm_index.json as proof this step finished, and an empty one is not.
         print(f"ERROR: no shader in {src} unpacked. Check that it holds the carved .dxbc files of a supported "
