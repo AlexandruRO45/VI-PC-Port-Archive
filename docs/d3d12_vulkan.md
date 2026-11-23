@@ -3280,8 +3280,6 @@ Not implemented yet:
 - Mesh-shader statistics (`PIPELINE_STATISTICS1`, D3D-132), and stream-output statistics that count real
   primitives (they wait for stream output itself). (`GetClockCalibration` is implemented: see section 4.4,
   "Fences, queues and frames in flight".)
-- Stream-output and mesh-shader statistics. (`GetClockCalibration` is implemented: see section 4.4, "Fences,
-  queues and frames in flight".)
 - Xbox-specific query heap types (if any) are **Open**; unknown types are logged.
 
 ### 4.7 Indirect commands and command signatures
