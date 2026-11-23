@@ -18157,6 +18157,14 @@ def main():
             why[f"translator error {type(e).__name__}"] += 1
             drop_stale(name)
             continue
+        except struct.error:
+            # A readable but truncated input -- a zero-byte or short .dxbc container, or a short FSSM sidecar --
+            # raises struct.error from a short struct.unpack. It is malformed input, not the file being unreadable
+            # (the OSError above) and not a translator fault: count it as its own reason (struct.error's class name
+            # is "error", so the translator-error label would read "translator error error") and keep going.
+            why["truncated input (short container or sidecar)"] += 1
+            drop_stale(name)
+            continue
         ok += 1
         sa = os.path.join(a.out, name + ".spvasm")
         sv = os.path.join(a.out, name + ".spv")

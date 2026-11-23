@@ -773,5 +773,96 @@ class PopsInvocationInterlock(unittest.TestCase):
         self.assertEqual(spv.count("OpEndInvocationInterlockEXT"), 0)
 
 
+class TruncatedInput(unittest.TestCase):
+    """A readable but truncated input -- a zero-byte or short .dxbc container, or a short FSSM sidecar -- raised
+    struct.error out of main() and tracebacked. It is malformed input like the IndexError/KeyError/ValueError case
+    beside it (not an unreadable file): counted as its own reason, the shader's previous module retired, and the run
+    continues."""
+
+    GOOD_DXBC = b"DXBC" + bytes(28)
+    GOOD_FSSM = bytes(0x148)
+
+    def make(self, root, bad, kind):
+        (root / "disasm").mkdir()
+        (root / "disasm" / "ps_ok.s").write_text("\ts_endpgm\n", encoding="utf-8")
+        (root / "ps_ok.dxbc").write_bytes(self.GOOD_DXBC)
+        (root / "disasm" / (bad + ".s")).write_text("\ts_endpgm\n", encoding="utf-8")
+        if kind == "dxbc":
+            (root / (bad + ".dxbc")).write_bytes(self.GOOD_DXBC)
+        else:
+            (root / "fssm").mkdir()
+            (root / "fssm" / (bad + ".fssm")).write_bytes(self.GOOD_FSSM)
+
+    def truncate(self, root, bad, kind, size):
+        path = root / (bad + ".dxbc") if kind == "dxbc" else root / "fssm" / (bad + ".fssm")
+        path.write_bytes(path.read_bytes()[:size])
+
+    def run_tool(self, root):
+        """main() with the SPIR-V binaries stubbed, so this runs where spirv-as/spirv-val are not installed."""
+        def spirv_tool(cmd, **kwargs):
+            if os.path.basename(cmd[0]) == "spirv-as":
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(root / "disasm"), "--out", str(root / "spirv")]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = rdna2spirv.main()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_each_truncated_input_is_one_reason_and_the_run_continues(self):
+        # One subTest per truncation that tracebacked before the fix: the .dxbc header read at offset 28 needs 32
+        # bytes and the FSSM dispatch state needs 0x148.
+        cases = (
+            ("dxbc_zero", "ps_bad", "dxbc", 0), ("dxbc_1", "ps_bad", "dxbc", 1),
+            ("dxbc_8", "ps_bad", "dxbc", 8), ("dxbc_20", "ps_bad", "dxbc", 20),
+            ("dxbc_31", "ps_bad", "dxbc", 31), ("dxbc_half", "ps_bad", "dxbc", 16),
+            ("fssm_zero", "cs_bad", "fssm", 0), ("fssm_4", "cs_bad", "fssm", 4),
+            ("fssm_12", "cs_bad", "fssm", 12),
+        )
+        for label, bad, kind, size in cases:
+            with self.subTest(kind=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.make(root, bad, kind)
+                self.truncate(root, bad, kind, size)
+                out = root / "spirv"
+                out.mkdir()
+                (out / (bad + ".spv")).write_bytes(b"old module")
+                (out / "index.json").write_text(json.dumps({bad: {"stage": "ps"}}), encoding="utf-8")
+                code, stdout, stderr = self.run_tool(root)
+                self.assertIsNone(code, stderr)       # the translator-error convention below it: keep going
+                self.assertNotIn("Traceback", stderr)
+                self.assertEqual(stderr, "")
+                self.assertIn("truncated input (short container or sidecar)", stdout)
+                self.assertIn("2 shaders: 1 translated, 1 pass spirv-val", stdout)
+                self.assertFalse((out / (bad + ".spv")).exists())    # retired like any failed shader
+                self.assertTrue((out / "ps_ok.spv").is_file())
+                self.assertEqual(set(json.loads((out / "index.json").read_text(encoding="utf-8"))), {"ps_ok"})
+
+    def test_a_complete_input_is_unchanged(self):
+        # Positive control: nothing truncated, so the shader publishes as before and a rerun reproduces it exactly.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "disasm").mkdir()
+            (root / "disasm" / "ps_ok.s").write_text("\ts_endpgm\n", encoding="utf-8")
+            (root / "ps_ok.dxbc").write_bytes(self.GOOD_DXBC)
+            code, stdout, stderr = self.run_tool(root)
+            self.assertIsNone(code, stderr)
+            self.assertEqual(stderr, "")
+            self.assertEqual(stdout.splitlines()[-1], "1 shaders: 1 translated, 1 pass spirv-val")
+            out = root / "spirv"
+            self.assertEqual((out / "ps_ok.spv").read_bytes(), b"new module")
+            self.assertIn("OpEntryPoint Fragment %main \"main\"",
+                          (out / "ps_ok.spvasm").read_text(encoding="utf-8"))
+            self.assertEqual(set(json.loads((out / "index.json").read_text(encoding="utf-8"))), {"ps_ok"})
+            tree = {f.relative_to(out).as_posix(): f.read_bytes() for f in out.rglob("*") if f.is_file()}
+            code, stdout, stderr = self.run_tool(root)
+            self.assertIsNone(code, stderr)
+            self.assertEqual(stderr, "")
+            self.assertEqual({f.relative_to(out).as_posix(): f.read_bytes() for f in out.rglob("*") if f.is_file()},
+                             tree)
+
+
 if __name__ == "__main__":
     unittest.main()
