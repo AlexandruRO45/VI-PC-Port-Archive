@@ -31,9 +31,6 @@ RUNNER_SKIPS = {
         # One-line wrapper around _check_random_graphs(), which the runner already calls; listing it would run
         # the 18,000-graph sweep twice.
         "test_random_graphs",
-        # Dead on upstream/main at 16282101: its four S.depth() asserts run nowhere.  PR #3122 adds the call;
-        # drop this entry once that merges and the runner calls test_depth() first.
-        "test_depth",
     },
     "tests/test_feature_scan.py": {
         # Its __main__ runner calls every test_* through run_tests([... for ... in globals().items() ...]), a
@@ -75,8 +72,8 @@ def dispatches_tests(block):
     return False
 
 
-def uncalled_tests(source):
-    """Top-level test functions the file's __main__ runner never runs; None when there is no real guard."""
+def uncalled_tests(rel, source):
+    """Return missed tests after documented skips, or None when there is no real guard."""
     tree = ast.parse(source)
     block = runner_block(tree)
     if block is None:
@@ -85,6 +82,7 @@ def uncalled_tests(source):
         return []
     names = {n.id for n in ast.walk(block) if isinstance(n, ast.Name)}
     names |= {n.attr for n in ast.walk(block) if isinstance(n, ast.Attribute)}
+    names.update(RUNNER_SKIPS.get(rel, ()))
     return [node.name for node in tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name.startswith("test") and node.name not in names]
@@ -106,21 +104,33 @@ class RunnerCallsTestsTest(unittest.TestCase):
     def test_every_stdlib_runner_calls_its_test_functions(self):
         dead = []
         for rel in self.files:
-            missing = uncalled_tests(registration.read(registration.ROOT, rel))
-            if not missing:               # None (no guard) and [] (every test reached) both pass
+            missing = uncalled_tests(rel, registration.read(registration.ROOT, rel))
+            if not missing:
                 continue
-            skips = RUNNER_SKIPS.get(rel, ())
             dead += [f"  {rel}: {name}() is defined but its __main__ runner never calls it, so the python -I loop "
                      f"runs it nowhere and still prints ok; call it, or add it to RUNNER_SKIPS with a reason"
-                     for name in missing if name not in skips]
+                     for name in missing]
         self.assertEqual(dead, [], "dead top-level tests in stdlib-mode runners:\n" + "\n".join(dead))
 
     def test_a_dropped_call_is_flagged(self):
         # Bite check on a file this PR does not touch: losing one runner call must be reported, not absorbed.
-        source = registration.read(registration.ROOT, "tests/test_lane_masks.py")
-        self.assertEqual(uncalled_tests(source), [])
+        rel = "tests/test_lane_masks.py"
+        source = registration.read(registration.ROOT, rel)
+        self.assertEqual(uncalled_tests(rel, source), [])
         sabotaged = source.replace("    test_straight_line()", "    # dropped for the bite check", 1)
-        self.assertEqual(uncalled_tests(sabotaged), ["test_straight_line"])
+        self.assertEqual(uncalled_tests(rel, sabotaged), ["test_straight_line"])
+
+    def test_cfg_runner_reports_a_dropped_depth_call(self):
+        rel = "tests/test_cfg_structure.py"
+        source = (
+            "def test_depth(): pass\n"
+            "def _check_random_graphs(): pass\n"
+            "def test_random_graphs(): _check_random_graphs()\n"
+            "if __name__ == '__main__':\n"
+            "    _check_random_graphs()\n"
+        )
+        self.assertEqual(uncalled_tests(rel, source + "    test_depth()\n"), [])
+        self.assertEqual(uncalled_tests(rel, source), ["test_depth"])
 
 
 if __name__ == "__main__":
