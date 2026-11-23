@@ -160,5 +160,79 @@ class TestMulkASTAndTypes(unittest.TestCase):
         self.assertEqual(words[0], (-32) & MASK32)
 
 
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter for SALU blocks."""
+
+    def __init__(self) -> None:
+        self.sgprs = [0] * 64
+
+    def exec_line(self, line: str) -> None:
+        tokens = line.strip().replace(",", " ").split()
+        if not tokens:
+            return
+        op = tokens[0]
+        if op == "s_mov_b32":
+            dst = int(tokens[1].lstrip("s"))
+            val = int(tokens[2], 0)
+            self.sgprs[dst] = val & MASK32
+        elif op == "s_mulk_i32":
+            dst = int(tokens[1].lstrip("s"))
+            k = int(tokens[2], 0)
+            self.sgprs[dst] = s_mulk_i32_oracle(self.sgprs[dst], k)
+
+
+class TestMulkScalarInterpreter(unittest.TestCase):
+    """Commit 3: deterministic scalar instruction interpreter for s_mulk_i32."""
+
+    def test_sequential_chained_execution(self):
+        interp = ScalarInterpreter()
+        lines = [
+            "s_mov_b32 s0, 3",
+            "s_mulk_i32 s0, 5",
+            "s_mulk_i32 s0, -2",
+            "s_mulk_i32 s0, 10",
+        ]
+        for ln in lines:
+            interp.exec_line(ln)
+        self.assertEqual(interp.sgprs[0], (-300) & MASK32)
+
+        prog = lines + [
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_mulk_ps(prog, "ps_mulk_chained")
+        self.assertEqual(words[0], interp.sgprs[0])
+
+    def test_parallel_sgpr_operations(self):
+        interp = ScalarInterpreter()
+        lines = [
+            "s_mov_b32 s0, 10",
+            "s_mov_b32 s1, 20",
+            "s_mov_b32 s2, 30",
+            "s_mov_b32 s3, 40",
+            "s_mulk_i32 s0, 2",
+            "s_mulk_i32 s1, -3",
+            "s_mulk_i32 s2, 4",
+            "s_mulk_i32 s3, -5",
+        ]
+        for ln in lines:
+            interp.exec_line(ln)
+        self.assertEqual(interp.sgprs[0], 20)
+        self.assertEqual(interp.sgprs[1], (-60) & MASK32)
+        self.assertEqual(interp.sgprs[2], 120)
+        self.assertEqual(interp.sgprs[3], (-200) & MASK32)
+
+        prog = lines + [
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, s2",
+            "v_mov_b32 v3, s3",
+        ]
+        words = run_mulk_ps(prog, "ps_mulk_parallel_sgprs")
+        self.assertEqual(words, [interp.sgprs[0], interp.sgprs[1], interp.sgprs[2], interp.sgprs[3]])
+
+
 if __name__ == '__main__':
     unittest.main()
