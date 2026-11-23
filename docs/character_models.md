@@ -331,6 +331,18 @@ python -I tools/ped_assemble.py cull-overlap --target <upper> --ref <lower> -o <
 python -I tools/ped_assemble.py inspect-seams <parts...>
 ```
 
+Static GLB inputs preserve node placement: the importer composes each mesh node's ancestry using
+glTF's column-major `matrix` or `T * R * S`, bakes the linear transform into positions, and retains
+the world translation for standing-space alignment. Normals use the normalized inverse transpose;
+mirrored transforms reverse triangle winding. This also preserves shear introduced by a rotated
+child under a nonuniformly scaled parent. Singular static transforms are rejected before output.
+Import still visits all mesh nodes in file order, with a bare-mesh fallback; it does not filter by
+the selected scene. Skin parts retain their existing payload and local-translation handling. The
+static bake does not apply to skins, whose glTF deformation uses joint globals and inverse binds
+instead of the instantiating mesh node's global transform (see the glTF 2.0
+[transformations](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#transformations) and
+[skins](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#skins) rules).
+
 ### 15-channel meshlet vertex layout
 
 Character geometry uses GPU meshlets (16-byte headers, up to 128 local vertices per meshlet,

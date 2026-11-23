@@ -290,6 +290,101 @@ def _identity_mat4_col() -> tuple[float, ...]:
     )
 
 
+def _glb_local_transform(node: dict, *, path: str):
+    """Return glTF's affine matrix as a row-major 3x3 and a translation."""
+    def values(key, default, count):
+        raw = node.get(key, default)
+        try:
+            if not isinstance(raw, (list, tuple)) or len(raw) != count:
+                raise ValueError
+            result = tuple(float(v) for v in raw)
+            if not all(math.isfinite(v) for v in result):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise PedAssembleError(f"{path}: node {key} must contain {count} finite numbers")
+        return result
+
+    if "matrix" in node:
+        if any(key in node for key in ("translation", "rotation", "scale")):
+            raise PedAssembleError(f"{path}: node matrix and TRS are mutually exclusive")
+        m = values("matrix", (), 16)
+        if (m[3], m[7], m[11], m[15]) != (0.0, 0.0, 0.0, 1.0):
+            raise PedAssembleError(f"{path}: static node matrix must be affine")
+        return tuple(tuple(m[c * 4 + r] for c in range(3)) for r in range(3)), m[12:15]
+    translation = values("translation", (0.0, 0.0, 0.0), 3)
+    rotation = values("rotation", (0.0, 0.0, 0.0, 1.0), 4)
+    scale = values("scale", (1.0, 1.0, 1.0), 3)
+    length = math.hypot(*rotation)
+    if length == 0.0:
+        raise PedAssembleError(f"{path}: node rotation quaternion must be nonzero")
+    rotation = glb_writer._quat_matrix(tuple(v / length for v in rotation))
+    return tuple(tuple(rotation[r][c] * scale[c] for c in range(3)) for r in range(3)), translation
+
+
+def _glb_transform_resolver(nodes: list, *, path: str):
+    """Resolve only requested static nodes, preserving the importer's flat mesh order."""
+    parents = {}
+    for parent, node in enumerate(nodes):
+        children = node.get("children", [])
+        if not isinstance(children, list):
+            raise PedAssembleError(f"{path}: nodes[{parent}].children must be an array")
+        for child in children:
+            if type(child) is not int or not 0 <= child < len(nodes):
+                raise PedAssembleError(f"{path}: nodes[{parent}] has invalid child index {child!r}")
+            if child in parents:
+                raise PedAssembleError(f"{path}: nodes[{child}] has more than one parent reference")
+            parents[child] = parent
+    identity = (((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)), (0.0, 0.0, 0.0))
+    cache = {None: identity}
+
+    def resolve(node_index):
+        current = node_index
+        chain, seen = [], set()
+        while current not in cache:
+            if current in seen:
+                raise PedAssembleError(f"{path}: cycle in static node ancestry at nodes[{current}]")
+            seen.add(current)
+            chain.append(current)
+            current = parents.get(current)
+        for index in reversed(chain):
+            matrix, translation = _glb_local_transform(nodes[index], path=f"{path}: nodes[{index}]")
+            parent_matrix, parent_translation = cache[parents.get(index)]
+            world_matrix = tuple(tuple(sum(parent_matrix[r][k] * matrix[k][c] for k in range(3))
+                                       for c in range(3)) for r in range(3))
+            world_translation = _vec_add(tuple(_vec_dot(row, translation) for row in parent_matrix),
+                                         parent_translation)
+            cache[index] = world_matrix, world_translation
+        return cache[node_index]
+
+    return resolve
+
+
+def _transform_glb_geometry(positions, normals, triangles, matrix, *, path: str):
+    """Bake a static node's linear transform without losing parent-induced shear."""
+    if matrix == ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+        return positions, normals, triangles
+    scale = max(abs(v) for row in matrix for v in row)
+    if not math.isfinite(scale) or scale == 0.0:
+        raise PedAssembleError(f"{path}: static node transform must be finite and invertible")
+    # Positive uniform rescaling preserves determinant sign and normalized normal directions.
+    # It also avoids rejecting small valid scales through an arbitrary determinant epsilon.
+    scaled = tuple(tuple(v / scale for v in row) for row in matrix)
+    cofactors = (_vec_cross(scaled[1], scaled[2]), _vec_cross(scaled[2], scaled[0]),
+                 _vec_cross(scaled[0], scaled[1]))
+    determinant = _vec_dot(scaled[0], cofactors[0])
+    if determinant == 0.0 or not math.isfinite(determinant):
+        raise PedAssembleError(f"{path}: static node transform must be invertible")
+    positions = [tuple(_vec_dot(row, position) for row in matrix) for position in positions]
+    if normals is not None:
+        # Cofactors are det(M) * inverse(transpose(M)); normalization removes the magnitude.
+        sign = -1.0 if determinant < 0.0 else 1.0
+        normals = [glb_writer._normalize3(*(sign * _vec_dot(row, normal) for row in cofactors))
+                   for normal in normals]
+    if determinant < 0.0:
+        triangles = [(a, c, b) for a, b, c in triangles]
+    return positions, normals, triangles
+
+
 def classify_part_role(name: str) -> str:
     """Infer the modular ped slot role from a drawable or part name."""
     base = os.path.splitext(os.path.basename(name))[0].strip().lower()
@@ -1433,11 +1528,12 @@ def read_glb_parts(path: str) -> list[MeshPart]:
             remaining_implicit_rows -= rows
         return _read_glb_accessor(doc, bin_chunk, index)
 
-    mesh_nodes = [(n, n["mesh"]) for n in nodes if "mesh" in n]
+    mesh_nodes = [(i, n, n["mesh"]) for i, n in enumerate(nodes) if "mesh" in n]
     if not mesh_nodes:
-        mesh_nodes = [({"name": m.get("name", f"{stem}_{i}")}, i) for i, m in enumerate(meshes)]
+        mesh_nodes = [(None, {"name": m.get("name", f"{stem}_{i}")}, i) for i, m in enumerate(meshes)]
+    world_transform = None
 
-    for node, mesh_idx in mesh_nodes:
+    for node_index, node, mesh_idx in mesh_nodes:
         mesh = meshes[mesh_idx]
         node_name = node.get("name") or mesh.get("name") or stem
         trans = tuple(float(v) for v in node.get("translation", (0.0, 0.0, 0.0)))
@@ -1510,6 +1606,16 @@ def read_glb_parts(path: str) -> list[MeshPart]:
             else:
                 part_joint_names = None
 
+            part_translation = trans
+            if not has_node_skin and not has_skin_attrs:
+                if world_transform is None:
+                    world_transform = _glb_transform_resolver(nodes, path=path)
+                matrix, part_translation = world_transform(node_index)
+                positions, normals, triangles = _transform_glb_geometry(
+                    positions, normals, triangles, matrix, path=f"{path}: part {pname!r}")
+            # Skin deformation uses joint globals and inverse binds, not the mesh node transform.
+            # Keep the existing skin payload and local-translation convention unchanged here.
+
             mat_spec = None
             if "material" not in prim or 0 <= prim["material"] < len(materials):
                 gm = materials[prim["material"]] if "material" in prim else {"name": f"{pname}_mat"}
@@ -1530,7 +1636,7 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 positions=positions,
                 triangles=triangles,
                 coord_space="y-up",
-                translation=trans,
+                translation=part_translation,
                 normals=normals,
                 uvs=uvs,
                 colors=colors,
