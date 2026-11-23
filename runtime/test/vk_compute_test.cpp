@@ -211,12 +211,12 @@ int main(int argc, char** argv) {
     const bool needs_float64 = leonida::vk_test::spirv_declares_capability(code.data(), code.size(), 10);  // Float64
     if (needs_float64 && !f2q.features.shaderFloat64) {
         std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64\n", argv[1]);
+        return 77;
+    }
     // Int64Atomics: rdna2spirv.py's 64-bit compare/carry buffer and global atomics (shaderBufferInt64Atomics)
     const bool needs_int64_atomics = leonida::vk_test::spirv_declares_capability(code.data(), code.size(), 12);
     if (needs_int64_atomics && !f12q.shaderBufferInt64Atomics) {
         std::fprintf(stderr, "unsupported: %s uses Int64Atomics and the device has no shaderBufferInt64Atomics\n", argv[1]);
-        return 77;
-    }
         return 77;
     }
     // A size the device can't require but runs anyway: one min..max range (fixed), or its default subgroupSize in a
