@@ -401,6 +401,7 @@ def write_json_report(path, report):
     try:
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(report, f, indent=1)
+            f.write("\n")
     except OSError as e:
         return f"cannot write --json {path}: {e.strerror or e}"
     return None
