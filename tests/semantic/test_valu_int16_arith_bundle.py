@@ -102,6 +102,23 @@ class TestVAddI16EdgeCases(unittest.TestCase):
         expected = [(i * 700) & MASK16 for i in range(64)]
         self.assertEqual(res, expected)
 
+class TestVAddI16Translator(unittest.TestCase):
+    def test_translate_v_add_i16(self):
+        lines = [
+            "v_mov_b32 v1, 100",
+            "v_mov_b32 v2, 200",
+            "v_add_i16 v0, v1, v2",
+            "v_mov_b32 v3, 30000",
+            "v_mov_b32 v4, 10000",
+            "v_add_i16 v1, v3, v4 clamp",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_add_i16", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = mrt0_words(spv)
+        self.assertEqual(words, [300, 0x7FFF, 300, 0x7FFF])
+
 
 if __name__ == "__main__":
     unittest.main()
