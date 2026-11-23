@@ -340,6 +340,26 @@ class CliTest(unittest.TestCase):
         self.assertIn("--out", self.cli_error([path, "--out", os.path.join(path, "sub", "r.json")]))
         self.assertIn("folder", self.cli_error([path, "--out", self.tmp.name]))
 
+    def test_negative_or_empty_window_is_one_error(self):
+        defs, m = scene()
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([defs, m]))
+        self.assertIn("--start must not be negative", self.cli_error([path, "--start", "-1"]))
+        self.assertIn("--limit must be at least 1", self.cli_error([path, "--limit", "0"]))
+        self.assertIn("--limit must be at least 1", self.cli_error([path, "--limit", "-5"]))
+
+    def test_start_outside_the_data_area_is_an_error_not_a_traceback(self):
+        # rpf() writes the data area at 0x40, so 0 is inside the header and size is past the end. scan_rpf names both;
+        # main() used to let that ValueError out, so the run ended in a traceback with exit 1.
+        defs, m = scene()
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([defs, m]))
+        size = os.path.getsize(path)
+        for start in (0, size, size + 4096):
+            self.assertIn("outside the data area", self.cli_error([path, "--start", "%d" % start]))
+
     def test_missing_path_is_an_error(self):
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
             sys.stderr, saved = io.StringIO(), sys.stderr
