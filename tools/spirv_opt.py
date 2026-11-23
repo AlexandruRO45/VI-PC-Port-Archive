@@ -408,6 +408,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
     const_true_id = next(iter(const_true)) if const_true else None
     const_false_id = next(iter(const_false)) if const_false else None
     all_decorated = module_info["decorated_ids"] if module_info is not None else decorated_ids
+    ext_decorated = module_info.get("ext_decorated_ids", frozenset()) if module_info is not None else frozenset()
 
     if module_info is not None:
         insts, _ = spirv_mem2reg.promote_function(
@@ -586,7 +587,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         changed = True
 
                 # Trivial OpPhi simplification (only in reachable blocks so dominance is guaranteed).
-                if op == "OpPhi" and reachable and res is not None and res not in decorated_ids and len(args) >= 3:
+                if op == "OpPhi" and reachable and res is not None and res not in all_decorated and len(args) >= 3:
                     vals = [args[k] for k in range(1, len(args), 2)]
                     non_self = {v for v in vals if v != res}
                     if len(non_self) == 1:
@@ -597,7 +598,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         continue
 
                 # Algebraic / copy / constant-fold / round-trip bitcast simplifications
-                if res is not None and res not in decorated_ids:
+                if res is not None and res not in all_decorated:
                     if op == "OpCopyObject" and len(args) == 2:
                         alias[res] = args[1]
                         dead_idx.add(idx)
@@ -794,7 +795,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         continue
 
                 # Dominator-scoped OpAccessChain CSE
-                if op == "OpAccessChain" and res is not None and res not in decorated_ids:
+                if op == "OpAccessChain" and res is not None and res not in all_decorated:
                     key = tuple(args)
                     prev = ac_cse.get(key)
                     if prev is not None:
@@ -808,7 +809,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                     continue
 
                 # Dominator-scoped pure-value CSE (with commutative operand canonicalization)
-                if res is not None and res not in decorated_ids and (
+                if res is not None and res not in all_decorated and (
                     op in _PURE_OPS or (op == "OpExtInst" and len(args) >= 3 and args[1] in glsl_sets and args[2] in _PURE_GLSL_EXT)
                 ):
                     if op in _COMMUTATIVE_OPS and len(args) == 3 and args[1] > args[2]:
@@ -840,7 +841,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                                     cached = entry_null_zero[root]
                                 elif root in static_null_zero and slot not in stored_slots:
                                     cached = static_null_zero[root]
-                            if cached is not None and res not in decorated_ids:
+                            if cached is not None and res not in all_decorated:
                                 alias[res] = cached
                                 dead_idx.add(idx)
                                 deleted_ids.add(res)
@@ -852,7 +853,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                             # Dynamic load from root: protect all pending intra-block stores to root.
                             for s in [k for k in last_store if k[0] == root]:
                                 last_store.pop(s, None)
-                    elif not volatile and (root in readonly_global_vars or ptr in readonly_global_vars) and res not in decorated_ids:
+                    elif not volatile and (root in readonly_global_vars or ptr in readonly_global_vars) and res not in all_decorated:
                         ro_key = (args[0], ptr)
                         prev = ro_load_cse.get(ro_key)
                         if prev is not None:
@@ -1052,6 +1053,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
         insts, dce_changed = spirv_mem2reg.mark_and_sweep_dce(
             insts, trackable, readonly_global_vars, ptr_root,
             glsl_sets, _PURE_OPS, _PURE_GLSL_EXT, deleted_ids,
+            protected_ids=ext_decorated,
         )
         if dce_changed:
             changed = True
@@ -1178,7 +1180,7 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
         opt_funcs[start] = new_body
         all_deleted.update(deleted)
 
-    # Reassemble module, dropping OpDecorate / OpName lines that target deleted SSA IDs.
+    # Reassemble module, removing or trimming decoration / debug lines that target deleted SSA IDs.
     out: list[str] = []
     func_map = {start: (end, opt_funcs[start]) for start, end in func_ranges}
     i = 0
@@ -1192,9 +1194,21 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
         raw = lines[i]
         if all_deleted:
             stripped = raw.lstrip()
-            if stripped.startswith(("OpDecorate ", "OpName ")):
+            if stripped.startswith(("OpDecorate ", "OpDecorateId ", "OpDecorateString ",
+                                    "OpDecorateStringGOOGLE ", "OpName ")):
                 toks = stripped.split(None, 2)
                 if len(toks) >= 2 and toks[1] in all_deleted:
+                    i += 1
+                    continue
+            elif stripped.startswith("OpGroupDecorate "):
+                semi = stripped.find(";")
+                head = stripped[:semi] if semi >= 0 else stripped
+                toks = head.split()
+                if len(toks) >= 3 and any(t in all_deleted for t in toks[2:]):
+                    kept = [t for t in toks[2:] if t not in all_deleted]
+                    if kept:
+                        indent = raw[:len(raw) - len(stripped)]
+                        out.append(f"{indent}OpGroupDecorate {toks[1]} {' '.join(kept)}")
                     i += 1
                     continue
         out.append(raw)

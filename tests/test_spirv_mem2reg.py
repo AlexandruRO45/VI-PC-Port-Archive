@@ -60,8 +60,12 @@ def _assert_valid_spirv(spvasm: str) -> None:
                 if res in global_defs:
                     raise AssertionError(f"duplicate global SSA ID {res}")
                 global_defs.add(res)
-            if op in ("OpDecorate", "OpDecorateId") and args and args[0].startswith("%"):
+            if op == "OpDecorate" and args and args[0].startswith("%"):
                 decor_targets.append((op, args[0]))
+            elif op == "OpDecorateId" and args:
+                for t in args:
+                    if t.startswith("%"):
+                        decor_targets.append((op, t))
             elif op == "OpGroupDecorate" and len(args) >= 2:
                 for t in args[1:]:
                     if t.startswith("%"):
@@ -194,6 +198,41 @@ def _assert_valid_spirv(spvasm: str) -> None:
                         if not ((db == b and dord < order)
                                 or (db != b and spirv_mem2reg._dominates(db, b, idom, depth))):
                             raise AssertionError(f"SSA dominance violated for {tok}: {raw}")
+
+        reachable_set = set(rpo)
+        for b in range(len(blocks)):
+            if b in reachable_set:
+                continue
+            for order, idx in enumerate(blocks[b]):
+                res, op, args, raw = insts[idx]
+                if op is None or not args or op == "OpLabel":
+                    continue
+                if op == "OpPhi":
+                    for k in range(1, len(args), 2):
+                        val_tok, pred_lbl = args[k], args[k + 1]
+                        if pred_lbl not in l2b:
+                            raise AssertionError(f"undefined OpPhi label {pred_lbl} in unreachable {blabels[b]}: {raw}")
+                        if val_tok not in global_defs and val_tok not in fn_params and val_tok not in def_pos:
+                            raise AssertionError(f"undefined OpPhi value {val_tok} in unreachable {blabels[b]}: {raw}")
+                elif op in ("OpBranch", "OpBranchConditional", "OpSwitch", "OpSelectionMerge", "OpLoopMerge"):
+                    val_toks = [args[0]] if op in ("OpBranchConditional", "OpSwitch") else []
+                    for tok in val_toks:
+                        if tok.startswith("%") and tok not in global_defs and tok not in fn_params:
+                            if tok not in def_pos:
+                                raise AssertionError(f"undefined SSA use {tok} in unreachable {blabels[b]}: {raw}")
+                            db, dord = def_pos[tok]
+                            if db == b and dord >= order:
+                                raise AssertionError(f"same-block SSA order violated in unreachable {blabels[b]}: {raw}")
+                else:
+                    start_k = 1 if res is not None else 0
+                    for tok in args[start_k:]:
+                        if not tok.startswith("%") or tok in global_defs or tok in fn_params:
+                            continue
+                        if tok not in def_pos:
+                            raise AssertionError(f"undefined SSA use {tok} in unreachable {blabels[b]}: {raw}")
+                        db, dord = def_pos[tok]
+                        if db == b and dord >= order:
+                            raise AssertionError(f"same-block SSA order violated in unreachable {blabels[b]}: {raw}")
 
     for op, tgt in decor_targets:
         if tgt not in all_defs:
@@ -728,6 +767,140 @@ class SpirvMem2RegTests(unittest.TestCase):
         opt_dup = spirv_opt.optimize(spv_dup)
         _assert_valid_spirv(opt_dup)
         self.assertEqual(list(run_fragment(opt_dup, inputs={"%in0": 11})["%out0"]), [11, 3, 0, 0])
+
+    def test_group_decorate_id_and_string_on_unused_pure_and_foldable_select(self):
+        # OpGroupDecorate, OpDecorateId, and OpDecorateString targeting unused pure ops (OpIAdd)
+        # and foldable OpSelect instructions must never leave dangling decoration targets.
+        spvasm = """               OpCapability Shader
+               OpExtension "SPV_GOOGLE_decorate_string"
+               OpExtension "SPV_GOOGLE_hlsl_functionality1"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %in0 %out0
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %in0 Location 0
+               OpDecorate %in0 Flat
+               OpDecorate %out0 Location 0
+               OpDecorate %dg RelaxedPrecision
+         %dg = OpDecorationGroup
+               OpGroupDecorate %dg %dead_grp %sel_grp
+               OpDecorateId %dead_id UniformId %scope_sub
+               OpDecorateId %sel_id UniformId %scope_sub
+               OpDecorateString %dead_str UserSemantic "unused_add"
+               OpDecorateString %sel_str UserSemantic "kept_sel"
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %bool = OpTypeBool
+       %uint = OpTypeInt 32 0
+     %v4uint = OpTypeVector %uint 4
+    %_ptr_In = OpTypePointer Input %uint
+   %_ptr_Out = OpTypePointer Output %v4uint
+         %u0 = OpConstant %uint 0
+         %u1 = OpConstant %uint 1
+  %scope_sub = OpConstant %uint 3
+       %true = OpConstantTrue %bool
+        %in0 = OpVariable %_ptr_In Input
+       %out0 = OpVariable %_ptr_Out Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %iv = OpLoad %uint %in0
+ %dead_plain = OpIAdd %uint %iv %u1
+   %dead_grp = OpIAdd %uint %iv %u1
+    %dead_id = OpIAdd %uint %iv %u1
+   %dead_str = OpIAdd %uint %iv %u1
+  %sel_plain = OpSelect %uint %true %iv %u0
+    %sel_grp = OpSelect %uint %true %iv %u0
+     %sel_id = OpSelect %uint %true %iv %u0
+    %sel_str = OpSelect %uint %true %iv %u0
+        %vec = OpCompositeConstruct %v4uint %sel_grp %sel_id %sel_str %sel_plain
+               OpStore %out0 %vec
+               OpReturn
+               OpFunctionEnd
+"""
+        _assert_valid_spirv(spvasm)
+        opt = spirv_opt.optimize(spvasm)
+        _assert_valid_spirv(opt)
+        # Undecorated unused OpIAdd and foldable OpSelect still optimize away.
+        self.assertNotIn("%dead_plain = OpIAdd", opt)
+        self.assertNotIn("%sel_plain = OpSelect", opt)
+        # All OpGroupDecorate / OpDecorateId / OpDecorateString targets remain defined and decorated.
+        for sym in ("%dead_grp = OpIAdd", "%dead_id = OpIAdd", "%dead_str = OpIAdd",
+                    "%sel_grp = OpSelect", "%sel_id = OpSelect", "%sel_str = OpSelect"):
+            self.assertIn(sym, opt)
+        self.assertIn("OpGroupDecorate %dg %dead_grp %sel_grp", opt)
+        self.assertIn("OpDecorateId %dead_id UniformId %scope_sub", opt)
+        self.assertIn("OpDecorateId %sel_id UniformId %scope_sub", opt)
+        self.assertIn('OpDecorateString %dead_str UserSemantic "unused_add"', opt)
+        self.assertIn('OpDecorateString %sel_str UserSemantic "kept_sel"', opt)
+
+    def test_unreachable_block_uses_promoted_and_aliased_values_stay_valid(self):
+        # An unreachable block referencing values eliminated by Mem2Reg (%v), OpSelect folding (%s),
+        # trivial OpPhi collapse (%p), and GVN-Hoist (%e2) must have every operand rewritten cleanly.
+        spvasm = """               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %in0 %out0
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %in0 Location 0
+               OpDecorate %in0 Flat
+               OpDecorate %out0 Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %bool = OpTypeBool
+       %uint = OpTypeInt 32 0
+     %v4uint = OpTypeVector %uint 4
+    %_ptr_In = OpTypePointer Input %uint
+    %_ptr_Fu = OpTypePointer Function %uint
+   %_ptr_Out = OpTypePointer Output %v4uint
+         %u0 = OpConstant %uint 0
+         %u1 = OpConstant %uint 1
+         %u7 = OpConstant %uint 7
+       %true = OpConstantTrue %bool
+        %in0 = OpVariable %_ptr_In Input
+       %out0 = OpVariable %_ptr_Out Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %x = OpVariable %_ptr_Fu Function %u0
+         %iv = OpLoad %uint %in0
+               OpStore %x %iv
+          %v = OpLoad %uint %x
+          %s = OpSelect %uint %true %v %u0
+       %cond = OpINotEqual %bool %s %u0
+               OpSelectionMerge %merge None
+               OpBranchConditional %cond %then %else
+       %then = OpLabel
+         %e1 = OpIAdd %uint %iv %u7
+               OpBranch %merge
+       %else = OpLabel
+         %e2 = OpIAdd %uint %iv %u7
+               OpBranch %merge
+      %merge = OpLabel
+          %p = OpPhi %uint %v %then %v %else
+         %pe = OpPhi %uint %e1 %then %e2 %else
+        %sum = OpIAdd %uint %p %pe
+        %vec = OpCompositeConstruct %v4uint %sum %s %u0 %u0
+               OpStore %out0 %vec
+               OpReturn
+       %dead = OpLabel
+         %d1 = OpIAdd %uint %v %s
+         %d2 = OpIAdd %uint %p %e1
+         %d3 = OpIAdd %uint %d2 %e2
+         %d4 = OpIAdd %uint %d1 %d3
+        %dv4 = OpCompositeConstruct %v4uint %d4 %u0 %u0 %u0
+               OpStore %out0 %dv4
+               OpReturn
+               OpFunctionEnd
+"""
+        _assert_valid_spirv(spvasm)
+        opt = spirv_opt.optimize(spvasm)
+        _assert_valid_spirv(opt)
+        self.assertNotIn("%x = OpVariable", opt)
+        self.assertNotIn("%v = OpLoad", opt)
+        self.assertNotIn("%s = OpSelect", opt)
+        self.assertNotIn("%p = OpPhi", opt)
+        self.assertEqual(opt.count("OpIAdd %uint %iv %u7"), 1)
+        # %dead still exists and has no dangling references to any eliminated ID.
+        self.assertIn("%dead = OpLabel", opt)
+        self.assertEqual(list(run_fragment(opt, inputs={"%in0": 5})["%out0"]), [17, 5, 0, 0])
+        self.assertEqual(list(run_fragment(opt, inputs={"%in0": 0})["%out0"]), [7, 0, 0, 0])
 
     def test_cf_diff_wave32_and_wave64_with_opt_bit_exact_and_valid(self):
         old_opt = rdna2spirv.OPT_SPIRV

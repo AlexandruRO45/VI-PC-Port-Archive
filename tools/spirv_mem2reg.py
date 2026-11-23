@@ -46,14 +46,17 @@ def _parse_inst_for_header(line: str):
     stripped = line.lstrip()
     if not stripped or stripped.startswith(";"):
         return None
-    if '"' in stripped:
+    if stripped.startswith(("OpDecorateString ", "OpDecorateStringGOOGLE ")):
         q = stripped.find('"')
-        prefix = stripped[:q].split()
-        if len(prefix) >= 2 and prefix[0] in ("OpDecorateString", "OpDecorateStringGOOGLE"):
+        prefix = (stripped[:q] if q >= 0 else stripped).split()
+        if len(prefix) >= 2:
             return None, prefix[0], prefix[1:]
         return None
     semi = stripped.find(";")
-    toks = (stripped[:semi] if semi >= 0 else stripped).split()
+    head = stripped[:semi] if semi >= 0 else stripped
+    if '"' in head:
+        return None
+    toks = head.split()
     if not toks:
         return None
     if len(toks) >= 3 and toks[1] == "=":
@@ -70,6 +73,7 @@ def collect_module_info(lines: list[str], const_ids: set[str], const_type: dict[
     ptr_types: set[str] = set()
     const_composite_elems: dict[str, tuple[str, list[str]]] = {}
     decorated_ids: set[str] = set()
+    ext_decorated_ids: set[str] = set()
 
     # Only scan the module header (before the first OpFunction); function bodies have no
     # decorations, type declarations, or global constants in valid SPIR-V.
@@ -82,13 +86,25 @@ def collect_module_info(lines: list[str], const_ids: set[str], const_type: dict[
         if parsed is None:
             continue
         res, op, args = parsed
-        if op in ("OpDecorate", "OpDecorateId", "OpDecorateString", "OpDecorateStringGOOGLE") and args:
+        if op == "OpDecorate" and args:
             decorated_ids.add(args[0])
+        elif op == "OpDecorateId" and args:
+            decorated_ids.add(args[0])
+            ext_decorated_ids.add(args[0])
+            for tok in args[1:]:
+                if tok.startswith("%"):
+                    decorated_ids.add(tok)
+                    ext_decorated_ids.add(tok)
+        elif op in ("OpDecorateString", "OpDecorateStringGOOGLE") and args:
+            decorated_ids.add(args[0])
+            ext_decorated_ids.add(args[0])
         elif op == "OpGroupDecorate" and len(args) >= 2:
             for t in args[1:]:
                 decorated_ids.add(t)
+                ext_decorated_ids.add(t)
         elif op == "OpDecorationGroup" and res:
             decorated_ids.add(res)
+            ext_decorated_ids.add(res)
         elif op == "OpTypePointer" and res and len(args) >= 2:
             ptr_types.add(res)
             ptr_pointee_type[res] = args[1]
@@ -111,6 +127,7 @@ def collect_module_info(lines: list[str], const_ids: set[str], const_type: dict[
         "ptr_pointee_type": ptr_pointee_type,
         "ptr_types": ptr_types,
         "decorated_ids": decorated_ids,
+        "ext_decorated_ids": ext_decorated_ids,
         "used_ids": used_ids,
     }
 
@@ -712,7 +729,8 @@ def collapse_trivial_phis(insts: list[list], build_cfg_and_dom, decorated_ids: s
 
 def mark_and_sweep_dce(insts: list[list], trackable: set[str], readonly_global_vars: set[str],
                        ptr_root: dict[str, str], glsl_sets: set[str], pure_ops: frozenset[str],
-                       pure_glsl_ext: frozenset[str], deleted_ids: set[str]) -> tuple[list[list], bool]:
+                       pure_glsl_ext: frozenset[str], deleted_ids: set[str],
+                       protected_ids: set[str] | frozenset[str] = frozenset()) -> tuple[list[list], bool]:
     """Mark-and-sweep pure DCE over a function body; eliminates dead OpPhi cycles as well."""
     n = len(insts)
     def_idx: dict[str, int] = {}
@@ -721,7 +739,7 @@ def mark_and_sweep_dce(insts: list[list], trackable: set[str], readonly_global_v
             def_idx[res] = idx
 
     def is_pure_removable(res: str | None, op: str | None, args: list[str] | None) -> bool:
-        if res is None or op is None or args is None:
+        if res is None or op is None or args is None or res in protected_ids:
             return False
         if op in pure_ops or op == "OpPhi":
             return True
