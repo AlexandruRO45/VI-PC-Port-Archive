@@ -179,7 +179,15 @@ int lose(const char* label, Scene& scene, bool gpu, bool fault_enabled, mock::Fa
         EXPECT(queue.execute({&pb, 1}) == ReplayResult::unsupported);
         EXPECT(context.is_device_lost());
         const unsigned markers = mock::markers, faults = mock::fault_calls;
-        EXPECT(markers == (gpu ? 4u : 0u));  // A's two and B's two, recorded before B's submission failed
+        // A's two and B's two around the lists, and one after each of their operations (per-op progress),
+        // recorded before B's submission failed.
+        std::uint32_t op = 0;
+        unsigned ops = 0;
+        for (const CommandList* list : {pa, pb})
+            for (const auto& command : list->commands()) ops += breadcrumb_op_of(command, op);
+        EXPECT(markers == (gpu ? 4u + ops : 0u));
+        // The mock records no marker, so nothing the GPU did is known: no list may claim an operation completed.
+        for (const auto& e : ring->snapshot()) EXPECT(e.completed_ops == 0 && e.state != BreadcrumbState::completed);
         EXPECT(faults == (fault_enabled ? (fault == mock::Fault::fail_counts ? 1u : 2u) : 0u));
 
         // After the loss: no second report, no submission, no marker, no fault query.
@@ -268,6 +276,40 @@ int concurrent(Scene& scene) {
     return 0;
 }
 
+// Level 2 never reuses a slot whose list the GPU has not been seen to finish. The mock records no marker, so no
+// list ever reads finished: after kSlots lists every slot is held, and the next list gets its two list markers but
+// no per-op one, and its progress inside the list is unknown, not "0 completed".
+int busy_slots(Scene& scene) {
+    const char* label = "device lost: busy slots";
+    mock::reset(mock::Fault::empty);
+    VulkanContext context(mock::get_device, scene.d.device, true);
+    EXPECT(context.loaded());
+    EXPECT(context.configure_breadcrumbs(scene.d.memory_properties(), true, false));
+    ResourceBinding src{}, dst{};
+    src.buffer = scene.src;
+    src.size = 64;
+    dst.buffer = scene.dst;
+    dst.size = 64;
+    context.add_resource(1, src);
+    context.add_resource(2, dst);
+    VulkanQueue queue(context, scene.d.queue, scene.d.family);
+    EXPECT(queue.ok());
+    BreadcrumbRing* ring = context.breadcrumbs();
+    EXPECT(ring && ring->per_op());
+    const CommandList* pa = &scene.a;  // one operation
+    for (std::uint32_t i = 0; i < BreadcrumbRing::kSlots; ++i) EXPECT(queue.execute({&pa, 1}) == ReplayResult::success);
+    EXPECT(queue.idle());
+    EXPECT(mock::markers == BreadcrumbRing::kSlots * 3u);  // begin, end and one per-op marker each
+    EXPECT(queue.execute({&pa, 1}) == ReplayResult::success);
+    EXPECT(queue.idle());
+    EXPECT(mock::markers == BreadcrumbRing::kSlots * 3u + 2u);  // no free slot: the list markers only
+    const auto entries = ring->snapshot();
+    EXPECT(!entries.empty() && !entries.back().progress_known && entries.back().completed_ops == 0);
+    for (const auto& e : entries) EXPECT(e.completed_ops == 0 && e.state != BreadcrumbState::completed);
+    std::printf("device lost: every slot held by an unfinished list: no per-op markers, progress unknown ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -290,7 +332,7 @@ int main() {
     EXPECT(scene.a.copy_buffer({2, 0, 1, 0, 16}) && scene.a.close());
     EXPECT(scene.b.copy_buffer({2, 16, 1, 16, 16}) && scene.b.close());
 
-    if (scenarios(scene) || concurrent(scene)) return 1;
+    if (scenarios(scene) || concurrent(scene) || busy_slots(scene)) return 1;
     const unsigned errors = d.validation_errors();
     std::printf("device lost: %u validation errors\n", errors);
     return errors ? 1 : 0;

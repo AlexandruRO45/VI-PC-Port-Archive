@@ -1427,8 +1427,10 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_dred_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_dred_off COMMAND d3d12_dred_test off)
     add_test(NAME d3d12_dred_on COMMAND d3d12_dred_test on)
-    set_tests_properties(d3d12_dred_off d3d12_dred_on PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME d3d12_dred_ops COMMAND d3d12_dred_test on)  # LEONIDA_DRED=2: per-operation breadcrumbs too
+    set_tests_properties(d3d12_dred_off d3d12_dred_on d3d12_dred_ops PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_dred_on PROPERTIES ENVIRONMENT LEONIDA_DRED=1)
+    set_tests_properties(d3d12_dred_ops PROPERTIES ENVIRONMENT LEONIDA_DRED=2)
     set_tests_properties(d3d12_dred_off PROPERTIES ENVIRONMENT_MODIFICATION LEONIDA_DRED=unset:)
 
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.

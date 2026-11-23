@@ -145,6 +145,16 @@ inline BreadcrumbState breadcrumb_state(std::uint32_t begin_word, std::uint32_t 
     return BreadcrumbState::submitted;
 }
 
+// Per-operation progress (PoC): after its k-th D3D12 operation (0-based) a list's stream writes `first + k` into its
+// slot's progress word, at BOTTOM_OF_PIPE. Op numbers are unique per list and never 0, so a word from the slot's
+// previous owner (an older range) or the initial 0 falls outside [first, first + count) and counts as nothing.
+// Unsigned arithmetic: correct across the 32-bit wrap as long as fewer than 2^31 operations separate two owners of
+// one slot (at most kSlots lists apart).
+inline std::uint32_t breadcrumb_ops_completed(std::uint32_t word, std::uint32_t first, std::size_t count) {
+    const std::uint32_t k = word - first;
+    return k < count ? k + 1 : 0;
+}
+
 inline const char* breadcrumb_state_name(BreadcrumbState state) {
     switch (state) {
         case BreadcrumbState::completed: return "completed";
@@ -212,6 +222,9 @@ public:
         std::vector<std::uint32_t> ops;
         std::uint64_t sequence = 0;  // the order mark() handed it out in; does not wrap
         std::wstring list_name, queue_name;  // copies of the D3D12 debug names at submission, when given
+        std::uint32_t first_op = 0;           // the op number of ops[0] (breadcrumb_ops_completed)
+        bool progress_safe = true;            // level 2: its slot's earlier owners can write nothing more into it
+        std::vector<std::uint32_t> positions;  // the command index of each op, for the per-op markers
     };
     // A submitted list as the breadcrumbs see it now.
     struct Entry {
@@ -221,6 +234,8 @@ public:
         BreadcrumbState state = BreadcrumbState::submitted;
         std::uint64_t queue_id = 0;
         std::wstring list_name, queue_name;
+        bool progress_known = false;      // GPU breadcrumbs: completed_ops is what the progress word says
+        std::uint32_t completed_ops = 0;  // operations finished, in order (D3D12's *pLastBreadcrumbValue)
     };
 
     static constexpr std::uint32_t kSlots = 1024;  // lists kept: the newest 1024 submitted
@@ -237,12 +252,15 @@ public:
 
     // GPU breadcrumbs. False (whatever was made is freed with the ring) when the marker command is missing or no
     // host-visible coherent memory fits; the caller may fall back to initialize_cpu_only().
-    bool initialize(VkDevice device, const VkPhysicalDeviceMemoryProperties& memory, const BreadcrumbFunctions& fn) {
+    // `per_op`: a progress marker after every D3D12 operation (BUILD-1655), or only the two around each list.
+    bool initialize(VkDevice device, const VkPhysicalDeviceMemoryProperties& memory, const BreadcrumbFunctions& fn,
+                    bool per_op = true) {
         if (!fn.write_marker || !fn.create_buffer || !fn.map) return false;
+        per_op_ = per_op;
         device_ = device;
         fn_ = fn;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = VkDeviceSize(kSlots) * 2 * sizeof(std::uint32_t);
+        info.size = VkDeviceSize(kSlots) * kWords * sizeof(std::uint32_t);
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;  // the usage buffer markers need
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         if (fn_.create_buffer(device_, &info, nullptr, &buffer_) != VK_SUCCESS) return false;
@@ -262,7 +280,7 @@ public:
             mapped_ = nullptr;
             return false;
         }
-        for (std::uint32_t i = 0; i < kSlots * 2; ++i) mapped_[i] = 0;  // no tag is 0
+        for (std::uint32_t i = 0; i < kSlots * kWords; ++i) mapped_[i] = 0;  // no tag or op number is 0
         gpu_ = true;
         return true;
     }
@@ -301,13 +319,40 @@ public:
               const Names* held = nullptr) {
         if (!identity) identity = &list;
         Mark m;
+        std::uint32_t op = 0;
+        const auto commands = list.commands();
+        for (std::size_t i = 0; i < commands.size(); ++i)
+            if (breadcrumb_op_of(commands[i], op)) {
+                m.ops.push_back(op);
+                m.positions.push_back(static_cast<std::uint32_t>(i));
+            }
         {
             std::lock_guard lock(mutex_);
+            // A range of op numbers that does not contain 0 ("never written").
+            const auto count = static_cast<std::uint32_t>(m.ops.size());
+            if (next_op_ + 1 == 0 || next_op_ + count < next_op_) next_op_ = 0;
+            m.first_op = next_op_ + 1;
+            next_op_ += count;
             if (++next_tag_ == 0) ++next_tag_;  // 0 means "never written"
             m.tag = next_tag_;
             m.sequence = ++next_sequence_;
             m.slot = next_slot_;
-            next_slot_ = (next_slot_ + 1) % kSlots;
+            if (gpu_ && per_op_) {
+                // A slot is taken over only once its owner wrote its end word (or the slot is free): a finished list
+                // writes nothing more, so no older list's progress write can land in this list's word, however many
+                // op numbers were handed out since. If every slot still holds a list the GPU has not finished, this
+                // list gets no per-op markers and its progress inside the list stays unknown.
+                m.progress_safe = false;
+                for (std::uint32_t i = 0; i < kSlots; ++i) {
+                    const std::uint32_t slot = (next_slot_ + i) % kSlots;
+                    if (owner_[slot] == 0 || read(slot, 1) == owner_[slot]) {
+                        m.slot = slot;
+                        m.progress_safe = true;
+                        break;
+                    }
+                }
+            }
+            next_slot_ = (m.slot + 1) % kSlots;
             // The slot is about to carry this list's tag: the list that used it before can no longer be read.
             // Queues submit in their own order, so the history is not sorted by slot; snapshot() skips any
             // entry whose slot has a newer owner.
@@ -322,9 +367,6 @@ public:
         }
         m.list_id = reinterpret_cast<std::uintptr_t>(identity);
         m.queue_id = reinterpret_cast<std::uintptr_t>(queue);
-        std::uint32_t op = 0;
-        for (const auto& command : list.commands())
-            if (breadcrumb_op_of(command, op)) m.ops.push_back(op);
         return m;
     }
 
@@ -332,6 +374,29 @@ public:
     void record_begin(VkCommandBuffer command_buffer, const Mark& m) const {
         if (gpu_) fn_.write_marker(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, buffer_, offset(m.slot, 0), m.tag);
     }
+    // For emit(): where and how the per-op markers of `m` are written; write == nullptr without GPU breadcrumbs.
+    PFN_vkCmdWriteBufferMarkerAMD op_marker_function() const { return gpu_ && per_op_ ? fn_.write_marker : nullptr; }
+    // Whether `m` gets per-op markers: level 2, and a slot no earlier list can still write into.
+    bool op_markers_for(const Mark& m) const { return gpu_ && per_op_ && m.progress_safe; }
+    bool per_op() const { return gpu_ && per_op_; }
+
+    // For tests: the next list's op numbers start after `last`, so a test can cross the 32-bit wrap without
+    // submitting four billion operations.
+    void skip_op_numbers_to(std::uint32_t last) {
+        std::lock_guard lock(mutex_);
+        next_op_ = last;
+    }
+    // For tests: what the history keeps per operation, in 32-bit words (the ops; the per-op command positions are
+    // dropped when a list is submitted).
+    std::size_t history_words() const {
+        std::lock_guard lock(mutex_);
+        std::size_t words = 0;
+        for (const auto& m : history_) words += m.ops.size() + m.positions.capacity();
+        return words;
+    }
+    VkBuffer marker_buffer() const { return buffer_; }
+    VkDeviceSize progress_offset(const Mark& m) const { return offset(m.slot, 2); }
+
     void record_end(VkCommandBuffer command_buffer, const Mark& m) const {
         if (gpu_)
             fn_.write_marker(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, buffer_, offset(m.slot, 1), m.tag);
@@ -339,9 +404,15 @@ public:
 
     // After vkQueueSubmit: keeps the marks when the submission succeeded, forgets them when it did not.
     void submitted(std::vector<Mark>&& marks, bool ok) {
-        if (!ok) return;
         std::lock_guard lock(mutex_);
+        if (!ok) {
+            // Never ran, so it writes nothing: its slots are free again.
+            for (const auto& m : marks)
+                if (owner_[m.slot] == m.tag) owner_[m.slot] = 0;
+            return;
+        }
         for (auto& m : marks) {
+            std::vector<std::uint32_t>().swap(m.positions);  // only emit() needs them: the history keeps ops alone
             history_.push_back(std::move(m));
             if (history_.size() > kSlots) history_.pop_front();  // its slot is reused from now on
         }
@@ -361,7 +432,18 @@ public:
         for (const Mark* m : kept) {
             const BreadcrumbState state =
                 gpu_ ? breadcrumb_state(read(m->slot, 0), read(m->slot, 1), m->tag) : BreadcrumbState::unknown;
-            out.push_back(Entry{m->tag, m->list_id, m->ops, state, m->queue_id, m->list_name, m->queue_name});
+            Entry e{m->tag, m->list_id, m->ops, state, m->queue_id, m->list_name, m->queue_name};
+            if (state == BreadcrumbState::completed) {
+                e.progress_known = true;  // the end word: every operation finished
+                e.completed_ops = static_cast<std::uint32_t>(m->ops.size());
+            } else if (gpu_ && per_op_ && m->progress_safe) {
+                // Only a word in this list's own range counts; anything else reads as no operation finished, never
+                // as more. A finished operation also proves the list started, should its begin word not show yet.
+                e.progress_known = true;
+                e.completed_ops = breadcrumb_ops_completed(read(m->slot, 2), m->first_op, m->ops.size());
+                if (e.completed_ops && e.state == BreadcrumbState::submitted) e.state = BreadcrumbState::started;
+            }
+            out.push_back(std::move(e));
         }
         return out;
     }
@@ -416,7 +498,14 @@ private:
         if (!e.list_name.empty()) std::fprintf(out, " \"%s\"", breadcrumb_utf8(e.list_name).c_str());
         std::fprintf(out, " on queue %#llx", static_cast<unsigned long long>(e.queue_id));
         if (!e.queue_name.empty()) std::fprintf(out, " \"%s\"", breadcrumb_utf8(e.queue_name).c_str());
-        std::fprintf(out, ", tag %u: %s, %zu operations", e.tag, breadcrumb_state_name(e.state), e.ops.size());
+        if (e.progress_known && e.state == BreadcrumbState::started)
+            std::fprintf(out, ", tag %u: %s, %u of %zu operations completed", e.tag, breadcrumb_state_name(e.state),
+                         e.completed_ops, e.ops.size());
+        else if (e.state == BreadcrumbState::started)  // list markers only: how far it got is not known
+            std::fprintf(out, ", tag %u: %s, %zu operations, progress inside the list not recorded", e.tag,
+                         breadcrumb_state_name(e.state), e.ops.size());
+        else
+            std::fprintf(out, ", tag %u: %s, %zu operations", e.tag, breadcrumb_state_name(e.state), e.ops.size());
         const std::size_t shown = e.ops.size() < 8 ? e.ops.size() : 8;
         for (std::size_t k = 0; k < shown; ++k)
             std::fprintf(out, "%s%s", k ? ", " : ": ", breadcrumb_op_name(e.ops[k]));
@@ -428,10 +517,10 @@ private:
         return n;
     }
     VkDeviceSize offset(std::uint32_t slot, std::uint32_t word) const {
-        return (VkDeviceSize(slot) * 2 + word) * sizeof(std::uint32_t);
+        return (VkDeviceSize(slot) * kWords + word) * sizeof(std::uint32_t);
     }
     std::uint32_t read(std::uint32_t slot, std::uint32_t word) const {
-        return static_cast<const volatile std::uint32_t*>(mapped_)[slot * 2 + word];
+        return static_cast<const volatile std::uint32_t*>(mapped_)[slot * kWords + word];
     }
 
     VkDevice device_ = VK_NULL_HANDLE;
@@ -444,6 +533,9 @@ private:
     std::uint32_t next_tag_ = 0;
     std::uint32_t next_slot_ = 0;
     std::uint64_t next_sequence_ = 0;
+    std::uint32_t next_op_ = 0;  // the last op number handed out
+    bool per_op_ = true;
+    static constexpr std::uint32_t kWords = 4;  // per slot: begin tag, end tag, progress (op number), padding
     std::deque<Mark> history_;
     std::uint32_t owner_[kSlots] = {};  // the tag each slot was last handed out with
     std::unordered_map<const CommandList*, std::wstring> list_names_;

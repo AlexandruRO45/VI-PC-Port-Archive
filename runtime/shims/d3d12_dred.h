@@ -60,15 +60,20 @@ std::wstring dred_debug_name(T* object) {
     return {};
 }
 
-// LEONIDA_DRED=1 asks for device-lost diagnostics, read once.
-inline bool dred_requested() {
-    static const bool requested = [] {
+// LEONIDA_DRED, read once: 1 asks for device-lost diagnostics with a breadcrumb per command list (two GPU markers
+// per list, close to free); 2 adds one after every D3D12 operation, so *pLastBreadcrumbValue says how far a list
+// got (BUILD-1655; on an RTX 4060 Ti about 0.4 us of GPU time per operation, docs/d3d12_vulkan.md section 4.11).
+// Anything else is off.
+inline int dred_level() {
+    static const int level = [] {
         char text[4] = {};
         std::size_t length = 0;
-        return getenv_s(&length, text, "LEONIDA_DRED") == 0 && length > 1 && text[0] == '1';
+        if (getenv_s(&length, text, "LEONIDA_DRED") != 0 || length != 2) return 0;
+        return text[0] == '1' ? 1 : text[0] == '2' ? 2 : 0;
     }();
-    return requested;
+    return level;
 }
+inline bool dred_requested() { return dred_level() > 0; }
 
 // The D3D12 view of the layer's diagnostics at one moment: the nodes and the fault VA, with storage that lives as
 // long as this object (the host runtime's pointers stay valid as long as the device).
@@ -86,7 +91,7 @@ public:
                 continue;
             histories_.emplace_back();
             for (const std::uint32_t op : e.ops) histories_.back().push_back(static_cast<D3D12_AUTO_BREADCRUMB_OP>(op));
-            last_.push_back(0);  // list granularity: none of its operations is known to have completed
+            last_.push_back(e.progress_known ? e.completed_ops : 0);  // operations the GPU finished, in order
             names_.push_back(Names{e.list_name, ansi(e.list_name), e.queue_name, ansi(e.queue_name)});
         }
         const std::size_t count = histories_.size();

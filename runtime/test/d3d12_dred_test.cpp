@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <utility>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -230,6 +231,38 @@ int snapshot() {
            D3D12_AUTO_BREADCRUMB_OP_BARRIER == op::barrier &&
            D3D12_AUTO_BREADCRUMB_OP_WRITEBUFFERIMMEDIATE == op::write_buffer_immediate &&
            D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCEREGION == op::resolve_subresource_region);
+    // Per-operation progress (BUILD-1655, synthetic entries, not GPU-observed): BreadcrumbCount is the list's
+    // operations, pCommandHistory their order, *pLastBreadcrumbValue the ones finished; a list whose progress is
+    // not known (list markers only) claims none.
+    std::vector<leonida::BreadcrumbRing::Entry> progress = {
+        {4, 0x40, {op::copy_buffer_region, op::resource_barrier, op::dispatch, op::draw_indexed_instanced},
+         BreadcrumbState::started},
+        {5, 0x50, {op::clear_render_target_view, op::draw_instanced}, BreadcrumbState::submitted},
+        {6, 0x60, {op::copy_resource, op::resolve_subresource}, BreadcrumbState::started},
+    };
+    progress[0].progress_known = true;
+    progress[0].completed_ops = 2;  // two of four finished
+    progress[1].progress_known = true;
+    progress[1].completed_ops = 0;  // not started
+    s.build(progress, {}, arena);
+    n = s.head1();
+    EXPECT(n && n->BreadcrumbCount == 4 && n->pLastBreadcrumbValue && *n->pLastBreadcrumbValue == 2);
+    EXPECT(n->pCommandHistory[0] == D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION &&
+           n->pCommandHistory[1] == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER &&
+           n->pCommandHistory[2] == D3D12_AUTO_BREADCRUMB_OP_DISPATCH &&
+           n->pCommandHistory[3] == D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED);
+    n = n->pNext;
+    EXPECT(n && n->BreadcrumbCount == 2 && *n->pLastBreadcrumbValue == 0 &&
+           n->pCommandHistory[0] == D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW);
+    n = n->pNext;
+    EXPECT(n && n->BreadcrumbCount == 2 && *n->pLastBreadcrumbValue == 0 && !n->pNext);  // unknown: none claimed
+    EXPECT(s.head()->pLastBreadcrumbValue && *s.head()->pLastBreadcrumbValue == 2);  // the same in NODE and NODE1
+    int nodes = 0;
+    for (auto [a, b] = std::pair{s.head(), s.head1()}; a || b; a = a->pNext, b = b->pNext, ++nodes) {
+        EXPECT(a && b && a->BreadcrumbCount == b->BreadcrumbCount && a->pCommandHistory == b->pCommandHistory &&
+               a->pLastBreadcrumbValue == b->pLastBreadcrumbValue && *a->pLastBreadcrumbValue <= a->BreadcrumbCount);
+    }
+    EXPECT(nodes == 3);
     std::printf("snapshot: nodes for the lists that did not complete, operations and fault VA ok\n");
     return 0;
 }

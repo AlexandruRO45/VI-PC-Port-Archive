@@ -4393,7 +4393,8 @@ public:
                 state_.context->set_occlusion_resolve_memory(state_.memory);
         }
         if ((dred_requested() || info.buffer_marker) &&
-            !state_.context->configure_breadcrumbs(state_.memory, info.buffer_marker, info.device_fault))
+            !state_.context->configure_breadcrumbs(state_.memory, info.buffer_marker, info.device_fault,
+                                                   dred_level() >= 2))
             std::fprintf(stderr, "[rt] d3d12 DRED: no GPU breadcrumbs (%s); a device-lost report lists the submitted "
                                  "command lists with their GPU progress UNKNOWN\n",
                          info.buffer_marker ? "no host-visible memory for them" : "no VK_AMD_buffer_marker");

@@ -1123,8 +1123,10 @@ public:
     // extension that is not enabled must not be called, even when the loader returned one. True with GPU
     // breadcrumbs (VK_AMD_buffer_marker); false when the ring keeps only what the CPU knows, because the marker
     // extension is not enabled or no host-visible memory fits.
+    // `per_op` (BUILD-1655): a progress marker after every D3D12 operation; false keeps the two around each list
+    // (for measuring what the per-op markers cost).
     bool configure_breadcrumbs(const VkPhysicalDeviceMemoryProperties& memory, bool buffer_marker_enabled,
-                               bool device_fault_enabled) {
+                               bool device_fault_enabled, bool per_op = true) {
         device_fault_enabled_ = device_fault_enabled;
         BreadcrumbFunctions fn;
         fn.create_buffer = vk.vkCreateBuffer;
@@ -1137,7 +1139,7 @@ public:
         fn.unmap = vk.vkUnmapMemory;
         fn.write_marker = buffer_marker_enabled ? vk.vkCmdWriteBufferMarkerAMD : nullptr;
         auto ring = std::make_unique<BreadcrumbRing>();
-        const bool gpu = fn.write_marker && ring->initialize(device_, memory, fn);
+        const bool gpu = fn.write_marker && ring->initialize(device_, memory, fn, per_op);
         if (!gpu) {
             ring = std::make_unique<BreadcrumbRing>();  // frees whatever a failed initialize() made
             ring->initialize_cpu_only();
@@ -2056,7 +2058,13 @@ private:
                                                   i < held_names.size() ? &held_names[i] : nullptr));
                 breadcrumbs->record_begin(command_buffer, marks.back());
             }
-            emit(list, command_buffer, replay, &next_tracker, &open_labels);
+            OpMarkers op_markers;
+            if (breadcrumbs && breadcrumbs->op_markers_for(marks.back())) {
+                const BreadcrumbRing::Mark& m = marks.back();
+                op_markers = {breadcrumbs->op_marker_function(), breadcrumbs->marker_buffer(),
+                              breadcrumbs->progress_offset(m), m.first_op, m.positions.data(), m.positions.size()};
+            }
+            emit(list, command_buffer, replay, &next_tracker, &open_labels, op_markers.write ? &op_markers : nullptr);
             if (breadcrumbs) breadcrumbs->record_end(command_buffer, marks.back());
             wrote_readback |= list.wrote_readback;
             readback_stages |= list.readback_src_stages;

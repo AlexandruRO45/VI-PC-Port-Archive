@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -84,7 +85,8 @@ int synthetic() {
     EXPECT(text.find("2 of the last 4 lists did not complete") != std::string::npos);
     EXPECT(text.find("list 0x10") == std::string::npos);
     EXPECT(text.find("list 0x20 on queue 0, tag 2: completed, 1 operations: Dispatch") != std::string::npos);
-    EXPECT(text.find("list 0x30 on queue 0, tag 3: started (not completed), 10 operations: DrawIndexedInstanced") !=
+    EXPECT(text.find("list 0x30 on queue 0, tag 3: started (not completed), 10 operations, progress inside the list "
+                     "not recorded: DrawIndexedInstanced") !=
            std::string::npos);
     EXPECT(text.find(", ...") != std::string::npos);  // more than 8 operations are cut
     EXPECT(text.find("list 0x40 on queue 0, tag 4: submitted (not started), 0 operations") != std::string::npos);
@@ -124,6 +126,27 @@ int synthetic() {
         EXPECT(kept_entries.size() == 1 && kept_entries[0].tag == tag &&
                kept_entries[0].state == BreadcrumbState::unknown);
     }
+    // Per-operation progress: the word holds first + k after op k; anything outside the list's range is nothing.
+    EXPECT(breadcrumb_ops_completed(0, 100, 3) == 0);    // never written
+    EXPECT(breadcrumb_ops_completed(99, 100, 3) == 0);   // the slot's previous owner
+    EXPECT(breadcrumb_ops_completed(100, 100, 3) == 1);
+    EXPECT(breadcrumb_ops_completed(102, 100, 3) == 3);
+    EXPECT(breadcrumb_ops_completed(103, 100, 3) == 0);  // a later owner (cannot be this list's)
+    EXPECT(breadcrumb_ops_completed(1, 0xfffffffeu, 4) == 4);  // across the 32-bit wrap
+    EXPECT(breadcrumb_ops_completed(5, 5, 0) == 0);      // a list without operations
+    BreadcrumbRing::Entry partial;
+    partial.tag = 9;
+    partial.list_id = 0x77;
+    partial.state = BreadcrumbState::started;
+    partial.ops = {breadcrumb_op::copy_buffer_region, breadcrumb_op::draw_instanced, breadcrumb_op::dispatch};
+    partial.progress_known = true;
+    partial.completed_ops = 1;
+    EXPECT(report_of({partial}).find("tag 9: started (not completed), 1 of 3 operations completed: CopyBufferRegion, "
+                                     "DrawInstanced, Dispatch") != std::string::npos);
+    partial.completed_ops = 0;  // observed: none finished yet, which is not the same as unknown
+    EXPECT(report_of({partial}).find("tag 9: started (not completed), 0 of 3 operations completed") != std::string::npos);
+    partial.progress_known = false;
+    EXPECT(report_of({partial}).find("3 operations, progress inside the list not recorded") != std::string::npos);
     std::printf("breadcrumbs: state, operations and report on synthetic data ok\n");
     return 0;
 }
@@ -160,6 +183,27 @@ int main() {
     EXPECT(b.close());
     const CommandList* pa = &a;
     const CommandList* pb = &b;
+
+    // List markers only (no per-op markers): a finished list reads all its operations completed (its end word);
+    // inside a list nothing is known, so a started one would say nothing about its operations, not "0 completed".
+    {
+        VulkanContext context(d.device_proc, d.device, true);
+        EXPECT(context.loaded());
+        if (d.buffer_marker) {
+            EXPECT(context.configure_breadcrumbs(d.memory_properties(), true, false, false));
+            BreadcrumbRing* ring = context.breadcrumbs();
+            EXPECT(ring && ring->gpu() && !ring->per_op() && !ring->op_marker_function());
+            context.add_resource(1, src_rb);
+            context.add_resource(2, dst_rb);
+            VulkanQueue queue(context, d.queue, d.family);
+            EXPECT(queue.execute({&pb, 1}) == ReplayResult::success);
+            EXPECT(queue.idle());
+            const auto entries = ring->snapshot();
+            EXPECT(entries.size() == 1 && entries[0].state == BreadcrumbState::completed &&
+                   entries[0].progress_known && entries[0].completed_ops == 2);
+            std::printf("breadcrumbs: list markers only: a finished list, no per-op progress claimed ok\n");
+        }
+    }
 
     // 4. Fallbacks: a context that was not configured has no breadcrumbs; one without the marker command refuses;
     //    without the marker extension the ring keeps the CPU's view only.
@@ -198,7 +242,7 @@ int main() {
         const auto entries = ring->snapshot();
         EXPECT(entries.size() == 2);
         for (const auto& e : entries) {
-            EXPECT(e.state == BreadcrumbState::unknown);  // never "completed" without GPU writes
+            EXPECT(e.state == BreadcrumbState::unknown && !e.progress_known && e.completed_ops == 0);  // no GPU writes
             EXPECT(e.queue_id == reinterpret_cast<std::uintptr_t>(&queue) && e.queue_name == L"copy queue");
         }
         EXPECT(entries[0].list_name == L"list A" && entries[1].list_name.empty());
@@ -267,6 +311,7 @@ int main() {
         const auto* released = find(entries, reinterpret_cast<std::uintptr_t>(pb));
         EXPECT(released && released->state == BreadcrumbState::completed && released->list_name == L"held list");
         EXPECT(released->ops.size() == 2 && released->ops[1] == breadcrumb_op::resource_barrier);
+        EXPECT(released->progress_known && released->completed_ops == 2);  // the held copy got the per-op markers
         ring->label_list(pb, L"");
         std::printf("breadcrumbs: completed / held behind an unsignalled fence, then released under its own id and "
                     "name / completed ok\n");
@@ -324,6 +369,50 @@ int main() {
                         "released out of order) ok\n");
         }
 
+        // Per-operation markers: three operations in one list, two lists in one submission, and a list that is
+        // reset and recorded again between two submissions; each history keeps what was submitted.
+        {
+            CommandList three;
+            // Bytes 16..48 only: `a`, in the same submission, writes 0..16, and two copies into the same bytes would need
+            // a copy -> copy barrier between them.
+            EXPECT(three.copy_buffer({2, 16, 1, 16, 16}) && three.uav_barrier({2}) && three.copy_buffer({2, 32, 1, 32, 16}));
+            EXPECT(three.close());
+            const CommandList* pthree = &three;
+            const CommandList* pair[] = {pthree, pa};
+            EXPECT(queue.execute(pair) == ReplayResult::success);
+            EXPECT(queue.idle());
+            three = CommandList{};  // Reset: one operation now
+            EXPECT(three.copy_buffer({2, 48, 1, 48, 16}) && three.close());
+            EXPECT(queue.execute({&pthree, 1}) == ReplayResult::success);
+            EXPECT(queue.idle());
+            entries = ring->snapshot();
+            EXPECT(entries.size() >= 3);
+            const auto& first = entries[entries.size() - 3];
+            const auto& second = entries[entries.size() - 2];
+            const auto& again = entries[entries.size() - 1];
+            EXPECT(first.ops.size() == 3 && first.progress_known && first.completed_ops == 3);
+            EXPECT(second.ops.size() == 1 && second.completed_ops == 1);
+            EXPECT(again.list_id == first.list_id && again.ops.size() == 1 && again.completed_ops == 1);
+            std::printf("breadcrumbs: per-operation progress over 3 + 1 operations and a reset list ok\n");
+        }
+
+        // Op numbers across the 32-bit wrap, on the GPU: a range that would contain 0 starts after it, and the
+        // lists on both sides of the wrap read every operation as completed.
+        {
+            CommandList four;
+            EXPECT(four.copy_buffer({2, 16, 1, 16, 16}) && four.uav_barrier({2}) && four.copy_buffer({2, 32, 1, 32, 16}) &&
+                   four.uav_barrier({2}));
+            EXPECT(four.close());
+            const CommandList* pfour = &four;
+            ring->skip_op_numbers_to(0xfffffffdu);  // the next list's 4 op numbers would wrap through 0
+            for (int i = 0; i < 3; ++i) EXPECT(queue.execute({&pfour, 1}) == ReplayResult::success);
+            EXPECT(queue.idle());
+            entries = ring->snapshot();
+            for (std::size_t i = entries.size() - 3; i < entries.size(); ++i)
+                EXPECT(entries[i].ops.size() == 4 && entries[i].progress_known && entries[i].completed_ops == 4);
+            std::printf("breadcrumbs: per-operation progress across the 32-bit wrap of op numbers ok\n");
+        }
+
         // Two lists in one ExecuteCommandLists get a slot each, and the ring keeps the newest kSlots lists.
         const CommandList* both[] = {&a, &b};
         for (std::uint32_t i = 0; i < BreadcrumbRing::kSlots / 2; ++i)
@@ -331,7 +420,8 @@ int main() {
         EXPECT(queue.idle());
         entries = ring->snapshot();
         EXPECT(entries.size() == BreadcrumbRing::kSlots);
-        for (const auto& e : entries) EXPECT(e.state == BreadcrumbState::completed);
+        for (const auto& e : entries)
+            EXPECT(e.state == BreadcrumbState::completed && e.progress_known && e.completed_ops == e.ops.size());
         EXPECT(entries.back().list_id == reinterpret_cast<std::uintptr_t>(pb));
         EXPECT(entries[entries.size() - 2].list_id == reinterpret_cast<std::uintptr_t>(pa));
         std::printf("breadcrumbs: %u lists across a ring wrap ok\n", BreadcrumbRing::kSlots + 2);
@@ -358,7 +448,7 @@ int main() {
         EXPECT(entries.size() == BreadcrumbRing::kSlots);
         std::uint32_t from_a = 0, from_b = 0;
         for (std::size_t i = 0; i < entries.size(); ++i) {
-            EXPECT(entries[i].state == BreadcrumbState::completed);
+            EXPECT(entries[i].state == BreadcrumbState::completed && entries[i].completed_ops == entries[i].ops.size());
             if (i) EXPECT(entries[i].tag > entries[i - 1].tag);  // marking order, no tag twice
             if (i >= entries.size() - 2 * per_thread) {
                 from_a += entries[i].list_id == reinterpret_cast<std::uintptr_t>(pa);
@@ -367,6 +457,48 @@ int main() {
         }
         EXPECT(from_a == per_thread && from_b == per_thread);  // the newest 800 are the two threads' lists
         std::printf("breadcrumbs: two queues on two threads, %u lists, ordered and recycled ok\n", 2 * per_thread);
+    }
+
+    // Cost (informational, NVIDIA only so far): lists of N operations (a copy, then a copy -> copy barrier, repeated),
+    // without the diagnostics, with the list markers only and with the per-op markers. `record` is execute()
+    // (prepare, record, submit) on the CPU; `wait` is idle() after it, the GPU finishing. Best of 7.
+    {
+        const GlobalBarrier copy_to_copy{d3d12_sync::copy, d3d12_sync::copy, d3d12_access::copy_dest,
+                                         d3d12_access::copy_dest};
+        for (const std::uint32_t n : {100u, 1000u, 2000u, 10000u}) {
+            CommandList many;
+            for (std::uint32_t i = 0; i < n / 2; ++i)
+                EXPECT(many.copy_buffer({2, 0, 1, 0, 16}) && many.barrier(copy_to_copy));
+            EXPECT(many.close());
+            const CommandList* pmany = &many;
+            double record[3] = {1e9, 1e9, 1e9}, wait[3] = {1e9, 1e9, 1e9};
+            for (int mode = 0; mode < 3; ++mode) {  // 0 off, 1 list markers, 2 per-op markers
+                VulkanContext context(d.device_proc, d.device, true);
+                EXPECT(context.loaded());
+                if (mode) EXPECT(context.configure_breadcrumbs(d.memory_properties(), true, false, mode == 2));
+                context.add_resource(1, src_rb);
+                context.add_resource(2, dst_rb);
+                VulkanQueue queue(context, d.queue, d.family);
+                for (int run = 0; run < 7; ++run) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    EXPECT(queue.execute({&pmany, 1}) == ReplayResult::success);
+                    const auto t1 = std::chrono::steady_clock::now();
+                    EXPECT(queue.idle());
+                    const auto t2 = std::chrono::steady_clock::now();
+                    record[mode] = std::min(record[mode], std::chrono::duration<double, std::milli>(t1 - t0).count());
+                    wait[mode] = std::min(wait[mode], std::chrono::duration<double, std::milli>(t2 - t1).count());
+                }
+                if (mode) {
+                    const auto e = context.breadcrumbs()->snapshot();
+                    EXPECT(e.size() == 7 && e.back().ops.size() == n && e.back().completed_ops == n);
+                    // The history keeps the ops alone: the per-op positions went with the submission.
+                    EXPECT(context.breadcrumbs()->history_words() == 7u * n);
+                }
+            }
+            std::printf("breadcrumbs: cost %5u ops: record %.3f / %.3f / %.3f ms, wait %.3f / %.3f / %.3f ms "
+                        "(off / list markers / per-op markers)\n",
+                        n, record[0], record[1], record[2], wait[0], wait[1], wait[2]);
+        }
     }
 
     const unsigned errors = d.validation_errors();
