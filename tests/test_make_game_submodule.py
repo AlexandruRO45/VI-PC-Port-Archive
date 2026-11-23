@@ -63,6 +63,39 @@ class EnsureSubmoduleTest(unittest.TestCase):
             make_game.ensure_submodule()
         self.assertEqual(fixture.read_text(encoding="utf-8"), "synthetic\n")
 
+    def advance_pin(self):
+        checkout = self.source / self.submodule
+        original = self.git(checkout, "rev-parse", "HEAD").strip()
+        fixture = checkout / "Core" / "fixture.txt"
+        fixture.write_text("updated pin\n", encoding="utf-8", newline="\n")
+        self.git(checkout, "add", "Core/fixture.txt")
+        self.git(checkout, "commit", "-qm", "Second decoder revision")
+        pinned = self.git(checkout, "rev-parse", "HEAD").strip()
+        self.git(self.source, "add", self.submodule.as_posix())
+        self.git(self.source, "commit", "-qm", "Advance decoder pin")
+        self.git(checkout, "checkout", "-q", "--detach", original)
+        return fixture, original, pinned
+
+    def test_updates_an_initialized_checkout_when_its_pin_changes(self):
+        fixture, _, pinned = self.advance_pin()
+        with (mock.patch.object(make_game, "ROOT", str(self.source)),
+              mock.patch.object(make_game.subprocess, "run", new=partial(subprocess.run, env=self.git_env))):
+            self.assertFalse(make_game.submodule_ready())
+            make_game.ensure_submodule()
+            self.assertTrue(make_game.submodule_ready())
+        self.assertEqual(self.git(self.source / self.submodule, "rev-parse", "HEAD").strip(), pinned)
+        self.assertEqual(fixture.read_text(encoding="utf-8"), "updated pin\n")
+
+    def test_an_outdated_checkout_keeps_a_conflicting_local_edit(self):
+        fixture, original, _ = self.advance_pin()
+        fixture.write_text("local edit\n", encoding="utf-8", newline="\n")
+        with (mock.patch.object(make_game, "ROOT", str(self.source)),
+              mock.patch.object(make_game.subprocess, "run", new=partial(subprocess.run, env=self.git_env)),
+              self.assertRaises(SystemExit)):
+            make_game.ensure_submodule()
+        self.assertEqual(self.git(self.source / self.submodule, "rev-parse", "HEAD").strip(), original)
+        self.assertEqual(fixture.read_text(encoding="utf-8"), "local edit\n")
+
     def test_initializes_submodule_in_clone(self):
         checkout = self.root / "clone"
         self.git(self.root, "clone", "-q", "--no-recurse-submodules", self.source, checkout)

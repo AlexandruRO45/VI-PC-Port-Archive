@@ -967,14 +967,20 @@ def dotnet_sdk_ok() -> bool:
 
 
 def submodule_ready() -> bool:
-    """Whether third_party/rpf9-explorer is checked out (a non-empty Core): what ensure_submodule() requires and
-    what decoder_digest() is only meaningful after."""
+    """A non-empty decoder checkout, at the recorded gitlink when Git metadata is available."""
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
-    return os.path.isdir(core) and bool(os.listdir(core))
+    if not os.path.isdir(core) or not os.listdir(core):
+        return False
+    git = shutil.which("git")
+    if not git or not os.path.exists(os.path.join(ROOT, ".git")):
+        return True
+    status = subprocess.run([git, "-C", ROOT, "submodule", "status", "--", "third_party/rpf9-explorer"],
+                            capture_output=True)
+    # Git prefixes a matching revision with a space and marks missing, outdated or conflicted checkouts.
+    return status.returncode == 0 and status.stdout.startswith(b" ")
 
 
 def ensure_submodule() -> None:
-    core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
     if submodule_ready():
         return
     clone = "git clone --recursive https://github.com/ItsNotRexed/Leonida"
@@ -986,12 +992,13 @@ def ensure_submodule() -> None:
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
         fail("third_party/rpf9-explorer is missing (a \"Download ZIP\" from GitHub leaves it out). "
              f"Download the project with: {clone}")
-    log("fetching third_party/rpf9-explorer")
-    r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive"])
-    if r.returncode == 0 and os.path.isdir(core):
+    log("initializing or updating third_party/rpf9-explorer")
+    r = subprocess.run([git, "-C", ROOT, "submodule", "update", "--init", "--recursive", "--checkout",
+                        "--", "third_party/rpf9-explorer"])
+    if r.returncode == 0 and submodule_ready():
         return
-    fail("fetching third_party/rpf9-explorer failed. Check your network connection, then run "
-         "\"git submodule update --init --recursive\" in this folder and build again.")
+    fail("fetching third_party/rpf9-explorer failed. Check the Git output, then run "
+         "\"git submodule update --init --recursive --checkout -- third_party/rpf9-explorer\" and build again.")
 
 
 def check(game: str, full: bool) -> dict:
