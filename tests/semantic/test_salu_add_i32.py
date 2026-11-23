@@ -516,5 +516,90 @@ class TestSAddI32SIMDDivergence(unittest.TestCase):
             expected = 42 if lane < 8 else 0
             self.assertEqual(wave.vgprs[lane][2], expected)
 
+class TestSAddI32RegisterAliasing(unittest.TestCase):
+    """Unit tests for in-place register aliasing and self-addition."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState()
+        self.interp = ScalarInterpreter(self.state)
+
+    def test_dst_aliases_src0(self) -> None:
+        self.state.sgprs[10] = 500
+        self.state.sgprs[11] = 300
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 10),
+            ssrc0=Reg(OperandKind.SGPR, 10),
+            ssrc1=Reg(OperandKind.SGPR, 11),
+        )
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, 800)
+        self.assertEqual(scc, 0)
+        self.assertEqual(self.state.sgprs[10], 800)
+        self.assertEqual(self.state.sgprs[11], 300)
+
+    def test_dst_aliases_src1(self) -> None:
+        self.state.sgprs[10] = 100
+        self.state.sgprs[11] = 400
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 11),
+            ssrc0=Reg(OperandKind.SGPR, 10),
+            ssrc1=Reg(OperandKind.SGPR, 11),
+        )
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, 500)
+        self.assertEqual(scc, 0)
+        self.assertEqual(self.state.sgprs[10], 100)
+        self.assertEqual(self.state.sgprs[11], 500)
+
+    def test_dst_aliases_both_srcs_doubling(self) -> None:
+        # Doubling positive without overflow
+        self.state.sgprs[7] = 1000
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 7),
+            ssrc0=Reg(OperandKind.SGPR, 7),
+            ssrc1=Reg(OperandKind.SGPR, 7),
+        )
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, 2000)
+        self.assertEqual(scc, 0)
+        self.assertEqual(self.state.sgprs[7], 2000)
+
+        # Doubling 0x40000000 -> 0x80000000 (positive overflow)
+        self.state.sgprs[7] = 0x40000000
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, UINT32_INT_MIN)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.state.sgprs[7], UINT32_INT_MIN)
+
+        # Doubling 0x80000000 -> 0x00000000 (negative overflow)
+        self.state.sgprs[7] = UINT32_INT_MIN
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, 0)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.state.sgprs[7], 0)
+
+        # Doubling -0x40000000 (0xC0000000) -> 0x80000000 (no overflow)
+        self.state.sgprs[7] = 0xC0000000
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, UINT32_INT_MIN)
+        self.assertEqual(scc, 0)
+        self.assertEqual(self.state.sgprs[7], UINT32_INT_MIN)
+
+    def test_chain_aliased_accumulator(self) -> None:
+        self.state.sgprs[0] = 0
+        self.state.sgprs[1] = 10
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 0),
+            ssrc0=Reg(OperandKind.SGPR, 0),
+            ssrc1=Reg(OperandKind.SGPR, 1),
+        )
+        for i in range(1, 11):
+            self.interp.step(inst)
+            self.assertEqual(self.state.sgprs[0], i * 10)
+
 if __name__ == "__main__":
     unittest.main()
