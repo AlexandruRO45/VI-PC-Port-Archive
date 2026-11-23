@@ -287,15 +287,16 @@ def lsns_word_check(blob, spans, blocks):
     its own bytes. A word in the rest of the container is a reference candidate; a chance-level hit is
     possible for a 32-bit word, so only the 64-bit figure reads as a test.
     """
-    rest = bytearray()
+    pieces = []
     last = 0
     for start, end in sorted(spans):
-        rest += blob[last:start]
-        last = end
-    rest += blob[last:]
-    rest = bytes(rest)
-    words8 = {rest[i:i + 8] for i in range(len(rest) - 7)}
-    words4 = {rest[i:i + 4] for i in range(len(rest) - 3)}
+        if start > last:
+            pieces.append(blob[last:start])
+        last = max(last, end)
+    if last < len(blob):
+        pieces.append(blob[last:])
+    words8 = {p[i:i + 8] for p in pieces for i in range(len(p) - 7)}
+    words4 = {p[i:i + 4] for p in pieces for i in range(len(p) - 3)}
     checked64 = found64 = checked32 = found32 = 0
     for record in lsns_records(blocks):
         for at in (0, 8):

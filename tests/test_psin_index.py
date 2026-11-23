@@ -286,6 +286,21 @@ class TestLsnsRecords(unittest.TestCase):
             self.assertEqual(len(spans), 1)
             self.assertEqual(blocks, [(0x101, records(1))])
 
+    def test_word_check_does_not_cross_excluded_section_boundary(self):
+        # Removing LSNS must not splice its neighbours into synthetic 4-/8-byte windows like "ABCDLGID" or "CDLG".
+        lsns_payload = make_lsns([(0x101, b"ABCDLGIDabcdefgh" + b"CDLGIJKLmnopqrst")])
+        boundary_only = make_psin([("LSCH", b""), ("LRSC", b"ABCD"), ("LSNS", lsns_payload), ("LGID", b"")])
+        parsed = P.parse(boundary_only)
+        spans = [(s["offset"], s["offset"] + s["size"]) for s in parsed["sections"] if s["tag"] == "LSNS"]
+        blocks = P.lsns_blocks(next(s["payload"] for s in parsed["sections"] if s["tag"] == "LSNS"))
+        self.assertEqual(P.lsns_word_check(boundary_only, spans, blocks), (4, 0, 8, 2))
+
+        with_physical_hit = make_psin([("LSCH", b""), ("LRSC", b"ABCDLGIDxxxxABCD"), ("LSNS", lsns_payload), ("LGID", b"")])
+        parsed2 = P.parse(with_physical_hit)
+        spans2 = [(s["offset"], s["offset"] + s["size"]) for s in parsed2["sections"] if s["tag"] == "LSNS"]
+        blocks2 = P.lsns_blocks(next(s["payload"] for s in parsed2["sections"] if s["tag"] == "LSNS"))
+        self.assertEqual(P.lsns_word_check(with_physical_hit, spans2, blocks2), (4, 1, 8, 3))
+
 
 class TestSchema(unittest.TestCase):
     def test_lsch_layout(self):
