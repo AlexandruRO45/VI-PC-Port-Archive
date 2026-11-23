@@ -230,12 +230,13 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     const UINT y = c.dst_y >= 0 ? UINT(c.dst_y) : c.rect ? UINT(rect.top) : 0;
     resolve_list1->ResolveSubresourceRegion(target.p, c.plane, x, y, source.p, c.plane, c.rect ? &rect : nullptr,
                                             c.format, c.mode);
-    if (run_invalid) {
-        // None of the lists above ran, so the destination is still in the state the clears left it in.
-        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    } else {
-        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
-    }
+    // Close before the readback barrier is recorded: a list that closed runs its resolve and leaves the destination in
+    // RESOLVE_DEST, one that was refused as a batch (Close failed) records nothing, so the destination is still where
+    // the clears left it. run_invalid is also used for resolves that succeed (the layer's own loop), so the result
+    // decides this, not the parameter.
+    if (run_invalid) out.close = resolve_list->Close();
+    barriers[1].Transition.StateBefore = (run_invalid && FAILED(out.close)) ? D3D12_RESOURCE_STATE_DEPTH_WRITE
+                                                                            : D3D12_RESOURCE_STATE_RESOLVE_DEST;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     copy_list->ResourceBarrier(1, &barriers[1]);
     for (UINT i = 0; i < planes; ++i) {
@@ -248,12 +249,14 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
         dst.PlacedFootprint = placed[i];
         copy_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
-    out.close = resolve_list->Close();
-    if (FAILED(out.close) && !run_invalid) return true;
+    if (!run_invalid) {
+        out.close = copy_list->Close();
+        if (FAILED(out.close)) return true;
+    }
     if (run_invalid) {
-        ID3D12CommandList* refused_lists[] = {refused_list.p};
-        queue->ExecuteCommandLists(1, refused_lists);     // the layer refuses the batch; nothing of it runs
         CHECK(SUCCEEDED(readback_list->Close()));
+        ID3D12CommandList* resolve_lists[] = {resolve_list};
+        queue->ExecuteCommandLists(1, resolve_lists);     // a refused list is dropped as a whole; a good one runs
         ID3D12CommandList* readback_lists[] = {readback_list.p};
         queue->ExecuteCommandLists(1, readback_lists);
     } else {
