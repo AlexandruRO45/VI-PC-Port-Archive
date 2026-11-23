@@ -128,5 +128,71 @@ class TestValuDot4I32I8Oracle(unittest.TestCase):
         self.assertEqual(ref_dot4_i32_i8(0, 0x12345678, 0xDEADBEEF), 0xDEADBEEF)
         self.assertEqual(ref_dot4_i32_i8(0x12345678, 0, 0xCAFEBABE), 0xCAFEBABE)
 
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: OperandKind
+    index: int = 0
+    value: int = 0
+
+    @staticmethod
+    def vgpr(idx: int) -> Operand:
+        return Operand(OperandKind.VGPR, index=idx)
+
+    @staticmethod
+    def sgpr(idx: int) -> Operand:
+        return Operand(OperandKind.SGPR, index=idx)
+
+    @staticmethod
+    def imm(val: int) -> Operand:
+        return Operand(OperandKind.IMM, value=val & MASK32)
+
+
+@dataclass(frozen=True)
+class VDot4I32I8Instruction:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+    clamp: bool = False
+
+    def disasm(self) -> str:
+        def fmt(op: Operand) -> str:
+            if op.kind == OperandKind.VGPR:
+                return f"v{op.index}"
+            if op.kind == OperandKind.SGPR:
+                return f"s{op.index}"
+            return f"{op.value:#x}"
+        c = " clamp" if self.clamp else ""
+        return f"v_dot4_i32_i8 {fmt(self.dst)}, {fmt(self.src0)}, {fmt(self.src1)}, {fmt(self.src2)}{c}"
+
+
+class TestValuDot4I32I8AST(unittest.TestCase):
+    """Stage 2: AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_formatting(self) -> None:
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(3),
+        )
+        self.assertEqual(instr.disasm(), "v_dot4_i32_i8 v0, v1, v2, v3")
+
+    def test_ast_with_clamp_modifier(self) -> None:
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(4),
+            src0=Operand.sgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.imm(0x100),
+            clamp=True,
+        )
+        self.assertEqual(instr.disasm(), "v_dot4_i32_i8 v4, s0, v1, 0x100 clamp")
+
 if __name__ == "__main__":
     unittest.main()
