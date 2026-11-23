@@ -345,7 +345,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
         if benum is not None:
             tok = toks[idx]
             mask = 0
-            flag_params: list[tuple[int, tuple[str, ...]]] = []
+            flag_params: dict[int, tuple[str, ...]] = {}
             for part in tok.split("|"):
                 entry = benum.get(part)
                 if entry is None:
@@ -356,12 +356,12 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
                 bval, params = entry
                 mask |= bval
                 if params:
-                    flag_params.append((bval, params))
+                    flag_params[bval] = params
             out.append(mask)
             idx += 1
             # SPIR-V spec: bit-mask extra parameters appear in ascending bit-value order.
-            flag_params.sort(key=lambda pair: pair[0])
-            for _, params in flag_params:
+            # Repeated flags and aliases set one bit, so consume its parameters only once.
+            for _, params in sorted(flag_params.items()):
                 for pk in params:
                     if idx >= len(toks):
                         raise SpirvAsmError(f"line {lineno}: missing parameter {pk} for {kind} {tok!r}")
