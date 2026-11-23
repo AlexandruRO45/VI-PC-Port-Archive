@@ -1131,11 +1131,22 @@ def main(argv=None) -> int:
     ap.add_argument("-o", "--out", required=True, help="output .spvasm file")
     ap.add_argument("--passes", type=int, default=4, help="max optimization passes (default: 4)")
     args = ap.parse_args(argv)
-    with open(args.src, encoding="utf-8") as f:
-        text = f.read()
+    try:
+        with open(args.src, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        print(f"ERROR: cannot read {args.src}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    except UnicodeDecodeError as e:
+        print(f"ERROR: {args.src} is not UTF-8 text: {e}", file=sys.stderr)
+        return 2
     opt = optimize(text, max_passes=args.passes)
-    with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-        f.write(opt)
+    try:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(opt)
+    except OSError as e:
+        print(f"ERROR: cannot write {args.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     return 0
 
 
