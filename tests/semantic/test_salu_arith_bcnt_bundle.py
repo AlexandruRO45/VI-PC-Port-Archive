@@ -139,6 +139,13 @@ class TestSAbsI32TranslatorAndControls(unittest.TestCase):
         with self.assertRaises(Exception):
             support.translate_lines("ps_neg_s_abs_i32", ["s_abs_i32", "s_endpgm"])
 
+class TestSAbsdiffI32ReferenceOracle(unittest.TestCase):
+    """Stage 1 for s_absdiff_i32: reference mathematical oracle validation."""
+
+    def test_s_absdiff_i32_oracle_identity(self):
+        res = oracle_s_absdiff_i32(0x5, 0x9)
+        self.assertEqual(res, 0x4)
+
 
 if __name__ == '__main__':
     unittest.main()
