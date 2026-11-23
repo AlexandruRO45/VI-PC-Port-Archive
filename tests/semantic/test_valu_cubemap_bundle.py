@@ -425,5 +425,16 @@ class VCubeMaSimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.get_vgpr(i, 6), -1.0)
 
+class VCubeMaEdgeCasesTests(unittest.TestCase):
+    def test_cubema_signed_zero_normalization(self):
+        # Hardware rule: v_cubema_f32 returns +0.0 (never -0.0) when major axis is ±0.0
+        pos_zero_ma = oracle_cubema_f32(0.0, 0.0, 0.0)
+        neg_zero_ma = oracle_cubema_f32(-0.0, -0.0, -0.0)
+        self.assertEqual(pos_zero_ma, 0.0)
+        self.assertEqual(neg_zero_ma, 0.0)
+        # Sign bit check: must be positive (+0.0)
+        self.assertEqual(f32_to_u32(pos_zero_ma), 0x00000000)
+        self.assertEqual(f32_to_u32(neg_zero_ma), 0x00000000)
+
 if __name__ == "__main__":
     unittest.main()
