@@ -94,7 +94,9 @@ def build(args):
             raise SystemExit("no entity resolves to an exported model")
         best = max(cells, key=cells.get)
         args.center = [(best[0] + 0.5) * 50, (best[1] + 0.5) * 50]
-    picked = select_rows(rows, args.center, args.radius, args.max_props * 4)
+    # Missing models or empty geometry must not exhaust a positive placement budget.
+    candidate_limit = len(rows) if args.max_props > 0 else args.max_props * 4
+    picked = select_rows(rows, args.center, args.radius, candidate_limit)
 
     textures, tex_ids = [], {}
     meshes, mesh_ids = [], {}
