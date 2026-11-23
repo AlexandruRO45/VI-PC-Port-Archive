@@ -164,6 +164,25 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(reparsed["op"], ins["op"])
         self.assertEqual(reparsed["mods"], ins["mods"])
 
+    def test_vop3_permlane_opsel_is_two_bits(self):
+        # v_permlane16/x16_b32 carry only FI and BOUND_CTRL in op_sel[1:0]
+        # (docs/design.md SHADER-74; rdna2spirv reads opsel_bits(mods, 2)). llvm-mc prints
+        # op_sel:[s0,s1], not the generic VOP3 [s0,s1,s2,dst]. Encodings assembled with
+        # llvm-mc -mcpu=gfx1013: v_permlane16_b32 v11, v2, s4, s5 op_sel:[0,1] etc.
+        cases = [
+            (0xD777100B, "v_permlane16_b32", ["op_sel:[0,1]"]),
+            (0xD777080C, "v_permlane16_b32", ["op_sel:[1,0]"]),
+            (0xD778100F, "v_permlanex16_b32", ["op_sel:[0,1]"]),
+            (0xD778080F, "v_permlanex16_b32", ["op_sel:[1,0]"]),
+            (0xD777000A, "v_permlane16_b32", []),
+        ]
+        for w0, op, mods in cases:
+            with self.subTest(word=hex(w0)):
+                ins = rdna2_decode.decode_bytes(words(w0, 0x00140902))["insns"][0]
+                self.assertEqual(ins["op"], op)
+                self.assertEqual(ins["mods"], mods)
+                self.assertEqual([a["r"] for a in ins["args"]], [w0 & 0xFF, 2, 4, 5])
+
     def test_smem_vcc_tuple_and_offsets(self):
         # s_buffer_load_dwordx8 [s100..s105,vcc_lo,vcc_hi], s[0:3], null (SMEM op=0x0b, sdata=100, sbase=0, soff=125)
         w0 = (0x3D << 26) | (0x0B << 18) | (100 << 6) | 0

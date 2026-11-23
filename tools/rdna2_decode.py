@@ -979,8 +979,12 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         if op_sel:
             # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC).
             nbits = nsrc if opc < 0x100 else (nsrc + 1)
-            bits = [(op_sel >> i) & 1 for i in range(nsrc)]
-            if nbits > nsrc:
+            # v_permlane16/x16_b32 carry only FI and BOUND_CTRL in op_sel[1:0]
+            # (design.md SHADER-74; rdna2spirv reads them via opsel_bits(mods, 2)).
+            if opc in (0x377, 0x378):
+                nbits = 2
+            bits = [(op_sel >> i) & 1 for i in range(min(nsrc, nbits))]
+            if nbits > len(bits):
                 bits.append((op_sel >> 3) & 1)
             mods.append(f"op_sel:[{','.join(str(b) for b in bits)}]")
         if clamp:
