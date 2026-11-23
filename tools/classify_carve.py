@@ -8,7 +8,7 @@ Classes:
   other:<hex>  anything else, keyed by its first 4 bytes
 
 Usage:
-    python -I classify_carve.py <work>\\carve
+    python -I tools/classify_carve.py <work>\\carve
 Writes types.json (per archive and overall counts/bytes per class, plus size stats) and prints a summary.
 Every per-class entry, overall and per archive, is {"files": N, "bytes": B, "min": ..., "max": ..., "median": ...}:
 min, max and median are the smallest, largest and median file size in bytes among the files of that class in that
@@ -63,7 +63,7 @@ def entry(v):
     return {"files": v[0], "bytes": v[1], "min": min(sizes), "max": max(sizes), "median": median_low(sizes)}
 
 
-USAGE = "usage: python -I classify_carve.py <work>\\carve"
+USAGE = "usage: python -I tools/classify_carve.py <work>\\carve"
 
 
 def main():
@@ -77,6 +77,10 @@ def main():
     if not os.path.isdir(root):
         what = "is not a folder" if os.path.exists(root) else "does not exist"
         print(f"{root}: {what}; give the carve folder (the one with an index.json per archive)", file=sys.stderr)
+        return 2
+    report = os.path.join(root, "types.json")
+    if os.path.isdir(report):
+        print(f"{report}: is a directory; remove or rename that directory before rerun", file=sys.stderr)
         return 2
     per = {}
     total = defaultdict(lambda: [0, 0, []])
@@ -106,8 +110,8 @@ def main():
             json.dump(out, f, indent=1)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(temp, published_mode(os.path.join(root, "types.json")))   # mkstemp creates 0600
-        os.replace(temp, os.path.join(root, "types.json"))
+        os.chmod(temp, published_mode(report))                             # mkstemp creates 0600
+        os.replace(temp, report)
     except BaseException:
         try:
             os.unlink(temp)

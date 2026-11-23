@@ -21,6 +21,8 @@ guess. A malformed container, a file with no skin, or a skin whose
 inverseBindMatrices count differs from its joint count exits nonzero. Structural
 problems also exit nonzero with a one-line ``ERROR:`` message.
 
+Each joint's inverse bind matrix must have the affine fourth row (0, 0, 0, 1).
+
 Only the standard library is used, and the input is read, never modified.
 """
 from __future__ import annotations
@@ -122,6 +124,16 @@ def _number(value):
     return _is_int(value) or isinstance(value, float)
 
 
+def _finite_number(value):
+    """True for a finite JSON number; an integer too large for float is not one."""
+    if not _number(value):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _reject_json_constant(token):
     raise ValueError(f"non-finite JSON number {token}")
 
@@ -185,6 +197,8 @@ def parse_glb(data):
     try:
         text = json_chunk.decode("utf-8")
         gltf = json.loads(text, parse_constant=_reject_json_constant)
+    except RecursionError as exc:
+        raise GlbSkinError("invalid GLB JSON chunk: nesting is too deep") from exc
     except (UnicodeDecodeError, ValueError) as exc:
         raise GlbSkinError(f"invalid GLB JSON chunk: {exc}") from exc
     if not isinstance(gltf, dict):
@@ -289,7 +303,7 @@ class _Reader:
             if (
                 not isinstance(value, list)
                 or len(value) != components
-                or not all(_number(v) and math.isfinite(v) for v in value)
+                or not all(_finite_number(v) for v in value)
             ):
                 raise GlbSkinError(
                     f"accessors[{index}].{key} must be {components} finite number(s)"
@@ -427,7 +441,7 @@ def _validate_skins(gltf, reader, warnings, errors):
         for joint_offset, joint in enumerate(joints):
             if not _is_int(joint):
                 raise GlbSkinError(f"{path}.joints[{joint_offset}] must be an integer")
-            if nodes and (joint < 0 or joint >= len(nodes)):
+            if joint < 0 or joint >= len(nodes):
                 errors.append(
                     f"{_skin_label(skin_index, name)} joint {joint_offset} references "
                     f"node {joint}, but the GLB has {len(nodes)} nodes"
@@ -437,7 +451,7 @@ def _validate_skins(gltf, reader, warnings, errors):
         if skeleton is not None:
             if not _is_int(skeleton):
                 raise GlbSkinError(f"{path}.skeleton must be an integer")
-            if nodes and (skeleton < 0 or skeleton >= len(nodes)):
+            if skeleton < 0 or skeleton >= len(nodes):
                 errors.append(
                     f"{_skin_label(skin_index, name)} skeleton references node {skeleton}, "
                     f"but the GLB has {len(nodes)} nodes"
@@ -486,8 +500,18 @@ def _validate_skins(gltf, reader, warnings, errors):
                     f"{meta['component_type_name']} is not FLOAT"
                 )
             bad = 0
-            for row in values:
+            first_non_affine = None
+            for index, row in enumerate(values):
                 bad += sum(1 for value in row if not math.isfinite(value))
+                # glTF stores MAT4 columns consecutively; translation is in the last column.
+                if (first_non_affine is None and index < len(joints) and meta["type"] == "MAT4"
+                        and row[3::4] != (0.0, 0.0, 0.0, 1.0)):
+                    first_non_affine = index
+            if first_non_affine is not None:
+                errors.append(
+                    f"{_skin_label(skin_index, name)}: inverseBindMatrices[{first_non_affine}] "
+                    "fourth row must be [0, 0, 0, 1]"
+                )
             inverse["non_finite_count"] = bad
             if bad:
                 errors.append(
