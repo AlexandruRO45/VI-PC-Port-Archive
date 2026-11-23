@@ -291,5 +291,37 @@ class TestSaluXorB64SIMDDivergence(unittest.TestCase):
         self.assertEqual(scc, 1)
 
 
+class TestSaluXorB64Aliasing(unittest.TestCase):
+    """Stage 5: Register aliasing and in-place operand preservation."""
+
+    def test_aliasing_dst_src0(self) -> None:
+        state = ScalarMachineState()
+        state.write_operand64(ASTOperand.sgpr(0), 0xF0F0F0F0F0F0F0F0)
+        state.write_operand64(ASTOperand.sgpr(2), 0x0F0F0F0F0F0F0F0F)
+        instr = ASTInstruction(
+            Opcode.S_XOR_B64,
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(2),
+        )
+        res, scc = ScalarInterpreter().step(instr, state)
+        self.assertEqual(res, ALL_LANES_ACTIVE)
+        self.assertEqual(state.read_operand64(ASTOperand.sgpr(0)), ALL_LANES_ACTIVE)
+
+    def test_aliasing_self_cancel(self) -> None:
+        state = ScalarMachineState()
+        state.write_operand64(ASTOperand.sgpr(0), 0x123456789ABCDEF0)
+        instr = ASTInstruction(
+            Opcode.S_XOR_B64,
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(0),
+        )
+        res, scc = ScalarInterpreter().step(instr, state)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.read_operand64(ASTOperand.sgpr(0)), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
