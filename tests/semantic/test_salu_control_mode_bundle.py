@@ -266,6 +266,18 @@ class TestSleepAST(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestSleepDuration(unittest.TestCase):
+    def test_duration_multipliers(self):
+        for count in (1, 4, 16, 64):
+            self.assertEqual(model_sleep(count), count * 64)
+
+    def test_translator_sleep_durations(self):
+        for imm in (1, 5, 10):
+            prog = [f"s_sleep {imm}", "s_endpgm"]
+            spv = support.translate_lines(f"cs_sleep_{imm}", prog, fssm=saveexec_run.fssm())
+            self.assertIn("OpCapability Shader", spv)
+            si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
