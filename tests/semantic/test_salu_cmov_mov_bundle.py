@@ -221,6 +221,20 @@ class TestSCmovB64PairGating(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x23456789)
 
+class TestSCmovB64Translator(unittest.TestCase):
+    def test_translator_s_cmov_b64_execution(self) -> None:
+        body = [
+            "s_cmp_eq_u32 0, 0",
+            "s_mov_b64 s[4:5], 0",
+            "s_mov_b64 s[6:7], 0xaabbccddeeff0011",
+            "s_cmov_b64 s[4:5], s[6:7]",
+            "v_mov_b32_e32 v1, s5",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_cmov_b64_exec")
+        for l in range(32):
+            self.assertEqual(results[l], 0xAABBCCDD)
+
 
 if __name__ == "__main__":
     unittest.main()
