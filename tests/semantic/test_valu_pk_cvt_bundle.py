@@ -363,5 +363,17 @@ class VCvtPknormU16F16OracleTests(unittest.TestCase):
     def test_zeros_and_negatives(self):
         self.assertEqual(ref_cvt_pknorm_u16_f16(0x0000, 0xBC00), 0x00000000)
 
+class VCvtPknormU16F16AstTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = PackedInstructionAST(
+            mnemonic="v_cvt_pknorm_u16_f16",
+            dst=Operand(RegKind.VGPR, index=0),
+            src0=Operand(RegKind.VGPR, index=1),
+            src1=Operand(RegKind.VGPR, index=2),
+            op_sel=(0, 1, 0),
+        )
+        self.assertEqual(ast.mnemonic, "v_cvt_pknorm_u16_f16")
+        self.assertEqual(ast.op_sel, (0, 1, 0))
+
 if __name__ == '__main__':
     unittest.main()
