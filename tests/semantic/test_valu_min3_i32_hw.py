@@ -413,5 +413,32 @@ class TestVMin3I32Aliasing(unittest.TestCase):
         ScalarInterpreter.step(instr, state)
         self.assertEqual(to_s32(state.vgprs[3]), -50)
 
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# -----------------------------------------------------------------------------
+
+class TestVMin3I32ConditionCodes(unittest.TestCase):
+    """Unit tests verifying condition codes and flag properties for v_min3_i32.
+
+    In RDNA2, vector ALU instructions (VOP3) do not update SCC.
+    We test zero and sign detection on the output word.
+    """
+
+    def test_zero_result_detection(self):
+        res = v_min3_i32_oracle(0, 10, 20)
+        self.assertEqual(res, 0)
+        is_zero = (res == 0)
+        self.assertTrue(is_zero)
+
+    def test_negative_result_sign_bit(self):
+        res = v_min3_i32_oracle(to_u32(-1), 10, 20)
+        is_negative = bool(res & SIGN_BIT32)
+        self.assertTrue(is_negative)
+
+    def test_positive_result_sign_bit(self):
+        res = v_min3_i32_oracle(10, 20, 30)
+        is_negative = bool(res & SIGN_BIT32)
+        self.assertFalse(is_negative)
+
 if __name__ == "__main__":
     unittest.main()
