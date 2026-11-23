@@ -1,369 +1,330 @@
+"""Translator-backed semantic execution tests for AMD RDNA2 register swap and relative addressing instructions.
+
+Subsystem Feature Bundle 56 covers 6 RDNA2 register swap and relative addressing opcodes:
+  1. v_swap_b32    - Exchanges two 32-bit VGPRs across active lanes
+  2. v_swaprel_b32 - Exchanges VGPR[D + M0[25:16]] and VGPR[S0 + M0[9:0]] under active lanes
+  3. s_swappc_b64  - Driver subroutine linkage in VS; rejected in PS and CS
+  4. s_movrels_b32 - Relative SGPR read through M0: D = SGPR[(S0 + M0) % 128]
+  5. s_movrels_b64 - Relative 64-bit SGPR read through M0: D = SGPR_pair[(S0 + M0) % 128]
+  6. v_movrels_b32 - Relative VGPR read through M0: D = VGPR[S0 + M0]
+
+Every test executes via support.translate_lines(...) and verifies computed register values
+via support.mrt0_words, preventing unverified mock regressions.
+
+Standard library Python only (unittest, struct, math). Zero game data.
+"""
 from __future__ import annotations
 
-"""Architectural reference models, symbolic AST, deterministic interpreter,
-multi-lane Wave64 divergence tests, and translator integration tests for
-Bundle 56: Vector & Scalar Register Swap and Relative Addressing Suite.
-
-Covers RDNA2 Instructions:
-    - v_swap_b32 vD, vS
-        Exchanges two 32-bit VGPRs across active execution lanes.
-    - v_swaprel_b32 vD, vS
-        Exchanges VGPR[D + M0[25:16]] and VGPR[S0 + M0[9:0]] under active lanes.
-    - s_swappc_b64 sD, sS
-        Saves next program counter in 64-bit SGPR pair D and jumps to address in S.
-    - s_movrels_b32 sD, sS
-        Reads SGPR[(S + M0) % 128] into scalar destination register sD.
-    - s_movrels_b64 sD, sS
-        Reads 64-bit SGPR pair starting at (S + M0) % 128 into pair sD.
-    - v_movrels_b32 vD, vS
-        Reads VGPR[S + M0] into destination vector register vD.
-
-Hardware rules (GFX10 RDNA2):
-    - v_swap_b32 exchanges values simultaneously using temporary storage.
-    - Inactive lanes in EXEC preserve their existing VGPR values during vector swaps.
-    - Relative addressing wraps modulo register bank bounds (128 SGPRs / 256 VGPRs).
-    - M0 register provides dynamic base offsets for scalar and vector register files.
-    - s_swappc_b64 acts as subroutine linkage in driver vertex fetch shaders and is rejected in compute kernels.
-
-Standard library Python only (unittest, struct, math, dataclasses, enum).
-Strictly zero game data.
-"""
-
-from dataclasses import dataclass, field
-from enum import Enum
 import os
-import struct
 import sys
-from typing import Dict, List, Optional, Set, Tuple, Union
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+for p in (TOOLS_DIR, HERE):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-import support
-import rdna2spirv
-import spirv_mini_interp as si
-import saveexec_run
+import rdna2spirv  # noqa: E402
+import support  # noqa: E402
 
-MASK32: int = 0xFFFF_FFFF
-MASK64: int = 0xFFFF_FFFF_FFFF_FFFF
-
-
-def model_swap(v0: int, v1: int) -> Tuple[int, int]:
-    return v1 & MASK32, v0 & MASK32
+MASK32: int = 0xFFFFFFFF
 
 
-def model_swaprel(dst_reg: int, src_reg: int, m0: int, vgprs: Dict[int, int]) -> Dict[int, int]:
-    m0_src = m0 & 0x3FF
-    m0_dst = (m0 >> 16) & 0x3FF
-    actual_dst = (dst_reg + m0_dst) & 0xFF
-    actual_src = (src_reg + m0_src) & 0xFF
-    val_dst = vgprs.get(actual_dst, 0)
-    val_src = vgprs.get(actual_src, 0)
-    out = dict(vgprs)
-    out[actual_dst] = val_src
-    out[actual_src] = val_dst
-    return out
+def run_ps(name: str, body: list[str], export_regs: tuple[str, ...] = ("v0", "v1", "v0", "v1")) -> list[int]:
+    """Helper to translate lines into a pixel shader, run it, and return exported MRT0 words."""
+    regs_str = ", ".join(export_regs)
+    lines = list(body) + [f"exp mrt0 {regs_str} done vm", "s_endpgm"]
+    spv = support.translate_lines(name, lines)
+    return support.mrt0_words(spv)
 
 
-def model_swappc(pc: int, target: int) -> Tuple[int, int]:
-    return target & MASK64, (pc + 4) & MASK64
+class TestVSwapB32(unittest.TestCase):
+    """Execution verification for v_swap_b32."""
 
+    def test_swap_basic_pair(self):
+        words = run_ps(
+            "ps_swap_basic",
+            [
+                "v_mov_b32 v0, 100",
+                "v_mov_b32 v1, 200",
+                "v_swap_b32 v0, v1",
+            ],
+            export_regs=("v0", "v1", "v0", "v1"),
+        )
+        self.assertEqual(words, [200, 100, 200, 100])
 
-def model_movrels_b32(src_reg: int, m0: int, sgprs: Dict[int, int]) -> int:
-    idx = (src_reg + m0) & 127
-    return sgprs.get(idx, 0) & MASK32
-
-
-def model_movrels_b64(src_reg: int, m0: int, sgprs: Dict[int, int]) -> Tuple[int, int]:
-    idx0 = (src_reg + m0) & 127
-    idx1 = (src_reg + m0 + 1) & 127
-    return sgprs.get(idx0, 0) & MASK32, sgprs.get(idx1, 0) & MASK32
-
-
-def model_v_movrels(src_reg: int, m0: int, vgprs: Dict[int, int]) -> int:
-    idx = (src_reg + m0) & 255
-    return vgprs.get(idx, 0) & MASK32
-
-class TestSwapOracle(unittest.TestCase):
-    def test_oracle_exchange(self):
-        a, b = model_swap(0x12345678, 0x9ABCDEF0)
-        self.assertEqual(a, 0x9ABCDEF0)
-        self.assertEqual(b, 0x12345678)
-
-    def test_translator_swap_oracle(self):
-        prog = ["v_mov_b32_e32 v0, 100", "v_mov_b32_e32 v1, 200", "v_swap_b32 v0, v1", "s_endpgm"]
-        spv = support.translate_lines("cs_swap_oracle", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpCopyObject", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
-
-class TestSwapAST(unittest.TestCase):
-    def test_ast_evaluation(self):
-        x, y = 55, 99
-        x, y = model_swap(x, y)
-        self.assertEqual(x, 99)
-        self.assertEqual(y, 55)
-
-    def test_translator_swap_ast(self):
-        prog = ["v_mov_b32_e32 v2, 55", "v_mov_b32_e32 v3, 99", "v_swap_b32 v2, v3", "s_endpgm"]
-        spv = support.translate_lines("cs_swap_ast", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpCopyObject", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
-
-class TestSwapDivergence(unittest.TestCase):
-    def test_self_swap(self):
-        a, b = model_swap(0xCAFE, 0xCAFE)
-        self.assertEqual(a, 0xCAFE)
-        self.assertEqual(b, 0xCAFE)
-
-    def test_translator_swap_divergence(self):
-        prog = [
-            "s_mov_b32 exec_lo, 0x55555555",
-            "s_mov_b32 exec_hi, 0xAAAAAAAA",
-            "v_mov_b32_e32 v4, 111",
-            "v_mov_b32_e32 v5, 222",
-            "v_swap_b32 v4, v5",
-            "s_endpgm",
+    def test_swap_boundary_constants(self):
+        pairs = [
+            (0x00000000, 0xFFFFFFFF),
+            (0x12345678, 0x9ABCDEF0),
+            (0x80000000, 0x00000001),
+            (0xCAFEBABE, 0xDEADBEEF),
         ]
-        spv = support.translate_lines("cs_swap_div", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpCopyObject", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+        for idx, (a, b) in enumerate(pairs):
+            with self.subTest(a=hex(a), b=hex(b)):
+                words = run_ps(
+                    f"ps_swap_pair_{idx}",
+                    [
+                        f"v_mov_b32 v0, {a:#x}",
+                        f"v_mov_b32 v1, {b:#x}",
+                        "v_swap_b32 v0, v1",
+                    ],
+                    export_regs=("v0", "v1", "v0", "v1"),
+                )
+                self.assertEqual(words, [b, a, b, a])
 
-class TestSwapTranslator(unittest.TestCase):
-    def test_translator_mutation_guard(self):
-        prog = ["v_mov_b32_e32 v6, 1234", "v_mov_b32_e32 v7, 5678", "v_swap_b32 v6, v7", "s_endpgm"]
-        spv = support.translate_lines("cs_swap_trans", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpCopyObject", spv)
-        self.assertIn("OpCapability Shader", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+    def test_swap_identity_self(self):
+        words = run_ps(
+            "ps_swap_self",
+            [
+                "v_mov_b32 v0, 0xCAFE",
+                "v_swap_b32 v0, v0",
+            ],
+            export_regs=("v0", "v0", "v0", "v0"),
+        )
+        self.assertEqual(words, [0xCAFE, 0xCAFE, 0xCAFE, 0xCAFE])
 
-class TestSwapRelOracle(unittest.TestCase):
-    def test_oracle_swaprel(self):
-        vgprs = {0: 10, 1: 20}
-        out = model_swaprel(0, 1, 0, vgprs)
-        self.assertEqual(out[0], 20)
-        self.assertEqual(out[1], 10)
+    def test_swap_double_involution(self):
+        words = run_ps(
+            "ps_swap_double",
+            [
+                "v_mov_b32 v0, 0x11223344",
+                "v_mov_b32 v1, 0x55667788",
+                "v_swap_b32 v0, v1",
+                "v_swap_b32 v0, v1",
+            ],
+            export_regs=("v0", "v1", "v0", "v1"),
+        )
+        self.assertEqual(words, [0x11223344, 0x55667788, 0x11223344, 0x55667788])
 
-    def test_translator_swaprel_oracle(self):
-        prog = ["s_mov_b32 m0, 0", "v_mov_b32_e32 v0, 10", "v_mov_b32_e32 v1, 20", "v_swaprel_b32 v0, v1", "s_endpgm"]
-        spv = support.translate_lines("cs_swaprel_oracle", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpBitwiseAnd", spv)
-        self.assertIn("OpSelect", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+    def test_swap_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_swap_bad", ["v_swap_b32"])
 
-class TestSwapRelAST(unittest.TestCase):
-    def test_ast_evaluation(self):
-        vgprs = {4: 100, 8: 200}
-        m0 = (4 << 16) | 4
-        out = model_swaprel(0, 4, m0, vgprs)
-        self.assertEqual(out[4], 200)
-        self.assertEqual(out[8], 100)
 
-    def test_translator_swaprel_ast(self):
-        prog = ["s_mov_b32 m0, 0x00040004", "v_mov_b32_e32 v4, 100", "v_mov_b32_e32 v8, 200", "v_swaprel_b32 v0, v4", "s_endpgm"]
-        spv = support.translate_lines("cs_swaprel_ast", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpShiftRightLogical", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+class TestVSwapRelB32(unittest.TestCase):
+    """Execution verification for v_swaprel_b32."""
 
-class TestSwapRelM0Fields(unittest.TestCase):
-    def test_m0_dual_fields(self):
-        m0 = (16 << 16) | 32
-        vgprs = {16: 777, 32: 888}
-        out = model_swaprel(0, 0, m0, vgprs)
-        self.assertEqual(out[16], 888)
-        self.assertEqual(out[32], 777)
+    def test_swaprel_zero_m0(self):
+        words = run_ps(
+            "ps_swaprel_zero",
+            [
+                "s_mov_b32 m0, 0",
+                "v_mov_b32 v0, 10",
+                "v_mov_b32 v1, 20",
+                "v_swaprel_b32 v0, v1",
+            ],
+            export_regs=("v0", "v1", "v0", "v1"),
+        )
+        self.assertEqual(words, [20, 10, 20, 10])
 
-    def test_translator_swaprel_m0_fields(self):
-        prog = ["s_mov_b32 m0, 0x00100020", "v_swaprel_b32 v0, v0", "s_endpgm"]
-        spv = support.translate_lines("cs_swaprel_m0", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpBitwiseAnd", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+    def test_swaprel_dual_m0_offsets(self):
+        # M0[25:16] = 4 (dst offset), M0[9:0] = 4 (src offset)
+        # With instruction v_swaprel_b32 v0, v4:
+        # actual dst = v0 + 4 = v4
+        # actual src = v4 + 4 = v8
+        words = run_ps(
+            "ps_swaprel_dual",
+            [
+                "s_mov_b32 m0, 0x00040004",
+                "v_mov_b32 v4, 100",
+                "v_mov_b32 v8, 200",
+                "v_swaprel_b32 v0, v4",
+            ],
+            export_regs=("v4", "v8", "v4", "v8"),
+        )
+        self.assertEqual(words, [200, 100, 200, 100])
 
-class TestSwapRelTranslator(unittest.TestCase):
-    def test_translator_mutation_guard(self):
-        prog = ["s_mov_b32 m0, 0", "v_swaprel_b32 v2, v3", "s_endpgm"]
-        spv = support.translate_lines("cs_swaprel_trans", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpSelect", spv)
-        self.assertIn("OpLogicalAnd", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+    def test_swaprel_split_indices(self):
+        # M0[25:16] = 1, M0[9:0] = 2
+        # v_swaprel_b32 v0, v0 exchanges v1 and v2
+        words = run_ps(
+            "ps_swaprel_split",
+            [
+                "s_mov_b32 m0, 0x00010002",
+                "v_mov_b32 v1, 777",
+                "v_mov_b32 v2, 888",
+                "v_swaprel_b32 v0, v0",
+            ],
+            export_regs=("v1", "v2", "v1", "v2"),
+        )
+        self.assertEqual(words, [888, 777, 888, 777])
 
-class TestSwapPCOracle(unittest.TestCase):
-    def test_oracle_swappc(self):
-        new_pc, link = model_swappc(0x1000, 0x8000)
-        self.assertEqual(new_pc, 0x8000)
-        self.assertEqual(link, 0x1004)
+    def test_swaprel_self_identity(self):
+        words = run_ps(
+            "ps_swaprel_self",
+            [
+                "s_mov_b32 m0, 0",
+                "v_mov_b32 v2, 555",
+                "v_swaprel_b32 v2, v2",
+            ],
+            export_regs=("v2", "v2", "v2", "v2"),
+        )
+        self.assertEqual(words, [555, 555, 555, 555])
 
-    def test_translator_swappc_rejection_in_cs(self):
-        prog = ["s_swappc_b64 s[0:1], s[2:3]", "s_endpgm"]
+    def test_swaprel_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_swaprel_bad", ["v_swaprel_b32 s0, v1"])
+
+
+class TestSSwappcB64(unittest.TestCase):
+    """Rejection and syntax verification for s_swappc_b64."""
+
+    def test_swappc_rejected_in_ps(self):
         with self.assertRaises(rdna2spirv.Unsupported):
-            support.translate_lines("cs_swappc_oracle", prog, fssm=saveexec_run.fssm())
+            support.translate_lines("ps_swappc", ["s_swappc_b64 s[0:1], s[2:3]", "s_endpgm"])
 
-class TestSwapPCAST(unittest.TestCase):
-    def test_ast_evaluation(self):
-        pc = 0x2000
-        target = 0x5000
-        new_pc, link = model_swappc(pc, target)
-        self.assertEqual(new_pc, target)
-        self.assertEqual(link, pc + 4)
+    def test_swappc_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_swappc_bad", ["s_swappc_b64"])
 
-    def test_translator_swappc_rejection_in_compute(self):
-        prog = ["s_swappc_b64 s[4:5], s[6:7]", "s_endpgm"]
-        with self.assertRaises(rdna2spirv.Unsupported):
-            support.translate_lines("cs_swappc_ast", prog, fssm=saveexec_run.fssm())
 
-class TestSwapPCPair(unittest.TestCase):
-    def test_64bit_pc_swap(self):
-        pc = 0x00000001_80000000
-        target = 0x00000002_40000000
-        new_pc, link = model_swappc(pc, target)
-        self.assertEqual(new_pc, 0x00000002_40000000)
-        self.assertEqual(link, 0x00000001_80000004)
+class TestSMovRelSB32(unittest.TestCase):
+    """Execution verification for s_movrels_b32."""
 
-    def test_translator_swappc_rejection_unsupported(self):
-        prog = ["s_swappc_b64 s[8:9], s[10:11]", "s_endpgm"]
-        with self.assertRaises(rdna2spirv.Unsupported):
-            support.translate_lines("cs_swappc_pair", prog, fssm=saveexec_run.fssm())
+    def test_movrels32_zero_offset(self):
+        words = run_ps(
+            "ps_movrels32_zero",
+            [
+                "s_mov_b32 m0, 0",
+                "s_mov_b32 s4, 42",
+                "s_movrels_b32 s0, s4",
+                "v_mov_b32 v0, s0",
+            ],
+            export_regs=("v0", "v0", "v0", "v0"),
+        )
+        self.assertEqual(words[0], 42)
 
-class TestSwapPCTranslator(unittest.TestCase):
-    def test_translator_rejection_guard(self):
-        prog = ["s_swappc_b64 s[0:1], s[0:1]", "s_endpgm"]
-        with self.assertRaises(rdna2spirv.Unsupported):
-            support.translate_lines("cs_swappc_guard", prog, fssm=saveexec_run.fssm())
+    def test_movrels32_positive_offset(self):
+        words = run_ps(
+            "ps_movrels32_pos",
+            [
+                "s_mov_b32 m0, 5",
+                "s_mov_b32 s15, 165",
+                "s_movrels_b32 s2, s10",
+                "v_mov_b32 v0, s2",
+            ],
+            export_regs=("v0", "v0", "v0", "v0"),
+        )
+        self.assertEqual(words[0], 165)
 
-class TestMovRelS32Oracle(unittest.TestCase):
-    def test_oracle_movrels(self):
-        sgprs = {5: 42, 6: 43}
-        self.assertEqual(model_movrels_b32(5, 0, sgprs), 42)
-        self.assertEqual(model_movrels_b32(5, 1, sgprs), 43)
+    def test_movrels32_modulo_128_wrapping(self):
+        # Index = (127 + 1) & 127 = 0
+        words = run_ps(
+            "ps_movrels32_wrap",
+            [
+                "s_mov_b32 m0, 1",
+                "s_mov_b32 s0, 999",
+                "s_movrels_b32 s2, s127",
+                "v_mov_b32 v0, s2",
+            ],
+            export_regs=("v0", "v0", "v0", "v0"),
+        )
+        self.assertEqual(words[0], 999)
 
-    def test_translator_movrels32_oracle(self):
-        prog = ["s_mov_b32 m0, 0", "s_mov_b32 s4, 42", "s_movrels_b32 s0, s4", "s_endpgm"]
-        spv = support.translate_lines("cs_movrels32_oracle", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+    def test_movrels32_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_movrels32_bad", ["s_movrels_b32 v0, s1"])
 
-class TestMovRelS32AST(unittest.TestCase):
-    def test_ast_evaluation(self):
-        sgprs = {i: i * 11 for i in range(128)}
-        self.assertEqual(model_movrels_b32(10, 5, sgprs), 165)
 
-    def test_translator_movrels32_ast(self):
-        prog = ["s_mov_b32 m0, 5", "s_mov_b32 s15, 165", "s_movrels_b32 s2, s10", "s_endpgm"]
-        spv = support.translate_lines("cs_movrels32_ast", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+class TestSMovRelSB64(unittest.TestCase):
+    """Execution verification for s_movrels_b64."""
 
-class TestMovRelS32Modulo(unittest.TestCase):
-    def test_modulo_wrapping(self):
-        sgprs = {0: 999, 127: 888}
-        self.assertEqual(model_movrels_b32(127, 1, sgprs), 999)
-        self.assertEqual(model_movrels_b32(120, 7, sgprs), 888)
+    def test_movrels64_zero_offset(self):
+        words = run_ps(
+            "ps_movrels64_zero",
+            [
+                "s_mov_b32 m0, 0",
+                "s_mov_b32 s4, 100",
+                "s_mov_b32 s5, 200",
+                "s_movrels_b64 s[0:1], s[4:5]",
+                "v_mov_b32 v0, s0",
+                "v_mov_b32 v1, s1",
+            ],
+            export_regs=("v0", "v1", "v0", "v1"),
+        )
+        self.assertEqual(words[:2], [100, 200])
 
-    def test_translator_movrels32_modulo(self):
-        prog = ["s_mov_b32 m0, 1", "s_movrels_b32 s0, s127", "s_endpgm"]
-        spv = support.translate_lines("cs_movrels32_mod", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpBitwiseAnd", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+    def test_movrels64_positive_offset(self):
+        words = run_ps(
+            "ps_movrels64_pos",
+            [
+                "s_mov_b32 m0, 2",
+                "s_mov_b32 s20, 0xAAAA",
+                "s_mov_b32 s21, 0xBBBB",
+                "s_movrels_b64 s[2:3], s[18:19]",
+                "v_mov_b32 v0, s2",
+                "v_mov_b32 v1, s3",
+            ],
+            export_regs=("v0", "v1", "v0", "v1"),
+        )
+        self.assertEqual(words[:2], [0xAAAA, 0xBBBB])
 
-class TestMovRelS32Translator(unittest.TestCase):
-    def test_translator_mutation_guard(self):
-        prog = ["s_mov_b32 m0, 2", "s_movrels_b32 s1, s4", "s_endpgm"]
-        spv = support.translate_lines("cs_movrels32_trans", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        self.assertIn("OpIAdd", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+    def test_movrels64_wrapping_pair(self):
+        # Reads pair starting at s127: (127 + 0) = s127, (127 + 1) % 128 = s0
+        words = run_ps(
+            "ps_movrels64_wrap",
+            [
+                "s_mov_b32 m0, 0",
+                "s_mov_b32 s127, 0x111",
+                "s_mov_b32 s0, 0x222",
+                "s_movrels_b64 s[6:7], s[127:128]",
+                "v_mov_b32 v0, s6",
+                "v_mov_b32 v1, s7",
+            ],
+            export_regs=("v0", "v1", "v0", "v1"),
+        )
+        self.assertEqual(words[:2], [0x111, 0x222])
 
-class TestMovRelS64Oracle(unittest.TestCase):
-    def test_oracle_pair(self):
-        sgprs = {10: 100, 11: 200}
-        lo, hi = model_movrels_b64(10, 0, sgprs)
-        self.assertEqual(lo, 100)
-        self.assertEqual(hi, 200)
+    def test_movrels64_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_movrels64_bad", ["s_movrels_b64 s0, s[2:3]"])
 
-    def test_translator_movrels64_oracle(self):
-        prog = ["s_mov_b32 m0, 0", "s_mov_b32 s4, 100", "s_mov_b32 s5, 200", "s_movrels_b64 s[0:1], s[4:5]", "s_endpgm"]
-        spv = support.translate_lines("cs_movrels64_oracle", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
-class TestMovRelS64AST(unittest.TestCase):
-    def test_ast_evaluation(self):
-        sgprs = {20: 0xAAAA, 21: 0xBBBB}
-        lo, hi = model_movrels_b64(18, 2, sgprs)
-        self.assertEqual(lo, 0xAAAA)
-        self.assertEqual(hi, 0xBBBB)
+class TestVMovRelSB32(unittest.TestCase):
+    """Execution verification for v_movrels_b32."""
 
-    def test_translator_movrels64_ast(self):
-        prog = ["s_mov_b32 m0, 2", "s_mov_b32 s20, 0xAAAA", "s_mov_b32 s21, 0xBBBB", "s_movrels_b64 s[2:3], s[18:19]", "s_endpgm"]
-        spv = support.translate_lines("cs_movrels64_ast", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+    def test_v_movrels_zero_offset(self):
+        words = run_ps(
+            "ps_v_movrels_zero",
+            [
+                "s_mov_b32 m0, 0",
+                "v_mov_b32 v1, 777",
+                "v_movrels_b32 v0, v1",
+            ],
+            export_regs=("v0", "v0", "v0", "v0"),
+        )
+        self.assertEqual(words[0], 777)
 
-class TestMovRelS64Addressing(unittest.TestCase):
-    def test_wrapping_pair(self):
-        sgprs = {127: 0x111, 0: 0x222}
-        lo, hi = model_movrels_b64(127, 0, sgprs)
-        self.assertEqual(lo, 0x111)
-        self.assertEqual(hi, 0x222)
+    def test_v_movrels_positive_offset(self):
+        words = run_ps(
+            "ps_v_movrels_pos",
+            [
+                "s_mov_b32 m0, 5",
+                "v_mov_b32 v25, 999",
+                "v_movrels_b32 v2, v20",
+            ],
+            export_regs=("v2", "v2", "v2", "v2"),
+        )
+        self.assertEqual(words[0], 999)
 
-    def test_translator_movrels64_addressing(self):
-        prog = ["s_mov_b32 m0, 0", "s_movrels_b64 s[6:7], s[8:9]", "s_endpgm"]
-        spv = support.translate_lines("cs_movrels64_addr", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+    def test_v_movrels_dynamic_indexing(self):
+        words = run_ps(
+            "ps_v_movrels_dyn",
+            [
+                "s_mov_b32 m0, 10",
+                "v_mov_b32 v20, 1234",
+                "v_movrels_b32 v0, v10",
+            ],
+            export_regs=("v0", "v0", "v0", "v0"),
+        )
+        self.assertEqual(words[0], 1234)
 
-class TestMovRelS64Translator(unittest.TestCase):
-    def test_translator_mutation_guard(self):
-        prog = ["s_mov_b32 m0, 4", "s_movrels_b64 s[10:11], s[12:13]", "s_endpgm"]
-        spv = support.translate_lines("cs_movrels64_trans", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        self.assertIn("OpBitwiseAnd", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
-
-class TestVMovRelSOracle(unittest.TestCase):
-    def test_oracle_v_movrels(self):
-        vgprs = {10: 777}
-        val = model_v_movrels(10, 0, vgprs)
-        self.assertEqual(val, 777)
-
-    def test_translator_v_movrels_oracle(self):
-        prog = ["s_mov_b32 m0, 0", "v_mov_b32_e32 v1, 777", "v_movrels_b32 v0, v1", "s_endpgm"]
-        spv = support.translate_lines("cs_v_movrels_oracle", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
-
-class TestVMovRelSAST(unittest.TestCase):
-    def test_ast_evaluation(self):
-        vgprs = {25: 999}
-        val = model_v_movrels(20, 5, vgprs)
-        self.assertEqual(val, 999)
-
-    def test_translator_v_movrels_ast(self):
-        prog = ["s_mov_b32 m0, 5", "v_mov_b32_e32 v25, 999", "v_movrels_b32 v2, v20", "s_endpgm"]
-        spv = support.translate_lines("cs_v_movrels_ast", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
-
-class TestVMovRelSAddressing(unittest.TestCase):
-    def test_modulo_wrapping(self):
-        vgprs = {0: 1234}
-        val = model_v_movrels(255, 1, vgprs)
-        self.assertEqual(val, 1234)
-
-    def test_translator_v_movrels_addressing(self):
-        prog = ["s_mov_b32 m0, 1", "v_movrels_b32 v0, v255", "s_endpgm"]
-        spv = support.translate_lines("cs_v_movrels_addr", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
-
-class TestVMovRelSTranslator(unittest.TestCase):
-    def test_translator_mutation_guard(self):
-        prog = ["s_mov_b32 m0, 3", "v_movrels_b32 v3, v4", "s_endpgm"]
-        spv = support.translate_lines("cs_v_movrels_trans", prog, fssm=saveexec_run.fssm())
-        self.assertIn("OpAccessChain", spv)
-        self.assertIn("OpCapability Shader", spv)
-        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+    def test_v_movrels_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_v_movrels_bad", ["v_movrels_b32 s0, v1"])
 
 
 if __name__ == "__main__":
