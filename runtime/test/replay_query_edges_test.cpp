@@ -239,8 +239,8 @@ struct MockReplay {
             VkDeviceSize off) {
             helper(false, false, p, f, n, b, off);
         };
-        v.sum_statistics = [helper](VkCommandBuffer, VkQueryPool p, VkQueryPool, const std::uint8_t*, unsigned f,
-            unsigned n, VkBuffer b, VkDeviceSize off) {
+        v.sum_statistics = [helper](VkCommandBuffer, VkQueryPool p, VkQueryPool, VkQueryPool, const std::uint8_t*,
+            unsigned f, unsigned n, std::uint32_t, VkBuffer b, VkDeviceSize off) {
             helper(true, false, p, f, n, b, off);
         };
         v.resolve_binary_occlusion = [helper](VkCommandBuffer, VkQueryPool p, unsigned f, unsigned n, VkBuffer b,
@@ -286,9 +286,11 @@ void test_helper_chunks() {
         const VkDescriptorSet*, unsigned, const unsigned*) {};
     vk.vkCmdPushConstants = +[](VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, unsigned off, unsigned size,
         const void*p) {
-        // The count, then statistics_sum.comp's mesh flag (D3D-291), which no segment here sets.
-        expect(off == 0 && size == 2 * sizeof(unsigned), "chunk push constants");
+        // The count, then statistics_sum.comp's mesh flag (D3D-291), which no segment here sets, and the result's
+        // counters (D3D-132): the eleven of D3D12_QUERY_DATA_PIPELINE_STATISTICS, as no query here is STATISTICS1.
+        expect(off == 0 && size == 3 * sizeof(unsigned), "chunk push constants");
         expect(static_cast<const unsigned *>(p)[1] == 0, "chunk push constants: no mesh segment");
+        expect(static_cast<const unsigned *>(p)[2] == statistics_counters, "chunk push constants: eleven counters");
         MockReplay::current->chunks.push_back(*static_cast<const unsigned *>(p));
     };
     vk.vkCmdDispatch = +[](VkCommandBuffer, unsigned x, unsigned y, unsigned z) {
@@ -348,7 +350,8 @@ void test_helper_chunks() {
                 }
             } else {
                 if (mode == MockReplay::statistics) {
-                    helper.sum_statistics({}, qp, VK_NULL_HANDLE, nullptr, first, n, dst, output_offset);
+                    helper.sum_statistics({}, qp, VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr, first, n, statistics_counters, dst,
+                                          output_offset);
                 } else {
                     helper.sum({}, qp, first, n, dst, output_offset);
                 }
@@ -388,7 +391,8 @@ void test_helper_chunks() {
     expect(c.word(dst, output_offset) == reset_sum, "sum accumulator reset between calls");
     c.mode = MockReplay::statistics;
     c.values[qp][first_query].fill(reset_counter);
-    helper.sum_statistics({}, qp, VK_NULL_HANDLE, nullptr, first_query, 1, dst, output_offset);
+    helper.sum_statistics({}, qp, VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr, first_query, 1, statistics_counters, dst,
+                          output_offset);
     for (unsigned j = 0; j < statistics_counters; ++j) {
         expect(c.word(dst, output_offset + word_size * j) == reset_counter, "statistics accumulator reset");
     }
