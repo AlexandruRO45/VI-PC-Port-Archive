@@ -1016,6 +1016,12 @@ def checked_heatmap_paths(reference, candidate, reference_directory, candidate_d
                     f"heatmap '{heatmap_path}' would overwrite input '{input_path}'. "
                     f"Choose different scene names or image paths"
                 )
+        for other_path in paths.values():
+            if paths_alias(heatmap_path, other_path):
+                raise ToolError(
+                    f"heatmap '{heatmap_path}' would alias another heatmap '{other_path}'. "
+                    f"Choose scene names that remain distinct on this filesystem"
+                )
         paths[scene.name] = heatmap_path
     return paths
 

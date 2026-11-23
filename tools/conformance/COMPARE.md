@@ -184,9 +184,11 @@ same size as the candidate:
 
 Heatmaps are written for passing scenes too, so a clean run leaves a complete
 visual record. Existing heatmaps are overwritten. Before writing any heatmap,
-the tool refuses an output that aliases either manifest or any reference or
-candidate PNG, including through links. Such a collision exits 2 and leaves all
-inputs and existing heatmaps unchanged. The tool is deterministic: the
+the tool refuses an output that aliases either manifest, any reference or
+candidate PNG, or another planned heatmap, including through links. For example,
+`Clear` and `clear` cannot have separate heatmaps on Windows.
+Such a collision exits 2 and leaves all inputs and existing heatmaps unchanged.
+The tool is deterministic: the
 same inputs produce byte-identical heatmaps (verified with SHA-256 over two
 runs).
 

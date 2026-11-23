@@ -50,13 +50,13 @@ class HeatmapPaths(unittest.TestCase):
              "--reference", str(reference), "--candidate", str(candidate), *options],
             capture_output=True, text=True, timeout=30)
 
-    def assert_refused_without_writes(self, reference, candidate, *options):
+    def assert_refused_without_writes(self, reference, candidate, *options, message="would overwrite input"):
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
         result = self.run_diff(reference, candidate, *options)
         after = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
         self.assertEqual(after, before, "diff changed files before refusing the collision")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("would overwrite input", result.stderr)
+        self.assertIn(message, result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(result.stdout, "")
 
@@ -145,6 +145,50 @@ class HeatmapPaths(unittest.TestCase):
         reference = self.manifest(self.reference, [("clear", "ref.png")])
         candidate = self.manifest(self.candidate, [("clear", "CLEAR.DIFF.PNG")])
         self.assert_refused_without_writes(reference, candidate)
+
+    @unittest.skipUnless(os.name == "nt", "Windows case-insensitive path spelling")
+    def test_case_only_scene_names_cannot_share_a_heatmap_path(self):
+        scenes = [("Clear", "first.png"), ("clear", "second.png")]
+        for directory in (self.reference, self.candidate):
+            for _, png in scenes:
+                self.image(directory, png)
+        reference = self.manifest(self.reference, scenes)
+        candidate = self.manifest(self.candidate, scenes)
+        # Neither planned output exists yet: the check must recognise the case alias by name.
+        self.assert_refused_without_writes(
+            reference, candidate, message="would alias another heatmap")
+
+    def test_existing_heatmaps_cannot_alias_each_other_through_a_hard_link(self):
+        scenes = [("first", "first.png"), ("second", "second.png")]
+        for directory in (self.reference, self.candidate):
+            for _, png in scenes:
+                self.image(directory, png)
+        reference = self.manifest(self.reference, scenes)
+        candidate = self.manifest(self.candidate, scenes)
+        first = self.image(self.candidate, "first.diff.png", (70, 80, 90))
+        try:
+            os.link(first, self.candidate / "second.diff.png")
+        except OSError as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        self.assert_refused_without_writes(
+            reference, candidate, message="would alias another heatmap")
+
+    def test_distinct_scenes_keep_both_heatmaps(self):
+        scenes = [("first", "first.png"), ("second", "second.png")]
+        for directory in (self.reference, self.candidate):
+            for _, png in scenes:
+                self.image(directory, png)
+        self.image(self.candidate, "second.png", (255, 20, 30))
+        reference = self.manifest(self.reference, scenes)
+        candidate = self.manifest(self.candidate, scenes)
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        result = self.run_diff(reference, candidate)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        first = C.read_png(str(self.candidate / "first.diff.png")).stored_pixel(0, 0)
+        second = C.read_png(str(self.candidate / "second.diff.png")).stored_pixel(0, 0)
+        self.assertEqual(first, (48, 48, 48))
+        self.assertNotEqual(second, first)
 
     def test_normal_diff_preserves_inputs_and_replaces_existing_heatmap(self):
         ref_image = self.image(self.reference, "ref.png")
