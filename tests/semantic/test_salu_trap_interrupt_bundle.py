@@ -488,5 +488,26 @@ class TestSTrapRange(unittest.TestCase):
         self.assertEqual(str(cm.exception), "s_trap")
 
 
+class TestSTrapStages(unittest.TestCase):
+    def test_trap_refused_in_compute_shader(self):
+        bad_lines = [
+            "s_trap 0",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("cs_trap_test", bad_lines, fssm=FSSM)
+        self.assertEqual(str(cm.exception), "s_trap")
+
+    def test_trap_refused_in_vertex_shader(self):
+        bad_lines = [
+            "s_trap 0",
+            "exp pos0 v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("vs_trap_test", bad_lines)
+        self.assertEqual(str(cm.exception), "s_trap")
+
+
 if __name__ == "__main__":
     unittest.main()
