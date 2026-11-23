@@ -41,10 +41,21 @@ class PipelinesJobsTest(unittest.TestCase):
         self.assertEqual(args.count("--jobs"), 1, args)
         return args[args.index("--jobs") + 1]
 
+    def host_independent_jobs(self):
+        """Keep the clamp from reducing a requested --jobs on a small machine.
+
+        main() clamps --jobs to the host's CPU count through leonida_tui.clamp_jobs, so a test that asks
+        for 5 or 3 jobs only sees them on a machine with at least that many cores; on a 4-core laptop or a
+        2-core CI runner the assertion compared the clamped value. The behaviour under test is the
+        forwarding, not the clamp.
+        """
+        return mock.patch.object(make_game.leonida_tui, "cpu_jobs_bounds", return_value=(1, 1, 64))
+
     def main_with(self, *extra):
         argv = ["make_game.py", "--game", self.game, "--work", self.work, "--out", self.out,
                 "--stages", "pipelines", "--no-tui", *extra]
-        with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \
+        with self.host_independent_jobs(), \
+                mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "below_normal"), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
                 mock.patch.object(make_game, "preflight"):
             self.assertEqual(make_game.main(), 0)
@@ -67,7 +78,8 @@ class PipelinesJobsTest(unittest.TestCase):
                 pass
         argv = ["make_game.py", "--game", self.game, "--work", self.work, "--out", self.out,
                 "--stages", "runtime,pipelines", "--runtime-build", supplied, "--jobs", "3"]
-        with mock.patch.object(sys, "argv", argv), mock.patch.object(make_game, "ROOT", self.root), \
+        with self.host_independent_jobs(), mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(make_game, "ROOT", self.root), \
                 mock.patch("os.name", "nt"), mock.patch.object(make_game, "below_normal"), \
                 mock.patch.object(make_game, "check", return_value={"expected_exe": "g.exe"}), \
                 mock.patch.object(make_game, "log"), mock.patch.object(make_game, "run") as run:

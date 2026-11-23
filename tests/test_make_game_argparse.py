@@ -296,6 +296,16 @@ class StageValidationAndSequencingTest(unittest.TestCase):
 class JobsHandlingTest(unittest.TestCase):
     """Test --jobs default computation, command-line overrides, and forwarding."""
 
+    def host_independent_jobs(self):
+        """Keep the clamp from reducing a requested --jobs on a small machine.
+
+        make_game.main() clamps --jobs to the host's CPU count (leonida_tui.clamp_jobs), so a test that
+        asks for 6 jobs only sees 6 on a machine with at least 6 cores; on a 4-core laptop or a 2-core CI
+        runner the assertion compared the clamped value. The behaviour under test is the forwarding, not
+        the clamp.
+        """
+        return patch.object(make_game.leonida_tui, "cpu_jobs_bounds", return_value=(1, 1, 64))
+
     def test_jobs_default_calculation_scenarios(self):
         scenarios = [
             (None, 1),
@@ -320,7 +330,7 @@ class JobsHandlingTest(unittest.TestCase):
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
                                             "--no-tui", "--stages", "shaders", "--jobs", "6"]):
-                with patch("make_game.below_normal"):
+                with self.host_independent_jobs(), patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight") as mock_preflight:
                             with patch("make_game.log"):
@@ -346,7 +356,7 @@ class JobsHandlingTest(unittest.TestCase):
             os.makedirs(game)
             with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
                                             "--no-tui", "--stages", "assets", "--wav", "--jobs", "10"]):
-                with patch("make_game.below_normal"):
+                with self.host_independent_jobs(), patch("make_game.below_normal"):
                     with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
                         with patch("make_game.preflight"):
                             with patch("make_game.log"):
