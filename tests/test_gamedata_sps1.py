@@ -6,6 +6,7 @@ Every fixture is synthetic: SPS1 blobs with length-prefixed NUL-terminated prese
 multi-stream 64 KiB carve directories, and minimal SGD5 databases for cross-reference and hash-lookup checks.
 """
 import json
+import locale
 import os
 import struct
 import subprocess
@@ -262,8 +263,10 @@ class GamedataSps1Test(unittest.TestCase):
         for cmd in ([sys.executable, "-I", TOOL, missing],
                     [sys.executable, "-I", TOOL, self.carve, "--shaders", missing]):
             with self.subTest(cmd=cmd[3:]):
+                # The tool under -I writes its redirected stderr in the locale code page (the ANSI one on Windows,
+                # cp1252 on most), not UTF-8: read it the same way, or a non-ASCII letter in TEMP breaks the match.
                 p = subprocess.run(cmd, cwd=self.root, capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace")
+                                   encoding=locale.getencoding(), errors="replace")
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
                 lines = p.stderr.strip().splitlines()

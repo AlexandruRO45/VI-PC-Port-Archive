@@ -109,8 +109,12 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         snippet = text[helpers_start:helpers_end] + "\n" + text[lookup_start:lookup_end]
 
         def run_probe(vs_dir: Path, path_dirs: list[Path]) -> tuple[str, str]:
+            # Windows PowerShell writes a redirected stdout in the caller's console code page: OEM (cp850 on a pt-BR
+            # system) by default, UTF-8 after `chcp 65001`. Pin it to UTF-8 so a non-ASCII letter in TEMP reads back
+            # as written (unpinned, "ação" came back as "a‡Æo" and no path matched).
             ps = (
                 "$ErrorActionPreference = 'Stop'\n"
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
                 "$vs = $env:LEONIDA_VS_DIR\n"
                 + snippet
                 + "\nWrite-Output \"CMAKE=$cmake\"\nWrite-Output \"NINJA=$ninja\"\n"
@@ -118,7 +122,7 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             env = dict(os.environ, PATH=";".join(str(p) for p in path_dirs), LEONIDA_VS_DIR=str(vs_dir))
             res = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
-                env=env, capture_output=True, text=True, check=True, timeout=30,
+                env=env, capture_output=True, text=True, encoding="utf-8", check=True, timeout=30,
             )
             found = {}
             for line in res.stdout.splitlines():

@@ -6,6 +6,7 @@ Every fixture is synthetic: 40-byte header + u64 offset table + 16-byte-aligned
 struct, wrapper and array records linked by 0x71717171-tagged pointers.
 """
 import json
+import locale
 import os
 import struct
 import subprocess
@@ -189,9 +190,11 @@ class ScriptQtableTests(unittest.TestCase):
         # A target the tool cannot open is a diagnostic, not a short census: the other tools exit 2 here.
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "no_such_container.bin")
+            # The tool under -I writes its redirected stderr in the locale code page (the ANSI one on Windows,
+            # cp1252 on most), not UTF-8: read it the same way, or a non-ASCII letter in TEMP breaks the match.
             p = subprocess.run(
                 [sys.executable, "-I", TOOL, missing],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                capture_output=True, text=True, encoding=locale.getencoding(), errors="replace",
             )
             self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
             lines = [line for line in p.stderr.splitlines() if line.strip()]
