@@ -121,5 +121,119 @@ class SaluNandB32OracleTests(unittest.TestCase):
             self.assertEqual(ref_nand_b32(bit_mask, inv_mask), MASK32)
 
 
+class OperandKind(enum.Enum):
+    SGPR = "sgpr"
+    IMM = "imm"
+    SPECIAL = "special"
+    NULL = "null"
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    kind: OperandKind
+    raw: str
+    reg_num: int | None = None
+    imm_val: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class SOP2Instruction:
+    op: str
+    dst: Operand
+    src0: Operand
+    src1: Operand
+
+
+def parse_operand(token: str) -> Operand:
+    tok = token.strip().rstrip(",")
+    if not tok:
+        raise ValueError("empty operand token")
+    if tok == "null":
+        return Operand(kind=OperandKind.NULL, raw=tok)
+    if tok in ("vcc_lo", "vcc_hi", "exec_lo", "exec_hi", "scc"):
+        return Operand(kind=OperandKind.SPECIAL, raw=tok)
+    if tok.startswith("s") and tok[1:].isdigit():
+        r = int(tok[1:])
+        if not (0 <= r <= 105):
+            raise ValueError(f"SGPR index out of range [0, 105]: {tok}")
+        return Operand(kind=OperandKind.SGPR, raw=tok, reg_num=r)
+    try:
+        if tok.startswith(("0x", "0X")):
+            val = int(tok, 16)
+        else:
+            val = int(tok, 10)
+        return Operand(kind=OperandKind.IMM, raw=tok, imm_val=val & MASK32)
+    except ValueError:
+        raise ValueError(f"unrecognized operand syntax: {tok}")
+
+
+def parse_sop2(line: str) -> SOP2Instruction:
+    clean = line.split(";")[0].strip()
+    if not clean:
+        raise ValueError("empty line")
+    parts = clean.split(None, 1)
+    op = parts[0]
+    if len(parts) < 2:
+        raise ValueError(f"instruction missing operands: {line}")
+    args = [arg.strip() for arg in parts[1].split(",") if arg.strip()]
+    if len(args) != 3:
+        raise ValueError(f"SOP2 instruction requires 3 operands (dst, src0, src1), got {len(args)}: {line}")
+    dst = parse_operand(args[0])
+    src0 = parse_operand(args[1])
+    src1 = parse_operand(args[2])
+    return SOP2Instruction(op=op, dst=dst, src0=src0, src1=src1)
+
+
+def validate_sop2(inst: SOP2Instruction) -> None:
+    if inst.op != "s_nand_b32":
+        raise ValueError(f"unsupported opcode: {inst.op}")
+    if inst.dst.kind == OperandKind.IMM:
+        raise ValueError(f"destination cannot be immediate: {inst.dst.raw}")
+    imm_count = sum(1 for src in (inst.src0, inst.src1) if src.kind == OperandKind.IMM)
+    if imm_count > 1:
+        raise ValueError("RDNA2 SOP2 encodes at most one literal constant operand")
+
+
+class SaluNandB32AstTests(unittest.TestCase):
+    """AST structure and operand parsing validation for s_nand_b32."""
+
+    def test_ast_parse_reg_reg(self):
+        inst = parse_sop2("s_nand_b32 s0, s1, s2")
+        validate_sop2(inst)
+        self.assertEqual(inst.op, "s_nand_b32")
+        self.assertEqual(inst.dst.kind, OperandKind.SGPR)
+        self.assertEqual(inst.dst.reg_num, 0)
+        self.assertEqual(inst.src0.reg_num, 1)
+        self.assertEqual(inst.src1.reg_num, 2)
+
+    def test_ast_parse_reg_imm(self):
+        inst = parse_sop2("s_nand_b32 s4, s5, 0x12345678")
+        validate_sop2(inst)
+        self.assertEqual(inst.dst.reg_num, 4)
+        self.assertEqual(inst.src0.reg_num, 5)
+        self.assertEqual(inst.src1.kind, OperandKind.IMM)
+        self.assertEqual(inst.src1.imm_val, 0x12345678)
+
+    def test_ast_parse_special_registers(self):
+        inst1 = parse_sop2("s_nand_b32 null, s0, s1")
+        validate_sop2(inst1)
+        self.assertEqual(inst1.dst.kind, OperandKind.NULL)
+
+        inst2 = parse_sop2("s_nand_b32 vcc_lo, s2, s3")
+        validate_sop2(inst2)
+        self.assertEqual(inst2.dst.kind, OperandKind.SPECIAL)
+        self.assertEqual(inst2.dst.raw, "vcc_lo")
+
+    def test_ast_validation_rejects_invalid_forms(self):
+        with self.assertRaises(ValueError):
+            validate_sop2(parse_sop2("s_nor_b32 s0, s1, s2"))
+        with self.assertRaises(ValueError):
+            validate_sop2(parse_sop2("s_nand_b32 0x10, s1, s2"))
+        with self.assertRaises(ValueError):
+            validate_sop2(parse_sop2("s_nand_b32 s0, 0x10, 0x20"))
+        with self.assertRaises(ValueError):
+            parse_sop2("s_nand_b32 s106, s1, s2")
+
+
 if __name__ == "__main__":
     unittest.main()
