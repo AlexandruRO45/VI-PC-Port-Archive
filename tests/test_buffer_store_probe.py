@@ -161,6 +161,47 @@ class SummaryLineTests(unittest.TestCase):
         self.assertIn("unorm16 tbuffer_store_format_x:", out)
         self.assertNotIn("unorm8 buffer_store_format_x:", out)
 
+    def test_oracle_closed_on_non_gfx10_and_harness_errors_exit_2(self):
+        non_gfx10 = unittest.mock.MagicMock(arch="gfx1150")
+        err = io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=non_gfx10), \
+             unittest.mock.patch.object(hw_asm, "family", return_value="gfx11"), \
+             redirect_stderr(err):
+            self.assertEqual(probe.main(["--waves", "32"]), 77)
+        non_gfx10.close.assert_called_once()
+
+        for responses, match in (
+            ([[]], "oracle returned 0 results"),
+            ([[None] * len(probe.norm_inputs("unorm", 16))], "unorm16 buffer_store_format_x wave32: None"),
+            ([[[0, 0]] * len(probe.norm_inputs(k, b)) for _, _, k, b in probe.NORM_FORMATS for _ in range(2)]
+             + [["kernel rejected"]],
+             "snorm2_ties wave32"),
+        ):
+            with self.subTest(match=match):
+                ora = unittest.mock.MagicMock(arch="gfx1030")
+                ora.run.side_effect = responses
+                out, err = io.StringIO(), io.StringIO()
+                with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=ora), \
+                     unittest.mock.patch.object(hw_asm, "family", return_value="gfx10"), \
+                     redirect_stdout(out), redirect_stderr(err):
+                    rc = probe.main(["--waves", "32"])
+                self.assertEqual(rc, 2)
+                self.assertIn(match, err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+                ora.close.assert_called_once()
+
+        for responses, match in (
+            ([[]], "8_8_UNORM wave32"),
+            ([[None] * 5], "8_8_UNORM wave32"),
+            ([[[0x11, 0], [0x11, 0], [0x22, 0], [0x33, 0], [0x11, 0]]] * len(probe.TWO_COMP_FORMATS) + [[]],
+             "32_32_UINT wave32: oracle returned 0 results"),
+        ):
+            with self.subTest(two_comp=match):
+                ora = unittest.mock.MagicMock(arch="gfx1030")
+                ora.run.side_effect = responses
+                with self.assertRaisesRegex(RuntimeError, match):
+                    probe.probe_two_comp(ora, hw_asm, 32)
+
 
 if __name__ == "__main__":
     unittest.main()

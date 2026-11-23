@@ -160,6 +160,45 @@ class SummaryLineTests(unittest.TestCase):
         self.assertIn("6/7 f16 transcendentals 0/65536 RNE/RTZ diffs", out)
         self.assertIn("v_sin_f16_e32: 3/65536 RNE/RTZ diffs", out)
 
+    def test_oracle_closed_on_non_gfx10_and_harness_errors_exit_2(self):
+        non_gfx10 = mock.MagicMock(arch="gfx1150")
+        err = io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=non_gfx10), \
+             mock.patch.object(hw_asm, "family", return_value="gfx11"), \
+             mock.patch.object(sys, "stderr", err):
+            self.assertEqual(probe.main(["--waves", "32"]), 77)
+        non_gfx10.close.assert_called_once()
+
+        for responses, match in (
+            ([[]], "cases wave32: oracle returned 0 results"),
+            ([[None] * (2 * len(probe.CASES))], "cvt_f16_f32_pos wave32"),
+            ([[[0]] * (2 * len(probe.CASES))], "add_f64 wave32"),
+        ):
+            with self.subTest(cases=match):
+                ora = mock.MagicMock(arch="gfx1030")
+                ora.run.side_effect = responses
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=ora), \
+                     mock.patch.object(hw_asm, "family", return_value="gfx10"), \
+                     mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+                    rc = probe.main(["--waves", "32"])
+                self.assertEqual(rc, 2)
+                self.assertIn(match, err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+                ora.close.assert_called_once()
+
+        for responses, match in (
+            ([[]], "v_rcp_f16_e32 wave32: oracle returned 0 results"),
+            ([[None] * 64], "v_rcp_f16_e32 wave32: None"),
+            ([[[0] * 1024] * 64, ["spot rejected"]], "v_rcp_f16_e32 spot wave32"),
+            ([[[0] * 1024] * 64, []], "v_rcp_f16_e32 spot wave32"),
+        ):
+            with self.subTest(transcendentals=match):
+                ora = mock.MagicMock(arch="gfx1030")
+                ora.run.side_effect = responses
+                with self.assertRaisesRegex(RuntimeError, match):
+                    probe.probe_transcendentals(ora, hw_asm, 32)
+
 
 if __name__ == "__main__":
     unittest.main()

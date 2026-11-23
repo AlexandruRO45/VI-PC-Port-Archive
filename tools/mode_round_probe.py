@@ -86,11 +86,15 @@ def probe_cases(oracle, asm_mod, wave):
         ks.append(_case_kernel(asm_mod, setup, op, is_64, wave, RNE))
         ks.append(_case_kernel(asm_mod, setup, op, is_64, wave, RTZ))
     res = oracle.run(ks, words=2)
+    if len(res) != len(ks):
+        raise RuntimeError(f"cases wave{wave}: oracle returned {len(res)} results for {len(ks)} kernels")
     ok = 0
     mismatches = []
     for i, (name, _, _, is_64, want_rne, want_rtz) in enumerate(CASES):
         r_rne, r_rtz = res[2 * i], res[2 * i + 1]
-        if isinstance(r_rne, str) or isinstance(r_rtz, str):
+        need = 2 if is_64 else 1
+        if (r_rne is None or isinstance(r_rne, str) or len(r_rne) < need
+                or r_rtz is None or isinstance(r_rtz, str) or len(r_rtz) < need):
             raise RuntimeError(f"{name} wave{wave}: rne={r_rne} rtz={r_rtz}")
         if is_64:
             got_rne, got_rtz = (r_rne[0], r_rne[1]), (r_rtz[0], r_rtz[1])
@@ -125,13 +129,18 @@ def probe_transcendentals(oracle, asm_mod, wave):
             ]
             ks.append(asm_mod.Kernel(lines, wave, 1024, 1024, raw=True, vgprs=8, sgprs=16))
         res = oracle.run(ks, words=1024)
+        if len(res) != len(ks):
+            raise RuntimeError(f"{op} wave{wave}: oracle returned {len(res)} results for {len(ks)} kernels")
         diffs = 0
         for chunk in res:
-            if isinstance(chunk, str) or len(chunk) != 1024:
+            if chunk is None or isinstance(chunk, str) or len(chunk) != 1024:
                 raise RuntimeError(f"{op} wave{wave}: {chunk}")
             diffs += sum(1 for w in chunk if w != 0)
         spot_k = _case_kernel(asm_mod, (f"v_mov_b32 v1, {sample_in:#x}",), f"{op} v3, v1", False, wave, RTZ)
-        spot_got = oracle.run([spot_k], words=2)[0][0] & 0xFFFF
+        spot_res = oracle.run([spot_k], words=2)
+        if len(spot_res) != 1 or spot_res[0] is None or isinstance(spot_res[0], str) or len(spot_res[0]) < 1:
+            raise RuntimeError(f"{op} spot wave{wave}: {spot_res}")
+        spot_got = spot_res[0][0] & 0xFFFF
         ok = (diffs == 0) and (spot_got == sample_want)
         if not ok:
             all_ok = False
@@ -226,24 +235,32 @@ def main(argv=None):
     except runner.Unavailable as exc:
         print(f"SKIP: {exc}", file=sys.stderr)
         return 77
-    if asm.family(oracle.arch) != "gfx10":
-        print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
-        return 77
-    out = {"arch": oracle.arch, "waves": {}}
-    mismatches = 0
-    for wave in waves:
-        c = probe_cases(oracle, asm, wave)
-        t = probe_transcendentals(oracle, asm, wave)
-        out["waves"][str(wave)] = {"cases": c, "transcendentals": t}
-        if c["ok"] != c["total"] or not t["all_ok"]:
-            mismatches += 1
-        t_ok = sum(info["ok"] for info in t["ops"].values())
-        print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
-              f"{t_ok}/{len(t['ops'])} f16 transcendentals 0/65536 RNE/RTZ diffs")
-        for op, info in t["ops"].items():
-            if not info["ok"]:
-                print(f"  {op}: {info['rne_rtz_diffs']}/{info['inputs']} RNE/RTZ diffs, "
-                      f"RTZ spot word {info['spot_got']} (want {info['spot_want']})")
+    try:
+        if asm.family(oracle.arch) != "gfx10":
+            print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
+            return 77
+        out = {"arch": oracle.arch, "waves": {}}
+        mismatches = 0
+        for wave in waves:
+            try:
+                c = probe_cases(oracle, asm, wave)
+                t = probe_transcendentals(oracle, asm, wave)
+            except RuntimeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            out["waves"][str(wave)] = {"cases": c, "transcendentals": t}
+            if c["ok"] != c["total"] or not t["all_ok"]:
+                mismatches += 1
+            t_ok = sum(info["ok"] for info in t["ops"].values())
+            print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
+                  f"{t_ok}/{len(t['ops'])} f16 transcendentals 0/65536 RNE/RTZ diffs")
+            for op, info in t["ops"].items():
+                if not info["ok"]:
+                    print(f"  {op}: {info['rne_rtz_diffs']}/{info['inputs']} RNE/RTZ diffs, "
+                          f"RTZ spot word {info['spot_got']} (want {info['spot_want']})")
+    finally:
+        if hasattr(oracle, "close"):
+            oracle.close()
     if args.json_out is not None:
         write_err = write_json_report(args.json_out, out)
         if write_err:

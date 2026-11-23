@@ -181,10 +181,12 @@ def probe_norm(oracle, asm_mod, wave):
         for inst in ("buffer_store_format_x", "tbuffer_store_format_x"):
             ks = [_store_kernel(asm_mod, inst, code, sel, (u,), wave) for u in inputs]
             got = oracle.run(ks, words=2)
+            if len(got) != len(ks):
+                raise RuntimeError(f"{name} {inst} wave{wave}: oracle returned {len(got)} results for {len(ks)} kernels")
             exact_ok = double_diffs = 0
             first_bad = None
             for u, words in zip(inputs, got):
-                if isinstance(words, str) or len(words) < 2:
+                if words is None or isinstance(words, str) or len(words) < 2:
                     raise RuntimeError(f"{name} {inst} wave{wave}: {words}")
                 hw = words[0] & mask
                 want = model_norm(u, kind, bits)
@@ -202,6 +204,8 @@ def probe_norm(oracle, asm_mod, wave):
     tie_vals = (f32_to_u32(0.5), f32_to_u32(-0.5), f32_to_u32(0.5) - 1, f32_to_u32(-0.5) - 1)
     ks = [_store_kernel(asm_mod, "buffer_store_format_xyzw", 45, SEL_XYZW, (u, 0, 0, 0), wave) for u in tie_vals]
     got = oracle.run(ks, words=2)
+    if len(got) != len(ks) or any(w is None or isinstance(w, str) or len(w) < 2 for w in got):
+        raise RuntimeError(f"snorm2_ties wave{wave}: {got}")
     tie_ok = sum((w[0] & 3) == model_norm(u, "snorm", 2) for u, w in zip(tie_vals, got))
     report["snorm2_ties"] = {"inputs": len(tie_vals), "exact": tie_ok,
                              "half_pos": got[0][0] & 3, "half_neg": got[1][0] & 3}
@@ -225,7 +229,7 @@ def probe_two_comp(oracle, asm_mod, wave):
         )
         ks = [_store_kernel(asm_mod, inst, code, sel, vals, wave) for _, inst, sel in cases]
         got = oracle.run(ks, words=2)
-        if any(isinstance(w, str) or len(w) < 2 for w in got):
+        if len(got) != len(ks) or any(w is None or isinstance(w, str) or len(w) < 2 for w in got):
             raise RuntimeError(f"{fname} wave{wave}: {got}")
         # Reference: mubuf_xy_XY01 == mubuf_xyzw_XY01 == mtbuf_xyzw_XYZW == (x, y),
         # mubuf_xy_XYZW == (x, 0), mubuf_xyzw_XYZW == (x, w) (distinct from (x, y) and (x, 0))
@@ -242,10 +246,12 @@ def probe_two_comp(oracle, asm_mod, wave):
     ks = [_store_kernel(asm_mod, "buffer_store_format_xyzw", 62, (sx, sy, sz, 1), int_vals, wave)
           for sx, sy, sz in triples]
     got = oracle.run(ks, words=2)
+    if len(got) != len(ks):
+        raise RuntimeError(f"32_32_UINT wave{wave}: oracle returned {len(got)} results for {len(ks)} kernels")
     triples_ok = 0
     triple_bad = []
     for (sx, sy, sz), w in zip(triples, got):
-        if isinstance(w, str) or len(w) < 2:
+        if w is None or isinstance(w, str) or len(w) < 2:
             raise RuntimeError(f"32_32_UINT ({sx},{sy},{sz}) wave{wave}: {w}")
         want = model_2comp_channels((sx, sy, sz, 1), int_vals)
         if (w[0], w[1]) == want:
@@ -366,31 +372,39 @@ def main(argv=None):
     except runner.Unavailable as exc:
         print(f"SKIP: {exc}", file=sys.stderr)
         return 77
-    if asm.family(oracle.arch) != "gfx10":
-        print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
-        return 77
-    out = {"arch": oracle.arch, "waves": {}}
-    mismatches = 0
-    for wave in waves:
-        norm = probe_norm(oracle, asm, wave)
-        two = probe_two_comp(oracle, asm, wave)
-        out["waves"][str(wave)] = {"norm": norm, "two_comp": two}
-        sweeps = [(f"{name} {inst}", info) for name, *_ in NORM_FORMATS for inst, info in norm[name].items()]
-        bad_sweeps = [(label, info) for label, info in sweeps if info["exact"] != info["inputs"]]
-        mismatches += len(bad_sweeps)
-        ties = norm["snorm2_ties"]
-        if ties["exact"] != ties["inputs"]:
-            mismatches += 1
-        if two["formats_ok"] != two["formats_total"] or two["triples_ok"] != two["triples_total"]:
-            mismatches += 1
-        print(f"wave{wave} ({oracle.arch}): norm {len(sweeps) - len(bad_sweeps)}/{len(sweeps)} sweeps exact across "
-              f"{len(NORM_FORMATS)} formats, snorm2 ties {ties['exact']}/{ties['inputs']}, "
-              f"2-comp {two['formats_ok']}/{two['formats_total']} formats, "
-              f"{two['triples_ok']}/{two['triples_total']} DST_SEL triples")
-        for label, info in bad_sweeps:
-            first = info["first_mismatch"]
-            print(f"  {label}: {info['exact']}/{info['inputs']} exact, first mismatch f32 {first['f32']} "
-                  f"hw {first['hw']} want {first['want']} (double-rounded {first['double']})")
+    try:
+        if asm.family(oracle.arch) != "gfx10":
+            print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
+            return 77
+        out = {"arch": oracle.arch, "waves": {}}
+        mismatches = 0
+        for wave in waves:
+            try:
+                norm = probe_norm(oracle, asm, wave)
+                two = probe_two_comp(oracle, asm, wave)
+            except RuntimeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            out["waves"][str(wave)] = {"norm": norm, "two_comp": two}
+            sweeps = [(f"{name} {inst}", info) for name, *_ in NORM_FORMATS for inst, info in norm[name].items()]
+            bad_sweeps = [(label, info) for label, info in sweeps if info["exact"] != info["inputs"]]
+            mismatches += len(bad_sweeps)
+            ties = norm["snorm2_ties"]
+            if ties["exact"] != ties["inputs"]:
+                mismatches += 1
+            if two["formats_ok"] != two["formats_total"] or two["triples_ok"] != two["triples_total"]:
+                mismatches += 1
+            print(f"wave{wave} ({oracle.arch}): norm {len(sweeps) - len(bad_sweeps)}/{len(sweeps)} sweeps exact across "
+                  f"{len(NORM_FORMATS)} formats, snorm2 ties {ties['exact']}/{ties['inputs']}, "
+                  f"2-comp {two['formats_ok']}/{two['formats_total']} formats, "
+                  f"{two['triples_ok']}/{two['triples_total']} DST_SEL triples")
+            for label, info in bad_sweeps:
+                first = info["first_mismatch"]
+                print(f"  {label}: {info['exact']}/{info['inputs']} exact, first mismatch f32 {first['f32']} "
+                      f"hw {first['hw']} want {first['want']} (double-rounded {first['double']})")
+    finally:
+        if hasattr(oracle, "close"):
+            oracle.close()
     if args.json_out is not None:
         err = write_json_report(args.json_out, out)
         if err:
