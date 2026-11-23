@@ -34,11 +34,11 @@ class PreflightEnv:
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def write_shader_index(self):
+    def write_shader_index(self, contents='{"shader_0": {}}'):
         spirv = os.path.join(self.work, "shaders", "spirv")
-        os.makedirs(spirv)
-        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8") as f:
-            f.write('{"shader_0": {}}')   # a finished translation is never empty
+        os.makedirs(spirv, exist_ok=True)
+        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(contents)
 
     def assert_preflight_fails(self, stages, match):
         err = io.StringIO()
@@ -86,6 +86,14 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
         self.write_shader_index()
         with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"):
             make_game.preflight(["pipelines"], self.work)
+
+    def test_pipelines_rejects_a_non_object_shader_index(self):
+        with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"):
+            for contents in ('[{"shader_0": {}}]', '"shader_0"', "null"):
+                with self.subTest(contents=contents):
+                    self.write_shader_index(contents)
+                    err = self.assert_preflight_fails(["pipelines"], "must contain a JSON object")
+                    self.assertIn("run the shaders stage again", err)
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX execute permissions")
     def test_non_executable_linux_checker_without_cmake_fails_preflight(self):
