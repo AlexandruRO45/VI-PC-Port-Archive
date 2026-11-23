@@ -423,5 +423,55 @@ class SaluNandB32SimdDivergenceTests(unittest.TestCase):
         self.assertEqual(ref_nand_b32(none_lanes, none_lanes), all_lanes)
 
 
+class SaluNandB32RegisterAliasingTests(unittest.TestCase):
+    """In-place operand register aliasing validation for s_nand_b32."""
+
+    def test_alias_dst_equals_src0(self):
+        """Verify s_nand_b32 s0, s0, s1 preserves operands until write."""
+        interp = ScalarInterpreter()
+        s0_init = 0x0F0F0F0F
+        s1_val = 0x33333333
+        interp.sgprs[0] = s0_init
+        interp.sgprs[1] = s1_val
+        interp.exec_line("s_nand_b32 s0, s0, s1")
+        expected = ref_nand_b32(s0_init, s1_val)
+        self.assertEqual(interp.sgprs[0], expected)
+        self.assertEqual(interp.sgprs[1], s1_val)
+
+    def test_alias_dst_equals_src1(self):
+        """Verify s_nand_b32 s1, s0, s1 preserves operands until write."""
+        interp = ScalarInterpreter()
+        s0_val = 0x12345678
+        s1_init = 0x87654321
+        interp.sgprs[0] = s0_val
+        interp.sgprs[1] = s1_init
+        interp.exec_line("s_nand_b32 s1, s0, s1")
+        expected = ref_nand_b32(s0_val, s1_init)
+        self.assertEqual(interp.sgprs[1], expected)
+        self.assertEqual(interp.sgprs[0], s0_val)
+
+    def test_alias_dst_equals_both_srcs(self):
+        """Verify s_nand_b32 s0, s0, s0 produces exact bitwise NOT."""
+        interp = ScalarInterpreter()
+        s0_val = 0xDEADBEEF
+        interp.sgprs[0] = s0_val
+        interp.exec_line("s_nand_b32 s0, s0, s0")
+        expected = (~s0_val) & MASK32
+        self.assertEqual(interp.sgprs[0], expected)
+
+    def test_alias_chained_accumulators(self):
+        """Verify chained updates on an accumulator register match oracle."""
+        interp = ScalarInterpreter()
+        acc = 0x11223344
+        ops = [0x55667788, 0x99AABBCC, 0xDDEEFF00, 0x01234567]
+        interp.sgprs[0] = acc
+        for idx, val in enumerate(ops):
+            r = idx + 1
+            interp.sgprs[r] = val
+            interp.exec_line(f"s_nand_b32 s0, s0, s{r}")
+            acc = ref_nand_b32(acc, val)
+            self.assertEqual(interp.sgprs[0], acc)
+
+
 if __name__ == "__main__":
     unittest.main()
