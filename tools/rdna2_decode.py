@@ -1322,7 +1322,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             tname = f"param{tgt - 32}"
         else:
             tname = f"tgt{tgt}"
-        args = [{"k": "target", "t": tname}]
+        args = [{"k": "special" if tname == "null" else "target", "t": tname}]
         if compr:
             # Compressed export: en bit 0/1 enables vsrc0 (printed twice), bit 2/3 enables vsrc1 (printed twice).
             for pair in (0, 1):
