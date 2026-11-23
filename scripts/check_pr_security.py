@@ -704,15 +704,21 @@ def export_changed(repo, base, head, out_dir):
 
 # The documents every reader starts from: the repository's top folder, and the docs index.
 TOP_DOC = re.compile(r"^[^/]+\.(md|rst|txt)$|^docs/readme\.md$|^licen[cs]e", re.I)
-LINK_HOST = re.compile(r"(?i)\b(?:https?://|www\.)((?:[a-z0-9-]+\.)+[a-z]{2,})")
+LINK_HOST = re.compile(r"(?i)\b(?:https?://|www\.)((?:[a-z0-9-]+\.)+[a-z]{2,})(/[^\s)\"'<>]*)?")
 KNOWN_LINK_HOSTS = frozenset(("github.com", "docs.github.com", "gist.github.com"))
+# Hosts that serve any repository's files: a link there is this repository's own when its path starts with it.
+REPO_FILE_HOSTS = frozenset(("raw.githubusercontent.com", "media.githubusercontent.com"))
+OWN_REPOSITORY = "/itsnotrexed/leonida/"
 
 
 def link_hosts(text):
     hosts = set()
     for match in LINK_HOST.finditer(text):
         host = match.group(1).lower()
-        hosts.add(host[4:] if host.startswith("www.") else host)
+        host = host[4:] if host.startswith("www.") else host
+        if host in REPO_FILE_HOSTS and (match.group(2) or "").lower().startswith(OWN_REPOSITORY):
+            continue  # this repository's own files, like the install scripts
+        hosts.add(host)
     return hosts
 
 

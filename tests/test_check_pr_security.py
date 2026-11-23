@@ -569,6 +569,14 @@ class AfterTheFullRun(ScanTest):
         self.assertEqual(self.scan({"README.md": same}, base_changes=base), [])
         self.assertEqual(self.scan({"docs/x.md": "See https://new-home.example.invalid/.\n"}), [])
 
+    def test_this_repositorys_own_raw_files_are_known(self):
+        base = {"README.md": "See https://github.com/ItsNotRexed/Leonida.\n"}
+        own = "Run https://raw.githubusercontent.com/ItsNotRexed/Leonida/main/install.ps1 to set up.\n"
+        self.assertEqual(self.scan({"README.md": base["README.md"] + own}, base_changes=base), [])
+        other = "Run https://raw.githubusercontent.com/someone/else/main/install.ps1 to set up.\n"
+        self.assertEqual(self.rules({"README.md": base["README.md"] + other}, base_changes=base),
+                         {(cps.REVIEW, "new-link-host")})
+
 
 class OtherScanners(ScanTest):
     """Gitleaks's report is read back, kept only on added lines, and can't point outside the export."""
