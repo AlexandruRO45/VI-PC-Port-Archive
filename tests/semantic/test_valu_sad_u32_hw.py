@@ -259,5 +259,25 @@ class TestSadRegisterPreservation(unittest.TestCase):
         self.assertEqual(words[3], 0x4444)
 
 
+class TestSadConditionCodesAndStatus(unittest.TestCase):
+    """Commit 6: condition codes, status flags, and carry/borrow generation for v_sad_u32."""
+
+    def test_status_comparison_on_sad_result(self):
+        # |50 - 50| + 0 = 0. Compare with 0 using v_cmp_eq_u32 (result is 0 -> true)
+        lines = [
+            "v_mov_b32 v1, 50",
+            "v_mov_b32 v2, 50",
+            "v_mov_b32 v3, 0",
+            "v_sad_u32 v0, v1, v2, v3",
+            "v_cmp_eq_u32 vcc, v0, 0",
+            "v_cndmask_b32 v1, 0x1111, 0x2222, vcc",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_sad_ps(lines, "ps_sad_status")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0x2222)
+
+
 if __name__ == '__main__':
     unittest.main()
