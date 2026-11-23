@@ -666,7 +666,6 @@ def read_entities(path):
     before the scan instead of crashing the summary after it. UnicodeDecodeError (binary garbage) is
     re-raised as ValueError with the path.
     """
-    rows = []
     try:
         with open(path, encoding="utf-8") as f:
             for n, line in enumerate(f, 1):
@@ -703,10 +702,9 @@ def read_entities(path):
                     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
                         raise ValueError("%s:%d: %s is not a number: %r" % (path, n, key, v))
                     row[key] = v
-                rows.append(row)
+                yield row
     except UnicodeDecodeError:
         raise ValueError("%s: not UTF-8 text" % path) from None
-    return rows
 
 
 def summarize(total, entities=None, lights_out=None):
@@ -817,7 +815,9 @@ def main(argv=None):
         return 2
     if a.entities:
         try:
-            read_entities(a.entities)    # refuse malformed rows before the scan, not after it
+            # Exhaust the validation pass before starting the archive scan.
+            for _ in read_entities(a.entities):
+                pass
         except (ValueError, OSError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
