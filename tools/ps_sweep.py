@@ -15,6 +15,8 @@ For native and fallback translations drawn from the same sample, compare exact R
 
 The report (exact_<variant>.json) gives one row per sampled draw, with target classes in attachment order for
 compatible pairs. An exact draw is observable if any component differs from the worker's -1 clear value.
+Pass --occlusion to run on a device supporting precise occlusion queries. Both compare modes then include
+samples_passed in tag order for each draw (null for an unavailable measurement).
 A clear-only match cannot distinguish a discarded fragment from an explicit write of the clear value.
 
 A `--spirv` folder translated with `--bary-fallback`, with `python -I tools/bary_fallback_gs.py <folder>` run on it
@@ -183,7 +185,12 @@ def cmd_run(a):
     done = set()
     if os.path.exists(log):
         with open(log, encoding="utf-8") as f:
-            done = {json.loads(line)["i"] for line in f if line.strip()}
+            for line in f:
+                if line.strip():
+                    previous = json.loads(line)
+                    if a.occlusion and previous["code"] == 0 and "samples_passed" not in previous:
+                        raise SystemExit("--occlusion needs a fresh tag or suffix for previously unmeasured draws")
+                    done.add(previous["i"])
     hi = a.hi or len(sample)
     for i, s in enumerate(sample):
         if i < a.lo or i >= hi or i in done or (a.only and i not in a.only):
@@ -205,6 +212,8 @@ def cmd_run(a):
         env = job_env(os.environ, a.timeout, a.variant, meta, gs)
         cmd = [a.exe, make_vs(a.glslang, meta, cache), os.path.join(a.spirv, s["name"] + ".spv"), raw,
                str(W), str(H), str(targets)]
+        if a.occlusion:
+            cmd.append("--occlusion")
         start = time.time()
         try:
             r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=a.timeout + 15,
@@ -221,6 +230,12 @@ def cmd_run(a):
                     reason = line.split(" (line")[0][:60]
                     break
         rec = {"i": i, "code": code, "reason": reason, "targets": targets, "sec": round(time.time() - start, 2)}
+        if a.occlusion and code == 0:
+            prefix = "samples_passed "
+            counts = [line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)]
+            if len(counts) != 1 or not counts[0].isascii() or not counts[0].isdecimal():
+                raise SystemExit("worker succeeded without a valid samples_passed measurement")
+            rec["samples_passed"] = int(counts[0])
         with open(log, "a", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(rec) + "\n")
     print("done", a.tag, a.variant, a.lo)
@@ -335,6 +350,11 @@ def exact_pair(i, left, right):
     return "clear-only exact", targets
 
 
+def draw_measurements(left, right):
+    counts = [rec.get("samples_passed") if rec and rec["code"] == 0 else None for rec in (left, right)]
+    return {"samples_passed": counts} if any(count is not None for count in counts) else {}
+
+
 def compare_exact(a, sample, ra, rb):
     draws, attachments = Counter(), Counter()
     rows = []
@@ -343,7 +363,7 @@ def compare_exact(a, sample, ra, rb):
         outcome, targets = exact_pair(i, left, right)
         draws[outcome] += 1
         attachments.update(targets)
-        rows.append({"i": i, "class": outcome, "targets": targets,
+        rows.append({"i": i, "class": outcome, "targets": targets, **draw_measurements(left, right),
                      "codes": [r["code"] if r else None for r in (left, right)]})
     with open(os.path.join(a.out, f"exact_{a.variant}.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({"tags": a.tags, "draws": draws, "targets": attachments, "rows": rows}, f)
@@ -367,7 +387,8 @@ def cmd_compare(a):
         c, sc = classify_pair(ra[i], rb[i], os.path.join(ra[i]["dir"], f"{i}.raw"), os.path.join(rb[i]["dir"], f"{i}.raw"))
         counts[c] = counts.get(c, 0) + 1
         sub[(c, sc)] = sub.get((c, sc), 0) + 1
-        rows.append({"i": i, "class": c, "sub": sc, "stratum": s["stratum"], ta: ra[i]["code"], tb: rb[i]["code"],
+        rows.append({"i": i, "class": c, "sub": sc, "stratum": s["stratum"], **draw_measurements(ra[i], rb[i]),
+                     ta: ra[i]["code"], tb: rb[i]["code"],
                      ta + "_reason": ra[i]["reason"], tb + "_reason": rb[i]["reason"]})
     with open(os.path.join(a.out, f"classes_{a.variant}.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(rows, f)
@@ -395,6 +416,7 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=20261122)
     ap.add_argument("--tag", help="a label for the GPU this run uses")
     ap.add_argument("--tags", nargs=2, default=["a", "b"])
+    ap.add_argument("--occlusion", action="store_true", help="measure precise samples passed per draw (run)")
     ap.add_argument("--exact", action="store_true", help="compare target bytes and count clear-only pairs separately")
     ap.add_argument("--variant", choices=["z", "t"], default="z")
     ap.add_argument("--exe", help="vk_ps_sweep")
@@ -405,6 +427,8 @@ def main(argv=None):
     ap.add_argument("--only", type=lambda s: [int(x) for x in s.split(",")], default=None)
     ap.add_argument("--suffix", default="", help="results folder suffix (a re-run uses _re)")
     a = ap.parse_args(argv)
+    if a.occlusion and a.cmd != "run":
+        ap.error("--occlusion needs run")
     if a.exact and (a.cmd != "compare" or a.tags[0] == a.tags[1]):
         ap.error("--exact needs compare with two different tags")
     if a.cmd == "run" and not (a.tag and a.exe and a.spirv):

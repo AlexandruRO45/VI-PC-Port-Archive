@@ -243,7 +243,10 @@ class CompareCommand(unittest.TestCase):
                         if pair[side] is None:
                             continue
                         n, data = pair[side]
-                        print(json.dumps({"i": i, "code": 0, "targets": n}), file=log)
+                        rec = {"i": i, "code": 0, "targets": n}
+                        if side == 1:
+                            rec["samples_passed"] = 0
+                        print(json.dumps(rec), file=log)
                         if data is not None:
                             (folder / f"{i}.raw").write_bytes(data)
             rerun = out / "a_z_re"
@@ -260,6 +263,37 @@ class CompareCommand(unittest.TestCase):
             self.assertEqual(report["rows"][0]["targets"], ["clear-only exact", "non-clear exact"])
             self.assertEqual(report["targets"], {"non-clear exact": 1, "clear-only exact": 2, "mismatch": 1})
             self.assertEqual(report["rows"][-1]["codes"], [3, 0])
+            self.assertEqual(report["rows"][0]["samples_passed"], [None, 0])
+            self.assertEqual(report["rows"][-1]["samples_passed"], [None, 0])
+            self.assertNotIn("samples_passed", report["rows"][6])
+
+    @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a precise-query Vulkan worker")
+    def test_clear_draws_with_opposite_coverage(self):
+        from pathlib import Path
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for tag, statement in (("covered", "color = vec4(-1);"), ("discarded", "discard;")):
+                folder = out / tag
+                folder.mkdir()
+                src = folder / "control.frag"
+                src.write_text("#version 450\nlayout(location=0) out vec4 color;\nvoid main() {" + statement + "}\n",
+                               encoding="utf-8", newline="\n")
+                subprocess.run(["glslangValidator", "-V", str(src), "-o", str(folder / "control.spv")], check=True)
+                (folder / "index.json").write_text('{"control":{"stage":"ps"}}', encoding="utf-8", newline="\n")
+                if tag == "covered":
+                    ps_sweep.main(["sample", "--spirv", str(folder), "--out", tmp])
+                ps_sweep.main(["run", "--spirv", str(folder), "--out", tmp, "--tag", tag, "--occlusion",
+                               "--exe", os.environ["PS_SWEEP_TEST_EXE"]])
+            compare = ["compare", "--out", tmp, "--tags", "covered", "discarded"]
+            ps_sweep.main(compare)
+            ps_sweep.main(compare + ["--exact"])
+            exact = json.loads((out / "exact_z.json").read_text())["rows"][0]
+            ordinary = json.loads((out / "classes_z.json").read_text())[0]
+            self.assertEqual(exact["class"], "clear-only exact")
+            self.assertEqual(exact["samples_passed"], [ps_sweep.W * ps_sweep.H, 0])
+            self.assertEqual(ordinary["samples_passed"], exact["samples_passed"])
 
     def test_help_warns_about_nvidia_resets(self):
         buf = io.StringIO()

@@ -116,8 +116,9 @@ static double now_s() {
 
 int main(int argc, char** argv) {
     const double t_start = now_s();
-    if (argc != 7) {
-        std::fprintf(stderr, "usage: vk_ps_sweep vs.spv ps.spv out.raw width height render-targets\n");
+    const bool occlusion = argc == 8 && std::strcmp(argv[7], "--occlusion") == 0;
+    if (argc != 7 && !occlusion) {
+        std::fprintf(stderr, "usage: vk_ps_sweep vs.spv ps.spv out.raw width height render-targets [--occlusion]\n");
         return 2;
     }
     const uint32_t W = uint32_t(std::atoi(argv[4])), H = uint32_t(std::atoi(argv[5]));
@@ -223,6 +224,10 @@ int main(int argc, char** argv) {
         missing += what;
     };
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    if (occlusion) {
+        need(have.features.occlusionQueryPrecise, "occlusionQueryPrecise");
+        enable.features.occlusionQueryPrecise = VK_TRUE;
+    }
     VkPhysicalDeviceVulkan12Features en12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
@@ -682,12 +687,24 @@ int main(int argc, char** argv) {
     for (auto& c : clears) for (float& f : c.color.float32) f = -1;
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rbi.renderPass = rp; rbi.framebuffer = fb; rbi.renderArea = sc; rbi.clearValueCount = targets; rbi.pClearValues = clears.data();
+    LOADD(vkCreateQueryPool); LOADD(vkDestroyQueryPool); LOADD(vkGetQueryPoolResults);
+    LOADD(vkCmdResetQueryPool); LOADD(vkCmdBeginQuery); LOADD(vkCmdEndQuery);
+    VkQueryPool query = VK_NULL_HANDLE;
+    if (occlusion) {
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_OCCLUSION;
+        info.queryCount = 1;
+        CHECK(vkCreateQueryPool(dev, &info, nullptr, &query));
+        vkCmdResetQueryPool(cmd, query, 0, 1);
+    }
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     const VkDescriptorSet ds = set->set();
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
     vkCmdPushConstants(cmd, pl, pcs, 0, pc_bytes, pc);
+    if (occlusion) vkCmdBeginQuery(cmd, query, 0, VK_QUERY_CONTROL_PRECISE_BIT);
     vkCmdDraw(cmd, 3, 1, 0, 0);
+    if (occlusion) vkCmdEndQuery(cmd, query, 0);
     vkCmdEndRenderPass(cmd);
     for (uint32_t t = 0; t < targets; ++t) {
         VkBufferImageCopy reg{};
@@ -709,6 +726,12 @@ int main(int argc, char** argv) {
         return 3;
     }
     CHECK(waited);
+    if (occlusion) {
+        uint64_t samples = 0;
+        CHECK(vkGetQueryPoolResults(dev, query, 0, 1, sizeof(samples), &samples, sizeof(samples), VK_QUERY_RESULT_64_BIT));
+        vkDestroyQueryPool(dev, query, nullptr);
+        std::printf("samples_passed %llu\n", static_cast<unsigned long long>(samples));
+    }
     const double t_draw = now_s();
     void* p;
     CHECK(vkMapMemory(dev, bmem, 0, bi.size, 0, &p));
