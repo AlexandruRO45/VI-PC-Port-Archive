@@ -119,6 +119,24 @@ class AmdSwizzleCliGuardTests(unittest.TestCase):
                     self.assertIn("--offset must be inside the blob", err.getvalue())
                     self.assertEqual(out.getvalue(), "")   # nothing ran before the refusal
 
+    def test_geometry_is_validated_before_the_pattern_tables_load(self):
+        # a bad --width is the caller's mistake, not the AMD_SWIZZLE_HEADER env's: refuse it before load()
+        # raises the confusing '<ref>\\mesa-addrlib' OSError the header default produces without the env set.
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "blob.bin")
+            with open(blob, "wb") as f:
+                f.write(bytes(64))
+            for extra, message in ((["--width", "0", "--height", "8"], "--width and --height"),
+                                   (["--width", "8", "--height", "0"], "--width and --height"),
+                                   (["--width", "8", "--height", "8", "--bpe", "0"], "--bpe")):
+                with self.subTest(extra=extra), mock.patch.object(sys, "stderr", io.StringIO()) as err, \
+                        mock.patch.object(sys, "stdout", io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        self.mod.main([blob, *extra])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn(message, err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+
     def test_bad_out_paths_rejected_before_reading_or_searching(self):
         with tempfile.TemporaryDirectory() as tmp:
             blob = os.path.join(tmp, "blob.bin")

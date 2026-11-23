@@ -191,6 +191,12 @@ def main(argv=None):
     if not 0 <= a.offset < len(data):
         ap.error(f"--offset must be inside the blob: {a.offset} is not (0..{len(data) - 1})")
     data = data[a.offset:]
+    # the geometry and element size are validated before the pattern tables load, so a bad --width is
+    # refused as itself instead of the header-missing OSError the load below raises without AMD_SWIZZLE_HEADER
+    if a.width <= 0 or a.height <= 0:
+        ap.error(f"--width and --height must be at least 1: {a.width}x{a.height}")
+    if a.bpe <= 0:
+        ap.error(f"--bpe must be at least 1: {a.bpe}")
     nibbles, tables = load()
     # BC formats cover 4x4 pixels per element; uncompressed 1/2/4 bpe formats have one pixel per element.
     block = 4 if a.bpe in (8, 16) else 1
