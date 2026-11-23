@@ -188,14 +188,51 @@ def probe(oracle, asm, waves):
     return out
 
 
-def main():
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, report):
+    """Create missing parent directories and write `report` as LF-terminated JSON, or return an error string."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return f"cannot create directory for --json {path}: {e.strerror or e}"
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=2)
+    except OSError as e:
+        return f"cannot write --json {path}: {e.strerror or e}"
+    return None
+
+
+def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--waves", default="32,64", help="wave sizes to run (default: 32,64)")
     ap.add_argument("--json", dest="json_out", help="write the full report to this path")
     ap.add_argument("--self-test", action="store_true", help="check the models without a GPU")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.self_test:
         self_test()
         return 0
@@ -203,6 +240,11 @@ def main():
     if not waves or any(w not in (32, 64) for w in waves):
         print("--waves must be a non-empty list of 32 and/or 64", file=sys.stderr)
         return 2
+    if args.json_out is not None:
+        err = validate_json_path(args.json_out)
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return 2
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle()
@@ -232,9 +274,11 @@ def main():
           f"{gfx11_diff} disagree with the measured RDNA2/GFX11 column, "
           f"{gfx10_diff} disagree with Mesa's GFX10 column, "
           f"{wave_diff} wave32/wave64 differences")
-    if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=2)
+    if args.json_out is not None:
+        err = write_json_report(args.json_out, report)
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return 2
     return 1 if gfx11_diff or wave_diff else 0
 
 
