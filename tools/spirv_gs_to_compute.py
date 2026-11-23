@@ -376,7 +376,17 @@ def main(argv):
         return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
-    text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout
+    try:
+        text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout
+    except FileNotFoundError:
+        print(f"ERROR: {dis} not found: install SPIRV-Tools, put it on PATH, or set SPIRV_DIS to it",
+              file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or "").strip().splitlines()
+        print(f"ERROR: {args[0]} is not a SPIR-V module {dis} can read"
+              + (f": {detail[-1].strip()}" if detail else ""), file=sys.stderr)
+        return 2
     ver = re.search(r"; Version: (\d+)\.(\d+)", text)
     version = (int(ver[1]), int(ver[2])) if ver else (1, 5)
     try:
@@ -385,7 +395,18 @@ def main(argv):
         print(f"{args[0]}: not supported: {e}", file=sys.stderr)
         return 1
     target = f"spv{version[0]}.{version[1]}" if ver else "vulkan1.2"
-    subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True)
+    try:
+        subprocess.run([asm, "--target-env", target, "-", "-o", args[1]], input=new, check=True, text=True,
+                       capture_output=True)
+    except FileNotFoundError:
+        print(f"ERROR: {asm} not found: install SPIRV-Tools, put it on PATH, or set SPIRV_AS to it",
+              file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or "").strip().splitlines()
+        print(f"ERROR: {asm} failed on the rewritten module" + (f": {detail[-1].strip()}" if detail else ""),
+              file=sys.stderr)
+        return 2
     if lay_path:
         with open(lay_path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(lay, f, indent=1)
