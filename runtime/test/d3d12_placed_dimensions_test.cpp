@@ -260,7 +260,7 @@ bool round_trip(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fe
     }
 
     if (FAILED(readback->Map(0, nullptr, &mapped))) return false;
-    UINT64 wrong = 0, checked = 0;
+    UINT64 wrong = 0, checked = 0, cleared_bytes = 0;
     for (UINT s = 0; s < count; ++s)
         for (UINT z = 0; z < layouts[s].Footprint.Depth; ++z)
             for (UINT y = 0; y < rows[s]; ++y) {
@@ -269,6 +269,7 @@ bool round_trip(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fe
                     const bool cleared = clear && s == 0 && z == 1 && UINT64(clear->left) * 4 <= x &&
                                          x < UINT64(clear->right) * 4 && UINT(clear->top) <= y && y < UINT(clear->bottom);
                     constexpr std::uint8_t red[4] = {255, 0, 0, 255};
+                    cleared_bytes += cleared;
                     const auto want = cleared ? red[x % 4] : pattern(s, z, y, x);
                     if (row[x] == want) continue;
                     if (!wrong++)
@@ -277,6 +278,17 @@ bool round_trip(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fe
                 }
             }
     readback->Unmap(0, nullptr);
+    if (clear) {
+        // The fixture has 2560x16x2 at mip 0, 1280x8x1 at mip 1, and a 2x2 rectangle on W slice 1.
+        constexpr UINT64 expected_bytes = 4ull * (2560 * 16 * 2 + 1280 * 8);
+        constexpr UINT64 expected_cleared = 4ull * 2 * 2;
+        if (checked != expected_bytes || cleared_bytes != expected_cleared) {
+            std::fprintf(stderr, "%s: read back %llu of %llu bytes, including %llu of %llu bytes in the clear rectangle\n",
+                         name, static_cast<unsigned long long>(checked), static_cast<unsigned long long>(expected_bytes),
+                         static_cast<unsigned long long>(cleared_bytes), static_cast<unsigned long long>(expected_cleared));
+            return false;
+        }
+    }
     if (wrong) {
         std::fprintf(stderr, "%s: %llu of %llu bytes differ\n", name, static_cast<unsigned long long>(wrong),
                      static_cast<unsigned long long>(checked));
@@ -284,6 +296,8 @@ bool round_trip(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fe
     }
     std::printf("%s: %u subresources, %llu bytes round-tripped\n", name, count,
                 static_cast<unsigned long long>(checked));
+    if (clear)
+        std::printf("%s: %llu bytes in the clear rectangle matched\n", name, static_cast<unsigned long long>(cleared_bytes));
     return true;
 }
 
@@ -354,17 +368,33 @@ int check_wide_xbox_volume() {
                      static_cast<unsigned long long>(info2.SizeInBytes));
         return 1;
     }
+    // The Xbox creation ABI normalizes its layout word before using the backend's allocation rules.
+    using XboxCreateResourceFn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                                 const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+                                                 const D3D12_CLEAR_VALUE*, REFIID, void**);
+    constexpr unsigned create_resource_slot = 76;
+    auto* const* vtable = *reinterpret_cast<void***>(xbox.p);
+    const auto create_resource = reinterpret_cast<XboxCreateResourceFn>(vtable[create_resource_slot]);
+    auto xbox_desc = wide;
+    xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    const auto hits = rt::d3d12_xs::device_slot_hits(create_resource_slot);
     Ref<ID3D12Resource> committed;
-    if (FAILED(xbox->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &wide, D3D12_RESOURCE_STATE_COMMON,
-                                            nullptr, IID_PPV_ARGS(&committed.p))) || !committed.p) {
-        std::fprintf(stderr, "Xbox wide-volume committed creation failed after a valid allocation query\n");
+    const HRESULT created = create_resource(xbox.p, &heap, D3D12_HEAP_FLAG_NONE, &xbox_desc,
+                                            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&committed.p));
+    if (FAILED(created) || !committed.p || rt::d3d12_xs::device_slot_hits(create_resource_slot) != hits + 1) {
+        std::fprintf(stderr, "Xbox wide-volume creation through slot 76 failed (0x%08lx)\n",
+                     static_cast<unsigned long>(created));
         return 1;
     }
     const auto actual = committed->GetDesc();
     if (actual.Dimension != t3 || actual.Width != wide.Width || actual.Height != wide.Height ||
-        actual.DepthOrArraySize != 1 || actual.Format != wide.Format || actual.Flags != wide.Flags) return 1;
+        actual.DepthOrArraySize != 1 || actual.Format != wide.Format || actual.Flags != wide.Flags ||
+        actual.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || UINT(xbox_desc.Layout) != 0x101) {
+        std::fprintf(stderr, "slot 76 changed the volume description or did not normalize its layout\n");
+        return 1;
+    }
     committed.reset();
-    std::printf("Xbox 2560x1440x1 RGBA8 volume: allocation variants agree (%llu bytes), committed 3D\n",
+    std::printf("Xbox 2560x1440x1 RGBA8 volume: allocation variants agree (%llu bytes), slot 76 committed 3D\n",
                 static_cast<unsigned long long>(info.SizeInBytes));
 
     auto tiled = wide;

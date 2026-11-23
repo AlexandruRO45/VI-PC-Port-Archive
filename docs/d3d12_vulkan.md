@@ -2221,8 +2221,9 @@ The trace will enumerate them.
   The Vulkan device created by `D3D12XboxCreateDevice` also accepts 3D color textures with an unspecified
   (`UNKNOWN`) layout and U/V above 2048 when the requested Vulkan 3D format and usage support those extents.
   U/V are capped at 16384 by the texture descriptor, and W retains its 2048 limit. The same sizing applies to
-  allocation queries and resource creation. `d3d12_xbox_wide_volume` checks a 2560-wide volume through the Xbox
-  device, including the render-target clear and untouched bytes in the other W slice and mip.
+  allocation queries and resource creation. `d3d12_xbox_wide_volume` compares the allocation queries and creates
+  a volume through Xbox slot 76, which maps `0x101` to `UNKNOWN` for textures. It also checks a placed volume's
+  render-target clear and the untouched bytes in its other W slice and mip.
 - `GetAdapterLuid` (implemented): `VkPhysicalDeviceIDProperties::deviceLUID`, which on Windows is the DXGI
   adapter's LUID; `d3d12_fence_timing_test` finds it with `IDXGIFactory4::EnumAdapterByLuid` (RTX 4090, driver
   621.14). A driver that reports `deviceLUIDValid = VK_FALSE` gets a zero LUID, logged.
