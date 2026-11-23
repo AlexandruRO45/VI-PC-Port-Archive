@@ -34,16 +34,21 @@ Usage:
 
 An index that cannot be read, is not JSON or is not the shape tools/shader_meta.py writes, and a --json path that
 cannot be written, each give one ERROR line and exit 2.
+`--json` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 """
 import argparse
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 POINTER_KINDS = ("ptr32_lo", "ptr64_lo")
@@ -263,8 +268,7 @@ def main(argv=None):
         report = {**summary, "vs_ps_pairs": pc}
     if a.json:
         try:
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(report, f, indent=1, sort_keys=True)
+            write_json_report(a.json, report)
         except OSError as e:
             print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2
@@ -276,6 +280,43 @@ def main(argv=None):
     for b in bad:
         print("MISMATCH", b, file=sys.stderr)
     return 1 if bad else 0
+
+
+def write_json_report(path: str, report: dict) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination.
+
+    Missing parent folders are not created: the previous direct writer failed the same way
+    (one ERROR line / exit 2), and creating them would hide that case.
+    """
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1, sort_keys=True)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".user_sgpr_census-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1, sort_keys=True)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

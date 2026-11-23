@@ -394,3 +394,13 @@ def test_pairs_cli_writes_the_report_and_no_names():
         assert "VS/PS pairs: 1 techniques with both stages" in result.stdout
         assert "Fog" not in result.stdout
         assert json.loads(report.read_text(encoding="utf-8"))["vs_ps_pairs"]["shared_different_kind"] == 0
+
+
+def test_json_write_failure_preserves_previous_report(tmp_path):
+    previous = '{"previous": true}'
+    js = tmp_path / "census.json"
+    js.write_text(previous, encoding="utf-8")
+    with mock.patch.object(usc, "replace_retry", side_effect=OSError(13, "Permission denied")):
+        with pytest.raises(OSError):
+            usc.write_json_report(str(js), {"shaders": 1})
+    assert js.read_text(encoding="utf-8") == previous
