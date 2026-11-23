@@ -110,6 +110,11 @@ def read_before_write(insns):
 
 
 def survey(dxbc_dir):
+    report, _, _ = _survey(dxbc_dir)
+    return report
+
+
+def _survey(dxbc_dir):
     with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8") as f:
         index = json.load(f)
     if not isinstance(index, list) or not all(isinstance(e, dict) for e in index):
@@ -118,7 +123,8 @@ def survey(dxbc_dir):
         raise ValueError("index.json has a vertex shader entry without a string file")
     names = [os.path.splitext(e["file"])[0] for e in index if e.get("stage") == "vs"]
     markers, vgprs, families = Counter(), Counter(), Counter()
-    missing = 0
+    missing = empty = 0
+    observed_mbcnt = False
     for n in names:
         path = os.path.join(dxbc_dir, "disasm", n + ".s")
         if not os.path.isfile(path):
@@ -126,7 +132,11 @@ def survey(dxbc_dir):
             continue
         with open(path, encoding="utf-8", errors="replace") as f:
             text = f.read()
-        _, read_v = read_before_write(shader_ir.parse_file(path)["insns"])
+        insns = shader_ir.parse_file(path)["insns"]
+        empty += not insns
+        # The historical marker count also includes mentions in comments.
+        observed_mbcnt = observed_mbcnt or any(MBCNT.fullmatch(ins["op"]) for ins in insns)
+        _, read_v = read_before_write(insns)
         for r in read_v:
             if r < 16:
                 vgprs[f"v{r}"] += 1
@@ -143,9 +153,10 @@ def survey(dxbc_dir):
             families["reads v0 (vertex id)" + (" and v3 (instance id)" if 3 in read_v else "")] += 1
         else:
             families["reads neither v0 nor a fetch call"] += 1
-    return {"vertex_shaders": len(names), "missing_listings": missing, "markers": dict(markers),
-            "input_vgprs_read": dict(sorted(vgprs.items(), key=lambda kv: int(kv[0][1:]))),
-            "families": dict(families)}
+    report = {"vertex_shaders": len(names), "missing_listings": missing, "markers": dict(markers),
+              "input_vgprs_read": dict(sorted(vgprs.items(), key=lambda kv: int(kv[0][1:]))),
+              "families": dict(families)}
+    return report, empty, observed_mbcnt
 
 
 def main():
@@ -158,7 +169,7 @@ def main():
         print(f"vs_input_survey: error: --json would overwrite the input {index_path}", file=sys.stderr)
         return 2
     try:
-        r = survey(a.dxbc)
+        r, empty, observed_mbcnt = _survey(a.dxbc)
     except (OSError, ValueError) as e:  # missing or non-folder <dxbc>, unreadable, non-UTF-8 or malformed index.json
         print(f"vs_input_survey: error: cannot read {index_path}: {e}", file=sys.stderr)
         return 2
@@ -168,12 +179,16 @@ def main():
     print(f"exports: pos0 {m.get('exp pos0', 0)}, param {m.get('exp param', 0)}; fetch call {m.get('fetch call', 0)}")
     print("input VGPRs read before written (v0..v15):", r["input_vgprs_read"])
     print("families:", r["families"])
-    if m.get("exp prim") or m.get("s_sendmsg") or m.get("v_mbcnt"):
+    if m.get("exp prim") or m.get("s_sendmsg") or observed_mbcnt:
         print("layout: NGG markers present: check the VS input layout")
     elif not r["vertex_shaders"]:
         print("layout: unknown (no vertex shader entries)")
     elif r["missing_listings"] == r["vertex_shaders"]:
         print("layout: unknown (no vertex shader listings)")
+    elif empty + r["missing_listings"] == r["vertex_shaders"]:
+        print("layout: unknown (no decoded vertex shader instructions)")
+    elif empty:
+        print("layout: unknown (incomplete coverage; some listings have no decoded instructions)")
     elif r["missing_listings"]:
         print("layout: unknown (incomplete coverage; no NGG markers in available listings)")
     else:
