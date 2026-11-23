@@ -155,6 +155,14 @@ def scan(lines, stats=None):
                 site["list"] = True
             elif left > 1:
                 tail.append((site, left - 1))
+        # A reached target opens its window before the call check below: the target itself can be the call.
+        for item in pending[:]:
+            site, opened = item
+            if addr == site["target"]:
+                watching.append((site, FALLBACK_WINDOW + 1))  # the target and the instructions after it
+                pending.remove(item)
+            elif idx - opened > PENDING_WINDOW:
+                pending.remove(item)
         for item in watching[:]:
             site, left = item
             watching.remove(item)
@@ -162,13 +170,6 @@ def scan(lines, stats=None):
                 site["fallback_slot"] = int(vm.group(2), 16) // 8
             elif left > 1:
                 watching.append((site, left - 1))
-        for item in pending[:]:
-            site, opened = item
-            if addr == site["target"]:
-                watching.append((site, FALLBACK_WINDOW))
-                pending.remove(item)
-            elif idx - opened > PENDING_WINDOW:
-                pending.remove(item)
         if mnem == "mov" and (sb := STORE_BACK.match(ops)):
             site = classify(window, sb.group(1), sb.group(2))
             if site:

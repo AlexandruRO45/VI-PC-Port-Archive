@@ -64,6 +64,23 @@ class InlineScanTests(unittest.TestCase):
         self.assertEqual(site["header"], 0x4002C400)
         self.assertEqual(site["fallback_slot"], 14)
 
+    def test_fallback_call_at_the_branch_target_itself(self):
+        # The vtable is loaded before the compare, so the slow path is a bare call at the branch target.
+        rows = (("mov rdx,qword ptr [rbx]",) + GUARDED[:9]
+                + ("@0000000140002000 call qword ptr [rdx+0000000000000070h]",))
+        (site,) = sites(rows)
+        self.assertTrue(site["checked"])
+        self.assertEqual(site["target"], 0x140002000)
+        self.assertEqual(site["fallback_slot"], 14)
+
+    def test_fallback_window_still_reaches_sixteen_instructions_past_the_target(self):
+        filler = ("nop ",) * (inline_scan.FALLBACK_WINDOW - 1)
+        rows = GUARDED[:10] + filler + ("call qword ptr [rax+0000000000000070h]",)
+        (site,) = sites(rows)
+        self.assertEqual(site["fallback_slot"], 14)
+        (site,) = sites(rows[:-1] + ("nop ", rows[-1]))
+        self.assertIsNone(site["fallback_slot"])
+
     def test_the_same_write_without_its_compare_is_unchecked(self):
         # The only list field (+140h) is written after the store-back.
         (site,) = sites(UNGUARDED)
