@@ -533,6 +533,11 @@ class GWSBranchReleaseStatusFlags:
         )
 
 
+# ============================================================================
+# Commit 7: IEEE 754 edge cases
+# ============================================================================
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br_v."""
 
@@ -991,6 +996,82 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         flags = GWSBranchReleaseStatusFlags.compute(val, awakened, wrapped=True)
         self.assertTrue(flags.carry_flag)
         self.assertTrue(flags.zero_flag)
+
+
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 edge cases for ds_gws_sema_br_v."""
+
+    def setUp(self) -> None:
+        self.gws = GWSSubsystem()
+        self.interp = ScalarGWSInterpreter()
+
+    def test_initial_counter_positive_zero_float(self) -> None:
+        pos_zero_bits = struct.unpack(">I", struct.pack(">f", 0.0))[0]
+        self.assertEqual(pos_zero_bits, 0x0000_0000)
+
+        rid = 1
+        self.gws.init_resource(rid, init_val=pos_zero_bits)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+
+        val, awakened, branch = self.interp.execute(state, inst)
+        self.assertEqual(val, 1)
+
+    def test_initial_counter_negative_zero_float(self) -> None:
+        neg_zero_bits = struct.unpack(">I", struct.pack(">f", -0.0))[0]
+        self.assertEqual(neg_zero_bits, 0x8000_0000)
+
+        rid = 2
+        self.gws.init_resource(rid, init_val=neg_zero_bits)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+
+        val, awakened, branch = self.interp.execute(state, inst)
+        self.assertEqual(val, 0x8000_0001)
+
+    def test_subnormal_float_preserved_without_ftz_flush(self) -> None:
+        max_subnormal = 0x007F_FFFF
+        rid = 3
+        self.gws.init_resource(rid, init_val=max_subnormal)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+
+        val, awakened, branch = self.interp.execute(state, inst)
+        self.assertEqual(val, 0x0080_0000)
+
+    def test_infinity_float_increment(self) -> None:
+        pos_inf_bits = struct.unpack(">I", struct.pack(">f", float("inf")))[0]
+        self.assertEqual(pos_inf_bits, 0x7F80_0000)
+
+        rid = 4
+        self.gws.init_resource(rid, init_val=pos_inf_bits)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+
+        val, awakened, branch = self.interp.execute(state, inst)
+        self.assertEqual(val, 0x7F80_0001)
+
+    def test_quiet_nan_preserved_without_canonicalization(self) -> None:
+        qnan_bits = 0x7FC0_0000
+        rid = 5
+        self.gws.init_resource(rid, init_val=qnan_bits)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+
+        val, awakened, branch = self.interp.execute(state, inst)
+        self.assertEqual(val, 0x7FC0_0001)
+
+    def test_m0_populated_with_float_bit_patterns(self) -> None:
+        patterns = [0x7FC0_0004, 0x7F80_0008, 0x8000_0010]
+        for pattern in patterns:
+            expected_rid = pattern & GWS_RESOURCE_ID_MASK
+            self.gws.init_resource(expected_rid, init_val=0)
+            state = ScalarThreadState(wave_id=1, m0=pattern, gws=self.gws)
+            inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+
+            val, awakened, branch = self.interp.execute(state, inst)
+            self.assertEqual(val, 1)
+            self.assertEqual(self.gws.resources[expected_rid].value, 1)
 
 
 if __name__ == "__main__":
