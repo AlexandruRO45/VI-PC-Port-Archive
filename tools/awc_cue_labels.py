@@ -1,5 +1,6 @@
 """Convert one exported cue_regions.json to per-channel Audacity label tracks."""
 
+import sys
 import argparse
 import json
 from pathlib import Path
@@ -52,4 +53,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is a strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     main()
