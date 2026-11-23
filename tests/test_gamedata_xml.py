@@ -398,6 +398,17 @@ class GamedataXmlTest(unittest.TestCase):
                 self.assertIn("ERROR: cannot write", p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
 
+    def test_json_write_failure_preserves_previous_report(self):
+        previous = '{"previous": true}'
+        path = os.path.join(self.root, "out.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(g, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                g.write_json(path, {"documents": 0}, {}, [])
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
+
 
 if __name__ == "__main__":
     unittest.main()

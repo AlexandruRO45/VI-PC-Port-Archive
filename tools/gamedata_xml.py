@@ -20,6 +20,7 @@ individual file is identified by the basename that was passed. The output is a l
 be committed or attached to an issue. Report paths are refused before the scan when they alias an input: a
 nested XML in directory mode, or a carve ``index.json`` or stream. The test fixtures are synthetic and contain
 no game data.
+`--json` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 Usage: `python -I tools/gamedata_xml.py --help` lists the options.
 """
 import argparse
@@ -31,6 +32,7 @@ import re
 import stat
 import statistics
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from xml.parsers.expat import errors
@@ -39,6 +41,8 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import gamedata_index as gi  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 BOM = b"\xef\xbb\xbf"
@@ -730,14 +734,46 @@ def main() -> int:
     if args.json:
         public_rows = [{key: value for key, value in row.items() if key != "_scan"} for row in rows]
         try:
-            _make_parent(args.json)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"summary": summary, "roots": agg["roots"], "rows": public_rows}, f, indent=1)
+            write_json(args.json, summary, agg["roots"], public_rows)
         except OSError as exc:
             print(f"ERROR: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
             return 2
         print("wrote", args.json)
     return 0 if clean else 1
+
+
+def write_json(path: str, summary: dict, roots: dict, rows: list) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    _make_parent(path)
+    payload = {"summary": summary, "roots": roots, "rows": rows}
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=os.path.dirname(destination) or ".", prefix=".gamedata_xml-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
