@@ -38,7 +38,7 @@ wraps the same decoder: `inspect <in.bin> --codec <1..7> --size <uncompressed_by
 the stream's header, entropy statistics and validation results; `decode <in.bin> <out.bin> --codec <1..7>
 --size <uncompressed_bytes> [--provisional]` writes the rebuilt BC blocks; `profile <in.bin> --codec <1..7>
 --size <uncompressed_bytes>` reports per-symbol frequency statistics. Strict confirmed-history mode is
-the default; `--allow-provisional` enables the
+the default; `--provisional` on the decoder tool (and `--allow-provisional` on `tools/ttpf_mips.py`) enables
 provisional and last-resort history entries, and `--history <path>` supplies locally
 calibrated BC6H/BC7 initial history JSON tables at run time (no fitted BC6H/BC7 history
 data is embedded in the repository). `rpf9dump`'s C# `TtpfReader` (submodule pin `e293917`,
