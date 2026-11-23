@@ -151,13 +151,31 @@ reproduces the release counts exactly (235,259 recovered, 71 rejected) and yield
 |---|---:|---|
 | Large-mesh index buffers | 64 | The system/graphics split is found, but `RageModelDecoder.Decode` rejects the drawable because a mesh has more than 65,535 triangles or vertex references; the recovery loop keeps requesting continuation blocks until the archive ends and reports no continuation. |
 | Short secondary LOD palette | 1 | `LooksLikeFragment` is true but the ordinary extent probe cannot complete (`MetadataComplete == false` on the first block), leaving the system/graphics split ambiguous; the declared-split fragment probe resolves it. |
-| Extent probe returns null | 6 | Single-block candidates pass `LooksLikeResource` but `ProbeRequiredExtents` returns null (inconsistent drawable/fragment layout); `Rpf9TextureRecovery` recovers none of them, so they are not texture dictionaries. |
+| Extent probe returns null | 6 | Single-block `.#ft` fragments whose main drawable is empty: null LOD0–3 at `+0x50` and empty-sentinel bounds (min +FLT_MAX, max −FLT_MAX, radius 0). `ExtentReader.Probe()` fails `LooksLikeDrawableHeader` on that main drawable and returns null (`split-exhausted:split1:probe-null`). Not texture dictionaries: `Rpf9TextureRecovery` recovers none. |
 
 Re-running `Rpf9ModelRecovery.RecoverAtOffsets` on the 71 `levels.rpf` offsets recovers 64 at
 `7ef5c51` and 65 at `16134b0`, leaving the 6 above. The 64 are recovered by upstream
 [rpf9-explorer#18](https://github.com/breadbbbb/rpf9-explorer/pull/18) and the 1 by
 [rpf9-explorer#26](https://github.com/breadbbbb/rpf9-explorer/pull/26); the 6 remain rejected at
-`16134b0`.
+`16134b0` and at upstream main `4eee1e6`.
+
+The 6 are the fragments that [docs/character_models.md](character_models.md#what-is-not-decoded)
+counts as having "a main drawable that fails the embedded-drawable header test". Each declares
+two drawable records (u16 `+0x30` = 2, records 0x110 apart from the main drawable). All of its
+geometry is in the child record at main `+0x110`: that record has real bounds and its LOD0
+pointer at record `+0x50` (main `+0x160`). Two of the six also have LOD1. The per-fragment
+geometry ranges from 1 mesh / 55 vertices / 52 triangles to 2 meshes / 3,638 vertices / 4,304
+triangles.
+
+Measured with a scratch copy of the `16134b0` decoder. When the main drawable has null LOD0–3 and
+sentinel bounds, the copy reads the LOD groups from the child record. All 6 then recover and pass
+the decoder's strict index, vertex-reference, bounds and bone-palette checks. A full `levels.rpf`
+run recovered 235,330 of 235,330 candidates with none lost. That patch still reports the
+sentinel bounds rather than the child record's. The decoder change is reported upstream as
+[rpf9-explorer#29](https://github.com/breadbbbb/rpf9-explorer/issues/29).
+
+Hypothesis, not measured: the child record is a detail or variant drawable of the same object.
+The first three and the last three of the six each share one bounding box.
 
 Method checks: sharded 4 MiB `FindCandidateOffsets` was verified exact-equal against the
 single-threaded scan on `packs.rpf` (`26,389 == 26,389`), and `tools/rpf9dump models` end-to-end
