@@ -1,19 +1,26 @@
 """Count declared G-buffer signatures and static exports in an indexed shader carve."""
 import argparse
 from collections import Counter
+import hashlib
 import json
 from pathlib import Path
 import re
 import struct
 import sys
+import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from feature_scan import parts, signature_offsets
+from fssm_unpack import unpack_all
 from shader_ir import ENC, HDR, parse_line
 
 
 def signature(path):
-    sig = parts(path.read_bytes())["OSG1"]
+    return signature_bytes(path.read_bytes())
+
+
+def signature_bytes(data):
+    sig = parts(data)["OSG1"]
     rows = []
     for offset in signature_offsets(sig):
         index, system, ctype, register, mask, _, precision = struct.unpack_from(
@@ -52,11 +59,30 @@ def exports(path):
     return counts, bool(complete)
 
 
-def census(directory, listings):
+def payload_identity(data):
+    """Only assign an entry when its container identifies one whole FSSM."""
+    try:
+        if data is None or not data.startswith(b"DXBC"):
+            return "unavailable", None
+        identities = {hashlib.sha256(blob).digest() for blob in unpack_all(data)}
+    except (ValueError, struct.error, zlib.error):
+        return "unavailable", None
+    if not identities:
+        return "unavailable", None
+    if len(identities) > 1:
+        return "ambiguous", None
+    return "identified", identities.pop()
+
+
+def census(directory, listings, *, payload_coverage=False):
     predicates = ("all indexed ps", "entry contains deferred (casefold)",
                   "stem contains Deferred (case-sensitive)", "stem contains PS_DeferredTextured (case-sensitive)")
     report = {key: {"coverage": Counter(), "declared_counts": Counter(), "signatures": Counter(), "observed_exports": Counter()}
               for key in predicates}
+    identities = {key: Counter() for key in predicates}
+    if payload_coverage:
+        for group in report.values():
+            group["payload_coverage"] = dict(identified=0, ambiguous=0, unavailable=0)
     for row in json.loads((directory / "index.json").read_text(encoding="utf-8")):
         if row["stage"] != "ps":
             continue
@@ -66,8 +92,10 @@ def census(directory, listings):
         coverage = Counter(indexed=1)
         sig = None
         observed = Counter()
+        data = None
         try:
-            sig = signature(path)
+            data = path.read_bytes()
+            sig = signature_bytes(data)
             coverage["signature_read"] += 1
         except FileNotFoundError:
             coverage["container_missing"] += 1
@@ -80,15 +108,26 @@ def census(directory, listings):
             coverage["listing_missing"] += 1
         except (OSError, IndexError, ValueError):
             coverage["listing_unreadable"] += 1
+        if payload_coverage:
+            status, digest = payload_identity(data)
         for key, include in zip(predicates, selected):
             if include:
                 group = report[key]
+                if payload_coverage:
+                    group["payload_coverage"][status] += 1
+                    if digest is not None:
+                        identities[key][digest] += 1
                 group["coverage"].update(coverage)
                 group["observed_exports"].update(observed)
                 if sig is not None:
                     shape, layout = sig
                     group["declared_counts"][shape] += 1
                     group["signatures"][layout] += 1
+    if payload_coverage:
+        for key, counts in identities.items():
+            summary = report[key]["payload_coverage"]
+            summary["distinct_payloads"] = len(counts)
+            summary["payloads_by_indexed_entry_count"] = Counter(counts.values())
     return report
 
 
@@ -96,8 +135,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dxbc", type=Path, help="shader_carve directory containing index.json")
     parser.add_argument("--disasm", type=Path, help="listing directory (default: DXBC/disasm)")
+    parser.add_argument("--payload-coverage", action="store_true",
+                        help="count distinct whole FSSM payloads per cohort and histogram their indexed entry counts")
     args = parser.parse_args()
-    print(json.dumps(census(args.dxbc, args.disasm or args.dxbc / "disasm"), indent=2, sort_keys=True))
+    print(json.dumps(census(args.dxbc, args.disasm or args.dxbc / "disasm",
+                            payload_coverage=args.payload_coverage), indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

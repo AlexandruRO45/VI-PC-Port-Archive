@@ -9,8 +9,35 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from gbuffer_census import census
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_fssm_unpack import make_dxbc, make_xbch, make_xdat_list
+
 
 class CensusTests(unittest.TestCase):
+    def test_whole_payload_multiplicity_with_independent_coverage(self):
+        a = make_xbch(b"FSSM01a")
+        b = make_xbch(b"FSSM01b")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rows = []
+            for i, slots in enumerate(([a], [a, a], [b], [a, b], [], [b"bad"], None)):
+                name = f"shader{i}.dxbc"
+                rows.append({"file": name, "stage": "ps", "name": "deferred" if i else "ordinary"})
+                if slots is not None:
+                    dxil = make_xdat_list([(13, slot) for slot in slots])
+                    (root / name).write_bytes(make_dxbc([(b"DXIL", dxil)], digest=bytes([i]) * 16))
+            (root / "index.json").write_text(json.dumps(rows), encoding="utf-8", newline="\n")
+            report = census(root, root, payload_coverage=True)
+            default = census(root, root)
+            self.assertEqual(report["all indexed ps"]["payload_coverage"],
+                             {"identified": 3, "distinct_payloads": 2, "ambiguous": 1,
+                              "unavailable": 3, "payloads_by_indexed_entry_count": {1: 1, 2: 1}})
+            deferred = report["entry contains deferred (casefold)"]["payload_coverage"]
+            self.assertEqual(deferred["payloads_by_indexed_entry_count"], {1: 2})
+            for key, group in report.items():
+                group.pop("payload_coverage")
+                self.assertEqual(group, default[key])
+
     def test_cohorts_and_independent_coverage(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
