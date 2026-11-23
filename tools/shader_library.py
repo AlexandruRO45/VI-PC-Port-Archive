@@ -261,6 +261,9 @@ def main(argv=None) -> int:
         ap.error("--jobs must be at least 1")
     if not a.out and not a.save:
         ap.error("give --out, --save or both")
+    if not os.path.isfile(a.src):
+        print(f"error: {a.src}: no such file or folder", file=sys.stderr)
+        return 2
     with open(a.src, "rb") as f:
         head = f.read(4)
         f.seek(0)

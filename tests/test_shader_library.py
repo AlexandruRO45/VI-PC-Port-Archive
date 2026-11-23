@@ -181,6 +181,18 @@ class Main(unittest.TestCase):
             rc = sl.main(list(args))
         return rc, out.getvalue()
 
+    def test_missing_or_folded_input_is_a_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc, _ = self.run_main(os.path.join(tmp, "gone.rpf"), "--save", os.path.join(tmp, "lib.bin"))
+            self.assertEqual(rc, 2)
+            self.assertIn("no such file or folder", err.getvalue())
+            with contextlib.redirect_stderr(err):
+                rc, _ = self.run_main(tmp, "--save", os.path.join(tmp, "lib.bin"))
+            self.assertEqual(rc, 2)
+            self.assertIn("no such file or folder", err.getvalue())
+
     def test_unpack_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "shaders.rpf")
