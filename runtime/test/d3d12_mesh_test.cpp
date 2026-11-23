@@ -48,6 +48,8 @@ using PsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHAD
 using CsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, D3D12_SHADER_BYTECODE>;
 using AsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE>;
 using MsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE>;
+// Subobject type 24 is the console's mesh shader in streams without a PC MS subobject (PC: the AS number).
+using ConsoleMsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>;
 using TopologySubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE>;
 using TargetsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY>;
 using DepthStencil1Subobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1>;
@@ -210,6 +212,25 @@ int main() {
         vs_stream.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
         vs_stream.add(TargetsSubobject{.inner = one_target()});
         EXPECT(SUCCEEDED(create(device.p, vs_stream, vs_pso)));
+
+        // Console streams (slot 86): type 24 with no MS subobject is the mesh shader, so it builds a mesh pipeline.
+        Ref<ID3D12PipelineState> console_mesh_pso;
+        Stream console_stream;
+        console_stream.add(RootSubobject{.inner = root.p}).add(ConsoleMsSubobject{.inner = ms});
+        console_stream.add(PsSubobject{.inner = ps}).add(TargetsSubobject{.inner = one_target()});
+        EXPECT(SUCCEEDED(create(device.p, console_stream, console_mesh_pso)) && console_mesh_pso.p);
+        // With a real MS (25), 24 keeps the PC reading: an amplification shader, which is refused.
+        Stream as_and_ms = mesh_stream;
+        as_and_ms.add(ConsoleMsSubobject{.inner = ms});
+        EXPECT(create(device.p, as_and_ms, refused) == E_NOTIMPL && !refused.p);
+        // 24 with a VS and no MS is still the mesh shader, and a mesh PSO has no vertex stage.
+        Stream console_and_vs = console_stream;
+        console_and_vs.add(VsSubobject{.inner = vs});
+        EXPECT(create(device.p, console_and_vs, refused) == E_INVALIDARG && !refused.p);
+        // 23 is no subobject type, with or without MS.
+        Stream console_23 = console_stream;
+        console_23.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(23), D3D12_SHADER_BYTECODE>{.inner = vs});
+        EXPECT(create(device.p, console_23, refused) == E_INVALIDARG && !refused.p);
 
         // Streams the PC runtime refuses.
         Stream bad = mesh_stream;
@@ -482,7 +503,7 @@ int main() {
         }
 
         for (auto* r : {&upload, &readback, &target}) r->reset();
-        for (auto* p : {&mesh_pso, &vs_pso, &refused}) p->reset();
+        for (auto* p : {&mesh_pso, &vs_pso, &console_mesh_pso, &refused}) p->reset();
         root.reset();
         rtv_heap.reset();
         list6.reset();

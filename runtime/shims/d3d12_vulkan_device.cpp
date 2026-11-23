@@ -2891,7 +2891,23 @@ struct PipelineStream {
     D3D12_SHADER_BYTECODE as{};
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
+    bool has_ms = false;              // the PC MS subobject (type 25) was in the stream
 };
+
+// Subobject type 24 is the PC amplification shader's number, but in the console's slot 86 streams it is the mesh
+// shader: the console enum has no gap at 23 (PC: view instancing 22, nothing at 23, AS 24, MS 25), so console MS is
+// 24. TreXito's static reading of the retail title showed that type 24 exists there (Leonida#8186); sh1shu1 and
+// lines9686-rgb showed its meaning on a retail boot: every refused payload size matches a mesh-shader container, and
+// taking 24 as the MS lets the boot run with real mesh pipelines (Leonida#8815). A stream with no PC MS subobject
+// therefore takes 24 as its MS. A stream that already has an MS keeps the PC reading: 24 stays an amplification
+// shader, which create_graphics refuses. Type 23 is not mapped: nobody has seen it, so it stays an unknown type.
+void map_console_stages(PipelineStream& out) {
+    if (out.has_ms || !out.as.pShaderBytecode || !out.as.BytecodeLength) return;
+    out.ms = out.as;
+    out.has_ms = true;
+    out.as = {};
+    log_once("console stream subobject 24 taken as the mesh shader (no MS subobject); once", 0);
+}
 
 HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out) {
     if (!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes) return E_INVALIDARG;
@@ -2962,7 +2978,10 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: stage(g.HS); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: stage(g.GS); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: stage(out.as); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: stage(out.ms); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+            stage(out.ms);
+            out.has_ms = true;
+            break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
             take(out.compute.CS);
             out.has_cs = true;
@@ -3068,6 +3087,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         }
         if (!ok) return E_INVALIDARG;
     }
+    map_console_stages(out);
     if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
     if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
     return S_OK;
