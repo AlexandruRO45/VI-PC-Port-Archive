@@ -448,6 +448,11 @@ def main(argv: list[str] | None = None) -> int:
     port = 8080 if args.port is None else args.port
     if not 0 <= port <= 65535:
         parser.error("--port must be between 0 and 65535")
+    for option, value in (("--models-dir", args.models_dir), ("--textures-dir", args.textures_dir)):
+        # A misspelt folder used to be replaced by a candidate under the checkout, so the page showed an empty
+        # gallery and the run created that folder in the repository. Say it instead.
+        if value is not None and not os.path.isdir(value):
+            parser.error(f"{option} is not a directory: {value}")
     try:
         start_server(
             port=port,
