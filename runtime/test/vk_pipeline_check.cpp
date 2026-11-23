@@ -1414,6 +1414,13 @@ int main(int argc, char** argv) {
                 ++done;
                 continue;
             }
+            if (stage == "cs" || is_graphics_stage(stage)) {
+                if (const auto missing = check_missing_feature(meta); !missing.empty()) {
+                    record_skip(name, stage, missing);
+                    ++done;
+                    continue;
+                }
+            }
             // Enter before reading the module: creation can also enter the driver. Hold until its pipeline and
             // module have been destroyed, including on failure. The watchdog and cache writer don't take this lock.
             const bool isolated = large_module_bytes && std::cmp_greater(file_size, large_module_bytes);
@@ -1449,33 +1456,198 @@ int main(int argc, char** argv) {
                 else { modules_bad[stage]++; std::printf("MODULE FAIL %s\n", name.c_str()); }
             }
             if (mod_ok && stage == "cs") {
-                const std::string miss = check_missing_feature(meta);
-                if (!miss.empty()) {
-                    record_skip(name, stage, miss);
+                VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{};
+                VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+                cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = sm; cpi.stage.pName = "main";
+                bool sg_forced = false;
+                if (uses_runtime_compute_layout(meta)) {
+                    const auto request = runtime_compute_subgroup(meta);
+                    leonida::apply_subgroup_request(request, reqSg, cpi.stage);
+                    sg_forced = request.size != 0;
+                    cpi.layout = runtime_compute_layout;
                 } else {
-                    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{};
-                    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-                    cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-                    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; cpi.stage.module = sm; cpi.stage.pName = "main";
-                    bool sg_forced = false;
-                    if (uses_runtime_compute_layout(meta)) {
-                        const auto request = runtime_compute_subgroup(meta);
-                        leonida::apply_subgroup_request(request, reqSg, cpi.stage);
-                        sg_forced = request.size != 0;
-                        cpi.layout = runtime_compute_layout;
-                    } else {
-                        reqSg.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
-                        reqSg.requiredSubgroupSize = meta.subgroup_size;
-                        sg_forced = can_require_sg(meta.subgroup_size, VK_SHADER_STAGE_COMPUTE_BIT);
-                        if (sg_forced) cpi.stage.pNext = &reqSg;
-                        cpi.layout = layout_for(meta);
+                    reqSg.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+                    reqSg.requiredSubgroupSize = meta.subgroup_size;
+                    sg_forced = can_require_sg(meta.subgroup_size, VK_SHADER_STAGE_COMPUTE_BIT);
+                    if (sg_forced) cpi.stage.pNext = &reqSg;
+                    cpi.layout = layout_for(meta);
+                }
+                cpi.flags = capture;
+                // Only whole-pipeline feedback is reported.
+                VkPipelineCreationFeedback fb{};
+                VkPipelineCreationFeedbackCreateInfo fci{
+                    VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, nullptr, &fb, 0, nullptr};
+                if (feedback) cpi.pNext = &fci;
+                const auto t0 = std::chrono::steady_clock::now();
+                {
+                    std::lock_guard<std::mutex> g(mu);
+                    inflight[std::this_thread::get_id()] = {name, t0, "pipeline"};
+                    if (isolated) write_inflight();   // a large module: name it now (alone with --large-parallel 1)
+                }
+                VkPipeline p = VK_NULL_HANDLE;
+                maybe_simulate_crash(name);
+                VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
+                const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (r == VK_SUCCESS) write_stats(name, stage, VK_SHADER_STAGE_COMPUTE_BIT, p);
+                if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
+                record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec, fb.flags);
+            } else if (mod_ok && is_graphics_stage(stage)) {
+                std::vector<VkPipelineShaderStageCreateInfo> stages;
+                VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+                reqSg.requiredSubgroupSize = meta.subgroup_size;
+
+                bool sg_forced = false;
+                auto make_stage = [&](VkShaderStageFlagBits bit, VkShaderModule mod, bool real) {
+                    VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+                    si.stage = bit; si.module = mod; si.pName = "main";
+                    if (real && can_require_sg(meta.subgroup_size, bit)) {
+                        si.pNext = &reqSg;
+                        sg_forced = true;
                     }
-                    cpi.flags = capture;
-                    // Only whole-pipeline feedback is reported.
+                    return si;
+                };
+
+                std::string skip_reason;
+                std::vector<VkFormat> color_formats;
+                VkFormat depth_format = VK_FORMAT_UNDEFINED;
+                bool use_vertex_input = true;
+
+                if (stage == "ps") {
+                    std::string vs_fn = stub_filename("vs", meta.inputs);
+                    VkShaderModule vs_mod = load_stub(vs_fn);
+                    if (!vs_mod) {
+                        skip_reason = "missing stub " + vs_fn;
+                    } else {
+                        uint32_t n_color = 0;
+                        for (uint32_t loc : meta.outputs) n_color = std::max(n_color, loc + 1);
+                        if (n_color > props.limits.maxColorAttachments) {
+                            skip_reason = "exceeds maxColorAttachments";
+                        } else {
+                            color_formats.assign(n_color, VK_FORMAT_R32G32B32A32_SFLOAT);
+                            if (meta.writes_depth) depth_format = VK_FORMAT_D32_SFLOAT;
+                            stages.push_back(make_stage(VK_SHADER_STAGE_VERTEX_BIT, vs_mod, false));
+                            stages.push_back(make_stage(VK_SHADER_STAGE_FRAGMENT_BIT, sm, true));
+                        }
+                    }
+                } else if (stage == "vs") {
+                    std::string ps_fn = stub_filename("ps", meta.outputs);
+                    VkShaderModule ps_mod = load_stub(ps_fn);
+                    if (!ps_mod) {
+                        skip_reason = "missing stub " + ps_fn;
+                    } else {
+                        color_formats.push_back(VK_FORMAT_R32G32B32A32_SFLOAT);
+                        stages.push_back(make_stage(VK_SHADER_STAGE_VERTEX_BIT, sm, true));
+                        stages.push_back(make_stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps_mod, false));
+                    }
+                } else if (stage == "ms") {
+                    use_vertex_input = false;
+                    std::string ps_fn = stub_filename("ps", meta.params);
+                    VkShaderModule ps_mod = load_stub(ps_fn);
+                    if (!ps_mod) {
+                        skip_reason = "missing stub " + ps_fn;
+                    } else {
+                        color_formats.push_back(VK_FORMAT_R32G32B32A32_SFLOAT);
+                        stages.push_back(make_stage(VK_SHADER_STAGE_MESH_BIT_EXT, sm, true));
+                        stages.push_back(make_stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps_mod, false));
+                    }
+                } else if (stage == "gs") {
+                    const auto& gs_in = meta.has_gs_input_locations ? meta.gs_input_locations : meta.gs_inputs;
+                    const auto& gs_out = meta.has_gs_output_locations ? meta.gs_output_locations : meta.gs_outputs;
+                    std::string vs_fn = stub_filename("vs", gs_in);
+                    std::string ps_fn = stub_filename("ps", gs_out);
+                    VkShaderModule vs_mod = load_stub(vs_fn);
+                    VkShaderModule ps_mod = load_stub(ps_fn);
+                    if (!vs_mod) skip_reason = "missing stub " + vs_fn;
+                    else if (!ps_mod) skip_reason = "missing stub " + ps_fn;
+                    else {
+                        color_formats.push_back(VK_FORMAT_R32G32B32A32_SFLOAT);
+                        stages.push_back(make_stage(VK_SHADER_STAGE_VERTEX_BIT, vs_mod, false));
+                        stages.push_back(make_stage(VK_SHADER_STAGE_GEOMETRY_BIT, sm, true));
+                        stages.push_back(make_stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps_mod, false));
+                    }
+                }
+
+                if (!skip_reason.empty()) {
+                    record_skip(name, stage, skip_reason);
+                } else {
+                    VkVertexInputBindingDescription vbind{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
+                    std::vector<VkVertexInputAttributeDescription> vattrs;
+                    if (stage == "vs") {
+                        for (const auto& vi : meta.vertex_inputs) {
+                            VkFormat fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
+                            if (vi.type == "uint") fmt = VK_FORMAT_R32G32B32A32_UINT;
+                            else if (vi.type == "sint") fmt = VK_FORMAT_R32G32B32A32_SINT;
+                            vattrs.push_back({vi.location, 0, fmt, 0});
+                        }
+                    }
+                    VkPipelineVertexInputStateCreateInfo vi_state{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+                    if (!vattrs.empty()) {
+                        vi_state.vertexBindingDescriptionCount = 1;
+                        vi_state.pVertexBindingDescriptions = &vbind;
+                        vi_state.vertexAttributeDescriptionCount = uint32_t(vattrs.size());
+                        vi_state.pVertexAttributeDescriptions = vattrs.data();
+                    }
+                    VkPipelineInputAssemblyStateCreateInfo ia_state{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+                    ia_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+                    VkPipelineViewportStateCreateInfo vp_state{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+                    vp_state.viewportCount = 1;
+                    vp_state.scissorCount = 1;
+                    VkDynamicState dyn_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+                    VkPipelineDynamicStateCreateInfo dyn_state{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+                    dyn_state.dynamicStateCount = 2;
+                    dyn_state.pDynamicStates = dyn_states;
+
+                    VkPipelineRasterizationStateCreateInfo rast{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+                    rast.polygonMode = VK_POLYGON_MODE_FILL;
+                    rast.cullMode = VK_CULL_MODE_NONE;
+                    rast.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+                    rast.lineWidth = 1.0f;
+
+                    VkPipelineMultisampleStateCreateInfo msaa{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+                    msaa.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+                    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+                    if (depth_format != VK_FORMAT_UNDEFINED) {
+                        ds.depthTestEnable = VK_TRUE;
+                        ds.depthWriteEnable = VK_TRUE;
+                        ds.depthCompareOp = VK_COMPARE_OP_LESS;
+                    }
+
+                    std::vector<VkPipelineColorBlendAttachmentState> blend_atts(color_formats.size());
+                    for (auto& ba : blend_atts) ba.colorWriteMask = 0xF;
+                    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+                    blend.attachmentCount = uint32_t(blend_atts.size());
+                    blend.pAttachments = blend_atts.empty() ? nullptr : blend_atts.data();
+
+                    VkPipelineRenderingCreateInfo rend{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+                    rend.colorAttachmentCount = uint32_t(color_formats.size());
+                    rend.pColorAttachmentFormats = color_formats.empty() ? nullptr : color_formats.data();
+                    rend.depthAttachmentFormat = depth_format;
+
+                    VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+                    gpci.pNext = &rend;
+                    gpci.stageCount = uint32_t(stages.size());
+                    gpci.pStages = stages.data();
+                    gpci.pVertexInputState = use_vertex_input ? &vi_state : nullptr;
+                    gpci.pInputAssemblyState = use_vertex_input ? &ia_state : nullptr;
+                    gpci.pViewportState = &vp_state;
+                    gpci.pRasterizationState = &rast;
+                    gpci.pMultisampleState = &msaa;
+                    gpci.pDepthStencilState = &ds;
+                    gpci.pColorBlendState = &blend;
+                    gpci.pDynamicState = &dyn_state;
+                    gpci.layout = layout_for(meta);
+                    gpci.renderPass = VK_NULL_HANDLE;
+                    gpci.flags = capture;
+                    // Zeroed per call and read after it returns; per-stage entries are required but not reported.
                     VkPipelineCreationFeedback fb{};
                     VkPipelineCreationFeedbackCreateInfo fci{
-                        VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, nullptr, &fb, 0, nullptr};
-                    if (feedback) cpi.pNext = &fci;
+                        VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, &rend, &fb, 0, nullptr};
+                    if (feedback) gpci.pNext = &fci;  // keeps rend chained behind it
+
                     const auto t0 = std::chrono::steady_clock::now();
                     {
                         std::lock_guard<std::mutex> g(mu);
@@ -1484,186 +1656,11 @@ int main(int argc, char** argv) {
                     }
                     VkPipeline p = VK_NULL_HANDLE;
                     maybe_simulate_crash(name);
-                    VkResult r = vkCreateComputePipelines(dev, cache, 1, &cpi, nullptr, &p);
+                    VkResult r = vkCreateGraphicsPipelines(dev, cache, 1, &gpci, nullptr, &p);
                     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                    if (r == VK_SUCCESS) write_stats(name, stage, VK_SHADER_STAGE_COMPUTE_BIT, p);
+                    if (r == VK_SUCCESS) write_stats(name, stage, stage_bit(stage), p);
                     if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
                     record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec, fb.flags);
-                }
-            } else if (mod_ok && is_graphics_stage(stage)) {
-                const std::string miss = check_missing_feature(meta);
-                if (!miss.empty()) {
-                    record_skip(name, stage, miss);
-                } else {
-                    std::vector<VkPipelineShaderStageCreateInfo> stages;
-                    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
-                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
-                    reqSg.requiredSubgroupSize = meta.subgroup_size;
-
-                    bool sg_forced = false;
-                    auto make_stage = [&](VkShaderStageFlagBits bit, VkShaderModule mod, bool real) {
-                        VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-                        si.stage = bit; si.module = mod; si.pName = "main";
-                        if (real && can_require_sg(meta.subgroup_size, bit)) {
-                            si.pNext = &reqSg;
-                            sg_forced = true;
-                        }
-                        return si;
-                    };
-
-                    std::string skip_reason;
-                    std::vector<VkFormat> color_formats;
-                    VkFormat depth_format = VK_FORMAT_UNDEFINED;
-                    bool use_vertex_input = true;
-
-                    if (stage == "ps") {
-                        std::string vs_fn = stub_filename("vs", meta.inputs);
-                        VkShaderModule vs_mod = load_stub(vs_fn);
-                        if (!vs_mod) {
-                            skip_reason = "missing stub " + vs_fn;
-                        } else {
-                            uint32_t n_color = 0;
-                            for (uint32_t loc : meta.outputs) n_color = std::max(n_color, loc + 1);
-                            if (n_color > props.limits.maxColorAttachments) {
-                                skip_reason = "exceeds maxColorAttachments";
-                            } else {
-                                color_formats.assign(n_color, VK_FORMAT_R32G32B32A32_SFLOAT);
-                                if (meta.writes_depth) depth_format = VK_FORMAT_D32_SFLOAT;
-                                stages.push_back(make_stage(VK_SHADER_STAGE_VERTEX_BIT, vs_mod, false));
-                                stages.push_back(make_stage(VK_SHADER_STAGE_FRAGMENT_BIT, sm, true));
-                            }
-                        }
-                    } else if (stage == "vs") {
-                        std::string ps_fn = stub_filename("ps", meta.outputs);
-                        VkShaderModule ps_mod = load_stub(ps_fn);
-                        if (!ps_mod) {
-                            skip_reason = "missing stub " + ps_fn;
-                        } else {
-                            color_formats.push_back(VK_FORMAT_R32G32B32A32_SFLOAT);
-                            stages.push_back(make_stage(VK_SHADER_STAGE_VERTEX_BIT, sm, true));
-                            stages.push_back(make_stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps_mod, false));
-                        }
-                    } else if (stage == "ms") {
-                        use_vertex_input = false;
-                        std::string ps_fn = stub_filename("ps", meta.params);
-                        VkShaderModule ps_mod = load_stub(ps_fn);
-                        if (!ps_mod) {
-                            skip_reason = "missing stub " + ps_fn;
-                        } else {
-                            color_formats.push_back(VK_FORMAT_R32G32B32A32_SFLOAT);
-                            stages.push_back(make_stage(VK_SHADER_STAGE_MESH_BIT_EXT, sm, true));
-                            stages.push_back(make_stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps_mod, false));
-                        }
-                    } else if (stage == "gs") {
-                        const auto& gs_in = meta.has_gs_input_locations ? meta.gs_input_locations : meta.gs_inputs;
-                        const auto& gs_out = meta.has_gs_output_locations ? meta.gs_output_locations : meta.gs_outputs;
-                        std::string vs_fn = stub_filename("vs", gs_in);
-                        std::string ps_fn = stub_filename("ps", gs_out);
-                        VkShaderModule vs_mod = load_stub(vs_fn);
-                        VkShaderModule ps_mod = load_stub(ps_fn);
-                        if (!vs_mod) skip_reason = "missing stub " + vs_fn;
-                        else if (!ps_mod) skip_reason = "missing stub " + ps_fn;
-                        else {
-                            color_formats.push_back(VK_FORMAT_R32G32B32A32_SFLOAT);
-                            stages.push_back(make_stage(VK_SHADER_STAGE_VERTEX_BIT, vs_mod, false));
-                            stages.push_back(make_stage(VK_SHADER_STAGE_GEOMETRY_BIT, sm, true));
-                            stages.push_back(make_stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps_mod, false));
-                        }
-                    }
-
-                    if (!skip_reason.empty()) {
-                        record_skip(name, stage, skip_reason);
-                    } else {
-                        VkVertexInputBindingDescription vbind{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
-                        std::vector<VkVertexInputAttributeDescription> vattrs;
-                        if (stage == "vs") {
-                            for (const auto& vi : meta.vertex_inputs) {
-                                VkFormat fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
-                                if (vi.type == "uint") fmt = VK_FORMAT_R32G32B32A32_UINT;
-                                else if (vi.type == "sint") fmt = VK_FORMAT_R32G32B32A32_SINT;
-                                vattrs.push_back({vi.location, 0, fmt, 0});
-                            }
-                        }
-                        VkPipelineVertexInputStateCreateInfo vi_state{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-                        if (!vattrs.empty()) {
-                            vi_state.vertexBindingDescriptionCount = 1;
-                            vi_state.pVertexBindingDescriptions = &vbind;
-                            vi_state.vertexAttributeDescriptionCount = uint32_t(vattrs.size());
-                            vi_state.pVertexAttributeDescriptions = vattrs.data();
-                        }
-                        VkPipelineInputAssemblyStateCreateInfo ia_state{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-                        ia_state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-                        VkPipelineViewportStateCreateInfo vp_state{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-                        vp_state.viewportCount = 1;
-                        vp_state.scissorCount = 1;
-                        VkDynamicState dyn_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-                        VkPipelineDynamicStateCreateInfo dyn_state{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-                        dyn_state.dynamicStateCount = 2;
-                        dyn_state.pDynamicStates = dyn_states;
-
-                        VkPipelineRasterizationStateCreateInfo rast{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-                        rast.polygonMode = VK_POLYGON_MODE_FILL;
-                        rast.cullMode = VK_CULL_MODE_NONE;
-                        rast.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-                        rast.lineWidth = 1.0f;
-
-                        VkPipelineMultisampleStateCreateInfo msaa{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-                        msaa.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-                        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-                        if (depth_format != VK_FORMAT_UNDEFINED) {
-                            ds.depthTestEnable = VK_TRUE;
-                            ds.depthWriteEnable = VK_TRUE;
-                            ds.depthCompareOp = VK_COMPARE_OP_LESS;
-                        }
-
-                        std::vector<VkPipelineColorBlendAttachmentState> blend_atts(color_formats.size());
-                        for (auto& ba : blend_atts) ba.colorWriteMask = 0xF;
-                        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-                        blend.attachmentCount = uint32_t(blend_atts.size());
-                        blend.pAttachments = blend_atts.empty() ? nullptr : blend_atts.data();
-
-                        VkPipelineRenderingCreateInfo rend{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-                        rend.colorAttachmentCount = uint32_t(color_formats.size());
-                        rend.pColorAttachmentFormats = color_formats.empty() ? nullptr : color_formats.data();
-                        rend.depthAttachmentFormat = depth_format;
-
-                        VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-                        gpci.pNext = &rend;
-                        gpci.stageCount = uint32_t(stages.size());
-                        gpci.pStages = stages.data();
-                        gpci.pVertexInputState = use_vertex_input ? &vi_state : nullptr;
-                        gpci.pInputAssemblyState = use_vertex_input ? &ia_state : nullptr;
-                        gpci.pViewportState = &vp_state;
-                        gpci.pRasterizationState = &rast;
-                        gpci.pMultisampleState = &msaa;
-                        gpci.pDepthStencilState = &ds;
-                        gpci.pColorBlendState = &blend;
-                        gpci.pDynamicState = &dyn_state;
-                        gpci.layout = layout_for(meta);
-                        gpci.renderPass = VK_NULL_HANDLE;
-                        gpci.flags = capture;
-                        // Zeroed per call and read after it returns; per-stage entries are required but not reported.
-                        VkPipelineCreationFeedback fb{};
-                        VkPipelineCreationFeedbackCreateInfo fci{
-                            VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, &rend, &fb, 0, nullptr};
-                        if (feedback) gpci.pNext = &fci;  // keeps rend chained behind it
-
-                        const auto t0 = std::chrono::steady_clock::now();
-                        {
-                            std::lock_guard<std::mutex> g(mu);
-                            inflight[std::this_thread::get_id()] = {name, t0, "pipeline"};
-                            if (isolated) write_inflight();   // a large module: name it now (alone with --large-parallel 1)
-                        }
-                        VkPipeline p = VK_NULL_HANDLE;
-                        maybe_simulate_crash(name);
-                        VkResult r = vkCreateGraphicsPipelines(dev, cache, 1, &gpci, nullptr, &p);
-                        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                        if (r == VK_SUCCESS) write_stats(name, stage, stage_bit(stage), p);
-                        if (r == VK_SUCCESS) vkDestroyPipeline(dev, p, nullptr);
-                        record_pipe(name, stage, meta.subgroup_size, sg_forced, r, sec, fb.flags);
-                    }
                 }
             } else if (mod_ok) {
                 record_skip(name, stage, "unsupported stage " + stage);
