@@ -140,11 +140,13 @@ Cross-tabulated against the skip table:
 where their BCPack chunks sit, not by which BCPack mode they use, so it does not say how much of
 the catalog a decoder limited to BC1–BC5 loses. Reading each entry's per-mip codec set from the same catalogs (`tools/ttpf_mips.py scan` over the 57 pools: 357,115 entries, 0 refused)
 gives **3,270 entries that touch a BC6H or BC7 chunk at some mip** and **752 that are BC6H/BC7 at
-every mip**. Only those 752 are out of reach of a strict BC1–BC5 path, so a decoder limited to BC1–BC5 can
-complete at most 356,363 entries; its BC7 chunks are 583 strict of 5,167 (§5 below). The
+every mip**. A decoder limited to BC1–BC5 can complete only **353,845 full chains**
+(357,115 - 3,270); **356,363** entries have at least one mip it can read, which is not a complete
+export count. The 583 strict / 5,167 BC7 chunk figure in §5 is for the BC7-capable decoder, not for
+a BC1–BC5-only path, and a chunk that decodes does not by itself prove an entry exported. The
 descriptor's DXGI format is not a substitute for this count: formats 95–99 name 53,637 entries
-(1,000 BC6H_UF16, 25 BC6H_SF16, 0 BC7_UNORM, 52,612 BC7_UNORM_SRGB), most of which carry zlib/raw
-mips as well and export fine.
+(1,000 BC6H_UF16, 25 BC6H_SF16, 27,386 BC7_TYPELESS, 0 BC7_UNORM, 25,226 BC7_UNORM_SRGB), and only
+508 of the 25,226 sRGB entries touch BC7.
 
 The partial exports are a separate gap. Of the 210,292:
 
