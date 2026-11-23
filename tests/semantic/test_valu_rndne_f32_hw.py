@@ -569,5 +569,161 @@ class TestValuRndneF32IEEE754EdgeCases(unittest.TestCase):
         self.assertEqual(ref_rndne_f32(just_above_neg_half), F32_NEG_ONE)
 
 
+def parse_v_rndne_f32_asm(asm_line: str) -> ASTInstruction:
+    """Parse a single assembly instruction line for v_rndne_f32."""
+    clean = asm_line.strip()
+    if not clean:
+        raise ValueError("Empty assembly line")
+    parts = clean.split(None, 1)
+    raw_mnemonic = parts[0].lower()
+    mnemonic = raw_mnemonic
+    for suf in ("_e32", "_e64"):
+        if mnemonic.endswith(suf):
+            mnemonic = mnemonic[: -len(suf)]
+    if mnemonic != "v_rndne_f32":
+        raise ValueError(f"Expected mnemonic v_rndne_f32, got {raw_mnemonic}")
+    if len(parts) < 2:
+        raise ValueError("Missing operands")
+
+    operands_raw = [op.strip() for op in parts[1].split(",")]
+    if len(operands_raw) < 2:
+        raise ValueError(f"Expected at least dst and src0, got {len(operands_raw)}")
+
+    dst_str = operands_raw[0]
+    src0_tokens = operands_raw[1].split()
+    src0_str = src0_tokens[0]
+    clamp = "clamp" in src0_tokens or (len(operands_raw) > 2 and "clamp" in operands_raw[2].lower())
+
+    if not (dst_str.lower().startswith("v") and dst_str[1:].isdigit()):
+        raise ValueError(f"Destination must be a VGPR, got {dst_str}")
+    dst = ASTOperand.vgpr(int(dst_str[1:]))
+
+    src0_lower = src0_str.lower()
+    if src0_lower.startswith("v") and src0_lower[1:].isdigit():
+        src0 = ASTOperand.vgpr(int(src0_lower[1:]))
+    elif src0_lower.startswith("s") and src0_lower[1:].isdigit():
+        src0 = ASTOperand.sgpr(int(src0_lower[1:]))
+    elif src0_str.startswith("0x"):
+        src0 = ASTOperand.literal32(int(src0_str, 16))
+    else:
+        try:
+            val_f = float(src0_str)
+            src0 = ASTOperand.inline_float(val_f)
+        except ValueError:
+            raise ValueError(f"Invalid operand: {src0_str}")
+
+    inst = ASTInstruction(Opcode.V_RNDNE_F32, dst, src0, clamp=clamp)
+    inst.validate()
+    return inst
+
+
+def mutant_trunc(src0_bits: int) -> int:
+    """Mutant 1: truncates towards zero instead of round to nearest even."""
+    val = bits_to_f32(src0_bits)
+    if math.isnan(val) or math.isinf(val):
+        return src0_bits
+    r = math.trunc(val)
+    if r == 0:
+        return F32_NEG_ZERO if (src0_bits >> 31) & 1 else F32_POS_ZERO
+    return f32_to_bits(float(r))
+
+
+def mutant_floor(src0_bits: int) -> int:
+    """Mutant 2: floors towards -infinity instead of round to nearest even."""
+    val = bits_to_f32(src0_bits)
+    if math.isnan(val) or math.isinf(val):
+        return src0_bits
+    r = math.floor(val)
+    return f32_to_bits(float(r))
+
+
+def mutant_round_away(src0_bits: int) -> int:
+    """Mutant 3: rounds half away from zero instead of ties to even."""
+    val = bits_to_f32(src0_bits)
+    if math.isnan(val) or math.isinf(val):
+        return src0_bits
+    sign = -1.0 if val < 0 else 1.0
+    r = math.floor(abs(val) + 0.5) * sign
+    return f32_to_bits(float(r))
+
+
+def mutant_ignore_sign_zero(src0_bits: int) -> int:
+    """Mutant 4: always produces positive zero for -0.0 input."""
+    res = ref_rndne_f32(src0_bits)
+    if res == F32_NEG_ZERO:
+        return F32_POS_ZERO
+    return res
+
+
+class TestValuRndneF32NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, mutation detection, and translator execution."""
+
+    def test_syntax_rejection_malformed(self):
+        with self.assertRaises(ValueError):
+            parse_v_rndne_f32_asm("")
+
+        with self.assertRaises(ValueError):
+            parse_v_rndne_f32_asm("v_floor_f32 v0, v1")
+
+        with self.assertRaises(ValueError):
+            parse_v_rndne_f32_asm("v_rndne_f32 v0")
+
+        with self.assertRaises(ValueError):
+            parse_v_rndne_f32_asm("v_rndne_f32 s0, v1")
+
+    def test_mutation_detection_trunc(self):
+        inp = f32_to_bits(1.5)
+        self.assertNotEqual(ref_rndne_f32(inp), mutant_trunc(inp))
+
+    def test_mutation_detection_floor(self):
+        inp = f32_to_bits(-1.2)
+        self.assertNotEqual(ref_rndne_f32(inp), mutant_floor(inp))
+
+    def test_mutation_detection_round_away(self):
+        inp = f32_to_bits(2.5)
+        self.assertNotEqual(ref_rndne_f32(inp), mutant_round_away(inp))
+
+    def test_mutation_detection_ignore_sign_zero(self):
+        inp = F32_NEG_ZERO
+        self.assertNotEqual(ref_rndne_f32(inp), mutant_ignore_sign_zero(inp))
+
+    def test_rndne_spirv_emission(self):
+        """Verify that support.translate_lines emits expected SPIR-V RoundEven for v_rndne_f32."""
+        lines = [
+            "s_mov_b32 s0, 0x3fc00000",
+            "v_mov_b32_e32 v0, s0",
+            "v_rndne_f32_e32 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_test_rndne_f32_emit", lines)
+        self.assertIn("RoundEven", spv)
+
+    def test_rndne_hardware_execution(self):
+        """Verify hardware-accurate execution of v_rndne_f32 through support.mrt0_words."""
+        lines = [
+            "s_mov_b32 s0, 0x3fc00000",
+            "s_mov_b32 s1, 0x40200000",
+            "s_mov_b32 s2, 0xbfc00000",
+            "s_mov_b32 s3, 0x3f000000",
+            "v_mov_b32_e32 v0, s0",
+            "v_mov_b32_e32 v1, s1",
+            "v_mov_b32_e32 v2, s2",
+            "v_mov_b32_e32 v3, s3",
+            "v_rndne_f32_e32 v0, v0",
+            "v_rndne_f32_e32 v1, v1",
+            "v_rndne_f32_e32 v2, v2",
+            "v_rndne_f32_e32 v3, v3",
+            "exp mrt0, v0, v1, v2, v3 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_rndne_f32_hw", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x40000000)
+        self.assertEqual(words[1], 0x40000000)
+        self.assertEqual(words[2], 0xC0000000)
+        self.assertEqual(words[3], 0x00000000)
+
+
 if __name__ == "__main__":
     unittest.main()
