@@ -383,6 +383,17 @@ class TestSMovB32RegisterAliasing(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x43218765)
 
+class TestSMovB32Translator(unittest.TestCase):
+    def test_translator_s_mov_b32_execution(self) -> None:
+        body = [
+            "s_mov_b32 s4, 777777",
+            "v_mov_b32_e32 v1, s4",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_mov_b32_exec")
+        for l in range(32):
+            self.assertEqual(results[l], 777777)
+
 
 if __name__ == "__main__":
     unittest.main()
