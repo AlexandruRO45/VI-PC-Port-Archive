@@ -81,5 +81,44 @@ class PixelTestOnDeviceWithoutAFeature(unittest.TestCase):
         self.assertIn("SKIP (unsupported: no fragmentShaderBarycentric)", rows[0])
         self.assertIn("0/1 passed, 1 skipped", out.getvalue())
 
+class ImageStoreOnDeviceWithoutFormatlessWrites(unittest.TestCase):
+    """run_gpu_tests.py's vk_store_test branch with a fake harness (no assembler or GPU needed). The typed
+    stores need shaderStorageImageWriteWithoutFormat, which vk_store_test checks and answers 77 for; the
+    runner must report that as SKIP, as every other branch does, not as a failing device."""
+
+    def run_case(self, code, stderr):
+        def fake_run_cmd(cmd, env=None, gpu=True):
+            if cmd[0] == sys.executable:                    # the translator: leave the .spv it would write
+                (Path(cmd[cmd.index("--out") + 1]) / "cs_imgstore.spv").touch()
+                return 0, ""
+            return code, stderr
+
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter="cs_imgstore", llvm_mc="llvm-mc", build=tmp)
+            fake_assemble = lambda _mc, _src, dst, _name: Path(dst).touch()
+            with (patch.object(run_gpu_tests, "assemble_to_s", side_effect=fake_assemble),
+                  patch.object(run_gpu_tests, "spirv_as"),
+                  patch.object(run_gpu_tests, "run_cmd", side_effect=fake_run_cmd),
+                  contextlib.redirect_stdout(out)):
+                rc = run_gpu_tests.run_suite(args, tmp)
+        return out.getvalue(), rc
+
+    def test_unsupported_write_feature_skips(self):
+        out, rc = self.run_case(77, "device: fake (subgroup 32..32)\n"
+                                    "unsupported: shaderStorageImageWriteWithoutFormat=0 shaderInt64=1\n")
+        self.assertEqual(rc, 0, out)
+        rows = [line for line in out.splitlines() if "cs_imgstore" in line]
+        self.assertEqual(len(rows), 1, out)
+        self.assertIn("SKIP (unsupported: shaderStorageImageWriteWithoutFormat=0 shaderInt64=1)", rows[0])
+        self.assertIn("0/1 passed, 1 skipped", out)
+
+    def test_other_harness_errors_still_fail(self):
+        out, rc = self.run_case(1, "readback mismatch\n")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL", out)
+        self.assertIn("readback mismatch", out)
+
+
 if __name__ == "__main__":
     unittest.main()

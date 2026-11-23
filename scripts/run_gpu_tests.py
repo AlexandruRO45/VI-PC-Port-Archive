@@ -1086,7 +1086,10 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            if rc == UNSUPPORTED:   # e.g. the device lacks shaderStorageImageWriteWithoutFormat
+                results.append((name, None, unsupported_skip(msg)))
+            else:
+                results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
         elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load" if name == "cs_imgload" else "load-d16"])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
