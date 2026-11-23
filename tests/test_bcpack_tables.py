@@ -9,6 +9,7 @@ zero game data or proprietary assets are used.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unittest
 
@@ -521,6 +522,24 @@ class TestFormatDescriptorsAndModeValidation(unittest.TestCase):
                 256,
                 allow_provisional=True,
             )
+
+
+class ProbTablesMatchHardware(unittest.TestCase):
+    """PROB_TABLES against FREQ_TABLE of third_party/bcpack-rs, which is generated from Microsoft's
+    mdu_minirans.v (the MDU decoder's own tables). Width 10 has no hardware table and is not compared."""
+
+    def test_widths_1_to_9_match_the_mdu_freq_table(self):
+        path = os.path.join(ROOT, "third_party", "bcpack-rs", "src", "tables.rs")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        block = text.split("pub static FREQ_TABLE")[1].split("];\n")[0]
+        rows = [tuple(int(x) for x in row.split(","))
+                for row in re.findall(r"\[(\d+(?:,\s*\d+){9})\]", block)]
+        self.assertEqual(len(rows), 9 * 16)
+        for width in range(1, 10):
+            for q in range(16):
+                with self.subTest(width=width, q=q):
+                    self.assertEqual(tables.PROB_TABLES[(width, q)], rows[(width - 1) * 16 + q][:width + 1])
 
 
 if __name__ == "__main__":
