@@ -274,6 +274,13 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             issues.append(f"sampler[{sampler_index}] input accessor is missing")
         elif input_count is None or input_count == 0:
             issues.append(f"sampler[{sampler_index}] input accessor has no keyframes")
+        if input_accessor is not None:
+            missing_bounds = [bound for bound in ("min", "max") if bound not in input_accessor]
+            if missing_bounds:
+                issues.append(
+                    f"sampler[{sampler_index}] input accessor is missing animation time bounds: "
+                    f"{', '.join(missing_bounds)}"
+                )
         if input_type is not None and input_type != "SCALAR":
             issues.append(f"sampler[{sampler_index}] input accessor type is {input_type}, expected SCALAR")
         if output_accessor is None:
