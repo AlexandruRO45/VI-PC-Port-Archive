@@ -343,6 +343,19 @@ class TestInterpP2F16HighHalf(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP2F16Translator(unittest.TestCase):
+    def test_p2_f16_translator_pipeline(self):
+        code = [
+            "v_interp_p1ll_f16 v16, v0, attr9.w",
+            "v_interp_p2_f16 v16, v1, attr9.w, v16",
+            "exp mrt0, v16, v16, v16, v16 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p2_f16_trans", code)
+        self.assertIn("OpEntryPoint Fragment", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
