@@ -449,6 +449,17 @@ class TestVAlignbitB32Oracle(unittest.TestCase):
         res = ref_v_alignbit_b32(0x12345678, 0x9abcdef0, 8)
         self.assertEqual(res, 0x789abcde)
 
+class TestVAlignbitB32ASTAndInterpreter(unittest.TestCase):
+    def test_scalar_interpreter_step(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, 0x12345678)
+        state.write_vgpr(1, 0x9abcdef0)
+        state.write_vgpr(2, 8)
+        inst = ASTInstruction(Opcode.V_ALIGNBIT_B32, ASTOperand.vgpr(3), ASTOperand.vgpr(0), ASTOperand.vgpr(1), ASTOperand.vgpr(2))
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0x789abcde)
+        self.assertEqual(state.vgprs[3], 0x789abcde)
+
 
 if __name__ == "__main__":
     unittest.main()
