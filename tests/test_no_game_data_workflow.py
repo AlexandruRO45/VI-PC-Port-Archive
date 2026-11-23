@@ -78,6 +78,16 @@ class ExtensionCheck(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("shader.spvasm", result.stdout)
 
+    def test_carved_programs_package_containers_world_packs_and_grooms_are_caught(self):
+        # fspx_unpack.py's raw .code and .state carry no magic, so this step is the only check that sees them.
+        caught = ["prog.code", "prog.state", "package.xvc", "chunk.lpk", "groom.smh"]
+        result = self.run_step(["README.md", "codes.txt", "state.md", *caught])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for name in caught:
+            self.assertIn(name, result.stdout)
+        self.assertNotIn("codes.txt", result.stdout)
+        self.assertNotIn("state.md", result.stdout)
+
     def test_a_name_git_quotes_is_caught(self):
         names = ["README.md", "ünï.spvasm", "café.obj"]
         result = self.run_step(names)

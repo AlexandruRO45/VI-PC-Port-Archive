@@ -25,7 +25,10 @@ jobs:
           fetch-depth: 1
       - name: No game data tracked
         run: |
-          bad=$(git ls-files -z | grep -ziE '\.(rpf|ttpf|xvd|msixvc|dxbc|fssm|spv|spvasm|dds|bk2|awc|r9modeldata|obj|glb|ogg|wav|exe|dll)$' | tr '\0' '\n' || true)
+          # .code and .state: the native programs tools/fspx_unpack.py carves out of the package, raw machine code with
+          # no magic for the next step to read. .xvc: a package container, as make_game.py's CONTAINER_SUFFIXES has
+          # it. .lpk: world_build.py's packs of the game's geometry. .smh: the package's groom files (smh_groom.py).
+          bad=$(git ls-files -z | grep -ziE '\.(rpf|ttpf|xvd|msixvc|xvc|dxbc|fssm|spv|spvasm|code|state|dds|bk2|awc|r9modeldata|obj|glb|lpk|smh|ogg|wav|exe|dll)$' | tr '\0' '\n' || true)
           if [ -n "$bad" ]; then
             echo "Game or binary files tracked:"
             echo "$bad"
