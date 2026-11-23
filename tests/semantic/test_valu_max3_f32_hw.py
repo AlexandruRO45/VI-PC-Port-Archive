@@ -153,5 +153,39 @@ class TestOpcodeTranslation(unittest.TestCase):
         self.assertIn("OpFNegate", spv)
         self.assertIn("NMax", spv)
 
+class TestScalarExecution(unittest.TestCase):
+    """Deterministic scalar execution via support.translate_lines and mrt0_words."""
+
+    def _run_max3(self, s0: int, s1: int, s2: int, *, clamp: bool = False) -> int:
+        clamp_str = "clamp " if clamp else ""
+        prog = [
+            f"v_mov_b32 v1, {s0:#x}",
+            f"v_mov_b32 v2, {s1:#x}",
+            f"v_mov_b32 v3, {s2:#x}",
+            f"v_max3_f32 {clamp_str}v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_exec", prog)
+        words = support.mrt0_words(spv)
+        return words[0]
+
+    def test_standard_float_values(self):
+        cases = [
+            (1.0, 2.0, 3.0),
+            (3.0, 1.0, 2.0),
+            (2.0, 3.0, 1.0),
+            (-10.0, -5.0, -1.0),
+            (-2.5, 0.0, 1.5),
+            (100.0, 100.0, 100.0),
+            (0.125, 0.5, 0.25),
+            (-0.5, -2.5, -1.5),
+        ]
+        for a, b, c in cases:
+            s0, s1, s2 = f32_to_u32(a), f32_to_u32(b), f32_to_u32(c)
+            got = self._run_max3(s0, s1, s2)
+            expected = f32_to_u32(ref_max3_f32(a, b, c))
+            self.assertEqual(got, expected, f"Failed for {a}, {b}, {c}")
+
 if __name__ == "__main__":
     unittest.main()
