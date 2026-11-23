@@ -627,22 +627,6 @@ class SameStemTest(unittest.TestCase):
 
 
 class FakeFfmpegDecodeTest(unittest.TestCase):
-    def test_long_same_stem_inputs_export_and_resume(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(tmp, "in")
-            out = Path(tmp, "out")
-            names = ["a" * 250 + ext for ext in (".ogg", ".opus")]
-            write_fake_opus_inputs(src, names)
-            run = [sys.executable, "-I", TOOL, src, "--out", str(out), "--jobs", "2",
-                   "--ffmpeg", write_fake_ffmpeg(tmp)]
-            for summary in ("2 WAV written", "0 WAV written, 2 already present"):
-                result = subprocess.run(run, capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn(summary, result.stdout)
-                files = list(out.glob("*.wav"))
-                self.assertEqual(len(files), 2)
-                self.assertEqual({p.read_bytes() for p in files}, {b"FAKE:" + name.encode() for name in names})
-
     def test_every_input_gets_its_own_wav(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in")
@@ -664,6 +648,22 @@ class FakeFfmpegDecodeTest(unittest.TestCase):
             p = subprocess.run(run, capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("0 WAV written, 3 already present", p.stdout)
+
+    def test_long_same_stem_inputs_export_and_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            out = Path(tmp, "out")
+            names = ["a" * 250 + ext for ext in (".ogg", ".opus")]
+            write_fake_opus_inputs(src, names)
+            run = [sys.executable, "-I", TOOL, src, "--out", str(out), "--jobs", "2",
+                   "--ffmpeg", write_fake_ffmpeg(tmp)]
+            for summary in ("2 WAV written", "0 WAV written, 2 already present"):
+                result = subprocess.run(run, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(summary, result.stdout)
+                files = list(out.glob("*.wav"))
+                self.assertEqual(len(files), 2)
+                self.assertEqual({p.read_bytes() for p in files}, {b"FAKE:" + name.encode() for name in names})
 
     def test_directory_at_wav_destination_counts_as_failed_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
