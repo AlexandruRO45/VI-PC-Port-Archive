@@ -520,7 +520,10 @@ def check_scarab(root):
     catalogue = os.path.join(root, "components", "extension-wrapper", "docs",
                              "console-extension-catalogue.tsv")
     if os.path.exists(iid_table):
-        theirs = parse_scarab_iid_table(iid_table)
+        try:
+            theirs = parse_scarab_iid_table(iid_table)
+        except (OSError, ValueError) as e:
+            return errors + ["cannot read %s: %s" % (iid_table, e)], notes
         mine = dict(STANDARD_GUIDS)
         mine.update(CONSOLE_IIDS)
         if set(theirs) != set(mine):
@@ -533,7 +536,10 @@ def check_scarab(root):
     else:
         errors.append("missing %s" % iid_table)
     if os.path.exists(iid_console):
-        theirs = parse_scarab_iid_console(iid_console)
+        try:
+            theirs = parse_scarab_iid_console(iid_console)
+        except (OSError, ValueError) as e:
+            return errors + ["cannot read %s: %s" % (iid_console, e)], notes
         known = {name for _n, name, _kind, _ev in DATA_EXPORTS}
         unexpected = set(theirs) - known
         if unexpected:
@@ -548,7 +554,10 @@ def check_scarab(root):
     else:
         errors.append("missing %s" % iid_console)
     if os.path.exists(catalogue):
-        rows = parse_scarab_catalogue(catalogue)
+        try:
+            rows = parse_scarab_catalogue(catalogue)
+        except (OSError, ValueError) as e:
+            return errors + ["cannot read %s: %s" % (catalogue, e)], notes
         methods = [r for r in rows if r[0] == "method"]
         enums = [r for r in rows if r[0] == "enum"]
         notes.append("catalogue: %d method rows, %d enum rows" % (len(methods), len(enums)))
