@@ -844,5 +844,34 @@ class TestTruncF16SIMDAndIEEE(unittest.TestCase):
         self.assertEqual(ref_trunc_f16(SNAN16), SNAN16)
 
 
+# ------------------------------------------------------------------------------
+# v_trunc_f16 Rejection & Hardware Translator
+# ------------------------------------------------------------------------------
+
+class TestTruncF16HardwareTranslator(unittest.TestCase):
+    def test_hardware_translator_execution(self):
+        cases = [
+            (f16_to_bits(1.9), f16_to_bits(1.0)),
+            (f16_to_bits(-1.9), f16_to_bits(-1.0)),
+            (f16_to_bits(5.0), f16_to_bits(5.0)),
+            (POS_ZERO16, POS_ZERO16),
+            (NEG_ZERO16, NEG_ZERO16),
+            (POS_INF16, POS_INF16),
+            (NEG_INF16, NEG_INF16),
+            (QNAN16, QNAN16),
+        ]
+        for src_val, expected in cases:
+            prog = [
+                "v_mov_b32 v0, 0",
+                f"v_mov_b32 v1, {src_val:#x}",
+                "v_trunc_f16 v0, v1",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines("ps_trunc_f16_hw", prog)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0] & 0xFFFF, expected, f"Failed on trunc_f16({src_val:#x})")
+
+
 if __name__ == '__main__':
     unittest.main()
