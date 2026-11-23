@@ -155,6 +155,8 @@ For each selection the reader visits the preset and then its parents, looking up
 
 The JSON report writes kit, preset and state IDs as `0x` followed by eight hex digits. It writes each 64-bit resource hash as a string of sixteen hex digits so consumers can preserve every bit. A missing state leaves the selected member in the report with zero hashes and a warning. A missing parent preserves any fields already found. An unknown child ID, a nested-kit cycle, or a nonzero selector on a nested kit skips that edge with a warning. A missing root kit or ambiguous definition is an error.
 
+When matching a nonzero resource hash to an export manifest's `Id64` or `AssetKey`, normalize hex case and keep all sixteen digits, including leading zeros. Check file availability separately on the export machine using the manifest-relative path or the index's absolute local path.
+
 ---
 
 ## Verified corpus counts (Xbox package `1.0.2.1`, `packs.rpf`)
