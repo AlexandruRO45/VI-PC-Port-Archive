@@ -11,7 +11,6 @@ Tests can run side by side because each writes only into its own temporary folde
 """
 import argparse
 import concurrent.futures
-import fnmatch
 import os
 import re
 import subprocess
@@ -23,7 +22,9 @@ def test_modules(directory):
     """Names of the top-level test files and package directories to schedule."""
     for _, dirs, files in os.walk(directory):
         packages = [name for name in dirs if os.path.isfile(os.path.join(directory, name, "__init__.py"))]
-        return sorted(packages + [name for name in files if fnmatch.fnmatchcase(name, "test*.py")])
+        # The test*.py pattern also matches names unittest cannot import as modules.
+        standalone = [name for name in files if re.fullmatch(r"test\w*\.py", name)]
+        return sorted(packages + standalone)
     return []
 
 

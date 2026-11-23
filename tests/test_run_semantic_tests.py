@@ -44,6 +44,14 @@ class RunnerTest(unittest.TestCase):
                         "plain_dir/test_three.py": "", "testx.py": ""})
             self.assertEqual(r.test_modules(tmp), ["pkg", "test_one.py", "testx.py"])
 
+    def test_standalone_discovery_skips_backup_file_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_real.py": PASS,
+                        "test_real.saved.py": BROKEN, "test-saved.py": BROKEN})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 0, out)
+            self.assertIn("1 files, 2 tests, 0 files failed", out)
+
     def test_all_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_p1.py": PASS, "test_p2.py": PASS})
