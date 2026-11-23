@@ -30,6 +30,7 @@ from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_
 from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
+from check import LANE_MASK_RUNS, lane_mask_problem   # vs_lane_mask: a VS that reads its lane (SHADER-302)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
@@ -319,6 +320,38 @@ def _device_per_vertex():
             pass
         _PER_VERTEX.append(answer)
     return _PER_VERTEX[0]
+
+
+def no_vertex_subgroups() -> bool:
+    """LEONIDA_NO_VERTEX_SUBGROUPS=1 (or 0): translate with --no-vertex-subgroups, so a VS computes its subgroup lane
+    from a ballot and a scan instead of reading SubgroupLocalInvocationId. Unset, it is on where the device has no
+    subgroup operations in the vertex stage: tools/vk_subgroup_info.py reports vertex_in_supported_stages false
+    (MoltenVK)."""
+    v = (os.environ.get("LEONIDA_NO_VERTEX_SUBGROUPS") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return _device_vertex_subgroups() is False
+
+
+_VERTEX_SUBGROUPS = []
+
+
+def _device_vertex_subgroups():
+    """vertex_in_supported_stages from tools/vk_subgroup_info.py for the device the tests run on (cached), or None."""
+    if not _VERTEX_SUBGROUPS:
+        answer = None
+        try:
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
+                               capture_output=True, text=True, timeout=60)
+            # The driver may log to stdout after the JSON line, so take the last line that is a JSON object.
+            line = next((ln for ln in reversed(r.stdout.splitlines()) if ln.lstrip().startswith("{")), "")
+            answer = json.loads(line).get("vertex_in_supported_stages")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        _VERTEX_SUBGROUPS.append(answer)
+    return _VERTEX_SUBGROUPS[0]
 
 
 def w64_emulated() -> bool:
@@ -629,7 +662,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
               SIGNED_MIP_TEST: "vs_ids.asm", UINT_MIP_TEST: "vs_ids.asm",
-              "vs_base_ids": "ps_flat.asm"}
+              "vs_base_ids": "ps_flat.asm", "vs_lane_mask": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
 
@@ -829,6 +862,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--bary-fallback")
         if f16_interp_fallback():   # *_f16 interps from decoded-half inputs, no PerVertexKHR (MoltenVK)
             cmd.append("--f16-interp-fallback")
+        if no_vertex_subgroups():   # a VS computes its lane: no SubgroupLocalInvocationId (MoltenVK)
+            cmd.append("--no-vertex-subgroups")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
@@ -1495,6 +1530,22 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
+        elif name == "vs_lane_mask":
+            # The VS reads its subgroup lane for a mask in user SGPR s2 (SHADER-302), as check.py checks.
+            raw = os.path.join(raw_dir, f"{name}.raw")
+            for sgprs, want in LANE_MASK_RUNS:
+                env = dict(gfx_env or os.environ, VKH_SGPRS=sgprs)
+                rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, os.path.join(spirv_dir, "ps_flat.spv"), raw],
+                                       env=env)
+                if rc != 0:
+                    results.append((name, None, unsupported_skip(msg)) if rc == UNSUPPORTED else (name, False, msg))
+                    break
+                with open(raw, "rb") as source:
+                    if problem := lane_mask_problem(source.read(), want):
+                        results.append((name, False, f"VKH_SGPRS={sgprs}: {problem}"))
+                        break
+            else:
+                results.append((name, True, "picks by its lane's bit of s2, exact for 0 and all bits"))
         elif name == "vs_base_ids":
             # Zero-based v0 / v3 (the hardware's VS input VGPRs): drawn with firstVertex 16 and firstInstance 7,
             # ps_flat must still see vertex 0 of instance 0 (0x101), as check.py checks.

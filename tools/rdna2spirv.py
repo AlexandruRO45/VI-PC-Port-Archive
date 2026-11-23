@@ -100,6 +100,13 @@ PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
 F16_HALVES = False
 F16_HALF_TOP = 29
 OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pass on emitted SPIR-V (#884)
+# --no-vertex-subgroups: for devices without subgroups in the vertex stage (subgroupSupportedStages has no vertex bit:
+# MoltenVK). A Metal vertex function has no SIMD-group lane id, so SPIRV-Cross stops on SubgroupLocalInvocationId with
+# "Subgroup builtins are not available in this type of function"; ballots and scans still compile there. A VS that
+# needs its lane then computes it at entry (vertex_lane_lines) into a Private %sg_lane instead of reading the builtin:
+# the rank of the invocation among the active ones (an exclusive add of 1) picks that set bit of the active lanes'
+# ballot, which is the invocation's own bit, so the lane is the same as SubgroupLocalInvocationId on any active set.
+NO_VERTEX_SUBGROUPS = False
 
 
 # The heap base as one %ulong, in the entry block of %main: the push constants don't change during the invocation, and
@@ -110,6 +117,41 @@ HEAP_BASE_ENTRY = ["%heap_base_lo = OpLoad %uint %ud_base_lo_p",
                    "%heap_base_hi64 = OpUConvert %ulong %heap_base_hi",
                    "%heap_base_hi_sh = OpShiftLeftLogical %ulong %heap_base_hi64 %c64_32",
                    "%heap_base = OpBitwiseOr %ulong %heap_base_hi_sh %heap_base_lo64"]
+
+
+def vertex_lane_lines(c):
+    """--no-vertex-subgroups: entry-block lines that store this invocation's subgroup lane in the Private %sg_lane,
+    without SubgroupLocalInvocationId: rank = OpGroupNonUniformIAdd ExclusiveScan of 1 (the active invocations below
+    this one), and the lane is the position of set bit `rank` (counting from 0) of OpGroupNonUniformBallot(true). The
+    ballot word holding it is the first whose running bit count exceeds rank (subgroups up to 128 lanes), and a binary
+    search over halves of that word, by bit count, finds the bit. `c` maps an integer to its uint constant's id."""
+    L = [f"%vl_bal = OpGroupNonUniformBallot %v4uint_bal {c(3)} %true",
+         f"%vl_rank = OpGroupNonUniformIAdd %uint {c(3)} ExclusiveScan {c(1)}"]
+    L += [f"%vl_w{k} = OpCompositeExtract %uint %vl_bal {k}" for k in range(4)]
+    L += [f"%vl_n{k} = OpBitCount %uint %vl_w{k}" for k in range(3)]
+    word, base, rank, below = "%vl_w0", c(0), "%vl_rank", "%vl_n0"
+    for k in range(1, 4):           # word k holds the bit when rank >= the bits in words 0..k-1
+        L += [f"%vl_in{k} = OpUGreaterThanEqual %bool %vl_rank {below}",
+              f"%vl_word{k} = OpSelect %uint %vl_in{k} %vl_w{k} {word}",
+              f"%vl_base{k} = OpSelect %uint %vl_in{k} {c(32 * k)} {base}",
+              f"%vl_left{k} = OpISub %uint %vl_rank {below}",
+              f"%vl_rank{k} = OpSelect %uint %vl_in{k} %vl_left{k} {rank}"]
+        word, base, rank = f"%vl_word{k}", f"%vl_base{k}", f"%vl_rank{k}"
+        if k < 3:
+            L.append(f"%vl_below{k} = OpIAdd %uint {below} %vl_n{k}")
+            below = f"%vl_below{k}"
+    pos = c(0)
+    for half in (16, 8, 4, 2, 1):   # the bit is in the upper half of the window when rank >= the lower half's bits
+        L += [f"%vl_sh{half} = OpShiftRightLogical %uint {word} {pos}",
+              f"%vl_lo{half} = OpBitwiseAnd %uint %vl_sh{half} {c((1 << half) - 1)}",
+              f"%vl_cnt{half} = OpBitCount %uint %vl_lo{half}",
+              f"%vl_up{half} = OpUGreaterThanEqual %bool {rank} %vl_cnt{half}",
+              f"%vl_pos{half}u = OpIAdd %uint {pos} {c(half)}",
+              f"%vl_pos{half} = OpSelect %uint %vl_up{half} %vl_pos{half}u {pos}",
+              f"%vl_r{half}u = OpISub %uint {rank} %vl_cnt{half}",
+              f"%vl_r{half} = OpSelect %uint %vl_up{half} %vl_r{half}u {rank}"]
+        pos, rank = f"%vl_pos{half}", f"%vl_r{half}"
+    return L + [f"%vl_lane = OpIAdd %uint {base} {pos}", "OpStore %sg_lane %vl_lane"]
 
 
 def pc_tail_chain(name, member, c):
@@ -14303,11 +14345,18 @@ def assemble(gen):
     psb = gen.uses_psb
     tex = gen.uses_tex
     sg = gen.uses_subgroup
+    # --no-vertex-subgroups: a VS that reads its lane computes it at entry (vertex_lane_lines) into a Private %sg_lane,
+    # with a ballot (hence uses_ballot) and an exclusive scan; one that doesn't declares no lane at all.
+    lane_calc = vs and NO_VERTEX_SUBGROUPS and sg and any(
+        "%sg_lane" in l for b in [gen.body] + list(gen.blocks) if b is not None for l in b)
+    lane_builtin = sg and not (vs and NO_VERTEX_SUBGROUPS)
+    if lane_calc:
+        gen.uses_ballot = True
     if tex:
         iface += ["%images", "%samplers", "%desc_map"] + (["%images_arr"] if gen.uses_tex_array else []) + \
                  (["%simages"] if gen.uses_storage else []) + (["%images_1d"] if gen.uses_tex_1d else []) + \
                  (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else [])
-    if sg:
+    if lane_builtin or lane_calc:
         iface += ["%sg_lane"]
     if gen.writes_depth:
         iface += ["%out_depth"]
@@ -14356,7 +14405,7 @@ def assemble(gen):
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformVote") if c not in caps]
     if gen.uses_ballot or gen.uses_bcast_first:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformBallot") if c not in caps]
-    if gen.uses_wave_bits:
+    if gen.uses_wave_bits or lane_calc:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformArithmetic") if c not in caps]
     if gen.uses_quad:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformQuad") if c not in caps]
@@ -14573,7 +14622,8 @@ def assemble(gen):
             dec += ["OpDecorate %simages DescriptorSet 0", "OpDecorate %simages Binding 4"]
     if sg:
         types += ["%_ptr_Input_uint = OpTypePointer Input %uint"]
-        dec += ["OpDecorate %sg_lane BuiltIn SubgroupLocalInvocationId"]
+        if lane_builtin:
+            dec += ["OpDecorate %sg_lane BuiltIn SubgroupLocalInvocationId"]
         if gen.stage == "ps":
             dec += ["OpDecorate %sg_lane Flat"]
         gen.consts.setdefault(3, "%c3")
@@ -14832,8 +14882,11 @@ def assemble(gen):
         types += [f"%arr_pv4 = OpTypeArray %v4float {gen.cu(3)}", "%_ptr_Input_pv4 = OpTypePointer Input %arr_pv4"]
     gvars += [f"{n} = OpVariable {'%_ptr_Input_pv4' if k in gen.per_vertex else '%_ptr_Input_v4'} Input"
               for n, k in gen.inputs.items()]
-    if sg:
+    if lane_builtin:
         gvars += ["%sg_lane = OpVariable %_ptr_Input_uint Input"]
+    elif lane_calc:
+        types += ["%_ptr_Private_lane = OpTypePointer Private %uint"]
+        gvars += ["%sg_lane = OpVariable %_ptr_Private_lane Private"]
     if tex:
         gvars += ["%images = OpVariable %_ptr_UC_rt_img UniformConstant",
                   "%samplers = OpVariable %_ptr_UC_rt_smp UniformConstant",
@@ -14913,6 +14966,8 @@ def assemble(gen):
         fn += ["%ii = OpLoad %int %instance_index", "%bi = OpLoad %int %base_instance", "%iz = OpISub %int %ii %bi",
                "%iiu = OpBitcast %uint %iz",
                f"%v3p = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(3)}", "OpStore %v3p %iiu"]
+        if lane_calc:       # --no-vertex-subgroups: the lane from a ballot and a scan, before any use of it
+            fn += vertex_lane_lines(gen.cu)
     if gsx:
         fn[2:2] = ["%gs_stage = OpVariable %_ptr_Function_gs_stage Function %null_gs_stage",
                    "%gs_emitted = OpVariable %_ptr_Function_uint Function %c0"]
@@ -17703,6 +17758,10 @@ def main():
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
+    ap.add_argument("--no-vertex-subgroups", action="store_true",
+                    help="for devices without subgroup operations in the vertex stage (MoltenVK): a VS computes its "
+                         "subgroup lane from a ballot and an exclusive scan instead of reading "
+                         "SubgroupLocalInvocationId, which a Metal vertex function can't declare")
     ap.add_argument("--max-shared-memory", type=int, default=MAX_SHARED_BYTES, metavar="BYTES",
                     help="cap on a compute shader's workgroup memory, its LDS plus what --wave64-emulate adds "
                          "(default %(default)s, the 64 KiB hard cap): over it the LDS array shrinks to the program's "
@@ -17753,6 +17812,8 @@ def main():
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
+    global NO_VERTEX_SUBGROUPS
+    NO_VERTEX_SUBGROUPS = a.no_vertex_subgroups
     OPT_SPIRV = a.opt
     if a.merge:
         try:

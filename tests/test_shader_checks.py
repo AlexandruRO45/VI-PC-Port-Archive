@@ -35,8 +35,9 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 15)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
+         + len(check.TEXTURE_CONSTANTS) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
+         # ps_ssharp, vs_base_ids, vs_lane_mask, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more
+         # case) and cs_fmt_all
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -181,6 +182,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "texture_gradient_a16_test", return_value=""),
                   patch.object(check, "texture_constant_test", return_value=""),
                   patch.object(check, "base_ids_test", return_value=""),
+                  patch.object(check, "lane_mask_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
                   contextlib.redirect_stdout(output)):
@@ -1077,6 +1079,26 @@ class FmaFusedChecks(unittest.TestCase):
         res = self.run_fma([], khr_index=True, code=77, raw_out="unsupported: cs_fma_fused.spv needs VK_KHR_shader_fma\n")
         self.assertIsInstance(res, check.Skip)
         self.assertIn("VK_KHR_shader_fma", res)
+
+class LaneMaskFrames(unittest.TestCase):
+    """vs_lane_mask + ps_flat (SHADER-302): every pixel must read the provoking vertex's (want, want + 1)."""
+
+    def frame(self, a, b, n=64 * 64):
+        return struct.pack("<2I2f", a, b, 0.5, 0.5) * n
+
+    def test_exact_frames_pass(self):
+        for _, want in check.LANE_MASK_RUNS:
+            self.assertEqual(check.lane_mask_problem(self.frame(want, want + 1), want), "")
+
+    def test_other_values_and_empty_frames_fail(self):
+        self.assertIn("4096 of 4096 pixels differ from 0x202", check.lane_mask_problem(self.frame(0x101, 0x102), 0x202))
+        mixed = self.frame(0x202, 0x203, 4095) + self.frame(0x101, 0x102, 1)
+        self.assertIn("1 of 4096", check.lane_mask_problem(mixed, 0x202))
+        self.assertTrue(check.lane_mask_problem(b"", 0x101))
+
+    def test_runs_cover_both_choices(self):
+        self.assertEqual(sorted(w for _, w in check.LANE_MASK_RUNS), [0x101, 0x202])
+
 
 if __name__ == "__main__":
     unittest.main()

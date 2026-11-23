@@ -1536,6 +1536,40 @@ def interp_f16_high_problem(px):
     return "" if err < 2e-3 else f"f16 halves off by {err:.3g}"
 
 
+# vs_lane_mask (SHADER-302): the VS reads its subgroup lane for a v_cndmask mask in user SGPR s2. Drawn with ps_flat once
+# per VKH_SGPRS below, every pixel shows the provoking vertex's choice, the same for every lane of a uniform mask.
+LANE_MASK_RUNS = (("0,0,0", 0x101), ("0,0,0xffffffff", 0x202))
+
+
+def lane_mask_problem(data, want):
+    """'' when every pixel of a vs_lane_mask + ps_flat frame reads (want, want + 1), else what differs."""
+    px = list(struct.iter_unpack("<2I2f", data))
+    wrong = [p for p in px if (p[0], p[1]) != (want, want + 1)]
+    if px and not wrong:
+        return ""
+    return f"{len(wrong)} of {len(px)} pixels differ from {want:#x}, e.g. {hex(wrong[0][0]) if wrong else 'no pixels'}"
+
+
+def lane_mask_test(tools, spirv):
+    """vs_lane_mask with ps_flat under each LANE_MASK_RUNS mask: the VS must build and pick by its lane's bit."""
+    for n in ("vs_lane_mask", "ps_flat"):
+        if not os.path.isfile(os.path.join(spirv, n + ".spv")):
+            return f"missing {n}.spv"
+    for sgprs, want in LANE_MASK_RUNS:
+        with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
+            raw = Path(tmp) / "pixels.raw"
+            code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_lane_mask.spv"),
+                            os.path.join(spirv, "ps_flat.spv"), raw, env=dict(os.environ, VKH_SGPRS=sgprs))
+            if code == UNSUPPORTED:
+                m = re.search(r"unsupported: .*", out)
+                return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+            if code or not raw.is_file():
+                return out if out.startswith("could not start") else "vk_harness failed or returned no pixels"
+            if problem := lane_mask_problem(raw.read_bytes(), want):
+                return f"VKH_SGPRS={sgprs}: {problem}"
+    return ""
+
+
 def base_ids_test(tools, spirv):
     """vs_base_ids with ps_flat, drawn with firstVertex 16 and firstInstance 7: the VS input VGPRs are zero-based on
     the hardware, so every pixel must still see vertex 0 of instance 0 (0x101, 0x102), not 0x7111."""
@@ -1808,6 +1842,7 @@ def main():
     for name in TEXTURE_CONSTANTS:
         results.append((name, texture_constant_test(tools, spirv, name)))
     results.append(("vs_base_ids", base_ids_test(tools, spirv)))
+    results.append(("vs_lane_mask", lane_mask_test(tools, spirv)))
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append(("ps_ssharp", sampler_test(tools, spirv)))
     results.append(("ps_imgatomic", bindless_test(tools, spirv, "ps_imgatomic")))

@@ -449,6 +449,23 @@ MoltenVK can't convert to Metal ("PerVertexKHR decoration is not supported in MS
 on or off; `build.py` (for `check.py`) translates with the flag only when that variable is `1`. `ms_f16_pack` also runs
 on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`.
 
+## Macs: vertex shaders without subgroups
+
+MoltenVK supports subgroup operations in compute, fragment and tessellation-control shaders, not in vertex shaders: a
+Metal vertex function has no SIMD-group lane id. A VS that needs its lane (a buffer read through a run-time V#, for
+`ADD_TID_ENABLE`; a lane mask held in an SGPR; its own wave operations) would otherwise read
+`SubgroupLocalInvocationId`, and its pipeline fails with "Subgroup builtins are not available in this type of
+function". With `--no-vertex-subgroups` the VS computes the lane at entry from a ballot and an exclusive scan, which
+Metal compiles in a vertex function (`docs/design.md`, "Vertex shaders without subgroups"). `make_game.py` and
+`run_gpu_tests.py` ask `tools/vk_subgroup_info.py` (`vertex_in_supported_stages`) and turn the flag on where it is
+false. `LEONIDA_NO_VERTEX_SUBGROUPS=1` or `0` forces it on or off; `build.py` takes only `1`. The GPU test for it is
+`vs_lane_mask` (drawn with `ps_flat`): on a Mac it passes with the flag and fails without it.
+
+The D3D12 tests' shaders (`generated/*_shaders` in the runtime build) are translated by CMake through `build.py`, so
+nothing asks the device there: for a Windows build that runs under Wine on a Mac, set `LEONIDA_NO_VERTEX_SUBGROUPS=1`
+for `cmake --build`. Ninja doesn't rebuild those outputs when only the variable changes, so delete
+`generated/*_shaders` in an existing build folder first.
+
 ## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
 
 `ps_texoff` and `ps_texoff_implicit` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;

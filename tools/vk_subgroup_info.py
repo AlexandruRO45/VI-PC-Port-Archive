@@ -35,6 +35,10 @@ false, the shaders are translated with --f16-interp-fallback.
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
+
+vertex_in_supported_stages says whether subgroup operations are supported in the vertex stage (subgroupSupportedStages).
+MoltenVK leaves the vertex bit out (a Metal vertex function has no SIMD-group lane id); where it is false, the shaders
+are translated with --no-vertex-subgroups.
 """
 import argparse
 import ctypes
@@ -67,6 +71,7 @@ RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x143
                     (0x1506, 0x1506), (0x164E, 0x164E), (0x13C0, 0x13C0))
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
+VK_SHADER_STAGE_VERTEX_BIT = 0x1
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
 VK_QUEUE_GRAPHICS_BIT = 1
@@ -324,6 +329,7 @@ def query(*, stage_caps=False) -> dict:
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
+            "vertex_in_supported_stages": bool(supported_stages & VK_SHADER_STAGE_VERTEX_BIT),
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,
             "device_id": device,

@@ -1366,7 +1366,8 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--no-vertex-subgroups", "no_vertex_subgroups"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -1488,6 +1489,13 @@ def runtime_gpu_per_vertex():
         return None if v is None else bool(v)
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
+
+
+def runtime_gpu_vertex_subgroups():
+    """vertex_in_supported_stages as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where
+    subgroup operations aren't supported in the vertex stage (MoltenVK), None when it can't tell."""
+    v = runtime_gpu_info().get("vertex_in_supported_stages")
+    return None if v is None else bool(v)
 
 
 def runtime_gpu_max_push_constants():
@@ -2470,6 +2478,9 @@ def main() -> int:
     ap.add_argument("--f16-interp-fallback", action="store_true",
                     help="16-bit interpolation from decoded halves the vertex/mesh shader exports instead of "
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
+    ap.add_argument("--no-vertex-subgroups", action="store_true",
+                    help="vertex shaders compute their subgroup lane instead of reading SubgroupLocalInvocationId; "
+                         "on by itself when the runtime's GPU has no vertex-stage subgroups (MoltenVK)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader")
@@ -2561,6 +2572,14 @@ def main() -> int:
             log(f"shaders: the GPU the runtime would use reports maxPushConstantsSize = {max_pc} (< {need_pc}): "
                 "translating with --pc-tail-ubo")
             a.pc_tail_ubo = True
+    if "shaders" in stages and not a.no_vertex_subgroups:
+        vertex_subgroups = runtime_gpu_vertex_subgroups()
+        if vertex_subgroups is False:
+            log("shaders: the GPU the runtime would use has no subgroup operations in the vertex stage (MoltenVK): "
+                "translating with --no-vertex-subgroups")
+            a.no_vertex_subgroups = True
+        elif vertex_subgroups is None:
+            a.no_vertex_subgroups = keep_recorded_fallback("--no-vertex-subgroups", work)
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     overlap = True
     a.jobs = leonida_tui.clamp_jobs(a.jobs)

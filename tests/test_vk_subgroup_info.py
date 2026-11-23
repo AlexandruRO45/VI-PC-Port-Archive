@@ -797,6 +797,7 @@ class QueryTest(unittest.TestCase):
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "per_vertex_inputs": True,
+                    "vertex_in_supported_stages": False,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
                     "device_id": 0,
@@ -804,6 +805,16 @@ class QueryTest(unittest.TestCase):
                     "rdna1_amd_windows": False,
                     "rdna2_amd_windows": False,
                 })
+
+    def test_vertex_in_supported_stages(self):
+        """The vertex bit of subgroupSupportedStages; MoltenVK reports compute, fragment and tessellation control
+        only."""
+        compute = vk_info.VK_SHADER_STAGE_COMPUTE_BIT
+        for label, stages, want in (("all_graphics", compute | vk_info.VK_SHADER_STAGE_VERTEX_BIT | 0x10, True),
+                                    ("moltenvk", compute | 0x10 | 0x2, False), ("vertex_only", 0x1, True)):
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(subgroup_supported_stages=stages))
+                self.assertIs(res["vertex_in_supported_stages"], want)
 
     def test_max_push_constants_size(self):
         """limits.maxPushConstantsSize is read from VkPhysicalDeviceProperties (offset 328 on 64-bit)."""

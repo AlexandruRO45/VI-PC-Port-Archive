@@ -632,16 +632,27 @@ class _Wave:
         elif op in ("OpGroupNonUniformBitwiseOr", "OpGroupNonUniformBitwiseAnd", "OpGroupNonUniformBitwiseXor",
                     "OpGroupNonUniformIAdd"):
             kind = a[2]
-            if kind != "Reduce":
+            if kind not in ("Reduce", "InclusiveScan", "ExclusiveScan"):
                 raise UnsupportedConstruct(f"{op} {kind}")
             w = (1 << self.m.bits(a[0])) - 1
+            combine = {"OpGroupNonUniformBitwiseOr": lambda r, v: r | v,
+                       "OpGroupNonUniformBitwiseAnd": lambda r, v: r & v,
+                       "OpGroupNonUniformBitwiseXor": lambda r, v: r ^ v,
+                       "OpGroupNonUniformIAdd": lambda r, v: r + v}[op]
+            identity = w if op == "OpGroupNonUniformBitwiseAnd" else 0
             vs = [self.int_of(L[i], a[3]) for i in members]
-            r = vs[0]
-            for v in vs[1:]:
-                r = {"OpGroupNonUniformBitwiseOr": r | v, "OpGroupNonUniformBitwiseAnd": r & v,
-                     "OpGroupNonUniformBitwiseXor": r ^ v, "OpGroupNonUniformIAdd": r + v}[op]
-            for i in members:
-                L[i].values[res] = r & w
+            # Reduce: every invocation gets the whole group's result; a scan, the result over the invocations with a
+            # lower id (ExclusiveScan, the identity for the lowest) or up to and including its own (InclusiveScan).
+            r = identity
+            for i, v in zip(members, vs):
+                before, r = r, combine(r, v)
+                if kind == "ExclusiveScan":
+                    L[i].values[res] = before & w
+                elif kind == "InclusiveScan":
+                    L[i].values[res] = r & w
+            if kind == "Reduce":
+                for i in members:
+                    L[i].values[res] = r & w
         elif op in ("OpGroupNonUniformShuffle", "OpGroupNonUniformBroadcast"):
             src_vals = {i: self.raw(L[i], a[2]) for i in members}
             for i in members:
@@ -703,11 +714,6 @@ class _Wave:
                         raise UnsupportedConstruct(f"psb access chain into {k[0]}")
                 lane.pointers[res] = ("psb", addr, ty)
                 return None
-            if p[0] == "psb":
-                if m.size(p[2]) != 4:
-                    raise UnsupportedConstruct("psb load wider than one word")
-                v = self.memory.get(p[1], 0)
-                return F(v) if m.types[p[2]][0] == "float" else v & MASK
             if p[0] == "pc":
                 off, ty = p[1], p[2]
                 for x in a[2:]:
@@ -742,6 +748,11 @@ class _Wave:
             p = lane.pointers.get(a[1])
             if p is None:
                 raise UnsupportedConstruct(f"OpLoad from {a[1]}, which is not a pointer")
+            if p[0] == "psb":
+                if m.size(p[2]) != 4:
+                    raise UnsupportedConstruct("psb load wider than one word")
+                v = self.memory.get(p[1], 0)
+                return F(v) if m.types[p[2]][0] == "float" else v & MASK
             if p[0] == "pc":
                 if m.size(p[2]) != 4:
                     raise UnsupportedConstruct("push-constant load wider than one word")
