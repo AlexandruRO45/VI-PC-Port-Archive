@@ -52,6 +52,14 @@ class SamePathTests(unittest.TestCase):
         touch(self.p("b.json"))
         self.assertFalse(report_paths.same_report_path(self.p("a.json"), self.p("b.json")))
 
+    def test_existing_files_take_priority_over_a_matching_normalized_name(self):
+        first, second = self.p("a.json"), self.p("b.json")
+        touch(first)
+        touch(second)
+        # Simulate a name rule folding two spellings that the directory keeps distinct.
+        with mock.patch.object(report_paths, "_resolved_key", return_value="report.json"):
+            self.assertFalse(report_paths.same_report_path(first, second))
+
     def test_paths_that_do_not_exist_yet(self):
         self.assertTrue(report_paths.same_report_path(self.p("new", "x.json"), self.p("new", "..", "new", "x.json")))
         self.assertFalse(report_paths.same_report_path(self.p("new", "x.json"), self.p("new", "y.json")))
