@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 
@@ -152,6 +153,37 @@ class Api(unittest.TestCase):
         os.environ[pc.SKIP_ENV] = "1"
         c = pc.SpecChecker(XBOX)
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
+
+    def test_rebar_advisory_when_8gb_gpu_has_rebar_disabled(self):
+        c = pc.SpecChecker(XBOX)
+        rep = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 5060 (8 GB VRAM)", 32, rebar=False)
+        self.assertIn("Resizable BAR is disabled", rep.rebar_note)
+        self.assertIn("Resizable BAR is disabled", rep.as_text())
+        self.assertEqual(rep.as_dict()["rebar_note"], rep.rebar_note)
+
+    def test_rebar_no_advisory_when_rebar_active(self):
+        c = pc.SpecChecker(XBOX)
+        rep = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 5060 (8 GB VRAM)", 32, rebar=True)
+        self.assertEqual(rep.rebar_note, "")
+        self.assertNotIn("Resizable BAR is disabled", rep.as_text())
+
+    def test_rebar_no_advisory_for_high_vram_gpu(self):
+        c = pc.SpecChecker(XBOX)
+        rep = c.check("Intel Core i7-10700K", "NVIDIA GeForce RTX 4090 (24 GB VRAM)", 32, rebar=False)
+        self.assertEqual(rep.rebar_note, "")
+
+    def test_detect_rebar_helpers(self):
+        with mock.patch.object(pc, "_run", return_value="BAR1 Memory Usage Total : 256 MiB\n"):
+            with mock.patch.object(pc.shutil, "which", return_value="nvidia-smi"):
+                active, mb = pc.detect_rebar()
+                self.assertFalse(active)
+                self.assertEqual(mb, 256)
+
+        with mock.patch.object(pc, "_run", return_value="BAR1 Memory Usage Total : 8192 MiB\n"):
+            with mock.patch.object(pc.shutil, "which", return_value="nvidia-smi"):
+                active, mb = pc.detect_rebar()
+                self.assertTrue(active)
+                self.assertEqual(mb, 8192)
 
 
 if __name__ == "__main__":
