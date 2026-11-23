@@ -210,5 +210,24 @@ class TestAdd3U32ASTInterpreter(unittest.TestCase):
         self.assertEqual(res, 75)
         self.assertEqual(interp.vgprs[0], 75)
 
+# ---------------------------------------------------------------------------
+# Opcode 1: v_add3_u32 - SIMD and Boundary Tests
+# ---------------------------------------------------------------------------
+
+class TestAdd3U32SIMDBoundaries(unittest.TestCase):
+    def test_simd_wave32_divergence(self) -> None:
+        wave = SIMDWavefront(wave_size=32, exec_mask=0x5555_5555)
+        s0 = [1] * 32
+        s1 = [2] * 32
+        s2 = [3] * 32
+        res = wave.execute(oracle_add3_u32, s0, s1, s2)
+        for lane in range(32):
+            self.assertEqual(res[lane], 6 if lane % 2 == 0 else 0)
+
+    def test_boundary_values(self) -> None:
+        self.assertEqual(oracle_add3_u32(0x7FFF_FFFF, 1, 0), 0x8000_0000)
+        self.assertEqual(oracle_add3_u32(0x8000_0000, 0x8000_0000, 0), 0)
+        self.assertEqual(oracle_add3_u32(MASK32, MASK32, MASK32), MASK32 - 2)
+
 if __name__ == "__main__":
     unittest.main()
