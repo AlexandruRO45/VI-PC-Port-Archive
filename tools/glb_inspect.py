@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import struct
 import sys
@@ -214,16 +215,17 @@ def _accessor_count(gltf: dict, index: object) -> int | None:
 
 
 def _accessor_max(accessor: dict | None) -> float | None:
-    """An accessor's declared max[0], or None when it is missing or not a number."""
+    """An accessor's declared max[0] as a finite float, or None."""
     if accessor is None:
         return None
     upper = accessor.get("max")
     if (isinstance(upper, list) and upper
             and isinstance(upper[0], (int, float)) and not isinstance(upper[0], bool)):
         try:
-            return float(upper[0])
+            value = float(upper[0])
         except (OverflowError, ValueError):
             return None  # an integer too large to be a float has no usable bound
+        return value if math.isfinite(value) else None
     return None
 
 
@@ -270,6 +272,8 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             issues.append(f"sampler[{sampler_index}] input accessor is missing")
         elif input_count is None or input_count == 0:
             issues.append(f"sampler[{sampler_index}] input accessor has no keyframes")
+        if input_accessor is not None and "max" in input_accessor and duration is None:
+            issues.append(f"sampler[{sampler_index}] input accessor max does not declare a finite duration")
         if input_type is not None and input_type != "SCALAR":
             issues.append(f"sampler[{sampler_index}] input accessor type is {input_type}, expected SCALAR")
         if output_accessor is None:
