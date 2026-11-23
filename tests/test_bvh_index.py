@@ -510,6 +510,24 @@ class ScanTest(unittest.TestCase):
         self.assertIn("is a folder, not a report file", err.getvalue())
 
 
+class MissingTargetTest(unittest.TestCase):
+    """A target that cannot be opened is one line naming the path once; the OSError text repeated it and repr'd it."""
+
+    def _stderr(self, argv):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bvh_index.main(argv), 2)
+        return err.getvalue()
+
+    def test_cli_names_a_missing_target_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "no-such.rpf")
+            text = self._stderr([missing])
+        self.assertIn(f"{missing}: No such file or directory", text)
+        self.assertNotIn("[Errno", text)
+        self.assertEqual(text.count(missing), 1)
+
+
 class _Unprintable:
     """A cell whose str() fails part-way through the CSV, standing in for a write that dies mid-report."""
 
