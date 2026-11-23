@@ -376,14 +376,18 @@ def _decode_lanes_native(raw, widths, nsym):
 _NATIVE_BLOCKS = {
     # codec: (lookup table bytes, confirmed defaults, provisional defaults, values per entry)
     1: (lambda: bytes(_tables.BC1_QUADRANT), "BC1_HISTORY_CONFIRMED", "BC1_HISTORY_PROVISIONAL", 6),
+    3: (lambda: bytes(v for pair in _tables.BC3_ALPHA_PAIR for v in pair) + bytes(_tables.BC3_COLOUR_QUADRANT),
+        "BC3_HISTORY_CONFIRMED", "BC3_HISTORY_PROVISIONAL", 8),
     4: (lambda: bytes(v for pair in _tables.BC4_PAIR for v in pair), "BC4_HISTORY_CONFIRMED",
         "BC4_HISTORY_PROVISIONAL", 2),
+    5: (lambda: bytes(v for pair in _tables.BC5_PAIR for v in pair), "BC5_HISTORY_CONFIRMED",
+        "BC5_HISTORY_PROVISIONAL", 4),
 }
 _NATIVE_BUILTIN = {}
 
 
 def _decode_blocks_native(raw, codec, out_size, history):
-    """BC1/BC4 bytes from the Rust lanes + strict rebuild, or None to decode in Python.
+    """BC1/BC3/BC4/BC5 bytes from the Rust lanes + strict rebuild, or None to decode in Python.
 
     Rust only takes the strict path: a stream it refuses, a non-zero lane 1 or
     a history entry that is not confirmed returns None, and Python decodes the
@@ -398,8 +402,11 @@ def _decode_blocks_native(raw, codec, out_size, history):
     lut, conf_name, prov_name, k = spec
     cached = _NATIVE_BUILTIN.get(codec) if history is None else None
     if cached is None:
-        confirmed, _ = _resolve_bc_history(
-            codec, getattr(_tables, conf_name), getattr(_tables, prov_name), history)
+        try:
+            confirmed, _ = _resolve_bc_history(
+                codec, getattr(_tables, conf_name), getattr(_tables, prov_name), history)
+        except (ValueError, TypeError, OSError):
+            return None  # Python reads the same history after the lanes, so its error order is unchanged
         flat = [-1] * (256 * k)
         for entry, values in confirmed.items():
             if 0 <= entry < 256 and len(values) == k:

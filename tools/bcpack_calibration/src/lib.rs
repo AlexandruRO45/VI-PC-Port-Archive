@@ -300,9 +300,10 @@ pub unsafe extern "C" fn unpack_model(
     used as isize
 }
 
-// Lanes and the strict block rebuild of codec 1 (BC1) or 4 (BC4) in one call.
-// `lut` is BC1_QUADRANT or the flattened BC4_PAIR, `builtin` the confirmed
-// built-in history (rows of 6 or 2 values, -1 where absent). Returns the bytes
+// Lanes and the strict block rebuild of codec 1 (BC1), 3 (BC3), 4 (BC4) or 5
+// (BC5) in one call. `lut` is BC1_QUADRANT, the flattened BC3_ALPHA_PAIR then
+// BC3_COLOUR_QUADRANT, the flattened BC4_PAIR or the flattened BC5_PAIR,
+// `builtin` the confirmed built-in history (rows of 6, 8, 2 or 4 values, -1 where absent). Returns the bytes
 // used, or -1: then Python decodes the chunk itself.
 #[no_mangle]
 pub unsafe extern "C" fn decode_blocks(
@@ -321,6 +322,9 @@ pub unsafe extern "C" fn decode_blocks(
     output: *mut u8,
     output_len: usize,
 ) -> isize {
+    if lanes != 12 {
+        return -1;
+    }
     let stream = slice::from_raw_parts(data, size);
     let bits = slice::from_raw_parts(widths, lanes);
     let Some(t) = model::Tables::new(slice::from_raw_parts(tables, tables_len)) else {
@@ -337,7 +341,9 @@ pub unsafe extern "C" fn decode_blocks(
     let out = slice::from_raw_parts_mut(output, output_len);
     let done = match codec {
         1 => blocks::bc1(&symbols, target, lut, builtin, out),
+        3 => blocks::bc3(&symbols, target, lut, builtin, out),
         4 => blocks::bc4(&symbols, target, lut, builtin, out),
+        5 => blocks::bc5(&symbols, target, lut, builtin, out),
         _ => None,
     };
     if done.is_some() {
