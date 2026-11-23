@@ -471,9 +471,16 @@ STORE_WORDS = {
 # ps_get_lod = (clamped LOD, calculated LOD, calculated LOD at 4u, clamped LOD at 4u) on the two-mip texture,
 # ps_get_lod_array = (clamped, calculated LOD at 32u, clamped, calculated LOD) on the one-level 2D array.
 # A device may keep as few as four fraction bits of LOD (Vulkan's smallest mipmapPrecisionBits), hence the tolerance.
+# ps_get_lod_a16 packs u and v into one f16 pair (image_get_lod a16) and scales one axis at a time, so the calculated
+# LOD of the (4u, v) and (u, 4v) draws shows which half supplied which coordinate:
+# ps_get_lod_a16 = (clamped, calculated, calculated at 4u, calculated at 4v) on the two-mip texture,
+# ps_get_lod_a16_array = (clamped, calculated, calculated at 32u, calculated at 32v) on the one-level 2D array, with
+# the slice in the second address VGPR.
 GET_LOD_TESTS = {
     "ps_get_lod": (("c00000", True, (1.0, 1.0, 3.0, 1.0)), ("40000", True, (0.0, 1.0, 3.0, 0.0))),
     "ps_get_lod_array": (("c00000", False, (0.0, 2.0, 0.0, -3.0)),),
+    "ps_get_lod_a16": (("c00000", True, (1.0, 1.0, 3.0, 3.0)), ("40000", True, (0.0, 1.0, 3.0, 3.0))),
+    "ps_get_lod_a16_array": (("c00000", False, (0.0, -3.0, 2.0, 2.0)),),
 }
 GET_LOD_TOLERANCE = 1 / 16
 
