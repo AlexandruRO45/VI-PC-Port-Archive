@@ -174,7 +174,7 @@ unset, it costs one flag test per hook.
 | `VICTORY_PROFILE_INTERVAL=<seconds>` | time between summaries |
 | `VICTORY_PROFILE_HITCH_MS=<ms>` | a frame interval above this is a hitch (default 50) |
 | `VICTORY_PROFILE_TRACE_US=<us>` | timed scopes shorter than this are counted, not traced (default 100) |
-| `VICTORY_PROFILE_DUMP=30,90` | a full report at those seconds; one is also logged when the host GPU fails |
+| `VICTORY_PROFILE_DUMP=30,90` | a full report at those seconds (with every thread's stack in a diagnostics build); one is also logged when the host GPU fails |
 
 A summary has the frame rate and 1% low, frame interval avg, p50, p95,
 p99 and max, hitches and stutters (over twice the median); per frame, the
