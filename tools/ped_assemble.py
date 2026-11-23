@@ -32,7 +32,10 @@ binary glTF 2.0 (`.glb`):
    a strict binary glTF 2.0 container.
 
 Supports JSON mesh/manifest specs, Wavefront OBJ (via ``tools/glb_writer.py``),
-and binary glTF 2.0 (``.glb``) inputs. Standard library only; no game files.
+and binary glTF 2.0 (``.glb``) inputs, including sparse mesh attributes and indices.
+A GLB may expand up to 1,000,000 implicit zero-initialized accessor rows across its
+imported mesh instances. For larger parts, supply a dense base bufferView.
+Standard library only; no game files.
 """
 from __future__ import annotations
 
@@ -56,6 +59,7 @@ import glb_writer  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
+MAX_IMPLICIT_SPARSE_ROWS = 1_000_000
 CHUNK_TYPE_JSON = 0x4E4F534A
 CHUNK_TYPE_BIN = 0x004E4942
 TARGET_ARRAY_BUFFER = 34962
@@ -1125,14 +1129,6 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
         acc = accessors[index]
         if not isinstance(acc, dict):
             raise bad(f"accessors[{index}] must be an object")
-        view_index = acc.get("bufferView")
-        if view_index is None:
-            raise bad(f"accessors[{index}] has no bufferView (sparse and empty accessors are not supported)")
-        if not is_index(view_index) or view_index >= len(views):
-            raise bad(f"accessors[{index}] names bufferView {view_index!r} (GLB has {len(views)})")
-        view = views[view_index]
-        if not isinstance(view, dict):
-            raise bad(f"bufferViews[{view_index}] must be an object")
         ctype, atype, count = acc.get("componentType"), acc.get("type"), acc.get("count")
         if type(ctype) is not int or ctype not in COMPONENT_STRUCT:
             raise bad(f"accessors[{index}] has unsupported componentType {ctype!r}")
@@ -1142,14 +1138,79 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
             raise bad(f"{what} is accessor {index} of type {atype}, expected {' or '.join(allowed)}")
         if not is_whole(count):
             raise bad(f"accessors[{index}] has invalid count {count!r}")
-        offsets = (view.get("byteOffset", 0), acc.get("byteOffset", 0))
-        stride = view.get("byteStride")
-        if not all(is_whole(v) for v in offsets) or not (stride is None or is_whole(stride)):
-            raise bad(f"accessors[{index}] has an invalid byteOffset or byteStride")
-        elem_bytes = COMPONENT_STRUCT[ctype][1] * TYPE_COMPONENTS[atype]
-        count, base, step = int(count), int(offsets[0]) + int(offsets[1]), int(stride or elem_bytes)
-        if count and base + (count - 1) * step + elem_bytes > len(bin_chunk):
-            raise bad(f"accessors[{index}] ({what}) runs past the BIN chunk ({len(bin_chunk)} bytes)")
+        count = int(count)
+        component_size = COMPONENT_STRUCT[ctype][1]
+        elem_bytes = component_size * TYPE_COMPONENTS[atype]
+        label = f"accessors[{index}]"
+        has_sparse = "sparse" in acc
+
+        def check_region(section, name, rows, size, alignment, *, packed=False):
+            """Validate the rows before unpacking them; sparse indices/values always use tight packing."""
+            view_index = section.get("bufferView")
+            if packed and is_whole(view_index):
+                view_index = int(view_index)
+            if not is_index(view_index) or view_index >= len(views):
+                raise bad(f"{name} names bufferView {view_index!r} (GLB has {len(views)})")
+            view = views[view_index]
+            if not isinstance(view, dict):
+                raise bad(f"bufferViews[{view_index}] must be an object")
+            offsets = (view.get("byteOffset", 0), section.get("byteOffset", 0))
+            stride = view.get("byteStride")
+            if not all(is_whole(v) for v in offsets) or not (stride is None or is_whole(stride)):
+                raise bad(f"{name} has an invalid byteOffset or byteStride")
+            start, offset = map(int, offsets)
+            step = int(stride or size)
+            end = offset + ((rows - 1) * step + size if rows else 0)
+            if rows and start + end > len(bin_chunk):
+                raise bad(f"{name} ({what}) runs past the BIN chunk ({len(bin_chunk)} bytes)")
+            if has_sparse:
+                if packed and ("byteStride" in view or "target" in view):
+                    raise bad(f"{name} must use a bufferView without byteStride or target")
+                if offset % alignment or (start + offset) % alignment or step < size or step % alignment:
+                    raise bad(f"{name} has an invalid offset alignment or stride")
+                buffers = doc.get("buffers")
+                if (not is_whole(view.get("buffer")) or view["buffer"] != 0
+                        or not isinstance(buffers, list) or not buffers or not isinstance(buffers[0], dict)
+                        or "uri" in buffers[0]):
+                    raise bad(f"{name} must use the embedded GLB buffer")
+                length = view.get("byteLength")
+                limit = buffers[0].get("byteLength")
+                if (not is_whole(length) or not is_whole(limit) or end > length
+                        or start + length > limit or limit > len(bin_chunk)):
+                    raise bad(f"{name} exceeds its bufferView or embedded buffer")
+            return start + offset
+
+        if "bufferView" in acc:
+            check_region(acc, label, count, elem_bytes, component_size)
+        elif not has_sparse:
+            raise bad(f"{label} has no bufferView")
+        elif "byteOffset" in acc:
+            raise bad(f"{label} cannot specify byteOffset without a base bufferView")
+        if not has_sparse:
+            return
+
+        sparse = acc["sparse"]
+        if not isinstance(sparse, dict):
+            raise bad(f"{label}.sparse must be an object")
+        n = sparse.get("count")
+        if not is_whole(n) or not 1 <= n <= count:
+            raise bad(f"{label}.sparse.count must be between 1 and {count}")
+        n = int(n)
+        indices, values = sparse.get("indices"), sparse.get("values")
+        if not isinstance(indices, dict) or not isinstance(values, dict):
+            raise bad(f"{label}.sparse needs indices and values objects")
+        index_type = indices.get("componentType")
+        if not is_whole(index_type) or index_type not in (COMPONENT_UNSIGNED_BYTE, COMPONENT_UNSIGNED_SHORT,
+                                                           COMPONENT_UNSIGNED_INT):
+            raise bad(f"{label}.sparse.indices must use unsigned byte, short or int components")
+        fmt, width = COMPONENT_STRUCT[int(index_type)]
+        start = check_region(indices, f"{label}.sparse.indices", n, width, width, packed=True)
+        check_region(values, f"{label}.sparse.values", n, elem_bytes, component_size, packed=True)
+        previous = -1
+        for (dest,) in struct.iter_unpack("<" + fmt, memoryview(bin_chunk)[start:start + n * width]):
+            if not previous < dest < count:
+                raise bad(f"{label}.sparse.indices must be strictly increasing and below {count}")
+            previous = dest
 
     for i, mesh in enumerate(meshes):
         if not isinstance(mesh, dict):
@@ -1216,15 +1277,12 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
 
 def _read_glb_accessor(doc: dict, bin_chunk: bytes, acc_idx: int) -> list:
     acc = doc["accessors"][acc_idx]
-    bv = doc["bufferViews"][acc["bufferView"]]
     ctype = acc["componentType"]
     atype = acc["type"]
     count = int(acc["count"])
     fmt_char, comp_size = COMPONENT_STRUCT[ctype]
     n_comp = TYPE_COMPONENTS[atype]
     elem_bytes = comp_size * n_comp
-    stride = int(bv.get("byteStride") or elem_bytes)
-    base = int(bv.get("byteOffset", 0)) + int(acc.get("byteOffset", 0))
     normalized = bool(acc.get("normalized", False))
     denom = None
     if normalized:
@@ -1237,14 +1295,35 @@ def _read_glb_accessor(doc: dict, bin_chunk: bytes, acc_idx: int) -> list:
         elif ctype == COMPONENT_SHORT:
             denom = 32767.0
 
-    unpack_fmt = f"<{n_comp}{fmt_char}"
-    out = []
-    for i in range(count):
-        off = base + i * stride
-        vals = struct.unpack_from(unpack_fmt, bin_chunk, off)
+    unpack = struct.Struct(f"<{n_comp}{fmt_char}").unpack_from
+
+    def read_row(offset):
+        vals = unpack(bin_chunk, offset)
         if denom is not None:
             vals = tuple(v / denom for v in vals)
-        out.append(vals[0] if n_comp == 1 else vals)
+        return vals[0] if n_comp == 1 else vals
+
+    def start_of(section):
+        view = doc["bufferViews"][int(section["bufferView"])]
+        return int(view.get("byteOffset", 0)) + int(section.get("byteOffset", 0))
+
+    if "bufferView" in acc:
+        base = start_of(acc)
+        stride = int(doc["bufferViews"][acc["bufferView"]].get("byteStride") or elem_bytes)
+        out = [read_row(base + i * stride) for i in range(count)]
+    else:
+        zero = 0 if n_comp == 1 else (0,) * n_comp
+        out = [zero] * count
+
+    if "sparse" in acc:
+        sparse = acc["sparse"]
+        indices = sparse["indices"]
+        fmt, width = COMPONENT_STRUCT[int(indices["componentType"])]
+        start = start_of(indices)
+        packed_indices = memoryview(bin_chunk)[start:start + int(sparse["count"]) * width]
+        values_start = start_of(sparse["values"])
+        for i, (dest,) in enumerate(struct.iter_unpack("<" + fmt, packed_indices)):
+            out[dest] = read_row(values_start + i * elem_bytes)
     return out
 
 
@@ -1331,6 +1410,21 @@ def read_glb_parts(path: str) -> list[MeshPart]:
     skins = doc.get("skins", [])
     parts: list[MeshPart] = []
 
+    # Unlike dense rows, a zero base has no corresponding bytes in the file to bound the
+    # Python lists built for each visible attribute and each instance of the mesh.
+    remaining_implicit_rows = MAX_IMPLICIT_SPARSE_ROWS
+
+    def read_accessor(index):
+        nonlocal remaining_implicit_rows
+        acc = doc["accessors"][index]
+        if "bufferView" not in acc:
+            rows = int(acc["count"])
+            if rows > remaining_implicit_rows:
+                raise PedAssembleError(f"{path}: accessors[{index}] would exceed the per-file limit of "
+                                       f"{MAX_IMPLICIT_SPARSE_ROWS:,} implicit sparse rows")
+            remaining_implicit_rows -= rows
+        return _read_glb_accessor(doc, bin_chunk, index)
+
     mesh_nodes = [(n, n["mesh"]) for n in nodes if "mesh" in n]
     if not mesh_nodes:
         mesh_nodes = [({"name": m.get("name", f"{stem}_{i}")}, i) for i, m in enumerate(meshes)]
@@ -1349,41 +1443,41 @@ def read_glb_parts(path: str) -> list[MeshPart]:
             attrs = prim.get("attributes", {})
             if "POSITION" not in attrs:
                 continue
-            positions = [tuple(float(x) for x in p) for p in _read_glb_accessor(doc, bin_chunk, attrs["POSITION"])]
+            positions = [tuple(float(x) for x in p) for p in read_accessor(attrs["POSITION"])]
             if "indices" in prim:
-                raw_idx = [int(i) for i in _read_glb_accessor(doc, bin_chunk, prim["indices"])]
+                raw_idx = [int(i) for i in read_accessor(prim["indices"])]
             else:
                 raw_idx = list(range(len(positions)))
             triangles = _normalize_triangles(raw_idx)
             normals = (
-                [tuple(float(x) for x in n) for n in _read_glb_accessor(doc, bin_chunk, attrs["NORMAL"])]
+                [tuple(float(x) for x in n) for n in read_accessor(attrs["NORMAL"])]
                 if "NORMAL" in attrs else None
             )
             uvs = (
-                [tuple(float(x) for x in u) for u in _read_glb_accessor(doc, bin_chunk, attrs["TEXCOORD_0"])]
+                [tuple(float(x) for x in u) for u in read_accessor(attrs["TEXCOORD_0"])]
                 if "TEXCOORD_0" in attrs else None
             )
             colors = None
             if "COLOR_0" in attrs:
-                raw_c = _read_glb_accessor(doc, bin_chunk, attrs["COLOR_0"])
+                raw_c = read_accessor(attrs["COLOR_0"])
                 colors = [
                     (float(c[0]), float(c[1]), float(c[2]), float(c[3]) if len(c) > 3 else 1.0)
                     for c in raw_c
                 ]
             joints_0 = (
-                [tuple(int(x) for x in j) for j in _read_glb_accessor(doc, bin_chunk, attrs["JOINTS_0"])]
+                [tuple(int(x) for x in j) for j in read_accessor(attrs["JOINTS_0"])]
                 if "JOINTS_0" in attrs else None
             )
             weights_0 = (
-                [tuple(float(x) for x in w) for w in _read_glb_accessor(doc, bin_chunk, attrs["WEIGHTS_0"])]
+                [tuple(float(x) for x in w) for w in read_accessor(attrs["WEIGHTS_0"])]
                 if "WEIGHTS_0" in attrs else None
             )
             joints_1 = (
-                [tuple(int(x) for x in j) for j in _read_glb_accessor(doc, bin_chunk, attrs["JOINTS_1"])]
+                [tuple(int(x) for x in j) for j in read_accessor(attrs["JOINTS_1"])]
                 if "JOINTS_1" in attrs else None
             )
             weights_1 = (
-                [tuple(float(x) for x in w) for w in _read_glb_accessor(doc, bin_chunk, attrs["WEIGHTS_1"])]
+                [tuple(float(x) for x in w) for w in read_accessor(attrs["WEIGHTS_1"])]
                 if "WEIGHTS_1" in attrs else None
             )
             pname = node_name if len(mesh.get("primitives", [])) == 1 else f"{node_name}_p{pi}"
