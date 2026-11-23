@@ -336,5 +336,21 @@ class VFmaF64SimdIeeeTests(unittest.TestCase):
     def test_fma_nan_propagation(self):
         self.assertTrue(is_nan_u64(oracle_fma_f64(F64_QNAN, f64_to_u64(1.0), f64_to_u64(2.0))))
 
+class VFmaF64TranslatorTests(unittest.TestCase):
+    def test_fma_f64_translation_or_refusal(self):
+        lines = [
+            "v_mov_b32 v0, 0", "v_mov_b32 v1, 0x40000000",
+            "v_mov_b32 v2, 0", "v_mov_b32 v3, 0x40080000",
+            "v_mov_b32 v4, 0", "v_mov_b32 v5, 0x40100000",
+            "v_fma_f64 v[6:7], v[0:1], v[2:3], v[4:5]",
+            "exp mrt0 v6, v7, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        try:
+            spv = translate_lines("ps_fma_f64_test", lines)
+            self.assertIn("OpCapability", spv)
+        except rdna2spirv.Unsupported as caught:
+            self.assertIn("v_fma_f64", str(caught))
+
 if __name__ == "__main__":
     unittest.main()
