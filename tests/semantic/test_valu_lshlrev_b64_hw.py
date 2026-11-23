@@ -260,5 +260,24 @@ class TestLshlrevRegisterPreservation(unittest.TestCase):
         self.assertEqual(words[1], 0xBBBB)
 
 
+class TestLshlrevConditionCodesAndStatus(unittest.TestCase):
+    """Commit 6: condition codes, status flags, and carry/borrow generation for v_lshlrev_b64."""
+
+    def test_status_comparison_on_shift_halves(self):
+        # Shift 1 << 32 results in low=0, high=1. Compare low half against 0.
+        lines = [
+            "v_mov_b32 v2, 1",
+            "v_mov_b32 v3, 0",
+            "v_lshlrev_b64 v[0:1], 32, v[2:3]",
+            "v_cmp_eq_u32 vcc, 0, v0",           # v0 == 0 -> vcc is true
+            "v_cndmask_b32 v2, 0x1111, 0x2222, vcc", # selects 0x2222
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_lshlrev_ps(lines, "ps_lshlrev_status")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 1)
+        self.assertEqual(words[2], 0x2222)
+
+
 if __name__ == '__main__':
     unittest.main()
