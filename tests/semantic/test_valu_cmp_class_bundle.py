@@ -452,3 +452,27 @@ class TestCmpClassF32SIMDAndProperties(unittest.TestCase):
         val_inf, _ = run_cmp_shader("f32", 0x7F800000, CLASS_POS_NORMAL | CLASS_NEG_NORMAL, is_cmpx=False, test_id="inf_check")
         self.assertEqual(val_norm, 1)
         self.assertEqual(val_inf, 0)
+
+
+# ------------------------------------------------------------------------------
+# v_cmp_class_f32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestCmpClassF32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, -1)
+
+    def test_boundary_extremes_hardware(self):
+        # Min subnormal f32: 0x00000001
+        val_min_denorm, _ = run_cmp_shader("f32", 0x00000001, CLASS_POS_DENORM, is_cmpx=False, test_id="min_denorm")
+        self.assertEqual(val_min_denorm, 1)
+
+        # Max subnormal f32: 0x007FFFFF
+        val_max_denorm, _ = run_cmp_shader("f32", 0x007FFFFF, CLASS_POS_DENORM, is_cmpx=False, test_id="max_denorm")
+        self.assertEqual(val_max_denorm, 1)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        _, spv = run_cmp_shader("f32", 0x3F800000, CLASS_POS_NORMAL, is_cmpx=False, test_id="lowering")
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpShiftRightLogical", spv)
