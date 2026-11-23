@@ -556,13 +556,17 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     const fs::path live_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(live.pid) + L"_33.dll");
     const char bytes[8] = "purgeXX";
     write_file(stale_file, bytes, 8);
-    write_file(held_file, bytes, 8);
     write_file(live_file, bytes, 8);
     // An open handle without FILE_SHARE_DELETE stands in for another process's guard or mapped image: the purge's
-    // exclusive-open probe must fail against it.
-    HANDLE held = CreateFileW(held_file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+    // exclusive-open probe must fail against it. The handle creates the file, so the stand-in never exists without
+    // it: written first and opened afterwards, it was an ownerless clone for a moment, and the purge of another
+    // loader process running at the same time (ctest -j) deleted it before this test could open it.
+    HANDLE held = CreateFileW(held_file.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
     check(held != INVALID_HANDLE_VALUE, "opened the held clone stand-in without FILE_SHARE_DELETE");
+    DWORD held_written = 0;
+    check(held != INVALID_HANDLE_VALUE && WriteFile(held, bytes, 8, &held_written, nullptr) && held_written == 8,
+          "wrote the held clone stand-in through its own handle");
 
     const fs::path second = temp / "tiny_tls_purge_second.dll";
     check(CopyFileW(dll.c_str(), second.c_str(), FALSE) != 0, "copied the TLS fixture for the purge test");
