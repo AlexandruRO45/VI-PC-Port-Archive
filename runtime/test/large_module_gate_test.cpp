@@ -103,11 +103,61 @@ static int threads_never_exceed_the_budget() {
 }
 
 static int estimate_and_memory_query() {
+#if defined(_WIN32)
+    CHECK(leonida::kBytesPerSpirvByte == 2048);
+    CHECK(leonida::windows_available_memory(1000, 4000) == 1000);
+    CHECK(leonida::windows_available_memory(4000, 1200) == 1200);
+    CHECK(leonida::windows_available_memory(4000, 0) == 1);
+#else
+    CHECK(leonida::kBytesPerSpirvByte == 512);
+#endif
     CHECK(leonida::large_module_estimate(4u << 20) == (uint64_t(4) << 20) * leonida::kBytesPerSpirvByte);
+    CHECK(leonida::large_module_estimate(UINT64_MAX) == UINT64_MAX);
 #if defined(__linux__) || defined(_WIN32)
-    CHECK(leonida::available_memory_bytes() > 0);   // Linux: MemAvailable; Windows: ullAvailPhys
+    CHECK(leonida::available_memory_bytes() > 0);   // Linux: MemAvailable/cgroup; Windows: min(phys, commit)
 #endif
     leonida::release_free_memory();   // must be callable anywhere
+    return 0;
+}
+
+static uint64_t g_mock_live_available = 0;
+static uint64_t mock_live_available() { return g_mock_live_available; }
+
+static int live_headroom_and_oversized_warning() {
+    // 1. Live OS headroom bounds active_budget_ on idle (inflight == 0 -> 1) and stops concurrent entry if live falls.
+    g_mock_live_available = 100;
+    LargeModuleGate gate(75, 4, &mock_live_available);
+    gate.enter(5);
+    CHECK(gate.active_budget() == 75);
+    CHECK(gate.admits(5));
+    g_mock_live_available = 4;   // 3/4 of 4 is 3: next 5 exceeds remaining live headroom while inflight > 0
+    CHECK(!gate.admits(5));
+    g_mock_live_available = 1;   // exhausted (1 byte floor): 3/4 is 0, blocks all concurrent entry
+    CHECK(!gate.admits(1));
+    gate.leave(5);
+    CHECK(gate.active_budget() == 0);
+
+    g_mock_live_available = 12;  // 3/4 of 12 is 9: on idle, active_budget_ shrinks from 75 to 9
+    gate.enter(5);
+    CHECK(gate.active_budget() == 9);
+    CHECK(!gate.admits(5));      // 5 + 5 > 9 (even though initial startup budget was 75)
+    CHECK(gate.admits(4));       // 5 + 4 <= 9 fits
+    gate.leave(5);
+
+    g_mock_live_available = 200; // when live recovers, active_budget_ recovers up to startup cap 75
+    gate.enter(5);
+    CHECK(gate.active_budget() == 75);
+    CHECK(gate.admits(5));
+    gate.leave(5);
+
+    // 2. Oversized-module predicate and wording differences between exclusive and budget modes.
+    CHECK(!leonida::oversized_module_exceeds_memory(100, 0));
+    CHECK(!leonida::oversized_module_exceeds_memory(100, 100));
+    CHECK(leonida::oversized_module_exceeds_memory(101, 100));
+    const std::string budget_msg = leonida::format_oversized_module_warning("ex_mod", 25'000'000'000ULL, 16'000'000'000ULL, false);
+    CHECK(budget_msg.find("ex_mod needs about 25.0 GB, 16.0 GB available: it compiles alone among large modules and may not fit\n") != std::string::npos);
+    const std::string excl_msg = leonida::format_oversized_module_warning("ex_mod", 25'000'000'000ULL, 16'000'000'000ULL, true);
+    CHECK(excl_msg.find("ex_mod needs about 25.0 GB, 16.0 GB available: it compiles alone and may not fit\n") != std::string::npos);
     return 0;
 }
 
@@ -163,6 +213,7 @@ int main() {
     if (int r = ticket_releases()) return r;
     if (int r = threads_never_exceed_the_budget()) return r;
     if (int r = estimate_and_memory_query()) return r;
+    if (int r = live_headroom_and_oversized_warning()) return r;
     std::puts("large_module_gate: ok");
     return 0;
 }

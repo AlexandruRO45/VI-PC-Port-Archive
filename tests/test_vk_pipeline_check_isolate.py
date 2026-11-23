@@ -165,6 +165,23 @@ class IsolateTest(unittest.TestCase):
         self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
         self.assertEqual(snapshot.read_bytes(), b"")
 
+    def test_large_module_default_threshold_and_explicit_overrides(self):
+        default_run = self.run_tool([])
+        self.assertEqual(default_run.returncode, 0, default_run.stdout + default_run.stderr)
+        if "within " in default_run.stderr:
+            self.assertIn("large modules (over 1048576 bytes):", default_run.stderr)
+            explicit_run = self.run_tool(["--large-module-bytes", "2097152"])
+            self.assertEqual(explicit_run.returncode, 0, explicit_run.stdout + explicit_run.stderr)
+            self.assertIn("large modules (over 2097152 bytes):", explicit_run.stderr)
+
+        exclusive_run = self.run_tool(["--large-parallel", "1"])
+        self.assertEqual(exclusive_run.returncode, 0, exclusive_run.stdout + exclusive_run.stderr)
+        self.assertIn("large modules (over 4194304 bytes): one at a time", exclusive_run.stderr)
+
+        disabled_run = self.run_tool(["--large-module-bytes", "0"])
+        self.assertEqual(disabled_run.returncode, 0, disabled_run.stdout + disabled_run.stderr)
+        self.assertNotIn("large modules (over ", disabled_run.stderr)
+
 
 def main():
     """unittest.main(), except that a file whose tests all skipped succeeds: unittest exits 5 for an empty run, and

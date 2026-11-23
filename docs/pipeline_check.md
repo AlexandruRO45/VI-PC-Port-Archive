@@ -36,7 +36,7 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 | `--stage all\|cs\|graphics` | Which stages to check. `--compute-only` and `--graphics-only` are aliases. |
 | `--slow SEC` | Print pipelines slower than SEC (default 30); compiles past 60 s are named while running. |
 | `--max-bytes N` | Skip `.spv` files larger than N bytes (0 = no limit); every skip is named. |
-| `--large-module-bytes N` | Compile modules larger than N bytes alone (default 4 MiB; 0 disables isolation). |
+| `--large-module-bytes N` | Gate modules larger than N bytes (default 1 MiB in memory-budget mode, 4 MiB with `--large-parallel 1`; 0 disables). |
 | `--stats FILE` | Write the driver's per-shader statistics as CSV rows `name,stage,statistic,value`. Needs `VK_KHR_pipeline_executable_properties`; use it without `cache.bin`, because a cached pipeline may come without statistics. |
 | `--cache-feedback` | Group successful pipeline creations by `VkPipelineCreationFeedback`: cache hits, no hit reported, and unavailable. |
 | `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
@@ -247,17 +247,23 @@ acceptance only.
 
 ## Limiting concurrent compilation of large modules
 
-A SPIR-V module larger than 4 MiB is "large". [#884](https://github.com/ItsNotRexed/Leonida/issues/884)
-showed why that matters: several compiles that each needed gigabytes of host RAM ran at the same time. Large
-modules now share a memory budget (`runtime/test/large_module_gate.h`): each one reserves 512 bytes of RAM per
-SPIR-V byte, and they enter the driver while their reservations fit three quarters of the memory available when
-the run starts, up to `--jobs` of them. One large module always gets in when none is compiling, so a module
-bigger than the whole budget still compiles, alone among the large ones. Small modules are never held back. On
-Linux the budget is the smaller of `MemAvailable` and the room under the cgroup v2 `memory.max` of the process and
-every cgroup above it (a container, or `systemd-run -p MemoryMax=...`); on Windows it is `ullAvailPhys`. Where
-neither can be read, every large module compiles alone, as before. After each large module, glibc builds call
-`malloc_trim(0)`: the driver's compiler frees its memory into the arena of the thread it ran on, and glibc kept it
-there.
+A SPIR-V module larger than 1 MiB in the default memory-budget mode (or 4 MiB with `--large-parallel 1` or when OS
+free memory cannot be read) is "large". [#884](https://github.com/ItsNotRexed/Leonida/issues/884) and the Windows 32 GB
+runs showed why that matters: several compiles that each needed gigabytes of host RAM ran at the same time, including
+1–4 MiB wave64-emulated mesh and compute modules. Large modules share a memory budget
+(`runtime/test/large_module_gate.h`): each one reserves **2048 bytes of RAM per SPIR-V byte on Windows** (NVIDIA
+610.88 / 621.01 `--wave64-emulate` measurements) and **512 bytes per SPIR-V byte elsewhere** (RADV), and they enter the
+driver while their reservations fit three quarters of the memory available, up to `--jobs` of them. One large module
+always gets in when none is compiling, so a module bigger than the whole budget still compiles, alone among the large
+ones (and prints a warning before entering the driver if its estimate exceeds the available OS memory). Small modules
+are never held back. On Linux the budget is the smaller of `MemAvailable` and the room under the cgroup v2 `memory.max`
+of the process and every cgroup above it (a container, or `systemd-run -p MemoryMax=...`); on Windows it is the smaller
+of `ullAvailPhys` and `ullAvailPageFile` (physical RAM and commit/job headroom). When the gate is idle it refreshes its
+budget cap from current OS headroom, and while active it checks live OS memory before admitting another large module
+concurrently so retained driver memory shrinks concurrency safely. Where neither OS query succeeds, large modules
+above 4 MiB compile alone, as before. After each large module, glibc builds call `malloc_trim(0)` and Windows builds
+call `_heapmin()`: the driver's compiler frees its memory into the allocator, and returning unused segments prevents
+arenas from holding it across modules.
 
 Measured on an RX 9070 XT (RADV GFX1201, Mesa 25.3.6, Mesa shader cache off), on 40 consecutive translated
 compute modules of which 27 are over 4 MiB:

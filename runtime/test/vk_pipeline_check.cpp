@@ -12,7 +12,8 @@
 //   [cache.bin]   loaded first if it exists (a stopped run resumes: cached pipelines are instant), saved every
 //                 10 minutes and at the end
 //   --jobs N      compile on up to N worker threads (default: half the hardware threads)
-//   --large-module-bytes N  modules larger than N bytes are "large" (default: 4194304; 0 disables the gate)
+//   --large-module-bytes N  modules larger than N bytes are "large" (default: 1048576 in budget mode, 4194304
+//                 with --large-parallel 1 or unknown OS memory; 0 disables the gate)
 //   --large-parallel N  how many large modules may be in the driver at once: 0 (default) = as many as fit 3/4 of
 //                 the memory available at start, at large_module_gate.h's estimate per module, up to --jobs, with the
 //                 small ones compiling alongside; 1 = each large module alone, the other threads waiting (the
@@ -799,6 +800,7 @@ int main(int argc, char** argv) {
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
     size_t large_module_bytes = 4 * 1024 * 1024;
+    bool large_module_bytes_set = false;
     unsigned large_parallel = 0;   // 0 = by the memory budget
     double slow = 30.0;
     std::string stage_filter = "all";
@@ -840,7 +842,10 @@ int main(int argc, char** argv) {
         else if (a == "--compute-only") stage_filter = "cs";
         else if (a == "--graphics-only") stage_filter = "graphics";
         else if (a == "--max-bytes") valid = number(max_bytes);
-        else if (a == "--large-module-bytes") valid = number(large_module_bytes);
+        else if (a == "--large-module-bytes") {
+            valid = number(large_module_bytes);
+            large_module_bytes_set = true;
+        }
         else if (a == "--large-parallel") valid = number(large_parallel);
         else if (a == "--stats") valid = !(stats_path = value()).empty();
         else if (a == "--inflight-file") valid = !(inflight_path = value()).empty();
@@ -945,8 +950,9 @@ int main(int argc, char** argv) {
         }
         std::vector<std::string> pass = {"--jobs", std::to_string(jobs), "--slow", std::to_string(slow), "--stage", stage_filter,
                                          "--max-bytes", std::to_string(max_bytes),
-                                         "--large-module-bytes", std::to_string(large_module_bytes),
                                          "--large-parallel", std::to_string(large_parallel)};
+        if (large_module_bytes_set)
+            pass.insert(pass.end(), {"--large-module-bytes", std::to_string(large_module_bytes)});
         if (cache_feedback) pass.push_back("--cache-feedback");
         if (!inflight_path.empty()) pass.insert(pass.end(), {"--inflight-file", inflight_path});
         if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
@@ -1426,9 +1432,11 @@ int main(int argc, char** argv) {
     // Otherwise large modules share a memory budget and the small ones are never held back (large_module_gate.h).
     const uint64_t available_memory = leonida::available_memory_bytes();
     const bool large_exclusive = large_parallel == 1 || (large_parallel == 0 && available_memory == 0);
+    if (!large_module_bytes_set && !large_exclusive) large_module_bytes = 1024 * 1024;
     leonida::LargeModuleGate large_gate(
         large_parallel == 0 ? available_memory / 4 * 3 : UINT64_MAX,
-        large_parallel == 0 ? jobs : std::min<unsigned>(large_parallel, jobs));
+        large_parallel == 0 ? jobs : std::min<unsigned>(large_parallel, jobs),
+        large_parallel == 0 && available_memory > 0 ? &leonida::available_memory_bytes : nullptr);
     if (large_module_bytes) {
         if (large_exclusive)
             std::fprintf(stderr, "large modules (over %zu bytes): one at a time, the other threads waiting\n",
@@ -1621,6 +1629,7 @@ int main(int argc, char** argv) {
             // Enter before reading the module: creation can also enter the driver. Hold until its pipeline and
             // module have been destroyed, including on failure. The watchdog and cache writer don't take this lock.
             const bool isolated = large_module_bytes && std::cmp_greater(file_size, large_module_bytes);
+            const uint64_t large_estimate = isolated ? leonida::large_module_estimate(file_size) : 0;
             std::unique_lock exclusive(compile_gate, std::defer_lock);
             std::shared_lock parallel(compile_gate, std::defer_lock);
             leonida::LargeModuleGate::Ticket large_ticket;   // left after the module and its pipeline are gone
@@ -1628,13 +1637,22 @@ int main(int argc, char** argv) {
                 if (isolated) exclusive.lock();
                 else if (large_module_bytes) parallel.lock();
             } else if (isolated) {
-                large_ticket = leonida::LargeModuleGate::Ticket(large_gate,
-                                                                leonida::large_module_estimate(file_size));
+                large_ticket = leonida::LargeModuleGate::Ticket(large_gate, large_estimate);
             }
             {   // in flight from here: vkCreateShaderModule can also take long or die in the driver
                 std::lock_guard<std::mutex> g(mu);
                 inflight[std::this_thread::get_id()] = {name, std::chrono::steady_clock::now(), "module"};
                 if (isolated) write_inflight();   // a large module: name it now (alone with --large-parallel 1)
+            }
+            if (isolated && available_memory && (large_exclusive || large_parallel == 0)) {
+                const uint64_t avail_now = leonida::available_memory_bytes();
+                const uint64_t avail_check = avail_now ? avail_now : available_memory;
+                if (leonida::oversized_module_exceeds_memory(large_estimate, avail_check)) {
+                    const std::string warning = leonida::format_oversized_module_warning(
+                        name, large_estimate, avail_check, large_exclusive);
+                    std::fwrite(warning.data(), 1, warning.size(), stdout);
+                    std::fflush(stdout);   // a module that dies in the driver takes a buffered line with it
+                }
             }
 
             const auto code = leonida::read_spirv_words(f, file_size);
