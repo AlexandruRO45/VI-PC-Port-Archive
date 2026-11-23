@@ -1,4 +1,5 @@
 """Numerical reconstruction with an explicitly supplied local calibration profile.numpy is imported lazily, so a plain import (and `--help`) works on a checkout without it.
+Usage: `python -I tools/calibrated_texture.py --help` lists the options.
 """
 
 from functools import lru_cache
