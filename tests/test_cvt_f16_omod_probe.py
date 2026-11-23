@@ -245,16 +245,77 @@ class ProbeCliTests(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertIn("harness error", out)
 
-    def test_json_directory_refused_and_unwritable_path_exits_2(self):
+    def test_json_directory_refused_before_hardware(self):
         with tempfile.TemporaryDirectory() as d:
-            with self.assertRaises(SystemExit):
-                _run_main(FakeOracle(), "--json", d)
+            stderr = io.StringIO()
+            with mock.patch.object(runner, "open_oracle") as open_mock, mock.patch.object(sys, "stderr", stderr):
+                rc = pr.main(["--json", d])
+            self.assertEqual(rc, 2)
+            self.assertEqual(stderr.getvalue().splitlines(), [f"ERROR: --json path is a directory: {d}"])
+            open_mock.assert_not_called()
+
+    def test_bad_json_paths_rejected_before_open_oracle(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "dir"))
+            block_file = os.path.join(d, "file_not_dir")
+            with open(block_file, "wb") as f:
+                f.write(b"keep")
+            bad_paths = [
+                "",
+                "   ",
+                "bad\x00out.json",
+                os.path.join(d, "dir", "trailing") + os.sep,
+                os.path.join(block_file, "report.json"),
+            ]
+            for bad in bad_paths:
+                with self.subTest(json_path=bad):
+                    stderr = io.StringIO()
+                    with mock.patch.object(runner, "open_oracle") as open_mock, \
+                         mock.patch.object(sys, "stderr", stderr):
+                        rc = pr.main(["--json", bad])
+                    self.assertEqual(rc, 2)
+                    lines = stderr.getvalue().splitlines()
+                    self.assertEqual(len(lines), 1, lines)
+                    self.assertTrue(lines[0].startswith("ERROR: "), lines[0])
+                    self.assertNotIn("Traceback", stderr.getvalue())
+                    open_mock.assert_not_called()
+
+    def test_missing_parent_created_and_json_written(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "one", "two", "report.json")
+            self.assertIsNone(pr.write_json_report(out, {"ok": True, "arch": "gfx1036"}))
+            self.assertTrue(os.path.isdir(os.path.dirname(out)))
+            with open(out, "rb") as f:
+                raw = f.read()
+            self.assertNotIn(b"\r\n", raw)
+            self.assertEqual(json.loads(raw.decode("utf-8")), {"ok": True, "arch": "gfx1036"})
+            rc, out_text, err = _run_main(FakeOracle(), "--json", os.path.join(d, "cli", "r.json"))
+            self.assertEqual(rc, 0, out_text + err)
+            with open(os.path.join(d, "cli", "r.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["arch"], "gfx1036")
+
+    def test_write_failure_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as d:
             blocker = os.path.join(d, "file_not_dir")
             with open(blocker, "wb") as f:
                 f.write(b"keep")
-            rc, _, err = _run_main(FakeOracle(), "--modes", "rne_d0_i0", "--waves", "32", "--json", os.path.join(blocker, "r.json"))
-            self.assertEqual(rc, 2)
-            self.assertIn("ERROR: cannot write", err)
+            rc, out, err = _run_main(FakeOracle(), "--modes", "rne_d0_i0", "--waves", "32",
+                                     "--json", os.path.join(blocker, "r.json"))
+            self.assertEqual(rc, 2, out + err)
+            lines = err.splitlines()
+            self.assertEqual(len(lines), 1, err)
+            self.assertTrue(lines[0].startswith("ERROR: --json parent is not a directory: "), err)
+            self.assertNotIn("Traceback", err)
+            report = os.path.join(d, "report.json")
+            with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+                write_err = pr.write_json_report(report, {"ok": True})
+            self.assertIn("cannot write --json", write_err)
+            with mock.patch("builtins.open", side_effect=OSError("disk full")):
+                rc, out, err = _run_main(FakeOracle(), "--modes", "rne_d0_i0", "--waves", "32", "--json", report)
+            self.assertEqual(rc, 2, out + err)
+            lines = err.splitlines()
+            self.assertEqual(len(lines), 1, err)
+            self.assertTrue(lines[0].startswith("ERROR: cannot write --json "), err)
             self.assertNotIn("Traceback", err)
 
     def test_non_gfx10_arch_exits_77(self):
