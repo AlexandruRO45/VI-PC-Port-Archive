@@ -1,5 +1,12 @@
 #pragma once
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -63,12 +70,12 @@ public:
             std::lock_guard lock(mutex_);
             fences_.erase(semaphore);
         }
-        if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
+        if (held_.load(std::memory_order_acquire) == 0 || get_in_pump()) return;
         {
             std::lock_guard pump(pump_mutex_);
-            in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
+            set_in_pump(true);  // what is dropped may release other fences: they must not wait for this lock
             for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
-            in_pump() = false;
+            set_in_pump(false);
         }
         pump_ready();
     }
@@ -161,11 +168,11 @@ public:
     void pump_ready() {
         if (!any_held() && barrier_count_.load(std::memory_order_acquire) == 0) return;
         dirty_.store(true, std::memory_order_release);
-        if (in_pump()) return;  // a release on this thread submitted a Signal: the running pass will go again
+        if (get_in_pump()) return;  // a release on this thread submitted a Signal: the running pass will go again
         for (;;) {
             std::unique_lock pump(pump_mutex_, std::try_to_lock);
             if (!pump) return;  // another thread is releasing and will see dirty_
-            in_pump() = true;
+            set_in_pump(true);
             while (dirty_.exchange(false, std::memory_order_acq_rel)) {
                 bool progress = true;
                 while (progress) {
@@ -174,7 +181,7 @@ public:
                 }
                 run_barriers();
             }
-            in_pump() = false;
+            set_in_pump(false);
             pump.unlock();
             if (!dirty_.load(std::memory_order_acquire)) return;
         }
@@ -187,10 +194,27 @@ private:
         std::function<void()> fn;
     };
 
-    static bool& in_pump() {
+#ifdef _WIN32
+    static DWORD pump_tls_slot() {
+        static const DWORD slot = TlsAlloc();
+        return slot;
+    }
+    static bool get_in_pump() {
+        const DWORD slot = pump_tls_slot();
+        return slot != TLS_OUT_OF_INDEXES && TlsGetValue(slot) != nullptr;
+    }
+    static void set_in_pump(bool v) {
+        const DWORD slot = pump_tls_slot();
+        if (slot != TLS_OUT_OF_INDEXES) TlsSetValue(slot, v ? reinterpret_cast<LPVOID>(uintptr_t{1}) : nullptr);
+    }
+#else
+    static bool& in_pump_flag() {
         static thread_local bool pumping = false;
         return pumping;
     }
+    static bool get_in_pump() { return in_pump_flag(); }
+    static void set_in_pump(bool v) { in_pump_flag() = v; }
+#endif
 
     std::vector<Holder*> snapshot() const {
         std::lock_guard lock(mutex_);

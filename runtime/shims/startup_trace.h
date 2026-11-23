@@ -48,11 +48,30 @@ inline FILE* file = nullptr;
 inline unsigned long long seq = 0;
 inline std::chrono::steady_clock::time_point start;
 inline void* veh = nullptr;
-inline thread_local bool in_handler = false;
-// With nothing to handle it, OutputDebugStringW's DBG_PRINTEXCEPTION_WIDE_C falls back to OutputDebugStringA on its
-// own ANSI copy (ExceptionInformation[3]), a second, lossy exception for the same text. Every debug string on the
-// thread resets this, so only the exception right after the wide one, with that same pointer, is skipped.
-inline thread_local ULONG_PTR wide_fallback = 0;
+inline DWORD in_handler_tls_slot() {
+    static const DWORD slot = TlsAlloc();
+    return slot;
+}
+inline bool get_in_handler() {
+    const DWORD slot = in_handler_tls_slot();
+    return slot != TLS_OUT_OF_INDEXES && TlsGetValue(slot) != nullptr;
+}
+inline void set_in_handler(bool v) {
+    const DWORD slot = in_handler_tls_slot();
+    if (slot != TLS_OUT_OF_INDEXES) TlsSetValue(slot, v ? reinterpret_cast<LPVOID>(uintptr_t{1}) : nullptr);
+}
+inline DWORD wide_fallback_tls_slot() {
+    static const DWORD slot = TlsAlloc();
+    return slot;
+}
+inline ULONG_PTR get_wide_fallback() {
+    const DWORD slot = wide_fallback_tls_slot();
+    return slot != TLS_OUT_OF_INDEXES ? reinterpret_cast<ULONG_PTR>(TlsGetValue(slot)) : 0;
+}
+inline void set_wide_fallback(ULONG_PTR v) {
+    const DWORD slot = wide_fallback_tls_slot();
+    if (slot != TLS_OUT_OF_INDEXES) TlsSetValue(slot, reinterpret_cast<LPVOID>(v));
+}
 
 inline void append_escaped(std::string& out, const char* s, size_t n) {
     static const char hex[] = "0123456789abcdef";
@@ -167,9 +186,9 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
         if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
-            const ULONG_PTR fallback = wide_fallback;
+            const ULONG_PTR fallback = get_wide_fallback();
             const bool wide = r.ExceptionCode == kDbgPrintWide;
-            wide_fallback = wide && r.NumberParameters >= 4 ? r.ExceptionInformation[3] : 0;
+            set_wide_fallback(wide && r.NumberParameters >= 4 ? r.ExceptionInformation[3] : 0);
             if (!wide && fallback && r.NumberParameters >= 2 && r.ExceptionInformation[1] == fallback) return;
             std::string text = debug_text(r);
             while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
@@ -183,7 +202,18 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
-            if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
+            if (info.ContextRecord) {
+                const CONTEXT& ctx = *info.ContextRecord;
+                f += ",\"regs\":{\"rax\":" + quote(hex(ctx.Rax)) + ",\"rcx\":" + quote(hex(ctx.Rcx)) +
+                     ",\"rdx\":" + quote(hex(ctx.Rdx)) + ",\"rbx\":" + quote(hex(ctx.Rbx)) +
+                     ",\"rsp\":" + quote(hex(ctx.Rsp)) + ",\"rbp\":" + quote(hex(ctx.Rbp)) +
+                     ",\"rsi\":" + quote(hex(ctx.Rsi)) + ",\"rdi\":" + quote(hex(ctx.Rdi)) +
+                     ",\"r8\":" + quote(hex(ctx.R8)) + ",\"r9\":" + quote(hex(ctx.R9)) +
+                     ",\"r10\":" + quote(hex(ctx.R10)) + ",\"r11\":" + quote(hex(ctx.R11)) +
+                     ",\"r12\":" + quote(hex(ctx.R12)) + ",\"r13\":" + quote(hex(ctx.R13)) +
+                     ",\"r14\":" + quote(hex(ctx.R14)) + ",\"r15\":" + quote(hex(ctx.R15)) + "}";
+                f += ",\"stack\":" + stack_from(ctx);
+            }
             event("exception", f);
         }
     } catch (...) {
@@ -212,9 +242,9 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
 }
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
-    if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (!enabled() || get_in_handler() || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
-    in_handler = true;
+    set_in_handler(true);
 #ifdef _MSC_VER
     // Under /EHsc, catch(...) does not catch SEH faults (e.g. a bad DBG_PRINTEXCEPTION_C pointer or corrupt unwind).
     // Keep the __try frame free of C++ destructors so in_handler is always reset and the exception still propagates.
@@ -224,11 +254,11 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     }
 #else
     struct Reset {
-        ~Reset() { in_handler = false; }
+        ~Reset() { set_in_handler(false); }
     } reset;
     log_exception(*info);
 #endif
-    in_handler = false;
+    set_in_handler(false);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 }  // namespace detail

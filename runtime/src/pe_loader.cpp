@@ -165,12 +165,15 @@ struct TlsCloneRecord {
     std::filesystem::path path;
 };
 
+constexpr size_t kSelfTlsHostSlot = kMaxMappedTlsModules;
 std::mutex g_tls_alloc_mutex;
-std::array<TlsHostModule, kMaxMappedTlsModules> g_tls_hosts{};
+std::array<TlsHostModule, kMaxMappedTlsModules + 1> g_tls_hosts{};
 std::array<std::atomic<Module*>, kMaxMappedTlsModules> g_tls_slot_owners{};
 std::array<std::atomic<uint64_t>, kMaxMappedTlsModules> g_tls_slot_generations{};
 std::atomic<uint64_t> g_next_tls_generation{1};
 std::vector<TlsCloneRecord> g_tls_clones;
+// Keeps a .tls section in the host EXE so the OS always assigns it module TLS index 0 at startup.
+__declspec(thread) unsigned char g_exe_tls_slot0_anchor = 0;
 
 // Frees every TLS helper clone this process loaded and deletes its files. load() registers the wrapper with atexit;
 // the --run path in main() must also call this directly before ExitProcess, which skips the atexit table. Call it
@@ -270,7 +273,7 @@ TlsHostModule load_tls_host_image(const std::filesystem::path& path, bool hook_t
 
 // Must be called with g_tls_alloc_mutex held and WITHOUT g_tls_lock held (LoadLibraryExW takes the Windows loader lock).
 TlsHostModule ensure_tls_host(size_t slot) {
-    if (slot >= kMaxMappedTlsModules) return {};
+    if (slot > kMaxMappedTlsModules) return {};
     if (g_tls_hosts[slot].index != TLS_OUT_OF_INDEXES) return g_tls_hosts[slot];
 
     const std::filesystem::path primary = tls_host_base_path();
@@ -324,7 +327,7 @@ TlsHostModule ensure_tls_host(size_t slot) {
         DeleteFileW(clone_path.c_str());
         return {};
     }
-    for (size_t i = 0; i < kMaxMappedTlsModules; ++i) {
+    for (size_t i = 0; i <= kMaxMappedTlsModules; ++i) {
         if (i != slot && g_tls_hosts[i].index == loaded.index) {
             FreeLibrary(loaded.module);
             DeleteFileW(clone_path.c_str());
@@ -336,6 +339,60 @@ TlsHostModule ensure_tls_host(size_t slot) {
     return g_tls_hosts[slot];
 }
 
+// Moves the host EXE's own _tls_index away from slot 0 into a dedicated tls_host clone whose 4 KiB TLS block is
+// pre-filled with 0x80000000 (_Init_thread_epoch), freeing TEB module TLS slot 0 for a /GA-compiled guest EXE.
+// Caller must hold g_tls_alloc_mutex.
+bool redirect_host_exe_tls_once() {
+    static std::atomic<int> state{0};  // 0=not run, 1=ok, -1=failed
+    const int cur = state.load(std::memory_order_acquire);
+    if (cur != 0) return cur > 0;
+
+    HMODULE self = GetModuleHandleW(nullptr);
+    if (!self) {
+        state.store(-1, std::memory_order_release);
+        return false;
+    }
+    auto* base = reinterpret_cast<uint8_t*>(self);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    auto* nt = at<IMAGE_NT_HEADERS64>(base, dos->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!dir.Size || !dir.VirtualAddress) {
+        state.store(1, std::memory_order_release);
+        return true;
+    }
+    auto* tls = at<IMAGE_TLS_DIRECTORY64>(base, dir.VirtualAddress);
+    if (!tls->AddressOfIndex) {
+        state.store(1, std::memory_order_release);
+        return true;
+    }
+    auto* self_index_ptr = reinterpret_cast<uint32_t*>(tls->AddressOfIndex);
+    if (*self_index_ptr != 0) {
+        state.store(1, std::memory_order_release);
+        return true;
+    }
+    const size_t raw_size = static_cast<size_t>(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
+    const size_t total_size = raw_size + tls->SizeOfZeroFill;
+    if (total_size > 4096) {
+        std::fprintf(stderr, "[rt] loader: host EXE TLS size (%zu) exceeds 4096-byte pad\n", total_size);
+        state.store(-1, std::memory_order_release);
+        return false;
+    }
+    const TlsHostModule helper = ensure_tls_host(kSelfTlsHostSlot);
+    if (helper.index == TLS_OUT_OF_INDEXES || helper.index >= kMaxModuleTlsSlots) {
+        state.store(-1, std::memory_order_release);
+        return false;
+    }
+    void** slots = module_tls_slots();
+    if (!slots || !slots[0] || !slots[helper.index]) {
+        state.store(-1, std::memory_order_release);
+        return false;
+    }
+    std::memcpy(slots[helper.index], slots[0], total_size);
+    *self_index_ptr = helper.index;
+    state.store(1, std::memory_order_release);
+    return true;
+}
+
 struct ThreadTlsSlot {
     Module* module = nullptr;
     uint64_t generation = 0;
@@ -344,8 +401,26 @@ struct ThreadTlsSlot {
     uint32_t index = kNoTlsIndex;
 };
 
-// Per-thread installation state for each reserved TLS slot.
-thread_local std::array<ThreadTlsSlot, kMaxMappedTlsModules> g_thread_tls_slots{};
+using ThreadTlsArray = std::array<ThreadTlsSlot, kMaxMappedTlsModules>;
+
+DWORD thread_tls_slots_key() {
+    static const DWORD key = TlsAlloc();
+    return key;
+}
+
+ThreadTlsArray* get_thread_tls_slots(bool create) {
+    const DWORD key = thread_tls_slots_key();
+    if (key == TLS_OUT_OF_INDEXES) return nullptr;
+    auto* arr = static_cast<ThreadTlsArray*>(TlsGetValue(key));
+    if (!arr && create) {
+        arr = new (std::nothrow) ThreadTlsArray{};
+        if (arr && !TlsSetValue(key, arr)) {
+            delete arr;
+            arr = nullptr;
+        }
+    }
+    return arr;
+}
 
 // Orders the TLS owners' publication, their `initialised` flags and their retirement against the thread events. Shared
 // in on_host_thread_event, exclusive only for those short writes (no allocation and no call that takes the Windows
@@ -368,7 +443,9 @@ struct ExclusiveTlsLock {
 // thread's record, so it also works after the module that installed the copy is gone.
 void release_thread_slot(size_t slot) {
     if (slot >= kMaxMappedTlsModules) return;
-    ThreadTlsSlot& entry = g_thread_tls_slots[slot];
+    ThreadTlsArray* arr = get_thread_tls_slots(false);
+    if (!arr) return;
+    ThreadTlsSlot& entry = (*arr)[slot];
     if (!entry.module && !entry.block) return;
     if (entry.block) {
         void** slots = module_tls_slots();
@@ -421,7 +498,9 @@ bool has_existing_thread_block(DWORD thread, const Module& m) {
 void install_thread_block(Module& m) {
     if (m.tls_slot >= kMaxMappedTlsModules) return;
     const size_t slot = m.tls_slot;
-    ThreadTlsSlot& entry = g_thread_tls_slots[slot];
+    ThreadTlsArray* arr = get_thread_tls_slots(true);
+    if (!arr) throw std::runtime_error(m.name + ": cannot allocate thread TLS state");
+    ThreadTlsSlot& entry = (*arr)[slot];
     if (entry.module == &m && entry.generation == m.tls_generation) return;
     if (has_existing_thread_block(GetCurrentThreadId(), m)) return;  // load() already gave this thread its copy
     if (entry.module) {
@@ -463,7 +542,9 @@ void install_thread_block(Module& m) {
 void uninstall_thread_block(Module& m) {
     if (m.tls_slot >= kMaxMappedTlsModules) return;
     const size_t slot = m.tls_slot;
-    ThreadTlsSlot& entry = g_thread_tls_slots[slot];
+    ThreadTlsArray* arr = get_thread_tls_slots(false);
+    if (!arr) return;
+    ThreadTlsSlot& entry = (*arr)[slot];
     if (entry.module != &m || entry.generation != m.tls_generation) return;
     if (m.tls_block == entry.block) {
         m.tls_block = nullptr;
@@ -791,10 +872,11 @@ void __cdecl on_host_thread_event(DWORD reason) {
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[rt] loader: thread detach: %s\n", e.what());
         }
+        ThreadTlsArray* arr = get_thread_tls_slots(false);
         for (size_t i = kMaxMappedTlsModules; i-- > 0;) {
             Module* m = g_tls_slot_owners[i].load();
-            if (m && g_thread_tls_slots[i].module == m &&
-                g_thread_tls_slots[i].generation == m->tls_generation) {
+            if (m && arr && (*arr)[i].module == m &&
+                (*arr)[i].generation == m->tls_generation) {
                 try {
                     if (m->initialised) run_callbacks(*m, DLL_THREAD_DETACH);
                 } catch (const std::exception& e) {
@@ -807,6 +889,10 @@ void __cdecl on_host_thread_event(DWORD reason) {
             } else {
                 release_thread_slot(i);  // installed by a module whose Loader is gone (or nothing to do)
             }
+        }
+        if (arr) {
+            TlsSetValue(thread_tls_slots_key(), nullptr);
+            delete arr;
         }
     }
 }
@@ -1384,6 +1470,7 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
 // getting its own index. All kMaxMappedTlsModules slots can be live at once; a further module is rejected rather than
 // silently sharing (and corrupting) a slot.
 void Loader::initialize_tls(Module& m) {
+    if (g_exe_tls_slot0_anchor == 0xFF) return;
     auto* tls = tls_directory(m);
     if (!tls) return;
     // A present but all-zero directory is treated like an absent one.
@@ -1422,9 +1509,20 @@ void Loader::initialize_tls(Module& m) {
 
         // Load/clone gta6rt_tls_host.dll OUTSIDE ExclusiveTlsLock so LoadLibraryExW cannot deadlock with
         // on_host_thread_event (which runs under the Windows loader lock and takes SharedTlsLock).
-        index = ensure_tls_host(slot).index;
-        if (index == TLS_OUT_OF_INDEXES)
-            throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
+        auto* self_dos = reinterpret_cast<IMAGE_DOS_HEADER*>(m.base);
+        auto* self_nt = at<IMAGE_NT_HEADERS64>(m.base, self_dos->e_lfanew);
+        const bool is_exe = (self_nt->FileHeader.Characteristics & IMAGE_FILE_DLL) == 0;
+        if (slot == 0 && is_exe) {
+            if (ensure_tls_host(0).index == TLS_OUT_OF_INDEXES)
+                throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
+            if (!redirect_host_exe_tls_once())
+                throw std::runtime_error(m.name + ": cannot redirect host EXE off module TLS index 0");
+            index = 0;
+        } else {
+            index = ensure_tls_host(slot).index;
+            if (index == TLS_OUT_OF_INDEXES)
+                throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
+        }
         if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
 
         // The fields are complete before a thread event can see the owner.
@@ -1457,9 +1555,10 @@ void Loader::initialize_tls(Module& m) {
         throw;
     }
     // The loading thread's copy is the one the Module records (and ~Loader frees on that thread).
-    if (g_thread_tls_slots[slot].module == &m && g_thread_tls_slots[slot].generation == m.tls_generation) {
-        m.tls_block = g_thread_tls_slots[slot].block;
-        m.tls_saved_block = g_thread_tls_slots[slot].saved;
+    if (ThreadTlsArray* arr = get_thread_tls_slots(false);
+        arr && (*arr)[slot].module == &m && (*arr)[slot].generation == m.tls_generation) {
+        m.tls_block = (*arr)[slot].block;
+        m.tls_saved_block = (*arr)[slot].saved;
     }
     // Threads started from here on get their copy from the helper DLL's DLL_THREAD_ATTACH; the ones already running
     // get it now.

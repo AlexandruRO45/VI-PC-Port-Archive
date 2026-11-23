@@ -186,13 +186,20 @@ HRESULT STDMETHODCALLTYPE begin_alloc_not_provided(void*) {
 
 // XThreadSetTimeSensitive / XThreadIsTimeSensitive / XThreadAssertNotTimeSensitive. The flag is per thread, as in
 // the GDK; nothing is enforced offline (a time-sensitive thread may still block).
-thread_local bool t_time_sensitive = false;
+DWORD time_sensitive_tls_slot() {
+    static const DWORD slot = TlsAlloc();
+    return slot;
+}
 HRESULT STDMETHODCALLTYPE thread_set_time_sensitive(void*, bool value) {
-    t_time_sensitive = value;
+    const DWORD slot = time_sensitive_tls_slot();
+    if (slot != TLS_OUT_OF_INDEXES) TlsSetValue(slot, value ? reinterpret_cast<LPVOID>(uintptr_t{1}) : nullptr);
     return S_OK;
 }
 void STDMETHODCALLTYPE thread_assert_not_time_sensitive(void*) {}
-bool STDMETHODCALLTYPE thread_is_time_sensitive(void*) { return t_time_sensitive; }
+bool STDMETHODCALLTYPE thread_is_time_sensitive(void*) {
+    const DWORD slot = time_sensitive_tls_slot();
+    return slot != TLS_OUT_OF_INDEXES && TlsGetValue(slot) != nullptr;
+}
 
 #define XM(fn) reinterpret_cast<const void*>(&Method<&fn>::call)
 const void* const kThreadingVtable[] = {
@@ -255,6 +262,14 @@ void STDMETHODCALLTYPE error_set_callback(void*, XErrorCallback callback, void* 
 }
 // void XErrorSetOptions(XErrorOptions, XErrorOptions), as Microsoft documents it: nothing to configure offline.
 void STDMETHODCALLTYPE error_set_options(void*, uint32_t, uint32_t) {}
+
+HRESULT __stdcall XErrorReport(HRESULT hr, const char* message) { return error_report(nullptr, hr, message); }
+void __stdcall XErrorSetCallback(XErrorCallback callback, void* context) {
+    error_set_callback(nullptr, callback, context);
+}
+void __stdcall XErrorSetOptions(uint32_t optionsDebuggerPresent, uint32_t optionsDebuggerNotPresent) {
+    error_set_options(nullptr, optionsDebuggerPresent, optionsDebuggerNotPresent);
+}
 
 const void* const kErrorVtable[] = {
     reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
@@ -1329,6 +1344,9 @@ SHIM_TABLE(xgameruntime,
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
     XGR(XGameRuntimeInitialize),
     XGR(XGameRuntimeUninitialize),
+    XGR(XErrorReport),
+    XGR(XErrorSetCallback),
+    XGR(XErrorSetOptions),
     XGR(XSystemGetDeviceType),
     XGR(XSystemGetConsoleId),
     XGR(XSystemGetAppMemoryUsageLimit),

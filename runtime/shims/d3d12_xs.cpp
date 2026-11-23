@@ -222,6 +222,74 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacyS
 // so the policy is accepted and ignored.
 HRESULT WINAPI configure_virtual_memory(void* /*desc*/) { return S_OK; }
 
+namespace dstorage_stub {
+
+constexpr unsigned kFactorySlots = 32;
+
+struct Factory {
+    const void* const* vtable;
+};
+
+extern Factory g_factory;
+
+HRESULT WINAPI qi(Factory* self, const IID* /*riid*/, void** out) {
+    if (!out) return E_POINTER;
+    *out = self;
+    return S_OK;
+}
+ULONG WINAPI add_ref(Factory*) { return 2; }
+ULONG WINAPI release(Factory*) { return 1; }
+
+template <unsigned Slot>
+HRESULT WINAPI method_stub(Factory*, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] dstorage: IDStorageFactory slot %u called (args 0x%llx 0x%llx 0x%llx 0x%llx); "
+                     "returning S_OK\n",
+                     Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                     static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+    }
+    if constexpr (Slot == 3 || Slot == 4) {
+        if (a3 && !IsBadWritePtr(reinterpret_cast<void*>(a3), sizeof(void*))) {
+            *reinterpret_cast<void**>(a3) = &g_factory;
+        }
+    } else if constexpr (Slot == 5) {
+        if (a4 && !IsBadWritePtr(reinterpret_cast<void*>(a4), sizeof(void*))) {
+            *reinterpret_cast<void**>(a4) = &g_factory;
+        }
+    }
+    return S_OK;
+}
+
+template <std::size_t... I>
+const void* const* build_factory_vtable(std::index_sequence<I...>) {
+    static void* table[kFactorySlots];
+    auto init_slot = [](unsigned idx) -> void* {
+        if (idx == 0) return reinterpret_cast<void*>(&qi);
+        if (idx == 1) return reinterpret_cast<void*>(&add_ref);
+        return reinterpret_cast<void*>(&release);
+    };
+    ((table[I] = I < 3 ? init_slot(static_cast<unsigned>(I))
+                       : reinterpret_cast<void*>(&method_stub<static_cast<unsigned>(I)>)),
+     ...);
+    return table;
+}
+
+Factory g_factory{build_factory_vtable(std::make_index_sequence<kFactorySlots>{})};
+
+}  // namespace dstorage_stub
+
+HRESULT WINAPI dstorage_get_factory(const IID* /*riid*/, void** out) {
+    if (!out) return E_POINTER;
+    *out = &dstorage_stub::g_factory;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[rt] dstorage: DStorageGetFactory -> offline stub factory %p\n", *out);
+    }
+    return S_OK;
+}
+
 }  // namespace
 
 SHIM_TABLE(d3d12_xs,
@@ -231,4 +299,7 @@ SHIM_TABLE(d3d12_xs,
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
     {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
+    {"XCRDAPI.dll", "DStorageGetFactory", reinterpret_cast<void*>(&dstorage_get_factory)},
+    {"dstorage.dll", "DStorageGetFactory", reinterpret_cast<void*>(&dstorage_get_factory)},
+    {"dstorage_xs.dll", "DStorageGetFactory", reinterpret_cast<void*>(&dstorage_get_factory)},
 );

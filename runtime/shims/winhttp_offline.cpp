@@ -25,11 +25,14 @@
 // Each refused server is logged once ("[rt] winhttp: offline, refused <host>:<port>"), which says what a title tried
 // to reach. Only images mapped by the loader see these: they are bound through the registry, the runtime's own code
 // calls the host directly.
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <winhttp.h>
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -432,6 +435,123 @@ BOOL WINAPI crack_url(LPCWSTR url, DWORD length, DWORD flags, LPURL_COMPONENTS c
 
 }  // namespace rt::winhttp
 
+namespace rt::ws2 {
+namespace {
+
+void log_offline_once() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::fprintf(stderr, "[rt] ws2_32: offline; sockets and name resolution fail with WSAENETDOWN/WSAHOST_NOT_FOUND\n");
+    });
+}
+
+int WINAPI wsa_startup(WORD version_required, LPWSADATA data) {
+    log_offline_once();
+    if (data) {
+        std::memset(data, 0, sizeof(*data));
+        data->wVersion = version_required;
+        data->wHighVersion = MAKEWORD(2, 2);
+        std::snprintf(data->szDescription, sizeof(data->szDescription), "Leonida Offline WinSock");
+        std::snprintf(data->szSystemStatus, sizeof(data->szSystemStatus), "Offline");
+    }
+    SetLastError(0);
+    return 0;
+}
+
+int WINAPI wsa_cleanup() {
+    SetLastError(0);
+    return 0;
+}
+
+int WINAPI wsa_get_last_error() { return static_cast<int>(GetLastError()); }
+void WINAPI wsa_set_last_error(int error) { SetLastError(static_cast<DWORD>(error)); }
+
+SOCKET WINAPI wsa_socket_fail() {
+    log_offline_once();
+    SetLastError(WSAENETDOWN);
+    return INVALID_SOCKET;
+}
+
+int WINAPI wsa_socket_error() {
+    log_offline_once();
+    SetLastError(WSAENETDOWN);
+    return SOCKET_ERROR;
+}
+
+int WINAPI wsa_close_socket(SOCKET) {
+    SetLastError(WSAENOTSOCK);
+    return SOCKET_ERROR;
+}
+
+int WINAPI wsa_fd_isset(SOCKET, fd_set*) { return 0; }
+
+int WINAPI wsa_getaddrinfo(const char*, const char*, const addrinfo*, addrinfo** res) {
+    log_offline_once();
+    if (res) *res = nullptr;
+    SetLastError(WSAHOST_NOT_FOUND);
+    return WSAHOST_NOT_FOUND;
+}
+
+void WINAPI wsa_freeaddrinfo(addrinfo*) {}
+
+int WINAPI wsa_getaddrinfo_w(const wchar_t*, const wchar_t*, const ADDRINFOW*, ADDRINFOW** res) {
+    log_offline_once();
+    if (res) *res = nullptr;
+    SetLastError(WSAHOST_NOT_FOUND);
+    return WSAHOST_NOT_FOUND;
+}
+
+void WINAPI wsa_freeaddrinfo_w(ADDRINFOW*) {}
+
+hostent* WINAPI wsa_gethostbyname(const char*) {
+    log_offline_once();
+    SetLastError(WSAHOST_NOT_FOUND);
+    return nullptr;
+}
+
+int WINAPI wsa_gethostname(char* name, int namelen) {
+    if (!name || namelen < 8) {
+        SetLastError(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+    std::memcpy(name, "leonida", 8);
+    SetLastError(0);
+    return 0;
+}
+
+uint16_t WINAPI wsa_htons(uint16_t v) { return static_cast<uint16_t>((v >> 8) | (v << 8)); }
+uint32_t WINAPI wsa_htonl(uint32_t v) {
+    return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v & 0xFF0000u) >> 8) | ((v >> 24) & 0xFFu);
+}
+
+unsigned long WINAPI wsa_inet_addr(const char* cp) {
+    if (!cp) return INADDR_NONE;
+    uint32_t parts[4] = {};
+    int count = 0;
+    const char* p = cp;
+    while (*p && count < 4) {
+        if (*p < '0' || *p > '9') return INADDR_NONE;
+        uint32_t val = 0;
+        while (*p >= '0' && *p <= '9') {
+            val = val * 10 + static_cast<uint32_t>(*p - '0');
+            if (val > 255) return INADDR_NONE;
+            ++p;
+        }
+        parts[count++] = val;
+        if (*p == '.') {
+            if (count == 4) return INADDR_NONE;
+            ++p;
+        } else if (*p != '\0') {
+            return INADDR_NONE;
+        }
+    }
+    if (count != 4) return INADDR_NONE;
+    return parts[0] | (parts[1] << 8) | (parts[2] << 16) | (parts[3] << 24);
+}
+
+}  // namespace
+}  // namespace rt::ws2
+
 namespace {
 using namespace rt::winhttp;
 }  // namespace
@@ -453,4 +573,43 @@ SHIM_TABLE(winhttp_offline,
     {"winhttp.dll", "WinHttpSetStatusCallback", reinterpret_cast<void*>(&set_status_callback)},
     {"winhttp.dll", "WinHttpCloseHandle", reinterpret_cast<void*>(&close_handle)},
     {"winhttp.dll", "WinHttpCrackUrl", reinterpret_cast<void*>(&crack_url)},
+);
+
+#define WS2_ENTRY(ord, name, fn) {"ws2_32.dll", ord, reinterpret_cast<void*>(&fn)}, {"ws2_32.dll", name, reinterpret_cast<void*>(&fn)}
+
+SHIM_TABLE(ws2_offline,
+    WS2_ENTRY("#1", "accept", rt::ws2::wsa_socket_fail),
+    WS2_ENTRY("#2", "bind", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#3", "closesocket", rt::ws2::wsa_close_socket),
+    WS2_ENTRY("#4", "connect", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#6", "getsockname", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#7", "getsockopt", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#8", "htonl", rt::ws2::wsa_htonl),
+    WS2_ENTRY("#9", "htons", rt::ws2::wsa_htons),
+    WS2_ENTRY("#10", "ioctlsocket", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#11", "inet_addr", rt::ws2::wsa_inet_addr),
+    WS2_ENTRY("#13", "listen", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#14", "ntohl", rt::ws2::wsa_htonl),
+    WS2_ENTRY("#15", "ntohs", rt::ws2::wsa_htons),
+    WS2_ENTRY("#16", "recv", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#17", "recvfrom", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#18", "select", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#19", "send", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#20", "sendto", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#21", "setsockopt", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#22", "shutdown", rt::ws2::wsa_socket_error),
+    WS2_ENTRY("#23", "socket", rt::ws2::wsa_socket_fail),
+    WS2_ENTRY("#52", "gethostbyname", rt::ws2::wsa_gethostbyname),
+    WS2_ENTRY("#57", "gethostname", rt::ws2::wsa_gethostname),
+    WS2_ENTRY("#111", "WSAGetLastError", rt::ws2::wsa_get_last_error),
+    WS2_ENTRY("#112", "WSASetLastError", rt::ws2::wsa_set_last_error),
+    WS2_ENTRY("#115", "WSAStartup", rt::ws2::wsa_startup),
+    WS2_ENTRY("#116", "WSACleanup", rt::ws2::wsa_cleanup),
+    WS2_ENTRY("#151", "__WSAFDIsSet", rt::ws2::wsa_fd_isset),
+    {"ws2_32.dll", "getaddrinfo", reinterpret_cast<void*>(&rt::ws2::wsa_getaddrinfo)},
+    {"ws2_32.dll", "freeaddrinfo", reinterpret_cast<void*>(&rt::ws2::wsa_freeaddrinfo)},
+    {"ws2_32.dll", "GetAddrInfoW", reinterpret_cast<void*>(&rt::ws2::wsa_getaddrinfo_w)},
+    {"ws2_32.dll", "FreeAddrInfoW", reinterpret_cast<void*>(&rt::ws2::wsa_freeaddrinfo_w)},
+    {"ws2_32.dll", "WSASocketA", reinterpret_cast<void*>(&rt::ws2::wsa_socket_fail)},
+    {"ws2_32.dll", "WSASocketW", reinterpret_cast<void*>(&rt::ws2::wsa_socket_fail)},
 );

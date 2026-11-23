@@ -688,8 +688,56 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
 constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
+void* commit_region_or_placeholder(void* address, SIZE_T size, DWORD protect) {
+    if (void* p = VirtualAlloc(address, size, MEM_COMMIT, protect)) return p;
+    if (!address || size == 0 || !placeholder_api().available()) return nullptr;
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const uintptr_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address) & ~(gran - 1);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(address) + size + gran - 1) & ~(gran - 1);
+    uintptr_t cur = start;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cur), &mbi, sizeof(mbi))) return nullptr;
+        const uintptr_t reg_base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const uintptr_t reg_end = reg_base + mbi.RegionSize;
+        const uintptr_t step_end = reg_end < end ? reg_end : end;
+        const SIZE_T chunk = static_cast<SIZE_T>(step_end - cur);
+        if (mbi.State == MEM_COMMIT) {
+            DWORD old_prot = 0;
+            VirtualProtect(reinterpret_cast<void*>(cur), chunk, protect, &old_prot);
+            cur = step_end;
+            continue;
+        }
+        if (mbi.State != MEM_RESERVE) return nullptr;
+        if (void* p = VirtualAlloc(reinterpret_cast<void*>(cur), chunk, MEM_COMMIT, protect)) {
+            (void)p;
+            cur = step_end;
+            continue;
+        }
+        const uintptr_t alloc_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+        if (cur > alloc_base || step_end < reg_end) {
+            VirtualFree(reinterpret_cast<void*>(cur), chunk, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        }
+        if (!placeholder_api().virtual_alloc2(GetCurrentProcess(), reinterpret_cast<void*>(cur), chunk,
+                                              MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, protect, nullptr,
+                                              0)) {
+            return nullptr;
+        }
+        cur = step_end;
+    }
+    return address;
+}
+
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    const DWORD clean_type = allocation_type & ~(kMemGraphics | kMemTitle);
+    const DWORD prot = host_protect(protect);
+    LPVOID result = VirtualAlloc(address, size, clean_type, prot);
+    if (!result && address != nullptr && size != 0 && (clean_type & MEM_COMMIT) && !(clean_type & MEM_RESERVE)) {
+        return commit_region_or_placeholder(address, size, prot);
+    }
+    return result;
 }
 
 }  // namespace
