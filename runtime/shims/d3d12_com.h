@@ -49,6 +49,9 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out,
                              IUnknown* device = nullptr, const QueueClock& clock = {},
                              std::shared_ptr<void> queue_lease = {});
+// Borrows the Vulkan queue of a DIRECT queue on this context. On failure, the output arguments are unchanged.
+bool get_dxgi_present_queue(IUnknown* object, const leonida::VulkanContext& context,
+                            VkQueue& queue, std::uint32_t& family);
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
                             void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);

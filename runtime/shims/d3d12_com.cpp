@@ -1237,6 +1237,13 @@ public:
     bool ok() const { return queue_.ok(); }
     leonida::ReplayResult last_result() const { return last_result_; }
 
+    bool present_queue(const leonida::VulkanContext& context, VkQueue& queue, std::uint32_t& family) const {
+        if (&context_ != &context || desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT || !vk_queue_) return false;
+        queue = vk_queue_;
+        family = family_;
+        return true;
+    }
+
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override {
         d3d12_trace::record("ID3D12CommandQueue::GetDesc");
         D3D12_COMMAND_QUEUE_DESC desc = desc_;
@@ -1558,6 +1565,13 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
     }
     object->attach_device(device);
     return hand_out(object, riid, out);
+}
+
+bool get_dxgi_present_queue(IUnknown* object, const leonida::VulkanContext& context,
+                            VkQueue& queue, std::uint32_t& family) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(object)) object = real;
+    const CommandQueue* command_queue = CommandQueue::from(object);
+    return command_queue && command_queue->present_queue(context, queue, family);
 }
 
 HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device) {

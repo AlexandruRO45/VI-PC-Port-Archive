@@ -422,6 +422,9 @@ What is implemented (all of it testable without the game):
   `ID3D12ResourceStubs`) registered directly with `VulkanContext`, supporting `CreateSwapChainForHwnd`,
   `GetCurrentBackBufferIndex`, `GetBuffer`, `CreateRenderTargetView`, `Present`, and `ResizeBuffers` (preserving
   explicit buffer dimensions even when the HWND client size is unchanged via an offscreen backbuffer + blit path).
+  HWND swapchains created with `FLIP_SEQUENTIAL` support `Present1` dirty rectangles and scroll. The compositor
+  keeps the last accepted frame and applies the scroll before copying the dirty regions from the application's
+  backbuffer. The first frame after creation or resize must update the entire image.
   The factory answers up to `IDXGIFactory7` (D3D-2). `EnumAdapterByGpuPreference` returns the one Vulkan adapter
   at index 0 for every preference. It accepts a preference outside the enum, as the host does, and gives
   `DXGI_ERROR_INVALID_CALL` for a null `out` and `DXGI_ERROR_NOT_FOUND` past the end. The adapter list never

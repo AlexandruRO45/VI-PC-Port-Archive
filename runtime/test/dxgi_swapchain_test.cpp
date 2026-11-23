@@ -11,12 +11,14 @@
 #include "vulkan_loader.h"
 #include "../src/vulkan_device_filter.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -397,6 +399,7 @@ int main() {
 
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     std::uint32_t family = 0;
+    std::uint32_t queue_count = 1;
     VkPhysicalDeviceProperties chosen{};
     int best_rank = -1;
     for (auto cand : physicals) {
@@ -415,6 +418,7 @@ int main() {
                 best_rank = rank;
                 physical = cand;
                 family = i;
+                queue_count = std::min(fams[i].queueCount, 2u);
                 chosen = props;
             }
             break;
@@ -437,11 +441,11 @@ int main() {
     f12.timelineSemaphore = VK_TRUE;
     f12.separateDepthStencilLayouts = VK_TRUE;
 
-    const float prio = 1.0f;
+    const float priorities[]{1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = family;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &prio;
+    qci.queueCount = queue_count;
+    qci.pQueuePriorities = priorities;
 
     const char* dev_ext = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f12};
@@ -454,8 +458,9 @@ int main() {
     if (create_dev(physical, &dci, nullptr, &vk_dev) != VK_SUCCESS) return fail("vkCreateDevice");
     const auto destroy_dev = reinterpret_cast<PFN_vkDestroyDevice>(gdpa(vk_dev, "vkDestroyDevice"));
     const auto wait_idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(gdpa(vk_dev, "vkDeviceWaitIdle"));
+    const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(gdpa(vk_dev, "vkGetDeviceQueue"));
     VkQueue vk_queue = VK_NULL_HANDLE;
-    reinterpret_cast<PFN_vkGetDeviceQueue>(gdpa(vk_dev, "vkGetDeviceQueue"))(vk_dev, family, 0, &vk_queue);
+    get_queue(vk_dev, family, 0, &vk_queue);
 
     rt::d3d12::VulkanDeviceInfo info{};
     info.get_instance_proc = gipa;
@@ -464,6 +469,12 @@ int main() {
     info.device = vk_dev;
     info.queue = vk_queue;
     info.queue_family = family;
+    if (queue_count > 1) {
+        VkQueue second_queue = VK_NULL_HANDLE;
+        get_queue(vk_dev, family, 1, &second_queue);
+        if (!second_queue || second_queue == vk_queue) return fail("second graphics queue");
+        info.command_queues = {vk_queue, second_queue};
+    }
     info.separate_depth_stencil_layouts = true;
 
     ID3D12Device* dev = nullptr;
@@ -620,8 +631,12 @@ int main() {
     const D3D12_CPU_DESCRIPTOR_HANDLE h_rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
 
     UINT64 fence_val = 0;
+    struct PixelPatch { RECT area; std::uint8_t r, g, b; };
     auto run_clear_readback_present = [&](UINT exp_w, UINT exp_h, const float rgba[4], std::uint8_t exp_r,
-                                          std::uint8_t exp_g, std::uint8_t exp_b) -> int {
+                                          std::uint8_t exp_g, std::uint8_t exp_b,
+                                          const PixelPatch* patch = nullptr,
+                                          ID3D12CommandQueue* render_queue = nullptr) -> int {
+        if (!render_queue) render_queue = queue;
         DXGI_SWAP_CHAIN_DESC1 cur_desc{};
         if (FAILED(sc->GetDesc1(&cur_desc)) || cur_desc.Width != exp_w || cur_desc.Height != exp_h) {
             std::fprintf(stderr, "FAIL: GetDesc1 (%ux%u) != expected (%ux%u)\n", cur_desc.Width, cur_desc.Height,
@@ -672,10 +687,13 @@ int main() {
 
         alloc->Reset();
         cl->Reset(alloc, nullptr);
-        auto b_rt = make_transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        cl->ResourceBarrier(1, &b_rt);
-        cl->ClearRenderTargetView(h_rtv, rgba, 0, nullptr);
-        auto b_src = make_transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (rgba) {
+            auto b_rt = make_transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            cl->ResourceBarrier(1, &b_rt);
+            cl->ClearRenderTargetView(h_rtv, rgba, 0, nullptr);
+        }
+        const auto before_copy = rgba ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_PRESENT;
+        auto b_src = make_transition(bb, before_copy, D3D12_RESOURCE_STATE_COPY_SOURCE);
         cl->ResourceBarrier(1, &b_src);
         D3D12_TEXTURE_COPY_LOCATION src_loc{bb, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
         D3D12_TEXTURE_COPY_LOCATION dst_loc{};
@@ -688,8 +706,8 @@ int main() {
         cl->Close();
 
         ID3D12CommandList* lists[1] = {cl};
-        queue->ExecuteCommandLists(1, lists);
-        queue->Signal(fence, ++fence_val);
+        render_queue->ExecuteCommandLists(1, lists);
+        render_queue->Signal(fence, ++fence_val);
         if (!wait_fence(fence, fence_val)) {
             rb->Release();
             bb->Release();
@@ -707,6 +725,7 @@ int main() {
                               bb_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
         bool mismatch = false;
         std::uint8_t bad_r = 0, bad_g = 0, bad_b = 0, bad_a = 0;
+        std::uint8_t want_r = exp_r, want_g = exp_g, want_b = exp_b;
         for (UINT y = 0; y < exp_h && !mismatch; ++y) {
             const std::uint8_t* row = base + static_cast<std::size_t>(y) * fp.Footprint.RowPitch;
             for (UINT x = 0; x < exp_w; ++x) {
@@ -715,8 +734,13 @@ int main() {
                 const std::uint8_t g = px[1];
                 const std::uint8_t b = is_bgra ? px[0] : px[2];
                 const std::uint8_t a = px[3];
-                if (std::abs(int(r) - int(exp_r)) > 1 || std::abs(int(g) - int(exp_g)) > 1 ||
-                    std::abs(int(b) - int(exp_b)) > 1 || a != 255) {
+                const bool in_patch = patch && LONG(x) >= patch->area.left && LONG(x) < patch->area.right &&
+                                      LONG(y) >= patch->area.top && LONG(y) < patch->area.bottom;
+                want_r = in_patch ? patch->r : exp_r;
+                want_g = in_patch ? patch->g : exp_g;
+                want_b = in_patch ? patch->b : exp_b;
+                if (std::abs(int(r) - int(want_r)) > 1 || std::abs(int(g) - int(want_g)) > 1 ||
+                    std::abs(int(b) - int(want_b)) > 1 || a != 255) {
                     mismatch = true;
                     bad_r = r;
                     bad_g = g;
@@ -732,7 +756,7 @@ int main() {
 
         if (mismatch) {
             std::fprintf(stderr, "FAIL: backbuffer pixel (%u,%u,%u,%u) != expected (%u,%u,%u,255)\n", bad_r, bad_g,
-                         bad_b, bad_a, exp_r, exp_g, exp_b);
+                         bad_b, bad_a, want_r, want_g, want_b);
             return 1;
         }
         if (FAILED(sc->Present(0, 0))) return fail("Present");
@@ -1021,6 +1045,10 @@ int main() {
         UINT count_after_test = 0;
         if (FAILED(sc->GetLastPresentCount(&count_after_test)) || count_after_test != count_before)
             return fail("DXGI_PRESENT_TEST should not increment GetLastPresentCount");
+        RECT dirty{0, 0, 2, 2};
+        const DXGI_PRESENT_PARAMETERS partial{1, &dirty, nullptr, nullptr};
+        if (sc->Present1(0, 0, &partial) != DXGI_ERROR_INVALID_CALL || sc->GetCurrentBackBufferIndex() != before)
+            return fail("FLIP_DISCARD rejects Present1 dirty rectangles");
         if (sc->Present(5, 0) != DXGI_ERROR_INVALID_CALL || sc->GetCurrentBackBufferIndex() != before)
             return fail("Present(5, 0) should be DXGI_ERROR_INVALID_CALL and present nothing");
         if (sc->GetLastPresentCount(nullptr) != E_INVALIDARG)
@@ -1650,8 +1678,101 @@ int main() {
         DestroyWindow(hwnd_legacy);
     }
 
-    rtv_heap->Release();
     sc->Release();
+    sc = nullptr;
+    ID3D12CommandQueue* sequential_queue = queue;
+    if (queue_count > 1 && FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&sequential_queue))))
+        return fail("CreateCommandQueue for FLIP_SEQUENTIAL");
+
+    // Present1 uses the caller's FLIP_SEQUENTIAL effect and accepts partial metadata only after a full frame.
+    // The deterministic pixel checks live in dxgi_swapchain_count_test, without a desktop capture dependency.
+    {
+        auto sequential = scd;
+        sequential.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        IDXGISwapChain1* chain = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(sequential_queue, hwnd, &sequential, nullptr, nullptr, &chain)) ||
+            !chain)
+            return fail("CreateSwapChainForHwnd(FLIP_SEQUENTIAL)");
+        const HRESULT queried = chain->QueryInterface(IID_PPV_ARGS(&sc));
+        chain->Release();
+        if (FAILED(queried) || !sc) return fail("FLIP_SEQUENTIAL IDXGISwapChain3");
+        DXGI_SWAP_CHAIN_DESC1 desc1{};
+        DXGI_SWAP_CHAIN_DESC legacy{};
+        if (FAILED(sc->GetDesc1(&desc1)) || FAILED(sc->GetDesc(&legacy)) ||
+            desc1.SwapEffect != sequential.SwapEffect || legacy.SwapEffect != sequential.SwapEffect ||
+            desc1.BufferCount != sequential.BufferCount)
+            return fail("FLIP_SEQUENTIAL GetDesc/GetDesc1");
+
+        RECT dirty{44, 0, 76, 128}, scroll{32, 0, 92, 128};
+        POINT offset{32, 0};
+        const DXGI_PRESENT_PARAMETERS full{}, partial{1, &dirty, &scroll, &offset};
+        const auto unchanged = [&](UINT index, UINT count) {
+            UINT current = 0;
+            return sc->GetCurrentBackBufferIndex() == index && SUCCEEDED(sc->GetLastPresentCount(&current)) &&
+                   current == count;
+        };
+        UINT before = 0;
+        const UINT initial = sc->GetCurrentBackBufferIndex();
+        if (FAILED(sc->GetLastPresentCount(&before)) || sc->Present1(0, 0, &partial) != DXGI_ERROR_INVALID_CALL ||
+            !unchanged(initial, before))
+            return fail("Present1 partial frame before full history");
+
+        if (run_clear_readback_present(128, 128, green, 0, 255, 0, nullptr, sequential_queue) != 0) return 1;
+        const UINT index = sc->GetCurrentBackBufferIndex();
+        if (FAILED(sc->GetLastPresentCount(&before)) || sc->Present1(0, DXGI_PRESENT_TEST, &full) != S_OK ||
+            sc->Present1(0, DXGI_PRESENT_TEST, &partial) != DXGI_ERROR_INVALID_CALL || !unchanged(index, before))
+            return fail("Present1 TEST validates the hints without presenting");
+        RECT outside{0, 0, 129, 1};
+        const DXGI_PRESENT_PARAMETERS invalid[]{{1, nullptr, nullptr, nullptr}, {1, &outside, nullptr, nullptr}};
+        for (const auto& bad : invalid)
+            if (sc->Present1(0, 0, &bad) != DXGI_ERROR_INVALID_CALL || !unchanged(index, before))
+                return fail("Present1 rejected hints changed swapchain state");
+
+        ID3D12Resource* bb = nullptr;
+        if (FAILED(sc->GetBuffer(index, IID_PPV_ARGS(&bb))) || !bb) return fail("Present1 GetBuffer");
+        dev->CreateRenderTargetView(bb, nullptr, h_rtv);
+        auto state = make_transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const float yellow[]{1, 1, 0, 1};
+        bool rendered = false;
+        if (SUCCEEDED(alloc->Reset()) && SUCCEEDED(cl->Reset(alloc, nullptr))) {
+            cl->ResourceBarrier(1, &state);
+            cl->ClearRenderTargetView(h_rtv, yellow, 1, &dirty);
+            std::swap(state.Transition.StateBefore, state.Transition.StateAfter);
+            cl->ResourceBarrier(1, &state);
+            if (SUCCEEDED(cl->Close())) {
+                ID3D12CommandList* lists[]{cl};
+                sequential_queue->ExecuteCommandLists(1, lists);
+                rendered = true;
+            }
+        }
+        bb->Release();
+        UINT count = 0;
+        if (!rendered || sc->Present1(0, 0, &partial) != S_OK || FAILED(sc->GetLastPresentCount(&count)) ||
+            count != before + 1 || sc->GetCurrentBackBufferIndex() != (index + 1) % sequential.BufferCount)
+            return fail("Present1 dirty and scroll must present one frame and advance the ring");
+        if (FAILED(sequential_queue->Signal(fence, ++fence_val)) || !wait_fence(fence, fence_val))
+            return fail("Present1 fence before readback");
+
+        // Present the other slot without writing it, then read the reacquired partial frame through D3D12.
+        const PixelPatch yellow_patch{dirty, 255, 255, 0};
+        if (sc->Present(0, 0) != S_OK || sc->GetCurrentBackBufferIndex() != index)
+            return fail("reacquire the Present1 backbuffer");
+        if (run_clear_readback_present(128, 128, nullptr, 0, 255, 0, &yellow_patch, sequential_queue) != 0) return 1;
+
+        if (FAILED(sc->ResizeBuffers(0, 96, 80, DXGI_FORMAT_UNKNOWN, 0)) || FAILED(sc->GetDesc1(&desc1)) ||
+            desc1.SwapEffect != sequential.SwapEffect || desc1.Width != 96 || desc1.Height != 80)
+            return fail("ResizeBuffers preserves FLIP_SEQUENTIAL");
+        RECT resized_dirty{4, 4, 16, 16};
+        const DXGI_PRESENT_PARAMETERS after{1, &resized_dirty, nullptr, nullptr};
+        const UINT resized = sc->GetCurrentBackBufferIndex();
+        if (FAILED(sc->GetLastPresentCount(&before)) || sc->Present1(0, 0, &after) != DXGI_ERROR_INVALID_CALL ||
+            !unchanged(resized, before) || sc->Present1(0, 0, &full) != S_OK || sc->Present1(0, 0, &after) != S_OK)
+            return fail("ResizeBuffers resets history until a full Present1");
+    }
+
+    sc->Release();
+    if (sequential_queue != queue) sequential_queue->Release();
+    rtv_heap->Release();
     fence->Release();
     cl->Release();
     alloc->Release();
@@ -1670,6 +1791,6 @@ int main() {
     }
     std::printf("device: %s (validation %s)\n", chosen.deviceName, val_active ? "on" : "off");
     std::printf("dxgi_swapchain_test: PASS (CreateSwapChain, CreateSwapChainForHwnd, CreateSwapChainForCoreWindow, occlusion status, "
-                "GetBuffer+GetDesc, clear+readback, Present, ResizeBuffers; 0 validation errors)\n");
+                "GetBuffer+GetDesc, clear+readback, Present, Present1 dirty/scroll, ResizeBuffers; 0 validation errors)\n");
     return 0;
 }

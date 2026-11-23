@@ -1,4 +1,5 @@
 #include "dxgi_com.h"
+#include "d3d12_com.h"
 #include "d3d12_stubs.h"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <tuple>
@@ -216,6 +218,8 @@ public:
 
     ~SwapChain() {
         unregister_buffers();
+        // The device may be kept alive by this swapchain's queue reference alone.
+        swapchain_.close();
         if (restrict_to_output_) restrict_to_output_->Release();
         if (waitable_) CloseHandle(waitable_);
         if (device_) device_->Release();
@@ -225,11 +229,13 @@ public:
     bool init(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1& desc, VkFormat vk_fmt) {
         hwnd_ = hwnd;
         flags_ = desc.Flags;
+        swap_effect_ = desc.SwapEffect;
         const VkExtent2D size = size_or_client(desc.Width, desc.Height, {256u, 256u});
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
         const bool allow_tearing = (flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
-        if (!swapchain_.create(hwnd, w, h, vk_fmt, desc.BufferCount, allow_tearing)) return false;
+        const bool preserve_frames = swap_effect_ == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        if (!swapchain_.create(hwnd, w, h, vk_fmt, desc.BufferCount, allow_tearing, preserve_frames)) return false;
         if (flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
             // DXGI: waitable swapchains default to maximum frame latency 1.
             max_frame_latency_.store(1, std::memory_order_relaxed);
@@ -295,20 +301,7 @@ public:
 
     // IDXGISwapChain
     HRESULT STDMETHODCALLTYPE Present(UINT sync, UINT flags) override {
-        if (sync > 4) return DXGI_ERROR_INVALID_CALL;
-        if ((flags & DXGI_PRESENT_ALLOW_TEARING) &&
-            (sync != 0 || !(flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
-            return DXGI_ERROR_INVALID_CALL;
-        if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
-        const std::uint32_t cur = swapchain_.current_back_buffer_index();
-        if (!swapchain_.present(cur)) return E_FAIL;
-        ++present_count_;
-        LARGE_INTEGER qpc{};
-        if (QueryPerformanceCounter(&qpc)) last_present_qpc_.store(qpc.QuadPart, std::memory_order_relaxed);
-        std::uint32_t next = 0;
-        if (!swapchain_.acquire_next_image(next)) return E_FAIL;
-        if (waitable_) ReleaseSemaphore(waitable_, 1, nullptr);
-        return S_OK;
+        return present_frame(sync, flags);
     }
 
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT buffer, REFIID riid, void** surface) override {
@@ -336,7 +329,7 @@ public:
         desc->BufferCount = swapchain_.image_count();
         desc->OutputWindow = hwnd_;
         desc->Windowed = TRUE;
-        desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc->SwapEffect = swap_effect_;
         desc->Flags = flags_;
         return S_OK;
     }
@@ -359,18 +352,26 @@ public:
         // DXGI refuses to resize while the app still holds a back buffer reference.
         for (auto* bb : buffers_)
             if (bb->held_by_app()) return DXGI_ERROR_INVALID_CALL;
-        const std::size_t target_count = count ? count : buffers_.size();
+        const std::size_t target_count = count ? count : swapchain_.requested_image_count();
         if (node_masks && !std::all_of(node_masks, node_masks + target_count, [](UINT mask) { return mask <= 1; }))
             return DXGI_ERROR_INVALID_CALL;
-        if (present_queues && !std::all_of(present_queues, present_queues + target_count, is_direct_present_queue))
-            return DXGI_ERROR_INVALID_CALL;
-        unregister_buffers();
+        if (present_queues) {
+            const auto compatible_queue = [&](IUnknown* candidate) {
+                if (swap_effect_ != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) return is_direct_present_queue(candidate);
+                VkQueue queue = VK_NULL_HANDLE;
+                std::uint32_t family = 0;
+                return d3d12::get_dxgi_present_queue(candidate, context_, queue, family) &&
+                       swapchain_.uses_queue(queue, family);
+            };
+            if (!std::all_of(present_queues, present_queues + target_count, compatible_queue))
+                return DXGI_ERROR_INVALID_CALL;
+        }
         const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
         const UINT next_flags = flags ? flags : flags_;
         const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
-        if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
+        if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing, [this] { unregister_buffers(); })) return E_FAIL;
         statistics_disjoint_.store(true, std::memory_order_relaxed);
         flags_ = next_flags;
         register_buffers();
@@ -423,7 +424,7 @@ public:
         desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc->BufferCount = swapchain_.image_count();
         desc->Scaling = DXGI_SCALING_STRETCH;
-        desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc->SwapEffect = swap_effect_;
         desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
         desc->Flags = flags_;
         return S_OK;
@@ -440,8 +441,43 @@ public:
         *out = nullptr;
         return DXGI_ERROR_INVALID_CALL;
     }
-    HRESULT STDMETHODCALLTYPE Present1(UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS*) override {
-        return Present(sync, flags);
+    HRESULT STDMETHODCALLTYPE Present1(UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) override {
+        if (!parameters) return DXGI_ERROR_INVALID_CALL;
+        if (!parameters->DirtyRectsCount && !parameters->pScrollRect)
+            return present_frame(sync, flags);
+        if ((flags & DXGI_PRESENT_TEST) || swap_effect_ != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL ||
+            (parameters->DirtyRectsCount && !parameters->pDirtyRects) || !swapchain_.has_present_history())
+            return DXGI_ERROR_INVALID_CALL;
+
+        const auto rect = [](const RECT& value) {
+            return leonida::Rect{value.left, value.top, value.right, value.bottom};
+        };
+        const VkExtent2D extent = swapchain_.extent();
+        const auto fits = [&](const leonida::Rect& value) {
+            return leonida::present_rect_fits(value, extent.width, extent.height);
+        };
+        leonida::PresentRegions regions{};
+        if (parameters->pScrollRect) {
+            const auto destination = rect(*parameters->pScrollRect);
+            if (!fits(destination)) return DXGI_ERROR_INVALID_CALL;
+            const POINT offset = parameters->pScrollOffset ? *parameters->pScrollOffset : POINT{};
+            regions.scroll = leonida::present_scroll_copy({destination, offset.x, offset.y}, extent.width, extent.height);
+            if (!regions.scroll) return DXGI_ERROR_INVALID_CALL;
+        }
+
+        std::vector<leonida::Rect> dirty;
+        try {
+            dirty.reserve(parameters->DirtyRectsCount);
+            for (UINT i = 0; i < parameters->DirtyRectsCount; ++i) {
+                const auto area = rect(parameters->pDirtyRects[i]);
+                if (!fits(area)) return DXGI_ERROR_INVALID_CALL;
+                dirty.push_back(area);
+            }
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        regions.dirty = dirty;
+        return present_frame(sync, flags, &regions);
     }
     BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return FALSE; }
     HRESULT STDMETHODCALLTYPE GetRestrictToOutput(IDXGIOutput** out) override {
@@ -532,6 +568,23 @@ public:
     }
 
 private:
+    HRESULT present_frame(UINT sync, UINT flags, const leonida::PresentRegions* regions = nullptr) {
+        if (sync > 4) return DXGI_ERROR_INVALID_CALL;
+        if ((flags & DXGI_PRESENT_ALLOW_TEARING) &&
+            (sync != 0 || !(flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
+            return DXGI_ERROR_INVALID_CALL;
+        if (flags & DXGI_PRESENT_TEST) return S_OK;
+        const std::uint32_t cur = swapchain_.current_back_buffer_index();
+        if (!swapchain_.present(cur, regions)) return E_FAIL;
+        ++present_count_;
+        LARGE_INTEGER qpc{};
+        if (QueryPerformanceCounter(&qpc)) last_present_qpc_.store(qpc.QuadPart, std::memory_order_relaxed);
+        std::uint32_t next = 0;
+        if (!swapchain_.acquire_next_image(next)) return E_FAIL;
+        if (waitable_) ReleaseSemaphore(waitable_, 1, nullptr);
+        return S_OK;
+    }
+
     // DXGI: a zero width or height takes the whole size from the window's client area (host-measured).
     VkExtent2D size_or_client(UINT width, UINT height, VkExtent2D fallback) const {
         if (width && height) return {width, height};
@@ -580,6 +633,7 @@ private:
     HWND hwnd_ = nullptr;
     IDXGIOutput* restrict_to_output_ = nullptr;
     UINT flags_ = 0;
+    DXGI_SWAP_EFFECT swap_effect_ = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
     std::atomic<UINT> present_count_{0};
@@ -1038,7 +1092,13 @@ public:
         if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
         const VkFormat vk_fmt = dxgi_to_vk_format(desc->Format);
         if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
-        auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
+        VkQueue present_queue = queue_;
+        std::uint32_t present_family = queue_family_;
+        // Incremental composition reads the backbuffer on the same queue the application renders to.
+        if (desc->SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL &&
+            !d3d12::get_dxgi_present_queue(device, context_, present_queue, present_family))
+            return DXGI_ERROR_INVALID_CALL;
+        auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, present_queue, present_family);
         if (restrict_to_output) sc->set_restrict_to_output(restrict_to_output);
         if (!sc->init(hwnd, *desc, vk_fmt)) {
             sc->Release();
