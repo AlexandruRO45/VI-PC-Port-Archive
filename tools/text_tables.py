@@ -35,10 +35,13 @@ keeps every table's own guess in ``guess`` and its nested archive's offset in ``
 Usage:
     python -I text_tables.py <source> [<source> ...] [--labels FILE ...]
                              [--dialogue dialogue.csv] [--tables tables.csv] [--strings strings.csv]
+                             [--variants variants.csv]
 
 A source is an ``rpf9_carve.py`` directory, an ``.rpf`` archive (read through ``gamedata_index.py``; nothing is
 written), or files and directories of whole resources. ``--labels`` adds label names (word lists or a
-``hashdict.py`` JSON) so non-dialogue strings and table groups can be named. Standard library only. The outputs
+``hashdict.py`` JSON) so non-dialogue strings and table groups can be named. Every report, ``--variants``
+included, is written from the same single pass over the sources, so no report describes a different revision
+of the input than another. Standard library only. The outputs
 quote game text: they are local work products and must not be committed or attached to an issue. The tests use
 synthetic resources.
 """
@@ -99,6 +102,14 @@ SCRIPTS = (("ja", re.compile(r"[\u3040-\u30ff]")), ("ko", re.compile(r"[\uac00-\
            ("zh", re.compile(r"[\u4e00-\u9fff]")), ("ru", re.compile(r"[\u0400-\u04ff]")))
 LATIN_WORD = re.compile(r"[a-zà-ÿąćęłńóśźż]+")
 UNKNOWN = "xx"
+VARIANT_GROUP_TAG = 0x956A9DF5
+VARIANT_RECORD_TAG = 0x10075946
+TEXT_GENDERS = ("None", "Male", "Female", "Other")
+TEXT_PLURALITIES = ("None", "Singular", "Few", "Many")
+TEXT_SOURCES = (
+    "None", "Param1", "Param2", "Param3", "Param4", "Param5", "Param6",
+    "Param7", "Param8", "Param9", "Player", "Speaker", "Target",
+)
 
 
 # ---- string tables ----
@@ -202,6 +213,75 @@ def table_group(labels) -> str:
             break
         best = prefix
     return best
+
+
+def _descriptor_entries(buf: bytes, at: int) -> list:
+    """Return [(tag, start, size), ...] from the first blob descriptor entry at `at`."""
+    entries = []
+    while at + 16 <= len(buf):
+        tag, size, lo, hi = struct.unpack_from("<IIII", buf, at)
+        if hi or lo >> 28 != 5:
+            break
+        start = lo & 0x0FFFFFFF
+        if start + size > len(buf):
+            break
+        entries.append((tag, start, size))
+        at += 16
+    return entries
+
+
+def variant_tables(buf: bytes):
+    """Yield {label_hash: [variant_dict, ...]} for tables carrying 0x956a9df5 / 0x10075946 variant groups."""
+    for m in DESCRIPTOR.finditer(buf):
+        hash_bytes = struct.unpack("<I", m.group(2))[0]
+        hashes = _ptr(m.group(3))
+        entries = _descriptor_entries(buf, m.end() - 16)
+        chunks = [(start, start + size) for tag, start, size in entries if tag == 0x10]
+        groups = next(((start, size) for tag, start, size in entries if tag == VARIANT_GROUP_TAG), None)
+        records = next(((start, size) for tag, start, size in entries if tag == VARIANT_RECORD_TAG), None)
+        if not (0 < hash_bytes < len(buf) and hashes + hash_bytes <= len(buf) and chunks and groups and records):
+            continue
+        g_start, g_size = groups
+        r_start, r_size = records
+        out = {}
+        for o in range(hashes, hashes + hash_bytes - 15, 16):
+            h, zero = struct.unpack_from("<II", buf, o)
+            if not h or zero or buf[o + 8] <= 1:
+                continue
+            i24 = int.from_bytes(buf[o + 11:o + 14], "little")
+            g_off = g_start + i24 * 16
+            if g_off + 32 > g_start + g_size:
+                continue
+            _w0, _w1, count, _count2, ptr4, _ptr6 = struct.unpack_from("<IIIIQQ", buf, g_off)
+            src_a, src_b = buf[g_off + 26], buf[g_off + 27]
+            r_off = r_start + (ptr4 >> 20)
+            if r_off + count * 32 > r_start + r_size:
+                continue
+            items = []
+            for k in range(count):
+                v_off = r_off + k * 32
+                ref = struct.unpack_from("<Q", buf, v_off)[0]
+                chunk_idx = ref & 3
+                if chunk_idx >= len(chunks):
+                    continue
+                lo, hi = chunks[chunk_idx]
+                start = lo + (ref >> 20)
+                end = buf.find(b"\0", start, hi)
+                if not (lo <= start <= end):
+                    continue
+                gender, plurality, case = buf[v_off + 8], buf[v_off + 9], buf[v_off + 10]
+                items.append({
+                    "text": buf[start:end].decode("utf-8", "replace"),
+                    "gender": TEXT_GENDERS[gender] if gender < len(TEXT_GENDERS) else str(gender),
+                    "plurality": TEXT_PLURALITIES[plurality] if plurality < len(TEXT_PLURALITIES) else str(plurality),
+                    "case": "None" if case == 0 else f"Case{case}",
+                    "source_a": TEXT_SOURCES[src_a] if src_a < len(TEXT_SOURCES) else str(src_a),
+                    "source_b": TEXT_SOURCES[src_b] if src_b < len(TEXT_SOURCES) else str(src_b),
+                })
+            if items:
+                out[h] = items
+        if out:
+            yield out
 
 
 # ---- sources ----
@@ -405,6 +485,37 @@ class Scan:
                 yield row
 
 
+class VariantScan(Scan):
+    """A Scan that also collects 0x956a9df5 / 0x10075946 variant rows during the one pass over the sources.
+
+    ``add`` forwards its arguments unchanged rather than repeating the parameter list of ``Scan.add`` (which
+    grew a nested-archive argument on ``main``): the subclass only observes the bytes the scan already read.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.variant_found = []                             # (source, offset, guess, archive, {hash: [variant]})
+
+    def add(self, *args, **kwargs):
+        source, offset, data = args[0], args[1], args[2]
+        archive = args[3] if len(args) > 3 else kwargs.get("archive")
+        try:
+            super().add(*args, **kwargs)
+        except TypeError:  # 16282101 base Scan.add takes (source, offset, data) without `archive`
+            super().add(source, offset, data)
+        if _is_resource(data) and b"\x01\x01\x00\x00" in data:
+            for table in variant_tables(data):
+                texts = [v["text"] for items in table.values() for v in items]
+                self.variant_found.append((source, offset, language(texts), archive, table))
+
+    @property
+    def variants(self):
+        """[(source, offset, lang, {hash: [variant]})] using archive-resolved language when available."""
+        archive_lang = getattr(self, "archive_lang", {})
+        return [(s, o, archive_lang.get(archive, guess), vt)
+                for s, o, guess, archive, vt in self.variant_found]
+
+
 def _clean(s: str) -> str:
     return s.replace("\t", " ").replace("\r", " ").replace("\n", " ")
 
@@ -436,9 +547,10 @@ def main(argv=None) -> int:
     ap.add_argument("--dialogue", help="CSV: wave, key, label, speaker, text per language")
     ap.add_argument("--tables", help="CSV: one row per string table (source, offset, lang, group, counts)")
     ap.add_argument("--strings", help="CSV: every string (source, offset, lang, hash, label, text)")
+    ap.add_argument("--variants", help="CSV: grammatical variant entries (0x956a9df5 / 0x10075946)")
     a = ap.parse_args(argv)
     out_flags = [(flag, path) for flag, path in (("--dialogue", a.dialogue), ("--tables", a.tables),
-                                                 ("--strings", a.strings)) if path]
+                                                 ("--strings", a.strings), ("--variants", a.variants)) if path]
     outs = [path for _, path in out_flags]
     seen = []
     for flag, p in out_flags:
@@ -455,7 +567,7 @@ def main(argv=None) -> int:
         if any(os.path.exists(o) and os.path.samefile(path, o) for o in outs):
             ap.error("an output must not overwrite an input")
 
-    scan = Scan()
+    scan = VariantScan() if a.variants is not None else Scan()
     try:
         for source in a.sources:
             starts = archive_starts(source)
@@ -490,6 +602,14 @@ def main(argv=None) -> int:
                      ({"source": s, "offset": o, "lang": lang, "hash": f"{h:08x}", "label": names.get(h, ""),
                        "text": _clean(text)}
                       for s, o, lang, t in scan.tables for h, text in t.items())))
+    if a.variants:
+        jobs.append((a.variants,
+                     ["source", "offset", "lang", "hash", "label", "gender", "plurality", "case", "source_a",
+                      "source_b", "text"],
+                     ({"source": s, "offset": o, "lang": lang, "hash": f"{h:08x}", "label": names.get(h, ""),
+                       "gender": v["gender"], "plurality": v["plurality"], "case": v["case"],
+                       "source_a": v["source_a"], "source_b": v["source_b"], "text": _clean(v["text"])}
+                      for s, o, lang, vt in scan.variants for h, items in vt.items() for v in items)))
     # Stage every report next to its destination, then swap them all in. A write that fails part-way must
     # leave the previous reports intact instead of truncating the ones that came before it.
     staged = []

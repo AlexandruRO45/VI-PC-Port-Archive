@@ -163,6 +163,35 @@ keys reuse another mission's lines, so a key's root and its labels' prefix can d
 
 About 7-12% of lines have no text in a given language: the label's hash is in none of that language's tables.
 
+## Grammatical variants (`0x956a9df5` / `0x10075946`)
+
+In `data.rpf`, `62` non-English string tables (`10 it`, `9 fr`, `8 pl`, `6 de`, `6 ko`, `6 ru`, `6 zh-Hant`, `5 es-419`,
+`3 pt`, `2 es-ES`, `1 ja`) include `3,026` hash-table entries whose `byte@+8` is greater than `1` (`5`, `7` or `8`
+instead of `1`), pointing to `7,345` localized text variants across `3,026` groups.
+
+- **Why `byte@+8` is `5`, `7` or `8` and why a 32-bit record index failed on 28 of 62 tables:** in the enclosing `0DRP`
+  page's `q38` block table (`+0x38`), `byte@+8` is the **1-based `q38` block index** of the `0x956a9df5` group array
+  (`5` on single-blob tables, `7` on 3-chunk tables, `8` on 4-chunk tables), and `u24@+11` is the 16-byte unit index
+  (`2 * k`, since each group record is `32` bytes). Each `32`-byte `0x956a9df5` record holds:
+  - `+0x08..+0x0f`: `u32 count, u32 count2` (`1..7`, equal on `3,026 / 3,026` records),
+  - `+0x10..+0x17`: `u64 ptr4` = `(byte_offset << 20) | block_id`, a standard `0DRP` block pointer where `ptr4 & 0xFFFFF`
+    is the 1-based `q38` block index of `0x10075946` (`6`, `8` or `9`) and **`ptr4 >> 20` is the byte offset** into
+    that `0x10075946` array (`first_record * 32`),
+  - `+0x1a..+0x1b`: two `u8` source selectors (`rage__fwTextGender` / `rage__fwTextPlurality` source).
+  Across all `62 / 62` tables (`3,026 / 3,026` groups, `7,345 / 7,345` variant records), reading `ptr4 >> 20` as a byte
+  offset tiles the `0x10075946` block with **0 mismatches** and every `0x10075946` string reference (`+0x00` `u64`,
+  `chunk = ref & 3`, `off = ref >> 20`) lands on a NUL-terminated string (`7,345 / 7,345`).
+- **Embedded `0DRP` schema (`q28`/`q30`, case-sensitive joaat32 verified):**
+  - `rage__fwTextEntrySimple` (`0xa8478889`, `16` B): standard string entry (`Text` `0xb5a7cd47` at `+0x08`).
+  - `rage__fwTextEntryVariant` (`0x10075946`, `32` B): `Text` (`+0x00`), `Gender` (`0x159902a6`, `+0x08`), `Plurality`
+    (`0x3efaa23f`, `+0x09`), `Case` (`0x42db2391`, `+0x0a`), and a 9-element `2`-byte parameter requirement array
+    (`+0x0b..+0x1c`).
+  - `rage__fwTextGender` (`0x2a053c90`): `None` (`0`), `Male` (`1`), `Female` (`2`), `Other` (`3`).
+  - `rage__fwTextPlurality` (`0xb46aea0a`): `None` (`0`), `Singular` (`1`), `Few` (`2`), `Many` (`3`).
+  - `rage__fwTextCase` (`0x4ef01f30`): `None` (`0`), `Case1`..`Case15` (`1..15`).
+  - Source enum `0x12b29290`: `None` (`0`), `Param1`..`Param9` (`1..9`), `Player` (`10`), `Speaker` (`11`),
+    `Target` (`12`).
+
 ## Tables and label names
 
 `--labels` takes word lists or a `hashdict.py` JSON. Each table is then grouped by the longest `_`-prefix (up to three
@@ -175,18 +204,20 @@ group.
 ```sh
 python -I tools/text_tables.py <carve>/data <carve>/story000 <carve>/story000_restofworld <carve>/shared_minigame000 \
     --labels <temp>/hashes.json \
-    --dialogue <temp>/dialogue.csv --tables <temp>/tables.csv --strings <temp>/strings.csv
+    --dialogue <temp>/dialogue.csv --tables <temp>/tables.csv --strings <temp>/strings.csv \
+    --variants <temp>/variants.csv
 ```
 
 A source is an `rpf9_carve.py` directory, an `.rpf` archive (read through `gamedata_index.py`; nothing is written),
 or files and directories of whole resources. All sources are read before anything is written, because dialogue
-keys and their text sit in different archives.
+keys and their text sit in different archives, and every report comes from that one pass.
 
 | Output | Columns |
 |---|---|
 | `--dialogue` | `wave`, `key`, `label`, `speaker`, `text_<lang>` per language |
 | `--tables` | `source`, `offset`, `lang`, `guess` (the per-table guess), `archive` (nested archive offset), `group`, `strings`, `resolved` |
 | `--strings` | `source`, `offset`, `lang`, `hash`, `label`, `text` |
+| `--variants` | `source`, `offset`, `lang`, `hash`, `label`, `gender`, `plurality`, `case`, `source_a`, `source_b`, `text` |
 
 Standard library only. The four archives above take about 2 minutes on one core from a carve.
 
