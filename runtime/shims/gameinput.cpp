@@ -139,16 +139,27 @@ std::string env(const char* name) {
     return s;
 }
 
+// A float variable clamped to [lo, hi]; `value` (the default) is kept when the text is not a finite number. NaN
+// compares false, so std::clamp would hand it through, and every product with it would be NaN too.
+void read_float(const char* name, float lo, float hi, float& value) {
+    const std::string text = env(name);
+    if (text.empty()) return;
+    const double v = std::atof(text.c_str());
+    if (std::isnan(v)) {
+        std::fprintf(stderr, "[rt] gameinput: %s=%s is not a number, using %g\n", name, text.c_str(), value);
+        return;
+    }
+    value = static_cast<float>(std::clamp(v, static_cast<double>(lo), static_cast<double>(hi)));
+}
+
 rt::gameinput::Config read_config() {
     rt::gameinput::Config c;
     const std::string t = env("LEONIDA_DS_TRIGGERS");
     if (t == "off" || t == "0") c.ds_triggers = rt::gameinput::DsTriggerMode::Off;
     else if (t == "resistance") c.ds_triggers = rt::gameinput::DsTriggerMode::Resistance;
     else if (!t.empty() && t != "rumble") std::fprintf(stderr, "[rt] gameinput: LEONIDA_DS_TRIGGERS=%s unknown, using rumble\n", t.c_str());
-    if (const std::string g = env("LEONIDA_DS_TRIGGER_GAIN"); !g.empty())
-        c.ds_trigger_gain = std::clamp(static_cast<float>(std::atof(g.c_str())), 0.0f, 4.0f);
-    if (const std::string g = env("LEONIDA_MOUSE_SENSITIVITY"); !g.empty())
-        c.mouse_sensitivity = std::clamp(static_cast<float>(std::atof(g.c_str())), 0.1f, 10.0f);
+    read_float("LEONIDA_DS_TRIGGER_GAIN", 0.0f, 4.0f, c.ds_trigger_gain);
+    read_float("LEONIDA_MOUSE_SENSITIVITY", 0.1f, 10.0f, c.mouse_sensitivity);
     if (const std::string f = env("LEONIDA_DS_TRIGGER_FREQ"); !f.empty())
         c.ds_trigger_frequency = static_cast<uint8_t>(std::clamp(std::atoi(f.c_str()), 1, 255));
     if (const std::string l = env("LEONIDA_DS_LIGHTBAR"); !l.empty()) {

@@ -743,6 +743,24 @@ void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
     set_env("LEONIDA_MOUSE_SENSITIVITY", "0");
     rt::gameinput::reload_config();
     check(approx(rt::gameinput::config().mouse_sensitivity, 0.1f), "keyboard pad: mouse sensitivity clamps to 0.1");
+    // A value that is not a finite number keeps the default: NaN passes std::clamp unchanged, and with a NaN
+    // sensitivity the mouse moved the right stick by lround(NaN), which is not the default's distance (MSVC: 0).
+    for (const char* bad : {"nan", "-nan", "NAN(ind)"}) {
+        set_env("LEONIDA_MOUSE_SENSITIVITY", bad);
+        set_env("LEONIDA_DS_TRIGGER_GAIN", bad);
+        rt::gameinput::reload_config();
+        check(rt::gameinput::config().mouse_sensitivity == 1.0f && rt::gameinput::config().ds_trigger_gain == 1.0f,
+              "keyboard pad: a NaN mouse sensitivity or trigger gain keeps the default 1");
+        g_cursor_x += 10;
+        rt::gameinput::poll();
+        check(approx(pad_state(input, kb).rightThumbstickX, 10240 / 32767.0f),
+              "keyboard pad: with a NaN sensitivity the mouse moves the stick as with the default");
+        settle();
+    }
+    set_env("LEONIDA_DS_TRIGGER_GAIN", nullptr);
+    set_env("LEONIDA_MOUSE_SENSITIVITY", "inf");
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().mouse_sensitivity == 10.0f, "keyboard pad: an infinite mouse sensitivity clamps to 10");
     set_env("LEONIDA_MOUSE_SENSITIVITY", nullptr);
     rt::gameinput::reload_config();
     check(rt::gameinput::config().mouse_sensitivity == 1.0f && rt::gameinput::config().ds_trigger_gain == 1.0f,
