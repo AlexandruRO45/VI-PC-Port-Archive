@@ -280,5 +280,62 @@ class SXnorB64ExtremeBoundariesTests(unittest.TestCase):
         res, scc = oracle_xnor_b64(a, b)
         self.assertEqual(res, MASK64)
 
+class SXnorB64TranslatorIntegrationTests(unittest.TestCase):
+    def _run_ps(self, lines: list[str]) -> tuple[int, int]:
+        lines = list(lines) + [
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_xnor_b64", lines)
+        words = mrt0_words(spv)
+        return words[0], words[1]
+
+    def test_translator_basic_execution(self):
+        lines = [
+            "s_mov_b32 s0, 0x0000FFFF",
+            "s_mov_b32 s1, 0x00000000",
+            "s_mov_b32 s2, 0x0000FFFF",
+            "s_mov_b32 s3, 0xFFFFFFFF",
+            "s_xnor_b64 s[4:5], s[0:1], s[2:3]",
+        ]
+        rlo, rhi = self._run_ps(lines)
+        self.assertEqual(rlo, 0xFFFFFFFF)
+        self.assertEqual(rhi, 0x00000000)
+
+    def test_translator_identity(self):
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x9ABCDEF0",
+            "s_xnor_b64 s[4:5], s[0:1], s[0:1]",
+        ]
+        rlo, rhi = self._run_ps(lines)
+        self.assertEqual(rlo, 0xFFFFFFFF)
+        self.assertEqual(rhi, 0xFFFFFFFF)
+
+    def test_translator_inversion_to_zero(self):
+        lines = [
+            "s_mov_b32 s0, 0x55555555",
+            "s_mov_b32 s1, 0x55555555",
+            "s_mov_b32 s2, 0xAAAAAAAA",
+            "s_mov_b32 s3, 0xAAAAAAAA",
+            "s_xnor_b64 s[4:5], s[0:1], s[2:3]",
+        ]
+        rlo, rhi = self._run_ps(lines)
+        self.assertEqual(rlo, 0)
+        self.assertEqual(rhi, 0)
+
+    def test_translator_in_place_aliasing(self):
+        lines = [
+            "s_mov_b32 s4, 0x11111111",
+            "s_mov_b32 s5, 0x22222222",
+            "s_xnor_b64 s[4:5], s[4:5], s[4:5]",
+        ]
+        rlo, rhi = self._run_ps(lines)
+        self.assertEqual(rlo, 0xFFFFFFFF)
+        self.assertEqual(rhi, 0xFFFFFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
