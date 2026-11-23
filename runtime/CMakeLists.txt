@@ -22,7 +22,11 @@ if(LEONIDA_AVX2)
   if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>)
   elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-mavx2 -mfma -mbmi2>)
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:C,CXX>:-mavx2>
+      $<$<COMPILE_LANGUAGE:C,CXX>:-mfma>
+      $<$<COMPILE_LANGUAGE:C,CXX>:-mbmi2>
+    )
   endif()
   add_compile_definitions(LEONIDA_AVX2=1)
 endif()
