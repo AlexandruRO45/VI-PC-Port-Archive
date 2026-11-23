@@ -114,9 +114,20 @@ size_t emulate_clwb(CONTEXT&, const uint8_t* code, size_t available) {
     return tail ? at + tail : 0;
 }
 
+// MONITORX (0F 01 FA) and MWAITX (0F 01 FB), AMD's user-mode MONITOR/MWAIT. MONITORX only arms an address monitor and
+// has no visible effect, so it does nothing. MWAITX waits until the monitored line is written, an interrupt arrives
+// or its timer runs out; it is allowed to return early, and callers re-check their condition in a loop, so it yields
+// the thread and returns at once. Neither touches a register or memory.
+size_t emulate_monitorx_mwaitx(CONTEXT&, const uint8_t* code, size_t available) {
+    if (available < 3 || code[0] != 0x0F || code[1] != 0x01 || (code[2] != 0xFA && code[2] != 0xFB)) return 0;
+    if (code[2] == 0xFB) SwitchToThread();
+    return 3;
+}
+
 const Emulator kTable[] = {
     {"clzero", &emulate_clzero},
     {"clwb", &emulate_clwb},
+    {"monitorx_mwaitx", &emulate_monitorx_mwaitx},
 };
 
 // Copies up to kMaxInstructionLength bytes of the code at `ip`, fewer when it runs into unreadable memory, and
@@ -184,9 +195,17 @@ bool host_has_clwb() {
     return (regs[1] & (1 << 24)) != 0;
 }
 
+bool host_has_monitorx() {
+    int regs[4];
+    __cpuid(regs, static_cast<int>(0x80000000));
+    if (static_cast<unsigned>(regs[0]) < 0x80000001u) return false;
+    __cpuid(regs, static_cast<int>(0x80000001));
+    return (regs[2] & (1 << 29)) != 0;
+}
+
 bool install(bool force) {
     if (g_handler) return true;
-    if (!force && host_has_clzero() && host_has_clwb()) return false;
+    if (!force && host_has_clzero() && host_has_monitorx() && host_has_clwb()) return false;
     g_handler = AddVectoredExceptionHandler(1, &handler);
     return g_handler != nullptr;
 }
