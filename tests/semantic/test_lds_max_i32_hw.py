@@ -464,6 +464,37 @@ class TestConditionCodesAndStatus(unittest.TestCase):
         self.assertFalse(s_pos.zero)
         self.assertFalse(s_pos.negative)
 
+class TestIEEE754BoundaryExtremes(unittest.TestCase):
+    def test_signed_integer_boundary_extremes(self):
+        # max(INT32_MIN, INT32_MAX) -> INT32_MAX
+        self.assertEqual(ref_max_i32(INT32_MIN, INT32_MAX), INT32_MAX)
+
+        # max(-1, -2) -> -1 (0xFFFFFFFF > 0xFFFFFFFE)
+        minus_one = to_unsigned_u32(-1)
+        minus_two = to_unsigned_u32(-2)
+        self.assertEqual(ref_max_i32(minus_two, minus_one), minus_one)
+
+        # max(INT32_MIN, -1) -> -1
+        self.assertEqual(ref_max_i32(INT32_MIN, minus_one), minus_one)
+
+    def test_translator_signed_boundaries(self):
+        # Seed with INT32_MIN (0x80000000), update with -1 (0xFFFFFFFF)
+        instructions = [
+            "v_mov_b32_e32 v0, 0",
+            f"v_mov_b32_e32 v1, {INT32_MIN:#x}",
+            "ds_write_b32 v0, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v2, 0xFFFFFFFF",
+            "ds_max_i32 v0, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v3, v0",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v31, 0",
+            "buffer_store_dword v3, v31, s[0:3], 0 offen",
+        ]
+        mem = run_cs_lds(instructions)
+        self.assertEqual(mem.get(0), 0xFFFFFFFF)
+
 
 if __name__ == "__main__":
     unittest.main()
