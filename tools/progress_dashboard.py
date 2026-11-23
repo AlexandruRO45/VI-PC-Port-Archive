@@ -450,8 +450,16 @@ def collect_ctest(col, args):
     log = os.path.join(ROOT, "runtime", "build", "Testing", "Temporary", "LastTest.log")
     sets = []
     if os.path.isfile(log):
-        sets.append(("ctest", log, [(n, r, s, "") for n, r, s in parse_lasttest(read_utf8(log))], True))
-        col.source("ctest_lasttest", log, "ok", len(sets[-1][2]))
+        try:
+            with open(log, encoding="utf-8", errors="replace") as report:
+                log_text = report.read()
+                ran = os.fstat(report.fileno()).st_mtime
+        except OSError as e:
+            col.source("ctest_lasttest", log, "invalid", note=e.strerror or type(e).__name__)
+        else:
+            rows = [(n, r, s, "") for n, r, s in parse_lasttest(log_text)]
+            sets.append(("ctest", rows, True, ran))
+            col.source("ctest_lasttest", log, "ok", len(rows))
     else:
         col.source("ctest_lasttest", log, "missing", note="no runtime/build CTest run on this machine")
     for path in args.junit or []:
@@ -459,17 +467,21 @@ def collect_ctest(col, args):
             col.source("junit", path, "missing")
             continue
         try:
-            root = ET.parse(path).getroot()
+            with open(path, "rb") as report:
+                root = ET.parse(report).getroot()
+                ran = os.fstat(report.fileno()).st_mtime
+        except OSError as e:
+            col.source("junit", path, "invalid", note=e.strerror or type(e).__name__)
+            continue
         except (ET.ParseError, LookupError, ValueError) as e:
             col.source("junit", path, "invalid", note=str(e))
             continue
         # CTest writes a single testsuite with a disabled count and hostname. pytest wraps its suite in testsuites.
         is_ctest = root.tag == "testsuite" and {"disabled", "hostname"} <= root.attrib.keys()
         rows = parse_junit(root)
-        sets.append(("junit:" + os.path.basename(path), path, rows, is_ctest))
+        sets.append(("junit:" + os.path.basename(path), rows, is_ctest, ran))
         col.source("junit", path, "ok", len(rows))
-    for label, path, rows, is_ctest in sets:
-        ran = os.path.getmtime(path)
+    for label, rows, is_ctest, ran in sets:
         for name, res, secs, detail in rows:
             if res == "fail":
                 fresh, status = "failed", "failed"

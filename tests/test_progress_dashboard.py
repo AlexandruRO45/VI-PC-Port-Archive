@@ -5,6 +5,7 @@
 Every input is written here by hand (Markdown tables, JUnit XML, a CTest log, a fake work folder whose shader names
 are sentinels). No game files, no GPU, no network: the GitHub path is fed synthetic gh output.
 """
+import errno
 import json
 import os
 from pathlib import Path
@@ -61,6 +62,36 @@ class Contract(unittest.TestCase):
 
 
 class Tests(unittest.TestCase):
+    def test_ctest_collection_continues_after_unreadable_reports(self):
+        xml = '<testsuite><testcase name="available"/></testsuite>'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "checkout"
+            lasttest = root / "runtime" / "build" / "Testing" / "Temporary" / "LastTest.log"
+            lasttest.parent.mkdir(parents=True)
+            lasttest.write_text("1/1 Test: locked\nTest Passed.\n", encoding="utf-8", newline="\n")
+            locked = Path(directory) / "locked.xml"
+            available = Path(directory) / "available.xml"
+            for report in (locked, available):
+                report.write_text(xml, encoding="utf-8", newline="\n")
+            real_open = open
+
+            def open_report(path, *args, **kwargs):
+                if Path(path) in (lasttest, locked):
+                    raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+                return real_open(path, *args, **kwargs)
+
+            col = pd.Collector()
+            with (mock.patch.object(pd, "ROOT", str(root)), mock.patch.object(pd, "last_commit_time", return_value=None),
+                  mock.patch("builtins.open", side_effect=open_report)):
+                pd.collect_ctest(col, SimpleNamespace(junit=[str(locked), str(available)]))
+
+        self.assertEqual([(s["id"], s["status"], s.get("note")) for s in col.sources], [
+            ("ctest_lasttest", "invalid", "Permission denied"),
+            ("junit", "invalid", "Permission denied"),
+            ("junit", "ok", None),
+        ])
+        self.assertEqual([(c["name"], c["status"]) for c in col.components], [("available", "verified")])
+
     def test_junit_honors_each_reports_encoding(self):
         xml = '<?xml version="1.0" encoding="{}"?><testsuite><testcase name="{}"><failure/></testcase></testsuite>'
         with tempfile.TemporaryDirectory() as root:
