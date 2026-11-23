@@ -202,8 +202,13 @@ def main(argv=None) -> int:
             problems["no XBCH"] += 1
             continue
         stem = os.path.basename(shader)[:-5]
-        with open(os.path.join(out, stem + ".fssm"), "wb") as f:
-            f.write(fssm)
+        out_path = os.path.join(out, stem + ".fssm")
+        try:
+            with open(out_path, "wb") as f:
+                f.write(fssm)
+        except OSError as e:
+            print(f"ERROR: cannot write {out_path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         ends = [i for i in range(0, len(fssm) - 3, 4) if fssm[i:i + 4] == b"\x00\x00\x81\xbf"]
         payloads = sum(1 for tag, _ in xdat_entries_all(parts(d).get(b"DXIL", b"")) if tag == 0x0D)
         rows.append({"name": stem, "size": len(fssm), "magic": fssm[:4].decode("latin-1"),
@@ -216,13 +221,18 @@ def main(argv=None) -> int:
               "game version.", file=sys.stderr)
         return 1
     # Stage privately and publish only after the index is complete and synced.
-    with tempfile.TemporaryDirectory(dir=src) as staging:
-        tmp = os.path.join(staging, "fssm_index.json")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(rows, f)
-            f.flush()
-            os.fsync(f.fileno())
-        replace_retry(tmp, os.path.join(src, "fssm_index.json"))   # a scanner or sync client may hold tmp briefly on Windows
+    index_path = os.path.join(src, "fssm_index.json")
+    try:
+        with tempfile.TemporaryDirectory(dir=src) as staging:
+            tmp = os.path.join(staging, "fssm_index.json")
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(rows, f)
+                f.flush()
+                os.fsync(f.fileno())
+            replace_retry(tmp, index_path)   # a scanner or sync client may hold tmp briefly on Windows
+    except OSError as e:
+        print(f"ERROR: cannot write {index_path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     print("magic:", dict(Counter(r["magic"] for r in rows)))
     print("s_endpgm per blob:", dict(Counter(len(r["endpgm"]) for r in rows)))
     sizes = sorted(r["size"] for r in rows)

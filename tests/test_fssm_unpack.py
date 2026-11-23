@@ -685,6 +685,26 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.src)),
                          ["fssm", "fssm_index.json", "fssm_index.json.tmp", "shader_a.dxbc"])
 
+    def test_unwritable_fssm_output_exits_2_without_traceback(self):
+        dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
+            f.write(dxbc)
+        os.makedirs(os.path.join(self.src, "fssm", "shader_a.fssm"))
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True, errors="replace")
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("ERROR: cannot write", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_unwritable_index_exits_2_without_traceback(self):
+        dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
+            f.write(dxbc)
+        os.makedirs(os.path.join(self.src, "fssm_index.json"))
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True, errors="replace")
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("ERROR: cannot write", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
