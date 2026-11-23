@@ -915,11 +915,19 @@ class KillExit(unittest.TestCase):
         self.tier("ps_kill_vm_first", kill(["exp mrt1 v6, v7, v5, v5 vm"] + KILL, RUN_WQM, EXIT_PS),
                   "C", contains=["unsafe-vote-branch"])
 
-    def test_shared_exit_of_two_kills_stays_c(self):
-        # conservative: the exit sets EXEC from a live mask the second kill redefined behind the first vote (stale)
+    def test_shared_exit_of_two_kills_is_a(self):
+        # the exit sets EXEC from a live mask the second kill redefined behind the first vote. Both definitions are
+        # lane-local (`s_andn2_b64 D, D, vcc` after a v_cmp, SHADER-821), so each lane's bit is the same whichever
+        # vote a half took, and EXEC is not stale; test_kill_exit_shared_by_two_kills_invariant runs it
         second = ["v_cmp_gt_u32_e32 vcc, 50, v0", "s_andn2_b64 s[20:21], s[20:21], vcc"]
         run = RUN_WQM + second + ["s_cbranch_scc0 5"] + RUN_WQM
-        self.tier("ps_kill_shared", kill(KILL, run, EXIT_PS), "C", contains=["tainted-exec"])
+        self.tier("ps_kill_shared", kill(KILL, run, EXIT_PS), "A", [], [])
+
+    def test_shared_exit_after_a_scalar_mask_stays_c(self):
+        # the second "kill" ORs in a scalar register, not a lane compare: the mask is no longer lane-local
+        second = ["s_or_b64 s[20:21], s[20:21], s[10:11]"]
+        run = RUN_WQM + second + ["s_cbranch_scc0 5"] + RUN_WQM
+        self.tier("ps_kill_shared_scalar", kill(KILL, run, EXIT_PS), "C", contains=["tainted-exec"])
 
     def test_mov_of_a_mask_is_not_a_vote(self):
         # s_mov_b64 writes no SCC: the branch reads the lane-count compare before it, not a vote on the copy
@@ -944,6 +952,18 @@ class KillExit(unittest.TestCase):
         self.assertEqual(tier, "A")
         self.assertEqual(whole, halves)
         self.assertEqual([w[:2] for w in whole], [(0, 0)] * 40 + [(3 * k, 1) for k in range(40, 64)])
+
+    def test_kill_exit_shared_by_two_kills_invariant(self):
+        # vertices < 40 die in the first kill (the first half takes the exit at the first vote, the second half runs
+        # on) and the second kill takes 40..49, but whole-quad mode keeps 48 and 49 on with the quad of 50 and 51
+        after = RUN_WQM + ["v_mov_b32_e32 v7, 1"]
+        hop = sum(size(t) for t in after + EPI_VS) // 4
+        run = RUN_WQM + ["v_mul_u32_u24_e32 v6, 3, v0", "v_cmp_gt_u32_e32 vcc, 50, v0",
+                         "s_andn2_b64 s[20:21], s[20:21], vcc", f"s_cbranch_scc0 {hop}"] + after
+        tier, whole, halves = self.run_both("vs_kill_shared", kill(KILL, run, EXIT_VS, "vs"))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        self.assertEqual([w[:2] for w in whole], [(0, 0)] * 48 + [(3 * k, 1) for k in range(48, 64)])
 
     def test_kill_exit_that_widens_differs_and_is_c(self):
         tier, whole, halves = self.run_both("vs_kill_widen", kill(KILL, RUN_WQM + [
