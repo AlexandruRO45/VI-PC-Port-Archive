@@ -222,6 +222,32 @@ trigger impulse — so the shim reports a single waveform per motor (an intensit
 real ones, and plays any request as an intensity. A title that picks waveform 3 by name cannot be served beyond
 intensity 0; waveform indices other than 0 are `E_INVALIDARG`.
 
+## Lighting
+
+GameInput v0 has no lighting call, so the only lightbar control is `LEONIDA_DS_LIGHTBAR`, applied once when the pad
+connects. The v0 `GameInputKind` has no `Lighting` bit and the v0 `IGameInputDevice` has no method for a lamp.
+
+The current (v4) interface has both: `GameInputKindLighting` (0x00100000), and on `IGameInputDevice`
+`GetSupportedLightingGroups`, `GetSupportedLightingGroupSize`, `SetLightingColor`, `ApplyLightingColors` and
+`ApplyLightingSystemDefault`. Microsoft's
+[`SetLightingColor`](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinputdevice/methods/igameinputdevice_setlightingcolor)
+page names what it covers — "Windows Dynamic Lighting (LampArray) devices and the lightbar of DualSense controllers" —
+so this is the API a title uses to drive a DualSense lightbar. SDL exposes the same one lamp as `SDL_SetGamepadLED`
+(`SDL_SetJoystickLED` on the joystick).
+
+| GameInput v4 | SDL3 |
+|---|---|
+| `GetSupportedLightingGroups` | `GameInputLightingGroupCenterLight` (0x10) when `SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN` is true, else 0 |
+| `GetSupportedLightingGroupSize` | 1 for the center light; a DualSense has one RGB lamp and no per-button lamps |
+| `SetLightingColor(color, GameInputLightingGroupCenterLight)` | stages a colour; `SDL_SetGamepadLED` is immediate, so the shim has to hold the staged value |
+| `ApplyLightingColors` | `SDL_SetGamepadLED(r, g, b)` |
+| `ApplyLightingSystemDefault` | no SDL3 equivalent: after an `SDL_SetGamepadLED` call SDL keeps `color_set`, and `SDL_SetGamepadPlayerIndex` re-sends that colour instead of the player colour, so the shim would have to re-send the player colour itself |
+| `GetSupportedInput` | `GameInputKindLighting` on a pad with an RGB lamp |
+
+Only `CenterLight` can be answered: a DualSense has no lamp in the other groups (`FaceButtons`, `DPad`, the
+thumbsticks). The shim implements none of this; adding it means a v4 `IGameInputDevice`, not a field on the v0 one.
+Whether the executable binds a version with these methods is the first [VERIFY](#verify) item.
+
 ## Motion
 
 Pads whose SDL gamepad reports both a gyroscope and an accelerometer (a DualSense, a Switch Pro, Steam Input pads) get
@@ -492,7 +518,8 @@ These need the game executable or a test on hardware:
 
 - **Which API version and module.** The shim is GameInput v0 and registers `GameInputCreate` under `gameinput.dll`
   and `xgameruntime.dll`. GameInput v1 and later (NuGet 1.x and up) changed the interfaces; if the executable was
-  built against one of those, the vtables need a second set.
+  built against one of those, the vtables need a second set. v4 also adds `GameInputKindLighting` and the lighting
+  methods ([Lighting](#lighting)), the only GameInput route to a DualSense lightbar.
 - **IIDs.** `QueryInterface` answers the v0 IIDs from the public header.
 - **Reading history.** Microsoft's [next reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getnextreading)
   and [previous reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getpreviousreading) pages describe half a second of readings per device and failure when old readings leave the stream. The table above records the shim's HRESULT choices. Changes faster than the poll are not seen.
