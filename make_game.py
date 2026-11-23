@@ -2001,7 +2001,7 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
                 # built before that: a build that fails leaves the old export in place.
                 get_exporter(work)
                 log(f"assets: no matching decoder fingerprint for {mode} from {rel}: exporting again")
-                if os.path.islink(folder):
+                if _linked(folder):
                     fail(f"assets: {folder} is a symlink (symbolic link)")
                 try:
                     shutil.rmtree(folder)
@@ -2048,7 +2048,7 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         record = os.path.join(pool_dir, DECODER_RECORD)
         if os.path.isdir(pool_dir) and read_shader_setting(record) != decoder:
             log(f"assets: no matching decoder fingerprint for texture pool {os.path.relpath(p, game)}: exporting again")
-            if os.path.islink(pool_dir):
+            if _linked(pool_dir):
                 fail(f"assets: texture pool {os.path.relpath(p, game)}: {pool_dir} is a symlink (symbolic link)")
             try:
                 shutil.rmtree(pool_dir)
