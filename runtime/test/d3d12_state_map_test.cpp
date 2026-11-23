@@ -705,10 +705,9 @@ int main() {
         memory.memoryHeaps[2].size = 24ull << 30;                                         // Resizable BAR on
         CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
         // A BAR window of exactly 256 MiB (AMD without Smart Access Memory, RADV without Resizable BAR): not Resizable
-        // BAR, so upload heaps stay in system memory, but the 256 MiB arena fits and tries the window first. If the
-        // driver already uses part of it, that allocation fails and the arena moves on to system memory.
+        // BAR (checked above), so upload heaps stay in system memory, but the 256 MiB arena fits and tries the window
+        // first. If the driver already uses part of it, that allocation fails and the arena moves on to system memory.
         memory.memoryHeaps[2].size = 256 * mib;
-        CHECK(!resizable_bar(memory));
         CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
         CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib + 4096) == (order{1, 2}));   // one page more
     }
