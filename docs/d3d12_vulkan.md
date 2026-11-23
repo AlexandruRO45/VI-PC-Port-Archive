@@ -598,10 +598,15 @@ side inwards:
     depth comparison field. The layer marks the NEVER comparison in S# word 3, bit 12 (unused with
     DERIV_ADJUST_EN clear) to give it a separate lookup key and a comparison-enabled Vulkan sampler.
   - A view the layer cannot show (below) leaves a null descriptor, all zeros, which finds the fallback.
-  - A typed multisampled color texture has one mip. Its default SRV covers every layer. An explicit
-    `TEXTURE2DMS` view reads layer zero, while `TEXTURE2DMSARRAY` selects a range starting at
-    `FirstArraySlice` (`ArraySize = UINT_MAX` selects the remaining layers). The format-support query
-    advertises `MULTISAMPLE_LOAD` when the format can be sampled with MSAA and its binding pair is available.
+  - A multisampled color or depth/stencil texture has one mip. Its default SRV (on typed resources) covers every
+    layer; typeless multisampled textures require an explicit typed view format in the same family (or castable
+    list). An explicit `TEXTURE2DMS` view reads layer zero, while `TEXTURE2DMSARRAY` selects a range starting at
+    `FirstArraySlice` (`ArraySize = UINT_MAX` selects the remaining layers). Multisampled depth-plane SRVs
+    (`R32_FLOAT`, `R16_UNORM`, `R24_UNORM_X8_TYPELESS`, `R32_FLOAT_X8X24_TYPELESS`) bind in the float MS arrays
+    (bindings 20/21) with `VK_IMAGE_ASPECT_DEPTH_BIT`, and multisampled stencil-plane SRVs (`X24_TYPELESS_G8_UINT`,
+    `X32_TYPELESS_G8X24_UINT`, inferred as plane 1 since `D3D12_TEX2DMS_SRV` has no `PlaneSlice`) bind in the UINT
+    MS arrays (bindings 22/23) with `VK_IMAGE_ASPECT_STENCIL_BIT`. The format-support query advertises
+    `MULTISAMPLE_LOAD` when the format can be sampled with MSAA and its binding pair is available.
   - A texture is named in its T#s by an address of its own, above 4 GiB and 256 bytes apart, that nothing
     dereferences; its entries leave the set and the table when it is destroyed.
   - `VulkanDeviceInfo::bindless` says the Vulkan device has the features this needs: `runtimeDescriptorArray`,
@@ -630,14 +635,15 @@ volume, plus minimum-LOD clamped views (inside the mip range via `VK_EXT_image_v
 Known gaps in the descriptor path: buffer shader-resource views and constant-buffer views (the V# a shader would
 load for them; the structure is in `gfx10_descriptors.h`, the views are not written; buffer UAVs of every kind are,
 section 3.4 "Buffer UAVs", `d3d12_m4_compute_test` and `d3d12_buffer_uav_test`);
-1D-array SRVs, 1D and 3D storage views, other typeless volume formats, multisampled depth/stencil and typeless
-color SRVs, and shader-translator lowering for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
+1D-array SRVs, 1D and 3D storage views, other typeless volume formats, and shader-translator lowering for
+multisample loads. Single-sampled and multisampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
 depth aspect (the texture's backing format, so X24_8_32_FLOAT for a D24 texture where the layer stores it as
 `D32_SFLOAT_S8_UINT`), each on its own family only (the other family's is a null
-descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, as
-`X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
-aspect, in its float-typed sampled arrays like other single-sampled UINT views. Other gaps include descriptors
+descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, or inferred for `TEXTURE2DMS` /
+`TEXTURE2DMSARRAY`, as `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows
+through the stencil aspect (in its float-typed sampled arrays for single-sampled views, and in the UINT MS arrays
+for multisampled views). Other gaps include descriptors
 the game writes itself, which need
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); the literal S#s of shaders (`literal_samplers` in the index),
 which `rt::d3d12::register_samplers` registers without a heap slot but which nothing passes to it yet (the call at
