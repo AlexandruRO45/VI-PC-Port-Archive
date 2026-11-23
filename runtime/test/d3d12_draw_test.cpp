@@ -5,7 +5,7 @@
 //   - a vertex buffer copied into the GPU address arena, an index buffer read straight from an upload heap, root
 //     constants (a clip-space offset) and a root CBV (a tint) through the 32 user-data dwords;
 //   - a render target cleared blue, two indexed draws with different root arguments (top-left red, bottom-right
-//     green), and one back-facing triangle (bottom-left) that culling must remove;
+//     cyan), and one back-facing triangle (bottom-left) that culling must remove;
 //   - the image read back through CopyTextureRegion and compared pixel by pixel. Where the quadrants land also
 //     checks the viewport flip (D3D clip space is y-up) and the front-face winding;
 //   - full-screen blends that read destination alpha into B8G8R8X8 and B8G8R8A8 targets cleared with alpha 0.25:
@@ -17,6 +17,7 @@
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
 #include "vk_test_device.h"
+#include "xs_console_call.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
@@ -167,6 +168,16 @@ int main() {
         pso_desc.SampleDesc.Count = 1;
         Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused, xor_pso, fullscreen;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+        // CreateGraphicsPipelineStateX (slot 60) takes a public-layout descriptor with console flag bits.
+        // Its RG write mask preserves the blue clear color under draw 2's green pixels.
+        auto console_desc = pso_desc;
+        console_desc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(0x10000);
+        console_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED |
+                                                                       D3D12_COLOR_WRITE_ENABLE_GREEN;
+        Ref<ID3D12PipelineState> console_pso;
+        EXPECT(SUCCEEDED(xs_test::console_call(device.p, 60, &console_desc, std::uint64_t{0}, std::uint64_t{0},
+                                               &__uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&console_pso.p))) &&
+               console_pso.p);
         pso_desc.InputLayout = {elements, 1};  // COLOR missing: D3D12 rejects a layout that leaves an input unfed
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&unfed.p)) == E_INVALIDARG && !unfed.p);
         pso_desc.InputLayout = {elements, 2};
@@ -395,14 +406,15 @@ int main() {
         list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
         list->DrawIndexedInstanced(6, 1, 0, 0, 0);
-        // Draw 2: offset (1, -1), green tint -> bottom-right quadrant green. The root signature is set again after
-        // the arguments; it is the same one, so they stay bound (else the quad would land top-left, untinted).
-        list->SetPipelineState(pso.p);
+        // Draw 2: offset (1, -1), green tint and the console PSO's RG write mask -> bottom-right cyan.
+        // Setting the same root signature again preserves the offset and tint.
+        list->SetPipelineState(console_pso.p);
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 768);
         list->SetGraphicsRootSignature(root.p);
         list->DrawIndexedInstanced(6, 1, 0, 0, 0);
         // Draw 3: the back-facing triangle in the bottom-left quadrant; culled, so that quadrant stays blue.
+        list->SetPipelineState(pso.p);
         list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
         list->DrawInstanced(3, 1, 4, 0);
@@ -1020,7 +1032,7 @@ int main() {
         EXPECT(list->Close() == E_INVALIDARG);
 
         for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target}) r->reset();
-        for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen}) p->reset();
+        for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen, &console_pso}) p->reset();
         pso.reset();
         root.reset();
         rtv_heap.reset();
@@ -1041,7 +1053,7 @@ int main() {
             using Pixel = std::array<std::uint8_t, 4>;
             const Pixel want = (top && left) || corner4 ? Pixel{255, 0, 0, 255}
                                : corner5                ? Pixel{0, 0, 0, 255}
-                               : !top && !left          ? Pixel{0, 255, 0, 255}
+                               : !top && !left          ? Pixel{0, 255, 255, 255}
                                                         : Pixel{0, 0, 255, 255};
             const std::uint8_t* got = pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;
