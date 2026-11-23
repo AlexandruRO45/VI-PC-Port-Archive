@@ -5537,8 +5537,10 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
-            // As DispatchMesh: only a device with mesh shaders (MeshShaderTier 1) takes it.
-            if (!state_.info.mesh_shader) return E_NOTIMPL;
+            // Created on every device, with or without mesh shaders. Measured on an RX 5700 without them
+            // (MeshShaderTier 0, AMD driver 32.0.21045.29003, D3D12Core 10.0.26100.9818), which answers S_OK with the
+            // debug layer on too, and on WARP; d3d12_vulkan_device_test compares this answer with the host's live.
+            // Only mesh PSOs need VK_EXT_mesh_shader.
             kind = leonida::IndirectKind::dispatch_mesh;
             break;
         default: return E_NOTIMPL;

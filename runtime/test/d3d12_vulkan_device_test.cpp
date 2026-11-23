@@ -4154,6 +4154,15 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"command signature: dispatch, stride 64", [](ID3D12Device* d) {
              return command_signature(d, 64, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH});
          }},
+        // DISPATCH_MESH whatever the GPU's MeshShaderTier (the layer device here has no mesh shaders). Measured on an
+        // RX 5700 host (MeshShaderTier 0, AMD driver 32.0.21045.29003, D3D12Core 10.0.26100.9818) and on WARP: both
+        // create it and refuse a stride below its 12 bytes.
+        {"command signature: dispatch mesh", [](ID3D12Device* d) {
+             return command_signature(d, 12, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH});
+         }},
+        {"command signature: dispatch mesh stride 8", [](ID3D12Device* d) {
+             return command_signature(d, 8, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH});
+         }},
         {"command signature: no arguments", [](ID3D12Device* d) { return command_signature(d, 16, {}); }},
         {"command signature: stride 0", [](ID3D12Device* d) {
              return command_signature(d, 0, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW});

@@ -2051,6 +2051,8 @@ The trace will enumerate them.
 - **Device:** `VK_EXT_mesh_shader` with `meshShader` is enabled where the GPU has it (`VulkanDeviceInfo::mesh_shader`).
   `taskShader` is not enabled, since the corpus has no amplification shaders. `D3D12_OPTIONS7` reports
   `MeshShaderTier` 1 only then; without the extension it reports `NOT_SUPPORTED` and mesh PSOs are `E_NOTIMPL`.
+  A `DISPATCH_MESH` command signature is created either way, as the host runtime does: measured on an RX 5700 without
+  mesh shaders (MeshShaderTier 0, AMD driver 32.0.21045.29003) and on WARP (section 4.7).
 - **Streams:** `CreatePipelineState` parses the stream in the d3dx12.h layout: a subobject type, then its
   description at that description's alignment, each subobject pointer-aligned.
   - Every type up to `RASTERIZER2` is read.
@@ -3286,6 +3288,19 @@ Not implemented yet:
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which
   signatures the game creates.
+- `DISPATCH_MESH` signatures are created on every device, with or without `VK_EXT_mesh_shader`; only mesh PSOs need
+  the extension (section 3.6, D3D-29). The host runtime creates them on a GPU without mesh shaders too, measured on
+  an RX 5700 (MeshShaderTier 0, AMD driver 32.0.21045.29003, D3D12Core 10.0.26100.9818) and on WARP: both create a
+  12-byte one (`S_OK`, and neither debug layer reports a message) and refuse an 8-byte one (`E_INVALIDARG`).
+  `d3d12_vulkan_device_test` compares both answers with the host live. Why it matters: #7330's description reports a
+  retail boot through the layer whose renderer init creates five one-argument command signatures, the fifth a 12-byte
+  `DISPATCH_MESH`, and asserts when one of them fails (not reproduced here).
+  - `ExecuteIndirect` with such a signature is checked as a draw is (both buffers, their alignment, and the
+    argument-buffer bounds with 12-byte records), and runs on a direct list only: the host's `Close` fails after one
+    on a compute or a copy list. `Close` does not ask for a bound pipeline or root signature, on the host either.
+    `d3d12_execute_indirect_validation_test` compares each case's `Close` result with WARP and the hardware runtime
+    live; its `DISPATCH_MESH` rows were measured on WARP and the same RX 5700.
+  - It records nothing yet; #3777 replays it as `vkCmdDrawMeshTasksIndirectEXT`.
 - Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
   SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
   `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins

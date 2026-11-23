@@ -586,8 +586,10 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
-    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on a device with mesh shaders; ExecuteIndirect with it records nothing
-    // yet (the replay is #3777's), so a title that only creates such a signature at startup goes on.
+    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on every device, with or without mesh shaders, as the host runtime does on
+    // an RX 5700 without them (AMD driver 32.0.21045.29003) and on WARP (measured). ExecuteIndirect checks it as it
+    // checks a draw and then records nothing yet (the replay is #3777's), so a title that only creates such a
+    // signature at startup goes on.
     dispatch_mesh = 3,
 };
 

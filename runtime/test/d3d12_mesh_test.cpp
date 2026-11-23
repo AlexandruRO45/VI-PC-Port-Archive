@@ -1,7 +1,10 @@
 // D3D-29: mesh-shader PSOs from pipeline state streams and DispatchMesh, through the Xbox-ABI proxy over the Vulkan
 // device (docs/d3d12_vulkan.md section 5, "Pipelines").
 //   - A device without VK_EXT_mesh_shader reports D3D12_MESH_SHADER_TIER_NOT_SUPPORTED and refuses a mesh PSO with
-//     E_NOTIMPL; that part runs on every GPU. The rest needs the extension (exit 77 without it).
+//     E_NOTIMPL. It still creates a DISPATCH_MESH command signature, as the host runtime does on an RX 5700 without
+//     mesh shaders (AMD driver 32.0.21045.29003) and on WARP (measured), and a direct list with ExecuteIndirect on it
+//     closes, runs and is waited on: the device is not removed and the run is validation-clean. That part runs on
+//     every GPU. The rest needs the extension (exit 77 without it).
 //   - With it: MeshShaderTier 1; CreatePipelineState builds an MS + PS PSO and a VS + PS PSO from streams laid out as
 //     d3dx12.h lays them out (each subobject a type and its description, pointer-aligned); streams the PC runtime
 //     refuses (MS with VS, CS with PS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
@@ -12,8 +15,8 @@
 //     bottom-left quadrant (yellow). Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
-//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it records nothing
-//     yet, so its list closes.
+//   - With the extension too, a DISPATCH_MESH command signature is created and a stride below its 12 bytes refused;
+//     ExecuteIndirect with it records nothing yet, so its list closes.
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -170,7 +173,10 @@ int main() {
     const D3D12_SHADER_BYTECODE ps{ps_container.data(), ps_container.size()};
     const D3D12_SHADER_BYTECODE vs{vs_container.data(), vs_container.size()};
 
-    // Without the extension: no tier, and a mesh PSO is refused as not implemented.
+    // Without the extension: no tier, and a mesh PSO is refused as not implemented. A DISPATCH_MESH command signature
+    // is created all the same: the host runtime creates one on an RX 5700 (MeshShaderTier 0, AMD driver
+    // 32.0.21045.29003) and on WARP (measured), and d3d12_vulkan_device_test compares the answer with the host's. A
+    // stride below its 12 bytes is refused, as there.
     {
         Ref<ID3D12Device> device;
         Ref<ID3D12RootSignature> root;
@@ -182,17 +188,65 @@ int main() {
         stream.add(TargetsSubobject{.inner = one_target()});
         Ref<ID3D12PipelineState> pso;
         EXPECT(create(device.p, stream, pso) == E_NOTIMPL && !pso.p);
-        // A DISPATCH_MESH command signature is refused the same way.
         const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
         const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
-        Ref<ID3D12CommandSignature> sig;
-        EXPECT(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p)) == E_NOTIMPL && !sig.p);
+        const D3D12_COMMAND_SIGNATURE_DESC short_sig{8, 1, &mesh_arg, 0};
+        Ref<ID3D12CommandSignature> sig, short_one;
+        EXPECT(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p)) == S_OK && sig.p);
+        EXPECT(device->CreateCommandSignature(&short_sig, nullptr, IID_PPV_ARGS(&short_one.p)) == E_INVALIDARG &&
+               !short_one.p);
+
+        // ExecuteIndirect with it on one (1, 1, 1) record, in a direct list that is executed and waited on. Nothing
+        // is recorded for it (there is no mesh PSO to run it with), so the list does no GPU work of its own, and the
+        // device must come out of it usable.
+        const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+        const auto args_desc = buffer_desc(256);
+        Ref<ID3D12Resource> args;
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &args_desc,
+                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                         IID_PPV_ARGS(&args.p))));
+        void* mapped = nullptr;
+        EXPECT(SUCCEEDED(args->Map(0, nullptr, &mapped)) && mapped);
+        const D3D12_DISPATCH_MESH_ARGUMENTS one_group{1, 1, 1};
+        std::memcpy(mapped, &one_group, sizeof(one_group));
+        args->Unmap(0, nullptr);
+        const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+        Ref<ID3D12CommandQueue> queue;
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> list;
+        Ref<ID3D12Fence> fence;
+        EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                   IID_PPV_ARGS(&list.p))));
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+        list->SetGraphicsRootSignature(root.p);
+        list->ExecuteIndirect(sig.p, 1, args.p, 0, nullptr, 0);
+        EXPECT(list->Close() == S_OK);
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+        EXPECT(fence->GetCompletedValue() == 1);
+        EXPECT(device->GetDeviceRemovedReason() == S_OK);
+        list.reset();
+        allocator.reset();
+        queue.reset();
+        fence.reset();
+        args.reset();
+        sig.reset();
         root.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
+    // Counted here, so a GPU without the extension, which stops below, fails on an error in that run too.
+    if (d.validation_errors()) {
+        std::fprintf(stderr, "%u validation errors on the device without VK_EXT_mesh_shader\n", d.validation_errors());
+        return 1;
+    }
     if (!d.mesh_shader) {
         std::filesystem::remove_all(library);
-        std::printf("no VK_EXT_mesh_shader on this device: only the refusal without it was checked\n");
+        std::printf("no VK_EXT_mesh_shader on this device: only the device without it was checked (mesh PSO refused; "
+                    "DISPATCH_MESH signature created, and a list with its ExecuteIndirect run and waited on)\n");
         return 77;
     }
 

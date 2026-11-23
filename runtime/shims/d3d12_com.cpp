@@ -764,6 +764,11 @@ public:
         UINT stride = 0;
         if (!command_signature_info(signature, kind, stride) || !argument_buffer)
             return check(false);
+        // A mesh dispatch runs on a direct list only: the host's Close fails after one on a compute or a copy list
+        // (the list-type rows of d3d12_execute_indirect_validation_test, MaxCommandCount 0 among them, measured on
+        // WARP and an RX 5700, AMD driver 32.0.21045.29003).
+        if (kind == leonida::IndirectKind::dispatch_mesh && type_ != D3D12_COMMAND_LIST_TYPE_DIRECT)
+            return check(false);
         const auto arg_desc = argument_buffer->GetDesc();
         if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
             return check(false);
@@ -775,20 +780,12 @@ public:
         } else if (count_buffer_offset != 0) {
             return check(false);
         }
-        if (kind == leonida::IndirectKind::dispatch_mesh) {
-            // Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing is recorded, and the
-            // first such call says so. The list stays valid.
-            static std::atomic<bool> logged{false};
-            if (!logged.exchange(true, std::memory_order_relaxed))
-                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a DISPATCH_MESH signature is not replayed yet; "
-                                     "nothing was recorded\n");
-            return;
-        }
         if (max_command_count) {
             const UINT64 record_size =
                 kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
                 : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
                 : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+                : kind == leonida::IndirectKind::dispatch_mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)
                 : 0;
             if (!record_size || stride < record_size || stride % 4 != 0)
                 return check(false);
@@ -808,6 +805,21 @@ public:
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
+        }
+        if (kind == leonida::IndirectKind::dispatch_mesh) {
+            // Last, after the list type and every check the other kinds get (both buffers, their alignment and the
+            // argument-buffer bounds, with 12-byte records), so Close answers as the host's does: the DISPATCH_MESH
+            // rows of d3d12_execute_indirect_validation_test, measured on WARP and an RX 5700 (AMD driver
+            // 32.0.21045.29003). As for a draw, no pipeline or root signature has to be bound; the host's Close is
+            // S_OK without them too. Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing
+            // is recorded, the first such call says so, and the list stays valid. A device without mesh shaders has
+            // these signatures too (CreateCommandSignature creates them on every device), but no mesh PSO to run
+            // them with.
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a DISPATCH_MESH signature is not replayed yet; "
+                                     "nothing was recorded\n");
+            return;
         }
         check(list_.execute_indirect(cmd));
     }

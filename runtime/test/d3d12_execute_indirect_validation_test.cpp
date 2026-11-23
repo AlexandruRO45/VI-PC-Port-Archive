@@ -1,6 +1,7 @@
 // Host-parity validation and GPU execution sanity test for ID3D12GraphicsCommandList::ExecuteIndirect.
 // Compares Close() verdicts between the Vulkan layer, live Windows WARP, and live hardware D3D12 (0 disagreements),
-// then executes valid ExecuteIndirect dispatches on the Vulkan GPU with validation enabled. No game data.
+// then executes valid ExecuteIndirect dispatches on the Vulkan GPU with validation enabled. The cases cover draw,
+// draw-indexed, dispatch and DISPATCH_MESH signatures, and DISPATCH_MESH on compute and copy lists. No game data.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "host_wine.h"
@@ -59,6 +60,8 @@ struct Env {
     Ref<ID3D12CommandSignature> draw_indexed24;
     Ref<ID3D12CommandSignature> dispatch12;
     Ref<ID3D12CommandSignature> dispatch20;
+    Ref<ID3D12CommandSignature> mesh12;
+    Ref<ID3D12CommandSignature> mesh16;
     Ref<ID3D12RootSignature> empty_root;
     Ref<ID3D12PipelineState> compute_pso;
     ID3D12GraphicsCommandList* list = nullptr;
@@ -100,6 +103,10 @@ struct Env {
         CHECK(mksig(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, 24, draw_indexed24));
         CHECK(mksig(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, 12, dispatch12));
         CHECK(mksig(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, 20, dispatch20));
+        // Every device creates these, with or without mesh shaders: the layer device here has none, and WARP
+        // (MeshShaderTier 1) and an RX 5700 (MeshShaderTier 0, AMD driver 32.0.21045.29003) both create them.
+        CHECK(mksig(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, 12, mesh12));
+        CHECK(mksig(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, 16, mesh16));
 
         if (layer_cs_container) {
             D3D12_VERSIONED_ROOT_SIGNATURE_DESC rs_desc{};
@@ -125,16 +132,19 @@ struct Env {
 
 struct Case {
     const char* name;
-    bool expected_ok;  // Measured on Windows 11 WARP and RTX 5090 HW D3D12
+    // The host's Close result. The rows before the DISPATCH_MESH ones were measured on Windows 11 WARP and an RTX 5090;
+    // the DISPATCH_MESH rows, on direct, compute and copy lists, on Windows 11 WARP and an AMD Radeon RX 5700 (AMD
+    // driver 32.0.21045.29003), which agrees with every row.
+    bool expected_ok;
     std::function<void(Env&)> record;
+    D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;  // the list the case records and closes
 };
 
 bool run_case(Env& env, const Case& c, HRESULT& out_hr) {
     Ref<ID3D12CommandAllocator> alloc;
     Ref<ID3D12GraphicsCommandList> list;
-    CHECK(SUCCEEDED(env.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc.p))));
-    CHECK(SUCCEEDED(env.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, nullptr,
-                                                  IID_PPV_ARGS(&list.p))));
+    CHECK(SUCCEEDED(env.device->CreateCommandAllocator(c.list_type, IID_PPV_ARGS(&alloc.p))));
+    CHECK(SUCCEEDED(env.device->CreateCommandList(0, c.list_type, alloc.p, nullptr, IID_PPV_ARGS(&list.p))));
     env.list = list.p;
     c.record(env);
     env.list = nullptr;
@@ -263,6 +273,53 @@ std::vector<Case> parity_cases() {
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, 0, e.buf3.p, 0); }},
         {"count_buf width=3 off=0 (max=0)", false,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 0, e.buf3.p, 0); }},
+
+        // DISPATCH_MESH (12-byte D3D12_DISPATCH_MESH_ARGUMENTS records). The layer records nothing for these yet, but
+        // checks them as it checks a draw; no PSO or root signature is bound, as in the draw rows. These rows and
+        // the list-type rows below were measured on Windows 11 WARP (MeshShaderTier 1) and an AMD Radeon RX 5700
+        // (MeshShaderTier 0, AMD driver 32.0.21045.29003, D3D12Core 10.0.26100.9818), not on the RTX 5090.
+        {"mesh max=1 arg=0 cnt=null", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 0, nullptr, 0); }},
+        {"mesh max=1 arg=0 cnt=buf@0", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 0, e.count256.p, 0); }},
+        {"mesh arg_offset=244 exact fit (244+12==256)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 244, nullptr, 0); }},
+        {"mesh arg_offset=248 OOB (248+12>256, max=1)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 248, nullptr, 0); }},
+        {"mesh arg_offset=256 ==width (max=1)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 256, nullptr, 0); }},
+        {"mesh arg_offset=260 >width (max=0 no-op)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 0, e.buf256.p, 260, nullptr, 0); }},
+        {"mesh arg_offset=240 max=2 (OOB)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 2, e.buf256.p, 240, nullptr, 0); }},
+        {"mesh arg_offset=0 max=U32MAX (OOB)", false,
+         [=](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, kU32Max, e.buf256.p, 0, nullptr, 0); }},
+        {"mesh arg_buf width=3 (max=1 OOB)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf3.p, 0, nullptr, 0); }},
+        {"mesh arg_buf width=3 (max=0 no-op)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 0, e.buf3.p, 0, nullptr, 0); }},
+        {"mesh stride=16 off=228 max=2 (228+16+12==256)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh16.p, 2, e.buf256.p, 228, nullptr, 0); }},
+        {"mesh stride=16 off=232 max=2 (232+16+12>256)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh16.p, 2, e.buf256.p, 232, nullptr, 0); }},
+        {"mesh argument_buffer is texture (max=1)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.tex.p, 0, nullptr, 0); }},
+        {"mesh arg_offset=2 unaligned (max=1)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 2, nullptr, 0); }},
+        {"mesh count_offset=256 ==width (max=1)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 0, e.count256.p, 256); }},
+
+        // List type: a mesh dispatch needs a direct list; the host's Close fails after one on a compute or a copy list
+        // (measured on the same two devices as the rows above).
+        {"mesh on a compute list (max=1)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 0, nullptr, 0); },
+         D3D12_COMMAND_LIST_TYPE_COMPUTE},
+        {"mesh on a compute list (max=0)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 0, e.buf256.p, 0, nullptr, 0); },
+         D3D12_COMMAND_LIST_TYPE_COMPUTE},
+        {"mesh on a copy list (max=1)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 0, nullptr, 0); },
+         D3D12_COMMAND_LIST_TYPE_COPY},
     };
 }
 
@@ -418,6 +475,14 @@ int main() {
                     char name_buf[256]{};
                     std::snprintf(name_buf, sizeof(name_buf), "%ls", desc.Description);
                     hw_name = name_buf;
+                    // The user-mode driver's version, so the log names the driver the HW column was measured on.
+                    LARGE_INTEGER umd{};
+                    if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd))) {
+                        std::snprintf(name_buf, sizeof(name_buf), " (driver %u.%u.%u.%u)",
+                                      unsigned(HIWORD(umd.HighPart)), unsigned(LOWORD(umd.HighPart)),
+                                      unsigned(HIWORD(umd.LowPart)), unsigned(LOWORD(umd.LowPart)));
+                        hw_name += name_buf;
+                    }
                     hw_ran = true;
                     break;
                 }
