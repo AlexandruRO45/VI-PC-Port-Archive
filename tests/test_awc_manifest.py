@@ -3,12 +3,14 @@
     python -I tests/test_awc_manifest.py
 """
 import contextlib, csv, io, json, os, struct, subprocess, sys, tempfile, unittest
+from pathlib import Path
 from unittest import mock
 
 TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "tools", "awc_manifest.py")
 sys.path.insert(0, os.path.dirname(TOOL))
 import awc_manifest  # noqa: E402
+import awc_names  # noqa: E402
 
 HEADER = ["bank", "stream", "codec", "codec_name", "channels", "sample_rate", "declared_samples",
           "duration_s", "streamed_music", "data_offset", "data_size", "bank_size", "notes"]
@@ -24,14 +26,15 @@ def fmt(samples, rate, codec, channels):
 
 def music_blob(ids, samples, rate, toc=0xF8):
     """(descriptor, data) for one block of Opus channels. toc is the packet TOC byte."""
+    chunk = 2048 * (1 + len(ids))
     desc = bytearray(12 + 16 * len(ids))
-    struct.pack_into("<III", desc, 0, 1, 2048, len(ids))
+    struct.pack_into("<III", desc, 0, 1, chunk, len(ids))
     for i, cid in enumerate(ids):
         base = 12 + 16 * i
         struct.pack_into("<II", desc, base, cid, samples)
         struct.pack_into("<H", desc, base + 10, rate)
         desc[base + 12] = 0x0B
-    data = bytearray(2048 + 2048 * len(ids))          # aligned record table, then channel blocks
+    data = bytearray(chunk)                          # aligned record table, then channel blocks
     for i in range(len(ids)):
         struct.pack_into("<I", data, 24 * i + 4, 1)   # subblock count; skip stays 0
         struct.pack_into("<H", data, 2048 + 2048 * i, 1)
@@ -86,7 +89,7 @@ class ManifestTest(unittest.TestCase):
 
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True,
-                              text=True, encoding="utf-8", timeout=60)
+                              text=True, errors="replace", timeout=60)
 
     def test_csv_rows_codecs_and_bad_bank_skip(self):
         bank = self.write_bank()
@@ -150,6 +153,29 @@ class ManifestTest(unittest.TestCase):
                          [("00000123", "2"), ("00000123", "4")])
         self.assertNotIn("00000123~2", rows[0]["notes"])
         self.assertIn("00000123~2", rows[1]["notes"])
+
+    def test_inventory_can_name_plain_and_music_streams_without_banks(self):
+        root = Path(self.tmp.name)
+        names = ["zz_rootau_abcd_01", "zz_rootau_abcd_02"]
+        plain_id, music_id = [awc_names.joaat(name) & awc_names.M29 for name in names]
+        desc, audio = music_blob([music_id], 960, 48000)
+        bank = root / "banks" / "nested" / "one.AWC"
+        bank.parent.mkdir(parents=True)
+        bank.write_bytes(build_bank([(plain_id, [(0x76, fmt(2, 48000, 0, 1)), (0x55, bytes(4))]),
+                                     (0x50, [(0x48, desc), (0x55, audio)])]))
+        inventory = root / "inventory.json"
+        result = self.run_tool(root / "banks", "--out", inventory)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bank.unlink()
+
+        words, out = root / "words.txt", root / "names.csv"
+        words.write_text("\n".join(names), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-I", awc_names.__file__, inventory, "--words", words, "--out", out],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with out.open(encoding="utf-8", newline="") as fh:
+            self.assertCountEqual([(row["bank"], row["name"]) for row in csv.DictReader(fh)],
+                                  [("nested/one", name) for name in names])
 
     def test_json_out_is_inferred_from_extension(self):
         bank = self.write_bank(with_music=False)
@@ -267,6 +293,52 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual((doc["bank_count"], doc["stream_count"]), (0, 0))
         self.assertEqual(doc["streams"], [])
 
+    def test_incomplete_bank_discovery_preserves_the_previous_manifest(self):
+        root = self.tmp.name
+        blocked = os.path.join(root, "blocked")
+        out = os.path.join(root, "manifest.json")
+        previous = b'{"previous": true}\n'
+        with open(out, "wb") as f:
+            f.write(previous)
+
+        def walk(path, onerror=None):
+            if onerror:
+                onerror(PermissionError(13, "permission denied", blocked))
+            return iter(())
+
+        with mock.patch.object(awc_manifest.os, "walk", walk), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(awc_manifest.main([root, "--out", out]), 1)
+        self.assertIn(blocked, err.getvalue())
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), previous)
+
+    def test_unreadable_bank_preserves_the_previous_manifest(self):
+        good = os.path.join(self.tmp.name, "good.awc")
+        blocked = os.path.join(self.tmp.name, "unreadable.awc")
+        self.write_bank(good, with_music=False)
+        self.write_bank(blocked, with_music=False)
+        out = os.path.join(self.tmp.name, "manifest.json")
+        previous = b'{"previous": true}\n'
+        with open(out, "wb") as f:
+            f.write(previous)
+        read_bank = awc_manifest._bank_rows
+
+        def read_with_error(path, bank):
+            if path == blocked:
+                raise PermissionError(13, "permission denied", path)
+            return read_bank(path, bank)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(awc_manifest, "_bank_rows", side_effect=read_with_error), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(awc_manifest.main([self.tmp.name, "--out", out]), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("cannot read", stderr.getvalue())
+        self.assertIn(blocked, stderr.getvalue())
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), previous)
+
     def test_failed_write_keeps_the_previous_manifest(self):
         out = os.path.join(self.tmp.name, "manifest.json")
         with open(out, "w", encoding="utf-8") as f:
@@ -282,6 +354,30 @@ class ManifestTest(unittest.TestCase):
         with open(out, encoding="utf-8") as f:
             self.assertEqual(f.read(), '{"previous": true}\n')
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
+
+    def test_failed_replace_of_read_only_manifest_removes_writable_temp(self):
+        out = os.path.join(self.tmp.name, "manifest.json")
+        previous = '{"previous": true}\n'
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(previous)
+        os.chmod(out, 0o444)
+        self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+        made_writable = []
+        real_chmod = os.chmod
+
+        def chmod(path, mode, *args, **kwargs):
+            if isinstance(path, str) and os.path.basename(path).startswith(".awc_manifest-") and mode == 0o600:
+                made_writable.append(path)
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(awc_manifest.os, "replace", side_effect=OSError("replace denied")), \
+                mock.patch.object(awc_manifest.os, "chmod", chmod):
+            with self.assertRaises(OSError):
+                awc_manifest.write_manifest([], 0, 0, "json", out)
+        self.assertEqual(len(made_writable), 1)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])
 
     def test_recursive_report_distinguishes_banks_with_the_same_basename(self):
         for folder in ("left", "right"):

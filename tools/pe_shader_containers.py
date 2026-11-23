@@ -197,11 +197,16 @@ def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:
         stem = safe_stem(record["name"], k)
         file = f"{stem}.dxbc"
         target = os.path.join(directory, file)
-        if os.path.exists(target):
-            file = f"{stem}_{k:02d}.dxbc"
-            target = os.path.join(directory, file)
-        with open(target, "wb") as f:
-            f.write(data[record["offset"] : record["offset"] + record["size"]])
+        n = k
+        while True:
+            try:
+                with open(target, "xb") as f:
+                    f.write(data[record["offset"] : record["offset"] + record["size"]])
+                break
+            except FileExistsError:
+                file = f"{stem}_{n:02d}.dxbc"
+                target = os.path.join(directory, file)
+                n += 1
         index.append({"name": stem, "file": file, "stage": "cs"})
     return index
 
@@ -224,13 +229,18 @@ def main(argv=None) -> int:
 
     if a.extract and os.path.exists(a.extract) and not os.path.isdir(a.extract):
         ap.error(f"--extract {a.extract} is not a folder")
+    if a.extract:
+        index_path = os.path.join(a.extract, "index.json")
+        for image in a.images:
+            if same_report_path(index_path, image):
+                ap.error(f"--extract index {index_path} would overwrite the input image {image}")
     if a.json:
         if os.path.isdir(a.json):
             ap.error(f"--json {a.json} is a folder, not a file")
         for image in a.images:
             if same_report_path(a.json, image):
                 ap.error(f"--json {a.json} would overwrite the input image {image}")
-        if a.extract and same_report_path(a.json, os.path.join(a.extract, "index.json")):
+        if a.extract and same_report_path(a.json, index_path):
             ap.error(f"--json {a.json} would overwrite the extract index")
 
     all_records, status, index = [], 0, []
@@ -271,7 +281,6 @@ def main(argv=None) -> int:
                 return 2
 
     if a.extract:
-        index_path = os.path.join(a.extract, "index.json")
         try:
             with open(index_path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(index, f, indent=0)

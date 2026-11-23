@@ -8,6 +8,9 @@ game.dll.md), so an exe and a dll with the same stem get separate reports. Image
 different directories get a numbered suffix (x.exe-2.json), and the name used is printed to stderr. The same file
 given twice with the same import search folder is inspected once. Reads the file only; never runs it.
 
+The report also lists run-time load candidates: DLL names the image holds as ASCII or UTF-16 strings without
+importing them, where a LoadLibrary* the import table doesn't show would point (docs/runtime_imports.md).
+
 Standard library only: the headers, the section table, the import, delay-import, export, TLS and relocation
 directories are parsed with struct, so the tool runs under `python -I` without third-party packages and is covered
 by the same standard-library-only CI job as the other tools.
@@ -18,6 +21,7 @@ import argparse
 import json
 import math
 import os
+import re
 import struct
 import sys
 from collections import Counter
@@ -65,10 +69,16 @@ class PeImage:
 
     def __init__(self, data: bytes):
         self.data = data
-        if len(data) < 0x40 or data[:2] != b"MZ":
+        if data[:2] != b"MZ":
             raise PeFormatError("no MZ header")
+        if len(data) < 0x40:
+            # The MZ signature is there; the file is just too short to carry the MS-DOS header whose dword at
+            # 0x3c holds e_lfanew. Saying "no MZ header" here would blame a signature that is present.
+            raise PeFormatError(f"file is {len(data)} bytes, shorter than the 64-byte MS-DOS header")
         self.nt = struct.unpack_from("<I", data, 0x3C)[0]
-        if self.nt + 24 > len(data) or data[self.nt:self.nt + 4] != b"PE\0\0":
+        if self.nt + 24 > len(data):
+            raise PeFormatError(f"file is {len(data)} bytes, too short to hold the PE header at 0x{self.nt:x}")
+        if data[self.nt:self.nt + 4] != b"PE\0\0":
             raise PeFormatError("no PE signature")
         (self.machine, self.section_count, self.timestamp, _symbol_table, _symbols, opt_size,
          self.characteristics) = struct.unpack_from("<HHIIIHH", data, self.nt + 4)
@@ -119,10 +129,13 @@ class PeImage:
     def directory(self, index: int) -> tuple[int, int]:
         return self.directories[index] if index < len(self.directories) else (0, 0)
 
-    def offset(self, rva: int) -> int | None:
-        """File offset of an RVA, or None when no file bytes back it."""
+    def _range(self, rva: int) -> tuple[int, int] | None:
+        """Contiguous file [start, end) backed by headers or the single section holding `rva`."""
+        if rva < 0:
+            return None
         if rva < self.size_of_headers:
-            return rva if rva < len(self.data) else None
+            end = min(self.size_of_headers, len(self.data))
+            return (rva, end) if rva < end else None
         for s in self.sections:
             # A section is VirtualSize bytes in memory (SizeOfRawData when that is 0). File bytes past it are not
             # mapped, as in runtime/src/pe_loader.cpp: with SizeOfRawData larger than the span to the next
@@ -130,11 +143,23 @@ class PeImage:
             span = s["vsize"] or s["rawsize"]
             if s["rva"] <= rva < s["rva"] + span:
                 delta = rva - s["rva"]
-                if delta >= min(s["rawsize"], span):
+                mapped = min(s["rawsize"], span)
+                if delta >= mapped:
                     return None
                 at = s["rawptr"] + delta
-                return at if at < len(self.data) else None
+                end = min(s["rawptr"] + mapped, len(self.data))
+                return (at, end) if at < end else None
         return None
+
+    def offset(self, rva: int, size: int = 1) -> int | None:
+        """File offset of an RVA span wholly backed by headers or one section."""
+        if size <= 0:
+            return None
+        bounds = self._range(rva)
+        if bounds is None:
+            return None
+        start, end = bounds
+        return start if start + size <= end else None
 
     def section_data(self, section: dict) -> bytes:
         at = section["rawptr"]
@@ -143,8 +168,11 @@ class PeImage:
         return self.data[at:at + min(section["rawsize"], len(self.data) - at)]
 
     def string_at(self, rva: int) -> str | None:
-        at = self.offset(rva)
-        return None if at is None else _cstring(self.data, at)
+        bounds = self._range(rva)
+        if bounds is None:
+            return None
+        start, end = bounds
+        return _cstring(self.data, start, min(NAME_LIMIT, end - start))
 
     def word(self, at: int) -> int:
         return struct.unpack_from("<Q" if self.is64 else "<I", self.data, at)[0]
@@ -155,7 +183,7 @@ class PeImage:
         out = []
         width = 8 if self.is64 else 4
         for i in range(MAX_ENTRIES):
-            at = self.offset(lookup_rva + i * width)
+            at = self.offset(lookup_rva + i * width, width)
             if at is None:
                 break
             value = self.word(at)
@@ -164,7 +192,7 @@ class PeImage:
             if value & ordinal_flag:
                 out.append(f"#{value & 0xFFFF}")
                 continue
-            name = self.string_at((value & 0x7FFFFFFF) + 2)  # skip the 2-byte hint
+            name = self.string_at(value + 2)  # skip the 2-byte hint
             out.append(name if name is not None else "?")
         return out
 
@@ -173,15 +201,12 @@ def _imports(img: PeImage, kind: str, index: int, delay: bool = False) -> list[d
     rva, size = img.directory(index)
     if not rva or not size:
         return []
-    at = img.offset(rva)
-    if at is None:
-        return []
 
     entries = []
     step = 32 if delay else 20
-    for i in range(MAX_ENTRIES):
-        base = at + i * step
-        if base + step > len(img.data):
+    for i in range(min(size // step, MAX_ENTRIES)):
+        base = img.offset(rva + i * step, step)
+        if base is None:
             break
         if delay:
             (attributes, dll_rva, _handle, iat_rva, int_rva, _bound, _unload,
@@ -213,8 +238,11 @@ def _exports(img: PeImage) -> list[str]:
     rva, size = img.directory(DIR_EXPORT)
     if not rva or size < 40:
         return []
-    at = img.offset(rva)
+    at = img.offset(rva, 40)
     if at is None:
+        start = img.offset(rva)
+        if start is not None and start + 40 > len(img.data):
+            raise PeFormatError("truncated export directory")
         return []
     (_chars, _stamp, _major, _minor, _name, base, functions, name_count, addr_functions,
      addr_names, addr_ordinals) = struct.unpack_from("<IIHHIIIIIII", img.data, at)
@@ -223,14 +251,13 @@ def _exports(img: PeImage) -> list[str]:
         if index >= functions:
             return False
         # A zero RVA marks an unused slot. An RVA inside the export directory is a valid forwarder.
-        slot = img.offset(addr_functions + index * 4)
-        return (slot is not None and slot + 4 <= len(img.data)
-                and struct.unpack_from("<I", img.data, slot)[0] != 0)
+        slot = img.offset(addr_functions + index * 4, 4)
+        return slot is not None and struct.unpack_from("<I", img.data, slot)[0] != 0
 
     named, names = set(), []
     for i in range(min(name_count, MAX_ENTRIES)):
-        name_at = img.offset(addr_names + i * 4)
-        ord_at = img.offset(addr_ordinals + i * 2)
+        name_at = img.offset(addr_names + i * 4, 4)
+        ord_at = img.offset(addr_ordinals + i * 2, 2)
         if name_at is None or ord_at is None:
             break
         index = struct.unpack_from("<H", img.data, ord_at)[0]
@@ -245,12 +272,26 @@ def _exports(img: PeImage) -> list[str]:
     return names
 
 
+def _export_module_name(img: PeImage) -> str:
+    """The module name the export directory records (its Name field), or "" when there is none."""
+    rva, size = img.directory(DIR_EXPORT)
+    at = img.offset(rva, 40) if rva and size >= 40 else None
+    if at is None:
+        return ""
+    return img.string_at(struct.unpack_from("<I", img.data, at + 12)[0]) or ""
+
+
 def _tls_callbacks(img: PeImage) -> int:
     rva, size = img.directory(DIR_TLS)
-    if not rva or size < (40 if img.is64 else 24):
+    header_size = 40 if img.is64 else 24
+    callbacks_end = 32 if img.is64 else 16
+    if not rva or size < header_size:
         return 0
-    at = img.offset(rva)
+    at = img.offset(rva, header_size)
     if at is None:
+        start = img.offset(rva)
+        if start is not None and start + callbacks_end > len(img.data):
+            raise PeFormatError("truncated TLS directory")
         return 0
     callbacks_va = struct.unpack_from("<Q" if img.is64 else "<I", img.data, at + (24 if img.is64 else 12))[0]
     if not callbacks_va or callbacks_va < img.image_base:
@@ -259,7 +300,7 @@ def _tls_callbacks(img: PeImage) -> int:
     count = 0
     width = 8 if img.is64 else 4
     for i in range(MAX_ENTRIES):
-        entry = img.offset(callbacks + i * width)
+        entry = img.offset(callbacks + i * width, width)
         if entry is None or not img.word(entry):
             break
         count += 1
@@ -298,6 +339,30 @@ def _query_apiset(name: str) -> bool:
         return status == 0 and bool(present.value)
     except (OSError, AttributeError, ValueError):
         return False
+
+
+# A DLL file name as an image stores it for LoadLibrary*: ASCII or UTF-16LE, letters, digits, '_', '-' and '.'.
+# A UTF-16 name starts after a NUL (or at the start), so the tail of an ASCII string followed by one isn't read as one.
+_DLL_ASCII = re.compile(rb"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}\.[dD][lL][lL](?![A-Za-z0-9_])")
+_DLL_WIDE = re.compile(rb"(?<![^\x00])(?:[A-Za-z0-9_]\x00)(?:[A-Za-z0-9_.\-]\x00){0,63}"
+                       rb"\.\x00[dD]\x00[lL]\x00[lL]\x00(?![A-Za-z0-9_]\x00)")
+
+
+def dll_strings(data: bytes, imported: set[str], own_name: str | tuple[str, ...] = "") -> list[dict]:
+    """DLL names the image holds as strings but doesn't import: candidates for a run-time LoadLibrary*, which the
+    import table doesn't show (XCurl.dll and libHttpClient.GDK.dll reach xgameruntime.dll only this way,
+    docs/runtime_imports.md). `imported` is the lower-cased names from the import tables; the image's own names
+    (its file name and the name in its export directory) are left out too. Each entry is {"name", "encoding":
+    "ascii" | "utf-16" | "both"}, sorted by name. A string is not proof of a load, only of where to look."""
+    seen: dict[str, set[str]] = {}
+    for m in _DLL_ASCII.finditer(data):
+        seen.setdefault(m.group().decode("ascii").lower(), set()).add("ascii")
+    for m in _DLL_WIDE.finditer(data):
+        seen.setdefault(m.group().decode("utf-16-le").lower(), set()).add("utf-16")
+    own = (own_name,) if isinstance(own_name, str) else own_name
+    skip = imported | {n.lower() for n in own if n}
+    return [{"name": n, "encoding": "both" if len(e) == 2 else next(iter(e))}
+            for n, e in sorted(seen.items()) if n not in skip]
 
 
 def classify_dll(name: str, game_dir: str | None) -> str:
@@ -343,6 +408,10 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         entry["where"] = classify_dll(entry["dll"], game_dir)
 
     exports = _exports(img)
+    own_names = (os.path.basename(path), _export_module_name(img))
+    loads = dll_strings(img.data, {i["dll"].lower() for i in imports}, own_names)
+    for entry in loads:
+        entry["where"] = classify_dll(entry["name"], game_dir)
     pdata_rva, pdata_size = img.directory(DIR_EXCEPTION)
     reloc_rva, reloc_size = img.directory(DIR_BASERELOC)
 
@@ -364,6 +433,7 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "exports": exports,
         "pdata_functions": pdata_size // 12 if pdata_rva and pdata_size >= 12 else 0,
         "tls_callbacks": _tls_callbacks(img),
+        "runtime_load_candidates": loads,
     }
 
 
@@ -386,6 +456,13 @@ def to_markdown(r: dict) -> str:
     out += ["", "| dll | kind | resolves | functions |", "|---|---|---|---|"]
     for imp in sorted(r["imports"], key=lambda i: (i["where"] != "shim", i["dll"].lower())):
         out.append(f"| {imp['dll']} | {imp['kind']} | {imp['where']} | {len(imp['functions'])} |")
+    loads = r.get("runtime_load_candidates", [])
+    if loads:
+        out += ["", "## Run-time load candidates", "",
+                "DLL names held as strings but not imported: a `LoadLibrary*` the import table doesn't show "
+                "(a string is where to look, not proof of a load).", "",
+                "| dll | encoding | resolves |", "|---|---|---|"]
+        out += [f"| {d['name']} | {d['encoding']} | {d['where']} |" for d in loads]
     shims = [i for i in r["imports"] if i["where"] == "shim"]
     if shims:
         out += ["", "## Needs checking or a shim", ""]
@@ -413,6 +490,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--game-dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
     a = ap.parse_args(argv)
+    missing = [img for img in a.image if not os.path.exists(img)]
+    if missing:
+        for img in missing:
+            print(f"ERROR: {img}: does not exist", file=sys.stderr)
+        return 2
     if os.path.isfile(a.out):
         print(f"cannot create output directory {a.out}: path is a file, not a directory", file=sys.stderr)
         return 1

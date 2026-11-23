@@ -4,6 +4,8 @@
 
 Everything is synthetic: an RPF9-like header, zlib streams and hand-built block headers. No game data is used.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -12,6 +14,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "analyze_4240_full.py")
@@ -48,7 +51,7 @@ class Analyze4240Test(unittest.TestCase):
 
     def run_tool(self, *args, timeout=30):
         return subprocess.run([sys.executable, "-I", TOOL, *args], cwd=ROOT,
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, errors="replace", timeout=timeout)
 
     def truncated_archive(self):
         path = os.path.join(self.root, "truncated.rpf")
@@ -79,10 +82,24 @@ class Analyze4240Test(unittest.TestCase):
         # Slot 1 sits at 0x60 and slot 0 at 0x80; slot 2 shares 0x80, so it adds no stride.
         self.assertEqual(stats["strides"], {(1, 1, 0, 0x42, 0x20): 1})
 
+    def test_stream_starting_with_4240_block_is_measured(self) -> None:
+        path = os.path.join(self.root, "direct-4240.rpf")
+        # Four 8-byte positions from 0x80, then four 4-byte colors from 0xA0.
+        slots = [0x4042, (0x50 << 8) | 0x26] + [0] * 22
+        page = block_4240(slots) + bytes(0xA0 - 0x60) + bytes((10, 20, 30, 255)) * 4
+        make_archive(path, page)
+
+        stats = A.process_archive(path)
+
+        self.assertEqual((stats["streams"], stats["blocks_4240"], stats["blocks_6330"]), (1, 1, 0))
+        self.assertEqual(stats["slot_tag_counts"], {(0, 0x42): 1, (1, 0x26): 1})
+        self.assertEqual(stats["strides"], {(0, 0x42, 1, 0x26, 32): 1})
+        self.assertEqual(stats["errors"], 0)
+
     def test_missing_input_is_one_error_line(self):
         missing = os.path.join(self.root, "missing.rpf")
         p = self.run_tool(missing)
-        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn("does not exist", p.stderr)
         self.assertIn("missing.rpf", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
@@ -99,6 +116,30 @@ class Analyze4240Test(unittest.TestCase):
         self.assertIn("carve", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
         self.assertIn("Processing " + good, p.stdout, "the next archive is still read")
+
+    def test_unreadable_archive_is_reported_and_later_archives_are_measured(self):
+        blocked = os.path.join(self.root, "locked.rpf")
+        make_archive(blocked, BLOCK_6330)
+        good = self.truncated_archive()
+        out = os.path.join(self.root, "stats.json")
+        stderr = io.StringIO()
+
+        def open_archive(path, *args, **kwargs):
+            if path == blocked:
+                raise PermissionError(13, "input is locked", path)
+            return open(path, *args, **kwargs)
+
+        with (mock.patch.object(A, "open", create=True, side_effect=open_archive),
+              mock.patch.object(sys, "argv", [TOOL, blocked, good, "--json", out]),
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(stderr)):
+            self.assertEqual(A.main(), 1)
+        self.assertEqual(stderr.getvalue().splitlines(),
+                         [f"ERROR: cannot read {blocked}: input is locked"])
+        with open(out, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(len(doc), 1)
+        self.assertEqual(doc[0]["errors"], 1)
 
     def test_limit_below_one_is_refused(self):
         path = self.truncated_archive()

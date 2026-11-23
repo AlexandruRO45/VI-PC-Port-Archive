@@ -77,13 +77,12 @@ def rewrite(text, counts):
             raise SystemExit(f"{v}: binding {b} isn't in vulkan_bindless.h")
 
     defs = {}       # result id -> instruction text
-    ptr_pos = {}    # OpTypePointer result id -> line index, so shared capacities emit at the earliest pointer
+    definition_positions: dict[str, int] = {}
     for idx, ln in enumerate(lines):
         m = re.match(r"\s*(%\S+) = (.*)$", ln)
         if m:
             defs[m.group(1)] = m.group(2)
-            if re.match(r"OpTypePointer\b", m.group(2)):
-                ptr_pos[m.group(1)] = idx
+            definition_positions[m.group(1)] = idx
     uint = next((r for r, d in defs.items() if d == "OpTypeInt 32 0"), None)
 
     candidates = []
@@ -96,15 +95,22 @@ def rewrite(text, counts):
         rt = re.match(r"OpTypeRuntimeArray (%\S+)$", defs.get(ptr.group(1), "")) if ptr else None
         if not rt:
             continue
+        candidates.append((b, definition_positions[old_ptr], order, v, old_ptr, rt.group(1)))
+
+    if candidates:
         if uint is None:
             raise SystemExit("module has no 32-bit uint type for the array lengths")
-        candidates.append((b, ptr_pos.get(old_ptr, len(lines)), order, v, old_ptr, rt.group(1)))
+        first_pointer = min(candidate[1] for candidate in candidates)
+        uint_position = definition_positions[uint]
+        if uint_position > first_pointer:
+            # The generated length may precede an original declaration of its integer type.
+            lines.insert(first_pointer, lines.pop(uint_position))
 
     used_ids = set(defs) | set(sets) | set(binds)
     cap_by_bind = {}    # binding -> OpConstant id (emitted once per binding)
     ptr_by_key = {}     # (binding, elem_type) -> new OpTypePointer id
     new_types = []      # inserted right after the variable's pointer type is declared
-    retype = {}         # variable -> new pointer type
+    retype = {}         # resized variable or copied pointer ID -> new pointer type
     for b, _, _, v, old_ptr, elem in sorted(candidates):
         if (b, elem) in ptr_by_key:
             retype[v] = ptr_by_key[(b, elem)]
@@ -133,6 +139,12 @@ def rewrite(text, counts):
         m = re.match(r"(\s*(%\S+) = OpVariable )(%\S+)( UniformConstant)$", ln)
         if m and m.group(2) in retype:
             ln = f"{m.group(1)}{retype[m.group(2)]}{m.group(4)}"
+        # Retype copies by source ID so arrays sharing a type in other sets are unaffected.
+        m = re.match(r"(\s*(%\S+) = OpCopyObject )%\S+ (%\S+)$", ln)
+        if m and m.group(3) in retype:
+            ptr = retype[m.group(3)]
+            retype[m.group(2)] = ptr
+            ln = f"{m.group(1)}{ptr} {m.group(3)}"
         out.append(ln)
         m = re.match(r"\s*(%\S+) = OpTypePointer", ln)
         if m:
@@ -157,7 +169,9 @@ def main(argv):
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
         return 2
     dis, asm = _tools()
-    text = _run([dis, argv[1]], capture_output=True, text=True).stdout
+    # errors="replace": on Windows text=True decodes with the ANSI code page, and a program that answers in UTF-8
+    # (a path with non-ASCII letters in its error message) would otherwise kill the reader thread and lose stderr.
+    text = _run([dis, argv[1]], capture_output=True, text=True, errors="replace").stdout
     env = re.search(r"; Version: (\d+)\.(\d+)", text)
     target = f"spv{env.group(1)}.{env.group(2)}" if env else "vulkan1.2"
     _run([asm, "--target-env", target, "-", "-o", argv[2]], input=rewrite(text, counts), text=True)

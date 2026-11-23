@@ -74,8 +74,16 @@ def chunks():
     return struct.pack("<III", 0x88560988, 8, 7) + bytes(52)
 
 
+def aux(entries, payload=None, trailing=b""):
+    """A synthetic auxiliary table: u32 count, {u32 tag, u32 size} pairs, payloads, then trailing bytes."""
+    data = struct.pack("<I", len(entries)) + b"".join(struct.pack("<II", t, n) for t, n in entries)
+    if payload is None:
+        payload = b"".join(bytes([i + 1]) * n for i, (_, n) in enumerate(entries))
+    return data + payload + trailing
+
+
 def clip():
-    return struct.pack("<I", 3) + b"\x01\x01\x00\x00" + bytes(56)
+    return aux([(0x101, 8), (0x113, 12), (0x207, 4)], trailing=b"\xee" * 36)
 
 
 def rbf0():
@@ -167,7 +175,49 @@ class ClassifyTest(unittest.TestCase):
 
     def test_clip_header(self):
         r = anim_index.classify(clip(), 0x600, 70)
-        self.assertEqual((r["version"], r["detail"]), (3, "24-byte header"))
+        self.assertEqual((r["signature"], r["version"], r["count"], r["detail"]),
+                         ("clip-stream", None, 3, "aux-table tags=0x101,0x113,0x207 payload_end=52"))
+
+    def test_aux_two_entries_exact_fit(self):
+        data = aux([(0x101, 40), (0x207, 20)])   # payloads end exactly at the end of the stream
+        self.assertEqual(anim_index.aux_table(data), ([(0x101, 40), (0x207, 20)], len(data)))
+        r = anim_index.classify(data, 0, len(data))
+        self.assertEqual((r["signature"], r["count"]), ("clip-stream", 2))
+
+    def test_aux_trailing_schema_bytes_kept(self):
+        data = aux([(0x101, 16), (0x204, 8), (0x207, 8)], trailing=bytes(range(64)))
+        self.assertEqual(anim_index.aux_table(data)[1], 4 + 24 + 32)
+        self.assertEqual(anim_index.classify(data, 0, len(data))["signature"], "clip-stream")
+
+    def test_aux_payload_overruns_stream(self):
+        short = aux([(0x101, 40), (0x207, 30)])[:-1]   # last payload one byte short
+        self.assertIsNone(anim_index.aux_table(short))
+        self.assertEqual(anim_index.classify(short, 0, len(short))["signature"], "raw:02000000")
+
+    def test_aux_declared_size_too_large(self):
+        data = aux([(0x101, 8), (0x113, 0xFFFFFFF0), (0x207, 8)], payload=bytes(64))
+        self.assertIsNone(anim_index.aux_table(data))
+        self.assertNotEqual(anim_index.classify(data, 0, len(data))["signature"], "clip-stream")
+
+    def test_aux_truncated_directory(self):
+        data = aux([(0x101, 0), (0x113, 0), (0x207, 0)])[:20]   # the matching 8-byte prefix, directory cut
+        self.assertIsNone(anim_index.aux_table(data))
+        self.assertIsNone(anim_index.aux_table(data[:8]))
+        self.assertEqual(anim_index.classify(data[:8], 0, 8)["signature"], "raw:03000000")
+
+    def test_aux_wrong_count_or_first_tag(self):
+        for entries in ([(0x101, 4)], [(0x101, 4)] * 4, [(0x113, 4), (0x207, 4)], [(0x207, 4), (0x101, 4)]):
+            data = aux(entries, trailing=b"\x5a" * 64)
+            self.assertIsNone(anim_index.aux_table(data), entries)
+            self.assertNotEqual(anim_index.classify(data, 0, len(data))["signature"], "clip-stream")
+
+    def test_aux_prefix_with_overrunning_size_is_generic(self):
+        # The old 8-byte prefix check called this a clip stream; its declared payload does not fit.
+        data = struct.pack("<III", 2, 0x101, 1 << 20) + bytes(60)
+        self.assertEqual(anim_index.classify(data, 0, len(data))["signature"], "raw:02000000")
+
+    def test_aux_valid_page_stops_rbf0_continuation(self):
+        self.assertIn(anim_index.classify(clip(), 0, len(clip()))["signature"], anim_index.STOP_SIGNATURES)
 
     def test_rbf0(self):
         r = anim_index.classify(rbf0(), 0x700, 30)
@@ -270,7 +320,7 @@ class ArchiveTest(unittest.TestCase):
                                      ("--limit", "-100", "must be at least 1")):
             out = os.path.join(self.root, "bad.json")
             p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet", flag, value],
-                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertIn(message, p.stderr)
             self.assertNotIn("Traceback", p.stderr)
@@ -283,7 +333,7 @@ class ArchiveTest(unittest.TestCase):
                                   (self.rpf, out_in_missing, out_in_missing)):
             with self.subTest(path=os.path.relpath(path, self.root)):
                 p = subprocess.run([sys.executable, "-I", TOOL, source, out, "--quiet"],
-                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                                   capture_output=True, text=True, errors="replace")
                 self.assertEqual(p.returncode, 1, p.stderr)
                 self.assertTrue(p.stderr.startswith(path + ": "), p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
@@ -293,7 +343,7 @@ class ArchiveTest(unittest.TestCase):
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(out, encoding="utf-8") as f:
             doc = json.load(f)
@@ -307,7 +357,7 @@ class ArchiveTest(unittest.TestCase):
         with open(rigs, "w", encoding="utf-8") as f:
             f.write('{"previous": true}')
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", rigs, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("no anim/rigset/ keys found", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
@@ -318,16 +368,30 @@ class ArchiveTest(unittest.TestCase):
         folder_out = os.path.join(self.root, "out_folder")
         os.makedirs(folder_out)
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, folder_out, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("is a folder, not a .csv or .json file", p.stderr)
 
     def test_cli_rejects_invalid_extension(self):
         txt_out = os.path.join(self.root, "out.txt")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, txt_out, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("output must end in .json or .csv", p.stderr)
+
+    def test_cli_cannot_create_a_report_in_place_of_the_carve_manifest(self):
+        # <source>/index.json is the carve manifest's name even before a carve has written it.
+        carve = os.path.join(self.root, "carved_no_manifest")
+        os.makedirs(carve)
+        manifest = os.path.join(carve, "index.json")
+        out_csv = os.path.join(self.root, "no_manifest.csv")
+        for args, flag in (([manifest], "output"), ([out_csv, "--rigs", manifest], "--rigs")):
+            with self.subTest(flag=flag):
+                p = subprocess.run([sys.executable, "-I", TOOL, carve, *args, "--quiet"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn(f"{flag} would overwrite the carve manifest", p.stderr)
+                self.assertFalse(os.path.exists(manifest))
 
     def test_cli_carve_dir_protects_manifest_and_input_files(self):
         carve = os.path.join(self.root, "carved_manifest_test")
@@ -342,25 +406,25 @@ class ArchiveTest(unittest.TestCase):
 
         # Refuse to overwrite carve manifest via out
         p = subprocess.run([sys.executable, "-I", TOOL, carve, manifest, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("output would overwrite the carve manifest", p.stderr)
 
         # Refuse to overwrite carve manifest via --rigs
         p = subprocess.run([sys.executable, "-I", TOOL, carve, out_csv, "--rigs", manifest, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("--rigs would overwrite the carve manifest", p.stderr)
 
         # Refuse to overwrite carved input file via out
         p = subprocess.run([sys.executable, "-I", TOOL, carve, bin_file, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("output would overwrite an input file", p.stderr)
 
         # Refuse to overwrite carved input file via --rigs
         p = subprocess.run([sys.executable, "-I", TOOL, carve, out_csv, "--rigs", bin_file, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("--rigs would overwrite an input file", p.stderr)
 
@@ -375,6 +439,29 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual([r["signature"] for r in rows], ["move", "page-directory", "name-table"])
         self.assertEqual(summary["mode"], "directory")
 
+    def test_directory_classifies_each_payload_before_opening_the_next(self):
+        folder = os.path.join(self.root, "streamed")
+        os.mkdir(folder)
+        payloads = (move(), page(), names())
+        for name, payload in zip(("00001000.bin", "a.bin", "b.bin"), payloads):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(payload)
+
+        classify = mock.Mock(wraps=anim_index.classify)
+        reads = []
+
+        def tracked_open(path, mode):
+            self.assertEqual(classify.call_count, len(reads))
+            reads.append(os.path.basename(path))
+            return open(path, mode)
+
+        with mock.patch.object(anim_index, "classify", classify), \
+                mock.patch.object(anim_index, "open", tracked_open, create=True):
+            rows, summary = anim_index.scan_dir(folder)
+        self.assertEqual(reads, ["00001000.bin", "a.bin", "b.bin"])
+        self.assertEqual([row["offset"] for row in rows], [0x1000, 1, 2])
+        self.assertEqual(summary["span"], sum(map(len, payloads)))
+
     def test_directory_rejects_start_and_limit(self):
         folder = os.path.join(self.root, "carved")
         os.makedirs(folder)
@@ -386,7 +473,7 @@ class ArchiveTest(unittest.TestCase):
             with self.subTest(flags=flags):
                 out = os.path.join(self.root, f"bad{i}.json")
                 p = subprocess.run([sys.executable, "-I", TOOL, folder, out, "--quiet", *flags],
-                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                                   capture_output=True, text=True, errors="replace")
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
                 for flag in flags[::2]:
@@ -452,6 +539,29 @@ class RigArchiveTest(unittest.TestCase):
         self.assertEqual(r["summary"]["rigsets"], 3)
         self.assertEqual(r["summary"]["entries"], 3)
 
+    def test_collect_skeletons_dir_matches_archive_classification(self):
+        carved = os.path.join(self.root, "carved_skels")
+        os.makedirs(carved)
+        big_skel = b"SKEL_Large\x00" + b"SKEL_Other\x00" + b"\x00" * 20000
+        rbf0_with_skel = b"RBF0" + b"\x00" * 16 + b"SKEL_NotASkeleton\x00" + b"\x00" * 32
+        with open(os.path.join(carved, "000000000100.bin"), "wb") as f:
+            f.write(self.skel)
+        with open(os.path.join(carved, "000000000200.bin"), "wb") as f:
+            f.write(big_skel)
+        with open(os.path.join(carved, "000000000300.bin"), "wb") as f:
+            f.write(self.front)
+        with open(os.path.join(carved, "000000000400.bin"), "wb") as f:
+            f.write(rbf0_with_skel)
+        got = anim_index.collect_skeletons_dir(carved)
+        self.assertEqual(
+            [(r["offset"], r["kind"], r["names"]) for r in got],
+            [
+                (0x100, "plain-bone-table", ["SKEL_Second", "SKEL_Synthetic"]),
+                (0x200, "plain-bone-table", ["SKEL_Large", "SKEL_Other"]),
+                (0x300, "bone-table", ["SKEL_Front"]),
+            ],
+        )
+
     def test_cli_rejects_a_shared_rig_destination(self):
         out = os.path.join(self.root, "index.json")
         alias = os.path.join(self.root, ".", "index.json")
@@ -468,12 +578,12 @@ class RigArchiveTest(unittest.TestCase):
         folder = os.path.join(self.root, "rig_folder")
         os.makedirs(folder)
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", folder, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("is a folder, not a JSON file", p.stderr)
 
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", os.path.join(self.root, "rigs.csv"), "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("--rigs must end in .json", p.stderr)
 
@@ -481,7 +591,7 @@ class RigArchiveTest(unittest.TestCase):
         out = os.path.join(self.root, "index.json")
         rigs = os.path.join(self.root, "rigs.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", rigs, "--quiet"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                           capture_output=True, text=True, errors="replace")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(rigs, encoding="utf-8") as f:
             doc = json.load(f)
@@ -510,7 +620,7 @@ class RigArchiveTest(unittest.TestCase):
                 out = os.path.join(self.root, label + "-index.json")
                 rigs = os.path.join(self.root, label + "-rigs.json")
                 p = subprocess.run([sys.executable, "-I", TOOL, carved, out, "--rigs", rigs, "--quiet"],
-                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                                   capture_output=True, text=True, errors="replace")
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 with open(rigs, encoding="utf-8") as f:
                     summary = json.load(f)["rbf0"]["summary"]

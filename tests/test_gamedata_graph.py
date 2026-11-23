@@ -95,7 +95,7 @@ class GamedataGraphTest(unittest.TestCase):
 
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], cwd=self.root,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+                              capture_output=True, text=True, errors="replace")
 
     def test_cli_reports_unwritable_graph_report(self):
         self.finish()
@@ -152,6 +152,21 @@ class GamedataGraphTest(unittest.TestCase):
         with open(bin_path, "rb") as f:
             self.assertEqual(f.read(), content)
 
+    def test_json_cannot_replace_a_carved_payload_via_external_hard_link(self):
+        self.add(ALPHA)
+        self.finish()
+        payload = os.path.join(self.carve, f"{self.rows[0]['off']:012x}.bin")
+        report = os.path.join(self.root, "alias.json")
+        try:
+            os.link(payload, report)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+        r = self.run_tool(self.carve, "--json", report)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("would overwrite the input", r.stderr)
+        with open(payload, "rb") as f:
+            self.assertEqual(f.read(), ALPHA)
+
     def test_fresh_json_inside_carve_dir_is_allowed(self):
         self.add(ALPHA)
         self.finish()
@@ -162,6 +177,42 @@ class GamedataGraphTest(unittest.TestCase):
         with open(out, "r", encoding="utf-8") as f:
             data = json.load(f)
         self.assertEqual(data["summary"]["mode"], "carve")
+
+    def test_json_over_directory_mode_nested_xml_is_refused(self):
+        # Directory mode (no index.json) reads every nested *.xml; --json into one of them must not
+        # truncate it.
+        directory = os.path.join(self.root, "dir")
+        nested_dir = os.path.join(directory, "nested")
+        os.makedirs(nested_dir)
+        xml_path = os.path.join(nested_dir, "a.xml")
+        with open(xml_path, "wb") as f:
+            f.write(ALPHA)
+
+        r = self.run_tool(directory, "--json", xml_path)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("would overwrite the input", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(xml_path, "rb") as f:
+            self.assertEqual(f.read(), ALPHA)
+
+    def test_json_over_directory_mode_xml_hardlink_is_refused(self):
+        directory = os.path.join(self.root, "dir")
+        os.makedirs(directory)
+        xml_path = os.path.join(directory, "a.xml")
+        with open(xml_path, "wb") as f:
+            f.write(ALPHA)
+        alias = os.path.join(self.root, "alias.xml")
+        try:
+            os.link(xml_path, alias)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"hard links unavailable: {e}")
+
+        r = self.run_tool(directory, "--json", alias)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("would overwrite the input", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(xml_path, "rb") as f:
+            self.assertEqual(f.read(), ALPHA)
 
     def test_cycle_at_end_of_a_deep_include_chain(self):
         size = sys.getrecursionlimit() + 50

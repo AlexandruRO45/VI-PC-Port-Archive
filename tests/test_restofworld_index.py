@@ -4,7 +4,9 @@
 
 Every byte is built by this test. No game file, asset name or payload is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -312,6 +314,22 @@ class ArchiveTest(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.root, "no_such_folder")))
 
+    def test_write_failure_after_scan_names_the_output(self):
+        for ext in (".json", ".csv"):
+            out = os.path.join(self.root, "report" + ext)
+            with self.subTest(ext=ext), \
+                    unittest.mock.patch.object(sys, "argv", [TOOL, self.rpf, out]), \
+                    unittest.mock.patch.object(restofworld_index, "write_output",
+                                               side_effect=OSError("report write denied")) as write, \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(restofworld_index.main(), 1)
+                self.assertEqual(write.call_args.args[0], out)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+                self.assertIn(out, stderr.getvalue())
+                self.assertIn("report write denied", stderr.getvalue())
+
     def test_cli_rejects_output_aliasing_source_archive(self):
         with open(self.rpf, "rb") as f:
             original = f.read()
@@ -326,6 +344,54 @@ class ArchiveTest(unittest.TestCase):
             self.assertEqual(f.read(), original, "the source archive was overwritten")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("output must not overwrite the source archive", result.stderr)
+
+    def test_cli_rejects_output_aliasing_directory_payload_or_index(self):
+        folder = os.path.join(self.root, "carved_alias")
+        os.makedirs(folder)
+        payload = page()
+        with open(os.path.join(folder, f"{0x1000:012x}.bin"), "wb") as f:
+            f.write(payload)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            f.write("{}")
+        original = payload
+
+        # Directly overwriting the carved payload.
+        direct = subprocess.run(
+            [sys.executable, "-I", TOOL, folder, os.path.join(folder, f"{0x1000:012x}.bin")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(direct.returncode, 2, direct.stderr)
+        self.assertIn("output must not overwrite the source archive", direct.stderr)
+
+        # A hard link at a JSON path naming the payload.
+        link = os.path.join(self.root, "payload.json")
+        try:
+            os.link(os.path.join(folder, f"{0x1000:012x}.bin"), link)
+        except (OSError, NotImplementedError) as e:
+            link = None
+            with self.subTest("hardlink"):
+                self.skipTest(f"hard links unavailable: {e}")
+        if link is not None:
+            linked = subprocess.run(
+                [sys.executable, "-I", TOOL, folder, link],
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(linked.returncode, 2, linked.stderr)
+            self.assertIn("output must not overwrite the source archive", linked.stderr)
+
+        # Overwriting index.json, part of the carve.
+        idx = subprocess.run(
+            [sys.executable, "-I", TOOL, folder, os.path.join(folder, "index.json")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(idx.returncode, 2, idx.stderr)
+        self.assertIn("output must not overwrite the source archive", idx.stderr)
+
+        # None of the inputs changed, and the bytes are preserved.
+        with open(os.path.join(folder, f"{0x1000:012x}.bin"), "rb") as f:
+            self.assertEqual(f.read(), original, "the carved payload was overwritten")
+        with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{}", "the index was overwritten")
+        if link is not None:
+            with open(link, "rb") as f:
+                self.assertEqual(f.read(), original, "the hard link target changed")
 
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
@@ -497,6 +563,24 @@ class RageTextureDetectionTest(unittest.TestCase):
         self.assertIn("tex980=2;dict=1", row["detail"])
         self.assertIn("BC1_UNORM:1", row["detail"])
         self.assertIn("BC7_UNORM:1", row["detail"])
+
+    def test_dictionary_keeps_small_textures_and_counts_all_descriptors(self) -> None:
+        blob = _synth_pg_tex_dict([
+            _synth_tex_descriptor(0, 256, 256, 71, mips=7),
+            _synth_tex_descriptor(0x10000, 1, 2, 28, mips=2),
+        ])
+        row = restofworld_index.classify(blob, 0x2000, 128)
+        self.assertEqual(row["count"], 2)
+        self.assertIn("tex980=2;dict=1", row["detail"])
+        self.assertIn("R8G8B8A8_UNORM:1", row["detail"])
+        summary = restofworld_index.summarise([row], span=128, zero=0, unread=0)
+        self.assertEqual((summary["texture_dictionaries"], summary["texture_headers"]), (1, 2))
+
+    def test_small_texture_with_invalid_mip_count_is_excluded(self) -> None:
+        for mips in (0, 3):
+            with self.subTest(mips=mips):
+                descriptor = _synth_tex_descriptor(0, 1, 2, 28, mips=mips)
+                self.assertEqual(restofworld_index.find_rage_textures(descriptor), [])
 
     def test_non_dict_resource_page_with_linear_f16_texture(self):
         header = bytearray(0x60)

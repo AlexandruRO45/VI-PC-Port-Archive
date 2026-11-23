@@ -162,7 +162,7 @@ def split_args(s):
 
 SENDMSG = re.compile(r"sendmsg\([^)]*\)")
 
-MODWORDS = re.compile(r"\b(offset:\S+|offen|idxen|glc|slc|dlc|lds|tfe|unorm|da|d16|a16|nv|r128|lwe|clamp|"
+MODWORDS = re.compile(r"\b(offset:(?:swizzle\([^)]*\)|\S+)|offen|idxen|glc|slc|dlc|lds|tfe|unorm|da|d16|a16|nv|r128|lwe|clamp|"
                       r"mul:\d+|div:\d+|op_sel(?:_hi)?:\[[^\]]*\]|neg_lo:\[[^\]]*\]|neg_hi:\[[^\]]*\]|"
                       r"dmask:\S+|dim:\S+|format:\S+|done|vm|compr|row_mask:\S+|bank_mask:\S+|"
                       r"bound_ctrl:\S+|fi:\S+|offset0:\S+|offset1:\S+|gds|inst_offset:\S+|"
@@ -192,7 +192,9 @@ def parse_line(line):
     if parts and len(parts[0].split()) == 2:
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
-    if op.startswith(("v_add_f64", "v_cvt_f32_f64")):
+    if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
+                      "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_trunc_f64", "v_ceil_f64",
+                      "v_rndne_f64", "v_floor_f64")):
         for src, spelling in zip(args[1:], parts[1:]):
             # LLVM prints inline integers in decimal and the separate literal dword in hex,
             # even for two sources with the same numeric value (e.g. 0x1 and 1).
@@ -208,6 +210,9 @@ def parse_file(path):
     m = HDR.match(lines[0]) if lines else None
     pc = int(m.group(2), 16) if m else 0
     info["code_start"] = pc
+    # the end of the code range the header declares (exclusive), None without a header: undecodable words can sit
+    # between the last printed instruction and it
+    info["code_end"] = int(m.group(3), 16) if m else None
     start = 1 if (lines and not lines[0].startswith("\t")) else 0
     for ln in lines[start:]:
         if ln.startswith("; ---"):
@@ -243,12 +248,20 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.isdir(a.src):
         ap.error(f"{a.src} is not a folder")
-    with os.scandir(a.src) as entries:
-        files = sorted(entry.path for entry in entries
-                       if entry.name.endswith(".s") and entry.is_file())[:a.limit]
+    try:
+        with os.scandir(a.src) as entries:
+            files = sorted(entry.path for entry in entries
+                           if entry.name.endswith(".s") and entry.is_file())[:a.limit]
+    except OSError as e:
+        print(f"ERROR: cannot list {a.src}: {e.strerror or e}", file=sys.stderr)
+        return 2
     kinds, raw, n_ins, no_enc = Counter(), Counter(), 0, 0
     for path in files:
-        info = parse_file(path)
+        try:
+            info = parse_file(path)
+        except OSError as e:
+            print(f"ERROR: cannot read {e.filename or path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         for ins in info["insns"]:
             n_ins += 1
             no_enc += ins["enc"] is None
