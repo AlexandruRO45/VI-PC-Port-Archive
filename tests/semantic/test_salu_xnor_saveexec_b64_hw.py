@@ -1,0 +1,185 @@
+from __future__ import annotations
+
+"""Hardware semantic test and reference oracle for s_xnor_saveexec_b64.
+
+AMD RDNA2 / GFX10 Scalar ALU (SALU) SOP1 Instruction:
+    s_xnor_saveexec_b64 D, S0
+
+Hardware Semantics:
+    D = EXEC;
+    EXEC = ~(S0 ^ EXEC) & 0xFFFFFFFFFFFFFFFF;
+    SCC = (EXEC != 0);
+
+Key Architectural Characteristics:
+  1. Operates on 64-bit scalar register pairs (SGPR pairs), VCC, or EXEC.
+  2. D latches the prior EXEC mask before EXEC is modified.
+  3. Bitwise XNOR allows previously inactive lanes (EXEC bit = 0) to become active
+     if S0 bit = 0, because ~(0 ^ 0) = ~0 = 1.
+  4. SCC reflects whether any lane remains active in the new EXEC mask.
+  5. Translates through tools/rdna2spirv.py via support.translate_lines and
+     executes on spirv_mini_interp.run_workgroup.
+
+Standard library Python only (python -I, struct, math, unittest). Zero game data.
+"""
+
+import enum
+import math
+import os
+import re
+import struct
+import sys
+import unittest
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Dict, List, Optional, Set, Tuple, Union
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, HERE)
+
+import support
+import spirv_mini_interp as si
+
+# Architectural Bitmasks and Constants
+ALL64: int = 0xFFFF_FFFF_FFFF_FFFF
+MASK32: int = 0xFFFF_FFFF
+VSHARP: list[int] = [0, 0, 0x1000, 0x31016FAC]
+SCC_OFFSET: int = 256
+BCNT_OFFSET: int = 260
+FF1_OFFSET: int = 264
+
+
+def u32(val: int) -> int:
+    """Normalize integer to unsigned 32-bit dword."""
+    return val & MASK32
+
+
+def u64(val: int) -> int:
+    """Normalize integer to unsigned 64-bit qword."""
+    return val & ALL64
+
+
+def ref_s_xnor_saveexec_b64(s0: int, old_exec: int) -> Tuple[int, int, int]:
+    """Pure mathematical reference oracle for s_xnor_saveexec_b64.
+
+    Args:
+        s0: 64-bit source operand.
+        old_exec: 64-bit current EXEC mask.
+
+    Returns:
+        Tuple[int, int, int]: (new_exec, d_saved, scc)
+    """
+    s0_clean = u64(s0)
+    exec_clean = u64(old_exec)
+    new_exec = u64(~(s0_clean ^ exec_clean))
+    d_saved = exec_clean
+    scc = 1 if (new_exec != 0) else 0
+    return new_exec, d_saved, scc
+
+
+def build_cs_fssm(threads: int = 64) -> bytes:
+    """Build compute shader header blob declaring 64 threads per workgroup."""
+    header = bytearray(0x148)
+    struct.pack_into("<4I", header, 0x138, 0x8088, threads, 1, 1)
+    return bytes(header)
+
+
+def run_hw_xnor_saveexec(s0: int, old_exec: int) -> Tuple[int, int, int, int]:
+    """Translate and run s_xnor_saveexec_b64 through rdna2spirv and spirv_mini_interp.
+
+    Returns:
+        Tuple[int, int, int, int]: (new_exec, scc, d_popcount, d_ff1)
+    """
+    s0_clean = u64(s0)
+    exec_clean = u64(old_exec)
+
+    lines = [
+        "v_mbcnt_lo_u32_b32 v1, -1, 0",
+        "v_mbcnt_hi_u32_b32 v1, -1, v1",
+        "v_mov_b32_e32 v2, 0",
+        f"s_mov_b32 s12, {s0_clean & MASK32:#x}",
+        f"s_mov_b32 s13, {s0_clean >> 32:#x}",
+        f"s_mov_b32 exec_lo, {exec_clean & MASK32:#x}",
+        f"s_mov_b32 exec_hi, {exec_clean >> 32:#x}",
+        "s_xnor_saveexec_b64 s[6:7], s[12:13]",
+        "s_cselect_b32 s8, 1, 0",
+        "v_mov_b32_e32 v2, 1",
+        "s_mov_b64 exec, -1",
+        "s_bcnt1_i32_b64 s9, s[6:7]",
+        "s_ff1_i32_b64 s10, s[6:7]",
+        "v_lshlrev_b32_e32 v21, 2, v1",
+        "buffer_store_dword v2, v21, s[0:3], 0 offen",
+        "v_cmpx_eq_u32_e32 0, v1",
+        f"v_mov_b32_e32 v20, s8",
+        f"v_mov_b32_e32 v21, {SCC_OFFSET}",
+        "buffer_store_dword v20, v21, s[0:3], 0 offen",
+        f"v_mov_b32_e32 v20, s9",
+        f"v_mov_b32_e32 v21, {BCNT_OFFSET}",
+        "buffer_store_dword v20, v21, s[0:3], 0 offen",
+        f"v_mov_b32_e32 v20, s10",
+        f"v_mov_b32_e32 v21, {FF1_OFFSET}",
+        "buffer_store_dword v20, v21, s[0:3], 0 offen",
+        "s_endpgm"
+    ]
+
+    spv = support.translate_lines("cs_xnor_saveexec_hw", lines, fssm=build_cs_fssm(64))
+    memory: Dict[int, int] = {}
+    si.run_workgroup(
+        spv, 64, 64,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+        push_constants=VSHARP + [0] * 28,
+        memory=memory
+    )
+
+    new_exec = sum(memory.get(4 * lane, 0) << lane for lane in range(64))
+    scc = memory.get(SCC_OFFSET, 0)
+    bcnt = memory.get(BCNT_OFFSET, 0)
+    ff1 = memory.get(FF1_OFFSET, 0)
+
+    return new_exec, scc, bcnt, ff1
+
+
+class TestSALUXnorSaveexecReferenceOracle(unittest.TestCase):
+    """Phase 1: Unit tests for reference mathematical oracle and hardware translation."""
+
+    def test_oracle_all_ones(self) -> None:
+        new_exec, d_saved, scc = ref_s_xnor_saveexec_b64(ALL64, ALL64)
+        self.assertEqual(new_exec, ALL64)
+        self.assertEqual(d_saved, ALL64)
+        self.assertEqual(scc, 1)
+
+    def test_oracle_all_zeros(self) -> None:
+        new_exec, d_saved, scc = ref_s_xnor_saveexec_b64(0, 0)
+        self.assertEqual(new_exec, ALL64)
+        self.assertEqual(d_saved, 0)
+        self.assertEqual(scc, 1)
+
+    def test_oracle_complementary_masks_produce_zero_exec(self) -> None:
+        s0 = 0x55555555_55555555
+        old_exec = 0xAAAAAAAA_AAAAAAAA
+        new_exec, d_saved, scc = ref_s_xnor_saveexec_b64(s0, old_exec)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(d_saved, old_exec)
+        self.assertEqual(scc, 0)
+
+    def test_hardware_translation_against_reference(self) -> None:
+        test_vectors = [
+            (0x55555555_55555555, 0x00000000_FFFFFFFF),
+            (0xAAAAAAAA_AAAAAAAA, 0xFFFFFFFF_00000000),
+            (0x12345678_9ABCDEF0, 0x0FEDCBA9_87654321),
+            (ALL64, 0x80000000_00000000),
+        ]
+        for s0, old_exec in test_vectors:
+            with self.subTest(s0=hex(s0), old_exec=hex(old_exec)):
+                expected_exec, expected_d, expected_scc = ref_s_xnor_saveexec_b64(s0, old_exec)
+                hw_exec, hw_scc, hw_bcnt, hw_ff1 = run_hw_xnor_saveexec(s0, old_exec)
+                self.assertEqual(hw_exec, expected_exec)
+                self.assertEqual(hw_scc, expected_scc)
+                self.assertEqual(hw_bcnt, bin(expected_d).count("1"))
+                expected_ff1 = (expected_d & -expected_d).bit_length() - 1 if expected_d else 0xFFFFFFFF
+                self.assertEqual(hw_ff1, expected_ff1)
+
+
+if __name__ == "__main__":
+    unittest.main()
