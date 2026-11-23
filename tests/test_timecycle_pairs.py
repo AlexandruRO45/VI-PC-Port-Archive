@@ -145,6 +145,69 @@ class TimecyclePairsTests(unittest.TestCase):
                                      tp.summarize_documents(as_file))
                     self.assertEqual(tp.summarize_documents(as_file)["modifier_docs"], 1)
 
+    def test_carve_dir_joins_a_document_split_over_two_text_streams(self):
+        # RPF9 splits a file over 64 KiB into whole 64 KiB streams (docs/gamedata.md:20), so
+        # the first stream of a document stored without a declaration is exactly 65 536 bytes
+        # and the closing root tag sits in the next stream. The old branch tested gi.
+        # xml_complete() on the first stream alone and dropped the document: the same bytes
+        # as a plain .xml file are one document, so the two paths must agree.
+        body = SYNTH_MOD.split(b"\n", 1)[1]
+        close = b"</timecycle_modifier_data>\n"
+        core = body[: body.rindex(close)]
+        pad = b'  <modifier name="SYNTH_PAD" userFlags="0"><far_clip>1 2</far_clip></modifier>\n'
+        doc = core + pad * 2000 + close
+        first, rest = doc[:65536], doc[65536:]
+        self.assertEqual(len(first), 65536)
+        # Premise (the reviewer's input): both streams read as "text", the first opens the
+        # target root and does not close it, so completeness is only reached by joining.
+        self.assertEqual(tp.gi.stream_kind(first, {}), "text")
+        self.assertEqual(tp.gi.stream_kind(rest, {}), "text")
+        self.assertEqual(tp.gi.xml_root(first), "timecycle_modifier_data")
+        self.assertFalse(tp.gi.xml_complete("timecycle_modifier_data", first))
+        with tempfile.TemporaryDirectory() as tmp:
+            file_path = os.path.join(tmp, "doc.xml")
+            with open(file_path, "wb") as f:
+                f.write(doc)
+            as_file = tp.load_documents([file_path])
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            self.write_carve(carve, [
+                ("000000001000.bin", first),
+                ("000000002000.bin", rest),
+            ])
+            as_carve = tp.load_documents([carve])
+            self.assertEqual([r for r, _ in as_file], ["timecycle_modifier_data"])
+            self.assertEqual([r for r, _ in as_carve], [r for r, _ in as_file])
+            self.assertEqual(tp.summarize_documents(as_carve),
+                             tp.summarize_documents(as_file))
+            self.assertEqual(tp.summarize_documents(as_carve)["modifier_docs"], 1)
+
+    def test_carve_dir_skips_a_binary_document_stream_and_still_measures_the_run(self):
+        # A stream is "binary" once its first 4 KiB is under 95% printable, so 400 NUL bytes
+        # trailing the closing root tag make a document stream binary: it passes the counting
+        # test gi.xml_complete() but ET.fromstring rejects the NULs with "not well-formed",
+        # and one such stream ended the whole run with exit 2, measuring no document at all.
+        # main skipped binary streams; they must keep being skipped, leaving the run at 0.
+        nul_doc = (b"<timecycle_modifier_data><modifier name='test' userFlags='0'/>"
+                   b"</timecycle_modifier_data>") + b"\x00" * 400
+        declless = SYNTH_MOD.split(b"\n", 1)[1]
+        # Premise (the reviewer's input): the stream is binary, yet the counting test calls
+        # it a closed document — it is the ET.fromstring call that rejects it.
+        self.assertEqual(tp.gi.stream_kind(nul_doc, {}), "binary")
+        self.assertTrue(tp.gi.xml_complete("timecycle_modifier_data", nul_doc))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_carve(tmp, [
+                ("000000001000.bin", SYNTH_MOD),   # declared document: measured
+                ("000000002000.bin", nul_doc),     # binary stream: skipped
+                ("000000003000.bin", declless),    # complete text document: measured
+            ])
+            out_path = os.path.join(tmp, "report.json")
+            rc = tp.main([tmp, "--out", out_path])
+            self.assertEqual(rc, 0)
+            with open(out_path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["modifier_docs"], 2)
+
     def test_cli_validation_guards(self):
         with tempfile.TemporaryDirectory() as tmp:
             in_xml = os.path.join(tmp, "mod.xml")

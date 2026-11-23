@@ -39,8 +39,20 @@ def _iter_source_docs(source) -> list[tuple[str, bytes]]:
     docs: list[tuple[str, bytes]] = []
     while i < n:
         data = source.read(rows[i])
-        if gi.stream_kind(data, rows[i]) == "decl":
-            root = gi.xml_root(data)
+        kind = gi.stream_kind(data, rows[i])
+        root = gi.xml_root(data)
+        # A document can lack the XML declaration: its stream reads as "text", not "decl",
+        # yet the plain .xml file path reads those same bytes as a document. Such a start
+        # takes the "decl" branch's joining loop: RPF9 splits a file over 64 KiB into whole
+        # 64 KiB streams (docs/gamedata.md:20), so the closing root tag of a declaration-free
+        # document can sit in the next stream, and testing the first stream alone dropped it.
+        # Keep the document only when gi.xml_complete(root, blob) holds after joining, the
+        # same counting test the loop runs: a "binary" stream shaped like a closed document
+        # (400 NUL bytes trailing the root) passes that test but not ET.fromstring, and main
+        # never read a document from a binary stream, so binary keeps being skipped here.
+        # gi.build_rows() is not reused: it routes text through standalone_xml(), which still
+        # only looks for the closing tag in the last 512 bytes (the earlier bug).
+        if kind == "decl" or (kind == "text" and root in TARGET_ROOTS):
             blob = data
             j = i + 1
             while j < n and not gi.xml_complete(root, blob):
@@ -49,18 +61,10 @@ def _iter_source_docs(source) -> list[tuple[str, bytes]]:
                     break
                 blob += nxt
                 j += 1
-            if root in TARGET_ROOTS:
+            if root in TARGET_ROOTS and (kind == "decl" or gi.xml_complete(root, blob)):
                 docs.append((root, blob))
             i = j
         else:
-            # A complete document can lack the XML declaration: its stream reads as "text",
-            # not "decl", yet the plain .xml file path reads those same bytes as a document.
-            # Decide completeness with the same counting test the "decl" branch uses:
-            # gi.standalone_xml() only looks for the closing tag in the last 512 bytes, so a
-            # trailing comment or blank lines past that window hid an already-closed document.
-            root = gi.xml_root(data)
-            if root in TARGET_ROOTS and gi.xml_complete(root, data):
-                docs.append((root, data))
             i += 1
     return docs
 
