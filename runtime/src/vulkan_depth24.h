@@ -57,57 +57,86 @@ public:
     // larger, so no copy is too big for the device. `whole.scratch` and `whole.scratch_offset` tell the copy where
     // the floats are.
     bool prepare(Depth24Job& whole, std::vector<Depth24Job>& parts) {
+        parts.clear();
         // A row of the footprint is `aw` words wide and a row of the scratch `sw` (a texel is one word of each for
         // D24, three and four for 96-bit texels).
         const std::uint64_t aw = std::uint64_t(whole.width) * whole.app_texel_words();
         const std::uint64_t sw = std::uint64_t(whole.width) * whole.scratch_texel_words();
-        if (!loaded_ || !make_pipeline() || !whole.app || !whole.width || !whole.height || !whole.slices ||
-            whole.app_offset % 4 || whole.app_row_words < aw ||
-            whole.app_slice_words < std::uint64_t(whole.app_row_words) * (whole.height - 1) + aw)
+        if (!loaded_ || !whole.app || !whole.width || !whole.height || !whole.slices || (whole.app_offset % 4) ||
+            whole.app_row_words < aw || (whole.scratch && (whole.scratch_offset % 4)))
             return false;
         const std::uint64_t h = whole.height, s = whole.slices;
-        const std::uint64_t span_words = (s - 1) * whole.app_slice_words + (h - 1) * whole.app_row_words + aw;
-        if (whole.app_offset + span_words * 4 > whole.app_size) return false;
-        if (!whole.scratch && !scratch(sw * h * s * 4, whole.scratch, whole.scratch_offset)) return false;
+        std::uint64_t row_span = 0, one_slice_app_words = 0, slice_span = 0, span_words = 0, span_bytes = 0;
+        if (!checked_mul(whole.app_row_words, h - 1, row_span) ||
+            !checked_add(row_span, aw, one_slice_app_words) ||
+            whole.app_slice_words < one_slice_app_words ||
+            !checked_mul(whole.app_slice_words, s - 1, slice_span) ||
+            !checked_add(slice_span, one_slice_app_words, span_words) ||
+            !checked_mul(span_words, 4, span_bytes) ||
+            whole.app_offset > whole.app_size || span_bytes > whole.app_size - whole.app_offset)
+            return false;
+
+        std::uint64_t one_slice_scratch_words = 0, total_scratch_words = 0, total_scratch_bytes = 0;
+        if (!checked_mul(sw, h, one_slice_scratch_words) ||
+            !checked_mul(one_slice_scratch_words, s, total_scratch_words) ||
+            !checked_mul(total_scratch_words, 4, total_scratch_bytes) ||
+            (whole.scratch && whole.scratch_offset > UINT64_MAX - total_scratch_bytes))
+            return false;
 
         // A window starts at a multiple of 256 (the largest minStorageBufferOffsetAlignment), which costs up to 252 bytes.
         constexpr std::uint64_t slack = 256;
-        const std::uint64_t limit = max_range_;
-        const auto app_bytes = [&](std::uint64_t slices, std::uint64_t rows) {
-            return ((slices - 1) * whole.app_slice_words + (rows - 1) * whole.app_row_words + aw) * 4 + slack;
-        };
-        const auto scratch_bytes = [&](std::uint64_t slices, std::uint64_t rows) { return slices * rows * sw * 4 + slack; };
+        const std::uint64_t limit = std::min<std::uint64_t>(max_range_, UINT32_MAX);
+        if (limit <= slack) return false;
+        const std::uint64_t max_words = (limit - slack) / 4;
+        if (aw > max_words || sw > max_words) return false;
         std::uint64_t slices_per_part = 0;  // 0: a slice alone is too big
-        while (slices_per_part < s && app_bytes(slices_per_part + 1, h) <= limit && scratch_bytes(slices_per_part + 1, h) <= limit)
-            ++slices_per_part;
         std::uint64_t rows_per_part = h;
-        if (!slices_per_part) {
-            rows_per_part = 0;
-            while (rows_per_part < h && app_bytes(1, rows_per_part + 1) <= limit && scratch_bytes(1, rows_per_part + 1) <= limit)
-                ++rows_per_part;
+        if (one_slice_app_words <= max_words && one_slice_scratch_words <= max_words) {
+            slices_per_part = std::min({s, 1 + (max_words - one_slice_app_words) / whole.app_slice_words,
+                                        max_words / one_slice_scratch_words});
+        } else {
+            rows_per_part = std::min({h, 1 + (max_words - aw) / whole.app_row_words, max_words / sw});
             if (!rows_per_part) return false;
         }
-        parts.clear();
+
+        if (!make_pipeline()) return false;
+
+        VkBuffer scratch_buf = whole.scratch;
+        VkDeviceSize scratch_off = whole.scratch_offset;
+        std::size_t chunk_index = 0;
+        VkDeviceSize prev_used = 0;
+        if (!scratch_buf && !scratch(total_scratch_bytes, scratch_buf, scratch_off, chunk_index, prev_used))
+            return false;
+
+        std::vector<Depth24Job> built;
         for (std::uint64_t z = 0; z < s;) {
             const std::uint64_t n = slices_per_part ? std::min(slices_per_part, s - z) : 1;
             for (std::uint64_t y = 0; y < h; y += rows_per_part) {
                 const std::uint64_t rows = std::min(rows_per_part, h - y);
                 Depth24Job part = whole;
+                part.scratch = scratch_buf;
                 part.slices = std::uint32_t(n);
                 part.height = std::uint32_t(rows);
                 part.app_offset = whole.app_offset + (z * whole.app_slice_words + y * whole.app_row_words) * 4;
-                part.scratch_offset = whole.scratch_offset + ((z * h + y) * sw) * 4;
-                if (!make_part(part, whole.app_size)) return false;
-                parts.push_back(part);
+                part.scratch_offset = scratch_off + ((z * h + y) * sw) * 4;
+                if (!make_part(part, whole.app_size)) {
+                    if (!whole.scratch) current_.chunks[chunk_index].used = prev_used;
+                    return false;
+                }
+                built.push_back(part);
             }
             z += n;
         }
+        whole.scratch = scratch_buf;
+        whole.scratch_offset = scratch_off;
+        parts = std::move(built);
         return true;
     }
 
 
     // Records the dispatch. The caller records the barriers around it.
     void run(VkCommandBuffer command_buffer, const Depth24Job& job) const {
+        if (!pipeline_ || !job.width || !job.height || !job.slices) return;
         struct Push {
             std::uint32_t width, height, slices, to_float, app_base, app_row, app_slice, scratch_base;
         } push{job.width, job.height, job.slices, (job.to_float ? 1u : 0u) | (job.rgb96 ? 2u : 0u), job.app_base_words,
@@ -116,7 +145,7 @@ public:
         vk_.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &job.set, 0,
                                     nullptr);
         vk_.vkCmdPushConstants(command_buffer, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        vk_.vkCmdDispatch(command_buffer, (job.width + 7) / 8, (job.height + 7) / 8, job.slices);
+        vk_.vkCmdDispatch(command_buffer, (job.width - 1u) / 8u + 1u, (job.height - 1u) / 8u + 1u, job.slices);
     }
 
     // The jobs prepared since the last call belong to a submission that `timeline` reaches `ticket` for.
@@ -201,6 +230,18 @@ private:
         }
     };
 
+    static bool checked_add(std::uint64_t a, std::uint64_t b, std::uint64_t& out) {
+        if (a > UINT64_MAX - b) return false;
+        out = a + b;
+        return true;
+    }
+
+    static bool checked_mul(std::uint64_t a, std::uint64_t b, std::uint64_t& out) {
+        if (a && b > UINT64_MAX / a) return false;
+        out = a * b;
+        return true;
+    }
+
     bool make_pipeline() {
         if (pipeline_) return true;
         VkDescriptorSetLayoutBinding bindings[2]{};
@@ -221,31 +262,38 @@ private:
         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module_info.codeSize = sizeof(depth24_convert_spirv);
         module_info.pCode = depth24_convert_spirv;
+        VkDescriptorSetLayout set = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
         VkShaderModule module = VK_NULL_HANDLE;
-        bool ok = vk_.vkCreateDescriptorSetLayout(device_, &set_info, nullptr, &set_layout_) == VK_SUCCESS;
-        layout_info.pSetLayouts = &set_layout_;
-        ok = ok && vk_.vkCreatePipelineLayout(device_, &layout_info, nullptr, &pipeline_layout_) == VK_SUCCESS &&
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        bool ok = vk_.vkCreateDescriptorSetLayout(device_, &set_info, nullptr, &set) == VK_SUCCESS;
+        layout_info.pSetLayouts = &set;
+        ok = ok && vk_.vkCreatePipelineLayout(device_, &layout_info, nullptr, &layout) == VK_SUCCESS &&
              vk_.vkCreateShaderModule(device_, &module_info, nullptr, &module) == VK_SUCCESS;
         if (ok) {
             VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
                           module, "main", nullptr};
-            info.layout = pipeline_layout_;
-            ok = vk_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline_) == VK_SUCCESS;
+            info.layout = layout;
+            ok = vk_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS &&
+                 pipeline != VK_NULL_HANDLE;
         }
         if (module) vk_.vkDestroyShaderModule(device_, module, nullptr);
         if (!ok) {  // leave nothing half made; the next call tries again
-            if (pipeline_layout_) vk_.vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
-            if (set_layout_) vk_.vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
-            pipeline_layout_ = VK_NULL_HANDLE;
-            set_layout_ = VK_NULL_HANDLE;
+            if (layout) vk_.vkDestroyPipelineLayout(device_, layout, nullptr);
+            if (set) vk_.vkDestroyDescriptorSetLayout(device_, set, nullptr);
+            return false;
         }
-        return ok;
+        set_layout_ = set;
+        pipeline_layout_ = layout;
+        pipeline_ = pipeline;
+        return true;
     }
 
     // The descriptor set of one dispatch: windows of the application's buffer and of the scratch, each starting at
     // a multiple of 256 bytes, with the part's first word given to the shader as a base.
     bool make_part(Depth24Job& part, std::uint64_t app_size) {
+        if ((part.app_offset % 4) || (part.scratch_offset % 4)) return false;
         constexpr std::uint64_t alignment = 256;
         const std::uint64_t span = ((std::uint64_t(part.slices) - 1) * part.app_slice_words +
                                     (std::uint64_t(part.height) - 1) * part.app_row_words +
@@ -255,7 +303,7 @@ private:
         const std::uint64_t tight = std::uint64_t(part.width) * part.scratch_texel_words() * part.height * part.slices * 4;
         const std::uint64_t scratch_window = part.scratch_offset / alignment * alignment;
         const std::uint64_t scratch_range = part.scratch_offset - scratch_window + tight;
-        if (window + range > app_size) return false;
+        if (window > app_size || range > app_size - window) return false;
         part.app_base_words = std::uint32_t((part.app_offset - window) / 4);
         part.scratch_base_words = std::uint32_t((part.scratch_offset - scratch_window) / 4);
         part.set = allocate_set();
@@ -298,16 +346,23 @@ private:
     }
 
     // `bytes` of scratch, aligned for a descriptor offset, from this submission's chunks.
-    bool scratch(std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+    bool scratch(std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset, std::size_t& chunk_index,
+                 VkDeviceSize& prev_used) {
+        if (!bytes) return false;
         constexpr VkDeviceSize alignment = 256, minimum = 4u << 20;
-        for (auto& chunk : current_.chunks) {
-            const VkDeviceSize start = (chunk.used + alignment - 1) / alignment * alignment;
-            if (start + bytes <= chunk.size) {
-                chunk.used = start + bytes;
-                buffer = chunk.buffer;
-                offset = start;
-                return true;
-            }
+        for (std::size_t i = 0; i < current_.chunks.size(); ++i) {
+            auto& chunk = current_.chunks[i];
+            const VkDeviceSize rem = chunk.used % alignment;
+            const VkDeviceSize pad = rem ? alignment - rem : 0;
+            if (chunk.used > chunk.size || pad > chunk.size - chunk.used) continue;
+            const VkDeviceSize start = chunk.used + pad;
+            if (bytes > chunk.size - start) continue;
+            chunk_index = i;
+            prev_used = chunk.used;
+            chunk.used = start + bytes;
+            buffer = chunk.buffer;
+            offset = start;
+            return true;
         }
         Chunk chunk;
         for (std::size_t i = 0; i < spare_.size(); ++i)
@@ -317,6 +372,8 @@ private:
                 break;
             }
         if (!chunk.buffer && !make_chunk(std::max<std::uint64_t>(bytes, minimum), chunk)) return false;
+        chunk_index = current_.chunks.size();
+        prev_used = 0;
         chunk.used = bytes;
         buffer = chunk.buffer;
         offset = 0;

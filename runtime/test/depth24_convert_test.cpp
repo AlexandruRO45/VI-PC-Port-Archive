@@ -793,6 +793,492 @@ int main() {
         std::printf("depth24: ScratchBuffers::collect() checks vkGetSemaphoreCounterValue VkResult and ticket 0 ok\n");
     }
 
+    // 8. Depth24Converter::prepare(), make_pipeline(), scratch(), and collect() edge cases:
+    //    overflow/wraparound checks, O(1) max_range_ rejection before allocation, caller scratch_offset
+    //    checks, atomic rollback on mid-prepare failure, and failed pipeline creation handling.
+    {
+        struct ConverterMock {
+            std::uint64_t next_handle = 1;
+            bool fail_create_pipeline = false;
+            bool write_pipeline_on_fail = true;
+            VkPipeline pipeline_garbage = reinterpret_cast<VkPipeline>(std::uintptr_t(0xdead));
+            unsigned create_pipeline_calls = 0;
+            unsigned created_pipelines = 0;
+            unsigned destroyed_pipelines = 0;
+            bool destroyed_garbage_pipeline = false;
+            unsigned created_set_layouts = 0;
+            unsigned destroyed_set_layouts = 0;
+            unsigned created_pipeline_layouts = 0;
+            unsigned destroyed_pipeline_layouts = 0;
+            unsigned created_modules = 0;
+            unsigned destroyed_modules = 0;
+            bool fail_create_pool = false;
+            unsigned create_pool_calls = 0;
+            unsigned fail_create_pool_from = 0;  // 1-based call threshold when nonzero
+            unsigned created_pools = 0;
+            unsigned destroyed_pools = 0;
+            unsigned alloc_set_calls = 0;
+            unsigned fail_alloc_set_from = 0;  // 1-based call threshold when nonzero
+            unsigned created_buffers = 0;
+            unsigned destroyed_buffers = 0;
+            unsigned allocated_memories = 0;
+            unsigned destroyed_memories = 0;
+            VkResult sem_result = VK_SUCCESS;
+            std::uint64_t sem_value = 0;
+            unsigned sem_queries = 0;
+
+            static ConverterMock*& state() {
+                static ConverterMock* s = nullptr;
+                return s;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_module(VkDevice, const VkShaderModuleCreateInfo*,
+                                                                const VkAllocationCallbacks*, VkShaderModule* out) {
+                *out = reinterpret_cast<VkShaderModule>(state()->next_handle++);
+                ++state()->created_modules;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_module(VkDevice, VkShaderModule m,
+                                                             const VkAllocationCallbacks*) {
+                if (m) ++state()->destroyed_modules;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_set_layout(VkDevice, const VkDescriptorSetLayoutCreateInfo*,
+                                                                    const VkAllocationCallbacks*,
+                                                                    VkDescriptorSetLayout* out) {
+                *out = reinterpret_cast<VkDescriptorSetLayout>(state()->next_handle++);
+                ++state()->created_set_layouts;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_set_layout(VkDevice, VkDescriptorSetLayout l,
+                                                                 const VkAllocationCallbacks*) {
+                if (l) ++state()->destroyed_set_layouts;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_pipe_layout(VkDevice, const VkPipelineLayoutCreateInfo*,
+                                                                     const VkAllocationCallbacks*,
+                                                                     VkPipelineLayout* out) {
+                *out = reinterpret_cast<VkPipelineLayout>(state()->next_handle++);
+                ++state()->created_pipeline_layouts;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_pipe_layout(VkDevice, VkPipelineLayout l,
+                                                                  const VkAllocationCallbacks*) {
+                if (l) ++state()->destroyed_pipeline_layouts;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_pipelines(VkDevice, VkPipelineCache, std::uint32_t count,
+                                                                   const VkComputePipelineCreateInfo*,
+                                                                   const VkAllocationCallbacks*, VkPipeline* out) {
+                ++state()->create_pipeline_calls;
+                if (state()->fail_create_pipeline) {
+                    if (state()->write_pipeline_on_fail && count > 0 && out) out[0] = state()->pipeline_garbage;
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                for (std::uint32_t i = 0; i < count; ++i)
+                    out[i] = reinterpret_cast<VkPipeline>(state()->next_handle++);
+                state()->created_pipelines += count;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_pipeline(VkDevice, VkPipeline p,
+                                                               const VkAllocationCallbacks*) {
+                if (p == state()->pipeline_garbage) state()->destroyed_garbage_pipeline = true;
+                if (p) ++state()->destroyed_pipelines;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL create_pool(VkDevice, const VkDescriptorPoolCreateInfo*,
+                                                              const VkAllocationCallbacks*, VkDescriptorPool* out) {
+                ++state()->create_pool_calls;
+                if (state()->fail_create_pool ||
+                    (state()->fail_create_pool_from &&
+                     state()->create_pool_calls >= state()->fail_create_pool_from))
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                *out = reinterpret_cast<VkDescriptorPool>(state()->next_handle++);
+                ++state()->created_pools;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_pool(VkDevice, VkDescriptorPool p,
+                                                           const VkAllocationCallbacks*) {
+                if (p) ++state()->destroyed_pools;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL alloc_sets(VkDevice, const VkDescriptorSetAllocateInfo* info,
+                                                             VkDescriptorSet* out) {
+                ++state()->alloc_set_calls;
+                if (state()->fail_alloc_set_from && state()->alloc_set_calls >= state()->fail_alloc_set_from)
+                    return VK_ERROR_OUT_OF_POOL_MEMORY;
+                for (std::uint32_t i = 0; i < info->descriptorSetCount; ++i)
+                    out[i] = reinterpret_cast<VkDescriptorSet>(state()->next_handle++);
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL update_sets(VkDevice, std::uint32_t, const VkWriteDescriptorSet*,
+                                                          std::uint32_t, const VkCopyDescriptorSet*) {}
+            static VKAPI_ATTR VkResult VKAPI_CALL create_buf(VkDevice, const VkBufferCreateInfo*,
+                                                             const VkAllocationCallbacks*, VkBuffer* out) {
+                *out = reinterpret_cast<VkBuffer>(state()->next_handle++);
+                ++state()->created_buffers;
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL destroy_buf(VkDevice, VkBuffer b, const VkAllocationCallbacks*) {
+                if (b) ++state()->destroyed_buffers;
+            }
+            static VKAPI_ATTR void VKAPI_CALL mem_req(VkDevice, VkBuffer, VkMemoryRequirements* req) {
+                *req = {};
+                req->size = 4096;
+                req->alignment = 256;
+                req->memoryTypeBits = 1;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL bind_buf(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) {
+                return VK_SUCCESS;
+            }
+            static VKAPI_ATTR void VKAPI_CALL free_mem(VkDevice, VkDeviceMemory m, const VkAllocationCallbacks*) {
+                if (m) ++state()->destroyed_memories;
+            }
+            static VKAPI_ATTR void VKAPI_CALL cmd_bind_pipe(VkCommandBuffer, VkPipelineBindPoint, VkPipeline) {}
+            static VKAPI_ATTR void VKAPI_CALL cmd_bind_sets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout,
+                                                            std::uint32_t, std::uint32_t, const VkDescriptorSet*,
+                                                            std::uint32_t, const std::uint32_t*) {}
+            static VKAPI_ATTR void VKAPI_CALL cmd_push(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags,
+                                                       std::uint32_t, std::uint32_t, const void*) {}
+            static VKAPI_ATTR void VKAPI_CALL cmd_dispatch(VkCommandBuffer, std::uint32_t, std::uint32_t,
+                                                           std::uint32_t) {}
+            static VKAPI_ATTR VkResult VKAPI_CALL get_sem(VkDevice, VkSemaphore, std::uint64_t* out) {
+                ++state()->sem_queries;
+                if (out) *out = state()->sem_value;
+                return state()->sem_result;
+            }
+            static VKAPI_ATTR VkResult VKAPI_CALL wait_idle(VkDevice) { return VK_SUCCESS; }
+            static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL gdpa(VkDevice, const char* name) {
+                if (std::strcmp(name, "vkCreateShaderModule") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(create_module);
+                if (std::strcmp(name, "vkDestroyShaderModule") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(destroy_module);
+                if (std::strcmp(name, "vkCreateDescriptorSetLayout") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(create_set_layout);
+                if (std::strcmp(name, "vkDestroyDescriptorSetLayout") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(destroy_set_layout);
+                if (std::strcmp(name, "vkCreatePipelineLayout") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(create_pipe_layout);
+                if (std::strcmp(name, "vkDestroyPipelineLayout") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(destroy_pipe_layout);
+                if (std::strcmp(name, "vkCreateComputePipelines") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(create_pipelines);
+                if (std::strcmp(name, "vkDestroyPipeline") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(destroy_pipeline);
+                if (std::strcmp(name, "vkCreateDescriptorPool") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(create_pool);
+                if (std::strcmp(name, "vkDestroyDescriptorPool") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(destroy_pool);
+                if (std::strcmp(name, "vkAllocateDescriptorSets") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(alloc_sets);
+                if (std::strcmp(name, "vkUpdateDescriptorSets") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(update_sets);
+                if (std::strcmp(name, "vkCreateBuffer") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(create_buf);
+                if (std::strcmp(name, "vkDestroyBuffer") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(destroy_buf);
+                if (std::strcmp(name, "vkGetBufferMemoryRequirements") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(mem_req);
+                if (std::strcmp(name, "vkBindBufferMemory") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(bind_buf);
+                if (std::strcmp(name, "vkFreeMemory") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(free_mem);
+                if (std::strcmp(name, "vkCmdBindPipeline") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(cmd_bind_pipe);
+                if (std::strcmp(name, "vkCmdBindDescriptorSets") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(cmd_bind_sets);
+                if (std::strcmp(name, "vkCmdPushConstants") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(cmd_push);
+                if (std::strcmp(name, "vkCmdDispatch") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(cmd_dispatch);
+                if (std::strcmp(name, "vkGetSemaphoreCounterValue") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(get_sem);
+                if (std::strcmp(name, "vkDeviceWaitIdle") == 0)
+                    return reinterpret_cast<PFN_vkVoidFunction>(wait_idle);
+                return nullptr;
+            }
+        };
+
+        const VkDevice fake_dev = reinterpret_cast<VkDevice>(std::uintptr_t(1));
+        const VkBuffer fake_app = reinterpret_cast<VkBuffer>(std::uintptr_t(0x100));
+        const VkBuffer fake_scratch = reinterpret_cast<VkBuffer>(std::uintptr_t(0x200));
+        const VkSemaphore fake_sem = reinterpret_cast<VkSemaphore>(std::uintptr_t(0x300));
+        const auto alloc_mock = [&](ConverterMock& m) {
+            return [&](const VkMemoryRequirements&) {
+                ++m.allocated_memories;
+                return reinterpret_cast<VkDeviceMemory>(m.next_handle++);
+            };
+        };
+
+        // 8a-8e: bounds, overflow/wraparound, max_range_, caller scratch_offset, and mid-prepare rollback.
+        {
+            ConverterMock mock{};
+            ConverterMock::state() = &mock;
+            {
+                Depth24Converter conv(&ConverterMock::gdpa, fake_dev, alloc_mock(mock), 1024);
+                EXPECT(conv.loaded());
+
+                std::vector<Depth24Job> parts;
+
+                // 8a: app_offset + span_bytes 64-bit wraparound must be rejected with 0 allocations.
+                {
+                    Depth24Job job{};
+                    job.app = fake_app;
+                    job.app_offset = UINT64_MAX - 7;
+                    job.app_size = 4096;
+                    job.width = 4;
+                    job.height = 1;
+                    job.slices = 1;
+                    job.app_row_words = 4;
+                    job.app_slice_words = 4;
+                    job.scratch = fake_scratch;
+                    parts.push_back(job);
+                    EXPECT(!conv.prepare(job, parts));
+                    EXPECT(parts.empty() && mock.created_buffers == 0 && mock.created_pools == 0);
+                }
+
+                // 8b-1: span_words * 4 and total_scratch_bytes 64-bit multiplication wraparound (D24).
+                {
+                    Depth24Job job{};
+                    job.app = fake_app;
+                    job.app_offset = 0;
+                    job.app_size = 4096;
+                    job.width = 65536;
+                    job.height = 32768;
+                    job.slices = 1u << 31;
+                    job.app_row_words = 65536;
+                    job.app_slice_words = 1u << 31;
+                    EXPECT(!conv.prepare(job, parts));
+                    EXPECT(job.scratch == VK_NULL_HANDLE && parts.empty() && mock.created_buffers == 0);
+                }
+
+                // 8b-2: rgb96 where app span fits in UINT64_MAX, while total_scratch_bytes wraps modulo 2^64.
+                {
+                    Depth24Job job{};
+                    job.rgb96 = true;
+                    job.app = fake_app;
+                    job.app_offset = 0;
+                    job.app_size = UINT64_MAX;
+                    job.width = 16384;
+                    job.height = 32768;
+                    job.slices = 1u << 31;
+                    job.app_row_words = 16384u * 3u;
+                    job.app_slice_words = 16384u * 3u * 32768u;
+                    EXPECT(!conv.prepare(job, parts));
+                    EXPECT(job.scratch == VK_NULL_HANDLE && parts.empty() && mock.created_buffers == 0);
+                }
+
+                // 8c-1: max_range_ (1024) too small for single row + 256-byte alignment slack (1024 + 256 > 1024).
+                {
+                    Depth24Job job{};
+                    job.app = fake_app;
+                    job.app_offset = 0;
+                    job.app_size = 4096;
+                    job.width = 256;
+                    job.height = 1;
+                    job.slices = 1;
+                    job.app_row_words = 256;
+                    job.app_slice_words = 256;
+                    EXPECT(!conv.prepare(job, parts));
+                    EXPECT(job.scratch == VK_NULL_HANDLE && parts.empty() && mock.created_buffers == 0);
+                }
+
+                // 8d: caller-supplied scratch_offset unaligned or wrapping.
+                {
+                    Depth24Job job{};
+                    job.app = fake_app;
+                    job.app_offset = 0;
+                    job.app_size = 4096;
+                    job.width = 4;
+                    job.height = 1;
+                    job.slices = 1;
+                    job.app_row_words = 4;
+                    job.app_slice_words = 4;
+                    job.scratch = fake_scratch;
+                    job.scratch_offset = 2;
+                    EXPECT(!conv.prepare(job, parts));
+                    job.scratch_offset = UINT64_MAX - 7;
+                    EXPECT(!conv.prepare(job, parts));
+                    EXPECT(mock.created_buffers == 0 && mock.created_pools == 0);
+                }
+
+                // 8e: mid-loop make_part() failure rolls back whole.scratch, whole.scratch_offset, parts, and chunk bump.
+                {
+                    Depth24Job job{};
+                    job.app = fake_app;
+                    job.app_offset = 0;
+                    job.app_size = 4096;
+                    job.width = 37;
+                    job.height = 5;
+                    job.slices = 1;
+                    job.app_row_words = 64;
+                    job.app_slice_words = 400;
+                    parts.push_back(job);  // pre-existing entry must be cleared on failure
+                    mock.fail_alloc_set_from = mock.alloc_set_calls + 2;
+                    mock.fail_create_pool_from = mock.create_pool_calls + 2;
+                    EXPECT(!conv.prepare(job, parts));
+                    EXPECT(parts.empty() && job.scratch == VK_NULL_HANDLE && job.scratch_offset == 0);
+                    const unsigned buffers_after_fail = mock.created_buffers;
+                    EXPECT(buffers_after_fail == 1);
+
+                    // Clear failure flags and retry on the same converter: must reuse chunk 0 from offset 0.
+                    mock.fail_alloc_set_from = 0;
+                    mock.fail_create_pool_from = 0;
+                    EXPECT(conv.prepare(job, parts));
+                    EXPECT(parts.size() == 2 && job.scratch != VK_NULL_HANDLE && job.scratch_offset == 0);
+                    EXPECT(mock.created_buffers == buffers_after_fail);
+                }
+            }
+            EXPECT(!mock.destroyed_garbage_pipeline);
+            EXPECT(mock.destroyed_buffers == mock.created_buffers);
+            EXPECT(mock.destroyed_memories == mock.allocated_memories);
+            EXPECT(mock.destroyed_pools == mock.created_pools);
+            EXPECT(mock.destroyed_pipelines == mock.created_pipelines);
+            EXPECT(mock.destroyed_pipeline_layouts == mock.created_pipeline_layouts);
+            EXPECT(mock.destroyed_set_layouts == mock.created_set_layouts);
+            EXPECT(mock.destroyed_modules == mock.created_modules);
+            ConverterMock::state() = nullptr;
+        }
+
+        // 8c-2: max_range_ <= 256 leaves zero bytes after 256-byte descriptor alignment slack.
+        {
+            ConverterMock mock{};
+            ConverterMock::state() = &mock;
+            {
+                Depth24Converter conv(&ConverterMock::gdpa, fake_dev, alloc_mock(mock), 256);
+                EXPECT(conv.loaded());
+                Depth24Job job{};
+                job.app = fake_app;
+                job.app_offset = 0;
+                job.app_size = 4096;
+                job.width = 1;
+                job.height = 1;
+                job.slices = 1;
+                job.app_row_words = 1;
+                job.app_slice_words = 1;
+                std::vector<Depth24Job> parts;
+                EXPECT(!conv.prepare(job, parts));
+                EXPECT(job.scratch == VK_NULL_HANDLE && parts.empty() && mock.created_buffers == 0 &&
+                       mock.created_set_layouts == 0);
+            }
+            ConverterMock::state() = nullptr;
+        }
+
+        // 8f: failed vkCreateComputePipelines writing non-null garbage must not poison pipeline_.
+        {
+            ConverterMock mock{};
+            ConverterMock::state() = &mock;
+            {
+                Depth24Converter conv(&ConverterMock::gdpa, fake_dev, alloc_mock(mock), 1u << 20);
+                EXPECT(conv.loaded());
+                Depth24Job job{};
+                job.app = fake_app;
+                job.app_offset = 0;
+                job.app_size = 4096;
+                job.width = 4;
+                job.height = 1;
+                job.slices = 1;
+                job.app_row_words = 4;
+                job.app_slice_words = 4;
+                job.scratch = fake_scratch;
+                std::vector<Depth24Job> parts;
+
+                mock.fail_create_pipeline = true;
+                mock.write_pipeline_on_fail = true;
+                EXPECT(!conv.prepare(job, parts));
+                EXPECT(mock.create_pipeline_calls == 1 && !mock.destroyed_garbage_pipeline &&
+                       mock.created_pipelines == 0 &&
+                       mock.destroyed_pipeline_layouts == mock.created_pipeline_layouts &&
+                       mock.destroyed_set_layouts == mock.created_set_layouts &&
+                       mock.destroyed_modules == mock.created_modules);
+
+                // Second attempt while still failing must re-enter vkCreateComputePipelines (pipeline_ still null).
+                EXPECT(!conv.prepare(job, parts));
+                EXPECT(mock.create_pipeline_calls == 2 && !mock.destroyed_garbage_pipeline &&
+                       mock.created_pipelines == 0);
+
+                // Restore success on the same converter: 3rd prepare() must build the pipeline cleanly.
+                mock.fail_create_pipeline = false;
+                EXPECT(conv.prepare(job, parts));
+                EXPECT(mock.create_pipeline_calls == 3 && mock.created_pipelines == 1 && parts.size() == 1);
+            }
+            EXPECT(!mock.destroyed_garbage_pipeline);
+            EXPECT(mock.destroyed_pipelines == mock.created_pipelines);
+            EXPECT(mock.destroyed_pipeline_layouts == mock.created_pipeline_layouts);
+            EXPECT(mock.destroyed_set_layouts == mock.created_set_layouts);
+            EXPECT(mock.destroyed_modules == mock.created_modules);
+            EXPECT(mock.destroyed_pools == mock.created_pools);
+            ConverterMock::state() = nullptr;
+        }
+
+        // 8g: non-256-aligned >4 MiB chunk skip in scratch() + Depth24Converter::collect() VkResult & ticket 0.
+        {
+            ConverterMock mock{};
+            ConverterMock::state() = &mock;
+            {
+                Depth24Converter conv(&ConverterMock::gdpa, fake_dev, alloc_mock(mock), 1u << 27);
+                EXPECT(conv.loaded());
+                std::vector<Depth24Job> parts;
+
+                // Job 1: 1025 * 1025 * 4 = 4,202,500 bytes (> 4 MiB, % 256 == 4) fills chunk 1 completely.
+                Depth24Job j1{};
+                j1.app = fake_app;
+                j1.app_offset = 0;
+                j1.app_size = std::uint64_t(1025) * 1025 * 4;
+                j1.width = 1025;
+                j1.height = 1025;
+                j1.slices = 1;
+                j1.app_row_words = 1025;
+                j1.app_slice_words = 1025u * 1025u;
+                EXPECT(conv.prepare(j1, parts));
+                EXPECT(mock.created_buffers == 1 && j1.scratch_offset == 0);
+
+                // Job 2: must skip exhausted non-256-aligned chunk 1 cleanly and allocate chunk 2 at offset 0.
+                Depth24Job j2{};
+                j2.app = fake_app;
+                j2.app_offset = 0;
+                j2.app_size = 4096;
+                j2.width = 16;
+                j2.height = 1;
+                j2.slices = 1;
+                j2.app_row_words = 16;
+                j2.app_slice_words = 16;
+                EXPECT(conv.prepare(j2, parts));
+                EXPECT(mock.created_buffers == 2 && j2.scratch_offset == 0);
+
+                conv.retire(fake_sem, 1);
+
+                // Failing vkGetSemaphoreCounterValue writing UINT64_MAX must NOT reclaim chunks or destroy pools.
+                mock.sem_result = VK_ERROR_DEVICE_LOST;
+                mock.sem_value = UINT64_MAX;
+                conv.collect();
+                EXPECT(mock.destroyed_pools == 0);
+
+                // Ticket-0 batch must reclaim without querying the semaphore.
+                Depth24Job j3 = j2;
+                j3.scratch = VK_NULL_HANDLE;
+                EXPECT(conv.prepare(j3, parts));
+                EXPECT(mock.created_buffers == 3);
+                const unsigned queries_before = mock.sem_queries;
+                const unsigned pools_before = mock.destroyed_pools;
+                conv.retire(fake_sem, 0);
+                mock.sem_result = VK_SUCCESS;
+                mock.sem_value = 0;
+                conv.collect();
+                EXPECT(mock.sem_queries == queries_before + 1);  // queried only the ticket-1 batch
+                EXPECT(mock.destroyed_pools == pools_before + 1);  // ticket-0 batch pool destroyed, ticket-1 kept
+
+                // Now complete ticket 1 -> reclaims remaining pools cleanly.
+                mock.sem_value = 1;
+                conv.collect();
+                EXPECT(mock.destroyed_pools == mock.created_pools);
+            }
+            EXPECT(mock.destroyed_buffers == mock.created_buffers);
+            EXPECT(mock.destroyed_memories == mock.allocated_memories);
+            EXPECT(mock.destroyed_pools == mock.created_pools);
+            EXPECT(mock.destroyed_pipelines == mock.created_pipelines);
+            EXPECT(mock.destroyed_pipeline_layouts == mock.created_pipeline_layouts);
+            EXPECT(mock.destroyed_set_layouts == mock.created_set_layouts);
+            EXPECT(mock.destroyed_modules == mock.created_modules);
+            ConverterMock::state() = nullptr;
+        }
+        std::printf("depth24: Depth24Converter prepare bounds, splitting, rollback, pipeline, and collect ok\n");
+    }
+
     EXPECT(gpu.validation_errors() == 0);
     std::printf("depth24_convert_test: ok\n");
     return 0;
