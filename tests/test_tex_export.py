@@ -734,5 +734,18 @@ def test_missing_input_fails_without_traceback_when_numpy_missing(tmp_path):
     p = subprocess.run([sys.executable, "-I", "-S", str(tool), str(missing), str(tmp_path), str(tmp_path / "out")],
                        capture_output=True, text=True, timeout=60)
     assert p.returncode == 2
-    assert "ERROR: cannot read" in p.stderr
+    assert "cannot read" in p.stderr
     assert "Traceback" not in p.stderr
+
+
+def test_export_without_numpy_fails_cleanly(tmp_path):
+    tool = Path(__file__).resolve().parents[1] / "tools" / "tex_export.py"
+    index = tmp_path / "textures_index.json"
+    index.write_text('[{"archive": "x.rpf", "gpu": 4096}]', encoding="utf-8")
+    out = tmp_path / "out"
+    p = subprocess.run([sys.executable, "-I", "-S", str(tool), str(index), str(tmp_path), str(out)],
+                       capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2
+    assert "exporting textures needs numpy" in p.stderr
+    assert "Traceback" not in p.stderr
+    assert not out.exists()

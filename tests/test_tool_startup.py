@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOLS = os.path.join(ROOT, "tools")
 TOOL_NAMES = {os.path.splitext(os.path.basename(path))[0] for path in glob.glob(os.path.join(TOOLS, "*.py"))}
-NUMERIC = {"amd_swizzle", "calibrated_texture", "swizzle_search", "tex_export", "tex_mode_probe", "tile_probe"}
+NUMERIC = {"amd_swizzle", "calibrated_texture", "swizzle_search", "tex_mode_probe", "tile_probe"}
 
 # One process per tool is a few seconds in total; a hung import is a failure, not an infinite test.
 TIMEOUT = 120

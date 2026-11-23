@@ -232,6 +232,11 @@ def main():
     if same_report_path(report, a.index):
         print(f"ERROR: {report} must not overwrite input index {a.index}", file=sys.stderr)
         return 2
+    try:  # np is imported lazily so --help works without it; an export can't
+        import numpy  # noqa: F401
+    except ImportError as e:
+        print(f"ERROR: exporting textures needs numpy: {e}", file=sys.stderr)
+        return 2
     try:
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:  # a report path under an existing file, or a dangling symlink
