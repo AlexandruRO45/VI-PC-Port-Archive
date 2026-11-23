@@ -231,6 +231,54 @@ class Program:
         return "\n".join(inst.to_assembly() for inst in self.instructions)
 
 
+
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarLDSInterpreter:
+    """Deterministic scalar interpreter for ds_sub_u32."""
+
+    def __init__(self, capacity_dwords: int = LDS_SIZE_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.lds: LDSModel = LDSModel(capacity_dwords)
+        self.vcc: int = 0
+        self.last_condition_codes: Any | None = None
+        self.last_status_flags: Any | None = None
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= len(self.vgprs)) or (kind == RegKind.SGPR and idx >= len(self.sgprs)):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        return (self.vgprs[idx] if kind == RegKind.VGPR else self.sgprs[idx]) & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        if idx < 0 or (kind == RegKind.VGPR and idx >= len(self.vgprs)) or (kind == RegKind.SGPR and idx >= len(self.sgprs)):
+            raise IndexError(f"Register index out of bounds: {kind.value}{idx}")
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def step(self, inst: Instruction) -> int:
+        """Executes a single ds_sub_u32 instruction."""
+        vaddr = self.read_reg_u32(RegKind.VGPR, inst.vaddr.index)
+        vdata = self.read_reg_u32(RegKind.VGPR, inst.vdata.index)
+        res = self.lds.atomic_sub_u32(
+            vaddr=vaddr,
+            sub_val=vdata,
+            offset=inst.offset.offset,
+        )
+        self.trace.append(f"{inst.to_assembly()} => new_val={res:#010x}")
+        return res
+
+    def run_program(self, prog: Program) -> list[int]:
+        """Executes all instructions in a program sequentially."""
+        return [self.step(inst) for inst in prog.instructions]
+
+
 class TestLdsSubU32ReferenceOracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and hardware translator execution."""
 
@@ -344,6 +392,54 @@ class TestLdsSubU32AST(unittest.TestCase):
         ))
         expected = "ds_sub_u32 v1, v2 offset:4\nds_sub_u32 v3, v4"
         self.assertEqual(prog.to_assembly(), expected)
+
+
+
+class TestLdsSubU32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(capacity_dwords=1024)
+
+    def test_scalar_execution_basic(self) -> None:
+        # Seed address 0x10 with 80
+        self.interp.lds.write_dword(0x10, 80)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 25)
+
+        inst = Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 55)
+        self.assertEqual(self.interp.lds.read_dword(0x10), 55)
+        # Verify operands are preserved (non-returning)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 1), 0x10)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 2), 25)
+
+    def test_scalar_chained_execution(self) -> None:
+        self.interp.lds.write_dword(0x20, 100)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x20)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 20)
+        self.interp.write_reg_u32(RegKind.VGPR, 3, 30)
+
+        prog = Program()
+        prog.append(Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 2),
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.DS_SUB_U32,
+            vaddr=Register(RegKind.VGPR, 1),
+            vdata=Register(RegKind.VGPR, 3),
+        ))
+
+        results = self.interp.run_program(prog)
+        self.assertEqual(results, [80, 50])
+        self.assertEqual(self.interp.lds.read_dword(0x20), 50)
 
 
 if __name__ == "__main__":
