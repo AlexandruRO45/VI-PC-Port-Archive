@@ -581,6 +581,9 @@ void check_run_time_load() {
         check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, 2, tiny, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
                   used == 0,
               "slot 4 refuses a buffer that is too small");
+        char null_used[256];
+        check(reinterpret_cast<GetPath>(slot(pls, 4))(pls, sizeof(null_used), null_used, nullptr) == S_OK,
+              "slot 4 accepts path_used = nullptr (measured calling shape in the executable)");
 
         {
             std::ofstream cache_file(folder / L"cache.bin", std::ios::binary);

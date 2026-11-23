@@ -58,8 +58,9 @@ std::atomic<int> g_runtime_refs{0};
 // xodus-gaming/xgameruntime-docs (GPL-3.0; facts only, nothing copied): InitializeApiImplEx2 is the one
 // XGameRuntimeInitialize[WithOptions] calls, and QueryApiImpl hands out the runtime's COM classes. XThreadingImpl,
 // XErrorImpl, XNetworkingImpl, XSystemImpl, XPackageImpl, XGameRuntimeFeatureImpl and XSystemAnalyticsImpl are
-// served (their layouts are measured, below), XPersistentLocalStorageImpl and XGameImpl from the public docs' layout
-// (no caller in the shipped DLLs to measure), and the classes of the other xgameruntime_*.cpp files through their
+// served (their layouts are measured, below), XPersistentLocalStorageImpl from the executable's measured slots (below),
+// XGameImpl from the public docs' layout (no caller in the shipped DLLs to measure), and the classes of the other
+// xgameruntime_*.cpp files through their
 // query functions; for any other class QueryApiImpl logs the class and interface id and refuses it, so the first boot
 // with the executable lists the interfaces to implement next.
 
@@ -470,6 +471,7 @@ struct PersistentSpaceInfo {
     uint64_t total_bytes;           // the quota
 };
 static_assert(sizeof(PersistentSpaceInfo) == 32, "XPersistentLocalStorageSpaceInfo is four UINT64");
+static_assert(offsetof(PersistentSpaceInfo, available_free_bytes) == 0x00, "measured field offset in save caller");
 
 // The storage folder, created on first use. Empty when there is no overlay (no place to keep files) or the folder
 // cannot be created.
@@ -560,6 +562,9 @@ HRESULT STDMETHODCALLTYPE pls_mount_for_package(void*, const char*, void** mount
     return E_NOTIMPL;
 }
 
+// In the retail executable (game_scarlett_master.exe), exactly two thunks are linked: slot 4 (GetPath) and slot 5
+// (GetSpaceInfo), both referenced. Slots 3 (GetPathSize), 6-7 (PromptUserForSpace*), and 8 (MountForPackage)
+// have no thunks linked.
 #define PLS(fn) reinterpret_cast<const void*>(&fn)
 const void* const kPersistentStorageVtable[] = {
     PLS(object_query_interface), PLS(object_add_ref), PLS(object_release),
