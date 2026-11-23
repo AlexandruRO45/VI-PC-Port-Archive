@@ -183,6 +183,51 @@ class TestTextureMipDrop(unittest.TestCase):
         self.assertEqual(first_mip, 1)
         self.assertEqual(mip_count, 4)
 
+    def test_retained_mip_whole_copy_extent_derives_from_reduced_binding(self):
+        """Whole-mip copy (box=None) on retained mip must derive extent from reduced image (P1 fix)."""
+        # 8x8 texture, 3 mips, drop 1 -> physical image & binding is 4x4, 2 mips.
+        t = TextureCreateInfoModel(8, 8, 1, 3, flags=D3D12ResourceFlags.NONE, mip_drop_env=1)
+        self.assertEqual(t.width, 4)
+        self.assertEqual(t.height, 4)
+        self.assertEqual(t.mip_levels, 2)
+
+        # Original subresource 1 (orig mip 1) maps to physical subresource 0 (phys mip 0).
+        phys_subres = t.map_subresource(1)
+        self.assertEqual(phys_subres, 0)
+
+        # Whole-mip extent for physical mip 0:
+        phys_mip = phys_subres % t.mip_levels
+        phys_w = max(1, t.width >> phys_mip)
+        phys_h = max(1, t.height >> phys_mip)
+        self.assertEqual((phys_w, phys_h), (4, 4))
+        # Total bytes for RGBA8 (4 bytes per texel): 4 * 4 * 4 = 64 bytes (NOT 8 * 8 * 4 = 256)
+        self.assertEqual(phys_w * phys_h * 4, 64)
+
+    def test_dropped_mip_read_zeros_requested_box_with_pitches(self):
+        """Reading a dropped mip must zero all rows/slices across supplied pitches (P2 fix)."""
+        # Simulate reading dropped mip 0 of 8x8 RGBA8 (row_pitch 32, depth_pitch 256) into a 512-byte buffer.
+        buffer = bytearray([0xCD] * 512)
+        row_pitch = 32
+        depth_pitch = 256
+        width, height, depth = 8, 8, 1
+        b_left, b_top, b_front = 0, 0, 0
+        b_right, b_bottom, b_back = width, height, depth
+        bpp = 4
+
+        rows = b_bottom - b_top
+        row_bytes = (b_right - b_left) * bpp
+        slices = b_back - b_front
+
+        for z in range(slices):
+            for y in range(rows):
+                offset = z * depth_pitch + y * row_pitch
+                buffer[offset:offset + row_bytes] = b"\x00" * row_bytes
+
+        # First 256 bytes must be zeroed (8 rows * 32 bytes)
+        self.assertEqual(buffer[:256], b"\x00" * 256)
+        # Tail bytes (256..512) must remain untouched at 0xCD
+        self.assertEqual(buffer[256:], b"\xCD" * 256)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2023,11 +2023,11 @@ public:
         binding.depth24 = format.d24;
         binding.format = format.format;
         binding.aspects = format.aspects;
-        binding.width = std::uint32_t(desc_.Width);
-        binding.height = one_d ? 1u : desc_.Height;
-        binding.mip_levels = desc_.MipLevels;
+        binding.width = info.extent.width;
+        binding.height = info.extent.height;
+        binding.mip_levels = info.mipLevels;
         binding.array_layers = info.arrayLayers;
-        binding.depth = depth;
+        binding.depth = info.extent.depth;
         binding.volume = volume;
         binding.line = one_d;
         binding.samples = samples;
@@ -2120,6 +2120,16 @@ public:
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
         if (image_) {
+            if (mips_dropped_ > 0) {
+                const UINT orig_mips = desc_.MipLevels;
+                const UINT mip = subresource % orig_mips;
+                const UINT slice = subresource / orig_mips;
+                if (mip < mips_dropped_) {
+                    return !data && cpu_visible() ? S_OK : E_INVALIDARG;
+                }
+                const UINT new_mips = desc_.MipLevels - mips_dropped_;
+                subresource = slice * new_mips + (mip - mips_dropped_);
+            }
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&
                            leonida::image_range(binding_, subresource, range)
@@ -2195,7 +2205,30 @@ private:
             const UINT mip = subresource % orig_mips;
             const UINT slice = subresource / orig_mips;
             if (mip < mips_dropped_) {
-                if (!write) std::memset(data, 0, row_pitch);
+                if (write) return S_OK;
+                // Read from a dropped mip: zero the requested box/rows/slices across row_pitch and depth_pitch.
+                const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+                const bool one_d = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+                const std::uint32_t width = std::max(1u, std::uint32_t(desc_.Width) >> mip);
+                const std::uint32_t height = one_d ? 1u : std::max(1u, desc_.Height >> mip);
+                const std::uint32_t depth = volume ? std::max(1u, UINT(desc_.DepthOrArraySize) >> mip) : 1u;
+                const D3D12_BOX b = box ? *box : D3D12_BOX{0, 0, 0, width, height, depth};
+                if (b.right > width || b.bottom > height || b.back > depth) return E_INVALIDARG;
+                const auto block = leonida::copy_block_format(binding_, aspects_);
+                if (!block.bytes) return E_INVALIDARG;
+                const std::uint32_t k = block.block;
+                if (b.left % k || b.top % k || (b.right % k && b.right != width) || (b.bottom % k && b.bottom != height))
+                    return E_INVALIDARG;
+                if (b.left >= b.right || b.top >= b.bottom || b.front >= b.back) return S_OK;
+                const std::uint32_t rows = (b.bottom - b.top + k - 1) / k;
+                const std::uint64_t row_bytes = std::uint64_t((b.right - b.left + k - 1) / k) * block.bytes;
+                const std::uint32_t slices = b.back - b.front;
+                auto* bytes = static_cast<std::byte*>(data);
+                for (std::uint32_t z = 0; z < slices; ++z) {
+                    for (std::uint32_t y = 0; y < rows; ++y) {
+                        std::memset(bytes + std::uint64_t(z) * depth_pitch + std::uint64_t(y) * row_pitch, 0, row_bytes);
+                    }
+                }
                 return S_OK;
             }
             const UINT new_mips = desc_.MipLevels - mips_dropped_;
