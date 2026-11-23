@@ -221,6 +221,9 @@ public:
         unregister_buffers();
         if (restrict_to_output_) restrict_to_output_->Release();
         if (waitable_) CloseHandle(waitable_);
+        // Destroy VulkanSwapchain before releasing the device to avoid use-after-free.
+        // VulkanSwapchain's destructor calls destroy_swapchain() which uses the device.
+        swapchain_.~VulkanSwapchain();
         if (device_) device_->Release();
         if (parent_) parent_->Release();
     }

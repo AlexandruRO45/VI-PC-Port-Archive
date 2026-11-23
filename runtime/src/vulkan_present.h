@@ -942,6 +942,19 @@ private:
             copy.imageExtent = {extent_.width, extent_.height, 1};
             fn.copy_image_to_buffer(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, capture_buffer_, 1,
                                     &copy);
+            // Ensure the capture copy is visible to the host (CPU) before the fence signals.
+            // The capture buffer is HOST_VISIBLE | HOST_COHERENT, but the transfer only guarantees
+            // device visibility. This barrier makes the data available for host reads.
+            VkBufferMemoryBarrier host_read{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            host_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            host_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            host_read.buffer = capture_buffer_;
+            host_read.offset = 0;
+            host_read.size = VK_WHOLE_SIZE;
+            fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0,
+                                nullptr, 1, &host_read, 0, nullptr);
             layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             access = VK_ACCESS_TRANSFER_READ_BIT;
         }
