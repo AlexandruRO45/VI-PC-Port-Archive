@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import struct
 import subprocess
 import sys
@@ -317,6 +318,102 @@ class ScanTest(unittest.TestCase):
         missing = subprocess.run([sys.executable, "-I", TOOL, path + ".missing"], capture_output=True, text=True,
                                  timeout=120)
         self.assertEqual(missing.returncode, 2)
+
+
+class ReportPublicationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.src = self.root / "one.awc"
+        self.src.write_bytes(speech_bank(0x55, 48000, event(TICK, 1.0, 0)))
+        self.out = self.root / "published" / "markers.json"
+        self.out.parent.mkdir()
+
+    def run_report(self, path=None):
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            result = awc_markers.main([str(self.src), "--out", str(path or self.out)])
+        return result, out.getvalue(), err.getvalue()
+
+    def assert_write_failure(self, result):
+        status, stdout, stderr = result
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(stderr.splitlines()), 1)
+        self.assertIn("cannot write", stderr)
+        self.assertIn(str(self.out), stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_partial_json_write_preserves_previous_report_and_cleans_staging(self):
+        previous = b"previous complete report\n"
+        self.out.write_bytes(previous)
+        before = set(self.root.rglob("*"))
+
+        def interrupted_dump(report, stream, **kwargs):
+            stream.write('{"banks":')
+            stream.flush()
+            raise OSError(28, "injected disk full")
+
+        with mock.patch.object(awc_markers.json, "dump", side_effect=interrupted_dump):
+            result = self.run_report()
+        self.assert_write_failure(result)
+        self.assertEqual(self.out.read_bytes(), previous)
+        self.assertEqual(set(self.root.rglob("*")), before)
+
+    def test_replace_failure_preserves_existing_or_absent_report_and_cleans_staging(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                previous = b"previous complete report\n"
+                if existing:
+                    self.out.write_bytes(previous)
+                before = set(self.root.rglob("*"))
+                with mock.patch.object(awc_markers.os, "replace", side_effect=PermissionError(13, "locked")):
+                    result = self.run_report()
+                self.assert_write_failure(result)
+                self.assertEqual(self.out.read_bytes() if existing else self.out.exists(),
+                                 previous if existing else False)
+                self.assertEqual(set(self.root.rglob("*")), before)
+
+    def test_success_keeps_json_bytes_and_lf_without_staging_leftovers(self):
+        expected = (json.dumps(awc_markers.scan(str(self.src)), indent=2) + "\n").encode("utf-8")
+        self.out.write_bytes(b"old report\n")
+        before = set(self.root.rglob("*"))
+        status, stdout, stderr = self.run_report()
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("1 banks, 1 streams", stdout)
+        self.assertEqual(stderr, "")
+        self.assertEqual(self.out.read_bytes(), expected)
+        self.assertNotIn(b"\r", self.out.read_bytes())
+        self.assertEqual(set(self.root.rglob("*")), before)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_existing_and_new_report_permissions_match_ordinary_writes(self):
+        self.out.write_bytes(b"old report\n")
+        self.out.chmod(0o640)
+        self.assertEqual(self.run_report()[0], 0)
+        self.assertEqual(stat.S_IMODE(self.out.stat().st_mode), 0o640)
+        self.out.unlink()
+        ordinary = self.out.with_name("ordinary.json")
+        ordinary.write_bytes(b"")
+        expected = stat.S_IMODE(ordinary.stat().st_mode)
+        ordinary.unlink()
+        self.assertEqual(self.run_report()[0], 0)
+        self.assertEqual(stat.S_IMODE(self.out.stat().st_mode), expected)
+
+    def test_report_symlink_keeps_its_link_and_updates_the_target(self):
+        self.out.write_bytes(b"old report\n")
+        link = self.root / "report-link.json"
+        try:
+            link.symlink_to(Path("published") / self.out.name)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        before = set(self.root.rglob("*"))
+        expected = (json.dumps(awc_markers.scan(str(self.src)), indent=2) + "\n").encode("utf-8")
+        self.assertEqual(self.run_report(link)[0], 0)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.read_bytes(), expected)
+        self.assertEqual(self.out.read_bytes(), expected)
+        self.assertEqual(set(self.root.rglob("*")), before)
 
 
 if __name__ == "__main__":

@@ -28,8 +28,10 @@ import os
 import statistics
 import struct
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from rsc8_audio import parse_adat_at_file  # noqa: E402
 
 TAG_MUSIC, TAG_DATA, TAG_FORMAT, TAG_MARKER = 0x48, 0x55, 0x76, 0xBD
@@ -196,6 +198,18 @@ def scan(src: str) -> dict:
     return {"banks": banks, "streams": streams, **{name: _finish(g) for name, g in groups.items()}}
 
 
+def write_report(path: str, report: dict) -> None:
+    """Publish a complete report, following output symlinks and preserving destination permission bits."""
+    destination = os.path.realpath(path)
+    with tempfile.TemporaryDirectory(prefix=".awc-markers-", dir=os.path.dirname(destination)) as staging:
+        staged = os.path.join(staging, "report.json")
+        with open(staged, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=2)
+            f.write("\n")
+        os.chmod(staged, published_mode(destination))
+        os.replace(staged, destination)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Count AWC marker events (tag 0xBD); hashes and counts only.")
     ap.add_argument("src", help="an RPF9 archive, an .awc bank, or a directory scanned recursively for *.awc")
@@ -221,9 +235,7 @@ def main(argv=None) -> int:
         return 1
     if a.out:
         try:
-            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(report, f, indent=2)
-                f.write("\n")
+            write_report(a.out, report)
         except OSError as e:    # a folder removed or locked since the preflight: a line, not a traceback
             print(f"awc_markers: error: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
             return 1
