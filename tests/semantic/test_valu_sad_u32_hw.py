@@ -156,5 +156,59 @@ class TestSadASTAndTypes(unittest.TestCase):
         self.assertEqual(words[0], 25)
 
 
+class VectorInterpreter:
+    """Deterministic vector instruction interpreter for SAD blocks."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 64
+
+    def exec_line(self, line: str) -> None:
+        tokens = line.strip().replace(",", " ").split()
+        if not tokens:
+            return
+        op = tokens[0]
+        if op == "v_mov_b32":
+            dst = int(tokens[1].lstrip("v"))
+            val = int(tokens[2], 0)
+            self.vgprs[dst] = val & MASK32
+        elif op == "v_sad_u32":
+            dst = int(tokens[1].lstrip("v"))
+            src0 = self.resolve_src(tokens[2])
+            src1 = self.resolve_src(tokens[3])
+            src2 = self.resolve_src(tokens[4])
+            self.vgprs[dst] = v_sad_u32_oracle(src0, src1, src2)
+
+    def resolve_src(self, tok: str) -> int:
+        if tok.startswith("v"):
+            return self.vgprs[int(tok.lstrip("v"))]
+        return int(tok, 0) & MASK32
+
+
+class TestSadScalarInterpreter(unittest.TestCase):
+    """Commit 3: deterministic scalar instruction interpreter for v_sad_u32."""
+
+    def test_sequential_chained_sad(self):
+        interp = VectorInterpreter()
+        lines = [
+            "v_mov_b32 v1, 100",
+            "v_mov_b32 v2, 40",
+            "v_mov_b32 v3, 10",
+            "v_sad_u32 v0, v1, v2, v3",   # |100-40|+10 = 70
+            "v_mov_b32 v2, 90",
+            "v_sad_u32 v0, v0, v2, v3",   # |70-90|+10 = 30
+        ]
+        for ln in lines:
+            interp.exec_line(ln)
+        self.assertEqual(interp.vgprs[0], 30)
+
+        prog = lines + [
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_sad_ps(prog, "ps_sad_chained")
+        self.assertEqual(words[0], 30)
+
+
 if __name__ == '__main__':
     unittest.main()
