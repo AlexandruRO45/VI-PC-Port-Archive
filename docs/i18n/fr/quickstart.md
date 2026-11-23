@@ -148,6 +148,10 @@ encore ce cache.
   dans les deux cas, le script écrit `gta6rt.sh`, qui lance
   `gta6rt.exe` avec `wine`, ou avec le Wine désigné par la variable `WINE` (pour Proton, son `files/bin/wine`).
 
+Avec le backend Vulkan (`LEONIDA_D3D12=vulkan`), le runtime empaqueté trouve les shaders traduits dans
+`<work>/shaders/spirv` grâce à `shader_path.txt` à côté de `gta6rt.exe`. `LEONIDA_SHADERS` permet d'indiquer un autre
+dossier.
+
 ## Problèmes courants
 
 - **Vous avez utilisé « Download ZIP » sur GitHub** : le ZIP ne contient pas le sous-module
