@@ -169,9 +169,9 @@ LONG CALLBACK catch_unhandled_name(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-bool call_thread_name(void* fn, const char* name, DWORD thread_id) {
+bool call_thread_name(void* fn, const char* name, DWORD thread_id, ULONG_PTR type = 0x1000) {
     // The MSVC sample packs the DWORD thread ID and zero flags in one ULONG_PTR on x64.
-    const ULONG_PTR args[] = {0x1000, reinterpret_cast<ULONG_PTR>(name), thread_id};
+    const ULONG_PTR args[] = {type, reinterpret_cast<ULONG_PTR>(name), thread_id};
     g_unhandled_name = false;
     reinterpret_cast<decltype(&RaiseException)>(fn)(kThreadNameCode, 0, 3, args);
     return !g_unhandled_name;
@@ -265,8 +265,22 @@ bool valid_utf8(const fs::path& p) {
            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, all.data(), static_cast<int>(all.size()), nullptr, 0) > 0;
 }
 
-void test_trace(const fs::path& dir) {
-    const fs::path image = write_file(dir / kImageName, make_image());
+// Run before open() so the first guest RaiseException must install the handler itself.
+void test_legacy_name_without_trace(const fs::path& dir, const fs::path& image) {
+    rt::Loader loader(dir);
+    rt::Module& m = loader.load(image);
+    void* raise = m.base + caller_rva(2);
+    void* fallback = AddVectoredExceptionHandler(0, &catch_unhandled_name);
+    if (!fallback) throw std::runtime_error("cannot install the test's fallback handler");
+    check(call_thread_name(raise, "quiet worker", GetCurrentThreadId()), "legacy naming resumes with tracing off");
+    check(current_thread_has_name(L"quiet worker"), "an explicit thread ID works with tracing off");
+    check(!call_thread_name(raise, "wrong name", GetCurrentThreadId(), 0x1001),
+          "a legacy name with an invalid type reaches the fallback handler");
+    check(current_thread_has_name(L"quiet worker"), "the invalid payload leaves the thread description unchanged");
+    RemoveVectoredExceptionHandler(fallback);
+}
+
+void test_trace(const fs::path& dir, const fs::path& image) {
     const fs::path trace = dir / "trace.jsonl";
     check(rt::startup_trace::open(trace.c_str()), "open the trace file");
     {
@@ -288,8 +302,6 @@ void test_trace(const fs::path& dir) {
         check(current_thread_has_name(L"trace \"worker\""), "the legacy name becomes the native thread description");
         rt::startup_trace::event("exit", "\"code\":0");
         rt::startup_trace::close();
-        check(call_thread_name(raise, "quiet worker", GetCurrentThreadId()), "legacy naming resumes with tracing off");
-        check(current_thread_has_name(L"quiet worker"), "an explicit thread ID works with tracing off");
         RemoveVectoredExceptionHandler(fallback);
     }
     rt::startup_trace::close();
@@ -358,8 +370,10 @@ int wmain() {
         const fs::path dir = test_dir();
         test_thread_description();
         test_disabled_is_silent();
+        const fs::path image = write_file(dir / kImageName, make_image());
+        test_legacy_name_without_trace(dir, image);
         test_existing_file_is_kept(dir);
-        test_trace(dir);
+        test_trace(dir, image);
         std::error_code ec;
         fs::remove_all(dir, ec);
     } catch (const std::exception& e) {
