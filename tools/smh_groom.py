@@ -391,7 +391,7 @@ class Groom:
     length_random: tuple[float, float] = (0.0, 1.0)
     present: dict[str, bool] = field(default_factory=dict, repr=False)
     optional_raw: dict[str, bytes] = field(default_factory=dict, repr=False)
-    tail: bytes = field(default_factory=b"", repr=False)
+    tail: bytes = field(default=b"", repr=False)
     sentinel_2c: int = 0xFFFFFFFF
     ext_3c_offset: int = 0
 

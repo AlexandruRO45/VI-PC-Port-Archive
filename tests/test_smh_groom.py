@@ -346,6 +346,13 @@ class ParsingTests(unittest.TestCase):
         self.assertIn("node_4", summary["optionalArrays"])
         self.assertIn("node_2", summary["optionalArrays"])
 
+    def test_groom_without_tail_defaults_to_empty_bytes(self):
+        """tail used default_factory=b"", so Groom(...) without tail= raised TypeError."""
+        header = (0,) * (smh_groom.HEADER_SIZE // 4)
+        groom = smh_groom.Groom(archive="synth.smh", offset=0, system=b"", buffer=b"", header=header)
+        self.assertEqual(groom.tail, b"")
+        self.assertEqual(groom.summary()["tailBytes"], 0)
+
     def test_parse_standalone_gpu_buffer_without_system_page(self):
         _, gpu = build_synthetic_groom_buffers(include_optional=False)
         groom = smh_groom.parse(None, gpu, archive="raw.smh", offset=0)
