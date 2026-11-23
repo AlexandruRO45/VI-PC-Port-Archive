@@ -177,6 +177,65 @@ class SpirvAsmUnitTests(unittest.TestCase):
             self.assertEqual(len(words), len(ref_words))
             self.assertEqual(words[:2] + words[3:], ref_words[:2] + ref_words[3:])
 
+    def test_hex_float_narrowing_truncates_toward_zero(self):
+        # SPIRV-Tools keeps only the target's mantissa bits and silently drops the rest
+        # (hex_float.h), so a literal with more precision than the type truncates, never rounds.
+        asm = (
+            "OpCapability Shader\n"
+            "OpCapability Float16\n"
+            "OpCapability Float64\n"
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            "%void = OpTypeVoid\n"
+            "%fn = OpTypeFunction %void\n"
+            "%f16 = OpTypeFloat 16\n"
+            "%f32 = OpTypeFloat 32\n"
+            "%f64 = OpTypeFloat 64\n"
+            "%h_lo = OpConstant %f16 0x1.8p-24\n"
+            "%h_neg = OpConstant %f16 -0x1.8p-24\n"
+            "%h_max = OpConstant %f16 0x1.ffffp-24\n"
+            "%f_down = OpConstant %f32 0x1.0000018p+0\n"
+            "%f_up = OpConstant %f32 0x1.0000038p+0\n"
+            "%f_max = OpConstant %f32 0x1.ffffffp+127\n"
+            "%d = OpConstant %f64 0x1.00000000000018p+0\n"
+            "%d_max = OpConstant %f64 0x1.fffffffffffff8p+1023\n"
+            "%main = OpFunction %void None %fn\n"
+            "%entry = OpLabel\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n"
+        )
+        spv = spirv_asm.assemble(asm, target_env="vulkan1.2")
+        _validate(spv)
+        words = struct.unpack(f"<{len(spv) // 4}I", spv)
+        constants, i = [], 5
+        while i < len(words):
+            count = words[i] >> 16
+            if words[i] & 0xFFFF == 43:              # OpConstant
+                constants.append(words[i + 3:i + count])
+            i += count
+        self.assertEqual(constants, [
+            (0x0001,),                            # 1.5 subnormal units truncate to 1, not 2
+            (0x8001,),
+            (0x0001,),
+            (0x3F800000,),                        # 1 + 2^-24 + 2^-27 truncates to 1.0
+            (0x3F800001,),                        # 1 + 2^-24 + ... truncates to 1 + 2^-23
+            (0x7F7FFFFF,),                        # one bit under 2^128 is max finite, not Inf
+            (0x00000001, 0x3FF00000),
+            (0xFFFFFFFF, 0x7FEFFFFF),
+        ])
+        with self.assertRaises(spirv_asm.SpirvAsmError):
+            spirv_asm.assemble(asm.replace("0x1.0000018p+0", "0x1.0000018P+0"), target_env="vulkan1.2")
+        if SPIRV_AS:
+            with tempfile.TemporaryDirectory() as d:
+                sa, sv = os.path.join(d, "m.spvasm"), os.path.join(d, "m.spv")
+                with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(asm)
+                subprocess.run([SPIRV_AS, sa, "-o", sv, "--target-env", "vulkan1.2"], check=True)
+                with open(sv, "rb") as f:
+                    ref_words = struct.unpack(f"<{os.path.getsize(sv) // 4}I", f.read())
+            self.assertEqual(words[:2] + words[3:], ref_words[:2] + ref_words[3:])
+
     def test_translated_shaders_validate_and_match_spirv_as(self):
         # Translate diverse synthetic shaders (PS ALU/dot4/f16/branches, CS LDS/atomics/wave64-emulate)
         # and verify every binary assembled by spirv_asm passes spirv-val.

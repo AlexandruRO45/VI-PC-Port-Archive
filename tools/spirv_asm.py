@@ -146,7 +146,7 @@ def _parse_int(tok: str, lineno: int) -> int:
         raise SpirvAsmError(f"line {lineno}: invalid integer literal {tok!r}") from exc
 
 
-_HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$")
+_HEX_FLOAT_RE = re.compile(r"^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?p([+-]?\d+)$")
 _FLOAT_SPEC = {
     16: (5, 10, 15, "<e", "<H"),
     32: (8, 23, 127, "<f", "<I"),
@@ -184,17 +184,15 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
             return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits) | mant
         if e_biased > exp_max:
             return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
-        if 0 < e_biased < exp_max and top <= mant_bits:
-            frac = sig & ((1 << top) - 1)
-            mant = frac << (mant_bits - top)
-            return (sign << (exp_bits + mant_bits)) | (e_biased << mant_bits) | mant
-        try:
-            fv = float.fromhex(tok)
-            return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
-        except OverflowError:
-            return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
-        except ValueError as exc:
-            raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
+        # SPIRV-Tools drops the fraction bits below the target's quantum instead of rounding
+        # (hex_float.h, "silently drop them"), so any narrowing here truncates toward zero.
+        if e_biased <= 0:
+            shift = mant_bits - 1 + exp + bias
+            mant = (sig << shift) if shift >= 0 else (sig >> -shift)
+            return (sign << (exp_bits + mant_bits)) | mant
+        frac = sig & ((1 << top) - 1)
+        mant = (frac << (mant_bits - top)) if top <= mant_bits else (frac >> (top - mant_bits))
+        return (sign << (exp_bits + mant_bits)) | (e_biased << mant_bits) | mant
     try:
         fv = float(tok)
     except ValueError as exc:
