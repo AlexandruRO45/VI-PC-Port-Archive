@@ -225,6 +225,12 @@ class TestSwapPCPair(unittest.TestCase):
         with self.assertRaises(rdna2spirv.Unsupported):
             support.translate_lines("cs_swappc_pair", prog, fssm=saveexec_run.fssm())
 
+class TestSwapPCTranslator(unittest.TestCase):
+    def test_translator_rejection_guard(self):
+        prog = ["s_swappc_b64 s[0:1], s[0:1]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("cs_swappc_guard", prog, fssm=saveexec_run.fssm())
+
 
 if __name__ == "__main__":
     unittest.main()
