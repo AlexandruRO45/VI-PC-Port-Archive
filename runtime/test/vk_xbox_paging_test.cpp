@@ -5,7 +5,9 @@
 // Checks (FAIL = exit 1): remaps between GPU reads return the newly mapped page's data, in order; the arena's device
 // address never changes; two arena pages aliasing one physical page see each other's writes; a cleared page reads 0
 // (where the device guarantees it, residencyNonResidentStrict);
-// contiguous runs coalesce into one bind and scattered ones do not; no validation errors (LEONIDA_VK_VALIDATION=1).
+// contiguous runs coalesce into one bind and scattered ones do not; refused calls bind nothing; a destroyed arena,
+// a released page and a held or dropped bind each leave the pool able to free its chunk, and only then; a bind on
+// another queue's timeline is refused; no validation errors (LEONIDA_VK_VALIDATION=1).
 // Measurements (INFO lines): bind round-trip cost per call by page count, contiguous and scattered; and whether a
 // remap delays GPU work that was queued before it (the gap a bind puts between two submissions on the queue).
 // No device, no sparse residency for buffers, or less than 64 GiB of sparse address space: SKIP, exit 77.
@@ -19,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <numeric>
 #include <optional>
 #include <vector>
@@ -216,9 +219,10 @@ int main() {
     PagePool& pool = pool_storage.emplace(d.device, d.device_proc, page_type);
     EXPECT(pool.ok());
     PageMapper mapper(region, pool);
-    const SubmitBinds submit = [&](VkBuffer buffer, std::span<const VkSparseMemoryBind> binds) {
-        return queue.bind_sparse_ordered(buffer, binds);
-    };
+    const BindQueue submit{queue.timeline(), [&](VkBuffer buffer, std::span<const VkSparseMemoryBind> binds,
+                                                 BindQueue::Submitted submitted) {
+        return queue.bind_sparse_ordered(buffer, binds, std::move(submitted));
+    }};
     const auto address_now = [&] {
         VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         info.buffer = region.buffer();
@@ -325,7 +329,7 @@ int main() {
             EXPECT(mapper.unregister_page_pool(listed));
         }
         EXPECT(mapper.stats().submits == submits);
-        EXPECT(!mapper.clear_page_mappings(kScratch * kPageSize, 1, SubmitBinds{}));  // no way to submit
+        EXPECT(!mapper.clear_page_mappings(kScratch * kPageSize, 1, BindQueue{}));  // no way to submit
     }
 
     // Calls a pool or arena refuses instead of crashing on.
@@ -507,6 +511,84 @@ int main() {
         gpu.wait_queue(last);
         EXPECT(pool.trim(queue.completed_ticket()) == kChunkSize);
         EXPECT(mapper.unregister_page_pool(one_pool));
+    }
+
+    // A bind behind a Wait whose Signal is not submitted yet is held with the queue's work, in queue order, and
+    // trim() keeps its chunk until it has a ticket.
+    {
+        EXPECT(pool.chunk_count() == 0);
+        VulkanFence gate(context, 0), behind(context, 0);
+        std::uint64_t last_ticket = 0;
+        const BindQueue watched{queue.timeline(), [&](VkBuffer buffer, std::span<const VkSparseMemoryBind> binds,
+                                                      BindQueue::Submitted submitted) {
+            return queue.bind_sparse_ordered(buffer, binds, [&, submitted](std::uint64_t ticket) {
+                last_ticket = ticket;
+                submitted(ticket);
+            });
+        }};
+        std::vector<PageId> one;
+        EXPECT(pool.allocate(1, one));
+        const auto one_pool = mapper.register_page_pool(one);
+        const PageMappingRange range{PageRangeType::incrementing, 1, 0};
+        const PageMappingBatch batch{kScratch * kPageSize, &range, 1};
+        queue.wait(gate.semaphore(), 1);
+        EXPECT(queue.signal(behind.semaphore(), 7));  // held: the Wait ahead of it has no Signal yet
+        const std::uint64_t before = queue.submitted_ticket();
+        EXPECT(mapper.copy_page_mappings_batch(one_pool, {&batch, 1}, watched));
+        EXPECT(mapper.clear_page_mappings(kScratch * kPageSize, 1, watched));
+        pool.release(one);
+        EXPECT(queue.submitted_ticket() == before && last_ticket == 0);  // both binds held behind the Signal
+        EXPECT(pool.trim(UINT64_MAX) == 0);
+        EXPECT(gate.signal(1));
+        EXPECT(last_ticket == queue.submitted_ticket() && last_ticket > before + 1);  // the Signal first, then both
+        gpu.wait_queue(queue.submitted_ticket());
+        EXPECT(behind.completed() == 7);
+        EXPECT(pool.trim(queue.completed_ticket()) == kChunkSize);
+        EXPECT(mapper.unregister_page_pool(one_pool));
+    }
+
+    // A held bind dropped because the fence it waits on is released lets its chunk go. The clear behind it does not
+    // wait on that fence, so it is released and submitted.
+    {
+        std::vector<PageId> one;
+        EXPECT(pool.allocate(1, one));
+        const auto one_pool = mapper.register_page_pool(one);
+        const PageMappingRange range{PageRangeType::incrementing, 1, 0};
+        const PageMappingBatch batch{kScratch * kPageSize, &range, 1};
+        const std::uint64_t before = queue.submitted_ticket();
+        {
+            VulkanFence gate(context, 0);
+            queue.wait(gate.semaphore(), 1);
+            EXPECT(mapper.copy_page_mappings_batch(one_pool, {&batch, 1}, submit));
+            EXPECT(mapper.clear_page_mappings(kScratch * kPageSize, 1, submit));
+        }
+        EXPECT(queue.submitted_ticket() == before + 1);  // the clear only
+        gpu.wait_queue(queue.submitted_ticket());
+        pool.release(one);
+        EXPECT(pool.trim(queue.completed_ticket()) == kChunkSize);
+        EXPECT(mapper.unregister_page_pool(one_pool));
+    }
+
+    // A pool's binds go through one queue: a bind on another queue's timeline is refused before anything is bound.
+    {
+        VulkanQueue other(context, d.queue, d.family);
+        EXPECT(other.ok() && other.timeline() != queue.timeline());
+        const BindQueue via_other{other.timeline(), [&](VkBuffer buffer, std::span<const VkSparseMemoryBind> binds,
+                                                        BindQueue::Submitted submitted) {
+            return other.bind_sparse_ordered(buffer, binds, std::move(submitted));
+        }};
+        std::vector<PageId> one;
+        EXPECT(pool.allocate(1, one));
+        const auto one_pool = mapper.register_page_pool(one);
+        const PageMappingRange range{PageRangeType::incrementing, 1, 0};
+        const PageMappingBatch batch{kScratch * kPageSize, &range, 1};
+        const auto submits = mapper.stats().submits;
+        EXPECT(!mapper.copy_page_mappings_batch(one_pool, {&batch, 1}, via_other));
+        EXPECT(mapper.stats().submits == submits && other.submitted_ticket() == 0);
+        EXPECT(region.mapped(kScratch) == kNoPage);
+        EXPECT(mapper.unregister_page_pool(one_pool));
+        pool.release(one);
+        EXPECT(pool.trim(queue.completed_ticket()) == kChunkSize);
     }
 
     // A region destroyed with a page still mapped gives its chunk back to trim(), as one cleared first does.
