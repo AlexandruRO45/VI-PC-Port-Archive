@@ -220,7 +220,7 @@ async function freecamFixture(requestPointerLock = async () => { throw new Error
         addEventListener: (type, handler) => documentEvents.set(type, handler),
     };
     const source = viewerModule.split('// ---------- freecam ----------')[1].split('// ---------- chunk streaming ----------')[0];
-    const state = await vm.runInNewContext(`(async () => { ${source}\nreturn { yaw: () => yaw, keys }; })()`, {
+    const state = await vm.runInNewContext(`(async () => { ${source}\nreturn { yaw: () => yaw, speed: () => speed, keys }; })()`, {
         THREE: { MathUtils: { clamp: (x, min, max) => Math.min(Math.max(x, min), max) } },
         renderer: { domElement: canvas }, document,
         addEventListener: (type, handler) => windowEvents.set(type, handler),
@@ -245,8 +245,21 @@ async function freecamFixture(requestPointerLock = async () => { throw new Error
         move: buttons => windowEvents.get('mousemove')({ buttons, movementX: 10, movementY: 0 }),
         key: (code, modifiers) => windowEvents.get('keydown')({ code, ...modifiers }),
         blur: () => windowEvents.get('blur')(),
+        wheel: (deltaX, deltaY) => windowEvents.get('wheel')({ deltaX, deltaY }),
     };
 }
+
+test('only vertical wheel movement adjusts freecam speed', async () => {
+    const cam = await freecamFixture();
+    const initial = cam.speed();
+    cam.wheel(10, 0);
+    assert.equal(cam.speed(), initial);
+    cam.wheel(0, -1);
+    const faster = cam.speed();
+    assert.ok(faster > initial);
+    cam.wheel(0, 1);
+    assert.ok(cam.speed() < faster);
+});
 
 test('a pointerlockerror without a rejected promise enables drag-to-look', async () => {
     const cam = await freecamFixture(() => undefined);
