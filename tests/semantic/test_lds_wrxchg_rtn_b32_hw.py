@@ -547,5 +547,41 @@ class TestDSWrxchgRtnB32ConditionCodes(unittest.TestCase):
         self.assertEqual(self.flags.vcc, 0xFFFFFFFF_FFFFFFFF)
 
 
+class TestDSWrxchgRtnB32BoundaryExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_ieee754_exact_bit_preservation(self) -> None:
+        patterns = {
+            "pos_zero": 0x00000000,
+            "neg_zero": 0x80000000,
+            "pos_inf": 0x7F800000,
+            "neg_inf": 0xFF800000,
+            "qnan": 0x7FC00000,
+            "snan": 0x7F800001,
+            "subnormal_min": 0x00000001,
+            "subnormal_max": 0x007FFFFF,
+        }
+        for name, bits in patterns.items():
+            with self.subTest(pattern=name, bits=hex(bits)):
+                self.lds.write_dword(0x40, bits)
+                self.state.rf.set_vgpr(VGPR(1), 0x40)
+                self.state.rf.set_vgpr(VGPR(2), ~bits & MASK32)
+
+                inst = DSWrxchgInstruction(
+                    opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+                    vdst=VGPR(5),
+                    vaddr=VGPR(1),
+                    vdata=VGPR(2),
+                )
+                old, new = self.interp.execute(self.state, inst)
+                self.assertEqual(old, bits)
+                self.assertEqual(new, ~bits & MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
