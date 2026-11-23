@@ -1084,6 +1084,18 @@ inline float quantize_snorm(float value, double maximum) {
     return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
 }
 
+// A linear clear value for an sRGB colour channel as D3D12 writes it: NaN is 0, the value clamps to [0, 1], is encoded
+// with the sRGB curve and rounds to the nearest 8-bit code, ties to even. Returned as that code's linear value, which
+// a GPU's own encoding turns back into the code. NVIDIA (621.14) encodes 0.5 / 255 to 7 where WARP writes 6.
+inline float srgb_clear_value(float value) {
+    if (!(value > 0.0f)) return 0.0f;
+    if (value >= 1.0f) return 1.0f;
+    const double v = value;
+    const double encoded = v <= 0.0031308 ? v * 12.92 : 1.055 * std::pow(v, 1.0 / 2.4) - 0.055;
+    const double code = round_half_even(encoded * 255.0) / 255.0;
+    return static_cast<float>(code <= 0.04045 ? code / 12.92 : std::pow((code + 0.055) / 1.055, 2.4));
+}
+
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
 // component range and truncates fractions. Vulkan instead interprets the matching union member as an integer
 // already; copying float bits changes the value without a validation error. The normalised formats are rounded like
@@ -1136,14 +1148,23 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     case VK_FORMAT_R16_UNORM:
     case VK_FORMAT_R16G16_UNORM:
     case VK_FORMAT_R16G16B16A16_UNORM: is_integer = false; unorm = {65535, 65535, 65535, 65535}; break;
+    // B5G6R5, B5G5R5A1, B4G4R4A4: NVIDIA (621.14) converts 4-, 5- and 6-bit channels through 8 bits, so B5G6R5 green
+    // 0.3739 clears to 23 where WARP writes 24; the exact fraction comes through.
+    case VK_FORMAT_R5G6B5_UNORM_PACK16: is_integer = false; unorm = {31, 63, 31, 0}; break;
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: is_integer = false; unorm = {31, 31, 31, 1}; break;
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16: is_integer = false; unorm = {15, 15, 15, 15}; break;
     default: is_integer = false; break;
     }
     if (format != VK_FORMAT_A2B10G10R10_UINT_PACK32) alpha_high = high;
     VkClearColorValue value{};
     for (std::size_t i = 0; i < input.size(); ++i) {
         if (!is_integer) {
+            const bool srgb_colour = (format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB) && i < 3;
             if (snorm != 0) value.float32[i] = quantize_snorm(input[i], snorm);
-            else value.float32[i] = unorm[i] != 0.0 ? quantize_unorm(input[i], unorm[i]) : input[i];
+            else if (unorm[i] != 0.0) value.float32[i] = quantize_unorm(input[i], unorm[i]);
+            else if (srgb_colour) value.float32[i] = srgb_clear_value(input[i]);
+            else  // a float format: D3D12 flushes a denormal to a zero of its sign (WARP); Vulkan keeps it in R32_SFLOAT
+                value.float32[i] = std::fpclassify(input[i]) == FP_SUBNORMAL ? std::copysign(0.0f, input[i]) : input[i];
             continue;
         }
         const double maximum = i == 3 ? alpha_high : high;
@@ -3445,7 +3466,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
                                 : p.binding.format == VK_FORMAT_D16_UNORM
                                     ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
-                                    : depth_clear->depth;
+                                    : depth_clear_value(depth_clear->depth);  // a denormal clears to 0
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),

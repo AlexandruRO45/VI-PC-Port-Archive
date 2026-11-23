@@ -10,7 +10,8 @@
 //   whatever the format's type: 0x3f800000 into an R32_FLOAT channel is 1.0, 0xff into an R8_UNORM one is 1.0.
 //   A raw or structured buffer view takes value 0 for every 32-bit word. R9G9B9E5_SHAREDEXP has no independent
 //   per-channel integer bit layout and WARP clears it to 0 for any uint input.
-// - Float converts to the format: UNORM and SNORM clamp to [0, 1] / [-1, 1] and round to nearest (NaN is 0);
+// - Float converts to the format: UNORM and SNORM clamp to [0, 1] / [-1, 1], multiply in float and round to nearest,
+//   ties to even (NaN is 0);
 //   16-bit and the packed 11/10-bit floats round toward zero, a finite value too large becoming the largest finite
 //   (D3D11.3 3.2.2; WARP and NVIDIA agree), and the small floats have no sign: negative is 0.
 //   R9G9B9E5_SHAREDEXP clamps negative/NaN to 0 and +Inf/overflow to 65408.0, shares the largest channel's
@@ -113,6 +114,13 @@ struct Element {
 };
 
 namespace detail {
+
+// Rounds to nearest, ties to even, whatever the thread's floating-point rounding mode (std::nearbyint follows it, and
+// a game may change it). x is a float product, exact in a double.
+inline double round_half_even(double x) {
+    const double r = std::floor(x + 0.5);
+    return r - x == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
+}
 
 inline constexpr std::uint32_t mask(unsigned bits) { return bits >= 32 ? 0xffffffffu : (1u << bits) - 1; }
 
@@ -245,11 +253,12 @@ inline bool encode(VkFormat format, bool is_float, const std::array<std::uint32_
         const double scale = double(detail::mask(c.bits));
         switch (l->kind) {
         case Kind::unorm:
-            detail::put(out, c, std::isnan(v) ? 0 : std::uint32_t(std::lround(std::clamp(double(v), 0.0, 1.0) * scale)));
+            // A float product rounded to nearest, ties to even, as WARP does (0.5 / 255 clears R8_UNORM to 0, not 1).
+            detail::put(out, c, std::isnan(v) ? 0 : std::uint32_t(detail::round_half_even(std::clamp(v, 0.0f, 1.0f) * float(scale))));
             break;
         case Kind::snorm: {
-            const double max = double(detail::mask(c.bits - 1));
-            detail::put(out, c, std::isnan(v) ? 0 : std::uint32_t(std::lround(std::clamp(double(v), -1.0, 1.0) * max)));
+            const float max = float(detail::mask(c.bits - 1));
+            detail::put(out, c, std::isnan(v) ? 0 : std::uint32_t(std::int32_t(detail::round_half_even(std::clamp(v, -1.0f, 1.0f) * max))));
             break;
         }
         case Kind::uint: detail::put(out, c, detail::to_integer(v, false, c.bits)); break;

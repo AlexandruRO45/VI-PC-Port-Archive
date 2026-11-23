@@ -2,6 +2,7 @@
 // and normalised clears are rounded to nearest even like D3D (0.5 on 8 bits is 128).
 // No Vulkan loader, GPU, shaders or game data. Expected conversions also match the WARP differential GPU tests.
 #include "../src/vulkan_replay.h"
+#include "../src/uav_clear.h"
 #include <array>
 #include <cfenv>
 #include <cmath>
@@ -224,6 +225,63 @@ int main() {
                 return 1;
             }
             ++checks;
+        }
+    }
+    // Measured against WARP by d3d12_clear_fuzz_test, where NVIDIA (621.14) converts otherwise when handed the
+    // application's float: the packed 16-bit formats (through 8 bits there), sRGB colour channels, and denormals.
+    {
+        struct Exact {
+            VkFormat format;
+            unsigned channel;
+            float input;
+            double code, maximum;  // the expected float is code / maximum
+            const char* what;
+        };
+        const Exact exact[] = {
+            {VK_FORMAT_R5G6B5_UNORM_PACK16, 1, 0.373858f, 24, 63, "B5G6R5 green 0.373858 is 24 (NVIDIA: 23)"},
+            {VK_FORMAT_R5G6B5_UNORM_PACK16, 2, 0.309818f, 10, 31, "B5G6R5 blue 0.309818 is 10 (NVIDIA: 9)"},
+            {VK_FORMAT_A1R5G5B5_UNORM_PACK16, 1, 0.753251f, 23, 31, "B5G5R5A1 green 0.753251 is 23 (NVIDIA: 24)"},
+            {VK_FORMAT_A1R5G5B5_UNORM_PACK16, 3, 0.75f, 1, 1, "B5G5R5A1 alpha 0.75 is 1"},
+            {VK_FORMAT_A4R4G4B4_UNORM_PACK16, 0, 0.5f, 8, 15, "B4G4R4A4 0.5 is the tie 7.5, to the even 8"},
+            {VK_FORMAT_R8G8B8A8_SRGB, 0, 0.5f / 255.0f, 6.0 / 255.0 / 12.92, 1, "sRGB 0.5/255 encodes to code 6 (NVIDIA: 7)"},
+            {VK_FORMAT_R32_SFLOAT, 0, 1e-40f, 0, 1, "R32_FLOAT flushes a denormal to +0"},
+            {VK_FORMAT_R32_SFLOAT, 0, -1e-40f, -0.0, 1, "R32_FLOAT flushes a negative denormal to -0"},
+        };
+        for (const Exact& e : exact) {
+            leonida::ClearColor input{0.0f, 0.0f, 0.0f, 0.0f};
+            input[e.channel] = e.input;
+            const VkClearColorValue got = leonida::detail::render_target_clear_color(e.format, input);
+            const float want = float(e.code / e.maximum);
+            if (std::memcmp(&got.float32[e.channel], &want, sizeof want) != 0) {
+                std::fprintf(stderr, "%s: got %.9g, want %.9g\n", e.what, got.float32[e.channel], want);
+                return 1;
+            }
+            ++checks;
+        }
+        if (leonida::depth_clear_value(1e-40f) != 0.0f || leonida::depth_clear_value(0.25f) != 0.25f) {
+            std::fprintf(stderr, "depth_clear_value: a denormal depth must clear to 0\n");
+            return 1;
+        }
+        // ClearUnorderedAccessViewFloat rounds ties to even too (WARP clears R8_UNORM 0.5/255 to 0), whatever the
+        // FP rounding mode.
+        const int mode = std::fegetround();
+        for (const int m : {FE_TONEAREST, FE_UPWARD, FE_DOWNWARD}) {
+            std::fesetround(m);
+            leonida::uav_clear::Element element{};
+            const float half_code = 0.5f / 255.0f, minus_one = -1.0f;
+            std::array<std::uint32_t, 4> uav{};
+            std::memcpy(&uav[0], &half_code, 4);
+            std::memcpy(&uav[1], &minus_one, 4);
+            const bool unorm = leonida::uav_clear::encode(VK_FORMAT_R8G8B8A8_UNORM, true, uav, element) &&
+                               element.bytes[0] == 0;
+            const bool snorm = leonida::uav_clear::encode(VK_FORMAT_R8G8B8A8_SNORM, true, uav, element) &&
+                               element.bytes[1] == 0x81;
+            std::fesetround(mode);
+            if (!unorm || !snorm) {
+                std::fprintf(stderr, "uav_clear::encode under FP mode %d: not D3D12's rounding\n", m);
+                return 1;
+            }
+            checks += 2;
         }
     }
     if (failed_formats) {
