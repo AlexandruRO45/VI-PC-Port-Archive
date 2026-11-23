@@ -1,4 +1,4 @@
-﻿﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores by default.
+﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores by default.
 # Uses VS's CMake + Ninja when the "C++ CMake tools" component is installed (or native Windows cmake + ninja on PATH),
 # otherwise calls cl.exe directly.
 # The GameInput controller shim (SDL3, docs/gameinput.md) is built only on the CMake path: with an installed SDL3, or
