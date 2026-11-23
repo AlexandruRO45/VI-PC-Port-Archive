@@ -140,6 +140,7 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
+            ("cs_wm_ballot", [5, 1, 0, 1, 3, 3, 1, 3]),
             # mask-only wave64: s_bcnt1_i32_b64 on ordinary SGPRs, no WAVE64_RE EXEC markers (#210 / SHADER-28)
             ("cs_w64_mask_detect", [48]),
             ("cs_wqm_w64", [20, 4, 12, 8, 1, 0, 15728895, 20]), ("cs_wqm_w32", [12, 1, 4, 0, 8, 15728880, 4, 32]),
