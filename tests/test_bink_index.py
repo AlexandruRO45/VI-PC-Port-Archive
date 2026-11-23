@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import posixpath
 import struct
 import subprocess
 import tempfile
@@ -23,6 +24,9 @@ def load_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+import report_paths  # noqa: E402
 
 
 bink = load_module()
@@ -227,6 +231,22 @@ class TestCommandLine(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_the_output_guard_asks_report_paths(self):
+        # same_output_path forwards to report_paths.same_report_path, so a case-only spelling of the input is
+        # refused on a folding volume (macOS, simulated here as tests/test_report_paths.py does) even though
+        # the pre-delegation check - normcase plus samefile alone - would have passed it there.
+        first = os.path.join(self.tmp.name, "index.json")
+        with open(first, "w", encoding="utf-8") as f:
+            f.write("{}")
+        second = os.path.join(self.tmp.name, "INDEX.JSON")
+        fake_os = mock.Mock(wraps=os, pathconf=mock.Mock(return_value=0))
+        fake_os.path.normcase = posixpath.normcase
+        with mock.patch.multiple(report_paths, sys=mock.Mock(platform="darwin"), os=fake_os):
+            self.assertTrue(bink.same_output_path(first, second))
+        with mock.patch.object(report_paths, "sys", mock.Mock(platform="linux")):
+            self.assertEqual(bink.same_output_path(first, second),
+                             os.path.normcase("a") == os.path.normcase("A"))
 
     def test_csv_on_stdout_has_one_line_end_per_row(self):
         # A text stream that writes "\n" as "\r\n", as Windows' stdout does, on any platform.
