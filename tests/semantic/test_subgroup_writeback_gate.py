@@ -1,8 +1,10 @@
-"""Native subgroup writeback gates must read EXEC through a ballot after the shuffle.
+"""Native subgroup writeback gates must read EXEC after the shuffle, once per write, each with its own value.
 
 NVIDIA's Linux 580.65.06 driver (RTX 5080) returns the shuffle from select(active, shuffle, old) where active is false
-when active was computed before the shuffle (docs/design.md, "Write gate of a subgroup result"). This checks the
-emitted SPIR-V order that avoids it, for one v_permlane16_b32 and one ds_swizzle_b32 write."""
+when active was computed before the shuffle, and merges two identical post-shuffle EXEC reads so that the second one
+is computed before it again (docs/design.md, "Write gate of a subgroup result"). This checks the emitted SPIR-V order
+and that no two gates of a module read the same value, for one v_permlane16_b32 / ds_swizzle_b32 write and for two
+permlanes with a v_writelane_b32 between them."""
 import os
 import sys
 import unittest
@@ -27,7 +29,7 @@ class SubgroupWritebackGateTests(unittest.TestCase):
 
         shuffles = [(name, number) for name, (number, args) in defs.items()
                     if args[0] == "OpGroupNonUniformShuffle"]
-        self.assertEqual(len(shuffles), 1)
+        self.assertEqual(len(shuffles), 2, "the data shuffle and the gate's")   # in program order
         shuffle, shuffle_order = shuffles[0]
 
         # Follow the stored value of v2, ignoring swizzle's separate pre-shuffle source-presence ballot.
@@ -46,16 +48,29 @@ class SubgroupWritebackGateTests(unittest.TestCase):
             select_order, (_, gate, fetched, _) = find(stored, "OpSelect")
         self.assertEqual(fetched, shuffle)
 
-        extract_order, (_, _, ballot, lane) = find(gate, "OpGroupNonUniformBallotBitExtract")
+        compare_order, (_, got, salt) = find(gate, "OpIEqual")
+        _, (_, _, flag, lane) = find(got, "OpGroupNonUniformShuffle")
         _, lane_source = find(lane, "OpLoad")
         self.assertEqual(lane_source, ["%uint", "%sg_lane"])
-        ballot_order, (_, _, active) = find(ballot, "OpGroupNonUniformBallot")
-        _, active_source = find(active, "OpLoad")
+        flag_order, (_, active_value, flag_salt, _) = find(flag, "OpSelect")
+        self.assertEqual(flag_salt, salt)
+        _, active_source = find(active_value, "OpLoad")
         self.assertEqual(active_source, ["%bool", "%active"])
-        self.assertTrue(shuffle_order < ballot_order < extract_order < select_order < store_order,
-                        "v2 must use an EXEC ballot taken after its shuffle")
+        self.assertTrue(shuffle_order < flag_order < compare_order < select_order < store_order,
+                        "v2 must use an EXEC read taken after its shuffle")
 
-    def test_native_writeback_uses_a_post_shuffle_exec_ballot(self):
+    def gate_salts(self, spv):
+        """The salt of every gate: the constant an EXEC-on lane shuffles from itself."""
+        defs = {}
+        for line in spv.splitlines():
+            row = line.split()
+            if len(row) >= 3 and row[1] == "=":
+                defs[row[0]] = row[2:]
+        gates = [args for args in defs.values() if args[0] == "OpIEqual"
+                 and defs.get(args[2], [""])[0] == "OpGroupNonUniformShuffle"]
+        return [args[3] for args in gates]
+
+    def test_native_writeback_reads_exec_after_its_shuffle(self):
         cases = (
             ("permlane", "v_permlane16_b32 v2, v1, 0, 0"),
             ("swizzle", "ds_swizzle_b32 v2, v1 offset:swizzle(QUAD_PERM, 1, 0, 3, 2)"),
@@ -69,6 +84,22 @@ class SubgroupWritebackGateTests(unittest.TestCase):
                     instruction,
                 ], 32, emulate=False)
                 self.assert_post_shuffle_gate(spv, swizzle=name == "swizzle")
+
+    def test_two_gates_in_a_module_read_different_values(self):
+        # Two identical EXEC reads are merged by the NVIDIA compiler, which moves the second before the
+        # v_writelane_b32 select and the shuffle (crosslane_fuzz seed 70102, cs_xl32_7010410418).
+        spv, _ = translate_cs("cs_writeback_gate_two", [
+            "v_mov_b32_e32 v1, v0",
+            "v_mov_b32_e32 v4, 7",
+            "s_mov_b32 s8, 99",
+            "s_mov_b32 exec_lo, 0",
+            "v_permlanex16_b32 v5, v1, 0, 0",
+            "v_writelane_b32 v4, s8, 25",
+            "v_permlanex16_b32 v4, v1, 0, 0",
+        ], 32, emulate=False)
+        salts = self.gate_salts(spv)
+        self.assertEqual(len(salts), 2)
+        self.assertEqual(len(set(salts)), 2, "both permlane writes read EXEC through the same value")
 
 
 if __name__ == "__main__":

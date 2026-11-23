@@ -260,6 +260,7 @@ class Gen:
         self.lconsts = {}              # 64-bit constants: value -> id
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
         self.uses_ballot = False       # wave mask ballot (OpGroupNonUniformBallot)
+        self.gate_sites = 0            # subgroup-result write gates emitted (gate_after_subgroup's salt)
         self.uses_bcast_first = False  # OpGroupNonUniformBroadcastFirst (desc_lookup): Ballot capability only
         self.uses_wave_bits = False    # a whole lane mask gathered from the wave (OpGroupNonUniformBitwiseOr)
         self.uses_quad = False         # s_wqm on a lane mask (OpGroupNonUniformQuadSwap)
@@ -1158,17 +1159,25 @@ class Gen:
         return st.get("vcc") in lane_masks.MASK_KINDS
 
     def gate_after_subgroup(self, active):
-        """The lane's EXEC bit read back through a ballot taken after a subgroup op, for the write of that op's
-        result (v_permlane16/x16, ds_swizzle, ds_bpermute, ds_permute). NVIDIA's 580.65.06 Linux driver on an
+        """The lane's EXEC bit read back through a shuffle of its own, taken after a subgroup op, for the write of that
+        op's result (v_permlane16/x16, ds_swizzle, ds_bpermute, ds_permute). NVIDIA's 580.65.06 Linux driver on an
         RTX 5080 (Blackwell) returns the shuffle from select(active, shuffle, old) in lanes where active is false
         when active was computed before the shuffle and old is itself a select (#3918): three wave32
         crosslane_fuzz programs kept a v_permlane16/x16 result under EXEC = 0. A gate computed after the shuffle
-        avoids it. The ballot runs right after the shuffle, in the same lanes, so it needs no other convergence."""
-        bal, lane, own = self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal %c3 {active}")
+        avoids it, but only if the compiler can't move it back: a ballot of the same EXEC value taken for an
+        earlier subgroup op is merged with this one, which puts the gate before a v_writelane_b32 select and the
+        shuffle again (crosslane_fuzz seed 70102, cs_xl32_7010410418). So the gate is a shuffle from the lane's own
+        index of a value no other site shares: `salt` where EXEC is on, 0 where off. The index is
+        SubgroupLocalInvocationId, so the lane reads itself; the subgroup is converged here because the shuffle
+        just before needs the same."""
+        self.gate_sites += 1
+        salt = self.cu(self.gate_sites)
+        flag, lane, got, own = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{flag} = OpSelect %uint {active} {salt} {self.cu(0)}")
         self.emit(f"{lane} = OpLoad %uint %sg_lane")
-        self.emit(f"{own} = OpGroupNonUniformBallotBitExtract %bool %c3 {bal} {lane}")
-        self.uses_subgroup = self.uses_ballot = True
+        self.emit(f"{got} = OpGroupNonUniformShuffle %uint %c3 {flag} {lane}")
+        self.emit(f"{own} = OpIEqual %bool {got} {salt}")
+        self.uses_subgroup = True
         return own
 
     def dst(self, a, val, *, eager=False, after_subgroup=False):

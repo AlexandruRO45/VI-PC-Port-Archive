@@ -792,6 +792,7 @@ class NegativeControls(unittest.TestCase):
             r"(%\w+) = OpGroupNonUniformShuffle %uint %c3 (%\w+) %\w+",
             r"\1 = OpCopyObject %uint \2",
             spv,
+            count=1,   # the data shuffle comes first; the EXEC gate shuffles from itself after it
         )
         self.assertEqual(n3, 1)
         self.assertNotEqual(self._run(bad_shuf, 32, 32), want)
@@ -799,7 +800,7 @@ class NegativeControls(unittest.TestCase):
         # 4. Dropping the destination EXEC OpSelect overwrites inactive destination lanes.
         bad_exec, n4 = re.subn(
             r"(%\w+ = OpGroupNonUniformShuffle %uint %c3 %\w+ %\w+\n(?:.*\n){0,4}?\s*"
-            r"%\w+ = OpLoad %bool %active\n(?:.*\n){0,3}?\s*"   # the gate's ballot read-back (gate_after_subgroup)
+            r"%\w+ = OpLoad %bool %active\n(?:.*\n){0,6}?\s*"   # the gate's EXEC read-back (gate_after_subgroup)
             r"(%\w+) = OpSelect %uint %\w+ (%\w+)) %\w+",
             r"\1 \3",
             spv,
