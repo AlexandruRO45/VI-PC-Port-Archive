@@ -319,6 +319,47 @@ def build_rich_catalogue_blocks(
     return blocks, hashes
 
 
+def build_kit_blocks(kits, presets):
+    """Encode kit/member arrays and preset/state arrays in separate typed blocks."""
+    kit_rows = bytearray()
+    member_rows = bytearray()
+    for kit_id, members in kits:
+        kit = bytearray(80)
+        struct.pack_into("<I", kit, 0, kit_id)
+        struct.pack_into("<IIQ", kit, 56, len(members), len(members), _encode_ptr(5, len(member_rows)))
+        kit_rows.extend(kit)
+        for member_id, state_id in members:
+            member_rows.extend(struct.pack("<II", member_id, state_id))
+
+    preset_rows = bytearray()
+    state_rows = bytearray()
+    for preset_id, parent_id, states in presets:
+        preset_rows.extend(_pack_preset(
+            preset_id=preset_id, parent_id=parent_id, state_count=len(states), state_ptr=_encode_ptr(3, len(state_rows))
+        ))
+        state_rows.extend(b"".join(states))
+
+    root = bytearray(_pack_root(bucket0_count=len(presets), bucket0_ptr=_encode_ptr(2, 0)))
+    if kits:
+        struct.pack_into("<IIQ", root, 0x68, 1, 1, _encode_ptr(4, 0))
+    if len(kits) > 1:
+        struct.pack_into("<IIQ", root, 0x98, len(kits) - 1, len(kits) - 1, _encode_ptr(4, 80))
+    return [
+        (pc.CATALOG_ROOT_HASH, bytes(root)),
+        (pc.PRESET_STRUCT_HASH, bytes(preset_rows)),
+        (pc.STATE_STRUCT_HASH, bytes(state_rows)),
+        (0xA9D57751, bytes(kit_rows)),
+        (0x67E54CB2, bytes(member_rows)),
+    ]
+
+
+def run_kit_cli(catalogue_path, kit_id):
+    return subprocess.run(
+        [sys.executable, "-I", os.path.join(TOOLS, "ped_catalogues.py"), "kit", catalogue_path, "--id", kit_id, "--json"],
+        capture_output=True, text=True, timeout=10,
+    )
+
+
 def build_synthetic_rpf(streams: list[bytes]) -> bytes:
     """Build a minimal synthetic RPF9 (`9FPR`) archive with 16-byte-aligned zlib streams."""
     data_start = 0x100
@@ -335,6 +376,145 @@ def build_synthetic_rpf(streams: list[bytes]) -> bytes:
 
 
 class PedCataloguesTests(unittest.TestCase):
+    def test_raw_kit_member_arrays_use_only_valid_root_spans(self):
+        packs = build_kit_blocks(kits=[(10, []), (11, [(20, 0), (20, 0)])], presets=[])
+        blocks = {i: (kind, memoryview(data)) for i, (kind, data) in enumerate(packs, 1)}
+
+        kit_type, reachable = blocks[4]
+        orphan = bytearray(80)
+        struct.pack_into("<I", orphan, 0, 999)
+        # An unreferenced kit with a broken member pointer must not participate.
+        struct.pack_into("<IIQ", orphan, 56, 1, 1, _encode_ptr(6, 0))
+        blocks[4] = (kit_type, memoryview(bytes(reachable) + orphan))
+        self.assertEqual(pc.parse_kit_members(blocks, 1), {10: (), 11: ((20, 0), (20, 0))})
+
+        # These corruptions are in reachable rows. Each case changes just one thing.
+        duplicate = bytearray(reachable)
+        struct.pack_into("<I", duplicate, 80, 10)
+        member_type, members = blocks[5]
+        for case, index, kind, payload in [
+            ("duplicate kit ID", 4, kit_type, duplicate),
+            ("truncated kit array", 4, kit_type, reachable[:-1]),
+            ("truncated member array", 5, member_type, members[:-1]),
+            ("wrong member type", 5, pc.STATE_STRUCT_HASH, members),
+        ]:
+            with self.subTest(case=case):
+                invalid = dict(blocks)
+                invalid[index] = (kind, memoryview(payload))
+                with self.assertRaises(ValueError):
+                    pc.parse_kit_members(invalid, 1)
+
+    def test_kit_cli_nested_order_duplicates_and_material_inheritance(self):
+        # The root includes the same sub-kit twice and selects two states of the same preset.
+        blocks = build_kit_blocks(
+            kits=[(10, [(20, 0), (11, 0), (11, 0), (20, 7)]), (11, [(21, 0), (20, 0)])],
+            presets=[
+                (20, 22, [_pack_state(state_id=7, normal_hash=77),
+                          _pack_state(state_id=0, albedo_hash=0xFEDCBA9876543211)]),
+                (21, 0, [_pack_state(state_id=0, drawable_hash=21)]),
+                (22, 23, [_pack_state(state_id=99, normal_hash=99)]),
+                (23, 24, [_pack_state(state_id=0, drawable_hash=31, albedo_hash=32)]),
+                (24, 0, [_pack_state(state_id=0, drawable_hash=41, extra_hash=44)]),
+            ],
+        )
+        fields = ("preset_id", "state_id", "drawable_hash", "albedo_hash", "normal_hash", "extra_hash")
+
+        def member(preset_id, state_id, drawable, albedo, normal, extra):
+            return (f"0x{preset_id:08x}", f"0x{state_id:08x}",
+                    *(f"{h:016x}" for h in (drawable, albedo, normal, extra)))
+
+        state_zero = member(20, 0, 31, 0xFEDCBA9876543211, 0, 44)
+        other_preset = member(21, 0, 21, 0, 0, 0)
+        state_seven = member(20, 7, 0, 0, 77, 0)
+        expected = [state_zero, other_preset, state_seven]
+        with tempfile.TemporaryDirectory() as tmp:
+            for ext, build in (("0drp", build_synthetic_0drp), ("pso", build_synthetic_psin)):
+                with self.subTest(ext=ext):
+                    path = os.path.join(tmp, f"outfit.{ext}")
+                    with open(path, "wb") as fh:
+                        fh.write(build(blocks))
+                    result = run_kit_cli(path, "0xa")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    doc = json.loads(result.stdout)
+                    self.assertEqual(doc["kit_id"], "0x0000000a")
+                    self.assertEqual(doc["warnings"], [])
+                    self.assertEqual([tuple(row[key] for key in fields) for row in doc["members"]], expected)
+
+    def test_kit_cli_cycles_dangling_reference_and_unknown_kit(self):
+        # A nested kit returns to the active root, then points at an absent member.
+        # The valid sibling still resolves its fields through a cycle in its parent chain.
+        blocks = build_kit_blocks(
+            kits=[(10, [(11, 0), (20, 0)]), (11, [(10, 0), (404, 0)])],
+            presets=[(20, 21, [_pack_state(state_id=0, albedo_hash=52)]),
+                     (21, 20, [_pack_state(state_id=0, drawable_hash=51)])],
+        )
+        # 404 exists in the storage block but lies outside the root's preset arrays.
+        kind, preset_rows = blocks[1]
+        blocks[1] = (kind, preset_rows + _pack_preset(preset_id=404))
+        with tempfile.TemporaryDirectory() as tmp:
+            for ext, build in (("0drp", build_synthetic_0drp), ("pso", build_synthetic_psin)):
+                with self.subTest(ext=ext):
+                    path = os.path.join(tmp, f"cycle.{ext}")
+                    with open(path, "wb") as fh:
+                        fh.write(build(blocks))
+                    result = run_kit_cli(path, "10")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    doc = json.loads(result.stdout)
+                    self.assertEqual(len(doc["members"]), 1)
+                    row = doc["members"][0]
+                    self.assertEqual(row["preset_id"], "0x00000014")
+                    self.assertEqual(row["drawable_hash"], "0000000000000033")
+                    self.assertEqual(row["albedo_hash"], "0000000000000034")
+                    self.assertIsInstance(doc["warnings"], list)
+                    warnings = " ".join(doc["warnings"]).lower()
+                    self.assertIn("cycle", warnings)
+                    self.assertIn("0x00000194", warnings)
+                    self.assertNotEqual(run_kit_cli(path, "404").returncode, 0)
+
+    def test_kit_missing_selectors_and_parents_preserve_partial_results(self):
+        blocks = build_kit_blocks(
+            kits=[(10, [(11, 9), (20, 8), (20, 7)]), (11, [(21, 0)])],
+            presets=[(20, 404, [_pack_state(state_id=7, normal_hash=33)]),
+                     (21, 0, [_pack_state(state_id=0, drawable_hash=21)])],
+        )
+        members, warnings = pc.resolve_kit(build_synthetic_0drp(blocks), 10)
+        self.assertEqual([(m.preset_id, m.state_id, m.drawable_hash, m.albedo_hash, m.normal_hash, m.extra_hash)
+                          for m in members], [(20, 8, 0, 0, 0, 0), (20, 7, 0, 0, 33, 0)])
+        for value in (9, 8, 404):
+            self.assertTrue(any(f"0x{value:08x}" in w for w in warnings), warnings)
+
+    def test_kit_ambiguous_ids_and_selected_states_are_errors(self):
+        state = _pack_state(state_id=0, drawable_hash=33)
+        for case, presets in [
+            ("kit and preset share an ID", [(10, 0, [state])]),
+            ("two preset rows have one ID", [(20, 0, [state]), (20, 0, [state])]),
+            ("two matching states on one preset", [(20, 0, [state, state])]),
+        ]:
+            with self.subTest(case=case):
+                blocks = build_kit_blocks(kits=[(10, [(20, 0)])], presets=presets)
+                with self.assertRaisesRegex(ValueError, "ambiguous"):
+                    pc.resolve_kit(build_synthetic_psin(blocks), 10)
+
+    def test_kit_requires_complete_state_arrays(self):
+        state = _pack_state(state_id=0, drawable_hash=33)
+        for case, capacity, payload, readable in [
+            ("count exceeds capacity", 0, state, 1),
+            ("truncated state", 1, state[:-1], 0),
+        ]:
+            with self.subTest(case=case):
+                blocks = build_kit_blocks(kits=[(10, [(20, 0)])], presets=[(20, 0, [state])])
+                preset = bytearray(blocks[1][1])
+                struct.pack_into("<I", preset, 12, capacity)
+                blocks[1] = (pc.PRESET_STRUCT_HASH, preset)
+                blocks[2] = (pc.STATE_STRUCT_HASH, payload)
+                data = build_synthetic_0drp(blocks)
+                with self.assertRaises(ValueError):
+                    pc.resolve_kit(data, 10)
+                # The parser used by inspect and census still reports all readable states.
+                cat = pc.parse_catalogue_strict(data)
+                self.assertEqual(cat.stats["states"], readable)
+                self.assertEqual(bool(cat.warnings), readable == 0)
+
     def test_cull_drawable_key_matches_joaat(self):
         self.assertEqual(pc.joaat32("cull_drawable"), pc.CULL_DRAWABLE_KEY)
         self.assertEqual(pc.CULL_DRAWABLE_KEY, 0x46E1A048)
