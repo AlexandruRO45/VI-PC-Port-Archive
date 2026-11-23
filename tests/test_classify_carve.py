@@ -177,6 +177,16 @@ class MainTests(unittest.TestCase):
         self.assertEqual(counts(a["bink2"]), {"files": 1, "bytes": 3})
         self.assertEqual(counts(types["overall"]["rbf0"]), {"files": 2, "bytes": 40})
 
+    def test_hex_head_case_does_not_split_a_signature_group(self):
+        self.archive("a", [
+            {"head": "deadbeef0123", "size": 10},
+            {"head": "DEADBEEF0456", "size": 20},
+        ])
+        self.run_main()
+        self.assertEqual(self.types()["overall"], {
+            "other:deadbeef": {"files": 2, "bytes": 30, "min": 10, "max": 20, "median": 10},
+        })
+
     def test_overall_sums_across_archives(self):
         self.archive("a", [{"head": RBF0_HEAD, "size": 10}])
         self.archive("b", [{"head": RBF0_HEAD, "size": 25}])
@@ -236,6 +246,9 @@ class MainTests(unittest.TestCase):
             ('{"files": {}}', '"files" list'),
             ('{"files": [{"head": "00"}]}', "row 1"),
             ('{"files": [{"size": 12, "head": 42}]}', "row 1"),
+            ('{"files": [{"size": 12, "head": "001"}]}', "row 1 needs a hex byte string"),
+            ('{"files": [{"size": 12, "head": "gg"}]}', "row 1 needs a hex byte string"),
+            ('{"files": [{"size": 12, "head": "0  0"}]}', "row 1 needs a hex byte string"),
         ):
             with self.subTest(data=data):
                 with open(index, "w", encoding="utf-8") as f:

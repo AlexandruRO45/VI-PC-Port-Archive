@@ -16,6 +16,7 @@ scope. For an even count the median is the lower of the two middle sizes (statis
 in the report is an integer. A class only appears when it has at least one file, so the stats keys are never null.
 The tool keeps one size (a plain Python int) per file per class to compute these.
 """
+import binascii
 import json
 import os
 import sys
@@ -30,7 +31,7 @@ from file_mode import published_mode  # noqa: E402
 def classify(r):
     if r.get("type") == "bink2":
         return "bink2"
-    h = r["head"]
+    h = r["head"].lower()
     if h.startswith("52424630"):
         return "rbf0"
     if h.startswith("42400000"):
@@ -53,8 +54,14 @@ def index_rows(path):
     for number, row in enumerate(rows, 1):
         if not isinstance(row, dict) or type(row.get("size")) is not int or row["size"] < 0:
             raise ValueError(f"row {number} needs a nonnegative integer size")
-        if row.get("type") != "bink2" and not isinstance(row.get("head"), str):
-            raise ValueError(f"row {number} needs a string head")
+        if row.get("type") != "bink2":
+            head = row.get("head")
+            if not isinstance(head, str):
+                raise ValueError(f"row {number} needs a string head")
+            try:
+                binascii.unhexlify(head)
+            except ValueError:
+                raise ValueError(f"row {number} needs a hex byte string") from None
         yield row
 
 
