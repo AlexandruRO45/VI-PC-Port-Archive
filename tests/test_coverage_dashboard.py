@@ -151,6 +151,22 @@ class TestCoverageDashboard(unittest.TestCase):
             self.assertEqual(base_cov["categories"], new_cov["categories"])
             self.assertEqual(base_cov["covered"], new_cov["covered"])
 
+    def test_opcode_tokens_in_comments_do_not_raise_coverage(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            sem = Path(tmp) / "tests" / "semantic"
+            sem.mkdir(parents=True)
+            fixture = sem / "test_swizzle.py"
+            baseline = coverage_dashboard.get_rdna2_coverage(tmp)["covered"]
+
+            for source in ("# ds_swizzle\n", "value = 1  # ds_swizzle\n"):
+                with self.subTest(source=source):
+                    fixture.write_text(source, encoding="utf-8", newline="\n")
+                    self.assertEqual(coverage_dashboard.get_rdna2_coverage(tmp)["covered"], baseline)
+
+            fixture.write_text('asm = "ds_swizzle v0, v1"\n', encoding="utf-8", newline="\n")
+            self.assertEqual(coverage_dashboard.get_rdna2_coverage(tmp)["covered"], baseline + 1)
+
     def test_genuine_lowered_opcode_exercises_category(self):
         """Verify that genuine unexercised lowered RDNA2 opcodes increment their respective category."""
         from pathlib import Path

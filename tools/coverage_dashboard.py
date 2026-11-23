@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import tokenize
 import xml.etree.ElementTree as ET
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -150,9 +151,11 @@ def extract_exercised_semantic_opcodes(semantic_dir):
             if os.path.getsize(fpath) == 0:
                 continue
             with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read()
-            if not content.strip():
-                continue
+                # Assembly fixtures can be quoted strings, including multiline literals.
+                content = " ".join(
+                    token.string for token in tokenize.generate_tokens(fh.readline)
+                    if token.type != tokenize.COMMENT
+                )
             for word in re.findall(r"\b[a-z0-9_]+\b", content.lower()):
                 if MNEMONIC.match(word):
                     exercised.add(word)
