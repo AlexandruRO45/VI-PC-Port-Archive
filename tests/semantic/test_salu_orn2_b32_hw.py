@@ -210,5 +210,29 @@ class TestSOrn2B32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(mach.scc, 0)
 
 
+class TestSOrn2B32SIMDDivergence(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC interaction."""
+
+    def test_salu_scalar_uniformity(self):
+        # SALU operations are scalar and execute once per wavefront across all lanes
+        mach = ScalarMachine()
+        # Using s_orn2_b32 to compute a uniform active mask
+        mach.sgprs[1] = 0x0000FFFF
+        mach.sgprs[2] = 0xFF00FF00
+        mach.step(SOrn2B32Inst(Operand(RegType.SGPR, 0), Operand(RegType.SGPR, 1), Operand(RegType.SGPR, 2)))
+        # ~s2 = 0x00FF00FF. s1 | ~s2 = 0x00FFFFFF
+        self.assertEqual(mach.sgprs[0], 0x00FFFFFF)
+        self.assertEqual(mach.scc, 1)
+
+    def test_exec_mask_manipulation(self):
+        # Simulating s_orn2_b32 on exec mask bits
+        exec_lo = 0x55555555
+        filter_lo = 0x33333333
+        d, scc = ref_orn2_b32(exec_lo, filter_lo)
+        # ~filter_lo = 0xCCCCCCCC. exec_lo | 0xCCCCCCCC = 0xDDDDDDDD
+        self.assertEqual(d, 0xDDDDDDDD)
+        self.assertEqual(scc, 1)
+
+
 if __name__ == '__main__':
     unittest.main()
