@@ -98,6 +98,19 @@ class IsolateTest(unittest.TestCase):
         self.assertIn("cs: 5 modules ok, 0 failed", r.stdout)
         self.assertIn("cs pipelines: 5 ok, 0 failed, 0 skipped", r.stdout)
 
+    def test_isolate_reports_duplicates_like_a_normal_run(self):
+        duplicates = Path(self.tmp.name) / "duplicates.txt"
+        duplicates.write_text("m_bravo\tm_alpha\nm_delta\tm_alpha\n", encoding="utf-8", newline="\n")
+        args = ["--duplicates-file", str(duplicates)]
+        normal = self.run_tool(args, cache=self.cache("duplicates normal.cache"))
+        isolated = self.run_tool(args + ["--isolate", "--isolate-batch", "2"], cache=self.cache("duplicates iso.cache"))
+        line = "  cs duplicates of an earlier entry's pipeline, not compiled (--duplicates-file): 2"
+        for r in (normal, isolated):
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("cs: 3 modules ok, 0 failed", r.stdout)
+            self.assertIn("cs pipelines: 3 ok, 0 failed, 0 skipped", r.stdout)
+            self.assertIn(line, r.stdout.splitlines())
+
     def test_oversized_batch_keeps_the_requested_slice(self):
         r = self.run_tool(["--isolate", "--start", "2", "--count", "2",
                            "--isolate-batch", str(2 * sys.maxsize + 1)], cache=self.cache("iso_slice.cache"))

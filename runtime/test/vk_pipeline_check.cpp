@@ -989,7 +989,7 @@ int main(int argc, char** argv) {
         if (!inflight_path.empty()) pass.insert(pass.end(), {"--inflight-file", inflight_path});
         if (!skip_path.empty()) pass.insert(pass.end(), {"--skip-file", skip_path});
         if (!duplicates_path.empty()) pass.insert(pass.end(), {"--duplicates-file", duplicates_path});
-        struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, fb[3] = {}; };
+        struct Agg { uint32_t mod_ok = 0, mod_bad = 0, pipe_ok = 0, pipe_bad = 0, pipe_skip = 0, big = 0, crashed = 0, fb[3] = {}, dup = 0; };
         std::map<std::string, Agg> agg;
         std::vector<std::string> crashes;
         bool cache_ok = true, setup_failed = false;
@@ -1005,12 +1005,12 @@ int main(int argc, char** argv) {
                 if (line == "ISO-READY" || line.rfind("ISO-DONE", 0) == 0 || line.rfind("pipeline cache: ", 0) == 0) continue;
                 if (line.rfind("ISO-RESULT ", 0) == 0) {
                     char st[16];
-                    unsigned v[9] = {};
-                    if (std::sscanf(line.c_str(), "ISO-RESULT %15s %u %u %u %u %u %u %u %u %u", st, v, v + 1, v + 2, v + 3,
-                                    v + 4, v + 5, v + 6, v + 7, v + 8) == 10) {
+                    unsigned v[10] = {};
+                    if (std::sscanf(line.c_str(), "ISO-RESULT %15s %u %u %u %u %u %u %u %u %u %u", st, v, v + 1, v + 2,
+                                    v + 3, v + 4, v + 5, v + 6, v + 7, v + 8, v + 9) == 11) {
                         Agg& a = agg[st];
                         a.mod_ok += v[0]; a.mod_bad += v[1]; a.pipe_ok += v[2]; a.pipe_bad += v[3]; a.pipe_skip += v[4];
-                        a.big += v[5]; a.fb[0] += v[6]; a.fb[1] += v[7]; a.fb[2] += v[8];
+                        a.big += v[5]; a.fb[0] += v[6]; a.fb[1] += v[7]; a.fb[2] += v[8]; a.dup += v[9];
                     }
                     continue;
                 }
@@ -1077,6 +1077,9 @@ int main(int argc, char** argv) {
             if (a.crashed) std::printf("  %s crashed the driver: %u (counted as failed)\n", st.c_str(), a.crashed);
             if (cache_feedback)
                 std::printf("  %s cache feedback: %u hits, %u no hit reported, %u unavailable\n", st.c_str(), a.fb[0], a.fb[1], a.fb[2]);
+            if (a.dup)
+                std::printf("  %s duplicates of an earlier entry's pipeline, not compiled (--duplicates-file): %u\n",
+                            st.c_str(), a.dup);
             if (a.mod_bad || a.pipe_bad) failed = true;
         }
         uint32_t big_total = 0;
@@ -2005,9 +2008,10 @@ int main(int argc, char** argv) {
         for (const auto& st : all_stages) {
             const StageStats* s = stats.count(st) ? &stats[st] : nullptr;
             uint32_t big = big_skipped.count(st) ? big_skipped[st] : 0;
-            std::printf("ISO-RESULT %s %u %u %u %u %u %u %u %u %u\n", st.c_str(), modules_ok[st], modules_bad[st],
+            std::printf("ISO-RESULT %s %u %u %u %u %u %u %u %u %u %u\n", st.c_str(), modules_ok[st], modules_bad[st],
                         s ? s->pipes_ok : 0u, s ? s->pipes_bad : 0u, s ? s->pipes_skipped : 0u, big,
-                        s ? s->feedback[0] : 0u, s ? s->feedback[1] : 0u, s ? s->feedback[2] : 0u);
+                        s ? s->feedback[0] : 0u, s ? s->feedback[1] : 0u, s ? s->feedback[2] : 0u,
+                        s ? s->duplicates : 0u);
         }
         const bool saved = save_cache(true);
         std::printf("ISO-DONE cache_ok=%d\n", saved ? 1 : 0);
