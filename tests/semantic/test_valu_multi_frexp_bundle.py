@@ -227,5 +227,21 @@ class VFrexpExpI16F16SimdDivergenceTests(unittest.TestCase):
         # Subnormal 0x0001 (2^-24) -> exp = -23 (0xFFE9)
         self.assertEqual(oracle_frexp_exp_i16_f16(0x0001), 0xFFE9)
 
+class VFrexpExpI16F16TranslatorTests(unittest.TestCase):
+    def test_frexp_exp_f16_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v1, 0x3C00",
+            "v_frexp_exp_i16_f16 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_frexp_exp_f16_exec", lines)
+        val = mrt0_words(spv)[0]
+        self.assertEqual(val, 1)
+
+    def test_frexp_exp_f16_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_frexp_exp_f16", ["v_frexp_exp_i16_f16"])
+
 if __name__ == "__main__":
     unittest.main()
