@@ -829,9 +829,15 @@ State& g() {
 }
 
 void queue_event(const Event& e) {
+    State& s = g();
+    // Polling still records reading history. The dispatcher only needs events for active callback types.
+    if (std::none_of(s.callbacks.begin(), s.callbacks.end(), [&e](const Callback& callback) {
+            return callback.active && callback.type == e.type;
+        }))
+        return;
+    s.queue.push_back(e);
     if (e.device) e.device->AddRef();
     if (e.reading) e.reading->AddRef();
-    g().queue.push_back(e);
 }
 
 bool matches(const Callback& c, const Event& e) {
