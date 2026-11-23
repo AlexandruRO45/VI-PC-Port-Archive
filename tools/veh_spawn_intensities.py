@@ -10,7 +10,8 @@ carries a mud range (`MudMin`/`MudMax` above zero), and how the rain fields (`Di
     python -I veh_spawn_intensities.py <CGraphicsDefinitionsData.xml | rpf9_carve dir> [--json FILE]
 
 Accepts one rebuilt XML payload file or a carve directory made by `tools/rpf9_carve.py` (the
-`CGraphicsDefinitionsData` document is found by its root element among the inflated streams).
+document lives in `common.rpf`, so that is the archive to carve; it is found by its root
+element among the inflated streams).
 The CLI prints one aggregate JSON object and never prints entry keys, names or per-entry rows:
 those are game values. The Python API (`records`) returns entries that contain the table's own
 text, so call sites must not write them anywhere public. A bad input gives one ERROR line and
