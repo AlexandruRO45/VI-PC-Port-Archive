@@ -68,6 +68,8 @@ def records(root):
             raise CensusError("entry has no intensity sets")
         out.append({"key": item.get("key") or "", "sets": tuple(sets),
                     "rain": tuple(_number(item, f) for f in RAIN_FIELDS)})
+    if not out:  # an empty table has no bands to range over: aggregate() would raise on max()
+        raise CensusError("the VehSpawnIntensities table has no entries")
     return out
 
 

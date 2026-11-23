@@ -138,6 +138,19 @@ class CliTest(unittest.TestCase):
             self.assertTrue(err.startswith("ERROR:"))
             self.assertNotIn("Traceback", err)
 
+    def test_an_empty_table_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "empty.xml")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("<CGraphicsDefinitionsData><VehSpawnIntensities></VehSpawnIntensities>"
+                        "</CGraphicsDefinitionsData>")
+            status, out, err = self.run_tool(path)
+            self.assertEqual(status, 2)
+            self.assertEqual(out, "")
+            self.assertTrue(err.startswith("ERROR:"), err)
+            self.assertIn("VehSpawnIntensities table has no entries", err)
+            self.assertNotIn("max()", err)          # Python internals are not the report
+
     def test_a_non_finite_value_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = write_doc(tmp)
