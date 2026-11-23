@@ -52,6 +52,36 @@ using CopyFileExWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID
 using CopyFile2Fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS*);
 using SetFileAttributesWFn = BOOL(WINAPI*)(LPCWSTR, DWORD);
 using SetFileAttributesAFn = BOOL(WINAPI*)(LPCSTR, DWORD);
+using MoveFileWithProgressWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID, DWORD);
+using MoveFileWithProgressAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR, LPPROGRESS_ROUTINE, LPVOID, DWORD);
+using GetDiskFreeSpaceExWFn = BOOL(WINAPI*)(LPCWSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER);
+using GetDiskFreeSpaceExAFn = BOOL(WINAPI*)(LPCSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER);
+using PathNameWFn = DWORD(WINAPI*)(LPCWSTR, LPWSTR, DWORD);  // GetLongPathNameW and GetShortPathNameW
+using PathNameAFn = DWORD(WINAPI*)(LPCSTR, LPSTR, DWORD);
+using GetCompressedFileSizeWFn = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
+using ReplaceFileWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, LPVOID, LPVOID);
+using ReplaceFileAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR, LPCSTR, DWORD, LPVOID, LPVOID);
+
+// The last error a call leaves, with the call's own result discarded.
+template <typename F>
+DWORD error_of(F&& call) {
+    SetLastError(0);
+    call();
+    return GetLastError();
+}
+
+// A MoveFileWithProgress routine: counts its calls and cancels when *data says so.
+struct Progress {
+    int calls = 0;
+    bool cancel = false;
+};
+
+DWORD CALLBACK count_progress(LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, DWORD, DWORD, HANDLE, HANDLE,
+                              LPVOID data) {
+    auto* p = static_cast<Progress*>(data);
+    ++p->calls;
+    return p->cancel ? PROGRESS_CANCEL : PROGRESS_CONTINUE;
+}
 
 int g_checks = 0;
 int g_failures = 0;
@@ -1339,6 +1369,210 @@ void run_checks(const std::filesystem::path& root) {
         SetLastError(0);
         check(move_w(L"GAME:\\moves", L"GAME:\\MOVES") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a case rename of a package folder is refused like any other move of one");
+    }
+
+    // MoveFileWithProgress follows MoveFileEx's rules and hands the progress routine to the copy that moves a package
+    // file; a routine that cancels leaves the package name in place.
+    {
+        const auto move_progress_w =
+            resolve<MoveFileWithProgressWFn>("api-ms-win-core-file-l2-1-0.dll", "MoveFileWithProgressW");
+        const auto move_progress_a = resolve<MoveFileWithProgressAFn>("kernel32.dll", "MoveFileWithProgressA");
+        check(move_progress_w && move_progress_a, "MoveFileWithProgressA/W resolve through the registry");
+        write_path(package / "progress" / "pkg.bin", std::string(4096, 'p'));
+        write_path(package / "progress" / "keep.bin", "keep");
+        write_path(package / "progress" / "narrow.bin", "narrow");
+
+        Progress counted;
+        check(move_progress_w(L"GAME:\\progress\\pkg.bin", L"GAME:\\progress\\moved.bin", count_progress, &counted,
+                              MOVEFILE_COPY_ALLOWED) != FALSE,
+              "MoveFileWithProgressW moves a package file");
+        check(counted.calls > 0, "and the progress routine sees the copy");
+        check(read_path(overlay / "progress" / "moved.bin") == std::string(4096, 'p'),
+              "the moved file lands in the overlay with the package bytes");
+        check(attributes_w(L"GAME:\\progress\\pkg.bin") == INVALID_FILE_ATTRIBUTES &&
+                  std::filesystem::exists(package / "progress" / "pkg.bin"),
+              "its old name is gone from the title's view while the package keeps the file");
+
+        Progress cancelling;
+        cancelling.cancel = true;
+        SetLastError(0);
+        check(move_progress_w(L"GAME:\\progress\\keep.bin", L"GAME:\\progress\\cancelled.bin", count_progress,
+                              &cancelling, 0) == FALSE &&
+                  GetLastError() == ERROR_REQUEST_ABORTED,
+              "a progress routine that cancels fails the move with ERROR_REQUEST_ABORTED");
+        check(attributes_w(L"GAME:\\progress\\keep.bin") != INVALID_FILE_ATTRIBUTES &&
+                  attributes_w(L"GAME:\\progress\\cancelled.bin") == INVALID_FILE_ATTRIBUTES,
+              "and leaves the source visible and no destination");
+
+        check(move_progress_w(L"GAME:\\progress\\moved.bin", L"GAME:\\progress\\renamed.bin", nullptr, nullptr, 0) !=
+                      FALSE &&
+                  read_path(overlay / "progress" / "renamed.bin") == std::string(4096, 'p'),
+              "an overlay file is renamed, with no progress routine");
+        SetLastError(0);
+        check(move_progress_w(L"GAME:\\progress\\keep.bin", (root / L"host.bin").c_str(), nullptr, nullptr,
+                              MOVEFILE_COPY_ALLOWED) == FALSE &&
+                  GetLastError() == ERROR_NOT_SAME_DEVICE,
+              "a move from GAME: to a host path is refused with ERROR_NOT_SAME_DEVICE, as MoveFileEx refuses it");
+        check(move_progress_a("GAME:\\progress\\narrow.bin", "GAME:\\progress\\narrow2.bin", nullptr, nullptr, 0) !=
+                      FALSE &&
+                  read_path(overlay / "progress" / "narrow2.bin") == "narrow",
+              "MoveFileWithProgressA takes the same paths");
+    }
+
+    // GetDiskFreeSpaceEx of a console folder answers for the overlay's volume, where the title's writes land; the
+    // errors for a missing folder and for a file are the host's.
+    {
+        const auto free_w = resolve<GetDiskFreeSpaceExWFn>("api-ms-win-core-file-l1-1-0.dll", "GetDiskFreeSpaceExW");
+        const auto free_a = resolve<GetDiskFreeSpaceExAFn>("kernel32.dll", "GetDiskFreeSpaceExA");
+        check(free_w && free_a, "GetDiskFreeSpaceExA/W resolve through the registry");
+        ULARGE_INTEGER available{}, total{}, total_free{}, host_total{};
+        const std::wstring volume = overlay.root_path().wstring();
+        ::GetDiskFreeSpaceExW(volume.c_str(), nullptr, &host_total, nullptr);
+        check(free_w(L"GAME:\\data", &available, &total, &total_free) != FALSE && total.QuadPart == host_total.QuadPart &&
+                  total.QuadPart != 0,
+              "GetDiskFreeSpaceExW of a GAME: folder reports the overlay's volume");
+        check(free_w(L"GAME:\\data\\sub", nullptr, &total, nullptr) != FALSE,
+              "a folder only the package has counts, and the out parameters are optional");
+        total = {};
+        check(free_a("T:\\", nullptr, &total, nullptr) != FALSE && total.QuadPart == host_total.QuadPart,
+              "GetDiskFreeSpaceExA answers for T: too");
+
+        SetLastError(0);
+        ::GetDiskFreeSpaceExW((root / L"no_such_folder").c_str(), nullptr, &total, nullptr);
+        const DWORD host_missing = GetLastError();
+        SetLastError(0);
+        check(free_w(L"GAME:\\no_such_folder", nullptr, &total, nullptr) == FALSE && GetLastError() == host_missing,
+              "a missing GAME: folder fails with the host's error for a missing folder");
+        write_path(root / L"host_file.txt", "x");
+        SetLastError(0);
+        const BOOL host_file_ok = ::GetDiskFreeSpaceExW((root / L"host_file.txt").c_str(), nullptr, &total, nullptr);
+        const DWORD host_file_error = GetLastError();
+        SetLastError(0);
+        const BOOL shim_file_ok = free_w(L"GAME:\\progress\\keep.bin", nullptr, &total, nullptr);
+        check(host_file_ok == FALSE && shim_file_ok == FALSE && GetLastError() == host_file_error,
+              "a GAME: file fails the way the host fails a file");
+        SetLastError(0);
+        check(free_w(L"GAME:\\..\\..", nullptr, &total, nullptr) == FALSE && GetLastError() == ERROR_INVALID_NAME,
+              "a GAME: path that climbs out of the root is refused with ERROR_INVALID_NAME");
+    }
+
+    // GetLongPathName/GetShortPathName: console names have no 8.3 form, so a name the title sees comes back as given;
+    // a missing one fails with the host's error. GetCompressedFileSize reads what a read would open.
+    {
+        const auto long_w = resolve<PathNameWFn>("api-ms-win-core-file-l1-1-0.dll", "GetLongPathNameW");
+        const auto long_a = resolve<PathNameAFn>("kernel32.dll", "GetLongPathNameA");
+        const auto short_w = resolve<PathNameWFn>("kernel32.dll", "GetShortPathNameW");
+        const auto short_a = resolve<PathNameAFn>("kernelbase.dll", "GetShortPathNameA");
+        const auto compressed_w =
+            resolve<GetCompressedFileSizeWFn>("api-ms-win-core-file-l1-1-0.dll", "GetCompressedFileSizeW");
+        check(long_w && long_a && short_w && short_a && compressed_w,
+              "GetLongPathName*, GetShortPathName* and GetCompressedFileSizeW resolve through the registry");
+        write_path(package / "names" / "long_file_name.txt", "twelve bytes");
+
+        wchar_t buffer[MAX_PATH] = {};
+        const wchar_t* given = L"game:/names/../names/long_file_name.txt";
+        DWORD n = long_w(given, buffer, MAX_PATH);
+        check(std::wstring(buffer) == given && n == wcslen(given),
+              "GetLongPathNameW returns a visible console name as given (separators and .. kept, as the host keeps them)");
+        n = short_w(L"GAME:\\names\\long_file_name.txt", buffer, MAX_PATH);
+        check(std::wstring(buffer) == L"GAME:\\names\\long_file_name.txt", "GetShortPathNameW gives the same name back");
+        check(long_w(L"GAME:\\names\\long_file_name.txt", buffer, 3) == wcslen(L"GAME:\\names\\long_file_name.txt") + 1,
+              "too small a buffer gets the size it needs");
+        wcscpy_s(buffer, L"GAME:\\names");
+        check(long_w(buffer, buffer, MAX_PATH) == wcslen(L"GAME:\\names") && std::wstring(buffer) == L"GAME:\\names",
+              "the input buffer may be the output buffer, and a package folder is a visible name");
+        HANDLE h = create_w(L"T:\\names\\t.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(long_w(L"T:\\names\\t.bin", buffer, MAX_PATH) != 0 && std::wstring(buffer) == L"T:\\names\\t.bin",
+              "a T: file is a visible name");
+
+        const DWORD host_missing_file =
+            error_of([&] { ::GetLongPathNameW((root / L"nope.txt").c_str(), buffer, MAX_PATH); });
+        const DWORD host_missing_folder =
+            error_of([&] { ::GetLongPathNameW((root / L"nodir" / L"x.txt").c_str(), buffer, MAX_PATH); });
+        check(host_missing_file == ERROR_FILE_NOT_FOUND && host_missing_folder == ERROR_PATH_NOT_FOUND,
+              "(the host: a missing file is ERROR_FILE_NOT_FOUND, a missing folder ERROR_PATH_NOT_FOUND)");
+        check(error_of([&] { long_w(L"GAME:\\names\\nope.txt", buffer, MAX_PATH); }) == host_missing_file &&
+                  error_of([&] { short_w(L"GAME:\\nodir\\x.txt", buffer, MAX_PATH); }) == host_missing_folder,
+              "a missing console name fails with the host's errors");
+        check(error_of([&] { long_w(L"GAME:\\..\\x", buffer, MAX_PATH); }) == ERROR_INVALID_NAME,
+              "a console path that climbs out of the root is refused with ERROR_INVALID_NAME");
+        char narrow[MAX_PATH] = {};
+        check(long_a("GAME:\\names\\long_file_name.txt", narrow, MAX_PATH) != 0 &&
+                  std::string(narrow) == "GAME:\\names\\long_file_name.txt" &&
+                  short_a("GAME:\\names\\long_file_name.txt", narrow, MAX_PATH) != 0,
+              "the ANSI forms answer the same");
+
+        DWORD high = 1;
+        check(compressed_w(L"GAME:\\names\\long_file_name.txt", &high) == 12 && high == 0,
+              "GetCompressedFileSizeW sizes a package file");
+        delete_w(L"GAME:\\names\\long_file_name.txt");
+        check(compressed_w(L"GAME:\\names\\long_file_name.txt", nullptr) == INVALID_FILE_SIZE &&
+                  GetLastError() == ERROR_FILE_NOT_FOUND,
+              "and fails on a name the title deleted");
+    }
+
+    // ReplaceFile runs on the overlay copies: the package keeps both files, the title sees the replacement under the
+    // replaced name, the backup in the overlay and the replacement's own name gone. Errors are the host's.
+    {
+        const auto replace_w = resolve<ReplaceFileWFn>("api-ms-win-core-file-l2-1-0.dll", "ReplaceFileW");
+        const auto replace_a = resolve<ReplaceFileAFn>("kernel32.dll", "ReplaceFileA");
+        check(replace_w && replace_a, "ReplaceFileA/W resolve through the registry");
+        write_path(package / "replace" / "target.txt", "old");
+        write_path(package / "replace" / "new.txt", "new");
+        auto read_game = [&](const wchar_t* name) {
+            const HANDLE h = create_w(name, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return std::string("<missing>");
+            std::string text = read_handle(h);
+            ::CloseHandle(h);
+            return text;
+        };
+        check(replace_w(L"GAME:\\replace\\target.txt", L"GAME:\\replace\\new.txt", L"GAME:\\replace\\backup.txt", 0,
+                        nullptr, nullptr) != FALSE,
+              "ReplaceFileW replaces one package file with another");
+        check(read_game(L"GAME:\\replace\\target.txt") == "new" && read_game(L"GAME:\\replace\\backup.txt") == "old",
+              "the title reads the replacement under the replaced name and the old bytes in the backup");
+        check(read_game(L"GAME:\\replace\\new.txt") == "<missing>", "the replacement's own name is gone");
+        check(read_path(package / "replace" / "target.txt") == "old" && read_path(package / "replace" / "new.txt") == "new" &&
+                  !std::filesystem::exists(package / "replace" / "backup.txt"),
+              "and the package is untouched");
+
+        // The host's errors, measured on host files next to the test's folders.
+        write_path(root / L"r" / L"a.txt", "a");
+        write_path(root / L"r" / L"b.txt", "b");
+        std::filesystem::create_directories(root / L"r" / L"dir");
+        auto host_replace = [&](const wchar_t* replaced, const wchar_t* replacement, const wchar_t* backup) {
+            const std::wstring a = (root / L"r" / replaced).wstring(), b = (root / L"r" / replacement).wstring();
+            const std::wstring c = backup ? (root / L"r" / backup).wstring() : std::wstring();
+            return error_of([&] { ::ReplaceFileW(a.c_str(), b.c_str(), backup ? c.c_str() : nullptr, 0, nullptr, nullptr); });
+        };
+        write_path(package / "replace" / "b.txt", "b");
+        auto game_replace = [&](const wchar_t* replaced, const wchar_t* replacement, const wchar_t* backup) {
+            return error_of([&] { replace_w(replaced, replacement, backup, 0, nullptr, nullptr); });
+        };
+        check(game_replace(L"GAME:\\replace\\nope.txt", L"GAME:\\replace\\b.txt", nullptr) ==
+                  host_replace(L"nope.txt", L"b.txt", nullptr),
+              "a missing replaced file fails with the host's error");
+        check(game_replace(L"GAME:\\replace\\target.txt", L"GAME:\\replace\\nope.txt", nullptr) ==
+                  host_replace(L"a.txt", L"nope.txt", nullptr),
+              "a missing replacement fails with the host's error");
+        check(game_replace(L"GAME:\\replace", L"GAME:\\replace\\b.txt", nullptr) == host_replace(L"dir", L"b.txt", nullptr),
+              "a folder as the replaced file fails with the host's error");
+        check(game_replace(L"GAME:\\replace\\target.txt", L"GAME:\\replace\\b.txt", L"GAME:\\nodir\\bk.txt") ==
+                  host_replace(L"a.txt", L"b.txt", L"nodir\\bk.txt"),
+              "a backup whose folder is missing fails with the host's error");
+        check(read_game(L"GAME:\\replace\\b.txt") == "b", "and a failed replace leaves the replacement in place");
+        check(game_replace(L"GAME:\\replace\\target.txt", (root / L"r" / L"b.txt").c_str(), nullptr) ==
+                  ERROR_NOT_SAME_DEVICE,
+              "a console file replaced by a host file is refused with ERROR_NOT_SAME_DEVICE");
+
+        write_path(package / "replace" / "a_target.txt", "a old");
+        write_path(overlay / "replace" / "a_new.txt", "a new");
+        check(replace_a("GAME:\\replace\\a_target.txt", "GAME:\\replace\\a_new.txt", nullptr, 0, nullptr, nullptr) !=
+                      FALSE &&
+                  read_game(L"GAME:\\replace\\a_target.txt") == "a new" &&
+                  read_game(L"GAME:\\replace\\a_new.txt") == "<missing>",
+              "ReplaceFileA replaces a package file with an overlay-only one");
     }
 }
 

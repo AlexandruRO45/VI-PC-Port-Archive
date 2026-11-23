@@ -2,8 +2,9 @@
 //
 // A GDK title names its files on the console's drives, "GAME:\\data\\x.sps" being one in the installed game folder, so
 // the imports it makes of CreateFile*, FindFirstFile*/FindNextFile*/FindClose, GetFileAttributes*/GetFileAttributesEx*,
-// DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*, CopyFile*/CopyFile2 and SetFileAttributes* are answered
-// here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
+// DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*/MoveFileWithProgress*, CopyFile*/CopyFile2,
+// SetFileAttributes*, GetDiskFreeSpaceEx*, GetLongPathName*/GetShortPathName*,
+// GetCompressedFileSize* and ReplaceFile* are answered here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
 //     the overlay (RT-218); any other path is a host path and goes to the host;
@@ -1006,12 +1007,18 @@ BOOL WINAPI remove_directory_a(LPCSTR name) {
 
 // ---- Move, copy and attributes: the result lands in the overlay, a moved package name is deleted by a marker
 
-BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
+namespace {
+
+// MoveFileEx and MoveFileWithProgress share these rules; the progress routine, when there is one, is handed to the
+// host call that actually moves bytes (the overlay rename, or the copy of a package file), as MoveFileWithProgress
+// itself only reports a move that copies.
+BOOL move_file(LPCWSTR from, LPCWSTR to, LPPROGRESS_ROUTINE progress, LPVOID data, DWORD flags) {
     if (!from) return fail_bool(ERROR_INVALID_PARAMETER);
     std::vector<std::wstring> src, dst;
     const Parsed from_kind = parse_console(from, src);
     const Parsed to_kind = to ? parse_console(to, dst) : Parsed::Host;
-    if (from_kind == Parsed::Host && to_kind == Parsed::Host) return ::MoveFileExW(from, to, flags);
+    if (from_kind == Parsed::Host && to_kind == Parsed::Host)
+        return progress ? ::MoveFileWithProgressW(from, to, progress, data, flags) : ::MoveFileExW(from, to, flags);
     if (from_kind == Parsed::Refused || to_kind == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
     // A boot-time move or delete is a host feature a title cannot use on the console's drives.
     if (!to || (flags & MOVEFILE_DELAY_UNTIL_REBOOT) != 0) return fail_bool(ERROR_INVALID_PARAMETER);
@@ -1056,19 +1063,24 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
         // A package folder is left where it is (as DeleteFile does); an overlay-only folder is renamed in place.
         if (from_view.in_package) return fail_bool(ERROR_ACCESS_DENIED);
         if (to_view.kind != Kind::None) return fail_bool(ERROR_ACCESS_DENIED);
-        return ::MoveFileExW(overlay_from.c_str(), overlay_to.c_str(), flags & MOVEFILE_WRITE_THROUGH);
+        return ::MoveFileWithProgressW(overlay_from.c_str(), overlay_to.c_str(), progress, data,
+                                       flags & MOVEFILE_WRITE_THROUGH);
     }
 
     const bool write_through = (flags & MOVEFILE_WRITE_THROUGH) != 0;
     const DWORD keep = flags & (MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     DWORD error = 0;
     if (from_view.in_overlay) {
-        if (!::MoveFileExW(overlay_from.c_str(), overlay_to.c_str(), keep | MOVEFILE_COPY_ALLOWED)) return FALSE;
+        if (!::MoveFileWithProgressW(overlay_from.c_str(), overlay_to.c_str(), progress, data,
+                                     keep | MOVEFILE_COPY_ALLOWED))
+            return FALSE;
     } else {
         // The host never sees a move here, only a copy and a marker, so MOVEFILE_WRITE_THROUGH is honoured by
-        // flushing both before returning, as MoveFileEx does for its own copy and delete.
-        const BOOL fail_if_exists = (flags & MOVEFILE_REPLACE_EXISTING) == 0;
-        if (!::CopyFileW(join(r.game, src).c_str(), overlay_to.c_str(), fail_if_exists)) return FALSE;
+        // flushing both before returning, as MoveFileEx does for its own copy and delete. A progress routine that
+        // cancels fails the copy (ERROR_REQUEST_ABORTED, the copy removed), and then no marker is written.
+        const DWORD copy_flags = (flags & MOVEFILE_REPLACE_EXISTING) == 0 ? COPY_FILE_FAIL_IF_EXISTS : 0;
+        if (!::CopyFileExW(join(r.game, src).c_str(), overlay_to.c_str(), progress, data, nullptr, copy_flags))
+            return FALSE;
         if (write_through && !flush_file(overlay_to, error)) return fail_bool(error);
     }
     if (from_view.in_package) {
@@ -1077,6 +1089,21 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
         if (write_through && !flush_file(mark, error)) return fail_bool(error);
     }
     return TRUE;
+}
+
+}  // namespace
+
+BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) { return move_file(from, to, nullptr, nullptr, flags); }
+
+BOOL WINAPI move_file_with_progress_w(LPCWSTR from, LPCWSTR to, LPPROGRESS_ROUTINE progress, LPVOID data,
+                                      DWORD flags) {
+    return move_file(from, to, progress, data, flags);
+}
+
+BOOL WINAPI move_file_with_progress_a(LPCSTR from, LPCSTR to, LPPROGRESS_ROUTINE progress, LPVOID data, DWORD flags) {
+    if (!from) return fail_bool(ERROR_INVALID_PARAMETER);
+    const std::wstring wide_from = widen_ansi(from), wide_to = to ? widen_ansi(to) : std::wstring();
+    return move_file(wide_from.c_str(), to ? wide_to.c_str() : nullptr, progress, data, flags);
 }
 
 BOOL WINAPI move_file_w(LPCWSTR from, LPCWSTR to) {
@@ -1297,6 +1324,200 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+// ---- Path queries: a console path stays a console path
+
+namespace {
+
+DWORD fail_dword(DWORD error) {
+    SetLastError(error);
+    return 0;
+}
+
+}  // namespace
+
+// GetDiskFreeSpaceEx of a console folder answers for the volume that holds the overlay, where every write a title makes
+// on GAME:, G: or T: lands; the package's volume is never written. The folder must exist in the title's view, and a
+// file is refused the way the host refuses one (ERROR_DIRECTORY). The overlay is made on the first write, so until then
+// the nearest folder above it that exists stands in for it (the same volume).
+BOOL WINAPI get_disk_free_space_ex_w(LPCWSTR folder, PULARGE_INTEGER available, PULARGE_INTEGER total,
+                                     PULARGE_INTEGER total_free) {
+    std::vector<std::wstring> parts;
+    const Parsed parsed = folder ? parse_console(folder, parts) : Parsed::Host;
+    if (parsed == Parsed::Host) return ::GetDiskFreeSpaceExW(folder, available, total, total_free);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    const Roots r = roots();
+    if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
+    const View v = view(r, parts);
+    if (v.kind == Kind::None) return fail_bool(ERROR_PATH_NOT_FOUND);
+    if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
+    std::filesystem::path volume = r.overlay;
+    std::error_code ec;
+    while (!std::filesystem::is_directory(volume, ec) && volume.has_relative_path()) volume = volume.parent_path();
+    std::wstring probe = volume.native();
+    if (probe.empty() || !is_separator(probe.back())) probe += L'\\';
+    return ::GetDiskFreeSpaceExW(probe.c_str(), available, total, total_free);
+}
+
+BOOL WINAPI get_disk_free_space_ex_a(LPCSTR folder, PULARGE_INTEGER available, PULARGE_INTEGER total,
+                                     PULARGE_INTEGER total_free) {
+    if (!folder) return ::GetDiskFreeSpaceExA(folder, available, total, total_free);
+    const std::wstring wide = widen_ansi(folder);
+    return get_disk_free_space_ex_w(wide.c_str(), available, total, total_free);
+}
+
+namespace {
+
+// Hands a result string to a caller's buffer the way the host's path queries do: too small a buffer (or none) gets
+// the size it needs, terminator included, and is left alone; otherwise the length without the terminator. The
+// result is built before the copy, so a caller may pass its input as the output (GetLongPathName allows that).
+DWORD give_w(const std::wstring& out, DWORD length, LPWSTR buffer) {
+    const DWORD needed = static_cast<DWORD>(out.size() + 1);
+    if (!buffer || length < needed) return needed;
+    std::wmemmove(buffer, out.c_str(), needed);
+    return needed - 1;
+}
+
+DWORD give_a(const std::wstring& out, DWORD length, LPSTR buffer) {
+    const int needed = WideCharToMultiByte(CP_ACP, 0, out.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return 0;  // the conversion's own error is the last error
+    if (!buffer || length < static_cast<DWORD>(needed)) return static_cast<DWORD>(needed);
+    std::string narrow(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_ACP, 0, out.c_str(), -1, narrow.data(), needed, nullptr, nullptr);
+    std::memmove(buffer, narrow.data(), static_cast<size_t>(needed));
+    return static_cast<DWORD>(needed - 1);
+}
+
+// GetLongPathName and GetShortPathName of a console path: the console's names have no 8.3 form, so a name the title
+// can see comes back exactly as given (the host, too, keeps the caller's separators and ".." components). A missing
+// name fails as the host fails one: ERROR_FILE_NOT_FOUND when its folder exists, ERROR_PATH_NOT_FOUND when not.
+Parsed console_name_query(const std::wstring& path, DWORD& error) {
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(path, parts);
+    error = 0;
+    if (parsed == Parsed::Refused) error = ERROR_INVALID_NAME;
+    if (parsed != Parsed::Console) return parsed;
+    const Roots r = roots();
+    if (r.game.empty()) {
+        error = ERROR_PATH_NOT_FOUND;
+    } else if (view(r, parts).kind == Kind::None) {
+        error = is_folder(r, parent_of(parts)) ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND;
+    }
+    return parsed;
+}
+
+}  // namespace
+
+DWORD WINAPI get_long_path_name_w(LPCWSTR name, LPWSTR buffer, DWORD length) {
+    if (!name) return ::GetLongPathNameW(name, buffer, length);
+    DWORD error = 0;
+    if (console_name_query(name, error) == Parsed::Host) return ::GetLongPathNameW(name, buffer, length);
+    if (error) return fail_dword(error);
+    return give_w(name, length, buffer);
+}
+
+DWORD WINAPI get_long_path_name_a(LPCSTR name, LPSTR buffer, DWORD length) {
+    if (!name) return ::GetLongPathNameA(name, buffer, length);
+    const std::wstring wide = widen_ansi(name);
+    DWORD error = 0;
+    if (console_name_query(wide, error) == Parsed::Host) return ::GetLongPathNameA(name, buffer, length);
+    if (error) return fail_dword(error);
+    return give_a(wide, length, buffer);
+}
+
+DWORD WINAPI get_short_path_name_w(LPCWSTR name, LPWSTR buffer, DWORD length) {
+    if (!name) return ::GetShortPathNameW(name, buffer, length);
+    DWORD error = 0;
+    if (console_name_query(name, error) == Parsed::Host) return ::GetShortPathNameW(name, buffer, length);
+    if (error) return fail_dword(error);
+    return give_w(name, length, buffer);
+}
+
+DWORD WINAPI get_short_path_name_a(LPCSTR name, LPSTR buffer, DWORD length) {
+    if (!name) return ::GetShortPathNameA(name, buffer, length);
+    const std::wstring wide = widen_ansi(name);
+    DWORD error = 0;
+    if (console_name_query(wide, error) == Parsed::Host) return ::GetShortPathNameA(name, buffer, length);
+    if (error) return fail_dword(error);
+    return give_a(wide, length, buffer);
+}
+
+// GetCompressedFileSize reads the file a read would open: the overlay copy, else the package's.
+DWORD WINAPI get_compressed_file_size_w(LPCWSTR name, LPDWORD high) {
+    if (!name) return ::GetCompressedFileSizeW(name, high);
+    const Target t = read_target(name);
+    if (t.error) {
+        SetLastError(t.error);
+        return INVALID_FILE_SIZE;
+    }
+    return ::GetCompressedFileSizeW(t.path.c_str(), high);
+}
+
+DWORD WINAPI get_compressed_file_size_a(LPCSTR name, LPDWORD high) {
+    if (!name) return ::GetCompressedFileSizeA(name, high);
+    const std::wstring wide = widen_ansi(name);
+    return get_compressed_file_size_w(wide.c_str(), high);
+}
+
+// ---- ReplaceFile: done on the overlay copies, so the package keeps its files
+//
+// Both files are brought into the overlay (copied up when only the package has them) and the host's ReplaceFile runs
+// there; a replacement that only the package had is then deleted by a marker, since ReplaceFile consumes it. The backup,
+// when asked for, is written in the overlay. Errors for a missing file, a folder, and a backup whose folder is missing
+// are the host's (ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_UNABLE_TO_REMOVE_REPLACED); a mix of console and host
+// paths fails with ERROR_NOT_SAME_DEVICE, as MoveFile does.
+BOOL WINAPI replace_file_w(LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup, DWORD flags, LPVOID exclude,
+                           LPVOID reserved) {
+    if (!replaced || !replacement) return ::ReplaceFileW(replaced, replacement, backup, flags, exclude, reserved);
+    std::vector<std::wstring> dst, src, bak;
+    const Parsed dst_kind = parse_console(replaced, dst);
+    const Parsed src_kind = parse_console(replacement, src);
+    const Parsed bak_kind = backup ? parse_console(backup, bak) : Parsed::Host;
+    const bool any_console = dst_kind != Parsed::Host || src_kind != Parsed::Host || (backup && bak_kind != Parsed::Host);
+    if (!any_console) return ::ReplaceFileW(replaced, replacement, backup, flags, exclude, reserved);
+    if (dst_kind == Parsed::Refused || src_kind == Parsed::Refused || bak_kind == Parsed::Refused)
+        return fail_bool(ERROR_INVALID_NAME);
+    if (dst_kind != Parsed::Console || src_kind != Parsed::Console || (backup && bak_kind != Parsed::Console))
+        return fail_bool(ERROR_NOT_SAME_DEVICE);
+
+    const Roots r = roots();
+    if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
+    if (dst.empty() || src.empty() || (backup && bak.empty())) return fail_bool(ERROR_ACCESS_DENIED);
+    const View dst_view = view(r, dst), src_view = view(r, src);
+    if (dst_view.kind == Kind::None || src_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (dst_view.kind == Kind::Directory || src_view.kind == Kind::Directory) return fail_bool(ERROR_ACCESS_DENIED);
+
+    std::filesystem::path backup_path;
+    if (backup) {
+        if (!is_folder(r, parent_of(bak)) || view(r, bak).kind == Kind::Directory)
+            return fail_bool(ERROR_UNABLE_TO_REMOVE_REPLACED);
+        backup_path = join(r.overlay, bak);
+        std::error_code ec;
+        std::filesystem::create_directories(backup_path.parent_path(), ec);
+        if (ec) return fail_bool(static_cast<DWORD>(ec.value()));
+    }
+    const Target dst_target = write_target(replaced, true);
+    if (dst_target.error) return fail_bool(dst_target.error);
+    const Target src_target = write_target(replacement, true);
+    if (src_target.error) return fail_bool(src_target.error);
+    if (!::ReplaceFileW(dst_target.path.c_str(), src_target.path.c_str(), backup ? backup_path.c_str() : nullptr, flags,
+                        exclude, reserved))
+        return FALSE;
+    if (src_view.in_package) {
+        DWORD error = 0;
+        if (!write_marker(marker(r.overlay, src), error)) return fail_bool(error);
+    }
+    return TRUE;
+}
+
+BOOL WINAPI replace_file_a(LPCSTR replaced, LPCSTR replacement, LPCSTR backup, DWORD flags, LPVOID exclude,
+                           LPVOID reserved) {
+    if (!replaced || !replacement) return ::ReplaceFileA(replaced, replacement, backup, flags, exclude, reserved);
+    const std::wstring wide_dst = widen_ansi(replaced), wide_src = widen_ansi(replacement),
+                       wide_bak = backup ? widen_ansi(backup) : std::wstring();
+    return replace_file_w(wide_dst.c_str(), wide_src.c_str(), backup ? wide_bak.c_str() : nullptr, flags, exclude,
+                          reserved);
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -1332,6 +1553,18 @@ using namespace rt::fs;
         {dll, "MoveFileW", reinterpret_cast<void*>(&move_file_w)},                                       \
         {dll, "MoveFileExA", reinterpret_cast<void*>(&move_file_ex_a)},                                  \
         {dll, "MoveFileExW", reinterpret_cast<void*>(&move_file_ex_w)},                                  \
+        {dll, "MoveFileWithProgressA", reinterpret_cast<void*>(&move_file_with_progress_a)},             \
+        {dll, "MoveFileWithProgressW", reinterpret_cast<void*>(&move_file_with_progress_w)},             \
+        {dll, "GetDiskFreeSpaceExA", reinterpret_cast<void*>(&get_disk_free_space_ex_a)},                \
+        {dll, "GetDiskFreeSpaceExW", reinterpret_cast<void*>(&get_disk_free_space_ex_w)},                \
+        {dll, "GetLongPathNameA", reinterpret_cast<void*>(&get_long_path_name_a)},                       \
+        {dll, "GetLongPathNameW", reinterpret_cast<void*>(&get_long_path_name_w)},                       \
+        {dll, "GetShortPathNameA", reinterpret_cast<void*>(&get_short_path_name_a)},                     \
+        {dll, "GetShortPathNameW", reinterpret_cast<void*>(&get_short_path_name_w)},                     \
+        {dll, "GetCompressedFileSizeA", reinterpret_cast<void*>(&get_compressed_file_size_a)},           \
+        {dll, "GetCompressedFileSizeW", reinterpret_cast<void*>(&get_compressed_file_size_w)},           \
+        {dll, "ReplaceFileA", reinterpret_cast<void*>(&replace_file_a)},                                 \
+        {dll, "ReplaceFileW", reinterpret_cast<void*>(&replace_file_w)},                                 \
         {dll, "CopyFileA", reinterpret_cast<void*>(&copy_file_a)},                                       \
         {dll, "CopyFileW", reinterpret_cast<void*>(&copy_file_w)},                                       \
         {dll, "CopyFileExA", reinterpret_cast<void*>(&copy_file_ex_a)},                                  \

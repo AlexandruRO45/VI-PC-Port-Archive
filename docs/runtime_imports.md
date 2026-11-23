@@ -95,7 +95,8 @@ A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file 
 [ivall/xcl](https://github.com/ivall/xcl) (GPL-2.0-only; facts only, no code) documents for Xbox Series GDK titles that
 `GAME:` maps to the game folder and that writes go to a writable overlay instead of the package, which stays read-only.
 `gta6rt` therefore shims `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`, `GetFileAttributesA/W`,
-`GetFileAttributesExA/W` and `DeleteFileA/W` (`runtime/shims/file_system.cpp`), under `kernel32.dll`, `kernelbase.dll`
+`GetFileAttributesExA/W` and `DeleteFileA/W`, and the folder, move, copy, attribute, full-path and free-space calls
+listed below (`runtime/shims/file_system.cpp`), under `kernel32.dll`, `kernelbase.dll`
 and the `api-ms-win-core-file-*` sets a GDK title links against.
 
 - A `GAME:` path (any case, `\` or `/`) maps under `--game-dir`. A path without the prefix is a host path and is
@@ -154,6 +155,24 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 - `MoveFile*` onto the same name succeeds and changes nothing. A rename that changes only the case renames the overlay
   entry; a package file gets an overlay copy under the new spelling, and a package folder is refused like any other
   move of one.
+- `MoveFileWithProgress*` follows the `MoveFile*` rules. The progress routine goes to the host call that moves
+  the bytes: the copy of a package file into the overlay, or the overlay rename. A routine that cancels fails the move
+  with `ERROR_REQUEST_ABORTED`, leaving the package name visible and no destination.
+- `GetDiskFreeSpaceEx*` of a console folder answers for the volume that holds the overlay, where the title's writes
+  land (the nearest existing folder above the overlay until the first write makes it). A missing folder and a file
+  fail with the host's errors for a missing folder and for a file (CTest `file_system` compares them).
+- `GetLongPathName*` and `GetShortPathName*` return a console name the title can see exactly as given: the console has
+  no 8.3 names, and the host too keeps the caller's separators and `..`. A missing name fails as on the host,
+  `ERROR_FILE_NOT_FOUND` when its folder exists and `ERROR_PATH_NOT_FOUND` when not. `GetCompressedFileSize*` sizes
+  the file a read would open.
+- `ReplaceFile*` brings both files into the overlay (copying up what only the package has) and runs the host's
+  `ReplaceFile` there. A replacement that only the package had is then deleted by a marker, and the backup is written
+  in the overlay. A missing file, a folder and a backup whose folder is missing fail with the host's errors
+  (`ERROR_FILE_NOT_FOUND`, `ERROR_ACCESS_DENIED`, `ERROR_UNABLE_TO_REMOVE_REPLACED`; CTest `file_system` compares them);
+  a mix of console and host paths fails with `ERROR_NOT_SAME_DEVICE`, as `MoveFile*` does.
+- Not mapped yet: `CreateFile3` (Windows 11 24H2 and later), `CreateHardLink*`, `CreateSymbolicLink*`,
+  `FindFirstChangeNotification*`/`ReadDirectoryChangesW` (handle-based, but opened by path) and `SetCurrentDirectory*`
+  with a console path (a title's current folder on `GAME:` would need relative paths resolved against it).
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 

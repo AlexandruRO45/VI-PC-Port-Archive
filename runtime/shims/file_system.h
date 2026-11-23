@@ -13,7 +13,9 @@
 //
 // The shims that use this live in file_system.cpp: CreateFile*, FindFirstFile*/FindNextFile*/FindClose,
 // GetFileAttributes*/GetFileAttributesEx*, DeleteFile*, CreateDirectory*/RemoveDirectory*, MoveFile*/MoveFileEx*,
-// CopyFile*/CopyFileEx*/CopyFile2 and SetFileAttributes* (the rules for each are in docs/runtime_imports.md).
+// MoveFileWithProgress*, CopyFile*/CopyFileEx*/CopyFile2, SetFileAttributes*, GetDiskFreeSpaceEx*,
+// GetLongPathName*/GetShortPathName*, GetCompressedFileSize* and ReplaceFile* (the rules for each are in
+// docs/runtime_imports.md).
 #pragma once
 
 #include <filesystem>
