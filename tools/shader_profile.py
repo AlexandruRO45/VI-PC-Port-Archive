@@ -22,7 +22,14 @@ import json
 import os
 import re
 import sys
+import tempfile
 from collections import Counter, defaultdict
+
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_with_retry  # noqa: E402
 
 FAMILIES = [("s_buffer_", "smem"), ("s_load", "smem"), ("s_", "scalar"), ("v_", "vector"), ("ds_", "lds"),
             ("buffer_", "buffer"), ("tbuffer_", "buffer"), ("image_", "image"), ("global_", "global"),
@@ -279,7 +286,7 @@ def stage_map(disasm_dir) -> dict:
             entries = json.load(f)
         return {os.path.splitext(e["file"])[0]: e["stage"] for e in entries
                 if isinstance(e, dict) and isinstance(e.get("file"), str) and isinstance(e.get("stage"), str)}
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, RecursionError):
         return {}
 
 
@@ -291,6 +298,24 @@ def same_output_path(first, second):
         return os.path.samefile(first, second)
     except OSError:
         return False
+
+
+def _write_json_atomic(path, out):
+    """Write ``out`` to a sibling temporary file beside ``realpath(path)`` and replace atomically."""
+    target = os.path.realpath(path)
+    parent = os.path.dirname(target) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".shader_profile.", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(out, f, indent=1, allow_nan=False)
+        os.chmod(tmp_path, published_mode(target))
+        replace_with_retry(tmp_path, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def main():
@@ -383,8 +408,7 @@ def main():
     if a.per_shader:
         out["per_shader"] = sorted(shaders, key=lambda e: e["name"])
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(out, f, indent=1, allow_nan=False)
+        _write_json_atomic(path, out)
     except OSError as e:
         print(f"ERROR: cannot write {path}: {e.strerror or e}", file=sys.stderr)
         return 2

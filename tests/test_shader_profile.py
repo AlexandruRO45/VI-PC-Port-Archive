@@ -691,6 +691,66 @@ class TestCommandLineEndToEnd(unittest.TestCase):
         with open(report, "rb") as f:
             self.assertEqual(f.read(), original)
 
+    def test_stage_map_returns_empty_on_recursion_error(self):
+        from unittest.mock import patch
+
+        index = os.path.join(self.tmp.name, "index.json")
+        with open(index, "w", encoding="utf-8", newline="\n") as f:
+            f.write("[]")
+        with patch.object(P.json, "load", side_effect=RecursionError("maximum recursion depth exceeded")):
+            self.assertEqual(P.stage_map(self.disasm_dir), {})
+
+    def test_failed_report_write_preserves_previous_report_and_cleans_temp(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        self.write("ps_main", "\tv_mov_b32 v0, 1.0\n\ts_endpgm\n")
+        out_dir = os.path.join(self.tmp.name, "out")
+        os.makedirs(out_dir, exist_ok=True)
+        report = os.path.join(out_dir, "profile.json")
+        original = '{"previous": true}\n'
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            f.write(original)
+
+        def fail_dump(_obj, fh, **_kwargs):
+            fh.write("{partial")
+            raise OSError(28, "No space left on device")
+
+        stderr = StringIO()
+        with (patch.object(P.json, "dump", fail_dump),
+              patch.object(sys, "argv", ["shader_profile.py", self.disasm_dir, "--out", report]),
+              patch.object(sys, "stderr", stderr)):
+            self.assertEqual(P.main(), 2)
+
+        self.assertIn("ERROR: cannot write", stderr.getvalue())
+        with open(report, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(os.listdir(out_dir), ["profile.json"])
+
+    def test_report_write_preserves_symlinked_destination(self):
+        from io import StringIO
+        from unittest.mock import patch
+
+        self.write("ps_main", "\tv_mov_b32 v0, 1.0\n\ts_endpgm\n")
+        target = os.path.join(self.tmp.name, "real_profile.json")
+        with open(target, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"old": true}\n')
+        link = os.path.join(self.tmp.name, "link_profile.json")
+        try:
+            os.symlink(target, link)
+        except OSError as error:
+            self.skipTest(f"symlinks are unavailable: {error}")
+
+        stdout = StringIO()
+        with (patch.object(sys, "argv", ["shader_profile.py", self.disasm_dir, "--out", link]),
+              patch.object(sys, "stdout", stdout)):
+            self.assertIsNone(P.main())
+
+        self.assertTrue(os.path.islink(link))
+        with open(target, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["shaders"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
