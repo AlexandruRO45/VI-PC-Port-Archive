@@ -499,5 +499,49 @@ class TestVLdexpF32IEEE754EdgeCases(unittest.TestCase):
         neg_sub = min_sub | SIGN_MASK
         self.assertEqual(ref_ldexp_f32(neg_sub, 10), SIGN_MASK)
 
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+
+class TestVLdexpF32NegativeAndMutation(unittest.TestCase):
+    """Unit tests for negative syntax controls, bounds checking, and mutation detection."""
+
+    def test_reject_sgpr_destination(self):
+        for idx in (0, 1, 2, 100):
+            with self.subTest(idx=idx):
+                instr = VLdexpF32Instruction(
+                    dst=Operand(RegKind.SGPR, index=idx),
+                    src0=Operand(RegKind.VGPR, index=0),
+                    src1=Operand(RegKind.VGPR, index=1),
+                )
+                with self.assertRaises(TypeError):
+                    instr.validate()
+
+    def test_reject_out_of_bounds_vgpr(self):
+        for oob in (256, 257, 500):
+            with self.subTest(oob=oob):
+                instr = VLdexpF32Instruction(
+                    dst=Operand(RegKind.VGPR, index=oob),
+                    src0=Operand(RegKind.VGPR, index=0),
+                    src1=Operand(RegKind.VGPR, index=1),
+                )
+                with self.assertRaises(ValueError):
+                    instr.validate()
+
+    def test_mutation_detector_logic(self):
+        """Verify that mutations in mathematical ldexp behavior are detected."""
+        def mutant_add(s0: int, s1: int) -> int:
+            # Mutant: mistakenly interprets ldexp as float addition
+            f0 = struct.unpack("<f", struct.pack("<I", s0))[0]
+            res_f = f0 + float(s1)
+            return struct.unpack("<I", struct.pack("<f", res_f))[0]
+
+        one = 0x3F80_0000  # 1.0f
+        correct = ref_ldexp_f32(one, 2)  # 1.0 * 2^2 = 4.0f (0x4080_0000)
+        mutant = mutant_add(one, 2)      # 1.0 + 2.0 = 3.0f (0x4040_0000)
+
+        self.assertEqual(correct, 0x4080_0000)
+        self.assertNotEqual(mutant, correct)
+
 if __name__ == "__main__":
     unittest.main()
