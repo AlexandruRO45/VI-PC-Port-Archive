@@ -627,6 +627,13 @@ def cull_part_overlap(
 
 def compact_part_vertices(part: MeshPart) -> MeshPart:
     """Drop vertices no longer referenced by any triangle and remap triangle indices."""
+    vertex_count = len(part.positions)
+    for key, rows in part.uvs_extra.items():
+        if len(rows) != vertex_count:
+            raise PedAssembleError(
+                f"{part.name}: TEXCOORD_{key} has {len(rows)} rows for {vertex_count} vertices"
+            )
+
     used: dict[int, int] = {}
     order: list[int] = []
     new_tris: list[tuple[int, int, int]] = []

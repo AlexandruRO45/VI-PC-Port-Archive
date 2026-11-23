@@ -209,6 +209,32 @@ class ExtraUvsTest(unittest.TestCase):
         self.assertTrue(all(hashlib.sha256(path.read_bytes()).digest() == digest
                             for path, digest in originals.items()))
 
+    def test_cull_overlap_reports_extra_uv_row_count_before_compaction(self):
+        source = self.root / "part.json"
+        reference = self.root / "reference.json"
+        output = self.root / "culled.json"
+        for culled_positions, rows in (
+            (POSITIONS[:3], EXTRA[1][:-1]),
+            (POSITIONS[3:], EXTRA[1][:3]),
+            (POSITIONS[:3], EXTRA[1] + [(0, 0)]),
+        ):
+            with self.subTest(uv_rows=len(rows)):
+                write_json(reference, {"positions": culled_positions, "triangles": [[0, 1, 2]]})
+                part = pa.MeshPart("invalid", POSITIONS, [(0, 1, 2), (3, 4, 5)], uvs=UV0,
+                                   uvs_extra={1: rows})
+                write_json(source, pa.part_to_dict(part))
+                result = subprocess.run(
+                    [sys.executable, "-I", str(ROOT / "tools" / "ped_assemble.py"),
+                     "cull-overlap", "--target", str(source), "--ref", str(reference),
+                     "--compact-vertices", "-o", str(output)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), [
+                    f"ERROR: invalid: TEXCOORD_1 has {len(rows)} rows for {len(POSITIONS)} vertices",
+                ])
+                self.assertFalse(output.exists())
+
     def test_no_extra_sets_keep_existing_json_and_attributes(self):
         source = self.root / "primary.glb"
         write_geometry(source, extra=False)
