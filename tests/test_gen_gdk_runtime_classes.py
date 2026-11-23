@@ -92,5 +92,22 @@ class GenGdkRuntimeClassesTest(unittest.TestCase):
         self.assertNotIn("Traceback", err)
 
 
+class NonUtf8DocsTests(unittest.TestCase):
+    def test_a_non_utf8_docs_file_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            docs = Path(tmp) / "docs"
+            make_docs(docs)
+            (docs / "COM" / "XUser" / "Notes.md").write_bytes(b"Interface Id: \xff\xfe not utf-8\n")
+            out = Path(tmp) / "table.json"
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = gen.main([str(docs), "--out", str(out)])
+            message = err.getvalue()
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR: cannot read the docs", message)
+        self.assertNotIn("Traceback", message)
+        self.assertFalse(out.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
