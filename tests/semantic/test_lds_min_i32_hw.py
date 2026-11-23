@@ -783,3 +783,52 @@ class TestLdsMinI32ConditionCodes(unittest.TestCase):
         self.assertEqual(flags.old_value, 90)
         self.assertEqual(flags.operand_value, 30)
         self.assertEqual(flags.new_value, 30)
+
+
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+class TestLdsMinI32IEEE754AndBoundaries(unittest.TestCase):
+    """Unit tests for IEEE 754 bit-patterns and boundary two's-complement extremes."""
+
+    def test_ieee754_signed_zeros(self) -> None:
+        # +0.0 is 0x00000000 (signed value 0)
+        # -0.0 is 0x80000000 (signed value -2147483648 = INT32_MIN)
+        # In signed integer comparison, -0.0 bit pattern compares strictly less than +0.0!
+        res = oracle_ds_min_i32(0x00000000, 0x80000000)
+        self.assertEqual(res, 0x80000000)
+        res_rev = oracle_ds_min_i32(0x80000000, 0x00000000)
+        self.assertEqual(res_rev, 0x80000000)
+
+    def test_ieee754_nan_and_infinity_patterns(self) -> None:
+        # +Infinity is 0x7F800000 (signed value 2139095040)
+        # -Infinity is 0xFF800000 (signed value -8388608)
+        # -Infinity < +Infinity in signed two's complement
+        self.assertEqual(oracle_ds_min_i32(0x7F800000, 0xFF800000), 0xFF800000)
+        # NaN 0x7FC00000 vs 0: 0 < 0x7FC00000
+        self.assertEqual(oracle_ds_min_i32(0x7FC00000, 0), 0)
+
+    def test_signed_two_complement_extremes(self) -> None:
+        table = [
+            (INT32_MIN, INT32_MAX, INT32_MIN),
+            (INT32_MIN, 0, INT32_MIN),
+            (INT32_MIN, 0xFFFFFFFF, INT32_MIN),
+            (0xFFFFFFFF, 0, 0xFFFFFFFF),  # -1 < 0
+            (0xFFFFFFFF, 1, 0xFFFFFFFF),  # -1 < 1
+            (u32(-10), u32(-5), u32(-10)),
+            (u32(-5), u32(-10), u32(-10)),
+        ]
+        for m, d, expected in table:
+            with self.subTest(m=hex(m), d=hex(d)):
+                self.assertEqual(oracle_ds_min_i32(m, d), expected)
+
+    def test_differential_signed_vs_unsigned(self) -> None:
+        # When operands have different signs (bit 31 differs), signed and unsigned min diverge
+        cases = [
+            (1, 0x80000000, 0x80000000),  # signed min is 0x80000000 (unsigned min is 1)
+            (10, 0xFFFFFFFF, 0xFFFFFFFF), # signed min is -1 (unsigned min is 10)
+            (0x7FFFFFFF, 0x80000000, 0x80000000),
+        ]
+        for m, d, expected_signed in cases:
+            self.assertEqual(oracle_ds_min_i32(m, d), expected_signed)
