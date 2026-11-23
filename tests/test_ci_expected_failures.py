@@ -39,7 +39,7 @@ class Judge(unittest.TestCase):
         self.assertIn("::error::the test runner exited with 2 without naming a failed test", lines)
 
     def test_interrupted_run_cannot_pass_on_a_partial_failure_list(self):
-        for status in (-15, 143):
+        for status in (-15, 143, 0xC0000005):
             with self.subTest(status=status):
                 code, lines = cef.judge(["known"], status, ["known", "not_run"])
                 self.assertEqual(code, 1)
