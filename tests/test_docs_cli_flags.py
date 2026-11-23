@@ -137,11 +137,21 @@ def unknown_flags(pages, code):
 
 
 def fenced_commands(text):
-    """[(line number, one command)] for the fenced code lines, with backslash/backtick continuations joined."""
-    out, fence, buf, start = [], False, "", 0
+    """[(line number, one command)] for the fenced code lines, with backslash/backtick continuations joined.
+
+    A fence is paired by its length, as Markdown pairs it: an opening line of three or more backticks (an info
+    string may follow) and a closing line of at least as many backticks and nothing else. A ``` line inside a
+    longer block is quoted content, not the end of the block, so the commands it shows are still checked."""
+    out, fence, buf, start = [], 0, "", 0
     for n, line in enumerate(text.split("\n"), 1):
-        if line.lstrip().startswith("```"):
-            fence, buf = not fence, ""
+        content = line.strip()
+        ticks = len(content) - len(content.lstrip("`"))
+        if fence:
+            if ticks >= fence and not content[ticks:].strip():
+                fence, buf = 0, ""
+                continue
+        elif ticks >= 3:
+            fence, buf = ticks, ""
             continue
         if not fence:
             continue
