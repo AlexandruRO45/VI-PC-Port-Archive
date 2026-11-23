@@ -27,6 +27,7 @@ if _TOOLS_DIR not in sys.path:
 
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -209,7 +210,7 @@ def _scan_rpf_offsets(path: str, jobs: int = 1) -> tuple[list[int], int, int]:
     size = os.path.getsize(path)
     if size < 16:
         return [], 0, 0
-    workers = max(1, jobs)
+    workers = process_workers(max(1, jobs))   # a pool takes at most 61 workers on Windows
     chunk_sz = max(4 * 1024 * 1024, min(64 * 1024 * 1024, (size + workers - 1) // workers))
     ranges = [(path, s, min(size, s + chunk_sz)) for s in range(0, size, chunk_sz)]
     offs: list[int] = []

@@ -4,7 +4,8 @@
 
 Above 61 workers concurrent.futures.ProcessPoolExecutor raises `ValueError: max_workers must be <= 61` on Windows
 and multiprocessing.Pool hangs (tools/pool_workers.py has the measurement). awc_opus.py, awc_shorts.py,
-world_lights_paths.py, world_build.py, anim_clips.py and anim_glb.py (--coverage) handed --jobs to a pool as it was.
+world_lights_paths.py, world_build.py, anim_clips.py and anim_glb.py (--coverage) handed --jobs to a pool as it was,
+and so did fog_volumes.py (--jobs).
 
 Each tool is run through its own code three ways: with the limit patched in and the pool class replaced by one
 that records its size and runs the work in this process (so the cap is checked on every platform); the two audio
@@ -31,6 +32,7 @@ import anim_clips  # noqa: E402
 import anim_glb  # noqa: E402
 import awc_opus  # noqa: E402
 import awc_shorts  # noqa: E402
+import fog_volumes  # noqa: E402
 import pool_workers  # noqa: E402
 import world_build  # noqa: E402
 import world_lights_paths  # noqa: E402
@@ -139,6 +141,15 @@ class ToolPoolSizeTest(unittest.TestCase):
             for workers, size in ((2, 2), (62, 61), (200, 61)):
                 self.assertEqual(list(world_build._run_jobs(abs, iter(range(-300, 0)), workers)),
                                  list(range(300, 0, -1)))
+                self.assertEqual(SIZES.pop(), size)
+
+    def test_fog_volumes(self):
+        with open(self.path("zeros.rpf"), "wb") as f:
+            f.write(bytes(5 * 1024 * 1024))             # two 4 MiB chunks, so jobs > 1 opens a pool
+        one = fog_volumes._scan_rpf_offsets(self.path("zeros.rpf"), jobs=1)
+        with mock.patch.object(concurrent.futures, "ProcessPoolExecutor", RecordingExecutor):
+            for jobs, size in ((2, 2), (62, 61), (200, 61)):
+                self.assertEqual(fog_volumes._scan_rpf_offsets(self.path("zeros.rpf"), jobs=jobs), one)
                 self.assertEqual(SIZES.pop(), size)
 
     def test_anim_clips(self):
