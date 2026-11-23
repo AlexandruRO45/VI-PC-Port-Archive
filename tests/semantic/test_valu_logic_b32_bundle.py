@@ -172,3 +172,65 @@ class TestAndB32ASTAndScalar(unittest.TestCase):
             "v_and_b32 v0, v0, v1",
         ])
         self.assertEqual(val_inplace, 0x5678)
+
+
+# ------------------------------------------------------------------------------
+# v_and_b32 SIMD Divergence & Multi-Lane Properties
+# ------------------------------------------------------------------------------
+
+class SIMDWaveLogic:
+    def __init__(self, wave_size: int = 64):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def step_and(self, insn: VAndB32Instruction):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                s0 = self.vgprs[insn.src0.index][lane]
+                s1 = self.vgprs[insn.src1.index][lane]
+                self.vgprs[insn.dst.index][lane] = ref_and_b32(s0, s1)
+
+
+class TestAndB32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        wave = SIMDWaveLogic(wave_size=32)
+        for i in range(32):
+            wave.vgprs[1][i] = 1 << i
+            wave.vgprs[2][i] = 0x5555_5555
+            wave.vgprs[0][i] = 0
+
+        insn = VAndB32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+        )
+        wave.step_and(insn)
+
+        # Check lane 0 and lane 1 via hardware execution
+        val_lane0, _ = run_shader("ps_and_lane0", [
+            "v_mov_b32 v1, 1",
+            "v_mov_b32 v2, 0x55555555",
+            "v_and_b32 v0, v1, v2",
+        ])
+        val_lane1, _ = run_shader("ps_and_lane1", [
+            "v_mov_b32 v1, 2",
+            "v_mov_b32 v2, 0x55555555",
+            "v_and_b32 v0, v1, v2",
+        ])
+        self.assertEqual(wave.vgprs[0][0], val_lane0)
+        self.assertEqual(wave.vgprs[0][1], val_lane1)
+
+    def test_algebraic_properties_hardware(self):
+        # Commutativity: (a & b) == (b & a)
+        val_ab, _ = run_shader("ps_and_comm_ab", [
+            "v_mov_b32 v1, 0x1234ABCD",
+            "v_mov_b32 v2, 0x98765432",
+            "v_and_b32 v0, v1, v2",
+        ])
+        val_ba, _ = run_shader("ps_and_comm_ba", [
+            "v_mov_b32 v1, 0x1234ABCD",
+            "v_mov_b32 v2, 0x98765432",
+            "v_and_b32 v0, v2, v1",
+        ])
+        self.assertEqual(val_ab, val_ba)
