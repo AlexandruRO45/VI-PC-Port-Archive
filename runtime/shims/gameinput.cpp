@@ -29,8 +29,10 @@
 //
 // Nothing here goes online. docs/gameinput.md has the mapping, the environment variables and the VERIFY list.
 //
-// ASSUMPTION: the console executable is not available, so the DLL it imports GameInputCreate from is unknown. The PC
-// API lives in gameinput.dll; on console the GDK links it through xgameruntime. Both names are registered.
+// The retail executable imports GameInputCreate as GameInput.dll ordinal 1 (its only GameInput import; ordinal 1 is
+// GameInputCreate in the v0 and v1 import libraries) and was built against v0, the API this file implements
+// (docs/gameinput.md, "The retail executable"). The registrations at the end of this file are by name, under
+// gameinput.dll and xgameruntime.dll, so they don't serve that ordinal import yet.
 #include <windows.h>
 
 #include <SDL3/SDL.h>

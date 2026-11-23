@@ -12,9 +12,35 @@ features. That path is tested without the game: `gameinput_host_test` (ctest `ga
 built against the SDK's `gameinput.lib` and checks that its `GameInput.dll` import binds to the host's copy, that
 `GameInputCreate` and `GetCurrentTimestamp` work from mapped code, and that `GetCurrentReading` answers; with a pad
 attached, `GetGamepadState` must succeed on the reading. It passes on Windows 11 build 26300 (GameInput 0.2309) without
-a pad attached. The test skips only where Windows cannot load `GameInput.dll`; with the DLL present, an import that binds to nothing fails it. The game executable is not available yet,
-so whether it imports GameInput this way, and under which
-module, is unverified (see [VERIFY](#verify)).
+a pad attached. The test skips only where Windows cannot load `GameInput.dll`; with the DLL present, an import that binds to nothing fails it.
+
+The retail executable imports GameInput this way: its only GameInput import is `GameInput.dll` by ordinal 1, and it
+has no `xgameruntime.dll!GameInputCreate` (see [The retail executable](#the-retail-executable-rt-5)).
+
+### The retail executable (RT-5)
+
+Measured from the file alone (nothing run) on `game_scarlett_master.exe` 1.0.2.1 (SHA-256
+`e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`, the image of `docs/runtime_imports.md`):
+
+- **Module and import.** `python -I tools/pe_inspect.py game_scarlett_master.exe` lists one GameInput import,
+  `GameInput.dll` `#1`. In the two import libraries that link GameInput statically, the Windows SDK's
+  `um/x64/GameInput.lib` (10.0.26100, GameInput v0) and the `Microsoft.GameInput` NuGet 1.2.26100.4782 (v1),
+  `GameInputCreate` is imported from `GameInput.dll` by ordinal 1 (the import object's name type is ordinal). NuGet 2.x
+  to 4.x (checked: 2.2.26100.6114, 3.5.283, 4.1.314) don't import it: their `GameInput.lib` loads `GameInputRedist.dll`
+  at run time and calls `GameInputCreateWithVersion`, and the executable contains neither name (ASCII or UTF-16).
+  So the title is v0 or v1, and its import is `GameInputCreate`.
+- **v0, not v1.** v1's `GameInputCreate` returns an `IUnknown`, and the header's inline wrapper asks it for
+  `IID_IGameInput` (`40FFB7E4-6150-407A-B439-132BADC08D2D`) with `QueryInterface`, so a v1 title carries that IID.
+  The executable does not hold it, nor any of the 30 interface IIDs of the v0 to v4 headers (searched as their 16-byte
+  in-memory form). v0's `GameInputCreate` hands out `IGameInput` directly and needs no IID, which fits. This is strong
+  evidence for v0, not a proof: a compiler can build a GUID on the stack from immediates, though not usually for a
+  `const IID` object. The shim implements v0.
+- **No `QueryInterface` by a constant IID** on any GameInput object, by the same search: the IIDs the shim answers
+  (below) are not reached through constants in the image.
+
+The loader binds an import by the name or ordinal the image records, so the shim's by-name `gameinput.dll`
+registration does not serve this `#1` import: on `main` it goes to the host's `GameInput.dll`, or is unimplemented
+where there is none (Wine). #3410 and #7216 register ordinal 1.
 
 ## Building
 
@@ -490,9 +516,9 @@ as working; nothing measured them, and the `resistance` mode was not tried.
 
 These need the game executable or a test on hardware:
 
-- **Which API version and module.** The shim is GameInput v0 and registers `GameInputCreate` under `gameinput.dll`
-  and `xgameruntime.dll`. GameInput v1 and later (NuGet 1.x and up) changed the interfaces; if the executable was
-  built against one of those, the vtables need a second set.
+- **Which API version and module.** Settled from the file ([The retail executable](#the-retail-executable-rt-5)):
+  `GameInput.dll` ordinal 1, and v0 by strong evidence (no v1 `IID_IGameInput` in the image). Still to confirm in a
+  run: that the title's first GameInput calls land in v0's vtable slots.
 - **IIDs.** `QueryInterface` answers the v0 IIDs from the public header.
 - **Reading history.** Microsoft's [next reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getnextreading)
   and [previous reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getpreviousreading) pages describe half a second of readings per device and failure when old readings leave the stream. The table above records the shim's HRESULT choices. Changes faster than the poll are not seen.
