@@ -33,6 +33,7 @@ import mmap
 import os
 import struct
 import sys
+import tempfile
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -97,6 +98,8 @@ def resolve(V, P, p):
 
 def array(V, P, blocks, base_buf, at):
     """Follow a PSO array (u64 block pointer + u16 count) to (buffer, offset, count), or None."""
+    if at < 0 or at + 10 > len(base_buf):
+        return None
     p = struct.unpack_from("<Q", base_buf, at)[0]
     count = struct.unpack_from("<H", base_buf, at + 8)[0]
     if count == 0:
@@ -108,6 +111,8 @@ def array(V, P, blocks, base_buf, at):
     if buf is None:
         return None
     off = boff + (p >> 20)
+    if off >= len(buf):
+        return None
     return buf, off, count
 
 
@@ -141,7 +146,7 @@ def measure(V, P, T):
             continue
         lsize = structs.get(bname, (0,))[0]   # a block the schema has no struct for is unresolved
         buf, boff = resolve(V, P, bptr)
-        if buf is None or lsize == 0 or bsize % lsize:
+        if buf is None or lsize == 0 or bsize % lsize or boff + bsize > len(buf):
             add(T, "list_blocks_unresolved")
             continue
         for k in range(bsize // lsize):
@@ -159,20 +164,23 @@ def _f(buf, at, n=1):
 
 def list_common(structs, name, buf, lo, R):
     add(R, "lists")
-    lvl = buf[lo + member(structs, name, "lodLevel")] if member(structs, name, "lodLevel") is not None else None
+    lvl_at = member(structs, name, "lodLevel")
+    lvl = buf[lo + lvl_at] if lvl_at is not None and 0 <= lo + lvl_at < len(buf) else None
     add(R.setdefault("lodLevel", {}), str(lvl))
     sr_at = member(structs, name, "ScaleRange")
-    if sr_at is not None:
+    if sr_at is not None and 0 <= lo + sr_at and lo + sr_at + 8 <= len(buf):
         smin, smax = _f(buf, lo + sr_at, 2)
-        add(R, "scale_range_ordered", int(0 < smin <= smax))
+        add(R, "scale_range_ordered", int(math.isfinite(smin) and math.isfinite(smax) and 0 < smin <= smax))
     ild = member(structs, name, "InstanceLodDist")
     ld = member(structs, name, "lodDist")
-    if ild is not None and ld is not None:
+    if (ild is not None and ld is not None
+            and 0 <= lo + ild and lo + ild + 4 <= len(buf)
+            and 0 <= lo + ld and lo + ld + 4 <= len(buf)):
         a, b = _f(buf, lo + ild)[0], _f(buf, lo + ld)[0]
-        add(R, "instance_loddist_le_loddist", int(0 < a <= b))
+        add(R, "instance_loddist_le_loddist", int(math.isfinite(a) and math.isfinite(b) and 0 < a <= b))
     bb = member(structs, name, "BatchAABB")
     box = None
-    if bb is not None:
+    if bb is not None and 0 <= lo + bb and lo + bb + 28 <= len(buf):
         mn, mx = _f(buf, lo + bb, 3), _f(buf, lo + bb + 16, 3)
         if all(math.isfinite(x) for x in mn + mx) and all(mn[i] <= mx[i] for i in range(3)):
             add(R, "aabb_valid")
@@ -223,11 +231,12 @@ def grass_list(V, P, blocks, structs, buf, lo, R):
     list_common(structs, GRASS_LIST, buf, lo, R)
     for field, key in (("IsSLODList", "IsSLODList"),):
         at = member(structs, GRASS_LIST, field)
-        if at is not None:
+        if at is not None and 0 <= lo + at < len(buf):
             add(R.setdefault(key, {}), str(buf[lo + at]))
     ot = member(structs, GRASS_LIST, "OrientToTerrain")
-    if ot is not None:
-        add(R.setdefault("OrientToTerrain", {}), repr(round(_f(buf, lo + ot)[0], 2)))
+    if ot is not None and 0 <= lo + ot and lo + ot + 4 <= len(buf):
+        val = _f(buf, lo + ot)[0]
+        add(R.setdefault("OrientToTerrain", {}), repr(round(val, 2)) if math.isfinite(val) else repr(val))
     il = member(structs, GRASS_LIST, "InstanceList")
     ref = array(V, P, blocks, buf, lo + il) if il is not None else None
     if ref == "empty":
@@ -271,7 +280,10 @@ def resource_buffers(m, s, size):
         nxt = (pos + 15) & ~15
         if nxt >= size or not wi.ZHDR.match(m, nxt, size):
             break
-        more, mused, meof, _ = wi._inflate_stream(m, nxt, size, 64 << 20, keep=True)
+        try:
+            more, mused, meof, _ = wi._inflate_stream(m, nxt, size, 64 << 20, keep=True)
+        except zlib.error:
+            break
         if not meof:
             break
         parts.append(more)
@@ -324,6 +336,8 @@ def scan(path, T, start=None, limit=None):
                         measure(V, P, T)
                     except (struct.error, IndexError):
                         add(T, "resources_truncated")
+                else:
+                    add(T, "resources_truncated")
                 pos = s + max(used, 1)
 
 
@@ -358,7 +372,10 @@ def main(argv=None):
         return 2
     # The report is written after the whole scan, so check its path first: an archive given as --json used to be
     # replaced by the report (exit 0), and a directory ended the run in a traceback.
-    if args.json:
+    if args.json is not None:
+        if not args.json.strip():
+            print("error: --json path must not be empty", file=sys.stderr)
+            return 2
         if os.path.isdir(args.json):
             print(f"error: --json {args.json} is a directory", file=sys.stderr)
             return 2
@@ -377,11 +394,15 @@ def main(argv=None):
             print(f"error: {exc}", file=sys.stderr)
             return 2
     print(json.dumps(T, indent=1, sort_keys=True))
-    if args.json:
+    if args.json is not None:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as fh:
-                json.dump(T, fh, indent=1, sort_keys=True)
+            out_dir = os.path.dirname(os.path.abspath(args.json))
+            os.makedirs(out_dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=out_dir) as staging:
+                staged = os.path.join(staging, "instance_lists.json")
+                with open(staged, "w", encoding="utf-8", newline="\n") as fh:
+                    json.dump(T, fh, indent=1, sort_keys=True)
+                os.replace(staged, args.json)
         except OSError as exc:
             print(f"error: cannot write {args.json}: {exc.strerror or exc}", file=sys.stderr)
             return 2

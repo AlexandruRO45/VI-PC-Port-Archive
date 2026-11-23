@@ -209,6 +209,65 @@ class MeasureTests(unittest.TestCase):
         il.prop_list(bytes(pl), inst, blocks, structs, bytes(pl), 0, R)
         self.assertEqual(R.get("instances_truncated"), 1)
 
+    def test_truncated_list_block_counted_unresolved_without_dropping_siblings(self):
+        V = bytearray(self.V)
+        # Move PROP_LIST block pointer to 0x100 bytes from the end of V (0x170 bytes do not fit).
+        struct.pack_into("<Q", V, 0x200 + 8, 0x50000000 | (len(V) - 0x100))
+        T = {}
+        self.assertTrue(il.measure(bytes(V), self.P, T))
+        self.assertEqual(T.get("list_blocks_unresolved"), 1)
+        self.assertNotIn("prop", T)
+        self.assertEqual(T["grass"]["lists"], 1)
+        self.assertEqual(T["grass"]["instances"], 3)
+
+    def test_array_out_of_bounds_field_and_pointer_offset_return_none(self):
+        structs, blocks = il.schema(self.V)
+        self.assertIsNone(il.array(self.V, self.P, blocks, b"\0" * 8, 0))
+        self.assertIsNone(il.array(self.V, self.P, blocks, b"\0" * 16, -1))
+        pl = bytearray(prop_list())
+        # Intra-block offset == len(P) pushes target past end of physical buffer.
+        struct.pack_into("<QH", pl, 0x90, 3 | (len(self.P) << 20), 5)
+        self.assertIsNone(il.array(self.V, self.P, blocks, bytes(pl), 0x90))
+        R = {}
+        il.prop_list(self.V, self.P, blocks, structs, bytes(pl), 0, R)
+        self.assertEqual(R["lists"], 1)
+        self.assertEqual(R["lists_unresolved"], 1)
+        self.assertNotIn("instances", R)
+
+    def test_list_common_and_grass_out_of_bounds_member_offsets_do_not_crash(self):
+        short_buf = b"\0" * 4
+        structs = {
+            il.PROP_LIST: (0x170, {M[k]: (100, 0x21) for k in (
+                "lodLevel", "ScaleRange", "InstanceLodDist", "lodDist", "BatchAABB", "InstanceList")}),
+            il.GRASS_LIST: (0x1A0, {M[k]: (100, 0x21) for k in (
+                "lodLevel", "ScaleRange", "InstanceLodDist", "lodDist", "BatchAABB",
+                "IsSLODList", "OrientToTerrain", "InstanceList")}),
+        }
+        R_prop = {}
+        il.prop_list(self.V, self.P, [], structs, short_buf, 0, R_prop)
+        self.assertEqual((R_prop["lists"], R_prop["lists_unresolved"]), (1, 1))
+        R_grass = {}
+        il.grass_list(self.V, self.P, [], structs, short_buf, 0, R_grass)
+        self.assertEqual((R_grass["lists"], R_grass["lists_unresolved"]), (1, 1))
+
+    def test_infinite_scale_range_and_lod_dist_are_not_counted_valid(self):
+        V = bytearray(self.V)
+        struct.pack_into("<2f", V, 0x800 + 0x160, 1.0, float("inf"))
+        struct.pack_into("<f", V, 0x800 + 0x60, float("inf"))
+        T = {}
+        self.assertTrue(il.measure(bytes(V), self.P, T))
+        self.assertEqual(T["prop"]["scale_range_ordered"], 0)
+        self.assertEqual(T["prop"]["instance_loddist_le_loddist"], 0)
+
+    def test_nonfinite_orient_to_terrain_is_recorded_cleanly(self):
+        for value in (float("nan"), float("inf")):
+            with self.subTest(value=value):
+                V = bytearray(self.V)
+                struct.pack_into("<f", V, 0xA00 + 0xC0, value)
+                T = {}
+                self.assertTrue(il.measure(bytes(V), self.P, T))
+                self.assertEqual(T["grass"]["OrientToTerrain"], {repr(value): 1})
+
 
 class ArchiveTests(unittest.TestCase):
     def test_end_to_end(self):
@@ -315,6 +374,49 @@ class ArchiveTests(unittest.TestCase):
                                        capture_output=True, text=True)
                     self.assertEqual(r.returncode, 2, r.stderr)
                     self.assertNotIn("<lambda>", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertEqual(r.stdout, "")
+
+    def test_corrupt_continuation_stream_keeps_virtual_buffer(self):
+        V, _ = resource()
+        first = zlib.compress(V)
+        first += b"\0" * (-len(first) % 16)
+        # Valid virtual stream (vc=1, pc=1) followed by a corrupt continuation stream at 16B alignment.
+        blob = b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + first + b"\x78\x9c\xff\xff\xff\xff"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fake.rpf")
+            with open(path, "wb") as fh:
+                fh.write(blob)
+            T = {}
+            il.scan(path, T)
+        self.assertEqual(T.get("map_resources_read"), 1)
+        self.assertEqual(T.get("resources_with_lists"), 1)
+        self.assertEqual(T["prop"]["lists_unresolved"], 1)
+        self.assertEqual(T["grass"]["lists_unresolved"], 1)
+
+    def test_truncated_first_stream_counts_as_truncated(self):
+        V, _ = resource()
+        comp = zlib.compress(V)
+        # Keep the 0DRPz header intact inside the prefix, but truncate before zlib stream EOF.
+        truncated = comp[:-8]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fake.rpf")
+            with open(path, "wb") as fh:
+                fh.write(b"RPF9" + struct.pack("<I", 16) + b"\0" * 8 + truncated)
+            T = {}
+            il.scan(path, T)
+        self.assertEqual(T.get("map_resources_read"), 1)
+        self.assertEqual(T.get("resources_truncated"), 1)
+
+    def test_empty_json_path_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._archive(tmp)
+            for bad in ("", "   "):
+                with self.subTest(json_arg=bad):
+                    r = subprocess.run([sys.executable, "-I", TOOL, path, "--json", bad],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 2, r.stderr)
+                    self.assertIn("must not be empty", r.stderr)
                     self.assertNotIn("Traceback", r.stderr)
                     self.assertEqual(r.stdout, "")
 
