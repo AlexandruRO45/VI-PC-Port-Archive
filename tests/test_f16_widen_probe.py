@@ -105,6 +105,39 @@ class Sweep(unittest.TestCase):
             entry["one_3c00"]["classes"], ["payload"]
         )  # a finite half is the same either way
 
+    def test_sweep_rejects_a_load_that_returned_fewer_lanes_than_the_format(self):
+        class ShortLanesOracle(FakeOracle):
+            def run(self, kernels, words=4):
+                # two words per kernel: enough for the x and xy loads, not for xyzw
+                return [g[:2] for g in super().run(kernels, words)]
+
+        with self.assertRaises(RuntimeError) as ctx:
+            probe.sweep(ShortLanesOracle(), hw_asm, 32)
+        self.assertIn("xyzw", str(ctx.exception))
+        self.assertIn("expected 4", str(ctx.exception))
+
+    def test_sweep_rejects_an_oracle_that_answered_fewer_kernels_than_asked(self):
+        class DroppedOracle(FakeOracle):
+            def run(self, kernels, words=4):
+                return super().run(kernels, words)[:-3]
+
+        # a short results list must fail in sweep() with a clear message, not as a KeyError from print_table.
+        with self.assertRaises(RuntimeError) as ctx:
+            probe.sweep(DroppedOracle(), hw_asm, 32)
+        self.assertIn("the oracle returned", str(ctx.exception))
+        self.assertIn("kernels", str(ctx.exception))
+
+    def test_sweep_rejects_the_alu_case_without_an_output_word(self):
+        class EmptyAluOracle(FakeOracle):
+            def run(self, kernels, words=4):
+                got = super().run(kernels, words)
+                # the ALU batch is the second call: as many kernels as there are halves
+                return [[] if len(got) == len(probe.HALVES) else g for g in got]
+
+        with self.assertRaises(RuntimeError) as ctx:
+            probe.sweep(EmptyAluOracle(), hw_asm, 32)
+        self.assertIn("no output word", str(ctx.exception))
+
     def test_json_report_has_the_measured_table(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "sub", "report.json")

@@ -176,9 +176,19 @@ def sweep(oracle, asm_mod, wave):
                 _kernel(asm_mod, f"{form}_load_format_{suffix}", code, half, wave)
             )
     got = oracle.run(kernels, words=16)
+    # Every kernel must answer: zip() over a shorter list would drop the missing cases and print_table would
+    # then KeyError on a half-filled case (the same contract d16_format_probe.py checks, BUILD-733).
+    if len(got) != len(order):
+        raise RuntimeError(
+            f"wave{wave}: the oracle returned {len(got)} results for {len(order)} kernels"
+        )
     for (case, code, form, suffix, n, label, half), words in zip(order, got):
         if isinstance(words, str):
             raise RuntimeError(f"{case} {label} wave{wave}: {words}")
+        if len(words) < n:
+            raise RuntimeError(
+                f"{case} {label} wave{wave}: the load produced {len(words)} f32 lanes, expected {n}"
+            )
         lanes = words[:n]
         case_out = out.setdefault(case, {})
         case_out[label] = {
@@ -191,9 +201,17 @@ def sweep(oracle, asm_mod, wave):
         order.append(("alu/v_cvt_f32_f16", label, half))
         kernels.append(_alu_kernel(asm_mod, half, wave))
     got = oracle.run(kernels, words=16)
+    if len(got) != len(order):
+        raise RuntimeError(
+            f"wave{wave}: the oracle returned {len(got)} results for {len(order)} kernels"
+        )
     for (case, label, half), words in zip(order, got):
         if isinstance(words, str):
             raise RuntimeError(f"{case} {label} wave{wave}: {words}")
+        if len(words) < 1:
+            raise RuntimeError(
+                f"{case} {label} wave{wave}: the kernel produced no output word"
+            )
         out.setdefault(case, {})[label] = {
             "half": f"0x{half:04x}",
             "words": [f"0x{words[0]:08x}"],
