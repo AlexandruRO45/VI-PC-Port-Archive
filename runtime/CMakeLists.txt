@@ -423,6 +423,16 @@ elseif(NOT WIN32)
   message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux")
 endif()
 
+# RT-518: Windows converts a program's narrow argv to the ANSI code page, so a test given a file path in a build folder
+# that page cannot spell (%TEMP%\leo\<CJK>\L on code page 1252) got '?' in its place and could not open the file. The
+# manifest makes UTF-8 the test's ANSI code page, which std::ifstream and std::filesystem::path(char*) then use too.
+# Only for MSVC builds on a Windows host: the clang-cl cross build for Wine links as before.
+function(leonida_utf8_code_page target)
+  if(MSVC AND CMAKE_HOST_WIN32)
+    target_sources(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test/utf8_code_page.manifest")
+  endif()
+endfunction()
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
@@ -680,6 +690,7 @@ if(BUILD_TESTING)
     target_compile_options(tiny_game_abort_test PRIVATE /W4 /permissive- /utf-8)
     add_dependencies(tiny_game_abort_test gta6rt tiny_game)
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
+    leonida_utf8_code_page(pe_loader_test)
 
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
     # base relocations (HIGHLOW included). No fixture DLL is needed; the images are written to a temporary folder.
@@ -743,6 +754,7 @@ if(BUILD_TESTING)
     add_test(NAME loader_tls
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
+    leonida_utf8_code_page(loader_tls_test)
 
     # DisableThreadLibraryCalls from a mapped DllMain (shims/library_loader.cpp). The fixture is built without the CRT, so
     # DllMain's only work is that one call. No game files.
@@ -775,6 +787,7 @@ if(BUILD_TESTING)
     add_test(NAME dll_thread_calls
       COMMAND dll_thread_calls_test "$<TARGET_FILE:dll_thread_calls>"
     )
+    leonida_utf8_code_page(dll_thread_calls_test)
 
     # The host GameInput path (docs/gameinput.md): mapped code that imports GameInputCreate from GameInput.dll, with no
     # GameInput shim linked. Needs the SDK's gameinput.lib and GameInput.h to build the fixture, and a GameInput.dll on
@@ -801,6 +814,7 @@ if(BUILD_TESTING)
       target_compile_options(gameinput_host_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
       add_dependencies(gameinput_host_test gameinput_host)
       add_test(NAME gameinput_host COMMAND gameinput_host_test "$<TARGET_FILE:gameinput_host>")
+      leonida_utf8_code_page(gameinput_host_test)
       set_tests_properties(gameinput_host PROPERTIES SKIP_RETURN_CODE 77)  # Windows cannot load GameInput.dll
     endif()
 
@@ -1280,6 +1294,7 @@ if(TARGET Vulkan::Headers)
              "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/vk_pipeline_check_cli_input"
              "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
+    leonida_utf8_code_page(vk_pipeline_check)
     add_test(NAME vk_texture_cube_alpha COMMAND vk_texture_test --self-test-cube-alpha)
     if(WIN32)
       # Reads SizeOfStackReserve from the built file; the program is not run, so it needs no emulator.
@@ -1299,6 +1314,7 @@ if(TARGET Vulkan::Headers)
     set(LEONIDA_XDXR_OUT "${CMAKE_CURRENT_BINARY_DIR}/xdxr_build_cases")
     file(MAKE_DIRECTORY "${LEONIDA_XDXR_OUT}")
     add_test(NAME xdxr_build COMMAND vk_xdxr_build_test "${LEONIDA_XDXR_OUT}")
+    leonida_utf8_code_page(vk_xdxr_build_test)
     set_tests_properties(xdxr_build PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_SETUP xdxr_build_cases)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)
@@ -1366,6 +1382,7 @@ if(TARGET Vulkan::Headers)
                "${CMAKE_CURRENT_BINARY_DIR}/overlapping_occlusion.frag.spv" --no-statistics)
       set_tests_properties(vk_overlapping_occlusion vk_overlapping_occlusion_no_statistics
                            PROPERTIES SKIP_RETURN_CODE 77)
+      leonida_utf8_code_page(vk_overlapping_occlusion_test)
     endif()
   endif()
   # CPU-only: the ranking that makes these harnesses prefer a native ICD over Mesa's Dozen (#915). No GPU needed.
@@ -1461,6 +1478,7 @@ if(TARGET Vulkan::Headers)
                "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.vert.spv"
                "${CMAKE_CURRENT_BINARY_DIR}/binary_occlusion.frag.spv")
       set_tests_properties(vk_binary_occlusion PROPERTIES SKIP_RETURN_CODE 77)
+      leonida_utf8_code_page(vk_binary_occlusion_test)
     endif()
   endif()
   # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
@@ -1595,6 +1613,7 @@ if(TARGET Vulkan::Headers)
     set(LEONIDA_D3D12_XDXR_OUT "${CMAKE_CURRENT_BINARY_DIR}/d3d12_xdxr_cases")
     file(MAKE_DIRECTORY "${LEONIDA_D3D12_XDXR_OUT}")
     add_test(NAME d3d12_xdxr_rt COMMAND d3d12_xdxr_rt_test "${LEONIDA_D3D12_XDXR_OUT}")
+    leonida_utf8_code_page(d3d12_xdxr_rt_test)
     set_tests_properties(d3d12_xdxr_rt PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 FIXTURES_SETUP d3d12_xdxr_cases)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)

@@ -118,7 +118,9 @@ add a source file, add it to `runtime\CMakeLists.txt` and to the file list in `b
 A checkout under a folder whose name is not ASCII builds too (RT-518): `glslangValidator` reads its arguments in the
 ANSI code page and, with `-V`, aborts with `0xC0000409` in a working directory that page cannot spell, so CMake runs
 it there through the folders' 8.3 short names (`runtime\cmake\glslang_short_paths.cmake`). On a drive with 8.3 names
-turned off the configure warns, and the GLSL test shaders need an ASCII folder.
+turned off the configure warns, and the GLSL test shaders need an ASCII folder. The tests that get file paths on
+their command line (`pe_loader`, the occlusion tests, `xdxr_build`, ...) link `runtime\test\utf8_code_page.manifest`,
+which makes UTF-8 their ANSI code page, so the narrow `argv` Windows hands them spells such a folder too.
 
 ## Asset status (no exe needed)
 
