@@ -640,6 +640,19 @@ int main() {
                   adds(request, L"X-Co: b", WINHTTP_ADDREQ_FLAG_COALESCE_WITH_SEMICOLON) &&
                   adds(request, L"X-Co:", kReplace) && fails(request, L"X-Co:", kReplace, kNotFound),
               "COALESCE merges into the header there instead of adding another");
+        check(adds(request, L"X-Rn:", kReplace | kAddIfNew) && fails(request, L"X-Rn: 1", kAddIfNew, kExists) &&
+                  fails(request, L"X-Rn: 2", kReplace | kAddIfNew, kExists),
+              "REPLACE | ADD_IF_NEW adds a missing header, even with an empty value, and fails on one there");
+        const auto conflicting = [&](DWORD modifiers) {
+            return fails(request, L"X-Cf: 1", modifiers, ERROR_INVALID_PARAMETER) && adds(request, L"X-Cf: 0", kAdd) &&
+                   fails(request, L"X-Cf: 2", modifiers, ERROR_INVALID_PARAMETER) && adds(request, L"X-Cf:", kReplace);
+        };
+        check(conflicting(kReplace | WINHTTP_ADDREQ_FLAG_COALESCE_WITH_COMMA),
+              "REPLACE | COALESCE fails with ERROR_INVALID_PARAMETER, with or without the header");
+        check(conflicting(kReplace | WINHTTP_ADDREQ_FLAG_COALESCE_WITH_SEMICOLON),
+              "so does REPLACE | COALESCE_WITH_SEMICOLON");
+        check(conflicting(WINHTTP_ADDREQ_FLAG_COALESCE_WITH_COMMA | WINHTTP_ADDREQ_FLAG_COALESCE_WITH_SEMICOLON),
+              "and COALESCE | COALESCE_WITH_SEMICOLON");
         close(other);
         close(request);
         close(connection);

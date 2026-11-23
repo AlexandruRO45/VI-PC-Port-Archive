@@ -339,7 +339,8 @@ DWORD add_header(std::vector<Header>& headers, const std::wstring& line, DWORD m
             headers.erase(it);
         else if (found)
             it->second = std::move(value);
-        else if ((modifiers & WINHTTP_ADDREQ_FLAG_ADD) && !value.empty())
+        else if ((modifiers & WINHTTP_ADDREQ_FLAG_ADD_IF_NEW) ||
+                 ((modifiers & WINHTTP_ADDREQ_FLAG_ADD) && !value.empty()))
             headers.emplace_back(std::move(name), std::move(value));
         else
             return ERROR_WINHTTP_HEADER_NOT_FOUND;
@@ -358,7 +359,10 @@ BOOL WINAPI add_request_headers(HINTERNET request, LPCWSTR headers, DWORD length
     DWORD error = 0;
     Handle* r = acquire(request, false, false, true, error);
     if (!r) return fail(error);
-    if (!header_block_valid(headers, length)) {
+    constexpr DWORD kCoalesce = WINHTTP_ADDREQ_FLAG_COALESCE_WITH_COMMA | WINHTTP_ADDREQ_FLAG_COALESCE_WITH_SEMICOLON;
+    const DWORD coalesce = modifiers & kCoalesce;
+    const bool conflicting = coalesce == kCoalesce || (coalesce && (modifiers & WINHTTP_ADDREQ_FLAG_REPLACE));
+    if (conflicting || !header_block_valid(headers, length)) {
         release(r);
         return fail(ERROR_INVALID_PARAMETER);
     }
