@@ -1,13 +1,12 @@
 #pragma once
 
-// Which registered buffer a console VA falls in (VulkanContext::buffer_at, for vertex and index views and
-// WriteBufferImmediate). Ranges are kept ordered by their first VA, so a lookup is a binary search instead of a scan of
-// every registered resource. No Vulkan or Windows dependency; not thread-safe (VulkanContext guards it with
-// resource_mutex_, like the bindings themselves).
+// Which registered buffer holds a console VA or range. Ranges are kept ordered by their first VA, so a lookup starts
+// with a binary search instead of a scan of every registered resource. No Vulkan or Windows dependency; not
+// thread-safe (VulkanContext guards it with resource_mutex_, like the bindings themselves).
 //
 // D3D12 lets placed buffers alias, so ranges may overlap. A lookup then returns the containing range that starts
 // closest below the VA (the larger ID on a tie): the walk goes down from the nearest start and stops once no range can
-// still reach the VA, which `longest_` bounds. Without overlaps the first range it looks at is the answer, or none is.
+// still hold the requested bytes, which `longest_` bounds.
 // `longest_` is the longest range indexed now, not the longest ever: a large buffer that is freed stops lengthening
 // later misses. A miss still walks every start within the longest live range below the VA.
 
@@ -50,14 +49,19 @@ public:
     };
 
     // The range that holds `va`; false when none does.
-    bool find(std::uint64_t va, Hit& out) const {
+    bool find(std::uint64_t va, Hit& out) const { return find(va, 1, out); }
+
+    // The range that holds every requested byte. A shorter alias or adjacent buffer cannot cover the request.
+    bool find(std::uint64_t va, std::uint64_t bytes, Hit& out) const {
+        if (!bytes || bytes > longest_ || bytes - 1 > UINT64_MAX - va) return false;
+        const std::uint64_t max_offset = longest_ - bytes;
         auto it = ranges_.upper_bound({va, max_id()});
         while (it != ranges_.begin()) {
             --it;
             const std::uint64_t start = it->first.first;
             const std::uint64_t offset = va - start;  // start <= va here
-            if (offset >= longest_) return false;    // no range that starts this low reaches va
-            if (offset < it->second) {
+            if (offset > max_offset) return false;   // no range that starts this low holds all the bytes
+            if (offset < it->second && bytes <= it->second - offset) {
                 out = {it->first.second, start, it->second};
                 return true;
             }

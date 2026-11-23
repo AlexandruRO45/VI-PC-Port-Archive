@@ -2765,8 +2765,10 @@ Vulkan AS would be invisible to them. Two paths:
    The layout is the XDXR BVH4 runtime form ([bvh.md](bvh.md) §3.1). `tools/xdxr_bvh.py` encodes it on the
    CPU, with a reference traversal and a validator ([bvh.md](bvh.md) §7a). `runtime/src/xdxr_build.h` builds it on
    the GPU and is checked against that reference. The standalone device uses it for `BuildRaytracingAccelerationStructure`
-   and answers `GetRaytracingAccelerationStructurePrebuildInfo` from its layout, exactly. Acceleration-structure
-   buffers then keep their console VAs, the addresses the records name each other by. `LEONIDA_RT_AS=khr` keeps
+   and answers `GetRaytracingAccelerationStructurePrebuildInfo` from its layout, exactly. Before recording, replay
+   checks that the result, scratch, any separate refit source, and any contiguous TLAS instance array each fit in one
+   registered buffer. Acceleration-structure buffers keep their console VAs, the addresses the records name each
+   other by. `LEONIDA_RT_AS=khr` keeps
    #743's `VkAccelerationStructureKHR` builds (for `RayQueryKHR`), which the game's shaders can't read. Updates refit
    the source structure instead of rebuilding it, `CopyRaytracingAccelerationStructure` clones and compacts, and the
    postbuild compacted and current sizes are written ([bvh.md](bvh.md) §7a). Serialization and the Xbox

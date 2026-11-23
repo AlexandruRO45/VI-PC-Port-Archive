@@ -877,10 +877,8 @@ public:
         if (xdxr && loaded_) {
             xdxr_ = std::make_unique<XdxrBuilder>(get, device);
             if (xdxr_->loaded()) {
-                replay_.xdxr_check = [](const BuildAccelerationStructure& b) {
-                    XdxrLayout layout;
-                    return xdxr_inputs(b, nullptr, 0) && layout.compute(xdxr_elements(b), b.is_tlas) && b.dst_va &&
-                           b.scratch_va && (!b.is_tlas || !b.instance_count || b.instances_va);
+                replay_.xdxr_check = [this](const BuildAccelerationStructure& b) {
+                    return xdxr_build_supported(b, buffer_vas_);
                 };
                 replay_.xdxr_record = [this](VkCommandBuffer cb, const BuildAccelerationStructure& b) {
                     // Every address is a console VA in the GPU address arena: the device address is heap_base + VA,
@@ -1140,6 +1138,22 @@ public:
             out->push_back(g);
         }
         return true;
+    }
+
+    // Validate the build's known byte ranges in console VA space before recording heap_base + VA accesses.
+    static bool xdxr_build_supported(const BuildAccelerationStructure& b, const BufferVaIndex<ResourceId>& buffers) {
+        XdxrLayout layout;
+        if (!xdxr_inputs(b, nullptr, 0) || !layout.compute(xdxr_elements(b), b.is_tlas)) return false;
+
+        BufferVaIndex<ResourceId>::Hit hit;
+        if (!buffers.find(b.dst_va, layout.size, hit) || !buffers.find(b.scratch_va, layout.scratch, hit))
+            return false;
+
+        // An out-of-place refit copies layout.size bytes from its source. An in-place refit uses the checked result.
+        if (b.update && b.src_va && b.src_va != b.dst_va && !buffers.find(b.src_va, layout.size, hit)) return false;
+
+        // The builder reads one 64-byte D3D12_RAYTRACING_INSTANCE_DESC per instance.
+        return !b.is_tlas || !b.instance_count || buffers.find(b.instances_va, 64ull * b.instance_count, hit);
     }
 
     void register_acceleration_structure(std::uint64_t va, VkAccelerationStructureKHR as) {

@@ -2,7 +2,8 @@
 // 4.8, src/xdxr_build.h), the layout the game's translated traversal shaders read. A BLAS of two geometries (an
 // unindexed triangle soup, and an R16-indexed grid with a 16-byte stride and a 3x4 transform) and a TLAS of three
 // instances are built through the D3D12 API, sized by GetRaytracingAccelerationStructurePrebuildInfo, copied to
-// readback buffers and written to <out dir>; the BLAS is then updated in place (PERFORM_UPDATE) after its soup moves,
+// readback buffers and written to <out dir>. Build addresses use nonzero offsets, with the results and the instance
+// array ending at their respective buffer boundaries. The BLAS is then updated in place after its soup moves,
 // and written again as d3d12_blas_update; then its postbuild COMPACTED_SIZE and a TLAS rebuild's CURRENT_SIZE are
 // checked against the prebuild sizes, and the BLAS is compacted (CopyRaytracingAccelerationStructure COMPACT) into a
 // buffer of exactly that size, written as d3d12_blas_compacted as <case>.bin + <case>.json at their console GPU virtual addresses.
@@ -118,7 +119,11 @@ int main(int argc, char** argv) {
     const float transform[12] = {0, 2, 0, 1, 0, 0, 1, -2, 2, 0, 0, 3};   // exact in float
 
     const UINT64 soup_bytes = soup.size() * 4, grid_bytes = grid.size() * 4, index_bytes = indices.size() * 2;
-    const UINT64 upload_size = 256 + soup_bytes + grid_bytes + index_bytes + 64 + 3 * 64;
+    constexpr UINT instance_count = 3;
+    constexpr UINT64 instance_alignment = D3D12_RAYTRACING_INSTANCE_DESCS_BYTE_ALIGNMENT;
+    const UINT64 geometry_bytes = 256 + soup_bytes + grid_bytes + index_bytes + sizeof transform;
+    const UINT64 instances_offset = (geometry_bytes + instance_alignment - 1) & ~(instance_alignment - 1);
+    const UINT64 upload_size = instances_offset + instance_count * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
     Ref<ID3D12Resource> upload;
     HRESULT hr = buffer(device.p, D3D12_HEAP_TYPE_UPLOAD, upload_size, D3D12_RESOURCE_STATE_GENERIC_READ,
                         D3D12_RESOURCE_FLAG_NONE, upload.put());
@@ -170,42 +175,49 @@ int main(int argc, char** argv) {
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlas_inputs{};
     tlas_inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     tlas_inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    tlas_inputs.NumDescs = 3;
+    tlas_inputs.NumDescs = instance_count;
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlas_info{};
     device->GetRaytracingAccelerationStructurePrebuildInfo(&tlas_inputs, &tlas_info);
     if (!tlas_info.ResultDataMaxSizeInBytes) return fail("TLAS prebuild info is empty");
 
     const D3D12_RESOURCE_FLAGS uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     const D3D12_RESOURCE_STATES as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+    constexpr UINT64 build_offset = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
     Ref<ID3D12Resource> blas, tlas, scratch, blas_rb, tlas_rb;
     const UINT64 scratch_size = blas_info.ScratchDataSizeInBytes > tlas_info.ScratchDataSizeInBytes
                                     ? blas_info.ScratchDataSizeInBytes : tlas_info.ScratchDataSizeInBytes;
-    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, blas_info.ResultDataMaxSizeInBytes, as_state, uav, blas.put())) ||
-        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, tlas_info.ResultDataMaxSizeInBytes, as_state, uav, tlas.put())) ||
-        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, scratch_size, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, uav,
-                           scratch.put())) ||
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, build_offset + blas_info.ResultDataMaxSizeInBytes,
+                           as_state, uav, blas.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, build_offset + tlas_info.ResultDataMaxSizeInBytes,
+                           as_state, uav, tlas.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, build_offset + scratch_size,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, uav, scratch.put())) ||
         FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, blas_info.ResultDataMaxSizeInBytes,
                            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, blas_rb.put())) ||
         FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, tlas_info.ResultDataMaxSizeInBytes,
                            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, tlas_rb.put())))
         return fail("acceleration-structure buffers", hr);
-    if (blas->GetGPUVirtualAddress() % 256 || tlas->GetGPUVirtualAddress() % 256)
-        return fail("acceleration structures must be 256-byte aligned");
+    const UINT64 blas_va = blas->GetGPUVirtualAddress() + build_offset;
+    const UINT64 tlas_va = tlas->GetGPUVirtualAddress() + build_offset;
+    const UINT64 scratch_va = scratch->GetGPUVirtualAddress() + build_offset;
+    if (blas_va % build_offset || tlas_va % build_offset || scratch_va % build_offset)
+        return fail("build addresses must be 256-byte aligned");
 
     // ---- instances: identity, rotated + translated, and masked out ----
     const float c = std::cos(0.7f), s = std::sin(0.7f);
-    const float xforms[3][12] = {{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
+    const float xforms[instance_count][12] = {{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
                                  {c, -s, 0, 9, s, c, 0, -1, 0, 0, 1, 0.5f},
                                  {2, 0, 0, -9, 0, 0.5f, 0, 2, 0, 0, 1.5f, 1}};
-    const UINT masks[3] = {0xff, 0x01, 0x00};
-    D3D12_RAYTRACING_INSTANCE_DESC instances[3]{};
-    for (int i = 0; i < 3; ++i) {
+    const UINT masks[instance_count] = {0xff, 0x01, 0x00};
+    D3D12_RAYTRACING_INSTANCE_DESC instances[instance_count]{};
+    for (UINT i = 0; i < instance_count; ++i) {
         std::memcpy(instances[i].Transform, xforms[i], sizeof xforms[i]);
         instances[i].InstanceID = 20 + i;
         instances[i].InstanceMask = masks[i];
-        instances[i].AccelerationStructure = blas->GetGPUVirtualAddress();
+        instances[i].AccelerationStructure = blas_va;
     }
-    const UINT64 instances_va = place(instances, sizeof instances, 16);
+    at = instances_offset;
+    const UINT64 instances_va = place(instances, sizeof instances, instance_alignment);
     upload->Unmap(0, nullptr);
     tlas_inputs.InstanceDescs = instances_va;
 
@@ -224,21 +236,21 @@ int main(int argc, char** argv) {
         return fail("queue, allocator, list or fence");
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build{};
     build.Inputs = blas_inputs;
-    build.DestAccelerationStructureData = blas->GetGPUVirtualAddress();
-    build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    build.DestAccelerationStructureData = blas_va;
+    build.ScratchAccelerationStructureData = scratch_va;
     list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = nullptr;                         // every UAV: the BLAS and the scratch
     list->ResourceBarrier(1, &barrier);
     build.Inputs = tlas_inputs;
-    build.DestAccelerationStructureData = tlas->GetGPUVirtualAddress();
+    build.DestAccelerationStructureData = tlas_va;
     list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
     list->ResourceBarrier(1, &barrier);
     // The layer keeps buffers in one memory, so a copy out of an acceleration structure reads its bytes as they are
     // (D3D12 itself only allows CopyRaytracingAccelerationStructure; this is a test of the layer's records).
-    list->CopyBufferRegion(blas_rb.p, 0, blas.p, 0, blas_info.ResultDataMaxSizeInBytes);
-    list->CopyBufferRegion(tlas_rb.p, 0, tlas.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+    list->CopyBufferRegion(blas_rb.p, 0, blas.p, build_offset, blas_info.ResultDataMaxSizeInBytes);
+    list->CopyBufferRegion(tlas_rb.p, 0, tlas.p, build_offset, tlas_info.ResultDataMaxSizeInBytes);
     if (FAILED(hr = list->Close())) return fail("Close", hr);
     ID3D12CommandList* lists[] = {list.p};
     queue->ExecuteCommandLists(1, lists);
@@ -292,18 +304,18 @@ int main(int argc, char** argv) {
     };
     const std::string tris = triangles_json(soup);
     if (!dump(blas_rb.p, blas_info.ResultDataMaxSizeInBytes, "d3d12_blas",
-              "{\"kind\": \"blas\", \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
+              "{\"kind\": \"blas\", \"address\": " + std::to_string(blas_va) +
                   ", \"triangles\": " + tris + "}\n"))
         return fail("BLAS readback");
     std::string inst = "[";
-    for (int i = 0; i < 3; ++i) {
+    for (UINT i = 0; i < instance_count; ++i) {
         inst += i ? ", {\"transform\": [" : "{\"transform\": [";
         for (int k = 0; k < 12; ++k) inst += (k ? ", " : "") + num(xforms[i][k]);
         inst += "], \"mask\": " + std::to_string(masks[i]) + ", \"blas\": 0}";
     }
     inst += "]";
     if (!dump(tlas_rb.p, tlas_info.ResultDataMaxSizeInBytes, "d3d12_tlas",
-              "{\"kind\": \"tlas\", \"address\": " + std::to_string(tlas->GetGPUVirtualAddress()) +
+              "{\"kind\": \"tlas\", \"address\": " + std::to_string(tlas_va) +
                   ", \"bias\": 0, \"blas\": [\"d3d12_blas\"], \"instances\": " + inst + "}\n"))
         return fail("TLAS readback");
 
@@ -321,11 +333,11 @@ int main(int argc, char** argv) {
     if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for the update");
     build.Inputs = blas_inputs;
     build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
-    build.DestAccelerationStructureData = blas->GetGPUVirtualAddress();
-    build.SourceAccelerationStructureData = blas->GetGPUVirtualAddress();
+    build.DestAccelerationStructureData = blas_va;
+    build.SourceAccelerationStructureData = blas_va;
     list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
     list->ResourceBarrier(1, &barrier);
-    list->CopyBufferRegion(blas_rb.p, 0, blas.p, 0, blas_info.ResultDataMaxSizeInBytes);
+    list->CopyBufferRegion(blas_rb.p, 0, blas.p, build_offset, blas_info.ResultDataMaxSizeInBytes);
     if (FAILED(hr = list->Close())) return fail("Close (update)", hr);
     queue->ExecuteCommandLists(1, lists);
     if (FAILED(queue->Signal(fence.p, 2))) return fail("Signal (update)");
@@ -335,7 +347,7 @@ int main(int argc, char** argv) {
     if (event) CloseHandle(event);
     if (!updated) return fail("the update did not complete");
     if (!dump(blas_rb.p, blas_info.ResultDataMaxSizeInBytes, "d3d12_blas_update",
-              "{\"kind\": \"blas\", \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
+              "{\"kind\": \"blas\", \"address\": " + std::to_string(blas_va) +
                   ", \"triangles\": " + triangles_json(moved) + "}\n"))
         return fail("BLAS readback after the update");
 
@@ -359,14 +371,14 @@ int main(int argc, char** argv) {
     if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for postbuild");
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC compacted_desc{
         info->GetGPUVirtualAddress(), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE};
-    const D3D12_GPU_VIRTUAL_ADDRESS both[2] = {blas->GetGPUVirtualAddress(), tlas->GetGPUVirtualAddress()};
+    const D3D12_GPU_VIRTUAL_ADDRESS both[2] = {blas_va, tlas_va};
     list->EmitRaytracingAccelerationStructurePostbuildInfo(&compacted_desc, 2, both);
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC current_desc{
         info->GetGPUVirtualAddress() + 16, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE};
     build = {};
     build.Inputs = tlas_inputs;
-    build.DestAccelerationStructureData = tlas->GetGPUVirtualAddress();
-    build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    build.DestAccelerationStructureData = tlas_va;
+    build.ScratchAccelerationStructureData = scratch_va;
     list->BuildRaytracingAccelerationStructure(&build, 1, &current_desc);
     list->ResourceBarrier(1, &barrier);
     list->CopyBufferRegion(info_rb.p, 0, info.p, 0, 24);
@@ -394,7 +406,7 @@ int main(int argc, char** argv) {
                            D3D12_RESOURCE_FLAG_NONE, compacted_rb.put())))
         return fail("compacted buffers", hr);
     if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for compaction");
-    list->CopyRaytracingAccelerationStructure(compacted->GetGPUVirtualAddress(), blas->GetGPUVirtualAddress(),
+    list->CopyRaytracingAccelerationStructure(compacted->GetGPUVirtualAddress(), blas_va,
                                               D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
     list->ResourceBarrier(1, &barrier);
     list->CopyBufferRegion(compacted_rb.p, 0, compacted.p, 0, sizes[0]);

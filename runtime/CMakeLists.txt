@@ -1967,6 +1967,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_clear_gate_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_clear_gate COMMAND replay_clear_gate_test)
+    # XDXR build validation uses the VA index during replay preflight (CPU mocks, no GPU).
+    add_executable(replay_xdxr_build_ranges_test test/replay_xdxr_build_ranges_test.cpp)
+    target_link_libraries(replay_xdxr_build_ranges_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_xdxr_build_ranges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_xdxr_build_ranges COMMAND replay_xdxr_build_ranges_test)
     # WriteBufferImmediate suspends conditional rendering around vkCmdUpdateBuffer so Intel drivers do not drop it.
     add_executable(replay_write_immediate_predication_test test/replay_write_immediate_predication_test.cpp)
     target_link_libraries(replay_write_immediate_predication_test PRIVATE Vulkan::Headers)
