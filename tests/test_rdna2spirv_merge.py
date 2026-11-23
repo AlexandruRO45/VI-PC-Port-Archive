@@ -43,6 +43,26 @@ class MergeShardPartsTest(unittest.TestCase):
         self.marker(1, 2)
         self.assertEqual(R.merge_shard_parts(str(self.out)), {"a": {"r": 1}, "b": {"r": 2}})
 
+    def test_bracketed_out_folder(self):
+        # A work folder like "GTA VI [PC]" is a path, not a glob pattern: unescaped, [PC] is a character class
+        # that never matches the folder itself, and the merge would find no parts.
+        self.out = Path(self.tmp.name) / "GTA VI [PC]" / "spirv"
+        self.out.mkdir(parents=True)
+        self.part(0, {"a": {"r": 1}})
+        self.part(1, {"b": {"r": 2}})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        self.assertEqual(R.merge_shard_parts(str(self.out)), {"a": {"r": 1}, "b": {"r": 2}})
+
+    def test_bracketed_out_folder_reads_its_markers(self):
+        # The markers glob is escaped too: a marker that disagrees on the count must still be seen.
+        self.out = Path(self.tmp.name) / "work [1]" / "spirv"
+        self.out.mkdir(parents=True)
+        self.part(0, {"a": {"r": 1}})
+        self.marker(0, 2)
+        self.assertEqual(R._read_shard_markers(str(self.out)), {0: 2})
+        self.assertIn("missing", self.merge_error())
+
     def test_a_complete_set_of_empty_parts_is_refused(self):
         # Every shard finished but translated nothing: index.json must not say the corpus is done.
         self.part(0, {})

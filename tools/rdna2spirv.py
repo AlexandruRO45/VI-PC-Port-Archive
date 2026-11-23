@@ -17403,7 +17403,7 @@ def _read_shard_markers(out):
     """{index: count} from the shard<i>.json markers a --shard run writes beside its index.part<i>.json."""
     import glob as _gl, json as _js
     markers = {}
-    for path in sorted(_gl.glob(os.path.join(out, "shard*.json"))):
+    for path in sorted(_gl.glob(os.path.join(_gl.escape(out), "shard*.json"))):   # out may be "GTA VI [PC]"
         m = re.fullmatch(r"shard(\d+)\.json", os.path.basename(path))
         if not m:            # make_game.py's shards.json plan is not a marker
             continue
@@ -17450,7 +17450,7 @@ def merge_shard_parts(out):
     complete set of empty parts fails closed the same way: `index.json` is the marker that says the corpus was
     translated, so publishing {} claims a translation of nothing."""
     import glob as _gl, json as _js
-    parts = sorted(_gl.glob(os.path.join(out, "index.part*.json")))
+    parts = sorted(_gl.glob(os.path.join(_gl.escape(out), "index.part*.json")))   # brackets in out are literal
     if not parts:
         raise ShardSetError(f"no index.part*.json in {out}; run --shard i/n first, then --merge")
     indices = []
