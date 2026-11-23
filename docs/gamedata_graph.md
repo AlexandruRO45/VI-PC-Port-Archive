@@ -157,3 +157,6 @@ python -I tests/test_gamedata_graph.py
 The JSON is an aggregate work product: counts, root names, category names and prefix names. It
 contains no target strings, content-set ids, offsets or per-file names, so it can be reviewed
 without copying game data.
+
+`tests/test_gamedata_graph_corpus.py` re-measures every table above from a package named by
+`LEONIDA_GAME_DIR`, carving to a temporary folder; it skips when that variable is unset.

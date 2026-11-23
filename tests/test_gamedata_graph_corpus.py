@@ -49,6 +49,10 @@ class CommonRpfGraphTest(unittest.TestCase):
                                                  "parentFile": 3, "parentPath": 40})
         self.assertEqual(summary["nodes"], {"documents": 267, "content_sets": 30, "targets": 3364, "total": 3661})
         self.assertEqual(summary["edges"]["total"], 3428)
+        self.assertEqual({kind: summary["edges"][kind] for kind in
+                          ("defines", "includes", "contains_file", "loads_changeset", "parent_path", "parent_file")},
+                         {"defines": 28, "includes": 14, "contains_file": 3315, "loads_changeset": 28,
+                          "parent_path": 40, "parent_file": 3})
         self.assertEqual((summary["edges"]["document_edges"], summary["edges"]["target_edges"]), (42, 3386))
         self.assertEqual(summary["unique"]["targets"], 3364)
 
@@ -73,7 +77,7 @@ class CommonRpfGraphTest(unittest.TestCase):
         inherit = summary["parent_path_inheritance"]
         self.assertEqual((inherit["documents"], inherit["sites"], inherit["resolved_in_document"],
                           inherit["ambiguous"], inherit["unresolved"], inherit["cycles"]), (1, 40, 40, 0, 0, 0))
-        self.assertEqual(inherit["chain_depths"], {1: 35, 2: 3, 3: 1, 4: 1})
+        self.assertEqual(inherit["chain_depths"], {"1": 35, "2": 3, "3": 1, "4": 1})  # the tool stringifies depths
 
 
 if __name__ == "__main__":
