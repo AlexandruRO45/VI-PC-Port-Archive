@@ -538,6 +538,11 @@ class GWSBranchReleaseStatusFlags:
 # ============================================================================
 
 
+# ============================================================================
+# Commit 8: Negative rejection and mutation tests
+# ============================================================================
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br_v."""
 
@@ -1072,6 +1077,148 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
             val, awakened, branch = self.interp.execute(state, inst)
             self.assertEqual(val, 1)
             self.assertEqual(self.gws.resources[expected_rid].value, 1)
+
+
+class TestNegativeRejectionAndMutations(unittest.TestCase):
+    """Commit 8: Negative rejection and mutation tests for ds_gws_sema_br_v."""
+
+    def test_assembly_syntax_rejection(self) -> None:
+        invalid_assemblies = [
+            "",
+            "   ",
+            "v_add_f32 v0, v1, v2",
+            "ds_gws_sema_p offset:0",
+            "ds_gws_sema_br_v offset:0",  # missing gds keyword
+            "ds_gws_sema_br_v gds offset:0",  # gds not at end
+            "ds_gws_sema_br_v offset:-1 gds",  # negative offset
+            "ds_gws_sema_br_v offset:70000 gds",  # offset > 65535
+            "ds_gws_sema_br_v s0 offset:0 gds",  # SGPR for vdata
+            "ds_gws_sema_br_v v256 offset:0 gds",  # VGPR > 255
+            "ds_gws_sema_br_v unexpected_token offset:0 gds",
+            "ds_gws_sema_br_x offset:0 gds",  # invalid opcode
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, TypeError, IndexError)):
+                    Instruction.parse(asm)
+
+    def test_architectural_bounds_rejection(self) -> None:
+        with self.assertRaises(ValueError):
+            GWSSemaphoreResource(res_id=-1)
+        with self.assertRaises(ValueError):
+            GWSSemaphoreResource(res_id=64)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWaveState(wave_size=128)
+
+    def test_barrier_mode_execution_rejection(self) -> None:
+        gws = GWSSubsystem()
+        gws.init_resource(10, init_val=0, res_type=GWSResourceType.BARRIER)
+        with self.assertRaises(TypeError):
+            gws.bulk_release_br_v(10, release_count=1)
+
+    def test_mutation_killer_inverted_logic(self) -> None:
+        # Mutant: decrements counter on release instead of incrementing
+        def mutant_release_br_v(res: GWSSemaphoreResource, count: int = 1) -> Tuple[int, List[int], bool]:
+            res.value = (res.value - count) & MASK32
+            return res.value, [], False
+
+        res = GWSSemaphoreResource(res_id=0, value=5)
+        mutant_val, _, _ = mutant_release_br_v(res, count=2)
+
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=5)
+        oracle_val, _, _ = ref_ds_gws_sema_br_v(gws, m0_val=0, offset=0, release_count=2)
+
+        self.assertNotEqual(mutant_val, oracle_val)
+        self.assertEqual(mutant_val, 3)
+        self.assertEqual(oracle_val, 7)
+
+    def test_mutation_killer_lifo_queue_ordering(self) -> None:
+        # Mutant: wakes newest waiter (LIFO) instead of FIFO
+        def mutant_wake_lifo(res: GWSSemaphoreResource) -> List[int]:
+            if res.wait_queue:
+                return [res.wait_queue.pop()]
+            return []
+
+        res = GWSSemaphoreResource(res_id=0, wait_queue=[101, 102, 103])
+        lifo_awakened = mutant_wake_lifo(res)
+        self.assertEqual(lifo_awakened, [103])
+
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=0)
+        for w in [101, 102, 103]:
+            gws.wait_p(0, wave_id=w)
+        _, fifo_awakened, _ = ref_ds_gws_sema_br_v(gws, m0_val=0, offset=0, release_count=1)
+        self.assertEqual(fifo_awakened, [101])
+        self.assertNotEqual(lifo_awakened, fifo_awakened)
+
+    def test_mutation_killer_ignore_exec_mask(self) -> None:
+        class MutantSIMDInterpreter(SIMDGWSInterpreter):
+            def execute(self, wave: SIMDWaveState, inst: Instruction, branch_pc: Optional[int] = None) -> Tuple[int, List[int], bool]:
+                saved = wave.exec_mask
+                wave.exec_mask = 0xFFFF_FFFF
+                try:
+                    return super().execute(wave, inst, branch_pc)
+                finally:
+                    wave.exec_mask = saved
+
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=0)
+        wave = SIMDWaveState(wave_id=1, wave_size=32, exec_mask=0, m0=0, gws=gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+
+        mutant = MutantSIMDInterpreter()
+        mutant.execute(wave, inst)
+        self.assertEqual(gws.resources[0].value, 1)  # mutant incorrectly modified state!
+
+        # Correct interpreter preserves counter when EXEC == 0
+        gws.init_resource(0, init_val=0)
+        SIMDGWSInterpreter().execute(wave, inst)
+        self.assertEqual(gws.resources[0].value, 0)
+
+    def test_mutation_killer_dropped_offset(self) -> None:
+        class MutantDroppedOffset(ScalarGWSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: Instruction, branch_pc: Optional[int] = None) -> Tuple[int, List[int], bool]:
+                no_off = Instruction(opcode=inst.opcode, offset=0, gds=inst.gds)
+                return super().execute(state, no_off, branch_pc)
+
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=0)
+        gws.init_resource(5, init_val=0)
+
+        state = ScalarThreadState(wave_id=1, m0=0, gws=gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=5, gds=True)
+
+        mutant = MutantDroppedOffset()
+        mutant.execute(state, inst)
+        self.assertEqual(gws.resources[0].value, 1)
+        self.assertEqual(gws.resources[5].value, 0)
+
+        # Reset and run correct interpreter
+        gws.init_resource(0, init_val=0)
+        gws.init_resource(5, init_val=0)
+        ScalarGWSInterpreter().execute(state, inst)
+        self.assertEqual(gws.resources[0].value, 0)
+        self.assertEqual(gws.resources[5].value, 1)
+
+    def test_mutation_killer_floating_point_flush(self) -> None:
+        def mutant_subnormal_flush(val: int) -> int:
+            f = struct.unpack(">f", struct.pack(">I", val))[0]
+            if math.fabs(f) < 1.17549435e-38:
+                f = 0.0
+            return struct.unpack(">I", struct.pack(">f", f))[0]
+
+        max_subnormal = 0x007F_FFFF
+        mutant_val = mutant_subnormal_flush(max_subnormal)
+        self.assertEqual(mutant_val, 0)
+
+        gws = GWSSubsystem()
+        gws.init_resource(0, init_val=max_subnormal)
+        ref_ds_gws_sema_br_v(gws, m0_val=0, offset=0, release_count=1)
+        self.assertEqual(gws.resources[0].value, 0x0080_0000)
+        self.assertNotEqual(mutant_val, gws.resources[0].value)
 
 
 if __name__ == "__main__":
