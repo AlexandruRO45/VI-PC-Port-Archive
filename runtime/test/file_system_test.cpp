@@ -754,6 +754,43 @@ void run_checks(const std::filesystem::path& root) {
               "moving into a missing folder reports ERROR_PATH_NOT_FOUND");
     }
 
+    // A move onto a name that is already taken fails the way the host's MoveFileExW fails on the same shapes.
+    {
+        const std::filesystem::path host = root / "host_onto";
+        write_path(host / "file.txt", "file");
+        write_path(host / "dir" / "x.txt", "x");
+        write_path(host / "target.txt", "target");
+        std::filesystem::create_directories(host / "folder");
+        write_path(package / "onto" / "file.txt", "file");
+        write_path(package / "onto" / "dir" / "x.txt", "x");
+        write_path(package / "onto" / "target.txt", "target");
+        check(mkdir_w(L"GAME:\\onto\\folder", nullptr) != FALSE, "an overlay folder to move");
+        struct Move {
+            const wchar_t* from;
+            const wchar_t* to;
+            DWORD flags;
+        };
+        const DWORD replace = MOVEFILE_REPLACE_EXISTING;
+        for (const Move& m : {Move{L"file.txt", L"dir", 0}, Move{L"file.txt", L"dir", replace},
+                              Move{L"folder", L"dir", 0}, Move{L"folder", L"dir", replace},
+                              Move{L"folder", L"target.txt", 0}, Move{L"folder", L"target.txt", replace}}) {
+            SetLastError(0);
+            const BOOL host_moved = ::MoveFileExW((host / m.from).c_str(), (host / m.to).c_str(), m.flags);
+            const DWORD host_error = host_moved ? 0 : GetLastError();
+            const std::wstring from = L"GAME:\\onto\\" + std::wstring(m.from), to = L"GAME:\\onto\\" + std::wstring(m.to);
+            SetLastError(0);
+            const DWORD game_error = move_ex_w(from.c_str(), to.c_str(), m.flags) ? 0 : GetLastError();
+            char what[192];
+            std::snprintf(what, sizeof what, "MoveFileExW of %ls onto %ls (flags %lu) fails as on the host (%lu, GAME: %lu)",
+                          m.from, m.to, m.flags, host_error, game_error);
+            check(host_error != 0 && game_error == host_error, what);
+        }
+        check(read_path(package / "onto" / "file.txt") == "file" &&
+                  !std::filesystem::exists(overlay / "onto" / "file.txt") &&
+                  std::filesystem::is_directory(overlay / "onto" / "folder"),
+              "and nothing moved");
+    }
+
     // MOVEFILE_WRITE_THROUGH on a package file: the copy and the marker are flushed before the call returns.
     {
         write_path(package / "misc" / "wt.txt", "wt");
