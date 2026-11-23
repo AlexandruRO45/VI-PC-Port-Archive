@@ -237,8 +237,13 @@ class Scrub(unittest.TestCase):
                 self.assertEqual(pd.scrub(f'File "{path}", line 3'), 'File "tools/text_tables.py", line 3')
                 self.assertEqual(pd.scrub(f"Checkout: {checkout}"), "Checkout: .")
                 self.assertEqual(pd.scrub(f"Checkout {checkout} is ready"), "Checkout . is ready")
+                self.assertEqual(pd.scrub(f"Checkout {checkout} at tools/text_tables.py"),
+                                 "Checkout . at tools/text_tables.py")
                 sibling = os.path.join(checkout + "x", f"{SENTINEL}.fssm")
                 self.assertEqual(pd.scrub(f"Error: {sibling} line 3"), "Error: <path> line 3")
+                sibling = os.path.join(checkout + " backup", f"{SENTINEL}.fssm")
+                self.assertEqual(pd.scrub(f"Error: {sibling} line 3"), "Error: <path> line 3")
+                self.assertEqual(pd.scrub(f'File "{sibling}", line 3'), 'File "<path>", line 3')
                 if os.name == "nt":
                     alternate = os.path.join(checkout.swapcase(), "tools", "text_tables.py").replace("\\", "/")
                     self.assertEqual(pd.scrub(f"Error: {alternate} line 3"), "Error: tools/text_tables.py line 3")

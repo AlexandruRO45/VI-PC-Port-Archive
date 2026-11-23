@@ -124,8 +124,10 @@ def scrub(text, limit=240):
         checkout = rf"(?i:(?<![\w/\\]){root})"
     else:
         checkout = rf"(?<![\w.:/~]){re.escape(ROOT)}"
-    # Consume a same-prefix sibling too, so shown() can redact its entire path.
-    checkout_path = rf"{checkout}[^\s'\"]*"
+    # A same-prefix sibling can continue across a space if the next word contains a path separator.
+    # Ordinary prose after a bare checkout stays visible.
+    sibling_suffix = r"[^\s'\"\\/,:;]*[ \t]+[^\s'\"\\/:]+[\\/]"
+    checkout_path = rf"{checkout}(?:{sibling_suffix})?[^\s'\"]*"
     drive_path = r"(?i:\b[a-z]:[\\/][^\s'\"]*)"
     posix_path = r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*"
     line = re.sub(rf"{checkout_path}|{drive_path}|{posix_path}", shown, line)
