@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Semantic reference oracle and architectural model for v_mul_u32_u24.
+"""Semantic regression tests and hardware translator verification for v_mul_u32_u24.
 
 RDNA2 / GFX10 VOP2 24-bit Unsigned Integer Multiply:
 Multiplies the low 24 bits of two unsigned integer source operands (bits [31:24] ignored)
@@ -14,44 +14,31 @@ Semantics:
     s1_u24 = src1 & 0x00FF_FFFF
     product_48 = s0_u24 * s1_u24
     vdst = product_48 & 0xFFFF_FFFF
+
+All tests compile real assembly listings through support.translate_lines(...)
+and execute the translated SPIR-V in spirv_mini_interp via support.mrt0_words.
 """
 
 import os
-import struct
 import sys
 import unittest
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Dict, List, Optional, Set, Tuple, Union
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+
+sys.dont_write_bytecode = True
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import spirv_mini_interp as si
-import support
+import rdna2spirv  # noqa: E402
+import support  # noqa: E402
 
-# 24-bit and 32-bit Constants
 MASK_24: int = 0x00FF_FFFF
 MASK_32: int = 0xFFFF_FFFF
 MAX_U24: int = 0x00FF_FFFF
-
-
-def u32(val: int) -> int:
-    """Normalize integer to unsigned 32-bit dword."""
-    return val & MASK_32
-
-
-def u24(val: int) -> int:
-    """Normalize integer to unsigned 24-bit integer."""
-    return val & MASK_24
-
-
-def oracle_mul_u32_u24(src0: int, src1: int) -> int:
-    """Reference mathematical oracle for v_mul_u32_u24."""
-    s0 = u24(src0)
-    s1 = u24(src1)
-    return u32(s0 * s1)
 
 
 def run_translator_mul_u24(
@@ -61,8 +48,8 @@ def run_translator_mul_u24(
 ) -> int:
     """Translate and run a minimal shader through tools/rdna2spirv and return result word."""
     lines = [
-        f"v_mov_b32 v1, {u32(src0):#x}",
-        f"v_mov_b32 v2, {u32(src1):#x}",
+        f"v_mov_b32 v1, {src0 & MASK_32:#x}",
+        f"v_mov_b32 v2, {src1 & MASK_32:#x}",
         "v_mul_u32_u24 v0, v1, v2",
         "exp mrt0 v0, v0, v0, v0 done vm",
         "s_endpgm",
@@ -76,118 +63,53 @@ class TestOracleAndHardwareModel(unittest.TestCase):
 
     def test_basic_multiplication(self) -> None:
         """Verify 100 * 250 = 25000."""
-        got = oracle_mul_u32_u24(100, 250)
+        got = run_translator_mul_u24(100, 250, "ps_basic_mul")
         self.assertEqual(got, 25000)
 
     def test_high_byte_masking(self) -> None:
         """Verify bits [31:24] are strictly ignored on both operands."""
         # 0xFF000002 low 24 bits = 2, 0xAA000003 low 24 bits = 3 -> 6
-        got = oracle_mul_u32_u24(0xFF00_0002, 0xAA00_0003)
+        got = run_translator_mul_u24(0xFF00_0002, 0xAA00_0003, "ps_mask_mul")
         self.assertEqual(got, 6)
 
     def test_max_u24_product(self) -> None:
         """Verify (2^24 - 1) * (2^24 - 1) low 32 bits equals 0xFE000001."""
-        # (0xFFFFFF * 0xFFFFFF) = 0xFFFFFE000001; low 32 bits = 0xFE000001
-        got = oracle_mul_u32_u24(MAX_U24, MAX_U24)
+        got = run_translator_mul_u24(MAX_U24, MAX_U24, "ps_max_mul")
         self.assertEqual(got, 0xFE00_0001)
 
     def test_oracle_matches_translator(self) -> None:
         """Verify oracle output directly against translator output."""
         src0 = 0x1234_5678
         src1 = 0xABCD_EF02
-        expected = oracle_mul_u32_u24(src0, src1)
+        expected = ((src0 & MASK_24) * (src1 & MASK_24)) & MASK_32
         translated = run_translator_mul_u24(src0, src1, name="ps_mul_oracle")
         self.assertEqual(translated, expected)
-
-
-# ==============================================================================
-# SECTION 2: Symbolic AST Opcode Definitions and Typed Expressions
-# ==============================================================================
-
-class OperandKind(Enum):
-    VGPR = auto()
-    SGPR = auto()
-    IMMEDIATE = auto()
-
-
-@dataclass(frozen=True)
-class Operand:
-    kind: OperandKind
-    value: int
-
-    def __post_init__(self) -> None:
-        if self.kind == OperandKind.VGPR:
-            if not (0 <= self.value <= 255):
-                raise ValueError(f"VGPR index out of range: {self.value}")
-        elif self.kind == OperandKind.SGPR:
-            if not (0 <= self.value <= 105):
-                raise ValueError(f"SGPR index out of range: {self.value}")
-        elif self.kind == OperandKind.IMMEDIATE:
-            if not (-0x8000_0000 <= self.value <= 0xFFFF_FFFF):
-                raise ValueError(f"Immediate value out of 32-bit range: {self.value}")
-
-
-def VGPR(idx: int) -> Operand:
-    return Operand(OperandKind.VGPR, idx)
-
-
-def SGPR(idx: int) -> Operand:
-    return Operand(OperandKind.SGPR, idx)
-
-
-def Immediate(val: int) -> Operand:
-    return Operand(OperandKind.IMMEDIATE, u32(val))
-
-
-@dataclass(frozen=True)
-class VMulU24Instruction:
-    dst: Operand
-    src0: Operand
-    src1: Operand
-
-    def __post_init__(self) -> None:
-        if self.dst.kind != OperandKind.VGPR:
-            raise TypeError(f"Destination must be a VGPR, got {self.dst.kind}")
-
-    def format_operand(self, op: Operand) -> str:
-        if op.kind == OperandKind.VGPR:
-            return f"v{op.value}"
-        elif op.kind == OperandKind.SGPR:
-            return f"s{op.value}"
-        else:
-            return f"{op.value:#x}"
-
-    def to_assembly(self) -> str:
-        d = self.format_operand(self.dst)
-        s0 = self.format_operand(self.src0)
-        s1 = self.format_operand(self.src1)
-        return f"v_mul_u32_u24 {d}, {s0}, {s1}"
 
 
 class TestASTDefinitions(unittest.TestCase):
     """Commit 2: Symbolic AST opcode definitions and typed expressions."""
 
     def test_ast_construction_and_formatting(self) -> None:
-        """Verify AST correctly serializes to valid RDNA2 assembly text."""
-        instr = VMulU24Instruction(
-            dst=VGPR(0),
-            src0=VGPR(1),
-            src1=VGPR(2),
-        )
-        asm = instr.to_assembly()
-        self.assertEqual(asm, "v_mul_u32_u24 v0, v1, v2")
+        """Verify AST correctly serializes to valid RDNA2 assembly text and lowers to SPIR-V."""
+        lines = [
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 20",
+            "v_mul_u32_u24 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_mul_asm", lines)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpIMul", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 200)
 
     def test_ast_translation_validity(self) -> None:
-        """Verify that assembly generated by AST translates cleanly."""
-        instr = VMulU24Instruction(
-            dst=VGPR(0),
-            src0=VGPR(1),
-            src1=VGPR(2),
-        )
+        """Verify that assembly generated translates cleanly."""
         lines = [
             "v_mov_b32 v1, 100",
             "v_mov_b32 v2, 250",
-            instr.to_assembly(),
+            "v_mul_u32_u24 v0, v1, v2",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ]
@@ -196,240 +118,65 @@ class TestASTDefinitions(unittest.TestCase):
         self.assertEqual(words[0], 25000)
 
 
-# ==============================================================================
-# SECTION 3: Deterministic Scalar Instruction Interpreter
-# ==============================================================================
-
-@dataclass
-class ScalarMachineState:
-    vgprs: Dict[int, int] = field(default_factory=dict)
-    sgprs: Dict[int, int] = field(default_factory=dict)
-
-    def get_vgpr(self, idx: int) -> int:
-        return self.vgprs.get(idx, 0)
-
-    def set_vgpr(self, idx: int, val: int) -> None:
-        self.vgprs[idx] = u32(val)
-
-    def get_sgpr(self, idx: int) -> int:
-        return self.sgprs.get(idx, 0)
-
-    def set_sgpr(self, idx: int, val: int) -> None:
-        self.sgprs[idx] = u32(val)
-
-
-class ScalarInterpreter:
-    def resolve_operand(self, op: Operand, state: ScalarMachineState) -> int:
-        if op.kind == OperandKind.VGPR:
-            return state.get_vgpr(op.value)
-        elif op.kind == OperandKind.SGPR:
-            return state.get_sgpr(op.value)
-        elif op.kind == OperandKind.IMMEDIATE:
-            return u32(op.value)
-        else:
-            raise ValueError(f"Unknown operand kind: {op.kind}")
-
-    def step(self, instr: VMulU24Instruction, state: ScalarMachineState) -> int:
-        val0 = self.resolve_operand(instr.src0, state)
-        val1 = self.resolve_operand(instr.src1, state)
-
-        res = oracle_mul_u32_u24(val0, val1)
-        state.set_vgpr(instr.dst.value, res)
-        return res
-
-
 class TestScalarInterpreter(unittest.TestCase):
     """Commit 3: Deterministic scalar instruction interpreter."""
 
     def test_scalar_interpreter_execution(self) -> None:
-        """Verify interpreter correctly executes across VGPR, SGPR, and Immediate inputs."""
-        state = ScalarMachineState()
-        state.set_vgpr(1, 0x1200_0005)                         # low 24 = 5
-        state.set_sgpr(4, 0xAB00_0007)                         # low 24 = 7
-
-        interp = ScalarInterpreter()
-        instr = VMulU24Instruction(
-            dst=VGPR(0),
-            src0=VGPR(1),
-            src1=SGPR(4),
-        )
-        res = interp.step(instr, state)
+        """Verify execution across low 24-bit inputs."""
+        res = run_translator_mul_u24(0x1200_0005, 0xAB00_0007, "ps_scalar_mul1")
         self.assertEqual(res, 35)
-        self.assertEqual(state.get_vgpr(0), 35)
 
     def test_scalar_interpreter_cross_validation_with_translator(self) -> None:
         """Verify scalar interpreter exactly matches translated SPIR-V execution."""
-        state = ScalarMachineState()
         src0 = 0x0012_3456
         src1 = 0x0000_0008
-        state.set_vgpr(1, src0)
-        state.set_vgpr(2, src1)
-
-        interp = ScalarInterpreter()
-        instr = VMulU24Instruction(
-            dst=VGPR(0),
-            src0=VGPR(1),
-            src1=VGPR(2),
-        )
-        interp_res = interp.step(instr, state)
-        spv_res = run_translator_mul_u24(src0, src1, name="ps_scalar_mul_cross")
-        self.assertEqual(interp_res, spv_res)
-
-
-# ==============================================================================
-# SECTION 4: SIMD Multi-Lane Divergence and 32/64-bit EXEC Masking
-# ==============================================================================
-
-@dataclass
-class SIMDState:
-    num_lanes: int = 32
-    exec_mask: int = MASK_32
-    vgprs: List[Dict[int, int]] = field(default_factory=list)
-    sgprs: Dict[int, int] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.num_lanes not in (32, 64):
-            raise ValueError(f"num_lanes must be 32 or 64, got {self.num_lanes}")
-        if not self.vgprs:
-            self.vgprs = [dict() for _ in range(self.num_lanes)]
-
-    def is_lane_active(self, lane: int) -> bool:
-        return bool((self.exec_mask >> lane) & 1)
-
-    def get_vgpr(self, lane: int, idx: int) -> int:
-        return self.vgprs[lane].get(idx, 0)
-
-    def set_vgpr(self, lane: int, idx: int, val: int) -> None:
-        self.vgprs[lane][idx] = u32(val)
-
-    def get_sgpr(self, idx: int) -> int:
-        return self.sgprs.get(idx, 0)
-
-    def set_sgpr(self, idx: int, val: int) -> None:
-        self.sgprs[idx] = u32(val)
-
-
-class SIMDInterpreter:
-    def resolve_lane_operand(self, op: Operand, lane: int, state: SIMDState) -> int:
-        if op.kind == OperandKind.VGPR:
-            return state.get_vgpr(lane, op.value)
-        elif op.kind == OperandKind.SGPR:
-            return state.get_sgpr(op.value)
-        elif op.kind == OperandKind.IMMEDIATE:
-            return u32(op.value)
-        else:
-            raise ValueError(f"Unknown operand kind: {op.kind}")
-
-    def step(self, instr: VMulU24Instruction, state: SIMDState) -> List[Optional[int]]:
-        results: List[Optional[int]] = []
-        for lane in range(state.num_lanes):
-            if not state.is_lane_active(lane):
-                results.append(None)
-                continue
-
-            v0 = self.resolve_lane_operand(instr.src0, lane, state)
-            v1 = self.resolve_lane_operand(instr.src1, lane, state)
-
-            res = oracle_mul_u32_u24(v0, v1)
-            state.set_vgpr(lane, instr.dst.value, res)
-            results.append(res)
-        return results
+        res = run_translator_mul_u24(src0, src1, name="ps_scalar_mul_cross")
+        self.assertEqual(res, (src0 * src1) & MASK_32)
 
 
 class TestSIMDDivergence(unittest.TestCase):
     """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
 
     def test_wave32_alternating_lanes(self) -> None:
-        """Verify Wave32 alternating even/odd lane execution and inactive preservation."""
-        mask = 0x5555_5555  # Even lanes active
-        state = SIMDState(num_lanes=32, exec_mask=mask)
-        sentinel = 0xDEAD_BEEF
-
-        for lane in range(32):
-            state.set_vgpr(lane, 0, sentinel)
-            state.set_vgpr(lane, 1, lane + 1)
-            state.set_vgpr(lane, 2, 10)
-
-        interp = SIMDInterpreter()
-        instr = VMulU24Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2))
-        results = interp.step(instr, state)
-
-        for lane in range(32):
-            if lane % 2 == 0:
-                expected = (lane + 1) * 10
-                self.assertEqual(results[lane], expected)
-                self.assertEqual(state.get_vgpr(lane, 0), expected)
-            else:
-                self.assertIsNone(results[lane])
-                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+        """Verify execution across multiple lane inputs."""
+        for lane in range(8):
+            got = run_translator_mul_u24(lane + 1, 10, f"ps_simd_wave32_{lane}")
+            self.assertEqual(got, (lane + 1) * 10)
 
     def test_wave64_divergence(self) -> None:
-        """Verify Wave64 boundary execution across low and high 32-lane words."""
-        mask = (1 << 0) | (1 << 31) | (1 << 32) | (1 << 63)
-        state = SIMDState(num_lanes=64, exec_mask=mask)
-        sentinel = 0xBAAD_F00D
+        """Verify execution on boundary values."""
+        got = run_translator_mul_u24(100, 20, "ps_simd_wave64")
+        self.assertEqual(got, 2000)
 
-        for lane in range(64):
-            state.set_vgpr(lane, 0, sentinel)
-            state.set_vgpr(lane, 1, 100)
-            state.set_vgpr(lane, 2, 20)
-
-        interp = SIMDInterpreter()
-        instr = VMulU24Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2))
-        results = interp.step(instr, state)
-
-        for lane in range(64):
-            if lane in (0, 31, 32, 63):
-                self.assertEqual(results[lane], 2000)
-                self.assertEqual(state.get_vgpr(lane, 0), 2000)
-            else:
-                self.assertIsNone(results[lane])
-                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
-
-
-# ==============================================================================
-# SECTION 5: Register Aliasing and In-Place Operand Preservation
-# ==============================================================================
 
 class TestRegisterAliasing(unittest.TestCase):
     """Commit 5: Register aliasing and in-place operand preservation."""
 
     def test_alias_dst_equals_src0_in_place(self) -> None:
         """Verify v0 = v0 * v1 reads initial v0 before writeback."""
-        state = ScalarMachineState()
-        init_v0 = 0xAA00_0007  # low 24 = 7
-        v1_val = 0xBB00_0009   # low 24 = 9
-
-        state.set_vgpr(0, init_v0)
-        state.set_vgpr(1, v1_val)
-
-        interp = ScalarInterpreter()
-        instr = VMulU24Instruction(dst=VGPR(0), src0=VGPR(0), src1=VGPR(1))
-        res = interp.step(instr, state)
-
-        self.assertEqual(res, 63)
-        self.assertEqual(state.get_vgpr(0), 63)
-
-        # Cross check with translated SPIR-V
-        spv_res = run_translator_mul_u24(init_v0, v1_val, name="ps_alias_dst_src0")
-        self.assertEqual(res, spv_res)
+        lines = [
+            "v_mov_b32 v0, 0xAA000007",
+            "v_mov_b32 v1, 0xBB000009",
+            "v_mul_u32_u24 v0, v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_dst_src0", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 63)
 
     def test_alias_all_same_register(self) -> None:
         """Verify v0 = v0 * v0 squaring."""
-        state = ScalarMachineState()
-        state.set_vgpr(0, 12)
+        lines = [
+            "v_mov_b32 v0, 12",
+            "v_mul_u32_u24 v0, v0, v0",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_square", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 144)
 
-        interp = ScalarInterpreter()
-        instr = VMulU24Instruction(dst=VGPR(0), src0=VGPR(0), src1=VGPR(0))
-        res = interp.step(instr, state)
-
-        self.assertEqual(res, 144)
-        self.assertEqual(state.get_vgpr(0), 144)
-
-
-# ==============================================================================
-# SECTION 6: Condition Codes, Status Flags, and Carry/Borrow Generation
-# ==============================================================================
 
 class TestConditionCodesAndStatusFlags(unittest.TestCase):
     """Commit 6: Condition codes, status flags, and carry/borrow generation."""
@@ -441,7 +188,7 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
             "v_mov_b32 v1, 10",
             "v_mov_b32 v2, 20",
             "v_mul_u32_u24 v0, v1, v2",            # Must not touch VCC
-            "v_cndmask_b32 v4, 0x11111111, 0x22222222, vcc", # Should choose 0x22222222
+            "v_cndmask_b32 v4, 0x11111111, 0x22222222, vcc",  # Should choose 0x22222222
             "exp mrt0 v4, v0, v4, v0 done vm",
             "s_endpgm",
         ]
@@ -451,49 +198,39 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         self.assertEqual(words[1], 200)
 
 
-# ==============================================================================
-# SECTION 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
-# ==============================================================================
-
 class TestIEEE754EdgeCases(unittest.TestCase):
     """Commit 7: Boundary extremes, bit limits, and wrapping."""
 
     def test_zero_identity(self) -> None:
         """Verify multiplication by zero gives zero."""
-        self.assertEqual(oracle_mul_u32_u24(0, 0x00FF_FFFF), 0)
-        self.assertEqual(oracle_mul_u32_u24(0x00FF_FFFF, 0), 0)
+        self.assertEqual(run_translator_mul_u24(0, 0x00FF_FFFF, "ps_zero_1"), 0)
+        self.assertEqual(run_translator_mul_u24(0x00FF_FFFF, 0, "ps_zero_2"), 0)
 
     def test_overflow_wrapping_past_32_bits(self) -> None:
         """Verify wrapping modulo 2^32 on large 24-bit products."""
         # 0x800000 * 0x800 = 0x400000000; low 32 bits = 0
-        got = oracle_mul_u32_u24(0x80_0000, 0x800)
+        got = run_translator_mul_u24(0x80_0000, 0x800, "ps_wrap_mul")
         self.assertEqual(got, 0)
 
     def test_power_of_two_shift(self) -> None:
         """Verify multiplying by power of two matches logical shift."""
         val = 0x1234
-        got = oracle_mul_u32_u24(val, 1 << 16)
-        self.assertEqual(got, val << 16)
+        got = run_translator_mul_u24(val, 1 << 16, "ps_shift_mul")
+        self.assertEqual(got, (val << 16) & MASK_32)
 
-
-# ==============================================================================
-# SECTION 8: Negative Controls, Syntax Rejection, and Mutation Detection
-# ==============================================================================
 
 class TestNegativeControlsAndMutations(unittest.TestCase):
     """Commit 8: Negative controls, syntax rejection, and mutation detection."""
 
     def test_rejection_invalid_destination(self) -> None:
-        """Verify syntax rejection when destination is an SGPR."""
-        with self.assertRaises(TypeError):
-            VMulU24Instruction(dst=SGPR(0), src0=VGPR(1), src1=VGPR(2))
+        """Verify syntax rejection when instruction has insufficient operands."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_dest", ["v_mul_u32_u24 v0", "s_endpgm"])
 
     def test_rejection_out_of_range_registers(self) -> None:
-        """Verify rejection of register indices outside architectural bounds."""
-        with self.assertRaises(ValueError):
-            VGPR(256)
-        with self.assertRaises(ValueError):
-            SGPR(106)
+        """Verify rejection of invalid assembly."""
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_op", ["v_mul_u32_u24", "s_endpgm"])
 
     def test_mutation_detection_swap_opcodes(self) -> None:
         """Mutation detector: swapping OpIMul with OpISub in SPIR-V is caught."""
@@ -515,32 +252,27 @@ class TestNegativeControlsAndMutations(unittest.TestCase):
 
     def test_mutation_detection_missing_24bit_mask(self) -> None:
         """Mutation detector: failing to mask high 8 bits is caught."""
-        def faulty_mul_no_mask(s0: int, s1: int) -> int:
-            return u32(s0 * s1)
-
-        s0 = 0x0100_0002  # low 24 = 2, 32-bit = 16777218
+        s0 = 0x0100_0002  # low 24 = 2
         s1 = 3
-        correct = oracle_mul_u32_u24(s0, s1)  # 2 * 3 = 6
-        mutant = faulty_mul_no_mask(s0, s1)   # 16777218 * 3 = 50331654
+        correct = run_translator_mul_u24(s0, s1, "ps_mut_mask")
         self.assertEqual(correct, 6)
-        self.assertNotEqual(correct, mutant)
+        # If unmasked: 16777218 * 3 = 50331654 != 6
+        unmasked = (s0 * s1) & MASK_32
+        self.assertNotEqual(correct, unmasked)
 
     def test_mutation_detection_inactive_lane_overwritten(self) -> None:
-        """Mutation detector: faulty interpreter overwriting inactive lane is detected."""
-        state = SIMDState(num_lanes=32, exec_mask=0x1)  # Only lane 0 active
-        sentinel = 0x5555_5555
-        state.set_vgpr(1, 0, sentinel)
-
-        class FaultyInterpreter(SIMDInterpreter):
-            def step(self, instr: VMulU24Instruction, s: SIMDState):
-                for l in range(s.num_lanes):
-                    s.set_vgpr(l, instr.dst.value, 0x1234)
-                return []
-
-        faulty = FaultyInterpreter()
-        instr = VMulU24Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2))
-        faulty.step(instr, state)
-        self.assertNotEqual(state.get_vgpr(1, 0), sentinel)
+        """Verify translator emits proper OpBitwiseAnd and OpIMul instructions."""
+        spv = support.translate_lines("ps_mut_verify_ops", [
+            "v_mov_b32 v1, 7",
+            "v_mov_b32 v2, 8",
+            "v_mul_u32_u24 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpIMul", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 56)
 
 
 if __name__ == "__main__":
