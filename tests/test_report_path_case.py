@@ -25,6 +25,7 @@ if str(TOOLS) not in sys.path:
 HELPERS = {
     "bvh_index": "same_output_path",
     "anim_index": "same_report_path",
+    "manifest": "same_report_path",
     "gamedata_xml": None,
     "gamedata_index": None,
     "navmesh_decode": "same_report_path",
