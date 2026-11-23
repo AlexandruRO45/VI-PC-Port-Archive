@@ -463,3 +463,42 @@ class TestVMovreldB32AST(unittest.TestCase):
         spv = support.translate_lines("ps_vmovreld_exec", lines)
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0xCAFE1234)
+
+
+class TestVMovreldB32Indexing(unittest.TestCase):
+    def test_unwritten_registers_preserved(self):
+        # When writing v[2 + 1] = v3, v2 must retain its original sentinel
+        lines = [
+            "v_mov_b32 v2, 0xAAAAAAAA",
+            "v_mov_b32 v3, 0xBBBBBBBB",
+            "s_mov_b32 m0, 1",
+            "v_movreld_b32 v2, v3",
+            "v_mov_b32 v0, v2",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovreld_unwritten", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0xAAAAAAAA)
+
+    def test_dynamic_destination_sweep(self):
+        for offset in (1, 2, 4):
+            with self.subTest(offset=offset):
+                val = 0x20202020 * offset
+                lines = [
+                    f"v_mov_b32 v1, {val}",
+                    f"s_mov_b32 m0, {offset}",
+                    "v_movreld_b32 v10, v1",
+                    f"v_mov_b32 v0, v{10 + offset}",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines(f"ps_vmovreld_sweep_{offset}", lines)
+                out = support.mrt0_words(spv)
+                self.assertEqual(out[0], val)
