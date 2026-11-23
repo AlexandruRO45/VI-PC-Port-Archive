@@ -6,6 +6,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
 import warnings
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +45,7 @@ def translate_lines(name, lines, dxbc=STUB_DXBC, fssm=None):
 
 
 _scratch = {"dir": None, "files": {}}
+_scratch_lock = threading.RLock()     # the directory is shared: one translation at a time from write to read
 
 
 def _scratch_dir():
@@ -79,16 +81,19 @@ def _put(path, data):
 
 def translate_listing(name, data, dxbc=STUB_DXBC, fssm=None):
     """SPIR-V assembly text for a listing in the translator's input format (bytes of a .s file)."""
-    tmp = _scratch_dir()
-    listing = os.path.join(tmp, "disasm", name + ".s")
-    _put(listing, data)
-    _put(os.path.join(tmp, name + ".dxbc"), dxbc)
-    if fssm is not None or os.path.join(tmp, "fssm", name + ".fssm") in _scratch["files"]:
-        _put(os.path.join(tmp, "fssm", name + ".fssm"), fssm)
-    with warnings.catch_warnings():
-        # translate() leaves its .dxbc handle to the garbage collector; harmless, and not ours to change here.
-        warnings.simplefilter("ignore", ResourceWarning)
-        return rdna2spirv.translate(listing)
+    with _scratch_lock:
+        tmp = _scratch_dir()
+        stem = os.path.normcase(name)   # the same file name on a case-insensitive volume, so the same file and cache key
+        listing = os.path.join(tmp, "disasm", stem + ".s")
+        _put(listing, data)
+        _put(os.path.join(tmp, stem + ".dxbc"), dxbc)
+        fssm_path = os.path.join(tmp, "fssm", stem + ".fssm")
+        if fssm is not None or fssm_path in _scratch["files"]:
+            _put(fssm_path, fssm)
+        with warnings.catch_warnings():
+            # translate() leaves its .dxbc handle to the garbage collector; harmless, and not ours to change here.
+            warnings.simplefilter("ignore", ResourceWarning)
+            return rdna2spirv.translate(listing)
 
 
 def mrt0_words(spvasm, **run_options):
