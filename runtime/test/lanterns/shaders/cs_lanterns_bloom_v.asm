@@ -4,12 +4,22 @@
 ; stage: cs
 ; wave: 64
 ; group: 128,1,1
-; rsrc2: 0x28184
+; rsrc2: 0x2818a
 ;
-; RSRC2 0x28184: two user SGPRs (s[0:1], the table), TGID_X and TGID_Y (s2, s3), LDS_SIZE 5 x 512 bytes.
+; RSRC2 0x28184 before D3D-448 (now 0x2818a, see the moves below): two user SGPRs (s[0:1], the table), TGID_X and
+; TGID_Y (s2, s3), LDS_SIZE 5 x 512 bytes.
 ; v0 = lane in the group; v1 = the sample this lane loads; v3 = its LDS entry's byte address (entry lane, + 4 below).
 ; Slot 0 (s[0:1] + 0): the V# of the row sums. Slot 1 (+ 0x20): the V# of the bloom (the column sums), stride 16.
 ; s2 = column, s3 = 128-row segment.
+; D3D-448: a D3D12 compute PSO gets its root arguments in the console layout (rt::rootsig::pack_stage,
+; docs/d3d12_vulkan.md section 3.5): from s4 in root-signature order, a descriptor table as ONE dword (the 32-bit
+; VA of its first descriptor; the heaps live below 4 GiB), a constant one dword per value; s0..s3 are the driver's.
+; RSRC2 0x2818a therefore counts 5 user SGPRs (4 + 1), and the thread-group ids follow at s5. These moves rebuild the
+; layout the code below was written for: table s4 -> s[0:1] (high half 0); thread-group ids s5..s6 -> s2..s3.
+s_mov_b32 s0, s4
+s_mov_b32 s1, 0
+s_mov_b32 s2, s5
+s_mov_b32 s3, s6
 s_load_dwordx4 s[4:7], s[0:1], 0x0
 s_load_dwordx4 s[8:11], s[0:1], 0x20
 s_lshl_b32 s16, s3, 7
