@@ -230,5 +230,98 @@ class TestVMax3I32AST(unittest.TestCase):
         inst = VMax3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
         self.assertTrue(inst.to_assembly().startswith("v_max3_i32 v0, v1, v2, v3"))
 
+# ==============================================================================
+# SECTION 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    vgprs: Dict[int, int] = field(default_factory=dict)
+    sgprs: Dict[int, int] = field(default_factory=dict)
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs.get(idx, 0) & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0) & MASK32
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+
+class ScalarInterpreter:
+    def resolve_operand(self, op: Operand, state: ScalarMachineState) -> int:
+        if op.kind == OperandKind.VGPR:
+            return state.get_vgpr(op.value)
+        elif op.kind == OperandKind.SGPR:
+            return state.get_sgpr(op.value)
+        elif op.kind == OperandKind.IMMEDIATE:
+            return op.value & MASK32
+        raise ValueError(f"Unknown operand kind: {op.kind}")
+
+    def step(self, instr: VMax3I32Instruction, state: ScalarMachineState) -> int:
+        s0 = self.resolve_operand(instr.src0, state)
+        s1 = self.resolve_operand(instr.src1, state)
+        s2 = self.resolve_operand(instr.src2, state)
+        res = ref_v_max3_i32(s0, s1, s2)
+        state.set_vgpr(instr.dst.value, res)
+        return res
+
+
+class TestVMax3I32ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_basic_step(self) -> None:
+        """Verify scalar step evaluates signed maximum across VGPRs, SGPRs, and immediates."""
+        state = ScalarMachineState()
+        state.set_vgpr(1, (-50) & MASK32)
+        state.set_sgpr(0, 100)
+
+        interp = ScalarInterpreter()
+        instr = VMax3I32Instruction(
+            dst=VGPR(0),
+            src0=VGPR(1),
+            src1=SGPR(0),
+            src2=Immediate(25),
+        )
+        res = interp.step(instr, state)
+        self.assertEqual(res, 100)
+        self.assertEqual(state.get_vgpr(0), 100)
+
+    def test_scalar_interpreter_negative_maximum(self) -> None:
+        """Verify scalar step correctly identifies maximum when all operands are negative."""
+        state = ScalarMachineState()
+        state.set_vgpr(1, (-100) & MASK32)
+        state.set_vgpr(2, (-20) & MASK32)
+        state.set_vgpr(3, (-50) & MASK32)
+
+        interp = ScalarInterpreter()
+        instr = VMax3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+        res = interp.step(instr, state)
+        self.assertEqual(res, (-20) & MASK32)
+        self.assertEqual(state.get_vgpr(0), (-20) & MASK32)
+
+    def test_scalar_interpreter_state_isolation(self) -> None:
+        """Verify only the destination register is modified by step."""
+        state = ScalarMachineState()
+        state.set_vgpr(0, 0xDEADBEEF)
+        state.set_vgpr(1, 10)
+        state.set_vgpr(2, 20)
+        state.set_vgpr(3, 30)
+        state.set_vgpr(4, 0xCAFEBABE)
+
+        interp = ScalarInterpreter()
+        instr = VMax3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+        interp.step(instr, state)
+
+        self.assertEqual(state.get_vgpr(0), 30)
+        self.assertEqual(state.get_vgpr(1), 10)
+        self.assertEqual(state.get_vgpr(2), 20)
+        self.assertEqual(state.get_vgpr(3), 30)
+        self.assertEqual(state.get_vgpr(4), 0xCAFEBABE)
+
 if __name__ == "__main__":
     unittest.main()
