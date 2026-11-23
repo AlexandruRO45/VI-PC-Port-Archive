@@ -49,6 +49,9 @@ def find_ffmpeg(explicit: str):
         candidate = os.path.expanduser(explicit)
         if os.path.dirname(candidate):
             if os.path.isfile(candidate):
+                if os.name == "posix" and not os.access(candidate, os.X_OK):
+                    error(f"ffmpeg is not executable: {explicit}")
+                    return None
                 return os.path.abspath(candidate)
         else:
             found = shutil.which(candidate)
