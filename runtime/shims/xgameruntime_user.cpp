@@ -174,11 +174,11 @@ HRESULT STDMETHODCALLTYPE msa_async(void*, XUserHandle user, uint32_t, const cha
 HRESULT STDMETHODCALLTYPE signout_async(void*, XUserHandle user, XAsyncBlock* async) {
     return begin_offline<S_OK>(user, async);
 }
-// These operations always fail offline. A successful block belongs to another operation; its zero-payload
-// state may already have been cleaned up, so XAsyncGetResult cannot always detect an identity mismatch.
+// These operations always fail offline. Reject success using status without consuming another operation's payload.
+// Failed blocks have already lost their identity, so their status cannot be attributed to a specific operation.
 HRESULT offline_failure_result(XAsyncBlock* async) {
     if (!async) return E_INVALIDARG;
-    const HRESULT hr = XAsyncGetResult(async, &kOfflineIdentity, 0, nullptr, nullptr);
+    const HRESULT hr = XAsyncGetStatus(async, false);
     return hr == S_OK ? E_INVALIDARG : hr;
 }
 HRESULT STDMETHODCALLTYPE offline_result_size(void*, XAsyncBlock* async, size_t* size) {
@@ -191,6 +191,8 @@ HRESULT STDMETHODCALLTYPE offline_result(void*, XAsyncBlock* async, size_t, void
 HRESULT STDMETHODCALLTYPE picture_result(void*, XAsyncBlock* async, size_t, void*, size_t*) {
     return offline_failure_result(async);
 }
+// Successful zero-payload operations lose their identity on completion, so a completed privilege
+// resolution is indistinguishable from sign-out here without changing the async library contract.
 HRESULT STDMETHODCALLTYPE signout_result(void*, XAsyncBlock* async) {
     if (!async) return E_INVALIDARG;
     return XAsyncGetResult(async, &kOfflineIdentity, 0, nullptr, nullptr);

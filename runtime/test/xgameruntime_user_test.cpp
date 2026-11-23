@@ -156,6 +156,21 @@ int main(int argc, char** argv) {
     using ResultSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t*);
     using Result = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, void*, void*, size_t*);
     using PictureResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, void*, size_t*);
+    // A wrong getter must leave the add payload available to its proper getter.
+    for (int slot : {17, 18, 24, 25, 27, 28, 40, 41}) {
+        XAsyncBlock wrong{};
+        XUserHandle added = nullptr;
+        check(at<AddAsync>(user, 7)(user, 1, &wrong) == S_OK && finished(&wrong), "mismatch add completes");
+        size_t size = 0; char buffer[8]{}; void* data = nullptr;
+        HRESULT hr = slot == 18 ? at<PictureResult>(user, slot)(user, &wrong, sizeof(buffer), buffer, &size) :
+            (slot == 17 || slot == 24 || slot == 27 || slot == 41) ? at<ResultSize>(user, slot)(user, &wrong, &size) :
+            at<Result>(user, slot)(user, &wrong, sizeof(buffer), buffer, &data, &size);
+        check(hr != S_OK && at<AddResult>(user, 8)(user, &wrong, &added) == S_OK && added,
+              "wrong getter rejects without consuming add result");
+        if (added) at<void(STDMETHODCALLTYPE*)(void*, XUserHandle)>(user, 4)(user, added);
+    }
+    check(at<ResolveResult>(user, 49)(user, &resolve) == S_OK,
+          "sign-out result cannot distinguish completed zero-payload privilege resolution");
     XTaskQueueHandle queue{};
     check(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &queue) == S_OK, "manual queue created");
     for (int i = 0; i < 5; ++i) {
