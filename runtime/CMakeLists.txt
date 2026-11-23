@@ -681,6 +681,14 @@ if(BUILD_TESTING)
     add_dependencies(tiny_game_abort_test gta6rt tiny_game)
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
 
+    # Loader::ImportedDll, the per-descriptor import cache: a model of resolve() before and after it over fixed and
+    # random import tables, then a short benchmark of the calls it saves (System32 DLLs, an empty temporary folder).
+    add_executable(pe_loader_import_cache_test test/pe_loader_import_cache_test.cpp)
+    target_include_directories(pe_loader_import_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(pe_loader_import_cache_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(pe_loader_import_cache_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME pe_loader_import_cache COMMAND pe_loader_import_cache_test --reps 3)
+
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
     # base relocations (HIGHLOW included). No fixture DLL is needed; the images are written to a temporary folder.
     add_executable(test_pe_loader_bounds

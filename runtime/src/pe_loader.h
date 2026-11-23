@@ -139,6 +139,9 @@ private:
     void initialize_tls(Module& m);
     void bind_imports(Module& m);
     void* resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal);
+    struct ImportedDll;                    // what binding learns once per imported DLL (pe_loader.cpp)
+    struct ImportCache;                    // the imported DLLs of the bind_imports call running
+    ImportCache* import_cache_ = nullptr;  // that call's cache (under mutex_), nullptr outside one
     void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
     void parse_exports(Module& m);
     void protect_sections(Module& m);

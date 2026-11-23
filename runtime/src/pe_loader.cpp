@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 #include "base_reservation.h"
+#include "lazy.h"
 
 namespace rt {
 
@@ -1563,18 +1565,50 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     return reinterpret_cast<void*>(p);
 }
 
+// What binding learns about one imported DLL. Every import of a descriptor names the same DLL, so each fact is worked
+// out on the first import that needs it and kept for the rest: the game folder is probed (a file-system call) and the
+// host DLL loaded once per DLL a module imports instead of once per import. A kept answer is the one asking again
+// would give: load() of a mapped module returns it from by_name_, and LoadLibraryExA of a loaded DLL returns the same
+// handle (the loader never frees a host DLL, so only its reference count differs).
+struct Loader::ImportedDll {
+    explicit ImportedDll(const std::string& dll) : key(lower(dll)), host_crt(prefer_host_copy(key)) {}
+    const std::string key;  // lowered, the shim table's key
+    const bool host_crt;    // prefer_host_copy(key): never the bundled copy, and its throws go through the host
+    Lazy<Module*> bundled;  // the bundled module beside the game, nullptr when there is none (or host_crt)
+    Lazy<HMODULE> host;     // the host DLL, nullptr when LoadLibraryExA failed
+};
+
+// The DLLs one bind_imports call has met, by the name its descriptors spell. bind_imports installs one for the module
+// it binds and puts the outer one back after, since load() binds a dependency from inside resolve().
+struct Loader::ImportCache {
+    explicit ImportCache(ImportCache*& slot) : slot_(slot), outer_(slot) { slot_ = this; }
+    ~ImportCache() { slot_ = outer_; }
+    ImportCache(const ImportCache&) = delete;
+    ImportCache& operator=(const ImportCache&) = delete;
+    ImportedDll& get(const std::string& dll) { return dlls_.try_emplace(dll, dll).first->second; }
+
+private:
+    ImportCache*& slot_;
+    ImportCache* const outer_;
+    std::map<std::string, ImportedDll> dlls_;  // a node map: an entry stays put while later ones are added
+};
+
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {
-    std::string key = lower(dll);
+    std::optional<ImportedDll> uncached;  // resolve() outside bind_imports: nothing to keep the answers for
+    ImportedDll& imported = import_cache_ ? import_cache_->get(dll) : uncached.emplace(dll);
     std::string sym = by_ordinal ? "#" + std::to_string(ordinal) : name;
 
-    if (void* p = shims::find(key, sym)) {
+    if (void* p = shims::find(imported.key, sym)) {
         m.imports.push_back({dll, sym, Binding::Shim});
         return p;
     }
     // Bundled game module (an Xbox build that ships beside the game)?
-    auto bundled = game_dir_ / dll;
-    if (!prefer_host_copy(key) && std::filesystem::exists(bundled)) {
-        Module& dep = load(bundled);
+    Module* bundled = imported.bundled.get([&]() -> Module* {
+        auto path = game_dir_ / dll;
+        return !imported.host_crt && std::filesystem::exists(path) ? &load(path) : nullptr;
+    });
+    if (bundled) {
+        Module& dep = *bundled;
         if (auto it = dep.exports.find(sym); it != dep.exports.end()) {
             m.imports.push_back({dll, sym, Binding::Module});
             return it->second;
@@ -1588,11 +1622,15 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         }
     }
     // Host Windows: system DLLs and API sets. LOAD_LIBRARY_SEARCH_SYSTEM32 keeps the game folder out of the search.
-    if (HMODULE h = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
-        if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
+    if (HMODULE h = imported.host.get([&] {
+            HMODULE loaded = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            // Before any mapped code can throw through it (later calls for the same module return at once).
+            if (loaded && imported.host_crt) redirect_pc_to_file_header(loaded);
+            return loaded;
+        })) {
         FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
         if (p) {
-            if (prefer_host_copy(key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
+            if (imported.host_crt) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
             m.imports.push_back({dll, sym, Binding::Host});
             return reinterpret_cast<void*>(p);
         }
@@ -1624,6 +1662,7 @@ void Loader::bind_imports(Module& m) {
         }
     };
 
+    ImportCache imported_dlls(import_cache_);  // what resolve() learns about each DLL, for this module's imports
     const auto dir = directory(nt, IMAGE_DIRECTORY_ENTRY_IMPORT);
     if (dir.Size) {
         for (uint64_t i = 0;; ++i) {
