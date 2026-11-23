@@ -17401,7 +17401,11 @@ def main():
     old.update(meta)
     if shard is not None:   # a marker beside the part, so --merge can tell a complete set from a partial one
         write_index(os.path.join(a.out, SHARD_MARKER.format(index=shard)), {"index": shard, "count": sn})
-    write_index(idx_path, old)
+    if shard is not None and missing_inputs:
+        # A part is a completion marker for make_game's resume. Retry this slice after repair.
+        Path(idx_path).unlink(missing_ok=True)
+    else:
+        write_index(idx_path, old)
     if shard is None:
         import spirv_stubs
         spirv_stubs.generate_for_index(a.out, old)

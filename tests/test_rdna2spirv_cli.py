@@ -377,6 +377,18 @@ class ValidatedOutput(unittest.TestCase):
         self.assertTrue(self.module.exists())
         self.assertEqual(set(json.loads(self.index.read_bytes())), {"ps_fixture"})
 
+    def test_missing_dispatch_invalidates_completed_shard(self):
+        src = self.src.with_name("cs_dispatch.s")
+        self.src.rename(src)
+        (self.src.parent.parent / "ps_fixture.dxbc").rename(self.src.parent.parent / "cs_dispatch.dxbc")
+        part = self.out / "index.part0.json"
+        part.write_bytes(b"{}")
+        result = subprocess.run([sys.executable, "-I", TOOL, str(src), "--out", str(self.out),
+                                 "--shard", "0/1"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("1 of 1 selected shaders missing required inputs", result.stderr)
+        self.assertFalse(part.exists())
+
     def test_missing_assembler_is_one_setup_error(self):
         err = io.StringIO()
         with mock.patch.object(sys, "argv", [TOOL, str(self.src), "--out", str(self.out)]), \
