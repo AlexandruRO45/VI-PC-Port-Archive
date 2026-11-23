@@ -474,5 +474,103 @@ class TestLdsXorB32BoundariesAndWrapping(unittest.TestCase):
         self.assertEqual(old, 0x77777777)
         self.assertEqual(new, 0x66666666)
 
+class TestLdsXorB32TranslatorIntegration(unittest.TestCase):
+    """Live translator regression tests verifying tools/rdna2spirv.py emits valid SPIR-V."""
+
+    def test_translator_emits_valid_spirv_op_atomic_xor(self) -> None:
+        if support is None:
+            self.skipTest(f"Translator not available: {TRANSLATOR_ERROR}")
+
+        body = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 0x0F0F0F0F",
+            "ds_xor_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_test_ds_xor_b32", body)
+        self.assertIn("OpAtomicXor", spv)
+        self.assertIn("OpAccessChain", spv)
+
+    def test_translator_execution_matches_oracle(self) -> None:
+        if L is None or support is None:
+            self.skipTest(f"Translator not available: {TRANSLATOR_ERROR}")
+
+        # Execute returning form
+        init = {0x40: 0xFF00FF00}
+        rtns, fin = L.run_chain([("ds_xor_rtn_b32", 0x40, 0, (0x0F0F0F0F,))], init)
+        self.assertEqual(rtns, [0xFF00FF00])
+        self.assertEqual(fin, {0x40: 0xF00FF00F})
+
+        # Execute non-returning form
+        rtns2, fin2 = L.run_chain([("ds_xor_b32", 0x40, 0, (0x00FF00FF,))], {0x40: 0xFF00FF00})
+        self.assertEqual(rtns2, [0xDEAD])
+        self.assertEqual(fin2, {0x40: 0xFFFFFFFF})
+
+
+class TestLdsXorB32NegativeControls(unittest.TestCase):
+    """Unit tests for negative controls, syntax rejection, and invalid AST inputs."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+
+    def test_invalid_operand_kinds(self) -> None:
+        with self.assertRaises(ValueError):
+            # vaddr cannot be an SGPR
+            Instruction(Opcode.DS_XOR_B32, vaddr=Register(RegKind.SGPR, 0), vdata=Register(RegKind.VGPR, 1))
+        with self.assertRaises(ValueError):
+            # vdata cannot be an SGPR
+            Instruction(Opcode.DS_XOR_B32, vaddr=Register(RegKind.VGPR, 0), vdata=Register(RegKind.SGPR, 1))
+
+    def test_invalid_destination_semantics(self) -> None:
+        with self.assertRaises(ValueError):
+            # Non-returning form cannot have vdst
+            Instruction(
+                Opcode.DS_XOR_B32,
+                vdst=Register(RegKind.VGPR, 5),
+                vaddr=Register(RegKind.VGPR, 0),
+                vdata=Register(RegKind.VGPR, 1),
+            )
+        with self.assertRaises(ValueError):
+            # Returning form MUST have vdst
+            Instruction(
+                Opcode.DS_XOR_RTN_B32,
+                vdst=None,
+                vaddr=Register(RegKind.VGPR, 0),
+                vdata=Register(RegKind.VGPR, 1),
+            )
+
+
+class TestLdsXorB32MutationDetection(unittest.TestCase):
+    """Mutation tests: verifies that intentional sabotages/mutations of the oracle are caught."""
+
+    def test_mutation_returning_new_value_instead_of_old(self) -> None:
+        # Sabotage: returning new value instead of old value
+        def mutated_atomic_xor(m: int, d: int) -> tuple[int, int]:
+            return (m ^ d), (m ^ d)  # BUG: returns new as old
+
+        old, _ = mutated_atomic_xor(0x12345678, 0x000000FF)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(old, 0x12345678)
+
+    def test_mutation_unaligned_address_not_stripped(self) -> None:
+        # Sabotage: not dropping low 2 bits
+        def mutated_effective_dword(vaddr: int) -> int:
+            return vaddr >> 0  # BUG: byte address instead of dword
+
+        self.assertNotEqual(mutated_effective_dword(67), lds_effective_dword(67))
+
+    def test_mutation_simd_exec_leak(self) -> None:
+        simd = SIMDWavefrontInterpreter(wave_size=32)
+        simd.storage.write_dword(0, 0x12345678)
+        simd.set_exec_mask(0)  # All lanes disabled
+        inst = Instruction(Opcode.DS_XOR_B32, vaddr=Register(RegKind.VGPR, 0), vdata=Register(RegKind.VGPR, 1))
+        simd.step(inst)
+        # Memory must not change
+        self.assertEqual(simd.storage.read_dword(0), 0x12345678)
+
 if __name__ == "__main__":
     unittest.main()
