@@ -122,6 +122,15 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual([t["tag"] for t in tags], [0x12, 0x0D, 0x07])
         self.assertEqual(tags[1]["magic"], "XBCH")
 
+    def test_xdat_short_tag_does_not_read_neighbor_magic(self):
+        # Sub-4-byte tags must report empty magic without borrowing the neighbor's bytes; an exact 4-byte tag keeps its magic.
+        raw_xdat = xdat([(0x0D, b""), (0x0E, b"XBC"), (0x0F, b"XBCH")], 0)
+        tags = psc.xdat_tags(raw_xdat)
+        self.assertEqual(
+            [(t["tag"], t["size"], t["magic"]) for t in tags],
+            [(0x0D, 0, ""), (0x0E, 3, ""), (0x0F, 4, "XBCH")],
+        )
+
     def test_module_name_forms(self):
         self.assertEqual(psc.module_name(ildn("ConstructBVH4")), "ConstructBVH4")
         self.assertEqual(psc.module_name(b"\x00\x00\x0a\x00C:\\a\\b.pdb"), "b")
@@ -156,6 +165,7 @@ class ContainerTests(unittest.TestCase):
             with open(os.path.join(tmp, "RefitBVH4_00.dxbc"), "wb") as f:
                 f.write(b"stale")
             index = psc.extract(data, found, tmp)
+            self.assertEqual(index[0]["name"], "RefitBVH4_01")
             self.assertEqual(index[0]["file"], "RefitBVH4_01.dxbc")
             with open(os.path.join(tmp, index[0]["file"]), "rb") as f:
                 self.assertEqual(f.read(), data)

@@ -141,13 +141,13 @@ def xdat_tags(dxil: bytes) -> list[dict]:
         tag, offset, size = struct.unpack_from("<III", dxil, at)
         if offset + size > len(dxil):
             continue
-        magic = dxil[offset : offset + 4]
+        magic = dxil[offset : offset + 4] if size >= 4 else b""
         out.append(
             {
                 "tag": tag,
                 "size": size,
                 "magic": magic.decode("latin-1")
-                if all(0x20 <= b < 0x7F for b in magic)
+                if len(magic) == 4 and all(0x20 <= b < 0x7F for b in magic)
                 else "",
             }
         )
@@ -214,7 +214,8 @@ def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:
     index = []
     for k, record in enumerate(records):
         stem = safe_stem(record["name"], k)
-        file = f"{stem}.dxbc"
+        out_stem = stem
+        file = f"{out_stem}.dxbc"
         target = os.path.join(directory, file)
         n = k
         while True:
@@ -223,10 +224,11 @@ def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:
                     f.write(data[record["offset"] : record["offset"] + record["size"]])
                 break
             except FileExistsError:
-                file = f"{stem}_{n:02d}.dxbc"
+                out_stem = f"{stem}_{n:02d}"
+                file = f"{out_stem}.dxbc"
                 target = os.path.join(directory, file)
                 n += 1
-        index.append({"name": stem, "file": file, "stage": record.get("stage") or "cs"})
+        index.append({"name": out_stem, "file": file, "stage": record.get("stage") or "cs"})
     return index
 
 
