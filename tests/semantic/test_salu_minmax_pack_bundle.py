@@ -233,5 +233,22 @@ class SMinU32SimdDivergenceTests(unittest.TestCase):
         res2, scc2 = oracle_min_u32(0x20, 0x10)
         self.assertEqual(scc2, 0)
 
+class SMinU32TranslatorTests(unittest.TestCase):
+    def test_min_u32_translation_and_execution(self):
+        lines = [
+            "s_mov_b32 s0, 10",
+            "s_mov_b32 s1, 0xFFFFFFFF",
+            "s_min_u32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, s3",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_min_u32_exec", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 10)
+        self.assertEqual(words[1], 1)  # 10 < 0xFFFFFFFF -> SCC = 1
+
 if __name__ == "__main__":
     unittest.main()
