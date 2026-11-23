@@ -741,5 +741,95 @@ class TestVSadI16IEEE754BitPatterns(unittest.TestCase):
         s0 = pack_halfwords(f16_subnorm_min, 0)
         self.assertEqual(ref_sad_i16(s0, 0, 0), 1)
 
+# ==============================================================================
+# Unit Tests: Negative Controls, Syntax Rejection, and Mutation Detection
+# ==============================================================================
+
+class TestVSadI16NegativeControls(unittest.TestCase):
+    """Test suite verifying negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_destination_not_vgpr(self) -> None:
+        """Destination operand must strictly be a VGPR."""
+        with self.assertRaises(TypeError):
+            VSadI16Instruction(
+                dst=Operand.sgpr(0),
+                src0=Operand.vgpr(1),
+                src1=Operand.vgpr(2),
+                src2=Operand.literal(0),
+            )
+
+    def test_negative_control_bit_flip_detection(self) -> None:
+        """Single-bit corruptions of the expected result are caught."""
+        s0 = pack_halfwords(0x8000, 0x8000)
+        s1 = pack_halfwords(0x7FFF, 0x7FFF)
+        correct = ref_sad_i16(s0, s1, 0)
+        self.assertEqual(correct, 0x1FFFE)
+        corrupted = correct ^ 1
+        self.assertNotEqual(correct, corrupted)
+
+    def test_mutation_unsigned_instead_of_signed_diff_detected(self) -> None:
+        """Mutant: Treats 16-bit inputs as unsigned integers (v_sad_u16)."""
+        def mutant_sad_u16(s0: int, s1: int, s2: int) -> int:
+            diff0 = abs((s0 & 0xFFFF) - (s1 & 0xFFFF))
+            diff1 = abs(((s0 >> 16) & 0xFFFF) - ((s1 >> 16) & 0xFFFF))
+            return (diff0 + diff1 + (s2 & MASK32)) & MASK32
+
+        s0 = pack_halfwords(0xFFFF, 0)  # signed -1, unsigned 65535
+        s1 = pack_halfwords(0, 0)
+        s2 = 0
+
+        oracle_res = ref_sad_i16(s0, s1, s2)
+        mutant_res = mutant_sad_u16(s0, s1, s2)
+
+        # Oracle (signed): |-1 - 0| = 1
+        self.assertEqual(oracle_res, 1)
+        # Mutant (unsigned): |65535 - 0| = 65535
+        self.assertEqual(mutant_res, 65535)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_omitted_accumulator_detected(self) -> None:
+        """Mutant: Forgets to add accumulator src2."""
+        def mutant_sad_no_acc(s0: int, s1: int, s2: int) -> int:
+            return ref_sad_i16_sum(s0, s1)
+
+        s0 = 0
+        s1 = 0
+        s2 = 0x1234_5678
+
+        oracle_res = ref_sad_i16(s0, s1, s2)
+        mutant_res = mutant_sad_no_acc(s0, s1, s2)
+
+        self.assertEqual(oracle_res, s2)
+        self.assertEqual(mutant_res, 0)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_simd_ignore_exec_mask_detected(self) -> None:
+        """Mutant: SIMD interpreter writes inactive lanes ignoring EXEC mask."""
+        sentinel = 0xCAFEBABE
+        state = SIMDState(num_lanes=32, exec_mask=0x0000_0000)
+        for lane in range(32):
+            state.vgprs[lane][0] = sentinel
+
+        class BrokenSIMDInterpreter(SIMDInterpreter):
+            def step(self, instr: VSadI16Instruction, state: SIMDState) -> List[Optional[int]]:
+                results = []
+                for lane in range(state.num_lanes):
+                    res = ref_sad_i16(0xFFFF, 0, 0)
+                    state.write_lane(instr.dst, lane, res)
+                    results.append(res)
+                return results
+
+        broken = BrokenSIMDInterpreter()
+        instr = VSadI16Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.literal(0xFFFF),
+            src1=Operand.literal(0),
+            src2=Operand.literal(0),
+        )
+        broken.step(instr, state)
+
+        corrupted = [lane for lane in range(32) if state.vgprs[lane][0] != sentinel]
+        self.assertEqual(len(corrupted), 32)
+
 if __name__ == "__main__":
     unittest.main()
