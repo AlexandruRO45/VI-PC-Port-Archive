@@ -1098,6 +1098,31 @@ int main() {
                     EXPECT(std::equal(expected.begin(), expected.end(), pixel));
                 }
             }
+            // Negative control: a two-view PSO on a one-slice view must be refused instead of reaching Vulkan.
+            Ref<ID3D12DescriptorHeap> single_heap;
+            EXPECT(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&single_heap.p)) == S_OK);
+            const D3D12_CPU_DESCRIPTOR_HANDLE single_rtv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(single_heap.p, 9))(single_heap.p))};
+            view.Texture2DArray.ArraySize = 1;
+            device->CreateRenderTargetView(array_target.p, &view, single_rtv);
+            EXPECT(allocator->Reset() == S_OK && list->Reset(allocator.p, multiview.p) == S_OK);
+            list->ResourceBarrier(1, &begin_array_draw);
+            list->SetGraphicsRootSignature(root.p);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->IASetVertexBuffers(0, 1, &vbv);
+            list->IASetIndexBuffer(&ibv);
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &single_rtv, FALSE, nullptr);
+            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+            list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+            list->ResourceBarrier(1, &end_array_draw);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_subresource);
+            ++value;
+            EXPECT(queue->Signal(fence.p, value) == S_OK && fence->SetEventOnCompletion(value, nullptr) == S_OK);
             // Reset releases the last multiview PSO and its recorded references before the existing lifetime checks.
             EXPECT(allocator->Reset() == S_OK && list->Reset(allocator.p, pso.p) == S_OK && list->Close() == S_OK);
         } else {
