@@ -249,7 +249,49 @@ class TestBfiSIMD(unittest.TestCase):
                 self.assertEqual(wave.lanes[i].vgpr[0], 0xBAADF00D)
 
 
+
+class TestBfiAliasing(unittest.TestCase):
+    def test_dst_aliases_src0(self):
+        # dst is mask: v0 = (v0 & v1) | (~v0 & v2)
+        interp = ScalarInterp()
+        interp.vgpr[0] = 0x00FF00FF
+        interp.vgpr[1] = 0xAAAAAAAA
+        interp.vgpr[2] = 0x55555555
+        expected = ref_bfi_b32(0x00FF00FF, 0xAAAAAAAA, 0x55555555)
+        interp.execute_line("v_bfi_b32 v0, v0, v1, v2")
+        self.assertEqual(interp.vgpr[0], expected)
+
+    def test_dst_aliases_src1(self):
+        # dst is field: v1 = (v0 & v1) | (~v0 & v2)
+        interp = ScalarInterp()
+        interp.vgpr[0] = 0xF0F0F0F0
+        interp.vgpr[1] = 0x12345678
+        interp.vgpr[2] = 0x9ABCDEF0
+        expected = ref_bfi_b32(0xF0F0F0F0, 0x12345678, 0x9ABCDEF0)
+        interp.execute_line("v_bfi_b32 v1, v0, v1, v2")
+        self.assertEqual(interp.vgpr[1], expected)
+
+    def test_dst_aliases_src2(self):
+        # dst is base: v2 = (v0 & v1) | (~v0 & v2)
+        interp = ScalarInterp()
+        interp.vgpr[0] = 0x0F0F0F0F
+        interp.vgpr[1] = 0xFFFFFFFF
+        interp.vgpr[2] = 0x11111111
+        expected = ref_bfi_b32(0x0F0F0F0F, 0xFFFFFFFF, 0x11111111)
+        interp.execute_line("v_bfi_b32 v2, v0, v1, v2")
+        self.assertEqual(interp.vgpr[2], expected)
+
+    def test_all_operands_identical(self):
+        # v0 = (v0 & v0) | (~v0 & v0) = v0 | 0 = v0
+        interp = ScalarInterp()
+        val = 0xA5A5A5A5
+        interp.vgpr[0] = val
+        interp.execute_line("v_bfi_b32 v0, v0, v0, v0")
+        self.assertEqual(interp.vgpr[0], val)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
