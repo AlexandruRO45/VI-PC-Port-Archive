@@ -440,7 +440,8 @@ def find_harness(explicit: str | None) -> str:
         *(os.path.join(folder, executable) for folder in build_dirs),
     ):
         if candidate and os.path.isfile(candidate):
-            return candidate
+            # A bare filename would be searched on PATH when the harness starts.
+            return os.path.abspath(candidate) if not os.path.dirname(candidate) else candidate
     for folder in build_dirs:
         configured = find_test_program(folder, "vk_harness")
         if configured:

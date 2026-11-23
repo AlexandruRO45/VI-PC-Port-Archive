@@ -1,5 +1,6 @@
 """CPU-only checks for the first-light harness lookup."""
 
+from contextlib import chdir
 import os
 from pathlib import Path
 import sys
@@ -48,6 +49,17 @@ class FirstLightHarnessPathsTests(unittest.TestCase):
         self.assertEqual(first_light.find_harness(str(explicit) + ".missing"), str(environment))
         environment.unlink()
         self.assertEqual(first_light.find_harness(None), str(configured))
+
+    def test_selected_bare_filename_resolves_in_the_working_directory(self) -> None:
+        self.enterContext(chdir(self.root))
+        explicit = self.root / f"explicit-{self.executable}"
+        environment = self.root / self.executable
+        explicit.touch()
+        environment.touch()
+        os.environ["LEONIDA_VK_HARNESS"] = environment.name
+        for option, selected in ((explicit.name, explicit), ("missing-harness", environment), (None, environment)):
+            with self.subTest(option=option):
+                self.assertEqual(first_light.find_harness(option), str(Path.cwd() / selected.name))
 
 
 if __name__ == "__main__":
