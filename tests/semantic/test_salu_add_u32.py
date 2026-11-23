@@ -335,5 +335,82 @@ class SaluAddU32ScalarInterpreterTests(unittest.TestCase):
             self.assertEqual(scc, 0)
             self.assertEqual(state.get_sgpr(0), expected)
 
+
+# --- Section 4: SIMD Multi-Lane Divergence and Wave Execution ---
+
+class SimdLaneState:
+    """State of an individual vector lane."""
+
+    def __init__(self, lane_id: int) -> None:
+        self.lane_id = lane_id
+        self.vgprs: dict[int, int] = {}
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs.get(idx, 0) & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+
+class SimdWaveState:
+    """Simulates wave-level scalar execution and vector lane interactions."""
+
+    def __init__(self, wave_size: int = 32) -> None:
+        self.wave_size = wave_size
+        self.scalar_state = ScalarRegisterState()
+        self.lanes = [SimdLaneState(i) for i in range(wave_size)]
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def broadcast_scalar_to_lanes(self, sgpr_idx: int, vgpr_idx: int) -> None:
+        """Broadcast a scalar register to a VGPR across active lanes."""
+        val = self.scalar_state.get_sgpr(sgpr_idx)
+        for i, lane in enumerate(self.lanes):
+            if (self.exec_mask >> i) & 1:
+                lane.set_vgpr(vgpr_idx, val)
+
+
+class SaluAddU32SimdExecutionTests(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and EXEC masking tests."""
+
+    def test_wave32_uniform_scalar_broadcast(self) -> None:
+        wave = SimdWaveState(wave_size=32)
+        wave.scalar_state.set_sgpr(1, 0x1234)
+        wave.scalar_state.set_sgpr(2, 0x5678)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1), Operand(RegKind.SGPR, 2))
+        wave.scalar_state.step(ast)
+        wave.broadcast_scalar_to_lanes(sgpr_idx=0, vgpr_idx=5)
+        for lane in wave.lanes:
+            self.assertEqual(lane.get_vgpr(5), 0x68AC)
+
+    def test_divergent_exec_mask_preservation(self) -> None:
+        wave = SimdWaveState(wave_size=32)
+        for lane in wave.lanes:
+            lane.set_vgpr(0, 0xDEADBEEF)
+
+        wave.exec_mask = 0x0000FFFF  # only low 16 lanes active
+        wave.scalar_state.set_sgpr(0, 100)
+        wave.scalar_state.set_sgpr(1, 200)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+        wave.scalar_state.step(ast)
+        wave.broadcast_scalar_to_lanes(sgpr_idx=2, vgpr_idx=0)
+
+        for i, lane in enumerate(wave.lanes):
+            if i < 16:
+                self.assertEqual(lane.get_vgpr(0), 300)
+            else:
+                self.assertEqual(lane.get_vgpr(0), 0xDEADBEEF)
+
+    def test_wave64_scalar_uniformity(self) -> None:
+        wave = SimdWaveState(wave_size=64)
+        wave.scalar_state.set_sgpr(10, 0xFFFFFFFF)
+        wave.scalar_state.set_sgpr(11, 1)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 12), Operand(RegKind.SGPR, 10), Operand(RegKind.SGPR, 11))
+        wave.scalar_state.step(ast)
+        self.assertEqual(wave.scalar_state.get_sgpr(12), 0)
+        self.assertEqual(wave.scalar_state.scc, 1)
+        wave.broadcast_scalar_to_lanes(sgpr_idx=12, vgpr_idx=1)
+        for lane in wave.lanes:
+            self.assertEqual(lane.get_vgpr(1), 0)
+
 if __name__ == "__main__":
     unittest.main()
