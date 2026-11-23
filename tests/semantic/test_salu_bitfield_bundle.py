@@ -598,5 +598,28 @@ class TestSBfmB64Bounds(unittest.TestCase):
         self.assertEqual(ref_bfm_b64(8, 64), 0xFF)
 
 
+def run_hw_bfm_b64(width: int, offset: int) -> int:
+    lines = [
+        f"s_mov_b32 s0, {width & MASK32:#x}",
+        f"s_mov_b32 s1, {offset & MASK32:#x}",
+        "s_bfm_b64 s[2:3], s0, s1",
+        "v_cndmask_b32 v0, 0, 1, s[2:3]",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_bfm_b64_hw", lines)
+    return support.mrt0_words(spv)[0]
+
+
+class TestSBfmB64HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for s_bfm_b64."""
+
+    def test_translator_mask_cases(self):
+        # Lane 0 selected when offset <= 0 < offset + width
+        self.assertEqual(run_hw_bfm_b64(16, 0), 1)
+        # Lane 0 not selected when offset = 16
+        self.assertEqual(run_hw_bfm_b64(16, 16), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
