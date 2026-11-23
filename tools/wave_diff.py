@@ -370,7 +370,7 @@ def generate_program(rng, n_ops, wave=64, masks_as_data=False, permlane_partial=
 # ---- translator side --------------------------------------------------------------------------------------------
 
 def _write(path, lines, stores):
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("; wave_diff case  code 0x0..0x1000\n")
         for line in lines:
             f.write("\t" + line + "\n")
@@ -528,4 +528,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(errors="replace")
     sys.exit(main())

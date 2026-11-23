@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import sys
 from tempfile import TemporaryDirectory
 
 
@@ -52,4 +53,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(errors="replace")
     main()

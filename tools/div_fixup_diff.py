@@ -1032,4 +1032,5 @@ def _report(failure):
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(errors="replace")
     sys.exit(main())
