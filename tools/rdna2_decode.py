@@ -141,7 +141,7 @@ _SOPP_BRANCHES = frozenset({
 
 # SOPP instructions that take no operand at all.
 _SOPP_NO_OPERAND = frozenset({
-    "s_endpgm", "s_barrier", "s_icache_inv", "s_ttracedata", "s_ttracedata_imm",
+    "s_endpgm", "s_barrier", "s_icache_inv", "s_ttracedata",
     "s_wakeup", "s_endpgm_saved", "s_code_end", "s_endpgm_ordered_ps_done",
 })
 
