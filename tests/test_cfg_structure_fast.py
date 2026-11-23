@@ -9,9 +9,11 @@ loops, unreachable blocks, and multi-thousand-block diamond/loop/exit shader CFG
 from __future__ import annotations
 
 import collections
+import gc
 import os
 import random
 import sys
+import tracemalloc
 import unittest
 
 sys.dont_write_bytecode = True
@@ -189,9 +191,32 @@ class CfgStructureFastTests(unittest.TestCase):
                     self.assertEqual([rpo[pi] for pi in preds_i[vi]], ref_preds.get(v, []))
                 for v in range(len(g)):
                     if v not in ref_rpo:
-                        self.assertEqual(pos[v], -1)
+                        self.assertNotIn(v, pos)
                 got_rpo, got_back, got_preds = S._order(g)
                 self.assertEqual((got_rpo, got_back, dict(got_preds)), (ref_rpo, ref_back, dict(ref_preds)))
+
+    def test_dominators_wrapper_entry_without_predecessors_and_sparse_memory(self):
+        with self.subTest(case="plain_dict_without_entry_key"):
+            self.assertEqual(S._dominators([0, 1], {1: [0]}), ({0: 0, 1: 0}, {0: 0, 1: 1}))
+            rpo_o, _, preds_o = S._order([[1], []])
+            self.assertNotIn(0, preds_o)
+            S._dominators(rpo_o, preds_o)
+            self.assertNotIn(0, preds_o)
+            self.assertEqual(S._order_rpo([[1], []])[0], [0, 1])
+
+        with self.subTest(case="sparse_unreachable_blocks_memory"):
+            succ = [()] * 65536
+            succ[0] = (65535,)
+            gc.collect()
+            tracemalloc.start()
+            try:
+                tree = S.structure(succ)
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            self.assertEqual(tree, [("block", 0), ("block", 65535)])
+            self.assertLess(peak, 16384)
+            self.assertEqual(S._order_rpo(succ)[0], [0, 65535])
 
     def test_dominators_rpo_single_pass_dag_and_cyclic_parity(self):
         # 1. Early-exit DAG where common exit block has 400 predecessors (all dominated by root 0).

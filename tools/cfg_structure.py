@@ -29,9 +29,7 @@ END = -1
 
 def _order_rpo(succ):
     """Reverse postorder from block 0, its RPO index table, retreating edges, and RPO-indexed predecessors."""
-    n = len(succ)
-    state = [0] * n
-    state[0] = 1
+    state = {0: 1}
     order, back = [], []
     stack = [(0, 0, succ[0])]
     while stack:
@@ -40,7 +38,7 @@ def _order_rpo(succ):
         while idx < n_sv:
             w = sv[idx]
             idx += 1
-            st = state[w]
+            st = state.get(w, 0)
             if st == 0:
                 state[w] = 1
                 stack[-1] = (v, idx, sv)
@@ -54,9 +52,7 @@ def _order_rpo(succ):
             stack.pop()
     rpo = order[::-1]
     m = len(rpo)
-    pos = [-1] * n
-    for i, v in enumerate(rpo):
-        pos[v] = i
+    pos = {v: i for i, v in enumerate(rpo)}
     preds_i = [[] for _ in range(m)]
     for vi, v in enumerate(rpo):
         for w in succ[v]:
@@ -149,20 +145,21 @@ def _dominators_rpo(m, preds_i, has_back=True):
 def _dominators(rpo, preds):
     """Immediate dominator of each reachable block (Cooper, Harvey and Kennedy)."""
     pos = {v: i for i, v in enumerate(rpo)}
-    preds_i = [[pos[p] for p in preds[v] if p in pos] for v in rpo]
+    preds_i = [[]] + [[pos[p] for p in preds.get(v, ()) if p in pos] for v in rpo[1:]]
     idom_i = _dominators_rpo(len(rpo), preds_i)
     return {rpo[vi]: rpo[idom_i[vi]] for vi in range(len(rpo))}, pos
 
 
 def structure(succ):
-    n = len(succ)
     rpo, pos, back, preds_i = _order_rpo(succ)
     m = len(rpo)
     idom_i = _dominators_rpo(m, preds_i, bool(back))
 
     # Dominance among the members of each region. A member's parent is the member holding the immediate
     # dominator of its first block; that dominator is always inside the same region.
-    # Member encoding: integer node >= 0 is block node; node < 0 is loop headed by ~node (-1 - node).
+    # Member encoding in RPO index space (0..m-1):
+    #   integer node >= 0 is block at RPO index node (original block id rpo[node]);
+    #   integer node < 0 is loop headed at RPO index ~node (original header block id rpo[~node]).
     # Iterating xi in RPO order (1..m-1) appends children in strictly increasing RPO position.
     if back:
         for v, w in back:
@@ -193,30 +190,29 @@ def structure(succ):
                 elif xi != hi and xi in outer and outer[xi] < 0:
                     outer[xi] = hi
 
-        children = [[] for _ in range(2 * n)]
+        children = [[] for _ in range(2 * m)]
         for xi in range(1, m):
-            v = rpo[xi]
             reg = inner[xi]
             di = idom_i[xi]
             if reg == xi:                                 # a loop header: placed as its loop, in the outer region
                 t_reg = outer[xi]
-                child = ~v
+                child = ~xi
             else:
                 t_reg = reg
-                child = v
+                child = xi
             loop = inner[di]
             if loop == t_reg:
-                parent = rpo[di]
+                parent = di
             else:
                 while outer[loop] != t_reg:
                     loop = outer[loop]
-                parent = ~rpo[loop]
+                parent = ~loop
             children[parent].append(child)
         start = ~0 if 0 in bodies else 0
     else:
-        children = [[] for _ in range(n)]
+        children = [[] for _ in range(m)]
         for xi in range(1, m):
-            children[rpo[idom_i[xi]]].append(rpo[xi])
+            children[idom_i[xi]].append(xi)
         start = 0
 
     # Flatten dominated tail continuations out of enclosing guards and build iteratively so long sequential
@@ -234,11 +230,12 @@ def structure(succ):
         out_list, parent_list, node, d = stack.pop()
         if out_list is None:
             gbody = []
-            parent_list.append(("guard", node if node >= 0 else ~node, gbody))
+            parent_list.append(("guard", rpo[node if node >= 0 else ~node], gbody))
             out_list = gbody
         below = children[node]
         if node < 0:
-            x = ~node
+            hi = ~node
+            x = rpo[hi]
             lbody = []
             out_list.append(("loop", x, lbody))
             if below:
@@ -249,14 +246,15 @@ def structure(succ):
                 else:
                     for c in reversed(below):
                         stack.append((None, out_list, c, d + 1))
-            stack.append((lbody, None, x, 0))
+            stack.append((lbody, None, hi, 0))
         else:
-            out_list.append(("block", node))
+            x = rpo[node]
+            out_list.append(("block", x))
             if below:
                 n_below = len(below)
-                sx = succ[node]
+                sx = succ[x]
                 c0 = below[0]
-                if n_below == 1 and len(sx) == 1 and sx[0] == (c0 if c0 >= 0 else ~c0):
+                if n_below == 1 and len(sx) == 1 and sx[0] == rpo[c0 if c0 >= 0 else ~c0]:
                     stack.append((out_list, parent_list, c0, d))
                 elif parent_list is not None and (n_below >= 2 or d >= max_guard_depth):
                     stack.append((None, parent_list, below[-1], d))
