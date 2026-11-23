@@ -11490,9 +11490,28 @@ class Gen:
         self._scan = (body, len(body), open_)
         return not open_
 
-    def store_gather_taps(self, first_vgpr: int, taps: list[str], d16: bool) -> None:
-        """Write four taps in gather order, two per destination VGPR for d16."""
-        if d16:
+    # Dimensions whose image_sample_lz and image_gather4_lz read the float view directly (not image_read_typed), and
+    # narrow d16 by the T# format there (d16_fmt_pair).
+    D16_FMT_DIMS = ("dim:SQ_RSRC_IMG_2D_ARRAY", "dim:SQ_RSRC_IMG_CUBE")
+
+    def d16_fmt_pair(self, f0, f1, flags):
+        """pack_f16_pair_int with image_read_typed's d16 rule: two f32 results -> lo | hi << 16, each through
+        d16_norm_f16 with flags = fmt_float_flags(T# word 1) (UNORM/SNORM rounded once, 32_FLOAT toward zero).
+        Measured on an RX 6700 (gfx1031) for 2D_ARRAY and CUBE image_load, image_sample_lz and image_gather4_lz,
+        every UNORM16/SNORM16 value and the 32_FLOAT ties, wave32 and wave64 (tools/d16_image_probe.py --dims)."""
+        self.uses_d16_image = True
+        lo = self.d16_norm_f16(self.tou(f0), *flags)
+        hi = self.d16_norm_f16(self.tou(f1), *flags)
+        hi_s, out = self.tmp(), self.tmp()
+        self.emit(f"{hi_s} = OpShiftLeftLogical %uint {hi} {self.cu(16)}")
+        self.emit(f"{out} = OpBitwiseOr %uint {lo} {hi_s}")
+        return out
+
+    def store_gather_taps(self, first_vgpr: int, taps: list[str], d16: bool, flags=None) -> None:
+        """Write four taps in gather order, two per destination VGPR for d16 (by the T# format with flags)."""
+        if d16 and flags is not None:
+            words = [self.d16_fmt_pair(taps[0], taps[1], flags), self.d16_fmt_pair(taps[2], taps[3], flags)]
+        elif d16:
             words = [self.pack_f16_pair_int(taps[0], taps[1]), self.pack_f16_pair_int(taps[2], taps[3])]
         else:
             words = [self.tou(tap) for tap in taps]
@@ -11990,7 +12009,9 @@ class Gen:
                     comp = self.tmp()
                     self.emit(f"{comp} = OpCompositeExtract %float {res} {c}")
                     comps.append(comp)
-                self.store_gather_taps(vdata["r"], comps, d16)
+                flags = (self.fmt_float_flags(self.sgpr_word(a[2], 1))
+                         if d16 and dim in self.D16_FMT_DIMS else None)
+                self.store_gather_taps(vdata["r"], comps, d16, flags)
                 return
             kind = op[len("image_sample"):]          # '', '_lz', '_l', '_b', '_c_lz', '_d', '_d_cl' (+ '_o')
             off = None
@@ -12158,9 +12179,12 @@ class Gen:
             raise Unsupported("dmask")
         if d16:
             # d16: components are packed two per register as f16 (x|y<<16, z|w<<16).
+            flags = (self.fmt_float_flags(self.sgpr_word(a[2], 1))
+                     if op == "image_sample_lz" and dim in self.D16_FMT_DIMS else None)
             for i in range(0, len(comps), 2):
                 second = comps[i + 1] if i + 1 < len(comps) else "%f0"
-                p = self.pack_f16_pair_int(comps[i], second)
+                p = (self.d16_fmt_pair(comps[i], second, flags) if flags is not None
+                     else self.pack_f16_pair_int(comps[i], second))
                 self.dst({"k": "vgpr", "r": vdata["r"] + i // 2, "n": 1}, p)
         else:
             for i, comp in enumerate(comps):

@@ -14,6 +14,11 @@
 //   1.0 or 0.0 the reference 0.5 gives against the texel each pixel reads.
 //   vk_texture_test dref_a16 [out.raw]: the same with ps_sample_c_lz_a16 (16-bit coordinates).
 //   vk_texture_test dref_c / dref_c_b [out.raw]: the same with ps_sample_c (implicit LOD) / ps_sample_c_b (LOD bias).
+//   vk_texture_test d16_array|d16_cube f32|unorm16|snorm16 [out.raw]: ps_d16_array_sample / ps_d16_cube_sample
+//   against the 12-layer 2D array at binding 3 in R32_SFLOAT, R16_UNORM or R16_SNORM (the T# names that format),
+//   holding the f16 halfway cases and others; every d16 half (one sample, three gather taps a pixel) must be the
+//   texel narrowed as an RX 6700 narrows it (tools/d16_image_probe.py --dims): the exact UNORM/SNORM quotient
+//   rounded once to nearest even, a 32_FLOAT texel toward zero.
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 //   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
 //   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
@@ -80,9 +85,97 @@ static int cube_alpha_self_test() {
     return 0;
 }
 
+// f16 bits of p / q (q > 0, |p / q| <= 1) rounded once to nearest even, denormals kept: the d16 result of a
+// UNORM/SNORM texel (tools/d16_format_probe.py's "rte").
+static uint16_t f16_of_ratio(int64_t p, int64_t q) {
+    const uint16_t sign = p < 0 ? 0x8000 : 0;
+    if (p < 0) p = -p;
+    if (p == 0) return sign;
+    int e = 0;                                   // 2^e <= p / q < 2^(e + 1)
+    while ((p << -e) < q) --e;
+    const int k = std::max(e, -14) - 10;         // the ulp is 2^k
+    const int64_t num = p << -k, n0 = num / q, r = num % q;
+    const int64_t n = n0 + (2 * r > q || (2 * r == q && (n0 & 1)));
+    if (n < 1024) return uint16_t(sign | n);     // denormal (k = -24)
+    const int64_t exp = k + 25 + (n == 2048), mant = (n == 2048 ? 1024 : n) - 1024;
+    return uint16_t(sign | exp << 10 | mant);
+}
+
+// f16 bits of the f32 bits v narrowed toward zero (a finite |v| < 65536): the d16 result of a 32_FLOAT texel.
+static uint16_t f16_rtz_of_f32(uint32_t v) {
+    const uint16_t sign = uint16_t(v >> 16 & 0x8000);
+    const int e = int(v >> 23 & 0xFF) - 127;
+    const uint32_t full = (v & 0x7FFFFF) | 0x800000;
+    if (e >= -14) return uint16_t(sign | (e + 15) << 10 | (v & 0x7FFFFF) >> 13);
+    if (e >= -24) return uint16_t(sign | full >> (-14 - e + 13));
+    return sign;
+}
+
+// The 768 texels of the d16 modes, layer-major (texel (l, y, x) at (l * 8 + y) * 8 + x). f32: the 52 f16 halfway
+// points d16_image_probe uses (0x3f7ff000 and 0x3f7fb000, their negatives, and 48 more ties), the f32 on each side of
+// each, then a fixed fill in [-1, 1]; 16-bit: the values whose quotient's f32 is a halfway point (UNORM16 0xffaf and
+// 0xffef, SNORM16 0x7ff7 and 0x8009) with their neighbours, the ends, then every 85th value.
+static std::vector<uint32_t> d16_texels(VkFormat format, size_t count) {
+    std::vector<uint32_t> v;
+    if (format == VK_FORMAT_R32_SFLOAT) {
+        std::vector<uint32_t> ties;
+        for (uint32_t b : {0x3F7FF000u, 0x3F7FB000u}) { ties.push_back(b); ties.push_back(b | 0x80000000u); }
+        for (uint32_t e : {0x3F800000u, 0x3F000000u, 0x3E800000u, 0x3C000000u, 0x38800000u, 0x3F700000u})
+            for (uint32_t step = 1; step <= 4; ++step) {
+                const uint32_t b = e | (2 * step - 1) << 12;
+                ties.push_back(b); ties.push_back(b | 0x80000000u);
+            }
+        v = ties;
+        for (uint32_t b : ties) { v.push_back(b - 1); v.push_back(b + 1); }
+        uint32_t s = 308;
+        while (v.size() < count) {
+            s = s * 1664525u + 1013904223u;
+            const float f = float(s >> 8) / float(1 << 24) * 2.0f - 1.0f;
+            uint32_t bits; std::memcpy(&bits, &f, 4);
+            v.push_back(bits);
+        }
+    } else {
+        const bool snorm = format == VK_FORMAT_R16_SNORM;
+        const uint32_t edge[2][2] = {{0xFFAF, 0xFFEF}, {0x7FF7, 0x8009}};
+        for (uint32_t b : edge[snorm]) { v.push_back(b); v.push_back(b - 1); v.push_back(b + 1); }
+        for (uint32_t b : {0x0000u, 0x0001u, 0x7FFFu, 0x8000u, 0x8001u, 0xFFFFu}) v.push_back(b);
+        for (uint32_t i = 0; v.size() < count; ++i) v.push_back(i * 85u & 0xFFFF);
+    }
+    v.resize(count);
+    return v;
+}
+
+static uint16_t d16_expected(VkFormat format, uint32_t texel) {
+    if (format == VK_FORMAT_R32_SFLOAT) return f16_rtz_of_f32(texel);
+    if (format == VK_FORMAT_R16_UNORM) return f16_of_ratio(texel, 65535);
+    const int32_t s = int16_t(uint16_t(texel));
+    return f16_of_ratio(std::max(s, -32767), 32767);
+}
+
+static int d16_rule_self_test() {
+    struct { VkFormat f; uint32_t in; uint16_t want; } cases[] = {
+        {VK_FORMAT_R32_SFLOAT, 0x3F7FF001u, 0x3BFF}, {VK_FORMAT_R32_SFLOAT, 0x3F7FF000u, 0x3BFF},
+        {VK_FORMAT_R32_SFLOAT, 0xBF801000u, 0xBC00}, {VK_FORMAT_R32_SFLOAT, 0x3F800000u, 0x3C00},
+        {VK_FORMAT_R32_SFLOAT, 0x38800000u, 0x0400}, {VK_FORMAT_R32_SFLOAT, 0x33800000u, 0x0001},
+        {VK_FORMAT_R16_UNORM, 0xFFEF, 0x3BFF}, {VK_FORMAT_R16_UNORM, 0xFFAF, 0x3BFD}, {VK_FORMAT_R16_UNORM, 0xFFFF, 0x3C00},
+        {VK_FORMAT_R16_UNORM, 0x0001, 0x0100}, {VK_FORMAT_R16_UNORM, 0x0000, 0x0000},
+        {VK_FORMAT_R16_SNORM, 0x7FF7, 0x3BFF}, {VK_FORMAT_R16_SNORM, 0x8009, 0xBBFF}, {VK_FORMAT_R16_SNORM, 0x8000, 0xBC00},
+        {VK_FORMAT_R16_SNORM, 0x7FFF, 0x3C00}};
+    for (const auto& c : cases)
+        if (d16_expected(c.f, c.in) != c.want) {
+            std::fprintf(stderr, "d16 rule self-test: format %d, 0x%x -> 0x%04x, want 0x%04x\n", int(c.f), c.in,
+                         d16_expected(c.f, c.in), c.want);
+            return 1;
+        }
+    std::printf("d16 rule self-test ok\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--self-test-cube-alpha") == 0)
         return cube_alpha_self_test();
+    if (argc == 2 && std::strcmp(argv[1], "--self-test-d16-rule") == 0)
+        return d16_rule_self_test();
     const uint32_t W = 64, H = 64, TW = 8;
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
     const bool two_mip = signed_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
@@ -101,6 +194,20 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[1], "dref_c_b")) dref_ps = "ps_sample_c_b.spv";
     }
     const bool dref = dref_ps != nullptr;
+    // d16_array / d16_cube <f32|unorm16|snorm16>: the format of the 2D array at binding 3 (and of the T#).
+    const bool d16_array = argc >= 3 && !std::strcmp(argv[1], "d16_array");
+    const bool d16_cube = argc >= 3 && !std::strcmp(argv[1], "d16_cube");
+    const bool d16_mode = d16_array || d16_cube;
+    VkFormat d16_format = VK_FORMAT_UNDEFINED;
+    if (d16_mode) {
+        if (!std::strcmp(argv[2], "f32")) d16_format = VK_FORMAT_R32_SFLOAT;
+        else if (!std::strcmp(argv[2], "unorm16")) d16_format = VK_FORMAT_R16_UNORM;
+        else if (!std::strcmp(argv[2], "snorm16")) d16_format = VK_FORMAT_R16_SNORM;
+        else {
+            std::fprintf(stderr, "usage: vk_texture_test d16_array|d16_cube f32|unorm16|snorm16 [out]\n");
+            return 2;
+        }
+    }
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
@@ -110,7 +217,7 @@ int main(int argc, char** argv) {
         out_path = argv[3];
         ptr_sgpr = std::atoi(argv[4]);
         for (int i = 0; i < 4; ++i) ssharp[i] = (uint32_t)strtoul(argv[5 + i], 0, 16);
-    } else if (argc <= 2 || ((cube || dref) && argc == 3)) {
+    } else if (argc <= 2 || ((cube || dref) && argc == 3) || (d16_mode && argc <= 4)) {
         // Autonomous mode using synthetic hand-written shaders (no game files required)
         autonomous = true;
         auto find_spv = [](const char* name) -> std::string {
@@ -129,14 +236,15 @@ int main(int argc, char** argv) {
             return std::string("runtime/build/shaders/spirv/") + name;
         };
         vs_path = find_spv("vs_ids.spv");
-        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref ? dref_ps : "ps_texture_sample.spv");
-        const int out_arg = cube || dref ? 2 : 1;
+        fs_path = find_spv(cube ? "ps_cube_sample.spv" : dref ? dref_ps : d16_array ? "ps_d16_array_sample.spv" :
+                           d16_cube ? "ps_d16_cube_sample.spv" : "ps_texture_sample.spv");
+        const int out_arg = cube || dref ? 2 : d16_mode ? 3 : 1;
         out_path = argc > out_arg ? argv[out_arg] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b] [out] | d16_array|d16_cube f32|unorm16|snorm16 [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
@@ -145,6 +253,8 @@ int main(int argc, char** argv) {
         signed_mips ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
     uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(sampled_format) << 20, 0x33333333, 0x44440444,
                           0x55555555, 0x66666666, 0x77777777, 0x88888888};
+    if (d16_mode)   // the shader narrows its d16 results by this FORMAT (Gen.fmt_float_flags)
+        tsharp[1] = leonida::gfx10::format_from_vulkan(d16_format) << 20;
     const uint32_t tsharp_va = 256;
 
     gipa = load_vulkan();
@@ -367,8 +477,17 @@ int main(int argc, char** argv) {
             for (uint32_t l = 0; l < CUBE_LAYERS; l++)
                 cubes[(l * TW + y) * TW + x] = (x * 32u) | ((y * 32u) << 8) | ((l * 20u) << 16) | (255u << 24);
         }
+    // d16 modes: the array holds d16_texels in d16_format instead (2 or 4 bytes a texel).
+    const std::vector<uint32_t> d16_vals = d16_mode ? d16_texels(d16_format, cubes.size()) : std::vector<uint32_t>();
+    std::vector<uint8_t> cube_data(cubes.size() * sizeof(uint32_t));
+    std::memcpy(cube_data.data(), cubes.data(), cube_data.size());
+    if (d16_mode) {
+        const size_t bpp = d16_format == VK_FORMAT_R32_SFLOAT ? 4 : 2;
+        cube_data.assign(d16_vals.size() * bpp, 0);
+        for (size_t i = 0; i < d16_vals.size(); ++i) std::memcpy(&cube_data[i * bpp], &d16_vals[i], bpp);
+    }
     const VkFormat tfmt[4] = {VK_FORMAT_R8G8B8A8_UNORM, sampled_format,
-                              VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
+                              VK_FORMAT_R8G8B8A8_UNORM, d16_mode ? d16_format : VK_FORMAT_R8G8B8A8_UNORM};
     VkImage timg[4]; VkImageView tview[4];
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[0], &timg[0], &tview[0]));
     CHECK(make_tex(texture_side, texture_side, levels, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[1], &timg[1], &tview[1]));
@@ -378,10 +497,10 @@ int main(int argc, char** argv) {
     const VkDeviceSize texture_offset = 256;
     const VkDeviceSize texture_bytes = texels.size() * sizeof(uint32_t);
     const VkDeviceSize cube_offset = texture_offset + texture_bytes;
-    CHECK(make_buffer(cube_offset + cubes.size() * sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up, &upm, &upp));
+    CHECK(make_buffer(cube_offset + cube_data.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up, &upm, &upp));
     std::memcpy(upp, &magenta, sizeof(magenta));
     std::memcpy(static_cast<char*>(upp) + texture_offset, texels.data(), texture_bytes);
-    std::memcpy(static_cast<char*>(upp) + cube_offset, cubes.data(), cubes.size() * sizeof(uint32_t));
+    std::memcpy(static_cast<char*>(upp) + cube_offset, cube_data.data(), cube_data.size());
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
     sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
@@ -618,7 +737,45 @@ int main(int argc, char** argv) {
         }
         std::printf("vk_texture_test dref: PASSED (%u pixels, f32 and d16 depth compares exact)\n", W * H);
     }
-    if (autonomous && !cube && !dref) {
+    if (autonomous && d16_mode) {
+        // Pixel (px, py) reads texel (x, y) = (px % 8, px / 8) of layer py % 12: r the point sample, g/b/a the gather
+        // taps (x, y + 1), (x + 1, y + 1), (x + 1, y), clamped to the layer. Each channel's float is 0x3f80 << 16 | the
+        // d16 half (the shader puts it there).
+        const uint32_t* pixels = static_cast<const uint32_t*>(rbp);
+        const char* mode = d16_array ? "d16_array" : "d16_cube";
+        int wrong[4] = {0, 0, 0, 0}, high = 0, shown = 0;
+        for (uint32_t py = 0; py < H; py++)
+            for (uint32_t px = 0; px < W; px++) {
+                const uint32_t l = py % CUBE_LAYERS, x = px % TW, y = px / TW;
+                const uint32_t x1 = std::min(x + 1, TW - 1), y1 = std::min(y + 1, TW - 1);
+                const uint32_t at[4][2] = {{x, y}, {x, y1}, {x1, y1}, {x1, y}};
+                for (int c = 0; c < 4; ++c) {
+                    const uint32_t got = pixels[(py * W + px) * 4 + c];
+                    const uint32_t texel = d16_vals[(l * TW + at[c][1]) * TW + at[c][0]];
+                    const uint16_t want = d16_expected(d16_format, texel);
+                    high += (got >> 16) != 0x3F80;
+                    if ((got & 0xFFFF) != want) {
+                        ++wrong[c];
+                        if (shown++ < 8)
+                            std::fprintf(stderr, "  pixel (%u, %u) channel %d: texel 0x%08x layer %u (%u, %u): d16 0x%04x, "
+                                         "want 0x%04x\n", px, py, c, texel, l, at[c][0], at[c][1], got & 0xFFFF, want);
+                    }
+                }
+            }
+        uint32_t ties = 0;
+        for (uint32_t t : d16_vals)
+            ties += d16_format == VK_FORMAT_R32_SFLOAT ? ((t & 0x1FFF) == 0x1000 && (t & 0x7F800000) >= 0x38800000)
+                  : d16_format == VK_FORMAT_R16_UNORM ? (t == 0xFFAF || t == 0xFFEF) : (t == 0x7FF7 || t == 0x8009);
+        if (wrong[0] || wrong[1] || wrong[2] || wrong[3] || high) {
+            std::fprintf(stderr, "vk_texture_test %s %s: FAILED, wrong d16 halves: %d samples, %d/%d/%d gather taps "
+                         "(of %u each); %d channels lost their 0x3f80 high half\n", mode, argv[2], wrong[0], wrong[1],
+                         wrong[2], wrong[3], W * H, high);
+            return 1;
+        }
+        std::printf("vk_texture_test %s %s: PASSED (%u pixels: %u samples and %u gather taps exact, over %zu texels, "
+                    "%u of them f16 halfway cases)\n", mode, argv[2], W * H, W * H, 3 * W * H, d16_vals.size(), ties);
+    }
+    if (autonomous && !cube && !dref && !d16_mode) {
         const float* pixels = static_cast<const float*>(rbp);
         // Sample center pixel (32, 32)
         int idx = (32 * W + 32) * 4;

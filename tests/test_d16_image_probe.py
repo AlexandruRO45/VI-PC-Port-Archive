@@ -187,6 +187,121 @@ class Compare(unittest.TestCase):
         self.assertEqual(rc, 77, out)
 
 
+class FakeArrayOracle:
+    """Plays the GPU for the --dims kernels (label .Lpc<dim>_<fmt>_<block>): d16 by the hardware rule ("hw": the
+    quotient rounded once, 32_FLOAT toward zero) or the old translator's ("translator": f32 first, then nearest even),
+    the four gather taps lanes t..t+3 of the kernel, `point_off` a point sample that differs from the load."""
+    arch = "gfx1031"
+    device = "fake gfx1031"
+
+    def __init__(self, rule="hw", point_off=False):
+        self.rule, self.point_off = rule, point_off
+
+    def d16(self, kind, n, v):
+        if kind in ("unorm", "snorm"):
+            return _val(kind, n, v, "rte" if self.rule == "hw" else "f32_rte")
+        if kind == "f16":
+            return v
+        x = fp.Fraction(struct.unpack("<f", struct.pack("<I", v))[0])
+        return ip._f16_signed(x, v, self.rule == "hw")
+
+    @staticmethod
+    def f32(kind, n, v):
+        if kind in ("unorm", "snorm"):
+            return fp.models32(kind, n, v)["f32_rte"]
+        if kind == "f16":
+            return fp.f32_bits(struct.unpack("<e", struct.pack("<H", v))[0])
+        return v
+
+    def run(self, kernels, words=4):
+        out = []
+        for k in kernels:
+            dim, fmt, block = re.match(r"\.Lpc(2d_array|cube)_(\w+?)_(\d+):", k.lines[1]).groups()
+            _, kind, n, _ = ip.FORMATS[fmt]
+            vals = ip.array_values(fmt, int(block))
+            res = []
+            hi = ip.SEED & 0xFFFF0000
+            for lane, v in enumerate(vals):
+                taps = [vals[(lane + i) % len(vals)] for i in range(4)]
+                h = [self.d16(kind, n, t) for t in taps]
+                load = self.f32(kind, n, v)
+                res += [load, hi | self.d16(kind, n, v), load ^ (lane == 7 and self.point_off),
+                        hi | self.d16(kind, n, v), *[self.f32(kind, n, t) for t in taps],
+                        h[0] | h[1] << 16, h[2] | h[3] << 16, lane, 0]
+            out.append(res)
+        return out
+
+    def close(self):
+        pass
+
+
+class ArrayDims(unittest.TestCase):
+    def test_t_sharp_carries_type_layers_and_format(self):
+        for dim, (kind, _) in ip.ARRAY_DIMS.items():
+            for fmt in ip.ARRAY_FORMATS:
+                with self.subTest(dim=dim, fmt=fmt):
+                    w = ip.array_t_words(dim, fmt)
+                    width, rows, layers, _, _ = ip.array_geometry(dim, fmt)
+                    self.assertEqual((w[3] >> 28, w[4], (w[1] >> 20) & 0x1FF), (kind, layers - 1, ip.FORMATS[fmt][0]))
+                    self.assertEqual((((w[2] & 0xFFF) << 2 | w[1] >> 30) + 1, (w[2] >> 14 & 0x3FFF) + 1), (width, rows))
+                    self.assertEqual(width * ip.FORMATS[fmt][2] // 8, 256)       # rows are exactly 256 bytes
+        self.assertEqual(ip.array_geometry("cube", "unorm16")[:3], (128, 128, 6))
+
+    def test_kernels_assemble_for_rdna2(self):
+        try:
+            clang = runner.find_clang()
+        except runner.Unavailable as e:
+            self.skipTest(str(e))
+        for wave in (32, 64):
+            kernels = [asm.Kernel(ip.array_kernel_lines(d, f, 1, f"{d}_{f}_1"), wave, ip.TEXELS,
+                                  ip.TEXELS * ip.ARRAY_WORDS, raw=True, vgprs=32, sgprs=32)
+                       for d in ip.ARRAY_DIMS for f in ip.ARRAY_FORMATS]
+            text, _, _ = asm.module_text(kernels, "gfx1031", wave=wave)
+            with tempfile.TemporaryDirectory() as d:
+                s = Path(d) / "k.s"
+                s.write_text(text, encoding="utf-8")
+                r = subprocess.run([clang, "--target=amdgcn-amd-amdhsa", "-mcpu=gfx1031",
+                                    *(["-mwavefrontsize64"] if wave == 64 else []), "-c", str(s), "-o",
+                                    str(Path(d) / "k.o")], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr[:800])
+            self.assertIn("image_gather4_lz v[20:21], v[16:18], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_CUBE d16",
+                          text)
+
+    def test_hardware_rule_matches_every_lane_and_tap(self):
+        with tempfile.TemporaryDirectory() as d:
+            j = os.path.join(d, "r.json")
+            rc, out = run_main(FakeArrayOracle(), "--dims", "2d_array,cube", "--formats", "unorm16,float32,float16",
+                               "--waves", "32", "--json", j)
+            with open(j, encoding="utf-8") as f:
+                rep = json.load(f)["dims"]
+        self.assertEqual(rc, 0, out)
+        for dim in ("2d_array", "cube"):
+            u = rep[dim]["unorm16"]["forms"]
+            self.assertEqual(u["image_sample_lz_d16"]["match"]["rte"], 65536)
+            self.assertEqual(u["image_sample_lz_d16"]["match"]["f32_rte"], 65534)     # 0xffaf and 0xffef
+            self.assertEqual(u["image_gather4_lz_d16"]["match"]["rte"], 4 * 65536)
+            f = rep[dim]["float32"]["forms"]["image_gather4_lz_d16"]
+            self.assertEqual((f["match"]["rtz"], f["halfway"]["to_even"]), (f["inputs"], 0))
+            self.assertEqual(rep[dim]["float32"]["forms"]["image_sample_lz_d16"]["0x3f7ff001"][0], "0x3bff")
+            self.assertEqual(rep[dim]["float16"]["forms"]["image_load_d16"]["match"]["own"], rep[dim]["float16"]["inputs"])
+
+    def test_the_old_translator_rule_is_told_apart(self):
+        rc, out = run_main(FakeArrayOracle("translator"), "--dims", "2d_array", "--formats", "float32", "--waves", "32")
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r'image_sample_lz_d16: \{"inputs": 1024, "match": \{"rte": 1024, "rtz": 515\}')
+        self.assertRegex(out, r'"halfway": \{"inputs": 52, "to_even": 28, "toward_zero": 0')
+
+    def test_a_point_sample_off_the_load_is_a_harness_error(self):
+        rc, out = run_main(FakeArrayOracle(point_off=True), "--dims", "cube", "--formats", "float16", "--waves", "32")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("point sample differs from image_load", out)
+
+    def test_dims_take_only_their_formats(self):
+        r = subprocess.run([sys.executable, "-I", str(TOOLS / "d16_image_probe.py"), "--dims", "cube", "--formats",
+                            "unorm8"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+
+
 class Cli(unittest.TestCase):
     def test_exits_77_without_the_tools(self):
         env = dict(os.environ, LEONIDA_AMD_CLANG=str(TOOLS / "no-such-clang.exe"), LEONIDA_HW_DRM_NODE="")
@@ -222,6 +337,12 @@ class OnHardware(unittest.TestCase):
         self.assertEqual(res["control"], [])
         self.assertEqual(hw["load"][255], 0x3F800000)
         self.assertEqual(hw["load_d16"][255] & 0xFFFF, 0x3C00)
+
+    def test_array_float32_controls_hold_and_truncate(self):
+        hw = ip.array_sweep(self.oracle, "2d_array", "float32", 32)
+        res = ip.array_classify("2d_array", "float32", hw)
+        self.assertEqual(res["control"], [])
+        self.assertEqual(res["forms"]["image_sample_lz_d16"]["0x3f7ff001"], ["0x3bff"])
 
 
 if __name__ == "__main__":

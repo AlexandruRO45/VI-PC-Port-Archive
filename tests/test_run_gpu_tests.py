@@ -120,7 +120,8 @@ class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
             return rc, output.getvalue()
 
     def test_bindless_texture_and_gather_tests_skip(self):
-        for name in ("ps_cube_sample", "ps_texture_sample_d16", "ps_gather_wrap", "ps_array_resinfo"):
+        for name in ("ps_cube_sample", "ps_texture_sample_d16", "ps_gather_wrap", "ps_array_resinfo",
+                     "ps_d16_array_sample", "ps_d16_cube_sample"):
             with self.subTest(name=name):
                 rc, out = self.run_one(name)
                 self.assertEqual(rc, 0, out)
@@ -554,6 +555,7 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
         "ps_texture_sample": "device: X\nenabled VK_KHR_maintenance8\n",
         "ps_texture_sample_d16": "device: X\nenabled VK_KHR_maintenance8\n",
         "ps_cube_sample": "device: X\n", "ps_gather_wrap": "device: X\n",
+        "ps_d16_array_sample": "device: X\n", "ps_d16_cube_sample": "device: X\n",
         "ps_tex": "", "ps_imgatomic": "",
     }
 

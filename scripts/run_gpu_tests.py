@@ -602,8 +602,14 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
                  "ps_live_width": "w64_graphics.py"}
 
 
+# SHADER-308 follow-up: d16 image_sample_lz / image_gather4_lz on vk_texture_test's 12-layer array in R32_SFLOAT,
+# R16_UNORM and R16_SNORM; the program judges every d16 half (fixture -> its vk_texture_test mode).
+D16_ARRAY_TESTS = {"ps_d16_array_sample": "d16_array", "ps_d16_cube_sample": "d16_cube"}
+D16_ARRAY_FORMATS = ("f32", "unorm16", "snorm16")
+
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_bary": "vs_persp.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
+              **{name: "vs_ids.asm" for name in D16_ARRAY_TESTS},
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               "ps_sample_c": "vs_ids.asm", "ps_sample_c_b": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, "ps_ssharp": "vs_ids.asm", "ps_imgatomic": "vs_ids.asm",
@@ -1182,6 +1188,20 @@ def run_suite(a, work: str) -> int:
             problem = texture_gradient_a16_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or "4096 RGBA pixels matched"))
+        elif name in D16_ARRAY_TESTS:
+            # vk_texture_test finds vs_ids.spv and the shader in its working directory, once per array format.
+            tool = os.path.join(a.build, "vk_texture_test" + ext)
+            runs = [run_readback(os.path.join(raw_dir, f"{name}_{fmt}.raw"), run_cmd,
+                                 [tool, D16_ARRAY_TESTS[name], fmt, os.path.join(raw_dir, f"{name}_{fmt}.raw")],
+                                 cwd=spirv_dir) for fmt in D16_ARRAY_FORMATS]
+            unsupported = [msg for rc, msg in runs if rc == UNSUPPORTED]
+            if unsupported:
+                results.append((name, None, unsupported_skip(unsupported[0])))
+            else:
+                failed = [(rc, msg) for rc, msg in runs if not (rc == 0 and "PASSED" in msg)]
+                results.append((name, not failed, verdict_line(*failed[0]) if failed else
+                                "; ".join(next(ln for ln in msg.splitlines() if "PASSED" in ln).split(" ", 2)[-1]
+                                          for _rc, msg in runs)))   # "f32: PASSED (...)" per format
         elif name in ("ps_texture_sample", "ps_cube_sample", "ps_texture_sample_d16", "ps_sample_c_lz",
                       "ps_sample_c_lz_a16", "ps_sample_c", "ps_sample_c_b"):
             # Bindless texture tests: vk_texture_test finds vs_ids.spv and the shader in its working directory.
