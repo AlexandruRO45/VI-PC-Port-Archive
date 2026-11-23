@@ -586,5 +586,61 @@ class TestValuMin3U32IEEE754EdgeCases(unittest.TestCase):
         self.assertEqual(oracle_min3_u32(subnormal_min, subnormal_max, normal_min), subnormal_min)
         self.assertEqual(run_translated_min3_u32(subnormal_min, subnormal_max, normal_min), subnormal_min)
 
+class TestValuMin3U32NegativeControls(unittest.TestCase):
+    """Stage 8: Negative controls, syntax rejection, and mutation detection for v_min3_u32."""
+
+    def test_invalid_register_indices(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Register(RegKind.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Register(RegKind.SGPR, 106)
+
+    def test_invalid_destination_kind(self) -> None:
+        with self.assertRaises(ValueError):
+            VOP3Instruction(
+                Opcode.V_MIN3_U32,
+                Register(RegKind.SGPR, 0),
+                Register(RegKind.VGPR, 1),
+                Register(RegKind.VGPR, 2),
+                Register(RegKind.VGPR, 3),
+            )
+
+    def test_invalid_wave_size(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=16)
+        with self.assertRaises(ValueError):
+            SIMDWavefront(wave_size=128)
+
+    def test_mutation_detection_and_oracle_rejection(self) -> None:
+        a, b, c = MASK32, 10, 20
+        correct = oracle_min3_u32(a, b, c)  # 10
+
+        def mutated_max3(x: int, y: int, z: int) -> int:
+            return max(u32(x), u32(y), u32(z))
+
+        def mutated_signed_min3(x: int, y: int, z: int) -> int:
+            return min(s32(x), s32(y), s32(z)) & MASK32
+
+        self.assertNotEqual(mutated_max3(a, b, c), correct)
+        self.assertNotEqual(mutated_signed_min3(a, b, c), correct)
+
+    def test_translator_syntax_rejection(self) -> None:
+        prog = [
+            "v_min3_u32 v0, v1, v2",
+            "s_endpgm",
+        ]
+        with self.assertRaises((ValueError, rdna2spirv.Unsupported)):
+            support.translate_lines("ps_min3_missing_op", prog)
+
+    def test_unsupported_64bit_register_rejected(self) -> None:
+        prog = [
+            "v_min3_u32 v0, v[1:2], v3, v4",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_min3_64bit", prog)
+
 if __name__ == "__main__":
     unittest.main()
