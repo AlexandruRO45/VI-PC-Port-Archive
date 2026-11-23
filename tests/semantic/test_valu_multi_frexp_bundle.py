@@ -263,5 +263,15 @@ class VFrexpMantF16OracleTests(unittest.TestCase):
         # NaN preserved
         self.assertEqual(oracle_frexp_mant_f16(0x7E00), 0x7E00)
 
+class VFrexpMantF16AstInterpreterTests(unittest.TestCase):
+    def test_frexp_mant_f16_ast_construction(self):
+        ast = ValuInstructionAST("v_frexp_mant_f16", Operand(RegKind.VGPR, 0), Operand(RegKind.VGPR, 1))
+        self.assertEqual(ast.mnemonic, "v_frexp_mant_f16")
+
+    def test_frexp_mant_f16_scalar_execution(self):
+        # 2.0 (0x4000) -> 0.5 (0x3800)
+        res = oracle_frexp_mant_f16(0x4000)
+        self.assertEqual(res, 0x3800)
+
 if __name__ == "__main__":
     unittest.main()
