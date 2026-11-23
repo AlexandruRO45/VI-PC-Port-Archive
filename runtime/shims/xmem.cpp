@@ -31,33 +31,36 @@ namespace {
 
 constexpr size_t kAlign = 64;
 
-// gta6rt --trace FILE: the first XMemAlloc and the first XMemFree for each distinct raw attribute word go to the
-// startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
-// bits of the attribute word are not known yet; this records them from a real run without logging every allocation,
-// which would fill the file. Off: one relaxed load per call.
-void note_attributes(bool is_alloc, uint64_t attributes, size_t size, const void* caller) {
+// gta6rt --trace FILE: the first XMemAlloc, XMemFree and XMemVirtualAlloc for each distinct raw attribute word go to
+// the startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as
+// module+RVA). The bits of the attribute word are not known yet; this records them from a real run without logging
+// every allocation, which would fill the file. Off: one relaxed load per call.
+enum class XmemApi { alloc, free, virtual_alloc };
+
+void note_attributes(XmemApi api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
-    static std::set<std::pair<bool, uint64_t>> seen;
+    static std::set<std::pair<int, uint64_t>> seen;
     {
         const std::lock_guard lock(mutex);
-        if (!seen.insert({is_alloc, attributes}).second) return;
+        if (!seen.insert({static_cast<int>(api), attributes}).second) return;
     }
-    std::string fields = std::string("\"api\":\"") + (is_alloc ? "XMemAlloc" : "XMemFree") +
+    const char* name = api == XmemApi::alloc ? "XMemAlloc" : api == XmemApi::free ? "XMemFree" : "XMemVirtualAlloc";
+    std::string fields = std::string("\"api\":\"") + name +
                          "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
-    if (is_alloc) fields += ",\"size\":" + std::to_string(size);
+    if (api != XmemApi::free) fields += ",\"size\":" + std::to_string(size);
     fields += ",\"caller\":" +
               rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
-    note_attributes(true, attributes, size, _ReturnAddress());
+    note_attributes(XmemApi::alloc, attributes, size, _ReturnAddress());
     return _aligned_malloc(size ? size : 1, kAlign);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
-    note_attributes(false, attributes, 0, _ReturnAddress());
+    note_attributes(XmemApi::free, attributes, 0, _ReturnAddress());
     _aligned_free(p);
 }
 
@@ -134,6 +137,14 @@ constexpr SIZE_T kXmemPageSize64k = 0x10000;
 constexpr DWORD kXmemHostAllocationTypeMask =
     MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
 
+// The Win32 page-protection bits: one base protection (PAGE_NOACCESS 0x01 .. PAGE_EXECUTE_WRITECOPY 0x80) and the
+// PAGE_GUARD, PAGE_NOCACHE and PAGE_WRITECOMBINE modifiers. A console protection also carries bits above them
+// (0x800, 0x2000 and 0x20000 in the retail executable's startup reservations: graphics and cache attributes of the
+// memory), which VirtualAlloc rejects with ERROR_INVALID_PARAMETER. The host has one kind of memory, so they are
+// dropped and the CPU protection is kept. Not done: whether GPU-visible memory must come from an arena the D3D12
+// layer can see (#313).
+constexpr DWORD kHostProtectionMask = 0xFF | PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE;
+
 bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     const SIZE_T max = (std::numeric_limits<SIZE_T>::max)();
     if (alignment == 0 || (alignment & (alignment - 1)) != 0 || value > max - (alignment - 1)) return false;
@@ -144,13 +155,16 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
     // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
-    // region. Nonzero attribute flags also fail until their host mapping is known.
+    // region. The attribute word is taken and recorded (note_attributes): the retail executable's first three
+    // reservations pass 0x21, 0x3 and 0x183, and each must succeed for the boot to go on (RT-5). Its bits are not
+    // known, and none of them changes what a host reservation can give.
+    note_attributes(XmemApi::virtual_alloc, attributes, size, _ReturnAddress());
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    if (attributes != 0) {
-        SetLastError(ERROR_NOT_SUPPORTED);
+    if ((protect & 0xFF) == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);    // no CPU protection left once the console bits are dropped
         return nullptr;
     }
 
@@ -208,7 +222,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
-    return VirtualAlloc(address, size, host_type, protect);
+    return VirtualAlloc(address, size, host_type, protect & kHostProtectionMask);
 }
 
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,

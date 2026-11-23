@@ -224,10 +224,41 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     check(large_page == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
           "unsupported large-page allocation is rejected before host allocation");
 
+    // A nonzero attribute word is taken (RT-5: the retail executable's startup reservations pass 0x21, 0x3, 0x183).
+    void* const attributed = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, 0x183, PAGE_READWRITE);
+    check(attributed != nullptr, "a nonzero XMem allocation attribute word is accepted");
+    if (attributed) {
+        static_cast<volatile uint8_t*>(attributed)[0] = 0x5a;
+        check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed allocation");
+    }
+
+    // Console protection bits above the Win32 ones are dropped; the CPU protection stays (MEMORY_BASIC_INFORMATION).
+    const struct {
+        DWORD type, protect, want;
+        const char* what;
+    } protections[] = {
+        {MEM_RESERVE | 0x20400000, 0x801, PAGE_NOACCESS, "64 KiB reservation with PAGE_NOACCESS | 0x800"},
+        {MEM_RESERVE | MEM_COMMIT, 0x22004, PAGE_READWRITE, "commit with PAGE_READWRITE | 0x2000 | 0x20000"},
+        {MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_NOCACHE, PAGE_READWRITE | PAGE_NOCACHE,
+         "PAGE_NOCACHE is a host modifier and is kept"},
+    };
+    for (const auto& p : protections) {
+        void* const region = virtual_alloc(nullptr, 0x10000, p.type, 0x21, p.protect);
+        check(region != nullptr, p.what);
+        if (!region) continue;
+        MEMORY_BASIC_INFORMATION info{};
+        if (p.type & MEM_COMMIT) {
+            check(VirtualQuery(region, &info, sizeof(info)) == sizeof(info) && info.Protect == p.want, p.what);
+        } else {
+            check(VirtualQuery(region, &info, sizeof(info)) == sizeof(info) && info.AllocationProtect == p.want, p.what);
+        }
+        check(VirtualFree(region, 0, MEM_RELEASE), "release the region");
+    }
+
     SetLastError(ERROR_SUCCESS);
-    void* const attributed = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, 1, PAGE_READWRITE);
-    check(attributed == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
-          "nonzero XMem allocation attributes are rejected before host allocation");
+    void* const no_cpu = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, 0, 0x2000);
+    check(no_cpu == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "a protection with only console bits (no CPU protection) is rejected");
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
