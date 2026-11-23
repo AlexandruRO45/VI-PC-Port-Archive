@@ -95,3 +95,95 @@ class TestQuadmaskB32Oracle(unittest.TestCase):
                 "v_mov_b32 v0, s0",
             ])
             self.assertEqual(val_hw, 1 << i)
+
+
+# ------------------------------------------------------------------------------
+# s_quadmask_b32 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+class OperandType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    op_type: OperandType
+    index: int = 0
+
+    def __post_init__(self):
+        if self.op_type == OperandType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range: {self.index}")
+        if self.op_type == OperandType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index out of range: {self.index}")
+
+    @property
+    def name(self) -> str:
+        return f"{'v' if self.op_type == OperandType.VGPR else 's'}{self.index}"
+
+
+@dataclass(frozen=True)
+class LiteralOperand:
+    value: int
+
+    def __post_init__(self):
+        if not (-0x8000_0000 <= self.value <= 0xFFFF_FFFF_FFFF_FFFF):
+            raise ValueError(f"Literal out of range: {self.value}")
+
+
+@dataclass
+class SQuadmaskB32Instruction:
+    dst: RegisterOperand
+    src0: Union[RegisterOperand, LiteralOperand]
+
+
+class ScalarMachineQuadLogic:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.scc: int = 0
+
+    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
+        if isinstance(op, LiteralOperand):
+            return op.value & MASK32
+        elif op.op_type == OperandType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        elif op.op_type == OperandType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        raise TypeError(f"Unknown operand: {op}")
+
+    def step_quadmask_b32(self, insn: SQuadmaskB32Instruction):
+        s0 = self.read_operand(insn.src0)
+        res = ref_quadmask_b32(s0)
+        self.sgprs[insn.dst.index] = res
+        self.scc = 1 if res != 0 else 0
+
+
+class TestQuadmaskB32ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        machine = ScalarMachineQuadLogic()
+        machine.sgprs[1] = 0x00FF_00FF
+        insn = SQuadmaskB32Instruction(
+            dst=RegisterOperand(OperandType.SGPR, 0),
+            src0=RegisterOperand(OperandType.SGPR, 1),
+        )
+        machine.step_quadmask_b32(insn)
+
+        val_hw, _ = run_shader_words("ps_qm32_ast_scalar", [
+            "s_mov_b32 s1, 0x00FF00FF",
+            "s_quadmask_b32 s0, s1",
+            "v_mov_b32 v0, s0",
+        ])
+        self.assertEqual(machine.sgprs[0], val_hw)
+        self.assertEqual(val_hw, 0x33)
+
+    def test_scalar_scc_flag_hardware(self):
+        val_zero, _ = run_shader_words("ps_qm32_scc_zero", [
+            "s_mov_b32 s1, 0",
+            "s_quadmask_b32 s0, s1",
+            "s_cselect_b32 s2, 1, 2",
+            "v_mov_b32 v0, s2",
+        ])
+        # scc is 0 on zero -> s_cselect picks 2
+        self.assertEqual(val_zero, 2)
