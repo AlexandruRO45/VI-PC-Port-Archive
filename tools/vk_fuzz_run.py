@@ -111,7 +111,7 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
             path = os.path.join(work, name + ".asm")
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
-            r = mc_command.run(mc, input=text, capture_output=True, text=True)
+            r = mc_command.run(mc, input=text, capture_output=True, text=True, errors="replace")
             if r.returncode or "error:" in r.stderr:
                 names.append(None)
                 results.append("llvm-mc: " + (r.stderr.strip().splitlines() or ["failed"])[0][:100])
@@ -124,7 +124,7 @@ def run_programs(texts, words=4, wave=32, build=None, work_parent=None, retries=
             names.append(name)
             results.append(None)
         subprocess.run([sys.executable, "-I", os.path.join(HERE, "rdna2spirv.py"), disasm, "--out", spirv],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, errors="replace")
         index = {}
         index_path = os.path.join(spirv, "index.json")
         if os.path.isfile(index_path):
