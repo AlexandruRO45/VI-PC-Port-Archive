@@ -271,6 +271,12 @@ class TestPermLaneX16RowSwap(unittest.TestCase):
         spv = run_cs_permlane("v_permlanex16_b32", 0x01234567, 0x89ABCDEF, name="cs_px16_xor16")
         self.assertIn("OpBitwiseXor", spv)
 
+class TestPermLaneX16Nibbles(unittest.TestCase):
+    def test_nibble_extraction(self):
+        spv = run_cs_permlane("v_permlanex16_b32", 0x11111111, 0x22222222, name="cs_px16_nib")
+        self.assertIn("OpBitFieldUExtract", spv)
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
