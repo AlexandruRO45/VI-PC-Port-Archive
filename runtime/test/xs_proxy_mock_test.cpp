@@ -946,6 +946,51 @@ int check_allocators() {
     return 0;
 }
 
+// ---- 6b. Command-list slot 139: the retail title's Reset(allocator, pso) ----
+
+int check_console_list_reset() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    Mock* const real_allocator = reinterpret_cast<Mock*>(xs::allocator_proxy_real_allocator(allocator));
+    EXPECT(xs::is_allocator_proxy(allocator) && real_allocator);
+
+    // The console command-list IID {c3827890-4024-474c-98cf-645b51dc4874}: only this IID wraps the created list.
+    struct XboxCommandListDesc {
+        std::uint32_t type;
+        std::uint32_t node_mask;
+        std::uint64_t reserved[2];
+    } desc{};
+    desc.type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    const IID console_list_iid = {0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&console_list_iid), word(&list))) == S_OK);
+    EXPECT(list);
+    Mock* const real_list = reinterpret_cast<Mock*>(mock->last_child);
+    EXPECT(real_list && real_list->kind == Kind::command_list);
+
+    // Close (the console's accepted slot 9) then Reset 139: 139 reaches PC slot 10 with the allocator proxy unwrapped
+    // and the pipeline state unchanged.
+    EXPECT(hr_of(raw(list, 9)) == S_OK);
+    std::uint64_t pso = 0x1234;
+    EXPECT(hr_of(raw(list, 139, word(allocator), word(&pso))) == S_OK);
+    EXPECT(real_list->calls[9] == 0 && real_list->calls[10] == 1);
+    EXPECT(real_list->args[10][0] == word(real_allocator) && real_list->args[10][1] == word(&pso));
+    // Nulls pass through, and 140 stays refused.
+    EXPECT(hr_of(raw(list, 139, 0, 0)) == S_OK);
+    EXPECT(real_list->calls[10] == 2 && real_list->args[10][0] == 0 && real_list->args[10][1] == 0);
+    EXPECT(hr_of(raw(list, 140)) == E_NOTIMPL && real_list->calls[140] == 0);
+    EXPECT(release(list) == 0 && real_list->refs == 0);
+    EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: console list slot 139 forwards Reset to PC slot 10 with the allocator proxy unwrapped, after "
+                "Close; 140 stays refused\n", g_label);
+    return 0;
+}
+
 // ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) and the retail title (41) ----
 //
 // A device that answers ID3D12Device11 (80 PC slots) is the Vulkan layer's shape: slots 78/79 are inside its table
@@ -1586,8 +1631,8 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_fence_completed_value() ||
         check_create_failures() || check_open_shared() || check_alloc_failures() || check_allocators() ||
-        check_xbox_slots() || check_custom_heap_properties() || check_placed_resource_x() || check_view_heap_cap() ||
-        check_descriptor_heap_hooks())
+        check_console_list_reset() || check_xbox_slots() || check_custom_heap_properties() ||
+        check_placed_resource_x() || check_view_heap_cap() || check_descriptor_heap_hooks())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

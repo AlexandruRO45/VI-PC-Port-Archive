@@ -83,8 +83,9 @@
 // (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
 // unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
 // CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
-// (46) and EnqueueMakeResident (50). Command lists are not wrapped, so ExecuteCommandLists passes them through and a
-// heap proxy given to a list's SetDescriptorHeaps reaches the real list as it is. QueryInterface answers only the
+// (46) and EnqueueMakeResident (50). A command list created for the console command-list IID is wrapped: on it,
+// console slot 139 is the retail title's Reset(allocator, pso) and forwards to PC slot 10 with both proxies unwrapped.
+// A heap proxy given to a list's SetDescriptorHeaps reaches the real list as it is. QueryInterface answers only the
 // modelled interfaces; one the real object has but the proxy does not model is logged once and refused.
 #pragma once
 

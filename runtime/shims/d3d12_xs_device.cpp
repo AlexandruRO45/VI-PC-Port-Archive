@@ -867,6 +867,7 @@ static_assert(kQueueSlots * sizeof(void*) <= 4096 && kFenceSlots * sizeof(void*)
 constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // (ID3D12Fence*, UINT64)
 constexpr unsigned kFenceSignal = 10;                   // ID3D12Fence::Signal(UINT64), from the CPU
 constexpr unsigned kFenceCompletedValueSlot = 12;       // one past ID3D12Fence1: the completed value's address
+constexpr unsigned kConsoleListReset = 139;  // the retail title's Reset(allocator, pso) -> PC list slot 10
 static_assert(kFenceCompletedValueSlot >= kFence1PublicSlots && kFenceCompletedValueSlot < kFenceSlots,
               "fence slot 12 is past the public chain and inside the table");
 
@@ -945,6 +946,7 @@ const char* child_public_name(unsigned slot) {
                                                "CopyRaytracingAccelerationStructure", "SetPipelineState1",
                                                "DispatchRays", "RSSetShadingRate", "RSSetShadingRateImage"};
         if (slot >= 8 && slot - 8 < std::size(list)) return list[slot - 8];
+        if (slot == kConsoleListReset) return "Reset139";
     } else {
         if (slot == 8) return "Reset";
     }
@@ -1381,6 +1383,24 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             if (array.data()) a2 = array.data();
         }
         note_child_slot<K>(Slot);
+        // Console list slot 139 is the retail title's Reset(allocator, pso), measured immediately after Close (slot 9)
+        // and before recording: it is PC slot 10. The allocator (and a pipeline state) the title hands over are
+        // proxies; the real list takes the real objects.
+        if constexpr (K == ChildKind::list && Slot == kConsoleListReset) {
+            static std::atomic<bool> logged{false};
+            bool expected = false;
+            if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: command-list slot 139 (Reset) -> PC slot 10 (allocator 0x%llx, pso "
+                             "0x%llx)\n",
+                             static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2));
+            a1 = unwrap_object(a1);
+            a2 = unwrap_object(a2);
+            d3d12_trace::record("XboxID3D12GraphicsCommandList::Reset");
+            using ResetFn = HRESULT(WINAPI*)(void*, void*, void*);
+            return hr_to_u64(reinterpret_cast<ResetFn>(self->real_vtable[10])(
+                self->real, reinterpret_cast<void*>(a1), reinterpret_cast<void*>(a2)));
+        }
         if constexpr (K == ChildKind::queue && Slot >= kQueuePublicSlots) {
             // The retail executable presents through queue slot 32 (0x100): PresentX(plane_count, planes, params),
             // measured at its frame loop (the plane layout is in d3d12_xs_device.h). When a real presenter exists,

@@ -770,6 +770,11 @@ Queues and fences are wrapped the same way.
   per-fence mirror. Completion events refresh it immediately. A 10 ms wait timeout also refreshes it if the
   fence rewinds below the pending event's threshold. Slot 12 and the CPU `Signal` (10) refresh it synchronously.
   The descriptor's second word is a code pointer, which is not called.
+- **Command lists.** Device slot 73 (`CreateCommandListX`), asked for the console list IID, returns a list proxy.
+  Its PC chain (80 slots) is forwarded in order; console slots 131 and 132 are no-op `S_OK`
+  (presentation/clear-adjacent setup). Console slot 139 is the retail title's `Reset(allocator, pso)`, measured
+  between `Close` and recording: it forwards to PC `Reset` (slot 10) with the allocator and pipeline state proxies
+  unwrapped. `xs_proxy_mock_test` checks the `Close`-then-139 order and the unwrap.
 - **The guard region.** Each table sits at the end of the first page of a 64 KiB reservation, and the rest
   of that reservation is never committed. A slot past the table therefore faults on the vtable read itself,
   inside the reservation, and a vectored handler logs the slot before the fault goes on. A vtable read that
