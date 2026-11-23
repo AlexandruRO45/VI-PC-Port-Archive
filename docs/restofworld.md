@@ -430,6 +430,15 @@ geometry list containing the record. The layout count and the group's dense rang
 agreed in all 311. This includes the six uniquely paired page walks and seven
 walks with a repeated target block count.
 
+The check is `tools/draw_ownership.py` (ASSET-70; a library rather than a command):
+`walk_chain` and `walk_drawable` follow the drawable, LOD, model and geometry chain and raise a
+`WalkError` subclass on a schema violation (a used/capacity mismatch, a `model+54` contradiction
+or a pointer outside the segment), `reverse_pointers` builds the reverse index over the system
+segment, `classify_parent` sorts the records that point at one entries table into
+model-compatible and unknown parents, and `geometry_shape_check` reads the system-side half of a
+geometry record without the graphics segment. `python -I tests/test_draw_ownership.py` runs its
+synthetic tests; no game files are needed.
+
 **The eight auxiliary root paths (ASSET-273).** An independent scan of all 22
 archives reproduced 311 outliers and verified all 311 draw bindings. The regular
 drawable lists reached 264 blocks through LOD 0 and another 39 through LODs 1–3.
