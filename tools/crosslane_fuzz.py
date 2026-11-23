@@ -1443,10 +1443,23 @@ def _at_least_one(text):
     return value
 
 
+def _nonnegative_index(text):
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be non-negative (got {value})")
+    return value
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        epilog="To replay a window, keep the original seed and generation options. Example: "
+               "python -I tools/crosslane_fuzz.py --seed 7 --ops 24 --wave both --dpp --start-index 159 --programs 3",
+    )
     ap.add_argument("--programs", type=_at_least_one, default=100,
-                    help="programs per wave (at least 1; default 100)")
+                    help="total programs, including with --wave both (at least 1; default 100)")
+    ap.add_argument("--start-index", type=_nonnegative_index, default=0,
+                    help="zero-based index of the first random program (default 0)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--ops", type=_at_least_one, default=24, help="ops per program (at least 1; default 24)")
     ap.add_argument("--wave", choices=("32", "64", "both"), default="both")
@@ -1481,6 +1494,8 @@ def main():
     ap.add_argument("--translator", help="rdna2spirv.py to test (default: the one next to this file)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
+    if args.dpp_sweep and args.start_index:
+        ap.error("--start-index must be 0 with --dpp-sweep")
     if not os.path.isfile(args.exe):   # a Visual Studio build puts it in a configuration subfolder
         folder, name = os.path.split(args.exe)
         for config in ("RelWithDebInfo", "Release"):
@@ -1530,10 +1545,11 @@ def main():
         for wave in waves:
             progs += dpp_sweep_programs(wave)
         print(f"dpp sweep: {len(progs)} cases")
-    for i in range(0 if args.dpp_sweep else args.programs):
-        wave = waves[i % len(waves)]
-        progs.append(make_program(args.seed * 100003 + i, wave, args.ops, allow_maskdata=not args.no_maskdata,
-                                  wave32_hi_lanes=not args.no_w32_hi_lanes, dpp=args.dpp, ext=args.ext))
+    else:
+        for i in range(args.start_index, args.start_index + args.programs):
+            wave = waves[i % len(waves)]
+            progs.append(make_program(args.seed * 100003 + i, wave, args.ops, allow_maskdata=not args.no_maskdata,
+                                      wave32_hi_lanes=not args.no_w32_hi_lanes, dpp=args.dpp, ext=args.ext))
     stats = {}
     fails = []
     try:
