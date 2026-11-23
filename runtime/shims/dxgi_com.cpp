@@ -1188,9 +1188,14 @@ public:
     }
 
     // IDXGIAdapter3
-    HRESULT STDMETHODCALLTYPE RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE, DWORD* cookie) override {
-        if (cookie) *cookie = 0;
-        return E_NOTIMPL;
+    // Documented as "S_OK or an HRESULT error code" plus a cookie for the Unregister call
+    // (https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgiadapter3-registerhardwarecontentprotectionteardownstatusevent).
+    // The host answers DXGI_ERROR_INVALID_CALL for a null event or cookie and S_OK with a non-zero cookie otherwise.
+    // No hardware content protection exists here, so the event is registered and never signalled.
+    HRESULT STDMETHODCALLTYPE RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE event, DWORD* cookie) override {
+        if (!event || !cookie) return DXGI_ERROR_INVALID_CALL;
+        *cookie = next_teardown_cookie_.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
     }
     void STDMETHODCALLTYPE UnregisterHardwareContentProtectionTeardownStatus(DWORD) override {}
     HRESULT STDMETHODCALLTYPE QueryVideoMemoryInfo(UINT node_index, DXGI_MEMORY_SEGMENT_GROUP group,
@@ -1320,6 +1325,7 @@ private:
         }
     }
 
+    std::atomic<DWORD> next_teardown_cookie_{1};
     std::atomic<DWORD> next_budget_cookie_{1};
     std::atomic<ULONG> refs_{1};
     PrivateDataStore private_data_;
@@ -1428,7 +1434,15 @@ public:
         }
         return hr;
     }
-    HRESULT STDMETHODCALLTYPE CreateSoftwareAdapter(HMODULE, IDXGIAdapter**) override { return E_NOTIMPL; }
+    // Documented without error codes
+    // (https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgifactory-createsoftwareadapter); the
+    // host answers DXGI_ERROR_INVALID_CALL for a null module or a null output. A software adapter DLL is not loaded
+    // here, so a call that passes those checks stays E_NOTIMPL.
+    HRESULT STDMETHODCALLTYPE CreateSoftwareAdapter(HMODULE module, IDXGIAdapter** adapter) override {
+        if (adapter) *adapter = nullptr;
+        if (!module || !adapter) return DXGI_ERROR_INVALID_CALL;
+        return E_NOTIMPL;
+    }
 
     // IDXGIFactory1
     HRESULT STDMETHODCALLTYPE EnumAdapters1(UINT index, IDXGIAdapter1** out) override {
@@ -1530,7 +1544,12 @@ public:
         if (FAILED(hr) || !hwnd) return DXGI_ERROR_INVALID_CALL;
         return create_swap_chain(device, hwnd, desc, restrict_to_output, out);
     }
-    HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE, LUID*) override { return E_NOTIMPL; }
+    // The host answers DXGI_ERROR_INVALID_CALL for a null handle or a null LUID. Nothing here is shared between
+    // adapters, so any other handle stays E_NOTIMPL.
+    HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE resource, LUID* luid) override {
+        if (!resource || !luid) return DXGI_ERROR_INVALID_CALL;
+        return E_NOTIMPL;
+    }
     // Microsoft documents S_OK with a cookie for UnregisterStereoStatus (E_NOTIMPL is only the answer of the
     // Windows 7 Platform Update). Stereo is never enabled here, so the window or event is never notified.
     HRESULT STDMETHODCALLTYPE RegisterStereoStatusWindow(HWND hwnd, UINT msg, DWORD* cookie) override {
@@ -1557,8 +1576,13 @@ public:
         return S_OK;
     }
     void STDMETHODCALLTYPE UnregisterOcclusionStatus(DWORD) override {}
-    HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*,
-                                                            IDXGISwapChain1**) override {
+    // The page (https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgifactory2-createswapchainforcomposition)
+    // says pDevice, pDesc and ppSwapChain cannot be NULL and the error is DXGI_ERROR_INVALID_CALL, as on the host.
+    // Composition surfaces are not implemented, so a call that passes those checks stays E_NOTIMPL.
+    HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc,
+                                                            IDXGIOutput*, IDXGISwapChain1** out) override {
+        if (out) *out = nullptr;
+        if (!device || !desc || !out) return DXGI_ERROR_INVALID_CALL;
         return E_NOTIMPL;
     }
 
