@@ -22,7 +22,8 @@ class FirstLookShimReportTest(unittest.TestCase):
             # leaves that exit code in $LASTEXITCODE for the script's exit. (gdk_runtime_calls since round 43,
             # find_hash_lookup for mods, exe_checklist for the notes to confirm.)
             for name in ("scripts/first_look.ps1", "tools/pe_inspect.py", "tools/gdk_runtime_calls.py",
-                         "tools/gdk_runtime_classes.json", "tools/find_hash_lookup.py", "tools/exe_checklist.py"):
+                         "tools/gdk_runtime_classes.json", "tools/find_hash_lookup.py", "tools/exe_checklist.py",
+                         "tools/report_paths.py"):
                 (root / name).parent.mkdir(exist_ok=True)
                 shutil.copyfile(source / name, root / name)
             loader = root / "runtime/build/gta6rt.exe"
@@ -50,7 +51,7 @@ Set-Alias -Name (Join-Path $PWD 'runtime\build\gta6rt.exe') -Value Write-Output
                 self.assertEqual(run.returncode, 0, run.stderr)
                 # A failed find_hash_lookup step is only a warning in the script and later steps reset
                 # $LASTEXITCODE, so the exit status doesn't show it: check that each step wrote its report.
-                for report in ("fixture.exe.gdk_calls.json", "hash_lookup.json"):
+                for report in ("fixture.exe.gdk_calls.json", "hash_lookup.json", "checklist.md"):
                     self.assertTrue((reports / report).is_file(), (report, run.stdout, run.stderr))
                 imports = json.loads((reports / "fixture.exe.json").read_text("utf-8"))["imports"]
                 return {entry["dll"].lower() for entry in imports if entry["where"] == "shim"}
