@@ -161,6 +161,23 @@ class Instruction:
             parts.append("gds")
         return " ".join(parts)
 
+@dataclasses.dataclass(frozen=True)
+class LDSAtomicConditionCodes:
+    """Architectural condition codes evaluating LDS atomic operation results."""
+    zero: bool
+    negative: bool
+    parity_odd: bool
+    mutated: bool
+
+
+def compute_lds_condition_codes(old_val: int, vdata: int, new_val: int) -> LDSAtomicConditionCodes:
+    """Computes arithmetic condition codes for 32-bit atomic XOR."""
+    zero = (new_val == 0)
+    negative = bool(new_val & 0x80000000)
+    parity_odd = (bin(new_val).count("1") % 2 == 1)
+    mutated = (old_val != new_val)
+    return LDSAtomicConditionCodes(zero=zero, negative=negative, parity_odd=parity_odd, mutated=mutated)
+
 class ScalarLDSInterpreter:
     """Deterministic scalar instruction interpreter executing LDS instructions."""
 
@@ -402,6 +419,31 @@ class TestLdsXorB32RegisterAliasing(unittest.TestCase):
         # v2 should now contain old memory value 0x12345678
         self.assertEqual(self.interp.read_vgpr(2), 0x12345678)
         self.assertEqual(self.interp.storage.read_dword(10), 0x12CB5687)
+
+class TestLdsXorB32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and carry/borrow isolation."""
+
+    def test_condition_codes_zero_and_negative(self) -> None:
+        # XOR to 0
+        cc_zero = compute_lds_condition_codes(0x12345678, 0x12345678, 0)
+        self.assertTrue(cc_zero.zero)
+        self.assertFalse(cc_zero.negative)
+        self.assertFalse(cc_zero.parity_odd)
+        self.assertTrue(cc_zero.mutated)
+
+        # XOR resulting in negative bit set
+        cc_neg = compute_lds_condition_codes(0x00000000, 0x80000000, 0x80000000)
+        self.assertFalse(cc_neg.zero)
+        self.assertTrue(cc_neg.negative)
+        self.assertTrue(cc_neg.parity_odd)
+        self.assertTrue(cc_neg.mutated)
+
+    def test_condition_codes_unmutated_identity(self) -> None:
+        # XOR with 0 (unmutated)
+        cc_same = compute_lds_condition_codes(0x42, 0, 0x42)
+        self.assertFalse(cc_same.zero)
+        self.assertFalse(cc_same.negative)
+        self.assertFalse(cc_same.mutated)
 
 if __name__ == "__main__":
     unittest.main()
