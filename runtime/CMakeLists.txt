@@ -2119,6 +2119,12 @@ if(TARGET Vulkan::Headers)
                  "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
                  "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" ${_trace_runner})
         set_tests_properties(run_tiny_frame PROPERTIES SKIP_RETURN_CODE 77)
+        # The same run with LEONIDA_VK_VALIDATION=1: under Wine the device must still be created (Wine refuses the
+        # explicit layer; the host's layer comes from VK_INSTANCE_LAYERS), and no validation error may be printed.
+        add_test(NAME run_tiny_frame_validation COMMAND "${Python3_EXECUTABLE}" -I
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
+                 "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" --validation ${_trace_runner})
+        set_tests_properties(run_tiny_frame_validation PROPERTIES SKIP_RETURN_CODE 77)
       endif()
     endif()
     # bvh_builder_test can put the package's XboxBvhBuilder on this device too (LEONIDA_BVH_DEVICE=vulkan).

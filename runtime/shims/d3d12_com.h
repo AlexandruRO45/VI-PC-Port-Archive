@@ -181,7 +181,8 @@ struct VulkanDeviceInfo {
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out);
 
 // The same, on a Vulkan instance and device of its own (destroyed with the D3D12 device). Picks the first discrete
-// GPU with the features above. LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation.
+// GPU with the features above. LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation when the loader lists it
+// (Wine's never does: there the layer comes from VK_INSTANCE_LAYERS, docs/testing.md).
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out);
 
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's

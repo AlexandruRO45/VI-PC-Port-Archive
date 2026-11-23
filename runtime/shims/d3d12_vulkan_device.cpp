@@ -7921,8 +7921,28 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
                                     i.queue_family, riid, out);
 }
 
+namespace {
+
+// Whether the loader lists the instance layer `name` (vkEnumerateInstanceLayerProperties).
+bool instance_layer_listed(PFN_vkGetInstanceProcAddr get, const char* name) {
+    const auto enumerate =
+        reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(get(nullptr, "vkEnumerateInstanceLayerProperties"));
+    if (!enumerate) return false;
+    std::uint32_t count = 0;
+    if (enumerate(&count, nullptr) != VK_SUCCESS) return false;
+    std::vector<VkLayerProperties> layers(count);
+    if (enumerate(&count, layers.data()) < VK_SUCCESS) return false;
+    layers.resize(count);
+    for (const auto& l : layers)
+        if (!std::strcmp(l.layerName, name)) return true;
+    return false;
+}
+
+}  // namespace
+
 // Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and
-// VK_KHR_synchronization2 (vulkan13_features.h). LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
+// VK_KHR_synchronization2 (vulkan13_features.h). LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation when the
+// loader lists it; otherwise the device is made without it and a warning says why.
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -7989,9 +8009,23 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     char validation[8] = {};
     size_t length = 0;
     if (getenv_s(&length, validation, "LEONIDA_VK_VALIDATION") == 0 && length > 1 && validation[0] != '0') {
+        // The layer reads the synchronization-validation request however it was enabled: by this instance, or by the
+        // environment (VK_INSTANCE_LAYERS), which is the only way under Wine.
         instance_info.pNext = &validation_features;
-        instance_info.enabledLayerCount = 1;
-        instance_info.ppEnabledLayerNames = &layer;
+        if (instance_layer_listed(get, layer)) {
+            instance_info.enabledLayerCount = 1;
+            instance_info.ppEnabledLayerNames = &layer;
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_VALIDATION: VK_LAYER_KHRONOS_validation enabled\n");
+        } else {
+            // Asking for a layer the loader does not list fails vkCreateInstance (VK_ERROR_LAYER_NOT_PRESENT), and
+            // with it the whole device. Wine's vulkan-1.dll lists no layers and refuses every explicit one; a Windows
+            // machine without the Vulkan SDK has none to list.
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_VALIDATION: the Vulkan loader does not list "
+                                 "VK_LAYER_KHRONOS_validation, so the device is created without asking for it; "
+                                 "validation runs only if the layer is enabled outside this program (under Wine: "
+                                 "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation set before wine; on Windows: install "
+                                 "the Vulkan SDK)\n");
+        }
     }
     // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
     const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
