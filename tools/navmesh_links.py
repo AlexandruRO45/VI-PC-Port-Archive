@@ -38,6 +38,38 @@ def _counter_top(counter, limit=32):
     return {str(k): v for k, v in counter.most_common(limit)}
 
 
+def _count_reciprocity(b, polygons, edges, sector, polygon_count, totals):
+    """Match directed polygon counts within one tile whose pool sizes agree."""
+    records = (record for offset, count in edges
+               for record in struct.iter_unpack("<IH6x", memoryview(b)[offset:offset + count * 12]))
+    directed = Counter()
+    source = position = same = invalid = unlinked = 0
+    for offset, count in polygons:
+        for i in range(count):
+            packed = nd._u32(b, offset + 44 * i + 4)
+            if packed >> 4 != position:
+                return  # Overlapping or missing spans make edge ownership ambiguous.
+            for _ in range(packed & 15):
+                target_sector, target = next(records)
+                if target_sector == 0xFFFFFFFF and target == 0xFFFF:
+                    unlinked += 1
+                elif target_sector == sector and target < polygon_count:
+                    directed[source, target] += 1
+                    same += 1
+                else:
+                    invalid += 1
+            position += packed & 15
+            source += 1
+
+    excess = sum(max(0, n - directed[target, source])
+                 for (source, target), n in directed.items())
+    totals["tiles_counted"] += 1
+    totals["same_tile"] += same
+    totals["excess_directed"] += excess
+    totals["invalid_targets"] += invalid
+    totals["unlinked"] += unlinked
+
+
 def verify_tile(b, stats):
     """Verify +0x88 adjacent edges, polygon +0x20 link chain, and +0xA8/+0xB0 special links."""
     chk = {}
@@ -67,6 +99,8 @@ def verify_tile(b, stats):
 
     # 1. 12-byte adjacent-polygon edges at +0x88 (count = pool = u32@0x90).
     edges_ok = b88 is not None and pool_confirmed
+    if edges_ok and "reciprocity" in stats:
+        _count_reciprocity(b, b98, b88, c8, c4, stats["reciprocity"])
     same_tile = 0
     unlinked = 0
     edge_flags_lo = Counter()
@@ -305,14 +339,18 @@ def _iter_resources(path, start=0, limit=None):
                 yield bytes(buf)
 
 
-def scan(path, start=0, limit=None):
+def scan(path, start=0, limit=None, *, reciprocity=False):
     stats = new_stats()
+    if reciprocity:
+        stats["reciprocity"] = dict.fromkeys(
+            ("tiles_counted", "same_tile", "excess_directed", "invalid_targets", "unlinked"), 0)
     for buf in _iter_resources(path, start=start, limit=limit):
         stats["tiles"] += 1
         chk = verify_tile(buf, stats)
         for name, ok in chk.items():
             stats["checks"][name]["pass" if ok else "fail"] += 1
     return {
+        **({"reciprocity": stats["reciprocity"]} if reciprocity else {}),
         "tiles": stats["tiles"],
         "checks": stats["checks"],
         "edges": {
@@ -347,6 +385,8 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=None, help="Maximum byte span to scan")
     ap.add_argument("--out", default=None, help="Optional JSON output path")
     ap.add_argument("--quiet", action="store_true", help="Suppress stdout summary")
+    ap.add_argument("--reciprocity", action="store_true",
+                    help="Count same-tile directed edges in excess of their reverse multiplicity")
     args = ap.parse_args(argv)
 
     if args.start < 0:
@@ -374,7 +414,7 @@ def main(argv=None):
                     sys.stderr.write("error: --out must not overwrite a carved input stream\n")
                     return 2
 
-    doc = scan(args.input, start=args.start, limit=args.limit)
+    doc = scan(args.input, start=args.start, limit=args.limit, reciprocity=args.reciprocity)
     if args.out is not None:
         parent = os.path.dirname(os.path.abspath(args.out))
         if parent:

@@ -205,6 +205,37 @@ def build_tile(
 
 
 class NavmeshLinksTest(unittest.TestCase):
+    def test_reciprocity(self):
+        sector = 17
+        open_edge = (0xFFFFFFFF, 0xFFFF, 0, 0)
+        def local(target):
+            return (sector, target, 0, 0)
+
+        # Tile A has three 0->1 and one 1->0. Self edges match themselves.
+        a = [local(1)] * 3 + [local(0), local(0), local(1), open_edge,
+                               local(2), (sector + 1, 0, 0, 0)]
+        # Tile B has the opposite imbalance. Combining tiles first would hide it.
+        b = [local(1)] + [local(0)] * 3
+        first = build_tile(flags=1, sector=sector, poly_sizes=(4, 5), edges=a)
+        second = build_tile(flags=1, sector=sector, poly_sizes=(1, 3), edges=b)
+        bad = bytearray(second[0])
+        polygons = nd.split_array(bad, 0x98, 44, 2)
+        struct.pack_into("<I", bad, polygons[0][0] + 44 + 4, 3)  # overlapping span
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "tiles.rpf")
+            make_rpf(archive, first + second + [bad])
+            default = nl.scan(archive)
+            result = subprocess.run([sys.executable, "-I", TOOL, archive, "--reciprocity"],
+                                    check=True, capture_output=True, text=True)
+        doc = json.loads(result.stdout)
+        self.assertEqual(doc.pop("reciprocity"), {
+            "tiles_counted": 2, "same_tile": 10, "excess_directed": 4,
+            "invalid_targets": 2, "unlinked": 1,
+        })
+        self.assertEqual(doc, default)
+        self.assertEqual(doc["tiles"], 3)
+
     def test_valid_rpf_and_carved_dir(self):
         s1 = build_tile(flags=3)
         s2 = build_tile(flags=1, sector=(260 << 9) | 251, two_streams=True)

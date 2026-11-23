@@ -348,6 +348,11 @@ stored elsewhere, and which vehicles the 31 are (wagons, boats and trains would 
   JSON and optional numeric CSV metadata. It never writes payload bytes and never touches the TOC.
 - `tools/navmesh_links.py` (stdlib-only) decodes and verifies the 12-byte `+0x88` adjacent-polygon edges, the polygon
   `+0x20` special-link prefix-sum chain, and the 32-byte `+0xA8` special links and `+0xB0` index table.
+  Pass `--reciprocity` to include a `reciprocity` object. `tiles_counted` covers tiles with verified pool bounds
+  and contiguous polygon spans. Within each tile, `excess_directed` sums the positive differences between the
+  counts of A?B and B?A for each ordered polygon pair. Self edges contribute zero excess. The report counts
+  valid same-tile records, all-ones open targets and invalid targets separately. This measures polygon references
+  without testing geometric edge alignment.
 
 ```powershell
 python -I tools/navmesh_decode.py <package>\navmeshes.rpf --out <temp>/navmesh-decode.json --csv <temp>/navmesh-decode.csv
