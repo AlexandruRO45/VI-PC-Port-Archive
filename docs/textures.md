@@ -519,6 +519,29 @@ strict mode, which raises `BcpackProvisionalError` instead of using one.
 (Byte-exact blocks, a clean entropy end state and a DDS with fitted colours are three
 different levels of confirmation; this example shows the first.)
 
+#### The command line
+
+`tools/bcpack_tool.py` is the command line over that decoder. `--codec` is the BCPack mode
+from the table above, not the on-disk tag, and `--size` the chunk's decoded byte count. Below,
+`chunk.bin` stands for the stream bytes and `blocks.bin` for the blocks it writes.
+
+```sh
+python -I tools/bcpack_tool.py inspect chunk.bin --codec 7 --size 16        # ratio and per-lane symbol statistics
+python -I tools/bcpack_tool.py decode chunk.bin blocks.bin --codec 7 --size 16
+python -I tools/bcpack_tool.py profile chunk.bin --codec 7 --size 16       # symbol frequency distribution
+```
+
+`inspect --json` prints the same summary as one JSON document. `decode` is strict like
+`bcpack.decode`; `--provisional` allows the provisional history entries and a `--history`
+file or directory supplies the locally calibrated BC6H/BC7 initial tables. A missing input,
+a stream that fails the structural or rANS checks and a malformed `--history` are one
+`ERROR:` line on stderr with exit status 2.
+
+Run on the synthetic one-block BC7 stream above (`--size 16`), the three subcommands reported
+`BCPack BC7 stream: 104 bytes -> 16 bytes (1 blocks, ratio 6.500)` with 16 active lanes from
+`inspect`, wrote the expected `40 31 72 04 a5 68 19 be 02 34 56 78 9a bc de f0` from
+`decode`, and printed the BC7 symbol distribution from `profile`.
+
 ### The descriptor `mode` is tiling, not codec
 
 The ETPF descriptor's `mode` field (`b >> 23`) is the mip/tile family: mode 0 uses 64 KiB
