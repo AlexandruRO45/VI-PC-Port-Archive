@@ -202,7 +202,8 @@ class RunTestTest(unittest.TestCase):
             "ENVIRONMENT": ["LX_RESET=from-test", "LX_PATH="],
             "ENVIRONMENT_MODIFICATION": [
                 "LX_STRING=set:middle:with=punctuation", "LX_STRING=string_prepend:<", "LX_STRING=string_append:>",
-                "LX_PATH=path_list_append:middle", "LX_PATH=path_list_prepend:first", "LX_PATH=path_list_append:last",
+                "LX_PATH=path_list_append:D:/middle", "LX_PATH=path_list_prepend:C:/first",
+                "LX_PATH=path_list_append:E:/last",
                 "LX_LIST=cmake_list_append:middle", "LX_LIST=cmake_list_append:last", "LX_LIST=cmake_list_prepend:first",
                 "LX_RESET=unset:", "LX_RESET=reset:", "LX_UNSET=unset:", "LX_ABSENT=set:value", "LX_ABSENT=reset:",
             ],
@@ -213,7 +214,7 @@ class RunTestTest(unittest.TestCase):
             status, detail = self.run_entry(ctest_entry("modify_environment", command, props))
             self.assertEqual(status, "pass", detail)
             self.assertEqual(json.loads(detail.splitlines()[1]), [
-                "<middle:with=punctuation>", os.pathsep.join(("first", "middle", "last")),
+                "<middle:with=punctuation>", "C:/first;D:/middle;E:/last",
                 "first;middle;last", "from-test", None, None,
             ])
             self.assertEqual(os.environ["LX_RESET"], "from-host")

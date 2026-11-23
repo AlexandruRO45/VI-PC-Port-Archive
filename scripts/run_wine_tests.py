@@ -123,7 +123,8 @@ def modify_environment(env: dict[str, str], entries: list[str]) -> None:
     if not isinstance(entries, list):
         raise ValueError("expected a list of NAME=OP:VALUE entries")
     original = env.copy()
-    separators = {"string": "", "path_list": os.pathsep, "cmake_list": ";"}
+    # The inventory came from Windows CTest and the child under Wine is a Windows program.
+    separators = {"string": "", "path_list": ";", "cmake_list": ";"}
     for entry in entries:
         if not isinstance(entry, str) or "\0" in entry:
             raise ValueError("expected NAME=OP:VALUE")
