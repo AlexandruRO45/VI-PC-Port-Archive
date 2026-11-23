@@ -159,6 +159,33 @@ class VccTupleSmemTests(unittest.TestCase):
         ])
         self.assertIn("OpFunctionCall %uint %desc_lookup_fn", spv)
 
+    def test_slist_tsharp_resinfo_and_coherent_load(self):
+        # image_get_resinfo reads T# word 3 (BASE_LEVEL / LAST_LEVEL) and a glc image_load word 1;
+        # both must take it from the VCCTuple list instead of adding an offset to it (a TypeError).
+        tsharp = "[s100,s101,s102,s103,s104,s105,vcc_lo,vcc_hi]"
+        load = f"s_buffer_load_dwordx8 {tsharp}, s[0:3], 0x0"
+        spv = translate([
+            load, "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v0, 0",
+            f"image_get_resinfo v[4:7], v0, {tsharp} dmask:0xf dim:SQ_RSRC_IMG_2D unorm",
+            "s_waitcnt vmcnt(0)",
+            f"v_mov_b32_e32 v8, {OUT:#x}",
+            "global_store_dwordx4 v8, v[4:7], s[0:1]",
+        ])
+        self.assertIn("OpFunctionCall %uint %desc_lookup_fn", spv)
+        self.assertIn("OpImageQuerySizeLod", spv)
+        self.assertIn("OpImageQueryLevels", spv)
+        spv = translate([
+            load, "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 0",
+            f"image_load v[4:7], v[1:2], {tsharp} dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc dlc",
+            "s_waitcnt vmcnt(0)",
+            f"v_mov_b32_e32 v8, {OUT:#x}",
+            "global_store_dword v8, v4, s[0:1]",
+        ])
+        self.assertIn("OpFunctionCall %uint %desc_lookup_fn", spv)
+        self.assertIn("OpImageRead", spv)
+
     def test_slist_length_mismatch_rejected(self):
         with self.assertRaises(rdna2spirv.Unsupported):
             translate([

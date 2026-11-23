@@ -13169,7 +13169,7 @@ class Gen:
         self.uses_query = True
         if op == "image_get_resinfo":
             vals = self.resinfo_words(img, self.load_reg("vgpr", addr[0]), array_query,
-                                      self.load_reg("sgpr", a[2]["r"] + 3))
+                                      self.sgpr_word(a[2], 3))
             out = 0
             for c in range(4):
                 if dmask >> c & 1:
