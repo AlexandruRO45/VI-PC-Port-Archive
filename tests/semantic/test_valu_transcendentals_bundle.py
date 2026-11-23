@@ -228,5 +228,38 @@ class TestVSinF32SIMDAndIEEE(unittest.TestCase):
         self.assertAlmostEqual(res, subnormal * 2.0 * math.pi, places=6)
 
 
+def run_hw_sin_f32(src_val: float) -> float:
+    bits = f32_to_bits(src_val)
+    lines = [
+        f"v_mov_b32 v0, {bits:#x}",
+        "v_sin_f32 v0, v0",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_sin_f32_hw", lines)
+    out_bits = support.mrt0_words(spv)[0]
+    return bits_to_f32(out_bits)
+
+
+class TestVSinF32HardwareTranslator(unittest.TestCase):
+    """Translator integration and hardware execution tests for v_sin_f32."""
+
+    def test_translator_quarter_turns(self):
+        self.assertAlmostEqual(run_hw_sin_f32(0.25), 1.0, places=6)
+        self.assertAlmostEqual(run_hw_sin_f32(0.75), -1.0, places=6)
+        self.assertAlmostEqual(run_hw_sin_f32(-0.25), -1.0, places=6)
+
+    def test_translator_exact_zeros(self):
+        self.assertEqual(run_hw_sin_f32(0.0), 0.0)
+        self.assertEqual(run_hw_sin_f32(0.5), 0.0)
+        self.assertEqual(run_hw_sin_f32(1.0), 0.0)
+        self.assertEqual(run_hw_sin_f32(-0.5), 0.0)
+
+    def test_translator_signed_zero(self):
+        res_neg = run_hw_sin_f32(-0.0)
+        self.assertEqual(res_neg, -0.0)
+        self.assertEqual(math.copysign(1.0, res_neg), -1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
