@@ -717,27 +717,31 @@ def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
 
 
 def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader):
-    """Native wave64 ds_bpermute: a source lane missing from a partial wave must read 0, not an undefined shuffle."""
+    """Native wave64 ds_bpermute: a source lane missing from a partial wave or off in EXEC must read 0."""
     shader = make_shader("s_mov_b64 exec, -1\nv_lshlrev_b32_e32 v1, 2, v0\nds_bpermute_b32 v2, v1, v0\n"
                          "s_waitcnt lgkmcnt(0)\ns_endpgm\n", name="cs_bperm64_ci")
     asm = shader.translate()
     shader.validate(asm)
     assert rdna2spirv.translate.last_gen.wave64
-    assert re.search(
-        r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
+    shuffle = re.search(
+        r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 (%t\d+)\n\s*"
         r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \1 (%t\d+)\n\s*"
-        r"(%t\d+) = OpSelect %uint \2 \3 %t\d+\n\s*"
-        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \4\n\s*"
-        r"(%t\d+) = OpSelect %uint \2 %cffffffff %c0\n\s*"
-        r"%t\d+ = OpBitwiseAnd %uint \5 \6\n",
+        r"(%t\d+) = OpSelect %uint \3 \4 %t\d+\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \5\n\s*"
+        r"(%t\d+) = OpSelect %uint \3 %cffffffff %c0\n\s*"
+        r"%t\d+ = OpBitwiseAnd %uint \6 \7\n",
         asm,
-    ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
+    )
+    assert shuffle, "wave64 ds_bpermute did not keep the shuffle only where the source lane is active and running"
+    active_id = shuffle.group(2)
+    assert (f"{active_id} = OpLoad %bool %active" in asm or f"OpStore %active {active_id}" in asm), \
+        "wave64 ds_bpermute ballot must read the active lane predicate"
 
 
 
 def test_wave32_bpermute_zeroes_inactive_and_missing_source_lanes(make_shader):
-    """Wave32 ds_bpermute (RDNA ISA 10.4.4): the source value is 0 where the source lane is off in EXEC, and the
-    shuffle result is kept only where the source lane is running, as in the wave64 path."""
+    """Wave32 ds_bpermute (RDNA ISA 10.4.4): the source value is 0 where the source lane is off in EXEC or
+    missing from the wave, checked by balloting %active before the shuffle (SHADER-801)."""
     shader = make_shader(
         "v_cmp_ne_u32_e32 vcc_lo, 0, v0\ns_and_saveexec_b32 s4, vcc_lo\n"
         "v_lshlrev_b32_e32 v1, 2, v0\nds_bpermute_b32 v2, v1, v0\ns_waitcnt lgkmcnt(0)\ns_endpgm\n",
@@ -747,16 +751,15 @@ def test_wave32_bpermute_zeroes_inactive_and_missing_source_lanes(make_shader):
     shader.validate(asm)
     assert not rdna2spirv.translate.last_gen.wave64
     shuffle = re.search(
-        r"(%t\d+) = OpSelect %uint (%t\d+) %t\d+ %c0\n\s*"
-        r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 %true\n\s*"
-        r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \3 (%t\d+)\n\s*"
-        r"(%t\d+) = OpSelect %uint \4 \5 %t\d+\n\s*"
-        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 \1 \6\n\s*"
-        r"(%t\d+) = OpSelect %uint \4 %cffffffff %c0\n\s*"
-        r"(?P<result>%t\d+) = OpBitwiseAnd %uint \7 \8\n",
+        r"(%t\d+) = OpGroupNonUniformBallot %v4uint_bal %c3 (%t\d+)\n\s*"
+        r"(%t\d+) = OpGroupNonUniformBallotBitExtract %bool %c3 \1 (%t\d+)\n\s*"
+        r"(%t\d+) = OpSelect %uint \3 \4 %t\d+\n\s*"
+        r"(%t\d+) = OpGroupNonUniformShuffle %uint %c3 %t\d+ \5\n\s*"
+        r"(%t\d+) = OpSelect %uint \3 %cffffffff %c0\n\s*"
+        r"(?P<result>%t\d+) = OpBitwiseAnd %uint \6 \7\n",
         asm,
     )
-    assert shuffle, "wave32 ds_bpermute must mask inactive and missing source lanes"
+    assert shuffle, "wave32 ds_bpermute must ballot active lanes and mask inactive/missing source lanes"
     active_id = shuffle.group(2)
     assert (f"{active_id} = OpLoad %bool %active" in asm or f"OpStore %active {active_id}" in asm), \
         "source mask must read the active lane predicate"

@@ -5198,18 +5198,21 @@ class Gen:
 
     def ds_lane_read(self, dst: dict, data: str, src: str, lane: str) -> None:
         """DS swizzle and backward permute read zero from an inactive or absent source lane."""
-        value, result = self.tmp(), self.tmp()
-        self.emit(f"{value} = OpSelect %uint {self.active_b()} {data} {self.cu(0)}")
+        result = self.tmp()
         if self.emulate:
+            value = self.tmp()
+            self.emit(f"{value} = OpSelect %uint {self.active_b()} {data} {self.cu(0)}")
             self.g_shuffle(result, value, src)
         else:
-            # Redirect absent source lanes before the shuffle: even a masked undefined result is undefined.
+            # Ballot active lanes and redirect inactive or absent source lanes before the shuffle: even a masked
+            # undefined result is undefined, and a separate pre-shuffle OpSelect on data miscompiles in wave64 on
+            # the AMD Windows driver (SHADER-801).
             ballot, present, safe_src, shuffled, mask = (self.tmp() for _ in range(5))
             physical_src = self.wave_source_lane(src)
-            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
+            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 {self.active_b()}")
             self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {physical_src}")
             self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
-            self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint %c3 {value} {self.wave_source_lane(safe_src)}")
+            self.emit(f"{shuffled} = OpGroupNonUniformShuffle %uint %c3 {data} {self.wave_source_lane(safe_src)}")
             self.emit(f"{mask} = OpSelect %uint {present} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
             self.emit(f"{result} = OpBitwiseAnd %uint {shuffled} {mask}")
             self.uses_subgroup = self.uses_ballot = True
