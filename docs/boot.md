@@ -119,6 +119,25 @@ If startup stops before the first D3D12 call, the combined command still prints 
 or invalid requested trace is reported on stderr and sets exit code 2. In a partial JSON report that section
 is `null`; if neither input yields a report, stdout is empty.
 
+### The title's own crash dumps
+
+The title has its own crash reporter. Under `gta6rt` it cannot upload anything (`winhttp` is the offline shim), but
+it still writes a minidump through `CreateFileW` to `T:\<guid>.dmp`, and `T:` maps to the overlay's `.gta6rt-temp`
+folder. The dump's module list comes from the host loader: it names `gta6rt.exe` and the Wine or Windows DLLs, not
+the executable and DLLs `gta6rt` mapped itself, so a debugger shows the fault and the guest frames as bare
+addresses. `tools/minidump_summary.py` reads the dump together with the startup trace of the same run and
+attributes every address with both module lists, the trace's `map` events included:
+
+```sh
+python3 -I tools/minidump_summary.py <overlay>/.gta6rt-temp/<guid>.dmp --trace /tmp/boot.jsonl
+```
+
+It prints the exception (code, thread, `module+RVA`, and for an access violation the access type and target),
+each thread's instruction pointer, and the stack slots of the faulting thread that hold a module address
+(`--all-threads` for every thread). The slots come from a scan of the saved stack, not an unwind, so treat them
+as candidate frames. The tool warns when the dump's process id differs from the trace's. The dump and the
+report quote the title's memory and code offsets, so both stay on the player's machine.
+
 ## 4. The open questions, and the trace signal for each
 
 The questions are in [`d3d12_vulkan.md`](d3d12_vulkan.md) §8.2; that table repeats 16, 19 and 20, and this one is
