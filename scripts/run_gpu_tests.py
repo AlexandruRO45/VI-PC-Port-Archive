@@ -742,6 +742,16 @@ def _w64_graphics_only() -> frozenset:
 W64_GRAPHICS_ONLY = _w64_graphics_only()
 
 
+def recorded_twice(results) -> list[str]:
+    """Test names with more than one row in run_suite's results, in first-seen order."""
+    seen, twice = set(), []
+    for name, _ok, _detail in results:
+        if name in seen and name not in twice:
+            twice.append(name)
+        seen.add(name)
+    return twice
+
+
 def run_suite(a, work: str) -> int:
     asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
     # The wave64 pixel fixtures of runtime/test/shaders/w64_graphics.py (tiers A-C, #1541) are checked by that
@@ -953,11 +963,11 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_tbuffer_store":
             # tbuffer_store_format_*: the instruction's format, words measured natively on a Radeon 680M (the .asm header)
             problem = tbuffer_store_test(a.build, spirv_dir, cs_env)
+            results.append((name, not problem, problem or "128/128 dumped words exact"))
         elif name == "cs_fmt_d16_xyz":
             # d16_xyz / d16_xy typed-buffer loads and d16_xyz stores (cs_fmt_d16_xyz.asm header)
             problem = fmt_d16_xyz_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "80/80 dumped words exact"))
-            results.append((name, not problem, problem or "128/128 dumped words exact"))
         elif name in ("cs_global_neg_offset", "cs_global_mem_ext"):
             # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups give a 0x2800-byte
             # heap holding both the right addresses and the 4096-lower ones. One thread, no wave64 requirement.
@@ -1476,6 +1486,14 @@ def run_suite(a, work: str) -> int:
               file=sys.stderr)
         return 2
 
+    # Each test records one row. A name recorded twice means a branch above holds another branch's
+    # results.append (a new elif inserted between a check call and its append): the earlier test then has no
+    # row at all, so its failure would not show.
+    repeated = recorded_twice(results)
+    if repeated:
+        print(f"error: run_gpu_tests.py recorded more than one result for {', '.join(repeated)}; the branch "
+              "before each one probably lost its results.append", file=sys.stderr)
+
     print("\n=== GPU TEST RESULTS ===")
     passed = skipped = 0
     for name, ok, detail in results:
@@ -1484,7 +1502,7 @@ def run_suite(a, work: str) -> int:
         skipped += ok is None
         print(f"  {tag:4s}  {name:<20s}  {detail}")
     print(f"\n{passed}/{len(results)} passed" + (f", {skipped} skipped" if skipped else ""))
-    if passed + skipped != len(results):
+    if passed + skipped != len(results) or repeated:
         return 1
     if getattr(a, "require_pass", False) and not passed:
         print("error: --require-pass: no GPU tests passed", file=sys.stderr)

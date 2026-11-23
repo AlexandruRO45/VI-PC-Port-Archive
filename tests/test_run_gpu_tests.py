@@ -645,5 +645,65 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
 
 
+
+# The compute rows whose check is one function of check.py. Each must record its own row: on aa2988cc the
+# cs_tbuffer_store branch had none (its append sat under cs_fmt_d16_xyz, which then recorded two), so a
+# cs_tbuffer_store failure was dropped from the report and the exit code.
+FORMAT_ROWS = (("cs_fmt_1010102", "fmt_1010102_test"), ("cs_fmt_sint32", "fmt_sint32_test"),
+               ("cs_fmt_int_narrow", "fmt_int_narrow_test"), ("cs_fmt_xy_xyz", "fmt_xy_xyz_test"),
+               ("cs_tbuffer_store", "tbuffer_store_test"), ("cs_fmt_d16_xyz", "fmt_d16_xyz_test"))
+
+
+class OneResultPerTest(unittest.TestCase):
+    def run_row(self, name, checker, problem):
+        with tempfile.TemporaryDirectory() as tmp:
+            # "<name>.asm" so the filter selects this fixture alone, not a longer name that starts with it.
+            args = SimpleNamespace(filter=name + ".asm", build=tmp, llvm_mc="unused")
+
+            def translate(_cmd, env=None, gpu=True):
+                (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return 0, ""
+
+            out, err = io.StringIO(), io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, checker, return_value=problem) as check,
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(err)):
+                rc = rgt.run_suite(args, tmp)
+            check.assert_called_once()
+            return rc, out.getvalue(), err.getvalue()
+
+    def test_a_failing_check_is_one_failed_row(self):
+        for name, checker in FORMAT_ROWS:
+            with self.subTest(name=name):
+                rc, out, err = self.run_row(name, checker, "word 3: expected 0x1, got 0x0")
+                self.assertEqual(rc, 1, err)
+                rows = [line.split() for line in out.splitlines() if line.startswith("  FAIL") or
+                        line.startswith("  PASS") or line.startswith("  SKIP")]
+                self.assertEqual([r[:2] for r in rows], [["FAIL", name]])
+                self.assertIn("word 3: expected 0x1, got 0x0", out)
+                self.assertIn("0/1 passed", out)
+
+    def test_a_passing_check_is_one_passed_row(self):
+        for name, checker in FORMAT_ROWS:
+            with self.subTest(name=name):
+                rc, out, err = self.run_row(name, checker, None)
+                self.assertEqual(rc, 0, err)
+                self.assertIn("1/1 passed", out)
+                self.assertNotIn("more than one result", err)
+
+
+class RecordedTwice(unittest.TestCase):
+    def test_names_with_more_than_one_row(self):
+        rows = [("a", True, ""), ("b", False, "x"), ("a", True, ""), ("c", None, "SKIP"), ("b", True, ""),
+                ("a", True, "")]
+        self.assertEqual(rgt.recorded_twice(rows), ["a", "b"])
+
+    def test_one_row_each_is_fine(self):
+        self.assertEqual(rgt.recorded_twice([("a", True, ""), ("b", None, "SKIP")]), [])
+        self.assertEqual(rgt.recorded_twice([]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
