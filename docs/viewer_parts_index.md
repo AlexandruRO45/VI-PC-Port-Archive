@@ -2,8 +2,10 @@
 
 `tools/viewer_parts_index.py` builds a reusable SQLite database from existing exports. It reads manifests and entity JSONL, checks exported paths for availability, and never opens source RPF or TTPF files. It keeps drawable, placement and material references for later assembly.
 
+Use uv-managed CPython 3.12.13 for the example below. Run `uv python find 3.12.13` to locate the interpreter if it is not the default `python` in your shell.
+
 ```powershell
-uv run --no-project --python 3.12.13 python -I tools/viewer_parts_index.py `
+python -I tools/viewer_parts_index.py `
   --out D:/local-index/parts.sqlite `
   --models D:/exports/sample/models/manifest.json `
   --window D:/work/window-manifests/region/00000000000000000000-00000000000001048576/catalog-map.json `
