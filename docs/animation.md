@@ -323,8 +323,13 @@ Mapping to the name tables:
 - The RBF0 names do **not** overlap the clip/anim/motion namespace: direct name overlap is 0 and stem-hash
   overlap with the 2,298 paths is 0.
 - The RBF0 table contains 4,795 distinct rig and rig-set names. An earlier version of the indexer reported
-  zero stored joaat32 matches for every input. The count for this corpus needs to be measured again with the
-  corrected `--rigs` report. A match indicates that the four hash bytes occur somewhere in the blob.
+  zero stored joaat32 matches for every input, so the count was measured again on the 1.0.2.1 package with the
+  corrected `--rigs` report (`tools/anim_index.py` at `8497c702`): `stored_name_hashes` is **0 of 4,795**. A match
+  would mean the four hash bytes occur somewhere in the blob. An independent scan of the same 1,348,436-byte
+  blob agrees: the joaat32 of the full name and of its last path component, read as a little- or big-endian u32
+  at all four alignments, matches none of the 4,795 names (0 in each of the four runs). The same scan finds all
+  138 distinct words sampled from the blob, so the zero is the blob's and not the scan's. The table holds the
+  names as strings and none of their hashes.
 
 ### Bone tables and motion matchers
 
