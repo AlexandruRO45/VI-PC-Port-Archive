@@ -728,8 +728,8 @@ The compute path, end to end:
   The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
   D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. Each
   `DrawInstanced` / `DrawIndexedInstanced` records a copy of that state. A draw with no viewport (never set, or
-  unbound with `RSSetViewports(0, …)`) or an empty one rasterizes nothing in D3D12. Such a draw is not recorded,
-  since Vulkan forbids a 0×0 viewport.
+  unbound with `RSSetViewports(0, …)`) or with no nonempty viewport rasterizes nothing in D3D12. Such a draw is
+  not recorded, since Vulkan forbids a 0×0 viewport.
 
   At replay:
   - **Buffers:** vertex and index views resolve to buffers by VA (arena or upload). A view that runs past its
@@ -737,9 +737,13 @@ The compute path, end to end:
     arena's reserved first 64 KiB, which is kept zero (stride 0), so it gets the zeros D3D12 gives.
   - **Attachments:** they move to attachment layouts through the tracker, and the draw runs in a
     dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
-  - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
-    front-face winding then matches D3D12's.
-  - Only the first viewport and scissor are used, and primitive restart is not modelled yet.
+  - **Viewports and scissors:** up to 16 D3D12 slots are copied at each RS binding call and snapshotted per draw;
+    `SV_ViewportArrayIndex` selects its own viewport/scissor pair. Vulkan viewports are flipped (negative height)
+    because translated vertex shaders write D3D clip coordinates; front-face winding then matches D3D12's. A
+    normal one-slot draw uses the default graphics pipeline; multi-slot draws lazily create a 16-slot variant
+    when the logical device enabled `multiViewport`, otherwise the draw is refused without invalid Vulkan calls.
+    Unbound or zero-sized slots use legal placeholder viewport values and empty scissors. The synthetic
+    `d3d12_multi_viewport` test compares five WARP and Vulkan cases, including 16 slots and a bundle.
 
   **Resources and heaps:**
   - A buffer of 0 bytes, or one whose size wraps when aligned, is `E_INVALIDARG`. One the arena cannot hold is
