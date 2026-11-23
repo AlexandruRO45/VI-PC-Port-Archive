@@ -335,6 +335,7 @@ class Gen:
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
+        self.fmt_store_fns = {}   # (n, d16, linear) -> (name, function type, lines): typed stores per run-time format
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
@@ -3317,11 +3318,7 @@ class Gen:
             else:
                 fmt = self.tmp()
                 self.emit(f"{fmt} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
-            # Encodings for the formats that appear in store-heavy shaders; others store nothing.
-            f32 = {22: 1, 64: 2, 74: 3, 77: 4}
-            # Float views of the components, computed before any branch so every branch can use them.
-            fl = [self.tof(c) for c in comps] + ["%f0"] * (4 - len(comps))
-            plans = (fmt, comps, f32, fl, icomps)
+            plans = (fmt, comps, icomps)
             words = None
         if words is not None and per is not None and len(words) > 1:
             # modes 0 and 3: every dword is stored only if it ends inside (measured: a store that straddles the edge
@@ -3353,119 +3350,205 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        ptr, host = self.tmp(), self.host_addr(addr)
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
         if words is not None:
+            ptr, host = self.tmp(), self.host_addr(addr)
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
             for i, w in enumerate(words):
                 p = self.buf_dword_ptr(ptr, host, step, i)
                 self.emit(f"OpStore {p} {w} Aligned 4")
         else:
-            fmt, comps, f32, fl, icomps = plans
-            # Every format in FORMATS (the same table the loads decode); unknown formats store nothing.
-            fc = comps + [self.cu(0)] * (4 - len(comps))
-            ic = icomps + [self.cu(0)] * (4 - len(icomps))
-            # Normalized stores map either sign of NaN to zero before clamping.
-            # Compute this once per source component; float and integer formats use the original bits.
-            normalized = []
-            for component, float_value in zip(comps, fl):
-                nan, value = self.tmp(), self.tmp()
-                self.emit(f"{nan} = OpIsNan %bool {float_value}")
-                self.emit(f"{value} = OpSelect %uint {nan} {self.cu(0)} {component}")
-                normalized.append(value)
-            # The runtime names B8G8R8A8 and A2R10G10B10 UNORM with V# selectors Z,Y,X,W.
-            # Pad the input first: even store_format_x must put its red value in the third field.
-            unorm_rgba = normalized + [self.cu(0)] * (4 - n)
-            selectors, bgra, red, blue = (self.tmp() for _ in range(4))
-            self.emit(f"{selectors} = OpBitwiseAnd %uint {d3} {self.cu(0xfff)}")
-            self.emit(f"{bgra} = OpIEqual %bool {selectors} {self.cu(0xf2e)}")
-            self.emit(f"{red} = OpSelect %uint {bgra} {unorm_rgba[2]} {unorm_rgba[0]}")
-            self.emit(f"{blue} = OpSelect %uint {bgra} {unorm_rgba[0]} {unorm_rgba[2]}")
-            unorm_view = [red, unorm_rgba[1], blue, unorm_rgba[3]]
-            signed_ic = ic
-            if d16:
-                signed_ic = [self.tou(self.i16_half(regs[i // 2], i % 2)) for i in range(n)]
-                signed_ic = signed_ic + [self.cu(0)] * (4 - len(signed_ic))
-            # MUBUF 2-component stores infer COMP_SWAP from V# DST_SEL_X/Y/Z (measured natively on gfx1036 across
-            # all 1,296 valid DST_SEL tuples, wave32 and wave64): XY01 -> (x, y), YX01 -> (y, x), XYZW -> (x, w),
-            # YXZW/ZYXW -> (w, x). MTBUF (fixed_fmt is not None) ignores DST_SEL and always stores (x, y).
-            if fixed_fmt is None:
-                sx, sy, sz = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{sx} = OpBitFieldUExtract %uint {d3} {self.cu(0)} {self.cu(3)}")
-                self.emit(f"{sy} = OpBitFieldUExtract %uint {d3} {self.cu(3)} {self.cu(3)}")
-                self.emit(f"{sz} = OpBitFieldUExtract %uint {d3} {self.cu(6)} {self.cu(3)}")
-                sy_reg, sz_reg, sz_const, use_y = (self.tmp() for _ in range(4))
-                self.emit(f"{sy_reg} = OpUGreaterThanEqual %bool {sy} {self.cu(4)}")
-                self.emit(f"{sz_reg} = OpUGreaterThanEqual %bool {sz} {self.cu(4)}")
-                self.emit(f"{sz_const} = OpLogicalNot %bool {sz_reg}")
-                self.emit(f"{use_y} = OpLogicalAnd %bool {sy_reg} {sz_const}")
-                sx_ne4, yz_reg, rev2 = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{sx_ne4} = OpINotEqual %bool {sx} {self.cu(4)}")
-                self.emit(f"{yz_reg} = OpLogicalOr %bool {sy_reg} {sz_reg}")
-                self.emit(f"{rev2} = OpLogicalAnd %bool {sx_ne4} {yz_reg}")
-
-                def swiz2(arr):
-                    sec, c0, c1 = self.tmp(), self.tmp(), self.tmp()
-                    self.emit(f"{sec} = OpSelect %uint {use_y} {arr[1]} {arr[3]}")
-                    self.emit(f"{c0} = OpSelect %uint {rev2} {sec} {arr[0]}")
-                    self.emit(f"{c1} = OpSelect %uint {rev2} {arr[0]} {sec}")
-                    return [c0, c1]
-
-                norm2 = swiz2(unorm_rgba)
-                fc2 = swiz2(fc)
-                ic2 = swiz2(ic)
-                signed_ic2 = swiz2(signed_ic) if d16 else ic2
-            formats = self.FORMATS.items() if fmt is not None else [(fixed_fmt, self.FORMATS[fixed_fmt])]
-            for code, (size, kind, widths) in formats:
-                if fmt is not None:
-                    e = self.tmp()
-                    self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
-                    ld, le = self.tmp() + "_s", self.tmp() + "_se"
-                    self.emit(f"OpSelectionMerge {le} None")
-                    self.emit(f"OpBranchConditional {e} {ld} {le}")
-                    self.emit(f"{ld} = OpLabel")
-                ncomp = min(len(widths), n)
-                if len(widths) == 2 and fixed_fmt is None:
-                    fcs = norm2 if kind in ("unorm", "snorm") else fc2
-                    ics = signed_ic2 if kind in ("i32", "sint") else ic2
-                else:
-                    source = normalized if kind in ("unorm", "snorm") else fc
-                    fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
-                    if code in (50, 56):
-                        fcs = unorm_view
-                    integer_source = signed_ic if kind in ("i32", "sint") else ic
-                    ics = integer_source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
-                words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
-                if size >= 4:
-                    for k, w in enumerate(words[:size // 4]):
-                        pp = self.buf_dword_ptr(ptr, host, step, k)
-                        self.emit(f"OpStore {pp} {w} Aligned 4")
-                else:
-                    # 1- or 2-byte element: merge into its dword with atomics so neighbours are kept.
-                    al, sh, sh8, ap, mk, mks, inv, val, vs, t1, t2 = (self.tmp() for _ in range(11))
-                    self.emit(f"{sh} = OpUConvert %uint {addr}")
-                    lo3, lo64 = self.tmp(), self.tmp()
-                    self.emit(f"{lo3} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
-                    self.emit(f"{lo64} = OpUConvert %ulong {lo3}")
-                    self.emit(f"{al} = OpISub %ulong {addr} {lo64}")
-                    self.emit(f"{sh8} = OpShiftLeftLogical %uint {sh} {self.cu(3)}")
-                    sh24 = self.tmp()
-                    self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
-                    # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
-                    dword_arr = self.tmp()
-                    self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
-                    self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
-                    self.emit(f"{mk} = OpCopyObject %uint {self.cu((1 << (8 * size)) - 1)}")
-                    self.emit(f"{mks} = OpShiftLeftLogical %uint {mk} {sh24}")
-                    self.emit(f"{inv} = OpNot %uint {mks}")
-                    self.emit(f"{val} = OpBitwiseAnd %uint {words[0]} {mk}")
-                    self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
-                    self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
-                    self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
-                if fmt is not None:
-                    self.emit(f"OpBranch {le}")
-                    self.emit(f"{le} = OpLabel")
+            fmt, comps, icomps = plans
+            signed = [self.tou(self.i16_half(regs[i // 2], i % 2)) for i in range(n)] if d16 else icomps
+            ptr, host = self.tmp(), self.host_addr(addr)
+            if fmt is None:
+                self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+                self.store_format_body(None, d3, comps, icomps, signed, n, d16, ptr, host, addr, step, fixed_fmt)
+            else:
+                self.format_store_call(fmt, d3, addr, host, step, comps, icomps, signed, n, d16)
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
+
+    def format_store_call(self, fmt, d3, addr, host, step, comps, icomps, signed, n, d16):
+        """A store through the run-time FORMAT, as a call to one function per (component count, d16, step form).
+
+        Encoding the element in every format of FORMATS is about 2,000 instructions. Inlined at each such store, 22
+        stores made 90% of a 1 MB module that took the NVIDIA driver 30 s to compile (0.7 s with 3 formats), and
+        a shader with thousands of them would pass the id bound as the loads did (format_decode_call)."""
+        key = (n, d16, step is None)
+        fn = self.fmt_store_fns.get(key)
+        if fn is None:
+            name = f"%fmt_store_fn_{n}{'h' if d16 else 'w'}{'l' if step is None else 's'}"
+            wide = len(comps) if d16 else 0
+            kinds = ["fmt", "d3", "addr", "host"] + (["step"] if step is not None else []) + \
+                [f"c{i}" for i in range(n)] + [f"i{i}" for i in range(n)] + [f"s{i}" for i in range(wide)]
+            params = {k: f"{name}_{k}" for k in kinds}
+            saved, self.body = self.body, []
+            ptr = self.tmp()
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {params['host']}")
+            self.store_format_body(
+                params["fmt"], params["d3"], [params[f"c{i}"] for i in range(n)], [params[f"i{i}"] for i in range(n)],
+                [params[f"s{i}"] for i in range(wide)] if d16 else [params[f"i{i}"] for i in range(n)], n, d16, ptr,
+                params["host"], params["addr"], params.get("step"), None)
+            lines, self.body = self.body, saved
+            types = ["%ulong" if k in ("addr", "host") else "%uint" for k in kinds]
+            fn_type = f"%fn_fmt_store_{len(kinds)}"       # same parameter types, one declaration (SPIR-V: no duplicates)
+            fn = self.fmt_store_fns[key] = (
+                name, f"{fn_type} = OpTypeFunction %void " + " ".join(types),
+                [f"{name} = OpFunction %void None {fn_type}"] +
+                [f"{params[k]} = OpFunctionParameter {t}" for k, t in zip(kinds, types)] +
+                [f"{name}_entry = OpLabel"] + lines + ["         OpReturn", "OpFunctionEnd"])
+        name = fn[0]
+        args = [fmt, d3, addr, host] + ([step] if step is not None else []) + list(comps) + list(icomps) + \
+            (list(signed) if d16 else [])
+        self.emit(f"{self.tmp()} = OpFunctionCall %void {name} " + " ".join(args))
+
+    def store_format_body(self, fmt, d3, comps, icomps, signed, n, d16, ptr, host, addr, step, fixed_fmt):
+        """The stores of one typed-buffer element (buffer_store_format_*, tbuffer_store_format_*): `fmt` is the V#
+        FORMAT (a uint id, branched on over all of FORMATS) or None when `fixed_fmt` names the only format. `comps`
+        are the n f32 bit patterns (f16 values widened under d16), `icomps` the integer bit patterns and `signed` the
+        sign-extended ones; `ptr`/`host` address the element, `addr` is its Xbox address."""
+        # Every format in FORMATS (the same table the loads decode); unknown formats store nothing.
+        fl = [self.tof(c) for c in comps]
+        fc = comps + [self.cu(0)] * (4 - len(comps))
+        ic = icomps + [self.cu(0)] * (4 - len(icomps))
+        # Normalized stores map either sign of NaN to zero before clamping.
+        # Compute this once per source component; float and integer formats use the original bits.
+        normalized = []
+        for component, float_value in zip(comps, fl):
+            nan, value = self.tmp(), self.tmp()
+            self.emit(f"{nan} = OpIsNan %bool {float_value}")
+            self.emit(f"{value} = OpSelect %uint {nan} {self.cu(0)} {component}")
+            normalized.append(value)
+        # The runtime names B8G8R8A8 and A2R10G10B10 UNORM with V# selectors Z,Y,X,W.
+        # Pad the input first: even store_format_x must put its red value in the third field.
+        unorm_rgba = normalized + [self.cu(0)] * (4 - n)
+        selectors, bgra, red, blue = (self.tmp() for _ in range(4))
+        self.emit(f"{selectors} = OpBitwiseAnd %uint {d3} {self.cu(0xfff)}")
+        self.emit(f"{bgra} = OpIEqual %bool {selectors} {self.cu(0xf2e)}")
+        self.emit(f"{red} = OpSelect %uint {bgra} {unorm_rgba[2]} {unorm_rgba[0]}")
+        self.emit(f"{blue} = OpSelect %uint {bgra} {unorm_rgba[0]} {unorm_rgba[2]}")
+        unorm_view = [red, unorm_rgba[1], blue, unorm_rgba[3]]
+        signed_ic = list(signed) + [self.cu(0)] * (4 - len(signed))
+        # MUBUF 2-component stores infer COMP_SWAP from V# DST_SEL_X/Y/Z (measured natively on gfx1036 across
+        # all 1,296 valid DST_SEL tuples, wave32 and wave64): XY01 -> (x, y), YX01 -> (y, x), XYZW -> (x, w),
+        # YXZW/ZYXW -> (w, x). MTBUF (fixed_fmt is not None) ignores DST_SEL and always stores (x, y).
+        if fixed_fmt is None:
+            sx, sy, sz = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{sx} = OpBitFieldUExtract %uint {d3} {self.cu(0)} {self.cu(3)}")
+            self.emit(f"{sy} = OpBitFieldUExtract %uint {d3} {self.cu(3)} {self.cu(3)}")
+            self.emit(f"{sz} = OpBitFieldUExtract %uint {d3} {self.cu(6)} {self.cu(3)}")
+            sy_reg, sz_reg, sz_const, use_y = (self.tmp() for _ in range(4))
+            self.emit(f"{sy_reg} = OpUGreaterThanEqual %bool {sy} {self.cu(4)}")
+            self.emit(f"{sz_reg} = OpUGreaterThanEqual %bool {sz} {self.cu(4)}")
+            self.emit(f"{sz_const} = OpLogicalNot %bool {sz_reg}")
+            self.emit(f"{use_y} = OpLogicalAnd %bool {sy_reg} {sz_const}")
+            sx_ne4, yz_reg, rev2 = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{sx_ne4} = OpINotEqual %bool {sx} {self.cu(4)}")
+            self.emit(f"{yz_reg} = OpLogicalOr %bool {sy_reg} {sz_reg}")
+            self.emit(f"{rev2} = OpLogicalAnd %bool {sx_ne4} {yz_reg}")
+
+            def swiz2(arr):
+                sec, c0, c1 = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{sec} = OpSelect %uint {use_y} {arr[1]} {arr[3]}")
+                self.emit(f"{c0} = OpSelect %uint {rev2} {sec} {arr[0]}")
+                self.emit(f"{c1} = OpSelect %uint {rev2} {arr[0]} {sec}")
+                return [c0, c1]
+
+            norm2 = swiz2(unorm_rgba)
+            fc2 = swiz2(fc)
+            ic2 = swiz2(ic)
+            signed_ic2 = swiz2(signed_ic) if d16 else ic2
+        formats = self.FORMATS.items() if fmt is not None else [(fixed_fmt, self.FORMATS[fixed_fmt])]
+        # A run-time FORMAT encodes the element in every format with plain arithmetic and picks the words of the
+        # one that matches, then stores once: a store per format (41 branches, a dozen of them atomics) took the
+        # NVIDIA driver about 1.4 s per typed store (fixed_fmt, one format, stores in its own branch-free sequence).
+        picked = [self.cu(0)] * 4
+        for code, (size, kind, widths) in formats:
+            ncomp = min(len(widths), n)
+            if len(widths) == 2 and fixed_fmt is None:
+                fcs = norm2 if kind in ("unorm", "snorm") else fc2
+                ics = signed_ic2 if kind in ("i32", "sint") else ic2
+            else:
+                source = normalized if kind in ("unorm", "snorm") else fc
+                fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
+                if code in (50, 56):
+                    fcs = unorm_view
+                integer_source = signed_ic if kind in ("i32", "sint") else ic
+                ics = integer_source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
+            words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
+            if fmt is not None:
+                e = self.tmp()
+                self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
+                for k, w in enumerate(words[:max(1, size // 4)]):
+                    q = self.tmp()
+                    self.emit(f"{q} = OpSelect %uint {e} {w} {picked[k]}")
+                    picked[k] = q
+            else:
+                self.store_format_words(words, size, ptr, host, addr, step)
+        if fmt is None:
+            return
+        size = self.fmt_size_of(fmt)
+        for k in range(4):
+            # whole dwords: a format of 4 * (k + 1) bytes or more stores word k
+            if k == 0:
+                cond = self.tmp()
+                self.emit(f"{cond} = OpUGreaterThanEqual %bool {size} {self.cu(4)}")
+            else:
+                cond = self.tmp()
+                self.emit(f"{cond} = OpUGreaterThanEqual %bool {size} {self.cu(4 * (k + 1))}")
+            ld, le = self.tmp() + "_s", self.tmp() + "_se"
+            self.emit(f"OpSelectionMerge {le} None")
+            self.emit(f"OpBranchConditional {cond} {ld} {le}")
+            self.emit(f"{ld} = OpLabel")
+            pp = self.buf_dword_ptr(ptr, host, step, k)
+            self.emit(f"OpStore {pp} {picked[k]} Aligned 4")
+            self.emit(f"OpBranch {le}")
+            self.emit(f"{le} = OpLabel")
+        # 1- or 2-byte element (size 1 or 2): merge into its dword with atomics so neighbours are kept.
+        sub, one = self.tmp(), self.tmp()
+        self.emit(f"{sub} = OpISub %uint {size} {self.cu(1)}")
+        self.emit(f"{one} = OpULessThan %bool {sub} {self.cu(2)}")
+        ld, le = self.tmp() + "_s", self.tmp() + "_se"
+        self.emit(f"OpSelectionMerge {le} None")
+        self.emit(f"OpBranchConditional {one} {ld} {le}")
+        self.emit(f"{ld} = OpLabel")
+        is1, mk = self.tmp(), self.tmp()
+        self.emit(f"{is1} = OpIEqual %bool {size} {self.cu(1)}")
+        self.emit(f"{mk} = OpSelect %uint {is1} {self.cu(0xFF)} {self.cu(0xFFFF)}")
+        self.store_format_subdword(picked[0], mk, host, addr)
+        self.emit(f"OpBranch {le}")
+        self.emit(f"{le} = OpLabel")
+
+    def store_format_words(self, words, size, ptr, host, addr, step):
+        """One format's element: whole dwords (size >= 4), or a 1- or 2-byte element merged into its dword."""
+        if size >= 4:
+            for k, w in enumerate(words[:size // 4]):
+                pp = self.buf_dword_ptr(ptr, host, step, k)
+                self.emit(f"OpStore {pp} {w} Aligned 4")
+        else:
+            self.store_format_subdword(words[0], self.cu((1 << (8 * size)) - 1), host, addr)
+
+    def store_format_subdword(self, word, mk, host, addr):
+        """Merge the low bits of `word` selected by the mask `mk` into the dword holding the element at `addr`/`host`
+        with two atomics, so the neighbouring bytes are kept."""
+        sh, sh8, ap, mks, inv, val, vs, t1, t2 = (self.tmp() for _ in range(9))
+        self.emit(f"{sh} = OpUConvert %uint {addr}")
+        lo3, lo64, sh24 = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{lo3} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
+        self.emit(f"{lo64} = OpUConvert %ulong {lo3}")
+        self.emit(f"{sh8} = OpShiftLeftLogical %uint {sh} {self.cu(3)}")
+        self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
+        # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
+        dword_arr, al_host = self.tmp(), self.tmp()
+        self.emit(f"{al_host} = OpISub %ulong {host} {lo64}")     # = host_addr(addr - lo3)
+        self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {al_host}")
+        self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
+        self.emit(f"{mks} = OpShiftLeftLogical %uint {mk} {sh24}")
+        self.emit(f"{inv} = OpNot %uint {mks}")
+        self.emit(f"{val} = OpBitwiseAnd %uint {word} {mk}")
+        self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
+        self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
+        self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
 
     def cmp_class(self, a, exec_only=False, ty="f32", mods=()):
         """Test x's class against the mask and write the result to VCC/SGPR or EXEC.
@@ -13006,6 +13089,8 @@ def assemble(gen):
         types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
     if gen.tbuffer_norm_fns:
         types.append("%fn_tbuffer_norm = OpTypeFunction %uint %uint")
+    for fn_type in dict((t.split(" = ")[0], t) for _name, t, _lines in gen.fmt_store_fns.values()).values():
+        types.append(fn_type)
     if gen.fmt_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
         types.append("%fn_fmt_decode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 5))
@@ -13369,6 +13454,8 @@ def assemble(gen):
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or [])
     for function in gen.tbuffer_norm_fns.values():
+        helpers.extend(function)
+    for _name, _type, function in gen.fmt_store_fns.values():
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)

@@ -629,8 +629,11 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             pc, res_id, cur_label, prev_label = calls.pop()
             values[res_id] = ret
             continue
-        if op == "OpReturn" and not calls:
-            break
+        if op == "OpReturn":
+            if not calls:
+                break
+            pc, _, cur_label, prev_label = calls.pop()       # a void function: nothing to hand back
+            continue
         if op in ("OpFunction", "OpFunctionParameter"):
             raise UnsupportedConstruct(f"{op} reached by falling through")
         if op in _IGNORED:

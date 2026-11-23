@@ -346,6 +346,14 @@ typed-buffer loads each decoded every supported format inline. The exact UNORM/S
 dcd8ecf the run-time format decode is one function per module (`%fmt_decode_fn`):
 ActivateProbes went from 6.16 M to 2.20 M instructions (41.7 MB), and all three now validate.
 
+**Typed stores.** A `buffer_store_format_*` through the V# FORMAT used to encode and store the element in a
+branch for each of the 41 formats, about 2,000 instructions per store, and the NVIDIA driver inlines every
+function, so moving them into one is not enough. A compute module with 22 of them was 1.03 MB and compiled in
+30 s alone on an RTX 4080 SUPER; with 3 formats for the stores it compiled in 1.4 s. The stores now encode every
+format with plain arithmetic, select the words of the matching one and store once: the module is 0.24 MB and
+compiles in 5.0 s. Twelve compute shaders with 18 to 40 typed stores took 1,739 s to compile together before
+(slowest 483 s) and 176 s after (slowest 59 s).
+
 **Results.** With the pre-dcd8ecf translation (spirv4), entries 0–24,200 compiled with 0 module and
 0 pipeline failures; two modules over 16 MiB were skipped in the chunked part. The spirv5 cache (all
 26,503 entries, nothing skipped by size) is being built.
