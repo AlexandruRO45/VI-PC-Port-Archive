@@ -35,8 +35,9 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 14)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
+         + len(check.TEXTURE_CONSTANTS) + 16)  # three mesh fixtures, ps_tex, ps_imgatomic, five compute fixtures,
+         # ps_table_fetch, ps_table_fetch_mixed, ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz /
+         # cs_heap_init dumps (net one more case) and cs_fmt_all
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -57,9 +58,92 @@ def cvt_answer(env, wrong_for=None):
     return 0, "out[0..7] = " + " ".join(map(str, words + [0xEEEEEEEE] * 6)) + "\n"
 
 
+TABLE_FETCH_MODES = ("fetch-sint", "fetch-uint", "fetch-miss", "fetch-mixed", "fetch-mixed-swap")
+
+
+class TableFetchChecks(unittest.TestCase):
+    def run_fetch(self, mixed, *, failing_mode=None, answer=None, stale=False):
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = Path(tmp) / "spirv"
+            spirv.mkdir()
+
+            def harness(tool, mode, raw, *, cwd=None):
+                self.assertTrue(Path(tool).is_absolute())
+                self.assertEqual(Path(tool).name, "vk_texture_test" + check.EXE)
+                self.assertEqual(Path(cwd), spirv)
+                self.assertFalse(Path(raw).exists(), "previous readback was not removed")
+                sent.append(mode)
+                code, output, writes = answer if mode == failing_mode else (
+                    0, f"{mode}: 4096 exact pixels\n", True)
+                if writes:
+                    # The C++ harness compares the pixels; check.py requires its success line and a fresh frame.
+                    Path(raw).write_bytes(bytes(64 * 64 * 16))
+                return code, output
+
+            launch = check.run_readback
+
+            def readback(path, *args, **kwargs):
+                if stale:
+                    Path(path).write_bytes(bytes(64 * 64 * 16))
+                return launch(path, *args, **kwargs)
+
+            with patch.object(check, "run", side_effect=harness), \
+                    patch.object(check, "run_readback", side_effect=readback):
+                result = check.table_fetch_test(tmp, str(spirv), mixed=mixed)
+        return result, sent
+
+    def test_every_mode_runs_from_the_shader_directory(self):
+        for mixed, modes in ((False, TABLE_FETCH_MODES[:3]), (True, TABLE_FETCH_MODES[3:])):
+            with self.subTest(mixed=mixed):
+                result, sent = self.run_fetch(mixed)
+                self.assertEqual(result, "")
+                self.assertEqual(sent, list(modes))
+
+    def test_each_mode_failure_stops_the_sweep_and_names_the_mode(self):
+        for index, mode in enumerate(TABLE_FETCH_MODES):
+            with self.subTest(mode=mode):
+                mixed = index >= 3
+                result, sent = self.run_fetch(mixed, failing_mode=mode,
+                                              answer=(1, f"{mode}: pixel 0 differs\n", False))
+                self.assertNotIsInstance(result, check.Skip)
+                self.assertIn(f"exit 1: {mode}: pixel 0 differs", result)
+                self.assertEqual(sent, list(TABLE_FETCH_MODES[3 if mixed else 0:index + 1]))
+
+    def test_success_requires_the_mode_line_and_a_new_readback(self):
+        for index, mode in enumerate(TABLE_FETCH_MODES):
+            for output, writes, detail in (
+                ("another-mode: 4096 exact pixels\n", True, "exit 0"),
+                ("0 mismatches\n", True, "exit 0"),
+                (f"{mode}: 4096 exact pixels\n", False, "missing readback"),
+            ):
+                with self.subTest(mode=mode, detail=detail, output=output):
+                    result, sent = self.run_fetch(index >= 3, failing_mode=mode,
+                                                  answer=(0, output, writes), stale=True)
+                    self.assertNotIsInstance(result, check.Skip)
+                    self.assertIn(detail, result)
+                    self.assertEqual(sent[-1], mode)
+
+    def test_unsupported_mode_skips_and_stops_the_sweep(self):
+        for index, mode in enumerate(TABLE_FETCH_MODES):
+            with self.subTest(mode=mode):
+                result, sent = self.run_fetch(index >= 3, failing_mode=mode,
+                                              answer=(77, "unsupported: numeric image view\n", False))
+                self.assertIsInstance(result, check.Skip)
+                self.assertIn("numeric image view", result)
+                self.assertEqual(sent[-1], mode)
+
+
 class Wave64Checks(unittest.TestCase):
     def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False, fmt=(0, GOOD_FMT)):
-        def harness(_tool, shader, *args, env=None):
+        def harness(_tool, shader, *args, env=None, cwd=None):
+            if shader in TABLE_FETCH_MODES:
+                self.assertEqual(len(args), 1)
+                self.assertEqual(Path(cwd).name, "spirv")
+                raw = Path(args[0])
+                self.assertFalse(raw.exists())
+                raw.write_bytes(bytes(64 * 64 * 16))
+                return 0, f"{shader}: 4096 exact pixels\n"
             name = Path(shader).stem
             if name == "cs_fmt_1010102":
                 self.assertEqual(args, ("1", "dump"))
@@ -1076,10 +1160,6 @@ class FmaFusedChecks(unittest.TestCase):
         self.assertIsInstance(res, check.Skip)
         self.assertIn("VK_KHR_shader_fma", res)
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TexelOffsetFormsChecks(unittest.TestCase):
     """ps_texoff_forms (image_sample_o, image_sample_b_o, image_gather4_l_o): the judgement of a dump."""
 
@@ -1121,3 +1201,7 @@ class PixelTestRegistry(unittest.TestCase):
             with patch.object(check, "pixels", return_value=([want], "")) as pixels:
                 self.assertEqual(check.pixel_test("tools", tmp, "ps_legacy_mul"), "")
             self.assertEqual(pixels.call_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
