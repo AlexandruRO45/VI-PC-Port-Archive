@@ -63,20 +63,6 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                     for field in ("op", "args", "mods"):
                         self.assertEqual(ins[field], expected[field])
 
-    def test_special_sources_230_to_239_have_llvm_names(self):
-        # s_mov_b32 s0, <source code>: llvm-mc 23.1.6 names these; the decoded operand must be what shader_ir parses
-        # from that text, so the direct backend hands rdna2spirv the same operand as the llvm-mc path.
-        for code, name in ((230, "src_flat_scratch_base_lo"), (231, "src_flat_scratch_base_hi"),
-                           (235, "src_shared_base"), (236, "src_shared_limit"), (237, "src_private_base"),
-                           (238, "src_private_limit"), (239, "src_pops_exiting_wave_id")):
-            with self.subTest(code=code):
-                code_bytes = words(0xBE800300 | code)
-                text, invalid = rdna2_decode.disasm_bytes(code_bytes)
-                asm = f"s_mov_b32 s0, {name}"
-                self.assertEqual((text.split(";")[0].strip(), invalid), (asm, 0))
-                ins, = rdna2_decode.decode_bytes(code_bytes)["insns"]
-                self.assertEqual(ins["args"], shader_ir.parse_line(asm)["args"])
-
     def test_image_slc_is_independent_of_sampler(self):
         for sampler in (0, 64):
             for slc in (0, 1):
@@ -181,6 +167,20 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(info["insns"][0]["args"][1], {"k": "imm", "v": 0x12345678})
         self.assertEqual(info["insns"][3]["args"], [{"k": "special", "t": "hwreg(HW_REG_MODE, 2, 2)"},
                                                     {"k": "imm", "v": 3}])
+
+    def test_special_sources_230_to_239_have_llvm_names(self):
+        # s_mov_b32 s0, <source code>: llvm-mc 23.1.6 names these; the decoded operand must be what shader_ir parses
+        # from that text, so the direct backend hands rdna2spirv the same operand as the llvm-mc path.
+        for code, name in ((230, "src_flat_scratch_base_lo"), (231, "src_flat_scratch_base_hi"),
+                           (235, "src_shared_base"), (236, "src_shared_limit"), (237, "src_private_base"),
+                           (238, "src_private_limit"), (239, "src_pops_exiting_wave_id")):
+            with self.subTest(code=code):
+                code_bytes = words(0xBE800300 | code)
+                text, invalid = rdna2_decode.disasm_bytes(code_bytes)
+                asm = f"s_mov_b32 s0, {name}"
+                self.assertEqual((text.split(";")[0].strip(), invalid), (asm, 0))
+                ins, = rdna2_decode.decode_bytes(code_bytes)["insns"]
+                self.assertEqual(ins["args"], shader_ir.parse_line(asm)["args"])
 
     def test_vop1_vop2_vopc_and_readfirstlane(self):
         # v_mov_b32_e32 v2, 1.0 (VOP1 op=1, vdst=2, src0=242)
