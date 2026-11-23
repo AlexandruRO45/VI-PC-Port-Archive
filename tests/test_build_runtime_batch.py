@@ -44,5 +44,19 @@ class BuildRuntimeBatchTest(unittest.TestCase):
             )
 
 
+class BuildRuntimeScriptBytesTest(unittest.TestCase):
+    """The wrapper's first bytes: one UTF-8 BOM at most.
+
+    A second BOM is not whitespace PowerShell skips: it stays in front of `param(`, so param() is not the first
+    statement, no param block is declared, and `build_runtime.ps1 -jobs 4` loses its arguments (and `-Debug` binds
+    PowerShell's own common parameter). Byte-level, so the check runs on every OS without PowerShell.
+    """
+
+    def test_script_does_not_start_with_a_second_bom(self):
+        head = SCRIPT.read_bytes()[:6]
+        self.assertEqual(head[:3], b"\xef\xbb\xbf", "the script lost its UTF-8 BOM")
+        self.assertNotEqual(head[3:], b"\xef\xbb\xbf", "a second BOM hides param() from Windows PowerShell 5.1")
+
+
 if __name__ == "__main__":
     unittest.main()
