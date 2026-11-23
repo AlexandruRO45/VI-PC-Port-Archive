@@ -264,6 +264,13 @@ def main(argv=None) -> int:
         ap.error("--jobs must be at least 1")
     if not a.out and not a.save:
         ap.error("give --out, --save or both")
+    want = None
+    if a.stages != "all":
+        want = {s.strip() for s in a.stages.split(",")}
+        known = {"cs"} | {SLOTS.get(slot, f"slot{slot}") for slot in range(7)}
+        if not want <= known:
+            ap.error(f"--stages: unknown stage {', '.join(repr(s) for s in sorted(want - known))} "
+                     f"(give 'all' or some of {','.join(sorted(known))})")
     with open(a.src, "rb") as f:
         head = f.read(4)
         f.seek(0)
@@ -284,7 +291,6 @@ def main(argv=None) -> int:
     if not a.out:
         print(f"library: {len(b)} bytes written to {a.save}")
         return 0
-    want = None if a.stages == "all" else set(a.stages.split(","))
     os.makedirs(os.path.join(a.out, "fspx"), exist_ok=True)
     disasm = None
     if a.disasm:

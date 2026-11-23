@@ -234,6 +234,39 @@ class Main(unittest.TestCase):
             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
                              ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
 
+    def test_stage_filter_strips_spaces(self):
+        # "cs, ps" used to drop ps: the token was " ps", which matches no stage.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            rc, text = self.run_main(src, "--out", out, "--stages", "cs, ps")
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
+                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_ps_00000.code", "lib_ps_00000.json"])
+
+    def test_unknown_stage_is_a_usage_error(self):
+        # A typo used to write zero programs and exit 0; now it is a usage error (exit 2) before the input is read
+        # or the output folder is made.
+        for stages in ("px", "cs,", "cs,,ps", "unused", "slot7"):
+            with self.subTest(stages=stages), tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "out")
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    self.run_main(os.path.join(tmp, "missing.bin"), "--out", out, "--stages", stages)
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("--stages", err.getvalue())
+                self.assertFalse(os.path.exists(out))
+        with tempfile.TemporaryDirectory() as tmp:     # every name the tool can give a stage is accepted
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            rc, text = self.run_main(src, "--out", os.path.join(tmp, "out"),
+                                     "--stages", "cs,ps,vs,ms,slot3,slot4,slot5,slot6")
+            self.assertEqual(rc, 0)
+            self.assertIn("4 written", text)
+
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")
