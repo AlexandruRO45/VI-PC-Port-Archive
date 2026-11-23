@@ -22,10 +22,11 @@ runtime\build\gta6rt.exe --dry-run "$game\XboxBvhBuilder.dll" --game-dir $game
 Each run prints one line per mapped module:
 
 ```
-XboxBvhBuilder.dll  base=0000000180000000 size=909312 entry=+0x227cc  shim=4 host=53 module=0 unimplemented=0
+XboxBvhBuilder.dll  base=0000000180000000 size=909312 entry=+0x227cc  shim=5 host=52 module=0 unimplemented=0
     shim          d3d12_xs.dll!D3D12SerializeVersionedRootSignature
     shim          xmem.dll!XMemVirtualQuery
     shim          api-ms-win-crt-runtime-l1-1-0.dll!_configure_narrow_argv
+    shim          api-ms-win-crt-runtime-l1-1-0.dll!_cexit
     shim          api-ms-win-core-libraryloader-l1-2-0.dll!DisableThreadLibraryCalls
 1 module(s) mapped, 0 unimplemented import(s)
 unimplemented by return policy: hresult=0 other=0
@@ -36,23 +37,23 @@ unimplemented by return policy: hresult=0 other=0
 
 ## Measured result
 
-All 16 DLLs in the package map at their preferred base `0x180000000` with no relocation, and every import binds. `gta6rt --init` on each one also runs its TLS callbacks and `DllMain` and exits 0 (counts re-measured with `--dry-run` and `--init` on `main` `aa2988cc`, Windows 11):
+All 16 DLLs in the package map at their preferred base `0x180000000` with no relocation, and every import binds. `gta6rt --init` on each one also runs its TLS callbacks and `DllMain` and exits 0 (counts re-measured with `--dry-run` and `--init` on `main` `98fa503f`, Windows 11):
 
 | Image | Size of image | Entry RVA | Shim | Host | Module | Unimplemented | `--init` |
 |---|---:|---:|---:|---:|---:|---:|---|
-| `Bink2Scarlett.dll` | 278,528 | `0x2ac1c` | 4 | 56 | 0 | 0 | exit 0 |
-| `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 4 | 53 | 0 | 0 | exit 0 |
-| `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 6 | 80 | 0 | 0 | exit 0 |
-| `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 5 | 17 | 0 | 0 | exit 0 |
-| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 26 | 172 | 0 | 0 | exit 0 |
-| `XCurl.dll` | 188,416 | `0x17b0` | 24 | 116 | 0 | 0 | exit 0 |
-| `concrt140.dll` | 303,104 | `0x29160` | 2 | 101 | 0 | 0 | exit 0 |
-| `msvcp140.dll` | 577,536 | `0x525a0` | 13 | 174 | 0 | 0 | exit 0 |
-| `msvcp140_1.dll` | 36,864 | `0x15c0` | 2 | 31 | 0 | 0 | exit 0 |
-| `msvcp140_2.dll` | 192,512 | `0x1efa0` | 2 | 94 | 0 | 0 | exit 0 |
-| `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 4 | 60 | 0 | 0 | exit 0 |
-| `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 2 | 22 | 0 | 0 | exit 0 |
-| `vccorlib140.dll` | 344,064 | `0x27e50` | 7 | 107 | 0 | 0 | exit 0 |
+| `Bink2Scarlett.dll` | 278,528 | `0x2ac1c` | 5 | 55 | 0 | 0 | exit 0 |
+| `XboxBvhBuilder.dll` | 909,312 | `0x227cc` | 5 | 52 | 0 | 0 | exit 0 |
+| `amd_fidelityfx_upscaler_xbox.dll` | 802,816 | `0x26780` | 8 | 78 | 0 | 0 | exit 0 |
+| `amd_fidelityfx_loader_xbox.dll` | 32,768 | `0x18d0` | 6 | 16 | 0 | 0 | exit 0 |
+| `libHttpClient.GDK.dll` | 999,424 | `0x11f0` | 28 | 170 | 0 | 0 | exit 0 |
+| `XCurl.dll` | 188,416 | `0x17b0` | 26 | 114 | 0 | 0 | exit 0 |
+| `concrt140.dll` | 303,104 | `0x29160` | 4 | 99 | 0 | 0 | exit 0 |
+| `msvcp140.dll` | 577,536 | `0x525a0` | 15 | 172 | 0 | 0 | exit 0 |
+| `msvcp140_1.dll` | 36,864 | `0x15c0` | 3 | 30 | 0 | 0 | exit 0 |
+| `msvcp140_2.dll` | 192,512 | `0x1efa0` | 4 | 92 | 0 | 0 | exit 0 |
+| `msvcp140_atomic_wait.dll` | 81,920 | `0x3c80` | 6 | 58 | 0 | 0 | exit 0 |
+| `msvcp140_codecvt_ids.dll` | 28,672 | `0x1340` | 3 | 21 | 0 | 0 | exit 0 |
+| `vccorlib140.dll` | 344,064 | `0x27e50` | 9 | 105 | 0 | 0 | exit 0 |
 | `vcomp140.dll` | 86,016 | `0x6580` | 7 | 71 | 0 | 0 | exit 0 |
 | `vcruntime140.dll` | 110,592 | `0xf890` | 3 | 38 | 0 | 0 | exit 0 |
 | `vcruntime140_1.dll` | 49,152 | `0x3e90` | 1 | 33 | 0 | 0 | exit 0 |
@@ -61,7 +62,7 @@ Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's 
 
 The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`. `abort()` raises `SIGABRT` when the guest installed a handler (the guest's `signal()` import binds to the host CRT, so its table is the one raised here); with the default or ignore disposition, or a handler that returns, the run still ends with code 3. `run_tiny_game_abort_exit_codes` compares that with a native run of the stand-in image. The table above is `gta6rt --dry-run` on each DLL at the commit that added this paragraph.
 
-The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, which is why almost every DLL gained one or two. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 26 and 9 to 24 shim imports.
+The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, and so are its exit functions `_crt_atexit`, `_cexit`, `_c_exit`, `exit` and `quick_exit` (`39d3ab8c`), which is why almost every DLL gained two to four. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 28 and 9 to 26 shim imports.
 
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
