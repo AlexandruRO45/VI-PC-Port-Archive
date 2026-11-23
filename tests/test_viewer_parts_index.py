@@ -102,7 +102,7 @@ class PartsIndexTests(unittest.TestCase):
         self.assertEqual(totals["input_outside_region"], 1)
         self.assertEqual(self.read("""SELECT p.line, p.key_status, m.status, m.eligible_candidates
             FROM placements p JOIN placement_matches m USING (key_id)
-            WHERE p.input_id = (SELECT id FROM inputs WHERE path=?) ORDER BY p.line""", (str(entities),)), [
+            WHERE p.input_id = (SELECT id FROM inputs WHERE path=?) ORDER BY p.line""", (str(entities.resolve()),)), [
             (1, "present", "verified", 1), (2, "present", "ambiguous", 2), (3, "absent", "ambiguous", 3),
             (4, "present", "key_mismatch", 0), (5, "absent", "unresolved_archetype", 0),
             (6, "present", "verified", 1), (7, "invalid", "unverified", 1), (8, "present", "key_mismatch", 0),
@@ -178,7 +178,7 @@ class PartsIndexTests(unittest.TestCase):
         self.assertEqual(totals["input_catalog_ambiguous"], 2)
         self.assertEqual(totals["input_catalog_missing"], 1)
         self.assertEqual(self.read("SELECT m.offset,a.path FROM model_assets a JOIN models m ON m.id=a.model_id"),
-                         [(180, index.existing(glb))])
+                         [(180, index.existing(glb.resolve()))])
         self.assertEqual(self.read("SELECT size,mtime_ns FROM archives"), [(8192, 12345)])
         before = self.out.read_bytes()
         self.assertIn("commit marker", self.run_index("--models", manifest, result=2))

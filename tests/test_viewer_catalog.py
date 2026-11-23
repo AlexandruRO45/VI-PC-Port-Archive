@@ -137,7 +137,7 @@ class CatalogTests(unittest.TestCase):
             ready = [entry["name"] for entry in snapshot["assets"]]
             self.assertIn("prepared", ready)
             self.assertEqual(command, ["fake-rpf9dump"])
-            called.append(source.relative_to(game).as_posix())
+            called.append(source.relative_to(game.resolve()).as_posix())
             self.write_export(source.stem, [{"File": f"{source.stem}.obj"}], root=exports)
 
         flags = ["--game", str(game), "--archive", "data.rpf", "--archive", story, "--archive", "levels.rpf"]
@@ -301,9 +301,10 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("stale window checkpoint refused", self.catalog()["status"]["message"])
 
     def test_release_only_removes_exact_owned_window_folder(self):
-        root = self.root / "x" / "windows" / "levels"
+        # The CLI resolves the work directory before constructing a staging path.
+        root = self.root.resolve() / "x" / "windows" / "levels"
         (root / "0-5").mkdir(parents=True)
-        other = self.root / "x" / "windows" / "other"
+        other = root.with_name("other")
         other.mkdir()
         for bad in (other, root, root / "0-5" / "..", root / "not-a-window", self.root / "x"):
             with self.assertRaises(OSError):
