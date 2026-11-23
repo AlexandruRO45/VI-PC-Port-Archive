@@ -32,13 +32,14 @@ SPIRV_VAL = shutil.which("spirv-val")
 FSSM = bytes(0x138) + struct.pack("<4I", 0x88 | (12 << 1), 32, 1, 1)
 
 
-def translate(lines, *, emulate=False):
+def translate(lines, *, emulate=False, narrow_exec=True):
     prev = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
-        # Narrow EXEC immediately before the atomic. Unchanged EXEC can fold the guard to true.
-        narrowed = [*lines[:-1], "v_cmpx_eq_u32_e32 v1, v2", lines[-1], "s_endpgm"]
-        return support.translate_lines("cs_img_atomic_guard", narrowed, fssm=FSSM)
+        # Narrow EXEC immediately before the atomic when checking the dynamic guard.
+        if narrow_exec:
+            lines = [*lines[:-1], "v_cmpx_eq_u32_e32 v1, v2", lines[-1]]
+        return support.translate_lines("cs_img_atomic_guard", [*lines, "s_endpgm"], fssm=FSSM)
     finally:
         rdna2spirv.WAVE64_EMULATE = prev
 
@@ -111,6 +112,21 @@ def vgpr_ptrs(spv, reg_idx):
 
 
 class ImageAtomicsGuardTests(unittest.TestCase):
+    def test_unchanged_exec_uses_static_guard(self):
+        spv = translate([
+            "v_mov_b32_e32 v0, 5",
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 2",
+            "image_atomic_add v0, v[1:2], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc",
+        ], narrow_exec=False)
+        validate_spirv(spv)
+        texel_blocks = [
+            label for label, insns in parse_blocks(spv).items()
+            if any("= OpImageTexelPointer " in ln for ln in insns)
+        ]
+        self.assertEqual(len(texel_blocks), 1)
+        self.assertRegex(spv, rf"(?m)^\s*OpBranchConditional %true {re.escape(texel_blocks[0])} %\w+$")
+
     def test_all_image_atomics_2d_and_3d_guarded_and_valid(self):
         simple_ops = [
             ("image_atomic_add", "OpAtomicIAdd"),
