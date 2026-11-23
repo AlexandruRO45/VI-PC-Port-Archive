@@ -16,6 +16,7 @@ its real count, and the family rule uses the smallest family size whose control 
 
 Dictionary sources:
 
+``--dialogue``      a dialogue CSV exported by ``text_tables.py``; only its ``wave`` column supplies candidates.
 ``--words``         a text file with one word per line, or a ``hashdict.py`` JSON (its values are used);
 ``--conversations`` files or directories whose conversation data pairs a dialogue key with line labels
                     (``<ROOT>AU_<XXXX>\\0<LABEL>\\0``). A key with N labels yields the waves ``<key>_01`` ..
@@ -26,7 +27,7 @@ for ``.awc`` files, or an ``audio_manifest.json`` written by ``rpf9dump audio``.
 include their parent paths in report labels so they can be selected separately with ``opus_tags.py --source``.
 
 Usage:
-    python -I awc_names.py <banks> [<banks> ...] (--words FILE | --conversations PATH) [...]
+    python -I awc_names.py <banks> [<banks> ...] (--words FILE | --conversations PATH | --dialogue CSV) [...]
                            [--min-token N] [--out names.csv|.json]
 
 A JSON inventory from ``awc_manifest.py`` can also supply the bank names and stream IDs.
@@ -168,6 +169,24 @@ def read_words(path: str) -> list:
         return [str(v) for v in (doc.values() if isinstance(doc, dict) else doc)]
     with open(path, encoding="utf-8", errors="replace") as fh:
         return [line.strip() for line in fh if line.strip()]
+
+
+def read_dialogue_waves(path: str) -> list:
+    """Read only wave cells, even when subtitle fields span multiple physical lines."""
+    with open(path, encoding="utf-8-sig", newline="") as fh:
+        reader = csv.reader(fh, strict=True)
+        header = next(reader, [])
+        if header.count("wave") != 1:
+            raise ValueError("expected exactly one wave column")
+        column = header.index("wave")
+        waves = []
+        for row in reader:
+            if not row:
+                continue
+            if len(row) != len(header):
+                raise ValueError(f"line {reader.line_num}: expected {len(header)} columns, got {len(row)}")
+            waves.append(row[column])
+        return waves
 
 
 def conversation_waves(paths) -> list:
@@ -324,15 +343,17 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("banks", nargs="+", help="an .awc file, a bank directory, or JSON from awc_manifest.py or rpf9dump audio")
     ap.add_argument("--words", action="append", default=[], help="word list or hashdict.py JSON (repeatable)")
+    ap.add_argument("--dialogue", action="append", default=[],
+                    help="dialogue CSV from text_tables.py (wave column only, repeatable)")
     ap.add_argument("--conversations", action="append", default=[],
                     help="file or directory with conversation key/label pairs (repeatable)")
     ap.add_argument("--min-token", type=int, default=MIN_TOKEN,
                     help="dictionary words a family base token must appear in (default 5)")
     ap.add_argument("--out", help="names.csv or names.json; default is a summary only")
     a = ap.parse_args(argv)
-    if not a.words and not a.conversations:
-        ap.error("give at least one --words or --conversations source")
-    inputs = a.banks + a.words + a.conversations
+    if not (a.words or a.conversations or a.dialogue):
+        ap.error("give at least one --words, --conversations or --dialogue source")
+    inputs = a.banks + a.words + a.conversations + a.dialogue
     for path in inputs:
         if not os.path.exists(path):
             print(f"awc_names: error: {path}: no such file or directory", file=sys.stderr)
@@ -355,6 +376,12 @@ def main(argv=None) -> int:
             print(f"awc_names: error: cannot read {path}: {error}", file=sys.stderr)
             return 2
     waves = conversation_waves(a.conversations)
+    for path in a.dialogue:
+        try:
+            words.extend(read_dialogue_waves(path))
+        except (OSError, ValueError, csv.Error) as error:
+            print(f"awc_names: error: cannot read {path}: {error}", file=sys.stderr)
+            return 2
     dictionary = Dictionary(words + waves)
     bases = dictionary.bases(a.min_token)
     print(f"{len(dictionary.words)} words ({len(waves)} dialogue waves from conversations), "

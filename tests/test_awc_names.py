@@ -209,6 +209,38 @@ class TestConversations(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_dialogue_csv_uses_only_wave_cells_and_applies_source_control(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            names = [f"testau_abcd_{n:02d}" for n in range(1, 8)]
+            quiet = write(os.path.join(tmp, "quiet.awc"), make_bank(names))
+            salted = write(os.path.join(tmp, "salted.awc"), make_bank(names + [A.SALT + names[0]]))
+            first = write(os.path.join(tmp, "first.csv"),
+                          f'wave,key,label,speaker,text_en,text_fr\n'
+                          f'{names[0].upper()},{names[2]},{names[3]},{names[4]},{names[5]},"two,\nlines"\n')
+            second = write(os.path.join(tmp, "second.csv"),
+                           f'text_en,wave\n{names[6]},{names[1]}\nignored,{names[0]}\nignored,\n')
+            out = os.path.join(tmp, "names.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(A.main([quiet, salted, "--dialogue", first, "--dialogue", second,
+                                         "--out", out]), 0)
+            with open(out, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.assertCountEqual([(r["source"], r["name"], r["rule"]) for r in doc["streams"]],
+                                  [("quiet.awc", name, "dialogue") for name in names[:2]])
+            self.assertFalse(doc["summary"]["salted.awc"]["dialogue_rule"])
+
+    def test_malformed_dialogue_csv(self):
+        for data, message in [(b"label\nx\n", "wave column"), (b"wave,wave\n", "wave column"),
+                              (b"wave,label\nx\n", "line 2"), (b'wave\n"x\n', "unexpected end"),
+                              (b"wave\n\xff", "decode")]:
+            with self.subTest(data=data), tempfile.TemporaryDirectory() as tmp:
+                path = write(os.path.join(tmp, "dialogue.csv"), data)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(A.main([tmp, "--dialogue", path]), 2)
+                self.assertIn(path, err.getvalue())
+                self.assertIn(message, err.getvalue())
+
     def test_sources_with_same_basename_keep_separate_summaries_and_streams(self):
         with tempfile.TemporaryDirectory() as tmp:
             sources = []
