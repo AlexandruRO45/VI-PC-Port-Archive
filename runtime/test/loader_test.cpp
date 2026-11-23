@@ -272,6 +272,40 @@ void test_section_bounds() {
     }
 }
 
+void test_failed_map_can_be_retried() {
+    const char* what = "a failed map releases its range and preferred base for a corrected retry";
+    auto valid = make_image();
+    auto bad = valid;
+    IMAGE_FIRST_SECTION(nt_of(bad))->PointerToRawData = 0x3F0;  // 0x3F0 + 0x200 > file size
+    const auto path = write_image_as(bad, "map_retry.dll");
+    const uint64_t preferred = nt_of(valid)->OptionalHeader.ImageBase;
+
+    rt::Loader loader(g_dir);
+    try {
+        loader.load(path);
+        return failed(what, "the malformed first image loaded");
+    } catch (const std::exception&) {
+    }
+
+    std::string module;
+    uint32_t rva = 0;
+    const bool retained_range = loader.find_address(preferred, module, rva);
+    const size_t retained_modules = loader.modules().size();
+    write_image_as(valid, "map_retry.dll");
+    try {
+        rt::Module& retried = loader.load(path);
+        if (retained_modules)
+            return failed(what, "the failed image remained in modules()");
+        if (retained_range)
+            return failed(what, "find_address found the failed image's range");
+        if (reinterpret_cast<uint64_t>(retried.base) != preferred)
+            return failed(what, "the corrected image did not reclaim its preferred base");
+        pass(what);
+    } catch (const std::exception& e) {
+        failed(what, std::string("the corrected retry failed: ") + e.what());
+    }
+}
+
 void test_truncation() {
     // Every length of a valid image: no length below the full one may load, and none may crash.
     auto full = make_image();
@@ -1346,6 +1380,7 @@ int main() {
         test_entry_bounds();
         test_header_bounds();
         test_section_bounds();
+        test_failed_map_can_be_retried();
         test_truncation();
         test_relocations();
         test_exports();

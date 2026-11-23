@@ -1185,40 +1185,35 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
-    by_name_[lower(m->name)] = m;
-    order_.push_back(m);
+    try {
+        // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.
+        m->base = static_cast<uint8_t*>(base_reservation::commit_reserved(oh.ImageBase, oh.SizeOfImage));
+        if (!m->base)
+            m->base = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage,
+                                                         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!m->base) {
+            const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+            if (!relocs.Size)
+                throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
+            m->base =
+                static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
+        }
 
-    // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.
-    m->base = static_cast<uint8_t*>(base_reservation::commit_reserved(oh.ImageBase, oh.SizeOfImage));
-    if (!m->base)
-        m->base = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage,
-                                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    if (!m->base) {
-        const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-        if (!relocs.Size)
-            throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
-        m->base = static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
-    }
-    {
-        // From here an address inside the image names it. The memory stays until ~Loader, which unregisters the
-        // lookup first.
-        std::unique_lock lock(ranges_mutex_);
-        ranges_.push_back({reinterpret_cast<uint64_t>(m->base), m->size, m->name});
-    }
-
-    std::memcpy(m->base, file.data(), oh.SizeOfHeaders);
-    auto* sec = IMAGE_FIRST_SECTION(nt);
-    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-        if (sec->VirtualAddress < oh.SizeOfHeaders)
-            throw std::runtime_error(m->name + ": section " + std::to_string(i) + " overlaps the headers");
-        uint32_t n = std::min(sec->SizeOfRawData, sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData);
-        if (!n) continue;
-        if (sec->PointerToRawData > file.size() || n > file.size() - sec->PointerToRawData)
-            throw std::runtime_error(m->name + ": section " + std::to_string(i) + " reads past the end of the file");
-        require_range(m->name, sec->VirtualAddress, n, m->size, "a section's data");
-        std::memcpy(m->base + sec->VirtualAddress, file.data() + sec->PointerToRawData, n);
-    }
+        std::memcpy(m->base, file.data(), oh.SizeOfHeaders);
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+            if (sec->VirtualAddress < oh.SizeOfHeaders)
+                throw std::runtime_error(m->name + ": section " + std::to_string(i) + " overlaps the headers");
+            uint32_t n =
+                std::min(sec->SizeOfRawData, sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData);
+            if (!n) continue;
+            if (sec->PointerToRawData > file.size() || n > file.size() - sec->PointerToRawData)
+                throw std::runtime_error(m->name + ": section " + std::to_string(i) +
+                                         " reads past the end of the file");
+            require_range(m->name, sec->VirtualAddress, n, m->size, "a section's data");
+            std::memcpy(m->base + sec->VirtualAddress, file.data() + sec->PointerToRawData, n);
+        }
 
     int64_t delta = reinterpret_cast<int64_t>(m->base) - static_cast<int64_t>(oh.ImageBase);
     if (delta) {
@@ -1262,11 +1257,38 @@ Module& Loader::map_image(const std::filesystem::path& path) {
             block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uint8_t*>(block) + block->SizeOfBlock);
         }
     }
-    // The TLS directory and the exception directory hold virtual addresses, so both are read after relocation. TLS is
-    // installed here, before bind_imports can return control to the caller and before any image code can run.
-    initialize_tls(*m);
-    parse_exports(*m);
-    return *m;
+        // Both tables hold virtual addresses, so read them after relocation. Export validation cannot allocate TLS,
+        // and is therefore done first: until it succeeds the module has no state outside this function to roll back.
+        parse_exports(*m);
+
+        // Prepare every allocation needed to publish the module before installing TLS. Once initialize_tls succeeds,
+        // committing the already-prepared pointer and range cannot throw.
+        const std::string key = lower(m->name);
+        MappedRange range{reinterpret_cast<uint64_t>(m->base), m->size, m->name};
+        order_.reserve(order_.size() + 1);
+        {
+            std::unique_lock lock(ranges_mutex_);
+            ranges_.reserve(ranges_.size() + 1);
+        }
+        by_name_[key] = m;
+        try {
+            // Installed before bind_imports can return control to the caller and before any image code can run.
+            initialize_tls(*m);
+        } catch (...) {
+            by_name_.erase(key);
+            throw;
+        }
+        order_.push_back(m);
+        {
+            std::unique_lock lock(ranges_mutex_);
+            ranges_.push_back(std::move(range));
+        }
+        return *m;
+    } catch (...) {
+        if (m->base) VirtualFree(m->base, 0, MEM_RELEASE);
+        delete m;
+        throw;
+    }
 }
 
 // Static TLS for the thread that calls load(). The PE TLS directory only carries the template (Start..End) and the
