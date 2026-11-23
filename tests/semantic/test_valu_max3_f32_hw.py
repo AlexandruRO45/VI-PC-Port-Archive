@@ -187,5 +187,33 @@ class TestScalarExecution(unittest.TestCase):
             expected = f32_to_u32(ref_max3_f32(a, b, c))
             self.assertEqual(got, expected, f"Failed for {a}, {b}, {c}")
 
+class TestSimdDivergence(unittest.TestCase):
+    """Multi-lane divergence and independent execution verification."""
+
+    def test_multi_lane_independent_evaluations(self):
+        test_vectors = [
+            (1.0, 5.0, 2.0, 5.0),
+            (10.0, -1.0, 4.0, 10.0),
+            (-20.0, -30.0, -5.0, -5.0),
+            (0.25, 0.75, 0.5, 0.75),
+            (100.0, 200.0, 300.0, 300.0),
+            (-1.0, 0.0, 1.0, 1.0),
+            (7.5, 7.5, 2.0, 7.5),
+            (-100.0, -50.0, -10.0, -10.0),
+        ]
+        for lane_idx, (a, b, c, expected_f) in enumerate(test_vectors):
+            s0, s1, s2 = f32_to_u32(a), f32_to_u32(b), f32_to_u32(c)
+            prog = [
+                f"v_mov_b32 v1, {s0:#x}",
+                f"v_mov_b32 v2, {s1:#x}",
+                f"v_mov_b32 v3, {s2:#x}",
+                "v_max3_f32 v0, v1, v2, v3",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_max3_lane_{lane_idx}", prog)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], f32_to_u32(expected_f), f"Lane {lane_idx} mismatch")
+
 if __name__ == "__main__":
     unittest.main()
