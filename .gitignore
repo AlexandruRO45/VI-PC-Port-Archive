@@ -9,16 +9,21 @@ carve/
 *.ttpf
 *.xvd
 *.msixvc
+*.xvc
 *.dxbc
 *.fssm
 *.spv
 *.spvasm
+*.code
+*.state
 *.dds
 *.bk2
 *.awc
 *.r9modeldata
 *.obj
 *.glb
+*.lpk
+*.smh
 *.ogg
 *.wav
 

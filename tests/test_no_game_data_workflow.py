@@ -9,6 +9,7 @@ the step's `run:` script out of the workflow (not a copy, so it cannot drift) an
 git repository of empty files. Needs git and bash; no game files.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -49,6 +50,15 @@ def bash():
             folder = os.path.dirname(folder)
         return None
     return shutil.which("bash")
+
+
+class RefusedExtensionsAreIgnored(unittest.TestCase):
+    def test_every_extension_the_step_refuses_is_in_gitignore(self):
+        # What the step refuses, git ignores first, so a plain `git add` never stages it.
+        refused = re.search(r"\(([a-z0-9|]+)\)\$", step_script()).group(1).split("|")
+        with open(os.path.join(ROOT, ".gitignore"), encoding="utf-8") as f:
+            ignored = {line.strip()[2:] for line in f if line.strip().startswith("*.")}
+        self.assertEqual([ext for ext in refused if ext not in ignored], [])
 
 
 @unittest.skipUnless(shutil.which("git") and bash(), "needs git and bash")
