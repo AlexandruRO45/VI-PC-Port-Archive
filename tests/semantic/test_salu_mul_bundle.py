@@ -43,6 +43,47 @@ def i32(val: int) -> int:
     v = val & MASK32
     return v - 0x100000000 if v >= 0x80000000 else v
 
+class Opcode(Enum):
+    S_MUL_I32 = "s_mul_i32"
+    S_MUL_HI_I32 = "s_mul_hi_i32"
+    S_MUL_HI_U32 = "s_mul_hi_u32"
+
+
+class OperandKind(Enum):
+    SGPR = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    kind: OperandKind
+    index: int = 0
+    value: int = 0
+
+    @classmethod
+    def sgpr(cls, idx: int) -> ASTOperand:
+        return cls(kind=OperandKind.SGPR, index=idx)
+
+    @classmethod
+    def imm(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.IMM, value=val & MASK32)
+
+
+@dataclass(frozen=True)
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+
+    def disasm(self) -> str:
+        def fmt(op: ASTOperand) -> str:
+            if op.kind == OperandKind.SGPR:
+                return f"s{op.index}"
+            return hex(op.value)
+
+        return f"{self.opcode.value} {fmt(self.dst)}, {fmt(self.src0)}, {fmt(self.src1)}"
+
 def ref_s_mul_i32(s0: int, s1: int) -> int:
     """Low 32 bits of 32x32 integer multiply (identical for signed/unsigned)."""
     return (s0 * s1) & MASK32
@@ -64,6 +105,30 @@ class TestSMulI32Oracle(unittest.TestCase):
     def test_oracle_wrapping_modulo_2_32(self) -> None:
         # 0x10001 * 0x10001 = 0x200020001 & 0xFFFFFFFF = 0x00020001
         self.assertEqual(ref_s_mul_i32(0x10001, 0x10001), 0x00020001)
+
+class TestSMulI32ASTAndSignExtensions(unittest.TestCase):
+    def test_ast_instruction_disasm(self) -> None:
+        inst = ASTInstruction(
+            Opcode.S_MUL_I32,
+            ASTOperand.sgpr(2),
+            ASTOperand.sgpr(0),
+            ASTOperand.sgpr(1),
+        )
+        self.assertEqual(inst.disasm(), "s_mul_i32 s2, s0, s1")
+
+    def test_imm_operands_disasm(self) -> None:
+        inst = ASTInstruction(
+            Opcode.S_MUL_I32,
+            ASTOperand.sgpr(4),
+            ASTOperand.sgpr(2),
+            ASTOperand.imm(0x100),
+        )
+        self.assertEqual(inst.disasm(), "s_mul_i32 s4, s2, 0x100")
+
+    def test_sign_extension_consistency(self) -> None:
+        val_neg = u32(-50)
+        self.assertEqual(i32(val_neg), -50)
+        self.assertEqual(u32(i32(val_neg)), val_neg)
 
 if __name__ == "__main__":
     unittest.main()
