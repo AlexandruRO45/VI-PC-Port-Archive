@@ -171,6 +171,22 @@ class CmpF64Tests(unittest.TestCase):
         ])
         self.assertEqual(got_mod, [1, 1, 1, 1])
 
+    def test_small_upper_half_literal_is_not_an_inline_integer(self):
+        # 0x1 is a literal dword in bits 63:32 (2^-1042); inline 1 is the integer 1 sign-extended (2^-1074, the
+        # minimum subnormal). They are different binary64 values even though both would print as 1 in decimal.
+        got = run([
+            "v_mov_b32_e32 v4, 1", "v_mov_b32_e32 v5, 0",   # 2^-1074: the inline 1 value
+            "v_mov_b32_e32 v6, 0", "v_mov_b32_e32 v7, 1",   # 2^-1042: the literal 0x1 value
+            "v_cmp_eq_f64_e64 s4, 0x1, v[4:5]",
+            "v_cndmask_b32_e64 v0, 0, 1, s4",
+            "v_cmp_eq_f64_e64 s4, 1, v[4:5]",
+            "v_cndmask_b32_e64 v1, 0, 1, s4",
+            "v_cmp_eq_f64_e64 s4, 0x1, v[6:7]",
+            "v_cndmask_b32_e64 v2, 0, 1, s4",
+            "v_mov_b32_e32 v3, 0",
+        ])
+        self.assertEqual(got, [0, 1, 1, 0])
+
     def test_cmpx_exec_narrowing_and_inactive_lanes(self):
         got = run([
             "v_mov_b32_e32 v0, 10", "v_mov_b32_e32 v1, 20",

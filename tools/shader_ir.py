@@ -192,14 +192,22 @@ def parse_line(line):
     if parts and len(parts[0].split()) == 2:
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
+    def mark_f64_literal(src, spelling):
+        # LLVM prints inline integers in decimal and the separate literal dword in hex, even for two sources
+        # with the same numeric value (e.g. 0x1 and 1).
+        if src["k"] == "imm" and ("0x" in spelling or not -16 <= src["v"] <= 64):
+            src["f64_literal"] = True
+
     if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
                       "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_trunc_f64", "v_ceil_f64",
                       "v_rndne_f64", "v_floor_f64")):
         for src, spelling in zip(args[1:], parts[1:]):
-            # LLVM prints inline integers in decimal and the separate literal dword in hex,
-            # even for two sources with the same numeric value (e.g. 0x1 and 1).
-            if src["k"] == "imm" and ("0x" in spelling or not -16 <= src["v"] <= 64):
-                src["f64_literal"] = True
+            mark_f64_literal(src, spelling)
+    elif op.startswith(("v_cmp_", "v_cmpx_")) and "_f64" in op and "_class_" not in op:
+        # A binary64 compare has two sources and, for e64, a destination first; a small literal needs the
+        # same hex/decimal distinction as an arithmetic f64 source.
+        for src, spelling in zip(args, parts):
+            mark_f64_literal(src, spelling)
     return {"op": op, "args": args, "mods": mods, "enc": enc.hex() if enc else None}
 
 
