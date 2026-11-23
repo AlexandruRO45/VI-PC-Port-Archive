@@ -828,8 +828,14 @@ not from a committed tool.
   layouts remain possible.
 - **Registration.** The `CDataFileMgr__ContentChangeSetDef` in `common.rpf` lists both packs exactly as it
   lists the packs whose dictionaries were found: an `.ityp` (`PERMANENT_ITYP_FILE`), an `.rpf` and a
-  `_metadata.rpf`. No entry in that list names a clip dictionary. This suggests, without opening the packs,
-  that a pack's dictionary is stored inside its `.rpf`.
+  `_metadata.rpf`. No entry in that list names a clip dictionary.
+- **Pack layout in `levels.rpf`.** All eight confirmed `am_*_clip` roots are followed, with at most one stream
+  between (`am_aircon_clip`'s own `-0` page), by the `CMapTypes` resource whose archetypes reference that
+  dictionary. In the two packs inspected stream by stream (`am_bar_clip`'s and one other), the pack's models
+  come just before the root. Area dictionaries mostly do not follow this layout (93 of the 96 with a readable
+  name). In the escalator and gym packs, the stream after the last model's streams is the `CMapTypes`
+  resource holding the referencing archetypes (16 of the 64 escalator records and both treadmill records).
+  No stream lies between them where the other packs keep the dictionary.
 
 Outside the archetype records, the same streams hold `0x147869a0` as an aligned little-endian u32 once and
 `0x7e2abe07` twice. The single occurrence of `0x147869a0` sits among the sorted keys of an unidentified table
@@ -837,7 +843,8 @@ in `levels.rpf`. For uniformly random data, about 21 aligned occurrences per has
 these bytes, so it is not counted as a reference.
 
 In Xbox 1.0.2.1, both packs therefore ship models and archetypes that name a clip dictionary not found in
-the package. Whether the game animates these props another way at run time has not been checked.
+the package, and the place where their pack layout keeps that dictionary is empty. Whether the game animates
+these props another way at run time has not been checked.
 
 ## `MoVE` state-machine containers
 
