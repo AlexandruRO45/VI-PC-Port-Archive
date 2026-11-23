@@ -489,7 +489,7 @@ pipeline is created with the runtime's resource contract. It does not prove:
 - that the graphics pipelines (vertex/pixel/geometry/mesh) execute or draw the right pixels: the tool
   creates them with `vkCreateGraphicsPipelines` (dynamic rendering) but never draws with them;
 - that the game's descriptors, root signatures and push constants match the contract at run time
-  (the missing executable still owns that).
+  (a real run of the executable still owns that).
 
 No shader data, names or caches are committed. The caches live in the work directory and are inputs
 to a later run, not part of the repository.
