@@ -115,9 +115,12 @@ int main() {
     XAsyncBlock async{};
     GameLicense license;
     std::memset(&license, 0xCD, sizeof(license));
-    check(at<CtxAsync>(store, 28)(store, context, &async) == S_OK && finished(&async) &&
-              at<LicenseResult>(store, 29)(store, &async, &license) == S_OK,
-          "XStoreQueryGameLicenseAsync / Result");
+    check(at<CtxAsync>(store, 28)(store, context, &async) == S_OK && finished(&async),
+          "XStoreQueryGameLicenseAsync completes");
+    size_t license_size = 0;
+    check(XAsyncGetResultSize(&async, &license_size) == S_OK && license_size == 104,
+          "the game license result size is the measured 104 bytes");
+    check(at<LicenseResult>(store, 29)(store, &async, &license) == S_OK, "XStoreQueryGameLicenseResult");
     check(license.isActive && !license.isTrial && !license.isTrialOwnedByThisUser && !license.isDiscLicense &&
               license.trialTimeRemainingInSeconds == 0 && license.trialUniqueId[0] == '\0' &&
               std::strcmp(license.skuStoreId, "0010") == 0,
