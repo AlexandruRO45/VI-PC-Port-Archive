@@ -47,6 +47,24 @@ def test_empty_program_batch_is_a_usage_error(count, capsys, monkeypatch):
     assert captured.out == ""
 
 
+@pytest.mark.parametrize("flags, message", [
+    (["--show"], "--show requires --program"),
+    (["--minimize"], "--minimize requires --program"),
+    (["--show", "--minimize"], "--show requires --program"),
+])
+def test_show_or_minimize_without_a_program_is_a_usage_error(flags, message, capsys, monkeypatch):
+    def unexpected_suite(*args, **kwargs):
+        pytest.fail("ran the whole suite instead of one program")
+
+    monkeypatch.setattr(cf_diff, "run_suite", unexpected_suite)
+    with pytest.raises(SystemExit) as exc:
+        cf_diff.main(flags)
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert message in captured.err
+    assert captured.out == ""
+
+
 def test_a_run_where_every_program_was_skipped_is_not_a_success(capsys, monkeypatch):
     monkeypatch.setattr(cf_diff, "run_case", lambda *args, **kwargs: ("skip", "unsupported form"))
     assert cf_diff.main(["--programs", "2", "--seed", "1"]) == 2
