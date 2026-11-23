@@ -2083,7 +2083,8 @@ The trace will enumerate them.
   - **What it doesn't cover:** whether the console flattens a 3D `DispatchMesh` grid the same way. That is an open
     question in `docs/design.md`, "Mesh shaders"; the test shader reads the workgroup ID directly.
 - **`ExecuteIndirect` with `DISPATCH_MESH` signatures:** `CreateCommandSignature` takes them where
-  `VK_EXT_mesh_shader` is enabled (`E_NOTIMPL` without it, as mesh PSOs are), with `DISPATCH_MESH` as the one
+  `VK_EXT_mesh_shader` is enabled, or without it where the mesh PSOs are `--mesh-compute` ones (mesh tier 1 through
+  the fallback, below; `E_NOTIMPL` otherwise, as mesh PSOs are), with `DISPATCH_MESH` as the one
   argument; root constants or views before it are `E_NOTIMPL` (not expanded, section 4.7); `IndirectKind::dispatch_mesh`.
   `D3D12_DISPATCH_MESH_ARGUMENTS` and `VkDrawMeshTasksIndirectCommandEXT` are the same three dwords, so the records
   are read as they are. The call records the state `DispatchMesh` takes (no topology, vertex or index buffers) and
@@ -2117,8 +2118,25 @@ The trace will enumerate them.
     device address, alive until the submission completes), then `vkCmdDispatch` with the counts, a compute-write →
     vertex-read barrier, and in the draw's rendering scope a triangle-list `vkCmdDraw(groups × max_primitives × 3)`.
     A draw whose vertex count does not fit in 32 bits is `ReplayResult::unsupported`.
-  - **Not built:** `ExecuteIndirect` with `DISPATCH_MESH` (the group counts are GPU data, so the draw's vertex count
-    is too); its signatures stay `E_NOTIMPL` without the extension.
+  - **`ExecuteIndirect` with `DISPATCH_MESH`:** the group counts are GPU data, so the draw's vertex count is too. A
+    prepass (`runtime/src/mesh_indirect_prepare.comp`, run by `vulkan_mesh_indirect.h`) reads each record, and the
+    count when there is a count buffer, and writes a `VkDispatchIndirectCommand` (the record's three counts) and a
+    `VkDrawIndirectCommand` (groups × `max_primitives` × 3 vertices, computed in 64 bits) into a private buffer the
+    batch keeps until the submission completes. The replay then issues, per record, `vkCmdDispatchIndirect` of the
+    mesh-as-compute pipeline, a compute-write → vertex-read barrier, and in the rendering scope `vkCmdDrawIndirect`,
+    each record writing and reading its own region of slots (the mesh-as-compute module flattens its slot index from
+    `NumWorkgroups`, which the indirect dispatch fills). No `drawIndirectCount` or `multiDrawIndirect` is needed.
+    - **Limit:** the regions are sized on the CPU before the counts exist: a 64 MiB budget per call
+      (`mesh_indirect_budget`), split evenly over `MaxCommandCount` records, at most 2^22 groups each. A record past
+      the count, an empty grid, or one with more groups than its region holds, or whose vertex count does not fit in
+      32 bits, dispatches and draws nothing; the last two set a status word the batch logs when the submission
+      retires ("dropped records"). A call whose records don't get one slot each is `ReplayResult::unsupported`.
+    - **Test:** `d3d12_m5_mesh_test --mesh-compute` (`d3d12_m5_mesh_compute`, and `_single` without
+      `multiDrawIndirect`) runs M5's DispatchMesh and ExecuteIndirect cases on a layer device without the extension,
+      with `ms_m5` translated with `--mesh-compute --wave64-emulate` (`build.py`'s `LEONIDA_MESH_COMPUTE=1`): count
+      buffers, a count of 0, a count above `MaxCommandCount`, stride 24, GPU-written arguments, every pixel exact. On an
+      NVIDIA GeForce GTX 1050 Ti (Pascal, no `VK_EXT_mesh_shader`, driver 580.196.07, Linux, Wine 10.0): 30 records,
+      0 mismatched pixels in both runs.
   - **Test:** `d3d12_mesh_compute_test` makes the layer's device without the extension on any GPU and draws
     `test/glsl/ms_draw_compute.comp`, `ms_draw.mesh` written to the `--mesh-compute` contract: tier 1, a stream PSO,
     `DispatchMesh` over X, Y and Z, every pixel checked; a mesh shader without a layout is refused, f16 halves read

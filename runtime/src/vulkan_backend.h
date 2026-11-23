@@ -1097,6 +1097,9 @@ public:
                                     const VkPhysicalDeviceLimits& limits) {
         std::unique_lock lock(resource_mutex_);
         counted_dispatch_ = std::make_unique<IndirectDispatchCounter>(get, device_, memory, limits);
+        // The ExecuteIndirect(DISPATCH_MESH) prepass for --mesh-compute PSOs: the same requirement, and it builds
+        // its pipeline on first use, so devices with VK_EXT_mesh_shader never create it.
+        mesh_indirect_ = std::make_unique<MeshIndirectPreparer>(get, device_, memory);
     }
     VkDevice device() const { return device_; }
 
@@ -1691,6 +1694,7 @@ private:
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
+    std::unique_ptr<MeshIndirectPreparer> mesh_indirect_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
     DebugLabelFunctions labels_;
@@ -2221,6 +2225,7 @@ private:
         std::unique_ptr<PredicateReducer::Batch> batch;
         std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_batch;
+        std::unique_ptr<MeshIndirectPreparer::Batch> mesh_indirect_batch;
         if (captures) {
             if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
                 return ReplayResult::unsupported;
@@ -2277,6 +2282,21 @@ private:
             };
             replay.emit_counted_dispatch = [this](VkCommandBuffer cb, const CountedDispatch& job) {
                 context_.counted_dispatch_->emit(cb, job);
+            };
+        }
+        if (kind_ == QueueKind::direct && context_.mesh_indirect_) {
+            replay.prepare_mesh_indirect = [this, &tracker_lock, &mesh_indirect_batch](
+                VkBuffer args, VkDeviceSize args_offset, VkBuffer count, VkDeviceSize count_offset,
+                std::uint32_t stride, std::uint32_t records, std::uint32_t capacity, std::uint32_t max_primitives,
+                VkDeviceAddress output, VkDeviceSize region_bytes, MeshIndirect& out) {
+                // As the counted dispatch: lazy pipeline creation shared across queues, serialized here.
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                if (!mesh_indirect_batch) mesh_indirect_batch = context_.mesh_indirect_->batch();
+                return mesh_indirect_batch->prepare(args, args_offset, count, count_offset, stride, records, capacity,
+                                                    max_primitives, output, region_bytes, out);
+            };
+            replay.emit_mesh_indirect = [this](VkCommandBuffer cb, const MeshIndirect& job) {
+                context_.mesh_indirect_->emit(cb, job);
             };
         }
         if (context_.depth24_ && !transfer_only) {
@@ -2544,6 +2564,7 @@ private:
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
             slot->counted_dispatch = std::move(counted_batch);
+            slot->mesh_indirect = std::move(mesh_indirect_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
@@ -2777,6 +2798,7 @@ private:
         std::vector<VkEvent> events;  // order_timestamp_copy's, reset and reused once the slot completes
         std::unique_ptr<PredicatedBufferCopier::Batch> predicated_copy;
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_dispatch;
+        std::unique_ptr<MeshIndirectPreparer::Batch> mesh_indirect;  // logs dropped records when the slot completes
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
     };
@@ -2997,6 +3019,7 @@ private:
             reuse->predicate.reset();
             reuse->predicated_copy.reset();
             reuse->counted_dispatch.reset();
+            reuse->mesh_indirect.reset();
             reuse->ticket = UINT64_MAX;  // in use until submitted
             return reuse;
         }

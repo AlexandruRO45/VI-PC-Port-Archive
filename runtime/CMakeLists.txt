@@ -2155,15 +2155,46 @@ if(TARGET Vulkan::Headers)
                 ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating ms_m5, ps_m5_mesh, vs_m3 and ps_m5_flat for the M5 mesh test"
         VERBATIM)
-      add_executable(d3d12_m5_mesh_test test/d3d12_m5_mesh_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M5_MESH_FILES})
+      # The same shaders translated with --mesh-compute and --wave64-emulate: the test's --mesh-compute mode runs the
+      # same draws on a device without VK_EXT_mesh_shader (the layer's own device is created without it, so every
+      # GPU runs it), DispatchMesh through the mesh-as-compute pass and ExecuteIndirect(DISPATCH_MESH) through the
+      # prepass of vulkan_mesh_indirect.h.
+      set(LEONIDA_M5_MESH_COMPUTE_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m5_mesh_compute_shaders)
+      set(LEONIDA_M5_MESH_COMPUTE_FILES ${LEONIDA_M5_MESH_COMPUTE_DIR}/spirv/index.json
+                                        ${LEONIDA_M5_MESH_COMPUTE_DIR}/fssm/ms_m5.fssm
+                                        ${LEONIDA_M5_MESH_COMPUTE_DIR}/fssm/ps_m5_mesh.fssm
+                                        ${LEONIDA_M5_MESH_COMPUTE_DIR}/fssm/vs_m3.fssm
+                                        ${LEONIDA_M5_MESH_COMPUTE_DIR}/fssm/ps_m5_flat.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_M5_MESH_COMPUTE_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M5_MESH_COMPUTE_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                "LEONIDA_MESH_COMPUTE=1" "LEONIDA_W64_EMULATE=1"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_M5_MESH_COMPUTE_DIR} ms_m5 ps_m5_mesh vs_m3 ps_m5_flat
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_m5.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_mesh.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_flat.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating ms_m5, ps_m5_mesh, vs_m3 and ps_m5_flat with --mesh-compute for the M5 mesh test"
+        VERBATIM)
+      add_executable(d3d12_m5_mesh_test test/d3d12_m5_mesh_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M5_MESH_FILES}
+                     ${LEONIDA_M5_MESH_COMPUTE_FILES})
       target_link_libraries(d3d12_m5_mesh_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_m5_mesh_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
-                                 LEONIDA_TEST_M5_MESH_DIR="${LEONIDA_M5_MESH_DIR}")
+                                 LEONIDA_TEST_M5_MESH_DIR="${LEONIDA_M5_MESH_DIR}"
+                                 LEONIDA_TEST_M5_MESH_COMPUTE_DIR="${LEONIDA_M5_MESH_COMPUTE_DIR}")
       target_compile_options(d3d12_m5_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m5_mesh COMMAND d3d12_m5_mesh_test)
       add_test(NAME d3d12_m5_mesh_fallbacks COMMAND d3d12_m5_mesh_test --single-calls --no-count-buffers)
       add_test(NAME d3d12_m5_mesh_chunks COMMAND d3d12_m5_mesh_test --max-draw-indirect-count 3)
-      set_tests_properties(d3d12_m5_mesh d3d12_m5_mesh_fallbacks d3d12_m5_mesh_chunks PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_m5_mesh_compute COMMAND d3d12_m5_mesh_test --mesh-compute)
+      add_test(NAME d3d12_m5_mesh_compute_single COMMAND d3d12_m5_mesh_test --mesh-compute --single-calls)
+      set_tests_properties(d3d12_m5_mesh d3d12_m5_mesh_fallbacks d3d12_m5_mesh_chunks d3d12_m5_mesh_compute
+                           d3d12_m5_mesh_compute_single PROPERTIES SKIP_RETURN_CODE 77)
       # M4 (synthetic part): compute PSOs, a UAV table (structured and raw buffers, an R32_UINT storage image), an indirect
       # dispatch from arguments a first dispatch wrote, and a copy queue that streams the input in and reads the results
       # back across queue fences. cs_m4_fill.asm and cs_m4_indirect.asm go through the same build; build.py publishes

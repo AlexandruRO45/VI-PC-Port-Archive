@@ -31,6 +31,12 @@
 //     PSO, fail at execution (ReplayResult::invalid_draw).
 // Needs VK_EXT_mesh_shader (exit 77 without it). No game data. Set LEONIDA_VK_VALIDATION=1 to run under
 // VK_LAYER_KHRONOS_validation (0 errors required).
+//
+// --mesh-compute runs (a) and (b) without VK_EXT_mesh_shader on any GPU: the shaders translated with --mesh-compute
+// and --wave64-emulate (LEONIDA_TEST_M5_MESH_COMPUTE_DIR) and a layer device created without the extension, so
+// DispatchMesh is the mesh-as-compute pass and its slot draw, and ExecuteIndirect(DISPATCH_MESH) the prepass that
+// writes each record's indirect dispatch and draw on the GPU (vulkan_mesh_indirect.h). Count buffers need no
+// drawIndirectCount there (the prepass reads the count), so I2..I4 always run. The same CPU reference, error 0.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -48,6 +54,9 @@
 
 #ifndef LEONIDA_TEST_M5_MESH_DIR
 #error "LEONIDA_TEST_M5_MESH_DIR must name the folder build.py wrote (spirv/index.json, fssm/*.fssm)"
+#endif
+#ifndef LEONIDA_TEST_M5_MESH_COMPUTE_DIR
+#error "LEONIDA_TEST_M5_MESH_COMPUTE_DIR must name the folder build.py wrote with LEONIDA_MESH_COMPUTE=1"
 #endif
 
 #define EXPECT(condition) do { \
@@ -131,15 +140,16 @@ Constants constants(UINT first, unsigned r, unsigned g) { return {first, float(r
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool single_calls = false, no_count_buffers = false;
+    bool single_calls = false, no_count_buffers = false, mesh_compute = false;
     std::uint32_t max_draw_count = 0;  // 0: the device's maxDrawIndirectCount
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--single-calls") == 0) single_calls = true;
         else if (std::strcmp(argv[i], "--no-count-buffers") == 0) no_count_buffers = true;
+        else if (std::strcmp(argv[i], "--mesh-compute") == 0) mesh_compute = true;
         else if (std::strcmp(argv[i], "--max-draw-indirect-count") == 0 && i + 1 < argc)
             max_draw_count = std::uint32_t(std::strtoul(argv[++i], nullptr, 10));
         else {
-            std::fprintf(stderr, "usage: d3d12_m5_mesh_test [--single-calls] [--no-count-buffers] "
+            std::fprintf(stderr, "usage: d3d12_m5_mesh_test [--single-calls] [--no-count-buffers] [--mesh-compute] "
                                  "[--max-draw-indirect-count N]\n");
             return 2;
         }
@@ -150,7 +160,7 @@ int main(int argc, char** argv) {
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
 
-    const std::filesystem::path root_dir = LEONIDA_TEST_M5_MESH_DIR;
+    const std::filesystem::path root_dir = mesh_compute ? LEONIDA_TEST_M5_MESH_COMPUTE_DIR : LEONIDA_TEST_M5_MESH_DIR;
     leonida::ShaderLibrary library;
     EXPECT(library.load((root_dir / "spirv").string()));
     const auto container_of = [&](const char* name, const char* stage, std::vector<std::uint8_t>& out) {
@@ -200,36 +210,46 @@ int main(int argc, char** argv) {
         return device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&out.p));
     };
 
-    // (c) Without the extension, a DISPATCH_MESH signature is not implemented.
+    // (c) Without the extension, a DISPATCH_MESH signature is not implemented, unless the mesh shaders are
+    // --mesh-compute ones (mesh tier 1 through the mesh-as-compute pass): then it is, on the same device.
     {
         Ref<ID3D12Device> device;
         Ref<ID3D12CommandSignature> sig;
         EXPECT(make_device(false, device));
-        EXPECT(mesh_signature(device.p, sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), sig) == E_NOTIMPL && !sig.p);
+        if (mesh_compute) {
+            EXPECT(SUCCEEDED(mesh_signature(device.p, sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), sig)) && sig.p);
+        } else {
+            EXPECT(mesh_signature(device.p, sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), sig) == E_NOTIMPL && !sig.p);
+        }
     }
-    if (!d.mesh_shader) {
+    if (!mesh_compute && !d.mesh_shader) {
         std::printf("no VK_EXT_mesh_shader on this device: only the refusal without it was checked\n");
         return 77;
     }
     // ms_m5 is wave64 (not built with --wave64-emulate): it needs 64-wide subgroups in the mesh stage. Decided from
     // the library entry and the device's caps, as the layer decides it, so a device that cannot run it skips before
-    // any mesh PSO is created; the PSO's own request is checked against this below.
+    // any mesh PSO is created; the PSO's own request is checked against this below. Under --mesh-compute the mesh
+    // shader is an emulated-wave64 compute module: the layer checks its subgroup size at PSO creation.
     const leonida::ShaderEntry* ms_entry =
         library.find("ms", leonida::sha256_hex(read_file(root_dir / "fssm" / "ms_m5.fssm")));
     EXPECT(ms_entry);
-    const leonida::SubgroupRequest ms_request = leonida::decide_subgroup_size(*ms_entry, d.subgroup);
-    if (ms_request.outcome == leonida::SubgroupOutcome::unknown_device ||
-        ms_request.outcome == leonida::SubgroupOutcome::unknown_stage) {
-        std::fprintf(stderr, "the mesh stage's subgroup size was not decided (outcome %d)\n", int(ms_request.outcome));
-        return 1;
+    leonida::SubgroupRequest ms_request{};
+    if (!mesh_compute) {
+        ms_request = leonida::decide_subgroup_size(*ms_entry, d.subgroup);
+        if (ms_request.outcome == leonida::SubgroupOutcome::unknown_device ||
+            ms_request.outcome == leonida::SubgroupOutcome::unknown_stage) {
+            std::fprintf(stderr, "the mesh stage's subgroup size was not decided (outcome %d)\n",
+                         int(ms_request.outcome));
+            return 1;
+        }
+        if (ms_request.outcome == leonida::SubgroupOutcome::unavailable) {
+            std::printf("SKIP: the wave64 mesh shader cannot run 64-wide here (subgroup sizes %u..%u, default %u, "
+                        "requirable stages 0x%x)\n", d.subgroup.min_size, d.subgroup.max_size,
+                        d.subgroup.default_size, unsigned(d.subgroup.required_stages));
+            return 77;
+        }
     }
-    if (ms_request.outcome == leonida::SubgroupOutcome::unavailable) {
-        std::printf("SKIP: the wave64 mesh shader cannot run 64-wide here (subgroup sizes %u..%u, default %u, "
-                    "requirable stages 0x%x)\n", d.subgroup.min_size, d.subgroup.max_size, d.subgroup.default_size,
-                    unsigned(d.subgroup.required_stages));
-        return 77;
-    }
-    const bool counts = d.draw_indirect_count && !no_count_buffers;
+    const bool counts = mesh_compute || (d.draw_indirect_count && !no_count_buffers);
     if (!d.multi_draw_indirect || single_calls) std::printf("note: no multiDrawIndirect: the layer issues one call per record\n");
     if (!counts) std::printf("note: no drawIndirectCount: the count-buffer calls (I2, I3, I4) are not run\n");
 
@@ -237,7 +257,7 @@ int main(int argc, char** argv) {
     const char* subgroup = "?";
     {
         Ref<ID3D12Device> device;
-        EXPECT(make_device(true, device));
+        EXPECT(make_device(!mesh_compute, device));
         if (rt::d3d12::device_push_constants_need_fallback(device.p)) {
             std::printf("SKIP: the PSOs need 144 push-constant bytes and this GPU has %u\n",
                         rt::d3d12::device_max_push_constants_size(device.p));
@@ -316,10 +336,11 @@ int main(int argc, char** argv) {
             s.add(BlendSubobject{.inner = opaque});
             a.add(BlendSubobject{.inner = additive});
             EXPECT(stream_pso(s, mesh_opaque) && stream_pso(a, mesh_additive));
-            // The PSO's mesh-stage request must be the one decided above.
+            // The PSO's mesh-stage request must be the one decided above (a --mesh-compute PSO has no mesh stage).
             const auto* requests = rt::d3d12::pipeline_subgroup_requests(mesh_opaque.p);
             EXPECT(requests);
-            bool mesh_request = false;
+            bool mesh_request = mesh_compute;
+            if (mesh_compute) subgroup = "--mesh-compute, wave64 emulation";
             for (const auto& request : *requests) {
                 if (request.stage != VK_SHADER_STAGE_MESH_BIT_EXT) continue;
                 mesh_request = true;
@@ -569,11 +590,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("mesh tier 1, translated wave64 mesh shader (128 threads, %s): DispatchMesh 4x2x2, 3x1x1, 1x1x1 and an empty "
-                "grid, %u mismatched pixels; ExecuteIndirect DISPATCH_MESH, %u records drawn%s, %u mismatched pixels; "
-                "wrong-kind indirect draws fail at execution\n",
-                subgroup, direct_mismatches, records_drawn, counts ? " (count buffers included)" : " (no count buffers)",
-                indirect_mismatches);
+    std::printf("mesh tier 1%s, translated wave64 mesh shader (128 threads, %s): DispatchMesh 4x2x2, 3x1x1, 1x1x1 and "
+                "an empty grid, %u mismatched pixels; ExecuteIndirect DISPATCH_MESH, %u records drawn%s, %u mismatched "
+                "pixels; wrong-kind indirect draws fail at execution\n",
+                mesh_compute ? " without VK_EXT_mesh_shader" : "", subgroup, direct_mismatches, records_drawn,
+                counts ? " (count buffers included)" : " (no count buffers)", indirect_mismatches);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

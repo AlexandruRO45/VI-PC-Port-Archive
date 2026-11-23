@@ -1,0 +1,59 @@
+// ExecuteIndirect(DISPATCH_MESH) without VK_EXT_mesh_shader (--mesh-compute): turn each GPU-written
+// D3D12_DISPATCH_MESH_ARGUMENTS record (three uints) into the two indirect commands the fallback records, without
+// reading the arguments on the CPU:
+//   dispatch[k]: a VkDispatchIndirectCommand for the mesh shader running as compute (one output slot per group),
+//   draw[k]:     a VkDrawIndirectCommand for mesh_compute_vs.h, three vertices for every primitive a group may write.
+// A record past the GPU count (when there is a count buffer), with an empty grid, or with more groups than its
+// output region holds (capacity_groups), or whose vertex count does not fit in 32 bits, gets zero groups and zero
+// vertices; the last two also set bit 0 of the status word so the host can report the dropped work.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WordsIn {
+    uint data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer WordsOut {
+    uint data[];
+};
+layout(push_constant) uniform Params {
+    WordsIn arguments;      // the first record
+    WordsIn count;          // the count word; ignored when has_count is 0
+    WordsOut dispatch_out;  // records * 3 words
+    WordsOut draw_out;      // records * 4 words
+    WordsOut status;        // one word, bit 0: some record was dropped
+    uint stride_words;
+    uint records;
+    uint capacity_groups;
+    uint max_primitives;
+    uint has_count;
+} p;
+
+void main() {
+    const uint k = gl_GlobalInvocationID.x;
+    if (k >= p.records) return;
+    uint x = 0u, y = 0u, z = 0u, vertices = 0u;
+    if (p.has_count == 0u || k < p.count.data[0]) {
+        const uint source = k * p.stride_words;
+        x = p.arguments.data[source];
+        y = p.arguments.data[source + 1u];
+        z = p.arguments.data[source + 2u];
+        const uint64_t groups = uint64_t(x) * uint64_t(y) * uint64_t(z);
+        const uint64_t verts = groups * uint64_t(p.max_primitives) * 3ul;
+        if (groups == 0ul) {
+            x = y = z = 0u;
+        } else if (groups > uint64_t(p.capacity_groups) || verts > 0xFFFFFFFFul) {
+            x = y = z = 0u;
+            atomicOr(p.status.data[0], 1u);
+        } else {
+            vertices = uint(verts);
+        }
+    }
+    p.dispatch_out.data[k * 3u] = x;
+    p.dispatch_out.data[k * 3u + 1u] = y;
+    p.dispatch_out.data[k * 3u + 2u] = z;
+    p.draw_out.data[k * 4u] = vertices;
+    p.draw_out.data[k * 4u + 1u] = vertices != 0u ? 1u : 0u;
+    p.draw_out.data[k * 4u + 2u] = 0u;
+    p.draw_out.data[k * 4u + 3u] = 0u;
+}

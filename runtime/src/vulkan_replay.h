@@ -38,6 +38,7 @@
 #include "vulkan_predicate.h"
 #include "vulkan_predicated_copy.h"
 #include "vulkan_indirect_dispatch_count.h"
+#include "vulkan_mesh_indirect.h"
 
 #include <algorithm>
 #include <array>
@@ -903,6 +904,13 @@ struct ReplayFunctions {
     std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t,
                        CountedDispatch&)> prepare_counted_dispatch;
     std::function<void(VkCommandBuffer, const CountedDispatch&)> emit_counted_dispatch;
+    // A DISPATCH_MESH signature on a --mesh-compute PSO (no VK_EXT_mesh_shader): the prepass that turns each record
+    // into an indirect dispatch and an indirect draw (vulkan_mesh_indirect.h). Arguments: the argument buffer and
+    // offset, the count buffer (null: none) and offset, stride, records, capacity_groups, max_primitives, the slots'
+    // address and region bytes. Its buffers are owned by the queue's timeline-retained batch.
+    std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t, std::uint32_t,
+                       std::uint32_t, VkDeviceAddress, VkDeviceSize, MeshIndirect&)> prepare_mesh_indirect;
+    std::function<void(VkCommandBuffer, const MeshIndirect&)> emit_mesh_indirect;
     // VK_EXT_mesh_shader: DISPATCH_MESH signatures. The count variant also needs drawIndirectCount.
     PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
     PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
@@ -1065,16 +1073,21 @@ struct PreparedDraw {
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
-    // A --mesh-compute mesh draw: its workgroups and where their output slots are (0: not such a draw).
+    // A --mesh-compute mesh draw (mesh_compute): for DispatchMesh its workgroups and where their output slots are;
+    // for ExecuteIndirect(DISPATCH_MESH) the prepared indirect commands (mesh_indirect.records != 0) instead.
+    bool mesh_compute = false;
     std::uint64_t mesh_groups = 0;
     VkDeviceAddress mesh_output = 0;
+    MeshIndirect mesh_indirect;
 
     // Back to a new draw's state, keeping the vectors' storage.
     void reset() {
         graphics = nullptr;
         pipeline = VK_NULL_HANDLE;
+        mesh_compute = false;
         mesh_groups = 0;
         mesh_output = 0;
+        mesh_indirect = {};
         colors.clear();
         depth = {};
         vertex_buffers.clear();
@@ -2095,7 +2108,8 @@ namespace detail {
 // Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
 // typeless texture is viewed as the format the pipeline renders.
 template<typename Resolve>
-ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p) {
+ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p,
+                          bool indirect = false) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
         !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
         !vk.set_primitive_topology || !vk.set_primitive_restart_enable || !vk.set_stencil_reference ||
@@ -2112,12 +2126,16 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     if (draw.mesh && mc.pipeline) {
         // --mesh-compute: the workgroups' output slots, written by the dispatch and read by the draw that follows.
         // DispatchMesh's counts are in count, instances and first. The draw's vertex count must fit in 32 bits.
+        // ExecuteIndirect's counts are GPU data: its caller reserves the slots and prepares the indirect commands.
         if (!vk.dispatch || !vk.pipeline_barrier || !vk.mesh_output || (mc.bindless_set && !vk.bind_descriptor_sets))
             return ReplayResult::unsupported;
-        const std::uint64_t groups = std::uint64_t(draw.count) * draw.instances * draw.first;
-        if (!groups || groups * mc.max_primitives * 3 > UINT32_MAX) return ReplayResult::unsupported;
-        if (!vk.mesh_output(groups * mc.slot_bytes, p.mesh_output)) return ReplayResult::unsupported;
-        p.mesh_groups = groups;
+        p.mesh_compute = true;
+        if (!indirect) {
+            const std::uint64_t groups = std::uint64_t(draw.count) * draw.instances * draw.first;
+            if (!groups || groups * mc.max_primitives * 3 > UINT32_MAX) return ReplayResult::unsupported;
+            if (!vk.mesh_output(groups * mc.slot_bytes, p.mesh_output)) return ReplayResult::unsupported;
+            p.mesh_groups = groups;
+        }
     }
     p.graphics = pipeline;
     p.pipeline = pipeline->pipeline;
@@ -3028,13 +3046,25 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const VkDeviceSize bytes = VkDeviceSize(ind->max_count - 1) * ind->stride + record_size;
             if (!detail::indirect_range(p.binding, ind->argument_offset, bytes))
                 return ReplayResult::invalid_indirect_arguments;
+            // DISPATCH_MESH on a --mesh-compute PSO: no mesh draw call runs it, the prepass below and the
+            // mesh-as-compute pass do (vulkan_mesh_indirect.h), so the mesh-shader entry points are not needed.
+            // A pipeline of the wrong kind (a VS PSO under DISPATCH_MESH, a mesh PSO under DRAW) is an invalid draw on
+            // every device, before any check of the entry points the right kind would need.
+            const GraphicsPipeline* state_pipeline =
+                ind->state && vk.graphics_pipeline ? vk.graphics_pipeline(ind->state->pipeline) : nullptr;
+            if (state_pipeline && state_pipeline->pipeline && state_pipeline->mesh != ind->state->mesh)
+                return ReplayResult::invalid_draw;
+            const GraphicsPipeline* mesh_pipeline = ind->kind == IndirectKind::dispatch_mesh ? state_pipeline : nullptr;
+            const bool mesh_compute = mesh_pipeline && mesh_pipeline->mesh_compute.pipeline;
             if (ind->count_buffer) {
                 const ResourceBinding* cnt = resolve(ind->count_buffer);
                 if (!cnt || !cnt->buffer) return ReplayResult::unresolved_resource;
                 if (!detail::indirect_range(*cnt, ind->count_offset, sizeof(std::uint32_t)))
                     return ReplayResult::invalid_indirect_arguments;
                 p.source = *cnt;
-                if (ind->kind == IndirectKind::dispatch) {
+                if (mesh_compute) {
+                    // The prepass reads the count itself.
+                } else if (ind->kind == IndirectKind::dispatch) {
                     // Vulkan lacks vkCmdDispatchIndirectCount. Copy the GPU-visible commands to private scratch
                     // and replace commands past min(count, max_count) with zero-group dispatches.
                     if (!ind->pipeline || !vk.dispatch_indirect || !vk.prepare_counted_dispatch ||
@@ -3048,7 +3078,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                            (ind->kind == IndirectKind::dispatch_mesh && !vk.draw_mesh_tasks_indirect_count)) {
                     return ReplayResult::unsupported;
                 }
-            } else {
+            } else if (!mesh_compute) {
                 if ((ind->kind == IndirectKind::draw && !vk.draw_indirect) ||
                     (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect) ||
                     (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect) ||
@@ -3063,9 +3093,27 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 auto& prepared_draw = out.draws[out.draw_count];
                 prepared_draw.reset();
                 p.draw = std::uint32_t(out.draw_count++);
-                if (const auto r = detail::prepare_draw(*ind->state, resolve, vk, prepared_draw);
+                if (const auto r = detail::prepare_draw(*ind->state, resolve, vk, prepared_draw, true);
                     r != ReplayResult::success)
                     return r;
+                if (mesh_compute) {
+                    // Each record gets a region of capacity_groups output slots; the prepass zeroes a record that
+                    // would need more (mesh_indirect_capacity), and the draw count per record is written there too.
+                    const GraphicsPipeline::MeshCompute& mc = mesh_pipeline->mesh_compute;
+                    const std::uint32_t capacity = mesh_indirect_capacity(ind->max_count, mc.slot_bytes);
+                    if (!capacity || !vk.prepare_mesh_indirect || !vk.emit_mesh_indirect || !vk.dispatch_indirect ||
+                        !vk.draw_indirect || (statistics_active && !statistics_helpers))
+                        return ReplayResult::unsupported;
+                    const VkDeviceSize region = VkDeviceSize(capacity) * mc.slot_bytes;
+                    VkDeviceAddress slots = 0;
+                    if (!vk.mesh_output(region * ind->max_count, slots) ||
+                        !vk.prepare_mesh_indirect(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
+                                                  ind->count_buffer ? p.source.buffer : VK_NULL_HANDLE,
+                                                  ind->count_buffer ? p.source.buffer_offset + ind->count_offset : 0,
+                                                  ind->stride, ind->max_count, capacity, mc.max_primitives, slots,
+                                                  region, prepared_draw.mesh_indirect))
+                        return ReplayResult::unsupported;
+                }
             }
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
@@ -4018,7 +4066,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (const Draw* draw = detail::draw_of(command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];
             MeshComputeUserData mesh_data{};  // a --mesh-compute draw's push constants, for the dispatch and the draw
-            if (d.mesh_groups) {
+            const MeshIndirect& mesh_indirect = d.mesh_indirect;  // records != 0: ExecuteIndirect(DISPATCH_MESH)
+            if (d.mesh_compute) {
                 // The mesh shader as compute: one output slot per workgroup, then a barrier so the vertex shader
                 // that draws the slots sees them. Outside the draw's rendering scope, which opens below.
                 const GraphicsPipeline::MeshCompute& mc = d.graphics->mesh_compute;
@@ -4026,13 +4075,30 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 mesh_data.user.heap_base = vk.heap_base;
                 mesh_data.user.code_base = d.graphics->code_base;
                 mesh_data.output = d.mesh_output;
+                if (mesh_indirect.records) {
+                    // The prepass writes every record's dispatch and draw commands; no D3D12 query counts it.
+                    end_statistics();
+                    vk.emit_mesh_indirect(command_buffer, mesh_indirect);
+                    begin_statistics();
+                }
                 vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, mc.pipeline);
                 if (mc.bindless_set)
                     vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, mc.layout, 0, 1,
                                             &mc.bindless_set, 0, nullptr);
-                vk.push_constants(command_buffer, mc.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mesh_data),
-                                  &mesh_data);
-                vk.dispatch(command_buffer, draw->count, draw->instances, draw->first);
+                if (mesh_indirect.records) {
+                    // One indirect dispatch per record, each writing its own region of slots (a dropped record
+                    // dispatches zero groups).
+                    for (std::uint32_t k = 0; k < mesh_indirect.records; ++k) {
+                        mesh_data.output = mesh_indirect.output + VkDeviceSize(k) * mesh_indirect.region_bytes;
+                        vk.push_constants(command_buffer, mc.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                          sizeof(mesh_data), &mesh_data);
+                        vk.dispatch_indirect(command_buffer, mesh_indirect.commands, VkDeviceSize(k) * 12);
+                    }
+                } else {
+                    vk.push_constants(command_buffer, mc.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mesh_data),
+                                      &mesh_data);
+                    vk.dispatch(command_buffer, draw->count, draw->instances, draw->first);
+                }
                 VkMemoryBarrier written{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
                 written.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
                 written.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -4088,7 +4154,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
                                         &set0, 0, nullptr);
             }
-            if (d.mesh_groups)
+            if (d.mesh_compute)
                 vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(mesh_data),
                                   &mesh_data);
             else
@@ -4106,9 +4172,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
             // A --mesh-compute draw is a vertex pipeline that draws triangle lists.
-            if (!draw->mesh || d.mesh_groups) {
+            if (!draw->mesh || d.mesh_compute) {
                 const VkPrimitiveTopology topology =
-                    d.mesh_groups ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
+                    d.mesh_compute ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
                 vk.set_primitive_topology(command_buffer, topology);
                 const bool restart = draw->indexed && !draw->mesh && detail::strip_topology(topology) &&
                                      ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
@@ -4124,7 +4190,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
             if (draw->indexed) vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
-            if (const auto* indirect = std::get_if<ExecuteIndirect>(&command)) {
+            if (std::get_if<ExecuteIndirect>(&command) && mesh_indirect.records) {
+                // One indirect draw per record from the prepass's commands, each reading its record's slots.
+                for (std::uint32_t k = 0; k < mesh_indirect.records; ++k) {
+                    mesh_data.output = mesh_indirect.output + VkDeviceSize(k) * mesh_indirect.region_bytes;
+                    vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(mesh_data),
+                                      &mesh_data);
+                    vk.draw_indirect(command_buffer, mesh_indirect.commands,
+                                     mesh_indirect.draw_offset + VkDeviceSize(k) * 16, 1, 16);
+                }
+            } else if (const auto* indirect = std::get_if<ExecuteIndirect>(&command)) {
                 detail::emit_indirect(vk, command_buffer, p, *indirect);  // the arguments hold the counts
             } else if (draw->mesh && d.mesh_groups) {
                 // Three vertices for every primitive a workgroup may write (mesh_compute_vs.h); prepare_draw checked

@@ -5705,6 +5705,21 @@ public:
                                                         identity()));
     }
 
+    // Mesh tier 1 without VK_EXT_mesh_shader: the translated mesh shaders are --mesh-compute ones and the device can
+    // run them all as create_graphics does (buffer device addresses, 152 bytes of push constants, compute on the
+    // Direct queue's family, each one's subgroup size guaranteed). CheckFeatureSupport reports the tier from this and
+    // CreateCommandSignature accepts DISPATCH_MESH on it, so the two can't disagree.
+    bool mesh_compute_tier() {
+        const leonida::ShaderLibrary* library = state_.library();
+        const std::uint32_t push_limit = state_.info.max_push_constants_size;
+        return !state_.info.mesh_shader && library && library->mesh_compute_count() &&
+               state_.info.buffer_device_address &&
+               (!push_limit || push_limit >= sizeof(leonida::MeshComputeUserData)) &&
+               state_.direct_family_computes() &&
+               library->all_mesh_compute(
+                   [this](const leonida::ShaderEntry& e) { return state_.mesh_compute_subgroup_guaranteed(e); });
+    }
+
     HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                                      ID3D12RootSignature* root_signature, REFIID riid,
                                                      void** out) override {
@@ -5747,9 +5762,12 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
-            // Replayed as vkCmdDrawMeshTasksIndirect(Count)EXT; without VK_EXT_mesh_shader there is no mesh PSO to
-            // run it with (the device reports MeshShaderTier NOT_SUPPORTED then).
-            if (!state_.info.mesh_shader || !state_.context->vk.vkCmdDrawMeshTasksIndirectEXT) return E_NOTIMPL;
+            // Replayed as vkCmdDrawMeshTasksIndirect(Count)EXT, or without VK_EXT_mesh_shader, where the mesh PSOs are
+            // --mesh-compute ones (mesh_compute_tier), as the mesh-as-compute pass and the slot draw per record, with
+            // their indirect commands written on the GPU (vulkan_mesh_indirect.h). Without either, the device reports
+            // MeshShaderTier NOT_SUPPORTED and there is no mesh PSO to run it with.
+            if (!(state_.info.mesh_shader && state_.context->vk.vkCmdDrawMeshTasksIndirectEXT) && !mesh_compute_tier())
+                return E_NOTIMPL;
             // Root arguments or views before it would need the per-record expansion the draw kinds lack too
             // (section 4.7); refuse rather than read the group counts from the record's first bytes.
             if (desc->NumArgumentDescs != 1) return E_NOTIMPL;
@@ -7379,17 +7397,8 @@ public:
             // addresses, 152 bytes of push constants, compute on the Direct queue's family, and each one's subgroup
             // size guaranteed. Amplification shaders are part of the tier but refused at PSO creation (the game has
             // none); OPTIONS9's mesh statistics and full-range render target array index stay FALSE.
-            const leonida::ShaderLibrary* library = state_.library();
-            const std::uint32_t push_limit = state_.info.max_push_constants_size;
-            const bool mesh_compute =
-                !state_.info.mesh_shader && library && library->mesh_compute_count() &&
-                state_.info.buffer_device_address &&
-                (!push_limit || push_limit >= sizeof(leonida::MeshComputeUserData)) &&
-                state_.direct_family_computes() &&
-                library->all_mesh_compute(
-                    [this](const leonida::ShaderEntry& e) { return state_.mesh_compute_subgroup_guaranteed(e); });
-            opts->MeshShaderTier = state_.info.mesh_shader || mesh_compute ? D3D12_MESH_SHADER_TIER_1
-                                                                           : D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+            opts->MeshShaderTier = state_.info.mesh_shader || mesh_compute_tier() ? D3D12_MESH_SHADER_TIER_1
+                                                                                  : D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
             opts->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
             return d3d12_trace::result(method, S_OK);
         }

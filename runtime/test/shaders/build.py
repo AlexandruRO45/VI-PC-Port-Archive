@@ -198,6 +198,8 @@ def translate_tests(work, names):
         cmd.append("--wave64-emulate")
     if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
+    if os.environ.get("LEONIDA_MESH_COMPUTE") == "1":   # mesh shaders as compute, without VK_EXT_mesh_shader
+        cmd.append("--mesh-compute")
     if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma (default), OpFmaKHR, or emulated
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
     if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
