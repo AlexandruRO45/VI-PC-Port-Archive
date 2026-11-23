@@ -755,6 +755,18 @@ class SkinnedGlbTest(unittest.TestCase):
                     handle.write(data)
                 self._assert_one_line_error(self._run_cli(skeleton, component), path)
 
+    def test_cli_sections_must_be_an_array(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        model = _read_model(component)
+        for sections in (7, True, {}, ""):
+            with self.subTest(sections=sections):
+                model["drawable"]["buffers"][0]["mesh_blob"] = {"sections": sections}
+                _write_json(os.path.join(component, "model.json"), model)
+                result = self._run_cli(skeleton, component)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stderr.splitlines(), ["error: mesh_blob.sections must be an array"])
+
     def test_cli_bad_component_json_is_one_error_line(self):
         for name, data in self.BAD_JSON.items():
             with self.subTest(name):

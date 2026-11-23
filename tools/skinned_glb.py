@@ -316,6 +316,8 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
     sections = {}
     mesh_blob = vertex_buffer.get("mesh_blob")
     raw_sections = mesh_blob.get("sections") if isinstance(mesh_blob, dict) else None
+    if raw_sections is not None and not isinstance(raw_sections, (list, tuple)):
+        raise SkinError("mesh_blob.sections must be an array")
     if raw_sections:
         for row in raw_sections:
             if not isinstance(row, (list, tuple)) or len(row) != 3:
