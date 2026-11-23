@@ -187,5 +187,18 @@ class VMax3F32OracleTests(unittest.TestCase):
         self.assertEqual(ref_max3_f32_bits(qnan, v1, v2), v1)
         self.assertEqual(ref_max3_f32_bits(v2, qnan, v1), v1)
 
+class VMax3F32AstInterpreterTests(unittest.TestCase):
+    """AST modeling and interpreter simulation for v_max3_f32."""
+
+    def test_ast_emission(self):
+        node = Valu3AstNode("v_max3_f32", "v0", "v1", "v2", "v3")
+        self.assertEqual(node.emit_asm(), "v_max3_f32 v0, v1, v2, v3")
+
+    def test_interpreter_scalar_simulation(self):
+        regs = {"v1": f32_to_bits(10.0), "v2": f32_to_bits(100.0), "v3": f32_to_bits(50.0)}
+        res = ref_max3_f32_bits(regs["v1"], regs["v2"], regs["v3"])
+        regs["v0"] = res
+        self.assertAlmostEqual(bits_to_f32(regs["v0"]), 100.0)
+
 if __name__ == "__main__":
     unittest.main()
