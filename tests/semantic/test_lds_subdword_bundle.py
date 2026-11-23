@@ -472,5 +472,32 @@ class TestDsWriteB8Oracle(unittest.TestCase):
         self.assertEqual(self.lds.read_u8(3), 0x11)
 
 
+# ------------------------------------------------------------------------------
+# ds_write_b8 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class DSWriteB8Instruction:
+    addr: RegisterOperand
+    data: RegisterOperand
+    offset: int = 0
+
+    def __post_init__(self):
+        if self.addr.op_type != OperandType.VGPR or self.data.op_type != OperandType.VGPR:
+            raise TypeError("Operands of ds_write_b8 must be VGPRs")
+
+
+class TestDsWriteB8ASTAndScalar(unittest.TestCase):
+    def test_scalar_execution(self):
+        machine = ScalarMachineDS()
+        machine.vgprs[1] = 10
+        machine.vgprs[2] = 0xAA
+        insn = DSWriteB8Instruction(addr=RegisterOperand(OperandType.VGPR, 1), data=RegisterOperand(OperandType.VGPR, 2))
+        addr = machine.vgprs[insn.addr.index]
+        data = machine.vgprs[insn.data.index]
+        machine.lds.write_u8(addr, data, insn.offset)
+        self.assertEqual(machine.lds.read_u8(10), 0xAA)
+
+
 if __name__ == '__main__':
     unittest.main()
