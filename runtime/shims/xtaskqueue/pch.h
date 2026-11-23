@@ -21,6 +21,7 @@
 #include <mutex>
 #include <new>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #ifndef E_NO_TASK_QUEUE

@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <utility>
