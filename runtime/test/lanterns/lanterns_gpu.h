@@ -21,8 +21,10 @@ using d3d12test::Ref;
 struct Shaders {
     std::vector<std::uint8_t> vs, ps_lit, ps_floor, unknown_vs, rebuilt_vs, vs_w64, ps_lit_w64, cs_rise;
     std::vector<std::uint8_t> ps_tex_floor, ps_tex_solid;   // stage 6: they replace ps_floor and ps_lit
+    std::vector<std::uint8_t> ps_shadow;                    // stage 8: replaces both
 };
-// stage 1: graphics only; 3: plus cs_lanterns_rise; 6: plus the textured pixel shaders.
+// stage 1: graphics only; 3: plus cs_lanterns_rise; 6: plus the textured pixel shaders; 8: plus the shadow
+// pixel shader.
 bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out);
 
 // What a frame's readback holds besides the pixels (stage 3).
@@ -56,6 +58,10 @@ public:
     std::uint64_t next_compute_value() const { return compute_value_ + 1; }
     // Stage 6: the textures' SRVs (the floor's mosaic, the solids' squares) and the sampler, before the first frame.
     bool bind_textures(ID3D12Resource* floor, ID3D12Resource* solid);
+    // Stage 8: the light (its clip matrix for the depth pass, the shadow pixel shader's three rows after the camera's
+    // matrix) and whether the depth pass draws the casters (false: the map stays cleared to 1, the control).
+    bool set_light(const std::array<float, 16>& clip, const std::array<float, 12>& rows);
+    void set_shadow_casters(bool casters) { shadow_casters_ = casters; }
     // Waits until both queues are idle (before the objects are released).
     bool idle();
     // For the texture uploads (stage 6), which record on the same device and queue before the first frame.
@@ -65,6 +71,8 @@ public:
 private:
     bool create_pipelines(const Shaders& shaders);
     bool create_compute(const Shaders& shaders);
+    bool create_shadow();                       // lanterns_shadow_gpu.cpp
+    void record_shadow_pass(const Scene& scene);   // lanterns_shadow_gpu.cpp
     void bind_draw(const Scene& scene, std::size_t d);
     bool create_resources(const Scene& scene);
     bool initialize(const Scene& scene);
@@ -76,6 +84,12 @@ private:
     Ref<ID3D12PipelineState> pso_[2][2];   // [floor][depth test]
     Ref<ID3D12PipelineState> pso_w64_[2];  // [depth test]: the wave64 pair, for the draws marked wave64
     Ref<ID3D12PipelineState> compute_pso_;
+    Ref<ID3D12Resource> shadow_map_;
+    std::vector<std::uint8_t> vs_;
+    Ref<ID3D12PipelineState> shadow_pso_;
+    D3D12_CPU_DESCRIPTOR_HANDLE shadow_dsv_{};
+    bool shadow_ = false, shadow_casters_ = true, shadow_written_ = false;
+    std::uint64_t upload_light_ = 0;
     Ref<ID3D12Resource> vertex_buffer_, index_buffer_, instance_buffer_, upload_, readback_, target_, depth_;
     Ref<ID3D12Resource> particle_state_, particle_instances_;
     Ref<ID3D12DescriptorHeap> srv_heap_, rtv_heap_, dsv_heap_, sampler_heap_;

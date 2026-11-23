@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3|6 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|6|8 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -30,6 +30,11 @@
 // uploaded with CopyTextureRegion per level; the reference decodes them and bounds every pixel (lanterns_sampling.h).
 // Control: the solids two mip levels down must leave the main bounds wherever the two references cannot overlap.
 //
+// Stage 8: shadows. A depth-only pass (no render target, depth bias from the PSO) draws the solids from a directional
+// light into a 512x512 D32 shadow map; the main pass's pixel shader takes four comparison samples (LESS_EQUAL, 2x2 PCF)
+// and scales the face colour by the lit fraction (lanterns_shadow.h). Control: the map left cleared to 1 must change
+// exactly the pixels the reference says are shadowed.
+//
 // On success the guest prints one line starting "Lanterns stage N: PASS" and exits 0; run_lanterns.py checks that
 // line, the exit code and the device line.
 #include "lanterns_edges_gpu.h"
@@ -38,6 +43,7 @@
 #include "lanterns_reference.h"
 #include "lanterns_sampling.h"
 #include "lanterns_scene.h"
+#include "lanterns_shadow.h"
 #include "lanterns_textures_gpu.h"
 
 #include <algorithm>
@@ -341,6 +347,66 @@ int stage6(const std::filesystem::path& shader_dir, const std::filesystem::path&
     return 0;
 }
 
+// Stage 8: a shadow map from a directional light, sampled with 2x2 PCF (see the top of this file).
+int stage8(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
+    lanterns::Shaders shaders;
+    if (!lanterns::load_shaders(shader_dir, 8, shaders)) return 1;
+    const lanterns::Scene scene = lanterns::stage8();
+    const lanterns::Light light = lanterns::make_light();
+    std::vector<Color> frame, control;
+    {
+        lanterns::Gpu gpu;
+        if (!gpu.create(scene, shaders) || !gpu.set_light(light.clip, light.rows)) return 1;
+        if (!gpu.submit_frame(scene, true, 0) || !gpu.finish_frame(frame)) return 1;
+        gpu.set_shadow_casters(false);
+        if (!gpu.submit_frame(scene, true, 0) || !gpu.finish_frame(control) || !gpu.idle()) return 1;
+    }
+    const auto ref = lanterns::shadow_reference(scene, light, lanterns::shadow_map(scene, light, true));
+    const auto ref_lit = lanterns::shadow_reference(scene, light, lanterns::shadow_map(scene, light, false));
+    const lanterns::Comparison c = lanterns::compare_textured(frame, ref), cl = lanterns::compare_textured(control, ref_lit);
+    // Exact pixels: certain, with one possible colour (every tap certain), and equal to it.
+    unsigned exact = 0, single = 0, expected = 0, changed = 0;
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        const bool one = ref.certain[i] && lanterns::detail::same(ref.bounds[i].lo, ref.bounds[i].hi);
+        const bool one_lit = ref_lit.certain[i] && lanterns::detail::same(ref_lit.bounds[i].lo, ref_lit.bounds[i].hi);
+        single += one;
+        exact += one && lanterns::detail::same(frame[i], ref.bounds[i].lo);
+        if (one && one_lit && !lanterns::detail::same(ref.bounds[i].lo, ref_lit.bounds[i].lo)) {
+            ++expected;
+            changed += !lanterns::detail::same(frame[i], control[i]);
+        }
+    }
+    std::printf("lanterns: shadowed frame: %u of %u certain pixels within their bounds, %u of %u single-colour pixels "
+                "exact, %u of %u uncertain within bounds\n", c.certain_exact, c.certain, exact, single,
+                c.uncertain_plausible, c.uncertain);
+    if (!c.pass()) report("shadowed frame", c);
+    std::printf("lanterns: control, the map left cleared to 1: %u of %u certain pixels within the all-lit bounds; %u "
+                "pixels changed (the reference predicts %u)\n", cl.certain_exact, cl.certain, changed, expected);
+    // Each dump with its own reference: the middle of each pixel's bounds, and per pixel 3 (one colour, matched),
+    // 1 (bounded, within) or 2 (outside every box).
+    const auto bounds_dump = [&](const char* name, const std::vector<Color>& gpu, const lanterns::TexturedReference& r) {
+        lanterns::Reference shown;
+        shown.color.resize(gpu.size());
+        shown.candidates.resize(gpu.size());
+        std::vector<std::uint8_t> states(gpu.size());
+        for (std::size_t i = 0; i < gpu.size(); ++i) {
+            for (int k = 0; k < 4; ++k) shown.color[i][k] = (r.bounds[i].lo[k] + r.bounds[i].hi[k]) / 2;
+            const bool one = r.certain[i] && lanterns::detail::same(r.bounds[i].lo, r.bounds[i].hi);
+            states[i] = !lanterns::within_any(r, i, gpu[i]) ? 2 : one ? 3 : 1;
+        }
+        return dump(out_dir, name, gpu, shown, &states);
+    };
+    if (!bounds_dump("stage8-frame", frame, ref) || !bounds_dump("stage8-control", control, ref_lit)) return 1;
+    if (!c.pass() || !cl.pass() || exact != single || expected < 1000 || changed != expected) {
+        std::fprintf(stderr, "lanterns: stage 8 FAILED\n");
+        return 1;
+    }
+    std::printf("Lanterns stage 8: PASS, %u of %u single-colour pixels exact and %u of %u certain pixels within bounds "
+                "(D32 shadow map, PSO depth bias, 2x2 PCF with comparison samples), the map cleared to far changed %u "
+                "pixels as predicted\n", exact, single, c.certain_exact, c.certain, changed);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -360,8 +426,9 @@ int main(int argc, char** argv) {
     case 1: return stage1(shader_dir, out_dir);
     case 3: return stage3(shader_dir, out_dir);
     case 6: return stage6(shader_dir, out_dir);
+    case 8: return stage8(shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3|6 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|6|8 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }

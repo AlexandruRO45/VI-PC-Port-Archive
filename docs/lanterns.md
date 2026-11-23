@@ -43,6 +43,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 | [1](#stage-1) | Five indexed, instanced draws with a depth buffer | Depth test off changes the predicted pixels |
 | [3](#stage-3-compute-on-a-second-queue) | A compute queue moves the points of light; the frame waits on its fence | Point states and records equal the CPU's; the points move the predicted pixels |
 | [6](#stage-6-compressed-textures-with-mip-chains) | BC1 and BC7 textures with full mip chains, trilinear and explicit-LOD sampling | Two mips down leaves the predicted pixels' bounds |
+| [8](#stage-8-a-shadow-map) | A D32 shadow map with PSO depth bias, sampled with 2x2 PCF | The map cleared to far changes the predicted pixels |
 
 ## Stage 1
 
@@ -186,6 +187,24 @@ gives every pixel bounds instead of one colour (`lanterns_sampling.h`):
 
 ```
 Lanterns stage 6: PASS, 98144 of 98144 certain pixels within the BC1/BC7 sampling bounds (trilinear floor, image_sample_l solids), control two mips down moved 10221 of 10221 predicted pixels
+```
+
+## Stage 8: a shadow map
+
+A depth-only pass draws the solids from a directional light into a 512x512 `R32_TYPELESS` map. It uses
+`vs_lanterns`, no pixel shader and no render target, and the depth bias comes from the PSO (`DepthBias` 1000,
+`SlopeScaledDepthBias` 3). The map has a `D32_FLOAT` depth view and an `R32_FLOAT` shader view. The main pass's
+pixel shader, `ps_lanterns_shadow.asm`, moves the world position into light space and takes four comparison samples
+half a texel apart (`image_sample_c`, `LESS_EQUAL`, point filtering: 2x2 PCF). It scales the face colour by
+3/8 + 5/32 per lit sample.
+
+How the check works. `lanterns_shadow.h` rasterizes the map on the CPU. It bounds each texel's stored depth
+(coverage, tolerance, and any bias D3D12 and Vulkan allow) and each sample's texel. A pixel whose four samples are all
+certain has one exact colour; every other certain pixel must be within its bounds. Control: the depth pass without
+casters leaves the map cleared to 1, and that must change exactly the pixels the reference says are shadowed.
+
+```
+Lanterns stage 8: PASS, 95699 of 95699 single-colour pixels exact and 98144 of 98144 certain pixels within bounds (D32 shadow map, PSO depth bias, 2x2 PCF with comparison samples), the map cleared to far changed 9539 pixels as predicted
 ```
 
 ## Build and run

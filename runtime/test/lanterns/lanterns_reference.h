@@ -91,7 +91,8 @@ inline void add_unique(std::vector<Color>& out, const Color& c) {
 }
 
 // The vertex shader's arithmetic, in double: local = M * (p, 1), world = local * scale + offset, clip = VP * world.
-inline ScreenVertex transform(const Scene& scene, const Draw& draw, const Instance& inst, const Vertex& v) {
+inline ScreenVertex transform(const Scene& scene, const Draw& draw, const Instance& inst, const Vertex& v,
+                              unsigned width = kWidth, unsigned height = kHeight) {
     const auto& m = draw.model;
     double local[3], world[3], clip[4];
     for (int r = 0; r < 3; ++r)
@@ -102,7 +103,7 @@ inline ScreenVertex transform(const Scene& scene, const Draw& draw, const Instan
         clip[r] = double(vp[r * 4]) * world[0] + double(vp[r * 4 + 1]) * world[1] + double(vp[r * 4 + 2]) * world[2] +
                   vp[r * 4 + 3];
     const double q = 1.0 / clip[3];
-    return {(clip[0] * q + 1.0) * 0.5 * kWidth, (1.0 - clip[1] * q) * 0.5 * kHeight, clip[2] * q, q, world[0],
+    return {(clip[0] * q + 1.0) * 0.5 * width, (1.0 - clip[1] * q) * 0.5 * height, clip[2] * q, q, world[0],
             world[1], world[2]};
 }
 
@@ -135,19 +136,23 @@ struct PixelSite {
 
 namespace detail {
 
-// Every fragment of every face, in submission order, coloured by shade(site, fragment) (which sets colors and count).
+// Every fragment of every face, in submission order, coloured by shade(site, fragment) (which sets colors and count),
+// on a width x height target (the frame by default; stage 8's shadow map is another).
 template <class Shade>
-std::vector<std::vector<Fragment>> fragments(const Scene& scene, Shade shade, unsigned& degenerate_faces) {
-    std::vector<std::vector<Fragment>> frags(std::size_t(kWidth) * kHeight);
+std::vector<std::vector<Fragment>> fragments(const Scene& scene, Shade shade, unsigned& degenerate_faces,
+                                             unsigned width = kWidth, unsigned height = kHeight) {
+    std::vector<std::vector<Fragment>> frags(std::size_t(width) * height);
     unsigned seq = 0, groups = 0;
     for (const Draw& draw : scene.draws) {
+        if (draw.hidden) continue;
         const Mesh& mesh = scene.meshes[draw.mesh];
         for (const Instance& inst : draw.instances) {
             const unsigned group = groups++;
             for (const Face& face : mesh.faces) {
                 const unsigned self = seq++;
                 ScreenVertex s[6];
-                for (unsigned k = 0; k < face.count; ++k) s[k] = transform(scene, draw, inst, mesh.vertices[face.v[k]]);
+                for (unsigned k = 0; k < face.count; ++k)
+                    s[k] = transform(scene, draw, inst, mesh.vertices[face.v[k]], width, height);
                 double area = 0;
                 for (unsigned k = 0; k < face.count; ++k) {
                     const auto& a = s[k];
@@ -190,8 +195,8 @@ std::vector<std::vector<Fragment>> fragments(const Scene& scene, Shade shade, un
                     minx = std::min(minx, s[k].x), maxx = std::max(maxx, s[k].x);
                     miny = std::min(miny, s[k].y), maxy = std::max(maxy, s[k].y);
                 }
-                const int x0 = std::max(0, int(std::floor(minx)) - 1), x1 = std::min(int(kWidth) - 1, int(maxx) + 1);
-                const int y0 = std::max(0, int(std::floor(miny)) - 1), y1 = std::min(int(kHeight) - 1, int(maxy) + 1);
+                const int x0 = std::max(0, int(std::floor(minx)) - 1), x1 = std::min(int(width) - 1, int(maxx) + 1);
+                const int y0 = std::max(0, int(std::floor(miny)) - 1), y1 = std::min(int(height) - 1, int(maxy) + 1);
                 for (int y = y0; y <= y1; ++y)
                     for (int x = x0; x <= x1; ++x) {
                         const double px = x + 0.5, py = y + 0.5;
@@ -219,7 +224,7 @@ std::vector<std::vector<Fragment>> fragments(const Scene& scene, Shade shade, un
                             f.side = cross(q.x - p.x, q.y - p.y, cx - p.x, cy - p.y) > 0 ? 1 : -1;
                         }
                         shade(PixelSite{&draw, &inst, lit, px, py, world_at}, f);
-                        frags[std::size_t(y) * kWidth + x].push_back(f);
+                        frags[std::size_t(y) * width + x].push_back(f);
                     }
             }
         }

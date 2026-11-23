@@ -141,10 +141,10 @@ struct TexturedReference {
     std::vector<std::vector<Bounds>> others;    // else the box of each other surface that may show instead
 };
 
-inline TexturedReference textured_reference(const Scene& scene, const TexturedScene& ts) {
-    unsigned degenerate = 0;
-    const auto frags = detail::fragments(
-        scene, [&](const PixelSite& site, detail::Fragment& f) { textured_shade(ts, site, f); }, degenerate);
+// Per pixel: the bounds of the nearest certainly covering fragment, widened by every fragment that may be nearer
+// (within its depth tolerance) or may cover instead; the clear colour where nothing certainly covers. Each fragment's
+// colors[0] and colors[1] are its lower and upper bounds.
+inline TexturedReference resolve_bounds(const std::vector<std::vector<detail::Fragment>>& frags) {
     TexturedReference ref;
     ref.bounds.resize(frags.size());
     ref.certain.resize(frags.size());
@@ -179,6 +179,12 @@ inline TexturedReference textured_reference(const Scene& scene, const TexturedSc
         ref.certain[i] = certain;
     }
     return ref;
+}
+
+inline TexturedReference textured_reference(const Scene& scene, const TexturedScene& ts) {
+    unsigned degenerate = 0;
+    return resolve_bounds(detail::fragments(
+        scene, [&](const PixelSite& site, detail::Fragment& f) { textured_shade(ts, site, f); }, degenerate));
 }
 
 inline bool within(const Color& c, const Bounds& b) {

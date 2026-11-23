@@ -32,6 +32,8 @@ folder:
            the Wait | mask of frame 2
   stage 6: the textured frame; sheet: frame | the middle of its reference bounds / the control (solids two mips
            down) | where the control left the frame's bounds (red, as predicted)
+  stage 8: the shadowed frame; sheet: frame | the middle of its reference bounds / the control (map cleared to far) |
+           the control's mask against its own all-lit reference (grey exact, yellow bounded, red outside)
 """
 import argparse
 import array
@@ -67,6 +69,9 @@ PASS_LINES = {
     6: (rf"Lanterns stage 6: PASS, {N} of {N} certain pixels within the BC1/BC7 sampling bounds \(trilinear floor, "
         rf"image_sample_l solids\), control two mips down moved {N} of {N} predicted pixels",
         lambda a, b, moved, predicted: a == b and moved == predicted and predicted > 0),
+    8: (rf"Lanterns stage 8: PASS, {N} of {N} single-colour pixels exact and {N} of {N} certain pixels within bounds "
+        rf"\(D32 shadow map, PSO depth bias, 2x2 PCF with comparison samples\), the map cleared to far changed {N} "
+        rf"pixels as predicted", lambda a, b, c, d, moved: a == b and c == d and moved >= 1000),
 }
 
 
@@ -298,6 +303,8 @@ PANELS = {
         "sheet": [["stage3-frame2.gpu", "stage3-frame2.ref"], ["stage3-control.gpu", "stage3-frame2:mask"]]},
     6: {"main": [["stage6-frame.gpu"]],
         "sheet": [["stage6-frame.gpu", "stage6-frame.ref"], ["stage6-control.gpu", "stage6-control:mask"]]},
+    8: {"main": [["stage8-frame.gpu"]],
+        "sheet": [["stage8-frame.gpu", "stage8-frame.ref"], ["stage8-control.gpu", "stage8-control:mask"]]},
 }
 
 

@@ -56,6 +56,10 @@ bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out) {
     out.ps_lit_w64 = read_file(dir / "ps_lanterns_lit_w64.dxbc");
     CHECK(out.vs.size() > 64 && out.ps_lit.size() > 64 && out.ps_floor.size() > 64);
     CHECK(out.vs_w64.size() > 64 && out.ps_lit_w64.size() > 64);
+    if (stage == 8) {
+        out.ps_shadow = read_file(dir / "ps_lanterns_shadow.dxbc");
+        CHECK(out.ps_shadow.size() > 64);
+    }
     if (stage == 6) {
         out.ps_tex_floor = read_file(dir / "ps_lanterns_tex_floor.dxbc");
         out.ps_tex_solid = read_file(dir / "ps_lanterns_tex_solid.dxbc");
@@ -91,11 +95,14 @@ bool Gpu::create(const Scene& scene, const Shaders& shaders) {
     }
     compute_ = !shaders.cs_rise.empty();
     textured_ = !shaders.ps_tex_floor.empty() && !shaders.ps_tex_solid.empty();
+    shadow_ = !shaders.ps_shadow.empty();
+    if (shadow_) vs_ = shaders.vs;   // the depth pass's pipeline (create_shadow) uses it too
     geometry_ = flatten(scene);
     CHECK(create_pipelines(shaders));
     if (compute_) CHECK(create_compute(shaders));
     CHECK(create_resources(scene));
     CHECK(fill_descriptors(scene));
+    if (shadow_) CHECK(create_shadow());
     return initialize(scene);
 }
 
@@ -132,7 +139,7 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
     params[5].DescriptorTable = {1, &ranges[3]};
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
     root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-    root_desc.Desc_1_0 = {textured_ ? 6u : 4u, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    root_desc.Desc_1_0 = {textured_ || shadow_ ? 6u : 4u, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     const auto root_blob = serialize_root_signature(root_desc);
     CHECK(!root_blob.empty());
     CHECK(SUCCEEDED(device_->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root_.p))));
@@ -154,8 +161,9 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
     desc.SampleDesc.Count = 1;
     for (int floor = 0; floor < 2; ++floor)
         for (int depth = 0; depth < 2; ++depth) {
-            const auto& ps = textured_ ? (floor ? shaders.ps_tex_floor : shaders.ps_tex_solid)
-                                       : (floor ? shaders.ps_floor : shaders.ps_lit);
+            const auto& ps = shadow_     ? shaders.ps_shadow
+                             : textured_ ? (floor ? shaders.ps_tex_floor : shaders.ps_tex_solid)
+                                         : (floor ? shaders.ps_floor : shaders.ps_lit);
             desc.PS = {ps.data(), ps.size()};
             desc.DepthStencilState.DepthEnable = depth ? TRUE : FALSE;
             CHECK(SUCCEEDED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso_[floor][depth].p))));
@@ -215,7 +223,8 @@ bool Gpu::create_resources(const Scene& scene) {
     upload_ib_ = align(upload_vb_ + vb_bytes, 256);
     upload_inst_ = align(upload_ib_ + ib_bytes, 256);
     upload_cbv_ = align(upload_inst_ + inst_bytes, 256);
-    upload_particles_ = upload_cbv_ + 256;
+    upload_light_ = upload_cbv_ + 256;   // stage 8: the light's clip matrix, the depth pass's root CBV
+    upload_particles_ = upload_light_ + 256;
     const std::uint64_t upload_bytes = upload_particles_ + kStateBytes;
     const auto make_buffer = [&](const D3D12_HEAP_PROPERTIES& heap, std::uint64_t bytes, D3D12_RESOURCE_STATES state,
                                  Ref<ID3D12Resource>& out, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
@@ -261,7 +270,7 @@ bool Gpu::create_resources(const Scene& scene) {
     CHECK(scene.meshes.size() + scene.draws.size() + kComputeSlots + 2 <= 32);
     const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap_.p))));
-    const D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    const D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&dsv_desc, IID_PPV_ARGS(&dsv_heap_.p))));
     rtv_ = {SIZE_T(heap_cpu(rtv_heap_.p))};
     dsv_ = {SIZE_T(heap_cpu(dsv_heap_.p))};
@@ -372,12 +381,13 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_c
         before.push_back(transition(particle_instances_.p, D3D12_RESOURCE_STATE_COMMON,
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
     list_->ResourceBarrier(UINT(before.size()), before.data());
+    if (shadow_) record_shadow_pass(scene);
     list_->ClearRenderTargetView(rtv_, kClear.data(), 0, nullptr);
     list_->ClearDepthStencilView(dsv_, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     list_->SetGraphicsRootSignature(root_.p);
     ID3D12DescriptorHeap* heaps[] = {srv_heap_.p, sampler_heap_.p};
-    list_->SetDescriptorHeaps(textured_ ? 2 : 1, heaps);
-    if (textured_) {
+    list_->SetDescriptorHeaps(textured_ || shadow_ ? 2 : 1, heaps);
+    if (textured_ || shadow_) {
         CHECK(textures_bound_);
         list_->SetGraphicsRootDescriptorTable(4, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu_ + srv_texture_slot_ * srv_step_});
         list_->SetGraphicsRootDescriptorTable(5, D3D12_GPU_DESCRIPTOR_HANDLE{heap_gpu(sampler_heap_.p)});
@@ -395,6 +405,7 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_c
     list_->SetGraphicsRootConstantBufferView(3, upload_->GetGPUVirtualAddress() + upload_cbv_);
     for (std::size_t d = 0; d < scene.draws.size(); ++d) {
         const Draw& draw = scene.draws[d];
+        if (draw.hidden) continue;
         list_->SetPipelineState(draw.wave64 && !draw.floor ? pso_w64_[depth_test ? 1 : 0].p
                                                           : pso_[draw.floor ? 1 : 0][depth_test ? 1 : 0].p);
         bind_draw(scene, d);
