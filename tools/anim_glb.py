@@ -370,25 +370,35 @@ def read_part(sys, gfx, drawable, lod=0):
 def bind_part(meshes, joints, max_influences=8):
     """Model bone index -> skeleton joint index through the bone hashes; -> per mesh JOINTS/WEIGHTS sets.
 
-    With `max_influences` 4, a vertex keeps its four largest weights, renormalised, in one set (three.js and
+    With `max_influences` 4, a vertex keeps its four highest-weighted joints, renormalised, in one set (three.js and
     other viewers read only JOINTS_0/WEIGHTS_0)."""
     by_hash = {}
     for i, j in enumerate(joints):
         by_hash[j["hash"]] = i if j["hash"] not in by_hash else -1
     for mesh in meshes:
         mapping = [by_hash.get(h) for h in mesh["palette"]]
-        missing = {mesh["palette"][b] for pairs in mesh["skin"] for b, _w in pairs if mapping[b] is None or mapping[b] < 0}
-        require(not missing, "weighted bones not in the skeleton: " + ", ".join(f"0x{h:08x}" for h in sorted(missing)))
-        sets = 2 if max_influences > 4 and max((len(p) for p in mesh["skin"]), default=0) > 4 else 1
+        if None in mapping or -1 in mapping:
+            missing = {mesh["palette"][b] for pairs in mesh["skin"] for b, _w in pairs if mapping[b] in (None, -1)}
+            require(not missing, "weighted bones not in the skeleton: " + ", ".join(f"0x{h:08x}" for h in sorted(missing)))
+        limit = 8 if max_influences > 4 else 4
         joint_rows, weight_rows = [], []
         for pairs in mesh["skin"]:
-            pairs = sorted(pairs, key=lambda p: -p[1])[:4 * sets]
-            total = float(sum(w for _b, w in pairs))
+            # glTF permits one nonzero weight per joint, including across the two sets.
+            # Combine after mapping: distinct palette entries may name the same skeleton joint.
+            by_joint = {}
+            for bone, weight in pairs:
+                joint = mapping[bone]
+                by_joint[joint] = by_joint.get(joint, 0) + weight
+            kept = sorted(by_joint.items(), key=lambda pair: -pair[1])[:limit]
+            total = float(sum(w for _joint, w in kept))
             require(total > 0, "vertex with no weight")
-            row_j = [mapping[b] for b, _w in pairs] + [0] * (4 * sets - len(pairs))
-            row_w = [w / total for _b, w in pairs] + [0.0] * (4 * sets - len(pairs))
-            joint_rows.append(row_j)
-            weight_rows.append(row_w)
+            joint_rows.append([joint for joint, _w in kept])
+            weight_rows.append([w / total for _joint, w in kept])
+        sets = 2 if any(len(row) > 4 for row in joint_rows) else 1
+        for indices, weights in zip(joint_rows, weight_rows):
+            padding = 4 * sets - len(indices)
+            indices.extend([0] * padding)
+            weights.extend([0.0] * padding)
         mesh["joints"], mesh["weights"], mesh["sets"] = joint_rows, weight_rows, sets
     return meshes
 

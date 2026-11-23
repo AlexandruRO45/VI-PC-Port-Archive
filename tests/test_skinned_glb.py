@@ -340,6 +340,31 @@ class SkinnedGlbTest(unittest.TestCase):
             self.assertAlmostEqual(sum(values), 1.0, places=6)
             self.assertGreater(values[0], 0.0)
 
+    def test_export_preserves_pose_when_two_palette_entries_resolve_to_one_joint(self):
+        skeleton = _skeleton_dir(self.root)
+        streams = [bytes(row) * 3 for row in ((0, 2, 0, 2), (1, 0, 0, 0),
+                                              (52, 52, 52, 52), (47, 0, 0, 0))]
+        component = _component(self.root, buffer=_skin_buffer(*streams))
+        model_path = os.path.join(component, "model.json")
+        model = json.loads(_read(model_path))
+        palette = model["drawable"]["models"][0]["bone_palette"]
+        palette.append(palette[0])
+        _write_json(model_path, model)
+
+        payload, _ = skinned_glb.build_skinned_glb(skeleton, [component])
+        gltf, binary = skinned_glb.read_glb(self._write(payload))
+        attributes = gltf["meshes"][0]["primitives"][0]["attributes"]
+        for vertex in range(3):
+            active = []
+            for group in range(2):
+                joints = _accessor(gltf, binary, attributes[f"JOINTS_{group}"])[0]
+                weights = _accessor(gltf, binary, attributes[f"WEIGHTS_{group}"])[0]
+                active.extend((j, w) for j, w in zip(struct.unpack_from("<4H", joints, vertex * 8),
+                                                     struct.unpack_from("<4f", weights, vertex * 16)) if w)
+            self.assertEqual([j for j, _ in active], [1, 3])
+            # Move the spine +1 and the helper -2 along X; compare to the authored source blend.
+            self.assertAlmostEqual(active[0][1] - 2 * active[1][1], (208 - 2 * 47) / 255)
+
     def test_joint_indices_are_in_skin_range(self):
         gltf, binary, _stats = self._build()
         joint_count = len(gltf["skins"][0]["joints"])
@@ -428,6 +453,30 @@ class SkinnedGlbTest(unittest.TestCase):
                         weighted, unused = ("j1", "j0") if second_set else ("j0", "j1")
                         self.assertEqual(struct.unpack("<4H", out[weighted]), (65535, 0, 0, 0))
                         self.assertEqual(out[unused], bytes(8))
+
+    def test_repeated_mapped_joints_merge_before_normalising_the_raw_weights(self):
+        # Local slots 0 and 2 alias the same GLB joint. Include repeats within and across sets,
+        # joint zero as a real influence, a sum above 255, and an untouched row with a hole.
+        j0 = bytes([0, 2, 1, 3, 1, 255, 0, 3])
+        j1 = bytes([2, 4, 5, 6, 4, 5, 6, 255])
+        w0 = bytes([150, 90, 20, 0, 4, 0, 3, 2])
+        w1 = bytes([60, 9, 8, 7, 1, 6, 5, 0])
+        for backend in ([None, skinned_glb._np] if skinned_glb._np is not None else [None]):
+            with self.subTest(backend=backend), mock.patch.object(skinned_glb, "_np", backend):
+                out = skinned_glb.normalise_weights(j0, j1, w0, w1, 2, 7, [65535, 0, 65535, 3, 4, 5, 6])
+                expected = [
+                    ([65535, 0, 4, 5, 6, 0, 0, 0], [300, 20, 9, 8, 7, 0, 0, 0]),
+                    ([0, 0, 65535, 3, 4, 5, 6, 0], [4, 0, 3, 2, 1, 6, 5, 0]),
+                ]
+                for vertex, (joints, weights) in enumerate(expected):
+                    for group in range(2):
+                        start = 4 * group
+                        self.assertEqual(struct.unpack_from("<4H", out[f"j{group}"], vertex * 8),
+                                         tuple(joints[start:start + 4]))
+                        wanted = struct.pack("<4f", *(v / sum(weights) for v in weights[start:start + 4]))
+                        self.assertEqual(out[f"w{group}"][vertex * 16:(vertex + 1) * 16], wanted)
+                self.assertEqual(out["sum_min"], 21 / 255)
+                self.assertEqual(out["sum_max"], 344 / 255)
 
     def test_full_export_without_numpy(self):
         skeleton = _skeleton_dir(self.root)
@@ -619,7 +668,10 @@ class SkinnedGlbTest(unittest.TestCase):
         saved = skinned_glb._np
         try:
             skinned_glb._np = _FakeNp
-            got_np = skinned_glb.normalise_weights(j0, bytes(padded_j1), w0, w1, 3, 2, [1, 3], 4)
+            # This stand-in exercises the masked palette lookup. The rows have no duplicate
+            # influences; the merge itself is covered by the real NumPy comparison above.
+            with mock.patch.object(skinned_glb, "_merge_numpy_weights"):
+                got_np = skinned_glb.normalise_weights(j0, bytes(padded_j1), w0, w1, 3, 2, [1, 3], 4)
         finally:
             skinned_glb._np = saved
         self.assertEqual(got_np["j0"], got_default["j0"])

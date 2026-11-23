@@ -591,6 +591,34 @@ def own_parent_name(record, own_skeleton) -> str | None:
 
 
 # --------------------------------------------------------------------- weights
+def _merge_numpy_weights(indices, weights):
+    """Combine raw weights at the first occurrence of each output joint, across both VEC4s."""
+    # Sort a copy to find adjacent equal IDs; the sentinel is outside the full uint16 joint range.
+    unused = 65536
+    keys = indices.astype(_np.uint32)
+    keys[weights == 0] = unused
+    keys.sort(axis=1)
+    changed = ((keys[:, 1:] == keys[:, :-1]) & (keys[:, 1:] != unused)).any(axis=1)
+    if not changed.any():
+        return
+    joints = indices[changed]
+    merged = weights[changed]
+    for slot in range(1, merged.shape[1]):
+        active = merged[:, slot] != 0
+        if not active.any():
+            continue
+        same_joint = joints[:, :slot] == joints[:, slot:slot + 1]
+        rows, first = _np.nonzero(same_joint & (merged[:, :slot] != 0) & active[:, None])
+        # Earlier slots have already been merged, so each row has at most one match.
+        merged[rows, first] += merged[rows, slot]
+        merged[rows, slot] = 0
+        joints[rows, slot] = 0
+    # Keep first-occurrence order and move unused slots to the end of affected rows only.
+    order = (merged == 0).argsort(axis=1, kind="stable")
+    weights[changed] = _np.take_along_axis(merged, order, axis=1)
+    indices[changed] = _np.take_along_axis(joints, order, axis=1)
+
+
 def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
                       local_bones: int, local_to_joint: list[int],
                       joint_count: int | None = None) -> dict:
@@ -631,17 +659,17 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
             weighted = indices[weights > 0]
             if int(weighted.max()) >= local_bones:
                 raise SkinError("a weighted joint index is outside the local palette")
-        weights /= totals[:, None]
         # A zero-weight component may carry any index; clear it before the palette lookup
         # so an out-of-palette value cannot raise where the stdlib path returns zeros.
         zero = weights == 0
         indices[zero] = 0
         mapping = _np.asarray(local_to_joint, dtype=_np.uint16)
-        indices[weights == 0] = 0
         indices = mapping[indices]
         indices[zero] = 0
         if joint_count is not None and bool((indices >= joint_count).any()):
             raise SkinError("remapped joint index is invalid")
+        _merge_numpy_weights(indices, weights)
+        weights /= totals[:, None]
         return {
             "j0": indices[:, :4].astype("<u2").tobytes(),
             "j1": indices[:, 4:].astype("<u2").tobytes(),
@@ -660,10 +688,20 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
         if total <= 0:
             raise SkinError("a vertex has no skin weight")
         sum_min, sum_max = min(sum_min, total), max(sum_max, total)
+        remapped = [0] * 8
+        by_joint = {}
+        duplicate = False
         for slot, weight in enumerate(raw):
-            if weight and local[slot] >= local_bones:
-                raise SkinError("a weighted joint index is outside the local palette")
-        remapped = [local_to_joint[index] if raw[slot] else 0 for slot, index in enumerate(local)]
+            if weight:
+                if local[slot] >= local_bones:
+                    raise SkinError("a weighted joint index is outside the local palette")
+                joint = remapped[slot] = local_to_joint[local[slot]]
+                duplicate |= joint in by_joint
+                by_joint[joint] = by_joint.get(joint, 0) + weight
+        if duplicate:
+            padding = [0] * (8 - len(by_joint))
+            remapped = list(by_joint) + padding
+            raw = list(by_joint.values()) + padding
         floats = [weight / total for weight in raw]
         j0_out.extend(struct.pack("<4H", *remapped[:4]))
         j1_out.extend(struct.pack("<4H", *remapped[4:]))

@@ -884,7 +884,7 @@ class SkinnedJointRemappingTests(unittest.TestCase):
             triangles=[(0, 1, 2), (3, 4, 5)],
             # Swapped order + extra unweighted source joint "HelperUnused" at slot 4
             joint_names=["Root", "Chest", "Pelvis", "Spine", "HelperUnused"],
-            joints_0=[(1, 3, 2, 0)] * 6,
+            joints_0=[(1, 3, 0, 0)] * 6,
             weights_0=[(0.4, 0.3, 0.1, 0.0)] * 6,
             joints_1=[(2, 4, 0, 0)] * 6,
             weights_1=[(0.2, 0.0, 0.0, 0.0)] * 6,
@@ -919,8 +919,8 @@ class SkinnedJointRemappingTests(unittest.TestCase):
             u = reloaded["hand_fr1_000_nude_cull"]
             l = reloaded["feet_fr1_000_nude_cull"]
             # Master order: Root=0, Spine=1, Pelvis=2, Chest=3
-            # Upper src (Chest=1, Spine=3, Pelvis=2, Root=0) -> (3, 1, 2, 0)
-            self.assertEqual(u.joints_0[0], (3, 1, 2, 0))
+            # Upper primary influences are Chest, Spine and Root; Pelvis is in the second set.
+            self.assertEqual(u.joints_0[0], (3, 1, 0, 0))
             # Upper joints_1 src (Pelvis=2 [w=0.2], HelperUnused=4 [w=0.0], Root=0, Root=0) -> (2, 0, 0, 0)
             self.assertEqual(u.joints_1[0], (2, 0, 0, 0))
             # Lower src (Pelvis=1, Spine=2, Root=0) -> (2, 1, 0, 0)

@@ -14,7 +14,8 @@ BIN chunk, 4-byte padding), then checks every skin and every mesh primitive:
   normalized UNSIGNED_SHORT,
 * joint-index ranges and out-of-range counts,
 * non-finite POSITION, weight and inverseBindMatrices values,
-* the POSITION bounding box, computed from the accessor data.
+* the POSITION bounding box, computed from the accessor data,
+* repeated positive-weight joint indices across all sets for one vertex.
 
 Missing optional fields are reported as null; they are never filled in with a
 guess. A malformed container, a file with no skin, or a skin whose
@@ -28,6 +29,7 @@ Only the standard library is used, and the input is read, never modified.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -641,6 +643,32 @@ def _read_joint_set(reader, accessor_index, primitive_path, set_index, errors):
     return indices, meta, report
 
 
+def _check_duplicate_influences(joint_sets, weight_sets, path, errors):
+    # Check every available pair of rows, including those after the end of a shorter set.
+    pairs = [zip(joints, weight_sets[number])
+             for number, joints in joint_sets.items() if number in weight_sets]
+    count = 0
+    first = None
+    for vertex, rows in enumerate(itertools.zip_longest(*pairs)):
+        seen = set()
+        for pair in rows:
+            if pair is None:
+                continue
+            for joint, weight in zip(*pair):
+                if not math.isfinite(weight) or weight <= 0.0:
+                    continue
+                if joint in seen:
+                    count += 1
+                    if first is None:
+                        first = vertex, joint
+                seen.add(joint)
+    if first is not None:
+        vertex, joint = first
+        errors.append(f"{path} vertex {vertex}: joint {joint} has more than one positive weight "
+                      f"({count} repeated influence slots in this primitive)")
+    return count
+
+
 def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_index,
                         bindings, skins, warnings, errors):
     path = _primitive_label(mesh_index, mesh_name, primitive_index)
@@ -870,6 +898,7 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
             f"{path} WEIGHTS_{set_number} vertex {vertex}: weight {value:.7g} is outside [0, 1] "
             f"({out_of_range_weights} value(s) bad)"
         )
+    duplicate_count = _check_duplicate_influences(joint_rows_by_set, weight_rows_by_set, path, errors)
     return {
         "index": primitive_index,
         "mode": mode,
@@ -880,6 +909,7 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
         "vertex_count": vertex_count,
         "position": position_report,
         "joint_sets": joint_reports,
+        "duplicate_joint_influence_count": duplicate_count,
         "weight_sets": weight_reports,
         "max_influences": max_influences,
         "weight_sum": {
@@ -927,6 +957,7 @@ def analyze_glb(data):
         "joint_index_min": None,
         "joint_index_max": None,
         "out_of_range_joint_count": 0,
+        "duplicate_joint_influence_count": 0,
         "non_finite_value_count": sum(
             skin["inverse_bind_matrices"]["non_finite_count"] for skin in skins
         ),
@@ -969,6 +1000,7 @@ def analyze_glb(data):
                     summary["weight_sum_min"] = min(summary["weight_sum_min"], weight_sum["min"])
                     summary["weight_sum_max"] = max(summary["weight_sum_max"], weight_sum["max"])
             summary["bad_weight_sum_count"] += weight_sum["bad_count"]
+            summary["duplicate_joint_influence_count"] += report["duplicate_joint_influence_count"]
             joint_min = report["_joint_min"]
             joint_max = report["_joint_max"]
             if joint_min is not None:

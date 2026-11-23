@@ -106,10 +106,12 @@ class Builder:
         }
 
 
-def make_glb(weights=None, joints=None, *, ibm_count=2, add_static=False,
+def make_glb(weights=None, joints=None, *, joint_count=None, ibm_count=None, add_static=False,
              include_skin=True, bind_skin=True, weight_component="float",
              skin_name="Rig", two_sets=False):
-    """A three-vertex, two-joint skinned triangle, optionally plus a static mesh."""
+    """A three-vertex skinned triangle, optionally plus a static mesh."""
+    if joint_count is None:
+        joint_count = 4 if two_sets else 2
     builder = Builder()
     positions = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
     position_payload = b"".join(struct.pack("<3f", *point) for point in positions)
@@ -128,11 +130,11 @@ def make_glb(weights=None, joints=None, *, ibm_count=2, add_static=False,
                        (0.25, 0.75, 0.0, 0.0))
     if joints is None:
         if two_sets:
-            joints = ((0, 1, 0, 0, 0, 0, 0, 0),
-                      (0, 1, 0, 1, 0, 0, 0, 0),
-                      (0, 1, 0, 0, 1, 0, 0, 0))
+            joints = ((0, 1, 2, 0, 0, 0, 0, 0),
+                      (0, 1, 2, 3, 0, 0, 0, 0),
+                      (0, 1, 2, 0, 3, 0, 0, 0))
         else:
-            joints = ((0, 0, 0, 0), (0, 1, 0, 0), (1, 1, 0, 0))
+            joints = ((0, 0, 0, 0), (0, 1, 0, 0), (1, 0, 0, 0))
     width = 8 if two_sets else 4
     if any(len(row) != width for row in weights):
         raise ValueError(f"test weights must have {width} components per vertex")
@@ -174,6 +176,8 @@ def make_glb(weights=None, joints=None, *, ibm_count=2, add_static=False,
             )
         )
 
+    if ibm_count is None:
+        ibm_count = joint_count
     inverse_payload = b"".join(struct.pack("<16f", *IDENTITY) for _ in range(ibm_count))
     inverse_accessor = builder.add_accessor(
         inverse_payload, 5126, "MAT4", ibm_count,
@@ -189,16 +193,14 @@ def make_glb(weights=None, joints=None, *, ibm_count=2, add_static=False,
         "primitives": [{"attributes": attributes, "mode": 4}],
     }
     meshes = [mesh]
-    nodes = [
-        {"name": "Bone0", "children": [1]},
-        {"name": "Bone1"},
-        {"name": "BodyNode", "mesh": 0},
-    ]
-    scene_nodes = [0, 2]
+    nodes = [{"name": f"Bone{i}"} for i in range(joint_count)]
+    nodes[0]["children"] = list(range(1, joint_count))
+    nodes.append({"name": "BodyNode", "mesh": 0})
+    scene_nodes = [0, joint_count]
     if bind_skin:
-        nodes[2]["skin"] = 0
+        nodes[joint_count]["skin"] = 0
     if include_skin:
-        skin = {"joints": [0, 1], "inverseBindMatrices": inverse_accessor}
+        skin = {"joints": list(range(joint_count)), "inverseBindMatrices": inverse_accessor}
         if skin_name is not None:
             skin["name"] = skin_name
         skins = [skin]
@@ -214,7 +216,7 @@ def make_glb(weights=None, joints=None, *, ibm_count=2, add_static=False,
             "primitives": [{"attributes": {"POSITION": static_accessor}, "mode": 4}],
         })
         nodes.append({"name": "PropNode", "mesh": 1})
-        scene_nodes.append(3)
+        scene_nodes.append(len(nodes) - 1)
     return build_glb(builder.document(meshes, nodes, skins, scene_nodes), builder.data)
 
 
@@ -272,6 +274,7 @@ class GlbSkinningTests(unittest.TestCase):
         self.assertAlmostEqual(1.0, primitive["weight_sum"]["max"])
         self.assertEqual(0, primitive["weight_sum"]["bad_count"])
         self.assertEqual(0, primitive["joint_sets"][0]["out_of_range"])
+        self.assertEqual(0, primitive["duplicate_joint_influence_count"])
         self.assertEqual(0, report["summary"]["out_of_range_joint_count"])
         self.assertEqual([0.0, 0.0, 0.0], primitive["position"]["bbox_min"])
         self.assertEqual([1.0, 1.0, 0.0], primitive["position"]["bbox_max"])
@@ -474,7 +477,8 @@ class GlbSkinningTests(unittest.TestCase):
         for component, weights in cases.items():
             with self.subTest(component=component):
                 report = glb_skinning.analyze_glb(
-                    make_glb(weights=weights, weight_component=component)
+                    make_glb(weights=weights, weight_component=component, joint_count=3,
+                             joints=((0, 0, 0, 0), (0, 1, 0, 0), (0, 1, 2, 0)))
                 )
                 self.assertTrue(report["ok"], report["errors"])
                 primitive = report["meshes"][0]["primitives"][0]
@@ -495,7 +499,62 @@ class GlbSkinningTests(unittest.TestCase):
         self.assertAlmostEqual(1.0, primitive["weight_sum"]["max"])
         self.assertEqual(0, primitive["weight_sum"]["bad_count"])
         self.assertEqual(0, report["summary"]["out_of_range_joint_count"])
-        self.assertEqual([0, 1], report["skins"][0]["joints"])
+        self.assertEqual([0, 1, 2, 3], report["skins"][0]["joints"])
+
+    def test_repeated_positive_joint_within_and_across_sets(self):
+        # Vertex 1 repeats joint 1 three times; vertex 2 repeats joint 0 once.
+        # Vertex 0 has one influence and seven padding slots naming the same joint.
+        joints = ((0, 0, 0, 0, 0, 0, 0, 0),
+                  (1, 1, 0, 0, 1, 0, 0, 0),
+                  (0, 1, 0, 0, 0, 0, 0, 0))
+        weights = ((255, 0, 0, 0, 0, 0, 0, 0),
+                   (85, 85, 0, 0, 85, 0, 0, 0),
+                   (64, 127, 0, 0, 64, 0, 0, 0))
+        path = self.write("duplicate.glb", make_glb(weights, joints, two_sets=True, weight_component="u8"))
+        out = self.dir / "report.json"
+        proc = self.run_tool(path, "--json", out)
+        self.assertEqual(1, proc.returncode, proc.stdout)
+        self.assertIn("vertex 1", proc.stderr)
+        self.assertIn("joint 1", proc.stderr)
+        self.assertIn("3 repeated", proc.stderr)
+        report = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(3, report["summary"]["duplicate_joint_influence_count"])
+        self.assertEqual(0, report["summary"]["bad_weight_sum_count"])
+
+    def test_duplicate_in_third_set_is_counted_across_empty_middle_set(self):
+        data = make_glb(weights=((0.5, 0, 0, 0, 0, 0, 0, 0),) * 3,
+                        joints=((0,) * 8,) * 3, two_sets=True)
+        doc, binary, _ = glb_skinning.parse_glb(data)
+        attrs = doc["meshes"][0]["primitives"][0]["attributes"]
+        attrs["JOINTS_2"] = attrs["JOINTS_0"]
+        attrs["WEIGHTS_2"] = attrs["WEIGHTS_0"]
+        report = glb_skinning.analyze_glb(build_glb(doc, binary))
+        self.assertEqual(0, report["summary"]["bad_weight_sum_count"])
+        self.assertEqual(3, report["summary"]["duplicate_joint_influence_count"])
+
+    def test_short_or_unpaired_secondary_set_keeps_other_influence_checks(self):
+        data = make_glb(weights=((1, 0, 0, 0, 0, 0, 0, 0),) * 2 + ((0.5, 0.5, 0, 0, 0, 0, 0, 0),),
+                        joints=((0,) * 8,) * 3, two_sets=True)
+        for issue in ("short", "unpaired"):
+            doc, binary, _ = glb_skinning.parse_glb(data)
+            attrs = doc["meshes"][0]["primitives"][0]["attributes"]
+            if issue == "short":
+                doc["accessors"][attrs["JOINTS_1"]]["count"] = 1
+            else:
+                del attrs["JOINTS_1"]
+            with self.subTest(issue=issue):
+                report = glb_skinning.analyze_glb(build_glb(doc, binary))
+                self.assertFalse(report["ok"])
+                self.assertEqual(1, report["summary"]["duplicate_joint_influence_count"])
+                self.assertIn("vertex 2", "\n".join(report["errors"]))
+
+    def test_unreadable_secondary_joint_accessor_reports_its_path(self):
+        doc, binary, _ = glb_skinning.parse_glb(make_glb(two_sets=True))
+        doc["meshes"][0]["primitives"][0]["attributes"]["JOINTS_1"] = len(doc["accessors"])
+        proc = self.run_tool(self.write("bad_access.glb", build_glb(doc, binary)))
+        self.assertEqual(1, proc.returncode)
+        self.assertIn("JOINTS_1", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
 
     def test_non_finite_weight_is_reported_and_serializable(self):
         weights = ((1.0, 0.0, 0.0, 0.0),

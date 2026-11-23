@@ -268,16 +268,24 @@ class SkeletonAndPartTest(unittest.TestCase):
         self.assertEqual(mesh["weights"][3], [1.0, 0.0, 0.0, 0.0])   # the zero-weight component is dropped
 
     def test_eight_influences_make_two_sets_or_the_largest_four(self):
-        joints, _ = anim_glb.read_skeleton(skeleton_resource(), 0)
-        palette = [joaat32("skel_a"), joaat32("skel_b"), joaat32("skel_c")]
-        skin = [[(0, 60), (1, 50), (2, 40), (0, 35), (1, 30), (2, 25), (0, 10), (1, 5)]] * 4
+        palette = [joaat32(f"bone_{i}") for i in range(8)]
+        joints = [{"hash": h} for h in palette]
+        eight = list(enumerate((60, 50, 40, 35, 30, 25, 10, 5)))
+        # Joint 4 totals 36, enough to displace joint 3 (34) in a four-joint export.
+        split = [(0, 62), (1, 60), (2, 47), (4, 20), (3, 34), (5, 16), (4, 16)]
+        tie = [(3, 25), (2, 50), (3, 25)]
+        skin = [eight, split, tie, [(3, 255)]]
         sys_page, gfx = part_resource(palette, "u8x4", skin)
         mesh = anim_glb.bind_part(anim_glb.read_part(sys_page, gfx, 0), joints)[0]
         self.assertEqual((mesh["sets"], len(mesh["weights"][0])), (2, 8))
+        self.assertEqual(mesh["joints"][2], [3, 2, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(mesh["weights"][2], [0.5, 0.5, 0, 0, 0, 0, 0, 0])
         self.assertAlmostEqual(sum(mesh["weights"][0]), 1.0, places=6)
         mesh = anim_glb.bind_part(anim_glb.read_part(sys_page, gfx, 0), joints, max_influences=4)[0]
         self.assertEqual((mesh["sets"], len(mesh["weights"][0])), (1, 4))
         self.assertAlmostEqual(mesh["weights"][0][0], 60 / 185)
+        self.assertEqual(mesh["joints"][1], [0, 1, 2, 4])
+        self.assertAlmostEqual(mesh["weights"][1][3], 36 / 205)
         self.assertAlmostEqual(sum(mesh["weights"][0]), 1.0, places=6)
 
     def test_packed_indices_use_bits_0_to_11(self):
@@ -469,6 +477,32 @@ class ExportTest(unittest.TestCase):
         for got, want in zip(values, tracks[0]):
             for a, b in zip(got, want):
                 self.assertAlmostEqual(a, b, places=5)
+
+    def test_repeated_weights_are_combined_before_the_four_joint_limit(self):
+        # Slots 0 and 2 in the part palette both map to joint A. Four weights for A span the two input sets.
+        palette = [joaat32("skel_a"), joaat32("skel_b"), joaat32("skel_a")]
+        split = [(0, 52), (2, 52), (1, 47), (0, 52), (2, 52)]
+        control = [(0, 208), (1, 47)]
+        for layout in ("u8x4", "packed"):
+            part = part_resource(palette, layout, [split, control, [(1, 255)], [(1, 128), (0, 127)]])
+            self.offsets = write_archive(self.packs, [[skeleton_resource()], part])
+            for limit in (4, 8):
+                with self.subTest(layout=layout, limit=limit):
+                    (gltf, binary), _ = self.export("--max-influences", str(limit))
+                    attrs = gltf["meshes"][0]["primitives"][0]["attributes"]
+                    joints = accessor_values(gltf, binary, attrs["JOINTS_0"])
+                    weights = accessor_values(gltf, binary, attrs["WEIGHTS_0"])
+                    # Move only B by one unit: its weight is the displacement from the rest pose.
+                    active = list(zip(joints[0], weights[0]))
+                    if "JOINTS_1" in attrs:
+                        j1 = accessor_values(gltf, binary, attrs["JOINTS_1"])[0]
+                        w1 = accessor_values(gltf, binary, attrs["WEIGHTS_1"])[0]
+                        active.extend(zip(j1, w1))
+                    self.assertAlmostEqual(sum(w for j, w in active if j == 1), 47 / 255)
+                    self.assertEqual(joints[0], (0, 1, 0, 0))
+                    self.assertEqual((joints[0], weights[0]), (joints[1], weights[1]))
+                    self.assertNotIn("JOINTS_1", attrs)
+                    self.assertNotIn("WEIGHTS_1", attrs)
 
     def test_dictionary_lookup_stops_before_adjacent_resource(self):
         data = clips_fixture.two_sequence_dictionary()

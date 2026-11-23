@@ -290,7 +290,8 @@ it does and why:
   stored inverse bind matrices. The export refuses a skeleton whose default transforms disagree
   with them by 1e-3 or more.
 - **Part meshes** bind through their model's bone list: vertex bone index → `grmModel + 0x28` hash
-  → the skeleton bone with that `joaat32`. Weights are the UNORM bytes divided by their sum; up to
+  → the skeleton bone with that `joaat32`. When several source slots resolve to one bone,
+  their raw UNORM weights are added before selecting joints and normalising weights. Up to
   eight influences become `JOINTS_0/1` and `WEIGHTS_0/1`. three.js reads only the first set, and
   eight matter here: on the arms part below, 3,746 of 5,821 vertices have more than four
   influences, with up to 0.37 of the weight beyond the largest four. `--max-influences 4` keeps
@@ -366,8 +367,9 @@ has been measured, so `0x8B` is rejected rather than guessed.
 
 The output has one skin. Its joints are the full ped skeleton plus any drawable-local helper
 joints named by the palette; a palette hash that resolves nowhere is emitted as
-`bone_0x........`, never given an invented name. Every vertex keeps all eight influences as
-`JOINTS_0`/`JOINTS_1` and `WEIGHTS_0`/`WEIGHTS_1`. The source u8 weights sum to 255 and are
+`bone_0x........`, never given an invented name. Every vertex keeps the influence of each distinct joint
+across `JOINTS_0`/`JOINTS_1` and `WEIGHTS_0`/`WEIGHTS_1`. Slots that resolve to the same joint
+contribute their combined weight. The source u8 weights sum to 255 and are
 normalised to 1.0. Bind and inverse-bind matrices use the same Z-up to Y-up conversion as
 positions, `(x, y, z) -> (x, z, -y)`.
 
@@ -392,10 +394,11 @@ the report carries.
 `python -I tools/glb_skinning.py out.glb` checks the skin data itself: each skin's joint and
 `inverseBindMatrices` counts, the accessor types and finite values, which primitives carry
 skinning data and which are static, `JOINTS_n`/`WEIGHTS_n` pairing, every vertex's weight sum
-as FLOAT or normalized `UNSIGNED_BYTE`/`UNSIGNED_SHORT`, the joint-index range and the POSITION
+as FLOAT or normalized `UNSIGNED_BYTE`/`UNSIGNED_SHORT`, the joint-index range, repeated positive-weight
+joint indices within or across sets, and the POSITION
 bounds computed from the accessor. A malformed container, a file with no skin, or a skin whose
 `inverseBindMatrices` count differs from its joint count exits nonzero; `--json report.json`
-writes the same report as LF-only JSON. `python -I tests/test_glb_skinning.py` runs its 17
+writes the same report as LF-only JSON. `python -I tests/test_glb_skinning.py` runs its
 synthetic tests and needs no game files.
 
 ## Texture parameter split
