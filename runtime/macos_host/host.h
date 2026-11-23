@@ -95,6 +95,7 @@ struct Object {
     int refs = 1;  // DuplicateHandle hands out the same object; the last CloseHandle frees it
 };
 void free_signal(Signal* s);
+void set_signal(void* h);  // SetEvent
 Object* duplicate_object(void* h);  // a real handle to h, or to the calling thread for GetCurrentThread's -2
 using ThreadProc = uint32_t(MSABI*)(void*);
 Object* spawn_thread(ThreadProc proc, void* arg);  // nullptr on failure

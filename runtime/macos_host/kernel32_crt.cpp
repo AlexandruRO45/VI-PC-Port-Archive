@@ -4,7 +4,9 @@
 #include "host.h"
 
 #include <malloc/malloc.h>
+#include <errno.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -346,6 +348,14 @@ struct Signal {
     bool manual;
 };
 void free_signal(Signal* s) { delete s; }
+void set_signal(void* h) {
+    Signal* s = static_cast<Object*>(h)->signal;
+    {
+        std::lock_guard<std::mutex> g(s->m);
+        s->count = 1;
+    }
+    s->c.notify_all();
+}
 namespace {
 
 HANDLE make_signal(Object::Kind kind, int64_t count, int64_t max, bool manual) {
@@ -371,12 +381,7 @@ HANDLE CreateSemaphoreExW(void* sa, int32_t initial, int32_t max, const char16_t
     return CreateSemaphoreW(sa, initial, max, name);
 }
 int SetEvent(HANDLE h) {
-    Signal* s = static_cast<Object*>(h)->signal;
-    {
-        std::lock_guard<std::mutex> g(s->m);
-        s->count = 1;
-    }
-    s->c.notify_all();
+    set_signal(h);
     return 1;
 }
 int ReleaseSemaphore(HANDLE h, int32_t n, int32_t* previous) {
@@ -709,6 +714,11 @@ int GetThreadGroupAffinity(HANDLE, uint8_t* out) {  // GROUP_AFFINITY: Mask, Gro
 }
 int SetThreadGroupAffinity(HANDLE h, const uint8_t*, uint8_t* previous) { return previous ? GetThreadGroupAffinity(h, previous) : 1; }
 uint32_t GetProcessId(HANDLE) { return static_cast<uint32_t>(getpid()); }
+// Only "is this process alive" is asked (gta6rt sweeping stale TLS clones): a handle to nothing, or null.
+HANDLE OpenProcess(uint32_t, int, uint32_t pid) {
+    if (kill(static_cast<pid_t>(pid), 0) != 0 && errno != EPERM) return nullptr;
+    return new Object{Object::Event};
+}
 // No suspend or constrained-mode events on a Mac: the registration succeeds and never calls back.
 uint32_t register_app_notification(void*, void*, void** out) { return *out = reinterpret_cast<void*>(1), 0; }
 void unregister_app_notification(void*) {}
@@ -776,7 +786,7 @@ Exports kernel32_crt_exports() {
         K(GetSystemInfo), K(GetNativeSystemInfo), K(GetCurrentProcessorNumber), K(FlushProcessWriteBuffers),
         K(GetCurrentThread), K(DuplicateHandle), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventA), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
         K(SetEvent), K(ResetEvent), K(AreFileApisANSI), K(FormatMessageA), K(LocalFree), K(GetTempPathW),
-        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), EXPORT_AS("gameinput.dll", "#1", GameInputCreate), K(CreateMutexA), K(ReleaseMutex), K(InitializeCriticalSection), EXPORT_AS("kernel32.dll", "SetThreadPriority", set_ok), EXPORT_AS("kernel32.dll", "SetProcessPriorityBoost", set_ok), EXPORT_AS("kernel32.dll", "GetThreadPriority", thread_priority), EXPORT_AS("kernel32.dll", "ResumeThread", resume_thread), EXPORT_AS("kernel32.dll", "SuspendThread", suspend_thread), K(GetThreadGroupAffinity), K(SetThreadGroupAffinity), K(GetProcessId), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "RegisterAppStateChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "UnregisterAppStateChangeNotification", unregister_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "RegisterAppConstrainedChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "UnregisterAppConstrainedChangeNotification", unregister_app_notification), EXPORT_AS("msvcp140.dll", "?_Random_device@std@@YAIXZ", random_device), EXPORT("gameinput.dll", GameInputCreate), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(WaitForMultipleObjects), K(ExitThread), K(FreeLibraryAndExitThread),
+        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), EXPORT_AS("gameinput.dll", "#1", GameInputCreate), K(CreateMutexA), K(ReleaseMutex), K(InitializeCriticalSection), EXPORT_AS("kernel32.dll", "SetThreadPriority", set_ok), EXPORT_AS("kernel32.dll", "SetProcessPriorityBoost", set_ok), EXPORT_AS("kernel32.dll", "GetThreadPriority", thread_priority), EXPORT_AS("kernel32.dll", "ResumeThread", resume_thread), EXPORT_AS("kernel32.dll", "SuspendThread", suspend_thread), K(GetThreadGroupAffinity), K(SetThreadGroupAffinity), K(GetProcessId), K(OpenProcess), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "RegisterAppStateChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "UnregisterAppStateChangeNotification", unregister_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "RegisterAppConstrainedChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "UnregisterAppConstrainedChangeNotification", unregister_app_notification), EXPORT_AS("msvcp140.dll", "?_Random_device@std@@YAIXZ", random_device), EXPORT("gameinput.dll", GameInputCreate), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(WaitForMultipleObjects), K(ExitThread), K(FreeLibraryAndExitThread),
         K(GetExitCodeThread), EXPORT("advapi32.dll", OpenProcessToken), EXPORT("advapi32.dll", OpenThreadToken), K(DecodePointer),
     };
 }

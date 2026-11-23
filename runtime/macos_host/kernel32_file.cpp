@@ -76,6 +76,26 @@ int SetFilePointerEx(HANDLE h, int64_t distance, int64_t* pos, uint32_t method) 
     if (pos) *pos = r;
     return 1;
 }
+int GetFileSizeEx(HANDLE h, int64_t* size) {
+    struct stat st;
+    if (fstat(fd_of(h), &st) != 0) return failed();
+    *size = st.st_size;
+    return 1;
+}
+uint32_t GetFileSize(HANDLE h, uint32_t* high) {
+    int64_t size = 0;
+    if (!GetFileSizeEx(h, &size)) return 0xFFFFFFFFu;
+    if (high) *high = static_cast<uint32_t>(size >> 32);
+    return static_cast<uint32_t>(size);
+}
+int GetFileTime(HANDLE h, uint64_t* created, uint64_t* accessed, uint64_t* written) {
+    struct stat st;
+    if (fstat(fd_of(h), &st) != 0) return failed();
+    if (created) *created = filetime(st.st_birthtimespec);
+    if (accessed) *accessed = filetime(st.st_atimespec);
+    if (written) *written = filetime(st.st_mtimespec);
+    return 1;
+}
 int SetEndOfFile(HANDLE h) {
     off_t at = lseek(fd_of(h), 0, SEEK_CUR);
     return at >= 0 && ftruncate(fd_of(h), at) == 0 ? 1 : failed();
@@ -225,7 +245,7 @@ int FindClose(HANDLE h) {
 Exports kernel32_file_exports() {
     return {
         K(GetFileAttributesW), K(GetFileAttributesExW), K(CreateDirectoryW), K(CreateDirectoryExW), K(CopyFileW),
-        K(MoveFileExW), K(SetFilePointerEx), K(SetEndOfFile), K(FlushFileBuffers), K(GetFileInformationByHandle),
+        K(MoveFileExW), K(SetFilePointerEx), K(GetFileSizeEx), K(GetFileSize), K(GetFileTime), K(SetEndOfFile), K(FlushFileBuffers), K(GetFileInformationByHandle),
         K(GetFileInformationByHandleEx), K(GetCurrentDirectoryW), K(SetCurrentDirectoryW), K(GetFullPathNameW),
         K(GetFinalPathNameByHandleW), K(SetFileInformationByHandle), K(FindFirstFileExW), K(FindFirstFileW),
         K(FindNextFileW), K(FindClose),

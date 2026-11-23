@@ -1,5 +1,5 @@
 // The UCRT pieces a retail game imports that differ from the host libc (32-bit long, UTF-16 wchar_t, the MS rand),
-// plus GameInputCreate by ordinal. Exit code 0, or the number of the first check that failed.
+// plus GameInputCreate by ordinal and a ReadFile at an OVERLAPPED offset. Exit code 0, or the number of the first check that failed.
 #include <windows.h>
 #include <math.h>
 #include <stdio.h>
@@ -32,5 +32,17 @@ int main(void) {
     CreateFn create = (CreateFn)GetProcAddress(LoadLibraryA("GameInput.dll"), MAKEINTRESOURCEA(1));
     void* input = NULL;
     if (!create || create(&input) != S_OK || !input) return 10;
+    HANDLE f = CreateFileW(L"crt_probe.tmp", GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    DWORD n = 0;
+    char got[3] = {0};
+    OVERLAPPED at = {0};
+    at.Offset = 4;  // a read at an OVERLAPPED offset, not the file position
+    if (f == INVALID_HANDLE_VALUE || !WriteFile(f, "abcdefg", 7, &n, NULL) || !ReadFile(f, got, 2, &n, &at) ||
+        n != 2 || got[0] != 'e' || at.InternalHigh != 2)
+        return 11;
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(f, &size) || size.QuadPart != 7) return 12;
+    CloseHandle(f);
+    DeleteFileW(L"crt_probe.tmp");
     return 0;
 }

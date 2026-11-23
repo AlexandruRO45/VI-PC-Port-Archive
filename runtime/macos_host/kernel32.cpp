@@ -34,13 +34,28 @@ HANDLE GetStdHandle(uint32_t which) {
         default: return kInvalid;
     }
 }
-int WriteFile(HANDLE h, const void* buf, uint32_t n, uint32_t* written, void*) {
-    ssize_t r = write(static_cast<Object*>(h)->fd, buf, n);
+// An OVERLAPPED (Internal, InternalHigh, Offset, OffsetHigh, hEvent) names the file offset; the transfer is done
+// synchronously, so the call completes at once with the status and count filled in and the event set (the low bit of hEvent only asks for no completion port).
+// ponytail: no real async I/O; a reader that waits on the event or GetOverlappedResult sees it already done.
+static ssize_t transfer(HANDLE h, void* buf, uint32_t n, uint8_t* ov, bool write_it) {
+    const int fd = static_cast<Object*>(h)->fd;
+    if (!ov) return write_it ? write(fd, buf, n) : read(fd, buf, n);
+    const off_t at = static_cast<off_t>(*reinterpret_cast<uint32_t*>(ov + 16) |
+                                        uint64_t{*reinterpret_cast<uint32_t*>(ov + 20)} << 32);
+    const ssize_t r = write_it ? pwrite(fd, buf, n, at) : pread(fd, buf, n, at);
+    if (r >= 0) lseek(fd, at + r, SEEK_SET);  // a synchronous handle moves its position past the transfer
+    *reinterpret_cast<uint64_t*>(ov) = r < 0 ? 0xC0000185 /* STATUS_IO_DEVICE_ERROR */ : 0;
+    *reinterpret_cast<uint64_t*>(ov + 8) = r < 0 ? 0 : static_cast<uint64_t>(r);
+    if (HANDLE e = *reinterpret_cast<HANDLE*>(ov + 24)) set_signal(reinterpret_cast<HANDLE>(reinterpret_cast<uintptr_t>(e) & ~uintptr_t{1}));
+    return r;
+}
+int WriteFile(HANDLE h, const void* buf, uint32_t n, uint32_t* written, void* ov) {
+    ssize_t r = transfer(h, const_cast<void*>(buf), n, static_cast<uint8_t*>(ov), true);
     if (written) *written = r < 0 ? 0 : static_cast<uint32_t>(r);
     return r >= 0;
 }
-int ReadFile(HANDLE h, void* buf, uint32_t n, uint32_t* got, void*) {
-    ssize_t r = read(static_cast<Object*>(h)->fd, buf, n);
+int ReadFile(HANDLE h, void* buf, uint32_t n, uint32_t* got, void* ov) {
+    ssize_t r = transfer(h, buf, n, static_cast<uint8_t*>(ov), false);
     if (got) *got = r < 0 ? 0 : static_cast<uint32_t>(r);
     return r >= 0;
 }
@@ -362,7 +377,7 @@ Exports kernel32_exports() {
         K(GetStdHandle), K(WriteFile), K(ReadFile), K(ExitProcess), K(TerminateProcess), K(GetLastError),
         K(GetProcessHeap), K(HeapAlloc), K(HeapFree), K(VirtualAlloc), K(VirtualQuery), K(VirtualFree), K(TlsAlloc),
         K(TlsGetValue), K(TlsSetValue), K(CreateThread), K(CloseHandle), K(Sleep),
-        K(QueryPerformanceCounter), K(GetSystemTimeAsFileTime), K(CreateFileW), K(GetCommandLineA),
+        K(QueryPerformanceCounter), K(GetSystemTimeAsFileTime), EXPORT_AS("kernel32.dll", "GetSystemTimePreciseAsFileTime", GetSystemTimeAsFileTime), K(CreateFileW), K(GetCommandLineA),
         K(GetCurrentProcess), K(GetCurrentProcessId), K(GetCurrentThreadId),
         K(GetTempPathA), K(SetCurrentDirectoryA), K(InitializeSListHead), K(IsDebuggerPresent),
         K(IsProcessorFeaturePresent), K(SetUnhandledExceptionFilter), K(UnhandledExceptionFilter),
