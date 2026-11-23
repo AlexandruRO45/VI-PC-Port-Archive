@@ -390,8 +390,10 @@ class MainTest(unittest.TestCase):
         return [WINDOWS_ROOT + "/artifact/" + name]
 
     def run_main(self, entries, *extra, stderr=False):
-        listing = self.list_tests(entries)
-        argv = ["run_wine_tests.py", "--tests", listing, "--windows-root", WINDOWS_ROOT,
+        return self.run_main_listing(self.list_tests(entries), *extra)
+
+    def run_main_listing(self, listing, *extra):
+        argv = ["run_wine_tests.py", "--tests", str(listing), "--windows-root", WINDOWS_ROOT,
                 "--root", str(self.root), "--wine", sys.executable.replace(os.sep, "/"), *extra]
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -402,6 +404,33 @@ class MainTest(unittest.TestCase):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "ok")
         self.assertEqual(code, 0)
         self.assertIn("1 passed, 0 failed, 0 skipped under Wine (1 tests)", out)
+
+    def test_inventory_encodings_launch_the_required_test(self):
+        entry = ctest_entry("ok", self.command("ok.py"))
+        listing = Path(self.list_tests([entry]))
+        document = listing.read_text(encoding="utf-8")
+        for encoding, bom in (
+            ("utf-8", b""),
+            ("utf-8-sig", b""),
+            ("utf-16-le", b"\xff\xfe"),
+            ("utf-16-be", b"\xfe\xff"),
+        ):
+            with self.subTest(encoding=encoding):
+                listing.write_bytes(bom + document.encode(encoding))
+                code, out, err = self.run_main_listing(listing, "--require", "ok")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(err, "")
+                self.assertIn("[PASS] ok", out)
+
+    def test_a_truncated_utf16_inventory_is_rejected_before_launch(self):
+        listing = self.root / "ctest.json"
+        listing.write_bytes(b"\xff\xfe\x00")
+        with mock.patch.object(rwt, "run_test") as launch:
+            code, _, err = self.run_main_listing(listing)
+        self.assertEqual(code, 2)
+        self.assertIn(f"ERROR: cannot read {listing}", err)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        launch.assert_not_called()
 
     def test_a_required_test_that_fails_exits_one(self):
         code, out, _ = self.run_main([ctest_entry("bad", self.command("bad.py"))], "--require", "bad")

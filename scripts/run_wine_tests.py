@@ -260,8 +260,11 @@ def valid_test_row(test) -> bool:
 def read_tests(path: str) -> list[dict] | None:
     """The tests in a `ctest --show-only=json-v1` file, or None when it is not one."""
     try:
-        with open(path, encoding="utf-8-sig") as f:
-            doc = json.load(f)
+        with open(path, "rb") as f:
+            data = f.read()
+        # Windows PowerShell can save redirected output as UTF-16 with a BOM.
+        encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+        doc = json.loads(data.decode(encoding))
     except (OSError, ValueError) as e:
         print(f"ERROR: cannot read {path}: {e}", file=sys.stderr)
         return None
