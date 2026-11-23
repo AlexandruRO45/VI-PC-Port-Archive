@@ -481,5 +481,48 @@ class TestRegisterAliasing(unittest.TestCase):
         self.assertEqual(state.get_sgpr_pair(10), 0x33333333_44444444)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestConditionCodes(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes, status flags, and carry/borrow generation."""
+
+    def test_scc_asserted_when_new_exec_nonzero(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        state.exec_mask = 1
+        instr = SXnorSaveexecInstruction(
+            dst=Register64(RegKind.SGPR_PAIR, 6),
+            src0=Immediate64(1),
+        )
+        _, _, scc = interp.execute(instr, state)
+        self.assertEqual(scc, 1)
+
+    def test_scc_cleared_when_new_exec_zero(self) -> None:
+        state = ScalarMachineState()
+        interp = ScalarInterpreter()
+
+        old_exec = 0x12345678_9ABCDEF0
+        s0 = ~old_exec & ALL64
+
+        instr = SXnorSaveexecInstruction(
+            dst=Register64(RegKind.SGPR_PAIR, 6),
+            src0=Immediate64(s0),
+        )
+        state.exec_mask = old_exec
+        new_exec, _, scc = interp.execute(instr, state)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+
+    def test_hardware_scc_generation(self) -> None:
+        _, hw_scc0, _, _ = run_hw_xnor_saveexec(ALL64, 0)
+        self.assertEqual(hw_scc0, 0)
+
+        _, hw_scc1, _, _ = run_hw_xnor_saveexec(ALL64, ALL64)
+        self.assertEqual(hw_scc1, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
