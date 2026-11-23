@@ -21,7 +21,7 @@ and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json).
 
 Usage:
     python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms] [--disasm]
-                                [--mcpu gfx1013] [--jobs N]
+                                [--program-sha256-file FILE] [--mcpu gfx1013] [--jobs N]
     python -I shader_library.py <shaders.rpf> --save library.bin       # the reassembled file, nothing else
 
 DIR/library.json gets the header, both pipeline tables (stage -> program name) and the per-program stage. Programs
@@ -36,6 +36,7 @@ import struct
 import sys
 import zlib
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fspx_unpack  # noqa: E402
@@ -245,6 +246,40 @@ def program_name(i: int, stages) -> str:
     return f"lib_{st}_{i:05d}"
 
 
+def read_program_hashes(path: str) -> set[str]:
+    hashes = set()
+    try:
+        with open(path, encoding="ascii") as stream:
+            for number, line in enumerate(stream, 1):
+                digest = line.strip()
+                if not digest:
+                    continue
+                if not re.fullmatch(r"[0-9A-Fa-f]{64}", digest):
+                    raise LibraryError(f"program hash list line {number}: expected one SHA-256 digest")
+                hashes.add(digest.lower())
+    except (OSError, UnicodeError) as exc:
+        raise LibraryError(f"cannot read program hash list: {exc}") from exc
+    if not hashes:
+        raise LibraryError("program hash list is empty")
+    return hashes
+
+
+def select_program_hashes(b: bytes, lib: dict, programs, hashes: set[str]) -> list[int]:
+    """Match the entire kind-6 payload, including its prologue and padding, as the runtime does."""
+    selected = []
+    remaining = hashes.copy()
+    code = memoryview(b)[lib["layout"]["code"]:]
+    for i in programs:
+        offset, size = lib["programs"][i]
+        digest = sha256(code[offset:offset + size]).hexdigest()
+        if digest in hashes:
+            selected.append(i)
+            remaining.discard(digest)
+    if remaining:
+        raise LibraryError(f"{len(remaining)} of {len(hashes)} requested program hashes are not in the selected stages")
+    return selected
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the pipeline library stored in shaders.rpf.")
     ap.add_argument("src", help="shaders.rpf, or a library file written with --save")
@@ -252,6 +287,7 @@ def main(argv=None) -> int:
     ap.add_argument("--save", help="write the reassembled library file here")
     ap.add_argument("--stages", default="cs,ps,vs,ms",
                     help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot)")
+    ap.add_argument("--program-sha256-file", help="one exact kind-6 SHA-256 per line; requires a new --out without --save")
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
     ap.add_argument("--mcpu", default="gfx1013", help="llvm-mc CPU for --disasm (default gfx1013)")
     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
@@ -264,6 +300,9 @@ def main(argv=None) -> int:
         ap.error("--jobs must be at least 1")
     if not a.out and not a.save:
         ap.error("give --out, --save or both")
+    if a.program_sha256_file and (not a.out or a.save):
+        ap.error("--program-sha256-file requires --out without --save")
+    hashes = read_program_hashes(a.program_sha256_file) if a.program_sha256_file else None
     with open(a.src, "rb") as f:
         head = f.read(4)
         f.seek(0)
@@ -285,6 +324,15 @@ def main(argv=None) -> int:
         print(f"library: {len(b)} bytes written to {a.save}")
         return 0
     want = None if a.stages == "all" else set(a.stages.split(","))
+    program_ids = (i for i in range(lib["header"]["programs"])
+                   if want is None or not want.isdisjoint(lib["stage"].get(i, ())))
+    if hashes is not None:
+        program_ids = select_program_hashes(b, lib, program_ids, hashes)
+        # rdna2spirv takes the listings in this folder; reusing it would also translate stale programs.
+        try:
+            os.makedirs(a.out)
+        except OSError as exc:
+            raise LibraryError(f"cannot create a new filtered output folder: {exc}") from exc
     os.makedirs(os.path.join(a.out, "fspx"), exist_ok=True)
     disasm = None
     if a.disasm:
@@ -295,11 +343,9 @@ def main(argv=None) -> int:
     sources = carve_digests(a.carve) if a.carve else None
     cs_state = {c["program"]: c["state"] for c in lib["compute"]}
     index, written, work = [], 0, []
-    for i in range(lib["header"]["programs"]):
+    for i in program_ids:
         stages = lib["stage"].get(i, set())
         st = "+".join(sorted(stages)) if stages else "unused"
-        if want is not None and not stages & want:
-            continue
         code = program(b, lib, i)
         start, end = code_range(code)
         meta = {"program": i, "stage": st, "offset": lib["programs"][i][0], "size": len(code),

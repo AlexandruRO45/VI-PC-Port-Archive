@@ -120,6 +120,10 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
   interface.
 * `--save` writes the reassembled library. A saved file is also accepted as input.
 * `--stages` limits the output to some stages.
+* `--program-sha256-file <work>/missing.txt` extracts and disassembles only the selected programs. Supply one
+  exact kind-6 SHA-256 per line (the key from the runtime's FSPX lookup-miss message, not the DXBC `HASH` part).
+  The digest covers the complete payload, including prologue and padding. Use a new `--out` without `--save`;
+  if a requested digest is absent from the selected stages, the tool refuses before writing any output.
 
 The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest

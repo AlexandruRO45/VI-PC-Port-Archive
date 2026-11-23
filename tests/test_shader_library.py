@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from hashlib import sha256
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -233,6 +234,53 @@ class Main(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
                              ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
+
+    def test_program_hash_filter_exports_only_the_exact_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, ids, out = (os.path.join(tmp, name) for name in ("lib.bin", "hashes.txt", "out"))
+            code = prog(0x77778888, 3)
+            with open(src, "wb") as f:
+                f.write(sample())
+            with open(ids, "w", encoding="utf-8", newline="\n") as f:
+                f.write("\n" + sha256(code).hexdigest().upper() + "\n")
+            rc, _ = self.run_main(src, "--out", out, "--program-sha256-file", ids)
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual([e["program"] for e in json.load(f)], [3])
+            self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
+                             ["lib_cs_00003.code", "lib_cs_00003.json"])
+            with open(os.path.join(out, "fspx", "lib_cs_00003.code"), "rb") as f:
+                self.assertEqual(f.read(), code)
+
+    def test_program_hash_filter_never_publishes_an_incomplete_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, ids, out = (os.path.join(tmp, name) for name in ("lib.bin", "hashes.txt", "out"))
+            with open(src, "wb") as f:
+                f.write(sample())
+            both = "\n".join((sha256(prog(0x77778888, 3)).hexdigest(), sha256(prog(0x11112222)).hexdigest()))
+            for text in ("", "not a SHA-256", both):
+                with self.subTest(text=text):
+                    with open(ids, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(text + "\n")
+                    with self.assertRaises(sl.LibraryError):
+                        self.run_main(src, "--out", out, "--stages", "cs", "--program-sha256-file", ids)
+                    self.assertFalse(os.path.exists(out))
+
+    def test_program_hash_filter_refuses_stale_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, ids, out = (os.path.join(tmp, name) for name in ("lib.bin", "hashes.txt", "out"))
+            with open(src, "wb") as f:
+                f.write(sample())
+            with open(ids, "w", encoding="utf-8", newline="\n") as f:
+                f.write(sha256(prog(0x77778888, 3)).hexdigest() + "\n")
+            disasm = os.path.join(out, "disasm")
+            os.makedirs(disasm)
+            with open(os.path.join(disasm, "old.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("; old listing\n")
+            with self.assertRaises(sl.LibraryError):
+                self.run_main(src, "--out", out, "--program-sha256-file", ids)
+            self.assertEqual(os.listdir(out), ["disasm"])
+            self.assertEqual(os.listdir(disasm), ["old.s"])
 
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
