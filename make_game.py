@@ -1995,7 +1995,7 @@ for arg in "$@"; do
         --dry-run|--init|--run) mode_count=$((mode_count + 1)) ;;
         --trace-d3d12) ;;
         --overlay) has_overlay=1; expect_val=1 ;;
-        --trace|--game-dir|--mods|--view-mode-getter|--archetype-lookup) expect_val=1 ;;
+        --trace|--log|--game-dir|--mods|--view-mode-getter|--archetype-lookup) expect_val=1 ;;
         -*) ;;
         *) has_image=1 ;;
     esac
@@ -2027,7 +2027,7 @@ if [ "$mode_count" -eq 1 ] && [ "$has_image" -eq 0 ] && [ "$expect_val" -eq 0 ];
         elif [ "$in_game_args" -eq 0 ]; then
             case "$arg" in
                 --) in_game_args=1 ;;
-                --trace|--game-dir|--overlay|--mods) resolve_next=1 ;;
+                --trace|--log|--game-dir|--overlay|--mods) resolve_next=1 ;;
             esac
         fi
         set -- "$@" "$arg"

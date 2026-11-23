@@ -326,6 +326,12 @@ class RuntimePackagingTest(unittest.TestCase):
                          "--", "--trace", "game arg", "two words"], "vulkan"),
             (["--trace-d3d12", "--run"],
              self.game, ["./" + image, "--overlay", overlay, "--trace-d3d12", "--run"], "vulkan"),
+            (["--run", "--log", "run.log"],
+             self.game, ["--run", "./" + image, "--overlay", overlay,
+                         "--log", "Z:" + caller + "/run.log"], "vulkan"),
+            (["--run", "--log", "Z:\\tmp\\run.log", "--trace", "boot.jsonl"],
+             self.game, ["--run", "./" + image, "--overlay", overlay,
+                         "--log", "Z:\\tmp\\run.log", "--trace", "Z:" + caller + "/boot.jsonl"], "vulkan"),
             # Explicit image path, multiple modes, missing option value, or mode only after -- stay pass-through.
             (["--run", "--trace-d3d12", "other.exe"],
              caller, ["--run", "--trace-d3d12", "other.exe"], None),
@@ -333,6 +339,8 @@ class RuntimePackagingTest(unittest.TestCase):
              caller, ["--dry-run", "--run"], None),
             (["--run", "--trace"],
              caller, ["--run", "--trace"], None),
+            (["--run", "--log"],
+             caller, ["--run", "--log"], None),
             (["--", "--run"],
              caller, ["--", "--run"], None),
         ]
