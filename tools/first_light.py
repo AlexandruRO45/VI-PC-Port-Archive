@@ -585,9 +585,23 @@ def uv_probes(vertices, indices, width: int, height: int, limit: int = 4) -> lis
     return found
 
 
+def refresh_linux_harness(build: str) -> None:
+    """Bring vk_harness in a configured runtime/build/linux up to date, so a harness older than the checkout is not
+    run silently (#7148: one without VKH_DRAW_MESH draws nothing). Ninja makes this a no-op when nothing changed."""
+    linux = os.path.join(build, "linux")
+    if os.name == "nt" or not shutil.which("cmake") or not os.path.isfile(os.path.join(linux, "CMakeCache.txt")):
+        return
+    result = subprocess.run(["cmake", "--build", linux, "--target", "vk_harness"], check=False)
+    if result.returncode:
+        raise SystemExit(f"vk_harness: cmake --build {linux} --target vk_harness failed (exit {result.returncode}); "
+                         "fix the build, or pass --harness/LEONIDA_VK_HARNESS to use another harness")
+
+
 def find_harness(explicit: str | None) -> str:
     executable = "vk_harness.exe" if os.name == "nt" else "vk_harness"
     build = os.path.join(ROOT, "runtime", "build")
+    if not any(c and os.path.isfile(c) for c in (explicit, os.environ.get("LEONIDA_VK_HARNESS"))):
+        refresh_linux_harness(build)
     build_dirs = (os.path.join(build, "linux"), os.path.join(build, "windows"), build)
     for candidate in (
         explicit,

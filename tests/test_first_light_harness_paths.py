@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -48,6 +49,49 @@ class FirstLightHarnessPathsTests(unittest.TestCase):
         self.assertEqual(first_light.find_harness(str(explicit) + ".missing"), str(environment))
         environment.unlink()
         self.assertEqual(first_light.find_harness(None), str(configured))
+
+    def configure_linux_build(self) -> Path:
+        linux = self.root / "runtime" / "build" / "linux"
+        linux.mkdir(parents=True, exist_ok=True)
+        (linux / "CMakeCache.txt").touch()
+        return linux
+
+    def test_a_configured_linux_build_is_brought_up_to_date(self) -> None:
+        # #7148: a vk_harness older than the checkout drew nothing; the build is a no-op when it is current.
+        linux = self.configure_linux_build()
+        harness = self.put_harness("runtime", "build", "linux")
+        with patch.object(first_light.os, "name", "posix"), \
+                patch.object(first_light.shutil, "which", return_value="/usr/bin/cmake"), \
+                patch.object(first_light.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertEqual(first_light.find_harness(None), str(harness))
+        run.assert_called_once_with(["cmake", "--build", str(linux), "--target", "vk_harness"], check=False)
+
+    def test_a_failed_harness_build_stops_with_the_command(self) -> None:
+        self.configure_linux_build()
+        self.put_harness("runtime", "build", "linux")
+        with patch.object(first_light.os, "name", "posix"), \
+                patch.object(first_light.shutil, "which", return_value="/usr/bin/cmake"), \
+                patch.object(first_light.subprocess, "run", return_value=subprocess.CompletedProcess([], 2)):
+            with self.assertRaises(SystemExit) as ctx:
+                first_light.find_harness(None)
+        self.assertIn("--target vk_harness failed (exit 2)", str(ctx.exception))
+
+    def test_an_explicit_harness_is_used_as_is(self) -> None:
+        self.configure_linux_build()
+        explicit = self.put_harness("explicit")
+        with patch.object(first_light.os, "name", "posix"), \
+                patch.object(first_light.shutil, "which", return_value="/usr/bin/cmake"), \
+                patch.object(first_light.subprocess, "run") as run:
+            self.assertEqual(first_light.find_harness(str(explicit)), str(explicit))
+        run.assert_not_called()
+
+    def test_no_build_without_a_configured_tree(self) -> None:
+        harness = self.put_harness("runtime", "build", "linux")
+        with patch.object(first_light.os, "name", "posix"), \
+                patch.object(first_light.shutil, "which", return_value="/usr/bin/cmake"), \
+                patch.object(first_light.subprocess, "run") as run:
+            self.assertEqual(first_light.find_harness(None), str(harness))
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

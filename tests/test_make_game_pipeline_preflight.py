@@ -185,12 +185,25 @@ class LinuxPipelineCheckTest(PreflightEnv, unittest.TestCase):
             self.assert_preflight_fails(["shaders", "pipelines"], "llvm-mc")
         build.assert_not_called()
 
-    def test_a_built_checker_is_not_rebuilt(self):
+    def test_a_built_checker_outside_a_build_tree_is_not_rebuilt(self):
         self.write_shader_index()
-        with mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
+        with mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
                 mock.patch.object(make_game, "build_pipeline_check") as build:
             make_game.preflight(["pipelines"], self.work)
         build.assert_not_called()
+
+    def test_a_checker_in_a_configured_linux_build_is_brought_up_to_date(self):
+        # #7148: a vk_pipeline_check older than the checkout ran silently; the build is a no-op when it is current.
+        self.write_shader_index()
+        linux = os.path.join(self.root, "runtime", "build", "linux")
+        os.makedirs(linux)
+        open(os.path.join(linux, "CMakeCache.txt"), "w", encoding="utf-8").close()
+        with mock.patch.object(make_game, "ROOT", self.root), \
+                mock.patch.object(make_game, "pipeline_check_exe", return_value="/bin/vk_pipeline_check"), \
+                mock.patch.object(make_game, "build_pipeline_check") as build:
+            make_game.preflight(["pipelines"], self.work, jobs=2)
+        build.assert_called_once_with(2)
 
     def test_the_build_uses_the_readme_folder(self):
         with mock.patch.object(make_game, "ROOT", self.root), \
