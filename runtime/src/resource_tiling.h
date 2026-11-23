@@ -11,7 +11,9 @@
 // be packed, depending on the IHV"): where the packed tail starts, and how many tiles the packed mips take. Here
 // a mip stays standard while it is wider than half the tile or taller than the tile (depth does not count), as
 // AMD's PC runtime does on RDNA2 and RDNA4 (D3D-65; the console is AMD): measured on the 47 layouts of #868, see
-// resource_tiling_test. A standard mip may be smaller than a tile and then takes one tile on that axis. An NVIDIA
+// resource_tiling_test. For the split AMD rounds a mip's size up, ceil(size / 2^mip): a 129-wide mip 1 is 65 wide,
+// so an NPOT chain can keep one more standard mip than the floor sizes would. A texture with a single mip is never
+// packed (WARP agrees). A standard mip may be smaller than a tile and then takes one tile on that axis. An NVIDIA
 // GPU packs from the first mip smaller than a tile on any axis and WARP packs nothing; the test accepts all of
 // them. The packed tail takes one tile per tile-depth slice it spans: ceil(depth of the first packed mip / tile
 // depth), so 1 for 2D, as AMD's PC runtime reports on RDNA2 and RDNA4 (those 47 and 32 deeper volumes, see
@@ -136,7 +138,8 @@ inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
     const std::uint32_t layers = volume ? 1 : desc.depth_or_layers;
     const std::uint32_t depth = volume ? desc.depth_or_layers : 1;
 
-    // One array slice: standard mips while wider than half a tile or taller than a tile, then the packed tail.
+    // One array slice: standard mips while wider than half a tile or taller than a tile (sizes rounded up), then the
+    // packed tail. A single mip is never packed.
     std::vector<SubresourceTiling> slice(desc.mips);
     std::uint64_t standard_tiles = 0, packed_bytes = 0;
     std::uint32_t tail_depth = 0;   // depth of the first packed mip
@@ -144,7 +147,10 @@ inline bool resource_tiling(const TilingDesc& desc, ResourceTiling& out) {
         const std::uint64_t w = mip >= 64 ? 1 : std::max<std::uint64_t>(1, desc.width >> mip);
         const std::uint32_t h = mip >= 32 ? 1u : std::max(1u, desc.height >> mip);
         const std::uint32_t d = mip >= 32 ? 1u : std::max(1u, depth >> mip);
-        const bool standard = result.packed_mips == 0 && (w > result.shape.width / 2 || h > result.shape.height);
+        const std::uint64_t split_w = mip >= 64 ? 1 : ((desc.width - 1) >> mip) + 1;
+        const std::uint32_t split_h = mip >= 32 ? 1u : ((desc.height - 1) >> mip) + 1;
+        const bool standard = result.packed_mips == 0 &&
+                              (desc.mips == 1 || split_w > result.shape.width / 2 || split_h > result.shape.height);
         if (standard) {
             const std::uint64_t tw = up(w, result.shape.width);
             const std::uint64_t th = up(h, result.shape.height);

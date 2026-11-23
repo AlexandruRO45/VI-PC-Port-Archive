@@ -199,6 +199,21 @@ int main() {
         {"128x16x128 RGBA8 vol", {TiledKind::texture3d, 128, 16, 128, 8, 4, 1}, 3, 5, 1, 42},
         {"64x64x256 R8 vol", {TiledKind::texture3d, 64, 64, 256, 9, 1, 1}, 1, 8, 4, 16},
         {"32x16x64 RGBA16F vol", {TiledKind::texture3d, 32, 16, 64, 7, 8, 1}, 1, 6, 2, 4},
+        // Measured on an RX 6750 XT (RDNA2, gfx1031, driver 26.11.2) against the AMD PC runtime. A mip's size for the
+        // split is rounded up (129 wide is 65 at mip 1, so standard against half of a 128-texel tile), and a single
+        // mip is never packed (WARP agrees on those). The last three keep their split either way.
+        {"129x129 RGBA8", {TiledKind::texture2d, 129, 129, 1, 8, 4, 1}, 2, 6, 1, 5},
+        {"128x257 RG32F", {TiledKind::texture2d, 128, 257, 1, 9, 8, 1}, 3, 6, 1, 8},
+        {"257x16 BC6H", {TiledKind::texture2d, 257, 16, 1, 9, 16, 4}, 2, 7, 1, 3},
+        {"257x16 BC6H x3", {TiledKind::texture2d, 257, 16, 3, 9, 16, 4}, 2, 7, 1, 3},
+        {"33^3 RGBA8 vol", {TiledKind::texture3d, 33, 33, 33, 6, 4, 1}, 2, 4, 1, 13},
+        {"1x64 R16 1 mip", {TiledKind::texture2d, 1, 64, 1, 1, 2, 1}, 1, 0, 0, 0},
+        {"16x16 RGBA8 1 mip x4", {TiledKind::texture2d, 16, 16, 4, 1, 4, 1}, 1, 0, 0, 0},
+        {"1x1 RGBA8 1 mip", {TiledKind::texture2d, 1, 1, 1, 1, 4, 1}, 1, 0, 0, 0},
+        {"8^3 R8 vol 1 mip", {TiledKind::texture3d, 8, 8, 8, 1, 1, 1}, 1, 0, 0, 0},
+        {"100x60 R8", {TiledKind::texture2d, 100, 60, 1, 7, 1, 1}, 0, 7, 1, 0},
+        {"300x300 RGBA16F", {TiledKind::texture2d, 300, 300, 1, 9, 8, 1}, 3, 6, 1, 23},
+        {"1000x1000 BC1", {TiledKind::texture2d, 1000, 1000, 1, 10, 8, 4}, 2, 8, 1, 10},
     };
     for (const AmdCase& c : amd) {
         if (!resource_tiling(c.desc, t) || t.standard_mips != c.standard || t.packed_mips != c.packed ||
@@ -236,6 +251,8 @@ int main() {
     CHECK(!resource_tiling({TiledKind::texture2d, 128, 128, 1, 1, 16, 1u << 26}, t));
     // Buffer width near UINT64_MAX must not wrap in up().
     CHECK(!resource_tiling({TiledKind::buffer, ~std::uint64_t{0}}, t));
+    // Nor a texture's, where the split rounds mip sizes up.
+    CHECK(!resource_tiling({TiledKind::texture2d, ~std::uint64_t{0}, 1, 1, 2, 4, 1}, t));
     // mip >= 32 must clamp height/depth to 1 without shifting uint32_t by >= 32.
     CHECK(resource_tiling({TiledKind::texture2d, 1024, 1024, 1, 33, 4, 1}, t));
     CHECK(t.standard_mips == 4 && t.packed_mips == 29 && t.packed_tiles == 1 && t.total_tiles == 86);

@@ -2298,7 +2298,8 @@ The trace will enumerate them.
     The Xbox tiled layout word `0x101` is accepted as `64KB_UNDEFINED_SWIZZLE` (**Assumption**:
     that the console uses it for reserved resources too).
   - `GetResourceTiling`: the standard 64 KiB tile shapes, standard and packed mips (a mip stays standard while it is
-    wider than half the tile or taller than the tile, depth not counting, as AMD's PC runtime does on RDNA2 and RDNA4
+    wider than half the tile or taller than the tile, sizes rounded up, depth not counting, and a single mip is never
+    packed, as AMD's PC runtime does on RDNA2 and RDNA4
     and so, most likely, the console (D3D-65); an NVIDIA GPU packs from the first mip smaller than a tile on any axis.
     D3D11.3 functional spec 5.9.2.8.5 only requires that
     a mip filling a tile in every dimension stays standard, a smaller one "may or may not be packed, depending on the
@@ -2342,6 +2343,16 @@ The trace will enumerate them.
     where the bytes would fit in fewer (16x16x128 RGBA8: 8 tiles for 3 tiles of data). Those 32 are in the test too,
     79 layouts in all, identical on both GPUs. The console is RDNA2, so the layer follows this rule (D3D-65;
     **Assumption**: that the console's runtime splits like the PC's AMD driver).
+
+    In none of those layouts does rounding a mip's size up or down move it across half a tile. A sweep of random reserved textures against the AMD
+    PC runtime on an RX 6750 XT (RDNA2, driver 26.11.2) found two more parts of the rule. The split uses each mip's
+    size rounded up, `ceil(size / 2^mip)`, not the floor size the mip has: 129x129 RGBA8 keeps mip 1 (65 wide
+    against half of a 128-texel tile) standard, 2 standard mips where the floor sizes give 1, and the same for
+    128x257 RG32F (3, not 2), 257x16 BC6H (2, not 1) and a 33x33x33 RGBA8 volume (2, not 1). A texture with a single
+    mip is never packed: 1x1 RGBA8, 1x64 R16 or an 8x8x8 R8 volume report 1 standard mip and no packed tiles, as WARP
+    does too. The standard mips' tile counts still come from the real sizes. Those 12 layouts are in the test as
+    well; with them, about 2,200 random 2D and volume textures (seeds 2 and 3) give AMD's standard and packed counts,
+    packed start and tile counts.
   - `UpdateTileMappings` and `CopyTileMappings` bind pages in reserved buffers to default heaps from D3D-16.
     Sequential, NULL, SKIP and single-tile reuse ranges are supported. Queue timeline waits order binding between
     ordinary submissions, and the previous heap allocation is retained until an in-flight unbind completes.
