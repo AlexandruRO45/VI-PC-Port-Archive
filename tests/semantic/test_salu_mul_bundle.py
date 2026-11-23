@@ -403,5 +403,18 @@ class TestSMulHiI32SIMDAndWaveDivergence(unittest.TestCase):
         lanes = wave.broadcast_result(hi_val)
         self.assertTrue(all(l == 0xFFFFFFFF for l in lanes))
 
+class TestSMulHiI32IntegerOverflowExtremes(unittest.TestCase):
+    def test_int32_min_times_minus_one(self) -> None:
+        # -2147483648 * -1 = +2147483648 (0x00000000_80000000) -> high 32 bits is 0
+        self.assertEqual(ref_s_mul_hi_i32(0x80000000, 0xFFFFFFFF), 0)
+
+    def test_int32_max_times_int32_max(self) -> None:
+        # 0x7FFFFFFF * 0x7FFFFFFF = 0x3FFFFFFF_00000001 -> high 32 bits is 0x3FFFFFFF
+        self.assertEqual(ref_s_mul_hi_i32(0x7FFFFFFF, 0x7FFFFFFF), 0x3FFFFFFF)
+
+    def test_int32_min_times_int32_max(self) -> None:
+        # (-2^31) * (2^31 - 1) = -2^62 + 2^31 = 0xC0000000_80000000 -> high 32 bits is 0xC0000000
+        self.assertEqual(ref_s_mul_hi_i32(0x80000000, 0x7FFFFFFF), 0xC0000000)
+
 if __name__ == "__main__":
     unittest.main()
