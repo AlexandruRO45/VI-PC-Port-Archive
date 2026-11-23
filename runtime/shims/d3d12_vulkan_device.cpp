@@ -901,7 +901,8 @@ struct DeviceState {
         if (subgroups.lane_max < subgroups.lane_min) subgroups.lane_max = subgroups.lane_min;
         // D3D-121: Intel's D3D12 driver answers a fixed 16..16 on its older integrated GPUs, where Vulkan reports
         // the compiler's whole 8..32 choice. Measured on Xe-LP: UHD 770 (32.0.101.6129), Raptor Lake-S Mobile
-        // (101.7092) and Tiger Lake 0x9a78 (101.7088). Discrete Arc is not measured yet (TEST-57), so it keeps the
+        // (101.7092) and Tiger Lake 0x9a78 (101.7088). Discrete Arc answers the Vulkan range too (TEST-57, measured
+        // on Arc A770 0x56a0, 32.0.101.9150: 8..32 on both sides, host TotalLaneCount 16384), so it keeps the
         // Vulkan range. D3D-280: from Xe-LPG on the driver answers what Vulkan reports (Meteor Lake 0x7d55,
         // 32.0.101.6127: 8..32 on both sides), so there is no fixed answer to mirror and those lines keep the
         // Vulkan range too.

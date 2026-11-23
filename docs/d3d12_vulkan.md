@@ -2144,7 +2144,8 @@ The trace will enumerate them.
   (32.0.101.6129), Raptor Lake-S Mobile (101.7092) and Tiger Lake 0x9a78 (101.7088). From Xe-LPG on the driver
   answers the same range Vulkan reports (D3D-280, measured Meteor Lake 0x7d55 on 32.0.101.6127: 8..32 on both
   sides), so those lines keep the Vulkan range (Meteor/Arrow Lake device IDs 0x7d40-0x7dc5, Lunar Lake
-  0x64a0-0x64b6). Discrete Arc keeps the Vulkan range until it is measured (TEST-57).
+  0x64a0-0x64b6). Discrete Arc answers the Vulkan range too (TEST-57, measured on Arc A770 0x56a0,
+  32.0.101.9150: 8..32 on both sides, host `TotalLaneCount` 16384), so it keeps the Vulkan range.
   `TotalLaneCount` has no Vulkan equivalent: D3D12 counts every lane of the device, and the layer answers one full
   wave, so a game that sizes work from it plans for less parallelism than the GPU has, never more. Measured
   against the host PC runtime (616.86) on an RTX 5070: `S_OK` with `WaveOps` 1, lanes 32..32 and a total of 6144,
