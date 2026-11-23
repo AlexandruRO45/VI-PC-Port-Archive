@@ -159,6 +159,12 @@ class GuidSites(unittest.TestCase):
         self.assertEqual(len(r["queue_descs"]), 2)
         self.assertEqual(r["guid_candidates"][0]["value"], str(UNKNOWN))
 
+    def test_queue_desc_priorities_are_the_d3d12_values(self):
+        for priority in (0, 100, 10000):   # D3D12_COMMAND_QUEUE_PRIORITY_NORMAL/HIGH/GLOBAL_REALTIME
+            self.assertTrue(sites.queue_desc_shaped(struct.pack("<IIII", 2, priority, 1, 0)), priority)
+        for priority in (1, 2, 0x80000000, 0xFFFFFFFF):
+            self.assertFalse(sites.queue_desc_shaped(struct.pack("<IIII", 2, priority, 1, 0)), priority)
+
     def test_guid_shaped_rejects_non_guids(self):
         self.assertFalse(sites.guid_shaped(b"\0" * 16))
         self.assertFalse(sites.guid_shaped(b"\x01" * 16))  # constant fill

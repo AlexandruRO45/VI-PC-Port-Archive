@@ -265,7 +265,7 @@ def queue_desc_shaped(blob: bytes) -> bool:
     t, p, flags, node = struct.unpack_from("<IIII", blob)
     if t > 15 or node > 1:  # console list types stay small; a title queues on one node
         return False
-    if p not in (0, 1, 2, 0xFFFFFFFF, 0x80000000):  # NORMAL/HIGH/GLOBAL_REALTIME/"-1"/OR-ed
+    if p not in (0, 100, 10000):  # D3D12_COMMAND_QUEUE_PRIORITY_NORMAL/HIGH/GLOBAL_REALTIME
         return False
     return flags <= 0x3  # D3D12_COMMAND_QUEUE_FLAG_NONE/ALLOW_GPU_TIMEOUT/DISABLE_GPU_TIMEOUT
 
