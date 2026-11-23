@@ -7,7 +7,8 @@ an input or another output.
 case-insensitive macOS volume also case-folded and with composed and decomposed accents treated alike) or when both
 exist and `os.path.samefile` says they are one file (a hard link, another spelling the name rules missed). Neither
 path has to exist: two report paths that don't exist yet still collide when they differ only in case on a volume that
-ignores case. Where the name rules cannot tell, `same_name_on_folding_volume` asks the volume itself with one
+ignores case, or when one ends in a trailing space or dot on Windows (Win32 drops both from the last component).
+Where the name rules cannot tell, `same_name_on_folding_volume` asks the volume itself with one
 scratch folder: a Linux mount that folds case (vfat, exFAT, CIFS) answers neither `normcase` nor `pathconf`.
 Standard library only; no game data.
 """
@@ -47,6 +48,11 @@ def _resolved_key(path):
     # posixpath and keeps case; on Windows ntpath lowercases. Resolving a simulated
     # macOS path through ntpath would hide the case-sensitive branch under test.
     path = posixpath.normcase(path) if sys.platform == "darwin" else os.path.normcase(path)
+    if sys.platform == "win32":
+        # Win32 drops trailing spaces and dots from the last component, so `write "x.json."` writes x.json.
+        # realpath only resolves that once the file exists; two reports that do not exist yet would pass.
+        head, tail = os.path.split(path)
+        path = os.path.join(head, tail.rstrip(" ."))
     if case_insensitive_volume(path):
         # APFS and HFS+ also treat composed and decomposed accents as one name.
         return unicodedata.normalize("NFD", path.casefold())
