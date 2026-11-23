@@ -9,6 +9,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tracemalloc
+from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
@@ -39,14 +41,15 @@ class SceneBuildTests(unittest.TestCase):
         (self.models / filename).write_text(obj, encoding="utf-8", newline="\n")
         self.items.append({"Name": name, "File": filename, "MeshShaders": [0]})
 
-    def build_scene(self, rows, max_props, radius=20, center=(0, 0)):
-        (self.models / "manifest.json").write_text(json.dumps({"Items": self.items}), encoding="utf-8", newline="\n")
+    def build_scene(self, rows, max_props, radius=20, center=(0, 0), *, models_root=None, encoding="utf-8"):
+        (self.models / "manifest.json").write_text(json.dumps({"Items": self.items}, ensure_ascii=False),
+                                                   encoding=encoding, newline="\n")
         placements = self.root / "entities.jsonl"
         placements.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8", newline="\n")
         scene = self.root / "scene.bin"
         result = subprocess.run(
             [sys.executable, "-I", sandbox_scene.__file__, "--entities", str(placements),
-             "--models", str(self.models), *(["--center", *map(str, center)] if center is not None else []),
+             "--models", str(models_root or self.models), *(["--center", *map(str, center)] if center is not None else []),
              "--radius", str(radius),
              "--max-props", str(max_props), "--out", str(scene)],
             capture_output=True, text=True, timeout=30,
@@ -93,6 +96,56 @@ class SceneBuildTests(unittest.TestCase):
         rows.append(entity("synthetic_prop", 225, 25))
         meshes, positions, _ = self.build_scene(rows, max_props=1, center=None)
         self.assertEqual((meshes, positions), (1, [(225.0, 25.0, 0.0)]))
+
+    def test_resolves_colliding_names_from_complete_model_manifests_only(self):
+        fallback = "sandbox_synthetic_849b026611e0"
+        verified = "sandbox_synthetic_3c3a3afcb8f4"
+        self.assertEqual(world_names.joaat(fallback), world_names.joaat(verified))
+        self.assertNotEqual(world_names.hash64(fallback), world_names.hash64(verified))
+        self.add_model(fallback, "o empty\n")
+        self.add_model(verified)
+        self.add_model("synthétique")
+
+        # These earlier exports would win the exact key before the real model.
+        corrupt = self.root / "a_corrupt" / "models"
+        corrupt.mkdir(parents=True)
+        invalid_row = json.dumps({"Name": verified, "File": "not_present.obj"})
+        (corrupt / "manifest.json").write_text('{"Items": [' + invalid_row, encoding="utf-8", newline="\n")
+        textures = self.root / "b_textures" / "models"
+        textures.mkdir(parents=True)
+        (textures / "manifest.json").write_text(
+            json.dumps({"Items": [{"Name": verified, "Dir": "dictionary", "Textures": []}]}),
+            encoding="utf-8", newline="\n",
+        )
+
+        rows = [entity(fallback, 1), entity(fallback, 2, key=f"{world_names.hash64(verified):016x}"),
+                entity("synthétique", 3)]
+        meshes, positions, report = self.build_scene(rows, max_props=3, models_root=self.root, encoding="utf-8-sig")
+        self.assertEqual((meshes, positions), (2, [(2.0, 0.0, 0.0), (3.0, 0.0, 0.0)]))
+        self.assertIn("placed=2 unresolved=1", report)
+
+    def test_large_model_manifest_does_not_need_a_full_read(self):
+        manifest = self.models / "manifest.json"
+        payload = "x" * 8192
+        with manifest.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write('{"Count": 513, "Items": [\n')
+            for index in range(512):
+                stream.write(json.dumps({"Name": f"unused_model_{index}", "File": "unused.obj",
+                                         "UnusedMetadata": payload}) + ",\n")
+            stream.write(json.dumps(self.items[0]) + "]}\n")
+        placements = self.root / "entities.jsonl"
+        placements.write_text(json.dumps(entity("synthetic_prop", 1)) + "\n", encoding="utf-8", newline="\n")
+        args = SimpleNamespace(entities=placements, models=manifest, center=[0, 0], radius=1,
+                               max_props=1, textures=[], tex_size=256, out=self.root / "scene.bin")
+
+        tracemalloc.start()
+        try:
+            stats = sandbox_scene.build(args)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((stats["placed"], stats["draws"]), (1, 1))
+        self.assertLess(peak, manifest.stat().st_size)
 
     def test_models_without_usable_geometry_do_not_consume_limit(self):
         self.add_model("synthetic_empty", "o empty\n")

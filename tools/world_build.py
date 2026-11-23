@@ -753,64 +753,46 @@ def _list_field(record: dict, key: str) -> list:
     return value if isinstance(value, list) else []
 
 
+def _is_texture_manifest_item(item) -> bool:
+    # rpf9dump textures mode writes rows with Dir and Textures but no File.
+    return isinstance(item, dict) and "Dir" in item and "File" not in item
+
+
 def _is_model_manifest(path: str) -> bool:
     data = _load_json_dict(path)
     if data is None:
         return False
     items = data.get("Items")
-    if not isinstance(items, list):
-        return False
-    # rpf9dump textures mode writes textures/manifest.json with Items containing
-    # {"Dir": ..., "Textures": [...]} and no "File" field. Exclude those.
-    parent_name = os.path.basename(os.path.dirname(os.path.abspath(path))).lower()
-    if parent_name == "textures":
-        return False
-    if items:
-        has_file = any(isinstance(it, dict) and "File" in it for it in items)
-        all_tex_dicts = all(
-            isinstance(it, dict) and "Dir" in it and "File" not in it
-            for it in items
-        )
-        if not has_file and all_tex_dicts:
-            return False
-    return True
+    return isinstance(items, list) and (not items or not all(map(_is_texture_manifest_item, items)))
 
 
-def discover_model_manifests(assets_dir: str) -> list[str]:
-    """Find all rpf9dump model manifest.json files under assets_dir.
-
-    Handles:
-      - a single models/ directory containing manifest.json
-      - an archive directory containing models/manifest.json
-      - a whole <work>/assets tree containing */models/manifest.json
-    Returns sorted unique absolute paths.
-    """
+def model_manifest_candidates(assets_dir: str) -> list[str]:
+    """List sorted, unique absolute paths for model manifests without opening them."""
     abs_root = os.path.abspath(assets_dir)
     if not os.path.exists(abs_root):
         return []
+    # Texture export folders use the same manifest filename.
+    if os.path.isfile(abs_root):
+        parent_name = os.path.basename(os.path.dirname(abs_root)).lower()
+        return [] if parent_name == "textures" else [abs_root]
 
     found: dict[str, str] = {}
-
-    if os.path.isfile(abs_root):
-        if _is_model_manifest(abs_root):
-            found[os.path.normcase(abs_root)] = abs_root
-        return sorted(found.values())
-
-    # 1. Direct models/ directory (manifest.json directly inside assets_dir).
     direct = os.path.join(abs_root, "manifest.json")
-    if os.path.isfile(direct) and _is_model_manifest(direct):
-        abs_direct = os.path.abspath(direct)
-        found[os.path.normcase(abs_direct)] = abs_direct
+    if os.path.basename(abs_root).lower() != "textures" and os.path.isfile(direct):
+        found[os.path.normcase(direct)] = direct
 
-    # 2. Archive directory (models/manifest.json) or whole assets tree.
     for dirpath, dirnames, filenames in os.walk(abs_root):
         dirnames.sort()
         if "manifest.json" in filenames and os.path.basename(dirpath).lower() == "models":
             cand = os.path.abspath(os.path.join(dirpath, "manifest.json"))
-            if _is_model_manifest(cand):
-                found[os.path.normcase(cand)] = cand
+            found[os.path.normcase(cand)] = cand
 
     return sorted(found.values())
+
+
+def discover_model_manifests(assets_dir: str) -> list[str]:
+    """Find readable rpf9dump model manifests under the supplied path."""
+    return [path for path in model_manifest_candidates(assets_dir) if _is_model_manifest(path)]
 
 
 def _is_nonzero_key(key: str) -> bool:

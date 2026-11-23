@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dds_png  # noqa: E402
 import glb_writer  # noqa: E402
 import world_build  # noqa: E402
+from rpf_asset_resume import ManifestItems  # noqa: E402
 
 DIFFUSE_TEX = "C8E8C282"   # joaat("DiffuseTex"), the albedo Param of a material texture reference
 # Two-layer blend materials have no DiffuseTex; their first layer's albedo sits in this slot (name not known yet;
@@ -73,13 +74,44 @@ def texture_bytes(dds_path, max_size):
     return struct.pack("<II", w, h) + bytes(rgba)
 
 
+def _model_entries(assets_dir, world_names, archetypes):
+    """Stream manifests, retaining only model rows that could resolve a placement."""
+    if not archetypes:
+        return
+    for path in world_build.model_manifest_candidates(assets_dir):
+        matching = []
+        texture_only = True
+        try:
+            with open(path, "rb") as stream:
+                for item in ManifestItems(stream):
+                    texture_only = texture_only and world_build._is_texture_manifest_item(item)
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("Name")
+                    if isinstance(name, str):
+                        stem = name.split(".#", 1)[0].strip()
+                        if world_names.joaat(stem) in archetypes:
+                            matching.append(item)
+        except (OSError, ValueError):
+            continue
+        # Accept matches only after validating the whole manifest, as discovery did.
+        if not texture_only:
+            models_dir = os.path.dirname(path)
+            for item in matching:
+                yield models_dir, item
+
+
 def build(args):
     rows, counts = world_build.load_placements(args.entities)
-    entries = []
-    for path in world_build.discover_model_manifests(args.models):
-        data = world_build._load_json_dict(path) or {}
-        entries += [(os.path.dirname(path), it) for it in data.get("Items") or [] if isinstance(it, dict)]
-    index = world_build.model_name_index(entries, world_build._get_world_names())
+    # Missing models or empty geometry must not exhaust a positive placement budget.
+    candidate_limit = len(rows) if args.max_props > 0 else args.max_props * 4
+    picked = None
+    if args.center is not None:
+        picked = select_rows(rows, args.center, args.radius, candidate_limit)
+    match_rows = rows if picked is None else picked
+    world_names = world_build._get_world_names()
+    entries = _model_entries(args.models, world_names, {row["_arch"] for row in match_rows})
+    index = world_build.model_name_index(entries, world_names)
     ttpf = {}
     for root in args.textures:
         for k, v in world_build.index_ttpf_textures(root).items():
@@ -95,9 +127,7 @@ def build(args):
             raise SystemExit("no entity resolves to an exported model")
         best = max(cells, key=cells.get)
         args.center = [(best[0] + 0.5) * 50, (best[1] + 0.5) * 50]
-    # Missing models or empty geometry must not exhaust a positive placement budget.
-    candidate_limit = len(rows) if args.max_props > 0 else args.max_props * 4
-    picked = select_rows(rows, args.center, args.radius, candidate_limit)
+        picked = select_rows(rows, args.center, args.radius, candidate_limit)
 
     textures, tex_ids = [], {}
     meshes, mesh_ids = [], {}
