@@ -574,6 +574,24 @@ class MainTest(unittest.TestCase):
             self.assertTrue(os.path.isabs(got[0]))
             self.assertTrue(os.path.samefile(got[0], os.path.join(tmp, "Proton 9.0", "files", "bin", "wine")))
 
+    def test_a_quoted_relative_wine_path_comes_back_absolute(self):
+        # Quoted, alone or with arguments, a relative path names nothing from the test's folder either
+        # (sovljanskii's review).
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "Proton 9.0", "files", "bin"))
+            Path(tmp, "Proton 9.0", "files", "bin", "wine").write_text("", encoding="utf-8")
+            old = os.getcwd()
+            os.chdir(tmp)
+            try:
+                alone = rwt.wine_command('"Proton 9.0/files/bin/wine"')
+                with_flag = rwt.wine_command('"Proton 9.0/files/bin/wine" --flag')
+            finally:
+                os.chdir(old)
+            self.assertEqual(len(alone), 1)
+            self.assertTrue(os.path.isabs(alone[0]))
+            self.assertTrue(os.path.samefile(alone[0], os.path.join(tmp, "Proton 9.0", "files", "bin", "wine")))
+            self.assertEqual(with_flag, [alone[0], "--flag"])
+
 
 if __name__ == "__main__":
     unittest.main()

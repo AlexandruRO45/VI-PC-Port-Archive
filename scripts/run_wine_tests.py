@@ -237,7 +237,8 @@ def wine_command(text: str) -> list[str]:
     names an existing file is one program, spaces and all: Proton's Wine sits under folders such as
     "steamapps/common/Proton 9.0/files/bin/wine", and $WINE is set to that path unquoted. Such a path comes back
     absolute: each test runs with the test's own folder as its working directory, where a relative path no longer
-    names the file. A bare name (no folder part) is left to the PATH search, even if a file of that name is here."""
+    names the file. A bare name (no folder part) is left to the PATH search, even if a file of that name is here.
+    The same holds for a quoted first word: '"Proton 9.0/files/bin/wine" --flag' gets an absolute program path too."""
     value = text.strip()
     if ("/" in value or os.sep in value) and os.path.isfile(value):
         return [os.path.abspath(value)]
@@ -247,6 +248,8 @@ def wine_command(text: str) -> list[str]:
         raise argparse.ArgumentTypeError(f"malformed --wine: {e}") from None
     if not parts:
         raise argparse.ArgumentTypeError("must be a nonempty command")
+    if ("/" in parts[0] or os.sep in parts[0]) and os.path.isfile(parts[0]):
+        parts[0] = os.path.abspath(parts[0])
     return parts
 
 
