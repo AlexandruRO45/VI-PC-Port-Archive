@@ -8,6 +8,8 @@
 #include <string_view>
 
 #include "xmem_test_device.h"
+#include "raw_buffer_srv.h"
+#include "vm_raw_srv_cs.h"
 
 using Microsoft::WRL::ComPtr;
 using namespace std::literals;
@@ -249,6 +251,125 @@ struct SectionWindow {
     }
 };
 
+int raw_srv(bool warp)
+{
+    constexpr UINT test_words = 1024;
+    constexpr UINT64 bytes = test_words * sizeof(UINT32);
+    constexpr UINT64 begin = tile_bytes - bytes / 2;
+    constexpr UINT shift = 4;
+    bool unmatched = false;
+    const auto device = create_device(warp, unmatched);
+    if (unmatched) return 1;
+    if (!device) return 77;
+
+    Queue direct;
+    if (!direct.init(device.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT)) return 1;
+    const auto create_buffer = [&](D3D12_HEAP_TYPE type, UINT64 size, D3D12_RESOURCE_FLAGS flags,
+                                   D3D12_RESOURCE_STATES state, ID3D12Resource** result) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = type;
+        heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+        auto desc = buffer_desc();
+        desc.Width = size;
+        desc.Flags = flags;
+        return check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state,
+            nullptr, IID_PPV_ARGS(result)), "Create raw SRV fixture buffer");
+    };
+    ComPtr<ID3D12Resource> input, output, readback;
+    if (!create_buffer(D3D12_HEAP_TYPE_UPLOAD, 2 * tile_bytes, D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ, input.GetAddressOf()) ||
+        !create_buffer(D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, output.GetAddressOf()) ||
+        !create_buffer(D3D12_HEAP_TYPE_READBACK, 2 * bytes, D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST, readback.GetAddressOf())) return 1;
+    const D3D12_RANGE empty{};
+    void* mapped = nullptr;
+    if (!check(input->Map(0, &empty, &mapped), "Map SRV input")) return 1;
+    const auto sample = [](UINT word) { return pattern(word / words, word % words); };
+    for (UINT i = 0; i < 2 * words; ++i) static_cast<UINT32*>(mapped)[i] = sample(i);
+    input->Unmap(0, nullptr);
+
+    const UINT64 gpu = input->GetGPUVirtualAddress();
+    D3D12_SHADER_RESOURCE_VIEW_DESC correct{}, displaced{}, rejected{};
+    if (!check(make_raw_buffer_srv(gpu, 2 * tile_bytes, gpu + begin - 16, shift, test_words, correct),
+             "Resolve cross-page view") ||
+        !check(make_raw_buffer_srv(gpu, 2 * tile_bytes, gpu + begin, shift, test_words, displaced),
+             "Resolve displaced view") ||
+        make_raw_buffer_srv(gpu, 2 * tile_bytes, gpu + begin + 4, 0, test_words, rejected) != E_INVALIDARG ||
+        make_raw_buffer_srv(gpu, 2 * tile_bytes, gpu + 2 * tile_bytes, 0, 1, rejected) != E_INVALIDARG ||
+        make_raw_buffer_srv(gpu, 2 * tile_bytes, gpu + 2 * tile_bytes - 16, 0, 5, rejected) != E_INVALIDARG)
+        return 1;
+
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    if (!check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "Create SRV heap")) return 1;
+    const UINT stride = device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+    auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    device->CreateShaderResourceView(input.Get(), &correct, cpu);
+    cpu.ptr += stride;
+    device->CreateShaderResourceView(input.Get(), &displaced, cpu);
+
+    const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable = {1, &range};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    const D3D12_ROOT_SIGNATURE_DESC root_desc{2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> blob;
+    ComPtr<ID3D12RootSignature> root;
+    if (!check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr),
+            "Serialize SRV root signature") ||
+        !check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+            IID_PPV_ARGS(&root)), "Create SRV root signature")) return 1;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc{};
+    pipeline_desc.pRootSignature = root.Get();
+    pipeline_desc.CS = {vm_raw_srv_cs, sizeof(vm_raw_srv_cs)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (!check(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&pipeline)), "Create SRV pipeline") ||
+        !check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, direct.allocator.Get(), pipeline.Get(),
+            IID_PPV_ARGS(&list)), "Create SRV command list")) return 1;
+    ID3D12DescriptorHeap* heaps[]{heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(root.Get());
+    list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
+    auto table = heap->GetGPUDescriptorHandleForHeapStart();
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Transition = {output.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    for (UINT i = 0; i < 2; ++i) {
+        list->SetComputeRootDescriptorTable(0, table);
+        list->Dispatch(test_words / 64, 1, 1);
+        list->ResourceBarrier(1, &barrier);
+        list->CopyBufferRegion(readback.Get(), i * bytes, output.Get(), 0, bytes);
+        auto restore = barrier;
+        restore.Transition.StateBefore = barrier.Transition.StateAfter;
+        restore.Transition.StateAfter = barrier.Transition.StateBefore;
+        list->ResourceBarrier(1, &restore);
+        table.ptr += stride;
+    }
+    if (!check(list->Close(), "Close SRV command list")) return 1;
+    direct.execute(list.Get());
+    if (!check(direct.commands->Signal(direct.fence.Get(), 1), "Signal SRV command completion") ||
+        !wait_for_read(direct.fence.Get(), 1)) return 1;
+    const D3D12_RANGE read_range{0, 2 * bytes};
+    if (!check(readback->Map(0, &read_range, &mapped), "Map SRV readback")) return 1;
+    const auto* actual = static_cast<const UINT32*>(mapped);
+    UINT mismatches = 0, shifted_mismatches = 0, wrong_slot_mismatches = 0;
+    for (UINT i = 0; i < test_words; ++i) {
+        const UINT word = static_cast<UINT>(begin / sizeof(UINT32)) + i;
+        mismatches += actual[i] != sample(word);
+        shifted_mismatches += actual[test_words + i] != sample(word + shift);
+        wrong_slot_mismatches += actual[test_words + i] != sample(word);
+    }
+    readback->Unmap(0, &empty);
+    std::printf("SRV cross-page mismatches=%u shifted mismatches=%u negative=%u/%u\n",
+        mismatches, shifted_mismatches, wrong_slot_mismatches, test_words);
+    return mismatches == 0 && shifted_mismatches == 0 && wrong_slot_mismatches == test_words &&
+        check(device->GetDeviceRemovedReason(), "Device removal status") ? 0 : 1;
+}
+
 int provenance(bool warp)
 {
     constexpr UINT span_words = 1024;
@@ -347,6 +468,7 @@ int main(int argc, char** argv)
 {
     if (argc != 2) return 1;
     const std::string_view mode(argv[1]);
+    if (mode == "raw_srv_warp"sv || mode == "raw_srv_hardware"sv) return raw_srv(mode == "raw_srv_warp"sv);
     if (mode == "provenance_warp"sv || mode == "provenance_hardware"sv) return provenance(mode == "provenance_warp"sv);
     if (mode != "warp"sv && mode != "hardware"sv) return 1;
     return run(mode == "warp"sv);

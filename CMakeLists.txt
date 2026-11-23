@@ -4027,13 +4027,20 @@ else()
         "to an interpreter with requirements-dev.txt installed. Then rerun CMake.")
 endif()
 
-add_executable(vm_copy_queue_check tests/vm_copy_queue_check.cpp)
+set(vm_raw_srv_header "${CMAKE_CURRENT_BINARY_DIR}/vm_raw_srv_cs.h")
+add_custom_command(OUTPUT "${vm_raw_srv_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main -Vn vm_raw_srv_cs -Fh "${vm_raw_srv_header}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/vm_raw_srv.hlsl"
+    DEPENDS tests/vm_raw_srv.hlsl VERBATIM)
+add_executable(vm_copy_queue_check tests/vm_copy_queue_check.cpp "${vm_raw_srv_header}")
+target_include_directories(vm_copy_queue_check PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(vm_copy_queue_check PRIVATE cxx_std_17)
 target_link_libraries(vm_copy_queue_check PRIVATE d3d12 dxgi OneCore)
 foreach(adapter IN ITEMS warp hardware)
     add_test(NAME vm_copy_queue_${adapter} COMMAND vm_copy_queue_check ${adapter})
     add_test(NAME vm_page_provenance_${adapter} COMMAND vm_copy_queue_check provenance_${adapter})
-    set_tests_properties(vm_copy_queue_${adapter} vm_page_provenance_${adapter}
+    add_test(NAME vm_raw_srv_${adapter} COMMAND vm_copy_queue_check raw_srv_${adapter})
+    set_tests_properties(vm_copy_queue_${adapter} vm_page_provenance_${adapter} vm_raw_srv_${adapter}
         PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
 
