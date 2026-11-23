@@ -85,6 +85,26 @@ class FindHashLookupTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "encrypted"):
             fhl.rank(b"\x6f\x1b\xbc\xae" * 64, [("x", 1)])
 
+    def test_cli_preserves_input_when_report_aliases_it(self):
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            alias = os.path.join(tmp, "report.json")
+            os.link(exe, alias)
+            for report in (exe, os.path.join(tmp, ".", "image.exe"), alias):
+                with self.subTest(report=report):
+                    with open(exe, "wb") as f:
+                        f.write(data)
+                    result = subprocess.run(
+                        [sys.executable, "-I", TOOL, exe, "--json", report],
+                        capture_output=True, text=True)
+                    with open(exe, "rb") as f:
+                        self.assertEqual(f.read(), data)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("same file", result.stderr)
+
     def test_cli_writes_the_report_and_fails_cleanly(self):
         data, lookup, _ = image()
         with tempfile.TemporaryDirectory() as tmp:

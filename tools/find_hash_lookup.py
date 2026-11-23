@@ -14,6 +14,7 @@ Standard library only. No game data is written: the report holds RVAs and counts
 """
 import argparse
 import json
+import os
 import struct
 import sys
 from collections import Counter, defaultdict
@@ -124,6 +125,9 @@ def main(argv=None):
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     try:
+        if a.json and os.path.exists(a.json) and os.path.samefile(a.exe, a.json):
+            print("ERROR: input executable and JSON report refer to the same file", file=sys.stderr)
+            return 2
         with open(a.exe, "rb") as f:
             data = f.read()
         report = rank(data, hashes, a.window, a.top)
