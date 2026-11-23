@@ -27,8 +27,8 @@ in Settings › Leonida settings.
 
 ## What is in it
 
-The sidebar has **Home** and the **Library**, which holds **Leonida**, **Can I Run Leonida** and **GPU tests**. Each
-has its own tabs at the top right. The avatar next to the tabs opens **Settings**.
+The sidebar has **Home**, the **Library** with **Leonida**, and **Tools** with **Can I Run Leonida**. Each has its
+own tabs at the top right. The avatar next to the tabs opens **Settings**.
 
 | Where | What it does |
 |---|---|
@@ -38,7 +38,6 @@ has its own tabs at the top right. The avatar next to the tabs opens **Settings*
 | **Build progress** (⋯ menu) | The running or last build: each stage, the measured numbers, the shader translation, and the console. Its tabs are LEONIDA, BUILD and HISTORY. |
 | **Build history** (⋯ menu) | Every build the launcher ran, with its result, duration, stages, shaders, warnings, errors and peak memory. Each build has its log and a "build again with these options" button. |
 | **Can I Run Leonida** | Your CPU, GPU and memory, read from Windows, compared with every console on the [community checker](https://assttro.github.io/can-i-run-leonida/)'s list. It runs automatically, and **Detect again** reads the hardware again. |
-| **GPU tests** | For contributors: runs `scripts/run_gpu_tests.py` against the test programs built from your checkout (docs/testing.md), lists each test's result, and drafts the `Tested <commit> on <GPU, driver, OS>` report to paste on a pull request, with no local paths in it. It won't run during a build. |
 | **Settings** (avatar menu) | One page per group, one setting per row. **Launcher settings**: *General* (language, theme, start page, sidebar, avatar: random or your own picture), *Builds* (how builds stop, taskbar flash, sound, Windows notification, keep running in the tray, console text size, log clean-up), *Online* (GitHub and the Can I Run checker, each on or off), *About and files* (version, settings file, logs, restore defaults). **Leonida settings**: *Your setup* (`make_game.py`'s own preflight), *Play* (Play's options), *Folders and Python* (the Leonida folder, Python, environment variables), *Disk space* (what the build has written, folder by folder, with what deleting each costs). |
 
 The launcher is in **English**, **Polish** and **Russian**; choose the language in Launcher settings. The README pages and the
@@ -50,8 +49,9 @@ Closing the window keeps the build going from a tray icon (its tooltip says what
 stop it), and a Windows notification says when the build has finished, stopped or failed. Starting Leonida.exe again
 brings the window back. The launcher's questions and notices are its own popups in the middle of the window.
 
-There is a **light** and a **dark** theme, or **Same as Windows** (the default), which follows Windows' app mode
-(Settings › Personalisation › Colours). The black sidebar, the console and the white BUILD/PLAY button look the same in both.
+There is a **light** and a **dark** theme, **Same as Windows** (the default), which follows Windows' app mode
+(Settings › Personalisation › Colours), and the **Leonida Theme**: a violet night with the sunset still in the sky,
+the sidebar, card headers and background art in its colours. The console and the white BUILD/PLAY button look the same in all of them.
 
 ### The build popup
 

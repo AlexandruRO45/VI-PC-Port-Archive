@@ -48,7 +48,7 @@
       <Setter Property="Margin" Value="24,26,0,8"/>
     </Style>
     <Style x:Key="PageNav" TargetType="RadioButton">
-      <Setter Property="Foreground" Value="{StaticResource SideMuted}"/>
+      <Setter Property="Foreground" Value="{DynamicResource SideMuted}"/>
       <Setter Property="FontSize" Value="13"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="GroupName" Value="settings"/>
@@ -63,7 +63,7 @@
             </Border>
             <ControlTemplate.Triggers>
               <Trigger Property="IsMouseOver" Value="True">
-                <Setter TargetName="b" Property="Background" Value="{StaticResource SideHover}"/>
+                <Setter TargetName="b" Property="Background" Value="{DynamicResource SideHover}"/>
                 <Setter Property="Foreground" Value="#FFFFFF"/>
               </Trigger>
               <Trigger Property="IsChecked" Value="True">
@@ -85,7 +85,7 @@
     </Grid.ColumnDefinitions>
 
     <!-- ===== Left: the launcher and its version, the pages, Back ===== -->
-    <Border Background="{StaticResource Ink}">
+    <Border Background="{DynamicResource Ink}">
       <DockPanel>
         <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="24,34,0,10">
           <Border Width="44" Height="44" CornerRadius="4" ClipToBounds="True">
@@ -98,7 +98,7 @@
           </Border>
           <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
             <TextBlock Text="Leonida Launcher" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
-            <TextBlock x:Name="SideVersion" Foreground="{StaticResource SideMuted}" FontSize="11.5"/>
+            <TextBlock x:Name="SideVersion" Foreground="{DynamicResource SideMuted}" FontSize="11.5"/>
           </StackPanel>
         </StackPanel>
         <Border DockPanel.Dock="Bottom" BorderBrush="#262626" BorderThickness="0,1,0,0" Padding="0,10,0,14">
@@ -275,7 +275,7 @@
         <!-- ===== Online ===== -->
         <StackPanel x:Name="PageOnline" Visibility="Collapsed">
           <TextBlock Style="{StaticResource RowText}" Margin="0,6,0,6"
-                     Text="The launcher goes online only for these two. Builds, Play and the GPU tests never do."/>
+                     Text="The launcher goes online only for these two. Builds and Play never do."/>
           <Border Style="{StaticResource Row}">
             <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
               <StackPanel Style="{StaticResource RowLeft}">
@@ -436,7 +436,7 @@
           <Border Style="{StaticResource Row}">
             <StackPanel>
               <DockPanel>
-                <Button DockPanel.Dock="Right" Style="{StaticResource Small}" Content="Measure again" Click="OnDiskRefresh" AutomationProperties.Name="Measure again"/>
+                <Button DockPanel.Dock="Right" Style="{StaticResource Small}" Content="Measure again" Click="OnDiskRefresh" AutomationProperties.Name="Measure again" Width="164" Margin="0"/>
                 <StackPanel>
                   <TextBlock x:Name="DiskDrive" Style="{StaticResource RowTitle}" FontWeight="SemiBold"/>
                   <TextBlock x:Name="DiskSummary" Style="{StaticResource RowText}"/>
@@ -467,7 +467,7 @@
               <DataTemplate>
                 <Border BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1" Padding="0,16">
                   <Grid>
-                    <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="110"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="110"/><ColumnDefinition Width="164"/></Grid.ColumnDefinitions>
                     <StackPanel Margin="0,0,24,0" VerticalAlignment="Center">
                       <TextBlock Text="{Binding Title}" FontSize="15" Foreground="{DynamicResource Heading}"/>
                       <TextBlock Text="{Binding Description}" FontSize="12.5" Foreground="{DynamicResource SubText}" TextWrapping="Wrap" Margin="0,4,0,0"/>
@@ -477,11 +477,13 @@
                       <TextBlock Text="{Binding Size}" FontFamily="{StaticResource DisplayBold}" FontSize="20" Foreground="{DynamicResource Heading}" HorizontalAlignment="Right"/>
                       <TextBlock Text="{Binding FileCount}" FontSize="11" Foreground="{DynamicResource Faint}" HorizontalAlignment="Right"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                      <Button Style="{StaticResource Small}" Content="{Binding OpenText}" Click="OnDiskOpen" Tag="{Binding}"/>
-                      <Button Style="{StaticResource Small}" Content="{Binding DeleteText}" Click="OnDiskDelete" Tag="{Binding}" Visibility="{Binding DeleteVisibility}"
-                              IsEnabled="{Binding CanDelete}"/>
-                    </StackPanel>
+                    <!-- Same two slots on every row (Delete's stays empty for the port), so the buttons line up -->
+                    <Grid Grid.Column="2" VerticalAlignment="Center">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="76"/><ColumnDefinition Width="8"/><ColumnDefinition Width="80"/></Grid.ColumnDefinitions>
+                      <Button Style="{StaticResource Small}" Margin="0" HorizontalAlignment="Stretch" Content="{Binding OpenText}" Click="OnDiskOpen" Tag="{Binding}"/>
+                      <Button Grid.Column="2" Style="{StaticResource Small}" Margin="0" HorizontalAlignment="Stretch" Content="{Binding DeleteText}" Click="OnDiskDelete" Tag="{Binding}"
+                              Visibility="{Binding DeleteVisibility}" IsEnabled="{Binding CanDelete}"/>
+                    </Grid>
                   </Grid>
                 </Border>
               </DataTemplate>

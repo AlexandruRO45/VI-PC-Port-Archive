@@ -39,7 +39,7 @@
             Effect="{StaticResource SoftShadow}" MouseLeftButtonDown="OnPanelClick">
       <DockPanel>
         <!-- Header -->
-        <Border DockPanel.Dock="Top" Background="#000000" Padding="26,16">
+        <Border DockPanel.Dock="Top" Background="{DynamicResource CaptionBg}" Padding="26,16">
           <DockPanel>
             <Button DockPanel.Dock="Right" Style="{StaticResource WinClose}" Foreground="#FFFFFF" Content="&#xE8BB;" Click="OnClose" ToolTip="Close"/>
             <StackPanel>

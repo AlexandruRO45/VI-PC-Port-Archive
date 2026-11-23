@@ -15,7 +15,7 @@
       </DockPanel>
 
       <!-- What this page is: a test, nothing unlocks yet -->
-      <Border Background="#000000" Margin="0,20,0,18" Padding="18,14">
+      <Border Background="{DynamicResource CaptionBg}" Margin="0,20,0,18" Padding="18,14">
         <DockPanel>
           <TextBlock DockPanel.Dock="Left" Text="&#xE7BA;" FontFamily="{StaticResource Icons}" FontSize="22" Foreground="{StaticResource Pink}" Margin="0,2,16,0" VerticalAlignment="Top"/>
           <StackPanel>

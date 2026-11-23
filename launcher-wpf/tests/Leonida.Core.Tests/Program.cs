@@ -343,28 +343,6 @@ Check(HardwareDetector.MemoryTypeName(26) == "DDR4" && HardwareDetector.MemoryTy
     Check(LanguageFile.Placeholders("{0} of {1:N0}, {{literal}}").SequenceEqual([0, 1]), "placeholders are found, escaped braces are not");
 }
 
-// ---- GPU tests: the results block and the report
-{
-    string[] output =
-    [
-        "=== rdna2spirv.py ===", "  PASS  not_a_result  (before the block)",
-        "", "=== GPU TEST RESULTS ===",
-        "  PASS  cs_basic              ok", "  FAIL  cs_wave32_ballot      word 3: 0x1 != 0x0 (C:\\Users\\someone\\work\\x.spv)",
-        "  SKIP  ms_mesh               no VK_EXT_mesh_shader", "", "2/3 passed, 1 skipped",
-    ];
-    var r = GpuTests.Parse(output);
-    Check(r.Count == 3 && r[0] is { Name: "cs_basic", Outcome: GpuTestOutcome.Pass } && r[1].Outcome == GpuTestOutcome.Fail && r[2].Outcome == GpuTestOutcome.Skip,
-          "the GPU results block is read, and only it");
-    var report = GpuTests.Report("abc123def", "AMD Radeon RX 9070", "32.0.1", "Windows 11", null, r);
-    Check(report.StartsWith("Tested `abc123def` on AMD Radeon RX 9070, driver 32.0.1, Windows 11: **1 failed**"), "the report names the commit, card, driver and verdict");
-    Check(report.Contains("1/3 passed, 1 skipped") && report.Contains("`cs_wave32_ballot`"), "the report has the counts and each failure");
-    Check(!report.Contains("someone") && report.Contains("<path>"), "the report carries no local path");
-    var dir = Path.Combine(temp, "gpu", "runtime", "build", "Release");
-    Directory.CreateDirectory(dir);
-    File.WriteAllText(Path.Combine(dir, GpuTests.Marker), "");
-    Check(GpuTests.FindPrograms(Path.Combine(temp, "gpu")) == dir, "the test programs are found where docs/testing.md builds them");
-}
-
 try { Directory.Delete(temp, true); } catch (IOException) { }
 Console.WriteLine($"Leonida.Core.Tests: {checks} checks, {failures} failures");
 return failures;

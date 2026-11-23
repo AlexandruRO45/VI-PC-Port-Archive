@@ -208,7 +208,7 @@ public static partial class Markdown
         var group = new TableRowGroup();
         void AddRow(List<string> cells, bool head, bool shade)
         {
-            var row = new TableRow { Background = head ? Brushes.Black : shade ? Theme.Brush("CardAlt") : Theme.Brush("CardBg") };
+            var row = new TableRow { Background = head ? Theme.Brush("CaptionBg") : shade ? Theme.Brush("CardAlt") : Theme.Brush("CardBg") };
             for (var c = 0; c < header.Count; c++)
             {
                 var p = new Paragraph { Margin = new Thickness(0) };

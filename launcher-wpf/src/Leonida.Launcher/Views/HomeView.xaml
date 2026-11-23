@@ -85,13 +85,13 @@
       <Grid Grid.Row="1" Margin="0,0,0,14">
         <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-          <Border Background="{StaticResource Ink}" Padding="18,8" Margin="0,0,10,0">
+          <Border Background="{DynamicResource Ink}" Padding="18,8" Margin="0,0,10,0">
             <StackPanel>
               <TextBlock x:Name="PeopleCount" Foreground="#FFFFFF" FontFamily="{StaticResource DisplayBold}" FontSize="30"/>
               <TextBlock Text="PEOPLE" Foreground="#AAAAAA" FontSize="10.5" FontWeight="Bold"/>
             </StackPanel>
           </Border>
-          <Border Background="{StaticResource Ink}" Padding="18,8">
+          <Border Background="{DynamicResource Ink}" Padding="18,8">
             <StackPanel>
               <TextBlock x:Name="CommitCount" Foreground="#FFFFFF" FontFamily="{StaticResource DisplayBold}" FontSize="30"/>
               <TextBlock Text="COMMITS" Foreground="#AAAAAA" FontSize="10.5" FontWeight="Bold"/>

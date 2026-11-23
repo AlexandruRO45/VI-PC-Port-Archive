@@ -39,14 +39,14 @@
     </Grid.ColumnDefinitions>
 
     <!-- ===== Sidebar ===== -->
-    <Border Grid.Column="0" Background="{StaticResource Ink}">
+    <Border Grid.Column="0" Background="{DynamicResource Ink}">
       <DockPanel>
         <Grid DockPanel.Dock="Top" Height="112">
           <StackPanel Orientation="Horizontal" Margin="20,8,0,0" VerticalAlignment="Center">
             <Image Source="Assets/logo.png" Width="50" Height="50" RenderOptions.BitmapScalingMode="HighQuality"/>
             <StackPanel x:Name="BrandText" Margin="12,0,0,0" VerticalAlignment="Center">
               <TextBlock Text="LEONIDA" FontFamily="{StaticResource DisplayBold}" FontSize="26" Foreground="#FFFFFF"/>
-              <TextBlock Text="LAUNCHER" FontFamily="{StaticResource Display}" FontSize="12.5" Foreground="{StaticResource SideMuted}" Margin="1,-4,0,0"/>
+              <TextBlock Text="LAUNCHER" FontFamily="{StaticResource Display}" FontSize="12.5" Foreground="{DynamicResource SideMuted}" Margin="1,-4,0,0"/>
             </StackPanel>
           </StackPanel>
         </Grid>
@@ -78,7 +78,7 @@
               </Border>
               <StackPanel x:Name="HomeText" Margin="12,0,0,0" VerticalAlignment="Center">
                 <TextBlock Text="Home" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
-                <TextBlock Text="About Leonida" Foreground="{StaticResource SideMuted}" FontSize="11.5"/>
+                <TextBlock Text="About Leonida" Foreground="{DynamicResource SideMuted}" FontSize="11.5"/>
               </StackPanel>
             </StackPanel>
           </RadioButton>
@@ -100,7 +100,7 @@
               </Border>
               <StackPanel x:Name="LibText" Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
                 <TextBlock Text="Leonida" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
-                <TextBlock x:Name="LibStatus" Foreground="{StaticResource SideMuted}" FontSize="11.5" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="LibStatus" Foreground="{DynamicResource SideMuted}" FontSize="11.5" TextTrimming="CharacterEllipsis"/>
               </StackPanel>
               <!-- Build progress: a ring with the percentage inside; it spins while a stage has no percentage -->
               <Grid x:Name="LibRing" Grid.Column="2" Width="36" Height="36" Margin="8,0,0,0" VerticalAlignment="Center" Visibility="Collapsed"
@@ -118,6 +118,7 @@
               </Grid>
             </Grid>
           </RadioButton>
+          <TextBlock x:Name="ToolsHeader" Text="Tools" Foreground="#FFFFFF" FontWeight="Bold" FontSize="15" Margin="20,18,0,10"/>
           <RadioButton x:Name="LibCanIRun" AutomationProperties.Name="Can I Run Leonida" Style="{StaticResource LibraryItem}" GroupName="lib" Click="OnLibCanIRun" Checked="OnLibCanIRun" Margin="0,4,0,0">
             <StackPanel Orientation="Horizontal">
               <Border Width="38" Height="38" CornerRadius="3" Background="#1E1E1E">
@@ -125,18 +126,7 @@
               </Border>
               <StackPanel x:Name="CanText" Margin="12,0,0,0" VerticalAlignment="Center">
                 <TextBlock Text="Can I Run Leonida" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
-                <TextBlock Text="Your PC against the consoles" Foreground="{StaticResource SideMuted}" FontSize="11.5"/>
-              </StackPanel>
-            </StackPanel>
-          </RadioButton>
-          <RadioButton x:Name="LibGpu" AutomationProperties.Name="GPU tests" Style="{StaticResource LibraryItem}" GroupName="lib" Click="OnLibGpu" Checked="OnLibGpu" Margin="0,4,0,0">
-            <StackPanel Orientation="Horizontal">
-              <Border Width="38" Height="38" CornerRadius="3" Background="#1E1E1E">
-                <TextBlock Text="&#xE950;" FontFamily="{StaticResource Icons}" FontSize="18" Foreground="{StaticResource Pink}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-              </Border>
-              <StackPanel x:Name="GpuText" Margin="12,0,0,0" VerticalAlignment="Center">
-                <TextBlock Text="GPU tests" Foreground="#FFFFFF" FontSize="13" FontWeight="SemiBold"/>
-                <TextBlock Text="Test your card for Leonida" Foreground="{StaticResource SideMuted}" FontSize="11.5"/>
+                <TextBlock Text="Your PC against the consoles" Foreground="{DynamicResource SideMuted}" FontSize="11.5"/>
               </StackPanel>
             </StackPanel>
           </RadioButton>
@@ -230,7 +220,6 @@
           <v:HistoryView x:Name="HistoryPage" Visibility="Collapsed"/>
           <v:AchievementsView x:Name="AchievementsPage" Visibility="Collapsed"/>
           <v:CanIRunView x:Name="CanIRunPage" Visibility="Collapsed"/>
-          <v:GpuTestView x:Name="GpuPage" Visibility="Collapsed"/>
         </Grid>
       </DockPanel>
     </Grid>
@@ -245,7 +234,7 @@
     <Grid x:Name="PopupHost" Grid.ColumnSpan="2" Visibility="Collapsed" Panel.ZIndex="15"/>
 
     <!-- Window buttons, above every page and popup -->
-    <Border Grid.ColumnSpan="2" HorizontalAlignment="Right" VerticalAlignment="Top" Panel.ZIndex="20" Background="{StaticResource Ink}"
+    <Border Grid.ColumnSpan="2" HorizontalAlignment="Right" VerticalAlignment="Top" Panel.ZIndex="20" Background="{DynamicResource Ink}"
             CornerRadius="0,0,0,12" ClipToBounds="True" WindowChrome.IsHitTestVisibleInChrome="True">
       <StackPanel Orientation="Horizontal" Margin="6,0,2,2">
         <Button Style="{StaticResource WinButton}" Content="&#xE921;" Click="OnMinimize" ToolTip="Minimise" AutomationProperties.Name="Minimise"/>

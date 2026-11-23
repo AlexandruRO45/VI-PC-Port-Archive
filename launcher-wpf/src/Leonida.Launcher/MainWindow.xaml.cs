@@ -10,7 +10,7 @@ namespace Leonida.Launcher;
 
 public partial class MainWindow : Window
 {
-    static readonly string[] Pages = ["home", "leonida", "build", "history", "achievements", "caniru", "gpu"];
+    static readonly string[] Pages = ["home", "leonida", "build", "history", "achievements", "caniru"];
     readonly AppState state = AppState.Instance;
     readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(1) };
     bool syncing, closingAfterStop, reloading;
@@ -143,7 +143,6 @@ public partial class MainWindow : Window
         AchievementsPage.Visibility = page == "achievements" ? Visibility.Visible : Visibility.Collapsed;
         SettingsPage.Visibility = page == "settings" ? Visibility.Visible : Visibility.Collapsed;
         CanIRunPage.Visibility = page == "caniru" ? Visibility.Visible : Visibility.Collapsed;
-        GpuPage.Visibility = page == "gpu" ? Visibility.Visible : Visibility.Collapsed;
         syncing = true;
         var leonida = page is "leonida" or "build" or "history" or "achievements";
         TopTabs.Visibility = leonida ? Visibility.Visible : Visibility.Collapsed;
@@ -159,10 +158,8 @@ public partial class MainWindow : Window
         LibHome.IsChecked = page == "home";
         LibLeonida.IsChecked = leonida;
         LibCanIRun.IsChecked = page == "caniru";
-        LibGpu.IsChecked = page == "gpu";
         syncing = false;
         if (page == "caniru") CanIRunPage.Activate();
-        if (page == "gpu" && GpuPage.IsLoaded) _ = GpuPage.ActivateAsync();
         if (page == "leonida") LeonidaPage.Refresh();
         state.Settings.Current.LastPage = page;
     }
@@ -177,7 +174,6 @@ public partial class MainWindow : Window
     void OnLibHome(object sender, RoutedEventArgs e) { if (!syncing) { ShowPage("home"); HomePage.ShowPage(""); } }
     void OnLibLeonida(object sender, RoutedEventArgs e) { if (!syncing) ShowPage("leonida"); }
     void OnLibCanIRun(object sender, RoutedEventArgs e) { if (!syncing) ShowPage("caniru"); }
-    void OnLibGpu(object sender, RoutedEventArgs e) { if (!syncing) ShowPage("gpu"); }
 
     // ---------- sidebar ----------
 
@@ -188,11 +184,10 @@ public partial class MainWindow : Window
         state.Settings.Current.SidebarCollapsed = collapsed;
         SideColumn.Width = new GridLength(collapsed ? 78 : 270);
         var v = collapsed ? Visibility.Collapsed : Visibility.Visible;
-        BrandText.Visibility = LibraryHeader.Visibility = HomeText.Visibility = LibText.Visibility = CanText.Visibility = GpuText.Visibility = VersionText.Visibility = v;
+        BrandText.Visibility = LibraryHeader.Visibility = HomeText.Visibility = LibText.Visibility = CanText.Visibility = ToolsHeader.Visibility = VersionText.Visibility = v;
         LibHome.ToolTip = collapsed ? Loc.T("Home") : null;
         LibLeonida.ToolTip = collapsed ? "Leonida" : null;
         LibCanIRun.ToolTip = collapsed ? Loc.T("Can I Run Leonida") : null;
-        LibGpu.ToolTip = collapsed ? Loc.T("GPU tests") : null;
         CollapseButton.ApplyTemplate();
         if (CollapseButton.Template.FindName("g", CollapseButton) is TextBlock g) g.Text = collapsed ? "" : "";
     }
@@ -414,7 +409,6 @@ public partial class MainWindow : Window
         try { state.Settings.Save(); } catch (IOException) { }
         state.Session?.Dispose();
         Builds.Instance.Play?.Dispose();
-        GpuPage.Shutdown();
         Tray.Instance.Dispose();
         base.OnClosing(e);
     }

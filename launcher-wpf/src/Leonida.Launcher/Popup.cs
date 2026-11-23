@@ -85,7 +85,7 @@ public static class Popup
             head.Children.Add(mark);
         }
         head.Children.Add(new TextBlock { Text = Loc.T(title).ToUpper(Loc.Culture), Foreground = Brushes.White, FontFamily = (FontFamily)res["DisplayBold"], FontSize = 26, TextTrimming = TextTrimming.CharacterEllipsis });
-        var header = new Border { Background = Brushes.Black, Padding = new Thickness(26, 14, 26, 14), Child = head };
+        var header = new Border { Background = Theme.Brush("CaptionBg"), Padding = new Thickness(26, 14, 26, 14), Child = head };
 
         var card = new DockPanel();
         DockPanel.SetDock(header, Dock.Top);

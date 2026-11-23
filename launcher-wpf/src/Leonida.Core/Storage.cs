@@ -97,8 +97,6 @@ public sealed class LauncherSettings
     public int KeepLogsDays { get; set; } = 30;
     /// <summary>Picks the avatar's pattern and colours.</summary>
     public int AvatarSeed { get; set; } = Random.Shared.Next();
-    /// <summary>The GPU tests page's test-program folder (the one with vk_compute_test.exe), when not found by itself.</summary>
-    public string? GpuTestPrograms { get; set; }
     /// <summary>Show the picture the user chose (a square copy in the settings folder) instead of the random one.</summary>
     public bool AvatarCustom { get; set; }
 }
