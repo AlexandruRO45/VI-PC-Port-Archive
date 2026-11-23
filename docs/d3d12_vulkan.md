@@ -2217,6 +2217,12 @@ The trace will enumerate them.
   Intel Raptor Lake-S (101.7092) and RTX 5060 Laptop (621.24) hosts wrap, two 2^63 buffers to 0, and WARP on that
   PC still saturates. A wrapped total could make a caller allocate less than one of its resources, so the layer
   keeps saturating, and the test accepts a host that wraps.
+
+  The Vulkan device created by `D3D12XboxCreateDevice` also accepts 3D color textures with an unspecified
+  (`UNKNOWN`) layout and U/V above 2048 when the requested Vulkan 3D format and usage support those extents.
+  U/V are capped at 16384 by the texture descriptor, and W retains its 2048 limit. The same sizing applies to
+  allocation queries and resource creation. `d3d12_xbox_wide_volume` checks a 2560-wide volume through the Xbox
+  device, including the render-target clear and untouched bytes in the other W slice and mip.
 - `GetAdapterLuid` (implemented): `VkPhysicalDeviceIDProperties::deviceLUID`, which on Windows is the DXGI
   adapter's LUID; `d3d12_fence_timing_test` finds it with `IDXGIFactory4::EnumAdapterByLuid` (RTX 4090, driver
   621.14). A driver that reports `deviceLUIDValid = VK_FALSE` gets a zero LUID, logged.

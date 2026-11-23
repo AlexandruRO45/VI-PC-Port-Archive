@@ -7868,8 +7868,12 @@ private:
         }
         if (one_d && desc.Height != 1) return kInvalidAllocation;
         const UINT samples = desc.SampleDesc.Count, depth = volume ? desc.DepthOrArraySize : 1;
-        const UINT64 max_extent =
-            volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+        // Xbox color volumes can exceed the desktop 2048 limit in U/V. The T# holds 14 bits per axis in
+        // U/V (extent minus one). memory_requirements below checks the actual Vulkan 3D format and its limits.
+        const bool xbox_wide_volume = volume && state_.info.mode == VulkanDeviceMode::xbox &&
+                                      desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        const UINT64 max_extent = volume && !xbox_wide_volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION
+                                                            : D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
         const UINT max_layers =
             volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION;
         if (!desc.Width || !desc.Height || !desc.DepthOrArraySize || desc.Width > max_extent ||
@@ -8780,7 +8784,8 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
 
 // Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and
 // VK_KHR_synchronization2 (vulkan13_features.h). LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
-HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettings queue_test_settings) {
+HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettings queue_test_settings,
+                                        VulkanDeviceMode mode) {
     if (!out) return E_POINTER;
     *out = nullptr;
     static const HMODULE library = LoadLibraryA("vulkan-1.dll");
@@ -8915,6 +8920,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     std::vector<VkPhysicalDevice> physicals(count);
     vkEnumeratePhysicalDevices(owned.instance, &count, physicals.data());
     VulkanDeviceInfo info{};
+    info.mode = mode;
     info.get_instance_proc = get;
     info.instance = owned.instance;
     info.separate_depth_stencil_layouts = true;

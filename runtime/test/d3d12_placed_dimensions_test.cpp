@@ -4,9 +4,12 @@
 //     reads back. A dimension outside the enum is refused alike;
 //   - on the layer alone: bytes copied through a buffer into every subresource of a placed 3D texture and a placed 1D
 //     array, and back out, come back unchanged.
+// A separate mode through D3D12XboxCreateDevice verifies a wide volume's allocation and GPU readback.
 // No game data or shaders. LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation to the layer's device.
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_xs_device.h"
+#include "../shims/shims.h"
 #include <dxgi1_4.h>
 
 #include <cstdint>
@@ -156,7 +159,7 @@ std::uint8_t pattern(UINT subresource, UINT z, UINT y, UINT64 x) {
 // Writes a pattern into every subresource of a placed texture through an upload buffer, copies it back out to a
 // readback buffer and compares. True when every byte came back.
 bool round_trip(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64& fence_value,
-                const char* name, const D3D12_RESOURCE_DESC& desc) {
+                const char* name, const D3D12_RESOURCE_DESC& desc, const D3D12_RECT* clear = nullptr) {
     const D3D12_RESOURCE_ALLOCATION_INFO info = device->GetResourceAllocationInfo(0, 1, &desc);
     if (info.SizeInBytes == UINT64_MAX) {
         std::fprintf(stderr, "%s: no allocation size\n", name);
@@ -222,6 +225,23 @@ bool round_trip(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fe
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition = {placed.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST,
                           D3D12_RESOURCE_STATE_COPY_SOURCE};
+    Ref<ID3D12DescriptorHeap> rtv_heap;
+    if (clear) {
+        const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+        if (FAILED(device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap.p)))) return false;
+        const auto handle = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+        rtv.Format = desc.Format;
+        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+        rtv.Texture3D = {0, 1, 1};
+        device->CreateRenderTargetView(placed.p, &rtv, handle);
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        list->ResourceBarrier(1, &barrier);
+        constexpr float red[4] = {1, 0, 0, 1};
+        list->ClearRenderTargetView(handle, red, 1, clear);
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
     list->ResourceBarrier(1, &barrier);
     for (UINT s = 0; s < count; ++s) {
         D3D12_TEXTURE_COPY_LOCATION dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
@@ -246,10 +266,14 @@ bool round_trip(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fe
             for (UINT y = 0; y < rows[s]; ++y) {
                 const auto* row = static_cast<const std::uint8_t*>(mapped) + row_at(s, z, y);
                 for (UINT64 x = 0; x < row_bytes[s]; ++x, ++checked) {
-                    if (row[x] == pattern(s, z, y, x)) continue;
+                    const bool cleared = clear && s == 0 && z == 1 && UINT64(clear->left) * 4 <= x &&
+                                         x < UINT64(clear->right) * 4 && UINT(clear->top) <= y && y < UINT(clear->bottom);
+                    constexpr std::uint8_t red[4] = {255, 0, 0, 255};
+                    const auto want = cleared ? red[x % 4] : pattern(s, z, y, x);
+                    if (row[x] == want) continue;
                     if (!wrong++)
                         std::fprintf(stderr, "%s: subresource %u slice %u row %u byte %llu reads 0x%02x, want 0x%02x\n",
-                                     name, s, z, y, static_cast<unsigned long long>(x), row[x], pattern(s, z, y, x));
+                                     name, s, z, y, static_cast<unsigned long long>(x), row[x], want);
                 }
             }
     readback->Unmap(0, nullptr);
@@ -262,9 +286,116 @@ bool round_trip(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fence* fe
                 static_cast<unsigned long long>(checked));
     return true;
 }
+
+int check_wide_xbox_volume() {
+    constexpr auto flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    constexpr auto rgba8 = DXGI_FORMAT_R8G8B8A8_UNORM;
+    const auto wide = texture(t3, 2560, 1440, 1, 1, rgba8, flags);
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    {
+        Ref<ID3D12Device> desktop;
+        if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&desktop.p)))) return 77;
+        Ref<ID3D12Resource> refused;
+        if (desktop->GetResourceAllocationInfo(0, 1, &wide).SizeInBytes != UINT64_MAX ||
+            desktop->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &wide, D3D12_RESOURCE_STATE_COMMON,
+                                             nullptr, IID_PPV_ARGS(&refused.p)) != E_INVALIDARG || refused.p) {
+            std::fprintf(stderr, "desktop D3D12 accepted the wide volume\n");
+            return 1;
+        }
+        std::printf("desktop D3D12: refused 2560x1440x1 RGBA8 RTV/UAV\n");
+    }
+
+    using XboxCreate = HRESULT(WINAPI*)(IUnknown*, const void*, const IID*, void**);
+    const auto xbox_create = reinterpret_cast<XboxCreate>(rt::shims::find("d3d12_xs.dll", "D3D12XboxCreateDevice"));
+    Ref<ID3D12Device> xbox;
+    if (!xbox_create || FAILED(xbox_create(nullptr, nullptr, &__uuidof(ID3D12Device),
+                                         reinterpret_cast<void**>(&xbox.p)))) {
+        std::fprintf(stderr, "no Xbox D3D12 device\n");
+        return 1;
+    }
+    auto* inner = rt::d3d12_xs::device_proxy_real_device(xbox.p);
+    const auto* vk = rt::d3d12::vulkan_device_info(xbox.p);
+    if (!inner || !vk) return 1;
+    const auto get_format = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties>(
+        vk->get_instance_proc(vk->instance, "vkGetPhysicalDeviceImageFormatProperties"));
+    if (!get_format) return 1;
+    constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImageFormatProperties sizes{};
+    const auto support = get_format(vk->physical, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_3D,
+                                    VK_IMAGE_TILING_OPTIMAL, usage, VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT, &sizes);
+    if (support == VK_ERROR_FORMAT_NOT_SUPPORTED ||
+        (support == VK_SUCCESS && (sizes.maxExtent.width < wide.Width || sizes.maxExtent.height < wide.Height ||
+                                   sizes.maxExtent.depth < 2 || sizes.maxMipLevels < 2))) {
+        std::printf("SKIP: the Vulkan adapter cannot create the test's RGBA8 render target and storage volumes\n");
+        return 77;
+    }
+    if (support != VK_SUCCESS) return 1;
+
+    const auto info = xbox->GetResourceAllocationInfo(0, 1, &wide);
+    Ref<ID3D12Device4> device4;
+    Ref<ID3D12Device8> device8;
+    if (FAILED(inner->QueryInterface(IID_PPV_ARGS(&device4.p))) ||
+        FAILED(inner->QueryInterface(IID_PPV_ARGS(&device8.p)))) return 1;
+    const D3D12_RESOURCE_DESC1 desc1{wide.Dimension, wide.Alignment, wide.Width, wide.Height, wide.DepthOrArraySize,
+                                    wide.MipLevels, wide.Format, wide.SampleDesc, wide.Layout, wide.Flags, {}};
+    D3D12_RESOURCE_ALLOCATION_INFO1 entry1{}, entry2{};
+    const auto info1 = device4->GetResourceAllocationInfo1(0, 1, &wide, &entry1);
+    const auto info2 = device8->GetResourceAllocationInfo2(0, 1, &desc1, &entry2);
+    const auto matches = [&](D3D12_RESOURCE_ALLOCATION_INFO total, D3D12_RESOURCE_ALLOCATION_INFO1 entry) {
+        return total.SizeInBytes == info.SizeInBytes && total.Alignment == info.Alignment &&
+               entry.Offset == 0 && entry.SizeInBytes == info.SizeInBytes && entry.Alignment == info.Alignment;
+    };
+    if (info.SizeInBytes == UINT64_MAX || info.SizeInBytes < wide.Width * wide.Height * 4 || info.Alignment != k64 ||
+        !matches(info1, entry1) || !matches(info2, entry2)) {
+        std::fprintf(stderr, "Xbox wide-volume allocation disagreement: %llu / %llu / %llu bytes\n",
+                     static_cast<unsigned long long>(info.SizeInBytes), static_cast<unsigned long long>(info1.SizeInBytes),
+                     static_cast<unsigned long long>(info2.SizeInBytes));
+        return 1;
+    }
+    Ref<ID3D12Resource> committed;
+    if (FAILED(xbox->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &wide, D3D12_RESOURCE_STATE_COMMON,
+                                            nullptr, IID_PPV_ARGS(&committed.p))) || !committed.p) {
+        std::fprintf(stderr, "Xbox wide-volume committed creation failed after a valid allocation query\n");
+        return 1;
+    }
+    const auto actual = committed->GetDesc();
+    if (actual.Dimension != t3 || actual.Width != wide.Width || actual.Height != wide.Height ||
+        actual.DepthOrArraySize != 1 || actual.Format != wide.Format || actual.Flags != wide.Flags) return 1;
+    committed.reset();
+    std::printf("Xbox 2560x1440x1 RGBA8 volume: allocation variants agree (%llu bytes), committed 3D\n",
+                static_cast<unsigned long long>(info.SizeInBytes));
+
+    auto tiled = wide;
+    tiled.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    const D3D12_RESOURCE_DESC refused[] = {
+        tiled,
+        texture(t3, 16, 16, D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION + 1, 1, rgba8),
+        texture(t3, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION + 1, 16, 1, 1, rgba8),
+        texture(t3, 2560, 16, 1, 1, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+    };
+    for (const auto& desc : refused) {
+        if (inner->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != UINT64_MAX) {
+            std::fprintf(stderr, "wide-volume exception accepted a tiled, depth-stencil or out-of-range description\n");
+            return 1;
+        }
+    }
+
+    const D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12Fence> fence;
+    if (FAILED(inner->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue.p))) ||
+        FAILED(inner->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)))) return 1;
+    UINT64 signal = 0;
+    const D3D12_RECT rect{2558, 0, 2560, 2};
+    return round_trip(inner, queue.p, fence.p, signal, "Xbox wide volume RTV W-slice and untouched texels",
+                      texture(t3, 2560, 16, 2, 2, rgba8, flags), &rect) ? 0 : 1;
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--xbox-wide-volume") == 0) return check_wide_xbox_volume();
     Ref<ID3D12Device> ours;
     if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&ours.p))) || !ours.p) {
         std::printf("SKIP: no Vulkan device\n");

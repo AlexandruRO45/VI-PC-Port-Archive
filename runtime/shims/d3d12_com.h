@@ -68,6 +68,8 @@ std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, c
                                                            bool image, std::uint32_t memory_types);
 bool is_sparse_image(ID3D12Resource* resource);
 
+enum class VulkanDeviceMode { desktop, xbox };
+
 // The Vulkan objects a D3D12 device runs on. Vulkan 1.3 with dynamicRendering, synchronization2, timelineSemaphore
 // and (when separate_depth_stencil_layouts is set) separateDepthStencilLayouts enabled.
 struct VulkanDeviceInfo {
@@ -187,6 +189,8 @@ struct VulkanDeviceInfo {
     // colours fall back to transparent black.
     bool custom_border_color = false;
     bool custom_border_color_without_format = false;
+    // Keeps Xbox-only resource allowances off for callers using the desktop D3D12 layer.
+    VulkanDeviceMode mode = VulkanDeviceMode::desktop;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -202,7 +206,8 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
 // not serialize the game's queues; it says once that it ignores them.
 enum class QueueTestSettings { apply, ignore };
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out,
-                                        QueueTestSettings queue_test_settings = QueueTestSettings::apply);
+                                        QueueTestSettings queue_test_settings = QueueTestSettings::apply,
+                                        VulkanDeviceMode mode = VulkanDeviceMode::desktop);
 
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's
 // GetDevice must return. No reference is taken: the outer object owns the device. `outer` may be the proxy's
