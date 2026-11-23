@@ -46,8 +46,8 @@ gesammelt.
 
 - **Deine eigene Kopie** des Xbox-Series-Pakets in Version `1.0.2.1` (der Ordner mit `MicrosoftGame.Config` und den
   `.rpf`-Archiven, als normale, lesbare Dateien auf der Festplatte).
-- **Windows 10/11 x64** mit etwa **400 GB freiem Speicher** für die Arbeitsdateien (mit `--work` auch auf einem
-  anderen Laufwerk).
+- **Windows 10/11 x64** mit etwa **400 GB freiem Speicher** für die Arbeitsdateien (ein vollständiger
+  Asset-Export belegt allein etwa 337 GiB vor dem Audio-Schritt; mit `--work` auch auf einem anderen Laufwerk).
 - [Python 3.12+](https://www.python.org/downloads/) (bei der Installation *„Add python.exe to PATH“* anhaken).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` und `vulkaninfo`).
@@ -97,8 +97,7 @@ abgebrochener Build macht beim nächsten Start dort weiter, wo er aufgehört hat
 ### Wenig Speicherplatz
 
 Der Platzbedarf oben gilt für den vollständigen Build. Um den Port nur zu *starten*, braucht
-`--stages check,shaders,runtime` etwa 30 GB; die Stufe `assets`, die fast den ganzen Rest belegt, ist nur für die
-Asset-Tools da, und `--wav` kommt mit einem Mehrfachen der Ogg-Opus-Größe hinzu. `--work` und `--out` können auf
+`--stages check,shaders,runtime` etwa 30 GB; die Stufe `assets` (~370 GB) ist nur für die Asset-Tools da, und `--wav` kommt mit einem Mehrfachen der Ogg-Opus-Größe hinzu. `--work` und `--out` können auf
 einem anderen Laufwerk liegen. Die Runtime liest das Paket an Ort und Stelle; liegt es auf einem schreibgeschützten
 Laufwerk, brauchst du `gta6rt --overlay <beschreibbarer Ordner>` (eine Option von `gta6rt`, nicht von
 `make_game.py`). Lösche die `.s`-Dateien in `work/shaders/dxbc/disasm` nicht: Ohne sie und ohne
