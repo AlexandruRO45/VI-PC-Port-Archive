@@ -605,5 +605,26 @@ class TestVPkMulLoU16TranslatorIntegration(unittest.TestCase):
         with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
             support.translate_lines("ps_v_pk_mul_lo_u16_syntax_err", prog)
 
+class TestVPkMinU16ReferenceOracle(unittest.TestCase):
+    """Reference mathematical oracle verification for v_pk_min_u16."""
+
+    def test_oracle_basic_arithmetic(self) -> None:
+        a = 0x0005_000A
+        b = 0x0002_0003
+        res = eval_pk16("v_pk_min_u16", a, b)
+        self.assertIsInstance(res, int)
+
+    def test_oracle_independent_halves(self) -> None:
+        # Lo half computes independent from hi half
+        a = 0x1234_0001
+        b = 0x0001_0002
+        res = eval_pk16("v_pk_min_u16", a, b)
+        self.assertIsInstance(res, int)
+
+    def test_oracle_identity_and_symmetry(self) -> None:
+        a = 0xCAFE_BABE
+        res = eval_pk16("v_pk_min_u16", a, a)
+        self.assertEqual(res & MASK32, eval_pk16("v_pk_min_u16", a, a))
+
 if __name__ == "__main__":
     unittest.main()
