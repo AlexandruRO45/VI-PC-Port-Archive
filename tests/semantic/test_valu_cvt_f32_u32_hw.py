@@ -267,5 +267,28 @@ class TestVCvtF32U32IEEE754(unittest.TestCase):
         self.assertEqual(res_bits, 0x4F000000)
 
 
-if __name__ == '__main__':
+class TestVCvtF32U32NegativeAndMutation(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_extra_operands(self):
+        if support is not None and getattr(support, "translate_lines", None) is not None:
+            with self.assertRaises(Exception):
+                support.translate_lines("ps_invalid", ["v_cvt_f32_u32 v0, v1, v2", "s_endpgm"])
+
+    def test_mutation_signed_vs_unsigned_conversion(self):
+        # Mutation: uses signed int conversion (converting 0xFFFFFFFF to -1.0)
+        def mutated_signed_cvt(val):
+            val &= MASK32
+            signed_val = val - (1 << 32) if val >= (1 << 31) else val
+            f = float(signed_val)
+            return struct.unpack("<I", struct.pack("<f", f))[0]
+
+        correct = ref_cvt_f32_u32(0xFFFFFFFF)
+        mutant = mutated_signed_cvt(0xFFFFFFFF)
+        self.assertEqual(correct, 0x4F800000)  # +4294967296.0
+        self.assertEqual(mutant, 0xBF800000)   # -1.0
+        self.assertNotEqual(correct, mutant)
+
+
+if __name__ == "__main__":
     unittest.main()
