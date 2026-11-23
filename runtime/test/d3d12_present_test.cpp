@@ -350,6 +350,13 @@ int main() {
             if (!presenter->read_back(pixels, &size, &format)) return false;
             const VkExtent2D current = presenter->extent();
             if (size.width != current.width || size.height != current.height) return false;
+            const std::size_t texels = pixels.size() / 4;
+            if (size.width == 0 || size.height == 0 || pixels.size() % 4 != 0 ||
+                texels / size.width != size.height || texels % size.width != 0) {
+                std::fprintf(stderr, "presented image %ux%u: incomplete RGBA/BGRA readback (%zu bytes)\n",
+                             size.width, size.height, pixels.size());
+                return false;
+            }
             const bool bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
             for (std::size_t i = 0; i < pixels.size(); i += 4) {
                 const int r = pixels[i + (bgra ? 2 : 0)], g = pixels[i + 1], b = pixels[i + (bgra ? 0 : 2)];
