@@ -421,6 +421,18 @@ private:
         return -1;
     }
 
+    // The four hex digits of a \u escape at `at`; false when there are fewer or one is not a hex digit.
+    bool hex4(std::size_t at, unsigned& code) const {
+        if (at > text_.size() || text_.size() - at < 4) return false;
+        code = 0;
+        for (std::size_t i = at; i < at + 4; ++i) {
+            const int digit = hex_digit(text_[i]);
+            if (digit < 0) return false;
+            code = code << 4 | unsigned(digit);
+        }
+        return true;
+    }
+
     bool string(std::string& out) {
         if (pos_ >= text_.size() || text_[pos_++] != '"') return false;
         while (pos_ < text_.size()) {
@@ -440,20 +452,30 @@ private:
             case 'r': out.push_back('\r'); break;
             case 't': out.push_back('\t'); break;
             case 'u': {
-                if (pos_ + 4 > text_.size()) return false;
                 unsigned code = 0;
-                for (int i = 0; i < 4; ++i) {  // exactly four hex digits
-                    const int digit = hex_digit(text_[pos_++]);
-                    if (digit < 0) return false;
-                    code = code << 4 | unsigned(digit);
+                if (!hex4(pos_, code)) return false;  // exactly four hex digits
+                pos_ += 4;
+                // A character outside the BMP is a high surrogate escape followed by a low one (RFC 8259 section
+                // 7), which is how Python's json.dump writes it by default: one code point, 4 bytes of UTF-8. A
+                // lone surrogate has no UTF-8 form and is written as its 3-byte sequence.
+                unsigned low = 0;
+                if (code >= 0xd800 && code < 0xdc00 && text_.substr(pos_, 2) == "\\u" && hex4(pos_ + 2, low) &&
+                    low >= 0xdc00 && low < 0xe000) {
+                    pos_ += 6;
+                    code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
                 }
                 if (code < 0x80) {
                     out.push_back(char(code));
                 } else if (code < 0x800) {
                     out.push_back(char(0xc0 | (code >> 6)));
                     out.push_back(char(0x80 | (code & 0x3f)));
-                } else {  // surrogate pairs are kept as two 3-byte sequences; index names are ASCII
+                } else if (code < 0x10000) {
                     out.push_back(char(0xe0 | (code >> 12)));
+                    out.push_back(char(0x80 | ((code >> 6) & 0x3f)));
+                    out.push_back(char(0x80 | (code & 0x3f)));
+                } else {
+                    out.push_back(char(0xf0 | (code >> 18)));
+                    out.push_back(char(0x80 | ((code >> 12) & 0x3f)));
                     out.push_back(char(0x80 | ((code >> 6) & 0x3f)));
                     out.push_back(char(0x80 | (code & 0x3f)));
                 }
