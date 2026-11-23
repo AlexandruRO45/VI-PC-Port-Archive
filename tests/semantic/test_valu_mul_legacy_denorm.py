@@ -65,7 +65,9 @@ class LegacyMulDenormalTests(unittest.TestCase):
             (0x00800000, 0x3F000000, "mul:2", 0x00000000),
             (0x80800000, 0x3F000000, "mul:4", 0x00000000),
             (0x00800000, 0x3F800000, "div:2", 0x00000000),
-            (0x80800000, 0x3F800000, "div:2", 0x00000000),
+            # A normal product that omod scales into the subnormal range is flushed afterwards and keeps its sign
+            # (measured on gfx1036 in game MODE: -FLT_MIN * 1.0 with div:2 is -0, cs_legacy_mul_zero.asm).
+            (0x80800000, 0x3F800000, "div:2", 0x80000000),
             (0x40000000, 0x40400000, "div:2", 0x40400000),
         ]:
             with self.subTest(src0=hex(src0), src1=hex(src1), mods=mods):

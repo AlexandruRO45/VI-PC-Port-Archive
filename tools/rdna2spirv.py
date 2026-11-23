@@ -7978,17 +7978,25 @@ class Gen:
             x, y = (self.flush_f32(self.src_f(t)) for t in a[1:3])
             m, zx, zy, either, r = (self.tmp() for _ in range(5))
             self.emit(f"{m} = OpFMul %float {x} {y}")
-            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
-            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")
+            xm, ym = self.tmp(), self.tmp()
+            self.emit(f"{xm} = OpBitwiseAnd %uint {self.tou(x)} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{ym} = OpBitwiseAnd %uint {self.tou(y)} {self.cu(0x7FFFFFFF)}")
+            self.emit(f"{zx} = OpIEqual %bool {xm} {self.cu(0)}")
+            self.emit(f"{zy} = OpIEqual %bool {ym} {self.cu(0)}")
             self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
-            self.emit(f"{r} = OpSelect %float {either} %f0 {self.flush_f32(m)}")
-            r = self.flush_f32(self.clamp_mods(r, mods))
+            # The zero test is on the magnitude bits and the override an integer select of the word 0: with float
+            # compares against 0.0 and a float select, -0 * 3.0 came out -0 on the AMD Windows driver.
+            pu = self.tmp()
+            self.emit(f"{pu} = OpSelect %uint {either} {self.cu(0)} {self.tou(self.flush_f32(m))}")
+            r = self.tof(pu)
             if any(mod in ("mul:2", "mul:4", "div:2") for mod in mods):
-                # With IEEE off, omod makes -0 (including a flushed subnormal result) +0.
+                # With IEEE off, omod makes a -0 that enters it (a flushed subnormal product included) +0. A product
+                # that omod scales into the subnormal range is flushed afterwards and keeps its sign (measured).
                 z, pos = self.tmp(), self.tmp()
                 self.emit(f"{z} = OpFOrdEqual %bool {r} %f0")
                 self.emit(f"{pos} = OpSelect %float {z} %f0 {r}")
                 r = pos
+            r = self.flush_f32(self.clamp_mods(r, mods))
             self.dst(a[0], self.tou(r))
         elif op in ("v_mad_legacy_f32", "v_mac_legacy_f32"):
             # Legacy multiply treats 0 * anything (inf/NaN included) as 0, after the denormal flush.
