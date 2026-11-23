@@ -237,14 +237,16 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
     run's last group on its own from a copy padded to 64 node words (`--partial pad`).
   * *Wave64.* All three programs are wave64 (EXEC as 64 bits, a cross-lane read of lane 32, `v_permlanex16_b32`).
     Translated without `--wave64-emulate` and run on 32-lane subgroups, every box node comes out wrong.
-  * *`LeafRehydration` loses the device* (`VK_ERROR_DEVICE_LOST` at the queue wait) with a real table on the RTX 4080,
-    with and without `--wave64-emulate`. The cause is open. Ruled out without a GPU: every pointer the module forms
-    adds the heap base; every address an active lane computes on the 181-leaf input (geometry record, index,
-    vertex, transform) lies inside the heap; inactive lanes issue no loads; the module has no loops; both early-out
-    branches land before its one `s_barrier`, so every wave reaches it. It differs from the 49 programs that run in
-    its 1,024-thread groups, its size (about 301,000 SPIR-V words) and `v_mad_u64_u32` for the vertex addresses.
-    It also finds a chunk's five leaf arrays from the chunk's own leaf count, so a smaller count at its `+0x2c`
-    needs the arrays packed for it (`--leaf-count`).
+  * *`LeafRehydration` is right for lanes 0-31 and wrong above.* With `--leaf-count N` (the chunk's arrays packed for
+    N leaves) on the RTX 4080 with `--wave64-emulate`: N = 1, 8 and 32 write every leaf byte-exactly as the CPU
+    reference; at N = 33 the 33rd leaf (lane 32) has all 12 vertex floats wrong while its 4 integer words are right;
+    at N = 64 and on the full 181-leaf chunk the device is lost (`VK_ERROR_DEVICE_LOST`). Cause, a translator bug:
+    the disassembly prints a wave64 VALU lane-mask destination as one SGPR (`v_cmp_*_e64 s8, ...`), the translator
+    writes only that SGPR, and the following 64-bit read (`s_and_saveexec_b64 ..., s[8:9]`) gives lanes 32-63 the
+    stale high word, so they skip the index load and fetch vertices through stale indices (wild addresses with a
+    full half). 60 of the module's 423 lane-mask reads see such a stale high word, none of the box programs' 36. It
+    finds a chunk's five leaf arrays from the chunk's own leaf count, so a smaller count at its `+0x2c` needs the
+    arrays packed for it (`--leaf-count`).
 * **What is still open.** The other programs' outputs (the sorts, prefix sums, builders, refit and loaders) are not
   checked against a reference yet, and neither is `LeafRehydration` (above). Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
   above comes from `ILDN`, not from a runtime trace. The `STAT` bitcode and the `0x07 NOBC` record are not
