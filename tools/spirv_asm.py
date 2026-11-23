@@ -308,7 +308,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             return vid
         return _alloc_id(tok, lineno)
 
-    words: list[int] = [SPIRV_MAGIC, version, 0, 0, 0]
+    words = array.array("I", [SPIRV_MAGIC, version, 0, 0, 0])
     w_append = words.append
     w_extend = words.extend
 
@@ -571,10 +571,9 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
         w_extend(out)
 
     words[3] = next_id
-    arr = array.array("I", words)
     if sys.byteorder != "little":
-        arr.byteswap()
-    return arr.tobytes()
+        words.byteswap()
+    return words.tobytes()
 
 
 def main(argv=None) -> int:
