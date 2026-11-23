@@ -16,9 +16,11 @@ import argparse
 import json
 import struct
 import sys
+from bisect import bisect_right
 from collections import Counter, defaultdict
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
+HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 
 def joaat(name):
@@ -34,8 +36,13 @@ def joaat(name):
 
 
 def parse_hash(text):
+    if not text:
+        raise ValueError("hash must not be empty")
     if text.lower().startswith("0x"):
-        value = int(text, 16)
+        digits = text[2:]
+        if not digits or any(c not in HEX_DIGITS for c in digits):
+            raise ValueError(f"invalid hex hash: {text!r}")
+        value = int(digits, 16)
         if value > 0xFFFFFFFF:
             raise ValueError(f"{text} is wider than 32 bits")
         return value
@@ -73,37 +80,66 @@ def direct_calls(code, base_rva):
 
 
 def rank(data, hashes, window=48, top=15):
+    if window < 0:
+        raise ValueError("window must be non-negative")
+    if top < 0:
+        raise ValueError("top must be non-negative")
     code_sections = [s for s in sections(data) if s[4]]
     if not code_sections:
         raise ValueError("no executable section")
-    lo = min(s[1] for s in code_sections)
-    hi = max(s[1] + s[3] for s in code_sections)
+    code_slices = [(rva, data[raw:raw + size]) for _, rva, raw, size, _ in code_sections]
+    merged = []
+    for lo, hi in sorted((rva, rva + len(code)) for rva, code in code_slices if code):
+        if merged and lo <= merged[-1][1]:
+            if hi > merged[-1][1]:
+                merged[-1] = (merged[-1][0], hi)
+        else:
+            merged.append((lo, hi))
+    if not merged:
+        def in_code(_target):
+            return False
+    elif len(merged) == 1:
+        lo, hi = merged[0]
+
+        def in_code(target):
+            return lo <= target < hi
+    else:
+        starts = [lo for lo, _ in merged]
+
+        def in_code(target):
+            idx = bisect_right(starts, target) - 1
+            return idx >= 0 and target < merged[idx][1]
+    unique_hashes = []
+    seen_values = set()
+    for name, value in hashes:
+        if value not in seen_values:
+            seen_values.add(value)
+            unique_hashes.append((name, value))
     all_calls = defaultdict(list)
-    for _, rva, raw, size, _ in code_sections:
-        for target, sites in direct_calls(data[raw:raw + size], rva).items():
-            if lo <= target < hi:
+    for rva, code in code_slices:
+        for target, sites in direct_calls(code, rva).items():
+            if in_code(target):
                 all_calls[target].extend(sites)
     leads = defaultdict(set)      # candidate rva -> hashes that lead to it
-    hits = Counter()              # hash -> occurrences found
-    for name, value in hashes:
+    hits = Counter()              # hash value -> occurrences found
+    for name, value in unique_hashes:
         needle = struct.pack("<I", value)
-        for _, rva, raw, size, _ in code_sections:
-            code = data[raw:raw + size]
+        for rva, code in code_slices:
             at = code.find(needle)
             while at >= 0:
-                hits[name] += 1
+                hits[value] += 1
                 tail = code[at + 4:at + 4 + window]
                 j = tail.find(b"\xE8")
                 while 0 <= j <= len(tail) - 5:
                     rel = struct.unpack_from("<i", tail, j + 1)[0]
                     target = rva + at + 4 + j + 5 + rel
-                    if lo <= target < hi:
+                    if in_code(target):
                         leads[target].add(name)
                     j = tail.find(b"\xE8", j + 1)
                 at = code.find(needle, at + 1)
     ranked = sorted(leads, key=lambda t: (-len(leads[t]), -len(all_calls.get(t, ())), t))[:top]
     return {
-        "hashes": [{"name": n, "value": f"0x{v:08X}", "occurrences": hits[n]} for n, v in hashes],
+        "hashes": [{"name": n, "value": f"0x{v:08X}", "occurrences": hits[v]} for n, v in unique_hashes],
         "candidates": [{"rva": f"0x{t:X}", "led_by": sorted(leads[t]), "direct_callers": len(all_calls.get(t, ()))}
                        for t in ranked],
     }
@@ -118,6 +154,12 @@ def main(argv=None):
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--json", help="also write the report here")
     a = ap.parse_args(argv)
+    if a.window < 0:
+        print("ERROR: --window must be non-negative", file=sys.stderr)
+        return 2
+    if a.top < 0:
+        print("ERROR: --top must be non-negative", file=sys.stderr)
+        return 2
     try:
         hashes = [(h, parse_hash(h)) for h in (a.hash or ["player_story000_00", "cs_mandy"])]
     except ValueError as e:
@@ -130,16 +172,20 @@ def main(argv=None):
     except (OSError, ValueError, struct.error) as e:
         print(f"ERROR: {a.exe}: {e}", file=sys.stderr)
         return 2
+    if a.json:
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: {a.json}: {e}", file=sys.stderr)
+            return 2
     for h in report["hashes"]:
         print(f"{h['name']} = {h['value']}: {h['occurrences']} occurrence(s) in code")
     if not report["candidates"]:
         print("no direct call follows any of the hashes: try a larger --window, or the lookup is reached indirectly")
     for c in report["candidates"]:
         print(f"  {c['rva']:>12}  callers {c['direct_callers']:>6}  led by {', '.join(c['led_by'])}")
-    if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
-            f.write("\n")
     return 0
 
 
