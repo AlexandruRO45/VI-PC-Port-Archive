@@ -298,3 +298,19 @@ test('half-float coordinates follow the selected mip and late reads cannot repla
     await older;
     assert.equal(output.textContent, 'R = -2.5');
 });
+
+test('formatBytes handles zero, negative, non-finite, sub-byte and terabyte+ sizes without undefined or NaN', () => {
+    const { run } = loadStudio();
+    assert.equal(run('formatBytes(0)'), '0 B');
+    assert.equal(run('formatBytes(-512)'), '0 B');
+    assert.equal(run('formatBytes(NaN)'), '0 B');
+    assert.equal(run('formatBytes(Infinity)'), '0 B');
+    assert.equal(run('formatBytes(-Infinity)'), '0 B');
+    assert.equal(run('formatBytes(null)'), '0 B');
+    assert.equal(run('formatBytes(undefined)'), '0 B');
+    assert.equal(run('formatBytes(0.5)'), '0.5 B');
+    assert.equal(run('formatBytes(1024)'), '1 KB');
+    assert.equal(run('formatBytes(1536)'), '1.5 KB');
+    assert.equal(run('formatBytes(1024 ** 4)'), '1 TB');
+    assert.equal(run('formatBytes(2.5 * (1024 ** 5))'), '2560 TB');
+});
