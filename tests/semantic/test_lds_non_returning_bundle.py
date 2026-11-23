@@ -67,6 +67,25 @@ class TestLdsAddU32Offset(unittest.TestCase):
         self.assertEqual(fin[0x44], 22)
         self.assertEqual(fin[0x48], 33)
 
+class TestLdsAddU32Chaining(unittest.TestCase):
+    def test_chained_accumulations(self):
+        init = {0x40: 100}
+        ops = [("ds_add_u32", 0x40, 0, (10,)), ("ds_add_u32", 0x40, 0, (20,)), ("ds_add_u32", 0x40, 0, (30,))]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x40], 160)
+
+    def test_multi_location_independent_accumulations(self):
+        init = {0x10: 1000, 0x20: 2000}
+        ops = [
+            ("ds_add_u32", 0x10, 0, (50,)),
+            ("ds_add_u32", 0x20, 0, (75,)),
+            ("ds_add_u32", 0x10, 0, (50,)),
+            ("ds_add_u32", 0x20, 0, (25,)),
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x10], 1100)
+        self.assertEqual(fin[0x20], 2100)
+
 
 if __name__ == "__main__":
     unittest.main()
