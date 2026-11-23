@@ -526,5 +526,45 @@ class TestSNorB64ConditionCodes(unittest.TestCase):
         ScalarInterpreter.step(instr, state)
         self.assertEqual(state.scc, 0)
 
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
+
+class TestSNorB64IEEE754Bitwise(unittest.TestCase):
+    """Unit tests verifying that IEEE 754 float64 bit patterns are preserved bit-exact."""
+
+    FLOAT64_PATTERNS = {
+        "pos_zero": 0x0000_0000_0000_0000,
+        "neg_zero": 0x8000_0000_0000_0000,
+        "pos_inf": 0x7FF0_0000_0000_0000,
+        "neg_inf": 0xFFF0_0000_0000_0000,
+        "qnan": 0x7FF8_0000_0000_0000,
+        "snan": 0x7FF0_0000_0000_0001,
+        "min_subnormal": 0x0000_0000_0000_0001,
+        "max_subnormal": 0x000F_FFFF_FFFF_FFFF,
+        "min_normal": 0x0010_0000_0000_0000,
+        "max_normal": 0x7FEF_FFFF_FFFF_FFFF,
+        "one_point_zero": 0x3FF0_0000_0000_0000,
+    }
+
+    def test_float64_bitwise_nor_inversion(self):
+        """Verify NOR(pattern, 0) inverts float64 bit patterns bit-exact."""
+        for name, pattern in self.FLOAT64_PATTERNS.items():
+            with self.subTest(pattern_name=name):
+                d, scc = s_nor_b64_oracle(pattern, 0)
+                expected = (~pattern) & MASK64
+                self.assertEqual(d, expected)
+                expected_scc = 1 if expected != 0 else 0
+                self.assertEqual(scc, expected_scc)
+
+    def test_float64_zeros_nor(self):
+        """Verify NOR of pos_zero and neg_zero."""
+        pos_zero = self.FLOAT64_PATTERNS["pos_zero"]
+        neg_zero = self.FLOAT64_PATTERNS["neg_zero"]
+        # NOR(0, 0x8000_0000_0000_0000) = 0x7FFF_FFFF_FFFF_FFFF
+        d, scc = s_nor_b64_oracle(pos_zero, neg_zero)
+        self.assertEqual(d, 0x7FFF_FFFF_FFFF_FFFF)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
