@@ -32,6 +32,7 @@ class TinyGameCTestStatusTests(unittest.TestCase):
                     f"sys.stdout.write({output!r})\n"
                     f"raise SystemExit({exit_code})\n",
                     encoding="utf-8",
+                    newline="\n",
                 )
                 result = subprocess.run(
                     [CMAKE, f"-DRUNNER={sys.executable}", f"-DLOADER={loader}",
