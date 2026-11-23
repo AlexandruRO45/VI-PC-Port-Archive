@@ -5,6 +5,7 @@
 Zero game data: the "DLL" is synthetic bytes around hand-built containers (tests/test_fspx_unpack.py builds them), and
 the stage tests mock the tools the way tests/test_shader_stage_resume.py does.
 """
+import contextlib
 import hashlib
 import io
 import json
@@ -145,6 +146,9 @@ class FspxStage(unittest.TestCase):
         self.unpacked = os.path.join(self.work, "shaders", "fspx")
         self.spirv = os.path.join(self.work, "shaders", "spirv", "fspx")
         self.calls = []
+        # A translation with programs publishes a non-empty index. Default the mock to one so the reuse tests keep
+        # their meaning; a test that needs the empty case sets self.translations = {} itself.
+        self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"synthetic module")}
 
     def write_dll(self, code):
         with open(self.dll, "wb") as f:
@@ -179,6 +183,66 @@ class FspxStage(unittest.TestCase):
         self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
         self.assertEqual(self.run_step(), [])
+
+    def test_empty_index_is_retranslated_every_run(self):
+        """A translation that produced no modules publishes `{}`: that is not a finished FSPX stage, and
+        the build marker must not latch it as done forever (the port would silently ship with zero FSPX programs)."""
+        self.translations = {}
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {})
+        self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+
+    def test_empty_index_drops_stale_modules_from_the_previous_run(self):
+        self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"stale module")}
+        self.run_step()
+        stale = os.path.join(self.spirv, "upscaler_00.spv")
+        self.assertTrue(os.path.isfile(stale))
+        # Simulate a translation that produced no modules over an existing cache: the marker still matches and the
+        # old module is on disk.
+        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("{}")
+        self.translations = {}
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertFalse(os.path.exists(stale))
+        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {})
+
+    def test_failed_disassembly_leaves_no_marker_and_is_retried(self):
+        mc = os.path.join(self.tmp.name, "fake_mc.py")
+        with open(mc, "w", encoding="utf-8", newline="\n") as f:
+            f.write("import sys\nsys.stderr.write('error: disassembly stopped\\n')\nsys.exit(23)\n")
+        real_py = make_game.py
+
+        def run_tool(tool, *args):
+            if tool == "fspx_unpack.py":
+                self.calls.append((tool, args))
+                real_py(tool, *args)
+            else:
+                self.fake_py(tool, *args)
+
+        env = dict(LLVM_MC=f'"{sys.executable}" "{mc}"')
+        with mock.patch.dict(os.environ, env), mock.patch.object(make_game, "py", run_tool), \
+                mock.patch.object(make_game, "log", lambda *a: None):
+            with self.assertRaises(SystemExit) as error, contextlib.redirect_stderr(io.StringIO()):
+                make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+            self.assertEqual(error.exception.code, 1)
+            self.assertEqual([tool for tool, _ in self.calls], ["fspx_unpack.py"])
+            self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+            self.assertFalse(os.path.exists(os.path.join(self.spirv, "fspx_build.json")))
+            self.assertEqual(os.listdir(os.path.join(self.unpacked, "disasm")), [])
+            with open(mc, "w", encoding="utf-8", newline="\n") as f:
+                f.write("print('\\ts_endpgm')\n")
+            self.calls = []
+            make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+            self.assertEqual([tool for tool, _ in self.calls], ["fspx_unpack.py", "rdna2spirv.py"])
+            self.assertTrue(os.path.isfile(os.path.join(self.spirv, "index.json")))
+            self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
+            self.calls = []
+            make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+            self.assertEqual(self.calls, [])
 
     def test_missing_cached_module_is_rebuilt(self) -> None:
         self.translations = {"upscaler_00": ("c" * 64, "s" * 64, b"synthetic module")}
@@ -285,9 +349,15 @@ class ShadersStageWithTheDll(unittest.TestCase):
                     with open(os.path.join(dxbc, "disasm", "shader.s"), "w") as f:
                         f.write("s_endpgm\n")
                 elif tool == "rdna2spirv.py":
-                    touch(args[args.index("--out") + 1], "index.json")
-                    with open(os.path.join(args[args.index("--out") + 1], "index.json"), "w") as f:
-                        f.write("{}")
+                    out = args[args.index("--out") + 1]
+                    touch(out, "index.json")
+                    # The FSPX translation must publish a real program, not `{}`: an empty index is an empty step and
+                    # makes the second stage() call retranslate. An entry with no fspx_code_sha256 is skipped by
+                    # fspx_key_clash, so this is enough to model one translated module.
+                    with open(os.path.join(out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                        f.write('{"upscaler_00": {}}')
+                    with open(os.path.join(out, "upscaler_00.spv"), "wb") as f:
+                        f.write(b"synthetic module")
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
                 ran.append("translate")
@@ -311,6 +381,47 @@ class ShadersStageWithTheDll(unittest.TestCase):
             self.assertEqual(stage(), ["fspx_unpack.py", "rdna2spirv.py"])
             self.assertTrue(os.path.isfile(os.path.join(work, "shaders", "spirv", "index.json")))
             self.assertTrue(os.path.isfile(os.path.join(work, "shaders", "spirv", "fspx", "index.json")))
+
+
+class FspxCacheComplete(unittest.TestCase):
+    """Pin fspx_cache_complete(), the predicate that decides whether the FSPX outputs can be reused."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.spirv = os.path.join(self.tmp.name, "shaders", "spirv", "fspx")
+        os.makedirs(self.spirv)
+
+    def write_index(self, text):
+        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+
+    def test_empty_index_is_not_complete(self):
+        self.write_index("{}")
+        self.assertFalse(make_game.fspx_cache_complete(self.spirv))
+
+    def test_missing_index_is_not_complete(self):
+        self.assertFalse(make_game.fspx_cache_complete(self.spirv))
+
+    def test_malformed_index_is_not_complete(self):
+        self.write_index("{not json")
+        self.assertFalse(make_game.fspx_cache_complete(self.spirv))
+
+    def test_non_mapping_indexes_are_not_complete(self):
+        for text in ("[]", "null"):
+            with self.subTest(text=text):
+                self.write_index(text)
+                self.assertFalse(make_game.fspx_cache_complete(self.spirv))
+
+    def test_one_entry_with_its_module_is_complete(self):
+        self.write_index('{"upscaler_00": {}}')
+        with open(os.path.join(self.spirv, "upscaler_00.spv"), "wb") as f:
+            f.write(b"synthetic module")
+        self.assertTrue(make_game.fspx_cache_complete(self.spirv))
+
+    def test_one_entry_without_its_module_is_not_complete(self):
+        self.write_index('{"upscaler_00": {}}')
+        self.assertFalse(make_game.fspx_cache_complete(self.spirv))
 
 
 if __name__ == "__main__":

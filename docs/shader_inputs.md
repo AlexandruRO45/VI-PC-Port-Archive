@@ -8,6 +8,38 @@ it.
 Measured on the local package's disassembly (`work/shaders/dxbc/disasm`) at `16282101`. Offsets, bit positions and
 counts only; no shader text.
 
+## Bloom and exposure
+
+Reported by @Silliana in [#3235](https://github.com/ItsNotRexed/Leonida/issues/3235). The observations below were
+checked against the local disassembly. Offsets are bytes into the constant buffer read by the named shader.
+
+### A black bloom chain (`PS_DownSampleBloomFilterKaris`)
+
+- Check the RGB tint at `+0x00`, `+0x04` and `+0x08` first. The shader multiplies the filtered colour by these
+  values before export. An all-zero tint makes bloom black even with a valid source. The fourth value at `+0x0C`
+  feeds the exported alpha.
+- The sample loop has a limit of 13. Its luminance-dependent weight has the form `1 / (1 + k × luminance)`,
+  with scale `k` at `+0x1C`. Setting it to zero removes that dependence for finite inputs. The spatial filter
+  and output tint still apply.
+
+### Flat, wrong or slowly changing exposure (`PS_CalculateExposure`)
+
+- The mode dword at `+0x410` selects the exposure calculation. A nonzero value takes the path that computes
+  logarithmic exposure from the measured luminance. Check this before diagnosing the automatic exposure path.
+- On the compensation path, a nonzero dword at `+0x40C` selects the fixed value at `+0x408`. Zero selects a
+  sample from a 1D compensation curve. Check that the curve is bound when using the texture path.
+- Check the previous-exposure texture when the pass changes slowly. The adaptation code subtracts its sample
+  from the target exposure and can blend back toward the target. It tests `+0x3B0` against zero and compares
+  a value derived from the exposure delta against the threshold at `+0x3B4`. For a single-frame comparison,
+  the issue report suggests seeding the previous exposure with the target.
+
+### Luminance downsample and bloom upsample
+
+All five sampling sites in `PS_LuminanceSourceDownsample` contribute to the export. All nine in
+`PS_UpSampleBloomFilterBlend` do too. Check the source resolution, sampling and reduction before comparing
+the luminance pyramid with a whole-frame average.
+When inspecting the upsample in isolation, check in the pipeline state how its output blends with the previous level.
+
 ## Studio-shot lighting (`PS_STUDIOSHOT_PBR_MATERIAL_STANDARD_LIGHTING`)
 
 Reported by @Silliana in [#1892](https://github.com/ItsNotRexed/Leonida/issues/1892). The corpus has one program
@@ -40,7 +72,8 @@ The fields below are the ones confirmed. The rest of the record is read but not 
 |---|---|---|
 | +0x10 | 3 × f32 | Light position; the shader subtracts the world position of the pixel from it. |
 | +0x20 | u32 | Bits 0–8: profile index (9 bits) into the profile table. Bits 9–17 and 18–21 are two more fields, not decoded. |
-| +0x28 | u32 | Flags. Bit 24 enables the light-shaping planes; bit 16 takes part in the shadow-map gate; bits 17, 20, 21, 26, 27 and 30 are tested, not decoded. |
+| +0x28 | u32 | Flags. Bit 24 enables the light-shaping planes; bit 16 takes part in the shadow-map gate; bits 30–31 are the light type (0–3), which selects how +0x3C is used; bits 17, 20, 21, 26 and 27 are tested, not decoded. |
+| +0x3C | 2 × f16 | Light shape size: the light's dimensions, used differently per light type. See [Light shape size](#light-shape-size). |
 | +0x40 | u32 | Low 24 bits non-zero turns on one per-light factor; at zero that factor is 1.0, so the light still shades. The top byte isn't read on the paths checked. |
 | +0x4C | u32 | Top byte: number of light-shaping planes (0–255). See below. |
 | +0x5F | u8 | Read as byte / 255; at 0 one block of the light's shading is skipped. |
@@ -57,6 +90,23 @@ Only 11 planes fit in the record (the last at +0x1F0). A larger count reads on i
 end of the buffer after the last light. A float in this dword has its exponent in the top byte: 1.0f (`0x3F800000`)
 gives 63 planes. The loop itself ends after at most 255 iterations. If a device-lost still shows up there, check this
 dword and the buffer's bounds first.
+
+#### Light shape size
+
++0x3C holds two f16. How they are used depends on the light type (bits 30–31 at +0x28):
+
+| Type | Low half | High half | Source |
+|---|---|---|---|
+| 0 | Sphere radius: clamped against the reflection ray to pick the closest point on the light. Brightness grows with radius², since intensity is radiance. | No effect. | Tested by @Silliana [on the pull request](https://github.com/ItsNotRexed/Leonida/pull/3157): radius 60 → 5 dimmed the light about 134× (radius² predicts 144×). |
+| not decoded | Half-size along one axis of a rectangle. | Half-size along the other axis. | Shader: the light's position is moved by ± each half along its axis, and points are clamped to those bounds. |
+| not decoded | — | A length along the light's axis (clamped to ± half of it), also squared and compared against a distance. Probably a tube light's length (@Silliana's hypothesis, not tested). | Shader. |
+
+The low half also sets one blend factor. No range-style falloff was found: neither half divides a distance, and the
+early reading of the high half as a range is dropped.
+
+A value that's too big makes the light too large. On a sphere light, the brightness grows with the square of the
+radius. That gives scattered single-pixel specular blowups that look like a translator bug, for example when a range
+is written into both halves (reported by @Silliana).
 
 #### Correction to #1892
 
@@ -171,6 +221,13 @@ transmittance table #1897 names, so it runs second and not side by side with `CS
 (mip 0). Which texture is bound to which table comes from #1897, not from the program. If a sky pass runs before the
 tables are built, it reads whatever is in them, and the black or noisy sky looks like a translator bug.
 
+### Transmittance addresses texel corners
+
+`CS_Transmittance` turns its integer texel index into table coordinates as x × 1/256 and y × 1/64, with no +0.5,
+so each texel holds the value at its corner, not its centre (pointed out by @Silliana in
+[#3217](https://github.com/ItsNotRexed/Leonida/pull/3217#issuecomment-7084678180)). A reference table built at texel
+centres differs from it slightly, most visibly near the ground. That difference is expected and isn't a translator bug.
+
 ### The dword at +0xD0: output format, not an enable
 
 #1897 reports a SkyView dword that skips the stores when it is zero. In `CS_SkyView` and `CS_MultipleScattering`
@@ -195,3 +252,53 @@ same 32-bit word to all four components of the storage image. The data is useles
 says. The layer's UAV path for `R9G9B9E5_SHAREDEXP` already covers this: on a GPU without native RGB9E5 storage it
 binds an `R32_UINT` storage view ([`d3d12_vulkan.md`](d3d12_vulkan.md), from #1375 and #1388).
 `CS_Transmittance` and `CS_SkyAtmosphereLUT` contain no RGB9E5 packing.
+
+### The shared atmosphere constant buffer
+
+Reported by @Silliana in [#3990](https://github.com/ItsNotRexed/Leonida/issues/3990): the four passes read one
+atmosphere struct, each through its own buffer descriptor fetched from the resource table. Confirmed in the
+disassembly of the 1.0.2.1 package (llvm-mc 23.1.5, gfx1013): the 26,503-program corpus has exactly one program for
+each of the four names, and each reads the offsets below through a single descriptor. The three `sky_scattering`
+passes fetch that descriptor from table offset **+0x220**; `CS_SkyAtmosphereLUT` fetches it from **+0xC60**. So when
+one pass looks right and another looks wrong, check the slot binding before the layout. The +0xD0 output-format
+dword above sits in this same buffer.
+
+Everything is in km (#3990). Field names are #3990's reading; the offsets and the "consumed by" column are measured.
+A pass can load a dword as part of a wider load without using it, so "consumed" means an instruction reads the
+register before it is overwritten.
+
+| Offset | Type | Field (#3990) | Consumed by |
+|---|---|---|---|
+| +0x20 | f32 | Planet radius | all four |
+| +0x30 | f32 | Rayleigh scale height | none (loaded, see below) |
+| +0x34 | 3 × f32 | Rayleigh scattering RGB | all four |
+| +0x40 | f32 | Mie scale height | none (loaded, see below) |
+| +0x44 | 3 × f32 | Mie scattering RGB | all four |
+| +0x50 | f32 | Top of the atmosphere | all four |
+| +0x60 | 3 × f32 | Mie absorption RGB | all four |
+| +0x6C | f32 | Mie g (phase asymmetry) | `CS_SkyView` only |
+| +0x70 | f32 | Ozone layer width | all four |
+| +0x74 | 2 × f32 | Ozone below the layer: constant, slope | all four |
+| +0x7C | 2 × f32 | Ozone above the layer: constant, slope | all four |
+| +0x84 | 3 × f32 | Ozone absorption RGB | all four |
+| +0x90 | 3 × f32 | Sun direction | `CS_SkyView` only |
+| +0xA0 | 3 × f32 | Moon direction | `CS_SkyView` only |
+
+The two scale-height dwords are where the disassembly adds to #3990: every pass loads them inside a wide scalar
+load, but in all four programs the registers holding +0x30 and +0x40 are overwritten or never touched again before
+any instruction reads them. Only the RGB coefficients next to them are consumed. A wrong value in those two dwords
+cannot by itself explain a bad sky from these passes.
+
+The ozone block matches #3990's two-layer linear reading: the dword at +0x70 is compared per lane with a float
+(`v_cmp_gt_f32`) in the ozone block, the constant/slope pairs feed `v_fma_f32`, and the absorption RGB feeds the
+per-channel accumulate. `CS_SkyView` reads the sun direction at +0x90 and a second direction at +0xA0,
+which #3990 reads as the moon; its second output is the sky lit by that direction. The fourth dword of each
+direction (+0x9C, +0xAC) is not consumed.
+
+Some neighbouring dwords are read but not decoded here: +0x24 to +0x2C (next to the planet radius), +0x54 to +0x5C
+(`CS_SkyView`), and +0x04 to +0x13 (`CS_SkyView` and `CS_SkyAtmosphereLUT`).
+
+Sanity checks from #3990 (GPU experiments, not repeated here): zeroing the Rayleigh RGB makes the zenith go basically
+white, zeroing the ozone absorption mostly bumps green, and raising Mie g brightens the sky toward the sun. With
+Earth-like values `CS_Transmittance` lands within about 0.01 of a reference transmittance table, which makes it the
+cheapest pass to sanity-check a translation.
