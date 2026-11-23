@@ -192,6 +192,37 @@ class TestDsSwizzleB32SIMD(unittest.TestCase):
             # Target is l+1, which is odd (inactive) -> returns 0
             self.assertEqual(expr.eval(l, data, exec_mask), 0)
 
+class TestDsSwizzleB32Translator(unittest.TestCase):
+    def test_translator_quad_perm_execution(self) -> None:
+        # ds_swizzle_b32 v2, v1 offset:swizzle(QUAD_PERM,1,0,3,2)
+        body = [
+            "v_mov_b32_e32 v1, v0",
+            "ds_swizzle_b32 v2, v1 offset:swizzle(QUAD_PERM,1,0,3,2)",
+            "buffer_store_dword v2, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_swizzle_quad")
+        for quad in range(8):
+            base = quad * 4
+            self.assertEqual(results[base + 0], base + 1)
+            self.assertEqual(results[base + 1], base + 0)
+            self.assertEqual(results[base + 2], base + 3)
+            self.assertEqual(results[base + 3], base + 2)
+
+    def test_translator_bitmask_perm_execution(self) -> None:
+        # ds_swizzle_b32 v2, v1 offset:swizzle(BITMASK_PERM,"ppppi")
+        body = [
+            "v_mov_b32_e32 v1, v0",
+            'ds_swizzle_b32 v2, v1 offset:swizzle(BITMASK_PERM,"ppppi")',
+            "buffer_store_dword v2, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_swizzle_bitmask")
+        for l in range(32):
+            self.assertEqual(results[l], l ^ 1)
+
+    def test_translator_swizzle_syntax_rejection(self) -> None:
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("cs_swizzle_bad", ["ds_swizzle_b32 v1, v2 offset:99999", "s_endpgm"], fssm=FSSM)
+
 
 if __name__ == "__main__":
     unittest.main()
