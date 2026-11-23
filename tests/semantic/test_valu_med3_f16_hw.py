@@ -500,5 +500,94 @@ class TestVMed3F16BoundaryExtremes(unittest.TestCase):
         self.assertTrue(is_nan_f16(snan))
         self.assertEqual(v_med3_f16_oracle(snan, c2, c3), c2)
 
+# Append negative controls, mutation detection, and translator integration
+class TestVMed3F16NegativeAndMutation(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_bad_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(-10)
+
+    def test_syntax_rejection_bad_imm(self) -> None:
+        with self.assertRaises(ValueError):
+            ImmF16(0x10000)
+
+    def test_mutation_detection_clamp_dropped(self) -> None:
+        # Value 2.0 should clamp to 1.0 (0x3C00)
+        correct = v_med3_f16_oracle(0x4000, 0x4200, 0x4500, clamp=True)
+        mutant = v_med3_f16_oracle(0x4000, 0x4200, 0x4500, clamp=False)
+        self.assertEqual(correct, F16_ONE)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_detection_nan_fallback_dropped(self) -> None:
+        def buggy_med3_ignoring_nan_rule(x: int, y: int, z: int) -> int:
+            lo = nmin_f16(x, y)
+            hi = nmax_f16(x, y)
+            m1 = nmax_f16(z, lo)
+            return nmin_f16(m1, hi)
+
+        # NaN, 2.0, 3.0: RDNA2 hardware rule returns min3 (2.0)
+        correct = v_med3_f16_oracle(F16_QNAN, 0x4000, 0x4200)
+        self.assertEqual(correct, 0x4000)
+
+    def test_translator_rejects_malformed_syntax(self) -> None:
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("bad_syntax", ["v_med3_f16 v0, v1"])
+
+
+class TestVMed3F16TranslatorIntegration(unittest.TestCase):
+    """Hardware translator integration: tools/rdna2spirv.py and spirv_mini_interp."""
+
+    TABLE = (
+        (0x3C00, 0x4000, 0x4200, 0x4000),  # 1.0, 2.0, 3.0 -> 2.0
+        (0x4200, 0x3C00, 0x4000, 0x4000),  # permutation
+        (0x0000, 0x8000, 0x3C00, 0x0000),  # +0.0, -0.0, 1.0 -> +0.0
+        (0x7E00, 0x4000, 0x4200, 0x4000),  # NaN, 2.0, 3.0 -> min3 (2.0)
+    )
+
+    def test_translator_table_evaluation(self) -> None:
+        for x, y, z, want in self.TABLE:
+            with self.subTest(x=hex(x), y=hex(y), z=hex(z)):
+                lines = [
+                    f"v_mov_b32_e32 v1, {x:#x}",
+                    f"v_mov_b32_e32 v2, {y:#x}",
+                    f"v_mov_b32_e32 v3, {z:#x}",
+                    "v_mov_b32_e32 v0, 0xDEAD0000",
+                    "v_med3_f16 v0, v1, v2, v3",
+                    "exp mrt0 v0, v0, v0, v0 done",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines("ps_med3_f16_table", lines)
+                words = support.mrt0_words(spv)
+                self.assertEqual(words[0], 0xDEAD0000 | want)
+
+    def test_translator_clamp(self) -> None:
+        lines = [
+            "v_mov_b32_e32 v1, 0x4000",
+            "v_mov_b32_e32 v2, 0x4200",
+            "v_mov_b32_e32 v3, 0x4500",
+            "v_mov_b32_e32 v0, 0",
+            "v_med3_f16 v0, v1, v2, v3 clamp",
+            "exp mrt0 v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_f16_clamp", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & 0xFFFF, F16_ONE)
+
+    def test_translator_op_sel_routing(self) -> None:
+        lines = [
+            "v_mov_b32_e32 v1, 0x3C000000",  # s0 high = 1.0
+            "v_mov_b32_e32 v2, 0x00004000",  # s1 low = 2.0
+            "v_mov_b32_e32 v3, 0x42000000",  # s2 high = 3.0
+            "v_mov_b32_e32 v0, 0x0000BEEF",  # low = BEEF
+            "v_med3_f16 v0, v1, v2, v3 op_sel:[1,0,1,1]",
+            "exp mrt0 v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_f16_opsel", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x4000BEEF)
+
 if __name__ == "__main__":
     unittest.main()
