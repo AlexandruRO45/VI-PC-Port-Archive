@@ -18,8 +18,8 @@ How the search stays bounded and deterministic:
    shader_index*8 + meta_size + code_size``. The tool appends following streams after at most 1 MiB of zero
    padding until exactly that many inflated bytes exist. A stream that would overshoot, a missing stream, or a
    missing header is reported with the byte counts, not guessed.
-4. The file is written to ``--out``, which must be inside the system temporary directory, and then checked with
-   ``psocache_inspect.inspect``. The exit code is 0 only when that model holds.
+4. The file is written to the output path (the second argument), which must be inside the system temporary
+   directory, and then checked with ``psocache_inspect.inspect``. The exit code is 0 only when that model holds.
 
 Usage:
     python -I psocache_extract.py <archive.rpf|folder> <out> [--budget BYTES] [--max-streams N] [--quiet]
