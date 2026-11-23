@@ -236,6 +236,60 @@ class NavmeshLinksTest(unittest.TestCase):
         self.assertEqual(doc, default)
         self.assertEqual(doc["tiles"], 3)
 
+    def test_endpoint_agreement_cli(self):
+        sector = 42
+        open_edge = (0xffffffff, 0xffff, 0, 0)
+        # Each slot uses a distinct index; equality must use all six coordinate bytes.
+        def tile(left, right, local_left=(0,), local_right=(0,)):
+            values = left + right
+            edges = [((sector, 1, 0, 0) if j in local_left else open_edge)
+                     for j in range(len(left))]
+            edges.extend((sector, 0, 0, 0) if j in local_right else open_edge
+                         for j in range(len(right)))
+            buf = bytearray(build_tile(flags=1, sector=sector, n_verts=len(values),
+                                       poly_sizes=(len(left), len(right)), edges=edges)[0])
+            base = nd.split_array(buf, 0x70, 6, len(values))[0][0]
+            for j, z in enumerate(values):
+                struct.pack_into("<3H", buf, base + 6 * j, 5, 7, z)
+            return buf
+
+        samples = [
+            tile([1, 2, 3], [2, 1, 4]),        # outgoing reversed
+            tile([1, 2, 3], [1, 2, 4]),        # outgoing same direction
+            tile([1, 1, 3], [1, 1, 4]),        # unique zero-length pair
+            tile([1, 2, 1, 2], [2, 1, 4], (0, 2)),  # duplicate against one return
+            tile([1, 3, 2], [2, 4, 1]),        # incoming reversed across wrap
+        ]
+        other = build_tile(flags=1, sector=sector, poly_sizes=(3,), edges=[
+            (sector, 0, 0, 0), (sector, 1, 0, 0), (sector + 1, 0, 0, 0),
+        ])[0]
+        samples.append(other)
+        bad = bytearray(samples[0])
+        offset = nd.split_array(bad, 0x98, 44, 2)[0][0]
+        struct.pack_into("<I", bad, offset + 44 + 4, 3)
+        bad_index = bytearray(samples[0])
+        offset = nd.split_array(bad_index, 0x80, 2, 6)[0][0]
+        struct.pack_into("<H", bad_index, offset, 6)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "tiles.rpf")
+            make_rpf(path, samples + [bad, bad_index])
+            base = nl.scan(path, reciprocity=True)
+            proc = subprocess.run([sys.executable, "-I", TOOL, path, "--reciprocity",
+                                   "--endpoint-agreement"], capture_output=True, check=True)
+        report = json.loads(proc.stdout)
+        result = report.pop("endpoint_agreement")
+        self.assertEqual(report, base)
+        self.assertEqual(result["tiles_counted"], 6)
+        self.assertEqual(result["self_references"], 1)
+        self.assertEqual(result["invalid_targets"], 2)
+        self.assertEqual(result["outgoing"], {
+            "reversed": 2, "same_direction": 2, "degenerate": 2,
+            "repeated": 3, "no_exact_return": 2,
+        })
+        self.assertEqual(result["incoming"]["reversed"], 2)
+        self.assertEqual(result["incoming"]["no_exact_return"], 9)
+        self.assertEqual(result["unlinked"], 20)
+
     def test_valid_rpf_and_carved_dir(self):
         s1 = build_tile(flags=3)
         s2 = build_tile(flags=1, sector=(260 << 9) | 251, two_streams=True)

@@ -538,6 +538,23 @@ are authoring/build-time inputs to that partition:
   counts of A to B and B to A for each ordered polygon pair. Self edges contribute zero excess. The report counts
   valid same-tile records, all-ones open targets and invalid targets separately. This measures polygon references
   without testing geometric edge alignment.
+  Pass `--endpoint-agreement` to compare two ways to associate slot *j* of the adjacency span with its
+  polygon boundary. Under `outgoing` it runs from vertex *j* to the next vertex. Under `incoming` it runs
+  from the previous vertex to *j*. Both wrap within the polygon and compare all three stored u16 coordinates
+  at `+0x70` through the `+0x80` indices. The unit is a directed slot. With one occurrence on each polygon,
+  matching endpoints count as `reversed`, `same_direction`, or `degenerate` (identical endpoints).
+  If a return exists and either polygon repeats the same unordered endpoints for this neighbor, all affected
+  slots count as `repeated`. A slot with no return to its source at those exact coordinates counts as
+  `no_exact_return`. Open, invalid and self targets have separate totals.
+
+  Across all 27,644 Xbox 1.0.2.1 tiles, each convention accounts for 458,728,869 directed same-tile slots.
+  The endpoint agreement supports slot *j* describing the outgoing boundary edge. A unique return can run
+  in either direction. Another 34,295,319 slots were open. None had invalid or self targets.
+
+  | Boundary tested | Reversed | Same direction | Degenerate | Repeated | No exact return |
+  |---|---:|---:|---:|---:|---:|
+  | Outgoing | 449,013,586 | 9,676,624 | 42 | 94 | 38,523 |
+  | Incoming | 702 | 102,408 | 2 | 3 | 458,625,754 |
 - `tools/navmesh_nodes.py` (stdlib-only) counts the polygon flag bits under the lane-graph nodes
   ([above](#polygon-flags-under-the-lane-graph)). It reads `navmeshes.rpf` and `levels.rpf` and writes counts only.
 

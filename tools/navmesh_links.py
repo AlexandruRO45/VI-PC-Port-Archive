@@ -70,6 +70,65 @@ def _count_reciprocity(b, polygons, edges, sector, polygon_count, totals):
     totals["unlinked"] += unlinked
 
 
+ENDPOINT_CLASSES = (
+    "reversed", "same_direction", "degenerate", "repeated", "no_exact_return",
+)
+
+
+def _endpoint_counts(b, tables, sector, polygon_count, totals):
+    """Compare each slot under both cyclic boundary conventions within this tile."""
+    vertices, indices, edges, polygons = tables
+    coords = [xyz for offset, count in vertices
+              for (xyz,) in struct.iter_unpack("<6s", b[offset:offset + count * 6])]
+    ring_indices = [index for offset, count in indices
+                    for (index,) in struct.iter_unpack("<H", b[offset:offset + count * 2])]
+    targets = (target for offset, count in edges for target in
+               struct.iter_unpack("<IH6x", b[offset:offset + count * 12]))
+    hypotheses = {"outgoing": Counter(), "incoming": Counter()}
+    position = source = self_refs = unlinked = invalid = 0
+    for offset, count in polygons:
+        for i in range(count):
+            span = nd._u32(b, offset + 44 * i + 4)
+            if span >> 4 != position:
+                return
+            end = position + (span & 15)
+            ring = [coords[index] for index in ring_indices[position:end]]
+            for j, vertex in enumerate(ring):
+                target_sector, target = next(targets)
+                if (target_sector, target) == (0xffffffff, 0xffff):
+                    unlinked += 1
+                elif target_sector != sector or target >= polygon_count:
+                    invalid += 1
+                elif target == source:
+                    self_refs += 1
+                else:
+                    hypotheses["outgoing"][source, target, vertex, ring[(j + 1) % len(ring)]] += 1
+                    hypotheses["incoming"][source, target, ring[j - 1], vertex] += 1
+            position = end
+            source += 1
+
+    totals["tiles_counted"] += 1
+    totals["self_references"] += self_refs
+    totals["unlinked"] += unlinked
+    totals["invalid_targets"] += invalid
+    for convention, counts in hypotheses.items():
+        for (source, target, start, end), n in counts.items():
+            reverse = counts[target, source, end, start]
+            same = counts[target, source, start, end] if start != end else 0
+            if not (same or reverse):
+                category = "no_exact_return"
+            elif (n > 1 or reverse + same > 1 or
+                  (start != end and counts[source, target, end, start])):
+                category = "repeated"
+            elif start == end:
+                category = "degenerate"
+            elif reverse:
+                category = "reversed"
+            else:
+                category = "same_direction"
+            totals[convention][category] += n
+
+
 def verify_tile(b, stats):
     """Verify +0x88 adjacent edges, polygon +0x20 link chain, and +0xA8/+0xB0 special links."""
     chk = {}
@@ -101,6 +160,8 @@ def verify_tile(b, stats):
     edges_ok = b88 is not None and pool_confirmed
     if edges_ok and "reciprocity" in stats:
         _count_reciprocity(b, b98, b88, c8, c4, stats["reciprocity"])
+    if edges_ok and "endpoint_agreement" in stats:
+        _endpoint_counts(b, (b70, b80, b88, b98), c8, c4, stats["endpoint_agreement"])
     same_tile = 0
     unlinked = 0
     edge_flags_lo = Counter()
@@ -339,8 +400,13 @@ def _iter_resources(path, start=0, limit=None):
                 yield bytes(buf)
 
 
-def scan(path, start=0, limit=None, *, reciprocity=False):
+def scan(path, start=0, limit=None, *, reciprocity=False, endpoint_agreement=False):
     stats = new_stats()
+    if endpoint_agreement:
+        stats["endpoint_agreement"] = {
+            "tiles_counted": 0, "self_references": 0, "unlinked": 0, "invalid_targets": 0,
+            **{name: dict.fromkeys(ENDPOINT_CLASSES, 0) for name in ("incoming", "outgoing")},
+        }
     if reciprocity:
         stats["reciprocity"] = dict.fromkeys(
             ("tiles_counted", "same_tile", "excess_directed", "invalid_targets", "unlinked"), 0)
@@ -350,6 +416,7 @@ def scan(path, start=0, limit=None, *, reciprocity=False):
         for name, ok in chk.items():
             stats["checks"][name]["pass" if ok else "fail"] += 1
     return {
+        **({"endpoint_agreement": stats["endpoint_agreement"]} if endpoint_agreement else {}),
         **({"reciprocity": stats["reciprocity"]} if reciprocity else {}),
         "tiles": stats["tiles"],
         "checks": stats["checks"],
@@ -387,6 +454,8 @@ def main(argv=None):
     ap.add_argument("--quiet", action="store_true", help="Suppress stdout summary")
     ap.add_argument("--reciprocity", action="store_true",
                     help="Count same-tile directed edges in excess of their reverse multiplicity")
+    ap.add_argument("--endpoint-agreement", action="store_true",
+                    help="Compare incoming and outgoing boundary endpoints for same-tile edges")
     args = ap.parse_args(argv)
 
     if args.start < 0:
@@ -414,7 +483,8 @@ def main(argv=None):
                     sys.stderr.write("error: --out must not overwrite a carved input stream\n")
                     return 2
 
-    doc = scan(args.input, start=args.start, limit=args.limit, reciprocity=args.reciprocity)
+    doc = scan(args.input, start=args.start, limit=args.limit, reciprocity=args.reciprocity,
+               endpoint_agreement=args.endpoint_agreement)
     if args.out is not None:
         parent = os.path.dirname(os.path.abspath(args.out))
         if parent:
