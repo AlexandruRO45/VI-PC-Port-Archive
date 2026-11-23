@@ -11955,9 +11955,10 @@ class Gen:
         the four fetches can't reproduce it. A run-time S# can't be judged at translation time, so modes 4 and 5 are
         treated as clamp-to-edge there, and FORCE_UNNORMALIZED (bit 15) is not applied (the two remaining
         approximations, with gather_border_one's table colour at run time)."""
-        if s_op["k"] != "sgpr" or s_op.get("n", 1) < 4:
+        if not ((s_op["k"] == "sgpr" and s_op.get("n", 1) >= 4)
+                or (s_op["k"] == "slist" and len(s_op["r"]) >= 4)):
             raise Unsupported("descriptor operand")
-        lit = self.sgpr_imm.get(s_op["r"])
+        lit = self.sgpr_word_imm(s_op, 0)
         if lit is not None:
             if not unorm and (lit & 0x8000):
                 raise Unsupported("image_gather4_l with FORCE_UNNORMALIZED")
@@ -11966,7 +11967,7 @@ class Gen:
                 if mode in (4, 5):
                     raise Unsupported(f"image_gather4_l address mode {mode} (half border)")
             return m
-        w0 = self.load_reg("sgpr", s_op["r"])
+        w0 = self.sgpr_word(s_op, 0)
         out = []
         for k in range(2):
             m = self.tmp()
@@ -11980,14 +11981,14 @@ class Gen:
         (Mesa gfx10-rsrc.json SQ_IMG_SAMP_WORD3; SQ_TEX_BORDER_COLOR_* in gfx6.json): 0 transparent black (0,0,0,0),
         1 opaque black (0,0,0,1), 2 opaque white (1,1,1,1), 3 a colour from the border-colour table (BORDER_COLOR_PTR),
         which the translator can't read: Unsupported on a literal S#, transparent black at run time."""
-        lit = self.sgpr_imm.get(s_op["r"] + 3)
+        lit = self.sgpr_word_imm(s_op, 3)
         if lit is not None:
             kind = lit >> 30 & 3
             if kind == 3:
                 raise Unsupported("image_gather4_l border colour from the table (BORDER_COLOR_TYPE 3)")
             return kind == 2 or (kind == 1 and ch == 3)
         kind, white = self.tmp(), self.tmp()
-        self.emit(f"{kind} = OpShiftRightLogical %uint {self.load_reg('sgpr', s_op['r'] + 3)} {self.cu(30)}")
+        self.emit(f"{kind} = OpShiftRightLogical %uint {self.sgpr_word(s_op, 3)} {self.cu(30)}")
         self.emit(f"{white} = OpIEqual %bool {kind} {self.cu(2)}")
         if ch != 3:
             return white
@@ -11996,19 +11997,19 @@ class Gen:
         self.emit(f"{one} = OpLogicalOr %bool {white} {black}")
         return one
 
-    def clamp_gather_lod(self, lod: str, word_reg: int) -> str:
+    def clamp_gather_lod(self, lod: str, word_reg) -> str:
         """Clamp to S# word 1's unsigned 4.8 MIN_LOD and MAX_LOD before choosing the fetch mip.
 
         A literal S# uses FClamp. A run-time S# clamps with FMax then FMin: LLPC 26.10.1 (32.0.32015.7029)
         miscompiles the run-time FClamp here and leaves the gather at mip 0 when MIN_LOD should raise it (#1032).
         The two-instruction form is the FClamp result for min <= max and passes on that driver."""
-        literal = self.sgpr_imm.get(word_reg)
+        literal = self.sgpr_word_imm(word_reg, 1) if isinstance(word_reg, dict) else self.sgpr_imm.get(word_reg)
         if literal is not None:
             limits = [self.fconst(((literal >> bit) & 0xfff) / 256.0) for bit in (0, 12)]
             clamped = self.tmp()
             self.emit(f"{clamped} = OpExtInst %float %glsl FClamp {lod} {limits[0]} {limits[1]}")
             return clamped
-        word = self.load_reg("sgpr", word_reg)
+        word = self.sgpr_word(word_reg, 1) if isinstance(word_reg, dict) else self.load_reg("sgpr", word_reg)
         scale = self.fconst(1.0 / 256.0)
         limits = []
         for bit in (0, 12):
@@ -12116,7 +12117,7 @@ class Gen:
     def gather_depth_compare_prep(self, s_op):
         """Decode S# word 0 DEPTH_COMPARE_FUNC [14:12] once per depth-compare gather4.
         Returns ('const', func) for a literal S#, or ('dyn', b0, b1, b2, b02) for a run-time S#."""
-        lit = self.sgpr_imm.get(s_op["r"]) if s_op["k"] == "sgpr" else None
+        lit = self.sgpr_word_imm(s_op, 0)
         if lit is not None:
             return ("const", (lit >> 12) & 7)
         w0 = self.sgpr_word(s_op, 0)
@@ -12257,7 +12258,7 @@ class Gen:
         lv, lvm, mi, mc, mz = (self.tmp() for _ in range(5))
         self.emit(f"{lv} = OpImageQueryLevels %int {img}")
         self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
-        lod = self.clamp_gather_lod(raw_lod, a[3]["r"] + 1)
+        lod = self.clamp_gather_lod(raw_lod, a[3])
         # Share #4321's RDNA2 8-fraction-bit LOD rounding so ordinary and depth-compare gathers agree at
         # mip boundaries such as 0x3eff0000 (127.5/256) and 0x3eff0001: mip = (RoundEven(lod * 256) + 128) >> 8.
         sc, q, qi, b = self.tmp(), self.tmp(), self.tmp(), self.tmp()
@@ -12402,10 +12403,18 @@ class Gen:
             self.desc_cache[key] = idx
         return idx
 
+    def sgpr_word_imm(self, a, i):
+        if a["k"] == "sgpr" and i < a.get("n", 1):
+            return self.sgpr_imm.get(a["r"] + i)
+        if a["k"] == "slist" and i < len(a["r"]):
+            slot = a["r"][i]
+            return self.sgpr_imm.get(slot) if isinstance(slot, int) else None
+        raise Unsupported("descriptor operand")
+
     def sgpr_word(self, a, i):
-        if a["k"] == "sgpr":
+        if a["k"] == "sgpr" and i < a.get("n", 1):
             return self.load_reg("sgpr", a["r"] + i)
-        if a["k"] == "slist":
+        if a["k"] == "slist" and i < len(a["r"]):
             slot = a["r"][i]
             if isinstance(slot, int):
                 return self.load_reg("sgpr", slot)
@@ -12605,7 +12614,7 @@ class Gen:
                 # Size and level-count queries read view properties; only the texel fetches need a typed alias.
                 self.emit(f"{lv} = OpImageQueryLevels %int {img}")
                 self.emit(f"{lvm} = OpISub %int {lv} {self.as_int(self.cu(1))}")
-                lod = self.clamp_gather_lod(f[2], a[3]["r"] + 1)
+                lod = self.clamp_gather_lod(f[2], a[3])
                 # Native gather rounds the LOD to the nearest mip with ties up, not to even (SHADER-152: on
                 # Radeon Graphics 26.10.1, LOD 0.5 with bounds [0,1] selected mip 1, where RoundEven selected 0).
                 # floor + (fraction >= 0.5), not Floor(lod + 0.5): lod - floor(lod) is exact in binary32, the sum is
@@ -13666,12 +13675,12 @@ class Gen:
             level_f = lod if lod is not None else bias
         mip = None
         if level_f is not None:
-            lit = self.sgpr_imm.get(s_op["r"] + 2)
+            lit = self.sgpr_word_imm(s_op, 2)
             if lit is not None:
                 mip = lit >> 26 & 3
             else:
                 mip = self.tmp()
-                self.emit(f"{mip} = OpBitFieldUExtract %uint {self.load_reg('sgpr', s_op['r'] + 2)} "
+                self.emit(f"{mip} = OpBitFieldUExtract %uint {self.sgpr_word(s_op, 2)} "
                           f"{self.cu(26)} {self.cu(2)}")
             if mip == 0:
                 level_f = None
