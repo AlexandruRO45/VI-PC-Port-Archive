@@ -481,11 +481,9 @@ PVOID NTAPI pc_to_file_header(PVOID pc, PVOID* base) {
 // The Universal CRT's path calls a host CRT copy imports. A mapped title's std::fstream opens through the host
 // msvcp140.dll (std::_Fiopen calls _wfsopen), which the Windows loader binds to the host ucrtbase, so a GAME: path
 // never reached the CRT shims of file_system.cpp. Each of these is pointed at the shim registered under the same
-// import name, when there is one; a host path goes through the shim to ucrtbase unchanged.
-constexpr const char* kCrtPathImports[] = {
-    "fopen",     "_wfopen",     "_fsopen", "_wfsopen", "fopen_s", "_wfopen_s", "freopen",         "_wfreopen",
-    "freopen_s", "_wfreopen_s", "_open",   "_wopen",   "_sopen",  "_wsopen",   "_sopen_s",        "_wsopen_s",
-    "_sopen_dispatch", "_wsopen_dispatch"};
+// import name, when there is one; a host path goes through the shim to ucrtbase unchanged. These are the CRT path
+// calls the host CRT copies import (dumpbin: only msvcp140.dll has any).
+constexpr const char* kCrtPathImports[] = {"_fsopen", "_wfsopen", "_wremove", "_wrename", "_wrmdir"};
 
 bool is_crt_path_import(const char* name) {
     for (const char* n : kCrtPathImports)
