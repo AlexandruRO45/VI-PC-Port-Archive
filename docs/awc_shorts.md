@@ -16,7 +16,10 @@ The output is `<out>\<bank>\<stream id>.ogg` plus `<out>\shorts.csv` with bank, 
 packet channel count, packet count and relative path. For a directory scan, `<bank>` keeps the
 path relative to the source directory, without the `.awc` extension. For example, a nested
 `left/shared.awc` has a `bank` value of `left/shared`. Existing files are overwritten, and malformed
-banks are reported and skipped.
+banks are reported and skipped. A single named file that is not an AWC bank (`ADAT`) is refused with
+`holds no AWC bank` and exit 2 before `<out>` is created, as `awc_manifest.py` does, so a wrong path or
+format cannot read as an empty export; a directory scan with no bank in it still writes a header-only
+`shorts.csv`.
 
 ## Duration and channels
 
