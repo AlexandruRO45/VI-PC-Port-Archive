@@ -979,12 +979,15 @@ class FmaFusedChecks(unittest.TestCase):
     """cs_fma_fused: strict single-rounded words under --fma khr, fused-or-split f32 under --fma glsl (Mesa RADV)."""
     RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
 
-    def run_fma(self, words, *, khr_index=False, code=0, raw_out=None):
+    def run_fma(self, words, *, khr_index=False, fma_mode=None, code=0, raw_out=None):
         out = raw_out if raw_out is not None else "out[0..7] = " + " ".join(map(str, words)) + "\n"
         with tempfile.TemporaryDirectory() as tmp:
-            if khr_index:
+            if khr_index or fma_mode:
+                meta = {"features": ["shaderFmaFloat32"]} if khr_index else {}
+                if fma_mode:
+                    meta["fma"] = fma_mode
                 Path(tmp, "index.json").write_text(
-                    json.dumps({"cs_fma_fused": {"features": ["shaderFmaFloat32"]}}), encoding="utf-8")
+                    json.dumps({"cs_fma_fused": meta}), encoding="utf-8")
             with patch.dict(check.os.environ, {}, clear=False):
                 check.os.environ.pop("LEONIDA_FMA", None)
                 with patch.object(check, "run", return_value=(code, out)) as run:
@@ -1004,6 +1007,19 @@ class FmaFusedChecks(unittest.TestCase):
         problem = self.run_fma(self.RADV_SPLIT, khr_index=True)
         self.assertIn("word 0", problem)
         self.assertIn("OpFmaKHR", problem)
+
+    def test_fma_mode_recorded_in_index_is_honoured(self):
+        # TEST-1147: an --fma exact build has no FMAKHR capability, so without the recorded mode a fresh shell
+        # judges split words as a legal GLSL Fma result instead of a regression.
+        for mode in ("glsl", "khr", "exact"):
+            with tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "index.json").write_text(
+                    json.dumps({"cs_fma_fused": {"fma": mode}}), encoding="utf-8")
+                self.assertEqual(check.shader_fma_mode(tmp, "cs_fma_fused"), mode)
+        self.assertEqual(self.run_fma(check.FMA_FUSED, fma_mode="exact"), "")
+        problem = self.run_fma(self.RADV_SPLIT, fma_mode="exact")
+        self.assertIn("word 0", problem)
+        self.assertNotIn("LEONIDA_FMA=khr", check.judge_fma_fused(self.RADV_SPLIT, khr=True)[1])
 
     def test_wrong_f16_or_garbage_f32_fails_under_both_modes(self):
         bad_f16 = check.FMA_FUSED[:7] + [0x00007352]
