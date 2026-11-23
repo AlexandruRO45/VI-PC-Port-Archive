@@ -8302,6 +8302,25 @@ class Gen:
             self.uses_psb = True        # needs Int64 (declared with the PSB types)
             self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, rlo)
             self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, rhi)
+        elif op in ("v_and_b64", "v_or_b64", "v_xor_b64"):
+            # 64-bit bitwise VALU: v[d:d+1] = src0 & / | / ^ src1.
+            # Low and high 32-bit dwords are lowered independently with OpBitwiseAnd/Or/Xor,
+            # avoiding any Int64 capability dependency and matching 32-bit hardware execution.
+            def pair64(s):
+                if s["k"] in ("vgpr", "sgpr") and s.get("n") == 2:
+                    return self.load_reg(s["k"], s["r"]), self.load_reg(s["k"], s["r"] + 1)
+                return self.src64_data(s, op, allow_vgpr=True)
+
+            (x0, x1), (y0, y1) = pair64(a[1]), pair64(a[2])
+            spv_op = {"v_and_b64": "OpBitwiseAnd", "v_or_b64": "OpBitwiseOr", "v_xor_b64": "OpBitwiseXor"}[op]
+            rlo, rhi = self.tmp(), self.tmp()
+            self.emit(f"{rlo} = {spv_op} %uint {x0} {y0}")
+            self.emit(f"{rhi} = {spv_op} %uint {x1} {y1}")
+            if a[0]["k"] == "vgpr" and a[0].get("n") == 2:
+                self.dst({"k": "vgpr", "r": a[0]["r"], "n": 1}, rlo)
+                self.dst({"k": "vgpr", "r": a[0]["r"] + 1, "n": 1}, rhi)
+            else:
+                self.dst64_data(a[0], rlo, rhi, op)
         elif op == "v_fmac_f16":
             # dst = fma(src0, src1, dst). The accumulator is dst itself: low half, or high half under op_sel's dst bit.
             sel, dhi = self.opsel_bits(mods, 3)
