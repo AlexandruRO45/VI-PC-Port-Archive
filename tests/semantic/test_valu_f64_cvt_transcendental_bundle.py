@@ -302,6 +302,25 @@ class VCvtF64I32SimdIeeeTests(unittest.TestCase):
             res_bits = oracle_cvt_f64_i32(val & MASK32)
             self.assertEqual(u64_to_f64(res_bits), float(val))
 
+class VCvtF64I32TranslatorTests(unittest.TestCase):
+    def test_cvt_f64_i32_translation_and_interp(self):
+        lines = [
+            "v_mov_b32 v2, 42",
+            "v_cvt_f64_i32 v[0:1], v2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_cvt_f64_i32_test", lines)
+        self.assertIn("OpCapability Float64", spv)
+        self.assertIn("OpConvertSToF %double", spv)
+        res = spirv_interp.run(spv)
+        got = (res.vgpr[0] & MASK32) | ((res.vgpr[1] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(42.0))
+
+    def test_cvt_f64_i32_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_cvt_f64_i32", ["v_cvt_f64_i32"])
+
 
 if __name__ == "__main__":
     unittest.main()
