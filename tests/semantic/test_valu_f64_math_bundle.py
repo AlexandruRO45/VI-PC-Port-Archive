@@ -305,5 +305,19 @@ class VFmaF64OracleTests(unittest.TestCase):
         # 5.0 * 5.0 + 0.0 = 25.0
         self.assertEqual(oracle_fma_f64(f64_to_u64(5.0), f64_to_u64(5.0), F64_POS_ZERO), f64_to_u64(25.0))
 
+class VFmaF64AstInterpreterTests(unittest.TestCase):
+    def test_fma_ast_construction(self):
+        ast = Instruction64AST("v_fma_f64", Operand64(RegKind.VGPR_PAIR, 6), Operand64(RegKind.VGPR_PAIR, 0), Operand64(RegKind.VGPR_PAIR, 2), Operand64(RegKind.VGPR_PAIR, 4))
+        self.assertEqual(ast.mnemonic, "v_fma_f64")
+
+    def test_fma_scalar_execution(self):
+        wave = SimdWaveState64(lane_count=1)
+        wave.set_f64(0, 0, f64_to_u64(3.0))
+        wave.set_f64(0, 2, f64_to_u64(4.0))
+        wave.set_f64(0, 4, f64_to_u64(5.0))
+        res = oracle_fma_f64(wave.get_f64(0, 0), wave.get_f64(0, 2), wave.get_f64(0, 4))
+        wave.set_f64(0, 6, res)
+        self.assertEqual(wave.get_f64(0, 6), f64_to_u64(17.0))
+
 if __name__ == "__main__":
     unittest.main()
