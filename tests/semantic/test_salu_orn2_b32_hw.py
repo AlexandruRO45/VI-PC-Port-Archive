@@ -307,5 +307,34 @@ class TestSOrn2B32IEEE754(unittest.TestCase):
         self.assertEqual(d, nan_bits)
 
 
-if __name__ == '__main__':
+class TestSOrn2B32NegativeAndMutation(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_destination(self):
+        # SALU cannot output directly to VGPR
+        if support is not None and getattr(support, "translate_lines", None) is not None:
+            with self.assertRaises(Exception):
+                support.translate_lines("ps_invalid_dst", ["s_orn2_b32 v0, s1, s2", "s_endpgm"])
+
+    def test_mutation_inverted_operator(self):
+        # Mutation: uses AND instead of OR
+        def mutated_orn2(s0, s1):
+            return (s0 & (~s1 & MASK32)) & MASK32
+
+        s0 = 0xAAAAAAAA
+        s1 = 0x55555555
+        correct, _ = ref_orn2_b32(s0, s1)
+        mutant = mutated_orn2(s0, s1)
+        self.assertEqual(correct, 0xAAAAAAAA)
+        self.assertEqual(mutant, 0xAAAAAAAA)  # 0xAAAAAAAA & 0xAAAAAAAA = 0xAAAAAAAA
+
+        # Disambiguate with s0=0, s1=0:
+        correct_zero, _ = ref_orn2_b32(0, 0)
+        mutant_zero = mutated_orn2(0, 0)
+        self.assertEqual(correct_zero, MASK32)
+        self.assertEqual(mutant_zero, 0)
+        self.assertNotEqual(correct_zero, mutant_zero)
+
+
+if __name__ == "__main__":
     unittest.main()
