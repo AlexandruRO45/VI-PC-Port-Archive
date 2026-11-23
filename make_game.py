@@ -457,8 +457,11 @@ def icloud_default_notes() -> list:
 
 
 # ---------------------------------------------------------------- preflight
-# GiB (free bytes / 2**30), the unit Windows Explorer shows as "GB"; 370 GiB is about 397 GB in decimal units.
-MIN_FREE_GB = {"shaders": 30, "assets": 370}
+# GiB (free bytes / 2**30), the unit Windows Explorer shows as "GB"; 420 GiB is about 451 GB in decimal units.
+# assets: PeterGrieffindor measured a full --stages check,assets export with a matching 1.0.2.1 package at 414.7 GiB on
+# NTFS (407.5 GiB of file sizes + 7.2 GiB of NTFS overhead for 2,359,363 files): 363.8 GiB before the audio step,
+# which adds 50.9. 420 is that plus a little margin. With the shaders (30) the full build needs 450.
+MIN_FREE_GB = {"shaders": 30, "assets": 420}
 
 
 def tree_bytes(path: str) -> int:
@@ -651,7 +654,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if free_gb < need_gb and need.get("shaders") and shader_outputs_reusable(work, emulate, keep_emulated, fallbacks):
         log(f"preflight: the shaders in {work} can be reused; not counting their {need['shaders']} GB")
         need_gb -= need["shaders"]
-    # An export stopped part-way (no xma.done yet) has already put some of the 370 GB on the drive, and the rerun
+    # An export stopped part-way (no xma.done yet) has already put some of the 420 GB on the drive, and the rerun
     # skips the steps it finished. Only walked when the space is short, so a build with room to spare reads no
     # folder.
     # --wav still counts the whole estimate, as above: the WAV decode writes several times the Ogg Opus size and has
