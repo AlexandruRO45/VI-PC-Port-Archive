@@ -552,5 +552,40 @@ class TestLdsMinU32ConditionCodes(unittest.TestCase):
         self.assertEqual(interp.scc, 1)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+class TestLdsMinU32BoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, integer wrapping, and IEEE 754 bit representations."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=1024)
+
+    def test_32bit_integer_extremes(self) -> None:
+        # Unsigned min: 0 is minimum possible uint32
+        self.lds.write_dword(0, 0x7FFFFFFF)
+        updated = self.lds.atomic_min_u32(0, 0)
+        self.assertEqual(updated, 0)
+
+        # 0x7FFFFFFF < 0x80000000 in unsigned comparison
+        self.lds.write_dword(4, 0x80000000)
+        updated_msb = self.lds.atomic_min_u32(4, 0x7FFFFFFF)
+        self.assertEqual(updated_msb, 0x7FFFFFFF)
+
+    def test_float32_bit_patterns_as_uint32(self) -> None:
+        # Untyped min compares bits as unsigned integers.
+        # subnormal (0x00000001) vs quiet NaN (0x7FC00000): 0x00000001 is smaller as uint32
+        self.lds.write_dword(0x10, 0x7FC00000)
+        updated = self.lds.atomic_min_u32(0x10, 0x00000001)
+        self.assertEqual(updated, 0x00000001)
+
+    def test_lds_offset_boundary_max_16bit(self) -> None:
+        self.lds.write_dword(1023 * 4, 150)
+        updated = self.lds.atomic_min_u32(0, 50, offset16=0xFFFF)
+        self.assertEqual(updated, 50)
+        self.assertEqual(self.lds.read_dword(1023 * 4), 50)
+
+
 if __name__ == "__main__":
     unittest.main()
