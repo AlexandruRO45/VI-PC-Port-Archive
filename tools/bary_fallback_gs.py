@@ -18,12 +18,17 @@ Usage: `python -I tools/bary_fallback_gs.py --help` lists the options.
 """
 import argparse
 from collections.abc import Iterator
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 SUFFIX = ".bary_gs"   # <ps name>.bary_gs.spvasm / .spv next to the pixel shader
 
@@ -176,14 +181,24 @@ def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
         with tempfile.TemporaryDirectory(prefix=".bary-gs-", dir=os.path.dirname(spv)) as staging:
             staged_asm = os.path.join(staging, os.path.basename(asm))
             staged_spv = os.path.join(staging, os.path.basename(spv))
-            Path(staged_asm).write_text(shader, encoding="utf-8", newline="\n")
-            for cmd in (["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv],
-                        ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
-                r = subprocess.run(cmd, capture_output=True, text=True)
-                if r.returncode:
-                    raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
-            os.replace(staged_asm, asm)
-            os.replace(staged_spv, spv)
+            try:
+                Path(staged_asm).write_text(shader, encoding="utf-8", newline="\n")
+                for cmd in (["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv],
+                            ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
+                    r = subprocess.run(cmd, capture_output=True, text=True)
+                    if r.returncode:
+                        raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
+                os.chmod(staged_asm, published_mode(asm))
+                os.chmod(staged_spv, published_mode(spv))
+                replace_retry(staged_asm, asm)
+                replace_retry(staged_spv, spv)
+            finally:
+                for leftover in (staged_asm, staged_spv):
+                    if os.path.exists(leftover):
+                        with suppress(OSError):
+                            # Staging files may inherit a read-only target's mode; restore write bits so
+                            # TemporaryDirectory cleanup does not fail or strand them on Windows.
+                            os.chmod(leftover, 0o600)
         built.append(spv)
     return built
 

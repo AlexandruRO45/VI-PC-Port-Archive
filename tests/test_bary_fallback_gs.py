@@ -592,6 +592,74 @@ class TestBuildForIndex(unittest.TestCase):
             self.assertEqual(run_mock.call_count, 2)
 
 
+    def test_build_applies_published_mode_without_flipping_umask_and_uses_replace_retry(self):
+        import file_mode
+        index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def record_chmod(path, mode):
+                chmod_calls.append((Path(path), mode))
+                return real_chmod(path, mode)
+
+            with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=_successful_spirv_tools), \
+                    mock.patch.object(bary_fallback_gs, "published_mode", wraps=bary_fallback_gs.published_mode) as pub, \
+                    mock.patch.object(bary_fallback_gs, "replace_retry", wraps=bary_fallback_gs.replace_retry) as rep, \
+                    mock.patch.object(bary_fallback_gs.os, "chmod", side_effect=record_chmod), \
+                    mock.patch("os.umask", side_effect=AssertionError("os.umask must not be called")):
+                built = bary_fallback_gs.build_for_index(tmp)
+
+            asm = Path(tmp) / "ps_a.bary_gs.spvasm"
+            spv = Path(tmp) / "ps_a.bary_gs.spv"
+            self.assertEqual(built, [str(spv)])
+            self.assertEqual(pub.call_count, 2)
+            self.assertEqual(rep.call_count, 2)
+            self.assertEqual(len(chmod_calls), 2)
+            self.assertEqual(chmod_calls[0][1], file_mode.published_mode(str(asm)))
+            self.assertEqual(chmod_calls[1][1], file_mode.published_mode(str(spv)))
+            self.assertEqual(sorted(os.listdir(tmp)), ["index.json", "ps_a.bary_gs.spv", "ps_a.bary_gs.spvasm"])
+
+    def test_build_failed_replace_cleans_read_only_staging_dir(self):
+        index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            asm = Path(tmp) / "ps_a.bary_gs.spvasm"
+            spv = Path(tmp) / "ps_a.bary_gs.spv"
+            asm.write_text("; previous asm\n", encoding="utf-8", newline="\n")
+            spv.write_bytes(b"previous spv")
+            os.chmod(asm, 0o444)
+            os.chmod(spv, 0o444)
+            self.addCleanup(lambda: asm.exists() and os.chmod(asm, 0o600))
+            self.addCleanup(lambda: spv.exists() and os.chmod(spv, 0o600))
+            with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=_successful_spirv_tools), \
+                    mock.patch.object(bary_fallback_gs, "replace_retry", side_effect=PermissionError("locked")):
+                with self.assertRaises(PermissionError):
+                    bary_fallback_gs.build_for_index(tmp)
+            self.assertEqual(asm.read_text(encoding="utf-8"), "; previous asm\n")
+            self.assertEqual(spv.read_bytes(), b"previous spv")
+            self.assertEqual(sorted(os.listdir(tmp)), ["index.json", "ps_a.bary_gs.spv", "ps_a.bary_gs.spvasm"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_build_new_and_replaced_outputs_preserve_posix_bits(self):
+        import file_mode
+        index = {"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_index(tmp, index)
+            with mock.patch.object(bary_fallback_gs.subprocess, "run", side_effect=_successful_spirv_tools):
+                bary_fallback_gs.build_for_index(tmp)
+                asm = Path(tmp) / "ps_a.bary_gs.spvasm"
+                spv = Path(tmp) / "ps_a.bary_gs.spv"
+                expected_new = file_mode.new_file_mode(tmp)
+                self.assertEqual(os.stat(asm).st_mode & 0o777, expected_new)
+                self.assertEqual(os.stat(spv).st_mode & 0o777, expected_new)
+                os.chmod(asm, 0o640)
+                os.chmod(spv, 0o604)
+                bary_fallback_gs.build_for_index(tmp)
+                self.assertEqual(os.stat(asm).st_mode & 0o777, 0o640)
+                self.assertEqual(os.stat(spv).st_mode & 0o777, 0o604)
+
 class TestMainAndCLI(unittest.TestCase):
     def _call_main(self, argv):
         stdout, stderr = io.StringIO(), io.StringIO()
