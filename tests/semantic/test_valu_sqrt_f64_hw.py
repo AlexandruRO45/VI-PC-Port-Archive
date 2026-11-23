@@ -367,5 +367,97 @@ class TestValuSqrtF64AST(unittest.TestCase):
         self.assertIn("OpExtInst %double %glsl FClamp", spv)
 
 
+# ---------------------------------------------------------------------------
+# Stage 3: Deterministic scalar instruction interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarMachineState:
+    """Architectural state for executing VALU scalar instructions."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def read_f64(self, pair: RegisterPair) -> int:
+        if pair.kind == RegKind.VGPR:
+            return combine_f64_words(self.vgprs[pair.lo], self.vgprs[pair.hi])
+        return combine_f64_words(self.sgprs[pair.lo], self.sgprs[pair.hi])
+
+    def write_f64(self, pair: RegisterPair, bits: int) -> None:
+        lo, hi = split_f64_words(bits)
+        if pair.kind == RegKind.VGPR:
+            self.vgprs[pair.lo] = lo
+            self.vgprs[pair.hi] = hi
+        else:
+            self.sgprs[pair.lo] = lo
+            self.sgprs[pair.hi] = hi
+
+    def step(self, inst: Union[VOP1Instruction, VOP3Instruction]) -> int:
+        src_bits = self.read_f64(inst.src0)
+        if isinstance(inst, VOP3Instruction):
+            res_bits = oracle_sqrt_f64(
+                src_bits,
+                clamp=inst.clamp,
+                abs_src=inst.abs_src0,
+                neg_src=inst.neg_src0,
+            )
+        else:
+            res_bits = oracle_sqrt_f64(src_bits)
+        self.write_f64(inst.dst, res_bits)
+        return res_bits
+
+
+class TestValuSqrtF64ScalarInterpreter(unittest.TestCase):
+    """Stage 3: Deterministic scalar instruction interpreter for v_sqrt_f64."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+
+    def test_scalar_step_basic(self) -> None:
+        dst = RegisterPair(RegKind.VGPR, 0)
+        src = RegisterPair(RegKind.VGPR, 2)
+        self.state.write_f64(src, f64_to_bits(16.0))
+        inst = VOP1Instruction(Opcode.V_SQRT_F64, dst, src)
+        res_bits = self.state.step(inst)
+        self.assertEqual(bits_to_f64(res_bits), 4.0)
+        self.assertEqual(bits_to_f64(self.state.read_f64(dst)), 4.0)
+
+    def test_scalar_step_sgpr_source(self) -> None:
+        dst = RegisterPair(RegKind.VGPR, 0)
+        src = RegisterPair(RegKind.SGPR, 4)
+        self.state.write_f64(src, f64_to_bits(25.0))
+        inst = VOP1Instruction(Opcode.V_SQRT_F64, dst, src)
+        res_bits = self.state.step(inst)
+        self.assertEqual(bits_to_f64(res_bits), 5.0)
+
+    def test_scalar_step_vop3_clamp(self) -> None:
+        dst = RegisterPair(RegKind.VGPR, 0)
+        src = RegisterPair(RegKind.VGPR, 2)
+        self.state.write_f64(src, f64_to_bits(9.0))
+        inst = VOP3Instruction(Opcode.V_SQRT_F64_E64, dst, src, clamp=True)
+        res_bits = self.state.step(inst)
+        self.assertEqual(bits_to_f64(res_bits), 1.0)
+
+    def test_scalar_step_vop3_abs(self) -> None:
+        dst = RegisterPair(RegKind.VGPR, 0)
+        src = RegisterPair(RegKind.VGPR, 2)
+        self.state.write_f64(src, f64_to_bits(-100.0))
+        inst = VOP3Instruction(Opcode.V_SQRT_F64_E64, dst, src, abs_src0=True)
+        res_bits = self.state.step(inst)
+        self.assertEqual(bits_to_f64(res_bits), 10.0)
+
+    def test_scalar_matches_translated_shader(self) -> None:
+        dst = RegisterPair(RegKind.VGPR, 0)
+        src = RegisterPair(RegKind.VGPR, 2)
+        for val in [0.0, 1.0, 4.0, 9.0, 16.0]:
+            self.state.write_f64(src, f64_to_bits(val))
+            inst = VOP1Instruction(Opcode.V_SQRT_F64, dst, src)
+            scalar_res = self.state.step(inst)
+            lo, hi = split_f64_words(f64_to_bits(val))
+            out_lo, out_hi, _ = run_translated_sqrt_f64(lo, hi)
+            trans_bits = combine_f64_words(out_lo, out_hi)
+            self.assertEqual(scalar_res, trans_bits)
+
+
 if __name__ == "__main__":
     unittest.main()
