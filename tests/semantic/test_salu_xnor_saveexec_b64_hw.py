@@ -380,5 +380,49 @@ class TestScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.get_sgpr_pair(4), 0xFFFFFFFF_00000000)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class TestSIMDDivergence(unittest.TestCase):
+    """Phase 4: Unit tests for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_inactive_lanes_activated_by_xnor(self) -> None:
+        old_exec = 0x00000000_00000000
+        s0 = 0x00000000_00000000
+        new_exec, d_saved, scc = ref_s_xnor_saveexec_b64(s0, old_exec)
+        self.assertEqual(new_exec, ALL64)
+        self.assertEqual(scc, 1)
+
+        hw_exec, hw_scc, hw_bcnt, _ = run_hw_xnor_saveexec(s0, old_exec)
+        self.assertEqual(hw_exec, ALL64)
+        self.assertEqual(hw_scc, 1)
+        self.assertEqual(hw_bcnt, 0)
+
+    def test_active_lanes_deactivated_by_xnor(self) -> None:
+        old_exec = ALL64
+        s0 = 0x00000000_00000000
+        new_exec, d_saved, scc = ref_s_xnor_saveexec_b64(s0, old_exec)
+        self.assertEqual(new_exec, 0)
+        self.assertEqual(scc, 0)
+
+        hw_exec, hw_scc, hw_bcnt, _ = run_hw_xnor_saveexec(s0, old_exec)
+        self.assertEqual(hw_exec, 0)
+        self.assertEqual(hw_scc, 0)
+        self.assertEqual(hw_bcnt, 64)
+
+    def test_checkerboard_divergence_patterns(self) -> None:
+        mask_even = 0x55555555_55555555
+        mask_odd = 0xAAAAAAAA_AAAAAAAA
+
+        self.assertEqual(ref_s_xnor_saveexec_b64(mask_even, mask_even)[0], ALL64)
+        self.assertEqual(ref_s_xnor_saveexec_b64(mask_even, mask_odd)[0], 0)
+
+        hw_exec, hw_scc, hw_bcnt, _ = run_hw_xnor_saveexec(mask_even, mask_even)
+        self.assertEqual(hw_exec, ALL64)
+        self.assertEqual(hw_scc, 1)
+        self.assertEqual(hw_bcnt, 32)
+
+
 if __name__ == "__main__":
     unittest.main()
