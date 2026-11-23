@@ -847,8 +847,13 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         if not dotnet_sdk_ok():
             missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
                            "https://dotnet.microsoft.com/download/dotnet/8.0")
-    if os.name == "nt" and "runtime" in stages and not runtime_build and not visual_cpp_tools_ok():
-        missing.append("Visual Studio 2022 with 'Desktop development with C++'")
+    if os.name == "nt" and "runtime" in stages and not runtime_build:
+        if not visual_cpp_tools_ok():
+            missing.append("Visual Studio 2022 with 'Desktop development with C++'")
+        elif (sdk := windows_runtime_sdk_version()) is not None and sdk < (10, 0, 26100, 0):
+            selected = ".".join(map(str, sdk))
+            missing.append(f"Windows SDK 10.0.26100 or newer (Visual Studio selects {selected}); "
+                           "install it with Visual Studio Installer or winget install Microsoft.WindowsSDK.10.0.26100")
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         missing.extend(f"{s} (for the runtime stage, or pass --runtime-build)" for s in cross_build_missing())
     # The pipelines stage needs a checker the runtime stage builds (on Windows only with VULKAN_SDK set).
@@ -910,17 +915,49 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
 
 def visual_cpp_tools_ok() -> bool:
     """Look for the x64 C++ tools required by scripts/build_runtime.ps1."""
+    return visual_cpp_installation() is not None
+
+
+def visual_cpp_installation() -> str | None:
+    """Return the latest installation picked by the runtime's Windows build script."""
     vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
                            "Microsoft Visual Studio", "Installer", "vswhere.exe")
     if not os.path.isfile(vswhere):
-        return False
+        return None
     try:
         result = subprocess.run([vswhere, "-latest", "-products", "*", "-requires",
                                  "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                                 "-property", "installationPath"], capture_output=True, timeout=60)
+                                 "-property", "installationPath", "-utf8"], capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0 and bool(result.stdout.strip())
+        return None
+    return (result.stdout.decode("utf-8", errors="replace").strip() or None) if result.returncode == 0 else None
+
+
+def windows_runtime_sdk_version() -> tuple[int, ...] | None:
+    """Observe vcvars64's selected SDK, not the set of SDKs installed on the machine."""
+    installation = visual_cpp_installation()
+    if installation is None:
+        return None
+    vcvars = os.path.join(installation, "VC", "Auxiliary", "Build", "vcvars64.bat")
+    if not os.path.isfile(vcvars):
+        return None
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    cmd = subprocess.list2cmdline([os.path.join(root, "System32", "cmd.exe")])
+    # Match scripts/build_runtime.ps1's vcvars64 invocation without building. Expand the path from an environment
+    # value inside the quoted command, with delayed expansion off, and use /u for deterministic SET output.
+    command = cmd + ' /d /u /v:off /s /c ""%LEONIDA_VCVARS64%" >nul 2>&1 && set WindowsSDKVersion"'
+    env = {k: v for k, v in os.environ.items() if k.lower() != "windowssdkversion"}
+    env["LEONIDA_VCVARS64"] = vcvars
+    try:
+        result = subprocess.run(command, env=env, capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None  # an unknown result must not block builds that CMake can configure
+    if result.returncode == 0:
+        for line in result.stdout.decode("utf-16-le", errors="replace").splitlines():
+            match = re.fullmatch(r"WindowsSDKVersion=([0-9]+(?:\.[0-9]+){3})[\\/]*", line, re.IGNORECASE)
+            if match:
+                return tuple(map(int, match[1].split(".")))
+    return None
 
 
 def windows_powershell() -> str:

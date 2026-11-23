@@ -372,6 +372,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                  mock.patch("make_game.tool_available", return_value=True), \
                  mock.patch("make_game.ensure_submodule", return_value=None) as ensure_submodule, \
                  mock.patch("make_game.visual_cpp_tools_ok", return_value=True), \
+                 mock.patch("make_game.windows_runtime_sdk_version", return_value=(10, 0, 26100, 0)), \
                  mock.patch("shutil.disk_usage", return_value=Usage(1000 * 2**30, 200 * 2**30, 800 * 2**30)):
                 # off Windows runtime checks the cross-build instead (tests/test_make_game_platform.py)
                 stages = ["shaders", "assets"] + (["runtime"] if os.name == "nt" else [])
@@ -431,7 +432,40 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             self.assertTrue(make_game.visual_cpp_tools_ok())
         self.assertEqual(run.call_args.args[0][1:], ["-latest", "-products", "*", "-requires",
                                                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                                                   "-property", "installationPath"])
+                                                   "-property", "installationPath", "-utf8"])
+
+    def test_runtime_preflight_rejects_selected_old_windows_sdk_before_work(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch("os.name", "nt"), \
+             mock.patch("make_game.visual_cpp_tools_ok", return_value=True), \
+             mock.patch("make_game.windows_runtime_sdk_version", return_value=(10, 0, 22621, 0)):
+            work = os.path.join(root, "not-created")
+            err = self.assert_fails(make_game.preflight, ["runtime"], work,
+                                    match="Windows SDK 10.0.26100 or newer")
+            self.assertIn("10.0.22621.0", err)
+            self.assertFalse(os.path.exists(work))
+
+    def test_runtime_preflight_accepts_supported_or_unknown_windows_sdk(self):
+        for sdk in ((10, 0, 26100, 0), (10, 0, 28000, 0), None):
+            with self.subTest(sdk=sdk), tempfile.TemporaryDirectory() as work, \
+                 mock.patch("os.name", "nt"), \
+                 mock.patch("make_game.visual_cpp_tools_ok", return_value=True), \
+                 mock.patch("make_game.windows_runtime_sdk_version", return_value=sdk), \
+                 mock.patch("shutil.disk_usage", return_value=Usage(100 * 2**30, 0, 100 * 2**30)):
+                make_game.preflight(["runtime"], work)
+
+    def test_windows_sdk_probe_reads_selected_version_only_on_success(self):
+        for raw, code, expected in (
+            ("WindowsSDKVersion=10.0.26100.0\\\r\n", 0, (10, 0, 26100, 0)),
+            ("WindowsSDKVersion=10.0.22621.0\\\r\n", 1, None),
+            ("WindowsSDKVersion=malformed\r\n", 0, None),
+        ):
+            with self.subTest(raw=raw, code=code), \
+                 mock.patch("make_game.visual_cpp_installation", return_value=r"C:\V S"), \
+                 mock.patch("os.path.isfile", return_value=True), \
+                 mock.patch("subprocess.run", return_value=mock.Mock(returncode=code,
+                            stdout=raw.encode("utf-16-le"))):
+                self.assertEqual(make_game.windows_runtime_sdk_version(), expected)
 
     def test_preflight_python_version_check(self):
         with tempfile.TemporaryDirectory() as tmp_work:
@@ -563,6 +597,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             dotnet_sdk_ok=mock.Mock(return_value=True),
             ensure_submodule=mock.Mock(),
             visual_cpp_tools_ok=mock.Mock(return_value=True),
+            windows_runtime_sdk_version=mock.Mock(return_value=(10, 0, 26100, 0)),
             cross_build_missing=mock.Mock(return_value=[]),
             assets_exported=mock.Mock(return_value=False),
         ), mock.patch("shutil.which", return_value="/usr/bin/tool"):
@@ -585,6 +620,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             dotnet_sdk_ok=mock.Mock(return_value=True),
             ensure_submodule=mock.DEFAULT,
             visual_cpp_tools_ok=mock.Mock(return_value=True),
+            windows_runtime_sdk_version=mock.Mock(return_value=(10, 0, 26100, 0)),
             cross_build_missing=mock.Mock(return_value=[]),
             cross_configure=mock.DEFAULT,
             pipeline_check_exe=mock.Mock(return_value="vk_pipeline_check"),

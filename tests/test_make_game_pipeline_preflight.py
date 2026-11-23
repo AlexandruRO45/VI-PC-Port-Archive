@@ -108,6 +108,7 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
         with mock.patch("os.name", "nt"), \
                 mock.patch.dict(os.environ, {"VULKAN_SDK": r"C:\Vulkan"}), \
                 mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
+                mock.patch.object(make_game, "windows_runtime_sdk_version", return_value=(10, 0, 26100, 0)), \
                 mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
             make_game.preflight(["runtime", "pipelines"], self.work)
 
@@ -118,6 +119,7 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
             with self.subTest(sdk=sdk), mock.patch("os.name", "nt"), \
                     mock.patch.dict(os.environ), \
                     mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
+                    mock.patch.object(make_game, "windows_runtime_sdk_version", return_value=(10, 0, 26100, 0)), \
                     mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
                 if sdk is None:
                     os.environ.pop("VULKAN_SDK", None)
