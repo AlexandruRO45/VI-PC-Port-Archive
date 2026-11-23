@@ -310,5 +310,18 @@ class TestVPkMaxU16RegisterAliasing(unittest.TestCase):
         self.assertEqual(mach.vgprs[0], P(1234, 5678))
 
 
+class TestVPkMaxU16ConditionCodes(unittest.TestCase):
+    """Condition codes, status flags, and carry/borrow preservation."""
+
+    def test_vcc_and_scc_preserved(self):
+        vcc_initial = 0xDEADBEEF01234567
+        scc_initial = 1
+        vcc, scc = vcc_initial, scc_initial
+        res = ref_pk_max_u16(P(0, 0), P(0, 0))
+        self.assertEqual(res, 0)
+        self.assertEqual(vcc, vcc_initial)
+        self.assertEqual(scc, scc_initial)
+
+
 if __name__ == '__main__':
     unittest.main()
