@@ -16529,7 +16529,7 @@ def translate(path):
             ins_by_reg.setdefault(reg, sv)
         ins_sig = sorted(ins_by_reg.items())
         outs = output_signature(path, info["name"])
-        if not ins_sig or not outs:
+        if not ins_sig or not outs or any(reg >= 32 for reg, _ in outs):
             raise Unsupported("gs signature")
         n_emit = sum(1 for i in insns if base_op(i["op"]) == "s_sendmsg" and
                      any("GS_OP_EMIT" in x.get("t", "") for x in i["args"]))
