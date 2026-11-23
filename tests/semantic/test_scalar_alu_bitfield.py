@@ -56,10 +56,11 @@ if TOOLS_DIR not in sys.path:
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import rdna2spirv
-import spirv_mini_interp as si
+from support import mrt0_words, rdna2spirv, translate_lines  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
+PUSH_VSHARP = [0x1000, 0, 0x1000, 0x31016FAC] + [0] * 28
 
 
 def pack_bfe_ctl(offset: int, width: int) -> int:
@@ -682,8 +683,212 @@ class SpirvMiniInterpTests(unittest.TestCase):
             run_spv(body_ins, consts_ins)
 
 
+def translate_ps_bitfield(lines: list[str]) -> str:
+    """Translate a hand-written pixel shader listing exporting v0..v3 to mrt0."""
+    return translate_lines(
+        "ps_salu_bitfield",
+        [*lines, "exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"],
+    )
+
+
+class EndToEndTranslatorTests(unittest.TestCase):
+    """End-to-end rdna2spirv.translate + spirv_mini_interp execution for s_bfe_u32, s_bfe_i32, and s_bfm_b32."""
+
+    def test_runtime_s_bfe_u32_and_i32_dynamic_ctl_and_scc_transitions(self) -> None:
+        # Both S0 and S1 are loaded from buffer memory at runtime (neither is in sgpr_imm),
+        # exercising the dynamic control-word unpack + bfe_width clamp path and chained
+        # 0->1, 1->0, 1->1, and 0->0 SCC transitions without re-seeding SCC between steps.
+        for op, ref_fn in (("s_bfe_u32", ref_s_bfe_u32), ("s_bfe_i32", ref_s_bfe_i32)):
+            spv = translate_ps_bitfield([
+                "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+                "s_waitcnt lgkmcnt(0)",
+                "s_cmp_eq_u32 0, 1",          # initial SCC = 0
+                f"{op} s8, s4, s5",           # step 1: transition from SCC = 0
+                "s_cselect_b32 s9, 1, 0",
+                f"{op} s10, s6, s7",          # step 2: transition directly from step 1's SCC
+                "s_cselect_b32 s11, 1, 0",
+                "v_mov_b32 v0, s8",
+                "v_mov_b32 v1, s9",
+                "v_mov_b32 v2, s10",
+                "v_mov_b32 v3, s11",
+            ])
+
+            cases = [
+                # 0 -> 1 (8-bit field with dirty ignored bits in S1), then 1 -> 0 (width == 0 on all-ones source)
+                (0x12345678, pack_bfe_ctl(8, 8) | 0xFF80FFE0, 0xFFFFFFFF, pack_bfe_ctl(12, 0) | 0x80001FE0),
+                # 0 -> 0 (zero field), then 0 -> 1 (clamped past bit 31: offset=28, width=16 -> effective width 4)
+                (0xFFFF00FF, pack_bfe_ctl(8, 8), 0x80000000, pack_bfe_ctl(28, 16)),
+                # 0 -> 1 (1-bit negative/nonzero field), then 1 -> 1 (max 7-bit width=127 at offset=16 -> top 16 bits)
+                (0x00000001, pack_bfe_ctl(0, 1), 0xABCD1234, pack_bfe_ctl(16, 127)),
+                # 0 -> 1 (full 32-bit extract: offset=0, width=32), then 1 -> 0 (1-bit zero field at bit 31)
+                (0xDEADBEEF, pack_bfe_ctl(0, 32), 0x7FFFFFFF, pack_bfe_ctl(31, 5)),
+                # 0 -> 0 (width=0 at offset=31), then 0 -> 0 (extracted field is all zeros)
+                (0x80000000, pack_bfe_ctl(31, 0), 0xF0F00000, pack_bfe_ctl(4, 12)),
+                # Sign-bit boundary transitions for 4-bit (0x7 vs 0x8) and 8-bit (0x7F vs 0x80) fields
+                (0x00000070, pack_bfe_ctl(4, 4), 0x00000080, pack_bfe_ctl(4, 4)),
+                (0x00007F00, pack_bfe_ctl(8, 8), 0x00008000, pack_bfe_ctl(8, 8)),
+            ]
+
+            for s0_a, ctl_a, s0_b, ctl_b in cases:
+                want_da, want_scca = ref_fn(s0_a, ctl_a)
+                want_db, want_sccb = ref_fn(s0_b, ctl_b)
+                mem = {
+                    0x1000: s0_a,
+                    0x1004: ctl_a,
+                    0x1008: s0_b,
+                    0x100C: ctl_b,
+                }
+                with self.subTest(op=op, s0_a=hex(s0_a), ctl_a=hex(ctl_a), s0_b=hex(s0_b), ctl_b=hex(ctl_b)):
+                    got = tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem))
+                    self.assertEqual(got, (want_da, want_scca, want_db, want_sccb))
+
+    def test_runtime_src_with_folded_ctl_path(self) -> None:
+        # S0 is loaded at runtime from memory (x_val is None), while S1 is an immediate or
+        # sgpr_imm constant (ctl_val is not None), exercising rdna2spirv's constant-control-word
+        # lowering branch (including compile-time width clamping past bit 31 and width == 0).
+        ctl_clamped = pack_bfe_ctl(28, 12) | 0x008003E0  # dirty bits + width 12 clamped to 4 at offset 28
+        ctl_byte1 = pack_bfe_ctl(8, 8)
+        ctl_zero_wid = pack_bfe_ctl(4, 0)
+        spv = translate_ps_bitfield([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            f"s_mov_b32 s6, {ctl_clamped:#x}",
+            "s_bfe_u32 s8, s4, s6",                      # sgpr_imm control word, clamped width
+            f"s_bfe_i32 s9, s4, {ctl_clamped:#x}",       # immediate control word, signed clamped width
+            "s_cmp_eq_u32 1, 1",                         # pre-seed SCC = 1
+            f"s_bfe_u32 s10, s4, {ctl_zero_wid:#x}",     # width == 0 -> D = 0, SCC transitions 1 -> 0
+            "s_cselect_b32 s10, 1, 0",
+            f"s_bfe_i32 s11, s5, {ctl_byte1:#x}",        # signed byte extract, SCC transitions 0 -> 1
+            "s_cselect_b32 s12, 1, 0",
+            "s_lshl_b32 s10, s10, 1",
+            "s_or_b32 s10, s10, s12",                    # pack (scc_after_zero_wid << 1) | scc_after_byte1
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s11",
+            "v_mov_b32 v3, s10",
+        ])
+
+        for s4_val, s5_val in (
+            (0x80000000, 0x00008000),  # nibble = 8 (-8 signed), byte1 = 0x80 (-128 signed)
+            (0x70000000, 0x00007F00),  # nibble = 7 (+7 signed), byte1 = 0x7F (+127 signed)
+            (0xF0000000, 0xFFFF00FF),  # nibble = 15 (-1 signed), byte1 = 0x00 (0, SCC = 0)
+        ):
+            want_u, _ = ref_s_bfe_u32(s4_val, ctl_clamped)
+            want_i, _ = ref_s_bfe_i32(s4_val, ctl_clamped)
+            want_b1, want_scc_b1 = ref_s_bfe_i32(s5_val, ctl_byte1)
+            mem = {0x1000: s4_val, 0x1004: s5_val}
+            with self.subTest(s4=hex(s4_val), s5=hex(s5_val)):
+                got = tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem))
+                self.assertEqual(got, (want_u, want_i, want_b1, want_scc_b1))
+
+    def test_runtime_bfe_aliasing_and_special_operands(self) -> None:
+        # Verify dst==S0, dst==S1, dst==S0==S1, m0 as control word, and null destination on runtime values.
+        spv = translate_ps_bitfield([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_mov_b32 m0, s5",
+            "s_bfe_u32 s4, s4, m0",       # dst == S0, control word in m0
+            "s_bfe_i32 s5, s6, s5",       # dst == S1 (control word SGPR)
+            "s_bfe_u32 s7, s7, s7",       # dst == S0 == S1
+            "s_cmp_eq_u32 1, 1",          # pre-seed SCC = 1
+            "s_bfe_i32 null, s6, 0x40000",  # bits [3:0] of s6 (0) -> discarded, SCC transitions 1 -> 0
+            "s_cselect_b32 s8, 1, 0",
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+            "v_mov_b32 v2, s7",
+            "v_mov_b32 v3, s8",
+        ])
+        ctl = pack_bfe_ctl(8, 8)          # 0x00080008
+        self_val = pack_bfe_ctl(16, 8)    # 0x00080010: offset=16, width=8 -> extracts bits [23:16] = 0x08
+        mem = {
+            0x1000: 0x1234AB78,           # s4 -> bits [15:8] = 0xAB
+            0x1004: ctl,                  # s5 -> control word (offset=8, width=8)
+            0x1008: 0x00008500,           # s6 -> bits [15:8] = 0x85 -> sign-extended 0xFFFFFF85; bits [3:0] = 0
+            0x100C: self_val,             # s7 -> dst == S0 == S1 -> 0x08
+        }
+        got = tuple(mrt0_words(spv, push_constants=PUSH_VSHARP, memory=mem))
+        self.assertEqual(
+            got,
+            (
+                ref_s_bfe_u32(0x1234AB78, ctl)[0],
+                ref_s_bfe_i32(0x00008500, ctl)[0],
+                ref_s_bfe_u32(self_val, self_val)[0],
+                0,
+            ),
+        )
+
+    def test_runtime_s_bfm_b32_modulo32_scc_preservation_and_insert_pipeline(self) -> None:
+        # 1. Runtime s_bfm_b32 with dirty upper bits [31:5] in S0 (width) and S1 (offset),
+        #    destination aliasing, and SCC preservation across SCC = 0 and SCC = 1.
+        spv_bfm = translate_ps_bitfield([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # SCC = 0
+            "s_bfm_b32 s8, s4, s5",       # must preserve SCC = 0
+            "s_cselect_b32 s9, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # SCC = 1
+            "s_bfm_b32 s10, s6, s7",      # must preserve SCC = 1
+            "s_cselect_b32 s11, 1, 0",
+            "s_lshl_b32 s9, s9, 1",
+            "s_or_b32 s9, s9, s11",       # (scc0 << 1) | scc1 == 0b01 == 1
+            "s_bfm_b32 s4, s4, s5",       # dst == S0 aliasing
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s10",
+            "v_mov_b32 v2, s4",
+            "v_mov_b32 v3, s9",
+        ])
+
+        bfm_pairs = [
+            # Standard and modulo-32 dirty upper bits
+            (8, 8, 8 | 0xFFFFFFE0, 8 | 0x80000040),
+            # width & 31 == 0 (32 -> 0) and width = 31 at offset = 0 (0x7FFFFFFF)
+            (32, 12, 31 | 0x100, 0 | 0x40),
+            # width + offset > 32 truncates to 32 bits (width=16, offset=24 -> 0xFF000000)
+            (16, 24, 1 | 0x20, 31 | 0x60),
+            (0, 0, 4, 28),
+        ]
+        for w_a, o_a, w_b, o_b in bfm_pairs:
+            want_a = ref_s_bfm_b32(w_a, o_a)
+            want_b = ref_s_bfm_b32(w_b, o_b)
+            mem = {0x1000: w_a, 0x1004: o_a, 0x1008: w_b, 0x100C: o_b}
+            with self.subTest(w_a=hex(w_a), o_a=hex(o_a), w_b=hex(w_b), o_b=hex(o_b)):
+                got = tuple(mrt0_words(spv_bfm, push_constants=PUSH_VSHARP, memory=mem))
+                self.assertEqual(got, (want_a, want_b, want_a, 1))
+
+        # 2. End-to-end translated scalar bitfield-insert composition + roundtrip s_bfe_u32 extract.
+        spv_insert = translate_ps_bitfield([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",  # s4=base, s5=insert, s6=count, s7=offset
+            "s_waitcnt lgkmcnt(0)",
+            "s_bfm_b32 s8, s6, s7",                       # s8 = mask = ((1 << count) - 1) << offset
+            "s_lshl_b32 s9, s5, s7",                      # s9 = insert << offset
+            "s_and_b32 s9, s9, s8",                       # s9 = (insert << offset) & mask
+            "s_andn2_b32 s10, s4, s8",                    # s10 = base & ~mask
+            "s_or_b32 s11, s10, s9",                      # s11 = inserted result
+            "s_lshl_b32 s12, s6, 16",
+            "s_or_b32 s12, s12, s7",                      # s12 = pack_bfe_ctl(offset, count)
+            "s_bfe_u32 s13, s11, s12",                    # roundtrip extract
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s11",
+            "v_mov_b32 v2, s13",
+            "v_mov_b32 v3, 0",
+        ])
+        for base_val, ins_val, count, offset in (
+            (0xAA55AA55, 0x3F, 6, 12),
+            (0x12345678, 0xAB, 8, 8),
+            (0xFFFFFFFF, 0x00, 16, 8),
+            (0x80000001, 0x7FFF, 15, 16),
+        ):
+            want_mask = ref_s_bfm_b32(count, offset)
+            want_inserted = ref_bitfield_insert(base_val, ins_val, offset, count)
+            want_roundtrip, _ = ref_s_bfe_u32(want_inserted, pack_bfe_ctl(offset, count))
+            mem = {0x1000: base_val, 0x1004: ins_val, 0x1008: count, 0x100C: offset}
+            with self.subTest(base=hex(base_val), ins=hex(ins_val), count=count, offset=offset):
+                got = tuple(mrt0_words(spv_insert, push_constants=PUSH_VSHARP, memory=mem)[:3])
+                self.assertEqual(got, (want_mask, want_inserted, want_roundtrip))
+
+
 class NegativeControlTests(unittest.TestCase):
-    """Sensitivity tests ensuring mutations in bitfield logic are detected."""
+    """Sensitivity tests ensuring mutations in bitfield logic and translated SPIR-V are detected."""
 
     def test_signed_vs_unsigned_mutation_caught(self) -> None:
         # Extracting 0x00008000 with offset 8, width 8 gives 0x80.
@@ -713,6 +918,54 @@ class NegativeControlTests(unittest.TestCase):
         self.assertEqual(scc_nonzero, 1)
         self.assertEqual(scc_zero, 0)
         self.assertNotEqual(scc_nonzero, scc_zero)
+
+    def test_translated_spirv_mutations_caught(self) -> None:
+        # 1. s_bfe_i32: replacing OpBitFieldSExtract with OpBitFieldUExtract breaks sign extension,
+        #    and dropping the SCC store breaks SCC transitions.
+        spv_bfe = translate_ps_bitfield([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",
+            "s_bfe_i32 s6, s4, s5",
+            "s_cselect_b32 s7, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ])
+        mem_bfe = {0x1000: 0x00008000, 0x1004: pack_bfe_ctl(8, 8)}
+        self.assertEqual(
+            tuple(mrt0_words(spv_bfe, push_constants=PUSH_VSHARP, memory=mem_bfe)[:2]),
+            (0xFFFFFF80, 1),
+        )
+        bad_sextract = spv_bfe.replace("OpBitFieldSExtract %int", "OpBitFieldUExtract %int", 1)
+        self.assertNotEqual(bad_sextract, spv_bfe)
+        self.assertNotEqual(
+            mrt0_words(bad_sextract, push_constants=PUSH_VSHARP, memory=mem_bfe)[0],
+            0xFFFFFF80,
+        )
+        bad_scc = spv_bfe.replace("OpStore %scc", "OpStore %vcc_hi")
+        self.assertNotEqual(bad_scc, spv_bfe)
+        self.assertNotEqual(
+            mrt0_words(bad_scc, push_constants=PUSH_VSHARP, memory=mem_bfe)[1],
+            1,
+        )
+
+        # 2. s_bfm_b32: sabotaging OpISub (1 << w) - 1 breaks the mask.
+        spv_bfm = translate_ps_bitfield([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_bfm_b32 s6, s4, s5",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ])
+        mem_bfm = {0x1000: 8, 0x1004: 8}
+        self.assertEqual(mrt0_words(spv_bfm, push_constants=PUSH_VSHARP, memory=mem_bfm)[0], 0x0000FF00)
+        bad_bfm = spv_bfm.replace("OpISub %uint", "OpIAdd %uint", 1)
+        self.assertNotEqual(bad_bfm, spv_bfm)
+        self.assertNotEqual(mrt0_words(bad_bfm, push_constants=PUSH_VSHARP, memory=mem_bfm)[0], 0x0000FF00)
 
 
 if __name__ == "__main__":
