@@ -546,6 +546,14 @@ int main() {
             buffers.push_back(short_ranges);
         }
         {
+            // An inside-out rectangle covers nothing: the list closes and runs, and the clear writes nothing for it,
+            // alone or beside a rectangle that does cover elements (as D3D12 does on WARP and an NVIDIA device).
+            BufferCase nothing{"typed buffer, an inside-out rectangle", 256, {whole(64)}};
+            nothing.clears.push_back(typed(VK_FORMAT_R32_UINT, false, {9, 0, 0, 0}, 0, 64, {{5, 0, 2, 1}}));
+            nothing.clears.push_back(typed(VK_FORMAT_R32_UINT, false, {7, 0, 0, 0}, 0, 64, {{5, 0, 2, 1}, {8, 0, 12, 1}}));
+            buffers.push_back(nothing);
+        }
+        {
             // 16-byte elements over more than vkCmdUpdateBuffer's 64 KiB: written once, then doubled by copies.
             BufferCase wide{"typed buffer, 8- and 16-byte elements", 1 << 17, {whole((1 << 17) / 4)}};
             wide.clears.push_back(typed(VK_FORMAT_R32G32B32A32_UINT, false, {1, 2, 3, 4}, 16, 8000));
@@ -643,6 +651,12 @@ int main() {
              {texture_clear(VK_FORMAT_R8_UNORM, true, floats(0.75f, 0, 0, 0), 0, 0, 1, {{3, 0, 13, 2}})}},
             {"BGRA8_UNORM", DXGI_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, 4, 4, 1, 1, false,
              {texture_clear(VK_FORMAT_B8G8R8A8_UNORM, true, floats(1.0f, 0.5f, 0.0f, 1.0f), 0, 0, 1)}},
+            // Rectangles that cover nothing (inside out, empty) write nothing, alone or beside one that does.
+            {"R32_UINT, rectangles that cover nothing", DXGI_FORMAT_R32_UINT, VK_FORMAT_R32_UINT, 8, 8, 1, 1, false,
+             {texture_clear(VK_FORMAT_R32_UINT, false, {5, 0, 0, 0}, 0, 0, 1),
+              texture_clear(VK_FORMAT_R32_UINT, false, {9, 0, 0, 0}, 0, 0, 1, {{6, 6, 2, 2}}),
+              texture_clear(VK_FORMAT_R32_UINT, false, {9, 0, 0, 0}, 0, 0, 1, {{4, 4, 4, 8}}),
+              texture_clear(VK_FORMAT_R32_UINT, false, {7, 0, 0, 0}, 0, 0, 1, {{6, 6, 2, 2}, {0, 0, 2, 2}})}},
             {"RGBA8_UNORM volume, one mip", DXGI_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 4, 4, 2, 4, true,
              {texture_clear(VK_FORMAT_R8G8B8A8_UNORM, false, {1, 2, 3, 4}, 1, 0, 1)}},
         };
@@ -713,10 +727,12 @@ int main() {
             EXPECT(check([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, good, nullptr, values, 0, nullptr);
             }) == E_INVALIDARG);
+            // An inside-out rectangle is not one of them: it covers nothing, and the list closes (the cases above
+            // check that it writes nothing).
             const D3D12_RECT inside_out{5, 0, 2, 1};
             EXPECT(check([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, good, buffer.p, values, 1, &inside_out);
-            }) == E_INVALIDARG);
+            }) == S_OK);
 
             // Refused at execution, before anything is submitted: a buffer view of a texture, a texture view of a
             // buffer, a mip the texture does not have, a buffer view past the end, a rectangle clear of a volume.

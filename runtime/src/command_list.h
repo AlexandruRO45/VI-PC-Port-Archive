@@ -799,15 +799,19 @@ public:
         return append(copy);
     }
 
-    // A view of nothing (no resource, an empty buffer range or no layers) is invalid, as is a rectangle that is
-    // inside out. Ranges against the resource are checked at replay.
+    // A view of nothing (no resource, an empty buffer range or no layers) is invalid. A rectangle that is inside out
+    // or empty is not: D3D12 closes and runs the list and writes nothing for it (WARP and an NVIDIA device, no debug
+    // layer), so it is left out here. When none is left nothing is recorded, since a command without rectangles
+    // clears the whole view. Ranges against the resource are checked at replay.
     bool clear_unordered_access(const UavView& view, bool is_float, const std::array<std::uint32_t, 4>& values,
                                 std::span<const Rect> rects = {}) {
         if (!view.resource) return false;
         if (view.buffer ? (!view.size || !view.element_size) : !view.layer_count) return false;
+        std::vector<Rect> covering;
         for (const Rect& r : rects)
-            if (r.right < r.left || r.bottom < r.top) return false;
-        return append(ClearUnorderedAccess{view, is_float, values, {rects.begin(), rects.end()}});
+            if (r.left < r.right && r.top < r.bottom) covering.push_back(r);
+        if (!rects.empty() && covering.empty()) return !closed_;
+        return append(ClearUnorderedAccess{view, is_float, values, std::move(covering)});
     }
 
     // ExecuteBundle copies the closed bundle's commands [first, last) at the call site. The COM layer validates D3D12

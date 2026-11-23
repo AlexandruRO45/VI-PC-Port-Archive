@@ -361,5 +361,32 @@ int main() {
     CHECK(!list.acceleration_structure_postbuild({0x4000, 0, {0x1080}}));
     CHECK(list.close());
     CHECK(list.commands().size() == 7);
+
+    // ClearUnorderedAccessView: a rectangle that is inside out or empty covers nothing. D3D12 closes and runs such a
+    // list and writes nothing for it, so it is not an error: it is left out, and a clear with no rectangle left
+    // records no command (a command without rectangles would clear the whole view).
+    CommandList uav;
+    const std::array<std::uint32_t, 4> nine{9, 9, 9, 9};
+    const UavView texture_view{50, false, 98, 0, 0, 0, 0, 0, 1};
+    const Rect inside_out[] = {{6, 6, 2, 2}};
+    const Rect empty[] = {{4, 4, 4, 8}};
+    const Rect mixed[] = {{6, 6, 2, 2}, {0, 0, 2, 2}, {4, 4, 4, 8}};
+    CHECK(uav.clear_unordered_access(texture_view, false, nine, inside_out));
+    CHECK(uav.clear_unordered_access(texture_view, false, nine, empty));
+    CHECK(uav.commands().empty());
+    CHECK(uav.clear_unordered_access(texture_view, false, nine, mixed));
+    CHECK(uav.commands().size() == 1);
+    const auto& kept = std::get<ClearUnorderedAccess>(uav.commands()[0]).rects;
+    CHECK(kept.size() == 1 && kept[0].left == 0 && kept[0].top == 0 && kept[0].right == 2 && kept[0].bottom == 2);
+    CHECK(uav.clear_unordered_access(texture_view, false, nine));
+    CHECK(uav.commands().size() == 2 && std::get<ClearUnorderedAccess>(uav.commands()[1]).rects.empty());
+    // Still refused: a view of nothing, with or without rectangles, and any clear on a closed list.
+    CHECK(!uav.clear_unordered_access({0, false, 98, 0, 0, 0, 0, 0, 1}, false, nine, inside_out));
+    CHECK(!uav.clear_unordered_access({50, false, 98, 0, 0, 0, 0, 0, 0}, false, nine));
+    CHECK(!uav.clear_unordered_access({50, true, 0, 0, 0, 4, 0, 0, 0}, false, nine));
+    CHECK(uav.close());
+    CHECK(!uav.clear_unordered_access(texture_view, false, nine, inside_out));
+    CHECK(!uav.clear_unordered_access(texture_view, false, nine));
+    CHECK(uav.commands().size() == 2);
     return 0;
 }
