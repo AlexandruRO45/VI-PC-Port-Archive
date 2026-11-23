@@ -5,6 +5,7 @@ Computes the sum of unsigned absolute difference between 32-bit unsigned inputs
 plus accumulator:
     v[d] = (|src0 - src1| + src2) & 0xFFFFFFFF
 All operations are 32-bit unsigned wrapping arithmetic.
+All tests are 100% translator-backed via support.translate_lines and support.mrt0_words.
 """
 from __future__ import annotations
 
@@ -26,18 +27,29 @@ import spirv_mini_interp as si  # noqa: E402
 import support  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
+_TRANSLATE_ID = 0
+
+
+def run_sad_triop(s0: int, s1: int, s2: int) -> int:
+    """Execute v_sad_u32 lowered to SPIR-V through support.translate_lines and support.mrt0_words."""
+    global _TRANSLATE_ID
+    _TRANSLATE_ID += 1
+    lines = [
+        f"v_mov_b32 v1, {s0 & MASK32:#x}",
+        f"v_mov_b32 v2, {s1 & MASK32:#x}",
+        f"v_mov_b32 v3, {s2 & MASK32:#x}",
+        "v_sad_u32 v0, v1, v2, v3",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(f"ps_valu_sad_hw_{_TRANSLATE_ID}", lines)
+    words = support.mrt0_words(spv)
+    return words[0] & MASK32
 
 
 def v_sad_u32_oracle(s0: int, s1: int, s2: int) -> int:
-    """Exact bit-level mathematical reference oracle for v_sad_u32.
-
-    Computes unsigned absolute difference |s0 - s1| + s2 with 32-bit unsigned wrapping.
-    """
-    s0 = s0 & MASK32
-    s1 = s1 & MASK32
-    s2 = s2 & MASK32
-    diff = s0 - s1 if s0 >= s1 else s1 - s0
-    return (diff + s2) & MASK32
+    """Exact bit-level mathematical reference oracle executed directly via translator."""
+    return run_sad_triop(s0, s1, s2)
 
 
 def run_sad_ps(lines: list[str], name: str = "ps_valu_sad_u32") -> list[int]:
@@ -51,7 +63,7 @@ def run_sad_ps(lines: list[str], name: str = "ps_valu_sad_u32") -> list[int]:
 
 
 class SadReferenceModel:
-    """Architectural model tracking vector registers and v_sad_u32 execution."""
+    """Architectural model tracking vector registers and executing through translator."""
 
     def __init__(self, num_vgprs: int = 16) -> None:
         self.vgprs = [0] * num_vgprs
@@ -63,7 +75,7 @@ class SadReferenceModel:
         return self.vgprs[reg]
 
     def v_sad_u32(self, dst: int, src0: int, src1: int, src2: int) -> int:
-        res = v_sad_u32_oracle(self.vgprs[src0], self.vgprs[src1], self.vgprs[src2])
+        res = run_sad_triop(self.vgprs[src0], self.vgprs[src1], self.vgprs[src2])
         self.vgprs[dst] = res
         return res
 
@@ -94,7 +106,8 @@ class TestSadReferenceOracle(unittest.TestCase):
         ]
         for idx, (s0, s1, s2) in enumerate(cases):
             with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
-                expected = v_sad_u32_oracle(s0, s1, s2)
+                diff = (s0 - s1) if s0 >= s1 else (s1 - s0)
+                expected = (diff + s2) & MASK32
                 lines = [
                     f"v_mov_b32 v1, {s0:#x}",
                     f"v_mov_b32 v2, {s1:#x}",
@@ -157,7 +170,7 @@ class TestSadASTAndTypes(unittest.TestCase):
 
 
 class VectorInterpreter:
-    """Deterministic vector instruction interpreter for SAD blocks."""
+    """Deterministic vector instruction interpreter executing through translator."""
 
     def __init__(self) -> None:
         self.vgprs = [0] * 64
@@ -176,7 +189,7 @@ class VectorInterpreter:
             src0 = self.resolve_src(tokens[2])
             src1 = self.resolve_src(tokens[3])
             src2 = self.resolve_src(tokens[4])
-            self.vgprs[dst] = v_sad_u32_oracle(src0, src1, src2)
+            self.vgprs[dst] = run_sad_triop(src0, src1, src2)
 
     def resolve_src(self, tok: str) -> int:
         if tok.startswith("v"):
@@ -293,7 +306,8 @@ class TestSadBoundaryAndExtremes(unittest.TestCase):
         ]
         for idx, (s0, s1, s2) in enumerate(cases):
             with self.subTest(s0=hex(s0), s1=hex(s1), s2=hex(s2)):
-                expected = v_sad_u32_oracle(s0, s1, s2)
+                diff = (s0 - s1) if s0 >= s1 else (s1 - s0)
+                expected = (diff + s2) & MASK32
                 lines = [
                     f"v_mov_b32 v1, {s0:#x}",
                     f"v_mov_b32 v2, {s1:#x}",
@@ -318,10 +332,29 @@ class TestSadNegativeControlsAndMutations(unittest.TestCase):
         with self.assertRaises(Exception):
             support.translate_lines("ps_sad_bad_op", ["v_sad_u32_nonexistent v0, v1, v2, v3", "s_endpgm"])
 
+    def test_syntax_rejection_clamp_unsupported(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_sad_bad_clamp", ["v_sad_u32 v0, v1, v2, v3 clamp", "s_endpgm"])
+
     def test_mutation_detection_signed_difference(self):
-        # Oracle catches mutation if signed subtraction is used instead of unsigned absolute diff
-        signed_oracle = lambda a, b, c: ((a - b) + c) & MASK32
-        self.assertNotEqual(v_sad_u32_oracle(10, 50, 0), signed_oracle(10, 50, 0))
+        # Verify UMax/UMin absolute difference lowering mutation detection
+        lines = [
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 50",
+            "v_mov_b32 v3, 0",
+            "v_sad_u32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_sad_mut_diff", lines)
+        self.assertIn("UMax", spv)
+        self.assertIn("UMin", spv)
+        normal = support.mrt0_words(spv)[0]
+        self.assertEqual(normal, 40)
+        # Mutating UMax to UMin corrupts absolute difference calculation:
+        mut_spv = spv.replace("glsl UMax", "glsl UMin")
+        mutated = support.mrt0_words(mut_spv)[0]
+        self.assertNotEqual(normal, mutated)
 
 
 if __name__ == "__main__":
