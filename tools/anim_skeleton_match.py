@@ -14,6 +14,7 @@ import mmap
 import os
 import re
 import sys
+import tempfile
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -21,6 +22,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import anim_index  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 SKEL_RE = re.compile(rb"SKEL_[A-Za-z0-9_]+")
@@ -134,11 +136,26 @@ def main(argv=None):
     text = json.dumps(summary, indent=2)
     print(text)
     if a.out:
+        staged = None
         try:
-            with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
+            folder = os.path.dirname(os.path.abspath(a.out))
+            with tempfile.NamedTemporaryFile(
+                "w", dir=folder, prefix=".anim-skel-", suffix=".tmp",
+                encoding="utf-8", newline="\n", delete=False,
+            ) as fh:
+                staged = fh.name
                 fh.write(text + "\n")
+            os.chmod(staged, published_mode(a.out))
+            os.replace(staged, a.out)
+            staged = None
         except OSError as exc:
-            ap.error(f"cannot write --out ({a.out}): {exc}")
+            ap.error(f"cannot write --out ({a.out}): {exc.strerror or exc}")
+        finally:
+            if staged is not None:
+                try:
+                    os.remove(staged)
+                except OSError:
+                    pass
     return 0
 
 

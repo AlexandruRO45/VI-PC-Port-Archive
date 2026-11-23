@@ -61,6 +61,31 @@ class SkeletonMatchTests(unittest.TestCase):
                     asm.main([bad_in, anim_p])
                 self.assertEqual(cm.exception.code, 2)
 
+    def test_failed_replace_preserves_existing_report(self):
+        import contextlib
+        import io
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            packs_p = os.path.join(tmp, "packs.rpf")
+            anim_p = os.path.join(tmp, "anim.rpf")
+            out_p = os.path.join(tmp, "report.json")
+            with open(packs_p, "wb") as f:
+                f.write(b"RPF9" + bytes(12) + zlib.compress(b"SKEL_ROOT\x00" + b"A" * 128))
+            with open(anim_p, "wb") as f:
+                f.write(b"RPF9" + bytes(12) + zlib.compress(b"SKEL_ROOT\x00" + b"B" * 128))
+            with open(out_p, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"previous": true}\n')
+            err = io.StringIO()
+            with mock.patch.object(asm.os, "replace", side_effect=PermissionError(13, "busy")), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as cm:
+                    asm.main([packs_p, anim_p, "--out", out_p])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("cannot write --out", err.getvalue())
+            with open(out_p, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"previous": true}\n')
+            self.assertEqual(sorted(os.listdir(tmp)), ["anim.rpf", "packs.rpf", "report.json"])
+
 
 if __name__ == "__main__":
     unittest.main()
