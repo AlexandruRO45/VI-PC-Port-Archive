@@ -103,12 +103,11 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
 ## Delegation and context
 
 For multi-step work, delegate recon and bounded edits, and keep planning, judgment and final review with the
-orchestrator. Give each helper a bounded brief: goal, files, constraints, acceptance check and report shape.
-Parallelize independent reads; do not parallelize edits to the same files.
+orchestrator. Ask for a compact map, not file dumps. Give each helper a bounded brief: goal, files, constraints,
+acceptance check and report shape. Parallelize independent reads; do not parallelize edits to the same files.
 
 A helper's report is not verification. Run the checks in this file, keep long logs on disk, and report the exact
-commands, exit codes and counts. Before any work starts, post the claim required by `CONTRIBUTING.md`; a pull request
-still needs its item ID, `Depends on:` links and the AI-assisted note. Report GPU and driver results as
-`CONTRIBUTING.md` describes.
+commands, exit codes and counts. Before a pull request is opened, post the claim required by `CONTRIBUTING.md` and
+fill in the pull request template.
 
 Stop and surface on security, data loss, irreversible operations, or a conflict with a claimed item.
