@@ -624,9 +624,12 @@ names its `lod` tier and its grid `cell` (`[minx, minz, maxx, maxz]`, glTF metre
 - it ends where the next coarser tier present starts; the coarsest tier ends at its median `lodDist`;
 - ORPHAN_HD has no parent and runs from 0 to its median `lodDist`.
 
-`stats.lod_tiers` records the medians and each tier's chunk and placement counts. The viewer loads a tiered chunk
-while the horizontal distance from the camera to its cell is inside the band, and keeps it up to 32 m past the
-band, so each cell shows one tier. Worlds without `lod_bands` stream as before.
+`stats.lod_tiers` records the medians and each tier's chunk and placement counts. The viewer requests a tiered
+chunk when the horizontal distance from the camera to its cell falls inside its band. It can keep a loaded
+chunk up to 32 m outside that band. Each cell shows at most one tier from the HD-to-SLOD chain. A cached tier
+within that margin can stay visible while the in-band replacement loads. ORPHAN_HD draws independently and
+can appear alongside the chain tier whenever the camera is inside the orphan's own band.
+Worlds without `lod_bands` stream as before.
 
 Tier medians over all 1,670,435 entities (`lodDist` ≤ 0 means "use the archetype's default" and is left out):
 
