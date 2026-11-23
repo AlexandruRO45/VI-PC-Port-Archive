@@ -16042,24 +16042,36 @@ def main():
     import json as _js
     idx_path = os.path.join(a.out, f"index.part{shard}.json" if shard is not None else "index.json")
     old = {}
-    if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
+    merged_into = shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000
+    if merged_into:
         with open(idx_path, encoding="utf-8") as f:
             old = _js.load(f)  # partial runs merge into an existing index
         for name in invalid:
             old.pop(name, None)
     old.update(meta)
+    # .s inputs and not one valid module: index.json is the marker that says the corpus was translated (make_game.py
+    # reads it), so a fresh {} would claim a translation of nothing, like the empty --merge (5ee3f8c7). Exit 1 and
+    # publish no new index. An index this run merged into still gets the failed shaders dropped. A --shard slice is
+    # left alone: an empty slice is a success, and --merge judges the whole set.
+    nothing = shard is None and bool(files) and valid == 0
     if shard is not None:   # a marker beside the part, so --merge can tell a complete set from a partial one
         write_index(os.path.join(a.out, SHARD_MARKER.format(index=shard)), {"index": shard, "count": sn})
-    write_index(idx_path, old)
-    if shard is None:
-        import spirv_stubs
-        spirv_stubs.generate_for_index(a.out, old)
+    if not nothing or merged_into:
+        write_index(idx_path, old)
+        if shard is None:
+            import spirv_stubs
+            spirv_stubs.generate_for_index(a.out, old)
     print(f"{len(files)} shaders: {ok} translated, {valid} pass spirv-val")
     if W64G_COUNTS:
         print("wave64 VS/PS/GS on 32-wide subgroups: " + ", ".join(f"tier {t}: {n}" for t, n in sorted(W64G_COUNTS.items()))
               + (" (tier C is not exact there; see wave64_graphics_reasons in the index)" if W64G_COUNTS["C"] else ""))
     for k, v in why.most_common(25):
         print(f"  {v:6}  {k}")
+    if nothing:
+        print(f"ERROR: none of the {len(files)} .s files produced a valid module"
+              + ("; their entries were dropped from the existing index" if merged_into
+                 else f"; {idx_path} was not written"), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

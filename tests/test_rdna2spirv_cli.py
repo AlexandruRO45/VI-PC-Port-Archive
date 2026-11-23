@@ -372,7 +372,8 @@ class ValidatedOutput(unittest.TestCase):
     def test_validator_rejection_does_not_publish_binary(self):
         self.assertIn("INVALID: synthetic rejection", self.translate(reject_at="spirv-val"))
         self.assertFalse(self.module.exists())
-        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {})
+        # The only input was rejected: no index.json, which would claim a finished translation (SHADER-555).
+        self.assertFalse(self.index.exists())
         self.assertTrue((self.out / "ps_fixture.spvasm").is_file())
         self.assertEqual(list(self.out.glob("*.tmp")), [])
 
@@ -440,10 +441,63 @@ class EmptyShader(unittest.TestCase):
                 f.write(b"DXBC" + bytes(28))
             out = os.path.join(tmp, "spirv")
             p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out], capture_output=True, text=True)
-            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.returncode, 1, p.stderr)   # its only .s gave no module (SHADER-555)
             self.assertIn("0 translated", p.stdout, p.stdout)
             self.assertIn("no instructions (nothing tab-indented?)", p.stdout, p.stdout)
             self.assertFalse(os.path.exists(os.path.join(out, "ps_empty.spv")))
+            self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
+
+
+class NothingTranslated(unittest.TestCase):
+    """SHADER-555: .s inputs and no valid module exits 1 and publishes no new index.json.
+
+    index.json is what make_game.py takes as a finished translation, so {} from a run where every shader failed
+    claimed a translation of nothing, the single-run twin of the empty --merge that 5ee3f8c7 refuses.
+    """
+
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.src = root / "disasm"
+        self.src.mkdir()
+        for name in ("ps_a", "ps_b"):
+            (self.src / f"{name}.s").write_text("\ts_barrier\n\ts_endpgm\n", encoding="utf-8")   # PS: Unsupported
+            (root / f"{name}.dxbc").write_bytes(b"DXBC" + bytes(28))
+        self.out = root / "spirv"
+        self.index = self.out / "index.json"
+
+    def run_tool(self, *extra):
+        return subprocess.run([sys.executable, "-I", TOOL, str(self.src), "--out", str(self.out), *extra],
+                              capture_output=True, text=True)
+
+    def test_no_valid_module_exits_1_without_an_index(self):
+        p = self.run_tool()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("2 shaders: 0 translated", p.stdout)
+        self.assertIn("none of the 2 .s files produced a valid module", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertFalse(self.index.exists())
+
+    def test_an_index_it_merges_into_still_drops_the_failed_shaders(self):
+        self.out.mkdir()
+        (self.out / "ps_a.spv").write_bytes(b"old module")
+        self.index.write_text(json.dumps({"ps_a": {"stage": "ps"}, "cs_other": {"stage": "cs"}}), encoding="utf-8")
+        p = self.run_tool()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertEqual(json.loads(self.index.read_text(encoding="utf-8")), {"cs_other": {"stage": "cs"}})
+        self.assertFalse((self.out / "ps_a.spv").exists())
+
+    def test_an_empty_folder_and_an_empty_shard_slice_stay_a_success(self):
+        for name in ("ps_a", "ps_b"):
+            (self.src / f"{name}.s").unlink()
+        p = self.run_tool()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("0 shaders:", p.stdout)
+        # Two inputs, shard 2/3 gets none: a success, and --merge judges the whole set.
+        (self.src / "ps_a.s").write_text("\ts_endpgm\n", encoding="utf-8")
+        (self.src / "ps_b.s").write_text("\ts_endpgm\n", encoding="utf-8")
+        p = self.run_tool("--shard", "2/3")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue((self.out / "index.part2.json").is_file())
 
 
 class PopsInvocationInterlock(unittest.TestCase):
