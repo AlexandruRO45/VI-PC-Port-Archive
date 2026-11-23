@@ -134,12 +134,13 @@ def internal_area(hdr, out):
 
 def check(dehydrated, geometries, header_offset=0):
     """Rehydrate and run every check. Returns a report dict; report["consistent"] is the overall verdict."""
+    geometries = list(geometries)  # read twice below: an iterator would leave the pair check empty
     hdr = R.Header(dehydrated, header_offset)
     src = bytes(dehydrated[header_offset:header_offset + hdr.total_bytes])
     out = R.rehydrate(dehydrated, geometries, header_offset)
     outside, gap = check_bounds(hdr, out)
     good, bad = check_overrides(src, hdr, out)
-    pairs = check_pairs(src, hdr, list(geometries))
+    pairs = check_pairs(src, hdr, geometries)
     pairs_ok = all(ok == total for ok, total in pairs.values())
     return {"leaves": hdr.num_elements, "leaves_outside": outside, "bounds_gap": gap,
             "overrides_consistent": good, "overrides_inconsistent": bad,

@@ -35,6 +35,18 @@ class TestChecks(unittest.TestCase):
         self.assertEqual((r["leaves_outside"], r["bounds_gap"], r["pairs"]), (0, 0.0, {"0": [1, 1]}))
         self.assertGreater(r["internal_area"], 0.0)
 
+    def test_geometries_from_an_iterator(self):
+        # check() reads the geometries twice (rehydrate, then the pair check); an iterator must not leave the
+        # second read empty, which would skip the pair check and report a re-indexed geometry as consistent
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        r = C.check(src, iter([TRUE]))
+        self.assertTrue(r["consistent"], r)
+        self.assertEqual(r["pairs"], {"0": [1, 1]})
+        loose = R.Geometry(VB + struct.pack("<6f", 1, 1, 0, 1, 1, 0), indices=struct.pack("<6I", 0, 1, 2, 3, 4, 5))
+        r = C.check(src, (g for g in [loose]))
+        self.assertEqual(r["pairs"], {"0": [0, 1]})
+        self.assertFalse(r["consistent"])
+
     def test_shifted_geometry_fails_bounds(self):
         shifted = R.Geometry(VB, indices=IB, transform=((1, 0, 0, 0.5), (0, 1, 0, 0), (0, 0, 1, 0)))
         src, _, _ = build(LEAVES, bounds=BOUNDS)
