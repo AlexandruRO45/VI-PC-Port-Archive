@@ -262,6 +262,30 @@ BOOL WINAPI query_headers(HINTERNET request, DWORD, LPCWSTR, LPVOID, LPDWORD, LP
     return receive_response(request, nullptr);
 }
 
+// Credentials are accepted for the offline request but never retained or transmitted.
+BOOL WINAPI set_credentials(HINTERNET request, DWORD target, DWORD scheme, LPCWSTR user, LPCWSTR password,
+                            LPVOID params) {
+    DWORD error = 0;
+    Handle* r = acquire(request, false, false, true, error);
+    if (!r) return fail(error);
+    release(r);
+    const bool integrated = scheme == WINHTTP_AUTH_SCHEME_NTLM || scheme == WINHTTP_AUTH_SCHEME_NEGOTIATE;
+    if ((target != WINHTTP_AUTH_TARGET_SERVER && target != WINHTTP_AUTH_TARGET_PROXY) ||
+        (scheme != WINHTTP_AUTH_SCHEME_BASIC && scheme != WINHTTP_AUTH_SCHEME_DIGEST &&
+         scheme != WINHTTP_AUTH_SCHEME_PASSPORT && !integrated) || params ||
+        ((!user || !password) && !(integrated && !user && !password)))
+        return fail(ERROR_INVALID_PARAMETER);
+    return TRUE;
+}
+
+BOOL WINAPI query_auth_schemes(HINTERNET request, LPDWORD, LPDWORD, LPDWORD) {
+    return receive_response(request, nullptr);
+}
+
+BOOL WINAPI detect_auto_proxy_config_url(DWORD, LPWSTR*) {
+    return fail(ERROR_WINHTTP_AUTODETECTION_FAILED);
+}
+
 // RFC 7230 tchar grammar for HTTP header field-names (matches native WinHttpAddRequestHeaders):
 // printable ASCII 0x21..0x7E excluding HTTP token separators ()<>@,;:\"/[]?={}.
 bool is_header_name_char(wchar_t ch) {
@@ -446,6 +470,9 @@ SHIM_TABLE(winhttp_offline,
     {"winhttp.dll", "WinHttpReadData", reinterpret_cast<void*>(&read_data)},
     {"winhttp.dll", "WinHttpWriteData", reinterpret_cast<void*>(&write_data)},
     {"winhttp.dll", "WinHttpQueryHeaders", reinterpret_cast<void*>(&query_headers)},
+    {"winhttp.dll", "WinHttpSetCredentials", reinterpret_cast<void*>(&set_credentials)},
+    {"winhttp.dll", "WinHttpQueryAuthSchemes", reinterpret_cast<void*>(&query_auth_schemes)},
+    {"winhttp.dll", "WinHttpDetectAutoProxyConfigUrl", reinterpret_cast<void*>(&detect_auto_proxy_config_url)},
     {"winhttp.dll", "WinHttpAddRequestHeaders", reinterpret_cast<void*>(&add_request_headers)},
     {"winhttp.dll", "WinHttpSetTimeouts", reinterpret_cast<void*>(&set_timeouts)},
     {"winhttp.dll", "WinHttpSetOption", reinterpret_cast<void*>(&set_option)},

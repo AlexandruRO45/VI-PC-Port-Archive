@@ -2,7 +2,7 @@
 //
 // Every function is resolved through rt::shims::find under winhttp.dll, so the test runs against the table the
 // runtime installs. Nothing here touches the network: the server names use the reserved .invalid top-level domain, and
-// the only host WinHTTP call the shims make is WinHttpCrackUrl, which parses a string.
+// the shim only calls the host's WinHttpCrackUrl; two host calls below check rejection of an offline handle.
 #include <windows.h>
 #include <winhttp.h>
 #include <fcntl.h>
@@ -33,6 +33,9 @@ using QueryOptionFn = BOOL(WINAPI*)(HINTERNET, DWORD, LPVOID, LPDWORD);
 using SetStatusCallbackFn = WINHTTP_STATUS_CALLBACK(WINAPI*)(HINTERNET, WINHTTP_STATUS_CALLBACK, DWORD, DWORD_PTR);
 using CloseHandleFn = BOOL(WINAPI*)(HINTERNET);
 using CrackUrlFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPURL_COMPONENTS);
+using CredentialsFn = BOOL(WINAPI*)(HINTERNET, DWORD, DWORD, LPCWSTR, LPCWSTR, LPVOID);
+using AuthSchemesFn = BOOL(WINAPI*)(HINTERNET, LPDWORD, LPDWORD, LPDWORD);
+using DetectProxyFn = BOOL(WINAPI*)(DWORD, LPWSTR*);
 
 int g_checks = 0;
 int g_failures = 0;
@@ -214,6 +217,10 @@ int main() {
     const auto set_callback = resolve<SetStatusCallbackFn>("WinHttpSetStatusCallback");
     const auto close = resolve<CloseHandleFn>("WinHttpCloseHandle");
     const auto crack = resolve<CrackUrlFn>("WinHttpCrackUrl");
+    const auto credentials = resolve<CredentialsFn>("WinHttpSetCredentials");
+    const auto schemes = resolve<AuthSchemesFn>("WinHttpQueryAuthSchemes");
+    const auto detect_proxy = resolve<DetectProxyFn>("WinHttpDetectAutoProxyConfigUrl");
+    check(credentials && schemes && detect_proxy, "credential, auth scheme and auto proxy imports resolve offline");
     check(open && connect && open_request && send && receive && read && query_headers && add_headers &&
               set_timeouts && set_option && query_option && set_callback && close && crack &&
               rt::shims::find("winhttp.dll", "WinHttpQueryDataAvailable") &&
@@ -235,6 +242,40 @@ int main() {
             open_request(connection, L"GET", L"/x", nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                          WINHTTP_FLAG_SECURE);
         check(request != nullptr, "WinHttpOpenRequest returns a request");
+        const HMODULE host = LoadLibraryW(L"winhttp.dll");
+        const auto host_credentials = reinterpret_cast<CredentialsFn>(GetProcAddress(host, "WinHttpSetCredentials"));
+        const auto host_schemes = reinterpret_cast<AuthSchemesFn>(GetProcAddress(host, "WinHttpQueryAuthSchemes"));
+        DWORD host_supported = 0, host_first = 0, host_target = 0;
+        check(host_credentials && !host_credentials(request, WINHTTP_AUTH_TARGET_SERVER, WINHTTP_AUTH_SCHEME_BASIC,
+                                                    L"user", L"pass", nullptr) && GetLastError() == ERROR_INVALID_HANDLE,
+              "host credentials reject the offline request handle");
+        check(host_schemes && !host_schemes(request, &host_supported, &host_first, &host_target) &&
+                  GetLastError() == ERROR_INVALID_HANDLE, "host auth schemes reject the offline request handle");
+        if (host) FreeLibrary(host);
+        if (credentials && schemes && detect_proxy) {
+            check(credentials(request, WINHTTP_AUTH_TARGET_SERVER, WINHTTP_AUTH_SCHEME_BASIC, L"user", L"", nullptr),
+                  "credentials accept a blank password");
+            check(!credentials(request, WINHTTP_AUTH_TARGET_SERVER, WINHTTP_AUTH_SCHEME_BASIC, nullptr, L"pass", nullptr) &&
+                      GetLastError() == ERROR_INVALID_PARAMETER, "credentials reject a null user");
+            check(credentials(request, WINHTTP_AUTH_TARGET_PROXY, WINHTTP_AUTH_SCHEME_NTLM, nullptr, nullptr, nullptr),
+                  "integrated credentials accept the default identity");
+            check(!credentials(request, 99, WINHTTP_AUTH_SCHEME_BASIC, L"user", L"pass", nullptr) &&
+                      GetLastError() == ERROR_INVALID_PARAMETER, "credentials reject an invalid target");
+            check(!credentials(request, WINHTTP_AUTH_TARGET_SERVER, 0, L"user", L"pass", nullptr) &&
+                      GetLastError() == ERROR_INVALID_PARAMETER, "credentials reject an invalid scheme");
+            check(!credentials(nullptr, WINHTTP_AUTH_TARGET_SERVER, WINHTTP_AUTH_SCHEME_BASIC, L"user", L"pass", nullptr) &&
+                      GetLastError() == ERROR_INVALID_HANDLE, "credentials reject an invalid handle");
+            check(!credentials(session, WINHTTP_AUTH_TARGET_SERVER, WINHTTP_AUTH_SCHEME_BASIC, L"user", L"pass", nullptr) &&
+                      GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE, "credentials require a request");
+            DWORD supported = 17, first = 18, target = 19;
+            check(!schemes(request, &supported, &first, &target) && GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_STATE &&
+                      supported == 17 && first == 18 && target == 19, "auth schemes need a response");
+            check(!schemes(session, &supported, &first, &target) && GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE,
+                  "auth schemes require a request");
+            LPWSTR url = nullptr;
+            check(!detect_proxy(WINHTTP_AUTO_DETECT_TYPE_DHCP, &url) &&
+                      GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED && !url, "auto proxy detection fails offline");
+        }
         check(add_headers(request, L"X-Test: 1", static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD) != FALSE,
               "request headers are accepted");
         check(set_timeouts(request, 1000, 1000, 1000, 1000) != FALSE, "timeouts are accepted");
