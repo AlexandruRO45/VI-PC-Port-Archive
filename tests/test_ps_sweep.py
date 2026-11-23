@@ -192,6 +192,14 @@ class Classification(unittest.TestCase):
                 result = ps_sweep.classify_pair(self.rec(a), self.rec(b), self.tmp.name, self.tmp.name)
                 self.assertEqual(result, expected)
 
+    def test_unreadable_output_is_an_invalid_readback(self):
+        # A folder where the .raw file should be (or a permission failure: both raise OSError, not
+        # FileNotFoundError) is not a GPU result, so it is one class and not a traceback.
+        folder = os.path.join(self.tmp.name, "unreadable.raw")
+        os.makedirs(folder)
+        self.assertEqual(ps_sweep.classify_pair(self.rec(0), self.rec(0), folder, folder),
+                         ("invalid readback", "a: unreadable output"))
+
 
 class CompareCommand(unittest.TestCase):
     def test_readback_shapes(self):

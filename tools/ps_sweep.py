@@ -307,6 +307,9 @@ def classify_pair(rec_a, rec_b, raw_a, raw_b, tol=TOLERANCE):
                     data = f.read(size + 1)  # detect trailing bytes without reading an unbounded file
             except FileNotFoundError:
                 return "invalid readback", f"{tag}: missing output"
+            except OSError:
+                # A folder in place of the .raw file, or a permission failure, is not a GPU result either.
+                return "invalid readback", f"{tag}: unreadable output"
             if len(data) != size:
                 return "invalid readback", f"{tag}: wrong output size"
             outputs.append(struct.unpack(f"<{size // 4}f", data))
