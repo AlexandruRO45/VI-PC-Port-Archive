@@ -45,6 +45,7 @@
 //   test hook     VK_PIPELINE_CHECK_SIMULATE_CRASH=<module name substring>[:SIGNAL] raises SIGNAL (default SIGFPE)
 //                 just before the pipeline of a matching module is created. For testing --isolate and the
 //                 pipelines stage's retry.
+#include "../src/vulkan_bindless.h"
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
@@ -1125,20 +1126,25 @@ int main(int argc, char** argv) {
         return {};
     };
 
-    // Resource contract (docs/design.md): set 0, runtime-sized arrays as large bindless arrays.
-    std::vector<VkDescriptorSetLayoutBinding> b;
-    auto add = [&](uint32_t bind, VkDescriptorType t, uint32_t cnt) {
-        b.push_back({bind, t, cnt, VK_SHADER_STAGE_ALL, nullptr});
-    };
-    add(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096); add(1, VK_DESCRIPTOR_TYPE_SAMPLER, 1024);
-    add(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1); add(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024);
-    add(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
-    add(6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256); add(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
-    for (uint32_t i = 8; i <= 19; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
-    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
-    VkDescriptorSetLayout dsl;
-    if (VkResult r = vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl)) { std::fprintf(stderr, "layout %d\n", r); return 1; }
+    // Use the runtime's set-0 binding contract and size it for this device.
+    VkPhysicalDeviceVulkan12Properties indexed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    VkPhysicalDeviceVulkan11Properties v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &indexed};
+    VkPhysicalDeviceProperties2 bindless_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &v11};
+    vkGetPhysicalDeviceProperties2(pd, &bindless_props);
+    leonida::BindlessFeatures bindless;
+    bindless.update_after_bind = f12.descriptorBindingSampledImageUpdateAfterBind &&
+                                 f12.descriptorBindingStorageImageUpdateAfterBind &&
+                                 f12.descriptorBindingStorageBufferUpdateAfterBind;
+    bindless.partially_bound = f12.descriptorBindingPartiallyBound;
+    if (!leonida::bindless::size_bindings(bindless, props.limits, v11, indexed)) {
+        std::fprintf(stderr, "descriptor arrays reduced to fit device limits\n");
+    }
+    const leonida::bindless::SetLayout set0(bindless);
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    if (VkResult r = vkCreateDescriptorSetLayout(dev, &set0.info, nullptr, &dsl)) {
+        std::fprintf(stderr, "layout %d\n", r);
+        return 1;
+    }
     // Set 1 of --pc-tail-ubo shaders (docs/design.md): dynamic uniform block at binding 0 holding heap/code base.
     const VkDescriptorSetLayoutBinding tail_binding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
                                                     VK_SHADER_STAGE_ALL, nullptr};
