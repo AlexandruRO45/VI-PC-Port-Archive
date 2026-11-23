@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <initializer_list>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -40,7 +41,8 @@ constexpr std::uint32_t kExecModelGeometry = 3;
 constexpr std::uint32_t kModeInvocations = 0, kModeTriangles = 22, kModeOutputVertices = 26,
                         kModeOutputTriangleStrip = 29;
 constexpr std::uint32_t kDecorationBuiltIn = 11, kDecorationLocation = 30, kDecorationPerVertexKHR = 5285;
-constexpr std::uint32_t kBuiltInPosition = 0, kBuiltInClipDistance = 3, kBuiltInCullDistance = 4;
+constexpr std::uint32_t kBuiltInPosition = 0, kBuiltInClipDistance = 3, kBuiltInCullDistance = 4,
+                        kBuiltInPrimitiveId = 7;
 constexpr std::uint32_t kStorageInput = 1, kStorageOutput = 3;
 
 class Writer {
@@ -69,10 +71,13 @@ private:
 
 // The geometry shader's SPIR-V words: Position and the vec4 inputs at `locations` copied per vertex, the one-hot
 // barycentric vec3 at `bary_location`, and ClipDistance/CullDistance arrays of these lengths (0: none) copied too.
+// With `primitive_id`, the primitive's ID too (gl_PrimitiveIDIn to gl_PrimitiveID): a PS that reads PrimitiveId
+// behind a GS needs the GS to write it (VUID-VkGraphicsPipelineCreateInfo-pStages-00740).
 // Empty, with *error set, when the bary location is also a pass-through location or a length is over 8.
 inline std::vector<std::uint32_t> bary_fallback_gs(std::span<const std::uint32_t> locations,
                                                    std::uint32_t bary_location, std::uint32_t clip_count = 0,
-                                                   std::uint32_t cull_count = 0, std::string* error = nullptr) {
+                                                   std::uint32_t cull_count = 0, std::string* error = nullptr,
+                                                   bool primitive_id = false) {
     using namespace bary_gs_detail;
     const auto fail = [&](const std::string& why) {
         if (error) *error = why;
@@ -114,6 +119,8 @@ inline std::vector<std::uint32_t> bary_fallback_gs(std::span<const std::uint32_t
         ins.push_back(w.id());
         outs.push_back(w.id());
     }
+    const std::uint32_t p_in_int = primitive_id ? w.id() : 0, p_out_int = primitive_id ? w.id() : 0,
+                        in_prim = primitive_id ? w.id() : 0, out_prim = primitive_id ? w.id() : 0;
     const std::uint32_t out_bary = w.id(), fn_main = w.id(), entry = w.id();
 
     w.op(kOpCapability, {kCapabilityGeometry});
@@ -127,6 +134,10 @@ inline std::vector<std::uint32_t> bary_fallback_gs(std::span<const std::uint32_t
         entry_point.push_back(d.in);
         entry_point.push_back(d.out);
     }
+    if (primitive_id) {
+        entry_point.push_back(in_prim);
+        entry_point.push_back(out_prim);
+    }
     w.op(kOpEntryPoint, entry_point);
     w.op(kOpExecutionMode, {fn_main, kModeTriangles});
     w.op(kOpExecutionMode, {fn_main, kModeInvocations, 1});
@@ -138,6 +149,10 @@ inline std::vector<std::uint32_t> bary_fallback_gs(std::span<const std::uint32_t
     for (const Distance& d : distances) {
         w.op(kOpDecorate, {d.in, kDecorationBuiltIn, d.builtin});
         w.op(kOpDecorate, {d.out, kDecorationBuiltIn, d.builtin});
+    }
+    if (primitive_id) {
+        w.op(kOpDecorate, {in_prim, kDecorationBuiltIn, kBuiltInPrimitiveId});
+        w.op(kOpDecorate, {out_prim, kDecorationBuiltIn, kBuiltInPrimitiveId});
     }
     for (std::size_t i = 0; i < locs.size(); ++i) w.op(kOpDecorate, {ins[i], kDecorationLocation, locs[i]});
     for (std::size_t i = 0; i < locs.size(); ++i) w.op(kOpDecorate, {outs[i], kDecorationLocation, locs[i]});
@@ -164,6 +179,10 @@ inline std::vector<std::uint32_t> bary_fallback_gs(std::span<const std::uint32_t
         w.op(kOpTypePointer, {d.p_in_arr, kStorageInput, d.t_arr});
         w.op(kOpTypePointer, {d.p_out_arr, kStorageOutput, d.t_arr});
     }
+    if (primitive_id) {
+        w.op(kOpTypePointer, {p_in_int, kStorageInput, t_int});
+        w.op(kOpTypePointer, {p_out_int, kStorageOutput, t_int});
+    }
     w.op(kOpConstant, {t_float, c_f0, 0x00000000u});
     w.op(kOpConstant, {t_float, c_f1, 0x3f800000u});
     for (std::uint32_t v = 0; v < 3; ++v)
@@ -180,6 +199,11 @@ inline std::vector<std::uint32_t> bary_fallback_gs(std::span<const std::uint32_t
         w.op(kOpVariable, {d.p_out_arr, d.out, kStorageOutput});
     }
 
+    if (primitive_id) {
+        w.op(kOpVariable, {p_in_int, in_prim, kStorageInput});
+        w.op(kOpVariable, {p_out_int, out_prim, kStorageOutput});
+    }
+
     w.op(kOpFunction, {t_void, fn_main, 0 /* None */, t_fn});
     w.op(kOpLabel, {entry});
     for (std::uint32_t v = 0; v < 3; ++v) {
@@ -194,6 +218,11 @@ inline std::vector<std::uint32_t> bary_fallback_gs(std::span<const std::uint32_t
         for (std::size_t i = 0; i < locs.size(); ++i) copy(p_in_v4, t_v4, ins[i], outs[i]);
         for (const Distance& d : distances) copy(d.p_in_arr, d.t_arr, d.in, d.out);
         w.op(kOpStore, {out_bary, c_bary[v]});
+        if (primitive_id) {  // written before each vertex: outputs are undefined after EmitVertex
+            const std::uint32_t id = w.id();
+            w.op(kOpLoad, {t_int, id, in_prim});
+            w.op(kOpStore, {out_prim, id});
+        }
         w.op(kOpEmitVertex, {});
     }
     w.op(kOpEndPrimitive, {});
@@ -204,9 +233,9 @@ inline std::vector<std::uint32_t> bary_fallback_gs(std::span<const std::uint32_t
 
 // The geometry shader for a PSO's VS and its --bary-fallback PS: the pass-through locations are every located input
 // the PS module declares except the barycentric one (so after link_f16_halves, those it links), the distance arrays
-// the VS's. Empty, with *error set, when the pair can't be drawn this way: the PS has no barycentric input, or reads
-// PerVertexKHR inputs (which only the extension can feed), or the VS writes Layer or ViewportIndex (a geometry stage
-// can't read those to forward them).
+// the VS's. A PS that reads PrimitiveId gets it forwarded. Empty, with *error set, when the pair can't be drawn this
+// way: the PS has no barycentric input, or reads PerVertexKHR inputs (which only the extension can feed), or the VS
+// writes Layer or ViewportIndex (a geometry stage can't read those to forward them).
 inline std::vector<std::uint32_t> bary_fallback_gs_for(const ShaderEntry& vs, const ShaderEntry& ps,
                                                        std::span<const std::uint32_t> ps_words,
                                                        std::string* error = nullptr) {
@@ -231,7 +260,21 @@ inline std::vector<std::uint32_t> bary_fallback_gs_for(const ShaderEntry& vs, co
     std::vector<std::uint32_t> locations;
     for (const auto& [location, var] : inputs)
         if (location != bary) locations.push_back(location);
-    return bary_fallback_gs(locations, bary, vs.clip_distance_count, vs.cull_distance_count, error);
+    // Whether the PS reads PrimitiveId: an Input variable decorated BuiltIn PrimitiveId.
+    std::set<std::uint32_t> input_vars;
+    for (const spirv_detail::Inst& inst : module.insts) {
+        if (inst.opcode == spirv_detail::kOpFunction) break;
+        if (inst.opcode == spirv_detail::kOpVariable && inst.words.size() >= 4 &&
+            inst.words[3] == spirv_detail::kStorageInput)
+            input_vars.insert(inst.words[2]);
+    }
+    bool primitive_id = false;
+    for (const spirv_detail::Inst& inst : module.insts)
+        if (inst.opcode == bary_gs_detail::kOpDecorate && inst.words.size() >= 4 &&
+            inst.words[2] == bary_gs_detail::kDecorationBuiltIn &&
+            inst.words[3] == bary_gs_detail::kBuiltInPrimitiveId && input_vars.count(inst.words[1]))
+            primitive_id = true;
+    return bary_fallback_gs(locations, bary, vs.clip_distance_count, vs.cull_distance_count, error, primitive_id);
 }
 
 }  // namespace leonida

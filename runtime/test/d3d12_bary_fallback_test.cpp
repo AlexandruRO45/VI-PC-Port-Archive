@@ -7,9 +7,13 @@
 //     within 2/255 (w is 1, so perspective interpolation is linear), and alpha 255 from the colour's green: the
 //     geometry stage copied the VS output at location 0 as well;
 //   - pixels outside it stay zero. Pixels within half a pixel of the diagonal are not judged.
+// A second PS (test/glsl/ps_bary_fallback_primid.frag) also reads gl_PrimitiveID, which behind a GS must come from
+// the GS (VUID-VkGraphicsPipelineCreateInfo-pStages-00740). A quad of two triangles through it: every pixel's
+// barycentrics sum to one, and alpha is 0 in primitive 0 and 255 in primitive 1, so the stage forwarded each ID.
 // Also refused with E_NOTIMPL: the PS with a line topology, with a PSO's own geometry shader, and with a VS that
 // writes Layer (none of which the pass-through stage can serve). Skipped where the GPU lacks geometryShader.
-// Shaders: test/glsl/vs_draw.vert, ps_bary_fallback.frag, gs_double.geom. No game data.
+// Shaders: test/glsl/vs_draw.vert, ps_bary_fallback.frag, ps_bary_fallback_primid.frag, gs_double.geom. No game
+// data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -20,8 +24,9 @@
 #include <cmath>
 #include <cstring>
 
-#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_GS_SPV) || !defined(LEONIDA_TEST_PS_BARY_SPV)
-#error "LEONIDA_TEST_VS_SPV, LEONIDA_TEST_GS_SPV and LEONIDA_TEST_PS_BARY_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_GS_SPV) || !defined(LEONIDA_TEST_PS_BARY_SPV) || \
+    !defined(LEONIDA_TEST_PS_BARY_PRIMID_SPV)
+#error "LEONIDA_TEST_VS_SPV, LEONIDA_TEST_GS_SPV, LEONIDA_TEST_PS_BARY_SPV and LEONIDA_TEST_PS_BARY_PRIMID_SPV must name the compiled test shaders"
 #endif
 
 #define EXPECT(condition) do { \
@@ -52,8 +57,10 @@ int main() {
     const auto vs_layer_program = fssm_program({0x56530002, 0xbf810000});
     const auto gs_program = fssm_program({0x47530001, 0xbf810000});
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
+    const auto ps_primid_program = fssm_program({0x50530002, 0xbf810000});
     const auto vs_container = shader_container(vs_program), vs_layer_container = shader_container(vs_layer_program),
-               gs_container = shader_container(gs_program), ps_container = shader_container(ps_program);
+               gs_container = shader_container(gs_program), ps_container = shader_container(ps_program),
+               ps_primid_container = shader_container(ps_primid_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_bary_fallback_test";
     std::filesystem::create_directories(library);
     const auto overwrite = std::filesystem::copy_options::overwrite_existing;
@@ -61,6 +68,7 @@ int main() {
     std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_layer.spv", overwrite);
     std::filesystem::copy_file(LEONIDA_TEST_GS_SPV, library / "gs_double.spv", overwrite);
     std::filesystem::copy_file(LEONIDA_TEST_PS_BARY_SPV, library / "ps_bary_fallback.spv", overwrite);
+    std::filesystem::copy_file(LEONIDA_TEST_PS_BARY_PRIMID_SPV, library / "ps_bary_primid.spv", overwrite);
     {
         const char* signature =
             "\"input_signature\": ["
@@ -78,11 +86,14 @@ int main() {
               << "\", \"bindings\": [], \"push_constant_bytes\": 144},\n"
               << " \"ps_bary_fallback\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"inputs\": [0], \"outputs\": [0], "
+                 "\"bary_fallback_input\": {\"location\": 1}},\n"
+              << " \"ps_bary_primid\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_primid_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"inputs\": [0], \"outputs\": [0], "
                  "\"bary_fallback_input\": {\"location\": 1}}}";
     }
 
     constexpr UINT size = 64;
-    std::vector<std::uint8_t> pixels(size * 256);
+    std::vector<std::uint8_t> pixels(size * 256), primid_pixels(size * 256);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -131,8 +142,11 @@ int main() {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso_desc.SampleDesc.Count = 1;
-        Ref<ID3D12PipelineState> pso, refused;
+        Ref<ID3D12PipelineState> pso, primid_pso, refused;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC primid_desc = pso_desc;
+        primid_desc.PS = {ps_primid_container.data(), ps_primid_container.size()};
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&primid_desc, IID_PPV_ARGS(&primid_pso.p))));
         // What the pass-through stage can't serve.
         D3D12_GRAPHICS_PIPELINE_STATE_DESC lines = pso_desc;
         lines.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
@@ -146,6 +160,10 @@ int main() {
 
         const Vertex vertices[3] = {{-1, 1, 0, 255, 0, 255}, {1, 1, 0, 255, 0, 255}, {-1, -1, 0, 255, 0, 255}};
         const std::uint16_t indices[3] = {0, 1, 2};
+        // The quad: the same triangle (primitive 0), then the one below the diagonal (primitive 1).
+        const Vertex quad[4] = {{-1, 1, 0, 255, 0, 255}, {1, 1, 0, 255, 0, 255}, {-1, -1, 0, 255, 0, 255},
+                                {1, -1, 0, 255, 0, 255}};
+        const std::uint16_t quad_indices[6] = {0, 1, 2, 2, 1, 3};
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -174,6 +192,8 @@ int main() {
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         std::memcpy(up, vertices, sizeof(vertices));
         std::memcpy(up + 256, indices, sizeof(indices));
+        std::memcpy(up + 512, quad, sizeof(quad));
+        std::memcpy(up + 768, quad_indices, sizeof(quad_indices));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -232,8 +252,34 @@ int main() {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
 
+        // Second pass: the quad through the PS that reads gl_PrimitiveID.
+        EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, primid_pso.p)));
+        D3D12_RESOURCE_BARRIER to_target = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(1, &to_target);
+        list->ClearRenderTargetView(rtv, zero, 0, nullptr);
+        list->SetGraphicsRootSignature(root.p);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const D3D12_VERTEX_BUFFER_VIEW quad_vbv{upload_va + 512, sizeof(quad), sizeof(Vertex)};
+        list->IASetVertexBuffers(0, 1, &quad_vbv);
+        const D3D12_INDEX_BUFFER_VIEW quad_ibv{upload_va + 768, sizeof(quad_indices), DXGI_FORMAT_R16_UINT};
+        list->IASetIndexBuffer(&quad_ibv);
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->SetGraphicsRoot32BitConstants(0, 2, no_offset, 0);
+        list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+        list->ResourceBarrier(1, &to_copy);
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        EXPECT(list->Close() == S_OK);
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+        std::memcpy(primid_pixels.data(), mapped, primid_pixels.size());
+
         for (auto* r : {&upload, &readback, &target}) r->reset();
         pso.reset();
+        primid_pso.reset();
         root.reset();
         rtv_heap.reset();
         list.reset();
@@ -270,13 +316,33 @@ int main() {
         }
     }
     EXPECT(!mismatches);
+    // The quad: alpha says which primitive the fragment's PrimitiveId named, and the barycentrics sum to one.
+    unsigned primitive_pixels[2] = {0, 0};
+    for (UINT row = 0; row < size; ++row) {
+        for (UINT col = 0; col < size; ++col) {
+            const double x = (col + 0.5) / (size / 2.0) - 1, y = 1 - (row + 0.5) / (size / 2.0);
+            const double w = 1 - (x + 1) / 2 - (1 - y) / 2;  // > 0 in primitive 0, < 0 in primitive 1
+            if (std::fabs(w) < 0.5 / size) continue;
+            const std::uint8_t* got = primid_pixels.data() + row * 256 + col * 4;
+            const int primitive = w > 0 ? 0 : 1;
+            const int sum = got[0] + got[1] + got[2];
+            const bool ok = got[3] == (primitive ? 255 : 0) && std::abs(sum - 255) <= 3;
+            ++primitive_pixels[primitive];
+            if (ok) continue;
+            if (mismatches++ < 6)
+                std::fprintf(stderr, "primitive %d pixel (%u, %u): got %u,%u,%u,%u\n", primitive, col, row, got[0],
+                             got[1], got[2], got[3]);
+        }
+    }
+    EXPECT(!mismatches);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
     std::printf("bary_fallback: the layer drew a --bary-fallback PS through its pass-through geometry shader, %u "
                 "pixels inside the triangle hold their barycentrics and location 0, %u outside stayed clear; a line "
-                "topology, a PSO's own GS and a VS writing Layer refused\n",
-                inside, outside);
+                "topology, a PSO's own GS and a VS writing Layer refused; a PS reading gl_PrimitiveID got 0 on %u "
+                "pixels and 1 on %u through the stage\n",
+                inside, outside, primitive_pixels[0], primitive_pixels[1]);
     return 0;
 }

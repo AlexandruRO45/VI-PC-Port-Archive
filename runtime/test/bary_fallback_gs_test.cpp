@@ -84,16 +84,19 @@ void inst(std::vector<std::uint32_t>& w, std::uint16_t op, std::initializer_list
     w.insert(w.end(), args.begin(), args.end());
 }
 
-// A PS module reduced to what bary_fallback_gs_for reads: Input variables (id 10 + n) at these locations, and an
-// optional extra decoration on the first.
-std::vector<std::uint32_t> ps_module(const std::vector<std::uint32_t>& locations, std::uint32_t extra = 0) {
+// A PS module reduced to what bary_fallback_gs_for reads: Input variables (id 10 + n) at these locations, an optional
+// extra decoration on the first, and with `primitive_id` an Input variable (id 30) decorated BuiltIn PrimitiveId.
+std::vector<std::uint32_t> ps_module(const std::vector<std::uint32_t>& locations, std::uint32_t extra = 0,
+                                     bool primitive_id = false) {
     auto w = header();
     for (std::size_t i = 0; i < locations.size(); ++i)
         inst(w, kOpDecorate, {std::uint32_t(10 + i), kDecorationLocation, locations[i]});
     if (extra) inst(w, kOpDecorate, {10, extra});
+    if (primitive_id) inst(w, kOpDecorate, {30, kDecorationBuiltIn, kBuiltInPrimitiveId});
     inst(w, kOpTypePointer, {5, kStorageInput, 4});
     for (std::size_t i = 0; i < locations.size(); ++i)
         inst(w, kOpVariable, {5, std::uint32_t(10 + i), kStorageInput});
+    if (primitive_id) inst(w, kOpVariable, {5, 30, kStorageInput});
     return w;
 }
 
@@ -164,6 +167,14 @@ int main(int argc, char** argv) {
     vs.clip_distance_count = 4;
     CHECK(summarize(bary_fallback_gs_for(vs, ps, ps_module({5, 3}))).builtins_out.count(kBuiltInClipDistance));
     vs.clip_distance_count = 0;
+    // A PS that reads PrimitiveId gets it from the GS (VUID-VkGraphicsPipelineCreateInfo-pStages-00740); one that
+    // doesn't, doesn't.
+    CHECK(!l.builtins_in.count(kBuiltInPrimitiveId) && !l.builtins_out.count(kBuiltInPrimitiveId));
+    const auto with_id = bary_fallback_gs_for(vs, ps, ps_module({5, 3}, 0, true));
+    const Summary p = summarize(with_id);
+    CHECK(p.ok && p.builtins_in.count(kBuiltInPrimitiveId) && p.builtins_out.count(kBuiltInPrimitiveId));
+    CHECK(p.interface_count == l.interface_count + 2);
+    CHECK(p.locations_in == std::set<std::uint32_t>{5} && p.bary_location == 3);
     // Refusals.
     CHECK(bary_fallback_gs_for(vs, ps, ps_module({5}), &error).empty() &&
           error.find("no input at") != std::string::npos);
@@ -184,6 +195,7 @@ int main(int argc, char** argv) {
         CHECK(write(argv[1], "bare", bare));
         CHECK(write(argv[1], "clip", clipped));
         CHECK(write(argv[1], "clip_cull", both));
+        CHECK(write(argv[1], "primitive_id", with_id));
     }
     std::printf("bary_fallback_gs: interface, one-hot constants, clip/cull forwarding, PS-module locations and the "
                 "refusals all as expected\n");

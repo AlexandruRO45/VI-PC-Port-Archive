@@ -716,7 +716,7 @@ if(BUILD_TESTING)
   find_program(LEONIDA_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
   if(LEONIDA_SPIRV_VAL)
     set_tests_properties(bary_fallback_gs PROPERTIES FIXTURES_SETUP bary_fallback_gs_modules)
-    foreach(module plain bare clip clip_cull)
+    foreach(module plain bare clip clip_cull primitive_id)
       add_test(NAME bary_fallback_gs_val_${module}
                COMMAND ${LEONIDA_SPIRV_VAL} --target-env vulkan1.0 ${LEONIDA_BARY_GS_DIR}/${module}.spv)
       set_tests_properties(bary_fallback_gs_val_${module} PROPERTIES FIXTURES_REQUIRED bary_fallback_gs_modules)
@@ -1913,9 +1913,11 @@ if(TARGET Vulkan::Headers)
       set(LEONIDA_TEST_VS_INT ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_draw_int.spv)
       set(LEONIDA_TEST_GS_DOUBLE ${CMAKE_CURRENT_BINARY_DIR}/generated/gs_double.spv)
       set(LEONIDA_TEST_PS_BARY ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_bary_fallback.spv)
+      set(LEONIDA_TEST_PS_BARY_PRIMID ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_bary_fallback_primid.spv)
       foreach(pair "vs_draw.vert;${LEONIDA_TEST_VS}" "ps_draw.frag;${LEONIDA_TEST_PS}"
                    "vs_fullscreen.vert;${LEONIDA_TEST_VS_FULLSCREEN}" "vs_draw_int.vert;${LEONIDA_TEST_VS_INT}"
-                   "gs_double.geom;${LEONIDA_TEST_GS_DOUBLE}" "ps_bary_fallback.frag;${LEONIDA_TEST_PS_BARY}")
+                   "gs_double.geom;${LEONIDA_TEST_GS_DOUBLE}" "ps_bary_fallback.frag;${LEONIDA_TEST_PS_BARY}"
+                   "ps_bary_fallback_primid.frag;${LEONIDA_TEST_PS_BARY_PRIMID}")
         list(GET pair 0 source)
         list(GET pair 1 output)
         add_custom_command(
@@ -2006,11 +2008,13 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_depth24_draw PROPERTIES SKIP_RETURN_CODE 77)
       # --bary-fallback (SHADER-98): the layer draws such a PS through its pass-through geometry shader.
       add_executable(d3d12_bary_fallback_test test/d3d12_bary_fallback_test.cpp shims/d3d12_xs_device.cpp
-                     ${LEONIDA_TEST_VS} ${LEONIDA_TEST_GS_DOUBLE} ${LEONIDA_TEST_PS_BARY})
+                     ${LEONIDA_TEST_VS} ${LEONIDA_TEST_GS_DOUBLE} ${LEONIDA_TEST_PS_BARY}
+                     ${LEONIDA_TEST_PS_BARY_PRIMID})
       target_link_libraries(d3d12_bary_fallback_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_bary_fallback_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_GS_SPV="${LEONIDA_TEST_GS_DOUBLE}"
-                                 LEONIDA_TEST_PS_BARY_SPV="${LEONIDA_TEST_PS_BARY}")
+                                 LEONIDA_TEST_PS_BARY_SPV="${LEONIDA_TEST_PS_BARY}"
+                                 LEONIDA_TEST_PS_BARY_PRIMID_SPV="${LEONIDA_TEST_PS_BARY_PRIMID}")
       target_compile_options(d3d12_bary_fallback_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bary_fallback COMMAND d3d12_bary_fallback_test)
       set_tests_properties(d3d12_bary_fallback PROPERTIES SKIP_RETURN_CODE 77)
