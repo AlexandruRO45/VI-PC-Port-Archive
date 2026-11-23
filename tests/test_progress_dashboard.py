@@ -60,6 +60,26 @@ class Contract(unittest.TestCase):
 
 
 class Tests(unittest.TestCase):
+    def test_junit_rejects_unrelated_root_and_keeps_other_reports(self):
+        reports = {
+            "coverage.xml": '<coverage><testsuite><testcase name="foreign"/></testsuite></coverage>',
+            "empty.xml": '<testsuite tests="0"/>',
+            "pytest.xml": '<testsuites><testsuite><testcase name="valid"/></testsuite></testsuites>',
+        }
+        with tempfile.TemporaryDirectory() as root:
+            paths = []
+            for filename, xml in reports.items():
+                path = os.path.join(root, filename)
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(xml)
+                paths.append(path)
+            col = pd.Collector()
+            with mock.patch.object(pd, "ROOT", root), mock.patch.object(pd, "last_commit_time", return_value=None):
+                pd.collect_ctest(col, SimpleNamespace(junit=paths))
+        self.assertEqual({s["path"]: s["status"] for s in col.sources if s["id"] == "junit"},
+                         {"coverage.xml": "invalid", "empty.xml": "ok", "pytest.xml": "ok"})
+        self.assertEqual([c["name"] for c in col.components], ["valid"])
+
     def test_junit_honors_each_reports_encoding(self):
         xml = '<?xml version="1.0" encoding="{}"?><testsuite><testcase name="{}"><failure/></testcase></testsuite>'
         with tempfile.TemporaryDirectory() as root:
