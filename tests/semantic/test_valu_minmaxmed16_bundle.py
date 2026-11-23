@@ -164,6 +164,13 @@ class TestVMax3U16SIMDAndEdgeCases(unittest.TestCase):
                 self.assertEqual(hi, 0x55AA)
                 self.assertEqual(lo, expected)
 
+class TestVMax3U16TranslatorAndControls(unittest.TestCase):
+    """Stage 4 for v_max3_u16: translator integration and negative controls."""
+
+    def test_v_max3_u16_negative_controls(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_neg_v_max3_u16", ["v_max3_u16", "s_endpgm"])
+
 
 if __name__ == '__main__':
     unittest.main()
