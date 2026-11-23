@@ -509,6 +509,34 @@ class PageIndexTest(unittest.TestCase):
                     self.assertEqual(f.read(), sentinel)
                 self.assertEqual(sorted(os.listdir(tmp)), ["a.rpf", "report" + ext])
 
+    def test_failed_replace_of_readonly_report_cleans_up_staged_file(self):
+        import contextlib
+        import io
+        import stat
+        from unittest import mock
+        for ext, sentinel in ((".json", '{"previous": true}\n'), (".csv", "previous\n")):
+            with self.subTest(ext=ext), tempfile.TemporaryDirectory() as tmp:
+                rpf = os.path.join(tmp, "a.rpf")
+                make_rpf(rpf, [header(0x100)])
+                out = os.path.join(tmp, "report" + ext)
+                with open(out, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(sentinel)
+                os.chmod(out, stat.S_IREAD)
+                try:
+                    err = io.StringIO()
+                    replace_ctx = (contextlib.nullcontext() if sys.platform == "win32"
+                                   else mock.patch.object(page_index.os, "replace",
+                                                          side_effect=PermissionError(13, "read-only")))
+                    with replace_ctx, contextlib.redirect_stderr(err):
+                        rc = page_index.main([rpf, out, "--quiet"])
+                    self.assertEqual(rc, 2)
+                    self.assertNotIn("Traceback", err.getvalue())
+                    with open(out, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), sentinel)
+                    self.assertEqual(sorted(os.listdir(tmp)), ["a.rpf", "report" + ext])
+                finally:
+                    os.chmod(out, stat.S_IRUSR | stat.S_IWUSR)
+
 
 if __name__ == "__main__":
     unittest.main()

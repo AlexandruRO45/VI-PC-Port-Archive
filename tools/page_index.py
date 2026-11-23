@@ -36,6 +36,7 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
 import tempfile
@@ -390,7 +391,11 @@ def _atomic_write(path, newline, writer):
             try:
                 os.remove(staged)
             except OSError:
-                pass
+                try:
+                    os.chmod(staged, stat.S_IRUSR | stat.S_IWUSR)
+                    os.remove(staged)
+                except OSError:
+                    pass
 
 
 def write_json(path, pages, summary):
