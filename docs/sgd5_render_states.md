@@ -25,9 +25,9 @@ The field positions below are the byte distributions over every stored row (64 r
 | Row | Offset | Measured values | Decoded as |
 |---|---:|---|---|
 | Rasterizer (16 B) | 0 | 3 in 64 rows | `fill_mode`, raw integer (the single value stored) |
-| | 1 | 1 in 25 rows, 2 in 35, 3 in 4 | `cull_mode`; named none / front / back with the D3D11 values 1 / 2 / 3 |
+| | 1 | 1 in 25 rows, 2 in 35, 3 in 4 | `cull_mode`; named none / front / back with the D3D11 values 1 / 2 / 3. Which winding counts as front depends on the front-face flag below, so the winding a `front` or `back` row culls is not established |
 | | 2..15 | bytes 2, 12 and 13 are 1 in every row, the rest 0 | raw: which of the three is the front-face flag is not settled, because none of them varies |
-| Depth/stencil (24 B) | 0, 1 | each in `0..1` (0 in 9 and 17 rows) | `depth_enable`, `depth_write`; the order follows the D3D11 description, the two values differ in 9 vs 17 rows, so data alone does not say which is which |
+| Depth/stencil (24 B) | 0, 1 | each in `0..1` (0 in 9 and 17 rows) | `depth_enable`, `depth_write`, in the D3D11 order. The pairs are (1, 1) in 106 rows, (1, 0) in 9, (0, 0) in 8 and (0, 1) in 1. In this order the nine mixed rows test depth without writing it, the usual read-only depth pass; swapped, nine rows would write depth without testing it. The order is the likelier reading, not a proof |
 | | 2 | 2 in 7 rows, 3 in 30, 5 in 6, 7 in 80, 8 in 1 | `depth_func`, compare function; 1..8 named never .. always |
 | | 3 | `0..1` | `stencil_enable`: it is 0 in exactly the 18 rows whose bytes 8 and 12 are 1 (stencil pass operation) and 1 in the other 106 rows, which have 3 there |
 | | 4..23 | 4 is 128 or 255, 5 is 0, 127 or 255, 6, 7, 10, 11, 22, 23 are 1, 8 and 12 are 1 or 3, 9 and 13 are 6 or 8, 14..21 are 0 | raw; bytes 6..13 have the shape of two stencil faces, but the values do not fix the names |
