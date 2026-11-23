@@ -1488,12 +1488,29 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
+        // On Intel Gen12 (Iris Xe, Windows Vulkan driver 31.0.101.4032), transitioning one depth/stencil subresource
+        // out of UNDEFINED after another subresource has been written resets shared HiZ/aux state to 1.0 across
+        // neighbouring mips or array slices (reproduced in d3d12_copy_xfmt and d3d12_stencil_copy). When every
+        // subresource of the aspect is still UNDEFINED, initialize the whole aspect at once so later subresources
+        // never transition out of UNDEFINED.
+        VkImageSubresourceRange init_range = piece.range;
+        bool expanded = false;
+        if (tracker && (piece.range.aspectMask & depth_stencil_aspects) &&
+            (resource.mip_levels > 1 || resource.array_layers > 1)) {
+            const VkImageSubresourceRange full{piece.range.aspectMask, 0, resource.mip_levels, 0,
+                                               resource.array_layers};
+            LayoutPieces all;
+            if (tracker->pieces(id, full, all) && all.size() == 1 && all[0].layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+                init_range = full;
+                expanded = true;
+            }
+        }
         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
-        const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
+        const bool color = init_range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
         const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
         const bool compressed = fmt.block > 1 || (!can_clear && color);
         if (resource.not_zeroed || (!can_clear && !color)) {
-            image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
+            image_barrier(vk, command_buffer, resource, init_range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         } else if (compressed) {
             const bool can_zero =
@@ -1501,35 +1518,40 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
                 ((vk.zero_buffer && vk.zero_size >= fmt.bytes) || (vk.copy_scratch && vk.fill_buffer));
             if (can_zero) {
                 const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
+                image_barrier(vk, command_buffer, resource, init_range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                               VK_PIPELINE_STAGE_TRANSFER_BIT);
-                const bool zeroed = zero_compressed_image(vk, command_buffer, resource, piece.range, dst);
-                image_barrier(vk, command_buffer, resource, piece.range, dst, layout,
+                const bool zeroed = zero_compressed_image(vk, command_buffer, resource, init_range, dst);
+                image_barrier(vk, command_buffer, resource, init_range, dst, layout,
                               zeroed ? VK_ACCESS_TRANSFER_WRITE_BIT : 0,
                               zeroed ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory,
                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             } else {
-                image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
+                image_barrier(vk, command_buffer, resource, init_range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             }
         } else {
             const VkImageLayout dst = image_layout(resource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
+            image_barrier(vk, command_buffer, resource, init_range, VK_IMAGE_LAYOUT_UNDEFINED, dst, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_PIPELINE_STAGE_TRANSFER_BIT);
-            if (piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+            if (init_range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
                 const VkClearColorValue zero{};
-                vk.clear_color_image(command_buffer, resource.image, dst, &zero, 1, &piece.range);
+                vk.clear_color_image(command_buffer, resource.image, dst, &zero, 1, &init_range);
             } else {
                 const VkClearDepthStencilValue zero{};
-                vk.clear_depth_stencil_image(command_buffer, resource.image, dst, &zero, 1, &piece.range);
+                vk.clear_depth_stencil_image(command_buffer, resource.image, dst, &zero, 1, &init_range);
             }
-            image_barrier(vk, command_buffer, resource, piece.range, dst, layout, VK_ACCESS_TRANSFER_WRITE_BIT,
+            image_barrier(vk, command_buffer, resource, init_range, dst, layout, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_PIPELINE_STAGE_TRANSFER_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         }
         piece.layout = layout;
-        if (tracker) tracker->set(id, piece.range, layout);
+        if (expanded) {
+            for (auto& other : pieces)
+                if (other.layout == VK_IMAGE_LAYOUT_UNDEFINED && other.range.aspectMask == init_range.aspectMask)
+                    other.layout = layout;
+        }
+        if (tracker) tracker->set(id, init_range, layout);
     }
 }
 
