@@ -1181,7 +1181,7 @@ endif()
 if(TARGET Vulkan::Headers)
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test
-          vk_xdxr_build_test vk_queue_test vk_sandbox)
+          vk_xdxr_build_test vk_xdxr_rehydrate_test vk_queue_test vk_sandbox)
     add_executable(${tool} test/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
@@ -1248,6 +1248,14 @@ if(TARGET Vulkan::Headers)
       add_test(NAME xdxr_build_check COMMAND "${Python3_EXECUTABLE}" -I
                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xdxr_bvh.py" check-build "${LEONIDA_XDXR_OUT}" --rays 1000)
       set_tests_properties(xdxr_build_check PROPERTIES FIXTURES_REQUIRED xdxr_build_cases SKIP_RETURN_CODE 77)
+      # XDXR rehydration (src/xdxr_rehydrate.*): synthetic dehydrated BLASes with tools/bvh_rehydrate.py's bytes, then
+      # the GPU's result compared with them byte for byte.
+      set(LEONIDA_XDXR_REHYDRATE_OUT "${CMAKE_CURRENT_BINARY_DIR}/xdxr_rehydrate_cases")
+      add_test(NAME xdxr_rehydrate_cases COMMAND "${Python3_EXECUTABLE}" -I
+               "${CMAKE_CURRENT_SOURCE_DIR}/test/xdxr_rehydrate_cases.py" "${LEONIDA_XDXR_REHYDRATE_OUT}")
+      set_tests_properties(xdxr_rehydrate_cases PROPERTIES FIXTURES_SETUP xdxr_rehydrate_cases)
+      add_test(NAME xdxr_rehydrate COMMAND vk_xdxr_rehydrate_test "${LEONIDA_XDXR_REHYDRATE_OUT}")
+      set_tests_properties(xdxr_rehydrate PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_REQUIRED xdxr_rehydrate_cases)
     endif()
   endif()
   # VulkanQueue/VulkanContext query-state synchronization (remove_query_pool vs commit, cross-queue plan/commit)

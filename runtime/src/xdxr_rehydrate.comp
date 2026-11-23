@@ -1,0 +1,502 @@
+// Rehydration of a dehydrated XDXR BVH4 bottom-level structure on the GPU: XboxBvhBuilder.dll's
+// RehydrateRaytracingAccelerationStructure*X, as tools/bvh_rehydrate.py models it byte for byte (docs/bvh.md §3.1 and
+// §4a). The same steps, in the same order, with the same float32 rounding:
+//
+//   MODE_PLAN    one thread: reads the dehydrated header and its level table and writes the plan (xdxr_rehydrate.h):
+//                one VkDispatchIndirectCommand per later pass, the header fields they use, the levels. A structure
+//                that is not dehydrated, or whose header or level table does not fit, gets a non-zero status and
+//                zero-sized passes, so the destination is left as it was.
+//   MODE_CLEAR   the destination's total size (64 * (totalSizeIn64BNodes + 1) bytes) is zeroed: the model starts
+//                from a zero buffer, and the passes below leave gaps.
+//   MODE_HEADER  the kept header bytes are copied, the dehydrated flag cleared, the root's parent entry set to
+//                0xffffffff.
+//   MODE_LEAVES  one thread per leaf: the packed chunk record becomes a 64-byte Leaf from the geometry, through the
+//                leaf frame of compressionParams.
+//   MODE_BOX32,  one workgroup per stored group of a level, bottom-up (pc.level): each node's box is recomputed
+//   MODE_BOX16   from its rehydrated children, the stored override components replace the masked ones, and the
+//                node writes itself as its children's parent.
+//
+// Every node and leaf is written at the offset its packed bytes occupy, so the result has exactly the dehydrated
+// size. The source and the destination must be different buffers (the recorder refuses the same address).
+//
+// Float arithmetic: the model rounds every operation to float32 and computes `a * b + c` in double before one
+// rounding, which is fma's single rounding. `precise` keeps the compiler from fusing or reordering the others.
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+
+const uint MODE_PLAN = 0u, MODE_CLEAR = 1u, MODE_HEADER = 2u, MODE_LEAVES = 3u, MODE_BOX32 = 4u, MODE_BOX16 = 5u;
+
+// The plan, at pc.plan (xdxr_rehydrate.h keeps the same offsets).
+const uint PLAN_STATUS = 0u;            // 0 ok; otherwise the first problem found (STATUS_*)
+const uint PLAN_CMDS = 16u;             // VkDispatchIndirectCommand: 0 clear, 1 header, 2 leaves, 3 + 2 * level box32,
+                                        // 4 + 2 * level box16
+const uint MAX_LEVELS = 32u;
+const uint PLAN_LEVELS = 832u;          // per level: box32 start, box32 count, box16 start, box16 count
+const uint PLAN_HDR = 1344u;            // cached header fields, HDR_* words
+const uint PLAN_ROT = 1408u;            // 64 rotations, 9 floats each, written by the recorder
+const uint PLAN_GEOM = 3712u;           // per geometry, 8 words: vertices lo hi, stride, indices lo hi, index type,
+                                        // transform lo hi
+const uint HDR_TOTAL = 0u, HDR_ELEMENTS = 1u, HDR_NODES = 2u, HDR_ELEMS_OFF = 3u, HDR_PARENTS = 4u, HDR_ROOT = 5u,
+           HDR_FLAGS = 6u, HDR_KEPT = 7u, HDR_COMPRESSION = 8u, HDR_ROOT_ENTRY = 9u, HDR_BOUNDS = 10u;  // 6 floats
+
+const uint STATUS_NOT_DEHYDRATED = 1u, STATUS_HEADER = 2u, STATUS_LEVELS = 3u, STATUS_GEOMETRY = 4u,
+           STATUS_ORDER = 5u, STATUS_CHUNK = 6u;
+
+const uint FLAG_DEHYDRATED = 0x01000000u, FLAG_UPDATABLE = 0x00040000u, NO_TRANSFORM = 0x007f7f7fu;
+const uint INVALID = 0xffffffffu, NAN32 = 0x7fc00000u;
+const uint TRI0 = 0u, TRI1 = 1u, BOX16 = 4u, BOX32 = 5u;
+const uint FLT_MAX_BITS = 0x7f7fffffu, NEG_FLT_MAX_BITS = 0xff7fffffu;
+const uint HALF_POS_INF = 0x7c00u, HALF_NEG_INF = 0xfc00u;
+const float HALF_MIN_NORMAL = 6.103515625e-05;   // 2^-14
+const uint LEAVES_PER_CHUNK = 2048u, CHUNK_STRIDE = 131072u;
+
+layout(push_constant) uniform Push {
+    uvec2 src;            // the dehydrated structure (header at byte 0)
+    uvec2 dst;            // the rehydrated structure
+    uvec2 plan;           // the plan (xdxr_rehydrate.h XdxrRehydrator::plan_bytes)
+    uint mode;
+    uint level;           // MODE_BOX32/16: the level, bottom-up
+    uint geometries;      // geometry records in the plan
+    uint pad;
+} pc;
+
+// ---- 64-bit addresses as uvec2, words and bytes ----
+uvec2 add(uvec2 a, uint b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b, carry);
+    return uvec2(lo, a.y + carry);
+}
+uint load(uvec2 base, uint off) { return Words(add(base, off)).w[0]; }
+void store(uvec2 base, uint off, uint v) { Words(add(base, off)).w[0] = v; }
+float loadf(uvec2 base, uint off) { return uintBitsToFloat(load(base, off)); }
+bool is_null(uvec2 a) { return a.x == 0u && a.y == 0u; }
+
+// Bytes at any offset, read from the aligned words around them.
+uint load8(uvec2 base, uint off) { return (load(base, off & ~3u) >> (8u * (off & 3u))) & 0xffu; }
+uint load16(uvec2 base, uint off) {
+    uint s = off & 3u, a = off & ~3u;
+    if (s <= 2u) return (load(base, a) >> (8u * s)) & 0xffffu;
+    return (load(base, a) >> 24u) | ((load(base, a + 4u) & 0xffu) << 8u);
+}
+uint load24(uvec2 base, uint off) {
+    uint s = off & 3u, a = off & ~3u;
+    if (s <= 1u) return (load(base, a) >> (8u * s)) & 0xffffffu;
+    uint lo = load(base, a) >> (8u * s);
+    uint hi = load(base, a + 4u);
+    return (lo | (hi << (32u - 8u * s))) & 0xffffffu;
+}
+
+uint plan_word(uint off) { return load(pc.plan, off); }
+uint hdr(uint i) { return plan_word(PLAN_HDR + 4u * i); }
+void set_status(uint s) {
+    // The first problem wins; a later pass only writes when nothing was found before.
+    if (plan_word(PLAN_STATUS) == 0u) store(pc.plan, PLAN_STATUS, s);
+}
+void set_cmd(uint k, uint groups) {
+    uint at = PLAN_CMDS + 12u * k;
+    store(pc.plan, at, groups);
+    store(pc.plan, at + 4u, 1u);
+    store(pc.plan, at + 8u, 1u);
+}
+
+// ---- IEEE helpers as the model has them ----
+bool nan_bits(uint u) { return (u & 0x7fffffffu) > 0x7f800000u; }
+bool is_nan(float x) { return nan_bits(floatBitsToUint(x)); }
+float min_num(float a, float b) {   // a NaN operand loses
+    if (is_nan(a)) return b;
+    if (is_nan(b)) return a;
+    return a <= b ? a : b;
+}
+float max_num(float a, float b) {
+    if (is_nan(a)) return b;
+    if (is_nan(b)) return a;
+    return a >= b ? a : b;
+}
+
+float half_to_float(uint h) {   // exact
+    uint sign = (h & 0x8000u) << 16u, e = (h >> 10u) & 0x1fu, m = h & 0x3ffu;
+    if (e == 0u) {
+        precise float v = float(m) * 5.9604644775390625e-08;   // m * 2^-24
+        return uintBitsToFloat(floatBitsToUint(v) | sign);
+    }
+    if (e == 31u) return uintBitsToFloat(sign | 0x7f800000u | (m << 13u));
+    return uintBitsToFloat(sign | ((e + 112u) << 23u) | (m << 13u));
+}
+
+// A float that half_down/half_up already made representable (low 13 mantissa bits zero, normal or zero), or NaN, or
+// past the half range (infinity, as the model's OverflowError gives).
+uint exact_half(float x) {
+    uint u = floatBitsToUint(x), sign = (u >> 16u) & 0x8000u;
+    if (nan_bits(u)) return sign | 0x7e00u;
+    float a = abs(x);
+    if (a > 65504.0) return sign | 0x7c00u;
+    if (a == 0.0) return sign;
+    uint e = ((u >> 23u) & 0xffu) - 112u;
+    return sign | (e << 10u) | ((u >> 13u) & 0x3ffu);
+}
+
+uint half_down(float x) {   // the largest half not above x (a BOX16 minimum)
+    if (is_nan(x)) return exact_half(x);
+    uint b = floatBitsToUint(x);
+    float y;
+    if (x < 0.0) {
+        y = min_num(uintBitsToFloat((b + 0x1fffu) & ~0x1fffu), -HALF_MIN_NORMAL);
+    } else {
+        y = uintBitsToFloat(b & ~0x1fffu);
+        y = y < HALF_MIN_NORMAL ? 0.0 : y;
+    }
+    return exact_half(y);
+}
+uint half_up(float x) {     // the smallest half not below x (a BOX16 maximum)
+    if (is_nan(x)) return exact_half(x);
+    uint b = floatBitsToUint(x);
+    float y;
+    if (x > 0.0) {
+        y = max_num(uintBitsToFloat((b + 0x1fffu) & ~0x1fffu), HALF_MIN_NORMAL);
+    } else {
+        y = uintBitsToFloat(b & ~0x1fffu);
+        y = y > -HALF_MIN_NORMAL ? 0.0 : y;
+    }
+    return exact_half(y);
+}
+
+// ---- the header's parent table (32-bit arithmetic) ----
+// The entry for the node at `node_offset` when the structure stores it, else INVALID: only the entries from the
+// header end to offsetToElements are kept.
+uint stored_parent_entry(uint node_offset, uint elems_off, uint parents_off, uint total) {
+    uint unit = (node_offset - elems_off) >> 6u;
+    uint entry = parents_off + 4u * unit;
+    if (entry >= 64u && entry + 4u <= min(elems_off, total)) return entry;
+    return INVALID;
+}
+
+// ---- MODE_PLAN ----
+void plan() {
+    if (gl_GlobalInvocationID.x != 0u) return;
+    store(pc.plan, PLAN_STATUS, 0u);
+    for (uint k = 0u; k < 3u + 2u * MAX_LEVELS; ++k) set_cmd(k, 0u);
+    uint flags = load(pc.src, 0u), units = load(pc.src, 4u), elements = load(pc.src, 12u);
+    uint nodes = load(pc.src, 40u), remap = load(pc.src, 44u), root = load(pc.src, 48u);
+    uint elems_off = load(pc.src, 52u), parents_off = load(pc.src, 56u), compression = load(pc.src, 60u);
+    if ((flags & FLAG_DEHYDRATED) == 0u) { set_status(STATUS_NOT_DEHYDRATED); return; }
+    uint total = (units + 1u) * 64u;
+    uint kept;
+    if (remap != 0u) {
+        kept = parents_off;
+    } else {
+        uint k = (flags >> 20u) & 15u;
+        kept = 16u * (9u * k * k + 4u);
+    }
+    kept = (kept + 15u) & ~15u;
+    if (units >= 0x3ffffffu || kept > total) { set_status(STATUS_HEADER); return; }
+
+    // The levels, bottom-up, when the root is a box.
+    uint level_count = 0u;
+    uint root_kind = root & 7u;
+    if (root_kind == BOX16 || root_kind == BOX32) {
+        level_count = load(pc.src, total - 4u);
+        if (level_count > MAX_LEVELS || 8u * level_count + 4u + 64u > total) { set_status(STATUS_LEVELS); return; }
+        uint table = total - 4u - 8u * level_count;
+        uint prev = 0u;
+        for (uint lv = 0u; lv < level_count; ++lv) {
+            uint b32 = load(pc.src, table + 8u * lv), b16 = load(pc.src, table + 8u * lv + 4u);
+            if (b32 < prev || b16 < b32 || ((b32 - prev) % 128u) != 0u || ((b16 - b32) % 64u) != 0u) {
+                set_status(STATUS_LEVELS);
+                return;
+            }
+            uint n32 = (b32 - prev) / 128u, n16 = (b16 - b32) / 64u;
+            uint at = PLAN_LEVELS + 16u * lv;
+            store(pc.plan, at, prev);
+            store(pc.plan, at + 4u, n32);
+            store(pc.plan, at + 8u, b32);
+            store(pc.plan, at + 12u, n16);
+            prev = b16;
+        }
+    }
+
+    uint root_entry = stored_parent_entry(((root >> 3u) << 6u), elems_off, parents_off, total);
+    store(pc.plan, PLAN_HDR + 4u * HDR_TOTAL, total);
+    store(pc.plan, PLAN_HDR + 4u * HDR_ELEMENTS, elements);
+    store(pc.plan, PLAN_HDR + 4u * HDR_NODES, nodes);
+    store(pc.plan, PLAN_HDR + 4u * HDR_ELEMS_OFF, elems_off);
+    store(pc.plan, PLAN_HDR + 4u * HDR_PARENTS, parents_off);
+    store(pc.plan, PLAN_HDR + 4u * HDR_ROOT, root);
+    store(pc.plan, PLAN_HDR + 4u * HDR_FLAGS, flags);
+    store(pc.plan, PLAN_HDR + 4u * HDR_KEPT, kept);
+    store(pc.plan, PLAN_HDR + 4u * HDR_COMPRESSION, compression);
+    store(pc.plan, PLAN_HDR + 4u * HDR_ROOT_ENTRY, root_entry);
+    for (uint a = 0u; a < 6u; ++a) store(pc.plan, PLAN_HDR + 4u * (HDR_BOUNDS + a), load(pc.src, 16u + 4u * a));
+
+    uint header_words = kept / 4u;
+    if (root_entry != INVALID) header_words = max(header_words, root_entry / 4u + 1u);
+    set_cmd(0u, (total / 4u + 63u) / 64u);
+    set_cmd(1u, (header_words + 63u) / 64u);
+    set_cmd(2u, (elements + 63u) / 64u);
+    for (uint lv = 0u; lv < level_count; ++lv) {
+        uint at = PLAN_LEVELS + 16u * lv;
+        set_cmd(3u + 2u * lv, (load(pc.plan, at + 4u) + 63u) / 64u);
+        set_cmd(4u + 2u * lv, (load(pc.plan, at + 12u) + 63u) / 64u);
+    }
+}
+
+// ---- MODE_CLEAR, MODE_HEADER ----
+void clear_dst() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < hdr(HDR_TOTAL) / 4u) store(pc.dst, 4u * i, 0u);
+}
+
+void copy_header() {
+    uint i = gl_GlobalInvocationID.x;
+    uint root_entry = hdr(HDR_ROOT_ENTRY), kept = hdr(HDR_KEPT);
+    if (root_entry != INVALID && 4u * i == root_entry) {   // after the copy in the model: the entry wins
+        store(pc.dst, 4u * i, INVALID);
+    } else if (4u * i < kept) {
+        uint v = load(pc.src, 4u * i);
+        if (i == 0u) v &= ~FLAG_DEHYDRATED;
+        store(pc.dst, 4u * i, v);
+    }
+}
+
+// ---- MODE_LEAVES ----
+uvec2 geom_addr(uint g, uint word) {
+    uint at = PLAN_GEOM + 32u * g + 4u * word;
+    return uvec2(plan_word(at), plan_word(at + 4u));
+}
+
+uint triangle_index(uint g, uint prim, uint k) {
+    uvec2 indices = geom_addr(g, 3u);
+    uint type = plan_word(PLAN_GEOM + 32u * g + 20u);
+    if (type == 0u || is_null(indices)) return 3u * prim + k;
+    if (type == 1u) return load16(indices, 6u * prim + 2u * k);
+    return load(indices, 12u * prim + 4u * k);
+}
+
+vec3 vertex(uint g, uint i) {
+    uvec2 vertices = geom_addr(g, 0u);
+    uint stride = plan_word(PLAN_GEOM + 32u * g + 8u);
+    uint at = i * stride;
+    vec3 v = vec3(loadf(vertices, at), loadf(vertices, at + 4u), loadf(vertices, at + 8u));
+    uvec2 m = geom_addr(g, 6u);
+    if (is_null(m)) return v;
+    vec3 o;
+    for (uint row = 0u; row < 3u; ++row) {
+        precise float acc = loadf(m, 16u * row) * v.x;
+        acc = fma(loadf(m, 16u * row + 4u), v.y, acc);
+        acc = fma(loadf(m, 16u * row + 8u), v.z, acc);
+        precise float r = acc + loadf(m, 16u * row + 12u);
+        o[row] = r;
+    }
+    return o;
+}
+
+// The leaf frame (R * v - t) * s of compressionParams, or the identity.
+vec3 frame(vec3 v) {
+    uint word = hdr(HDR_COMPRESSION);
+    if (word == NO_TRANSFORM) return v;
+    uint rot = PLAN_ROT + 36u * ((word >> 24u) & 0x3fu);
+    vec3 t = vec3(0.0), s = vec3(1.0);
+    if (((word >> 30u) & 1u) != 0u) {
+        for (uint a = 0u; a < 3u; ++a) {
+            float lo = uintBitsToFloat(hdr(HDR_BOUNDS + a)), hi = uintBitsToFloat(hdr(HDR_BOUNDS + 3u + a));
+            if (lo > 0.0 || hi < 0.0) {
+                precise float sum = lo + hi;
+                precise float c = sum * 0.5;
+                t[a] = c;
+            }
+        }
+    }
+    if (((word >> 31u) & 1u) != 0u)
+        for (uint a = 0u; a < 3u; ++a) s[a] = uintBitsToFloat(((word >> (8u * a)) & 0xffu) << 23u);
+    vec3 o;
+    for (uint row = 0u; row < 3u; ++row) {
+        precise float acc = loadf(pc.plan, rot + 12u * row) * v.x;
+        acc = fma(loadf(pc.plan, rot + 12u * row + 4u), v.y, acc);
+        acc = fma(loadf(pc.plan, rot + 12u * row + 8u), v.z, acc);
+        precise float d = acc - t[row];
+        precise float r = d * s[row];
+        o[row] = r;
+    }
+    return o;
+}
+
+const uint SLOT_OF_ORDER[3] = uint[3](2u, 0u, 1u);   // vertex-order value -> leaf vertex slot
+
+void leaves() {
+    uint leaf = gl_GlobalInvocationID.x;
+    uint elements = hdr(HDR_ELEMENTS);
+    if (leaf >= elements) return;
+    uint chunk = leaf / LEAVES_PER_CHUNK, i = leaf % LEAVES_PER_CHUNK;
+    uint c = min(LEAVES_PER_CHUNK, elements - chunk * LEAVES_PER_CHUNK);
+    uint base = hdr(HDR_ELEMS_OFF) + chunk * CHUNK_STRIDE;
+    if (base + 11u * c > hdr(HDR_TOTAL)) { set_status(STATUS_CHUNK); return; }
+    uint g = load24(pc.src, base + 3u * i);
+    uint flags = load8(pc.src, base + 3u * c + i);
+    uint prim0 = load24(pc.src, base + 4u * c + 3u * i);
+    uint prim1 = load24(pc.src, base + 7u * c + 3u * i);
+    uint order = load8(pc.src, base + 10u * c + i);
+    if (g >= pc.geometries) { set_status(STATUS_GEOMETRY); return; }
+    uint a = order & 3u, b = (order >> 2u) & 3u;
+    uint third = (a ^ 3u) - b;   // 32-bit: a value past 2 is caught below
+    if (a > 2u || b > 2u || third > 2u || a == b) { set_status(STATUS_ORDER); return; }
+
+    vec3 tri[3];
+    for (uint k = 0u; k < 3u; ++k) tri[k] = frame(vertex(g, triangle_index(g, prim0, k)));
+    vec3 slots[4];
+    bool fourth_nan = prim1 == 0xffffffu;
+    if (!fourth_nan) {
+        uint k = (order & 0x20u) != 0u ? 0u : (order & 0x80u) != 0u ? 1u : 2u;
+        slots[3] = frame(vertex(g, triangle_index(g, prim1, k)));
+    }
+    slots[SLOT_OF_ORDER[a]] = tri[0];
+    slots[SLOT_OF_ORDER[b]] = tri[1];
+    slots[SLOT_OF_ORDER[third]] = tri[2];
+
+    uint out_at = base + 64u * i;
+    for (uint s = 0u; s < 3u; ++s)
+        for (uint k = 0u; k < 3u; ++k) store(pc.dst, out_at + 12u * s + 4u * k, floatBitsToUint(slots[s][k]));
+    for (uint k = 0u; k < 3u; ++k)
+        store(pc.dst, out_at + 36u + 4u * k, fourth_nan ? NAN32 : floatBitsToUint(slots[3][k]));
+    store(pc.dst, out_at + 48u, (g << 8u) | flags);
+    store(pc.dst, out_at + 52u, prim0);
+    store(pc.dst, out_at + 56u, fourth_nan ? INVALID : prim1);
+    store(pc.dst, out_at + 60u, (order & 0xfu) | ((order << 4u) & 0xf00u));
+}
+
+// ---- MODE_BOX32, MODE_BOX16 ----
+// (min xyz, max xyz) of the rehydrated node a child pointer names, read back from the destination.
+void node_bounds(uint ptr, out vec3 lo, out vec3 hi) {
+    uint kind = ptr & 7u, at = (ptr >> 3u) << 6u;
+    if (kind == TRI0 || kind == TRI1) {
+        uint first = kind == TRI0 ? at : at + 12u;
+        uint count = 3u;
+        if (kind == TRI0 && (load(pc.dst, at + 48u) & 0x80u) != 0u) count = 4u;
+        lo = vec3(loadf(pc.dst, first), loadf(pc.dst, first + 4u), loadf(pc.dst, first + 8u));
+        hi = lo;
+        for (uint p = 1u; p < count; ++p) {
+            for (uint k = 0u; k < 3u; ++k) {
+                float v = loadf(pc.dst, first + 12u * p + 4u * k);
+                lo[k] = min_num(lo[k], v);
+                hi[k] = max_num(hi[k], v);
+            }
+        }
+    } else if (kind == BOX32) {
+        for (uint k = 0u; k < 3u; ++k) {
+            lo[k] = loadf(pc.dst, at + 16u + 4u * k);
+            hi[k] = loadf(pc.dst, at + 16u + 12u + 4u * k);
+        }
+        for (uint s = 1u; s < 4u; ++s) {
+            for (uint k = 0u; k < 3u; ++k) {
+                lo[k] = min_num(lo[k], loadf(pc.dst, at + 16u + 24u * s + 4u * k));
+                hi[k] = max_num(hi[k], loadf(pc.dst, at + 16u + 24u * s + 12u + 4u * k));
+            }
+        }
+    } else if (kind == BOX16) {
+        for (uint c = 0u; c < 6u; ++c) {
+            uint best = load16(pc.dst, at + 16u + 2u * c);
+            for (uint s = 1u; s < 4u; ++s) {
+                uint cand = load16(pc.dst, at + 16u + 2u * (6u * s + c));
+                float x = half_to_float(best), y = half_to_float(cand);
+                if (is_nan(x) || (!is_nan(y) && (c < 3u ? y < x : y > x))) best = cand;
+            }
+            float v = half_to_float(best);
+            if (c < 3u) lo[c] = v; else hi[c - 3u] = v;
+        }
+    } else {
+        lo = vec3(uintBitsToFloat(FLT_MAX_BITS));
+        hi = vec3(uintBitsToFloat(NEG_FLT_MAX_BITS));
+    }
+}
+
+shared uint s_kids[64];
+shared uint s_values[64];
+
+void boxes(bool wide) {
+    uint at_level = PLAN_LEVELS + 16u * pc.level + (wide ? 0u : 8u);
+    uint start = plan_word(at_level), count = plan_word(at_level + 4u);
+    uint group = gl_WorkGroupID.x, t = gl_LocalInvocationID.x;
+    uint node_size = wide ? 128u : 64u, group_bytes = wide ? 8192u : 4096u, value_size = wide ? 4u : 2u;
+    uint n = group * 64u < count ? min(64u, count - group * 64u) : 0u;
+    uint base = hdr(HDR_NODES) + start + group * group_bytes;
+
+    // Every thread reaches both barriers; the threads past `n` only take part.
+    uint word = 0u;
+    if (t < n) word = load(pc.src, base + 4u * t);
+    s_kids[t] = word >> 24u;
+    s_values[t] = bitCount(word & 0xffffffu);
+    barrier();
+    uint kids_before = 0u, values_before = 0u, kids_total = 0u;
+    for (uint k = 0u; k < n; ++k) {
+        if (k < t) { kids_before += s_kids[k]; values_before += s_values[k]; }
+        kids_total += s_kids[k];
+    }
+    uint kids = word >> 24u, mask = word & 0xffffffu;
+    uint children[4] = uint[4](INVALID, INVALID, INVALID, INVALID);
+    uint child_at = base + 4u * n + 4u * kids_before;
+    uint value_at = base + 4u * (n + kids_total) + value_size * values_before;
+    uint values[24];
+    if (t < n) {
+        for (uint s = 0u; s < kids && s < 4u; ++s) children[s] = load(pc.src, child_at + 4u * s);
+        uint v = 0u;
+        for (uint bit = 0u; bit < 24u; ++bit) {
+            if (((mask >> bit) & 1u) != 0u) {
+                values[bit] = wide ? load(pc.src, value_at + 4u * v) : load16(pc.src, value_at + 2u * v);
+                ++v;
+            }
+        }
+    }
+    barrier();   // the group's packed bytes are all read before any node is written
+    if (t >= n) return;
+
+    uint comps[24];
+    for (uint s = 0u; s < 4u; ++s) {
+        if (s < kids) {
+            vec3 lo, hi;
+            node_bounds(children[s], lo, hi);
+            for (uint k = 0u; k < 3u; ++k) {
+                comps[6u * s + k] = wide ? floatBitsToUint(lo[k]) : half_down(lo[k]);
+                comps[6u * s + 3u + k] = wide ? floatBitsToUint(hi[k]) : half_up(hi[k]);
+            }
+        } else {
+            for (uint k = 0u; k < 3u; ++k) {
+                comps[6u * s + k] = wide ? FLT_MAX_BITS : HALF_POS_INF;
+                comps[6u * s + 3u + k] = wide ? NEG_FLT_MAX_BITS : HALF_NEG_INF;
+            }
+        }
+    }
+    for (uint bit = 0u; bit < 24u; ++bit)
+        if (((mask >> bit) & 1u) != 0u) comps[bit] = values[bit];
+
+    uint at = base + t * node_size;
+    for (uint s = 0u; s < 4u; ++s) store(pc.dst, at + 4u * s, children[s]);
+    if (wide) {
+        for (uint k = 0u; k < 24u; ++k) store(pc.dst, at + 16u + 4u * k, comps[k]);
+        for (uint k = 0u; k < 4u; ++k) store(pc.dst, at + 112u + 4u * k, 0u);
+    } else {
+        for (uint k = 0u; k < 12u; ++k) store(pc.dst, at + 16u + 4u * k, comps[2u * k] | (comps[2u * k + 1u] << 16u));
+    }
+
+    uint me = ((at >> 6u) << 3u) | (wide ? BOX32 : BOX16);
+    bool updatable = (hdr(HDR_FLAGS) & FLAG_UPDATABLE) != 0u;
+    uint elems_off = hdr(HDR_ELEMS_OFF), parents_off = hdr(HDR_PARENTS), total = hdr(HDR_TOTAL);
+    for (uint s = 0u; s < 4u; ++s) {
+        uint child = children[s];
+        if ((child & 6u) == 4u || ((child & 7u) == TRI0 && updatable)) {
+            uint entry = stored_parent_entry(((child >> 3u) << 6u), elems_off, parents_off, total);
+            if (entry != INVALID) store(pc.dst, entry, me);
+        }
+    }
+}
+
+void main() {
+    if (pc.mode == MODE_PLAN) plan();
+    else if (pc.mode == MODE_CLEAR) clear_dst();
+    else if (pc.mode == MODE_HEADER) copy_header();
+    else if (pc.mode == MODE_LEAVES) leaves();
+    else if (pc.mode == MODE_BOX32) boxes(true);
+    else if (pc.mode == MODE_BOX16) boxes(false);
+}
