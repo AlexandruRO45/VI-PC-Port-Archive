@@ -1512,18 +1512,27 @@ def prepare_bcpack() -> None:
     import bcpack_native
 
     crate = bcpack_native.CRATE
-    library = bcpack_native.library_path()
+    batch = crate.with_name("bcpack_dds")
     cargo = shutil.which("cargo")
     if cargo is None:
         return
     sources = [crate / "Cargo.toml", crate / "Cargo.lock", *crate.glob("src/**/*.rs")]
     vendor = crate.parent.parent / "third_party" / "bcpack-rs"
     sources.extend([vendor / "Cargo.toml", *vendor.glob("src/**/*.rs")])
-    if library.is_file():
-        built = library.stat().st_mtime_ns
+    if not os.environ.get("LEONIDA_BCPACK_DDS"):
+        batch_sources = [*sources, batch / "Cargo.toml", batch / "Cargo.lock", *batch.glob("src/**/*.rs")]
+        executable = "bcpack_dds.exe" if os.name == "nt" else "bcpack_dds"
+        build_bcpack(cargo, batch, batch / "target" / "release" / executable, batch_sources)
+    build_bcpack(cargo, crate, bcpack_native.library_path(), sources)
+    bcpack_native.kernel.cache_clear()
+
+
+def build_bcpack(cargo, crate, target, sources):
+    if target.is_file():
+        built = target.stat().st_mtime_ns
         if all(source.stat().st_mtime_ns <= built for source in sources):
             return
-    log("assets: building the optional Rust BCPack decoder")
+    log(f"assets: building the optional Rust {crate.name} tool")
     try:
         result = run([cargo, "build", "--release", "--locked", "--offline",
                       "--manifest-path", crate / "Cargo.toml", "--target-dir",
@@ -1531,8 +1540,7 @@ def prepare_bcpack() -> None:
     except OSError:
         result = 1
     if result:
-        log("assets: Rust BCPack build failed. The strict Python decoder is available.")
-    bcpack_native.kernel.cache_clear()
+        log(f"assets: building {crate.name} failed. The reference exporter is available.")
 
 
 def assets(game: str, work: str, wav: bool, jobs: int) -> None:
@@ -1573,7 +1581,8 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
         pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
     if pools:
         prepare_bcpack()
-    settings = ttpf_assets.load_profile(work) if pools else None
+    rust_exporter = ttpf_assets.batch_executable() if pools else None
+    settings = ttpf_assets.load_profile(work, rust_exporter) if pools else None
     # rpf9dump names each pool's output folder after the source basename. Pools with the same basename
     # in one destination namespace would share that folder and its manifest, so the second pool would
     # look already exported and lose all its DDS. Give every member of a colliding group its own
@@ -1600,7 +1609,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
             manifest = ttpf_manifest(pool_dir)
             if manifest is None:
                 fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
-        written, blocked = ttpf_assets.complete_pool(p, pool_dir, manifest, settings)
+        written, blocked = ttpf_assets.complete_pool(p, pool_dir, manifest, settings, rust_exporter, jobs)
         if written or blocked:
             log(f"assets: {name}: {written} full BCPack DDS written, {blocked} limited (see manifest.json)")
     if not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json")):

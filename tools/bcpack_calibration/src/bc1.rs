@@ -4,7 +4,7 @@ use std::slice;
 
 const WIDTHS: [u8; 12] = [8, 8, 5, 6, 5, 5, 6, 5, 8, 8, 8, 8];
 
-fn blocks(
+pub(crate) fn blocks(
     count: usize,
     symbol: impl Fn(usize, usize) -> u8,
     endpoints: &[[i32; 6]],

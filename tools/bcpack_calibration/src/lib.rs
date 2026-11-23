@@ -4,6 +4,7 @@ use std::slice;
 
 mod bc1;
 mod bc7;
+pub mod blocks;
 mod entropy;
 
 #[repr(C)]

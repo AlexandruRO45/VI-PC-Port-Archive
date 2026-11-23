@@ -53,7 +53,8 @@ class TextureAssets(unittest.TestCase):
     def row_after_export(self):
         return json.loads(self.catalog.read_bytes())["Textures"][0]
 
-    def test_assets_use_native_strict_then_local_calibration(self):
+    @mock.patch.object(ttpf_assets, "batch_executable", return_value=None)
+    def test_assets_use_native_strict_then_local_calibration(self, _batch):
         try:
             bcpack_native.library().decode_strict_bc1
         except (OSError, AttributeError) as exc:
@@ -96,6 +97,18 @@ class TextureAssets(unittest.TestCase):
             self.assertEqual(bcpack.decode(stream, 7, len(expected)), expected)
         with self.assertRaises(bcpack.BcpackError):
             bcpack.decode(stream[:1], 7, len(expected))
+
+    @unittest.skipUnless(os.environ.get("LEONIDA_BCPACK_DDS"), "set LEONIDA_BCPACK_DDS to the built CLI")
+    def test_assets_complete_pool_through_rust_batch(self):
+        _, linear, _ = build_bc1_bcpack_pool(self.pool)
+        self.legacy()
+        with mock.patch.object(ttpf_assets.ttpf, "Pool", side_effect=AssertionError("expected Rust batch")):
+            self.build()
+            self.build()
+        row = self.row_after_export()
+        self.assertEqual(row["BCPackDecoder"], "v1-strict")
+        self.assertEqual((self.folder / row["File"]).read_bytes()[148:], b"".join(linear.values()))
+        self.assertEqual(row["Mips"], 5)
 
     def test_partial_upgrade_failure_then_resume(self):
         _, linear, _ = build_bc1_bcpack_pool(self.pool)
@@ -165,7 +178,8 @@ class TextureAssets(unittest.TestCase):
             self.assertEqual(row["Mips"], 5)
             self.assertEqual((folder / row["File"]).read_bytes()[148:], b"".join(linear.values()))
 
-    def test_complete_pool_handles_unmapped_range_without_crashing(self):
+    @mock.patch.object(ttpf_assets, "batch_executable", return_value=None)
+    def test_complete_pool_handles_unmapped_range_without_crashing(self, _batch):
         # If pool.codecs() raises ValueError (e.g., an unmapped hole inside a texture's span),
         # complete_pool must record BCPackLimitation on that row instead of aborting the pool.
         build_bc1_bcpack_pool(self.pool)

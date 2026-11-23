@@ -31,3 +31,16 @@ The top-level JSON object contains `"version": 1` and the sections used by the r
 - Optional `entries` maps pool basename and zero-based index to a profile name (default `base`). Optional `compatibility` maps a compressed BC1 stream's SHA-256 to a list of flattened symbol positions. Rotate the symbols at those positions left once to reproduce a known historical feeder ordering.
 
 Cargo builds the entropy decoder from the two upstream modules included in `third_party/bcpack-rs`. With the Rust toolchain installed, this step works offline with an empty Cargo cache. The [source and license notes](../../third_party/bcpack-rs/README.md) identify the upstream revision. The Python reader handles streams for which that reader does not report full consumption. The fitted BC7 reconstruction tracks precision while decoding blocks in archive order. Visible blocks must resolve before the DDS is written.
+
+## Rust batch export
+
+The batch executable reads the RDS5 pool index once, schedules textures across Rust threads, detiles mips and publishes DDS files and a SHA-256 manifest. It defaults to strict export. Pass `--calibration PROFILE.json` to retry strict failures with a local version 1 profile. The fitted decoder takes BC1/3/4/7 tables from the profile, including BC7 visible-block endpoint adjustments. It accepts an optional `bc5` history map keyed by slot number and BC6H history with supplied predictors. The native strict decoder covers self-contained BCPack chunks and raw or zlib chunks in supported BC layouts. Reference history tables, provisional recovery with missing BC6H predictors and unsupported layouts can still require the reference readers.
+
+```powershell
+cargo build --release --locked --manifest-path tools/bcpack_dds/Cargo.toml --target-dir tools/bcpack_dds/target
+tools/bcpack_dds/target/release/bcpack_dds.exe path/to/pool.ttpf out/dds --jobs 8
+$env:LEONIDA_BCPACK_DDS = (Resolve-Path tools/bcpack_dds/target/release/bcpack_dds.exe).Path
+python -IB tests/test_bcpack_dds.py -q
+```
+
+The ordinary `assets` stage attempts an offline build when Cargo and the cached dependencies are available. It also accepts a prebuilt executable via `LEONIDA_BCPACK_DDS`. The native batch processes eligible texture completion and the reference readers handle rejected entries. The assets stage publishes the existing catalog used by material lookups.
