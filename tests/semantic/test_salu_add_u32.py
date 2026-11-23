@@ -412,5 +412,60 @@ class SaluAddU32SimdExecutionTests(unittest.TestCase):
         for lane in wave.lanes:
             self.assertEqual(lane.get_vgpr(1), 0)
 
+
+# --- Section 5: Register Aliasing and In-Place Operands ---
+
+class SaluAddU32RegisterAliasingTests(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation tests."""
+
+    def test_dst_aliases_src0(self) -> None:
+        state = ScalarRegisterState()
+        state.set_sgpr(4, 50)
+        state.set_sgpr(5, 75)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 4), Operand(RegKind.SGPR, 4), Operand(RegKind.SGPR, 5))
+        res, scc = state.step(ast)
+        self.assertEqual(res, 125)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.get_sgpr(4), 125)
+
+    def test_dst_aliases_src1(self) -> None:
+        state = ScalarRegisterState()
+        state.set_sgpr(4, 50)
+        state.set_sgpr(5, 75)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 5), Operand(RegKind.SGPR, 4), Operand(RegKind.SGPR, 5))
+        res, scc = state.step(ast)
+        self.assertEqual(res, 125)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.get_sgpr(5), 125)
+
+    def test_all_operands_alias(self) -> None:
+        state = ScalarRegisterState()
+        state.set_sgpr(8, 0x1000)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 8), Operand(RegKind.SGPR, 8), Operand(RegKind.SGPR, 8))
+        res, scc = state.step(ast)
+        self.assertEqual(res, 0x2000)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.get_sgpr(8), 0x2000)
+
+    def test_aliased_overflow_in_place(self) -> None:
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0x80000000)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 0))
+        res, scc = state.step(ast)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 1)
+        self.assertEqual(state.get_sgpr(0), 0)
+        self.assertEqual(state.scc, 1)
+
+    def test_src0_equals_src1_distinct_dst(self) -> None:
+        state = ScalarRegisterState()
+        state.set_sgpr(1, 0x3FFFFFF)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 1), Operand(RegKind.SGPR, 1))
+        res, scc = state.step(ast)
+        self.assertEqual(res, 0x7FFFFFE)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.get_sgpr(1), 0x3FFFFFF)
+        self.assertEqual(state.get_sgpr(2), 0x7FFFFFE)
+
 if __name__ == "__main__":
     unittest.main()
