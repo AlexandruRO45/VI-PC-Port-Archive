@@ -52,6 +52,7 @@
 #include "large_module_gate.h"
 #include "../src/spirv_words.h"
 #include "../src/subgroup_size.h"
+#include "pipeline_check_descriptors.h"
 
 #include <algorithm>
 #include <array>
@@ -77,6 +78,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -100,7 +102,8 @@ struct ShaderMeta {
     uint32_t lds_bytes = 0;
     uint32_t push_constant_bytes = 0;  // 0 = absent in index (128 with pc_tail, else 144)
     uint32_t pc_tail_bytes = 0;        // >0 = --pc-tail-ubo uniform block at set 1, binding 0
-    bool no_set0_bindings = false;
+    // Older indexes omit bindings. Keep their original set-0 contract (bindings 0..19).
+    uint32_t set0_bindings = (1u << leonida::bindless::first_ms_binding) - 1;
     bool wave64 = false;
     std::array<uint32_t, 3> local_size{1, 1, 1};
     std::string wave64_exchange;
@@ -349,12 +352,18 @@ struct JsonParser {
                 m.push_constant_bytes = parse_strict_u32("expected unsigned 32-bit push_constant_bytes");
             else if (k == "pc_tail") m.pc_tail_bytes = parse_pc_tail_bytes();
             else if (k == "bindings") {
-                const size_t start = i;
-                m.no_set0_bindings = consume('[') && consume(']');
-                if (!m.no_set0_bindings) {
-                    i = start;
-                    skip_value();
-                }
+                ws();
+                if (i < s.size() && s[i] == '[') {
+                    m.set0_bindings = 0;
+                    for (uint32_t binding : parse_u32_array()) {
+                        // Keep the full layout for an index from a newer translator.
+                        if (binding >= leonida::bindless::binding_count) {
+                            m.set0_bindings = ~0u;
+                            break;
+                        }
+                        m.set0_bindings |= 1u << binding;
+                    }
+                } else skip_value();
             }
             else if (k == "wave64") {
                 ws();
@@ -504,7 +513,7 @@ constexpr uint32_t required_push_bytes(uint32_t push_constant_bytes, uint32_t pc
 constexpr uint32_t runtime_compute_push_bytes = 144;  // sizeof(leonida::ShaderUserData)
 
 bool uses_runtime_compute_layout(const ShaderMeta& meta) {
-    return meta.stage == "cs" && meta.no_set0_bindings && !meta.pc_tail_bytes &&
+    return meta.stage == "cs" && meta.set0_bindings == 0 && !meta.pc_tail_bytes &&
            required_push_bytes(meta.push_constant_bytes, meta.pc_tail_bytes) == runtime_compute_push_bytes;
 }
 
@@ -925,13 +934,13 @@ int main(int argc, char** argv) {
         leonida::vk_test::report_no_device();
         return 1;
     }
-    VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
-    VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
-    VkPhysicalDeviceFloatControlsProperties fcProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+    VkPhysicalDeviceVulkan11Properties props11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+    VkPhysicalDeviceVulkan12Properties props12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, &props11};
+    VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES, &props12};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &sgProps;
-    sgProps.pNext = &fcProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
+    const auto& props = props2.properties;
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
 
     uint32_t en = 0;
@@ -1009,6 +1018,15 @@ int main(int argc, char** argv) {
         mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = mesh.meshShaderQueries = VK_FALSE;
         mesh.taskShader = VK_FALSE;
     }
+    const leonida::vk_test::PipelineCheckDescriptors descriptors(f12, props.limits, props11, props12);
+    if (descriptors.compact)
+        std::fprintf(stderr, "set 0: checking per-shader bindings against ordinary descriptor limits\n");
+
+    // Vulkan disallows robustBufferAccess with these enabled features on devices without this property.
+    if (!props12.robustBufferAccessUpdateAfterBind &&
+        (f12.descriptorBindingStorageBufferUpdateAfterBind || f12.descriptorBindingUniformBufferUpdateAfterBind ||
+         f12.descriptorBindingStorageTexelBufferUpdateAfterBind || f12.descriptorBindingUniformTexelBufferUpdateAfterBind))
+        f2.features.robustBufferAccess = VK_FALSE;
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = 0; qci.queueCount = 1; qci.pQueuePriorities = &prio;
@@ -1075,6 +1093,8 @@ int main(int argc, char** argv) {
                    std::to_string(props.limits.maxPushConstantsSize) +
                    (need_pc > 128 ? " (translate with --pc-tail-ubo)" : "");
         }
+        if (!descriptors.fits(meta.set0_bindings))
+            return "set-0 storage image bindings exceed device limit";
         if (is_graphics_stage(meta.stage) && !f13.dynamicRendering) return "no dynamicRendering";
         if (meta.stage == "ms" && !(ext_mesh && mesh.meshShader)) return "no VK_EXT_mesh_shader";
         if (meta.stage == "gs" && !f2.features.geometryShader) return "no geometryShader";
@@ -1089,9 +1109,9 @@ int main(int argc, char** argv) {
         // property, not a feature.
         for (const auto& fc : meta.float_controls) {
             if (fc == "shaderSignedZeroInfNanPreserveFloat32") {
-                if (!fcProps.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
+                if (!props12.shaderSignedZeroInfNanPreserveFloat32) return "no " + fc;
             } else if (fc == "shaderDenormPreserveFloat16") {
-                if (!fcProps.shaderDenormPreserveFloat16) return "no " + fc;
+                if (!props12.shaderDenormPreserveFloat16) return "no " + fc;
             } else {
                 return "unknown float control " + fc;
             }
@@ -1125,20 +1145,6 @@ int main(int argc, char** argv) {
         return {};
     };
 
-    // Resource contract (docs/design.md): set 0, runtime-sized arrays as large bindless arrays.
-    std::vector<VkDescriptorSetLayoutBinding> b;
-    auto add = [&](uint32_t bind, VkDescriptorType t, uint32_t cnt) {
-        b.push_back({bind, t, cnt, VK_SHADER_STAGE_ALL, nullptr});
-    };
-    add(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096); add(1, VK_DESCRIPTOR_TYPE_SAMPLER, 1024);
-    add(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1); add(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024);
-    add(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
-    add(6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256); add(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
-    for (uint32_t i = 8; i <= 19; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
-    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
-    VkDescriptorSetLayout dsl;
-    if (VkResult r = vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl)) { std::fprintf(stderr, "layout %d\n", r); return 1; }
     // Set 1 of --pc-tail-ubo shaders (docs/design.md): dynamic uniform block at binding 0 holding heap/code base.
     const VkDescriptorSetLayoutBinding tail_binding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
                                                     VK_SHADER_STAGE_ALL, nullptr};
@@ -1148,32 +1154,42 @@ int main(int argc, char** argv) {
     if (VkResult r = vkCreateDescriptorSetLayout(dev, &tail_dli, nullptr, &dsl_tail)) {
         std::fprintf(stderr, "tail layout %d\n", r); return 1;
     }
-    // One VkPipelineLayout per (push_constant_bytes, has_pc_tail) needed by the selected shaders that fits
-    // maxPushConstantsSize; never declares a range above the device limit (VUID-VkPushConstantRange-size-00298).
-    std::map<std::pair<uint32_t, bool>, VkPipelineLayout> layouts;
+    const auto layout_key = [&](const ShaderMeta& meta) {
+        return std::make_tuple(required_push_bytes(meta.push_constant_bytes, meta.pc_tail_bytes),
+                               meta.pc_tail_bytes != 0, descriptors.layout_mask(meta.set0_bindings));
+    };
+    std::map<std::tuple<uint32_t, bool, uint32_t>, VkPipelineLayout> layouts;
+    std::map<uint32_t, VkDescriptorSetLayout> set_layouts;
+    LOADD(vkDestroyDescriptorSetLayout); LOADD(vkDestroyPipelineLayout);
     for (const auto& [_, meta] : work) {
-        const uint32_t need_pc = required_push_bytes(meta->push_constant_bytes, meta->pc_tail_bytes);
-        if (need_pc > props.limits.maxPushConstantsSize) continue;
-        const std::pair<uint32_t, bool> key{need_pc, meta->pc_tail_bytes != 0};
-        if (layouts.count(key)) continue;
+        const auto key = layout_key(*meta);
+        const auto [need_pc, has_tail, mask] = key;
+        if (need_pc > props.limits.maxPushConstantsSize || uses_runtime_compute_layout(*meta) ||
+            !descriptors.fits(meta->set0_bindings) || layouts.count(key)) continue;
+        auto& dsl = set_layouts[mask];
+        if (!dsl) {
+            const leonida::bindless::SetLayout set0(descriptors.features, mask);
+            if (VkResult r = vkCreateDescriptorSetLayout(dev, &set0.info, nullptr, &dsl)) {
+                std::fprintf(stderr, "descriptor layout %d\n", r);
+                return 1;
+            }
+        }
         VkPushConstantRange pcr{VK_SHADER_STAGE_ALL, 0, need_pc};
         VkDescriptorSetLayout sets[2] = {dsl, dsl_tail};
         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        pli.setLayoutCount = key.second ? 2u : 1u;
+        pli.setLayoutCount = has_tail ? 2u : 1u;
         pli.pSetLayouts = sets;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pcr;
         VkPipelineLayout pl = VK_NULL_HANDLE;
-        if (VkResult r = vkCreatePipelineLayout(dev, &pli, nullptr, &pl)) {
-            std::fprintf(stderr, "pipeline layout (%u bytes%s) %d\n", need_pc, key.second ? ", set 1" : "", r);
+        VkResult result = vkCreatePipelineLayout(dev, &pli, nullptr, &pl);
+        if (result != VK_SUCCESS) {
+            std::fprintf(stderr, "pipeline layout (%u bytes%s) %d\n", need_pc, has_tail ? ", set 1" : "", result);
             return 1;
         }
         layouts.emplace(key, pl);
     }
-    auto layout_for = [&](const ShaderMeta& meta) -> VkPipelineLayout {
-        const uint32_t need_pc = required_push_bytes(meta.push_constant_bytes, meta.pc_tail_bytes);
-        return layouts.at({need_pc, meta.pc_tail_bytes != 0});
-    };
+    auto layout_for = [&](const ShaderMeta& meta) { return layouts.at(layout_key(meta)); };
     VkPipelineLayout runtime_compute_layout = VK_NULL_HANDLE;
     if (runtime_compute_push_bytes <= props.limits.maxPushConstantsSize &&
         std::any_of(work.begin(), work.end(), [](const Item& item) {
@@ -1719,6 +1735,10 @@ int main(int argc, char** argv) {
     watch.join();
 
     for (auto& [_, mod] : stub_cache) if (mod) vkDestroyShaderModule(dev, mod, nullptr);
+    for (const auto& [_, layout] : layouts) vkDestroyPipelineLayout(dev, layout, nullptr);
+    if (runtime_compute_layout) vkDestroyPipelineLayout(dev, runtime_compute_layout, nullptr);
+    for (const auto& [_, layout] : set_layouts) vkDestroyDescriptorSetLayout(dev, layout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, dsl_tail, nullptr);
 
     std::set<std::string> all_stages;
     for (auto& [st, _] : modules_ok) all_stages.insert(st);

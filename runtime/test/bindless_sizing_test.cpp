@@ -5,6 +5,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include "../src/vulkan_bindless.h"
+#include "pipeline_check_descriptors.h"
 
 #include <cstdio>
 
@@ -93,6 +94,37 @@ int main() {
     using D = ImageDimension;
     constexpr auto defaults = bindless::default_counts();
     static_assert(defaults[0] == 4096 && defaults[bindless::sampler_binding] == 1024 && defaults[8] == 256);
+
+    // Xe-LP has large update-after-bind limits but only 200 ordinary sampled images and 16 storage images.
+    {
+        Device d = uniform(200, 65536);
+        d.limits.maxPerStageDescriptorStorageImages = 16;
+        VkPhysicalDeviceVulkan12Features enabled{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        enabled.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+        enabled.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
+        enabled.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
+        constexpr uint32_t image_and_table = (1u << 2) | (1u << 4);
+        const leonida::vk_test::PipelineCheckDescriptors indexed(enabled, d.limits, d.v11, d.v12);
+        const bindless::SetLayout whole(indexed.features, indexed.layout_mask(image_and_table));
+        EXPECT(!indexed.compact && whole.info.flags == VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT);
+        EXPECT(whole.entries[4].descriptorCount > d.limits.maxPerStageDescriptorStorageImages);
+        EXPECT(whole.flags[4] & VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT);
+
+        enabled.descriptorBindingStorageBufferUpdateAfterBind = VK_FALSE;
+        d.limits.maxPerStageDescriptorStorageImages = 4;
+        const leonida::vk_test::PipelineCheckDescriptors plain(enabled, d.limits, d.v11, d.v12);
+        const bindless::SetLayout subset(plain.features, plain.layout_mask(image_and_table));
+        EXPECT(plain.compact && subset.info.flags == 0 && subset.info.bindingCount == 2);
+        EXPECT(subset.entries[0].binding == 2 && subset.entries[1].binding == 4);
+        EXPECT(subset.entries[0].descriptorCount == 1 && subset.entries[1].descriptorCount == 1);
+        EXPECT(plain.fits(0) && plain.fits(image_and_table) && !plain.fits(~0u));
+
+        // If reduced ordinary arrays fit, keep the shared layout and its real descriptor counts.
+        const Device reduced = uniform(4000, 65536);
+        const leonida::vk_test::PipelineCheckDescriptors sized(enabled, reduced.limits, reduced.v11, reduced.v12);
+        EXPECT(!sized.compact && sized.layout_mask(image_and_table) == ~0u);
+        EXPECT(sized.features.counts[0] > 1 && sized.features.counts[0] < defaults[0]);
+    }
 
     // An RTX 5070 (driver 621.24): 1048576 of each descriptor type, update-after-bind or not, 4000 samplers.
     for (const bool update_after_bind : {true, false}) {

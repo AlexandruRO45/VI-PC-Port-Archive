@@ -14,6 +14,11 @@ module counts as a failure. A rejected partner stub is unavailable, so the affec
 It also exits 2, before loading Vulkan, if `index.json` is missing, unreadable, empty or malformed, so a wrong
 directory can't pass as an empty corpus. A valid `{}` is an intentionally empty index.
 
+For shaders with descriptors, set 0 uses the runtime's descriptor types and device-sized arrays. On devices with
+update-after-bind support it uses those limits. If the GPU's ordinary descriptor limits cannot hold the shared
+layout even at its smallest size, the checker uses one descriptor for each binding listed by the shader. This
+suffices for pipeline creation. Older indexes without a binding list keep the original set of bindings 0 through 19.
+
 For an index entry with `lds_bytes`, the checker compares the reported workgroup memory with the selected GPU's
 `maxComputeSharedMemorySize` for compute or `maxMeshSharedMemorySize` for supported mesh shaders. An entry above its
 limit counts as a module failure before Vulkan receives the shader. Older indexes without this field still use the

@@ -172,10 +172,12 @@ struct SetLayout {
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
     VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
 
-    explicit SetLayout(const BindlessFeatures& features) {
+    // The runtime uses every enabled binding. The pipeline checker can request only those its shader declares.
+    explicit SetLayout(const BindlessFeatures& features, std::uint32_t binding_mask = ~0u) {
+        static_assert(binding_count <= 32);
         std::uint32_t count = 0;
         for (std::uint32_t b = 0; b < binding_count; ++b) {
-            if (!binding_enabled(b, features)) continue;
+            if (!binding_enabled(b, features) || !(binding_mask & (1u << b))) continue;
             entries[count] = {b, bindings[b].type, features.counts[b], VK_SHADER_STAGE_ALL, nullptr};
             flags[count] = (features.update_after_bind ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT : 0) |
                            (features.partially_bound ? VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0);
@@ -217,10 +219,11 @@ inline constexpr std::uint32_t growth_headroom = 64;
 // step 3 then also grows past maxPerSetDescriptors where the device says the layout works (Intel's Xe-LP reports
 // 6159 and supports the full sizes, D3D-219). It is asked only once the sum is above maxPerSetDescriptors.
 // Sets features.counts; returns false when a count is below its default because the device's limits are.
+// minimum_fits reports whether the fixed-size secondary arrays fit even with all growable counts at one.
 inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimits& limits,
                           const VkPhysicalDeviceVulkan11Properties& v11,
                           const VkPhysicalDeviceVulkan12Properties& v12,
-                          const std::function<bool(const BindlessFeatures&)>& layout_supported = {}) {
+                          const std::function<bool(const BindlessFeatures&)>& layout_supported = {}, bool* minimum_fits = nullptr) {
     const bool uab = features.update_after_bind;
     const std::uint32_t sampled_limit =
         uab ? std::min(v12.maxPerStageDescriptorUpdateAfterBindSampledImages,
@@ -284,6 +287,7 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     constexpr std::uint64_t no_limit = ~0ull;
     const auto ms_samples = features.ms_samples;
     features.ms_samples.fill(VK_SAMPLE_COUNT_1_BIT);
+    if (minimum_fits) *minimum_fits = fits(0, no_limit);
     grow(samplers, bindings[sampler_binding].count, 0, no_limit);
     grow(storage, bindings[storage_binding(ImageDimension::dim_2d, 0)].count, 0, no_limit);
     grow(images, bindings[sampled_binding(ImageDimension::dim_2d)].count, 0, no_limit);
