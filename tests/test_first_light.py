@@ -415,6 +415,17 @@ class OracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_image(self.image(centre=(0.75, 0.25)), self.manifest)
 
+    def test_rejects_nan_at_each_checked_pixel(self):
+        self.manifest["uv_probes"][0]["pixel"] = [1, 1]
+        self.manifest["min_coverage"] = 3 / 16  # One covered pixel may lose its alpha and still pass coverage.
+        for x, y, diagnostic in ((0, 0, "clear pixel"), (2, 2, "centre"), (1, 1, "UV probe")):
+            for channel in range(4):
+                with self.subTest(probe=diagnostic, channel=channel):
+                    data = bytearray(self.image())
+                    struct.pack_into("<f", data, ((y * 4 + x) * 4 + channel) * 4, float("nan"))
+                    with self.assertRaisesRegex(AssertionError, diagnostic):
+                        check_image(data, self.manifest)
+
     def test_rejects_a_short_image(self):
         with self.assertRaises(AssertionError):
             check_image(b"", self.manifest)
