@@ -7783,11 +7783,13 @@ int main() {
     do { \
         if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
     } while (0)
+    // Each heap holds one resource kind, so a resource heap tier 1 host (NVIDIA Pascal) creates it too (D3D-504).
     const auto placed_cast_scenario = [](ID3D12Device10* device10, bool layer, std::uint8_t* out) -> bool {
         D3D12_HEAP_DESC heap_desc{};
         heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
         heap_desc.SizeInBytes = 256 * 1024;
         heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
         Ref<ID3D12Heap> heap;
         CAST_CHECK(SUCCEEDED(device10->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
         D3D12_RESOURCE_DESC1 texture{};
@@ -7879,8 +7881,11 @@ int main() {
         heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
         heap_desc.SizeInBytes = 256 * 1024;
         heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-        Ref<ID3D12Heap> heap;
+        heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+        Ref<ID3D12Heap> heap, buffer_heap;
         if (FAILED(device10->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap.p)))) return false;
+        heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        if (FAILED(device10->CreateHeap(&heap_desc, IID_PPV_ARGS(&buffer_heap.p)))) return false;
         D3D12_RESOURCE_DESC1 texture{};
         texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         texture.Width = 4;
@@ -7902,7 +7907,7 @@ int main() {
         const DXGI_FORMAT unknown_list[] = {DXGI_FORMAT_UNKNOWN};
         const DXGI_FORMAT wide_list[] = {DXGI_FORMAT_R16G16B16A16_FLOAT};
         Ref<ID3D12Resource> refused;
-        out[0] = device10->CreatePlacedResource2(heap.p, 0, &buffer, D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, 1,
+        out[0] = device10->CreatePlacedResource2(buffer_heap.p, 0, &buffer, D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, 1,
                                                  srgb_list, IID_PPV_ARGS(&refused.p));
         out[1] = device10->CreatePlacedResource2(heap.p, 0, &texture, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1,
                                                  unknown_list, IID_PPV_ARGS(&refused.p));
