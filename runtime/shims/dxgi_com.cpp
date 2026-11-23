@@ -1,5 +1,6 @@
 #include "dxgi_com.h"
 #include "d3d12_stubs.h"
+#include "d3d12_com_object.h"
 
 #include <winternl.h>  // NTSTATUS, which d3dkmthk.h needs and WIN32_LEAN_AND_MEAN leaves out
 #include <d3dkmthk.h>
@@ -150,29 +151,15 @@ DXGI_FORMAT vk_to_dxgi_format(VkFormat fmt) {
 
 // Real ID3D12Resource COM object representing a swapchain backbuffer. Its pointer value is the
 // leonida::ResourceId registered in VulkanContext, matching d3d12_com.h's resource_id(ID3D12Resource*) contract.
-class BackBufferResource final : public ID3D12ResourceStubs {
+// Reference counting, private data and SetName are the shared ID3D12Object ones (d3d12_com_object.h), so a back
+// buffer keeps a name and private data as the host's does (D3D-451, d3d12_private_data_test).
+class BackBufferResource final
+    : public rt::d3d12::Object<BackBufferResource, ID3D12ResourceStubs, ID3D12Object, ID3D12DeviceChild,
+                               ID3D12Pageable, ID3D12Resource> {
 public:
+    static constexpr GUID kTag{0x6b1d3f4e, 0x2a7c, 0x4e95, {0x9c, 0x31, 0x5e, 0x08, 0xd2, 0x7a, 0x4b, 0x16}};
+
     explicit BackBufferResource(const D3D12_RESOURCE_DESC& desc) : desc_(desc) {}
-
-    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
-    ULONG STDMETHODCALLTYPE Release() override {
-        const ULONG left = --refs_;
-        if (!left) delete this;
-        return left;
-    }
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
-        if (!out) return E_POINTER;
-        *out = nullptr;
-        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
-            riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource)) {
-            *out = static_cast<ID3D12Resource*>(this);
-            AddRef();
-            return S_OK;
-        }
-        return E_NOINTERFACE;
-    }
-
-    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return S_OK; }
 
 #ifdef _MSC_VER
     D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc(void) override { return desc_; }
@@ -197,10 +184,9 @@ public:
     }
 
     leonida::ResourceId resource_id() const { return reinterpret_cast<leonida::ResourceId>(this); }
-    bool held_by_app() const { return refs_ > 1; }
+    bool held_by_app() const { return references() > 1; }
 
 private:
-    std::atomic<ULONG> refs_{1};
     D3D12_RESOURCE_DESC desc_{};
 };
 

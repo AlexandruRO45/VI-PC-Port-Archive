@@ -3,13 +3,17 @@
 // runs on the device and on a fence, a committed buffer, a command allocator and a descriptor heap of each device,
 // and records every HRESULT, every size the call writes back, the bytes it reads and the reference count of an
 // interface the object holds. The two records must be the same, step by step, and the same as Microsoft's answers
-// recorded in d3d12_private_data_answers.h, which is what Wine and Proton check (their host D3D12 is vkd3d). No
-// shaders or game data. Skips (77) without a Vulkan GPU. Set LEONIDA_D3D49_VERBOSE=1 to print every step, and
-// LEONIDA_D3D49_DUMP=1 to print the host's record in the answers file's format (Windows only).
+// recorded in d3d12_private_data_answers.h, which is what Wine and Proton check (their host D3D12 is vkd3d). A
+// swapchain back buffer of each device (DXGI on the host, the layer's dxgi_com.cpp on Vulkan) runs the same script,
+// in a window of its own (D3D-451); that part is compared with the host on Windows only. No shaders or game data.
+// Skips (77) without a Vulkan GPU. Set LEONIDA_D3D49_VERBOSE=1 to print every step, and LEONIDA_D3D49_DUMP=1 to
+// print the host's record in the answers file's format (Windows only).
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "d3d12_private_data_answers.h"
 #include "../shims/d3d12_com.h"
+
+#include <dxgi1_4.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -291,6 +295,91 @@ bool record(ID3D12Device* device, Record& r) {
     return true;
 }
 
+// A 64x64 flip-model swapchain on `window` for `device`'s direct queue, made by `factory`.
+bool make_swapchain(ID3D12Device* device, IDXGIFactory2* factory, HWND window, Ref<ID3D12CommandQueue>& queue,
+                    Ref<IDXGISwapChain1>& chain) {
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p)))) return false;
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    return SUCCEEDED(factory->CreateSwapChainForHwnd(queue.p, window, &desc, nullptr, nullptr, &chain.p));
+}
+
+// The script on both back buffers of a swapchain of `device`, and what a name set on one is after the buffer is
+// asked for again (the same object both times, on the host).
+bool record_back_buffers(ID3D12Device* device, IDXGIFactory2* factory, HWND window, Record& r) {
+    Ref<ID3D12CommandQueue> queue;
+    Ref<IDXGISwapChain1> chain;
+    if (!make_swapchain(device, factory, window, queue, chain)) return false;
+    for (UINT index = 0; index < 2; ++index) {
+        Ref<ID3D12Resource> buffer;
+        if (FAILED(chain->GetBuffer(index, IID_PPV_ARGS(&buffer.p)))) return false;
+        Record one;
+        script(one, buffer.p);
+        const std::string kind = "back buffer " + std::to_string(index) + ": ";
+        for (std::size_t i = 0; i < one.names.size(); ++i) r.add(kind + one.names[i], one.values[i]);
+    }
+    {
+        Ref<ID3D12Resource> buffer;
+        if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&buffer.p)))) return false;
+        r.add("back buffer: SetName hr", std::uint32_t(name_guarded(buffer.p, L"back")));
+        buffer->SetPrivateData(key(200), 4, "abc");
+    }
+    Ref<ID3D12Resource> again;
+    if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&again.p)))) return false;
+    get(r, "back buffer asked for again: name W", again.p, kNameW, 64);
+    get(r, "back buffer asked for again: private data", again.p, key(200), 64);
+    Ref<ID3D12Resource> other;
+    if (FAILED(chain->GetBuffer(1, IID_PPV_ARGS(&other.p)))) return false;
+    get(r, "the other back buffer: name W", other.p, kNameW, 64);
+    return true;
+}
+
+LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
+    return DefWindowProcW(window, message, w, l);
+}
+
+// A hidden 64x64 window for the swapchains, or null when the process can't make one (no window station).
+HWND make_window() {
+    WNDCLASSW window_class{};
+    window_class.lpfnWndProc = window_proc;
+    window_class.hInstance = GetModuleHandleW(nullptr);
+    window_class.lpszClassName = L"LeonidaPrivateDataTest";
+    RegisterClassW(&window_class);
+    return CreateWindowExW(0, window_class.lpszClassName, L"Leonida private data", WS_OVERLAPPEDWINDOW, 0, 0, 64,
+                           64, nullptr, nullptr, window_class.hInstance, nullptr);
+}
+
+// Compares the layer's record with the host's step by step; prints what differs (every step when `verbose`).
+// Returns the mismatches.
+int compare_with_host(const Record& ours, const Record& theirs, const char* what, bool verbose) {
+    int mismatches = 0, faulted = 0;
+    for (std::size_t i = 0; i < ours.values.size(); ++i) {
+        if (theirs.values[i] == kFaulted) {  // SetName(nullptr): the host faults; the layer clears the name
+            if (verbose)
+                std::printf("%s %s: the host faults, not compared (ours 0x%llx)\n", what, ours.names[i].c_str(),
+                            static_cast<unsigned long long>(ours.values[i]));
+            ++faulted;
+            continue;
+        }
+        const bool same = ours.values[i] == theirs.values[i];
+        if (verbose || !same)
+            std::printf("%s %s: ours 0x%llx host 0x%llx%s\n", what, ours.names[i].c_str(),
+                        static_cast<unsigned long long>(ours.values[i]),
+                        static_cast<unsigned long long>(theirs.values[i]), same ? "" : "  MISMATCH");
+        mismatches += !same;
+    }
+    std::printf("%s: %zu steps compared with the host (%d more the host faults on), %d mismatches\n", what,
+                ours.values.size() - faulted, faulted, mismatches);
+    return mismatches;
+}
+
 }  // namespace
 
 int main() {
@@ -360,6 +449,54 @@ int main() {
         };
         if (host.p) EXPECT(compare("the host", theirs) == 0);
         EXPECT(compare("Microsoft's recorded answers", recorded) == 0);
+    }
+
+    // Back buffers (D3D-451): a device of their own with presentation, and the host's DXGI factory.
+    {
+        vktest::Device presenting;
+        HWND window = nullptr;
+        if (presenting.initialize(true) != vktest::DeviceStatus::ready || !(window = make_window())) {
+            std::printf("back buffers: no Vulkan presentation device or window, not compared\n");
+        } else {
+            rt::d3d12::VulkanDeviceInfo info{};
+            info.get_instance_proc = presenting.instance_proc;
+            info.instance = presenting.instance;
+            info.physical = presenting.physical;
+            info.device = presenting.device;
+            info.queue = presenting.queue;
+            info.queue_family = presenting.family;
+            info.presentation = true;
+            Ref<ID3D12Device> device;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
+            Ref<IDXGIFactory2> factory;
+            EXPECT(SUCCEEDED(rt::d3d12::create_dxgi_factory(device.p, IID_PPV_ARGS(&factory.p))));
+            Record ours;
+            EXPECT(record_back_buffers(device.p, factory.p, window, ours));
+
+            const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
+                                                 reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                                           : nullptr;
+            using CreateFactory = HRESULT(WINAPI*)(UINT, REFIID, void**);
+            const auto create_factory = dxgi ? reinterpret_cast<CreateFactory>(
+                                                   reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory2")))
+                                             : nullptr;
+            Ref<ID3D12Device> host;
+            Ref<IDXGIFactory2> host_factory;
+            if (!create_host || !create_factory || hostwine::host_is_wine() ||
+                FAILED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))) ||
+                FAILED(create_factory(0, IID_PPV_ARGS(&host_factory.p)))) {
+                std::printf("back buffers: no Windows D3D12 device or DXGI factory; %zu steps recorded, not compared\n",
+                            ours.values.size());
+            } else {
+                Record theirs;
+                EXPECT(record_back_buffers(host.p, host_factory.p, window, theirs));
+                EXPECT(theirs.names == ours.names);
+                EXPECT(compare_with_host(ours, theirs, "back buffers", verbose) == 0);
+            }
+            DestroyWindow(window);
+        }
     }
     std::printf("d3d12_private_data_test: OK\n");
     return 0;

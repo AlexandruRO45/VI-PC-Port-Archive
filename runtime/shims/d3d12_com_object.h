@@ -120,6 +120,9 @@ public:
     }
 
 protected:
+    // The current reference count, for an object that must know whether anyone else still holds it.
+    ULONG references() const { return refs_.load(); }
+
     virtual ~Object() {
         for (auto& entry : data_)
             if (entry.object) entry.object->Release();

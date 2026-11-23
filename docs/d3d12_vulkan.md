@@ -458,12 +458,13 @@ What is implemented (all of it testable without the game):
 
 - **DXGI Swapchain** (`runtime/shims/dxgi_swapchain.h`, `runtime/shims/dxgi_com.{h,cpp}`): `IDXGIFactory4` and
   `IDXGISwapChain3` over `VK_KHR_win32_surface` + `VkSwapchainKHR`, exposed via `rt::d3d12::create_dxgi_factory`.
-  Swapchain backbuffers are real `ID3D12Resource` COM objects (`BackBufferResource` inheriting from
-  `ID3D12ResourceStubs`) registered directly with `VulkanContext`, supporting `CreateSwapChainForHwnd`,
-  `GetCurrentBackBufferIndex`, `GetBuffer`, `CreateRenderTargetView`, `Present`, and `ResizeBuffers` (preserving
-  explicit buffer dimensions even when the HWND client size is unchanged via an offscreen backbuffer + blit path,
-  and exposing exactly the requested `BufferCount` even when Vulkan's native image count differs, in which case the
-  offscreen ring is the app-visible swapchain and each present blits the current slot into the acquired image).
+  Swapchain backbuffers are real `ID3D12Resource` COM objects (`BackBufferResource`, on the shared `Object` base
+  over `ID3D12ResourceStubs`, so names and private data work as on the host, section 4.10) registered directly with
+  `VulkanContext`, supporting `CreateSwapChainForHwnd`, `GetCurrentBackBufferIndex`, `GetBuffer`,
+  `CreateRenderTargetView`, `Present`, and `ResizeBuffers` (preserving explicit buffer dimensions even when the HWND
+  client size is unchanged via an offscreen backbuffer + blit path, and exposing exactly the requested `BufferCount`
+  even when Vulkan's native image count differs, in which case the offscreen ring is the app-visible swapchain and
+  each present blits the current slot into the acquired image).
   The factory answers up to `IDXGIFactory7` (D3D-2). `EnumAdapterByGpuPreference` returns the one Vulkan adapter
   at index 0 for every preference. It accepts a preference outside the enum, as the host does, and gives
   `DXGI_ERROR_INVALID_CALL` for a null `out` and `DXGI_ERROR_NOT_FOUND` past the end. The adapter list never
@@ -3468,7 +3469,11 @@ Games and middleware call these every frame (PIX events), so they must be cheap 
   live in the shared `Object` base, so the device, queues, allocators, lists, fences, descriptor heaps and
   resources all have them. Every answer is the host runtime's: `d3d12_private_data_test` runs the same 672 steps
   on the device, a fence, a buffer, an allocator and a descriptor heap of both devices and compares each HRESULT,
-  returned size, byte and reference count (RTX 3060, driver 610.88, no debug layer):
+  returned size, byte and reference count (RTX 3060, driver 610.88, no debug layer). Swapchain back buffers
+  (`BackBufferResource` in `dxgi_com.cpp`) use the same base since D3D-451: the test runs the script on both back
+  buffers of a host DXGI swapchain and of the layer's, and checks that a name and private data set on a buffer are
+  still there when `GetBuffer` hands it out again, and not on the other buffer (RX 9070 XT, driver 32.0.31044.16;
+  276 steps). Before that, `SetName` stored nothing and the other three answered `E_NOTIMPL`:
   - `SetPrivateDataInterface` holds a reference until the entry is replaced (by bytes or another interface),
     removed or the object is destroyed; `GetPrivateData` returns the pointer with a reference added. A null
     interface releases the one held and stays as a pointer-sized entry that reads back as null.
