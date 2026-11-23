@@ -30,7 +30,8 @@ resumes from the DDS files already written.
 
 **Bottom line:** the compact mip chain is decoded and validated below, and a clean-room
 stdlib-only BCPack decoder (`tools/bcpack.py`, `tools/bcpack_tables.py`,
-`tools/bcpack_tables_bptc.py`) now decodes the rANS entropy layer and rebuilds BC blocks
+`tools/bcpack_tables_bptc.py`, with `tools/bcpack_tool.py` as its command line) now decodes
+the rANS entropy layer and rebuilds BC blocks
 for all six active modes (BC1, BC3, BC4, BC5, BC6H and BC7 — 100% of BCPack codecs in the
 corpus). Strict confirmed-history mode is the default; `--allow-provisional` enables the
 provisional and last-resort history entries, and `--history <path>` supplies locally
