@@ -51,6 +51,7 @@ import random
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 W = H = 32
@@ -153,6 +154,15 @@ def job_env(base, timeout, variant, meta, gs):
     return env
 
 
+def _publish_vs_file(staged, cached):
+    try:
+        os.replace(staged, cached)
+    except PermissionError:
+        # On Windows a reader can hold the other worker's completed file open without delete sharing.
+        if os.name != "nt" or not os.path.isfile(cached):
+            raise
+
+
 def make_vs(glslang, meta, cache_dir):
     locs = sorted(meta.get("inputs", []))
     flats = set(meta.get("ps_flat_interpolants", [])) & set(locs)
@@ -160,13 +170,18 @@ def make_vs(glslang, meta, cache_dir):
     key = ("vs_" + ("_".join(map(str, locs)) if locs else "none") + ("_f" + "_".join(map(str, sorted(flats))) if flats else "")
            + "".join(f"_h{n}_{lo}_{hi}" for n, (lo, hi) in sorted(halves.items(), key=lambda kv: int(kv[0]))))
     spv = os.path.join(cache_dir, key + ".spv")
-    if not os.path.exists(spv):
-        src = spv[:-4] + ".vert"
+    if os.path.exists(spv):
+        return spv
+    with tempfile.TemporaryDirectory(dir=cache_dir) as staging:
+        src = os.path.join(staging, "shader.vert")
+        compiled = os.path.join(staging, "shader.spv")
         with open(src, "w", encoding="utf-8", newline="\n") as f:
             f.write(vs_glsl(locs, flats, halves))
-        r = subprocess.run([glslang, "-V", "-S", "vert", src, "-o", spv], capture_output=True, text=True)
+        r = subprocess.run([glslang, "-V", "-S", "vert", src, "-o", compiled], capture_output=True, text=True)
+        _publish_vs_file(src, spv[:-4] + ".vert")
         if r.returncode:
             raise SystemExit("glslangValidator failed: " + r.stdout[-300:])
+        _publish_vs_file(compiled, spv)
     return spv
 
 

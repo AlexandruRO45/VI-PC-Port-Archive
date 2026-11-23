@@ -8,10 +8,14 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import ps_sweep  # noqa: E402
@@ -113,6 +117,71 @@ class VertexShader(unittest.TestCase):
     def test_without_halves_the_text_is_unchanged(self):
         self.assertEqual(ps_sweep.vs_glsl([0, 2], {2}), ps_sweep.vs_glsl([0, 2], {2}, {}))
         self.assertNotIn("unpackHalf2x16", ps_sweep.vs_glsl([0, 2], {2}, None))
+
+
+class VertexShaderCache(unittest.TestCase):
+    def test_concurrent_worker_reads_only_a_complete_cache_entry(self):
+        partial_written = threading.Event()
+        finish = threading.Event()
+
+        def compile_shader(argv, **kwargs):
+            with open(argv[-1], "wb") as out:
+                out.write(b"first")
+                if argv[0] == "slow":
+                    out.flush()
+                    partial_written.set()
+                    self.assertTrue(finish.wait(10), "slow compiler never released")
+                out.write(b"-last")
+            return subprocess.CompletedProcess(argv, 0, stdout="")
+
+        with tempfile.TemporaryDirectory() as cache, patch.object(ps_sweep.subprocess, "run", compile_shader):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                slow = pool.submit(ps_sweep.make_vs, "slow", {}, cache)
+                try:
+                    self.assertTrue(partial_written.wait(10), "slow compiler never wrote its first bytes")
+                    path = ps_sweep.make_vs("fast", {}, cache)
+                    with open(path, "rb") as reader:
+                        self.assertEqual(reader.read(), b"first-last")
+                        finish.set()
+                        self.assertEqual(slow.result(timeout=10), path)
+                finally:
+                    finish.set()
+            self.assertEqual(Path(path).read_bytes(), b"first-last")
+            self.assertEqual(set(os.listdir(cache)), {"vs_none.vert", "vs_none.spv"})
+            self.assertEqual(Path(path).with_suffix(".vert").read_text(encoding="utf-8"), ps_sweep.vs_glsl([], set()))
+
+    def test_failed_compilation_is_retried_and_success_is_cached(self):
+        def compile_shader(argv, **kwargs):
+            failed = argv[0] == "fail"
+            Path(argv[-1]).write_bytes(b"partial" if failed else b"complete")
+            return subprocess.CompletedProcess(argv, int(failed), stdout="fake compiler diagnostic")
+
+        with tempfile.TemporaryDirectory() as cache, patch.object(
+            ps_sweep.subprocess, "run", side_effect=compile_shader
+        ) as run:
+            with self.assertRaisesRegex(SystemExit, "fake compiler diagnostic"):
+                ps_sweep.make_vs("fail", {}, cache)
+            self.assertFalse((Path(cache) / "vs_none.spv").exists())
+            path = ps_sweep.make_vs("retry", {}, cache)
+            self.assertEqual(Path(path).read_bytes(), b"complete")
+            self.assertEqual(ps_sweep.make_vs("cached", {}, cache), path)
+            self.assertEqual([call.args[0][0] for call in run.call_args_list], ["fail", "retry"])
+            self.assertEqual(set(os.listdir(cache)), {"vs_none.vert", "vs_none.spv"})
+
+    def test_late_compiler_failure_preserves_another_workers_success(self):
+        with tempfile.TemporaryDirectory() as cache:
+            def compile_shader(argv, **kwargs):
+                if argv[0] == "late":
+                    ps_sweep.make_vs("winner", {}, cache)
+                    Path(argv[-1]).write_bytes(b"partial")
+                    return subprocess.CompletedProcess(argv, 1, stdout="late failure")
+                Path(argv[-1]).write_bytes(b"complete")
+                return subprocess.CompletedProcess(argv, 0, stdout="")
+
+            with patch.object(ps_sweep.subprocess, "run", compile_shader):
+                with self.assertRaisesRegex(SystemExit, "late failure"):
+                    ps_sweep.make_vs("late", {}, cache)
+            self.assertEqual((Path(cache) / "vs_none.spv").read_bytes(), b"complete")
 
 
 class GeometryShaderLookup(unittest.TestCase):
