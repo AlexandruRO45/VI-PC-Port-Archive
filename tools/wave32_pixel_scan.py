@@ -204,9 +204,13 @@ def scan_directory(disasm):
     """Aggregate over one carve disasm directory: pixel-shader totals and per-family counts. No names."""
     report = {"ps": 0, "ps_wave32": 0, "crossing": 0, "quad_only": 0,
               "shaders": {f: 0 for f in FAMILIES}, "occurrences": {f: 0 for f in FAMILIES},
-              "only_family": {f: 0 for f in CROSSING}}
+              "only_family": {f: 0 for f in CROSSING}, "unreadable": 0}
     for path in scanned_paths(disasm):
-        info = parse_file(path)
+        try:
+            info = parse_file(path)
+        except (OSError, ValueError, RecursionError):  # counted, not a traceback, like feature_scan's listings
+            report["unreadable"] += 1
+            continue
         if rdna2spirv.stage_of(info["name"], path) != "ps":
             continue
         report["ps"] += 1
@@ -255,6 +259,8 @@ def main(argv=None) -> int:
     for fam in FAMILIES:
         only = " (%d with no other family)" % r["only_family"][fam] if fam in r["only_family"] else ""
         print("  %-12s %5d shaders, %6d instructions%s" % (fam, r["shaders"][fam], r["occurrences"][fam], only))
+    if r["unreadable"]:
+        print("%d listing(s) could not be read" % r["unreadable"])
     if args.out:
         with open(args.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(r, f, indent=1)

@@ -172,6 +172,29 @@ class ScanTests(unittest.TestCase):
             scan.main(["no_such_shaders_dir_xyz"])
         self.assertNotEqual(cm.exception.code, 0)
 
+    def test_unreadable_listing_is_counted_not_a_traceback(self):
+        # One .s listing that cannot be opened used to end the scan in an OSError traceback; it is counted now.
+        import builtins
+        import unittest.mock
+        with tempfile.TemporaryDirectory() as directory:
+            victim = os.path.join(directory, PS_LANE_ID[0])
+            with open(victim, "w", encoding="utf-8", newline="\n") as f:
+                f.write(PS_LANE_ID[1])
+            name2, text2 = VS_W32
+            with open(os.path.join(directory, name2), "w", encoding="utf-8", newline="\n") as f:
+                f.write(text2)
+            real_open = builtins.open
+
+            def deny_one(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(os.fspath(path))) == os.path.normcase(os.path.abspath(victim)):
+                    raise PermissionError(13, "denied", os.fspath(path))
+                return real_open(path, *args, **kwargs)
+
+            with unittest.mock.patch.object(builtins, "open", deny_one):
+                r = scan.scan_directory(directory)
+        self.assertEqual(r["unreadable"], 1)
+        self.assertEqual(r["ps"], 0)   # the unreadable listing is not counted as a shader
+
 
 if __name__ == "__main__":
     unittest.main()

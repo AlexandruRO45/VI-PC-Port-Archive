@@ -113,9 +113,14 @@ def scan_directory(disasm):
                          "mask_word_source": {"exec_vcc": Counter(), "other": Counter()}}
                  for stage in GRAPHICS}
     other = {"shaders": 0, "wave64": 0}
+    unreadable = 0
     paths = scanned_paths(disasm)
     for path in paths:
-        info = parse_file(path)
+        try:
+            info = parse_file(path)
+        except (OSError, ValueError, RecursionError):  # counted, not a traceback, like feature_scan's listings
+            unreadable += 1
+            continue
         stage = rdna2spirv.stage_of(info["name"], path)
         fssm_path = rdna2spirv.native_paths(path, info["name"])[0]
         try:
@@ -144,7 +149,7 @@ def scan_directory(disasm):
         bucket["occurrences"] = dict(sorted(bucket["occurrences"].items(), key=lambda kv: -kv[1]))
         bucket["mask_word_source"] = {part: dict(sorted(cnt.items(), key=lambda kv: -kv[1]))
                                       for part, cnt in bucket["mask_word_source"].items()}
-    return {"per_stage": per_stage, "other_stages": other}
+    return {"per_stage": per_stage, "other_stages": other, "unreadable": unreadable}
 
 
 def main(argv=None) -> int:
@@ -192,6 +197,8 @@ def main(argv=None) -> int:
             print("    mask-word sources (%s)" % "; ".join(parts))
     o = report["other_stages"]
     print("other stages: %d shaders, %d wave64 (not counted)" % (o["shaders"], o["wave64"]))
+    if report["unreadable"]:
+        print("%d listing(s) could not be read" % report["unreadable"])
     if args.out:
         with open(args.out, "w", encoding="utf-8", newline="\n") as f:
             json.dump(report, f, indent=1)

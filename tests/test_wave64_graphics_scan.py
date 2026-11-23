@@ -162,6 +162,31 @@ class ScanTests(unittest.TestCase):
             self.assertIn("v_mbcnt_hi_u32_b32", blob)
 
 
+    def test_unreadable_listing_is_counted_not_a_traceback(self):
+        # One .s listing that cannot be opened used to end the scan in an OSError traceback; it is counted now.
+        import builtins
+        import unittest.mock
+        with tempfile.TemporaryDirectory() as directory:
+            name, text = PS_W64_SENSITIVE
+            victim = os.path.join(directory, name)
+            with open(victim, "w", encoding="utf-8") as f:
+                f.write(text)
+            name2, text2 = VS_W64
+            with open(os.path.join(directory, name2), "w", encoding="utf-8") as f:
+                f.write(text2)
+            real_open = builtins.open
+
+            def deny_one(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(os.fspath(path))) == os.path.normcase(os.path.abspath(victim)):
+                    raise PermissionError(13, "denied", os.fspath(path))
+                return real_open(path, *args, **kwargs)
+
+            with unittest.mock.patch.object(builtins, "open", deny_one):
+                report = scan.scan_directory(directory)
+        self.assertEqual(report["unreadable"], 1)
+        self.assertEqual(report["per_stage"]["vs"]["shaders"], 1)   # the readable listing is still scanned
+        self.assertEqual(report["per_stage"]["ps"]["shaders"], 0)
+
 class CliTests(unittest.TestCase):
     def test_scan_ignores_shader_named_directories(self):
         with tempfile.TemporaryDirectory() as src:
