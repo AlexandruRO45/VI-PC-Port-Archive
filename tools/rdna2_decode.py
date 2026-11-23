@@ -980,10 +980,12 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             elif fn == "SRC2":
                 args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4)))
         if op_sel:
-            # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC).
-            nbits = nsrc if opc < 0x100 else (nsrc + 1)
-            bits = [(op_sel >> i) & 1 for i in range(nsrc)]
-            if nbits > nsrc:
+            # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC). v_permlane16_b32 and
+            # v_permlanex16_b32 are the exception: their op_sel holds only FI (bit 0) and BOUND_CTRL (bit 1),
+            # llvm-mc prints exactly those two bits with no destination selector, and bits 2-3 are unused.
+            nbits = 2 if opc in (0x377, 0x378) else (nsrc if opc < 0x100 else nsrc + 1)
+            bits = [(op_sel >> i) & 1 for i in range(min(nsrc, nbits))]
+            if nbits > len(bits):
                 bits.append((op_sel >> 3) & 1)
             mods.append(f"op_sel:[{','.join(str(b) for b in bits)}]")
         if clamp:
