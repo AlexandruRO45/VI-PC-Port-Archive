@@ -243,6 +243,56 @@ class Cli(unittest.TestCase):
             self.assertIn("No space left on device", err.getvalue())
 
 
+class OracleGuardTests(unittest.TestCase):
+    def test_check_modes_refuses_truncated_or_none_results(self):
+        fake_oracle = mock.MagicMock(arch="gfx1030")
+
+        # Truncated results (fewer results than kernels)
+        fake_oracle.run.return_value = [[0x3C0]] * 3  # expects 4 (2 modes * 2 waves)
+        with self.assertRaises(RuntimeError) as cm:
+            sw.check_modes(fake_oracle, ["keep16", "flush16"])
+        self.assertIn("the hardware runner returned 3 results for 4 kernels", str(cm.exception))
+
+        # None entry
+        fake_oracle.run.return_value = [None, [0x3C0], [0x3C0], [0x3C0]]
+        with self.assertRaises(RuntimeError) as cm:
+            sw.check_modes(fake_oracle, ["keep16", "flush16"])
+        self.assertIn("the oracle returned no result word (None)", str(cm.exception))
+
+        # Empty entry
+        fake_oracle.run.return_value = [[], [0x3C0], [0x3C0], [0x3C0]]
+        with self.assertRaises(RuntimeError) as cm:
+            sw.check_modes(fake_oracle, ["keep16", "flush16"])
+        self.assertIn("the oracle returned no result word ([])", str(cm.exception))
+
+    def test_sweep_refuses_truncated_or_none_results(self):
+        fake_oracle = mock.MagicMock(arch="gfx1030")
+
+        # Truncated results (expects 8 kernels for 65536 // PER_KERNEL)
+        fake_oracle.run.return_value = [[0] * (sw.PER_KERNEL // 2)] * 7
+        with self.assertRaises(RuntimeError) as cm:
+            sw.sweep(fake_oracle, "v_exp_f16", "keep16", 32)
+        self.assertIn("the hardware runner returned 7 results for 8 kernels", str(cm.exception))
+
+        # None entry
+        bad = [[0] * (sw.PER_KERNEL // 2)] * 8
+        bad[0] = None
+        fake_oracle.run.return_value = bad
+        with self.assertRaises(RuntimeError) as cm:
+            sw.sweep(fake_oracle, "v_exp_f16", "keep16", 32)
+        self.assertIn("kernel 0: no result", str(cm.exception))
+
+    def test_main_exits_2_on_harness_error(self):
+        fake_oracle = mock.MagicMock(device="fake-gpu", arch="gfx1030")
+        fake_oracle.run.return_value = []
+        out = io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=fake_oracle), redirect_stdout(out):
+            rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32"])
+        self.assertEqual(rc, 2)
+        self.assertIn("harness error:", out.getvalue())
+        fake_oracle.close.assert_called_once()
+
+
 class OnHardware(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
