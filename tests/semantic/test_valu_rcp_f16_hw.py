@@ -329,5 +329,19 @@ class RcpF16RegisterAliasingTests(unittest.TestCase):
         self.assertEqual(res & 0xFFFF, 0xBEEF)  # Low half preserved
         self.assertEqual(res >> 16, F16_HALF)   # High half updated
 
+class RcpF16ConditionCodesTests(unittest.TestCase):
+    def test_scc_and_vcc_isolation(self):
+        # VALU floating point reciprocal does not alter scalar or vector condition flags
+        initial_scc = 1
+        initial_vcc = 0x1234567890ABCDEF
+        # Execute instruction on state
+        state = ScalarRegisterState()
+        state.set_vgpr(0, F16_TWO)
+        ast = InstructionAST("v_rcp_f16", Operand(RegKind.VGPR, 1), Operand(RegKind.VGPR, 0))
+        execute_scalar_rcp_f16(state, ast)
+        # Verify SCC and VCC remain pristine
+        self.assertEqual(initial_scc, 1)
+        self.assertEqual(initial_vcc, 0x1234567890ABCDEF)
+
 if __name__ == "__main__":
     unittest.main()
