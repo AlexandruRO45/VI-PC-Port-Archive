@@ -576,5 +576,28 @@ class TestSSendMsgHaltRefusal(unittest.TestCase):
         self.assertEqual(str(cm.exception), "s_sendmsghalt")
 
 
+class TestSSendMsgHaltVariants(unittest.TestCase):
+    def test_sendmsghalt_numeric_message_refused(self):
+        for msg_id in (0, 1, 15, 255):
+            bad_lines = [
+                f"s_sendmsghalt {msg_id}",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm",
+            ]
+            with self.assertRaises(rdna2spirv.Unsupported) as cm:
+                support.translate_lines(f"ps_sendmsghalt_{msg_id}", bad_lines)
+            self.assertEqual(str(cm.exception), "s_sendmsghalt")
+
+    def test_sendmsghalt_named_message_refused(self):
+        bad_lines = [
+            "s_sendmsghalt sendmsg(MSG_ORDERED_PS_DONE)",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_sendmsghalt_ordered", bad_lines)
+        self.assertEqual(str(cm.exception), "s_sendmsghalt")
+
+
 if __name__ == "__main__":
     unittest.main()
