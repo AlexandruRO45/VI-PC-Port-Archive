@@ -105,10 +105,13 @@ def classify(window, base, stored):
     span.reverse()
     stores, header, limit, target, evidence = 0, None, None, None, False
     limit_regs = {}  # register -> limit offset, for `mov rdx,[list+30h]` ... `cmp rcx,rdx`
+    derived = set()  # registers holding the cursor or cursor + size at this point, e.g. `lea rdx,[rax+10h]`
     for i, (addr, mnem, ops) in enumerate(span):
+        cursor = touched | derived  # a compare is a limit check only when one of these is on the cursor's side
         if mnem == "mov" and (lr := LIMIT_LOAD.match(ops)) and lr.group(2) in bases and int(lr.group(3), 16) != 0x18:
             limit_regs[lr.group(1)] = int(lr.group(3), 16)
-        if mnem == "cmp" and (rr := COPY.match(ops)) and (rr.group(1) in touched or rr.group(1) in limit_regs):
+        if mnem == "cmp" and (rr := COPY.match(ops)) and (
+                rr.group(1) in cursor or (rr.group(1) in limit_regs and rr.group(2) in cursor)):
             nxt = span[i + 1] if i + 1 < len(span) else None
             if nxt and nxt[1] in UNSIGNED_JCC:
                 # the limit came from [list+X] here, or in a block that jumps to this one (REG_LIMIT)
@@ -123,12 +126,18 @@ def classify(window, base, stored):
         if (lf := LIST_FIELDS.search(ops)) and lf.group(1) in bases:
             evidence = True
         if mnem == "cmp" and (cm := CMP.match(ops)):
-            reg_base, disp = (cm.group(2), cm.group(3)) if cm.group(1) else (cm.group(4), cm.group(5))
-            if reg_base in bases and int(disp, 16) != 0x18:
+            reg, reg_base, disp = cm.group(1, 2, 3) if cm.group(1) else cm.group(6, 4, 5)
+            if reg in cursor and reg_base in bases and int(disp, 16) != 0x18:
                 limit = int(disp, 16)
                 nxt = span[i + 1] if i + 1 < len(span) else None
                 if nxt and nxt[1].startswith("j") and nxt[1] != "jmp" and (jt := JCC_TARGET.match(nxt[2])):
                     target = int(jt.group(1), 16)
+        if mnem == "mov" and (lm := LOAD.match(ops)) and lm.group(2) in bases:
+            derived.add(lm.group(1))
+        elif mnem in ("mov", "lea") and (src := (COPY if mnem == "mov" else LEA).match(ops)) and src.group(2) in cursor:
+            derived.add(src.group(1))
+        elif mnem not in ("add", "cmp", "test", "push"):  # an add keeps a cursor a cursor; another write ends it
+            derived.discard(ops.split(",", 1)[0])
     if not stores or base == "rsp":
         return None
     checked = limit is not None

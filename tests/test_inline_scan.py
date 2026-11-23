@@ -107,6 +107,41 @@ class InlineScanTests(unittest.TestCase):
         self.assertTrue(site["checked"])
         self.assertEqual(site["limit"], inline_scan.REG_LIMIT)
 
+    def test_a_compare_that_does_not_involve_the_cursor_is_not_a_check(self):
+        # r8 is unrelated to the cursor (rax): comparing it with another list field guards nothing.
+        for compare in (("cmp r8,qword ptr [rbx+48h]", "je 0000000140004000"),
+                        ("cmp qword ptr [rbx+48h],r8", "jae 0000000140004000"),
+                        ("mov rdx,qword ptr [rbx+48h]", "cmp rdx,r8", "jae 0000000140004000")):
+            with self.subTest(compare=compare):
+                (site,) = sites(UNGUARDED[:1] + compare + UNGUARDED[1:])
+                self.assertTrue(site["list"])
+                self.assertFalse(site["checked"])
+                self.assertIsNone(site["limit"])
+                self.assertIsNone(site["target"])
+
+    def test_an_unrelated_compare_after_the_limit_check_keeps_the_limit_and_the_fallback(self):
+        rows = list(GUARDED)
+        rows[3:3] = ["cmp r8,qword ptr [rbx+48h]", "je 0000000140004000"]
+        (site,) = sites(rows)
+        self.assertTrue(site["checked"])
+        self.assertEqual(site["limit"], 0x28)
+        self.assertEqual(site["fallback_slot"], 14)
+
+    def test_compare_of_the_advanced_cursor_in_another_register_is_a_check(self):
+        # rdx = cursor + size is compared, rax is the register that is advanced and stored back.
+        for advance in (("lea rdx,[rax+10h]",), ("mov rdx,rax", "add rdx,10h")):
+            for compare in ("cmp rdx,qword ptr [rbx+28h]", "cmp qword ptr [rbx+28h],rdx"):
+                with self.subTest(advance=advance, compare=compare):
+                    (site,) = sites(UNGUARDED[:1] + advance + (compare, "ja 0000000140002000") + UNGUARDED[1:])
+                    self.assertTrue(site["checked"])
+                    self.assertEqual(site["limit"], 0x28)
+
+    def test_a_register_overwritten_after_holding_the_cursor_is_not_the_cursor(self):
+        rows = UNGUARDED[:1] + ("lea rdx,[rax+10h]", "mov rdx,r9", "cmp rdx,qword ptr [rbx+48h]",
+                                "ja 0000000140004000") + UNGUARDED[1:]
+        (site,) = sites(rows)
+        self.assertFalse(site["checked"])
+
     def test_list_copied_to_another_register_is_followed(self):
         rows = (
             "mov rbx,rcx",
