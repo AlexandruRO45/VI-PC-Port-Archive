@@ -271,6 +271,13 @@ def heap_init_env():
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
+
+# cs_code_base.asm: the code base (push-constant dwords 34-35) is 0x800 and the four-word table sits at Xbox VA 0x880,
+# so the heap must hold 0x890 bytes (552 words); the shader reads it back through s_getpc_b64 + s_add_u32/s_addc_u32 +
+# s_load_dwordx4, then reads the last word at table offset 12 from a second s_getpc_b64 site.
+CODE_BASE = 0x800
+CODE_BASE_ENV = {"VKC_CODE_BASE": hex(CODE_BASE), "VKC_OUT_WORDS": "552"}
+CODE_BASE_WORDS = [0xCAFE0F00, 0x1234ABCD, 0x5EED0001, 0x9E3779B9, 0x9E3779B9]
 # cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
 # them; FMA_FUSED are the exact single-rounded words and FMA_SPLIT are the exact split-rounded words (derivations in
 # the .asm header; out[7] is f16 round-to-odd, never GLSL Fma, so it is always 0x7351). Under --fma khr
@@ -1551,6 +1558,8 @@ def main():
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
     results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
+    results.append(("cs_code_base", compute_test(tools, spirv, "cs_code_base", "1", "dump",
+                                                 expected_words=CODE_BASE_WORDS, env=CODE_BASE_ENV)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",

@@ -18,6 +18,9 @@
 //   subgroups not in invocation order print "not available", as a size that can't be pinned does.
 //   VKC_SGPRS=w4,w5,... (env): set s4, s5, ... (decimal or 0x hex, up to s31), the user SGPRs after the output V#,
 //   so a test can take input words (cs_user_sgprs.asm). They are zero otherwise. Same syntax as vk_harness's VKH_SGPRS.
+//   VKC_CODE_BASE=addr (env): the code base push constant (dwords 34-35), where the runtime puts a shader's FSSM blob
+//   in the Xbox VA window (docs/design.md, "Code-embedded data"). Whatever the shader finds at that address is read
+//   from the heap buffer. Zero otherwise.
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // LEONIDA_PC_TAIL_UBO=1 (modules from rdna2spirv.py --pc-tail-ubo): s0..s31 only, the rest at set 1 (vk_pc_tail.h).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
@@ -146,6 +149,13 @@ int main(int argc, char** argv) {
             return 2;
         }
         out_words = uint32_t(n);
+    }
+    uint32_t code_base = 0;
+    if (const char* code_base_env = std::getenv("VKC_CODE_BASE")) {
+        if (!parse_u32(code_base_env, code_base) || *code_base_env) {
+            std::fprintf(stderr, "VKC_CODE_BASE: expected one Xbox VA (decimal or 0x hex), got \"%s\"\n", code_base_env);
+            return 2;
+        }
     }
     std::ifstream f(argv[1], std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
@@ -357,6 +367,7 @@ int main(int argc, char** argv) {
 
     pc[0] = 0; pc[1] = 0; pc[2] = 0xFFFFFFFFu; pc[3] = 0x31016FACu;     // V#: base 0, stride 0, num_records max, OOB_SELECT 3 (raw)
     pc[32] = uint32_t(heap); pc[33] = uint32_t(heap >> 32);    // heap base
+    pc[34] = code_base;                                     // code base, as VKC_CODE_BASE gives it
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = qi;
     VkCommandPool pool; CHECK(vkCreateCommandPool(dev, &cpci, nullptr, &pool));

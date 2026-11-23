@@ -34,6 +34,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIEN
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
+from check import CODE_BASE_ENV, CODE_BASE_WORDS   # cs_code_base: the code base and the table read through it
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
@@ -936,6 +937,15 @@ def run_suite(a, work: str) -> int:
             vals = words[:len(HEAP_INIT_EXPECTED)] if words else []
             results.append((name, rc == 0 and vals == HEAP_INIT_EXPECTED,
                             " ".join(hex(x) for x in vals) if vals else msg))
+        elif name == "cs_code_base":
+            # Code-embedded data (cs_code_base.asm): the table at Xbox VA 0x880 read through the code base
+            # (VKC_CODE_BASE) with s_getpc_b64 + s_add_u32/s_addc_u32 + s_load.
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **CODE_BASE_ENV))
+            words = dump_words(msg)
+            vals = words[:len(CODE_BASE_WORDS)] if words else []
+            ok = rc == 0 and vals == CODE_BASE_WORDS
+            results.append((name, ok, f"{len(CODE_BASE_WORDS)}/{len(CODE_BASE_WORDS)} words exact" if ok
+                            else " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_user_sgprs":
             # vk_compute_test seeds s4..s7 from VKC_SGPRS; the shader stores them back.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **USER_SGPRS_ENV))
