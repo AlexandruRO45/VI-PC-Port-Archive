@@ -22,3 +22,7 @@ extern "C" BOOL WINAPI dll_thread_calls_main(HINSTANCE instance, DWORD reason, L
 extern "C" __declspec(dllexport) BOOL dll_thread_calls_bogus_handle() {
     return DisableThreadLibraryCalls(reinterpret_cast<HMODULE>(static_cast<uintptr_t>(0x10000)));
 }
+
+extern "C" __declspec(dllexport) DWORD WINAPI dll_exit_thread(void* module) {
+    FreeLibraryAndExitThread(static_cast<HMODULE>(module), 73);
+}

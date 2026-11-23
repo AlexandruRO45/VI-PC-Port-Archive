@@ -30,11 +30,11 @@ void check(bool ok, const std::string& what) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
+    if (argc > 2) {
         std::fprintf(stderr, "usage: dll_thread_calls_test <dll_thread_calls.dll>\n");
         return 2;
     }
-    const std::filesystem::path dll = argv[1];
+    const std::filesystem::path dll = argc == 2 ? argv[1] : "fixtures/RelWithDebInfo/dll_thread_calls.dll";
     try {
         rt::Loader loader(dll.parent_path());
         rt::Module& m = loader.load(dll);
@@ -71,6 +71,33 @@ int main(int argc, char** argv) {
         check(owned != nullptr, "the shims hand out a pseudo-handle for the module they own (xmem.dll)");
         check(disable != nullptr && owned != nullptr && disable(owned) == TRUE,
               "DisableThreadLibraryCalls on a shim pseudo-handle answers TRUE");
+
+        bool exit_shimmed = false;
+        for (const auto& r : m.imports)
+            if (r.name == "FreeLibraryAndExitThread") exit_shimmed = r.binding == rt::Binding::Shim;
+        check(exit_shimmed, "FreeLibraryAndExitThread import binds to the shim, not the host");
+        if (exit_shimmed) {
+            const auto worker = reinterpret_cast<LPTHREAD_START_ROUTINE>(m.exports.at("dll_exit_thread"));
+            auto run = [&](HMODULE module, const char* label) {
+                HANDLE thread = CreateThread(nullptr, 0, worker, module, 0, nullptr);
+                DWORD code = 0;
+                bool ok = thread && WaitForSingleObject(thread, 10000) == WAIT_OBJECT_0 &&
+                          GetExitCodeThread(thread, &code) && code == 73;
+                check(ok, label);
+                if (thread) CloseHandle(thread);
+            };
+            run(owned, "pseudo-handle worker exits with code 73");
+            run(reinterpret_cast<HMODULE>(m.base), "mapped module worker exits with code 73");
+            HMODULE host = LoadLibraryW(dll.c_str());
+            HMODULE second = LoadLibraryW(dll.c_str());
+            check(host && second == host, "host fixture has two references");
+            if (host && second) {
+                run(host, "host module worker exits with code 73");
+                FreeLibrary(second);
+                check(GetModuleHandleW(dll.filename().c_str()) == nullptr,
+                      "worker released exactly one host module reference");
+            }
+        }
     } catch (const std::exception& e) {
         std::printf("FAIL unexpected exception: %s\n", e.what());
         ++g_failures;

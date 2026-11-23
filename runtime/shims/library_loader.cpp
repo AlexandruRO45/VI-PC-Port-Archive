@@ -282,6 +282,13 @@ BOOL WINAPI free_library(HMODULE module) {
     return FreeLibrary(module);
 }
 
+// Mapped images remain live until ~Loader, so a thread can safely exit from its own image.
+// Like FreeLibrary, pseudo and mapped handles do not currently have individual reference counts.
+void WINAPI free_library_and_exit_thread(HMODULE module, DWORD exit_code) {
+    free_library(module);
+    ExitThread(exit_code);
+}
+
 // DisableThreadLibraryCalls(hinstance) from a mapped image's DllMain. The real function only accepts a module the
 // Windows loader mapped, so for ours it fails, and a DllMain that returns its result (the MSVC runtime's satellite
 // DLLs do) fails Loader::initialise() with "DllMain returned FALSE". Owned and mapped modules answer TRUE. The loader
@@ -302,6 +309,7 @@ BOOL WINAPI disable_thread_calls(HMODULE module) {
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
     {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)},                           \
+    {dll, "FreeLibraryAndExitThread", reinterpret_cast<void*>(&rt::shims::library_loader::free_library_and_exit_thread)}, \
     {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)}
 
 }  // namespace
