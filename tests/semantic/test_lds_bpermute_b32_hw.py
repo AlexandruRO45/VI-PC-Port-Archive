@@ -492,8 +492,82 @@ class TestIEEE754BoundaryExtremes(unittest.TestCase):
         self.assertTrue(all(v == QNAN for v in results))
 
 
+class TestNegativeControlsAndMutation(unittest.TestCase):
+    def test_negative_dst_rejection(self):
+        with self.assertRaises(TypeError):
+            DSBPermuteB32Instruction(
+                dst=Operand.sgpr(0),
+                vaddr=Operand.vgpr(1),
+                vdata=Operand.vgpr(2),
+            )
+
+    def test_negative_addr_rejection(self):
+        with self.assertRaises(TypeError):
+            DSBPermuteB32Instruction(
+                dst=Operand.vgpr(0),
+                vaddr=Operand.sgpr(1),
+                vdata=Operand.vgpr(2),
+            )
+
+    def test_negative_data_rejection(self):
+        with self.assertRaises(TypeError):
+            DSBPermuteB32Instruction(
+                dst=Operand.vgpr(0),
+                vaddr=Operand.vgpr(1),
+                vdata=Operand.sgpr(2),
+            )
+
+    def test_negative_syntax_rejection(self):
+        invalid_assemblies = [
+            "ds_bpermute_b32",
+            "ds_bpermute_b32 v1",
+            "ds_bpermute_b32 v1, v2",
+            "ds_bpermute_b32 s0, v1, v2",
+            "ds_bpermute_b32 v0, s1, v2",
+            "ds_bpermute_b32 v0, v1, s2",
+            "ds_bpermute_b32 v0, v1, v2 offset:-4",
+            "ds_bpermute_b32 v0, v1, v2 offset:70000",
+            "ds_bpermute_b32 v0, v1, v2 bad_modifier",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises((ValueError, TypeError)):
+                    DSBPermuteB32Instruction.parse(asm)
+
+    def test_mutation_omitted_byte_division(self):
+        # Mutated: using addr directly instead of addr // 4
+        # For addr = 16 (lane 4): correct reads lane 4, mutant reads lane 16
+        vdata = [i * 10 for i in range(32)]
+        correct = ref_ds_bpermute_b32(0, 16, vdata)
+        mutant = vdata[16 % 32]
+        self.assertEqual(correct, 40)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_inactive_lane_nonzero(self):
+        # Mutated: inactive lane reading local data instead of 0
+        vdata = [100 + i for i in range(32)]
+        exec_mask = 0xFFFFFFFF ^ (1 << 3)
+        correct = ref_ds_bpermute_b32(0, 3 * 4, vdata, exec_mask=exec_mask)
+        mutant = vdata[3]
+        self.assertEqual(correct, 0)
+        self.assertNotEqual(correct, mutant)
+
+    def test_translator_emits_subgroup_shuffle_and_ballot(self):
+        lines = [
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 42",
+            "ds_bpermute_b32 v3, v1, v2 offset:16",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bp_check", lines)
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+        self.assertIn("OpGroupNonUniformBallot", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
