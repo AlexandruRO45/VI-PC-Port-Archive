@@ -44,8 +44,12 @@
 namespace rt::d3d12_xs {
 namespace {
 
-constexpr unsigned kMaxSlots = 128;
-static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
+// The proxy table covers the PC device (ID3D12Device14, 83 slots) and the console's own methods past it, which
+// refuse_beyond_device answers with E_NOTIMPL and logs once. The retail title (game_scarlett_master.exe 1.0.2.1,
+// measured under gta6rt --run) calls device slot 133 during startup; with a 128-entry table that call read past the
+// table, found a null pointer and jumped to address 0 instead of getting the refusal.
+constexpr unsigned kMaxSlots = 256;
+static_assert(kMaxSlots > 133, "the proxy table must reach the console slots the title calls (133 measured)");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
               "the Xbox handle ABI is an 8-byte value in RAX; the heap thunk converts the PC hidden-pointer form");
