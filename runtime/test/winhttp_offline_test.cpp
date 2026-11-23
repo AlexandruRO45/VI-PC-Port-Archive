@@ -381,6 +381,15 @@ int main() {
         check(open(L"agent", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0x1) == nullptr &&
                   GetLastError() == ERROR_INVALID_PARAMETER,
               "WinHttpOpen rejects invalid flags");
+        SetLastError(0);
+        const auto incomplete_secure = open(L"agent", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr,
+                                            WINHTTP_FLAG_SECURE_DEFAULTS & ~WINHTTP_FLAG_ASYNC);
+        check(incomplete_secure == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+              "WinHttpOpen rejects SECURE_DEFAULTS without its ASYNC bit");
+        if (incomplete_secure) close(incomplete_secure);
+        const auto secure = open(L"agent", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, WINHTTP_FLAG_SECURE_DEFAULTS);
+        check(secure != nullptr, "WinHttpOpen accepts the full SECURE_DEFAULTS flag");
+        if (secure) close(secure);
 
         SetLastError(0);
         check(connect(session, L"example.invalid", 80, 1) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
@@ -403,6 +412,19 @@ int main() {
         SetLastError(0);
         check(connect(session, L"example.invalid:80", 80, 0) == nullptr && GetLastError() == ERROR_WINHTTP_INVALID_URL,
               "WinHttpConnect rejects port-containing server name");
+        for (const auto name : {L"example.invalid?x", L"example@invalid", L"bad..invalid", L"[example]", L"[::1",
+                                L"abc[::1]", L"[::1]:80", L"[1.2.3.4]"}) {
+            SetLastError(0);
+            const auto invalid = connect(session, name, 80, 0);
+            check(invalid == nullptr && GetLastError() == ERROR_WINHTTP_INVALID_URL,
+                  "WinHttpConnect rejects malformed host names and IPv6 literals");
+            if (invalid) close(invalid);
+        }
+        for (const auto name : {L"[::1]", L"[fe80::1%5]", L"host_name.invalid.", L"t\u00e9st.invalid"}) {
+            const auto valid = connect(session, name, 80, 0);
+            check(valid != nullptr, "WinHttpConnect accepts bracketed IPv6 and international host names");
+            if (valid) close(valid);
+        }
 
         SetLastError(0);
         check(open_request(connection, L"GET", L"/", nullptr, nullptr, nullptr, 0x1) == nullptr &&

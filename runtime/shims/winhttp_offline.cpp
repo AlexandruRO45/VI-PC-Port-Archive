@@ -26,6 +26,7 @@
 // to reach. Only images mapped by the loader see these: they are bound through the registry, the runtime's own code
 // calls the host directly.
 #include <windows.h>
+#include <in6addr.h>
 #include <winhttp.h>
 
 #include <atomic>
@@ -34,6 +35,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "shims.h"
@@ -187,14 +189,24 @@ BOOL fail(DWORD error) {
 
 bool is_invalid_server_name(LPCWSTR s) {
     if (!s || !*s) return true;
-    bool in_brackets = false;
-    for (const wchar_t* p = s; *p; ++p) {
-        if (*p <= 32) return true;  // spaces, tabs, control characters are refused (ERROR_WINHTTP_INVALID_URL)
-        if (*p == L'[') in_brackets = true;
-        else if (*p == L']') in_brackets = false;
-        else if (!in_brackets) {
-            if (*p == L'/' || *p == L'\\' || *p == L':') return true;
-        }
+    const std::wstring_view name(s);
+    if (name.front() == L'[') {
+        // Parse the numeric address and optional scope locally, without DNS or Winsock.
+        if (name.back() != L']') return true;
+        using ParseIpv6Fn = LONG (NTAPI*)(PCWSTR, IN6_ADDR*, PULONG, PUSHORT);
+        static const auto parse = reinterpret_cast<ParseIpv6Fn>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlIpv6StringToAddressExW"));
+        IN6_ADDR address{};
+        ULONG scope = 0;
+        USHORT port = 0;
+        return !parse || parse(s, &address, &scope, &port) != 0;
+    }
+
+    if (name.front() == L'.' || name.find(L"..") != std::wstring_view::npos) return true;
+    for (const wchar_t c : name) {
+        const bool valid = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                           (c >= L'0' && c <= L'9') || c == L'.' || c == L'-' || c == L'_' || c >= 0x80;
+        if (!valid) return true;
     }
     return false;
 }
@@ -213,8 +225,7 @@ HINTERNET WINAPI open_session(LPCWSTR, DWORD access_type, LPCWSTR proxy_name, LP
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    constexpr DWORD kAllowedSessionFlags = WINHTTP_FLAG_ASYNC | WINHTTP_FLAG_SECURE_DEFAULTS;
-    if ((flags & ~kAllowedSessionFlags) != 0) {
+    if (flags != 0 && flags != WINHTTP_FLAG_ASYNC && flags != WINHTTP_FLAG_SECURE_DEFAULTS) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
