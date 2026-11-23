@@ -18,7 +18,7 @@ use std::thread;
 use std::time::Instant;
 
 const USAGE: &str =
-    "bcpack_dds <pool.ttpf> <output> [--jobs N] [--selection FILE] [--calibration PROFILE.json] [--manifest FILE]";
+    "bcpack_dds <pool.ttpf> <output> [--jobs N] [--selection FILE] [--calibration PROFILE.json] [--entry-fits FITS.json] [--manifest FILE]";
 
 #[derive(Deserialize)]
 struct Selection {
@@ -34,6 +34,8 @@ struct Selection {
 
 #[derive(Deserialize)]
 struct Calibration {
+    #[serde(skip)]
+    fits: BTreeMap<u64, EntryFit>,
     version: u32,
     bc1: Option<Bc1Calibration>,
     bc3: Option<Bc3Calibration>,
@@ -49,6 +51,91 @@ struct Calibration {
     compatibility: BTreeMap<String, Vec<usize>>,
     #[serde(default)]
     entries: BTreeMap<String, BTreeMap<usize, String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Patch {
+    packed_offset: Option<usize>,
+    #[serde(default)]
+    bc7_endpoints: Vec<[usize; 3]>,
+    #[serde(default)]
+    bc7_indices: Vec<[usize; 3]>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EntryFit {
+    #[serde(default)]
+    bc1_endpoints: BTreeMap<u8, [u8; 6]>,
+    #[serde(default)]
+    bc5_endpoints: blocks::Seeds<[u8; 4]>,
+    #[serde(default)]
+    bc6h_endpoints: blocks::Seeds<[[u16; 4]; 3]>,
+    #[serde(default)]
+    strict: bool,
+    shared_base: Option<String>,
+    #[serde(default)]
+    chunks: Vec<Patch>,
+    packed_offset: Option<usize>,
+    #[serde(default)]
+    bc7_endpoints: Vec<[usize; 3]>,
+    #[serde(default)]
+    bc7_indices: Vec<[usize; 3]>,
+}
+
+fn apply_fields(
+    seed: &mut [[u8; 2]],
+    endpoints: &[[usize; 3]],
+    indices: &[[usize; 3]],
+) -> Result<()> {
+    for &[slot, field, value] in endpoints {
+        if slot >= 256 || field >= 24 || value > 255 {
+            return Err("invalid BC7 endpoint override".into());
+        }
+        seed[((256 - slot) % 256) * 56 + field] = [value as u8, 8];
+    }
+    for &[slot, field, value] in indices {
+        if slot >= 256 || field >= 32 || value > 15 {
+            return Err("invalid BC7 selector override".into());
+        }
+        seed[((256 - slot) % 256) * 56 + 24 + ((field + 16) % 32)] = [(value as u8) << 4, 8];
+    }
+    Ok(())
+}
+
+impl EntryFit {
+    fn decode(
+        &self,
+        bc7: &Bc7Calibration,
+        packed: &[u8],
+        length: usize,
+        offset: usize,
+        visible: &[usize],
+    ) -> Result<Vec<u8>> {
+        let name = self.shared_base.as_deref().unwrap_or("retail");
+        let mut seed = bc7.seed(name)?;
+        if self.packed_offset.is_none() || self.packed_offset == Some(offset) {
+            apply_fields(&mut seed, &self.bc7_endpoints, &self.bc7_indices)?;
+        }
+        for chunk in self
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.packed_offset == Some(offset))
+        {
+            apply_fields(&mut seed, &chunk.bc7_endpoints, &chunk.bc7_indices)?;
+        }
+        let mut state = blocks::FittedBc7::unpack(packed, length)?;
+        state.apply(
+            bc7.labels.as_slice().try_into()?,
+            bc7.anchors.as_slice().try_into()?,
+            &seed,
+        )?;
+        if visible.iter().any(|&i| state.ready[i] == 0) {
+            return Err("unresolved visible BC7 blocks using entry recipe".into());
+        }
+        Ok(state.blocks)
+    }
 }
 
 #[derive(Deserialize)]
@@ -238,7 +325,7 @@ impl Bc6hCalibration {
 
 enum Mode<'a> {
     Strict(&'a Profile),
-    Fitted(&'a Calibration, &'a str),
+    Fitted(&'a Calibration, &'a str, Option<&'a EntryFit>),
 }
 
 impl Mode<'_> {
@@ -276,12 +363,24 @@ impl Mode<'_> {
         };
         Ok(match self {
             Mode::Strict(profile) => blocks::decode(packed, length, codec, profile)?,
-            Mode::Fitted(profile, _) if codec == Codec::Bc1 => {
+            Mode::Fitted(profile, _, recipe) if codec == Codec::Bc1 => {
                 let bc1 = profile
                     .bc1
                     .as_ref()
                     .ok_or("profile has no fitted BC1 table")?;
-                let endpoints = bc1.endpoints.as_slice().try_into()?;
+                let mut endpoints: [[i32; 6]; 256] = bc1.endpoints.as_slice().try_into()?;
+                if let Some(recipe) = recipe {
+                    for (&slot, values) in &recipe.bc1_endpoints {
+                        if values
+                            .iter()
+                            .zip([31, 63, 31, 31, 63, 31])
+                            .any(|(&v, limit)| v > limit)
+                        {
+                            return Err("BC1 endpoint exceeds RGB565 component range".into());
+                        }
+                        endpoints[(256 - usize::from(slot)) % 256] = values.map(i32::from);
+                    }
+                }
                 let selectors: Vec<[u32; 256]> = bc1
                     .selectors
                     .iter()
@@ -297,12 +396,12 @@ impl Mode<'_> {
                 blocks::decode_fitted_bc1(
                     packed,
                     length,
-                    endpoints,
+                    &endpoints,
                     selectors.as_slice().try_into()?,
                     rotation.map_or(&[], Vec::as_slice),
                 )?
             }
-            Mode::Fitted(profile, _) if codec == Codec::Bc3 => {
+            Mode::Fitted(profile, _, _) if codec == Codec::Bc3 => {
                 let bc3 = profile
                     .bc3
                     .as_ref()
@@ -315,29 +414,60 @@ impl Mode<'_> {
                     bc3.alpha.as_slice().try_into()?,
                 )?
             }
-            Mode::Fitted(profile, name) if codec == Codec::Bc4 => {
+            Mode::Fitted(profile, name, _) if codec == Codec::Bc4 => {
                 let seeds = profile
                     .bc4
                     .get(*name)
                     .ok_or("profile has no fitted BC4 table for this entry")?;
                 blocks::decode_fitted_bc4(packed, length, seeds)?
             }
-            Mode::Fitted(profile, _) if codec == Codec::Bc5 => {
-                blocks::decode_fitted_bc5(packed, length, &profile.bc5)?
+            Mode::Fitted(profile, _, entry) if codec == Codec::Bc5 => {
+                let mut seeds = profile.bc5.clone();
+                if let Some(fit) = entry {
+                    seeds.extend(
+                        fit.bc5_endpoints
+                            .iter()
+                            .map(|(&slot, &values)| (slot, values)),
+                    );
+                }
+                blocks::decode_fitted_bc5(packed, length, &seeds)?
             }
-            Mode::Fitted(profile, _) if codec == Codec::Bc6h => {
+            Mode::Fitted(profile, _, fit) if codec == Codec::Bc6h => {
                 let profile = profile
                     .bc6h_profile
                     .as_ref()
                     .ok_or("profile has no fitted BC6H tables")?;
-                blocks::decode(packed, length, codec, profile)?
+                if let Some(recipe) = fit.filter(|r| !r.bc6h_endpoints.is_empty()) {
+                    let mut fitted = Profile {
+                        bc6h_endpoints: profile.bc6h_endpoints.clone(),
+                        bc6h_indices: profile.bc6h_indices.clone(),
+                        ..Profile::default()
+                    };
+                    for (&slot, channels) in &recipe.bc6h_endpoints {
+                        if channels
+                            .iter()
+                            .any(|p| p[1] >= 1024 || p[2] >= 64 || p[3] >= 64)
+                        {
+                            return Err("BC6H endpoint exceeds history precision".into());
+                        }
+                        fitted.bc6h_endpoints.insert(slot, *channels);
+                    }
+                    blocks::decode(packed, length, codec, &fitted)?
+                } else {
+                    blocks::decode(packed, length, codec, profile)?
+                }
             }
-            Mode::Fitted(profile, name) if codec == Codec::Bc7 => {
+            Mode::Fitted(profile, name, fit) if codec == Codec::Bc7 => {
                 let bc7 = profile
                     .bc7
                     .as_ref()
                     .ok_or("profile has no fitted BC7 table")?;
-                bc7.decode(packed, length, name, visible)?
+                match fit {
+                    Some(recipe) => {
+                        recipe.decode(bc7, packed, length, chunk.stored_start, visible)?
+                    }
+                    None => bc7.decode(packed, length, name, visible)?,
+                }
             }
             Mode::Fitted(..) => return Err("fitted codec requires the reference exporter".into()),
         })
@@ -594,6 +724,13 @@ fn entry(
         Ok(chunks) => chunks,
         Err(error) => return failed(error.to_string()),
     };
+    if selection.bcpack_only
+        && !pool.chunks[chunks.clone()]
+            .iter()
+            .any(|chunk| matches!(chunk.codec, 1 | 3..=7))
+    {
+        return json!({"index": index, "status": "skipped"});
+    }
     let layout = match Layout::new(texture, element, &pool.chunks[chunks.clone()]) {
         Ok(layout) if layout.allocation == span => layout,
         Ok(_) => {
@@ -602,13 +739,6 @@ fn entry(
         }
         Err(error) => return failed(error.to_string()),
     };
-    if selection.bcpack_only
-        && !pool.chunks[chunks]
-            .iter()
-            .any(|chunk| matches!(chunk.codec, 1 | 3..=7))
-    {
-        return json!({"index": index, "status": "skipped"});
-    }
     let supported = layout.mips.iter().all(|mip| {
         pool.chunks_for(texture.base + mip.offset, mip.region)
             .is_ok_and(|range| {
@@ -621,6 +751,10 @@ fn entry(
         return json!({"index": index, "status": "unsupported_codec", "format": texture.format,
            "format_name": format_name, "width": texture.width, "height": texture.height});
     }
+    let entry_fit = pool
+        .asset_keys
+        .get(index)
+        .and_then(|key| calibration?.fits.get(key));
     let fitted = |source: &mut File, profile: &Calibration| {
         if texture.dimension != 1
             || (texture.depth == 1
@@ -640,7 +774,7 @@ fn entry(
             texture,
             &layout,
             element,
-            Mode::Fitted(profile, name),
+            Mode::Fitted(profile, name, entry_fit),
         )
         .map(|data| (data, "fitted"))
     };
@@ -656,6 +790,8 @@ fn entry(
         .map(|data| (data, "strict"))
     };
     let result = match calibration {
+        _ if entry_fit.is_some_and(|fit| fit.strict) => encode_strict(source),
+        Some(profile) if entry_fit.is_some() => fitted(source, profile),
         Some(profile) if selection.prefer_fitted && texture.dimension == 1 => {
             fitted(source, profile)
         }
@@ -693,6 +829,7 @@ fn run() -> Result<()> {
     };
     let mut manifest = out.join("manifest.json");
     let mut calibration = None;
+    let mut entry_file = None;
     let mut jobs = thread::available_parallelism().map_or(4, |n| n.get().min(16));
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(USAGE)?;
@@ -705,6 +842,7 @@ fn run() -> Result<()> {
             }
             Some("--selection") => selection = serde_json::from_slice(&fs::read(value)?)?,
             Some("--manifest") => manifest = value.into(),
+            Some("--entry-fits") => entry_file = Some(value),
             Some("--calibration") => {
                 let mut profile: Calibration = serde_json::from_slice(&fs::read(value)?)?;
                 if profile.version != 1 {
@@ -728,6 +866,27 @@ fn run() -> Result<()> {
                 calibration = Some(profile);
             }
             _ => return Err(USAGE.into()),
+        }
+    }
+    if let Some(path) = entry_file {
+        let calibration = calibration
+            .as_mut()
+            .ok_or("--entry-fits requires --calibration")?;
+        let fits: BTreeMap<String, EntryFit> = serde_json::from_slice(&fs::read(path)?)?;
+        for (key, fit) in fits {
+            if key.len() != 16 {
+                return Err("expected a 16-digit hexadecimal asset key".into());
+            }
+            if fit.chunks.iter().any(|p| p.packed_offset.is_none()) {
+                return Err("each chunk override requires packedOffset".into());
+            }
+            if calibration
+                .fits
+                .insert(u64::from_str_radix(&key, 16)?, fit)
+                .is_some()
+            {
+                return Err("duplicate numeric asset key".into());
+            }
         }
     }
     let mut profile = Profile {

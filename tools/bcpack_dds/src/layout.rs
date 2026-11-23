@@ -170,7 +170,7 @@ impl Layout {
 
     fn volume(texture: Texture, element: usize) -> Result<Self> {
         let (bw, bh, bd, pattern) = match (texture.format, element) {
-            (54, 2) => (16, 8, 16, [0, 1, 2, 101, -1, 102, 3, -2, 103, 4, -3, 104]),
+            (54, 2) => (8, 16, 16, [0, 1, 101, -1, 102, -2, 2, 103, -3, 3, 104, -4]),
             (10, 8) => (8, 8, 8, [0, 0, 0, 1, 101, -1, 2, 102, -2, 3, 103, -3]),
             _ => return Err("unsupported volume format".into()),
         };

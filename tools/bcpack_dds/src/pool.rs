@@ -60,6 +60,7 @@ impl Texture {
 pub struct Pool {
     pub chunks: Vec<Chunk>,
     pub textures: Vec<Texture>,
+    pub asset_keys: Vec<u64>,
     spans: Vec<Option<usize>>,
 }
 
@@ -149,6 +150,13 @@ impl Pool {
             .chunks_exact(16)
             .map(Texture::read)
             .collect();
+        let key_count = count;
+        let mut key_bytes = vec![0; key_count * 8];
+        source.read_exact(&mut key_bytes)?;
+        let asset_keys = key_bytes
+            .chunks_exact(8)
+            .map(|key| word64(key, 0))
+            .collect();
         let mut spans = vec![None; textures.len()];
         let mut next_base = virtual_size;
         let mut next_distinct = virtual_size;
@@ -167,6 +175,7 @@ impl Pool {
         Ok(Self {
             chunks,
             textures,
+            asset_keys,
             spans,
         })
     }
