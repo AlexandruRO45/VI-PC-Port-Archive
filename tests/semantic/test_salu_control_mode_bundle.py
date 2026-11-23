@@ -225,6 +225,17 @@ class TestSetPrioLevels(unittest.TestCase):
             self.assertIn("OpCapability Shader", spv)
             si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestSetPrioBounds(unittest.TestCase):
+    def test_bounds(self):
+        self.assertEqual(model_setprio(-1), 0)
+        self.assertEqual(model_setprio(99), 3)
+
+    def test_translator_setprio_bounds(self):
+        prog = ["s_setprio 3", "s_endpgm"]
+        spv = support.translate_lines("cs_prio_bounds", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCapability Shader", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
