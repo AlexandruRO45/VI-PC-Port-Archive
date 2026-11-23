@@ -474,6 +474,21 @@ class TestDsReadU16SIMD(unittest.TestCase):
         for l in range(32):
             self.assertEqual(expr.eval(lds, l * 4), 0x1000 + l)
 
+class TestDsReadU16Translator(unittest.TestCase):
+    def test_translator_read_u16_execution(self) -> None:
+        body = [
+            "v_mov_b32_e32 v1, 0x80",
+            "v_mov_b32_e32 v2, 0x98765432",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_u16 v3, v1 offset:2",
+            "s_waitcnt lgkmcnt(0)",
+            "buffer_store_dword v3, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_read_u16_exec")
+        for l in range(32):
+            self.assertEqual(results[l], 0x9876)
+
 
 if __name__ == "__main__":
     unittest.main()
