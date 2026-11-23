@@ -458,5 +458,28 @@ class TestValuMin3F16ConditionCodes(unittest.TestCase):
         self.assertEqual(scc_after, 1)
         self.assertEqual(vcc_after, 0xFFFFFFFFFFFFFFFF)
 
+
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling
+# -----------------------------------------------------------------------------
+class TestValuMin3F16Ieee754Boundaries(unittest.TestCase):
+    """Commit 7: Boundary extremes, subnormals, infinities, and NaNs."""
+
+    def test_infinities(self):
+        self.assertEqual(ref_min3_f16(POS_INF, POS_ONE, POS_TWO), POS_ONE)
+        self.assertEqual(ref_min3_f16(NEG_INF, POS_ONE, POS_TWO), NEG_INF)
+        self.assertEqual(ref_min3_f16(POS_INF, POS_INF, POS_INF), POS_INF)
+        self.assertEqual(ref_min3_f16(NEG_INF, NEG_INF, POS_INF), NEG_INF)
+
+    def test_subnormals(self):
+        self.assertEqual(ref_min3_f16(POS_MIN_SUBNORM, POS_MAX_SUBNORM, POS_MIN_NORMAL), POS_MIN_SUBNORM)
+        self.assertEqual(ref_min3_f16(NEG_MIN_SUBNORM, NEG_MAX_SUBNORM, NEG_ZERO), NEG_MAX_SUBNORM)
+        self.assertEqual(ref_min3_f16(POS_MIN_SUBNORM, NEG_MIN_SUBNORM, POS_ZERO), NEG_MIN_SUBNORM)
+
+    def test_nans_and_gradual_underflow(self):
+        self.assertEqual(ref_min3_f16(QNAN_CANONICAL, POS_MIN_SUBNORM, POS_ONE), POS_MIN_SUBNORM)
+        self.assertEqual(ref_min3_f16(SNAN, QNAN_ALT, NEG_MAX_NORMAL), NEG_MAX_NORMAL)
+        self.assertTrue(is_nan16(ref_min3_f16(SNAN, QNAN_CANONICAL, QNAN_ALT)))
+
 if __name__ == '__main__':
     unittest.main()
