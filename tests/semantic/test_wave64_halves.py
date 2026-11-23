@@ -663,11 +663,11 @@ class ReviewRegressions(unittest.TestCase):
             "v_cmp_eq_u32_e32 vcc, 1, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execnz 2",
             "s_mov_b32 s5, 9", "s_branch 1", "v_mov_b32_e32 v8, 100", "s_or_b64 exec, exec, s[12:13]",
             "v_mov_b32_e32 v6, s5"]), "C", contains=["unsafe-execz-branch"])
-        # a VALU-only exec-zero side is refused too (kept simple: the side must be the join)
+        # Both sides only do lane work with unchanged EXEC, so the empty half is inert until the join.
         self.tier("ps_execz_valu", ps([
             "v_cmp_eq_u32_e32 vcc, 1, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_cbranch_execz 2",
             "v_mov_b32_e32 v6, 7", "s_branch 1", "v_mov_b32_e32 v6, 5", "s_or_b64 exec, exec, s[12:13]"]),
-            "C", contains=["unsafe-execz-branch"])
+            "A", [])
 
     def test_exec_zero_side_that_is_the_join_or_a_loop_exit_is_a_skip(self):
         self.tier("ps_execz_join", ps([

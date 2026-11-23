@@ -70,6 +70,11 @@ def _a_skip(i):
 def _a_uniform_vote(i):
     return (_x(i) + 7, 11, 36, 27)
 
+
+def _a_execz_diamond(i):
+    pixel = _x(i) == 5 and _y(i) == 7
+    return (_x(i) + 5 if pixel else 77, _y(i) + 7 if pixel else 88, 0, 0)
+
 CLEAR = 0xBF800000     # the harness clears the target to -1.0f: the words of a pixel no shader wrote
 
 
@@ -187,6 +192,7 @@ FIXTURES = {
     "ps_w64_a_swizzle": ("A", _a_swizzle, {}),
     "ps_w64_a_bpermute": ("A", _a_bpermute, {}),
     "ps_w64_a_uniform_vote": ("A", _a_uniform_vote, {"VKH_SGPRS": "0,0,0,0,9"}),
+    "ps_w64_a_execz_diamond": ("A", _a_execz_diamond, {}),
 
     "ps_w64_a_discard": ("A", _a_discard, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),

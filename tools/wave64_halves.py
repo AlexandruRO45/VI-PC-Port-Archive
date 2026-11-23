@@ -1315,6 +1315,8 @@ class Analysis:
             if run is None or skip is None or (self.reaches(run, n, -1) and not self.reaches(skip, n, -1)) \
                     or self.reaches(run, self.past_jumps(skip), n):
                 return
+            if self.exec_local_diamond(run, skip, n, st):
+                return
             if ev is not None:
                 ev["viol"].append(("unsafe-execz-branch", ins.get("pc"), op))
             return
@@ -1335,6 +1337,70 @@ class Analysis:
             ok = True
         if not ok and ev is not None:
             ev["viol"].append(("unsafe-vote-branch", ins.get("pc"), op))
+
+    def exec_local_diamond(self, run, skip, vote, st):
+        """Two straight EXEC-vote sides, with unchanged EXEC and no escaping scalar state.
+
+        An active half takes the wave's side. An empty half can take the other side, but arithmetic cannot
+        write any of its VGPRs. Both paths reach the same join with the same EXEC. Scalar writes are unmasked:
+        refuse any scalar destination read outside these sides (even a read before the vote, conservatively).
+        Every VGPR destination must be untainted and launch-uniform before the vote: narrowed writes can otherwise
+        hide partition-dependent values still held by inactive lanes (#4619).
+        This intentionally excludes memory, exports, nested branches, loops and every EXEC write.
+        """
+        def chain(start):
+            path, seen = [], {vote}
+            while start not in seen:
+                seen.add(start)
+                path.append(start)
+                if len(self.succ[start]) != 1:
+                    break
+                start = self.succ[start][0]
+            return path
+
+        if run is None or skip is None or st is None:
+            return False
+        left, right = chain(run), chain(skip)
+        common = set(left) & set(right)
+        if not common:
+            return False
+        join = next(b for b in left if b in common)
+        region = set(left[:left.index(join)] + right[:right.index(join)])
+        if not region:
+            return False
+        # An explicit list: no scalar stores, messages, mode changes, relative register accesses or lane spills.
+        scalar = {"s_mov_b32", "s_movk_i32", "s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32",
+                  "s_mul_i32", "s_and_b32", "s_or_b32", "s_xor_b32", "s_lshl_b32", "s_lshr_b32"}
+        written = set()
+        for b in region:
+            for ins in self.blocks[b]:
+                op = base_op(ins["op"])
+                dests, _, defs, _ = operands(ins)
+                if op in ("s_branch", "s_nop", "s_waitcnt"):
+                    continue
+                regs = {r for d in dests for r in _regs(d)} | set(defs)
+                if op in scalar:
+                    if any(not (r == "scc" or isinstance(r, tuple) and r[0] == "s") for r in regs):
+                        return False
+                elif op.startswith("v_") and op not in MOVREL_OPS and op != "v_writelane_b32":
+                    if not regs or any(not (isinstance(r, tuple) and r[0] == "v") for r in regs):
+                        return False
+                    if any(r[1] not in st["u"] or st["t"].get(r, 0) for r in regs):
+                        return False
+                else:
+                    return False
+                written.update(r for r in regs if not (isinstance(r, tuple) and r[0] == "v"))
+        for b, block in enumerate(self.blocks):
+            if b in region:
+                continue
+            for ins in block:
+                _, srcs, _, uses = operands(ins)
+                if written & ({r for x in srcs for r in _regs(x)} | set(uses)):
+                    return False
+                # Relative scalar reads can name a destination that is absent from the printed operands.
+                if written and base_op(ins["op"]) in ("s_movrels_b32", "s_movrels_b64"):
+                    return False
+        return True
 
     def kill_vote(self, n, op, reg):
         """Registers of the mask whose emptiness the branch ending block `n` tests (SCC or VCC = mask != 0), or None
