@@ -86,8 +86,11 @@ def main(argv=None) -> int:
     src, out = a.src, a.out
     if not os.path.isfile(src):
         ap.error(f"{src} is not a file")
-    if os.path.getsize(src) == 0:
-        ap.error(f"{src} is empty")
+    try:
+        if os.path.getsize(src) == 0:
+            ap.error(f"{src} is empty")
+    except OSError as e:          # removed between the isfile() above and here
+        ap.error(f"cannot read {src}: {e.strerror or e}")
     if os.path.isfile(out):
         ap.error(f"{out} is a file, not a folder")
     try:
@@ -95,6 +98,8 @@ def main(argv=None) -> int:
     except OSError as e:  # a regular file where a parent folder is expected
         ap.error(f"cannot create {out}: {e.strerror or e}")
     index, seen, used, bad = [], {}, set(), 0
+    index_path = os.path.join(out, "index.json")
+    stale_index = True   # an index.json from an earlier carve is dropped before the first payload is touched
     try:
         fh = open(src, "rb")
     except OSError as e:
@@ -136,6 +141,18 @@ def main(argv=None) -> int:
             pos = start + stored
             fname = file_name(name, seen, used)
             dxbc_path = os.path.join(out, fname)
+            if stale_index:
+                # A rerun must not leave an older index.json beside newer payloads: make_game takes its presence as
+                # proof that the carve finished. Drop it before the first payload, so a failure below leaves no
+                # index at all and the next build carves again; if it cannot be dropped, nothing has been touched.
+                try:
+                    os.unlink(index_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    print(f"ERROR: cannot replace {index_path}: {e.strerror or e}", file=sys.stderr)
+                    return 2
+                stale_index = False
             try:
                 with open(dxbc_path, "wb") as f:
                     f.write(data)
@@ -148,18 +165,24 @@ def main(argv=None) -> int:
         print(f"ERROR: no shaders carved from {src} (rejected candidates: {bad}).", file=sys.stderr)
         return 1
     # make_game.py takes index.json as proof the carve finished: write it last, under another name, then rename.
-    index_path = os.path.join(out, "index.json")
+    staging = None
     try:
-        with tempfile.TemporaryDirectory(dir=out, prefix=".shader-index-") as staging:
-            tmp = os.path.join(staging, "index.json")
-            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(index, f, indent=1)
-                f.flush()
-                os.fsync(f.fileno())
-            replace_retry(tmp, index_path)
+        staging = tempfile.TemporaryDirectory(dir=out, prefix=".shader-index-")
+        tmp = os.path.join(staging.name, "index.json")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(index, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        replace_retry(tmp, index_path)
     except OSError as e:
         print(f"ERROR: cannot write {index_path}: {e.strerror or e}", file=sys.stderr)
         return 2
+    finally:
+        if staging is not None:
+            try:
+                staging.cleanup()
+            except OSError as e:      # the index is published; say what is left behind instead of failing the run
+                print(f"WARNING: cannot remove {staging.name}: {e.strerror or e}", file=sys.stderr)
     from collections import Counter
     print(f"{len(index)} shaders carved, {bad} candidates rejected")
     print("stages:", dict(Counter(e["stage"] for e in index)))

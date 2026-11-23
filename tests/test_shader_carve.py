@@ -10,6 +10,7 @@ Validates tools/shader_carve.py without touching game files or proprietary asset
 - End-to-end archive carving, duplicate variant naming, filename character sanitization, and index.json output
 """
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -559,6 +560,66 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         with open(os.path.join(self.out, "index.json"), encoding="utf-8") as f:
             self.assertEqual([row["name"] for row in json.load(f)], ["valid"])
         self.assertFalse(any(os.path.isdir(os.path.join(self.out, name)) for name in os.listdir(self.out)))
+
+    def two_shader_archive(self, tag: bytes) -> bytes:
+        first = make_dxbc([(b"PRIV", tag + b"-first")])
+        second = make_dxbc([(b"PRIV", tag + b"-second")])
+        return make_rpf_entry("first", 1, first, entry_id=1) + make_rpf_entry("second", 2, second, entry_id=2)
+
+    def test_rerun_after_a_failed_payload_write_leaves_no_index(self):
+        # A rerun into a directory that already holds a completed carve: if a payload cannot be written, the old
+        # index.json must not survive beside newer payloads (make_game takes it as "the carve finished").
+        with open(self.archive, "wb") as f:
+            f.write(self.two_shader_archive(b"old"))
+        self.assertEqual(self.run_carve(self.archive, self.out).returncode, 0)
+        index_path = os.path.join(self.out, "index.json")
+        self.assertTrue(os.path.isfile(index_path))
+
+        os.remove(os.path.join(self.out, "second.dxbc"))
+        os.mkdir(os.path.join(self.out, "second.dxbc"))          # the second payload cannot be written
+        with open(self.archive, "wb") as f:
+            f.write(self.two_shader_archive(b"new"))
+        result = self.run_carve(self.archive, self.out)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR: cannot write", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(os.path.exists(index_path), "the stale index must not outlive a failed rerun")
+
+    def test_rerun_with_a_locked_index_touches_no_payload(self):
+        # If the stale index cannot be dropped, the carve aborts before the first payload: the published index and
+        # both payloads of the previous run stay byte-identical and consistent with each other.
+        with open(self.archive, "wb") as f:
+            f.write(self.two_shader_archive(b"old"))
+        self.assertEqual(self.run_carve(self.archive, self.out).returncode, 0)
+        index_path = os.path.join(self.out, "index.json")
+        before = {}
+        for name in sorted(os.listdir(self.out)):
+            with open(os.path.join(self.out, name), "rb") as f:
+                before[name] = f.read()
+        self.assertIn("index.json", before)
+
+        with open(self.archive, "wb") as f:
+            f.write(self.two_shader_archive(b"new"))
+        real_unlink = os.unlink
+
+        def locked(path, *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(index_path):
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_unlink(path, *args, **kwargs)
+
+        err = io.StringIO()
+        with mock.patch("shader_carve.os.unlink", side_effect=locked):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(shader_carve.main([self.archive, self.out]), 2)
+        self.assertIn("ERROR: cannot replace", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+        after = {}
+        for name in sorted(os.listdir(self.out)):
+            with open(os.path.join(self.out, name), "rb") as f:
+                after[name] = f.read()
+        self.assertEqual(after, before, "no payload or index may change when the stale index cannot be dropped")
 
     def test_unreadable_source_is_one_error_line(self):
         with open(self.archive, "wb") as f:
