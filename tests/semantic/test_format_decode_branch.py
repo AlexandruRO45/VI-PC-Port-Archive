@@ -1,13 +1,16 @@
-"""The run-time FORMAT decode of buffer_load_format (Gen.decode_any_format) branches to one format's decode.
+"""The run-time FORMAT decode of buffer_load_format gives every format's values (a code outside FORMATS gives zeros).
 
-Every code goes through the translator and the mini interpreter, which follows the branches, and is compared with a
-reference decoded here from the raw bits with exact quotients. A code outside FORMATS gives zeros.
+Every code goes through the translator and the mini interpreter and is compared with a reference decoded here from
+the raw bits with exact quotients. The shape of the translation (no branch per format) is in test_typed_load_flat.py.
 """
+import os
 import struct
+import sys
 import unittest
 from fractions import Fraction
 
-import support
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import support  # noqa: E402
 from spirv_mini_interp import half_to_float, run_fragment
 
 import rdna2spirv
@@ -60,20 +63,6 @@ class FormatDecodeBranchTests(unittest.TestCase):
             want = reference(code)
             if want is not None:
                 self.assertEqual(load(code), want, f"format {code}")
-
-    def test_only_the_chosen_decode_runs(self):
-        gen = rdna2spirv.Gen("ps")
-        gen.decode_any_format("%fmt", ["%w0", "%w1", "%w2", "%w3"])
-        lines = [ln.strip() for ln in gen.body]
-        merges = []
-        for ln in lines:
-            if ln.startswith("OpSelectionMerge"):
-                self.assertIn("DontFlatten", ln)
-                merges.append(ln.split()[1])
-            elif merges and ln == f"{merges[-1]} = OpLabel":
-                merges.pop()
-            elif "OpBitFieldUExtract" in ln or "OpIMul" in ln:
-                self.assertTrue(merges, f"decode work outside every branch: {ln}")
 
 
 if __name__ == "__main__":

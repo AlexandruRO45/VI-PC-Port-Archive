@@ -230,27 +230,32 @@ class TestFormatDecoderBoundary(unittest.TestCase):
         self.gen.decode_format(words, 7, fixed=False)
         self.assertEqual(len(self.gen.tbuffer_norm_fns), fns_count)
 
-    def test_decode_any_format_selection(self):
-        words = ["%w0", "%w1", "%w2", "%w3"]
-        initial_lines = len(self.gen.body)
-        comps = self.gen.decode_any_format("%run_fmt", words)
-        self.assertEqual(len(comps), 4)
-        emitted = "\n".join(self.gen.body[initial_lines:])
-        self.assertIn("OpIEqual %bool %run_fmt", emitted)
-        self.assertIn("OpSelect %uint", emitted)
+    def test_format_load_call_builds_and_caches_function(self):
+        words = ["%w0", "%w1", "%w2", "%w3", "%w4"]
+        self.assertEqual(self.gen.fmt_load_fns, {})
+        regs1 = self.gen.format_load_call("%fmt_var", "%d3", "%inb", "%bsh", words, 4, False)
+        self.assertEqual(len(regs1), 4)
+        self.assertEqual(list(self.gen.fmt_load_fns), [(4, False)])
+        first_fn = self.gen.fmt_load_fns[(4, False)]
 
-    def test_format_decode_call_builds_and_caches_function(self):
-        words = ["%w0", "%w1", "%w2", "%w3"]
-        self.assertIsNone(self.gen.fmt_fn)
-        comps1 = self.gen.format_decode_call("%fmt_var", words)
-        self.assertEqual(len(comps1), 4)
-        self.assertIsNotNone(self.gen.fmt_fn)
-        first_fn = self.gen.fmt_fn
+        # A second load of the same form reuses the function; another form gets its own, with fewer registers (d16)
+        regs2 = self.gen.format_load_call("%fmt_var2", "%d3", "%inb", "%bsh", words, 4, False)
+        self.assertEqual(len(regs2), 4)
+        self.assertIs(self.gen.fmt_load_fns[(4, False)], first_fn)
+        self.assertEqual(len(self.gen.format_load_call("%fmt_var", "%d3", "%inb", "%bsh", words, 3, True)), 2)
+        self.assertEqual(sorted(self.gen.fmt_load_fns), [(3, True), (4, False)])
 
-        # Subsequent call reuses the cached function
-        comps2 = self.gen.format_decode_call("%fmt_var2", words)
-        self.assertEqual(len(comps2), 4)
-        self.assertIs(self.gen.fmt_fn, first_fn)
+    def test_fmt_load_table_reads_every_format_of_formats(self):
+        tab = self.gen.fmt_load_table()
+        self.assertEqual(len(tab), 512)
+        for code, (_size, kind, widths) in self.gen.FORMATS.items():
+            for c in range(4):
+                entry = tab[4 * code + c]
+                field = c % len(widths)
+                self.assertEqual(entry >> 7 & 63, widths[field], (code, c))
+                self.assertEqual(entry & 127, sum(widths[:field]), (code, c))
+        for code in set(range(128)) - set(self.gen.FORMATS):
+            self.assertEqual([e & 0xFFFF for e in tab[4 * code:4 * code + 4]], [0] * 4, code)   # reads as zero
 
     def test_encode_format_saturation_and_boundary(self):
         fcomps = ["%f0", "%f1", "%f2", "%f3"]
