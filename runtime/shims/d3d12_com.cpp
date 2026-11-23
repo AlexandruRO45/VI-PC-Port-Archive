@@ -574,11 +574,16 @@ public:
                                         stencil, to_rects(count, rects)));
     }
 
-    // A null region discards the whole resource. Not allowed in a bundle.
+    // A null region discards the whole resource. Not allowed in a bundle or copy list; D3D12 also forbids discard
+    // rectangles on 3D textures (confirmed against Windows D3D12 and WARP).
     void STDMETHODCALLTYPE DiscardResource(ID3D12Resource* resource, const D3D12_DISCARD_REGION* region) override {
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        d3d12_trace::record("ID3D12GraphicsCommandList::DiscardResource");
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
+        if (!resource) return check(false);
         if (!region) return check(list_.discard({resource_id(resource), 0, 0, false, true}));
-        if (region->NumRects && !region->pRects) return check(false);
+        if (region->NumRects &&
+            (!region->pRects || resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D))
+            return check(false);
         check(list_.discard({resource_id(resource), region->FirstSubresource, region->NumSubresources,
                              region->NumRects != 0}));
     }

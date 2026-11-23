@@ -1183,6 +1183,25 @@ inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags& s
     access = static_cast<VkAccessFlags>(a2 & 0xFFFFFFFFull);
 }
 
+// Layouts that vkCmdPipelineBarrier may name as newLayout on the queue `vk` submits to. A discard barrier keeps the
+// image in its tracked layout (oldLayout = UNDEFINED -> newLayout = piece.layout), so on a non-direct queue (compute)
+// a graphics-only layout like COLOR_ATTACHMENT_OPTIMAL would violate VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-
+// 02820/02821/02822. Keeping contents is always spec-legal for DiscardResource, so skipping the barrier is safe.
+inline bool discard_layout_allowed(const ReplayFunctions& vk, VkImageLayout layout) {
+    if (layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
+    if (!vk.queue_stages) return true;
+    switch (layout) {
+    case VK_IMAGE_LAYOUT_GENERAL:
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        return true;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        return (vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) != 0;
+    default:
+        return false;
+    }
+}
+
 // A D3D12 barrier on a volume mip covers every W slice, including on devices with maintenance9.
 inline VkImageSubresourceRange layout_range(const ResourceBinding& resource, VkImageSubresourceRange range) {
     if (resource.volume) range.layerCount = VK_REMAINING_ARRAY_LAYERS;
@@ -3585,7 +3604,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 LayoutPieces pieces;
                 if (!tracker->pieces(id, range, pieces)) continue;
                 for (const auto& piece : pieces)
-                    if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED)
+                    if (detail::discard_layout_allowed(vk, piece.layout))
                         detail::image_barrier(vk, command_buffer, p.binding, piece.range, VK_IMAGE_LAYOUT_UNDEFINED,
                                               piece.layout, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                               any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);

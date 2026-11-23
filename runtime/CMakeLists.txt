@@ -1332,6 +1332,15 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_placed_dimensions PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
+    # DiscardResource Close() parity against the host runtime and WARP, invalid args, GPU readback & compute queue.
+    add_executable(d3d12_discard_resource_test test/d3d12_discard_resource_test.cpp)
+    target_link_libraries(d3d12_discard_resource_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_discard_resource_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_discard_resource_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_discard_resource COMMAND d3d12_discard_resource_test)
+    set_tests_properties(d3d12_discard_resource PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)
     target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com)
