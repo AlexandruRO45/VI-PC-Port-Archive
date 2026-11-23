@@ -423,5 +423,40 @@ class TestVCvtPknormI16F16ASTAndInterpreter(unittest.TestCase):
         self.assertEqual(res, 0x80017FFF)
         self.assertEqual(state.vgprs[2], 0x80017FFF)
 
+class TestVCvtPknormI16F16SIMDAndIEEE(unittest.TestCase):
+    def test_condition_code_neutrality(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0x5555555555555555
+        state.write_vgpr(0, 0x3C00)
+        state.write_vgpr(1, 0xBC00)
+        inst = ASTInstruction(
+            Opcode.V_CVT_PKNORM_I16_F16,
+            ASTOperand.vgpr(2),
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+        )
+        ScalarInterpreter().step(inst, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0x5555555555555555)
+
+    def test_register_aliasing(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, 0x3C00)
+        state.write_vgpr(1, 0xBC00)
+        inst = ASTInstruction(
+            Opcode.V_CVT_PKNORM_I16_F16,
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0x80017FFF)
+
+    def test_ieee754_nan_and_inf(self) -> None:
+        # lo: NaN -> 0; hi: Inf -> 0x7FFF
+        res = ref_v_cvt_pknorm_i16_f16(0x7E00, 0x7C00)
+        self.assertEqual(res, 0x7FFF0000)
+
 if __name__ == "__main__":
     unittest.main()
