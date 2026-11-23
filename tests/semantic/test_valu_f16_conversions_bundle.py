@@ -201,6 +201,18 @@ class TestVCvtF32F16Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0x3F800000)
 
+def ref_v_cvt_f16_u16(u16_val: int) -> int:
+    """Reference mathematical oracle for v_cvt_f16_u16."""
+    return float_to_f16_bits(float(u16_val & MASK16))
+
+
+class TestVCvtF16U16Oracle(unittest.TestCase):
+    def test_basic_values(self) -> None:
+        self.assertEqual(ref_v_cvt_f16_u16(0), 0x0000)
+        self.assertEqual(ref_v_cvt_f16_u16(1), 0x3C00)
+        self.assertEqual(ref_v_cvt_f16_u16(42), 0x5140)
+        self.assertEqual(ref_v_cvt_f16_u16(1024), 0x6400)
+
 
 if __name__ == "__main__":
     unittest.main()
