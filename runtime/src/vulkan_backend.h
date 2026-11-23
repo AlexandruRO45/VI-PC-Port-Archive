@@ -645,67 +645,142 @@ public:
     // the caller destroys the VkSemaphore.
     void cancel(VkSemaphore sem) {
         if (!sem) return;
-        std::vector<Entry> cancelled;
-        SignalEventFn fn = nullptr;
-        {
-            std::unique_lock lock(mutex_);
-            fn = signal_event_;
+        std::unique_lock lock(mutex_);
+        const SignalEventFn fn = signal_event_;
+        const std::thread::id me = std::this_thread::get_id();
+        std::vector<std::shared_ptr<DispatchSlot>> owned_slots;
+
+        auto prune_cancelled_owned = [&] {
+            owned_slots.erase(std::remove_if(owned_slots.begin(), owned_slots.end(), [&](const auto& slot) {
+                if (!slot->cancelled) return false;
+                const auto it = std::find(dispatching_.begin(), dispatching_.end(), slot);
+                if (it != dispatching_.end()) dispatching_.erase(it);
+                return true;
+            }), owned_slots.end());
+        };
+
+        auto has_pending_or_unstarted = [&] {
+            for (const Entry& e : pending_)
+                if (e.semaphore == sem) return true;
+            for (const auto& slot : dispatching_)
+                if (slot->semaphore == sem && !slot->active && !slot->cancelled) return true;
+            return false;
+        };
+
+        // Keep claimed entries registered as unstarted DispatchSlots in dispatching_ even across epoch_cv_.wait()
+        // so a re-entrant or concurrent cancel(sem) sees and claims them synchronously instead of letting them run
+        // after that cancel() returns.
+        auto claim_entries = [&] {
             std::size_t write = 0;
             for (std::size_t i = 0; i < pending_.size(); ++i) {
                 if (pending_[i].semaphore == sem) {
-                    cancelled.push_back(std::move(pending_[i]));
+                    auto slot = std::make_shared<DispatchSlot>();
+                    slot->semaphore = sem;
+                    slot->owner = me;
+                    slot->entry = std::move(pending_[i]);
+                    owned_slots.push_back(slot);
+                    dispatching_.push_back(slot);
                 } else {
                     if (write != i) pending_[write] = std::move(pending_[i]);
                     ++write;
                 }
             }
             pending_.resize(write);
-            // Entries already taken out of pending_ into a live ready batch but not yet started are claimed here
-            // so cancel() completes them (callback or event) synchronously before returning and before the caller
-            // destroys the semaphore, while dispatch_outside_lock() skips the claimed slot instead of touching it
-            // after cancel() returns.
-            for (const auto& slot : dispatching_) {
-                if (slot->semaphore == sem && !slot->active && !slot->cancelled) {
+            const std::size_t existing = dispatching_.size();
+            for (std::size_t i = 0; i < existing; ++i) {
+                const auto& slot = dispatching_[i];
+                if (slot->semaphore == sem && !slot->active && !slot->cancelled &&
+                    std::find(owned_slots.begin(), owned_slots.end(), slot) == owned_slots.end()) {
                     slot->cancelled = true;
-                    cancelled.push_back(std::move(slot->entry));
+                    auto mine = std::make_shared<DispatchSlot>();
+                    mine->semaphore = sem;
+                    mine->owner = me;
+                    mine->entry = std::move(slot->entry);
+                    owned_slots.push_back(mine);
+                    dispatching_.push_back(mine);
                 }
             }
-            if (waiting_ || callback_on_other_thread(sem)) {
+        };
+
+        while (true) {
+            prune_cancelled_owned();
+            claim_entries();
+            if (waiting_on(sem) || callback_on_other_thread(sem)) {
                 const std::uint64_t target_epoch = epoch_ + 1;
-                signal_wakeup_locked();
+                if (waiting_on(sem)) signal_wakeup_locked();
                 epoch_cv_.wait(lock, [this, sem, target_epoch] {
-                    return (!waiting_ || epoch_ >= target_epoch) && !callback_on_other_thread(sem);
+                    return (!waiting_on(sem) || epoch_ >= target_epoch) && !callback_on_other_thread(sem);
                 });
+                continue;
             }
-            if (!cancelled.empty()) {
-                dispatch_outside_lock(lock, cancelled, fn);
+            if (!owned_slots.empty()) {
+                dispatch_slots_outside_lock(lock, owned_slots, fn);
+                owned_slots.clear();
+                continue;
             }
+            if (!has_pending_or_unstarted()) break;
         }
     }
 
     void stop() {
+        const std::thread::id me = std::this_thread::get_id();
         std::thread to_join;
         {
             std::lock_guard lock(mutex_);
             stop_ = true;
             signal_wakeup_locked();
-            if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id())
+            if (thread_.joinable() && thread_.get_id() != me)
                 to_join = std::move(thread_);
         }
         cv_.notify_all();
         if (to_join.joinable()) to_join.join();
         std::unique_lock lock(mutex_);
-        if (worker_alive_ && worker_id_ != std::this_thread::get_id()) {
-            epoch_cv_.wait(lock, [this] { return !worker_alive_; });
-        }
-        if (!pending_.empty()) {
-            std::vector<Entry> drained = std::move(pending_);
-            pending_.clear();
-            dispatch_outside_lock(lock, drained, signal_event_);
+        while (true) {
+            if (worker_alive_ && worker_id_ != me) {
+                epoch_cv_.wait(lock, [this, me] { return !worker_alive_ || worker_id_ == me; });
+                continue;
+            }
+            if (!pending_.empty()) {
+                std::vector<Entry> drained = std::move(pending_);
+                pending_.clear();
+                stop_drainers_.push_back(me);
+                struct DrainGuard {
+                    FenceWaitDispatcher& self;
+                    std::unique_lock<std::mutex>& lock;
+                    std::thread::id me;
+                    ~DrainGuard() {
+                        if (!lock.owns_lock()) lock.lock();
+                        const auto it = std::find(self.stop_drainers_.begin(), self.stop_drainers_.end(), me);
+                        if (it != self.stop_drainers_.end()) self.stop_drainers_.erase(it);
+                        self.epoch_cv_.notify_all();
+                    }
+                } drain_guard{*this, lock, me};
+                dispatch_outside_lock(lock, drained, signal_event_);
+                continue;
+            }
+            if (any_other_stop_draining()) {
+                epoch_cv_.wait(lock, [this] { return !any_other_stop_draining(); });
+                continue;
+            }
+            break;
         }
     }
 
 private:
+    // True when another thread is currently inside stop() draining pending_ callbacks outside mutex_.
+    bool any_other_stop_draining() const {
+        const std::thread::id me = std::this_thread::get_id();
+        return std::any_of(stop_drainers_.begin(), stop_drainers_.end(), [&](std::thread::id id) {
+            return id != me;
+        });
+    }
+
+    // True only when vkWaitSemaphores is currently blocked with `sem` in its wait array.
+    // semaphores_ is populated only while holding mutex_ before waiting_ becomes true and is read-only during the wait.
+    bool waiting_on(VkSemaphore sem) const {
+        return waiting_ && std::find(semaphores_.begin(), semaphores_.end(), sem) != semaphores_.end();
+    }
+
     // True only for a callback already running on another thread. A slot that has not started yet is claimed by
     // cancel() and skipped by the batch loop, so it never uses a destroyed semaphore and must not hold up cancel().
     bool callback_on_other_thread(VkSemaphore sem) const {
@@ -715,22 +790,10 @@ private:
         });
     }
 
-    // mutex_ is held on entry and again on return. Recording every entry before unlocking closes the window where
-    // a batch has left pending_ but has not started its callback yet, so cancel() can claim not-yet-started entries
-    // and run them before returning while waiting on any entry already active on another thread.
-    void dispatch_outside_lock(std::unique_lock<std::mutex>& lock, std::vector<Entry>& entries, SignalEventFn fn) {
-        const std::thread::id me = std::this_thread::get_id();
-        std::vector<std::shared_ptr<DispatchSlot>> slots;
-        slots.reserve(entries.size());
-        for (Entry& e : entries) {
-            auto slot = std::make_shared<DispatchSlot>();
-            slot->semaphore = e.semaphore;
-            slot->owner = me;
-            slot->entry = std::move(e);
-            slots.push_back(slot);
-            dispatching_.push_back(slot);
-        }
-        entries.clear();
+    // mutex_ is held on entry and again on return. Runs pre-registered DispatchSlots outside mutex_, skipping any
+    // slot claimed by cancel() before it started.
+    void dispatch_slots_outside_lock(std::unique_lock<std::mutex>& lock,
+                                     std::vector<std::shared_ptr<DispatchSlot>>& slots, SignalEventFn fn) {
         lock.unlock();
         for (std::size_t i = 0; i < slots.size(); ++i) {
             DispatchSlot& slot = *slots[i];
@@ -764,6 +827,25 @@ private:
             if (it != dispatching_.end()) dispatching_.erase(it);
         }
         epoch_cv_.notify_all();
+    }
+
+    // mutex_ is held on entry and again on return. Recording every entry before unlocking closes the window where
+    // a batch has left pending_ but has not started its callback yet, so cancel() can claim not-yet-started entries
+    // and run them before returning while waiting on any entry already active on another thread.
+    void dispatch_outside_lock(std::unique_lock<std::mutex>& lock, std::vector<Entry>& entries, SignalEventFn fn) {
+        const std::thread::id me = std::this_thread::get_id();
+        std::vector<std::shared_ptr<DispatchSlot>> slots;
+        slots.reserve(entries.size());
+        for (Entry& e : entries) {
+            auto slot = std::make_shared<DispatchSlot>();
+            slot->semaphore = e.semaphore;
+            slot->owner = me;
+            slot->entry = std::move(e);
+            slots.push_back(slot);
+            dispatching_.push_back(slot);
+        }
+        entries.clear();
+        dispatch_slots_outside_lock(lock, slots, fn);
     }
 
     // Only signals wakeup_sem_ when run() is actively waiting (waiting_ == true) on wakeup_val_ + 1,
@@ -895,6 +977,7 @@ private:
     std::condition_variable epoch_cv_;
     std::vector<Entry> pending_;
     std::vector<std::shared_ptr<DispatchSlot>> dispatching_;  // ready-batch callbacks outside mutex_
+    std::vector<std::thread::id> stop_drainers_;              // threads currently draining pending_ in stop()
     std::vector<VkSemaphore> semaphores_;
     std::vector<std::uint64_t> values_;
     std::uint64_t epoch_ = 0;

@@ -13,7 +13,13 @@
 //   5. Non-DEVICE_LOST errors (VK_ERROR_OUT_OF_HOST_MEMORY) from vkWaitSemaphores and
 //      vkGetSemaphoreCounterValue back off cleanly instead of spinning at 100% CPU, keep
 //      device_lost_ false, and recover once the error clears.
-// Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
+//   6. Claimed-but-waiting entries in cancel(S) remain visible in dispatching_ across the
+//      epoch_cv_ wait, so a re-entrant cancel(S) from an active callback A for S claims and
+//      completes B synchronously before returning rather than letting the other thread run B
+//      after the nested cancel returns.
+//   7. Concurrent stop() waits for another stop()'s entire pending_ drain (not just worker exit),
+//      while a re-entrant stop() inside a drained callback still returns without deadlocking.
+// Skips with exit code 77 when no Vulkan 1.3 device is available; fails on DeviceStatus::failed. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
 
@@ -152,7 +158,9 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     vktest::Device d;
-    if (!d.create(false)) {
+    const vktest::DeviceStatus status = d.initialize(false);
+    if (status == vktest::DeviceStatus::failed) return 1;
+    if (status == vktest::DeviceStatus::unavailable) {
         std::printf("SKIP: no suitable Vulkan 1.3 device\n");
         return 77;
     }
@@ -523,6 +531,149 @@ int main() {
         ctx.cancel_fence_waits(f_cnt.semaphore());
     }
     std::printf("fence dispatcher edge 5: transient OOM backoff and recovery ok\n");
+
+    // 6. Claimed entries stay visible across cancel()'s wait: worker callback A for S enqueues B for S and blocks;
+    //    another thread calls cancel(S) (claiming B and waiting on A); A then re-entrantly calls cancel(S).
+    //    B must run strictly before the nested cancel(S) returns, never after.
+    for (int iter = 0; iter < 5; ++iter) {
+        driver::reset_faults();
+        VulkanContext ctx(driver::get_device, d.device, true);
+        EXPECT(ctx.loaded());
+        VulkanFence fence_s(ctx, 0);
+        const VkSemaphore sem_s = fence_s.semaphore();
+        EXPECT(sem_s != VK_NULL_HANDLE);
+
+        std::mutex mu;
+        std::condition_variable cv;
+        bool b_enqueued = false, release_a = false, a_done = false;
+        bool t2_started = false, t2_done = false;
+        bool nested_cancel_returned = false, b_after_nested_cancel = false;
+        int b_calls = 0;
+
+        ctx.enqueue_fence_callback(sem_s, 1, [&] {
+            ctx.enqueue_fence_callback(sem_s, 99, [&] {
+                std::lock_guard lk(mu);
+                ++b_calls;
+                if (nested_cancel_returned) b_after_nested_cancel = true;
+            });
+            {
+                std::unique_lock lk(mu);
+                b_enqueued = true;
+                cv.notify_all();
+                cv.wait(lk, [&] { return release_a; });
+            }
+            ctx.cancel_fence_waits(sem_s);
+            {
+                std::lock_guard lk(mu);
+                nested_cancel_returned = true;
+                a_done = true;
+            }
+            cv.notify_all();
+        });
+        EXPECT(wait_until_wait_sem_count(2));
+        EXPECT(fence_s.signal(1));
+        EXPECT(wait_flag(mu, cv, b_enqueued));
+
+        std::thread t2([&] {
+            {
+                std::lock_guard lk(mu);
+                t2_started = true;
+            }
+            cv.notify_all();
+            ctx.cancel_fence_waits(sem_s);
+            {
+                std::lock_guard lk(mu);
+                t2_done = true;
+            }
+            cv.notify_all();
+        });
+        EXPECT(wait_flag(mu, cv, t2_started));
+        // Give t2 time to enter cancel(sem_s), claim B, and park on epoch_cv_ waiting for active A.
+        {
+            std::unique_lock lk(mu);
+            EXPECT(!cv.wait_for(lk, std::chrono::milliseconds(40), [&] { return t2_done; }));
+            release_a = true;
+        }
+        cv.notify_all();
+        EXPECT(wait_flag(mu, cv, a_done));
+        EXPECT(wait_flag(mu, cv, t2_done));
+        t2.join();
+
+        {
+            std::lock_guard lk(mu);
+            EXPECT(b_calls == 1);
+            EXPECT(!b_after_nested_cancel);
+        }
+        ctx.cancel_fence_waits(sem_s);
+    }
+    std::printf("fence dispatcher edge 6: re-entrant cancel claims waiting cancel()'s entries (5/5) ok\n");
+
+    // 7. Concurrent stop() must wait until another stop() finishes draining pending_ callbacks (after worker exit),
+    //    while a re-entrant stop() inside the drained callback returns without deadlocking.
+    {
+        driver::reset_faults();
+        VulkanContext ctx(driver::get_device, d.device, true);
+        EXPECT(ctx.loaded());
+        VulkanFence fence_p(ctx, 0);
+        EXPECT(fence_p.semaphore() != VK_NULL_HANDLE);
+
+        std::atomic<bool> lost{false};
+        FenceWaitDispatcher disp(d.device, ctx.vk, lost);
+
+        std::mutex mu;
+        std::condition_variable cv;
+        bool p_entered = false, release_p = false, reentrant_stop_ok = false, p_done = false;
+        bool s1_done = false, s2_done = false;
+
+        disp.enqueue_callback(fence_p.semaphore(), 100, [&] {
+            {
+                std::unique_lock lk(mu);
+                p_entered = true;
+                cv.notify_all();
+                cv.wait(lk, [&] { return release_p; });
+            }
+            // Re-entrant stop() from inside the drained callback must not deadlock.
+            disp.stop();
+            {
+                std::lock_guard lk(mu);
+                reentrant_stop_ok = true;
+                p_done = true;
+            }
+            cv.notify_all();
+        });
+        EXPECT(wait_until_wait_sem_count(2));
+
+        // s1 stops the worker (worker exits), then begins draining pending_ and blocks inside P.
+        std::thread s1([&] {
+            disp.stop();
+            std::lock_guard lk(mu);
+            s1_done = true;
+            cv.notify_all();
+        });
+        EXPECT(wait_flag(mu, cv, p_entered));
+
+        // Now worker_alive_ is false and pending_ is empty, while s1 is still executing P.
+        // A second concurrent stop() must wait until s1 finishes draining P.
+        std::thread s2([&] {
+            disp.stop();
+            std::lock_guard lk(mu);
+            s2_done = true;
+            cv.notify_all();
+        });
+        {
+            std::unique_lock lk(mu);
+            EXPECT(!cv.wait_for(lk, std::chrono::milliseconds(150), [&] { return s2_done; }));
+            release_p = true;
+        }
+        cv.notify_all();
+        EXPECT(wait_flag(mu, cv, p_done));
+        EXPECT(wait_flag(mu, cv, s1_done));
+        EXPECT(wait_flag(mu, cv, s2_done));
+        s1.join();
+        s2.join();
+        EXPECT(reentrant_stop_ok);
+    }
+    std::printf("fence dispatcher edge 7: concurrent stop() waits for drain completion & re-entrant stop ok\n");
 
     EXPECT(!driver::destroyed_null_or_garbage.load(std::memory_order_acquire));
     EXPECT(d.validation_errors() == 0);
