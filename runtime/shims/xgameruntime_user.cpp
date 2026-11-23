@@ -414,7 +414,8 @@ void raise_user_change(XUserChangeEvent event) {
     std::vector<std::shared_ptr<UserRegistration>> registrations;
     {
         std::lock_guard<std::mutex> lock(g_tokens_mutex);
-        for (const auto& entry : g_tokens) registrations.push_back(entry.second);
+        for (const auto& entry : g_tokens)
+            if (entry.second->active) registrations.push_back(entry.second);
     }
     for (const auto& registration : registrations) {
         if (!registration->queue) continue;

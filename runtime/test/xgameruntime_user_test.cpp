@@ -194,6 +194,20 @@ int main(int argc, char** argv) {
         while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
         check(result.calls == 1, "queued callback suppressed after unregister");
     }
+    struct SelfUnregister { void* user; Unregister unregister; XTaskQueueRegistrationToken token; int calls; } self{user, at<Unregister>(user, 34), {}, 0};
+    auto self_callback = [](void* ctx, XUserLocalId, uint32_t) {
+        auto* s = static_cast<SelfUnregister*>(ctx);
+        ++s->calls;
+        s->unregister(s->user, s->token, true);
+        for (int i = 0; i < 4096; ++i) rt::shims::xgameruntime_user_raise_change_for_test(0);
+    };
+    check(at<Register>(user, 33)(user, manual, &self, self_callback, &self.token) == S_OK,
+          "register self-unregistering callback");
+    rt::shims::xgameruntime_user_raise_change_for_test(0);
+    XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0);
+    int extra_dispatches = 0;
+    while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) ++extra_dispatches;
+    check(self.calls == 1 && extra_dispatches == 0, "inactive registration submits no extra dispatches");
     XTaskQueueHandle saved_process = nullptr;
     check(XTaskQueueGetCurrentProcessTaskQueue(&saved_process), "save process queue");
     XTaskQueueSetCurrentProcessTaskQueue(nullptr);
