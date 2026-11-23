@@ -207,5 +207,118 @@ class TestDsPermuteOracleAndArchitecturalModel(unittest.TestCase):
         self.assertEqual(res[0], 0)
         self.assertEqual(res[32], 0)
 
+
+class OperandType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class ASTNode:
+    pass
+
+
+@dataclass(frozen=True)
+class RegisterNode(ASTNode):
+    name: str
+    index: int
+    is_vector: bool = True
+
+    def __str__(self) -> str:
+        return f"{'v' if self.is_vector else 's'}{self.index}"
+
+
+@dataclass(frozen=True)
+class ImmediateNode(ASTNode):
+    value: int
+
+    def __str__(self) -> str:
+        return hex(self.value) if self.value > 9 else str(self.value)
+
+
+@dataclass(frozen=True)
+class DsPermuteInsn(ASTNode):
+    dst: RegisterNode
+    addr: RegisterNode
+    data: RegisterNode
+    offset: int = 0
+
+    def __str__(self) -> str:
+        mod = f" offset:{self.offset}" if self.offset else ""
+        return f"ds_permute_b32 {self.dst}, {self.addr}, {self.data}{mod}"
+
+
+def parse_ds_permute_line(line: str) -> DsPermuteInsn:
+    """Parse a ds_permute_b32 assembly line into a symbolic AST node."""
+    clean = line.strip().split(";")[0].strip()
+    if not clean.startswith("ds_permute_b32"):
+        raise ValueError(f"Not a ds_permute_b32 instruction: {line}")
+
+    body = clean[len("ds_permute_b32"):].strip()
+    parts = [p.strip() for p in body.split(",") if p.strip()]
+    if len(parts) < 3:
+        raise ValueError(f"Malformed ds_permute_b32 instruction, expected 3 operands: {line}")
+
+    def parse_reg(tok: str) -> RegisterNode:
+        m = re.match(r"^([vs])(\d+)$", tok.strip())
+        if not m:
+            raise ValueError(f"Invalid register operand: {tok}")
+        return RegisterNode(name=tok.strip(), index=int(m.group(2)), is_vector=(m.group(1) == "v"))
+
+    dst = parse_reg(parts[0])
+    addr = parse_reg(parts[1])
+
+    data_tok = parts[2]
+    offset = 0
+    if "offset:" in data_tok:
+        subparts = data_tok.split()
+        data = parse_reg(subparts[0])
+        for sp in subparts[1:]:
+            if sp.startswith("offset:"):
+                off_val_str = sp.split(":")[1]
+                offset = int(off_val_str, 0)
+    else:
+        data = parse_reg(data_tok)
+
+    return DsPermuteInsn(dst=dst, addr=addr, data=data, offset=offset)
+
+
+class TestDsPermuteSymbolicAST(unittest.TestCase):
+    """Part 2: Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_immutability(self) -> None:
+        dst = RegisterNode("v10", 10)
+        addr = RegisterNode("v1", 1)
+        data = RegisterNode("v2", 2)
+        insn = DsPermuteInsn(dst=dst, addr=addr, data=data, offset=16)
+
+        self.assertEqual(insn.dst.index, 10)
+        self.assertEqual(insn.addr.index, 1)
+        self.assertEqual(insn.data.index, 2)
+        self.assertEqual(insn.offset, 16)
+        self.assertEqual(str(insn), "ds_permute_b32 v10, v1, v2 offset:16")
+
+    def test_parse_ds_permute_standard(self) -> None:
+        insn = parse_ds_permute_line("ds_permute_b32 v0, v1, v2")
+        self.assertEqual(insn.dst.index, 0)
+        self.assertEqual(insn.addr.index, 1)
+        self.assertEqual(insn.data.index, 2)
+        self.assertEqual(insn.offset, 0)
+
+    def test_parse_ds_permute_with_offset(self) -> None:
+        insn = parse_ds_permute_line("ds_permute_b32 v15, v3, v4 offset:32")
+        self.assertEqual(insn.dst.index, 15)
+        self.assertEqual(insn.addr.index, 3)
+        self.assertEqual(insn.data.index, 4)
+        self.assertEqual(insn.offset, 32)
+
+    def test_parse_ds_permute_hex_offset_and_comments(self) -> None:
+        insn = parse_ds_permute_line("  ds_permute_b32 v10, v20, v30 offset:0x40 ; scatter pass")
+        self.assertEqual(insn.dst.index, 10)
+        self.assertEqual(insn.addr.index, 20)
+        self.assertEqual(insn.data.index, 30)
+        self.assertEqual(insn.offset, 64)
+
 if __name__ == "__main__":
     unittest.main()
