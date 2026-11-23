@@ -5,6 +5,8 @@
 Every input is built here (index.json, synthetic FSSM payloads in DXBC containers, hand-written .s
 listings). No game data, no llvm-mc: the one unlisted payload is disassembled by an injected fake.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -188,6 +191,113 @@ class TestSurvey(unittest.TestCase):
         # The CLI disassembles the unlisted ES payload with llvm-mc; a synthetic blob has no code, so the
         # marker count for hw 2 stays empty and the run still succeeds.
         self.assertIn("vs|0|2", document["by_stage_hw"])
+
+
+class TestWriteJsonReport(unittest.TestCase):
+    """--json stages via a sibling temp file with published_mode and replace_retry."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dx = build(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_creates_parent_dirs_and_writes_lf_with_trailing_newline(self):
+        out = os.path.join(self._tmp.name, "nested", "reports", "census.json")
+        buf, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(V, "default_disasm", side_effect=fake_disasm), \
+                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            code = V.main([self.dx, "--json", out])
+        self.assertEqual(code, 0, err.getvalue())
+        with open(out, "rb") as f:
+            raw = f.read()
+        self.assertNotIn(b"\r\n", raw)
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(json.loads(raw.decode("utf-8"))["payloads"], 5)
+        self.assertEqual(os.listdir(os.path.dirname(out)), ["census.json"])
+
+    def test_applies_published_mode_without_flipping_umask_and_uses_replace_retry(self):
+        import file_mode
+        dest = os.path.join(self._tmp.name, "census.json")
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def record_chmod(path, mode):
+            chmod_calls.append((os.path.abspath(path), mode))
+            return real_chmod(path, mode)
+
+        with mock.patch.object(V, "published_mode", wraps=V.published_mode) as pub, \
+                mock.patch.object(V, "replace_with_retry", wraps=V.replace_with_retry) as rep, \
+                mock.patch.object(V.os, "chmod", side_effect=record_chmod), \
+                mock.patch("os.umask", side_effect=AssertionError("os.umask must not be called")):
+            V._write_json_report(dest, {"ok": True})
+
+        self.assertEqual(pub.call_count, 1)
+        self.assertEqual(rep.call_count, 1)
+        self.assertEqual(len(chmod_calls), 1)
+        staged_path, staged_mode = chmod_calls[0]
+        self.assertNotEqual(staged_path, os.path.abspath(dest))
+        self.assertEqual(staged_mode, file_mode.published_mode(dest))
+        with open(dest, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"ok": True})
+        self.assertEqual(sorted(os.listdir(self._tmp.name)), ["census.json", "dxbc"])
+
+    def test_write_failure_preserves_existing_report_and_cleans_staging(self):
+        out = os.path.join(self._tmp.name, "existing.json")
+        original = '{"previous": true}\n'
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(original)
+
+        def fail_mid_dump(_payload, stream, **_kwargs):
+            stream.write('{"partial": ')
+            raise OSError("disk full")
+
+        buf, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(V, "default_disasm", side_effect=fake_disasm), \
+                mock.patch.object(V.json, "dump", side_effect=fail_mid_dump), \
+                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            code = V.main([self.dx, "--json", out])
+
+        self.assertEqual(code, 2)
+        self.assertIn("vs_layout_census: error: cannot write", err.getvalue())
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(sorted(os.listdir(self._tmp.name)), ["dxbc", "existing.json"])
+
+    def test_failed_replace_cleans_read_only_staging_file(self):
+        dest = os.path.join(self._tmp.name, "readonly.json")
+        original = '{"old": 1}\n'
+        with open(dest, "w", encoding="utf-8", newline="\n") as f:
+            f.write(original)
+        os.chmod(dest, 0o444)
+        self.addCleanup(lambda: os.path.exists(dest) and os.chmod(dest, 0o600))
+
+        with mock.patch.object(V, "replace_with_retry", side_effect=PermissionError("locked")):
+            with self.assertRaises(PermissionError):
+                V._write_json_report(dest, {"new": 2})
+
+        with open(dest, encoding="utf-8") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(sorted(os.listdir(self._tmp.name)), ["dxbc", "readonly.json"])
+
+    def test_directory_destination_raises_without_creating_temp_files(self):
+        folder = os.path.join(self._tmp.name, "out_dir")
+        os.makedirs(folder)
+        before = sorted(os.listdir(self._tmp.name))
+        with self.assertRaises(IsADirectoryError):
+            V._write_json_report(folder, {"ok": True})
+        self.assertEqual(sorted(os.listdir(self._tmp.name)), before)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_posix_mode_bits_preserved_for_new_and_replaced_reports(self):
+        import file_mode
+        dest = os.path.join(self._tmp.name, "modes.json")
+        V._write_json_report(dest, {"v": 1})
+        self.assertEqual(os.stat(dest).st_mode & 0o777, file_mode.new_file_mode(self._tmp.name))
+        os.chmod(dest, 0o640)
+        V._write_json_report(dest, {"v": 2})
+        self.assertEqual(os.stat(dest).st_mode & 0o777, 0o640)
 
 
 if __name__ == "__main__":

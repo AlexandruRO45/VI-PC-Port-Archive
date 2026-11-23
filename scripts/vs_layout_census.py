@@ -19,10 +19,12 @@ Standard library only; llvm-mc only for payloads without a listing. Nothing from
 written beyond counts.
 """
 import argparse
+import errno
 import json
 import os
 import re
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +36,8 @@ import shader_disasm  # noqa: E402
 import shader_ir  # noqa: E402
 from vs_input_survey import (FETCH_CALL, MBCNT, PARAM_EXPORT, POS0_EXPORT, PRIM_EXPORT, SENDMSG,  # noqa: E402
                              read_before_write)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_with_retry  # noqa: E402
 
 ALLOC_REQ = re.compile(r"s_sendmsg\s+sendmsg\(MSG_GS_ALLOC_REQ\)")
 GS_OP = re.compile(r"s_sendmsg\s+sendmsg\(MSG_GS,")
@@ -179,6 +183,40 @@ def survey(dxbc_dir, disasm_fn=None, limit=None):
     }
 
 
+def _write_json_report(path, payload):
+    """Write a JSON report via a sibling temp file so a failure never truncates an existing report."""
+    dest = os.path.abspath(path)
+    if os.path.isdir(dest) or path.endswith((os.sep, "/")) or (os.altsep and path.endswith(os.altsep)):
+        raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), path)
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    mode = published_mode(dest)
+    fd, tmp = tempfile.mkstemp(prefix=".vs_layout_census_", suffix=".tmp", dir=parent)
+    stream = None
+    try:
+        stream = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        with stream:
+            json.dump(payload, stream, indent=1)
+            stream.write("\n")
+        os.chmod(tmp, mode)
+        replace_with_retry(tmp, dest)
+    except BaseException:
+        if stream is None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("dxbc", help="<work>/shaders/dxbc from make_game.py")
@@ -205,8 +243,7 @@ def main(argv=None):
           f"unlisted payloads disassembled {r['disassembled_unlisted']}")
     if a.json:
         try:
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(r, f, indent=1)
+            _write_json_report(a.json, r)
         except OSError as e:
             print(f"vs_layout_census: error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2
