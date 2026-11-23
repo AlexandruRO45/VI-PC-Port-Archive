@@ -16,7 +16,7 @@ fix in [rpf9-explorer PR #1](https://github.com/breadbbbb/rpf9-explorer/pull/1) 
 `third_party/rpf9-explorer` is now pinned at upstream `e293917` (was `917e9b9`, originally
 `48557ea`). Commits up to `917e9b9` added the `packs.rpf` drawable-dictionary roots (one drawable
 per entry), the TTPF compact/array/cubemap/volume layouts, and the external drawable-skeleton
-reader. Commits `917e9b9..e293917` add upstream `v1.2` model-discovery changes (PRs #8–#12:
+reader. Commits `917e9b9..e293917` add upstream `v1.2` model-discovery changes (PRs #8â€“#12:
 optional fragment pointers, skipping texture dictionaries in drawable-dictionary scans, 16-bit
 bone-palette indices, probe-count parity, and zero-radius drawables) plus BCPack BC1/BC3/BC4/BC5
 decoding (PR #7). A full ten-archive re-count at `e293917` recovers **382,781 models** (**+32,530**
@@ -50,7 +50,7 @@ current `packs.rpf` result.
 
 A fresh scan, recovery, and full `RageModelDecoder.Decode` readback across all ten archives in
 `MODEL_ARCHIVES` (no index cache; `RpfPreview.Core` at `e293917`, .NET 8/10 Release) measures the
-effect of upstream `v1.2` PRs #8–#12:
+effect of upstream `v1.2` PRs #8â€“#12:
 
 | Archive | Candidates | Models at `e293917` | Dict children | Standalone | Fragments | Bone-bound | Triangles | Rejects | Delta vs `917e9b9` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -60,12 +60,12 @@ effect of upstream `v1.2` PRs #8–#12:
 | `pack/story000_restofworld/...` | 1 | **3** | 3 | 0 | 0 | 0 | 2,620 | 0 | 0 |
 | `pack/story000/story000.rpf` | 4,195 | **7,461** | 4,156 | 3,305 | 0 | 0 | 39,861,747 | 0 | +1 |
 | `packs.rpf` | 26,389 | **26,585** | 23,720 | 2,865 | 2,865 | 26,585 | 64,966,572 | 0 | +2,551 |
-| `levels.rpf` | 235,330 | **343,327** | 130,239 | 213,088 | † | † | † | 71 | +29,327 |
+| `levels.rpf` | 235,330 | **343,327** | 130,239 | 213,088 | â€  | â€  | â€  | 71 | +29,327 |
 | `textures.rpf` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 |
 | `common.rpf`, `core_restofworld001` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| **Total** | **270,819** | **382,781** | **159,511** | **223,270** | **†** | **†** | **†** | **72** | **+32,530** |
+| **Total** | **270,819** | **382,781** | **159,511** | **223,270** | **â€ ** | **â€ ** | **â€ ** | **72** | **+32,530** |
 
-† `levels.rpf` was counted with `count.exe recover --verify`, which reports candidates, models,
+â€  `levels.rpf` was counted with `count.exe recover --verify`, which reports candidates, models,
 dictionary children, standalone models, rejects and decode failures only: no `levels.rpf` manifest
 exists and the harness emits no fragment, bone-binding or triangle field. Those three `levels.rpf`
 cells, and the totals that would include them, are therefore **not independently reproduced**. The
@@ -84,10 +84,10 @@ What moved between `917e9b9` and `e293917`:
   accounts for the bulk of the gain across `levels.rpf` (+29,313 standalone), `packs.rpf` (+2,551
   fragments, all bone-bound), `data.rpf` (+594), `core_restofworld` (+40 standalone), and
   `shared_minigame000` (+6).
-- **Texture-dictionary false positives eliminated (1,242 → 1).** Upstream
+- **Texture-dictionary false positives eliminated (1,242 â†’ 1).** Upstream
   [rpf9-explorer#9](https://github.com/breadbbbb/rpf9-explorer/pull/9) removes all 1,242 texture
-  dictionaries that were previously proposed as model candidates in `levels.rpf` (1,009 → 0),
-  `data.rpf` (75 → 0), `core_restofworld` (140 → 0), and `shared_minigame000` (18 → 0). Only one
+  dictionaries that were previously proposed as model candidates in `levels.rpf` (1,009 â†’ 0),
+  `data.rpf` (75 â†’ 0), `core_restofworld` (140 â†’ 0), and `shared_minigame000` (18 â†’ 0). Only one
   texture-dictionary candidate remains across all ten archives (in `textures.rpf`; rejected cleanly,
   and recovered by `Rpf9TextureRecovery`).
 - **Probe caps and zero-radius drawables (+25 dictionary children plus capped standalones).**
@@ -95,7 +95,7 @@ What moved between `917e9b9` and `e293917`:
   previously capped candidates (+1 in `story000.rpf`, and +14 dictionary children plus capped
   standalones in `levels.rpf`). Upstream
   [rpf9-explorer#12](https://github.com/breadbbbb/rpf9-explorer/pull/12) recovers all 11 zero-radius
-  dictionary children in `core_restofworld` (797 → 808); `story000_restofworld.rpf` already
+  dictionary children in `core_restofworld` (797 â†’ 808); `story000_restofworld.rpf` already
   recovered its 3 models at `917e9b9`, so its delta is 0.
 - **Remaining 72 rejects (down from 1,282 at `917e9b9`).** Aside from the single texture-dictionary
   candidate in `textures.rpf`, all 71 remaining rejects are in `levels.rpf` (0 texture dictionaries,
@@ -290,7 +290,7 @@ per-mesh shader indices, embedded textures, and material texture references.
 Three arrays describe the geometries one by one, in the same order as the OBJ's `o` groups:
 `MeshTris` (triangles), `MeshModels` (the position of the model in the drawable's primary-LOD model
 list) and `MeshGeoms` (the position of the geometry in that model). That pair is the geometry index
-a dehydrated BLAS leaf stores ([bvh.md](bvh.md) §4a), which is what `tools/bvh_match.py` matches on;
+a dehydrated BLAS leaf stores ([bvh.md](bvh.md) Â§4a), which is what `tools/bvh_match.py` matches on;
 `MeshShaders` maps each geometry to its entry in `Materials`, and therefore to its shader name hash.
 
 The manifest has no failure, skip, or layout fields. `Program.cs` increments `fail` only when a
@@ -519,7 +519,7 @@ a projected decal, 3 needs alpha testing, 6 is a water surface.
 
 ## Material shader hashes and the carved programs
 
-`rpf9dump` also writes each material's shader hash (`manifest.json` → `Materials[].Shader`, u32 as 8 hex digits).
+`rpf9dump` also writes each material's shader hash (`manifest.json` â†’ `Materials[].Shader`, u32 as 8 hex digits).
 It is the joaat (lower-cased) of the material's **effect** name. The carve index (`<work>/shaders/dxbc/index.json`)
 names compute programs `<effect>:<entry>_<8 hex>_Wrapped` after a one-byte length prefix (the `:` becomes `_` in
 file names), so the effect is recoverable from them. Measured on a 1.0.2.1 copy, `data.rpf` models and the full
@@ -595,7 +595,7 @@ are little-endian:
    otherwise `stage_list[selector - 1]`.
 
 The group walk and its counts above were reproduced on a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256
-`0bc16345…`). So was @jeremygold02's census of both databases' effects with `tools/sgd5_effects.py
+`0bc16345â€¦`). So was @jeremygold02's census of both databases' effects with `tools/sgd5_effects.py
 --list-effects` (#3036, `0029eba7`): 932 effect records with 932 distinct name hashes, 913 of them with a
 technique table, 25,037 techniques and 28,798 passes. Since `c0439966` the tool also **walks** the records
 forward from each database's effect count, using only stored lengths: every record's string pool, the next
@@ -666,7 +666,7 @@ are little-endian:
    otherwise `stage_list[selector - 1]`.
 
 The group walk and its counts above were reproduced on a 1.0.2.1 copy (the same `shaders.rpf`, SHA-256
-`0bc16345…`). So was @jeremygold02's census of both databases' effects with `tools/sgd5_effects.py
+`0bc16345â€¦`). So was @jeremygold02's census of both databases' effects with `tools/sgd5_effects.py
 --list-effects` (#3036, `0029eba7`): 932 effect records with 932 distinct name hashes, 913 of them with a
 technique table, 25,037 techniques and 28,798 passes. Since `c0439966` the tool also **walks** the records
 forward from each database's effect count, using only stored lengths: every record's string pool, the next
@@ -773,3 +773,16 @@ the indexed window are marked ambiguous. Even a single hit is a prediction: a st
 can mention another model. Export a window around the predicted offset with
 `rpf9dump models <archive> <outdir> --start BYTES --length BYTES`, compare the manifest offset and
 model identity and run `world_build.py --placements` with the exported geometry.
+
+Add `--window-bytes BYTES` to recommend one scan in the name index's archive.
+The optional `export_window` field gives the decimal `start` and `length` for
+`rpf9dump models`. It maximizes the sum of unmatched placement rows with a
+single predicted offset in that index. Each identity contributes its placement
+count once. Ambiguous identities contribute zero. For a tie it takes the earliest
+last offset, then trims the interval to its first and last included bytes.
+An empty selection yields JSON null. Run the lookup separately for each archive.
+
+The budget bounds the half-open range of candidate **starts**. The exporter can
+inspect prefix bytes and read model segments beyond the range. The report
+predicts coverage. Confirm identities and offsets in the exported manifest and
+check the resulting placement count with `world_build.py`.
