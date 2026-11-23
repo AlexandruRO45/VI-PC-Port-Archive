@@ -103,6 +103,11 @@ def bank_ids(path: str) -> list:
     return [v & M29 for v in struct.unpack(f"<{n}I", table)]
 
 
+def _scan_failed(error: OSError) -> None:
+    """An unreadable bank directory is an error, not an empty one (os.walk's default)."""
+    raise error
+
+
 def load_banks(source: str) -> dict:
     """{bank label: [stream ids]} from AWC banks, a Python inventory, or an rpf9dump manifest."""
     if os.path.isfile(source) and source.lower().endswith(".json"):
@@ -128,7 +133,7 @@ def load_banks(source: str) -> dict:
     if os.path.isfile(source):
         return {os.path.splitext(os.path.basename(source))[0]: bank_ids(source)}
     out = {}
-    for root, _dirs, files in os.walk(source):
+    for root, _dirs, files in os.walk(source, onerror=_scan_failed):
         for name in sorted(files):
             if name.lower().endswith(".awc"):
                 full = os.path.join(root, name)

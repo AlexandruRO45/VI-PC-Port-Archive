@@ -4,6 +4,7 @@
 """
 import contextlib
 import csv
+import errno
 import importlib.util
 import io
 import json
@@ -341,6 +342,31 @@ class TestCli(unittest.TestCase):
     def test_missing_input(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(A.main(["/nonexistent", "--words", "/nonexistent.txt"]), 2)
+
+    def test_unreadable_bank_subdirectory_reports_rc_2_without_traceback(self):
+        # os.walk's default skips an unreadable directory, so the bank list silently shrank and the tool exited 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            banks = os.path.join(tmp, "banks")
+            blocked = os.path.join(banks, "blocked")
+            os.makedirs(blocked)
+            words = write(os.path.join(tmp, "words.txt"), "alpha
+")
+            scandir = os.scandir
+
+            def list_directory(path):
+                if os.path.normcase(path) == os.path.normcase(blocked):
+                    raise PermissionError(errno.EACCES, "permission denied", path)
+                return scandir(path)
+
+            err = io.StringIO()
+            with mock.patch.object(os, "scandir", list_directory),                     contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = A.main([banks, "--words", words])
+            self.assertEqual(rc, 2, err.getvalue())
+            self.assertEqual(err.getvalue().count("
+"), 1, err.getvalue())
+            self.assertIn("awc_names: error:", err.getvalue())
+            self.assertIn("blocked", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
     def test_min_token_below_one_is_rejected(self):
         # --min-token counts the dictionary words a token must appear in. 0 or a negative used to pass
