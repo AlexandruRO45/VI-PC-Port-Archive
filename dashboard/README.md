@@ -12,7 +12,7 @@ browser. An example running from a fork's GitHub Pages: https://clhelper.github.
   every column (phones), the stages become rows with `main` as a lane across. `tests/test_dashboard_pipeline.cjs`
   checks that every stage keeps room for its dots at any width.
 - **Merge queue**: open PRs by CI result, the bottleneck they point at, the oldest green and failing PRs, rebases by
-  author and merge chains from the coordination issue.
+  author and merge chains from the coordination issue (5 shown, 20 more per click).
 - **Triage**: items that open PRs from more than one author work on (possible duplicates), and with a token the next
   merge round (green, mergeable PRs that share no file, so merging them all makes none of them conflict) and the files
   the most open PRs change. `tests/test_dashboard_triage.cjs` covers it (`node --test`).
@@ -51,8 +51,11 @@ From the browser, GET requests only, except the GraphQL sweep with a token:
   of the review table is type-checked and escaped before it is shown.
 - `api.github.com`: the coordination issue and its comments, the D3D12 tracker, GitHub search (open and merged PRs,
   CI results), the latest commits on `main` and the repository's star and contributor counts.
-- `api.github.com/graphql`, only with a token: every open PR with its changed files, CI result and merge state, about
-  a dozen read-only queries every 2 minutes while the tab is in use. It replaces the PR searches, so the pipeline
+- `api.github.com/graphql`, only with a token: every open PR with its changed files, CI result and merge state. A full
+  sweep (about a dozen read-only queries) runs every 10 minutes and after a merge lands on `main`; in between, every
+  2 minutes while the tab is in use, one query reads only the PRs updated since the last sweep (CI results and
+  conflicts don't change a PR's update time, so those wait for the next full sweep). After the first, sweeps run in
+  the background behind the list already shown. It replaces the PR searches, so the pipeline
   has no 1,000-result cap and conflicts are read live. A PR's description is fetched only when the PR changed.
 
 Every request gives up after 30 seconds (a GraphQL call after 60), so a call GitHub never answers cannot keep the

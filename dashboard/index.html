@@ -430,6 +430,7 @@ body.card-mode .card-url { display: block; }
 .authors { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; font-size: 13.5px; }
 .authors .who { font-weight: 700; }
 .chain { font: 500 13px var(--mono); margin: 4px 0; }
+.list-more { display: block; margin: 6px 8px 2px; font-size: 13px; }
 
 /* ---------- triage (triage.js) ---------- */
 #triageBody .card { contain: content; }
@@ -888,7 +889,8 @@ const CLOCK_MS = 1000;                 // status line countdown
 const D3D_TRACKER_FALLBACK = 313;
 const RING_LEN = 540.35;               // 2 * PI * r (r = 86)
 const STORE_PREFIX = 'ldash:v2:' + REPO + ':';   // v2: cached data is scrubbed (see scrub below)
-const ITEMS_PAGE = 60;
+const ITEMS_FIRST = 15;                 // work items shown before "Show more"
+const MORE_STEP = 20;                   // what each "Show more" adds, in every list
 const SCORE = { done: 1, wip: 0.5, research: 0.5, todo: 0 };
 // Act 4 (boot → playable) is a start-see-where-it-stops-fix loop of unknown length: "in progress" there says little
 // about how far along it is, so it counts a fifth instead of half. Keeps the ring from jumping when booting starts.
@@ -942,6 +944,8 @@ const fmt = n => (n == null || Number.isNaN(n)) ? '–' : Number(n).toLocaleStri
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const FETCH_TIMEOUT_MS = 30 * 1000;
+/** Label of a "Show more" button with `left` entries still hidden. */
+const moreLabel = left => `Show ${fmt(Math.min(MORE_STEP, left))} more (${fmt(left)} left)`;
 
 /**
  * fetch() that gives up after `ms`, reading the body included: a request GitHub never answers would otherwise keep the
@@ -1610,7 +1614,7 @@ function renderPulse(activity, commits) {
 }
 
 /* work board state */
-const board = { items: [], cat: 'ALL', state: 'all', q: '', shown: ITEMS_PAGE, cats: [] };
+const board = { items: [], cat: 'ALL', state: 'all', q: '', shown: ITEMS_FIRST, cats: [] };
 
 function buildBoard(coord, d3d) {
   const items = [];
@@ -1682,17 +1686,17 @@ function renderWork(coord) {
   renderItems();
   $('#workBody').querySelectorAll('.cat').forEach(b => b.addEventListener('click', () => {
     board.cat = board.cat === b.dataset.cat ? 'ALL' : b.dataset.cat;
-    board.shown = ITEMS_PAGE;
+    board.shown = ITEMS_FIRST;
     renderWork(coord);
   }));
   $('#stateSeg').querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
     board.state = b.dataset.state;
-    board.shown = ITEMS_PAGE;
+    board.shown = ITEMS_FIRST;
     renderWork(coord);
   }));
   const clear = $('#clearCat');
   if (clear) clear.addEventListener('click', () => { board.cat = 'ALL'; renderWork(coord); });
-  $('#q').addEventListener('input', e => { board.q = e.target.value; board.shown = ITEMS_PAGE; renderItems(); });
+  $('#q').addEventListener('input', e => { board.q = e.target.value; board.shown = ITEMS_FIRST; renderItems(); });
 }
 
 const STATE_LABEL = { grab: 'Up for grabs', claimed: 'Claimed', stale: 'Going stale', pr: 'Has a PR', blocked: 'Blocked' };
@@ -1715,10 +1719,10 @@ function renderItems() {
       <div class="who">${i.owner ? md(i.owner) : (i.state === 'grab' ? 'Nobody yet: <b style="color:var(--pink)">claim it</b>' : '')}${i.pr ? '<br>PR ' + md(i.pr) : ''}</div>
     </div>`).join('');
   $('#itemList').innerHTML = `<div class="items">${html || '<div class="card" style="color:var(--muted)">Nothing matches.</div>'}</div>
-    ${list.length > shown.length ? `<button class="btn more-btn" id="moreBtn" type="button">Show more (${list.length - shown.length} left)</button>` : ''}
+    ${list.length > shown.length ? `<button class="btn more-btn" id="moreBtn" type="button">${moreLabel(list.length - shown.length)}</button>` : ''}
     <p class="footnote">${list.length} of ${board.items.length} tracked items. Items that only exist as an open PR are counted in the area totals above.</p>`;
   const more = $('#moreBtn');
-  if (more) more.addEventListener('click', () => { board.shown += ITEMS_PAGE; renderItems(); });
+  if (more) more.addEventListener('click', () => { board.shown += MORE_STEP; renderItems(); });
 }
 
 /* ================= share ================= */

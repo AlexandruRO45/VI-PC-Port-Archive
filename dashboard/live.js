@@ -402,7 +402,8 @@ function renderQueue() {
        ${coord.rebaseBy.length > REBASE_AUTHORS ? `<p class="footnote">And ${coord.rebaseBy.length - REBASE_AUTHORS} more authors in the coordination issue.</p>` : ''}`
     : '<span style="color:var(--muted)">None listed.</span>';
   const chains = coord && coord.chains.length
-    ? coord.chains.map(c => `<div class="chain">${c.map(n => `<a href="${GH}/pull/${esc(n.slice(1))}" target="_blank" rel="noopener">${esc(n)}</a>`).join(' → ')}</div>`).join('')
+    ? coord.chains.slice(0, chainsShown).map(c => `<div class="chain">${c.map(n => `<a href="${GH}/pull/${esc(n.slice(1))}" target="_blank" rel="noopener">${esc(n)}</a>`).join(' → ')}</div>`).join('')
+      + (coord.chains.length > chainsShown ? `<button class="linkbtn list-more" type="button" data-chains>${moreLabel(coord.chains.length - chainsShown)}</button>` : '')
     : '<span style="color:var(--muted)">No chains listed.</span>';
   const html = `<div class="tiles">${tiles}</div>
     ${bottleneckHtml(coord)}
@@ -419,11 +420,22 @@ function renderQueue() {
         <p class="footnote">Chains of PRs that build on each other, from the coordination issue.</p></div>
     </div>
     <p class="footnote">CI waiting mostly means a fork's first run waits for a maintainer to approve it. The counts come from the same load as the pipeline above, ${graphCovers() ? `your token's sweep every ${Math.round(GRAPH_MS / 60000)} minutes` : `every ${Math.round(pipeInterval() / 60000)} minute${pipeInterval() > 60000 ? 's' : ''}`}.</p>`;
+  const box = $('#queueBody');
+  if (!box.dataset.more) {
+    box.dataset.more = '1';
+    box.addEventListener('click', e => {
+      if (!e.target.closest('[data-chains]')) return;
+      chainsShown += MORE_STEP;
+      renderQueue();
+    });
+  }
   if (html === queueHtml) return;   // runs after every feed update: leave an unchanged section alone
   queueHtml = html;
-  $('#queueBody').innerHTML = html;
+  box.innerHTML = html;
 }
 let queueHtml = '';
+const CHAINS_FIRST = 5;                  // merge chains shown before "Show more"
+let chainsShown = CHAINS_FIRST;
 
 /** The bottleneck the open PRs point at. */
 function bottleneckHtml(coord) {
@@ -796,7 +808,7 @@ async function runSync(force) {
     }
     // With a token one GraphQL sweep (triage.js) brings every open PR; otherwise, or when it fails, what is left of
     // the search limit goes to the pipeline first, then to the activity chart.
-    const graphState = await loadGraph(Date.now());
+    const graphState = await syncGraph(Date.now());
     const pipeState = graphState === 'done' || graphState === 'idle' ? graphState : await loadPipeline(Date.now());
     if (pipeState === 'waiting') setPart('pipeline', { state: 'waiting', ...waitingOn() });
     else if (pipeState === 'error') setPart('pipeline', { state: 'error', msg: 'the search failed' });

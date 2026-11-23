@@ -7,7 +7,7 @@ const { test } = require('node:test');
 // Exercise the dashboard's triage code (duplicates, merge round, GraphQL sweep) without a browser, a token or a network.
 const dir = process.env.DASHBOARD_DIR || join(__dirname, '..', 'dashboard');
 const source = readFileSync(join(dir, 'triage.js'), 'utf8');
-const EXPORTS = '\n;globalThis.t = { refIds, bodyRefs, itemsOf, itemPrefixes, coordItems, findDuplicates, conflictMap, loadGraph, graphCovers, graph, get bodies() { return bodies; } };';
+const EXPORTS = '\n;globalThis.t = { refIds, bodyRefs, itemsOf, itemPrefixes, coordItems, findDuplicates, conflictMap, loadGraph, syncGraph, graphCovers, graph, get bodies() { return bodies; } };';
 
 const CATS = ['SHADER', 'FUZZ', 'RT', 'D3D', 'ASSET', 'BUILD', 'TEST', 'PROC', 'BOOT'].map(key => ({ key }));
 
@@ -121,9 +121,12 @@ function fakeGraphql(nodes, calls) {
       const start = variables.cursor ? Number(variables.cursor) : 0;
       const size = variables.first;
       calls.sizes.push(size);
-      const page = nodes.slice(start, start + size);
-      const next = start + size < nodes.length;
-      return { ok: true, status: 200, headers, json: async () => ({ data: { repository: { pullRequests: { totalCount: nodes.length, pageInfo: { hasNextPage: next, endCursor: String(start + size) }, nodes: page } } } }) };
+      const when = n => Date.parse(n.updatedAt) || 0;
+      const list = variables.field === 'UPDATED_AT' ? [...nodes].sort((a, b) => when(b) - when(a)) : nodes;
+      if (variables.field === 'UPDATED_AT') calls.partial = (calls.partial || 0) + 1;
+      const page = list.slice(start, start + size);
+      const next = start + size < list.length;
+      return { ok: true, status: 200, headers, json: async () => ({ data: { repository: { pullRequests: { totalCount: list.length, pageInfo: { hasNextPage: next, endCursor: String(start + size) }, nodes: page } } } }) };
     }
     calls.bodies++;
     const asked = [...query.matchAll(/pullRequest\(number:(\d+)\)/g)].map(m => Number(m[1]));
@@ -184,6 +187,7 @@ test('the sweep pages through every open PR and reads a body only when its PR ch
   nodes[9] = node(10, { updatedAt: 'u2', body: 'BUILD-1 now' });
   nodes.pop();
   t.graph.at = 0;
+  t.graph.fullAt = 0;   // a full sweep: a partial one leaves closing PRs to the live feed
   calls.bodyPrs.length = 0;
   assert.equal(await t.loadGraph(Date.now()), 'done');
   await t.graph.bodiesRun;
@@ -241,6 +245,100 @@ test('a call with no answer in time counts as unanswered: asked again smaller, t
   assert.equal(await ctx.t.loadGraph(Date.now()), 'error', 'the sync goes on instead of waiting');
   assert.equal(asked, 3, 'asked at 100, 50 and 25 PRs');
   assert.equal(ctx.t.graph.busy, null);
+});
+
+test('the first sweep is waited for, later ones run behind the shown list', async () => {
+  const nodes = Array.from({ length: 30 }, (_, i) => node(i + 1));
+  const calls = { pages: 0, bodies: 0, bodyPrs: [], sizes: [] };
+  let hold = null;
+  const answer = fakeGraphql(nodes, calls);
+  const ctx = load({ fetch: (url, init) => (hold ? hold.then(() => answer(url, init)) : answer(url, init)) });
+  const { t } = ctx;
+  assert.equal(await t.syncGraph(Date.now()), 'done', 'the first sweep decides whether the search path runs');
+  await t.graph.bodiesRun;
+  assert.equal(await t.syncGraph(Date.now()), 'idle', 'not due');
+
+  // Due again while GitHub is slow: the sync does not wait, and a second sync does not start another sweep.
+  let release;
+  hold = new Promise(r => { release = r; });
+  t.graph.at = 0;
+  const pages = calls.pages;
+  assert.equal(await t.syncGraph(Date.now()), 'idle');
+  assert.ok(t.graph.sweepRun, 'a sweep runs in the background');
+  assert.equal(await t.syncGraph(Date.now()), 'idle');
+  release();
+  await t.graph.sweepRun;
+  assert.equal(calls.pages, pages + 1, 'one sweep, one page');
+  assert.equal(t.graph.sweepRun, null);
+  assert.ok(t.graphCovers());
+});
+
+test('a background sweep that fails hands the next sync to the search path', async () => {
+  const nodes = [node(1)];
+  let fail = false;
+  const answer = fakeGraphql(nodes, { pages: 0, bodies: 0, bodyPrs: [], sizes: [] });
+  const ctx = load({ fetch: (url, init) => (fail ? Promise.resolve({ ok: false, status: 401, headers: { get: () => null }, json: async () => ({}) }) : answer(url, init)) });
+  const { t } = ctx;
+  assert.equal(await t.syncGraph(Date.now()), 'done');
+  await t.graph.bodiesRun;
+  fail = true;
+  t.graph.at = 0;
+  assert.equal(await t.syncGraph(Date.now()), 'idle');
+  await t.graph.sweepRun;
+  assert.equal(t.graphCovers(), false);
+  assert.equal(await t.syncGraph(Date.now()), 'error', 'the sync loads the pipeline by search instead');
+});
+
+test('between full sweeps only PRs updated since the last sweep are read', async () => {
+  const old = '2020-01-01T00:00:00Z';
+  const nodes = Array.from({ length: 230 }, (_, i) => node(i + 1, { updatedAt: old }));
+  const calls = { pages: 0, bodies: 0, bodyPrs: [], sizes: [] };
+  const ctx = load({ fetch: fakeGraphql(nodes, calls) });
+  const { t } = ctx;
+  assert.equal(await t.loadGraph(Date.now()), 'done');
+  await t.graph.bodiesRun;
+  assert.equal(t.graph.last.full, true);
+  assert.equal(t.graph.last.calls, 3);
+
+  // Two PRs changed and one is new: one call of 25, newest update first, and the rest is kept as it was.
+  const now = new Date(Date.now() + 1000).toISOString();
+  nodes[4] = node(5, { updatedAt: now, title: 'PR 5 edited' });
+  nodes[9] = node(10, { updatedAt: now, isDraft: true });
+  nodes.push(node(231, { updatedAt: now }));
+  t.graph.at = 0;
+  const pages = calls.pages;
+  assert.equal(await t.loadGraph(Date.now()), 'done');
+  await t.graph.bodiesRun;
+  assert.equal(calls.pages, pages + 1, 'one call instead of three');
+  assert.equal(calls.partial, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(t.graph.last)), { full: false, calls: 1, changed: 3 });
+  const items = ctx.applied[ctx.applied.length - 1];
+  assert.equal(items.length, 231);
+  assert.equal(items.find(p => p.n === 5).title, 'PR 5 edited');
+  assert.equal(items.find(p => p.n === 10).draft, true);
+  assert.deepEqual([...items.map(p => p.n).slice(0, 3)], [1, 2, 3], 'oldest first, as from a full sweep');
+
+  // A full sweep again once GRAPH_FULL_MS has passed.
+  t.graph.at = 0;
+  t.graph.fullAt = 0;
+  assert.equal(await t.loadGraph(Date.now()), 'done');
+  assert.equal(t.graph.last.full, true);
+});
+
+test('a partial sweep with more changes than its pages hold becomes a full one', async () => {
+  const nodes = Array.from({ length: 150 }, (_, i) => node(i + 1, { updatedAt: '2020-01-01T00:00:00Z' }));
+  const calls = { pages: 0, bodies: 0, bodyPrs: [], sizes: [] };
+  const ctx = load({ fetch: fakeGraphql(nodes, calls) });
+  const { t } = ctx;
+  assert.equal(await t.loadGraph(Date.now()), 'done');
+  await t.graph.bodiesRun;
+  const now = new Date(Date.now() + 1000).toISOString();
+  for (let i = 0; i < 120; i++) nodes[i] = node(i + 1, { updatedAt: now });
+  t.graph.at = 0;
+  assert.equal(await t.loadGraph(Date.now()), 'done');
+  assert.equal(calls.partial, 4, 'four pages of 25, all changed');
+  assert.equal(t.graph.last.full, true);
+  assert.equal(ctx.applied[ctx.applied.length - 1].length, 150);
 });
 
 test('an error that a smaller page cannot fix is not retried', async () => {

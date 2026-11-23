@@ -15,7 +15,11 @@
  */
 'use strict';
 
-const GRAPH_MS = 2 * 60 * 1000;           // a full sweep this often while the tab is in use
+const GRAPH_MS = 2 * 60 * 1000;           // a sweep this often while the tab is in use: partial, or full when due
+const GRAPH_FULL_MS = 10 * 60 * 1000;     // a full sweep at least this often (CI results and conflicts don't bump updatedAt)
+const GRAPH_SLACK_MS = 60 * 1000;         // a partial sweep reads back this far before the last sweep started
+const GRAPH_PARTIAL_SIZES = [25];         // PRs per page of a partial sweep, newest update first
+const GRAPH_PARTIAL_PAGES = 4;            // more changed PRs than these pages hold: a full sweep instead
 const GRAPH_RETRY_MS = 5 * 60 * 1000;     // after a failed sweep the search path takes over this long
 // PRs per page, largest first. A page GitHub doesn't answer in time (no response, which a browser reports as
 // "Failed to fetch" because the gateway's error carries no CORS headers, or a 502/503/504) is asked again smaller.
@@ -32,13 +36,15 @@ const BODIES_KEY = 'graph:bodies:v1';
 const BODY_LEAD_LINES = 3;
 const MAX_REFS = 8;
 const DUP_LISTED = 12;
+const DUP_PRS_FIRST = 5;                  // PRs shown per duplicate item before "Show more"
 const ROUND_LISTED = 40;
 const HOT_LISTED = 8;
 const ITEM_RE = /\b([A-Z][A-Z0-9]{1,7})-(\d{1,5})\b/g;
 const DEPENDS_RE = /depends on:?([^\n]*)/gi;
 const STAGE_RANK = { ready: 0, green: 1, running: 2, waiting: 3, failing: 4, rebase: 5, draft: 6 };
 
-const graph = { at: 0, failAt: 0, ok: false, pages: 0, bodyCalls: 0, busy: null, bodiesRun: null };   // bodiesRun: the description load in the background   // busy: { what, done, total } while sweeping
+const graph = { at: 0, failAt: 0, ok: false, pages: 0, bodyCalls: 0, busy: null, bodiesRun: null, sweepRun: null,
+  nodes: new Map(), fullAt: 0, from: 0, last: null };   // nodes: the last swept PR nodes; last: { full, calls }   // bodiesRun: the description load in the background   // busy: { what, done, total } while sweeping
 let bodies = {};                          // n → { u: updatedAt, lids, deps }
 let triageHtml = '';
 
@@ -184,8 +190,8 @@ async function graphql(query, variables = {}) {
 }
 
 const [GQL_OWNER, GQL_NAME] = REPO.split('/');
-const PRS_QUERY = `query($owner:String!,$name:String!,$cursor:String,$first:Int!){ repository(owner:$owner,name:$name){
-  pullRequests(states:OPEN, first:$first, after:$cursor, orderBy:{field:CREATED_AT, direction:ASC}){
+const PRS_QUERY = `query($owner:String!,$name:String!,$cursor:String,$first:Int!,$field:IssueOrderField!,$dir:OrderDirection!){ repository(owner:$owner,name:$name){
+  pullRequests(states:OPEN, first:$first, after:$cursor, orderBy:{field:$field, direction:$dir}){
     totalCount pageInfo{ hasNextPage endCursor }
     nodes{ number title url isDraft createdAt updatedAt mergeable changedFiles
       author{ login avatarUrl } comments{ totalCount }
@@ -255,37 +261,75 @@ const graphCovers = () => !!activeToken() && graph.ok && Date.now() - graph.fail
 /** A failure that a smaller page may get past: no response at all, no response in time, or a gateway timeout. */
 const timedOut = e => !!e && (e.name === 'TypeError' || e.name === 'TimeoutError' || GRAPH_TIMEOUT_STATUS.includes(e.status));
 
+const BY_CREATED = { field: 'CREATED_AT', dir: 'ASC' };
+const BY_UPDATED = { field: 'UPDATED_AT', dir: 'DESC' };
+
 /** One page of open PRs after `cursor`, asked again with fewer PRs when GitHub doesn't answer in time. */
-async function prPage(cursor) {
+async function prPage(cursor, order = BY_CREATED, sizes = GRAPH_PAGE_SIZES) {
   for (let i = 0; ; i++) {
     try {
-      const data = await graphql(PRS_QUERY, { owner: GQL_OWNER, name: GQL_NAME, cursor, first: GRAPH_PAGE_SIZES[i] });
+      const data = await graphql(PRS_QUERY, { owner: GQL_OWNER, name: GQL_NAME, cursor, first: sizes[i], ...order });
       const prs = data.repository && data.repository.pullRequests;
       if (!prs) throw new Error('GraphQL returned no pull requests');
       return prs;
     } catch (e) {
-      if (!timedOut(e) || i === GRAPH_PAGE_SIZES.length - 1) throw e;
-      console.warn(`[dashboard] GraphQL page of ${GRAPH_PAGE_SIZES[i]} PRs got no answer in time; asking for ${GRAPH_PAGE_SIZES[i + 1]}`, e);
+      if (!timedOut(e) || i === sizes.length - 1) throw e;
+      console.warn(`[dashboard] GraphQL page of ${sizes[i]} PRs got no answer in time; asking for ${sizes[i + 1]}`, e);
     }
   }
+}
+
+/** Every open PR, oldest first. */
+async function sweepAll() {
+  const nodes = [];
+  let cursor = null;
+  let page = 0;
+  for (;;) {
+    const prs = await prPage(cursor);
+    nodes.push(...prs.nodes.filter(Boolean));
+    graph.pages = ++page;
+    if (!prs.pageInfo.hasNextPage) return { nodes, calls: page };
+    if (nodes.length >= GRAPH_MAX_PRS) throw new Error(`more than ${GRAPH_MAX_PRS} open PRs; the sweep stops there`);
+    cursor = prs.pageInfo.endCursor;
+    graphProgress('open PRs', page, page + Math.ceil(Math.max(0, prs.totalCount - nodes.length) / GRAPH_PAGE_SIZES[0]));
+  }
+}
+
+/** Open PRs updated since `since`, newest update first; null when more changed than a few pages hold. */
+async function sweepChanged(since) {
+  const nodes = [];
+  let cursor = null;
+  for (let page = 1; page <= GRAPH_PARTIAL_PAGES; page++) {
+    const prs = await prPage(cursor, BY_UPDATED, GRAPH_PARTIAL_SIZES);
+    const listed = prs.nodes.filter(Boolean);
+    const fresh = listed.filter(n => Date.parse(n.updatedAt) >= since);
+    nodes.push(...fresh);
+    if (fresh.length < listed.length || !prs.pageInfo.hasNextPage) return { nodes, calls: page };
+    cursor = prs.pageInfo.endCursor;
+  }
+  return null;
+}
+
+/** A full sweep is due: none yet, the last is GRAPH_FULL_MS old, or a merge landed on main since (conflicts move). */
+function graphFullDue(now) {
+  if (!graph.ok || !graph.nodes.size || now - graph.fullAt >= GRAPH_FULL_MS) return true;
+  return typeof pipe !== 'undefined' && pipe.mergedRecently.some(t => t > graph.fullAt);
 }
 
 /** Sweep every open PR when due. Returns 'off' (no token), 'idle' (not due), 'done' or 'error'. */
 async function loadGraph(now) {
   if (!activeToken()) return 'off';
   if (!graphDue(now)) return graph.ok ? 'idle' : 'error';
-  const nodes = [];
+  const started = Date.now();
+  let full = graphFullDue(now);
+  let swept;
   try {
-    let cursor = null;
-    let page = 0;
-    for (;;) {
-      const prs = await prPage(cursor);
-      nodes.push(...prs.nodes.filter(Boolean));
-      graph.pages = ++page;
-      if (!prs.pageInfo.hasNextPage) break;
-      if (nodes.length >= GRAPH_MAX_PRS) throw new Error(`more than ${GRAPH_MAX_PRS} open PRs; the sweep stops there`);
-      cursor = prs.pageInfo.endCursor;
-      graphProgress('open PRs', page, page + Math.ceil(Math.max(0, prs.totalCount - nodes.length) / GRAPH_PAGE_SIZES[0]));
+    swept = full ? null : await sweepChanged(graph.from - GRAPH_SLACK_MS);
+    if (!swept) {
+      const partialCalls = full ? 0 : GRAPH_PARTIAL_PAGES;
+      full = true;
+      swept = await sweepAll();
+      swept.calls += partialCalls;
     }
   } catch (e) {
     console.error('[dashboard] GraphQL sweep failed; the search path takes over for now', e);
@@ -294,9 +338,21 @@ async function loadGraph(now) {
     graphProgress(null);
     return 'error';
   }
+  if (full) {
+    graph.nodes = new Map(swept.nodes.map(n => [n.number, n]));
+    graph.fullAt = started;
+  } else {
+    // Between full sweeps the live feed takes merged and closed PRs off the pipeline: forget those here too.
+    const changed = new Set(swept.nodes.map(n => n.number));
+    if (typeof pipe !== 'undefined' && pipe.prs.size) for (const n of [...graph.nodes.keys()]) if (!pipe.prs.has(n) && !changed.has(n)) graph.nodes.delete(n);
+    for (const n of swept.nodes) graph.nodes.set(n.number, n);
+  }
+  const nodes = [...graph.nodes.values()].sort((a, b) => a.number - b.number);
   // The PR list is complete: show it now; descriptions (item IDs, dependencies) follow and refine it.
+  graph.from = started;
   graph.at = Date.now();
   graph.ok = true;
+  graph.last = { full, calls: swept.calls, changed: swept.nodes.length };
   store.set(GRAPH_KEY, { at: graph.at });
   applyGraph(nodes.map(pickGraphPr));
   graphProgress(null);
@@ -310,6 +366,19 @@ async function loadGraph(now) {
   return 'done';
 }
 
+/**
+ * The sync's entry to the sweep. The first sweep is waited for: until it has worked, the sync must know whether the
+ * search path has to load the pipeline. Later sweeps (every GRAPH_MS, 45 to 60 seconds each) run in the background
+ * behind the list already shown, so the status bar doesn't sit on "Updating…" for most of every other minute.
+ * A background sweep that fails clears graph.ok, and the next sync takes the search path as before.
+ */
+async function syncGraph(now) {
+  if (graph.sweepRun) return 'idle';
+  if (!graph.ok || !graphDue(now)) return loadGraph(now);
+  graph.sweepRun = loadGraph(now).finally(() => { graph.sweepRun = null; });
+  return 'idle';
+}
+
 /* ================= render ================= */
 const stageColor = key => (PIPE_STAGES[STAGE_INDEX[key]] || {}).color || 'var(--dim)';
 const stageLabel = key => (PIPE_STAGES[STAGE_INDEX[key]] || {}).label || '';
@@ -319,11 +388,16 @@ function triageRow(p, note) {
     <span class="n">#${esc(p.n)}</span><span class="t"><i class="sdot" style="background:${stageColor(p.stage)}" title="${esc(stageLabel(p.stage))}"></i>${esc(p.title)} <span style="color:var(--muted)">@${esc(p.user)}</span>${note ? ` <span class="tag">${esc(note)}</span>` : ''}</span><span class="when">${esc(ago(p.created))}</span></a>`;
 }
 
+/** PRs shown per duplicate item; "Show more" raises it for that item until the page is reloaded. */
+const dupOpen = new Map();
+const dupShown = id => dupOpen.get(id) || DUP_PRS_FIRST;
+
 function duplicatesCard(d) {
   const body = d.groups.length
     ? d.groups.slice(0, DUP_LISTED).map(g => `<div class="dup">
         <div class="dup-head"><b>${esc(g.id)}</b> <span>${g.prs.length} PRs by ${new Set(g.prs.map(p => p.user)).size} authors</span></div>
-        <div class="prs">${g.prs.map(p => triageRow(p, g.listed.includes(p.n) ? 'in the table' : p.draft ? 'draft' : '')).join('')}</div></div>`).join('')
+        <div class="prs">${g.prs.slice(0, dupShown(g.id)).map(p => triageRow(p, g.listed.includes(p.n) ? 'in the table' : p.draft ? 'draft' : '')).join('')}</div>
+        ${g.prs.length > dupShown(g.id) ? `<button class="linkbtn list-more" type="button" data-dup="${esc(g.id)}">${moreLabel(g.prs.length - dupShown(g.id))}</button>` : ''}</div>`).join('')
       + (d.groups.length > DUP_LISTED ? `<p class="footnote">And ${d.groups.length - DUP_LISTED} more items.</p>` : '')
     : '<span style="color:var(--muted)">No item has open PRs from more than one author.</span>';
   return `<div class="card"><div class="subhead" style="margin-top:0">Possible duplicates: one item, several authors</div>${body}
@@ -380,6 +454,15 @@ function renderTriage() {
   const html = `<div class="tiles">${tiles}</div>
     <div class="queue-grid"><div class="tcol">${roundCard(m)}${hotCard(m)}</div>${duplicatesCard(d)}</div>
     <p class="footnote">${m ? `From your token's sweep ${esc(ago(graph.at))}; it runs every ${Math.round(GRAPH_MS / 60000)} minutes while this tab is in use.` : 'Duplicates come from the same load as the pipeline. The merge round and the hot files need a token.'}</p>`;
+  if (!box.dataset.more) {
+    box.dataset.more = '1';
+    box.addEventListener('click', e => {
+      const btn = e.target.closest('[data-dup]');
+      if (!btn) return;
+      dupOpen.set(btn.dataset.dup, dupShown(btn.dataset.dup) + MORE_STEP);
+      renderTriage();
+    });
+  }
   if (html === triageHtml) return;   // nothing changed: leave the DOM alone
   triageHtml = html;
   box.innerHTML = html;
