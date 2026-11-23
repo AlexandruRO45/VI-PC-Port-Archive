@@ -385,6 +385,48 @@ class TestVAshrrevI16SIMDDivergenceAndExecMask(unittest.TestCase):
                 self.assertIsNone(results[i])
                 self.assertEqual(wave.lanes[i].get_vgpr(VGPR(0)), 0xDEADBEEF)
 
+class TestVAshrrevI16RegisterAliasing(unittest.TestCase):
+    """Part 5: Register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarThreadState()
+
+    def test_aliasing_vdst_equals_src0(self) -> None:
+        # vdst = v1, src0 = v1, src1 = v2
+        self.state.set_vgpr(VGPR(1), 2)       # shift = 2
+        self.state.set_vgpr(VGPR(2), 16)      # val = 16
+
+        inst = VAshrrevI16Instruction.parse("v_ashrrev_i16 v1, v1, v2")
+        res = self.interp.execute(self.state, inst)
+
+        # 16 >> 2 = 4
+        self.assertEqual(res, 4)
+        self.assertEqual(self.state.get_vgpr(VGPR(1)), 4)
+
+    def test_aliasing_vdst_equals_src1(self) -> None:
+        # vdst = v2, src0 = v1, src1 = v2
+        self.state.set_vgpr(VGPR(1), 3)       # shift = 3
+        self.state.set_vgpr(VGPR(2), 0xFFF0)  # val = -16
+
+        inst = VAshrrevI16Instruction.parse("v_ashrrev_i16 v2, v1, v2")
+        res = self.interp.execute(self.state, inst)
+
+        # -16 >> 3 = -2 (0xFFFE)
+        self.assertEqual(res, 0x0000FFFE)
+        self.assertEqual(self.state.get_vgpr(VGPR(2)), 0x0000FFFE)
+
+    def test_triple_aliasing(self) -> None:
+        # vdst = v0, src0 = v0, src1 = v0
+        # v0 = 0x0002 (value=2, shift=2 & 15 = 2). 2 >> 2 = 0
+        self.state.set_vgpr(VGPR(0), 0x0002)
+
+        inst = VAshrrevI16Instruction.parse("v_ashrrev_i16 v0, v0, v0")
+        res = self.interp.execute(self.state, inst)
+
+        self.assertEqual(res, 0)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), 0)
+
 
 if __name__ == '__main__':
     unittest.main()
