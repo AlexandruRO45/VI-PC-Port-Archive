@@ -532,7 +532,14 @@ D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
     using Fn = D3D12_CPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE*);
     const D3D12_CPU_DESCRIPTOR_HANDLE returned =
         reinterpret_cast<Fn>(self->real_vtable[9])(self->real, &handle);
-    return handle.ptr != kUnset ? handle : returned;
+    const D3D12_CPU_DESCRIPTOR_HANDLE result = handle.ptr != kUnset ? handle : returned;
+    static std::atomic<bool> logged{false};
+    if (first_call(logged)) {
+        std::fprintf(stderr, "[rt] d3d12_xs: heap slot 9 -> ptr=0x%llx (handle=0x%llx returned=0x%llx)\n",
+                     static_cast<unsigned long long>(result.ptr), static_cast<unsigned long long>(handle.ptr),
+                     static_cast<unsigned long long>(returned.ptr));
+    }
+    return result;
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self) {
@@ -1422,6 +1429,14 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
+    if (desc) {
+        static std::atomic<bool> logged_desc{false};
+        if (first_call(logged_desc)) {
+            std::fprintf(stderr, "[rt] d3d12_xs: CreateDescriptorHeap(type=%d, num=%u, flags=0x%x, mask=0x%x)\n",
+                         static_cast<int>(desc->Type), desc->NumDescriptors, static_cast<unsigned>(desc->Flags),
+                         desc->NodeMask);
+        }
+    }
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as the PC device does
     if (!riid) return E_POINTER;
     // No output: a capability check, answered by the device (S_FALSE, as on the PC).
@@ -1565,6 +1580,39 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// Xbox device slot 25 (GetResourceAllocationInfo): struct-returning method takes (return_buffer, this, visibleMask,
+// numResourceDescs, pResourceDescs) on Xbox instead of PC MSVC's (this, return_buffer, ...).
+std::uint64_t proxy_get_resource_allocation_info(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2,
+                                                 std::uint64_t a3, std::uint64_t a4) {
+    note_slot(25);
+    if (!is_device_proxy(self) && is_device_proxy(reinterpret_cast<const void*>(a1))) {
+        auto* dev = reinterpret_cast<DeviceProxy*>(a1);
+        auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(self);
+        const auto visible_mask = static_cast<UINT>(a2);
+        const auto num_descs = static_cast<UINT>(a3);
+        const auto* src_descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4);
+        std::vector<D3D12_RESOURCE_DESC> pc_descs;
+        const D3D12_RESOURCE_DESC* use_descs = src_descs;
+        if (src_descs && num_descs > 0 && num_descs <= 64) {
+            pc_descs.assign(src_descs, src_descs + num_descs);
+            for (auto& d : pc_descs) {
+                d.Layout = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+                d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(d.Flags) & 0x3Fu);
+            }
+            use_descs = pc_descs.data();
+        }
+        if (out) *out = dev->real->GetResourceAllocationInfo(visible_mask, num_descs, use_descs);
+        return reinterpret_cast<std::uint64_t>(out);
+    }
+    using PcFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(ID3D12Device*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT,
+                                                          const D3D12_RESOURCE_DESC*);
+    auto fn = reinterpret_cast<PcFn>(self->real_vtable[25]);
+    auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a1);
+    return reinterpret_cast<std::uint64_t>(fn(self->real, out, static_cast<UINT>(a2), static_cast<UINT>(a3),
+                                              reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4)));
+}
+
 // Xbox device slot 26 (GetCustomHeapProperties): on the console, struct-returning methods take (return_buffer, this,
 // node_mask, heap_type) instead of PC MSVC's (this, return_buffer, node_mask, heap_type). Detect the swapped pair via
 // is_device_proxy so both Xbox titles and PC unit tests work cleanly.
@@ -1654,6 +1702,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
             reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 25) {
+        return proxy_get_resource_allocation_info(self, a1, a2, a3, a4);
     } else if constexpr (Slot == 26) {
         return proxy_get_custom_heap_properties(self, a1, a2, a3);
     } else if constexpr (Slot == 62) {
@@ -1664,6 +1714,18 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 70) {
+        note_slot(70);
+        static std::atomic<bool> logged70{false};
+        if (first_call(logged70)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 70 (Xbox stand-in) args: a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx "
+                         "a5=0x%llx a6=0x%llx\n",
+                         static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                         static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6));
+        }
+        return hr_to_u64(S_OK);
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -1672,6 +1734,18 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 127) {
+        note_slot(127);
+        static std::atomic<bool> logged127{false};
+        if (first_call(logged127)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 127 (unimplemented Xbox slot) args: a1=0x%llx a2=0x%llx a3=0x%llx "
+                         "a4=0x%llx a5=0x%llx a6=0x%llx\n",
+                         static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                         static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6));
+        }
+        return hr_to_u64(E_NOTIMPL);
     } else if constexpr (Slot == 133) {
         return hr_to_u64(proxy_create_placed_resource_x(
             self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2), a3,
