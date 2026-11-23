@@ -722,6 +722,40 @@ def apply_standard_ped_culling(
     return out_parts, reports
 
 
+class _Components:
+    def __init__(self, count):
+        self.parent = list(range(count))
+
+    def find(self, index):
+        while self.parent[index] != index:
+            self.parent[index] = self.parent[self.parent[index]]
+            index = self.parent[index]
+        return index
+
+    def join(self, a, b):
+        self.parent[self.find(b)] = self.find(a)
+
+
+def _welded_vertices(points, tolerance):
+    """Map used positions to components of the Euclidean proximity graph."""
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise PedAssembleError("weld tolerance must be finite and nonnegative")
+    unique = list(dict.fromkeys(points))
+    if tolerance == 0:
+        return {point: i for i, point in enumerate(unique)}
+
+    groups = _Components(len(unique))
+    cells = defaultdict(list)
+    for i, point in enumerate(unique):
+        x, y, z = _cell_of(point, tolerance)
+        for dx, dy, dz in _NEIGHBOR_CELLS:
+            for other in cells.get((x + dx, y + dy, z + dz), ()):
+                if math.dist(point, unique[other]) <= tolerance:
+                    groups.join(i, other)
+        cells[x, y, z].append(i)
+    return {point: groups.find(i) for i, point in enumerate(unique)}
+
+
 def count_mesh_islands(
     positions: list[tuple[float, float, float]],
     triangles: list[tuple[int, int, int]],
@@ -740,32 +774,22 @@ def count_mesh_islands(
     if n_tris == 0:
         return {"island_count": 0, "largest_island_triangles": 0, "smallest_island_triangles": 0}
 
-    parent = list(range(n_tris))
-
-    def _find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def _union(a: int, b: int) -> None:
-        ra, rb = _find(a), _find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    vert_owner: dict[object, int] = {}
+    islands = _Components(n_tris)
+    welds = (_welded_vertices((tuple(positions[i]) for tri in triangles for i in tri), quant_tol)
+             if by_position else None)
+    vert_owner: dict[int, int] = {}
     for ti, tri in enumerate(triangles):
         for vi in tri:
-            key: object = _quantize_point(positions[vi], quant_tol) if by_position else vi
+            key = welds[tuple(positions[vi])] if welds is not None else vi
             first = vert_owner.get(key)
             if first is None:
                 vert_owner[key] = ti
             else:
-                _union(first, ti)
+                islands.join(first, ti)
 
     sizes: dict[int, int] = defaultdict(int)
     for ti in range(n_tris):
-        sizes[_find(ti)] += 1
+        sizes[islands.find(ti)] += 1
     counts = sorted(sizes.values(), reverse=True)
     return {
         "island_count": len(counts),
@@ -787,22 +811,21 @@ def analyze_edge_topology(
     double-drawn coplanar overlap bands). Triangles with fewer than three
     distinct welded corners are counted separately; they no longer form faces.
     """
-    edge_counts: dict[tuple[tuple[int, int, int], tuple[int, int, int]], int] = defaultdict(int)
-    collapsed = 0
+    faces = []
     for part in parts:
-        ox, oy, oz = part.translation
-        qpts = [
-            _quantize_point((p[0] + ox, p[1] + oy, p[2] + oz), weld_tol)
-            for p in part.positions
-        ]
-        for a, b, c in part.triangles:
-            qa, qb, qc = qpts[a], qpts[b], qpts[c]
-            if qa == qb or qb == qc or qc == qa:
-                collapsed += 1
-                continue
-            for u, v in ((qa, qb), (qb, qc), (qc, qa)):
-                edge = (u, v) if u < v else (v, u)
-                edge_counts[edge] += 1
+        world = [_vec_add(p, part.translation) for p in part.positions]
+        faces.extend((world[a], world[b], world[c]) for a, b, c in part.triangles)
+    welds = _welded_vertices(itertools.chain.from_iterable(faces), weld_tol)
+    edge_counts: dict[tuple[int, int], int] = defaultdict(int)
+    collapsed = 0
+    for face in faces:
+        a, b, c = (welds[p] for p in face)
+        if a == b or b == c or c == a:
+            collapsed += 1
+            continue
+        for u, v in ((a, b), (b, c), (c, a)):
+            edge = (u, v) if u < v else (v, u)
+            edge_counts[edge] += 1
 
     boundary = 0
     manifold = 0

@@ -219,6 +219,33 @@ class CoplanarCullingAndSeamTests(unittest.TestCase):
         self.assertEqual(fine["collapsed_triangles"], 0)
         self.assertEqual(fine["manifold_edges"], 2)
 
+    def test_weld_uses_distance_across_cells_and_parts(self):
+        def seam(dx, dy, dz):
+            return pa.MeshPart("half", [(0.49, 0.49, 0.49), (4.49, 0.49, 0.49), (2, 5, 0)],
+                               [(0, 1, 2)], translation=(dx, dy, dz))
+
+        left, right = seam(0, 0, 0), seam(0.02, 0, 0)
+        right.positions[-1] = (2, -5, 0)
+        topo = pa.analyze_edge_topology([left, right], weld_tol=1)
+        self.assertEqual((topo["manifold_edges"], topo["boundary_edges"]), (1, 4))
+        points = left.positions + [(x + 0.02, y, z) for x, y, z in right.positions]
+        tris = [(0, 1, 2), (3, 4, 5)]
+        self.assertEqual(pa.count_mesh_islands(points, tris, by_position=True, quant_tol=1)["island_count"], 1)
+        # Corners on opposite diagonals of the same rounded cell can be farther than one unit.
+        right.translation = (-0.98, -0.98, -0.98)
+        self.assertEqual(pa.analyze_edge_topology([left, right], weld_tol=1)["manifold_edges"], 0)
+
+    def test_weld_is_transitive_and_ignores_unused_vertices(self):
+        points = []
+        faces = []
+        for x in (0, 1.8, 0.9):
+            i = len(points)
+            points.extend([(x, 0, 0), (x * 20, 10, 0), (x * 20, 11, 2)])
+            faces.append((i, i + 1, i + 2))
+        for order in (faces, faces[::-1]):
+            self.assertEqual(pa.count_mesh_islands(points, order, by_position=True, quant_tol=1)["island_count"], 1)
+        self.assertEqual(pa.count_mesh_islands(points, faces[:2], by_position=True, quant_tol=1)["island_count"], 2)
+
     def _build_synthetic_body_parts(
         self,
         *,
