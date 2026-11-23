@@ -231,6 +231,40 @@ class PartialVersionMatchTest(PreflightTestBase):
         self.assertNotIn("incomplete copy", err)
         self.assertNotIn("Finish the download", err)
 
+    def test_a_complete_copy_of_another_build_keeps_the_unsupported_message(self):
+        # Every file there, only the probes with other sizes: another package, not an unfinished download.
+        for name in self.FILES:
+            self.write(name, self.FILES[name] + 1 if name in make_game.PROBES else None)
+        err = self.assert_fails(make_game.load_version, self.game,
+                                match="This doesn't look like a supported version of the game")
+        self.assertIn("Wrong size for MicrosoftGame.Config (13 bytes, expected 12).", err)
+        self.assertNotIn("incomplete copy", err)
+        self.assertNotIn("Finish the download", err)
+
+    def test_missing_files_with_matching_probes_still_name_the_incomplete_copy(self):
+        # The probes that are there have their sizes; appdata0.rpf and one archive are missing.
+        for name in self.FILES:
+            if name not in ("appdata0.rpf", "pack/e/f.rpf"):
+                self.write(name)
+        err = self.assert_fails(make_game.load_version, self.game,
+                                match="incomplete copy of Synthetic package 9.8.7.6")
+        self.assertIn("  missing  appdata0.rpf", err)
+        self.assertIn("  missing  pack/e/f.rpf", err)
+        self.assertIn("Finish the download", err)
+
+    def test_missing_files_and_a_probe_with_another_size_keep_the_unsupported_message(self):
+        # Mixed: files missing, and MicrosoftGame.Config there with another size. The probe size says which package
+        # this is, so another size means another build, whatever else is missing: the old message, with the size.
+        for name in self.FILES:
+            if name not in ("appdata0.rpf", "data/d.rpf"):
+                self.write(name, 99 if name == "MicrosoftGame.Config" else None)
+        err = self.assert_fails(make_game.load_version, self.game,
+                                match="This doesn't look like a supported version of the game")
+        self.assertIn("Wrong size for MicrosoftGame.Config (99 bytes, expected 12).", err)
+        self.assertIn("Missing appdata0.rpf.", err)
+        self.assertNotIn("incomplete copy", err)
+        self.assertNotIn("Finish the download", err)
+
     def test_a_complete_copy_still_loads(self):
         for name in self.FILES:
             self.write(name)

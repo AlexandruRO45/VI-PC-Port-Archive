@@ -375,10 +375,15 @@ def manifest_presence(game: str, version: dict) -> tuple[int, list[str], list[st
 
 def partial_version_message(game: str, version: dict) -> str | None:
     """The message for a folder that holds at least half of a version's manifest files with their sizes but misses
-    a probe file, so it is an incomplete copy of that version rather than another game. None below half."""
+    a probe file, so it is an incomplete copy of that version rather than another game. None below half, and None
+    when a probe file is there with another size: a download that stopped early leaves files missing, while a probe
+    with another size (MicrosoftGame.Config above all) is what a complete copy of another build looks like, so
+    load_version() keeps its "not a supported version" message, which lists those sizes."""
     total = len(version["files"])
     matched, missing, wrong, unreadable = manifest_presence(game, version)
     if not total or not matched or 2 * matched < total:
+        return None
+    if any(name in wrong for name in PROBES):
         return None
     files = version["files"]
     name = f"{version['title']} {version['version']}"
