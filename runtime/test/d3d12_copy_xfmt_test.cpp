@@ -7,6 +7,7 @@
 #include "../shims/d3d12_com.h"
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -31,8 +32,9 @@ D3D12_RESOURCE_DESC tex(DXGI_FORMAT f, UINT w, UINT h, D3D12_RESOURCE_FLAGS flag
     return d;
 }
 
-D3D12_RESOURCE_DESC mips(D3D12_RESOURCE_DESC d, UINT16 levels) {
+D3D12_RESOURCE_DESC mips(D3D12_RESOURCE_DESC d, UINT16 levels, UINT16 layers = 1) {
     d.MipLevels = levels;
+    d.DepthOrArraySize = layers;
     return d;
 }
 
@@ -84,8 +86,9 @@ bool run(ID3D12Device* dev, const Case& c, std::vector<unsigned char>& out, HRES
         FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a.p, nullptr, IID_PPV_ARGS(&l.p))) ||
         FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
         return false;
-    // One array layer. Upload every source mip so both copy calls have initialized input.
-    const UINT ns = c.src.MipLevels, nd = c.dst.MipLevels;
+    // Upload every source subresource in D3D12 order (mips within layers).
+    const UINT ns = UINT(c.src.MipLevels) * c.src.DepthOrArraySize;
+    const UINT nd = UINT(c.dst.MipLevels) * c.dst.DepthOrArraySize;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT sf[16]{}, df[16]{};
     UINT rows[16]{};
     UINT64 row_bytes[16]{};
@@ -114,11 +117,15 @@ bool run(ID3D12Device* dev, const Case& c, std::vector<unsigned char>& out, HRES
         }
     if (c.check_edge_bytes) {
         // The edge fixtures copy whole R32G32_UINT source rows, one eight-byte texel per BC1 block.
-        // Count the data bytes, excluding padding, so each row contains a different pattern.
-        const UINT64 bytes_per_row = c.src.Width * 8;
-        for (UINT y = 0; y < c.src.Height; ++y) {
-            auto* row = p + sf[0].Offset + UINT64(y) * sf[0].Footprint.RowPitch;
-            for (UINT64 x = 0; x < bytes_per_row; ++x) row[x] = upload_byte(y * bytes_per_row + x);
+        // Count data bytes across all mips and layers without including footprint padding.
+        UINT64 next_byte = 0;
+        for (UINT i = 0; i < ns; ++i) {
+            const auto& footprint = sf[i].Footprint;
+            const UINT64 bytes_per_row = UINT64(footprint.Width) * 8;
+            for (UINT y = 0; y < footprint.Height; ++y) {
+                auto* row = p + sf[i].Offset + UINT64(y) * footprint.RowPitch;
+                for (UINT64 x = 0; x < bytes_per_row; ++x) row[x] = upload_byte(next_byte++);
+            }
         }
     }
     upload->Unmap(0, nullptr);
@@ -239,6 +246,12 @@ int main() {
         {"CopyResource BC7 16x16 -> R32G32B32A32_UINT 4x4, 3 mips", mips(tex(DXGI_FORMAT_BC7_UNORM, 16, 16), 3), mips(tex(DXGI_FORMAT_R32G32B32A32_UINT, 4, 4), 3), true, false},
         {"negative control: CopyResource BC1 12x8 -> R32G32_UINT 3x2, 2 mips", mips(tex(DXGI_FORMAT_BC1_UNORM, 12, 8), 2), mips(tex(DXGI_FORMAT_R32G32_UINT, 3, 2), 2), true, false},
         {"CopyResource R32G32_UINT 3x2 -> BC1 12x8, 2 mips", mips(tex(DXGI_FORMAT_R32G32_UINT, 3, 2), 2), mips(tex(DXGI_FORMAT_BC1_UNORM, 12, 8), 2), true, false},
+        {.name = "CopyResource R32G32_UINT 4x2 -> BC1 16x8, 3 mips",
+         .src = mips(tex(DXGI_FORMAT_R32G32_UINT, 4, 2), 3), .dst = mips(tex(DXGI_FORMAT_BC1_UNORM, 16, 8), 3),
+         .whole = true, .depth_values = false, .check_edge_bytes = true},
+        {.name = "CopyResource R32G32_UINT 4x2 -> BC1 15x7, 3 mips and 2 layers",
+         .src = mips(tex(DXGI_FORMAT_R32G32_UINT, 4, 2), 3, 2), .dst = mips(tex(DXGI_FORMAT_BC1_UNORM, 15, 7), 3, 2),
+         .whole = true, .depth_values = false, .check_edge_bytes = true},
         {"CopyResource R32G32B32A32_UINT 4x4 -> BC7 16x16", tex(DXGI_FORMAT_R32G32B32A32_UINT, 4, 4), tex(DXGI_FORMAT_BC7_UNORM, 16, 16), true, false},
     };
 
@@ -254,7 +267,11 @@ int main() {
             std::vector<unsigned char> h, o;
             HRESULT hh = S_OK, oh = S_OK;
             if (c.check_edge_bytes) {
-                std::vector<unsigned char> expected(size_t(c.src.Width) * c.src.Height * 8);
+                size_t layer_bytes = 0;
+                for (UINT mip = 0; mip < c.src.MipLevels; ++mip)
+                    layer_bytes += size_t(std::max<UINT64>(1, c.src.Width >> mip)) *
+                                   std::max<UINT>(1, c.src.Height >> mip) * 8;
+                std::vector<unsigned char> expected(layer_bytes * c.src.DepthOrArraySize);
                 for (size_t i = 0; i < expected.size(); ++i) expected[i] = upload_byte(i);
                 const bool ours_ok = run(ours.p, c, o, oh);
                 if (!ours_ok || o != expected) {

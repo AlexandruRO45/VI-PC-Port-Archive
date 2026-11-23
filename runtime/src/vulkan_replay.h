@@ -1007,7 +1007,7 @@ struct Prepared {
     std::uint32_t rgb96_slice_words = 0;
     Depth24Job depth24;                    // the whole copy: where its scratch floats are
     std::vector<Depth24Job> depth24_parts;  // the dispatches that convert it
-    // A depth <-> colour copy: the source into `staged` (image to buffer), then `staged` into the destination.
+    // Depth <-> colour and partial BC copies use image-to-buffer followed by buffer-to-image.
     VkBuffer staged = VK_NULL_HANDLE;
     std::vector<VkBufferImageCopy> staged_reads, staged_writes;
     std::vector<VkImageSubresourceRange> discards;  // DiscardResource: the subresources to discard
@@ -1912,14 +1912,22 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
         const VkImageAspectFlags src_aspect = cross ? src.aspects : aspect;
         for (std::uint32_t mip = 0; mip < dst.mip_levels; ++mip) {
             const VkExtent2D extent = mip_extent(src, mip), to = mip_extent(dst, mip);
-            // Lower mips can differ in blocks (BC 12x8 mip 1 is 2x1 blocks, R32G32 3x2 mip 1 is 1x1): more source
-            // blocks than the destination holds is refused, as by WARP. shortcut: a BC destination mip with a partial
-            // edge block cannot take a whole uncompressed texel per block in one vkCmdCopyImage; refused until such
-            // a copy is staged through a buffer.
-            if (sb != db && (blocks(extent.width, sb) * db > to.width || blocks(extent.height, sb) * db > to.height))
+            // Lower mips can differ in block count. WARP refuses a source mip with more blocks than the destination.
+            const std::uint32_t columns = blocks(extent.width, sb), rows = blocks(extent.height, sb);
+            if (sb != db && (columns > blocks(to.width, db) || rows > blocks(to.height, db)))
                 return ReplayResult::invalid_copy;
-            p.image_copies.push_back({{src_aspect, mip, 0, dst.array_layers}, {0, 0, 0}, {aspect, mip, 0, dst.array_layers},
-                                      {0, 0, 0}, {extent.width, extent.height, std::max(1u, src.depth >> mip)}});
+            const VkImageCopy region{{src_aspect, mip, 0, dst.array_layers}, {},
+                                     {aspect, mip, 0, dst.array_layers}, {},
+                                     {extent.width, extent.height, std::max(1u, src.depth >> mip)}};
+            const std::uint32_t dst_w = columns * db, dst_h = rows * db;
+            if (db > sb && (dst_w > to.width || dst_h > to.height)) {
+                // The source row and the clipped destination row cover the same whole BC blocks in scratch.
+                p.staged_reads.push_back({0, extent.width, extent.height, region.srcSubresource, {}, region.extent});
+                p.staged_writes.push_back({0, dst_w, dst_h, region.dstSubresource, {},
+                    {std::min(dst_w, to.width), std::min(dst_h, to.height), region.extent.depth}});
+            } else {
+                p.image_copies.push_back(region);
+            }
         }
     }
     p.range = {dst.aspects, 0, dst.mip_levels, 0, dst.array_layers};
@@ -2749,20 +2757,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 } else p.buffer_copies.push_back({src, dst, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
                 result = detail::prepare_texture_copy(*texture_copy, p);
-                if (result == ReplayResult::success && !p.staged_reads.empty()) {
-                    // A block-compressed copy staged through transfer scratch (prepare_texture_copy): whole blocks of
-                    // the read's row length and height, one region a copy.
-                    const VkBufferImageCopy& read = p.staged_reads[0];
-                    const BlockFormat f = block_format(p.source.format, read.imageSubresource.aspectMask);
-                    const VkDeviceSize bytes = VkDeviceSize(read.bufferRowLength / f.block) *
-                                               (read.bufferImageHeight / f.block) * read.imageExtent.depth * f.bytes;
-                    VkDeviceSize base = 0;
-                    if (!f.bytes || !vk.copy_image_to_buffer || !vk.copy_buffer_to_image || !vk.copy_scratch ||
-                        !vk.copy_scratch(bytes, p.staged, base))
-                        return ReplayResult::invalid_copy;  // refused as before this path existed
-                    p.staged_reads[0].bufferOffset += base;
-                    p.staged_writes[0].bufferOffset += base;
-                }
                 // A depth plane footprint of a D24 texture stored as D32: words of 24-bit UNORM, floats in the image.
                 const bool upload = texture_copy->src.footprint;
                 const ResourceBinding& image = upload ? p.binding : p.source;
@@ -2811,6 +2805,27 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 }
             } else {
                 result = detail::prepare_resource_copy(p);
+            }
+            if (result == ReplayResult::success && !p.staged_reads.empty()) {
+                // Pack each clipped BC region with whole texels or blocks, including every array layer or depth slice.
+                const BlockFormat f = block_format(p.source.format, p.staged_reads.front().imageSubresource.aspectMask);
+                if (!f.bytes || !vk.copy_image_to_buffer || !vk.copy_buffer_to_image || !vk.copy_scratch)
+                    return ReplayResult::invalid_copy;
+                VkDeviceSize total = 0;
+                for (std::size_t region = 0; region < p.staged_reads.size(); ++region) {
+                    VkBufferImageCopy& read = p.staged_reads[region];
+                    read.bufferOffset = total;
+                    p.staged_writes[region].bufferOffset = total;
+                    const VkDeviceSize bytes = VkDeviceSize(read.bufferRowLength / f.block) *
+                        (read.bufferImageHeight / f.block) * read.imageExtent.depth *
+                        read.imageSubresource.layerCount * f.bytes;
+                    if (bytes > UINT64_MAX - total) return ReplayResult::invalid_copy;
+                    total += bytes;
+                }
+                VkDeviceSize base = 0;
+                if (!vk.copy_scratch(total, p.staged, base)) return ReplayResult::invalid_copy;
+                for (auto& read : p.staged_reads) read.bufferOffset += base;
+                for (auto& write : p.staged_writes) write.bufferOffset += base;
             }
             if (result == ReplayResult::success && !p.image_copies.empty() &&
                 p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask) {
@@ -3643,37 +3658,31 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             } else if (!p.buffer_copies.empty()) {
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
-            } else if (p.staged) {
-                // Depth <-> colour, or a block-compressed copy no one extent fits: the source into the scratch, then
-                // the scratch into the destination. The destination's copy_layout comes after the scratch write, so
-                // its barrier orders every earlier transfer write before the destination's (#860, Vonsek's
-                // synchronization-validation run).
-                const VkImageLayout src_layout = detail::copy_layout(
-                    vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
-                vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staged,
-                                        std::uint32_t(p.staged_reads.size()), p.staged_reads.data());
-                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                       VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-                const VkImageLayout dst_layout = detail::copy_layout(
-                    vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
-                vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, dst_layout,
-                                        std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
-            } else if (!p.image_copies.empty()) {
+            } else if (p.staged || !p.image_copies.empty()) {
                 // A subresource can be both the source and destination only in a shared layout.
-                const bool self = p.same_copy_subresource;
+                const bool self = !p.image_copies.empty() && p.same_copy_subresource;
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                     self ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     self ? VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT,
                     tracker);
+                if (p.staged) {
+                    // Finish the scratch write before the destination transition and scratch-to-image copy.
+                    vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staged,
+                                            std::uint32_t(p.staged_reads.size()), p.staged_reads.data());
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                }
                 const VkImageLayout dst_layout = self ? src_layout : detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                if (p.staged)
+                    vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, dst_layout,
+                                            std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
                 const auto count = std::uint32_t(p.image_copies.size());
                 const auto depth_stencil = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-                if (std::holds_alternative<CopyResource>(command) &&
+                if (count && std::holds_alternative<CopyResource>(command) &&
                     (p.binding.aspects & depth_stencil) == depth_stencil) {
                     // prepare_resource_copy groups regions by aspect. On RX 5700 XT (Windows driver
                     // 32.0.21045.5002), copying both groups in one command corrupts stencil in multi-mip
@@ -3688,7 +3697,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                            VK_PIPELINE_STAGE_TRANSFER_BIT);
                     vk.copy_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout,
                                   count - depth_count, p.image_copies.data() + depth_count);
-                } else {
+                } else if (count) {
                     vk.copy_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout,
                                   count, p.image_copies.data());
                 }
