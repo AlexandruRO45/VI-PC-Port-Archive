@@ -632,6 +632,21 @@ if(BUILD_TESTING)
   add_test(NAME shader_library COMMAND shader_library_test)
   add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
+  # The vertex shader that draws --mesh-compute slots (mesh_compute_vs.h). The test writes its modules to a folder;
+  # where the Vulkan SDK's spirv-val is found, each is validated after it.
+  add_executable(mesh_compute_vs_test test/mesh_compute_vs_test.cpp)
+  set(LEONIDA_MESH_VS_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/mesh_compute_vs)
+  file(MAKE_DIRECTORY ${LEONIDA_MESH_VS_DIR})
+  add_test(NAME mesh_compute_vs COMMAND mesh_compute_vs_test ${LEONIDA_MESH_VS_DIR})
+  find_program(LEONIDA_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  if(LEONIDA_SPIRV_VAL)
+    set_tests_properties(mesh_compute_vs PROPERTIES FIXTURES_SETUP mesh_compute_vs_modules)
+    foreach(module small corpus distances f16)
+      add_test(NAME mesh_compute_vs_val_${module}
+               COMMAND ${LEONIDA_SPIRV_VAL} --target-env vulkan1.2 ${LEONIDA_MESH_VS_DIR}/${module}.spv)
+      set_tests_properties(mesh_compute_vs_val_${module} PROPERTIES FIXTURES_REQUIRED mesh_compute_vs_modules)
+    endforeach()
+  endif()
   # Optional: skips unless LEONIDA_SHADERS names a translated work folder (<work>/shaders/spirv).
   add_executable(shader_library_corpus_test test/shader_library_corpus_test.cpp)
   add_test(NAME shader_library_corpus COMMAND shader_library_corpus_test)
@@ -1914,8 +1929,27 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
       set_tests_properties(d3d12_mesh PROPERTIES SKIP_RETURN_CODE 77)
+      # Mesh PSOs and DispatchMesh without VK_EXT_mesh_shader, through --mesh-compute (runs on every GPU: the layer's
+      # device is made without the extension).
+      set(LEONIDA_TEST_MS_COMPUTE ${CMAKE_CURRENT_BINARY_DIR}/generated/ms_draw_compute.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_MS_COMPUTE}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -o ${LEONIDA_TEST_MS_COMPUTE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw_compute.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ms_draw_compute.comp
+        COMMENT "Compiling the --mesh-compute test shader ms_draw_compute.comp"
+        VERBATIM)
+      add_executable(d3d12_mesh_compute_test test/d3d12_mesh_compute_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_MS_COMPUTE} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_mesh_compute_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_mesh_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_MS_COMPUTE_SPV="${LEONIDA_TEST_MS_COMPUTE}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_mesh_compute_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_mesh_compute COMMAND d3d12_mesh_compute_test)
+      set_tests_properties(d3d12_mesh_compute PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_mesh_test are not built")
+      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test, d3d12_mesh_test and d3d12_mesh_compute_test are not built")
     endif()
 
     # Subgroup size control in PSOs, end to end: runtime/test/shaders/cs_w64x_readlane.asm translated natively and with

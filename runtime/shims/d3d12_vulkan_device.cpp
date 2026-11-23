@@ -24,6 +24,7 @@
 #include "../src/conservative_raster.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
+#include "../src/mesh_compute_vs.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
@@ -2763,6 +2764,8 @@ public:
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
+        if (graphics_.mesh_compute.pipeline) vk.vkDestroyPipeline(dev, graphics_.mesh_compute.pipeline, nullptr);
+        if (graphics_.mesh_compute.layout) vk.vkDestroyPipelineLayout(dev, graphics_.mesh_compute.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
     }
@@ -2827,8 +2830,15 @@ public:
                      desc.GS.BytecodeLength || desc.StreamOutput.NumEntries))
             return E_INVALIDARG;  // D3D12: a mesh PSO has no vertex, tessellation or geometry stage
         if (!mesh && (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength)) return E_INVALIDARG;
-        if (mesh && (!device_.info.mesh_shader || !vk.vkCmdDrawMeshTasksEXT)) {
-            log_once("mesh-shader PSOs need VK_EXT_mesh_shader, which the device has not enabled; stage", 1);
+        // Without VK_EXT_mesh_shader a mesh PSO runs through --mesh-compute (rdna2spirv.py, #1053): the mesh shader
+        // as a compute pipeline writing one output slot per workgroup, drawn by a vertex shader built here
+        // (mesh_compute_vs.h). Its MS entry must be such a module (checked below), and both take 152 bytes of push
+        // constants.
+        const bool mesh_compute = mesh && (!device_.info.mesh_shader || !vk.vkCmdDrawMeshTasksEXT);
+        if (mesh_compute && device_.info.max_push_constants_size &&
+            device_.info.max_push_constants_size < sizeof(leonida::MeshComputeUserData)) {
+            log_once("--mesh-compute PSOs need 152 bytes of push constants; maxPushConstantsSize",
+                     int(device_.info.max_push_constants_size));
             return E_NOTIMPL;
         }
         if (!device_.arena.mapped) {
@@ -2887,7 +2897,10 @@ public:
             std::vector<std::uint8_t> fssm;
             std::vector<std::uint32_t> words;
         };
-        Stage stages[3] = {mesh ? Stage{"ms", VK_SHADER_STAGE_MESH_BIT_EXT, *ms}
+        // --mesh-compute: the MS entry is looked up as "ms", and its Vulkan stage is the vertex shader drawing its
+        // slots.
+        const VkShaderStageFlagBits ms_bit = mesh_compute ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_MESH_BIT_EXT;
+        Stage stages[3] = {mesh ? Stage{"ms", ms_bit, *ms}
                                 : Stage{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
                            {"gs", VK_SHADER_STAGE_GEOMETRY_BIT, desc.GS},
                            {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
@@ -2910,7 +2923,7 @@ public:
             const std::string hash = leonida::sha256_hex(stage.fssm);
             // Containers with the same program can differ in their input signature or bindings: a VS must have its
             // inputs fed by this input layout (else the layout check below reports it).
-            const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
+            const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !mesh;
             stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
                 return !vertex || layout_feeds(e, desc.InputLayout);
             });
@@ -2966,7 +2979,37 @@ public:
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
-        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry && !ps_stage.entry->f16_halves.empty()) {
+        // --mesh-compute: the MS module becomes the compute pipeline (create_mesh_compute, below), and stages[0] the
+        // vertex shader that draws its slots. That shader exports a param's decoded halves where the layout says, so
+        // a PS reading halves must read them there: pairing them per pipeline, as tools/mesh_compute_vs.py's
+        // pair_f16_halves does, is not built yet.
+        std::vector<std::uint32_t> mesh_compute_words;
+        if (mesh_compute) {
+            const leonida::ShaderEntry& ms_entry = *vs_stage.entry;
+            if (!ms_entry.mesh_compute) {
+                std::fprintf(stderr, "[rt] d3d12: %s: mesh-shader PSOs need VK_EXT_mesh_shader, which the device has "
+                                     "not enabled, or mesh shaders translated with --mesh-compute\n",
+                             ms_entry.name.c_str());
+                return E_NOTIMPL;
+            }
+            if (ps_stage.entry && ps_stage.entry->f16_halves != ms_entry.mesh_compute->f16_halves &&
+                !ps_stage.entry->f16_halves.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: %s reads f16 halves at other locations than %s's mesh_compute "
+                                     "layout exports them (per-pipeline pairing not built yet)\n",
+                             ps_stage.entry->name.c_str(), ms_entry.name.c_str());
+                return E_NOTIMPL;
+            }
+            std::string vs_error;
+            std::vector<std::uint32_t> vs_words = leonida::mesh_compute_vs(*ms_entry.mesh_compute, &vs_error);
+            if (vs_words.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: %s: %s\n", ms_entry.name.c_str(), vs_error.c_str());
+                return E_NOTIMPL;
+            }
+            mesh_compute_words = std::move(vs_stage.words);
+            vs_stage.words = std::move(vs_words);
+        }
+        if (vs_stage.entry && ps_stage.entry && !gs_stage.entry && !mesh_compute &&
+            !ps_stage.entry->f16_halves.empty()) {
             std::string link_error;
             if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
                                           &link_error)) {
@@ -2986,7 +3029,10 @@ public:
             info.stage = stage.bit;
             info.module = module;
             info.pName = "main";
-            subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
+            // The --mesh-compute vertex shader uses no subgroup operation: it asks for no size (the MS entry's
+            // size is the compute pipeline's).
+            if (!(mesh_compute && &stage == &vs_stage))
+                subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
         }
 
@@ -3251,7 +3297,9 @@ public:
         for (const Stage& stage : stages)
             if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
                 graphics_.push_stages |= stage.bit;
-        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
+        const VkPushConstantRange push{graphics_.push_stages, 0,
+                                       mesh_compute ? sizeof(leonida::MeshComputeUserData)
+                                                    : sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
@@ -3263,10 +3311,15 @@ public:
             graphics_.bindless_set = device_.bindless->set();
         }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
+        if (mesh_compute) {
+            if (const HRESULT hr = create_mesh_compute(*vs_stage.entry, mesh_compute_words); FAILED(hr)) return hr;
+        }
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
+        // A --mesh-compute pipeline is still a mesh PSO to D3D12 (DispatchMesh draws it), and a vertex pipeline to
+        // Vulkan: input assembly (triangle lists, set at the draw) and no vertex input.
         graphics_.mesh = mesh;
-        recipe_.mesh = mesh;
+        recipe_.mesh = mesh && !mesh_compute;
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
         recipe_.bindings = std::move(bindings);
@@ -3295,6 +3348,68 @@ public:
         device_.context->add_graphics_pipeline(id(), graphics_);
         registered_ = true;
         is_graphics_ = true;
+        return S_OK;
+    }
+
+    // A --mesh-compute mesh PSO's compute half (create_graphics): the MS module as a compute pipeline that writes the
+    // workgroups' output slots, with the 152-byte push-constant block (the output address in dwords 36..37), the
+    // device's set 0 where the module declares bindings, and the subgroup size the shader was translated for.
+    HRESULT create_mesh_compute(const leonida::ShaderEntry& entry, const std::vector<std::uint32_t>& words) {
+        auto& vk = device_.context->vk;
+        const VkDevice dev = device_.info.device;
+        // SHADER-309, as for compute PSOs: workgroup memory over the device's limit is refused here.
+        if (entry.lds_bytes && device_.info.get_instance_proc) {
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    device_.info.get_instance_proc(device_.info.instance, "vkGetPhysicalDeviceProperties"))) {
+                VkPhysicalDeviceProperties props{};
+                get_props(device_.info.physical, &props);
+                if (entry.lds_bytes > props.limits.maxComputeSharedMemorySize) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: %s declares %u bytes of workgroup memory, over the device's "
+                                 "maxComputeSharedMemorySize %u\n",
+                                 entry.name.c_str(), unsigned(entry.lds_bytes),
+                                 unsigned(props.limits.maxComputeSharedMemorySize));
+                    return E_NOTIMPL;
+                }
+            }
+        }
+        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module_info.codeSize = words.size() * 4;
+        module_info.pCode = words.data();
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
+        modules_.push_back(module);
+        auto& mc = graphics_.mesh_compute;
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::MeshComputeUserData)};
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (entry.binding_count) {  // create_graphics checked that the device has its bindless set
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+            mc.bindless_set = device_.bindless->set();
+        }
+        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &mc.layout) != VK_SUCCESS) return E_FAIL;
+        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = module;
+        pipeline_info.stage.pName = "main";
+        leonida::ShaderEntry as_compute = entry;  // its subgroup size is decided for the compute stage
+        as_compute.stage = "cs";
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+        subgroup_size_for(as_compute, required_size, pipeline_info.stage);
+        pipeline_info.layout = mc.layout;
+        if (device_.create_pipeline(
+                [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
+                    return vk.vkCreateComputePipelines(dev, cache, 1, &create, nullptr, &mc.pipeline);
+                },
+                pipeline_info) != VK_SUCCESS)
+            return E_FAIL;
+        mc.slot_bytes = entry.mesh_compute->slot_bytes;
+        mc.max_primitives = entry.mesh_compute->max_primitives;
         return S_OK;
     }
 
@@ -4458,10 +4573,16 @@ public:
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
-        // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
-        state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
-            return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        });
+        // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU. With buffer
+        // device addresses the same scratch holds --mesh-compute mesh draws' output slots (vulkan_replay.h).
+        const bool scratch_addresses = info.buffer_device_address;
+        state_.context->enable_copy_scratch(
+            get_device,
+            [this, scratch_addresses](const VkMemoryRequirements& requirements) {
+                return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr,
+                                       scratch_addresses);
+            },
+            scratch_addresses);
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
         // a 96-bit texture, which every GPU stores as RGBA32 (D3D-62): the converter is there whether or not the
         // GPU has a native D24_UNORM_S8_UINT. It costs nothing until a copy needs it (its pipeline is made on the
@@ -6545,11 +6666,16 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7*>(data);
             *opts = {};
-            // Tier 1 is mesh PSOs and DispatchMesh, on VK_EXT_mesh_shader. Amplification shaders are part of the tier
-            // but refused at PSO creation (the game has none); OPTIONS9's mesh statistics and full-range render
-            // target array index stay FALSE.
-            opts->MeshShaderTier =
-                state_.info.mesh_shader ? D3D12_MESH_SHADER_TIER_1 : D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+            // Tier 1 is mesh PSOs and DispatchMesh, on VK_EXT_mesh_shader, or without it where the translated mesh
+            // shaders are --mesh-compute ones and the device can run them (buffer device addresses, 152 bytes of push
+            // constants). Amplification shaders are part of the tier but refused at PSO creation (the game has none);
+            // OPTIONS9's mesh statistics and full-range render target array index stay FALSE.
+            const leonida::ShaderLibrary* library = state_.library();
+            const std::uint32_t push_limit = state_.info.max_push_constants_size;
+            const bool mesh_compute = library && library->mesh_compute_count() && state_.info.buffer_device_address &&
+                                      (!push_limit || push_limit >= sizeof(leonida::MeshComputeUserData));
+            opts->MeshShaderTier = state_.info.mesh_shader || mesh_compute ? D3D12_MESH_SHADER_TIER_1
+                                                                           : D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
             opts->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
             return d3d12_trace::result(method, S_OK);
         }

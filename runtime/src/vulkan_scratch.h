@@ -23,9 +23,15 @@ public:
     // A device-local allocation for a chunk; null on failure.
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
-    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate)
+    // With `device_address`, the chunks are storage buffers with a device address too (the allocation must then
+    // carry VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT), and `get_address` hands out scratch by address: the output of
+    // --mesh-compute mesh shaders goes there (vulkan_replay.h).
+    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate, bool device_address = false)
         : device_(device), allocate_(std::move(allocate)) {
         loaded_ = vk_.load(get, device);
+        if (device_address)
+            get_buffer_address_ =
+                reinterpret_cast<PFN_vkGetBufferDeviceAddress>(get(device, "vkGetBufferDeviceAddress"));
     }
 
     ~ScratchBuffers() {
@@ -66,6 +72,17 @@ public:
         buffer = chunk.buffer;
         offset = 0;
         current_.chunks.push_back(chunk);
+        return true;
+    }
+
+    // `bytes` of scratch for the next submission by device address; false without device addresses.
+    bool get_address(std::uint64_t bytes, VkDeviceAddress& address) {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        if (!get_buffer_address_ || !get(bytes, buffer, offset)) return false;
+        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        info.buffer = buffer;
+        address = get_buffer_address_(device_, &info) + offset;
         return true;
     }
 
@@ -149,6 +166,8 @@ private:
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (get_buffer_address_)
+            info.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, out.buffer, &requirements);
@@ -174,6 +193,7 @@ private:
     Allocate allocate_;
     Functions vk_;
     bool loaded_ = false;
+    PFN_vkGetBufferDeviceAddress get_buffer_address_ = nullptr;  // set: chunks have device addresses
     Batch current_;               // handed out, not yet submitted
     std::vector<Batch> retired_;  // submitted, waiting for the GPU
     std::vector<Chunk> spare_;    // finished chunks kept for reuse

@@ -759,6 +759,16 @@ struct GraphicsPipeline {
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    // A mesh PSO on a device without VK_EXT_mesh_shader (`--mesh-compute`): `mesh` is still set (DispatchMesh draws
+    // it), the mesh shader runs as this compute pipeline writing one output slot per workgroup, and `pipeline`,
+    // whose vertex shader is mesh_compute_vs.h's, draws the slots. Both take MeshComputeUserData. Null otherwise.
+    struct MeshCompute {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of `layout`; null: none
+        std::uint32_t slot_bytes = 0;
+        std::uint32_t max_primitives = 0;
+    } mesh_compute;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -768,6 +778,13 @@ struct ShaderUserData {
     std::uint64_t code_base;
 };
 static_assert(sizeof(ShaderUserData) == 144);
+
+// --mesh-compute modules and their vertex shader add the output buffer's address (dwords 36..37): 152 bytes.
+struct MeshComputeUserData {
+    ShaderUserData user;
+    std::uint64_t output;
+};
+static_assert(sizeof(MeshComputeUserData) == 152);
 
 struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
@@ -883,6 +900,9 @@ struct ReplayFunctions {
     // `bytes` of transfer scratch that stays alive until the submission completes (vulkan_scratch.h): depth <-> colour
     // copies go through it, image to buffer to image. Without it such a copy is unsupported.
     std::function<bool(VkDeviceSize bytes, VkBuffer&, VkDeviceSize&)> copy_scratch;
+    // `bytes` of the same scratch by device address: a --mesh-compute mesh draw's output slots
+    // (GraphicsPipeline::mesh_compute). Without it such a draw is unsupported.
+    std::function<bool(VkDeviceSize bytes, VkDeviceAddress&)> mesh_output;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -1000,11 +1020,16 @@ struct PreparedDraw {
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
+    // A --mesh-compute mesh draw: its workgroups and where their output slots are (0: not such a draw).
+    std::uint64_t mesh_groups = 0;
+    VkDeviceAddress mesh_output = 0;
 
     // Back to a new draw's state, keeping the vectors' storage.
     void reset() {
         graphics = nullptr;
         pipeline = VK_NULL_HANDLE;
+        mesh_groups = 0;
+        mesh_output = 0;
         colors.clear();
         depth = {};
         vertex_buffers.clear();
@@ -1933,9 +1958,20 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
-    if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
+    const GraphicsPipeline::MeshCompute& mc = pipeline->mesh_compute;
+    if (draw.mesh && !mc.pipeline && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
+    if (draw.mesh && mc.pipeline) {
+        // --mesh-compute: the workgroups' output slots, written by the dispatch and read by the draw that follows.
+        // DispatchMesh's counts are in count, instances and first. The draw's vertex count must fit in 32 bits.
+        if (!vk.dispatch || !vk.pipeline_barrier || !vk.mesh_output || (mc.bindless_set && !vk.bind_descriptor_sets))
+            return ReplayResult::unsupported;
+        const std::uint64_t groups = std::uint64_t(draw.count) * draw.instances * draw.first;
+        if (!groups || groups * mc.max_primitives * 3 > UINT32_MAX) return ReplayResult::unsupported;
+        if (!vk.mesh_output(groups * mc.slot_bytes, p.mesh_output)) return ReplayResult::unsupported;
+        p.mesh_groups = groups;
+    }
     p.graphics = pipeline;
     p.pipeline = pipeline->pipeline;
     p.area = {UINT32_MAX, UINT32_MAX};
@@ -3733,6 +3769,28 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const Draw* draw = detail::draw_of(command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];
+            MeshComputeUserData mesh_data{};  // a --mesh-compute draw's push constants, for the dispatch and the draw
+            if (d.mesh_groups) {
+                // The mesh shader as compute: one output slot per workgroup, then a barrier so the vertex shader
+                // that draws the slots sees them. Outside the draw's rendering scope, which opens below.
+                const GraphicsPipeline::MeshCompute& mc = d.graphics->mesh_compute;
+                std::copy(draw->user_data.begin(), draw->user_data.end(), mesh_data.user.s);
+                mesh_data.user.heap_base = vk.heap_base;
+                mesh_data.user.code_base = d.graphics->code_base;
+                mesh_data.output = d.mesh_output;
+                vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, mc.pipeline);
+                if (mc.bindless_set)
+                    vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, mc.layout, 0, 1,
+                                            &mc.bindless_set, 0, nullptr);
+                vk.push_constants(command_buffer, mc.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mesh_data),
+                                  &mesh_data);
+                vk.dispatch(command_buffer, draw->count, draw->instances, draw->first);
+                VkMemoryBarrier written{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                written.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                written.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                vk.pipeline_barrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &written, 0, nullptr, 0, nullptr);
+            }
             constexpr VkAccessFlags color_access =
                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             constexpr VkAccessFlags depth_access =
@@ -3780,7 +3838,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (graphics.bindless_set)
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
                                         &graphics.bindless_set, 0, nullptr);
-            vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+            if (d.mesh_groups)
+                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(mesh_data),
+                                  &mesh_data);
+            else
+                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
             const Viewport& v = draw->viewport;
@@ -3793,10 +3855,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.set_scissor(command_buffer, 0, 1, &scissor);
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
-            if (!draw->mesh) {
-                const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
+            // A --mesh-compute draw is a vertex pipeline that draws triangle lists.
+            if (!draw->mesh || d.mesh_groups) {
+                const VkPrimitiveTopology topology =
+                    d.mesh_groups ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
                 vk.set_primitive_topology(command_buffer, topology);
-                const bool restart = draw->indexed && detail::strip_topology(topology) &&
+                const bool restart = draw->indexed && !draw->mesh && detail::strip_topology(topology) &&
                                      ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
                                       (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
                 vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
@@ -3813,6 +3877,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
             if (const auto* indirect = std::get_if<ExecuteIndirect>(&command)) {
                 detail::emit_indirect(vk, command_buffer, p, *indirect);  // the arguments hold the counts
+            } else if (draw->mesh && d.mesh_groups) {
+                // Three vertices for every primitive a workgroup may write (mesh_compute_vs.h); prepare_draw checked
+                // that the count fits in 32 bits.
+                vk.draw(command_buffer,
+                        std::uint32_t(d.mesh_groups * graphics.mesh_compute.max_primitives * 3), 1, 0, 0);
             } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {
