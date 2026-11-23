@@ -398,6 +398,10 @@ int main(int argc, char** argv) {
         for (const auto& t : odd) x.vertex_data.insert(x.vertex_data.end(), t, t + 9);
         x.triangle_count += sizeof odd / sizeof odd[0];
         if (build_blas(gpu, builder, dir, "blas_box16_extremes", {x}, h3, 0, nullptr, false, true)) return 1;
+        // Two of these triangles' centroids sit at the top of their axis, where the Morton key must be bin 1023 on
+        // every device (xdxr_build.comp, morton). A divide that lands just under 1.0 gave bin 1022, a different tree,
+        // and a header size of 3,520 bytes instead of 3,072. A deliberate change to the tree shape updates this size.
+        EXPECT(h3.size == 3072);
         const Geometry big = soup(3000);
         const std::vector<Geometry> after = {move(big, 1.5f)};
         if (build_blas(gpu, builder, dir, "blas_box16_refit_in_place", {big}, h4, 300, &after, false, true)) return 1;
