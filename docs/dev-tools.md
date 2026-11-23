@@ -1,4 +1,4 @@
-# Development tool discovery
+# Development tools
 
 From the Leonida checkout root, use Python 3 to list the development tools:
 
@@ -32,3 +32,26 @@ and screenshots are unavailable through this entry point.
 
 Exit code `0` indicates that the inventory was emitted, including when a
 producer script is missing. Invalid CLI arguments exit with code `2`.
+
+## Analyze a boot trace
+
+Use the existing analyzer through the development CLI:
+
+```powershell
+python -I scripts/dev.py boot-trace --help
+python -I scripts/dev.py boot-trace "logs/startup trace.jsonl"
+python -I scripts/dev.py boot-trace "logs/startup trace.jsonl" --d3d12 "logs/d3d12 stderr.log" --json
+```
+
+Pass a startup JSONL from `gta6rt --trace`, a D3D12 stderr log from
+`gta6rt --trace-d3d12`, or both. Relative input paths are interpreted from
+the directory where you run the CLI. From outside the checkout, give the
+path to `scripts/dev.py` and keep the trace paths relative to your directory.
+
+The analyzer supplies the help, output, diagnostics and exit status. If one
+input fails but the other can be read, `--json` can still emit a partial
+summary on stdout with a diagnostic on stderr and exit code `2`. If neither
+input can be analyzed, there is no JSON summary. The summary describes the
+recorded events, and the exit status reports the analysis result.
+
+You can also run `python -I tools/boot_trace.py` with the same arguments.
