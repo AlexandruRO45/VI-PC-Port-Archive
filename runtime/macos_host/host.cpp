@@ -1,40 +1,46 @@
 // Prototype: run a Windows x64 PE natively on macOS (an x86-64 Mach-O under Rosetta 2), without Wine.
 // Maps the image, applies DIR64 relocations, binds imports to host functions with the Windows x64 calling
-// convention, gives every guest thread a TEB reached through gs:, and swaps gs back to the pthread base while a
-// host function runs. Proof of concept for #2947; the import table covers only guest/guest.c.
+// convention, gives every guest thread a TEB (with static TLS) reached through gs:, and swaps gs back to the
+// pthread base while a host function runs. Proof of concept for #2947.
+//
+//   macos_host <image.exe> [guest arguments...]
+#include "host.h"
+
 #include <mach/mach.h>
-#include <pthread.h>
 #include <sys/mman.h>
-#include <fcntl.h>
-#include <time.h>
 #include <unistd.h>
 
-#include <cstdint>
+#include <cctype>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <mutex>
-#include <string>
-#include <type_traits>
-#include <vector>
 
-extern "C" void _thread_set_tsd_base(uint64_t);  // private libsystem_kernel call; Wine uses it the same way
+namespace host {
 
-#define MSABI __attribute__((ms_abi))
+thread_local uint8_t* t_teb = nullptr;
+uint8_t* g_image = nullptr;
+std::string g_command_line;
+int g_argc = 0;
+char** g_argv = nullptr;
 
 namespace {
 
-// ---- TEB and gs ----------------------------------------------------------------------------------------------
-constexpr size_t kTebSize = 0x2000;
-constexpr size_t kTebStackBase = 0x08, kTebStackLimit = 0x10, kTebSelf = 0x30, kTebPid = 0x40, kTebTid = 0x48;
-constexpr size_t kTebPeb = 0x60, kTebLastError = 0x68, kTebTlsSlots = 0x1480;
-constexpr size_t kTebHostGs = 0x1F00;  // our stash, past the end of the documented x64 TEB (0x1838)
-constexpr int kTlsSlots = 64;
-
 uint8_t* g_peb = nullptr;
-thread_local uint8_t* t_teb = nullptr;  // only read while gs holds the pthread base
+std::map<std::string, void*> g_exports;
+
+struct StaticTls {  // IMAGE_TLS_DIRECTORY64, resolved
+    const uint8_t* start = nullptr;
+    size_t raw_size = 0, zero_fill = 0;
+    std::vector<void(MSABI*)(void*, uint32_t, void*)> callbacks;
+} g_tls;
+
+template <typename T> T rd(const uint8_t* p) {
+    T v;
+    std::memcpy(&v, p, sizeof v);
+    return v;
+}
 
 uint64_t pthread_gsbase() {  // what libpthread set gs to for this thread (Wine: mac_thread_gsbase)
     thread_identifier_info_data_t info;
@@ -42,15 +48,36 @@ uint64_t pthread_gsbase() {  // what libpthread set gs to for this thread (Wine:
     mach_port_t self = mach_thread_self();
     kern_return_t kr = thread_info(self, THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&info), &count);
     mach_port_deallocate(mach_task_self(), self);
-    if (kr != KERN_SUCCESS) { std::fprintf(stderr, "host: thread_info failed (%d)\n", kr); std::abort(); }
+    if (kr != KERN_SUCCESS) fail("thread_info failed");
     return info.thread_handle;
 }
 
-template <typename T> T& teb_at(uint8_t* teb, size_t off) { return *reinterpret_cast<T*>(teb + off); }
+}  // namespace
 
-uint8_t* make_teb() {  // for the calling thread
+[[noreturn]] void fail(const std::string& why) {
+    std::fprintf(stderr, "host: %s\n", why.c_str());
+    std::fflush(nullptr);
+    _exit(70);
+}
+
+void set_last_error(uint32_t e) { teb_at<uint32_t>(t_teb, kTebLastError) = e; }
+
+uint32_t thread_id() {
+    uint64_t tid = 0;
+    pthread_threadid_np(nullptr, &tid);
+    return static_cast<uint32_t>(tid);
+}
+
+std::string to_host_path(const char* p) {  // ponytail: backslashes only; no drive letters or GAME: yet
+    std::string s(p);
+    for (auto& c : s)
+        if (c == '\\') c = '/';
+    return s;
+}
+
+uint8_t* make_teb() {
     auto* teb = static_cast<uint8_t*>(aligned_alloc(0x1000, kTebSize));
-    if (!teb) std::abort();
+    if (!teb) fail("out of memory");
     std::memset(teb, 0, kTebSize);
     pthread_t self = pthread_self();
     auto* top = static_cast<uint8_t*>(pthread_get_stackaddr_np(self));
@@ -58,196 +85,90 @@ uint8_t* make_teb() {  // for the calling thread
     teb_at<void*>(teb, kTebStackLimit) = top - pthread_get_stacksize_np(self);
     teb_at<void*>(teb, kTebSelf) = teb;
     teb_at<uint64_t>(teb, kTebPid) = static_cast<uint64_t>(getpid());
-    uint64_t tid = 0;
-    pthread_threadid_np(nullptr, &tid);
-    teb_at<uint64_t>(teb, kTebTid) = tid;
+    teb_at<uint64_t>(teb, kTebTid) = thread_id();
     teb_at<void*>(teb, kTebPeb) = g_peb;
     teb_at<uint64_t>(teb, kTebHostGs) = pthread_gsbase();
+    if (g_tls.start) {  // MSVC reads gs:[0x58][_tls_index]; the image has one module, so _tls_index is 0
+        auto** slots = static_cast<uint8_t**>(calloc(1, sizeof(void*)));
+        slots[0] = static_cast<uint8_t*>(calloc(1, g_tls.raw_size + g_tls.zero_fill + 16));
+        std::memcpy(slots[0], g_tls.start, g_tls.raw_size);
+        teb_at<uint8_t**>(teb, kTebTlsPointer) = slots;
+    }
     t_teb = teb;
     return teb;
 }
 
-// Run guest code with gs on the thread's TEB.
-template <typename R, typename... A> R call_guest(uint8_t* teb, R(MSABI* fn)(A...), A... args) {
-    _thread_set_tsd_base(reinterpret_cast<uint64_t>(teb));
-    if constexpr (std::is_void_v<R>) {
-        fn(args...);
-        _thread_set_tsd_base(teb_at<uint64_t>(teb, kTebHostGs));
-    } else {
-        R r = fn(args...);
-        _thread_set_tsd_base(teb_at<uint64_t>(teb, kTebHostGs));
-        return r;
-    }
+void attach_thread(uint8_t*, uint32_t reason) {
+    for (auto cb : g_tls.callbacks) call_guest(cb, static_cast<void*>(g_image), reason, static_cast<void*>(nullptr));
 }
 
-// Entered from guest code: gs -> pthread base for the host function, back to the TEB on return.
-struct HostGs {
-    uint8_t* teb;
-    HostGs() {
-        __asm__ volatile("movq %%gs:0x30, %0" : "=r"(teb));
-        _thread_set_tsd_base(teb_at<uint64_t>(teb, kTebHostGs));
+void free_teb(uint8_t* teb) {
+    if (auto** slots = teb_at<uint8_t**>(teb, kTebTlsPointer)) {
+        free(slots[0]);
+        free(slots);
     }
-    ~HostGs() { _thread_set_tsd_base(reinterpret_cast<uint64_t>(teb)); }
+    if (t_teb == teb) t_teb = nullptr;
+    free(teb);
+}
+
+// ---- threads -------------------------------------------------------------------------------------------------
+namespace {
+struct ThreadStart {
+    Object* obj;
+    ThreadProc proc;
+    void* arg;
+    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t ready = PTHREAD_COND_INITIALIZER;
+    bool started = false;
 };
-
-template <typename Sig, Sig* F> struct Thunk;
-template <typename R, typename... A, R (*F)(A...)> struct Thunk<R(A...), F> {
-    static MSABI R call(A... a) {
-        HostGs g;
-        return F(a...);
-    }
-};
-
-// ---- Handles -------------------------------------------------------------------------------------------------
-struct Object {
-    enum Kind { File, Thread } kind;
-    int fd = -1;
-    pthread_t thread{};
-    uint32_t exit_code = 0;
-    bool joined = false;
-};
-using HANDLE = void*;
-HANDLE const kInvalid = reinterpret_cast<HANDLE>(-1);
-Object g_std[3] = {{Object::File, 0}, {Object::File, 1}, {Object::File, 2}};
-
-void set_last_error(uint32_t e) { teb_at<uint32_t>(t_teb, kTebLastError) = e; }
-
-// ---- kernel32 ------------------------------------------------------------------------------------------------
-HANDLE GetStdHandle(uint32_t which) {
-    switch (static_cast<int32_t>(which)) {
-        case -10: return &g_std[0];
-        case -11: return &g_std[1];
-        case -12: return &g_std[2];
-        default: return kInvalid;
-    }
-}
-int WriteFile(HANDLE h, const void* buf, uint32_t n, uint32_t* written, void*) {
-    ssize_t r = write(static_cast<Object*>(h)->fd, buf, n);
-    if (written) *written = r < 0 ? 0 : static_cast<uint32_t>(r);
-    return r >= 0;
-}
-int ReadFile(HANDLE h, void* buf, uint32_t n, uint32_t* got, void*) {
-    ssize_t r = read(static_cast<Object*>(h)->fd, buf, n);
-    if (got) *got = r < 0 ? 0 : static_cast<uint32_t>(r);
-    return r >= 0;
-}
-[[noreturn]] void ExitProcess(uint32_t code) {
-    std::fflush(nullptr);
-    _exit(static_cast<int>(code));
-}
-uint32_t GetLastError() { return teb_at<uint32_t>(t_teb, kTebLastError); }
-
-HANDLE GetProcessHeap() { return reinterpret_cast<HANDLE>(0x1000); }  // one heap: malloc
-void* HeapAlloc(HANDLE, uint32_t flags, uint64_t size) { return (flags & 0x8) ? calloc(1, size) : malloc(size); }
-int HeapFree(HANDLE, uint32_t, void* p) { free(p); return 1; }
-
-std::mutex g_vmem_lock;
-std::map<uintptr_t, size_t> g_vmem;  // ponytail: whole reserve/commit/release only, no partial decommit
-void* VirtualAlloc(void* addr, uint64_t size, uint32_t, uint32_t) {
-    void* p = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (p == MAP_FAILED) { set_last_error(8 /* ERROR_NOT_ENOUGH_MEMORY */); return nullptr; }
-    std::lock_guard<std::mutex> lock(g_vmem_lock);
-    g_vmem[reinterpret_cast<uintptr_t>(p)] = size;
-    return p;
-}
-int VirtualFree(void* addr, uint64_t, uint32_t type) {
-    if (type != 0x8000 /* MEM_RELEASE */) return 1;
-    std::lock_guard<std::mutex> lock(g_vmem_lock);
-    auto it = g_vmem.find(reinterpret_cast<uintptr_t>(addr));
-    if (it == g_vmem.end()) { set_last_error(87); return 0; }
-    munmap(addr, it->second);
-    g_vmem.erase(it);
-    return 1;
-}
-
-std::mutex g_tls_lock;
-bool g_tls_used[kTlsSlots] = {};
-uint32_t TlsAlloc() {
-    std::lock_guard<std::mutex> lock(g_tls_lock);
-    for (int i = 0; i < kTlsSlots; ++i)
-        if (!g_tls_used[i]) { g_tls_used[i] = true; return static_cast<uint32_t>(i); }
-    return 0xFFFFFFFFu;
-}
-void* TlsGetValue(uint32_t i) { return i < kTlsSlots ? teb_at<void*>(t_teb, kTebTlsSlots + 8 * i) : nullptr; }
-int TlsSetValue(uint32_t i, void* v) {
-    if (i >= kTlsSlots) return 0;
-    teb_at<void*>(t_teb, kTebTlsSlots + 8 * i) = v;
-    return 1;
-}
-
-using ThreadProc = uint32_t(MSABI*)(void*);
-struct ThreadStart { Object* obj; ThreadProc proc; void* arg; };
 void* thread_main(void* p) {
     auto* s = static_cast<ThreadStart*>(p);
+    Object* obj = s->obj;
+    ThreadProc proc = s->proc;
+    void* arg = s->arg;
+    obj->tid = thread_id();
+    pthread_mutex_lock(&s->lock);
+    s->started = true;
+    pthread_cond_signal(&s->ready);
+    pthread_mutex_unlock(&s->lock);  // s belongs to the creator from here on
     uint8_t* teb = make_teb();
-    s->obj->exit_code = call_guest(teb, s->proc, s->arg);
-    delete s;
-    t_teb = nullptr;
-    free(teb);
+    attach_thread(teb, 2 /* DLL_THREAD_ATTACH */);
+    obj->exit_code = call_guest(proc, arg);
+    attach_thread(teb, 3 /* DLL_THREAD_DETACH */);
+    free_teb(teb);
     return nullptr;
 }
-HANDLE CreateThread(void*, uint64_t, ThreadProc proc, void* arg, uint32_t, uint32_t* tid) {
+}  // namespace
+
+Object* spawn_thread(ThreadProc proc, void* arg) {
     auto* obj = new Object{Object::Thread};
-    if (pthread_create(&obj->thread, nullptr, thread_main, new ThreadStart{obj, proc, arg}) != 0) {
+    ThreadStart start{obj, proc, arg};
+    if (pthread_create(&obj->thread, nullptr, thread_main, &start) != 0) {
         delete obj;
-        set_last_error(8);
         return nullptr;
     }
-    if (tid) {
-        uint64_t id = 0;
-        pthread_threadid_np(obj->thread, &id);
-        *tid = static_cast<uint32_t>(id);
-    }
+    pthread_mutex_lock(&start.lock);  // wait for the id, as CreateThread returns it
+    while (!start.started) pthread_cond_wait(&start.ready, &start.lock);
+    pthread_mutex_unlock(&start.lock);
     return obj;
 }
-uint32_t WaitForSingleObject(HANDLE h, uint32_t) {  // ponytail: threads only, INFINITE only
-    auto* o = static_cast<Object*>(h);
-    if (o->kind != Object::Thread) return 0xFFFFFFFFu;
-    if (!o->joined) { pthread_join(o->thread, nullptr); o->joined = true; }
-    return 0;
-}
-int CloseHandle(HANDLE h) {
-    auto* o = static_cast<Object*>(h);
-    if (o >= g_std && o < g_std + 3) return 1;
-    if (o->kind == Object::File) close(o->fd);
-    if (o->kind == Object::Thread && !o->joined) pthread_detach(o->thread);
-    delete o;
-    return 1;
-}
-void Sleep(uint32_t ms) { usleep(ms * 1000u); }
-int QueryPerformanceCounter(int64_t* out) {
-    *out = static_cast<int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
-    return 1;
-}
-HANDLE CreateFileW(const char16_t* name, uint32_t access, uint32_t, void*, uint32_t disposition, uint32_t, HANDLE) {
-    std::string path;  // ponytail: ASCII names only
-    for (; *name; ++name) path.push_back(*name == u'\\' ? '/' : static_cast<char>(*name));
-    int mode = (access & 0x40000000) ? ((access & 0x80000000) ? O_RDWR : O_WRONLY) : O_RDONLY;
-    if (disposition == 1) mode |= O_CREAT | O_EXCL;       // CREATE_NEW
-    else if (disposition == 2) mode |= O_CREAT | O_TRUNC; // CREATE_ALWAYS
-    else if (disposition == 4) mode |= O_CREAT;           // OPEN_ALWAYS
-    else if (disposition == 5) mode |= O_TRUNC;           // TRUNCATE_EXISTING
-    int fd = open(path.c_str(), mode, 0644);
-    if (fd < 0) { set_last_error(2 /* ERROR_FILE_NOT_FOUND */); return kInvalid; }
-    return new Object{Object::File, fd};
+
+uint32_t wait_thread(Object* o) {
+    if (!o->joined) {
+        pthread_join(o->thread, nullptr);
+        o->joined = true;
+    }
+    return o->exit_code;
 }
 
-#define EXPORT(name) {"kernel32.dll!" #name, reinterpret_cast<void*>(&Thunk<decltype(name), &name>::call)}
-const std::map<std::string, void*> kExports = {
-    EXPORT(GetStdHandle), EXPORT(WriteFile), EXPORT(ReadFile), EXPORT(ExitProcess), EXPORT(GetLastError),
-    EXPORT(GetProcessHeap), EXPORT(HeapAlloc), EXPORT(HeapFree), EXPORT(VirtualAlloc), EXPORT(VirtualFree),
-    EXPORT(TlsAlloc), EXPORT(TlsGetValue), EXPORT(TlsSetValue), EXPORT(CreateThread),
-    EXPORT(WaitForSingleObject), EXPORT(CloseHandle), EXPORT(Sleep), EXPORT(QueryPerformanceCounter),
-    EXPORT(CreateFileW),
-};
+void close_object(Object* o) {
+    if (o->kind == Object::File && o->fd > 2) close(o->fd);
+    if (o->kind == Object::Thread && !o->joined) pthread_detach(o->thread);
+    if (o->fd > 2 || o->kind == Object::Thread) delete o;
+}
 
 // ---- PE loading ----------------------------------------------------------------------------------------------
-template <typename T> T rd(const uint8_t* p) { T v; std::memcpy(&v, p, sizeof v); return v; }
-
-[[noreturn]] void fail(const std::string& why) {
-    std::fprintf(stderr, "host: %s\n", why.c_str());
-    std::exit(70);
-}
+namespace {
 
 uint8_t* load_pe(const char* path) {
     std::ifstream f(path, std::ios::binary);
@@ -264,7 +185,6 @@ uint8_t* load_pe(const char* path) {
     uint64_t base = rd<uint64_t>(opt + 24);
     uint32_t image_size = rd<uint32_t>(opt + 56), header_size = rd<uint32_t>(opt + 60);
     auto dir = [&](int i) { return std::make_pair(rd<uint32_t>(opt + 112 + 8 * i), rd<uint32_t>(opt + 116 + 8 * i)); };
-    if (dir(9).second) fail("TLS directory not supported yet");
 
     auto* image = static_cast<uint8_t*>(
         mmap(reinterpret_cast<void*>(base), image_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0));
@@ -278,8 +198,8 @@ uint8_t* load_pe(const char* path) {
 
     int64_t delta = reinterpret_cast<int64_t>(image) - static_cast<int64_t>(base);
     if (delta) {
-        auto [rva, size] = dir(5);
         if (rd<uint16_t>(coff + 18) & 0x1) fail("image wants its exact base (relocations stripped)");
+        auto [rva, size] = dir(5);
         for (uint32_t off = 0; off < size;) {
             uint32_t page = rd<uint32_t>(image + rva + off), block = rd<uint32_t>(image + rva + off + 4);
             if (block < 8) break;
@@ -299,16 +219,31 @@ uint8_t* load_pe(const char* path) {
         uint32_t lookup = rd<uint32_t>(image + d) ? rd<uint32_t>(image + d) : rd<uint32_t>(image + d + 16);
         auto* iat = reinterpret_cast<uint64_t*>(image + rd<uint32_t>(image + d + 16));
         for (auto* t = reinterpret_cast<uint64_t*>(image + lookup); *t; ++t, ++iat) {
-            if (*t >> 63) { missing.push_back(dll + "!#" + std::to_string(*t & 0xffff)); continue; }
+            if (*t >> 63) {
+                missing.push_back(dll + "!#" + std::to_string(*t & 0xffff));
+                continue;
+            }
             std::string key = dll + "!" + reinterpret_cast<char*>(image + (*t & 0x7fffffff) + 2);
-            auto it = kExports.find(key);
-            if (it == kExports.end()) missing.push_back(key);
+            auto it = g_exports.find(key);
+            if (it == g_exports.end()) missing.push_back(key);
             else *iat = reinterpret_cast<uint64_t>(it->second);
         }
     }
     if (!missing.empty()) {
         for (auto& m : missing) std::fprintf(stderr, "host: unresolved import %s\n", m.c_str());
-        fail("unresolved imports");
+        fail(std::to_string(missing.size()) + " unresolved imports");
+    }
+
+    if (auto [rva, size] = dir(9); size) {
+        const uint8_t* t = image + rva;
+        uint64_t start = rd<uint64_t>(t), end = rd<uint64_t>(t + 8), index = rd<uint64_t>(t + 16),
+                 callbacks = rd<uint64_t>(t + 24);
+        g_tls.start = reinterpret_cast<const uint8_t*>(start);
+        g_tls.raw_size = end - start;
+        g_tls.zero_fill = rd<uint32_t>(t + 32);
+        if (index) *reinterpret_cast<uint32_t*>(index) = 0;
+        for (auto* cb = reinterpret_cast<uint64_t*>(callbacks); cb && *cb; ++cb)
+            g_tls.callbacks.push_back(reinterpret_cast<void(MSABI*)(void*, uint32_t, void*)>(*cb));
     }
 
     sec = opt + optsz;
@@ -321,17 +256,35 @@ uint8_t* load_pe(const char* path) {
     }
     std::fprintf(stderr, "host: mapped %s at %p (preferred %#llx)\n", path, static_cast<void*>(image),
                  static_cast<unsigned long long>(base));
+    g_image = image;
     return image + entry_rva;
 }
 
 }  // namespace
+}  // namespace host
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: macos_host <image.exe>\n"); return 64; }
+    using namespace host;
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: macos_host <image.exe> [guest arguments...]\n");
+        return 64;
+    }
+    for (auto* list : {&kernel32_exports, &crt_exports})
+        for (auto& [name, fn] : (*list)()) g_exports[name] = fn;
+
+    const char* slash = std::strrchr(argv[1], '/');
+    g_argc = argc - 1;
+    g_argv = argv + 1;
+    g_argv[0] = const_cast<char*>(slash ? slash + 1 : argv[1]);
+    g_command_line = g_argv[0];
+    for (int i = 1; i < g_argc; ++i) g_command_line += std::string(" ") + g_argv[i];
+
     g_peb = static_cast<uint8_t*>(calloc(1, 0x1000));
-    void* entry = load_pe(argv[1]);
+    auto entry = reinterpret_cast<void(MSABI*)()>(load_pe(argv[1]));
+    std::memcpy(g_peb + 0x10, &g_image, sizeof g_image);  // PEB.ImageBaseAddress
     uint8_t* teb = make_teb();
-    call_guest(teb, reinterpret_cast<void(MSABI*)()>(entry));
+    attach_thread(teb, 1 /* DLL_PROCESS_ATTACH */);
+    call_guest(entry);
     std::fprintf(stderr, "host: entry point returned\n");
     return 0;
 }
