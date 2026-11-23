@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Helper utility to filter, categorize, and locate extracted .obj assets."""
+"""Helper utility to filter, categorize, and locate extracted .obj assets.
+
+Category regexes use heuristic token matching on exported archive entry names
+(see tools/rpf9dump/Program.cs) rather than hardcoded game-specific paths.
+"""
 
 import argparse
 import math
@@ -9,10 +13,10 @@ import sys
 from pathlib import Path
 
 CATEGORIES = {
-    "characters": re.compile(r"^(cs_|ig_|hc_|player_|a_c_|crm_)", re.IGNORECASE),
-    "hair": re.compile(r"(hair|beard)", re.IGNORECASE),
-    "minigames": re.compile(r"(minigame|prop|veh|weap)", re.IGNORECASE),
-    "map": re.compile(r"^s\d+_w\d+", re.IGNORECASE),
+    "characters": re.compile(r"^(?:cs|ig|hc|player|a_c|crm)(?:_|\.)", re.IGNORECASE),
+    "hair": re.compile(r"(?:^|_)(?:hair|beard)(?:_|\.)", re.IGNORECASE),
+    "props": re.compile(r"(?:^|_)(?:prop|veh|weap|minigame)(?:_|\.)", re.IGNORECASE),
+    "map": re.compile(r"^s\d+_w\d+(?:_|\.)", re.IGNORECASE),
 }
 
 
@@ -36,6 +40,12 @@ def finite_non_negative_float(value: str) -> float:
             f"--min-size must be a finite number >= 0, got {value!r}"
         )
     return parsed
+
+
+def non_empty_path(value: str) -> Path:
+    if not value or not value.strip():
+        raise argparse.ArgumentTypeError("--work must be a non-empty path")
+    return Path(value)
 
 
 def scan_assets(work_dir: Path, category: str, min_kb: float, top_n: int) -> int:
@@ -77,11 +87,6 @@ def scan_assets(work_dir: Path, category: str, min_kb: float, top_n: int) -> int
 
             matches.append((size, obj_path))
 
-    if walk_errors:
-        for err in walk_errors:
-            print(f"[!] Error reading path: {err}", file=sys.stderr)
-        return 1
-
     matches.sort(key=lambda item: (-item[0], str(item[1])))
 
     shown = min(top_n, len(matches))
@@ -89,6 +94,11 @@ def scan_assets(work_dir: Path, category: str, min_kb: float, top_n: int) -> int
     for size, path in matches[:top_n]:
         size_mb = size / (1024 * 1024)
         print(f"[{size_mb:6.2f} MB] {path}")
+
+    if walk_errors:
+        for err in walk_errors:
+            print(f"[!] Error reading path: {err}", file=sys.stderr)
+        return 1
 
     return 0
 
@@ -99,13 +109,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--work",
-        type=Path,
+        type=non_empty_path,
         required=True,
         help="Path to the Leonida work directory (e.g. D:\\Leonida_work)",
     )
     parser.add_argument(
         "--category",
-        choices=["all", "characters", "hair", "minigames", "map"],
+        choices=["all", "characters", "hair", "props", "map"],
         default="all",
         help="Filter models by asset category (default: all)",
     )
