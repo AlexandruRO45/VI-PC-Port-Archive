@@ -17,7 +17,8 @@ The short version:
   directory and selects tag `0x0D`; SCARAB scans for `XBCH`. Both are correct on the
   common shape, but they disagree on duplicate entries (below).
 - SCARAB's **code start is 24 bytes early**: on the Leonida corpus the code starts at
-  `u32[0xC0] + 0x28`, not `+0x10`. The bytes at `+0x10` are a fixed two-record descriptor.
+  `u32[0xC0] + 0x28`, not `+0x10`. The bytes at `+0x10` are a two-record descriptor of fixed
+  shape that carries 12 bytes of the container's `HASH` digest (see *The 24-byte descriptor*).
 - SCARAB's **"RDNA2 / gfx10.3"** label is not supported by the encoding. The stream decodes
   as **gfx10.1.3 (`gfx1013`)**, the PS5/custom RDNA1.5 target; `gfx1030` is markedly worse.
 - SCARAB's **"XBSC ISA"** is the name of the vendor DLL (`xbsc_xs.dll`), not a distinct ISA.
@@ -59,8 +60,8 @@ The first payload and the second payload both decompress to `FSSM` v0x101, but t
 differs.
 In the measured pair the first is 3,679 bytes and starts with a GS/ES-like prologue
 (`s_bfm_b64`, `s_barrier`, no `exp`); the second is 3,551 bytes and has two `exp`
-instructions. The 24-byte descriptor at `code_off + 0x10` is identical in the measured
-pairs, so they belong to the same container record.
+instructions. The 24-byte descriptor at `code_off + 0x10` is identical in all 195 pairs (it
+is the container's hash, below), so they belong to the same container record.
 
 Leonida writes the second payload as `<name>.fssm` by default; `fssm_unpack.py --payload first`
 writes the first instead, which is the one SCARAB takes when it scans from the start. The
@@ -80,7 +81,7 @@ Covered by `tests/test_fssm_crosscheck.py::DuplicateXbchTest`:
 | `0x00 FSSM`, `0x04 u32 0x101`, `0x08 u64 len-16`, `0x10 u64 6`. | `fssm_parse.py`, `docs/fssm-analysis.md` | 26,503/26,503 match all four. | **Verified** |
 | `0xC0 u64 code_off`, `0xC8 u64 code_size`, `0xE8 u64 code_end`, `0xF0 u64 meta_ptr`. | `fssm_parse.py` | Same fields. `code_off` is 8-aligned: 11,971 blobs are `0 mod 16`, 14,532 are `8 mod 16`. `code_size` is `0 mod 16` in all 26,503. `meta_ptr` is `0xDEADBEEFDEADBEEF` in 635. | **Verified** |
 | `code_end == code_off + code_size` in 99.9%. | `fssm_parse.is_code_consistent()`, `docs/fssm-analysis.md` | 26,486/26,503. The 17 exceptions are not malformed: `code_end` is the `0xDEADBEEFDEADBEEF` "unset" sentinel. `code_off + code_size` is still valid in all 17. SCARAB's `fssm_to_rdna2.code_words()` uses `code_end` as the slice end, so for these 17 it would read from `code_off + 0x10` to EOF, including the metadata and name record. | **Verified claim; exception missing** |
-| `code_off + 0x00..0x10` is a 16-byte sub-header, `code_off + 0x10` is raw instructions. | `fssm_parse.py`, `fssm_to_rdna2.py`, `include/shader_bridge.h`, `docs/fssm-analysis.md`, `docs/shader-abi-notes.md` | **Wrong on this corpus.** The code starts at `code_off + 0x28`. `code_off + 0x10..0x28` is a fixed 24-byte block: dwords 0 and 3 have `0xD580` in their high 16 bits in 26,503/26,503; dwords 1 and 4 are `0x03FE0000` or `0x03FF0000`; dwords 2 and 5 vary. LLVM rejects the single word at `+0x10` in 100/100 sampled blobs; the single word at `+0x28` is a valid one-word instruction in 100/100. The family census over all 26,503 gives SOPP 25,715 (all opcode 32 = `s_inst_prefetch`) and SOP1 788 (all opcode 4 = `s_swappc_b64`). | **Corrected** |
+| `code_off + 0x00..0x10` is a 16-byte sub-header, `code_off + 0x10` is raw instructions. | `fssm_parse.py`, `fssm_to_rdna2.py`, `include/shader_bridge.h`, `docs/fssm-analysis.md`, `docs/shader-abi-notes.md` | **Wrong on this corpus.** The code starts at `code_off + 0x28`. `code_off + 0x10..0x28` is a 24-byte block of fixed shape: dwords 0 and 3 have `0xD580` in their high 16 bits and dwords 1 and 4 have `0x03FE` or `0x03FF` there, in 26,503/26,503; the low halves and dwords 2 and 5 vary (25,321 distinct blocks, see *The 24-byte descriptor*). LLVM (`gfx1013`) rejects the single word at `+0x10` in 13,313/26,503 blobs and decodes it as some other instruction in the rest; the single word at `+0x28` is a valid one-word instruction in 100/100. The family census over all 26,503 gives SOPP 25,715 (all opcode 32 = `s_inst_prefetch`) and SOP1 788 (all opcode 4 = `s_swappc_b64`). | **Corrected** |
 | The 16-byte sub-header is `(0,0,0,0)` or `(8,1,0,0)`. | `fssm_to_rdna2.py` docstring, `fssm_parse.py` | Those two values cover 14,965/26,503 (56.5%). Other common values: `(0x2110080,8,0,0)` 8,119, `(1,1,0,0)` 1,794, `(0x2100080,8,0,0)` 767. The tuple is not a two-value enum. | **Incomplete** |
 | `0x18`/`0x20` are sentinel-filled slots. | `docs/fssm-analysis.md` | Both are `0xDEADBEEFDEADBEEF` in 26,503/26,503. | **Verified** |
 | `0x78` is a `(2,N)` pair; `0x80` is `0x44`/`0x45`. | `docs/fssm-analysis.md` | `0x78` low word is `2` in all; high word is `0` (14,532), `2` (9,282), or `3` (2,689). `0x80` is `0x44` (17,221) or `0x45` (9,282). | **Verified** |
@@ -93,8 +94,9 @@ Covered by `tests/test_fssm_crosscheck.py::DuplicateXbchTest`:
 SCARAB's extractor emits `payload[code_off + 0x10 : code_end]`. On the Leonida corpus
 that is 6 dwords of the fixed descriptor followed by the real program, then 28-42+
 `s_code_end` filler dwords. The descriptor is not harmless padding: its first word fails
-LLVM in 100/100 sampled blobs, so it changes the first decoded instruction and the
-instruction count. SCARAB's observation that its walk is "never lower" than the vendor is
+LLVM (`gfx1013`) in 13,313 of the 26,503 blobs and decodes as an unrelated instruction in the
+other 13,190, so it changes the first decoded instruction and the instruction count.
+SCARAB's observation that its walk is "never lower" than the vendor is
 consistent with this: both decoders see the same extra 6 words, and the filler adds more.
 The constant 0x18 shift does not invalidate relative branch targets, which is why
 `branch_report` still looks healthy.
@@ -102,6 +104,26 @@ The constant 0x18 shift does not invalidate relative branch targets, which is wh
 Leonida's rule is `u32[0xC0] + 0x28` to the last `s_endpgm` (also `docs/design.md`,
 "Disassembling shaders"). The 17 `code_end = DEAD` blobs are handled because the last
 `s_endpgm` is used instead of `code_end`.
+
+### The 24-byte descriptor
+
+Read as six little-endian dwords `w0..w5` at `code_off + 0x10`, the block is two 12-byte VOP3
+encodings with opcode 0x180 (`w0`, `w3`: high half `0xD580`) whose `src2` field (bits 26:18 of
+`w1`, `w4`) is 255, the literal operand, so `w2` and `w5` sit where literals go. It is the
+container's shader hash. The DXBC `HASH` part is 20 bytes in all 26,503 containers: flags `0`
+and a 16-byte digest at part offset 4. In all 26,503 containers, and in both payloads of the 195
+two-payload ones, the low half of `w0` is digest bytes 0-1, `w2` is bytes 4-7, the low half of
+`w3` is bytes 8-9 and `w5` is bytes 12-15. Digest bytes 2-3 and 10-11 are not the low halves of
+`w1`/`w4`; where they are, if anywhere, was not found. There are 25,321 distinct digests and
+25,321 distinct descriptors, and no digest goes with two descriptors. No descriptor goes with two
+different blob tails (`code_off + 0x28` to the end of the last-payload blob). The 36-byte prologue
+of the 29 FSPX programs has the same record shape and also carries its container's `HASH` digest
+(`docs/fspx.md`).
+
+Measured with `tools/fssm_unpack.py` (`parts`, `unpack(payload="first"|"last")`) over every
+`.dxbc` in the work folder, listed with `os.listdir`; the LLVM count disassembles each block's 24
+bytes with `llvm-mc` 23.1.6, `--disassemble -triple=amdgcn -mcpu=gfx1013` (13,313 rejections of
+the first word; 13,313 with `gfx1010` too, 13,623 with `gfx1030`).
 
 ### Initial float mode (SHADER-190)
 
@@ -196,8 +218,9 @@ PR description.
   likely, but it is not directly verified against SCARAB's title.
 - Which of the two `$VS_*` XBCH payloads the game's pipeline actually uses is not
   established. The 24-byte descriptor is the same in both, so it does not disambiguate.
-- The meaning of the 24-byte descriptor (two 12-byte records with a `0xD580` tag) is not
-  established. It is a fixed header, not code.
+- The 24-byte descriptor (two 12-byte records with a `0xD580` tag) carries 12 of the 16 bytes
+  of the container's `HASH` digest; the low halves of its dwords 1 and 4 are not decoded. It is a
+  header, not code; whether the GPU ever executes it is not measured.
 - The vendor disassembler's `asic(CI)` label is unexplained; it does not override the
   gfx1013 decode result.
 - The post-`code_end` binding table is parsed, but the meaning of its five words and the bytes
