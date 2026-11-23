@@ -120,6 +120,30 @@ def test_vs_input_survey():
         check(verdicts["no VS"] != verdicts["all missing"], "no indexed vertex shaders and absent listings are distinct")
 
     with tempfile.TemporaryDirectory() as tmp:
+        dx = build(tmp)
+        with open(os.path.join(dx, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"stage": "vs", "file": "probe.dxbc"}], f)
+        listing = os.path.join(dx, "disasm", "probe.s")
+        report = os.path.join(tmp, "counts.json")
+        footer = "; --- end of code\n"
+        for marker, instruction in (("exp prim", "exp prim v0, off, off, off done"),
+                                    ("s_sendmsg", "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)"),
+                                    ("v_mbcnt", "v_mbcnt_lo_u32_b32 v0, -1, 0")):
+            line = "\t" + instruction + "\n"
+            for position, body, expected in (("before", line + footer, "layout: NGG markers present"),
+                                              ("after", footer + line, "layout: unknown")):
+                with open(listing, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("; synthetic listing\n" + body)
+                result = cli(dx, "--json", report)
+                layout = next((s for s in result.stdout.splitlines() if s.startswith("layout:")), "")
+                check(result.returncode == 0 and not result.stderr and layout.startswith(expected),
+                      f"{marker} {position} the delimiter: layout uses decoded instructions")
+                with open(report, encoding="utf-8") as f:
+                    counts = json.load(f)
+                check(counts["markers"][marker] == 1 and counts["missing_listings"] == 0,
+                      f"{marker} {position} the delimiter: JSON counts the textual marker in the listing")
+
+    with tempfile.TemporaryDirectory() as tmp:
         d = os.path.join(tmp, "dxbc")
         os.mkdir(d)
         plain = os.path.join(tmp, "plain")
