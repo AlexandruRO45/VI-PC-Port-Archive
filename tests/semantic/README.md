@@ -169,5 +169,6 @@ computed exactly and rounded once to binary32. `NMin`/`NMax` give the other oper
 `FMin`/`FMax`/`FClamp` order -0 below +0 (the order RDNA2 hardware uses). The `.asm`
 sources are written for `llvm-mc -mcpu=gfx1013`; these tests do not assemble them, so assembler syntax is not
 checked here.
-To add a shader: put the `.asm` in `runtime/test/shaders/`, add it to `SHADERS` in `regen_fixtures.py`, regenerate,
-and add its expected words (with derivation) to the matching test file.
+To add a shader, put the `.asm` in `runtime/test/shaders/` and run `python tests/semantic/regen_fixtures.py NAME`
+with the shader name without its `.asm` extension. This marks the source and generates its fixture.
+Add the expected words and their derivation to the matching test file.

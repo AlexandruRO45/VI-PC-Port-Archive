@@ -96,6 +96,32 @@ class RegenFixturesTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("cs_nope.asm", err)
 
+    def test_help_and_bad_options_leave_sources_and_fixtures_alone(self):
+        self.run_main("cs_a")
+        fixture = os.path.join(self.fix, "cs_a.s")
+        with open(fixture, "rb") as f:
+            previous = f.read()
+        self.write(os.path.join(self.asm, "cs_a.asm"), rf.ASM_MARK + "\nv_mov_b32 v0, 2\ns_endpgm\n")
+        cases = (("--help", 0), ("--chekc", 2), ("--chec", 2))
+        for option, status in cases:
+            with self.subTest(option=option):
+                args = [option, "cs_b"] if option == "--chec" else [option]
+                with (contextlib.redirect_stdout(io.StringIO()) as out,
+                      contextlib.redirect_stderr(io.StringIO()) as err,
+                      self.assertRaises(SystemExit) as stopped):
+                    rf.main(args)
+                self.assertEqual(stopped.exception.code, status)
+                message = out.getvalue() if status == 0 else err.getvalue()
+                self.assertIn("usage:" if status == 0 else option, message)
+                with open(fixture, "rb") as f:
+                    self.assertEqual(f.read(), previous)
+                self.assertEqual(rf.marked_names(), ["cs_a"])
+                self.assertFalse(os.path.exists(os.path.join(self.fix, "cs_b.s")))
+
+    def test_check_can_appear_between_names(self):
+        self.assertEqual(self.run_main("cs_a", "cs_b")[0], 0)
+        self.assertEqual(self.run_main("cs_a", "--check", "cs_b")[0], 0)
+
 
 class RepositoryTest(unittest.TestCase):
     def test_marked_sources_and_generated_fixtures_match(self):

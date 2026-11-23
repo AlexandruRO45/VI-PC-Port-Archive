@@ -16,6 +16,7 @@ longer edit the same lines. `--check` compares every marked source with its fixt
 and also reports a generated fixture whose source is no longer marked. Hand-written fixtures in the same folder
 (another first line) are left alone.
 """
+import argparse
 import os
 import sys
 
@@ -81,8 +82,12 @@ def shown(path):
 
 
 def main(argv):
-    check = "--check" in argv
-    named = [a for a in argv if not a.startswith("-")]
+    parser = argparse.ArgumentParser(description="Regenerate or check synthetic translator fixtures.",
+                                     allow_abbrev=False)
+    parser.add_argument("--check", action="store_true", help="check the fixtures without modifying files")
+    parser.add_argument("names", nargs="*", metavar="NAME", help="shader names, without the .asm extension")
+    args = parser.parse_intermixed_args(argv)
+    check, named = args.check, args.names
     missing = [n for n in named if not os.path.isfile(os.path.join(ASM_DIR, n + ".asm"))]
     if missing:
         print(f"no runtime/test/shaders/{missing[0]}.asm", file=sys.stderr)
