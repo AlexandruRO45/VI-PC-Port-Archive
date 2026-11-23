@@ -189,6 +189,7 @@ FIXTURES = {
     "ps_w64_a_uniform_vote": ("A", _a_uniform_vote, {"VKH_SGPRS": "0,0,0,0,9"}),
 
     "ps_w64_a_discard": ("A", _a_discard, {}),
+    "ps_w64_a_discard_exit_masks": ("A", _a_discard, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),
     "ps_w64_b_readfirstlane": ("B", _b_readfirstlane, {"VKH_SGPRS": "0,0,0,0,123"}),
     "ps_w64_b_readlane_uniform": ("B", _b_readlane_uniform, {"VKH_SGPRS": "0,0,0,0,123"}),

@@ -38,6 +38,7 @@ EXPECT = {
     "ps_w64_a_uniform_vote": ("A", [], []),
 
     "ps_w64_a_discard": ("A", [], []),
+    "ps_w64_a_discard_exit_masks": ("A", [], []),
     "ps_w64_b_waterfall": ("B", [], ["waterfall"]),
     "ps_w64_b_readfirstlane": ("B", [], ["readfirstlane-uniform"]),
     "ps_w64_b_readlane_uniform": ("B", [], ["readlane-uniform"]),

@@ -1330,7 +1330,7 @@ class Analysis:
         # A pixel's fate is its EXEC bit at the last `exp ... vm` it ran (else at the end), so no such export may run
         # before the vote: one that did would keep the pixels of the empty half alive in the wave.
         kregs = self.kill_vote(n, op, reg)
-        if not ok and kregs and run is not None and skip is not None and self.inert_exit(skip, kregs) \
+        if not ok and kregs and run is not None and skip is not None and self.inert_exit(skip, kregs, run) \
                 and self.confined(run, kregs) and not self.vm_export_before(n):
             ok = True
         if not ok and ev is not None:
@@ -1381,25 +1381,26 @@ class Analysis:
             work.extend(pred.get(b, []))
         return False
 
-    def inert_exit(self, blk, m):
-        """Whether `blk` (through plain jumps) only sets EXEC to a subset of mask `m` (or to 0), then may export
-        with that EXEC, and ends: nothing else, no other successor."""
+    def inert_exit(self, blk, m, run=None):
+        """Whether `blk` (through plain jumps) derives EXEC inside the whole quads of mask `m`, then exports
+        and ends with that EXEC. When the voted mask is empty in a half, all such subsets are empty too.
+        Only mask arithmetic is allowed: scalar results have no reader outside this terminating path."""
         seen = set()
-        narrowed = False
+        inside, sub = False, frozenset({m})
         while blk not in seen:
+            if run is not None and self.reaches(run, blk, -1):
+                return False
             seen.add(blk)
             for ins in self.blocks[blk]:
-                op, a = base_op(ins["op"]), ins["args"]
+                op = base_op(ins["op"])
                 if op in ("s_nop", "s_waitcnt", "s_branch"):
                     continue
                 if op == "s_endpgm":
-                    return narrowed
-                if op == "exp" and narrowed:
+                    return inside
+                if op == "exp" and inside:
                     continue
-                if a and _regs(a[0]) == ["exec"] and not _half(a[0]) and (
-                        (op == "s_mov_b64" and len(a) == 2 and (tuple(_regs(a[1])) == m or _zero(a[1]))) or
-                        (op == "s_and_b64" and len(a) == 3 and any(tuple(_regs(x)) == m or _zero(x) for x in a[1:]))):
-                    narrowed = True
+                if op in OFF_OK + ("s_or_b64", "s_xor_b64", "s_andn2_b64"):
+                    inside, sub = self.confine_step(ins, inside, sub)
                     continue
                 return False
             if len(self.succ[blk]) != 1:
