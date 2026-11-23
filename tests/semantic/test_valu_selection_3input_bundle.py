@@ -306,5 +306,30 @@ class VMed3F32SimdBoundaryTests(unittest.TestCase):
         s3 = 0x00000003
         self.assertEqual(ref_med3_f32_bits(s1, s3, s2), s2)
 
+class VMed3F32TranslatorIntegrationTests(unittest.TestCase):
+    """Translator execution and negative mutation controls for v_med3_f32."""
+
+    def test_spirv_translation_execution(self):
+        lines = [
+            "v_mov_b32 v0, 0x41200000",  # 10.0f
+            "v_mov_b32 v1, 0x41A00000",  # 20.0f
+            "v_mov_b32 v2, 0x41700000",  # 15.0f
+            "v_med3_f32 v3, v0, v1, v2",
+            "v_mov_b32 v0, v3",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_med3_f32_int", lines)
+        out = mrt0_words(spv)
+        self.assertAlmostEqual(bits_to_f32(out[0]), 15.0)
+
+    def test_negative_mutation_contrast(self):
+        a, b, c = f32_to_bits(1.0), f32_to_bits(2.0), f32_to_bits(3.0)
+        med_res = ref_med3_f32_bits(a, b, c)
+        min_res = ref_min3_f32_bits(a, b, c)
+        max_res = ref_max3_f32_bits(a, b, c)
+        self.assertNotEqual(med_res, min_res)
+        self.assertNotEqual(med_res, max_res)
+
 if __name__ == "__main__":
     unittest.main()
