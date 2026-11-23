@@ -23,6 +23,7 @@
 
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
+#include "host_wine.h"
 #include "shims.h"
 
 namespace {
@@ -116,6 +117,13 @@ int main(int argc, char** argv) {
 
     ComPtr<IDXGIFactory4> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf()));
+    if (FAILED(hr) && hostwine::host_is_wine()) {
+        // WARP is Microsoft's device, and the tests built on it need Microsoft's DXGI too. A plain Wine prefix
+        // creates the factory, one carrying the layer's dxgi.dll need not.
+        std::printf("SKIP device_proxy_test: no DXGI factory under Wine (0x%08lX)\n",
+                    static_cast<unsigned long>(hr));
+        return 77;
+    }
     check(SUCCEEDED(hr) && factory, "DXGI factory created");
     ComPtr<IDXGIAdapter> warp;
     if (factory) hr = factory->EnumWarpAdapter(IID_PPV_ARGS(warp.GetAddressOf()));
@@ -141,6 +149,12 @@ int main(int argc, char** argv) {
     hr = create_device(warp.Get(), params, &iid_device, &created);
     check(SUCCEEDED(hr) && created != nullptr, "D3D12XboxCreateDevice returns a device");
     if (!created) {
+        // Wine's vkd3d rejects the console device over its WARP stand-in; the proxy needs Microsoft's runtime.
+        if (hostwine::host_is_wine()) {
+            std::printf("SKIP device_proxy_test: D3D12XboxCreateDevice failed under Wine (0x%08lX)\n",
+                        static_cast<unsigned long>(hr));
+            return 77;
+        }
         std::printf("device_proxy_test: FAILED (no device)\n");
         return 1;
     }

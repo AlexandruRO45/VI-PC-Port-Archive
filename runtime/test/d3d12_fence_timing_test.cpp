@@ -6,8 +6,8 @@
 // integrated one). No shaders or game data.
 // LEONIDA_VK_VALIDATION=1 runs the test-made device under VK_LAYER_KHRONOS_validation; any validation error fails
 // the test.
-#include "vk_test_device.h"
 #include "host_wine.h"
+#include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
@@ -247,6 +247,13 @@ int check_held_cpu_signal(ID3D12Device* device, ID3D12CommandQueue* queue) {
 int check_luid(ID3D12Device* device) {
     const LUID luid = device->GetAdapterLuid();
     EXPECT(luid.LowPart || luid.HighPart);
+    if (hostwine::host_is_wine()) {
+        // The LUID comes from the layer, but matching it needs Microsoft's DXGI; Wine's (or a prefix carrying a
+        // shim) need not have an adapter for it.
+        std::printf("GetAdapterLuid: %08lx:%08lx (Wine's DXGI has no adapter to match it; not checked)\n",
+                    luid.HighPart, luid.LowPart);
+        return 0;
+    }
     Ref<IDXGIFactory4> factory;
     EXPECT(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))));
     Ref<IDXGIAdapter1> adapter;
