@@ -33,6 +33,7 @@ import os
 import struct
 import sys
 import tempfile
+import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -49,11 +50,26 @@ for _i in range(256):
     _CRC.append(_r & 0xFFFFFFFF)
 
 
-def ogg_crc(data: bytes) -> int:
+def _ogg_crc_bytewise(data: bytes) -> int:
+    """The reference: one table step per byte (slow). Kept for the tests that check ogg_crc against it."""
     c = 0
     for b in data:
         c = ((c << 8) & 0xFFFFFFFF) ^ _CRC[((c >> 24) ^ b) & 0xFF]
     return c
+
+
+_REVERSE_BITS = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
+
+
+def ogg_crc(data: bytes) -> int:
+    """The Ogg page checksum: CRC-32, polynomial 0x04C11DB7, initial value 0, not reflected, no final xor.
+
+    zlib.crc32 is the reflected form (poly 0xEDB88320) with init and final xor of 0xFFFFFFFF. A reflected CRC over
+    bit-reversed bytes, reversed again at the end, is the unreflected CRC, so zlib's C loop does the work. A start
+    value of 0xFFFFFFFF makes zlib's own initial xor give a zero register, and the result's xor cancels its final one.
+    """
+    c = zlib.crc32(data.translate(_REVERSE_BITS), 0xFFFFFFFF) ^ 0xFFFFFFFF
+    return int.from_bytes(struct.pack("<I", c).translate(_REVERSE_BITS), "big")
 
 
 def ogg_page(serial: int, seq: int, granule: int, packets: list, flags: int) -> bytes:

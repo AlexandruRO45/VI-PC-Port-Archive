@@ -1050,6 +1050,32 @@ class MalformedBankTest(unittest.TestCase):
             self.assertIn("skip bad.awc", out.getvalue())
 
 
+def bitwise_ogg_crc(data):
+    """The Ogg checksum straight from its definition: bit by bit, polynomial 0x04C11DB7, init 0, no xor."""
+    crc = 0
+    for byte in data:
+        crc ^= byte << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if crc & 0x80000000 else (crc << 1) & 0xFFFFFFFF
+    return crc
+
+
+class OggCrcTest(unittest.TestCase):
+    def test_matches_the_bitwise_definition_on_every_length_class(self):
+        import random
+        rng = random.Random(7)
+        lengths = list(range(0, 70)) + [255, 256, 4096, 4097, 65307] + [rng.randrange(65308) for _ in range(40)]
+        for n in lengths:
+            data = rng.randbytes(n)
+            self.assertEqual(awc.ogg_crc(data), bitwise_ogg_crc(data), n)
+
+    def test_every_page_we_write_carries_a_valid_checksum(self):
+        page = awc.ogg_page(5, 3, 960, [bytes(range(200)), b"\xff" * 300], 0x04)
+        stored = struct.unpack_from("<I", page, 22)[0]
+        zeroed = page[:22] + bytes(4) + page[26:]
+        self.assertEqual(stored, bitwise_ogg_crc(zeroed))
+
+
 class WriteFileReadOnlyTest(unittest.TestCase):
     def test_failed_replace_over_a_read_only_file_leaves_no_staging_file(self):
         real_remove = os.remove
