@@ -1,6 +1,6 @@
 """Synthetic tests for tools/anim_move.py (ASSET-86).
 
-    python -I -m unittest tests/test_anim_move.py -v
+    python -I tests/test_anim_move.py -v
 
 Every byte here is built synthetically by the test: single-stream and 64 KiB-split multi-stream MoVE v19
 containers with request/flag/5-byte descriptor preambles, Type 1 (StateMachine), Type 3 (InlinedStateMachine),
