@@ -657,6 +657,18 @@ CS, 10,974 PS).
 
 ## Posting your result
 
+For a Windows runtime CTest report, list the tests registered in the build you ran:
+
+```powershell
+ctest --test-dir runtime/build -C RelWithDebInfo -N
+```
+
+Include the registered total alongside the pass, fail and skip counts. CMake omits tests when build tools are
+missing, so those tests never appear as skipped. For example, `d3d12_translated_draw` needs `llvm-mc` with the
+AMDGPU target plus `spirv-as` and `spirv-val`; `d3d12_subgroup` needs `llvm-mc` and `glslangValidator`.
+If either test is absent, include the relevant tool lookup message from CMake configuration so readers can
+compare coverage across machines.
+
 Use the template at the top of [#166](https://github.com/ItsNotRexed/Leonida/issues/166): GPU, driver, subgroup
 range, OS, the commit you built, the tool versions and the counts each script printed. Post counts and pass/fail
 lines only, never shaders or logs from the game. A failure that isn't in the table above gets its own issue, linked
