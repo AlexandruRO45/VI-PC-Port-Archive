@@ -3,7 +3,7 @@
 > [!NOTE]
 > La documentación en inglés ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) y
 > [`docs/README.md`](../../README.md)) es **la referencia oficial**. Esta guía solo recoge las instrucciones
-> estables de instalación y compilación (sincronizada con el commit `003e7812`). Para el estado del proyecto, que
+> estables de instalación y compilación (sincronizada con el commit `d974c88a`). Para el estado del proyecto, que
 > cambia a diario, consulte el [`README.md`](../../../README.md).
 
 ## Qué es Leonida
@@ -26,8 +26,8 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 
 - **Su propia copia** del paquete de Xbox Series, versión `1.0.2.1`: la carpeta que contiene `MicrosoftGame.Config`
   y los archivos `.rpf`, como ficheros legibles en el disco.
-- **Windows 10/11 x64**, con unos **350 GB libres** para los archivos de trabajo. Pueden ir a otra unidad con
-  `--work`.
+- **Windows 10/11 x64**, con unos **350 GB libres** para los archivos de trabajo de la compilación completa (véase
+  *Poco espacio en disco* más abajo). Pueden ir a otra unidad con `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (marque «Add python.exe to PATH» durante la instalación).
 - [SDK de .NET 8](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [SDK de Vulkan](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` y `vulkaninfo`).
@@ -35,7 +35,12 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
   - La versión oficial de LLVM para Windows **no incluye** el destino AMDGPU.
   - Para compilar un `llvm-mc.exe` nativo con ese destino, ejecute `.\scripts\build_llvm_mc.ps1` en PowerShell
     desde la raíz del repositorio. El script necesita `git` y las herramientas de C++ de Visual Studio. Define
-    `LLVM_MC` para su usuario: abra después un terminal nuevo para que la variable se aplique.
+    `LLVM_MC` para su usuario: abra después un terminal nuevo para que la variable se aplique. Tarda unos 20-40
+    minutos.
+  - Más rápido, si usa [conda](https://docs.conda.io/): `conda install -c conda-forge llvm-tools` (su versión para
+    Windows incluye el destino AMDGPU; [`docs/testing.md`](../../testing.md) usó la 23.1.6). Después defina
+    `LLVM_MC` con la ruta completa del `llvm-mc.exe` que instala (`where llvm-mc` la muestra con el entorno
+    activado).
   - Con WSL, instale `llvm-21` en Ubuntu y pase el comando completo a `LLVM_MC`, en la sesión de PowerShell
     donde vaya a ejecutar `make_game.py`:
 
@@ -51,6 +56,15 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 - [ffmpeg](https://ffmpeg.org/download.html) en el `PATH` *(opcional: decodifica los flujos XMA2 y es obligatorio
   con `--wav`)*.
 
+**Poco espacio en disco:** los ~350 GB corresponden a la compilación completa. Para *ejecutar* el port,
+`--stages check,shaders,runtime` necesita unos 30 GB; la etapa `assets` (~300 GB) solo sirve para las herramientas
+de recursos, y `--wav` añade varias veces el tamaño del Ogg Opus (la comprobación previa propone esta opción cuando
+lo que no cabe es la etapa `assets`). `--work` y `--out` pueden ir a otra unidad. El runtime lee el paquete en su
+sitio, así que si la unidad del paquete es de solo lectura necesita `gta6rt --overlay <carpeta con escritura>`;
+`--overlay` es una opción de `gta6rt`, no de `make_game.py`. No borre los archivos `.s` de
+`work/shaders/dxbc/disasm`: si se borran junto con el `work/shaders/spirv/index.json` traducido, la etapa `shaders`
+puede parecer terminada con cero shaders.
+
 ## Compilar
 
 ### La forma sencilla (Windows)
@@ -62,8 +76,9 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
    ```
 3. Haga doble clic en **`Build.bat`**.
 
-El script encuentra su copia por sí solo: busca en Descargas, Escritorio, Documentos, Games, su carpeta de usuario
-y en la raíz de cada disco, dos niveles de carpetas en profundidad. Si encuentra varias copias, le pregunta cuál
+El script encuentra su copia por sí solo: busca en Descargas, Escritorio, Documentos (también donde Windows los
+guarda, por ejemplo en OneDrive), Games, su carpeta de usuario y en la raíz de cada disco, dos niveles de carpetas
+en profundidad. Reconoce la versión por el tamaño de unos pocos archivos, sin leer nada grande. Si encuentra varias copias, le pregunta cuál
 usar; si no encuentra ninguna, le pide que pegue la ruta de la carpeta. Antes de empezar comprueba los requisitos
 y el espacio libre, y enumera de una vez todo lo que falta. El resultado va a `Documents\Leonida`. Una
 compilación interrumpida se reanuda donde quedó.
@@ -72,7 +87,9 @@ compilación interrumpida se reanuda donde quedó.
 
 ```powershell
 python -I make_game.py --find                          # enumera las copias encontradas en este PC
+python -I make_game.py --pick                          # elige la carpeta del juego en un diálogo
 python -I make_game.py --check                         # verifica su copia, sin compilar nada
+python -I make_game.py --check --full-check            # además compara el SHA-256 de cada archivo (lento)
 python -I make_game.py --game "D:\ruta\al\paquete" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # solo algunas etapas
 python -I make_game.py --game "D:\ruta\al\paquete" --wav  # además decodifica el Opus a WAV PCM (ocupa mucho)
@@ -83,8 +100,10 @@ Las etapas se ejecutan en este orden: `check` → `shaders` → `assets` → `ru
 
 - **`--wave64-emulate`**: traduce los shaders compute y mesh wave64 de forma exacta cualquiera que sea el tamaño de
   subgrupo de la GPU. Las GPU NVIDIA e Intel usan subgrupos de 32 y lo necesitan. El valor predeterminado, `auto`,
-  consulta `vulkaninfo` y activa la emulación salvo que todas las GPU anuncien subgrupos de 64.
-- **`--work`**: elija un disco con al menos 350 GB libres. La traducción de shaders es la etapa más larga; por
+  consulta `vulkaninfo` y activa la emulación si alguna GPU no tiene subgrupos de 64 o no se conoce su tamaño. Con
+  el controlador de AMD para Windows, `auto` usa wave64 nativo en RDNA1 y RDNA2 cuando la GPU del runtime lo
+  admite, porque ese controlador puede fallar con el código LDS emulado (#857). `on` y `off` fuerzan cada modo.
+- **`--work`**: para la compilación completa, elija un disco con unos 350 GB libres. La traducción de shaders es la etapa más larga; por
   defecto usa la mitad de los hilos del procesador (ajustable con `--jobs`).
 - **`--wav`**: desactivado por defecto, porque el WAV PCM de 16 bits ocupa varias veces más que el Ogg Opus.
 - **Linux y Wine/Proton**: `make_game.py` también funciona en Linux. El cargador es un programa de Windows y se

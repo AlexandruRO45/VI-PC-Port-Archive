@@ -308,6 +308,11 @@ across seven functions. It counted 11 direct calls through the vtable entry and 
 loaded from that entry. All 29 passed one global barrier group containing one `D3D12_GLOBAL_BARRIER` with
 the same compute-shading and unordered-access arguments described above. The counts cover the two
 enumerated dispatch forms in the builder's `.text`. [Static corroboration and coverage details](https://github.com/ItsNotRexed/Leonida/issues/1626)
+Two consequences for a replacement list, from the same enumeration (static, not run). A scan that only matches
+`call [reg+0x490]` finds 11 of the 29 sites, so anything that counts or intercepts the call has to follow the
+`mov r9,[reg+0x490]` … `call r9` form too. And 16 of the 18 register sites sit in the per-element loop of `0xe6a0`,
+so slot 146 would run once per element, not once per build. `Barrier` returns `void` and the builder never reads a
+return value, so an `E_NOTIMPL`-style stub fails silently, and a no-op drops the UAV barrier between dispatches.
 
 The same two inner functions (`0x1d540` and `0x1d7c0`) contain the `+0x70`, `+0xc8`, `+0x108`,
 `+0x138`, `+0x168` and `+0x490` calls; the outer batched function contains the `+0xd0` barrier.
@@ -511,13 +516,18 @@ shape and the shift around them, but the shape alone does not single the method 
 | 55 (`+0x1b8`) | **51** | `DiscardResource` | `(resource, null)` at `0x6dcb`, after the pending barriers are flushed through slot 26 |
 | 59 (`+0x1d8`) | — | console only (shape) | four calls, two shapes: `(1, blob, size)` at `0x6b5a` and `0x6d53`, the blob a run of qwords whose first is `0xf3080 \| (qword count & 0x7f)`; and `(0, &qword, 8)` with the qword 1 at `0x6e52` and `0x6eb8`, only when a profiling bit of the context is set (`0x6e2a`). The first argument is set as a byte (`mov dl, 1` / `xor edx, edx`). It looks like one slot for both ends of a GPU event; no public method takes a bool first. With 55 at +4 and 61 at +2, the two slots the console lacks are among 56–60 |
 | 61 (`+0x1e8`) | **59** | `ExecuteIndirect` | `(signature, 1, argument buffer, offset, null, 0)` at `0x59a0` |
-| 85 (`+0x2a8`) | — | `CopyTextureRegion` shape (inferred) | run: `(stack pointer, 0, 0)`, twice per dispatch. Statically six arguments, `(&dst, 0, 0, 0, &src, null)`: the public `CopyTextureRegion` (PC 16) with two `D3D12_TEXTURE_COPY_LOCATION`s, not one pointer. At `0x7147` dst is `{texture, SUBRESOURCE_INDEX, 0}` and src `{buffer, PLACED_FOOTPRINT, footprint}`, the footprint from device slot 38 (`GetCopyableFootprints`, `0x708b`); at `0x7191` both are subresource 0 (texture to texture). The caller also clears the next stack argument (`0x70e7`); whether the method takes a seventh is open, as is what console slot 16 is |
+| 85 (`+0x2a8`) | 16 (inferred) | `CopyTextureRegion` shape (inferred) | run: `(stack pointer, 0, 0)`, twice per dispatch. Statically six arguments, `(&dst, 0, 0, 0, &src, null)`: the public `CopyTextureRegion` (PC 16) with two `D3D12_TEXTURE_COPY_LOCATION`s, not one pointer. At `0x7147` dst is `{texture, SUBRESOURCE_INDEX, 0}` and src `{buffer, PLACED_FOOTPRINT, footprint}`, the footprint from device slot 38 (`GetCopyableFootprints`, `0x708b`); at `0x7191` both are subresource 0 (texture to texture). The caller also clears the next stack argument (`0x70e7`); whether the method takes a seventh is open, as is what console slot 16 is |
 | 141 (`+0x468`) | — | console only | `(2, GPU VA, size, n)` at `0x65f8`: binds a buffer the DLL names `FFX_XBox_ComputeScratch`; `n` is the bound pipeline's scratch value from pipeline slot 11 (see above) |
 
 So the console list has four more methods than the PC list between `ResourceBarrier` (26) and `SetDescriptorHeaps`
 (console 32), and two fewer between `ClearUnorderedAccessViewUint` (console 53) and `ExecuteIndirect` (console 61).
 Mapping the console list as "PC plus a constant" is wrong. The BVH builder adds 37, 39, 43 and 45 (the rest of the
 +4 root group) and the console-only 71, 73, 80, 146 (`Barrier`) and 148 (sections 3.3 and 3.3a).
+
+A bounds check sized to the PC list does not catch console slot 85: `0x2a8 / 8 = 85` is inside every PC list from
+`ID3D12GraphicsCommandList10` on (GCL9 adds slots 82–83, GCL10 `SetProgram` 84 and `DispatchGraph` 85). A PC-ordered table would
+answer the console's texture copy with `DispatchGraph`, so a proxy has to fail closed by console slot, not by table
+length ([#1626](https://github.com/ItsNotRexed/Leonida/issues/1626)).
 
 **The list object is wider than its vtable, and this is what that width is for.** Before a root-argument or dispatch
 call the DLL checks a write cursor at `+0x18` against a limit (`+0x30` for root arguments, `+0x28` for a dispatch). While there is room,
