@@ -26,8 +26,6 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 
 - **Su propia copia** del paquete de Xbox Series, versión `1.0.2.1`: la carpeta que contiene `MicrosoftGame.Config`
   y los archivos `.rpf`, como ficheros legibles en el disco.
-- **Windows 10/11 x64**, con unos **350 GB libres** para una compilación completa. Los archivos de trabajo pueden
-  ir a otra unidad con `--work`; más abajo se explica cómo omitir la exportación de recursos y usar unos 30 GB.
 - **Windows 10/11 x64**, con unos **400 GB libres** para los archivos de trabajo. Pueden ir a otra unidad con
   `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (marque «Add python.exe to PATH» durante la instalación).
