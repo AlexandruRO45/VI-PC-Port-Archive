@@ -1713,7 +1713,8 @@ The trace will enumerate them.
 | `ID3D12PipelineLibrary` | map + `VkPipelineCache` | D3D12 cached blobs are ignored. |
 | `ID3D12StateObject` (ray tracing) | likely unused | RT work includes compute traversal (`image_bvh*`) plus `XboxBvhBuilder`; a DXR state-object path is stubbed until the trace shows it. |
 | `ID3D12ShaderCacheSession` | `VkPipelineCache` | Stub with logging. |
-| DRED, protected sessions, meta commands, shared handles | stubs | Not needed for single-player boot; return a clean failure and log. |
+| DRED, protected sessions, shared handles | stubs | Not needed for single-player boot; return a clean failure and log. |
+| Meta commands | none offered | `EnumerateMetaCommands` succeeds with 0 commands; `EnumerateMetaCommandParameters` and `CreateMetaCommand` return `E_INVALIDARG`. |
 
 ### 4.1 Device and feature queries
 
