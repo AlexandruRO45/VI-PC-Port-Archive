@@ -313,13 +313,16 @@ bool make_swapchain(ID3D12Device* device, IDXGIFactory2* factory, HWND window, R
 
 // The script on both back buffers of a swapchain of `device`, what a name and private data set on one are after the
 // buffer is asked for again (the same object both times, on the host), on the other buffer, and after ResizeBuffers.
-bool record_back_buffers(ID3D12Device* device, IDXGIFactory2* factory, HWND window, Record& r) {
+// no_swapchain when the factory makes no swapchain: the host's DXGI refuses one in a session without an interactive
+// desktop (SSH, session 0), which is not a failure of the layer.
+enum class BackBuffers { recorded, no_swapchain, failed };
+BackBuffers record_back_buffers(ID3D12Device* device, IDXGIFactory2* factory, HWND window, Record& r) {
     Ref<ID3D12CommandQueue> queue;
     Ref<IDXGISwapChain1> chain;
-    if (!make_swapchain(device, factory, window, queue, chain)) return false;
+    if (!make_swapchain(device, factory, window, queue, chain)) return BackBuffers::no_swapchain;
     for (UINT index = 0; index < 2; ++index) {
         Ref<ID3D12Resource> buffer;
-        if (FAILED(chain->GetBuffer(index, IID_PPV_ARGS(&buffer.p)))) return false;
+        if (FAILED(chain->GetBuffer(index, IID_PPV_ARGS(&buffer.p)))) return BackBuffers::failed;
         Record one;
         script(one, buffer.p);
         const std::string kind = "back buffer " + std::to_string(index) + ": ";
@@ -327,27 +330,27 @@ bool record_back_buffers(ID3D12Device* device, IDXGIFactory2* factory, HWND wind
     }
     {
         Ref<ID3D12Resource> buffer;
-        if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&buffer.p)))) return false;
+        if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&buffer.p)))) return BackBuffers::failed;
         r.add("back buffer: SetName hr", std::uint32_t(name_guarded(buffer.p, L"back")));
         buffer->SetPrivateData(key(200), 4, "abc");
     }
     {
         Ref<ID3D12Resource> again;
-        if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&again.p)))) return false;
+        if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&again.p)))) return BackBuffers::failed;
         get(r, "back buffer asked for again: name W", again.p, kNameW, 64);
         get(r, "back buffer asked for again: private data", again.p, key(200), 64);
         Ref<ID3D12Resource> other;
-        if (FAILED(chain->GetBuffer(1, IID_PPV_ARGS(&other.p)))) return false;
+        if (FAILED(chain->GetBuffer(1, IID_PPV_ARGS(&other.p)))) return BackBuffers::failed;
         get(r, "the other back buffer: name W", other.p, kNameW, 64);
         get(r, "the other back buffer: private data", other.p, key(200), 64);
     }
     // ResizeBuffers (no buffer held) makes new buffers: the name and private data are gone on both devices.
     r.add("ResizeBuffers hr", std::uint32_t(chain->ResizeBuffers(0, 32, 32, DXGI_FORMAT_UNKNOWN, 0)));
     Ref<ID3D12Resource> resized;
-    if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&resized.p)))) return false;
+    if (FAILED(chain->GetBuffer(0, IID_PPV_ARGS(&resized.p)))) return BackBuffers::failed;
     get(r, "back buffer after ResizeBuffers: name W", resized.p, kNameW, 64);
     get(r, "back buffer after ResizeBuffers: private data", resized.p, key(200), 64);
-    return true;
+    return BackBuffers::recorded;
 }
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {
@@ -480,7 +483,7 @@ int main() {
             Ref<IDXGIFactory2> factory;
             EXPECT(SUCCEEDED(rt::d3d12::create_dxgi_factory(device.p, IID_PPV_ARGS(&factory.p))));
             Record ours;
-            EXPECT(record_back_buffers(device.p, factory.p, window, ours));
+            EXPECT(record_back_buffers(device.p, factory.p, window, ours) == BackBuffers::recorded);
 
             const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
             const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -500,9 +503,16 @@ int main() {
                             ours.values.size());
             } else {
                 Record theirs;
-                EXPECT(record_back_buffers(host.p, host_factory.p, window, theirs));
-                EXPECT(theirs.names == ours.names);
-                EXPECT(compare_with_host(ours, theirs, "back buffers", verbose) == 0);
+                const BackBuffers host_result = record_back_buffers(host.p, host_factory.p, window, theirs);
+                EXPECT(host_result != BackBuffers::failed);
+                if (host_result == BackBuffers::no_swapchain) {
+                    std::printf("back buffers: the host's DXGI made no swapchain (no interactive desktop?); %zu steps "
+                                "recorded, not compared\n",
+                                ours.values.size());
+                } else {
+                    EXPECT(theirs.names == ours.names);
+                    EXPECT(compare_with_host(ours, theirs, "back buffers", verbose) == 0);
+                }
             }
             DestroyWindow(window);
         }
