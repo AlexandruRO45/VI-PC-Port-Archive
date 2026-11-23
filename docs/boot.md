@@ -144,7 +144,7 @@ the de-duplicated 1–22. It maps each question to the event to look for; it doe
 | 19 | `0x03000000` root-signature bits | the root-signature blobs; the mask is a workaround, not the meaning |
 | 20 | Which BVH builder programs the game uses | slot-62 PSOs on the first RT frame; map each to its `ILDN` container |
 | 21 | PIX `Metadata` blob | metadata values; 0 and 1 are decoded silently, so an `unsupported` line means an unexpected value; if it is 2, decode the console blob from the executable's PIX calls, not the PC WinPixEventRuntime layout |
-| 22 | `CheckFeatureSupport(OPTIONS5)` RaytracingTier | the `[rt]` feature id; the tier answer itself is not logged yet, and `DispatchRays` stays unimplemented |
+| 22 | `CheckFeatureSupport(OPTIONS5)` RaytracingTier | the `[rt]` feature id; the tier answer itself is not logged yet, and `DispatchRays` stays unimplemented. The executable has no call that passes `OPTIONS5` and its size as constants (`tools/feature_queries.py`, [`d3d12_vulkan.md`](d3d12_vulkan.md) §8.2 row 22), so a trace with no feature id 27 is the expected result |
 
 ## 5. What a good first run looks like
 
