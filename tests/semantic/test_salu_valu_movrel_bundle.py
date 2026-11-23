@@ -578,3 +578,36 @@ class TestVMovrelsB32Oracle(unittest.TestCase):
         spv = support.translate_lines("ps_vmovrels_base", lines)
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0x12344321)
+
+
+class TestVMovrelsB32AST(unittest.TestCase):
+    def test_ast_structure_and_emission(self):
+        lines = [
+            "v_mov_b32 v3, 0x99887766",
+            "s_mov_b32 m0, 1",
+            "v_movrels_b32 v1, v2",
+            "v_mov_b32 v0, v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovrels_ast", lines)
+        self.assertIn("OpAccessChain %_ptr_Function_uint %vgpr", spv)
+
+    def test_ast_execution_semantics(self):
+        lines = [
+            "v_mov_b32 v5, 0xFACEB00C",
+            "s_mov_b32 m0, 3",
+            "v_movrels_b32 v1, v2",
+            "v_mov_b32 v0, v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovrels_exec", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0xFACEB00C)
