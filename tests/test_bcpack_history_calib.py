@@ -758,7 +758,19 @@ class ReferenceInversionTest(unittest.TestCase):
                     index = calib.tiled_offset(layout, mip, x, y) // 8
                     if index < 256:
                         expected[index] = True
-        self.assertEqual(valid, expected)
+        self.assertEqual(list(valid), expected)
+
+    def test_retiled_reference_coverage_uses_one_byte_per_block(self):
+        for dxgi, block_bytes in ((71, 8), (95, 16)):
+            with self.subTest(dxgi=dxgi):
+                layout = ttpf.surface_layout(64, 32, dxgi, 1, ttpf.tile_bytes(2))
+                mip = layout["mips"][0]
+                tiled = bytearray(mip["region"])
+                known = bytearray(mip["region"] // block_bytes)
+                blocks = mip["blocks_w"] * mip["blocks_h"]
+                calib._retile_mip_into(bytes(blocks * block_bytes), layout, mip, tiled, known)
+                self.assertEqual(len(known), mip["region"] // block_bytes)
+                self.assertEqual(sum(known), blocks)
 
     def test_ref_dds_with_synthetic_ttpf_pool_and_ttpf_export(self):
         with tempfile.TemporaryDirectory() as tmp:

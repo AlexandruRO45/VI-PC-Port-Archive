@@ -334,7 +334,7 @@ def retile_mip(linear, layout, mip):
 
 
 def _retile_mip_into(linear: bytes, layout: dict, mip: dict, out: bytearray,
-                     known: bytearray | None = None) -> None:
+                     known_blocks: bytearray | None = None) -> None:
     """Write one mip's blocks into its region, which may also hold other tail mips."""
     eb = layout["element_bytes"]
     bw, bh = mip["blocks_w"], mip["blocks_h"]
@@ -349,8 +349,8 @@ def _retile_mip_into(linear: bytes, layout: dict, mip: dict, out: bytearray,
             off = tiled_offset(layout, mip, bx, by)
             src = row_at + bx * eb
             out[off:off + eb] = mv[src:src + eb]
-            if known is not None:
-                known[off:off + eb] = b"\x01" * eb
+            if known_blocks is not None:
+                known_blocks[off // eb] = 1
 
 
 def read_dds(path):
@@ -2129,7 +2129,7 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
             start = d["base"] + mip["offset"]
             if start not in tiled_ranges:
                 tiled_ranges[start] = bytearray(mip["region"])
-                known_ranges[start] = bytearray(mip["region"])
+                known_ranges[start] = bytearray(mip["region"] // lay["element_bytes"])
             _retile_mip_into(mips[m], lay, mip, tiled_ranges[start], known_ranges[start])
         # Match every BCPack chunk touching those mips.
         for m, mip in enumerate(lay["mips"]):
@@ -2144,21 +2144,28 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
                 if key in seen_chunks:
                     continue
                 # Assemble the chunk's reference tiled bytes from `tiled_ranges`.
+                eb = bcpack.BLOCK_BYTES[codec]
+                nblocks = csize // eb
+                max_b = min(nblocks, 256)
                 ref_chunk = bytearray(csize)
-                known_chunk = bytearray(csize)
+                valid_blocks = bytearray(max_b)
                 for mstart, mtiled in tiled_ranges.items():
                     mend = mstart + len(mtiled)
                     lo = max(virt, mstart)
                     hi = min(virt + csize, mend)
                     if lo < hi:
                         ref_chunk[lo - virt:hi - virt] = mtiled[lo - mstart:hi - mstart]
-                        known_chunk[lo - virt:hi - virt] = known_ranges[mstart][lo - mstart:hi - mstart]
-                eb = bcpack.BLOCK_BYTES[codec]
-                nblocks = csize // eb
-                max_b = min(nblocks, 256)
+                        # A coverage entry represents a complete codec block.
+                        # Only the first 256 blocks can reference initial history.
+                        if (mstart - virt) % eb:
+                            raise CliError(f"{dds_path}: reference region is not aligned to codec blocks")
+                        first = (lo - virt) // eb
+                        end = min((hi - virt) // eb, max_b)
+                        if first < end:
+                            src_first = (lo - mstart) // eb
+                            valid_blocks[first:end] = known_ranges[mstart][src_first:src_first + end - first]
                 # DDS files contain visible blocks only. Tiled padding and
                 # bytes belonging to absent mips are not reference evidence.
-                valid_blocks = [all(known_chunk[i * eb:(i + 1) * eb]) for i in range(max_b)]
                 if not any(valid_blocks):
                     continue
                 raw = pool.data[src:src + packed]
