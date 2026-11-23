@@ -220,7 +220,7 @@ def parse_line(line):
     if op in ("s_waitcnt", "s_waitcnt_depctr"):
         # LLVM separates named wait counters with spaces.
         parts = [token for part in parts for token in part.split()]
-    elif parts and len(parts[0].split()) == 2:
+    elif op == "exp" and parts and len(parts[0].split()) == 2:
         # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
