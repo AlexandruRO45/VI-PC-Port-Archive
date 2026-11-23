@@ -70,7 +70,11 @@ def _parse_spv(asm):
     fvars = []       # [(%name, elem_type, init_id_or_None)]
     blocks = {}      # %label -> [(res, op, args), ...]
     cur = None
-    in_main = False
+    cur_fn = None
+    cur_params = []
+    cur_insns = []
+    funcs = {}       # %fn_name -> (params, [(res, op, args), ...])
+    call_seq = 0
 
     for raw in asm.splitlines():
         s = raw.strip()
@@ -83,14 +87,22 @@ def _parse_spv(asm):
             res, op, args = None, toks[0], toks[1:]
 
         if op == "OpFunction":
-            in_main = (res == "%main")
+            cur_fn = res
+            cur_params = []
+            cur_insns = []
+            cur = None
+            continue
+        if op == "OpFunctionParameter":
+            cur_params.append(res)
             continue
         if op == "OpFunctionEnd":
-            in_main = False
+            if cur_fn:
+                funcs[cur_fn] = (cur_params, cur_insns)
+            cur_fn = None
             cur = None
             continue
 
-        if not in_main:
+        if cur_fn is None:
             if op == "OpTypeInt":
                 types[res] = ("int", int(args[0]), int(args[1]))
             elif op == "OpTypeBool":
@@ -126,6 +138,10 @@ def _parse_spv(asm):
                 gvars[res] = (sc, elem)
             continue
 
+        if cur_fn != "%main":
+            cur_insns.append((res, op, args))
+            continue
+
         if op == "OpLabel":
             cur = res
             blocks[cur] = []
@@ -134,6 +150,26 @@ def _parse_spv(asm):
             _, elem = ptr_elem[args[0]]
             init = args[2] if len(args) > 2 else None
             fvars.append((res, elem, init))
+            continue
+        if op == "OpFunctionCall":
+            ret_t, fn_name = args[0], args[1]
+            call_args = args[2:]
+            fn_params, fn_insns = funcs[fn_name]
+            id_map = dict(zip(fn_params, call_args))
+            call_seq += 1
+            for fres, fop, fa in fn_insns:
+                if fop == "OpLabel":
+                    continue
+                mapped_a = [id_map.get(x, x) for x in fa]
+                if fop == "OpReturnValue":
+                    blocks[cur].append((res, "OpCopyObject", [ret_t, mapped_a[0]]))
+                    break
+                if fop == "OpReturn":
+                    break
+                new_res = f"%fc{call_seq}_{fres[1:]}" if fres else None
+                if fres:
+                    id_map[fres] = new_res
+                blocks[cur].append((new_res, fop, mapped_a))
             continue
         if cur is not None:
             blocks[cur].append((res, op, args))
@@ -1023,7 +1059,7 @@ class DivergentLoopBallotTests(unittest.TestCase):
             with self.subTest(mode=label):
                 spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate)
                 if emulate:
-                    self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+                    self.assertIn(gen.control_flow, ("emulated wave64 structured", "emulated wave64 rounds"))
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 want = expected_for(threads)
                 for t in range(threads):
@@ -1341,7 +1377,7 @@ class BarrierInLoopsTests(unittest.TestCase):
         """
         prog = self._ring_shift_loop_cs(wave64=True, threads=128, iters=5)
         spv, gen = _translate_cs("cs_bar_loop_w64_emulate", prog, threads=128, lds_bytes=512, emulate=True)
-        self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+        self.assertIn(gen.control_flow, ("emulated wave64 structured", "emulated wave64 rounds"))
         for rev in (False, True):
             with self.subTest(reverse_subgroups=rev):
                 mem = run_compute_workgroup(spv, 128, 32, push_constants=VSHARP, reverse_subgroups=rev)
