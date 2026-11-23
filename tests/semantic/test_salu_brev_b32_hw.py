@@ -560,6 +560,76 @@ class TestSaluBrevB32RegisterAliasing(unittest.TestCase):
                 hw_res = run_salu_brev_inplace_ps(c)
                 self.assertEqual(hw_res, ref_s_brev_b32(c))
 
+# --- Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation ---
+
+def run_salu_brev_scc_ps(src_val: int, initial_scc: int) -> Tuple[int, int]:
+    """Verify SCC preservation across s_brev_b32 using s_cselect_b32."""
+    lines = [
+        f"s_mov_b32 s0, {1 if initial_scc else 0}",
+        "s_cmp_eq_u32 s0, 1",
+        f"s_mov_b32 s1, {src_val & MASK32:#x}",
+        "s_brev_b32 s2, s1",
+        "s_cselect_b32 s3, 1, 0",
+        "v_mov_b32 v0, s2",
+        "v_mov_b32 v1, s3",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines("ps_salu_brev_scc", lines)
+    words = mrt0_words(spv)
+    return words[0], words[1]
+
+
+class TestSaluBrevB32ConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation tests."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = SaluInterpreter(self.rf)
+
+    def test_scc_preserved_when_initially_one(self) -> None:
+        self.rf.scc = 1
+        self.rf.write_sgpr(0, 0x12345678)
+        inst = parse_salu_instruction("s_brev_b32 s1, s0")
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.scc, 1)
+
+    def test_scc_preserved_when_initially_zero(self) -> None:
+        self.rf.scc = 0
+        self.rf.write_sgpr(0, 0x12345678)
+        inst = parse_salu_instruction("s_brev_b32 s1, s0")
+        self.interp.execute(inst)
+        self.assertEqual(self.rf.scc, 0)
+
+    def test_scc_unaffected_by_zero_result(self) -> None:
+        """s_brev_b32 with result 0 must not set SCC or clear SCC."""
+        self.rf.scc = 1
+        inst_zero = parse_salu_instruction("s_brev_b32 s1, 0")
+        self.interp.execute(inst_zero)
+        self.assertEqual(self.rf.scc, 1)
+
+        self.rf.scc = 0
+        self.interp.execute(inst_zero)
+        self.assertEqual(self.rf.scc, 0)
+
+    def test_scc_unaffected_by_msb_set(self) -> None:
+        """s_brev_b32 resulting in MSB set (negative) does not modify SCC."""
+        self.rf.scc = 1
+        self.rf.write_sgpr(0, 1)
+        inst = parse_salu_instruction("s_brev_b32 s1, s0")
+        res = self.interp.execute(inst)
+        self.assertEqual(res, 0x80000000)
+        self.assertEqual(self.rf.scc, 1)
+
+    def test_hardware_scc_preservation(self) -> None:
+        for scc in (0, 1):
+            with self.subTest(initial_scc=scc):
+                res, out_scc = run_salu_brev_scc_ps(0x12345678, scc)
+                self.assertEqual(res, ref_s_brev_b32(0x12345678))
+                self.assertEqual(out_scc, scc)
+
 
 if __name__ == "__main__":
     unittest.main()
