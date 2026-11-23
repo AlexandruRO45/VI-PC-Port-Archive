@@ -44,6 +44,10 @@ import struct
 import sys
 import time
 import zlib
+
+# one place owns the platform's pool limit: same number everywhere else, 61 at most on Windows
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pool_workers import process_workers  # noqa: E402
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -459,7 +463,7 @@ def scan_archive(path, workers, window, start=None, limit=None, progress=True):
         results = map(scan_window, jobs)
         pool = None
     else:
-        pool = multiprocessing.Pool(workers, initializer=I.below_normal)
+        pool = multiprocessing.Pool(process_workers(workers), initializer=I.below_normal)
         results = pool.imap_unordered(scan_window, jobs)
     try:
         for done, t in enumerate(results, 1):

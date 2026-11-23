@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -269,6 +270,32 @@ class TestArchive(unittest.TestCase):
         self.assertEqual(w_before_bad.checked, 0)
         w_bad = C.scan_window((path, next_boundary, next_boundary + window))
         self.assertEqual((w_bad.checked, w_bad.passed), (1, 0))
+
+    def test_the_pool_is_created_through_the_shared_limit(self):
+        # tools/pool_workers.py owns the platform's pool limit (Windows WaitForMultipleObjects' 64 handles);
+        # scan_archive must ask it, so a --workers above the limit is clamped, not passed to multiprocessing.Pool.
+        created = []
+
+        class FakePool:
+            def __init__(self, workers, initializer=None):
+                created.append(workers)
+
+            def imap_unordered(self, fn, jobs):
+                return map(fn, jobs)
+
+            def close(self):
+                pass
+
+            def join(self):
+                pass
+
+        good = payload(build())
+        path = self.write_rpf([good, b"<?xml version='1.0'?><a/>" + bytes(64)])
+        with mock.patch.object(C.multiprocessing, "Pool", FakePool):
+            tally, _ = C.scan_archive(path, 62, 64, progress=False)   # window 64: more than one job, so a pool
+        rep = tally.report()
+        self.assertEqual((rep["checked"], rep["passed"]), (1, 1))
+        self.assertEqual(created, [61 if os.name == "nt" else 62], created)
 
     def test_cli_json_and_exit_status(self):
         with tempfile.TemporaryDirectory() as d:
