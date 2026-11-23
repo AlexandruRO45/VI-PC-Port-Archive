@@ -40,6 +40,16 @@ class MergeCheckTest(unittest.TestCase):
         self.write("docs/notes.md", "# Notes\n\nAn introduction long enough to be counted as a line of its own here.\n")
         self.commit("start")
 
+    def test_git_missing_from_path_is_a_cli_error(self):
+        result = subprocess.run(
+            [sys.executable, "-I", mc.__file__, "1=HEAD"], cwd=self.repo,
+            env={**os.environ, "PATH": self.repo}, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("merge_check: cannot start git:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def git(self, *args):
         r = subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                             "-c", "commit.gpgsign=false", "-C", self.repo, *args],
