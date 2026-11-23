@@ -34,10 +34,11 @@
 //                 cache.bin. Not compatible with --stats.
 //   --inflight-file F  keep the modules that are in the driver in F, one "name<TAB>phase" line each (phase: module
 //                 while vkCreateShaderModule runs, pipeline while its pipeline is created), so whoever ran the check
-//                 can tell which module was there when the process died. F is rewritten when a module over
-//                 --large-module-bytes enters or leaves the driver (with --large-parallel 1 it is alone then, so F
-//                 names exactly it; otherwise F names every module in flight and make_game.py retries each alone)
-//                 and by the 5 s watchdog for the others, and emptied at the end. make_game.py's pipelines stage
+//                 can tell which module was there when the process died. F is rewritten whenever a module enters
+//                 the driver (a small module can crash it within milliseconds, before the 5 s watchdog runs), when a
+//                 module over --large-module-bytes leaves it (with --large-parallel 1 it is alone then, so F names
+//                 exactly it; otherwise F names every module in flight and make_game.py retries each alone), by the
+//                 5 s watchdog, and emptied at the end. make_game.py's pipelines stage
 //                 reads it. With --isolate, the active child writes the snapshot.
 //   --skip-file F modules named in F (one per line) are not compiled: each is reported as MODULE CRASH and counted
 //                 as a failed pipeline, as --isolate does for a module that killed the driver. make_game.py writes F
@@ -1626,7 +1627,7 @@ int main(int argc, char** argv) {
             {   // in flight from here: vkCreateShaderModule can also take long or die in the driver
                 std::lock_guard<std::mutex> g(mu);
                 inflight[std::this_thread::get_id()] = {name, std::chrono::steady_clock::now(), "module"};
-                if (isolated) write_inflight();   // a large module: name it now (alone with --large-parallel 1)
+                write_inflight();   // name it now: a small module can kill the driver before the watchdog writes
             }
 
             const auto code = leonida::read_spirv_words(f, file_size);
@@ -1676,7 +1677,7 @@ int main(int argc, char** argv) {
                     {
                         std::lock_guard<std::mutex> g(mu);
                         inflight[std::this_thread::get_id()] = {name, t0, "pipeline"};
-                        if (isolated) write_inflight();   // a large module: name it now (alone with --large-parallel 1)
+                        write_inflight();   // name it now: a small module can kill the driver before the watchdog writes
                     }
                     VkPipeline p = VK_NULL_HANDLE;
                     maybe_simulate_crash(name);
@@ -1850,7 +1851,7 @@ int main(int argc, char** argv) {
                         {
                             std::lock_guard<std::mutex> g(mu);
                             inflight[std::this_thread::get_id()] = {name, t0, "pipeline"};
-                            if (isolated) write_inflight();   // a large module: name it now (alone with --large-parallel 1)
+                            write_inflight();   // name it now: a small module can kill the driver before the watchdog writes
                         }
                         VkPipeline p = VK_NULL_HANDLE;
                         maybe_simulate_crash(name);
