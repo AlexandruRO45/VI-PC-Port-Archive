@@ -209,6 +209,49 @@ class GuidSites(unittest.TestCase):
                 with open(header, "rb") as f:
                     self.assertEqual(f.read(), header_text)
 
+    def test_builtin_guids_include_d3d12_console_and_gdk(self):
+        builtin = sites.builtin_guids()
+        self.assertEqual(builtin.get("IID_ID3D12CommandQueue"), QUEUE)
+        self.assertIn("IID_ID3D12ConsDmaCommandList", builtin)
+        self.assertIn("XAccessibilityImpl", builtin)
+
+    def test_cli_uses_builtin_guids_without_header_and_respects_no_builtin(self):
+        builtin = sites.builtin_guids()
+        cons_dma = builtin["IID_ID3D12ConsDmaCommandList"]
+        xaccess = builtin["XAccessibilityImpl"]
+        rdata = QUEUE.bytes_le + cons_dma.bytes_le + xaccess.bytes_le + UNKNOWN.bytes_le
+        text = lea(0x2000, 0x1000) + lea(0x2010, 0x1007) + lea(0x2020, 0x100E) + lea(0x2030, 0x1015)
+        image, _ = pe32plus(text, rdata)
+        path = self.write("t7.dll", image)
+        header = os.path.join(self.tmp.name, "none.h")
+        out_on = os.path.join(self.tmp.name, "out_on.json")
+        out_off = os.path.join(self.tmp.name, "out_off.json")
+
+        res_on = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_guid_sites.py"), path,
+             "--header", header, "--json", out_on],
+            capture_output=True, text=True, cwd=ROOT)
+        self.assertEqual(res_on.returncode, 0, res_on.stderr)
+        with open(out_on, encoding="utf-8") as f:
+            data_on = json.load(f)
+        self.assertGreater(data_on["known"], 0)
+        by_val_on = {c["value"]: c["known"] for c in data_on["images"][0]["guid_candidates"]}
+        self.assertIn("IID_ID3D12CommandQueue", by_val_on[str(QUEUE)])
+        self.assertIn("IID_ID3D12ConsDmaCommandList", by_val_on[str(cons_dma)])
+        self.assertIn("XAccessibilityImpl", by_val_on[str(xaccess)])
+        self.assertIsNone(by_val_on[str(UNKNOWN)])
+
+        res_off = subprocess.run(
+            [sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_guid_sites.py"), path,
+             "--header", header, "--no-builtin", "--json", out_off],
+            capture_output=True, text=True, cwd=ROOT)
+        self.assertEqual(res_off.returncode, 0, res_off.stderr)
+        with open(out_off, encoding="utf-8") as f:
+            data_off = json.load(f)
+        self.assertEqual(data_off["known"], 0)
+        for cand in data_off["images"][0]["guid_candidates"]:
+            self.assertIsNone(cand["known"])
+
 
 if __name__ == "__main__":
     unittest.main()

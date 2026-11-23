@@ -13,8 +13,10 @@ non-executable initialized sections whose 16 bytes are GUID-shaped (version nibb
 variant). It also scans data sections for absolute 8-byte pointers to GUID-shaped constants (a GUID
 address stored in a struct), and lists `mov reg, [rip+...]` loads that go through an import slot,
 because a GUID imported as data would otherwise be invisible. Every kept candidate is matched
-against the IIDs of the installed d3d12.h plus `--known NAME=GUID` values; the rest are printed as
-unknown, with the referencing count and the constant's own RVA, for call-site triage.
+against Leonida's built-in GUID tables (`tools/d3d12_xs_surface.py` and `tools/gdk_runtime_classes.json`),
+the IIDs of the installed d3d12.h (when present), and any `--known NAME=GUID` values (`--no-builtin`
+disables the built-in tables); the rest are printed as unknown, with the referencing count and the
+constant's own RVA, for call-site triage.
 
 It also reports data windows referenced by code that parse as a `D3D12_COMMAND_QUEUE_DESC`
 {Type, Priority, Flags, NodeMask}: a static queue description with a console list type is where the
@@ -24,7 +26,7 @@ It prints names, counts and GUID values only, no bytes of the image.
 
 Usage:
     python -I tools/d3d12_guid_sites.py <image> [<image> ...] [--header PATH/d3d12.h]
-                                        [--known NAME=GUID ...] [--json OUT]
+                                        [--known NAME=GUID ...] [--no-builtin] [--json OUT]
 
 Without --header it takes d3d12.h from the newest Windows SDK under "Windows Kits\\10\\Include".
 The --json output must name a file separate from the images and the header.
@@ -66,6 +68,41 @@ def read_iids(header: str) -> dict[str, uuid.UUID]:
     with open(header, encoding="utf-8", errors="replace") as f:
         text = f.read()
     return {name: uuid.UUID(guid) for guid, name in MIDL.findall(text)}
+
+
+def builtin_guids() -> dict[str, uuid.UUID]:
+    """Load the repository's built-in D3D12/DXGI/console IIDs and GDK runtime class/interface IDs."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    out: dict[str, uuid.UUID] = {}
+    try:
+        import d3d12_xs_surface as xs
+    except ImportError:
+        xs = None
+    if xs is not None:
+        for table in (xs.STANDARD_GUIDS, xs.CONSOLE_IIDS):
+            for name, fields in table.items():
+                d1, d2, d3, *bs = fields
+                out[name] = uuid.UUID(bytes_le=struct.pack("<IHH8B", d1, d2, d3, *bs))
+    gdk_path = os.path.join(here, "gdk_runtime_classes.json")
+    if os.path.isfile(gdk_path):
+        try:
+            with open(gdk_path, encoding="utf-8") as f:
+                gdk = json.load(f)
+        except (OSError, ValueError):
+            gdk = {}
+        for section in ("classes", "interfaces"):
+            entries = gdk.get(section)
+            if not isinstance(entries, dict):
+                continue
+            for name, info in entries.items():
+                if isinstance(info, dict) and isinstance(info.get("id"), str):
+                    try:
+                        out.setdefault(name, uuid.UUID(info["id"]))
+                    except ValueError:
+                        pass
+    return out
 
 
 class Image:
@@ -350,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--header", help="d3d12.h to read the known IIDs from (default: newest Windows SDK)")
     ap.add_argument("--known", action="append", default=[], metavar="NAME=GUID",
                     help="a known GUID the header does not list, e.g. a console IID (repeatable)")
+    ap.add_argument("--no-builtin", action="store_true",
+                    help="do not preload built-in d3d12_xs_surface / gdk_runtime_classes GUID tables")
     ap.add_argument("--json", help="also write the result here")
     args = ap.parse_args(argv)
 
@@ -361,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
             if source and same_report_path(args.json, source):
                 ap.error(f"--json {args.json} would overwrite the input {source}")
 
-    known: dict[str, uuid.UUID] = {}
+    known: dict[str, uuid.UUID] = {} if args.no_builtin else builtin_guids()
     if header and os.path.isfile(header):
         known.update(read_iids(header))
     for pair in args.known:
