@@ -16,6 +16,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include <wrl/client.h>
 
 namespace rt::dxgi {
 namespace {
@@ -408,7 +409,7 @@ public:
         IDXGIOutput* fallback = nullptr;
         for (UINT i = 0;; ++i) {
             IDXGIOutput* candidate = nullptr;
-            if (adapter->EnumOutputs(i, &candidate) == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(adapter->EnumOutputs(i, &candidate))) break;
             if (!candidate) continue;
             DXGI_OUTPUT_DESC desc{};
             if (target && SUCCEEDED(candidate->GetDesc(&desc)) && desc.Monitor == target) {
@@ -424,7 +425,7 @@ public:
             }
         }
         adapter->Release();
-        if (!fallback) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        if (!fallback) return DXGI_ERROR_UNSUPPORTED;
         *out = fallback;
         return S_OK;
     }
@@ -744,6 +745,36 @@ std::vector<DisplayInfo> enumerate_displays() {
         }
     }
     return displays;
+}
+
+// DXGI associates outputs with a specific adapter. EnumDisplayMonitors alone sees the whole desktop.
+void select_adapter_displays(LUID luid, std::vector<DisplayInfo>& displays) {
+    // Keep the synthetic output when Windows exposes no desktop monitors.
+    if ((!luid.LowPart && !luid.HighPart) || !displays.front().monitor) return;
+    using Microsoft::WRL::ComPtr;
+    static const auto create = [] {
+        const HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return dxgi ? reinterpret_cast<decltype(&CreateDXGIFactory1)>(GetProcAddress(dxgi, "CreateDXGIFactory1"))
+                    : nullptr;
+    }();
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    if (!create || FAILED(create(IID_PPV_ARGS(factory.GetAddressOf()))) ||
+        FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(adapter.GetAddressOf()))))
+        return;
+
+    std::vector<DisplayInfo> attached;
+    for (UINT i = 0;; ++i) {
+        ComPtr<IDXGIOutput> output;
+        const auto hr = adapter->EnumOutputs(i, output.GetAddressOf());
+        if (hr == DXGI_ERROR_NOT_FOUND) break;
+        DXGI_OUTPUT_DESC desc{};
+        if (FAILED(hr) || !output || FAILED(output->GetDesc(&desc))) return;
+        const auto match = std::find_if(displays.begin(), displays.end(),
+                                        [&](const DisplayInfo& display) { return display.monitor == desc.Monitor; });
+        if (match != displays.end()) attached.push_back(*match);
+    }
+    displays.swap(attached);
 }
 
 bool is_supported_display_format(DXGI_FORMAT fmt) noexcept {
@@ -1138,7 +1169,8 @@ public:
     HRESULT STDMETHODCALLTYPE EnumOutputs(UINT index, IDXGIOutput** out) override {
         if (!out) return E_INVALIDARG;
         *out = nullptr;
-        const std::vector<DisplayInfo> displays = enumerate_displays();
+        auto displays = enumerate_displays();
+        select_adapter_displays(desc_.AdapterLuid, displays);
         if (index >= displays.size()) return DXGI_ERROR_NOT_FOUND;
         *out = new Output(static_cast<IDXGIAdapter*>(this), displays[index]);
         return S_OK;
