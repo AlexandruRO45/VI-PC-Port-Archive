@@ -268,6 +268,20 @@ class TestSLshlB64Oracle(unittest.TestCase):
         self.assertEqual(ref_s_lshl_b64(1, 64), (1, 1))
         self.assertEqual(ref_s_lshl_b64(1, 65), (2, 1))
 
+class SLshlB64Expr(ASTNode):
+    def __init__(self, src: int, shift: int) -> None:
+        self.src = src
+        self.shift = shift
+
+    def eval(self) -> tuple[int, int]:
+        return ref_s_lshl_b64(self.src, self.shift)
+
+
+class TestSLshlB64AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SLshlB64Expr(0x1, 40)
+        self.assertEqual(expr.eval(), (1 << 40, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
