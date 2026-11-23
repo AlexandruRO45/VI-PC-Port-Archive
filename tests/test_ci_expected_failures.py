@@ -65,6 +65,31 @@ class Main(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cef.main([]), 2)
 
+    def test_help_flag_prints_the_docstring_to_stdout(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cef.main(["--help"]), 0)
+        self.assertIn("python -I scripts/ci_expected_failures.py", out.getvalue())
+
+    def test_a_non_integer_exit_status_is_one_usage_line(self):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "failed.txt"
+            path.write_text("", encoding="utf-8")
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(cef.main([str(path), "ok"]), 2)
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
+        self.assertIn("EXIT_STATUS", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_an_unreadable_failed_list_is_one_usage_line(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(cef.main(["Z:/absent_dir/absent.txt", "0"]), 2)
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
+        self.assertIn("cannot read", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
