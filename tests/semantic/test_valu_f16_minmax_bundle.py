@@ -86,5 +86,96 @@ class TestMinF16Oracle(unittest.TestCase):
         self.assertEqual(ref_min_f16(NEG_ZERO16, POS_ZERO16), NEG_ZERO16)
 
 
+# ------------------------------------------------------------------------------
+# v_min_f16 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+class OperandType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    op_type: OperandType
+    index: int
+
+    def __post_init__(self):
+        if self.op_type == OperandType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range: {self.index}")
+        if self.op_type == OperandType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index out of range: {self.index}")
+
+    @property
+    def name(self) -> str:
+        return f"{'v' if self.op_type == OperandType.VGPR else 's'}{self.index}"
+
+
+@dataclass(frozen=True)
+class LiteralOperand:
+    value: int
+
+    def __post_init__(self):
+        if not (-0x8000_0000 <= self.value <= 0xFFFF_FFFF):
+            raise ValueError(f"Literal value out of range: {self.value}")
+
+
+@dataclass
+class VMinF16Instruction:
+    dst: RegisterOperand
+    src0: Union[RegisterOperand, LiteralOperand]
+    src1: Union[RegisterOperand, LiteralOperand]
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR:
+            raise TypeError("Destination must be a VGPR")
+
+
+class ScalarMachineMinF16:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
+        if isinstance(op, LiteralOperand):
+            return op.value & MASK16
+        elif op.op_type == OperandType.VGPR:
+            return self.vgprs[op.index] & MASK16
+        elif op.op_type == OperandType.SGPR:
+            return self.sgprs[op.index] & MASK16
+        raise TypeError(f"Unknown operand: {op}")
+
+    def step(self, insn: VMinF16Instruction):
+        s0 = self.read_operand(insn.src0)
+        s1 = self.read_operand(insn.src1)
+        res = ref_min_f16(s0, s1)
+        # Low 16 bits written, preserving high 16 bits
+        self.vgprs[insn.dst.index] = (self.vgprs[insn.dst.index] & 0xFFFF_0000) | res
+
+
+class TestMinF16ASTAndScalar(unittest.TestCase):
+    def test_ast(self):
+        insn = VMinF16Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+        )
+        self.assertEqual(insn.dst.name, "v0")
+
+    def test_scalar_execution(self):
+        machine = ScalarMachineMinF16()
+        machine.vgprs[0] = 0xAAAA_0000
+        machine.vgprs[1] = f16_to_bits(10.0)
+        machine.vgprs[2] = f16_to_bits(2.5)
+        insn = VMinF16Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+        )
+        machine.step(insn)
+        self.assertEqual(machine.vgprs[0], 0xAAAA_0000 | f16_to_bits(2.5))
+
+
 if __name__ == '__main__':
     unittest.main()
