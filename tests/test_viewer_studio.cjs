@@ -276,3 +276,59 @@ test('half-float coordinates follow the selected mip and late reads cannot repla
     await older;
     assert.equal(output.textContent, 'R = -2.5');
 });
+
+test('a superseded load that finishes late is disposed instead of leaking', () => {
+    const studio = loadStudio();
+    studio.run(`loadModel('/models/a.glb', 'a.glb', '', 1);
+        loadModel('/models/b.glb', 'b.glb', '', 1);`);
+    const [a, b] = studio.loads;
+    const modelB = fakeModel();
+    const staleA = fakeModel();
+    b.onLoad({ scene: modelB });
+    a.onLoad({ scene: staleA });
+    assert.deepEqual(staleA.parts.map(part => part.disposed), [true, true, true]);
+    assert.deepEqual(modelB.parts.map(part => part.disposed), [false, false, false]);
+});
+
+test('multi-material meshes toggle wireframe and dispose every material and texture', () => {
+    const studio = loadStudio();
+    const geometry = Object.assign(new Disposable(), { attributes: { position: { count: 3 } }, index: null });
+    const tex1 = Object.assign(new Disposable(), { isTexture: true });
+    const tex2 = Object.assign(new Disposable(), { isTexture: true });
+    const mat1 = Object.assign(new Disposable(), { map: tex1, wireframe: false });
+    const mat2 = Object.assign(new Disposable(), { map: tex2, wireframe: false });
+    const mesh = { isMesh: true, geometry, material: [mat1, mat2], userData: {} };
+    const multi = {
+        position: new Vector3(),
+        userData: {},
+        traverse(visit) { visit(this); visit(mesh); },
+    };
+    studio.run(`loadModel('/models/multi.glb', 'multi.glb', '', 1);`);
+    studio.loads[0].onLoad({ scene: multi });
+    studio.run('toggleWireframe();');
+    assert.equal(mat1.wireframe, true);
+    assert.equal(mat2.wireframe, true);
+
+    studio.run(`setShadingMode('clay'); loadModel('/models/next.glb', 'next.glb', '', 1);`);
+    studio.loads[1].onLoad({ scene: fakeModel() });
+    assert.deepEqual([geometry, mat1, mat2, tex1, tex2].map(p => p.disposed), [true, true, true, true, true]);
+    assert.equal(studio.run('clayMaterial.disposed'), false);
+});
+
+test('hostile texture preview URLs and format strings are escaped in both grid batches', () => {
+    function renderFields(preview, format) {
+        const studio = loadStudio();
+        studio.context.textures = Array.from({ length: 81 },
+            () => ({ name: 'plain.png', format, size: 4, preview }));
+        studio.run('allTextures = textures; renderTexturesGrid();');
+        const grid = studio.elements.get('textures-grid');
+        grid.children.at(-1).onclick();
+        const cards = grid.children.filter(child => child.className === 'tex-card');
+        assert.equal(cards.length, 81);
+        return cards[0].innerHTML + cards[80].innerHTML;
+    }
+    const plain = renderFields('/textures/x.png', 'PNG Image');
+    const hostile = renderFields('/textures/' + HOSTILE, HOSTILE);
+    assert.deepEqual(tagShape(hostile), tagShape(plain));
+    assert.ok(visibleText(hostile).includes(HOSTILE));
+});
