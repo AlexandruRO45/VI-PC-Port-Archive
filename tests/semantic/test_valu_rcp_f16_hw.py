@@ -200,5 +200,73 @@ class RcpF16AstValidationTests(unittest.TestCase):
         self.assertEqual(ast.src0.kind, RegKind.IMM)
         self.assertEqual(ast.src0.raw_val, F16_TWO)
 
+class ScalarRegisterState:
+    def __init__(self):
+        self.vgprs: dict[int, int] = {}
+        self.sgprs: dict[int, int] = {}
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs.get(idx, 0) & MASK32
+
+    def set_vgpr(self, idx: int, val: int):
+        self.vgprs[idx] = val & MASK32
+
+
+def execute_scalar_rcp_f16(state: ScalarRegisterState, ast: InstructionAST) -> None:
+    # Read source
+    if ast.src0.kind == RegKind.VGPR:
+        src_dword = state.get_vgpr(ast.src0.index)
+        src_u16 = (src_dword >> 16) & MASK16 if ast.mods.op_sel[0] else src_dword & MASK16
+    elif ast.src0.kind == RegKind.SGPR:
+        src_dword = state.sgprs.get(ast.src0.index, 0) & MASK32
+        src_u16 = (src_dword >> 16) & MASK16 if ast.mods.op_sel[0] else src_dword & MASK16
+    else:
+        src_u16 = ast.src0.raw_val & MASK16
+
+    res_u16 = oracle_rcp_f16(
+        src_u16,
+        neg=ast.mods.neg,
+        abs_val=ast.mods.abs_val,
+        clamp=ast.mods.clamp,
+        omod=ast.mods.omod,
+    )
+
+    # Destination preservation on GFX10
+    orig_dst = state.get_vgpr(ast.dst.index)
+    if ast.mods.op_sel[1]:
+        # Write to high half, preserve low half
+        new_dst = (orig_dst & 0x0000FFFF) | (res_u16 << 16)
+    else:
+        # Write to low half, preserve high half
+        new_dst = (orig_dst & 0xFFFF0000) | res_u16
+    state.set_vgpr(ast.dst.index, new_dst)
+
+
+class RcpF16ScalarInterpreterTests(unittest.TestCase):
+    def test_scalar_low_half_execution(self):
+        state = ScalarRegisterState()
+        state.set_vgpr(0, F16_TWO)
+        state.set_vgpr(1, 0xDEADBEEF)
+        ast = InstructionAST("v_rcp_f16", Operand(RegKind.VGPR, 1), Operand(RegKind.VGPR, 0))
+        execute_scalar_rcp_f16(state, ast)
+        res = state.get_vgpr(1)
+        self.assertEqual(res >> 16, 0xDEAD)  # Preserved high half
+        self.assertEqual(res & 0xFFFF, F16_HALF)  # Low half computed 1/2 = 0.5
+
+    def test_scalar_high_half_execution(self):
+        state = ScalarRegisterState()
+        state.set_vgpr(0, F16_TWO << 16)  # High half has 2.0
+        state.set_vgpr(1, 0xCAFEBABE)
+        ast = InstructionAST(
+            "v_rcp_f16",
+            Operand(RegKind.VGPR, 1),
+            Operand(RegKind.VGPR, 0),
+            ModifierFlags(op_sel=(1, 1)),  # Read src high, write dst high
+        )
+        execute_scalar_rcp_f16(state, ast)
+        res = state.get_vgpr(1)
+        self.assertEqual(res & 0xFFFF, 0xBABE)  # Preserved low half
+        self.assertEqual(res >> 16, F16_HALF)    # High half computed 1/2 = 0.5
+
 if __name__ == "__main__":
     unittest.main()
