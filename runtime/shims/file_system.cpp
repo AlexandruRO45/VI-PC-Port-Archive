@@ -141,7 +141,7 @@ Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     return letter == L'g' ? Drive::Game : Drive::Scratch;
 }
 
-Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
+Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts, bool enumeration = false) {
     size_t prefix_length = 0;
     const Drive drive = console_drive(path, prefix_length);
     if (drive == Drive::None) return Parsed::Host;
@@ -156,12 +156,12 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
-    auto flush = [&]() -> bool {
+    auto flush = [&](bool final = false) -> bool {
         if (part.empty() || part == L".") {
             part.clear();
             return true;
         }
-        if (part != L"..") {
+        if (part != L".." && !(enumeration && final && part.find_first_of(L"*?") != std::wstring::npos)) {
             const size_t end = part.find_last_not_of(L". ");
             if (end == std::wstring::npos) return false;
             part.erase(end + 1);
@@ -185,7 +185,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
             part.push_back(c);
         }
     }
-    if (!flush()) return Parsed::Refused;
+    if (!flush(true)) return Parsed::Refused;
     // The overlay's own folders are not part of the title's GAME: tree: hidden from its listings (internal_dir) and
     // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
     // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
@@ -761,7 +761,7 @@ HANDLE WINAPI find_first_file_w(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
         return INVALID_HANDLE_VALUE;
     }
     std::vector<std::wstring> parts;
-    const Parsed parsed = parse_console(pattern, parts);
+    const Parsed parsed = parse_console(pattern, parts, true);
     if (parsed == Parsed::Host) return ::FindFirstFileW(pattern, data);
     if (parsed == Parsed::Refused) {
         SetLastError(ERROR_INVALID_NAME);
@@ -788,7 +788,7 @@ HANDLE WINAPI find_first_file_ex_w(LPCWSTR pattern, FINDEX_INFO_LEVELS info_leve
         return INVALID_HANDLE_VALUE;
     }
     std::vector<std::wstring> parts;
-    const Parsed parsed = parse_console(pattern, parts);
+    const Parsed parsed = parse_console(pattern, parts, true);
     if (parsed == Parsed::Host)
         return ::FindFirstFileExW(pattern, info_level, data, search_op, search_filter, additional_flags);
     if (parsed == Parsed::Refused) {
@@ -838,7 +838,7 @@ HANDLE WINAPI find_first_file_ex_a(LPCSTR pattern, FINDEX_INFO_LEVELS info_level
     }
     const std::wstring wide = widen_ansi(pattern);
     std::vector<std::wstring> parts;
-    const Parsed parsed = parse_console(wide, parts);
+    const Parsed parsed = parse_console(wide, parts, true);
     if (parsed == Parsed::Host)
         return ::FindFirstFileExA(pattern, info_level, data, search_op, search_filter, additional_flags);
     WIN32_FIND_DATAW wide_data{};

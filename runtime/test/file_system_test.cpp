@@ -329,6 +329,24 @@ void run_checks(const std::filesystem::path& root) {
               "GetFileAttributesExW reports the overlay copy's size");
     }
 
+    // A final wildcard pattern keeps Win32's special extensionless-name meaning for "*.".
+    {
+        write_path(package / "wildcard" / "plain", "package");
+        write_path(package / "wildcard" / "with.txt", "package");
+        write_path(overlay / "wildcard" / "overlayplain", "overlay");
+        write_path(overlay / "wildcard" / "overlay.txt", "overlay");
+        const auto names = list(first_w, next_w, find_close, L"GAME:\\wildcard\\*.");
+        check(contains(names, L"plain") && contains(names, L"overlayplain") &&
+                  !contains(names, L"with.txt") && !contains(names, L"overlay.txt"),
+              "FindFirstFileW preserves *. to match only extensionless names");
+        WIN32_FIND_DATAW found{};
+        SetLastError(0);
+        const HANDLE h = first_w(L"GAME:\\.gta6rt-deleted.\\*.", &found);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+              "FindFirstFileW still rejects normalized reserved directory components");
+        if (h != INVALID_HANDLE_VALUE) find_close(h);
+    }
+
     // One listing, merged, overlay first and without duplicates.
     {
         const std::vector<std::wstring> names = list(first_w, next_w, find_close, L"GAME:\\data\\*");
