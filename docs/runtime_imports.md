@@ -140,9 +140,9 @@ What this does not show: `--run` has not been run, so the entry point has not be
 reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
 that name exists), and an unimplemented import stops the run only if the title calls it
 ([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
-functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
-host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
-which opens none.
+functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`); `gta6rt` serves them through the
+offline Winsock2 shim ([Winsock2 offline](#winsock2-offline)), like `winhttp.dll`, so neither opens host sockets or
+issues DNS queries.
 
 ## Console paths and the write overlay
 
@@ -571,6 +571,31 @@ end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMem
 Each refused server is logged once (`[rt] winhttp: offline, refused <host>:<port>`), which records what a title
 tried to reach. `runtime/test/winhttp_offline_test.cpp` (ctest `winhttp_offline`) covers the synchronous and
 asynchronous paths with `.invalid` names; it opens no connection.
+
+## Winsock2 offline
+
+`game_scarlett_master.exe` imports 25 functions from `ws2_32.dll` (23 by classic Winsock ordinal plus `getaddrinfo` and
+`freeaddrinfo`). Like `winhttp.dll`, `gta6rt` owns `ws2_32.dll` (`runtime/shims/ws2_32_offline.cpp`) and answers 89
+Winsock2 functions in-process under both export name and official Windows ordinal (178 registry entries), with no link
+dependency on or call into the host's `ws2_32.dll`:
+
+- `WSAStartup` and `WSACleanup` keep an initialization reference count; `socket` / `WSASocketA/W` allocate local
+  4-aligned handles; `bind`, `getsockname`, `listen`, `setsockopt`, `getsockopt`, `ioctlsocket`, `WSAIoctl`,
+  `WSAEventSelect`, `WSAEnumNetworkEvents`, `shutdown` and `closesocket` keep per-socket state in-process.
+- `connect`, `WSAConnect`, `WSAConnectByNameA/W`, `WSAConnectByList`, `sendto`, `WSASendTo` and `WSASendMsg` fail with
+  `WSAENETUNREACH`, record `SO_ERROR`, signal `FD_CONNECT` if selected, and log each distinct destination once
+  (`[rt] ws2_32: offline, refused <kind> <target>`).
+- Stream `send`, `recv` and `getpeername` return `WSAENOTCONN`; bound non-blocking UDP `recvfrom` returns
+  `WSAEWOULDBLOCK` immediately, while blocking UDP `recv*` and listening `accept` sleep briefly (honouring capped
+  `SO_RCVTIMEO` with `WSAETIMEDOUT`, or 1 ms with `WSAENETUNREACH`) so dedicated polling threads do not spin at 100%.
+- `select` and `WSAPoll` validate handles, report bound UDP sockets writable (`writefds` / `POLLWRNORM`, and `FD_WRITE`
+  through `WSAEventSelect`), and cap non-ready sleeps to 10 ms (1 ms for infinite waits).
+- `getaddrinfo`, `GetAddrInfoW`, `GetAddrInfoExA/W` and `gethostbyname` resolve numeric IPv4/IPv6 literals, passive
+  wildcards and `localhost` in-process; any other hostname is logged once and fails immediately with
+  `WSAHOST_NOT_FOUND`.
+
+`runtime/test/ws2_32_offline_test.cpp` (ctest `ws2_32_offline`) checks all 89 name/ordinal pairs, local socket state,
+offline refusals and DNS helpers with `.invalid` and RFC 5737/3849 addresses; the test binary imports no `ws2_32.dll`.
 
 ## What this proves and what it does not
 
