@@ -900,6 +900,98 @@ class MalformedJsavTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
 
+def nested_block(levels):
+    """A block holding `levels` nested arrays under one key: it nests levels + 1 deep."""
+    return b'{"nested":' + b"[" * levels + b"0" + b"]" * levels + b"}"
+
+
+def jsav_body_depth(data):
+    h, _ = saves.parse_jsav(data)
+    return saves.json_depth(json.loads(data[h["body_offset"]:h["body_end"]]))
+
+
+def jsav_nested(depth):
+    """A one-block JSAV whose body nests exactly `depth` levels. The levels the body adds around its blocks are
+    measured on a shallow build, not assumed."""
+    around = jsav_body_depth(saves.build_jsav(3, 1, [1], [1], [nested_block(0)])) - 1
+    return saves.build_jsav(3, 1, [1], [1], [nested_block(depth - around - 1)])
+
+
+class JsonDepthTest(unittest.TestCase):
+    """MAX_JSON_DEPTH is checked on the decoded value, so the answer no longer depends on how deep the running
+    Python's decoder happens to go (9,996 levels on 3.12, over 100,000 from 3.14 on)."""
+
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True, timeout=60)
+
+    def test_json_depth(self):
+        for value, depth in ((0, 0), ("text", 0), (None, 0), ([], 1), ({}, 1), ([[]], 2), ([1, [2, [3]], {}], 3),
+                             ({"a": [1, {"b": []}], "c": 2}, 4)):
+            with self.subTest(value=value):
+                self.assertEqual(saves.json_depth(value), depth)
+        value = 0
+        for _ in range(100_000):
+            value = [value]
+        self.assertEqual(saves.json_depth(value), 100_000)   # measured without recursion
+
+    def test_body_at_the_limit_is_read_and_extracted(self):
+        data = jsav_nested(saves.MAX_JSON_DEPTH)
+        self.assertEqual(jsav_body_depth(data), saves.MAX_JSON_DEPTH)
+        h, _ = saves.parse_jsav(data)
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "limit.jsav"), os.path.join(tmp, "export")
+            write(source, data)
+            for args in (("info", source), ("verify", source), ("diff", source, source), ("extract", source, out)):
+                with self.subTest(command=args[0]):
+                    result = self.run_tool(*args)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(rd_json(os.path.join(out, "save.pretty.json")),
+                             json.loads(data[h["body_offset"]:h["body_end"]]))
+
+    def test_body_one_level_over_is_refused_by_every_read_command(self):
+        data = jsav_nested(saves.MAX_JSON_DEPTH + 1)
+        with self.assertRaisesRegex(ValueError, f"nests {saves.MAX_JSON_DEPTH + 1} levels deep"):
+            saves.parse_jsav(data)
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "over.jsav"), os.path.join(tmp, "export")
+            write(source, data)
+            write(os.path.join(out, "index.json"), b"previous complete index")
+            for args in (("info", source), ("verify", source), ("diff", source, source), ("extract", source, out)):
+                with self.subTest(command=args[0]):
+                    result = self.run_tool(*args)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("ERROR: JSAV body is not valid UTF-8 JSON", result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(rd(os.path.join(out, "index.json")), b"previous complete index")
+                    self.assertEqual(os.listdir(out), ["index.json"])
+
+    def test_asav_payload_over_the_limit_is_kept_only_as_binary(self):
+        # 513 levels: over the limit on every version. 20,000: past 3.12's own decoder, which raises RecursionError.
+        for levels in (saves.MAX_JSON_DEPTH, 20_000):
+            payload = b'{"a":' + b"[" * levels + b"0" + b"]" * levels + b"}"
+            with self.subTest(depth=levels + 1), tempfile.TemporaryDirectory() as tmp:
+                source, out = os.path.join(tmp, "deep.asav"), os.path.join(tmp, "x")
+                write(source, make_asav(kind=2, payload=payload))
+                result = self.run_tool("extract", source, out)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("payload looks like text but did not parse as JSON", result.stdout)
+                self.assertEqual(rd(os.path.join(out, "payload.bin")), payload)
+                self.assertFalse(os.path.exists(os.path.join(out, "payload.json")))
+
+    def test_asav_payload_at_the_limit_is_written_as_json(self):
+        levels = saves.MAX_JSON_DEPTH - 1
+        payload = b'{"a":' + b"[" * levels + b"0" + b"]" * levels + b"}"
+        with tempfile.TemporaryDirectory() as tmp:
+            source, out = os.path.join(tmp, "limit.asav"), os.path.join(tmp, "x")
+            write(source, make_asav(kind=2, payload=payload))
+            result = self.run_tool("extract", source, out)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(saves.json_depth(rd_json(os.path.join(out, "payload.json"))), saves.MAX_JSON_DEPTH)
+
+
 class PackIndexValidationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

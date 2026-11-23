@@ -33,6 +33,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
+# The deepest a JSAV body or an ASAV JSON payload may nest arrays and objects. extract writes both back indented, and
+# Python's indenting encoder recurses once per level: it stops at 994 levels under the default recursion limit
+# (3.12, 3.14 and 3.15 alike). The C decoder in front of it takes 9,996 levels on 3.12 and over 100,000 from 3.14
+# on, so decoding alone is no guard. One explicit limit gives every command and Python version the same answer.
+MAX_JSON_DEPTH = 512
+
+
+def json_depth(value):
+    """How many levels of arrays and objects a decoded JSON value nests (a scalar is 0, [] is 1), without
+    recursion, so it can measure any document the decoder accepted."""
+    if not isinstance(value, (list, dict)):
+        return 0
+    deepest, stack = 0, [(value, 1)]
+    while stack:
+        v, depth = stack.pop()
+        deepest = max(deepest, depth)
+        stack.extend((c, depth + 1) for c in (v.values() if isinstance(v, dict) else v) if isinstance(c, (list, dict)))
+    return deepest
+
 # ---------------------------------------------------------------------------------------------- ASAV
 ASAV_HDR = 0x170          # header size seen on every plain ASAV file
 ASAV_TITLE = (0x28, 0x128)  # UTF-16LE display title, 128 code units
@@ -163,9 +182,12 @@ def parse_jsav(d):
         raise ValueError('JSAV body marker not found after the entry table') from None
     try:
         body_text = d[body_off:].rstrip(b'\0').decode('utf-8')
-        _, json_end = json.JSONDecoder().raw_decode(body_text)
+        body, json_end = json.JSONDecoder().raw_decode(body_text)
     except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ValueError(f'JSAV body is not valid UTF-8 JSON: {exc}') from None
+    if (depth := json_depth(body)) > MAX_JSON_DEPTH:
+        raise ValueError(f'JSAV body is not valid UTF-8 JSON: it nests {depth} levels deep, more than the '
+                         f'{MAX_JSON_DEPTH} this tool reads')
     # raw_decode returns a character offset, while the entry table uses byte offsets.
     # The last nonzero byte is not the JSON boundary: corrupt data can follow the document's padding.
     body_end = body_off + len(body_text[:json_end].encode('utf-8'))
@@ -347,9 +369,11 @@ def extract(p, out):
         if pl[:1] == b'{':
             try:
                 obj = json.loads(pl.rstrip(b'\0').decode('utf-8'))
+                if (depth := json_depth(obj)) > MAX_JSON_DEPTH:
+                    raise ValueError(f'it nests {depth} levels deep, more than the {MAX_JSON_DEPTH} this tool reads')
                 with open(os.path.join(out, 'payload.json'), 'w', encoding='utf-8', newline="\n") as f:
                     json.dump(obj, f, indent=1)
-            except ValueError as ex:
+            except (ValueError, RecursionError) as ex:   # RecursionError: 3.12's decoder past its own depth
                 print('payload looks like text but did not parse as JSON:', ex)
         elif h['kind'] == 3 and len(pl) >= 8:
             try:
@@ -381,6 +405,9 @@ def pack_from_dir(src, refuse=None):
         idx = json.loads(text)
     except (ValueError, RecursionError) as exc:
         raise ValueError(f'{index_path}: invalid JSON ({exc})') from None
+    if (depth := json_depth(idx)) > MAX_JSON_DEPTH:
+        raise ValueError(f'{index_path}: invalid JSON (it nests {depth} levels deep, more than the {MAX_JSON_DEPTH} '
+                         'this tool reads)')
     if not isinstance(idx, dict):
         invalid('index', 'an object')
     h, es = idx.get('header'), idx.get('entries')
