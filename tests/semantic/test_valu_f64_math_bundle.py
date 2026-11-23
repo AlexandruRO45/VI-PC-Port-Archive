@@ -241,5 +241,21 @@ class VMulF64AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 4, oracle_mul_f64(wave.get_f64(0, 0), wave.get_f64(0, 2)))
         self.assertEqual(wave.get_f64(0, 4), f64_to_u64(42.0))
 
+class VMulF64SimdIeeeTests(unittest.TestCase):
+    def test_mul_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0x0000FFFF
+        for i in range(32):
+            wave.set_f64(i, 4, 0x1111111122222222)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_f64(i, 4, oracle_mul_f64(f64_to_u64(i), f64_to_u64(2.0)))
+        for i in range(16):
+            self.assertEqual(wave.get_f64(i, 4), f64_to_u64(i * 2.0))
+        for i in range(16, 32):
+            self.assertEqual(wave.get_f64(i, 4), 0x1111111122222222)
+
+    def test_mul_zero_times_inf_is_nan(self):
+        self.assertTrue(is_nan_u64(oracle_mul_f64(F64_POS_ZERO, F64_POS_INF)))
+
 if __name__ == "__main__":
     unittest.main()
