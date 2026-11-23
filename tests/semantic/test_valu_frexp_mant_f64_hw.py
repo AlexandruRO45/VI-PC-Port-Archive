@@ -592,5 +592,70 @@ class TestValuFrexpMantF64Aliasing(unittest.TestCase):
         self.assertEqual(words[1], 0x3FE00000)
         self.assertEqual(words[0], 0x0)
 
+# ---------------------------------------------------------------------------
+# Phase 6: Condition Codes, Status Flags, and Floating-Point Classification
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class F64ClassificationFlags:
+    zero: bool
+    negative: bool
+    infinite: bool
+    nan: bool
+    subnormal: bool
+    normalized_mantissa: bool
+
+
+def classify_frexp_mant_f64(bits: int) -> F64ClassificationFlags:
+    """Classify 64-bit float result of v_frexp_mant_f64."""
+    exp = (bits >> 52) & 0x7FF
+    mant = bits & 0x000FFFFFFFFFFFFF
+    is_neg = bool(bits & SIGN_BIT64)
+
+    is_zero = (exp == 0 and mant == 0)
+    is_subnormal = (exp == 0 and mant != 0)
+    is_inf = (exp == 0x7FF and mant == 0)
+    is_nan = (exp == 0x7FF and mant != 0)
+    is_norm_mant = (exp == 1022)  # [0.5, 1.0) exponent is 1022
+
+    return F64ClassificationFlags(
+        zero=is_zero,
+        negative=is_neg,
+        infinite=is_inf,
+        nan=is_nan,
+        subnormal=is_subnormal,
+        normalized_mantissa=is_norm_mant,
+    )
+
+
+class TestValuFrexpMantF64StatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes and result classification."""
+
+    def test_status_flags_normal_mantissa(self) -> None:
+        res = oracle_frexp_mant_f64_bits(f64_to_u64(2.0))
+        flags = classify_frexp_mant_f64(res)
+        self.assertTrue(flags.normalized_mantissa)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+
+    def test_status_flags_negative_mantissa(self) -> None:
+        res = oracle_frexp_mant_f64_bits(f64_to_u64(-2.0))
+        flags = classify_frexp_mant_f64(res)
+        self.assertTrue(flags.normalized_mantissa)
+        self.assertTrue(flags.negative)
+
+    def test_status_flags_zero_preserved(self) -> None:
+        flags_pos = classify_frexp_mant_f64(0x0000000000000000)
+        self.assertTrue(flags_pos.zero)
+        self.assertFalse(flags_pos.negative)
+
+        flags_neg = classify_frexp_mant_f64(0x8000000000000000)
+        self.assertTrue(flags_neg.zero)
+        self.assertTrue(flags_neg.negative)
+
+    def test_status_flags_infinity_preserved(self) -> None:
+        flags_inf = classify_frexp_mant_f64(0x7FF0000000000000)
+        self.assertTrue(flags_inf.infinite)
+
 if __name__ == "__main__":
     unittest.main()
