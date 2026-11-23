@@ -60,21 +60,34 @@ device-local, so `runtime/src/xbox_physical.h` gives each physical page two halv
   `MEM_RESERVE_PLACEHOLDER`, then `MapViewOfFile3` with `MEM_REPLACE_PLACEHOLDER`), so one page can be mapped at
   several VAs, as the console allows. A slot is split out of its reservation's placeholder only when it is first
   mapped; a slot whose neighbours were split already is a placeholder of its own and is not split again.
-- **GPU half** (`PhysicalGpu`): a `PagePool` page, allocated when the page is first uploaded or bound.
+- **GPU half** (`PhysicalGpu`): a `PagePool` page, allocated when the page is first uploaded or bound, plus a copy of
+  what the two halves last agreed on (64 KiB a page, from its first upload on). A new GPU half is marked dirty, so
+  its first upload gives it all of the CPU half.
 - **CPU to GPU**: clean pages are read-only in every view. The first write faults, a vectored exception handler marks
   the page dirty and makes that view writable, and the write resumes. `take_dirty()` lists the dirty pages and
   write-protects them again; `record_upload` copies them into their GPU halves ahead of the title's commands on the
-  same queue, after earlier GPU work on it. An upload that fails leaves its pages dirty. A new GPU half is marked
-  dirty, so its first upload gives it the CPU half's contents.
-- **GPU to CPU**: only on request (readbacks, query results), with `record_readback` then `finish_readback`. A page
-  the CPU wrote since its last upload is not read back (the readback would overwrite those writes), and a readback
-  is dropped if the CPU writes one of its pages before it finishes.
+  same queue, after earlier GPU work on it. After a page's first upload only the 4-byte words the CPU changed since
+  the halves last agreed are copied, so a GPU write elsewhere on the page (a texture sharing a page with a CPU
+  object) stands. An upload that fails leaves its pages dirty.
+- **GPU to CPU**: only on request (readbacks, query results), with `record_readback` then `finish_readback`. The CPU
+  half takes the GPU's words where the CPU has not written since the halves last agreed; where it has, before the
+  readback or while it ran, the CPU's write stands and goes to the GPU with the next upload. When both wrote the
+  same word, the CPU's write is kept. The merge runs with the page's views read-only, so a CPU write that faults
+  meanwhile lands after it.
+- **Writes by the kernel**: the fault handler sees user-mode writes only, so `ReadFile`, overlapped I/O or `recv`
+  into a clean page fails with `ERROR_NOACCESS` (measured). `PhysicalPageStore::before_kernel_write(va, bytes)`
+  marks the pages under the range dirty and keeps their views writable until `after_kernel_write`, also across a
+  `take_dirty()`. A readback does not merge into a page while a kernel write into it is in flight.
+- **Freeing**: `PhysicalGpu::release` then `PhysicalPageStore::release` give a page back (refused while it is mapped
+  at a VA). `allocate()` hands a reused page out zeroed; its memory stays committed.
 
 `runtime/test/vk_xbox_physical_test.cpp` (Windows only) checks a page mapped at two VAs, CPU writes read back through
-the arena after one upload, a GPU fill read through a CPU view, and the refusals above. Measured on the GTX 1660
-SUPER (median of 8): the first write to a clean page costs 3.7 µs (fault and unprotect), `take_dirty` of 256 pages
-0.25 ms, and an upload of 256 dirty pages (16 MiB: copy to staging, GPU copy, wait) 8.7 ms, about 1.9 GB/s (7.8 to
-9.3 ms over the runs).
+the arena after one upload, a GPU fill read through a CPU view, a page both sides write (in both directions, the
+same word, and a CPU write during a readback), a failed upload, a new GPU half over a pool page holding other
+data, a `ReadFile` into a clean page with and without `before_kernel_write`, and freeing. Measured on the GTX 1660
+SUPER (median of 8, 256 pages = 16 MiB): the first write to a clean page costs 4.0 µs (fault and unprotect),
+`take_dirty` 0.26 ms; the first upload (allocating the GPU halves and synced copies) 15 ms, an upload of pages
+rewritten whole 9.1 ms, and of pages with one changed word each 2.7 ms.
 
 The staging buffer is used from offset 0 by every record call, so a command buffer holds one upload or readback,
 and it completes before the next one is recorded. A ring per frame in flight lifts that once the device proxy drives
@@ -88,13 +101,7 @@ it.
 - Wiring into `d3d12_xs_device` once the slots are measured from a real run.
 - Wiring `xbox_physical.h` to `XMemAllocatePhysicalPages` and `XMemMapPhysicalPages[Scatter]` once a call site shows
   their arguments.
-- Freeing physical pages: `PhysicalPageStore` commits pages but has no free yet, so its capacity only fills.
-- Pages both sides write: uploads and readbacks copy whole 64 KiB pages, so a page the CPU and the GPU both write
-  between two syncs loses one side's writes (a GPU-written resource sharing a page with a CPU-written object is
-  overwritten by the next upload). A readback of a CPU-written page is refused rather than lose the CPU's writes;
-  the other direction needs the GPU-written ranges tracked, or uploads of only the CPU-written bytes. Needed before
-  wiring.
-- Writes by the kernel: dirty tracking sees user-mode writes through the fault handler, so `ReadFile`, overlapped
-  I/O or `recv` into a clean page fails with `ERROR_NOACCESS` instead of marking it dirty. The I/O shims would mark
-  the target pages dirty and writable first. Whether `MEM_WRITE_WATCH` can apply to section views is not checked.
+- The I/O shims calling `before_kernel_write` and `after_kernel_write` around reads into title memory, once physical
+  pages are wired.
+- Words both sides write between two syncs resolve to the CPU's write; bytes inside one 4-byte word are not merged.
 - The `XALLOC_ATTRIBUTES` layout that tells `XMemAlloc` to hand out physical pages is not public.

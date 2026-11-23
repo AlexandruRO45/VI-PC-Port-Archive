@@ -3,8 +3,11 @@
 //
 // Checks (FAIL = exit 1): one physical page mapped at two VAs shows the same bytes; a write marks exactly that page
 // dirty, and taking the dirty list write-protects it again; CPU writes reach the GPU after an upload, read through
-// the arena; a GPU write reaches the CPU half after a readback; no validation errors (LEONIDA_VK_VALIDATION=1).
-// Measurements (INFO): cost of a first write to a clean page (the fault); upload cost per page.
+// the arena; a GPU write reaches the CPU half after a readback; on a page both sides write, each side's words stand
+// (the CPU's where both wrote one); a failed upload stays dirty; a new GPU half starts as its CPU half; ReadFile into
+// a clean page works after before_kernel_write; freed pages come back zeroed; no validation errors
+// (LEONIDA_VK_VALIDATION=1).
+// Measurements (INFO): cost of a first write to a clean page (the fault); upload cost, whole and changed words.
 // No device, no sparse residency for buffers, or less than 64 GiB of sparse address space: SKIP, exit 77. Windows
 // only.
 #include "vk_test_device.h"
@@ -155,9 +158,10 @@ int main() {
     PagePool& pool =
         pool_storage.emplace(d.device, d.device_proc, pick_page_memory_type(mem_props, region.memory_type_bits()));
     PageMapper mapper(region, pool);
-    const SubmitBinds submit = [&](VkBuffer buffer, std::span<const VkSparseMemoryBind> binds) {
-        return queue.bind_sparse_ordered(buffer, binds);
-    };
+    const BindQueue submit{queue.timeline(), [&](VkBuffer buffer, std::span<const VkSparseMemoryBind> binds,
+                                                 BindQueue::Submitted submitted) {
+        return queue.bind_sparse_ordered(buffer, binds, std::move(submitted));
+    }};
 
     PhysicalPageStore store(1024);
     if (!store.ok()) {
@@ -259,13 +263,73 @@ int main() {
     std::printf("INFO GPU fill of arena page -> readback -> CPU view of P%u reads 0x%02x\n", phys[2],
                 r1[2 * kPageSize]);
 
-    // --- Pages written on both sides, failed uploads and new GPU halves ------------------------------------------
+    // --- Pages both sides write ----------------------------------------------------------------------------------
+    // P2 is at r1 + 2 pages on the CPU and at kVa + 2 pages in the arena; P3 one page on.
+    constexpr VkDeviceSize kHalf = kPageSize / 2;
+    std::uint8_t* const p2_cpu = r1 + 2 * kPageSize;
+    const auto gpu_fill = [&](VkDeviceSize va, VkDeviceSize size, std::uint32_t word) {
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) {
+            d.fn<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(cb, region.buffer(), va, size, word);
+        }));
+    };
+    // Whether the arena page at `va` holds `value` in [offset, offset + size).
+    const auto gpu_holds = [&](VkDeviceSize va, VkDeviceSize offset, VkDeviceSize size, std::uint8_t value) {
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) {
+            const VkBufferCopy copy{va, 0, kPageSize};
+            d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(cb, region.buffer(), readback, 1, &copy);
+        }));
+        return all_bytes(static_cast<std::uint8_t*>(readback_map) + offset, value, std::size_t(size));
+    };
+    const auto upload_dirty = [&] {
+        const auto pages = store.take_dirty();
+        bool uploaded = false;
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { uploaded = gpu_half.record_upload(cb, pages); }));
+        return uploaded;
+    };
+    const auto read_back = [&](std::span<const PhysicalPage> pages) {
+        bool recorded = false;
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { recorded = gpu_half.record_readback(cb, pages); }));
+        return recorded && gpu_half.finish_readback(pages);
+    };
     {
-        // A page the CPU wrote since its last upload is not read back over: its writes would be lost.
-        r1[2 * kPageSize] = 0x33;
-        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(!gpu_half.record_readback(cb, p2)); }));
-        EXPECT(r1[2 * kPageSize] == 0x33);
+        const VkDeviceSize p2_gpu = kVa + 2 * kPageSize;
+        // The GPU writes the first half of P2 and the CPU the second: the upload keeps the GPU's half...
+        gpu_fill(p2_gpu, kHalf, 0x77777777u);
+        std::memset(p2_cpu + kHalf, 0x66, kHalf);
+        EXPECT(upload_dirty());
+        EXPECT(gpu_holds(p2_gpu, 0, kHalf, 0x77) && gpu_holds(p2_gpu, kHalf, kHalf, 0x66));
+        // ... and a readback gives the CPU the GPU's half.
+        EXPECT(read_back(p2));
+        EXPECT(all_bytes(p2_cpu, 0x77, kHalf) && all_bytes(p2_cpu + kHalf, 0x66, kHalf));
+        // The same with the CPU's write not uploaded yet: the readback keeps it, and the next upload sends it.
+        gpu_fill(p2_gpu, kHalf, 0x55555555u);
+        std::memset(p2_cpu + kHalf, 0x44, kHalf);
+        EXPECT(read_back(p2));
+        EXPECT(all_bytes(p2_cpu, 0x55, kHalf) && all_bytes(p2_cpu + kHalf, 0x44, kHalf));
+        EXPECT(upload_dirty());
+        EXPECT(gpu_holds(p2_gpu, 0, kHalf, 0x55) && gpu_holds(p2_gpu, kHalf, kHalf, 0x44));
+        // Both write the same word: the CPU's write stands, on both sides.
+        p2_cpu[0] = 0x12;
+        gpu_fill(p2_gpu, kPageSize, 0x34343434u);
+        EXPECT(read_back(p2));
+        EXPECT(p2_cpu[0] == 0x12 && all_bytes(p2_cpu + 4, 0x34, kPageSize - 4));
+        EXPECT(upload_dirty());
+        EXPECT(gpu_holds(p2_gpu, 0, 1, 0x12) && gpu_holds(p2_gpu, 4, kPageSize - 4, 0x34));
+        // A CPU write between recording a readback and finishing it stands too.
+        gpu_fill(p2_gpu, kPageSize, 0x21212121u);
+        bool recorded = false;
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { recorded = gpu_half.record_readback(cb, p2); }));
+        p2_cpu[8] = 0x99;
+        EXPECT(recorded && gpu_half.finish_readback(p2));
+        EXPECT(p2_cpu[8] == 0x99 && p2_cpu[12] == 0x21);
+        EXPECT(upload_dirty());
+        EXPECT(gpu_holds(p2_gpu, 8, 1, 0x99) && gpu_holds(p2_gpu, 12, 4, 0x21));
+    }
+
+    // --- Failed uploads, and pages the GPU half has nothing of yet ---------------------------------------------------
+    {
         // A failed upload leaves its pages dirty: P2 with a page the store does not have fails as a whole.
+        p2_cpu[16] = 0x5C;
         auto taken = store.take_dirty();
         EXPECT(taken.size() == 1 && taken[0] == phys[2]);
         taken.push_back(5000);
@@ -273,29 +337,103 @@ int main() {
         const auto again = store.take_dirty();
         EXPECT(again.size() == 1 && !again.empty() && again[0] == phys[2]);
         gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_upload(cb, again)); }));
-        // A CPU write between recording a readback and finishing it drops the readback.
-        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_readback(cb, p2)); }));
-        r1[2 * kPageSize + 1] = 0x44;
-        EXPECT(!gpu_half.finish_readback(p2));
-        EXPECT(r1[2 * kPageSize] == 0x33 && r1[2 * kPageSize + 1] == 0x44);
-        const auto written = store.take_dirty();
-        EXPECT(written.size() == 1);
-        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_upload(cb, written)); }));
-        // A page with no GPU half is not read back; a new GPU half is marked dirty, so its first upload gives it
-        // the CPU half's contents instead of whatever its pool page held.
+        // A page with no GPU half, or one never uploaded, is not read back. A new GPU half is marked dirty, and its
+        // first upload copies all of the CPU half over whatever its pool page held.
         std::vector<PhysicalPage> fresh;
         EXPECT(store.allocate(1, fresh));
-        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(!gpu_half.record_readback(cb, fresh)); }));
-        EXPECT(gpu_half.gpu_page(fresh[0]) != kNoPage);
+        EXPECT(!read_back(fresh));
+        const PageId fresh_gpu = gpu_half.gpu_page(fresh[0]);
+        EXPECT(fresh_gpu != kNoPage);
+        EXPECT(!read_back(fresh));
+        const std::uint32_t fresh_pool = mapper.register_page_pool({fresh_gpu});
+        const PageMappingRange single{PageRangeType::incrementing, 1, 0};
+        const VkDeviceSize fresh_va = kVa + 4 * kPageSize;
+        const PageMappingBatch at{fresh_va, &single, 1};
+        EXPECT(mapper.copy_page_mappings_batch(fresh_pool, {&at, 1}, submit));
+        gpu_fill(fresh_va, kPageSize, 0x99999999u);  // stands for what the pool page held
         const auto first = store.take_dirty();
         EXPECT(first.size() == 1 && !first.empty() && first[0] == fresh[0]);
         gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_upload(cb, first)); }));
+        EXPECT(gpu_holds(fresh_va, 0, kPageSize, 0x00));
+        EXPECT(mapper.clear_page_mappings(fresh_va, 1, submit));
+        EXPECT(mapper.unregister_page_pool(fresh_pool));
+    }
+
+    // --- Kernel writes into a clean page ---------------------------------------------------------------------------
+    {
+        wchar_t dir[MAX_PATH]{}, path[MAX_PATH]{};
+        EXPECT(GetTempPathW(MAX_PATH, dir) && GetTempFileNameW(dir, L"lxp", 0, path));
+        const HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        EXPECT(file != INVALID_HANDLE_VALUE);
+        const std::vector<std::uint8_t> pattern(kPageSize, 0xC3);
+        DWORD wrote = 0;
+        EXPECT(WriteFile(file, pattern.data(), DWORD(kPageSize), &wrote, nullptr) && wrote == kPageSize);
+        DWORD error = 0;
+        const auto read_into = [&](void* into) {
+            SetFilePointer(file, 0, nullptr, FILE_BEGIN);
+            DWORD got = 0;
+            const bool read = ReadFile(file, into, DWORD(kPageSize), &got, nullptr) && got == kPageSize;
+            error = read ? 0 : GetLastError();
+            return read;
+        };
+        std::uint8_t* const p3_cpu = r1 + 3 * kPageSize;
+        EXPECT(store.take_dirty().empty());
+        EXPECT(!read_into(p3_cpu) && error == ERROR_NOACCESS);  // the fault handler never sees a kernel write
+        EXPECT(PhysicalPageStore::before_kernel_write(p3_cpu, kPageSize));
+        const auto during = store.take_dirty();  // taken while the write is in flight: the page stays open
+        EXPECT(during.size() == 1 && !during.empty() && during[0] == phys[3]);
+        EXPECT(read_into(p3_cpu));
+        PhysicalPageStore::after_kernel_write(p3_cpu, kPageSize);
+        EXPECT(all_bytes(p3_cpu, 0xC3, kPageSize));
+        const auto after = store.take_dirty();
+        EXPECT(after.size() == 1 && !after.empty() && after[0] == phys[3]);
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_upload(cb, after)); }));
+        EXPECT(gpu_holds(kVa + 3 * kPageSize, 0, kPageSize, 0xC3));
+        // A finished readback merges nothing into a page while a kernel write into it is in flight.
+        EXPECT(PhysicalPageStore::before_kernel_write(p3_cpu, 1));
+        const PhysicalPage p3_page[1]{phys[3]};
+        bool recorded = false;
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { recorded = gpu_half.record_readback(cb, p3_page); }));
+        EXPECT(recorded && !gpu_half.finish_readback(p3_page));
+        PhysicalPageStore::after_kernel_write(p3_cpu, 1);
+        (void)upload_dirty();
+        // Memory no store maps is left alone.
+        int local = 0;
+        EXPECT(PhysicalPageStore::before_kernel_write(&local, sizeof local));
+        PhysicalPageStore::after_kernel_write(&local, sizeof local);
+        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
     }
 
     // --- Unmapping a view leaves the other mapping alone ----------------------------------------------------------
     const PhysicalPage none[1]{PhysicalPageStore::kUnmapped};
     EXPECT(store.map(r2 + 2 * kPageSize, none));
     EXPECT(r1[kPageSize] == 0x41);
+
+    // --- Freeing physical pages ----------------------------------------------------------------------------------
+    {
+        std::vector<PhysicalPage> two;
+        EXPECT(store.allocate(2, two));
+        auto* r4 = static_cast<std::uint8_t*>(store.reserve(1));
+        const PhysicalPage mapped_page[1]{two.empty() ? 0 : two[0]};
+        EXPECT(r4 && store.map(r4, mapped_page));
+        std::memset(r4, 0x6B, kPageSize);
+        std::memset(store.data(two[1]), 0x6C, kPageSize);
+        EXPECT(upload_dirty());  // gives two[0] a GPU half
+        const auto in_use = pool.pages_in_use();
+        EXPECT(!store.release(two));  // two[0] is still mapped at r4
+        const PhysicalPage unmap[1]{PhysicalPageStore::kUnmapped};
+        EXPECT(store.map(r4, unmap));
+        gpu_half.release(two);
+        EXPECT(pool.pages_in_use() == in_use - 1);  // only two[0] had a GPU half
+        EXPECT(store.release(two) && !store.allocated(two[0]) && !store.allocated(two[1]));
+        EXPECT(!store.release(two));  // not allocated any more
+        std::vector<PhysicalPage> back;
+        EXPECT(store.allocate(2, back));
+        EXPECT(back.size() == 2 && back[0] == two[0] && back[1] == two[1]);  // the lowest free pages
+        for (PhysicalPage b : back) EXPECT(all_bytes(store.data(b), 0, kPageSize));
+        EXPECT(store.release(back));
+    }
 
     // --- Costs -----------------------------------------------------------------------------------------------------
     {
@@ -328,6 +466,23 @@ int main() {
                     kN, double(kN * kPageSize) / (1 << 20),
                     std::chrono::duration<double, std::milli>(u1 - u0).count(),
                     double(kN * kPageSize) / std::chrono::duration<double>(u1 - u0).count() / 1e9);
+        for (std::uint32_t i = 0; i < kN; ++i) r3[std::size_t(i) * kPageSize + 64] = std::uint8_t(i + 1);
+        const auto again = store.take_dirty();
+        EXPECT(again.size() == kN);
+        const auto w0 = std::chrono::steady_clock::now();
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_upload(cb, again)); }));
+        const auto w1 = std::chrono::steady_clock::now();
+        std::printf("INFO upload of the same %u pages with one changed word each: %.3f ms\n", kN,
+                    std::chrono::duration<double, std::milli>(w1 - w0).count());
+        for (std::uint32_t i = 0; i < kN; ++i)
+            std::memset(r3 + std::size_t(i) * kPageSize, int(0x80 + i % 64), kPageSize);
+        const auto rewritten = store.take_dirty();
+        EXPECT(rewritten.size() == kN);
+        const auto a0 = std::chrono::steady_clock::now();
+        gpu.wait(gpu.submit([&](VkCommandBuffer cb) { EXPECT(gpu_half.record_upload(cb, rewritten)); }));
+        const auto a1 = std::chrono::steady_clock::now();
+        std::printf("INFO upload of the same %u pages rewritten whole: %.3f ms\n", kN,
+                    std::chrono::duration<double, std::milli>(a1 - a0).count());
     }
 
     EXPECT(mapper.clear_page_mappings(kVa, 4, submit));

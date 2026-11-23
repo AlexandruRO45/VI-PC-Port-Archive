@@ -6,13 +6,16 @@
 //   - CPU half: a 64 KiB slot of one pagefile-backed section (SEC_RESERVE, committed per page on allocation). Views
 //     of it are placed at the title's VAs over placeholder reservations (VirtualAlloc2 + MapViewOfFile3 with
 //     MEM_REPLACE_PLACEHOLDER), so one physical page can be mapped at several VAs, as the console allows.
-//   - GPU half: a PagePool page, allocated when the page is first uploaded or bound.
+//   - GPU half: a PagePool page, allocated when the page is first uploaded or bound, and a copy of what the two
+//     halves last agreed on.
 // Coherence:
 //   - CPU -> GPU: clean pages are read-only in every view. The first write faults; a vectored exception handler
 //     marks the page dirty, makes that view writable and resumes the write. take_dirty() lists dirty pages and
-//     write-protects them again, and PhysicalGpu::record_upload copies them into their GPU halves, recorded ahead of
-//     the title's commands on the same queue.
-//   - GPU -> CPU: only on request (readback, query results): record_readback then finish_readback.
+//     write-protects them again, and PhysicalGpu::record_upload copies the words the CPU changed into their GPU
+//     halves, recorded ahead of the title's commands on the same queue.
+//   - GPU -> CPU: only on request (readback, query results): record_readback then finish_readback, which merges the
+//     GPU's words into the words the CPU has not changed.
+//   - Kernel writes (ReadFile into title memory) do not fault into the handler: before_kernel_write opens the pages.
 // The xmem.dll exports that drive this (XMemAllocatePhysicalPages, XMemMapPhysicalPages[Scatter]) are wired when a
 // call site shows their arguments, as XMemAlloc's were measured; this is the mechanism they map onto.
 #pragma once
@@ -42,7 +45,9 @@ using PhysicalPage = std::uint32_t;
 class PhysicalPageStore {
 public:
     // capacity: the most physical pages that can exist at once (address space only until pages are allocated).
-    explicit PhysicalPageStore(std::uint32_t capacity) : capacity_(capacity), dirty_(capacity), used_(capacity, false) {
+    explicit PhysicalPageStore(std::uint32_t capacity)
+        : capacity_(capacity), dirty_(capacity), used_(capacity, false), reused_(capacity, false),
+          pinned_(capacity, 0) {
         const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
         if (kernelbase) {
             virtual_alloc2_ = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelbase, "VirtualAlloc2"));
@@ -83,6 +88,8 @@ public:
         for (std::uint32_t p = 0; p < capacity_ && out.size() - base < count; ++p) {
             if (used_[p]) continue;
             if (!VirtualAlloc(store_ + std::uint64_t(p) * kPageSize, kPageSize, MEM_COMMIT, PAGE_READWRITE)) break;
+            if (reused_[p]) std::memset(store_ + std::uint64_t(p) * kPageSize, 0, kPageSize);
+            reused_[p] = false;
             used_[p] = true;
             out.push_back(p);
         }
@@ -90,6 +97,24 @@ public:
         for (std::size_t i = base; i < out.size(); ++i) used_[out[i]] = false;
         out.resize(base);
         return false;
+    }
+
+    // XMemFreePhysicalPages' mechanism: the pages go back to the store, and allocate() hands them out zeroed. All
+    // or nothing: refused while one of them is mapped at a VA, a kernel write into it is in flight, or it is not
+    // allocated. Release their GPU halves first (PhysicalGpu::release). The memory stays committed for reuse.
+    bool release(std::span<const PhysicalPage> pages) {
+        std::unique_lock lock(mutex_);
+        for (PhysicalPage p : pages) {
+            if (p >= capacity_ || !used_[p] || pinned_[p]) return false;
+            const auto it = views_.find(p);
+            if (it != views_.end() && !it->second.empty()) return false;
+        }
+        for (PhysicalPage p : pages) {
+            used_[p] = false;
+            reused_[p] = true;
+            dirty_[p].store(0, std::memory_order_release);
+        }
+        return true;
     }
 
     // Placeholder reservation for `pages` 64 KiB pages; the title's mappings go here. Returns the base, or nullptr.
@@ -155,7 +180,8 @@ public:
             if (!dirty_[p].load(std::memory_order_relaxed) || !dirty_[p].exchange(0, std::memory_order_acq_rel))
                 continue;
             out.push_back(p);
-            protect_views(p, PAGE_READONLY);
+            if (pinned_[p]) dirty_[p].store(1, std::memory_order_release);  // a kernel write is in flight: stays open
+            else protect_views(p, PAGE_READONLY);
         }
         return out;
     }
@@ -164,6 +190,30 @@ public:
     void mark_dirty(PhysicalPage p) {
         if (allocated(p)) dirty_[p].store(1, std::memory_order_release);
     }
+
+    // Runs fn(i, cpu_half) for each of `pages` with no CPU write to them in flight: their views are read-only while
+    // it runs, and a write that faults meanwhile waits for it, then lands after. The views stay read-only after, so
+    // the next write is tracked again. false, and nothing run, if a page is not allocated or a kernel write into it
+    // is in flight.
+    template <typename F>
+    bool exclusive(std::span<const PhysicalPage> pages, F&& fn) {
+        std::unique_lock lock(mutex_);
+        for (PhysicalPage p : pages)
+            if (p >= capacity_ || !used_[p] || pinned_[p]) return false;
+        for (PhysicalPage p : pages) protect_views(p, PAGE_READONLY);
+        for (std::size_t i = 0; i < pages.size(); ++i) fn(i, store_ + std::uint64_t(pages[i]) * kPageSize);
+        return true;
+    }
+
+    // Before the kernel writes [va, va + bytes) (ReadFile, overlapped I/O, recv into title memory): the fault
+    // handler sees user-mode writes only, and a kernel write into a read-only view fails with ERROR_NOACCESS. The
+    // physical pages under the range are marked dirty and their views made writable until after_kernel_write, and
+    // take_dirty() in between leaves them open. Ranges no store maps are left alone. false if a mapped page could
+    // not be opened; call after_kernel_write for the same range either way.
+    static bool before_kernel_write(const void* va, std::size_t bytes) { return kernel_write(va, bytes, true); }
+
+    // Once that write has completed: the pages are dirty (the kernel wrote them) and tracked as before.
+    static void after_kernel_write(const void* va, std::size_t bytes) { kernel_write(va, bytes, false); }
 
     // Whether the CPU wrote `p` since it was last taken.
     bool dirty(PhysicalPage p) const { return p < capacity_ && dirty_[p].load(std::memory_order_acquire); }
@@ -217,13 +267,49 @@ private:
         list.erase(std::remove(list.begin(), list.end(), at), list.end());
     }
 
-    void protect_views(PhysicalPage p, DWORD protect) {
+    bool protect_views(PhysicalPage p, DWORD protect) {
         const auto it = views_.find(p);
-        if (it == views_.end()) return;
+        if (it == views_.end()) return true;
+        bool ok = true;
         for (void* view : it->second) {
             DWORD old = 0;
-            VirtualProtect(view, kPageSize, protect, &old);
+            ok = VirtualProtect(view, kPageSize, protect, &old) && ok;
         }
+        return ok;
+    }
+
+    // One page of a kernel write: -1 if no view of this store is at `address`, else whether it was opened (begin)
+    // or closed (end).
+    int pin(std::uintptr_t address, bool begin) {
+        std::unique_lock lock(mutex_);
+        Region* region = region_of(address);
+        if (!region) return -1;
+        const PhysicalPage p = region->pages[(address - region->base) / kPageSize];
+        if (p == kUnmapped) return -1;
+        dirty_[p].store(1, std::memory_order_release);  // the kernel writes it
+        if (begin) {
+            ++pinned_[p];
+            return protect_views(p, PAGE_READWRITE) ? 1 : 0;
+        }
+        if (pinned_[p]) --pinned_[p];
+        return 1;
+    }
+
+    static bool kernel_write(const void* va, std::size_t bytes, bool begin) {
+        if (!bytes) return true;
+        const std::uintptr_t first = reinterpret_cast<std::uintptr_t>(va) / kPageSize * kPageSize;
+        const std::uintptr_t end = reinterpret_cast<std::uintptr_t>(va) + bytes;
+        bool ok = true;
+        std::shared_lock lock(registry_mutex());
+        for (std::uintptr_t at = first; at < end; at += kPageSize) {
+            for (PhysicalPageStore* store : registry()) {
+                const int result = store->pin(at, begin);
+                if (result < 0) continue;
+                ok = ok && result == 1;
+                break;
+            }
+        }
+        return ok;
     }
 
     // The vectored handler: a write to a read-only view of a tracked page marks it dirty and opens that view.
@@ -281,6 +367,8 @@ private:
     mutable std::shared_mutex mutex_;
     std::vector<std::atomic<std::uint8_t>> dirty_;
     std::vector<bool> used_;
+    std::vector<bool> reused_;  // released since its last allocation: still committed, zeroed when handed out again
+    std::vector<std::uint32_t> pinned_;  // before_kernel_write calls not yet ended by after_kernel_write
     std::map<std::uintptr_t, Region> regions_;
     std::map<PhysicalPage, std::vector<void*>> views_;
     std::atomic<std::uint64_t> faults_{0};
@@ -315,7 +403,7 @@ public:
     ~PhysicalGpu() {
         for (auto& [memory, buffer] : access_) destroy_buffer_(device_, buffer, nullptr);
         std::vector<PageId> pages;
-        for (auto& [physical, gpu] : gpu_) pages.push_back(gpu);
+        for (auto& [physical, half] : gpu_) pages.push_back(half.gpu);
         pool_.release(pages);
         if (staging_) destroy_buffer_(device_, staging_, nullptr);
         if (staging_memory_) free_(device_, staging_memory_, nullptr);
@@ -331,9 +419,10 @@ public:
     }
 
     // CPU -> GPU: copies the CPU halves of `pages` (as take_dirty() returned them) into their GPU halves, recorded
-    // into `cb` before the title's commands. Barriers order the copies after earlier GPU work on the queue and make
-    // them visible to everything after. The staging copy happens now, on the CPU. On failure the pages are marked
-    // dirty again, so their writes are uploaded by a later call.
+    // into `cb` before the title's commands. A page's first upload copies all of it; after that only the 4-byte
+    // words the CPU changed since the halves last agreed, so GPU writes elsewhere on the page stand. Barriers order
+    // the copies after earlier GPU work on the queue and make them visible to everything after. The staging copy
+    // happens now, on the CPU. On failure the pages are marked dirty again, so their writes go with a later call.
     bool record_upload(VkCommandBuffer cb, std::span<const PhysicalPage> pages) {
         if (pages.empty()) return true;
         std::vector<Target> targets;
@@ -343,9 +432,30 @@ public:
         }
         readback_.clear();  // the staging data it was waiting for is overwritten
         std::map<VkBuffer, std::vector<VkBufferCopy>> copies;
+        // A run is read once from the CPU half into `scratch_`, and the staging bytes and the synced copy both come
+        // from that read: a CPU write landing meanwhile is then in neither or in both (and the page is dirty again).
+        // Staging is only written, since it may be write-combined.
         for (std::size_t i = 0; i < pages.size(); ++i) {
-            std::memcpy(staging_map_ + i * kPageSize, store_.data(pages[i]), kPageSize);
-            copies[targets[i].buffer].push_back({i * kPageSize, targets[i].offset, kPageSize});
+            const std::uint8_t* const cpu = store_.data(pages[i]);
+            std::uint8_t* const staged = staging_map_ + i * kPageSize;
+            auto& synced = gpu_[pages[i]].synced;
+            auto& regions = copies[targets[i].buffer];
+            if (!synced) {  // the first upload: all of it, read once into the synced copy
+                synced.reset(new std::uint8_t[kPageSize]);
+                std::memcpy(synced.get(), cpu, kPageSize);
+                std::memcpy(staged, synced.get(), kPageSize);
+                regions.push_back({i * kPageSize, targets[i].offset, kPageSize});
+                continue;
+            }
+            const std::size_t first = regions.size();
+            changed_words(cpu, synced.get(), i * kPageSize, targets[i].offset, regions);
+            for (std::size_t r = first; r < regions.size(); ++r) {
+                const VkDeviceSize at = regions[r].srcOffset - i * kPageSize;
+                const std::size_t size = std::size_t(regions[r].size);
+                std::memcpy(scratch_.get() + at, cpu + at, size);
+                std::memcpy(staged + at, scratch_.get() + at, size);
+                std::memcpy(synced.get() + at, scratch_.get() + at, size);
+            }
         }
         VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         before.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -353,7 +463,7 @@ public:
         barrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0,
                  nullptr);
         for (const auto& [buffer, regions] : copies)
-            copy_(cb, staging_, buffer, std::uint32_t(regions.size()), regions.data());
+            if (!regions.empty()) copy_(cb, staging_, buffer, std::uint32_t(regions.size()), regions.data());
         VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -364,12 +474,9 @@ public:
     }
 
     // GPU -> CPU, step 1: copy the GPU halves into staging (after the GPU work that wrote them). Refused for a page
-    // the CPU wrote since its last upload (the readback would overwrite those writes) and for a page with no GPU
-    // half yet (the GPU never wrote it).
+    // never uploaded: its GPU half holds nothing of the title's yet.
     bool record_readback(VkCommandBuffer cb, std::span<const PhysicalPage> pages) {
         if (pages.empty()) return true;
-        for (PhysicalPage p : pages)
-            if (store_.dirty(p)) return false;
         std::vector<Target> sources;
         if (!resolve(pages, sources, true) || !ensure_staging(pages.size() * kPageSize)) return false;
         VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -390,22 +497,36 @@ public:
         return true;
     }
 
-    // GPU -> CPU, step 2, once that work is complete: the CPU halves take the GPU data. `pages` must be the last
-    // record_readback's, with no upload recorded since; each readback is finished once. Refused, and dropped, if
-    // the CPU wrote one of the pages meanwhile.
+    // GPU -> CPU, step 2, once that work is complete: each CPU half takes the GPU's words where the CPU has not
+    // written since the halves last agreed. Where it has (before the readback or while it ran), the CPU's write
+    // stands and goes to the GPU with the next upload. `pages` must be the last record_readback's, with no upload
+    // recorded since; each readback is finished once. false, with nothing merged, while a kernel write into one of
+    // the pages is in flight.
     bool finish_readback(std::span<const PhysicalPage> pages) {
         if (readback_.empty() || !std::equal(pages.begin(), pages.end(), readback_.begin(), readback_.end()))
             return false;
-        for (PhysicalPage p : pages) {
-            if (store_.dirty(p)) {
-                readback_.clear();
-                return false;
-            }
-        }
-        for (std::size_t i = 0; i < pages.size(); ++i)
-            std::memcpy(store_.data(pages[i]), staging_map_ + i * kPageSize, kPageSize);
+        std::vector<std::uint8_t*> synced;
+        for (PhysicalPage p : pages) synced.push_back(gpu_[p].synced.get());
+        const bool merged = store_.exclusive(pages, [&](std::size_t i, std::uint8_t* cpu) {
+            std::memcpy(scratch_.get(), staging_map_ + i * kPageSize, kPageSize);  // one sequential read of staging
+            merge(cpu, synced[i], scratch_.get());
+        });
         readback_.clear();
-        return true;
+        return merged;
+    }
+
+    // The GPU halves of pages about to be released go back to the pool, which does not hand one out again while an
+    // arena still maps it, and their synced copies are dropped. A readback recorded for one of them is dropped too.
+    void release(std::span<const PhysicalPage> pages) {
+        std::vector<PageId> halves;
+        for (PhysicalPage p : pages) {
+            const auto it = gpu_.find(p);
+            if (it == gpu_.end()) continue;
+            halves.push_back(it->second.gpu);
+            gpu_.erase(it);
+            if (std::find(readback_.begin(), readback_.end(), p) != readback_.end()) readback_.clear();
+        }
+        pool_.release(halves);
     }
 
     std::uint64_t pages_uploaded() const { return uploaded_; }
@@ -416,26 +537,61 @@ private:
         VkDeviceSize offset;
     };
 
+    // A copy region for every run of 4-byte words in which `now` differs from `synced`.
+    static void changed_words(const std::uint8_t* now, const std::uint8_t* synced, VkDeviceSize src, VkDeviceSize dst,
+                              std::vector<VkBufferCopy>& out) {
+        constexpr VkDeviceSize kNone = kPageSize;
+        constexpr VkDeviceSize kBlock = 64;
+        VkDeviceSize start = kNone;
+        for (VkDeviceSize at = 0; at < kPageSize;) {
+            if (start == kNone && at % kBlock == 0 && std::memcmp(now + at, synced + at, kBlock) == 0) {
+                at += kBlock;  // an equal block outside a run
+                continue;
+            }
+            const bool changed = std::memcmp(now + at, synced + at, 4) != 0;
+            if (changed && start == kNone) start = at;
+            if (!changed && start != kNone) {
+                out.push_back({src + start, dst + start, at - start});
+                start = kNone;
+            }
+            at += 4;
+        }
+        if (start != kNone) out.push_back({src + start, dst + start, kPageSize - start});
+    }
+
+    // The CPU half takes the GPU's words where it equals the synced copy (the CPU has not written them); the synced
+    // copy becomes the GPU's, so words the CPU wrote differ from it and go with the next upload.
+    static void merge(std::uint8_t* cpu, std::uint8_t* synced, const std::uint8_t* gpu) {
+        for (VkDeviceSize at = 0; at < kPageSize; at += 4)
+            if (std::memcmp(cpu + at, synced + at, 4) == 0) std::memcpy(cpu + at, gpu + at, 4);
+        std::memcpy(synced, gpu, kPageSize);
+    }
+
     // The GPU half of `p`; `created` says whether it was allocated now.
     PageId half(PhysicalPage p, bool& created) {
         created = false;
         if (!store_.allocated(p)) return kNoPage;
         auto it = gpu_.find(p);
-        if (it != gpu_.end()) return it->second;
+        if (it != gpu_.end()) return it->second.gpu;
         std::vector<PageId> one;
         if (!pool_.allocate(1, one)) return kNoPage;
-        gpu_.emplace(p, one[0]);
+        gpu_.emplace(p, Half{one[0], nullptr});
         created = true;
         return one[0];
     }
 
-    // Each page's GPU half as a buffer and offset, so a failure records nothing. `existing`: only pages that have
-    // a GPU half already.
-    bool resolve(std::span<const PhysicalPage> pages, std::vector<Target>& out, bool existing) {
+    // Each page's GPU half as a buffer and offset, so a failure records nothing. `synced`: only pages uploaded
+    // before (a GPU half holds nothing of the title's until its first upload).
+    bool resolve(std::span<const PhysicalPage> pages, std::vector<Target>& out, bool synced) {
         out.clear();
         if (!ok()) return false;
-        for (PhysicalPage p : pages)
-            if (!store_.allocated(p) || (existing && !gpu_.count(p))) return false;
+        for (PhysicalPage p : pages) {
+            if (!store_.allocated(p)) return false;
+            if (synced) {
+                const auto it = gpu_.find(p);
+                if (it == gpu_.end() || !it->second.synced) return false;
+            }
+        }
         out.reserve(pages.size());
         for (PhysicalPage p : pages) {
             bool created = false;
@@ -481,14 +637,20 @@ private:
         if (create_buffer_(device_, &info, nullptr, &staging_) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         requirements_(device_, staging_, &requirements);
+        // Host-cached first, where the device has it: the CPU reads readbacks from staging.
         const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        for (std::uint32_t i = 0; i < properties_.memoryTypeCount; ++i) {
-            if (!(requirements.memoryTypeBits & (1u << i)) || (properties_.memoryTypes[i].propertyFlags & want) != want)
-                continue;
-            VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            alloc.allocationSize = requirements.size;
-            alloc.memoryTypeIndex = i;
-            if (allocate_(device_, &alloc, nullptr, &staging_memory_) == VK_SUCCESS) break;
+        for (const VkMemoryPropertyFlags extra : {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_CACHED_BIT),
+                                                  VkMemoryPropertyFlags(0)}) {
+            for (std::uint32_t i = 0; i < properties_.memoryTypeCount && !staging_memory_; ++i) {
+                const VkMemoryPropertyFlags flags = properties_.memoryTypes[i].propertyFlags;
+                if (!(requirements.memoryTypeBits & (1u << i)) || (flags & (want | extra)) != (want | extra)) continue;
+                VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                alloc.allocationSize = requirements.size;
+                alloc.memoryTypeIndex = i;
+                if (allocate_(device_, &alloc, nullptr, &staging_memory_) != VK_SUCCESS)
+                    staging_memory_ = VK_NULL_HANDLE;
+            }
+            if (staging_memory_) break;
         }
         void* mapped = nullptr;
         if (!staging_memory_ || bind_(device_, staging_, staging_memory_, 0) != VK_SUCCESS ||
@@ -513,13 +675,19 @@ private:
     PFN_vkCmdCopyBuffer copy_ = nullptr;
     PFN_vkCmdPipelineBarrier barrier_ = nullptr;
     std::map<VkDeviceMemory, VkBuffer> access_;
-    std::map<PhysicalPage, PageId> gpu_;
+    // A physical page's GPU half, and the contents both halves last agreed on (null until its first upload).
+    struct Half {
+        PageId gpu = kNoPage;
+        std::unique_ptr<std::uint8_t[]> synced;
+    };
+    std::map<PhysicalPage, Half> gpu_;
     VkBuffer staging_ = VK_NULL_HANDLE;
     VkDeviceMemory staging_memory_ = VK_NULL_HANDLE;
     std::uint8_t* staging_map_ = nullptr;
     VkDeviceSize staging_size_ = 0;
     std::uint64_t uploaded_ = 0;
     std::vector<PhysicalPage> readback_;  // staged by the last record_readback, not finished yet
+    std::unique_ptr<std::uint8_t[]> scratch_ = std::make_unique<std::uint8_t[]>(kPageSize);
 };
 
 }  // namespace leonida::xbox
