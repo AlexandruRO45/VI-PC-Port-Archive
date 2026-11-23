@@ -10,7 +10,7 @@ echo       L E O N I D A  -  Game Builder
 echo  ==========================================
 echo.
 set "PY="
-for %%V in (3.14 3.13 3.12 3) do (
+for %%V in (3.15 3.14 3.13 3.12 3) do (
   if not defined PY (
     py -%%V -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>nul && set "PY=py -%%V"
   )
