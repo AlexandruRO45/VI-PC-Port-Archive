@@ -140,6 +140,21 @@ albo tłumaczenie z zachowaniem wyodrębnionych wejść shaderów.
 - **`--work`**: najlepiej wskazać dysk z co najmniej 400 GB wolnego miejsca. Etap `shaders` trwa najdłużej i domyślnie używa połowy wątków procesora (można to zmienić przez `--jobs`).
 - **Linux i Wine/Proton**: `make_game.py` działa też na Linuksie. Aby wykonać etap `runtime` poza Windowsem, podaj `--runtime-build <folder>` z buildem dla Windowsa (`gta6rt.exe` i `gta6rt_tls_host.dll`). Skrypt utworzy wtedy `gta6rt.sh`, który uruchamia program przez `wine` (albo przez Wine wskazane zmienną `WINE`, np. z Protona).
 
+### Diagnostyka Vulkan na Linuksie
+
+Z CMake 3.24+, kompilatorem C++20 oraz zainstalowanymi nagłówkami i loaderem Vulkana:
+
+```sh
+cmake -S runtime -B runtime/build/linux
+cmake --build runtime/build/linux --parallel
+./runtime/build/linux/vk_pipeline_check /ścieżka/do/spirv
+```
+
+Do `vk_pipeline_check` podaj folder z plikiem `index.json` i przetłumaczonymi plikami SPIR-V.
+
+`make_game.py` działa też na Linuksie. Etap `pipelines` korzysta z `vk_pipeline_check` zbudowanego powyżej
+(`runtime/build/linux` albo `runtime/build`) i sam go tam buduje przed jakąkolwiek inną pracą, jeśli go brakuje.
+
 ## Częste problemy
 
 - **Pobrałeś repozytorium przyciskiem „Download ZIP” na GitHubie**: archiwum ZIP nie zawiera submodułu
