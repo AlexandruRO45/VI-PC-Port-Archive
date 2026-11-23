@@ -561,18 +561,19 @@ The authored curves and locations provide two controls for a runtime capture.
   differ by more than 0.000001 between inputs 1 and 5/6, the predictions for division by 10 and by 12.
   The other 11 are unsuitable as controls at that weather setting. The interpolation is an assumption of this test.
 - Hold the normalized input at 1. In the horizontal (XY) plane, 11 of the 45 pairs of sites have a midpoint
-  closer to the pair than to any third site. At 49% and 51% along each of those 11 segments, the nearest site switches. In every
-  case at least one octave's endpoint amplitudes differ by more than 0.000001 across the pair. A hard
-  nearest-site rule predicts a step there. Samples approaching the midpoint from both sides can distinguish
-  that prediction from a continuous blend.
+  closer to the pair than to any third site. At 49% and 51% along each of those 11 segments, the nearest site
+  switches. In every case at least one octave's endpoint amplitudes differ by more than 0.000001 across the
+  pair. A hard nearest-site rule predicts a step there. Samples approaching the midpoint from both sides can
+  distinguish that prediction from a continuous blend.
 - To test whether elevation enters the selection, hold XY at one of those midpoints. Evaluate the 3D distance
   first at one site's elevation and then at the other's. The unique nearest site switches for all 11 pairs.
   A selector using only XY sees identical inputs for both measurements.
 
-The ocean simulation technique has six compute programs. Four declare the same nine constant-buffer members
-in the same order and at the same byte offsets. In all four, the pipeline reflection binds one constant buffer
-at `b5, space1`. The other two declare zero members and zero constant buffers. To reproduce the program
-selection, run `python -I tools/sgd5_effects.py <shaders.rpf> --effect OceanWaveSim --technique oceanWaveSim`.
+The ocean simulation technique has six compute programs. Four list the same nine members in their native
+trailers, in the same order and at the same byte offsets. Their `PSV0` reflection declares one constant buffer
+at `b5, space1`. The other two have empty member lists in their trailers and no constant-buffer declaration
+in `PSV0`. To reproduce the selection, run
+`python -I tools/sgd5_effects.py <shaders.rpf> --effect OceanWaveSim --technique oceanWaveSim`.
 Compare the member keys and offsets in each program's counted trailer against the other passes, then check
 the constant-buffer register in its `PSV0` reflection.
 
