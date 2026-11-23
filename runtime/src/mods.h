@@ -15,6 +15,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -49,12 +50,24 @@ struct ArchetypeSwap {
     std::string when = "always";
 };
 
+// "camera": the view mode the game's view-mode getter answers (docs/modding.md, "First-person view"). The getter
+// takes a context (on foot, in a vehicle, ...) and returns an enum; `first_person_value` is that enum's first-person
+// value, 4 in GTA V's camViewModeSettings, to be confirmed in the executable. `contexts`: the getter's first-argument
+// values to override; empty = every context.
+struct CameraView {
+    bool set = false;           // the mod has a "camera" section
+    bool first_person = false;  // "view_mode": "first_person" (else "default": leave the game's choice)
+    uint32_t first_person_value = 4;
+    std::vector<uint32_t> contexts;
+};
+
 struct Mod {
     std::string folder;  // the folder name under mods/
     std::string name;
     std::string game_version;
     bool enabled = true;
     std::vector<ArchetypeSwap> archetype_swaps;
+    CameraView camera;
 };
 
 struct LoadResult {
@@ -82,8 +95,24 @@ inline bool parse_model_id(const std::string& text, uint32_t& out) {
     return true;
 }
 
+// A JSON number that is a whole value in [0, max]. Checked before any integer cast: converting a double outside the
+// target type's range is undefined, so `v != static_cast<int>(v)` cannot be the test for a value past INT_MAX.
+inline bool whole_number(double v, double max) { return v >= 0 && v <= max && v == std::floor(v); }
+
 // Parses one mod.json's text. On failure returns false with `error` set; `mod` is then not to be used.
 inline bool parse_mod(std::string_view text, const std::string& folder, Mod& mod, std::string& error) {
+    // Windows editors and shells mark the encoding. Notepad's "UTF-8 with BOM" and Windows PowerShell 5.1's
+    // `-Encoding utf8` put EF BB BF in front of the same JSON, so it is skipped. PowerShell 5.1's `>` writes UTF-16,
+    // which is not readable as bytes: say so, instead of blaming the JSON. A NUL in the first two bytes is UTF-16
+    // without a mark; no UTF-8 JSON text starts that way.
+    if (text.substr(0, 3) == std::string_view("\xEF\xBB\xBF", 3)) {
+        text.remove_prefix(3);
+    } else if (text.size() >= 2 && (text.substr(0, 2) == std::string_view("\xFF\xFE", 2) ||
+                                    text.substr(0, 2) == std::string_view("\xFE\xFF", 2) || text[0] == '\0' ||
+                                    text[1] == '\0')) {
+        error = "mod.json is UTF-16; save it as UTF-8";
+        return false;
+    }
     Json root;
     if (!JsonReader(text).parse(root) || root.kind != Json::Kind::object) {
         error = "mod.json is not a JSON object";
@@ -133,6 +162,40 @@ inline bool parse_mod(std::string_view text, const std::string& folder, Mod& mod
                 return false;
             }
             mod.archetype_swaps.push_back(std::move(swap));
+        }
+    }
+    if (const Json* cam = root.find("camera")) {
+        if (cam->kind != Json::Kind::object) {
+            error = "\"camera\" must be an object";
+            return false;
+        }
+        mod.camera.set = true;
+        const Json* view = cam->find("view_mode");
+        if (!view || view->kind != Json::Kind::string ||
+            (view->string != "first_person" && view->string != "default")) {
+            error = "\"camera\": \"view_mode\" must be \"first_person\" or \"default\"";
+            return false;
+        }
+        mod.camera.first_person = view->string == "first_person";
+        if (const Json* v = cam->find("first_person_value")) {
+            if (v->kind != Json::Kind::number || !whole_number(v->number, 255)) {
+                error = "\"camera\": \"first_person_value\" must be a whole number 0-255";
+                return false;
+            }
+            mod.camera.first_person_value = static_cast<uint32_t>(v->number);
+        }
+        if (const Json* c = cam->find("contexts")) {
+            if (c->kind != Json::Kind::array) {
+                error = "\"camera\": \"contexts\" must be a list of numbers";
+                return false;
+            }
+            for (const Json& x : c->array) {
+                if (x.kind != Json::Kind::number || !whole_number(x.number, 4294967295.0)) {
+                    error = "\"camera\": \"contexts\" must be a list of whole numbers from 0 to 4294967295";
+                    return false;
+                }
+                mod.camera.contexts.push_back(static_cast<uint32_t>(x.number));
+            }
         }
     }
     return true;
@@ -198,5 +261,31 @@ inline ArchetypeSwaps& active_slot() {
 }
 inline void set_active(ArchetypeSwaps swaps) { active_slot() = std::move(swaps); }
 inline const ArchetypeSwaps& active() { return active_slot(); }
+
+// The camera override of the enabled mods: the last one (in folder order) with a "camera" section decides.
+inline CameraView camera_of(const std::vector<Mod>& mods) {
+    CameraView view;
+    for (const Mod& m : mods)
+        if (m.enabled && m.camera.set) view = m.camera;
+    return view;
+}
+
+inline CameraView& camera_slot() {
+    static CameraView view;
+    return view;
+}
+inline void set_active_camera(CameraView view) { camera_slot() = std::move(view); }
+
+// What the hooked view-mode getter returns: the mod's first-person value for an overridden context, else the game's.
+inline uint32_t override_view_mode(uint32_t result, uint32_t context) {
+    const CameraView& v = camera_slot();
+    if (!v.first_person) return result;
+    if (!v.contexts.empty()) {
+        bool listed = false;
+        for (uint32_t c : v.contexts) listed = listed || c == context;
+        if (!listed) return result;
+    }
+    return v.first_person_value;
+}
 
 }  // namespace leonida::mods
