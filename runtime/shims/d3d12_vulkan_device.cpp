@@ -6297,9 +6297,18 @@ public:
             return;
         }
         const D3D12_BUFFER_UAV& view = desc->Buffer;
+        if (!view.NumElements || (view.Flags & ~D3D12_BUFFER_UAV_FLAG_RAW)) {
+            log_once("unordered-access view of a buffer has zero elements or unknown flags; flags", int(view.Flags));
+            return;
+        }
         const bool structured = desc->Format == DXGI_FORMAT_UNKNOWN;
         const bool raw = desc->Format == DXGI_FORMAT_R32_TYPELESS && (view.Flags & D3D12_BUFFER_UAV_FLAG_RAW);
         const bool typed = !structured && !raw;
+        if ((structured && (view.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) || (!structured && view.StructureByteStride)) {
+            log_once("unordered-access view of a buffer combines incompatible format, flags, or stride; stride",
+                     int(view.StructureByteStride));
+            return;
+        }
         std::uint32_t format_code = 0, element_bytes = 0;
         g::Swizzle channels = g::identity_swizzle;
         if (typed) {
@@ -6319,7 +6328,7 @@ public:
         }
         const UINT64 unit = structured ? view.StructureByteStride : typed ? element_bytes : 4;
         if (!unit || unit > 0x3fff || view.FirstElement > rd.Width / unit ||
-            (UINT64(view.FirstElement) + view.NumElements) > rd.Width / unit ||
+            view.NumElements > rd.Width / unit - view.FirstElement ||
             UINT64(view.NumElements) * (structured || typed ? 1 : 4) > ~0u) {
             log_once("unordered-access view of a buffer outside the resource or with a bad stride; elements",
                      int(view.NumElements));
