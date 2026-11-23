@@ -54,9 +54,11 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from pe_inspect import DIR_EXCEPTION, MACHINES, PeFormatError, PeImage  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
@@ -975,6 +977,71 @@ def summary(r: dict) -> str:
     return text
 
 
+def write_report_pair(json_path: str, json_text: str, txt_path: str, txt_text: str) -> None:
+    """Stage both report files next to their destination and swap them in together, so a write or replace failure
+    leaves any previous .json and .txt reports intact and keeps their permission bits."""
+    jobs = ((json_path, json_text), (txt_path, txt_text))
+    staged: list[tuple[str, str]] = []
+    originals: dict[str, str | None] = {}
+    try:
+        for dest, text in jobs:
+            if os.path.isdir(dest):
+                raise IsADirectoryError(21, "Is a directory", dest)
+            parent = os.path.dirname(os.path.abspath(dest))
+            tmp = None
+            try:
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
+                                                 prefix=".gdk_calls-", suffix=".tmp", delete=False) as f:
+                    tmp = f.name
+                    f.write(text)
+            except BaseException:
+                if tmp is not None:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                raise
+            staged.append((tmp, dest))
+        for tmp, dest in staged:
+            os.chmod(tmp, published_mode(dest))
+        for _tmp, dest in staged:
+            if os.path.lexists(dest):
+                fd, backup = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(dest)),
+                                              prefix=".gdk_calls-old-", suffix=".tmp")
+                os.close(fd)
+                os.remove(backup)
+                os.replace(dest, backup)
+                originals[dest] = backup
+            else:
+                originals[dest] = None
+        for tmp, dest in staged:
+            os.replace(tmp, dest)
+    except BaseException:
+        for dest, backup in originals.items():
+            try:
+                if os.path.lexists(dest):
+                    os.remove(dest)
+                if backup is not None:
+                    os.replace(backup, dest)
+            except OSError:
+                pass
+        for tmp, _ in staged:
+            try:
+                if os.path.lexists(tmp):
+                    os.chmod(tmp, 0o600)
+                    os.remove(tmp)
+            except OSError:
+                pass
+        raise
+    for backup in originals.values():
+        if backup is not None:
+            try:
+                os.chmod(backup, 0o600)
+                os.remove(backup)
+            except OSError:
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("image", nargs="+")
@@ -1046,11 +1113,8 @@ def main(argv: list[str] | None = None) -> int:
             rc = 1
             continue
         try:
-            with open(json_path, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"table": table.source, **r}, f, indent=1)
-                f.write("\n")
-            with open(txt_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(to_text(r))
+            json_text = json.dumps({"table": table.source, **r}, indent=1) + "\n"
+            write_report_pair(json_path, json_text, txt_path, to_text(r))
         except OSError as e:
             print(f"{path}: cannot write report ({e.strerror or e})", file=sys.stderr)
             rc = 1

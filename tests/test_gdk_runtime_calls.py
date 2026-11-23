@@ -406,6 +406,58 @@ class ImageTest(unittest.TestCase):
             self.assertEqual(f.read(), original)
         self.assertFalse(os.path.exists(os.path.join(aliased_dir, "thunks.dll.gdk_calls.txt")))
 
+    def test_failed_report_write_preserves_existing_json_and_txt_reports(self):
+        from unittest import mock
+
+        out = os.path.join(self.tmp, "atomic-out")
+        os.makedirs(out, exist_ok=True)
+        json_path = os.path.join(out, "thunks.dll.gdk_calls.json")
+        txt_path = os.path.join(out, "thunks.dll.gdk_calls.txt")
+        old_json = '{"previous": true}\n'
+        old_txt = "previous text report\n"
+        with open(json_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(old_json)
+        with open(txt_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(old_txt)
+
+        real_named_temp = tempfile.NamedTemporaryFile
+
+        def fail_second_write(*args, **kwargs):
+            handle = real_named_temp(*args, **kwargs)
+            if fail_second_write.calls == 1:
+                def fail_write(data):
+                    handle.file.write(data[:8])
+                    raise OSError(28, "No space left on device")
+
+                handle.write = fail_write
+            fail_second_write.calls += 1
+            return handle
+
+        fail_second_write.calls = 0
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(grc.tempfile, "NamedTemporaryFile", side_effect=fail_second_write), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = grc.main([self.path, "--out", out])
+        self.assertEqual(rc, 1)
+        self.assertIn("cannot write report", stderr.getvalue())
+        with open(json_path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), old_json)
+        with open(txt_path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), old_txt)
+        self.assertFalse([n for n in os.listdir(out) if n.startswith(".gdk_calls-")])
+
+        # If the second destination is a directory, the first file must not be overwritten either.
+        os.remove(txt_path)
+        os.makedirs(txt_path)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = grc.main([self.path, "--out", out])
+        self.assertEqual(rc, 1)
+        self.assertIn("cannot write report", stderr.getvalue())
+        with open(json_path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), old_json)
+        self.assertFalse([n for n in os.listdir(out) if n.startswith(".gdk_calls-")])
+
     def test_the_default_source_is_every_runtime_shim(self):
         # The classes xgameruntime.cpp hands on to its sibling files count as served: XUserImpl, XGameSaveImpl and
         # XStoreImpl live in xgameruntime_user.cpp, _gamesave.cpp and _store.cpp.
