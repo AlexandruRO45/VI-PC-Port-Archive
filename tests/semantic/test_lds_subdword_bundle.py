@@ -258,5 +258,23 @@ class TestDsReadI8ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[3], 0xFFFF_FFFE)
 
 
+# ------------------------------------------------------------------------------
+# ds_read_i8 SIMD Divergence & Sign Extension
+# ------------------------------------------------------------------------------
+
+class TestDsReadI8SIMD(unittest.TestCase):
+    def test_simd_mixed_positive_and_negative(self):
+        wave = SIMDWaveDS(wave_size=32)
+        for i in range(32):
+            val = 0x80 + i  # negative signed values in [-128, -97]
+            wave.lds.write_u8(i, val)
+            wave.vgprs[1][i] = i
+
+        for i in range(32):
+            wave.vgprs[3][i] = wave.lds.read_i8(wave.vgprs[1][i])
+            expected = (0x80 + i - 256) & MASK32
+            self.assertEqual(wave.vgprs[3][i], expected)
+
+
 if __name__ == '__main__':
     unittest.main()
