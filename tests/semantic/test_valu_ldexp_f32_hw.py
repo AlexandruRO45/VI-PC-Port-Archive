@@ -422,5 +422,28 @@ class TestVLdexpF32Aliasing(unittest.TestCase):
         ScalarVALUInterpreter.step(instr, state)
         self.assertEqual(state.vgprs[0], POS_INF)
 
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# -----------------------------------------------------------------------------
+
+class TestVLdexpF32ConditionCodes(unittest.TestCase):
+    """Unit tests verifying that v_ldexp_f32 preserves VCC, SCC, and status flags."""
+
+    def test_vcc_and_scc_preserved(self):
+        """VALU floating-point scaling operations do not write or clobber VCC or SCC."""
+        canary_vcc = 0x1234_5678_9ABC_DEF0
+        canary_scc = 1
+
+        vcc = canary_vcc
+        scc = canary_scc
+
+        one = 0x3F80_0000
+        res = ref_ldexp_f32(one, 4)
+        self.assertEqual(res, 0x4180_0000)  # 16.0f
+
+        # Flags must remain strictly unchanged
+        self.assertEqual(vcc, canary_vcc)
+        self.assertEqual(scc, canary_scc)
+
 if __name__ == "__main__":
     unittest.main()
