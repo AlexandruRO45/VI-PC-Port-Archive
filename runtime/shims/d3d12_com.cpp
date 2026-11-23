@@ -1257,7 +1257,7 @@ public:
         // the queue value may not be reached, and signalling then would break the same rule: the signal is dropped.
         leonida::VulkanContext* context = &context_;
         const VkSemaphore semaphore = fence_.semaphore();
-        context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_] {
+        context_.enqueue_fence_callback(semaphore, queued, [context, semaphore, queued, value, held = held_, beyond = beyond_] {
             std::uint64_t now = 0;
             bool signaled = false;
             std::uint64_t reached = 0;
@@ -1265,9 +1265,15 @@ public:
                 now >= queued && now < value) {
                 VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
                 info.semaphore = semaphore;
-                info.value = value - now > kMaxTimelineJump ? now + kMaxTimelineJump : value;
+                const bool clamped = value - now > kMaxTimelineJump;
+                info.value = clamped ? now + kMaxTimelineJump : value;
+                if (clamped) {
+                    beyond->reached.store(info.value);
+                    beyond->value.store(value);
+                }
                 signaled = context->vk.vkSignalSemaphore(context->device(), &info) == VK_SUCCESS;
                 reached = info.value;
+                if (clamped) context->retarget_fence_waits(semaphore, info.value, value, info.value);
             }
             held->fetch_sub(1);
             if (signaled) {
@@ -1287,8 +1293,16 @@ public:
             if (event) SetEvent(event);
             return S_OK;
         }
-        if (!event) return fence_.wait(std::min(value, fence_.completed() + kMaxTimelineJump), UINT64_MAX) ? S_OK : E_FAIL;
-        context_.enqueue_fence_wait(fence_.semaphore(), value, event);
+        if (!event) {
+            // Slices, so a clamped CPU signal (which moves the semaphore to less than `value`) is noticed through
+            // completed() and not waited for on the semaphore.
+            while (completed() < value) {
+                if (context_.is_device_lost()) return S_OK;
+                fence_.wait(wait_value(value), kBlockSliceNs);
+            }
+            return S_OK;
+        }
+        context_.enqueue_fence_wait(fence_.semaphore(), wait_value(value), event);
         return S_OK;
     }
 
@@ -1298,25 +1312,42 @@ public:
             waiter->hit();
             return;
         }
-        context_.enqueue_fence_callback(fence_.semaphore(), value, [w = std::move(waiter)] { w->hit(); });
+        context_.enqueue_fence_callback(fence_.semaphore(), wait_value(value), [w = std::move(waiter)] { w->hit(); });
     }
 
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
 
+    // The semaphore value that stands for the D3D12 value `value` in a wait: a value a clamped CPU signal has already
+    // passed is the value the semaphore was moved to, anything else is itself.
+    UINT64 wait_value(UINT64 value) const {
+        const UINT64 d3d12 = beyond_->value.load(), reached = beyond_->reached.load();
+        return d3d12 != 0 && value > reached && value <= d3d12 ? reached : value;
+    }
+
 private:
     // Vulkan lets a timeline move by at most maxTimelineSemaphoreValueDifference, whose guaranteed minimum is 2^31-1
     // (VUID-VkSemaphoreSignalInfo-value-03260); NVIDIA reports exactly that. A CPU signal further up than that, such
-    // as Signal(UINT64_MAX), moves the semaphore by the limit and keeps the D3D12 value here, so GetCompletedValue
-    // and the waits already satisfied by it answer as D3D12 does.
+    // as Signal(UINT64_MAX), moves the semaphore by the limit and keeps the D3D12 value in `beyond_`: GetCompletedValue
+    // reads it, a wait for a value it has passed waits for the value the semaphore was moved to (wait_value), and the
+    // event waits already pending on such a value are retargeted to it.
     static constexpr UINT64 kMaxTimelineJump = 0x7fffffffull;
-    UINT64 completed() const { return std::max<UINT64>(fence_.completed(), cpu_value_.load()); }
+    static constexpr std::uint64_t kBlockSliceNs = 20'000'000;
+    struct Beyond {
+        std::atomic<UINT64> value{0};    // the D3D12 value a clamped CPU signal set (0: none)
+        std::atomic<UINT64> reached{0};  // where that signal moved the semaphore
+    };
+    UINT64 completed() const { return std::max<UINT64>(fence_.completed(), beyond_->value.load()); }
     bool signal_now(UINT64 value) {
         const UINT64 now = fence_.completed();
         if (value - now <= kMaxTimelineJump) return fence_.signal(value);
-        cpu_value_.store(value);
-        return fence_.signal(now + kMaxTimelineJump);
+        const UINT64 reached = now + kMaxTimelineJump;
+        beyond_->reached.store(reached);
+        beyond_->value.store(value);
+        const bool ok = fence_.signal(reached);
+        context_.retarget_fence_waits(fence_.semaphore(), reached, value, reached);
+        return ok;
     }
-    std::atomic<UINT64> cpu_value_{0};
+    std::shared_ptr<Beyond> beyond_ = std::make_shared<Beyond>();
     bool claim_locked(UINT64 value, bool queue) {
         if (value <= highest_) {
             std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
@@ -1498,7 +1529,7 @@ public:
         Fence* f = Fence::from(fence);
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        queue_.wait(f->semaphore(), value, fence_pin(fence));
+        queue_.wait(f->semaphore(), f->wait_value(value), fence_pin(fence));
         return d3d12_trace::result(method, S_OK);
     }
 

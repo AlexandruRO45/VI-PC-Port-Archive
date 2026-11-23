@@ -170,6 +170,55 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
 // A CPU Signal above a queue Signal the GPU has not reached yet: vkSignalSemaphore would break
 // VUID-VkSemaphoreSignalInfo-value-03259, so the layer holds the CPU signal until the GPU passes the queue's value.
 // The queue's signal is kept pending by a Wait on a gate fence the CPU opens later.
+// CPU signals further up than a Vulkan timeline can move at once (maxTimelineSemaphoreValueDifference, 2^31-1 on
+// NVIDIA): the fence still reads, waits and releases as D3D12 does.
+int check_max_value_signals(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    auto make = [&](Ref<ID3D12Fence>& f) { return SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f.p))); };
+    {   // a held Signal(UINT64_MAX) behind a queue signal ends at UINT64_MAX once applied
+        Ref<ID3D12Fence> gate, f;
+        EXPECT(make(gate) && make(f));
+        EXPECT(SUCCEEDED(queue->Wait(gate.p, 1)));
+        EXPECT(SUCCEEDED(queue->Signal(f.p, 1)));
+        EXPECT(SUCCEEDED(f->Signal(UINT64_MAX)));
+        EXPECT(SUCCEEDED(gate->Signal(1)));
+        Event e;
+        EXPECT(SUCCEEDED(f->SetEventOnCompletion(1, e.h)));
+        EXPECT(e.set_within(2000));
+        Sleep(200);
+        EXPECT(f->GetCompletedValue() == UINT64_MAX);
+    }
+    {   // an event registered before the signal is set by it
+        Ref<ID3D12Fence> f;
+        Event e;
+        EXPECT(make(f) && SUCCEEDED(f->SetEventOnCompletion(UINT64_MAX, e.h)));
+        EXPECT(SUCCEEDED(f->Signal(UINT64_MAX)));
+        EXPECT(e.set_within(2000));
+    }
+    {   // a blocking wait returns only when the value is reached, not at the first step towards it
+        Ref<ID3D12Fence> f;
+        EXPECT(make(f));
+        std::thread t([&] { Sleep(200); f->Signal(0x7fffffffull); Sleep(1000); f->Signal(0x100000000ull); });
+        const UINT64 t0 = GetTickCount64();
+        EXPECT(SUCCEEDED(f->SetEventOnCompletion(0x100000000ull, nullptr)));
+        const UINT64 ms = GetTickCount64() - t0;
+        const UINT64 at = f->GetCompletedValue();
+        t.join();
+        EXPECT(ms >= 900);
+        EXPECT(at == 0x100000000ull);
+    }
+    {   // a queue Wait for a value the CPU has already passed is released
+        Ref<ID3D12Fence> f, done;
+        EXPECT(make(f) && make(done));
+        EXPECT(SUCCEEDED(f->Signal(UINT64_MAX)));
+        EXPECT(SUCCEEDED(queue->Wait(f.p, UINT64_MAX)));
+        EXPECT(SUCCEEDED(queue->Signal(done.p, 1)));
+        Event e;
+        EXPECT(SUCCEEDED(done->SetEventOnCompletion(1, e.h)));
+        EXPECT(e.set_within(2000));
+    }
+    return 0;
+}
+
 int check_held_cpu_signal(ID3D12Device* device, ID3D12CommandQueue* queue) {
     Ref<ID3D12Fence> gate, f;
     EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate.p))));
@@ -362,6 +411,7 @@ int main() {
         EXPECT(check_calibration(queue.p, gpu_frequency, "fallback (submitted timestamp query)") == 0);
         EXPECT(check_multiple_fences(device.p, queue.p) == 0);
         EXPECT(check_held_cpu_signal(device.p, queue.p) == 0);
+        EXPECT(check_max_value_signals(device.p, queue.p) == 0);
         EXPECT(check_luid(device.p) == 0);
         EXPECT(check_custom_heap_properties(device.p) == 0);
     }
@@ -409,6 +459,7 @@ int main() {
         EXPECT(check_calibration(queue.p, gpu_frequency, clock_path) == 0);
         EXPECT(check_multiple_fences(standalone.p, queue.p) == 0);
         EXPECT(check_held_cpu_signal(standalone.p, queue.p) == 0);
+        EXPECT(check_max_value_signals(standalone.p, queue.p) == 0);
         EXPECT(check_luid(standalone.p) == 0);
     }
 

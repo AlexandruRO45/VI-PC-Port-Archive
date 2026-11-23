@@ -613,6 +613,26 @@ public:
         cv_.notify_one();
     }
 
+    // A CPU signal further up than a timeline can move at once left `sem` at `to` while D3D12 reads `above`..`upto` as
+    // reached: the entries waiting on a value in (`above`, `upto`] are retargeted to `to`, which `sem` already holds,
+    // so they complete.
+    void retarget(VkSemaphore sem, std::uint64_t above, std::uint64_t upto, std::uint64_t to) {
+        if (!sem) return;
+        {
+            std::lock_guard lock(mutex_);
+            bool any = false;
+            for (auto& e : pending_) {
+                if (e.semaphore == sem && e.value > above && e.value <= upto) {
+                    e.value = to;
+                    any = true;
+                }
+            }
+            if (!any) return;
+            signal_wakeup_locked();
+        }
+        cv_.notify_one();
+    }
+
     // Wakes run() when another path marks the device lost so pending waits complete and stop()/cancel() never hang.
     void notify_device_lost() {
         {
@@ -1500,6 +1520,9 @@ public:
     }
     void cancel_fence_waits(VkSemaphore sem) {
         if (fence_dispatcher_) fence_dispatcher_->cancel(sem);
+    }
+    void retarget_fence_waits(VkSemaphore sem, std::uint64_t above, std::uint64_t upto, std::uint64_t to) {
+        if (fence_dispatcher_) fence_dispatcher_->retarget(sem, above, upto, to);
     }
 
     // Cross-queue Wait-before-Signal: per fence, the highest value a Signal was submitted for, and the queues that
