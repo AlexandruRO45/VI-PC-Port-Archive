@@ -995,7 +995,12 @@ function renderTexturesGrid() {
 
 function openModal(imgUrl, name) {
   document.getElementById('modal-title').innerText = name;
-  document.getElementById('modal-img').src = imgUrl;
+  const img = document.getElementById('modal-img');
+  // Changing only src keeps the previous texture on screen, under the new name, until the new preview (converted
+  // from DDS on demand) arrives. Clear it first so the modal shows nothing rather than the wrong texture.
+  img.removeAttribute('src');
+  img.alt = name;
+  img.src = imgUrl;
   document.getElementById('tex-modal').classList.add('active');
 }
 

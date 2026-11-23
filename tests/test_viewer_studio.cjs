@@ -113,3 +113,22 @@ test('switching models in clay mode disposes the old model\'s geometry, material
     assert.deepEqual(modelB.parts.map(part => part.disposed), [false, false, false]);
     assert.equal(studio.run('clayMaterial.disposed'), false);
 });
+
+test('opening a texture clears the previous one instead of showing it under the new name', () => {
+    // Chromium keeps showing the image it has while a new src loads (currentSrc stays the old URL), so a plain src
+    // swap left the last texture on screen under the next texture's name until its preview arrived.
+    const studio = loadStudio();
+    const img = {
+        attributes: new Map([['src', '/textures/a.png']]), shown: '/textures/a.png', alt: 'a.png',
+        get src() { return this.attributes.get('src') ?? ''; },
+        set src(url) { this.attributes.set('src', url); },          // shown changes only once the new image loads
+        removeAttribute(name) { this.attributes.delete(name); if (name === 'src') this.shown = null; },
+    };
+    studio.elements.set('modal-img', img);
+    studio.run(`openModal('/textures/b.png', 'b.png')`);
+    assert.equal(img.shown, null, 'the previous texture must not stay on screen');
+    assert.equal(img.src, '/textures/b.png');
+    assert.equal(img.alt, 'b.png');
+    assert.equal(studio.elements.get('modal-title').innerText, 'b.png');
+    assert.ok(studio.elements.get('tex-modal').classList);
+});
