@@ -33,6 +33,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import anim_index  # noqa: E402
+import file_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MAGIC = b"MoVE"
@@ -575,6 +576,7 @@ def _write_json_atomic(path, doc):
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             json.dump(doc, f, indent=1)
+        os.chmod(tmp_path, file_mode.published_mode(path))   # mkstemp creates 0600
         os.replace(tmp_path, path)
     except BaseException:
         try:
