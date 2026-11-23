@@ -237,5 +237,22 @@ class TestCeilScalarInterpreter(unittest.TestCase):
         self.assertEqual(words[2], 0x3F800000)
 
 
+class TestCeilSimdInteraction(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking for v_ceil_f32."""
+
+    def test_simd_conditional_cndmask_selection(self):
+        lines = [
+            "v_mov_b32 v1, 0x3F400000",  # 0.75 -> ceil = 1.0
+            "v_ceil_f32 v0, v1",
+            "v_mov_b32 v2, 0xC0200000",  # -2.5 -> ceil = -2.0 (0xC0000000)
+            "v_ceil_f32 v1, v2",
+            "v_cndmask_b32 v2, v0, v1, vcc",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_ceil_ps(lines, "ps_ceil_simd")
+        self.assertEqual(words[0], 0x3F800000)
+        self.assertEqual(words[1], 0xC0000000)
+
+
 if __name__ == '__main__':
     unittest.main()
