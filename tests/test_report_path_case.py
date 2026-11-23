@@ -23,7 +23,7 @@ if str(TOOLS) not in sys.path:
 
 # tool -> name of its two-path comparison helper
 HELPERS = {
-    "bvh_index": "same_output_path",
+    "bvh_index": "same_report_path",
     "anim_index": "same_report_path",
     "gamedata_xml": None,
     "gamedata_index": None,
