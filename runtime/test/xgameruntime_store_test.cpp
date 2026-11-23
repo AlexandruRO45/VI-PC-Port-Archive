@@ -124,6 +124,13 @@ int main() {
     std::memset(&license, 0xCD, sizeof(license));
     check(at<CtxAsync>(store, 28)(store, context, &async) == S_OK && finished(&async),
           "XStoreQueryGameLicenseAsync completes");
+    uint32_t wrong_count = 99;
+    check(at<AsyncResult>(store, 72)(store, nullptr) == E_INVALIDARG &&
+              at<Count>(store, 63)(store, nullptr, &wrong_count) == E_INVALIDARG,
+          "offline result and count reject a null block");
+    check(at<AsyncResult>(store, 72)(store, &async) == E_INVALIDARG &&
+              at<Count>(store, 63)(store, &async, &wrong_count) == E_INVALIDARG && wrong_count == 99,
+          "offline result and count reject a game license block");
     size_t license_size = 0;
     check(XAsyncGetResultSize(&async, &license_size) == S_OK && license_size == 104,
           "the game license result size is the measured 104 bytes");
@@ -204,6 +211,11 @@ int main() {
         const int result_slot = index == 62 ? 64 : index + 1;
         check(at<AsyncResult>(store, result_slot)(store, &request) == E_PENDING,
               "result remains pending before dispatch");
+        if (index == 71) {
+            check(at<AsyncResult>(store, 74)(store, &request) == E_INVALIDARG &&
+                      at<Count>(store, 63)(store, &request, &count) == E_INVALIDARG,
+                  "other offline operations reject a pending durables block");
+        }
         XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0);
         XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0);
         std::snprintf(label, sizeof(label), "slot %d callback and offline result", index);

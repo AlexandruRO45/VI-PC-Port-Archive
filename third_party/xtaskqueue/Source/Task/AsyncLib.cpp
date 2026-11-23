@@ -117,6 +117,7 @@ private:
 struct AsyncBlockInternal
 {
     AsyncState* state = nullptr;
+    const void* identity = nullptr;
     HRESULT status = E_PENDING;
     // Completer publishes the dead value (release) as its last write; DoLock's
     // fast path acquire-loads it, so observing it means the block is done.
@@ -283,6 +284,14 @@ public:
 
         return state;
     }
+
+    void SetIdentity(const void* identity) noexcept
+    {
+        m_internal->identity = identity;
+        m_userInternal->identity = identity;
+    }
+
+    const void* GetIdentity() const noexcept { return m_internal->identity; }
 
     HRESULT GetStatus() const noexcept
     {
@@ -862,6 +871,7 @@ STDAPI XAsyncBegin(
     {
         AsyncBlockInternalGuard internal{ asyncBlock };
         state = internal.GetState();
+        internal.SetIdentity(identity);
     }
 
     state->provider = provider;
@@ -926,6 +936,7 @@ STDAPI XAsyncBeginAlloc(
     {
         AsyncBlockInternalGuard internal{ asyncBlock };
         state = internal.GetState();
+        internal.SetIdentity(identity);
     }
 
     // Alloc using a context size should always fail and not
@@ -1182,4 +1193,12 @@ STDAPI XAsyncGetResult(
     }
 
     return result;
+}
+
+// Internal shim helper: the identity remains available after zero-payload completion.
+bool LeonidaAsyncHasIdentity(XAsyncBlock* asyncBlock, const void* identity) noexcept
+{
+    if (!asyncBlock) return false;
+    AsyncBlockInternalGuard internal{ asyncBlock };
+    return internal.GetIdentity() == identity;
 }

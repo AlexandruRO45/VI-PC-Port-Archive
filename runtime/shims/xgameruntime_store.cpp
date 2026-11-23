@@ -37,6 +37,8 @@
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+bool LeonidaAsyncHasIdentity(XAsyncBlock*, const void*) noexcept;
+
 namespace {
 
 // ---- Public GDK types (XStore.h, as the GDK reference documents them) ----
@@ -135,7 +137,13 @@ template <int Slot> HRESULT STDMETHODCALLTYPE unknown_slot(void*) {
 // ---- Async: every served *Async completes at once on the title's queue ----
 
 const char kProductsIdentity = 0, kLicenseIdentity = 0, kCanAcquireIdentity = 0, kGameLicenseIdentity = 0,
-           kAddOnsIdentity = 0, kUpdatesIdentity = 0, kOfflineIdentity = 0;
+           kAddOnsIdentity = 0, kUpdatesIdentity = 0;
+const char kOfflineIdentity[84] = {};
+
+bool is_offline_identity(const void* identity) {
+    for (const char& item : kOfflineIdentity) if (identity == &item) return true;
+    return false;
+}
 
 size_t result_size(const void* identity) {
     if (identity == &kProductsIdentity) return sizeof(XStoreProductQueryHandle);
@@ -153,7 +161,7 @@ HRESULT CALLBACK store_provider(XAsyncOp op, const XAsyncProviderData* data) {
     case XAsyncOp::Begin:
         return XAsyncSchedule(data->async, 0);
     case XAsyncOp::DoWork:
-        XAsyncComplete(data->async, identity == &kOfflineIdentity ? E_FAIL : S_OK, result_size(identity));
+        XAsyncComplete(data->async, is_offline_identity(identity) ? E_FAIL : S_OK, result_size(identity));
         return S_OK;
     case XAsyncOp::Cancel:
         XAsyncComplete(data->async, E_ABORT, 0);
@@ -187,34 +195,36 @@ HRESULT begin(XStoreContextHandle context, XAsyncBlock* async, const char* ident
     return XAsyncBegin(async, const_cast<char*>(identity), identity, name, store_provider);
 }
 
-HRESULT STDMETHODCALLTYPE store_offline_array_async(void*, XStoreContextHandle c, const char**, size_t, XAsyncBlock* a) {
-    return begin(c, a, &kOfflineIdentity, "XStoreOfflineArrayAsync");
+template <int Slot> HRESULT STDMETHODCALLTYPE store_offline_array_async(void*, XStoreContextHandle c, const char**, size_t, XAsyncBlock* a) {
+    return begin(c, a, &kOfflineIdentity[Slot], "XStoreOfflineArrayAsync");
 }
-HRESULT STDMETHODCALLTYPE store_offline_id_async(void*, XStoreContextHandle c, const char*, XAsyncBlock* a) {
-    return begin(c, a, &kOfflineIdentity, "XStoreOfflineIdAsync");
+template <int Slot> HRESULT STDMETHODCALLTYPE store_offline_id_async(void*, XStoreContextHandle c, const char*, XAsyncBlock* a) {
+    return begin(c, a, &kOfflineIdentity[Slot], "XStoreOfflineIdAsync");
 }
-HRESULT STDMETHODCALLTYPE store_offline_context_async(void*, XStoreContextHandle c, XAsyncBlock* a) {
-    return begin(c, a, &kOfflineIdentity, "XStoreOfflineContextAsync");
+template <int Slot> HRESULT STDMETHODCALLTYPE store_offline_context_async(void*, XStoreContextHandle c, XAsyncBlock* a) {
+    return begin(c, a, &kOfflineIdentity[Slot], "XStoreOfflineContextAsync");
 }
-HRESULT STDMETHODCALLTYPE store_offline_purchase_async(void*, XStoreContextHandle c, const char*, const char*,
+template <int Slot> HRESULT STDMETHODCALLTYPE store_offline_purchase_async(void*, XStoreContextHandle c, const char*, const char*,
                                                         const char*, XAsyncBlock* a) {
-    return begin(c, a, &kOfflineIdentity, "XStoreShowPurchaseUIAsync");
+    return begin(c, a, &kOfflineIdentity[Slot], "XStoreShowPurchaseUIAsync");
 }
-HRESULT STDMETHODCALLTYPE store_offline_redeem_async(void*, XStoreContextHandle c, const char*, const char**, size_t,
+template <int Slot> HRESULT STDMETHODCALLTYPE store_offline_redeem_async(void*, XStoreContextHandle c, const char*, const char**, size_t,
                                                       bool, XAsyncBlock* a) {
-    return begin(c, a, &kOfflineIdentity, "XStoreShowRedeemTokenUIAsync");
+    return begin(c, a, &kOfflineIdentity[Slot], "XStoreShowRedeemTokenUIAsync");
 }
-HRESULT STDMETHODCALLTYPE store_offline_associated_async(void*, XStoreContextHandle c, const char*, uint32_t,
+template <int Slot> HRESULT STDMETHODCALLTYPE store_offline_associated_async(void*, XStoreContextHandle c, const char*, uint32_t,
                                                           XAsyncBlock* a) {
-    return begin(c, a, &kOfflineIdentity, "XStoreShowAssociatedProductsUIAsync");
+    return begin(c, a, &kOfflineIdentity[Slot], "XStoreShowAssociatedProductsUIAsync");
 }
-HRESULT STDMETHODCALLTYPE store_offline_result(void*, XAsyncBlock* a) {
+template <int Slot> HRESULT STDMETHODCALLTYPE store_offline_result(void*, XAsyncBlock* a) {
+    if (!LeonidaAsyncHasIdentity(a, &kOfflineIdentity[Slot])) return E_INVALIDARG;
     return XAsyncGetStatus(a, false);
 }
 HRESULT STDMETHODCALLTYPE store_offline_count(void*, XAsyncBlock* a, uint32_t* count) {
     if (!count) return E_POINTER;
+    if (!LeonidaAsyncHasIdentity(a, &kOfflineIdentity[62])) return E_INVALIDARG;
     *count = 0;
-    return XAsyncGetResult(a, &kOfflineIdentity, 0, nullptr, nullptr);
+    return XAsyncGetResult(a, &kOfflineIdentity[62], 0, nullptr, nullptr);
 }
 
 // ---- IXStoreImpl (slots 3-69), IXStoreImpl2-6 (70-83) ----
@@ -470,34 +480,34 @@ const void* const kStoreVtable[] = {
     FN(unknown_slot<46>),                    // 46 (unknown in the docs)
     FN(unknown_slot<47>),                    // 47 (unknown in the docs)
     FN(unknown_slot<48>),                    // 48 (unknown in the docs)
-    FN(store_offline_purchase_async),        // 49 XStoreShowPurchaseUIAsync
-    FN(store_offline_result),                 // 50 XStoreShowPurchaseUIResult
-    FN(store_offline_context_async),         // 51 XStoreShowRateAndReviewUIAsync
-    FN(store_offline_result),                 // 52 XStoreShowRateAndReviewUIResult
-    FN(store_offline_redeem_async),          // 53 XStoreShowRedeemTokenUIAsync
-    FN(store_offline_result),                 // 54 XStoreShowRedeemTokenUIResult
+    FN(store_offline_purchase_async<49>),        // 49 XStoreShowPurchaseUIAsync
+    FN(store_offline_result<49>),                 // 50 XStoreShowPurchaseUIResult
+    FN(store_offline_context_async<51>),         // 51 XStoreShowRateAndReviewUIAsync
+    FN(store_offline_result<51>),                 // 52 XStoreShowRateAndReviewUIResult
+    FN(store_offline_redeem_async<53>),          // 53 XStoreShowRedeemTokenUIAsync
+    FN(store_offline_result<53>),                 // 54 XStoreShowRedeemTokenUIResult
     FN(store_updates_async),                 // 55 XStoreQueryGameAndDlcPackageUpdatesAsync
     FN(store_updates_count),                 // 56 XStoreQueryGameAndDlcPackageUpdatesResultCount
     FN(store_updates_result),                // 57 XStoreQueryGameAndDlcPackageUpdatesResult
-    FN(store_offline_array_async),           // 58 XStoreDownloadPackageUpdatesAsync
-    FN(store_offline_result),                 // 59 XStoreDownloadPackageUpdatesResult
-    FN(store_offline_array_async),           // 60 XStoreDownloadAndInstallPackageUpdatesAsync
-    FN(store_offline_result),                 // 61 XStoreDownloadAndInstallPackageUpdatesResult
-    FN(store_offline_array_async),           // 62 XStoreDownloadAndInstallPackagesAsync
+    FN(store_offline_array_async<58>),           // 58 XStoreDownloadPackageUpdatesAsync
+    FN(store_offline_result<58>),                 // 59 XStoreDownloadPackageUpdatesResult
+    FN(store_offline_array_async<60>),           // 60 XStoreDownloadAndInstallPackageUpdatesAsync
+    FN(store_offline_result<60>),                 // 61 XStoreDownloadAndInstallPackageUpdatesResult
+    FN(store_offline_array_async<62>),           // 62 XStoreDownloadAndInstallPackagesAsync
     FN(store_offline_count),                 // 63 XStoreDownloadAndInstallPackagesResultCount
-    FN(store_offline_result),                 // 64 XStoreDownloadAndInstallPackagesResult
+    FN(store_offline_result<62>),                 // 64 XStoreDownloadAndInstallPackagesResult
     FN(store_query_package_identifier),      // 65 XStoreQueryPackageIdentifier
     FN(store_register),                      // 66 XStoreRegisterGameLicenseChanged
     FN(store_unregister),                    // 67 XStoreUnregisterGameLicenseChanged
     FN(store_register),                      // 68 XStoreRegisterPackageLicenseLost
     FN(store_unregister),                    // 69 XStoreUnregisterPackageLicenseLost
     FN(unknown_slot<70>),                    // 70 XStoreIsAvailabilityPurchasable (2; no documented signature)
-    FN(store_offline_id_async),              // 71 XStoreAcquireLicenseForDurablesAsync (3)
-    FN(store_offline_result),                 // 72 XStoreAcquireLicenseForDurablesResult (3)
-    FN(store_offline_associated_async),      // 73 XStoreShowAssociatedProductsUIAsync (4)
-    FN(store_offline_result),                 // 74 XStoreShowAssociatedProductsUIResult (4)
-    FN(store_offline_id_async),              // 75 XStoreShowProductPageUIAsync (4)
-    FN(store_offline_result),                 // 76 XStoreShowProductPageUIResult (4)
+    FN(store_offline_id_async<71>),              // 71 XStoreAcquireLicenseForDurablesAsync (3)
+    FN(store_offline_result<71>),                 // 72 XStoreAcquireLicenseForDurablesResult (3)
+    FN(store_offline_associated_async<73>),      // 73 XStoreShowAssociatedProductsUIAsync (4)
+    FN(store_offline_result<73>),                 // 74 XStoreShowAssociatedProductsUIResult (4)
+    FN(store_offline_id_async<75>),              // 75 XStoreShowProductPageUIAsync (4)
+    FN(store_offline_result<75>),                 // 76 XStoreShowProductPageUIResult (4)
     FN(store_query_associated_for_id_async), // 77 XStoreQueryAssociatedProductsForStoreIdAsync (5)
     FN(store_products_result),               // 78 XStoreQueryAssociatedProductsForStoreIdResult (5)
     FN(store_package_updates_async),         // 79 XStoreQueryPackageUpdatesAsync (5)
