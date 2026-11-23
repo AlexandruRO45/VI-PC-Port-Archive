@@ -318,6 +318,10 @@ void test_extra_exports() {
             auto* data = static_cast<unsigned char*>(blob->GetBufferPointer());
             check(data != nullptr, "blob buffer");
             if (data) { data[0] = 42; check(data[0] == 42, "blob writable"); }
+            void* unsupported = blob;
+            const IID unsupported_iid = {0x12345678, 0x1234, 0x5678, {0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78}};
+            hr = blob->QueryInterface(unsupported_iid, &unsupported);
+            check(hr == E_NOINTERFACE && unsupported == nullptr, "blob rejects unsupported interface and clears output");
             check(blob->Release() == 0, "blob released");
         }
     }
