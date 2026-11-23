@@ -407,5 +407,18 @@ class SPackLlB32B16OracleTests(unittest.TestCase):
         self.assertEqual(oracle_pack_ll_b32_b16(0, 0), 0)
         self.assertEqual(oracle_pack_ll_b32_b16(0xFFFFFFFF, 0xFFFFFFFF), 0xFFFFFFFF)
 
+class SPackLlB32B16AstInterpreterTests(unittest.TestCase):
+    def test_pack_ll_ast_construction(self):
+        ast = SaluInstructionAST("s_pack_ll_b32_b16", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+        self.assertEqual(ast.mnemonic, "s_pack_ll_b32_b16")
+
+    def test_pack_ll_scalar_execution(self):
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0xAAAA1111)
+        state.set_sgpr(1, 0xBBBB2222)
+        res = oracle_pack_ll_b32_b16(state.get_sgpr(0), state.get_sgpr(1))
+        state.set_sgpr(2, res)
+        self.assertEqual(state.get_sgpr(2), 0x22221111)
+
 if __name__ == "__main__":
     unittest.main()
