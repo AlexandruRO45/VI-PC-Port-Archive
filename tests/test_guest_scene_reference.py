@@ -69,7 +69,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 1)
                     report = out / "report.json"
                     self.assertEqual(json.loads(report.read_text(encoding="utf-8"))["error"], "full: exit code 7")
-                    self.assertIn(str(report).encode(encoding, "backslashreplace"), result.stdout)
+                    # The CLI prints the resolved path, which can change casing on Windows.
+                    expected_path = str(report.resolve()).encode(encoding, "backslashreplace")
+                    self.assertIn(expected_path, result.stdout)
                     self.assertIn(diagnostic.encode(encoding, "backslashreplace"), result.stderr)
                     self.assertNotIn(b"UnicodeEncodeError", result.stderr)
 
