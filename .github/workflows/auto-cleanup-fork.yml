@@ -1,0 +1,40 @@
+name: Auto-cleanup fork after merge
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if all PRs merged
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prs = await github.rest.pulls.list({
+              owner: 'ItsNotRexed',
+              repo: 'Leonida',
+              head: 'AlpPesen',
+              state: 'open'
+            });
+            if (prs.data.length > 0) {
+              console.log('Open PRs remaining:', prs.data.length);
+              console.log('Fork not deleted yet.');
+              return;
+            }
+            // All PRs merged (or closed) - delete the fork
+            console.log('No open PRs. Deleting fork...');
+            const token = '${{ secrets.FORK_CLEANUP_TOKEN }}';
+            const res = await fetch('https://api.github.com/repos/AlpPesen/Leonida', {
+              method: 'DELETE',
+              headers: {
+                'Authorization': `token ${token}`,
+                'Accept': 'application/vnd.github.v3+json'
+              }
+            });
+            if (res.ok) {
+              console.log('Fork deleted successfully.');
+            } else {
+              console.log('Failed to delete fork:', res.status, await res.text());
+            }
