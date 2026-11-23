@@ -238,6 +238,23 @@ class EffectsTest(unittest.TestCase):
             with self.subTest(cut=cut), self.assertRaises(ValueError):
                 sgd5_effects.read_database(io.BytesIO(data[:cut]), layout)
 
+    def test_every_truncation_is_a_usage_error_not_a_traceback(self):
+        # BUILD-1627: a database cut anywhere (program counts, labels, effect counts, tables, pass rows,
+        # the string pool) must end in one parser error, never struct.error or IndexError.
+        row = (1, 0, 0, 0, 0, 0)
+        data, layout = database({0: ("Light",)}, [effect("Bulb", {0: (0,)}, [("Glow", [row])])])
+        with tempfile.TemporaryDirectory() as folder:
+            archive = Path(folder) / "cut.rpf"
+            for cut in range(len(data)):
+                archive.write_bytes(data[:cut])
+                for args in ((), ("--list-effects",), ("--effect", "Bulb", "--technique", "Glow")):
+                    with self.subTest(cut=cut, args=args), patch.object(sgd5_effects, "DATABASES", [layout]):
+                        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                            try:
+                                sgd5_effects.main([str(archive), *args])
+                            except SystemExit as exit_:
+                                self.assertEqual(exit_.code, 2)
+
     @unittest.skipUnless(os.environ.get("LEONIDA_GAME_DIR"), "set LEONIDA_GAME_DIR to check package counts")
     def test_xbox_package_counts(self):
         archive = Path(os.environ["LEONIDA_GAME_DIR"]) / "shaders.rpf"
