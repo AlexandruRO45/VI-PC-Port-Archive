@@ -110,5 +110,51 @@ class TestMul24ReferenceOracle(unittest.TestCase):
                 self.assertEqual(words[0], expected)
 
 
+class Vop2Opcode:
+    """Symbolic AST opcode descriptor for VOP2 instructions."""
+
+    def __init__(self, mnemonic: str, dst: str, src0: str, src1: str) -> None:
+        self.mnemonic = mnemonic
+        self.dst = dst
+        self.src0 = src0
+        self.src1 = src1
+
+    def emit_assembly(self) -> str:
+        return f"{self.mnemonic} {self.dst}, {self.src0}, {self.src1}"
+
+
+class TestMul24ASTAndTypes(unittest.TestCase):
+    """Commit 2: symbolic AST opcode definitions and typed expressions for v_mul_i32_i24."""
+
+    def test_ast_emission_and_translation(self):
+        op = Vop2Opcode("v_mul_i32_i24", "v0", "v1", "v2")
+        self.assertEqual(op.emit_assembly(), "v_mul_i32_i24 v0, v1, v2")
+        lines = [
+            "v_mov_b32 v1, 15",
+            "v_mov_b32 v2, 4",
+            op.emit_assembly(),
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        spv = support.translate_lines("ps_mul24_ast", lines + ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"])
+        self.assertIn("OpBitFieldSExtract", spv)
+        self.assertIn("OpIMul", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 60)
+
+    def test_ast_literal_constant_operand(self):
+        op = Vop2Opcode("v_mul_i32_i24", "v0", "7", "v1")
+        lines = [
+            "v_mov_b32 v1, -3",
+            op.emit_assembly(),
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_mul24_ps(lines, "ps_mul24_ast_lit")
+        self.assertEqual(words[0], (-21) & MASK32)
+
+
 if __name__ == '__main__':
     unittest.main()
