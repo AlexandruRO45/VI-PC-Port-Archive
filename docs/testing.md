@@ -295,6 +295,13 @@ on an Apple M3 Max (MoltenVK 1.4.2 and 1.4.3): 17 workgroup shapes from 1 to 102
 subgroups, with and without full subgroups and register pressure, all 32 lanes in order. A device whose default
 isn't the requested size still prints `not available`, and those tests skip.
 
+On a bare-metal Apple M4 Pro (macOS 27.2.1, Leonida `25e425a1`), `cs_dpp_ops` and
+`cs_w32_permlane_fi` passed on both MoltenVK 1.4.2 (default 32, range 4..32) and KosmicKrisp from
+Mesa 26.3.1 (fixed 32). Each driver gained 30 compute passes with `LEONIDA_W64_EMULATE=1`.
+Adding `LEONIDA_MESH_COMPUTE=1` gave MoltenVK six more passes and KosmicKrisp five.
+KosmicKrisp left the clear frame in `ms_wave_info_s3`, the symptom tracked in
+[#5741](https://github.com/ItsNotRexed/Leonida/pull/5741).
+
 ## Wave64 pixel, vertex and geometry shaders (`w64_graphics.py`)
 
 Graphics stages have no emulation: on a 32-wide subgroup a wave64 VS, PS or GS runs as two 32-lane halves, and the
