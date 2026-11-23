@@ -2312,7 +2312,9 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   queues interleave on it. Two test settings make the standalone device look like such a GPU, so the sharing path
   runs anywhere: `LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N` (at most N `VkQueue`s per family) and
   `LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1` (COMPUTE and COPY in the graphics family); both together are one family with
-  one queue (`docs/testing.md`, "Choosing the GPU"). Measured on an RTX 5080 (Linux, driver 580.65.06, Wine 11)
+  one queue (`docs/testing.md`, "Choosing the GPU"). Only the test executables apply them: the game's device
+  (`d3d12_xs`, `LEONIDA_D3D12=vulkan`) ignores them and says so, so a variable left in the environment cannot put
+  every queue of the game on one `VkQueue` (`run_tiny_frame_queue_test_settings`). Measured on an RTX 5080 (Linux, driver 580.65.06, Wine 11)
   and on lavapipe, under the validation layer with synchronization validation: `d3d12_queue_share_test` passes
   with no setting, with one queue per family, with one queue in all and on lavapipe (36 queues, a buffer copied
   exactly through all of them consumer first and producer first, 9 deferred CPU Signal cases, 4 threads on 9 queues:

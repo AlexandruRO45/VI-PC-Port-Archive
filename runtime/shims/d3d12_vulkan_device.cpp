@@ -84,20 +84,30 @@ void log_once(const char* what, int value) {
 // queues share a VkQueue runs on any GPU; both together give the Intel UHD 770 on Windows and lavapipe (one family,
 // one queue). LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N (1 to 16): at most N VkQueues per queue family (unset, or not a
 // number from 1 to 16: 16). LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1: COMPUTE and COPY queues use the graphics family, as on
-// a GPU without async compute or transfer families.
-bool graphics_family_only() {
-    char text[8] = {};
+// a GPU without async compute or transfer families. The game's device ignores both (QueueTestSettings::ignore).
+
+// The setting's value, or false when it is unset; set but ignored, it says so.
+bool queue_test_setting(const char* name, char* text, size_t size, rt::d3d12::QueueTestSettings settings) {
     size_t length = 0;
-    const bool on = getenv_s(&length, text, "LEONIDA_VK_GRAPHICS_FAMILY_ONLY") == 0 && length > 1 && text[0] != '0';
+    if (getenv_s(&length, text, size, name) != 0 || length <= 1) return false;
+    if (settings == rt::d3d12::QueueTestSettings::apply) return true;
+    std::fprintf(stderr, "[rt] d3d12: %s is a test setting; the game's device ignores it (all its Vulkan queues)\n",
+                 name);
+    return false;
+}
+
+bool graphics_family_only(rt::d3d12::QueueTestSettings settings) {
+    char text[8] = {};
+    const bool on = queue_test_setting("LEONIDA_VK_GRAPHICS_FAMILY_ONLY", text, sizeof(text), settings) &&
+                    text[0] != '0';
     if (on) std::fprintf(stderr, "[rt] d3d12: LEONIDA_VK_GRAPHICS_FAMILY_ONLY: every D3D12 queue in the graphics family\n");
     return on;
 }
 
-std::uint32_t max_queues_per_family() {
+std::uint32_t max_queues_per_family(rt::d3d12::QueueTestSettings settings) {
     constexpr std::uint32_t most = 16;
     char text[16] = {};
-    size_t length = 0;
-    if (getenv_s(&length, text, "LEONIDA_VK_MAX_QUEUES_PER_FAMILY") != 0 || length <= 1) return most;
+    if (!queue_test_setting("LEONIDA_VK_MAX_QUEUES_PER_FAMILY", text, sizeof(text), settings)) return most;
     char* end = nullptr;
     const unsigned long value = std::strtoul(text, &end, 10);
     if (end == text || *end || value < 1 || value > most) {
@@ -7936,7 +7946,7 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
 
 // Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and
 // VK_KHR_synchronization2 (vulkan13_features.h). LEONIDA_VK_VALIDATION=1 adds VK_LAYER_KHRONOS_validation.
-HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
+HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettings queue_test_settings) {
     if (!out) return E_POINTER;
     *out = nullptr;
     static const HMODULE library = LoadLibraryA("vulkan-1.dll");
@@ -8223,7 +8233,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, nullptr);
     std::vector<VkQueueFamilyProperties> families(family_count);
     vkGetPhysicalDeviceQueueFamilyProperties(info.physical, &family_count, families.data());
-    const std::uint32_t queue_cap = max_queues_per_family();
+    const std::uint32_t queue_cap = max_queues_per_family(queue_test_settings);
     const std::uint32_t command_queue_count = std::min(queue_cap, families[info.queue_family].queueCount);
     std::vector<float> priorities(16, 1.0f);
     std::vector<VkDeviceQueueCreateInfo> queue_infos;
@@ -8243,7 +8253,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     const bool sparse_buffers = chosen_features.sparseBinding && chosen_features.sparseResidencyBuffer &&
                                 chosen_features.sparseResidencyAliased;
     auto picked = leonida::sparse_capable_queue_families(families, preferred, sparse_buffers);
-    if (graphics_family_only()) picked = {info.queue_family, info.queue_family, info.queue_family};
+    if (graphics_family_only(queue_test_settings)) picked = {info.queue_family, info.queue_family, info.queue_family};
     std::uint32_t compute_count = 0, copy_count = 0;
     if (picked.compute != info.queue_family) {
         info.compute_family = picked.compute;

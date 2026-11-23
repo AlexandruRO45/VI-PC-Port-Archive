@@ -425,7 +425,9 @@ N Vulkan queues per queue family, and `LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1` puts C
 graphics family, as on a GPU without async compute or transfer families. Both together give the shape of the Intel
 UHD 770 on Windows and of lavapipe, one family with one queue; the `d3d12_queue_share_one_queue` and
 `d3d12_queue_wait_one_queue` tests run that way, and any other test can be run so by hand. The device logs what it
-applied; a queue count outside 1 to 16 is ignored, with a message.
+applied; a queue count outside 1 to 16 is ignored, with a message. Only tests apply them: the device that
+`gta6rt --run` creates for a game (`LEONIDA_D3D12=vulkan`) ignores both and prints `... is a test setting; the
+game's device ignores it`, so leaving them set cannot slow a game down (`run_tiny_frame_queue_test_settings`).
 
 ## Known problems
 
