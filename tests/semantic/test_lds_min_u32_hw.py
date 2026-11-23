@@ -566,3 +566,39 @@ class TestDsMinU32ConditionCodes(unittest.TestCase):
         inst = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
         interp.execute(inst)
         self.assertEqual(interp.lds.read_dword(0x10), 20)
+
+
+# -----------------------------------------------------------------------------
+# Part 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
+
+class TestDsMinU32IEEE754EdgeCases(unittest.TestCase):
+    """Test suite for IEEE 754 float patterns passing through unsigned integer atomic min."""
+
+    def test_signed_zero_comparison(self):
+        # +0.0 is 0x00000000, -0.0 is 0x80000000
+        # In unsigned comparison, 0 < 0x80000000
+        res1 = ref_min_u32(0x00000000, 0x80000000)
+        self.assertEqual(res1, 0x00000000)
+        res2 = ref_min_u32(0x80000000, 0x00000000)
+        self.assertEqual(res2, 0x00000000)
+
+    def test_positive_and_negative_infinities(self):
+        # +Inf is 0x7F800000, -Inf is 0xFF800000
+        # Unsigned: 0x7F800000 < 0xFF800000
+        res = ref_min_u32(0x7F800000, 0xFF800000)
+        self.assertEqual(res, 0x7F800000)
+
+    def test_subnormal_vs_normal(self):
+        # Subnormal float: 0x00400000
+        # Normal 1.0f: 0x3F800000
+        # Unsigned: subnormal < normal
+        res = ref_min_u32(0x00400000, 0x3F800000)
+        self.assertEqual(res, 0x00400000)
+
+    def test_nan_payload_preservation(self):
+        # Unsigned integer min does not alter NaN payloads or quieten sNaN
+        qnan = 0x7FC00000
+        snan = 0x7F800001
+        res = ref_min_u32(qnan, snan)
+        self.assertEqual(res, snan)
