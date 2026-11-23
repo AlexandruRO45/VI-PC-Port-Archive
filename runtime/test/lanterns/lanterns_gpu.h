@@ -5,6 +5,7 @@
 
 #include "../d3d12_test_shaders.h"
 #include "lanterns_particles.h"
+#include "lanterns_post.h"
 #include "lanterns_scene.h"
 
 #include <array>
@@ -23,11 +24,11 @@ struct Shaders {
     std::vector<std::uint8_t> ps_tex_floor, ps_tex_solid;   // stage 6: they replace ps_floor and ps_lit
     std::vector<std::uint8_t> ps_shadow;                    // stage 8: replaces both
 };
-// stage 1: graphics only; 3: plus cs_lanterns_rise; 6: plus the textured pixel shaders; 8: plus the shadow
+// stage 1: graphics only; 3 and 5: plus cs_lanterns_rise; 6: plus the textured pixel shaders; 8: plus the shadow
 // pixel shader.
 bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out);
 
-// What a frame's readback holds besides the pixels (stage 3).
+// What a frame's readback holds besides the pixels (stages 3 and 5).
 struct Readback {
     std::vector<Particle> state;
     std::vector<Instance> instances;   // what cs_lanterns_rise wrote
@@ -47,7 +48,10 @@ class Gpu {
 public:
     // Device, pipelines, buffers, and an initial direct-queue submission that copies the uploads into the DEFAULT
     // buffers (and the particles' first state, when the shaders include the compute shader).
-    bool create(const Scene& scene, const Shaders& shaders);
+    // target_format: R32G32B32A32_FLOAT (the other stages) or R16G16B16A16_FLOAT (stage 5's HDR target, which the post-process
+    // reads; finish_frame returns its pixels widened to float).
+    bool create(const Scene& scene, const Shaders& shaders,
+                DXGI_FORMAT target_format = DXGI_FORMAT_R32G32B32A32_FLOAT);
     // Records and submits one frame on the direct queue. With wait_compute != 0 the queue first waits for the
     // compute fence to reach that value (which may be signalled by a submission made after this one).
     bool submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_compute = 0);
@@ -64,9 +68,11 @@ public:
     void set_shadow_casters(bool casters) { shadow_casters_ = casters; }
     // Waits until both queues are idle (before the objects are released).
     bool idle();
-    // For the texture uploads (stage 6), which record on the same device and queue before the first frame.
+    // For the post-process (stage 5), which records on the same device and queue after the frame. Between frames the
+    // target is in COPY_SOURCE.
     ID3D12Device* device() const { return device_.p; }
     ID3D12CommandQueue* queue() const { return queue_.p; }
+    ID3D12Resource* target() const { return target_.p; }
 
 private:
     bool create_pipelines(const Shaders& shaders);
@@ -98,6 +104,7 @@ private:
     Ref<ID3D12GraphicsCommandList> list_, compute_list_;
     Ref<ID3D12Fence> fence_, compute_fence_;
     Geometry geometry_;
+    DXGI_FORMAT target_format_ = DXGI_FORMAT_R32G32B32A32_FLOAT;
     bool compute_ = false, textured_ = false, textures_bound_ = false;
     std::uint64_t srv_texture_slot_ = 0;   // the two texture SRVs (stage 6), after the compute tables
     std::uint64_t upload_vb_ = 0, upload_ib_ = 0, upload_inst_ = 0, upload_cbv_ = 0, upload_particles_ = 0;

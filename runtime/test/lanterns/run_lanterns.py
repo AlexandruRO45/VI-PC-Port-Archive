@@ -30,6 +30,8 @@ folder:
            mask of the depth frame: certain and exact (grey), certain and wrong (red), uncertain (yellow)
   stage 3: frames 1 and 2 side by side (the points rise); sheet: frame 2 | its reference / the control frame without
            the Wait | mask of frame 2
+  stage 5: the fp16 scene and the frame after the bloom post-process; sheet: final | its reference / the composite
+           with the blur skipped (the control) | mask of the final frame (yellow: bounded, not exact, pixels)
   stage 6: the textured frame; sheet: frame | the middle of its reference bounds / the control (solids two mips
            down) | where the control left the frame's bounds (red, as predicted)
   stage 8: the shadowed frame; sheet: frame | the middle of its reference bounds / the control (map cleared to far) |
@@ -66,6 +68,9 @@ PASS_LINES = {
         and centres >= 500),
     3: (rf"Lanterns stage 3: PASS, {N} and {N} of 98304 pixels exact, 256 points exact after 24 and 48 compute steps, "
         rf"points moved {N} pixels", lambda a, b, moved: 0 < a <= 98304 and 0 < b <= 98304 and moved >= 50),
+    5: (rf"Lanterns stage 5: PASS, fp16 scene {N} of {N} certain pixels exact, bloom composite {N} of {N} certain "
+        rf"pixels exact and {N} bounded pixels within bounds, skipping the blur changed {N} pixels as predicted",
+        lambda a, b, c, d, bounded, moved: a == b and c == d and d + bounded == 98304 and moved >= 1000),
     6: (rf"Lanterns stage 6: PASS, {N} of {N} certain pixels within the BC1/BC7 sampling bounds \(trilinear floor, "
         rf"image_sample_l solids\), control two mips down moved {N} of {N} predicted pixels",
         lambda a, b, moved, predicted: a == b and moved == predicted and predicted > 0),
@@ -301,6 +306,8 @@ PANELS = {
                   ["stage1-edges.gpu", "stage1-edges.ref"]]},
     3: {"main": [["stage3-frame1.gpu", "stage3-frame2.gpu"]],
         "sheet": [["stage3-frame2.gpu", "stage3-frame2.ref"], ["stage3-control.gpu", "stage3-frame2:mask"]]},
+    5: {"main": [["stage5-scene.gpu", "stage5-final.gpu"]],
+        "sheet": [["stage5-final.gpu", "stage5-final.ref"], ["stage5-skipped.gpu", "stage5-final:mask"]]},
     6: {"main": [["stage6-frame.gpu"]],
         "sheet": [["stage6-frame.gpu", "stage6-frame.ref"], ["stage6-control.gpu", "stage6-control:mask"]]},
     8: {"main": [["stage8-frame.gpu"]],

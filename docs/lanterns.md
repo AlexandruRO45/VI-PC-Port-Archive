@@ -42,6 +42,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 |---|---|---|
 | [1](#stage-1) | Five indexed, instanced draws with a depth buffer | Depth test off changes the predicted pixels |
 | [3](#stage-3-compute-on-a-second-queue) | A compute queue moves the points of light; the frame waits on its fence | Point states and records equal the CPU's; the points move the predicted pixels |
+| [5](#stage-5-an-fp16-target-and-a-bloom-post-process) | An fp16 target, then a wave64 bloom with LDS and `s_barrier` | Skipping the blur changes the predicted pixels |
 | [6](#stage-6-compressed-textures-with-mip-chains) | BC1 and BC7 textures with full mip chains, trilinear and explicit-LOD sampling | Two mips down leaves the predicted pixels' bounds |
 | [8](#stage-8-a-shadow-map) | A D32 shadow map with PSO depth bias, sampled with 2x2 PCF | The map cleared to far changes the predicted pixels |
 
@@ -166,6 +167,33 @@ How the check works:
 
 ```
 Lanterns stage 3: PASS, 97675 and 97664 of 98304 pixels exact, 256 points exact after 24 and 48 compute steps, points moved 14839 pixels
+```
+
+## Stage 5: an fp16 target and a bloom post-process
+
+The stage-3 frame after 48 compute steps is drawn into an `R16G16B16A16_FLOAT` target. Then a post-process runs on
+the same direct queue (`lanterns_post.h`):
+
+- Two wave64 compute passes blur what is brighter than a threshold, first along rows and then along columns. Each
+  group is 128 lanes in two waves that share LDS across an `s_barrier`. The row pass reads the scene through a T#
+  with `image_load`.
+- A fullscreen pixel shader reads `SV_Position`, the scene texel and the blur, and writes their sum into an
+  `R32G32B32A32_FLOAT` target.
+
+The wave64 shaders are translated with `--wave64-emulate`.
+
+How the check works:
+
+- The fp16 scene is checked as in stage 1, against the reference rounded to half.
+- The final frame must be exact where it is certain, and within bounds where the scene's edges leave it uncertain.
+- The point states and instance records must equal the CPU's, as in stage 3.
+- Control: the composite with the blur skipped must change exactly the certain pixels the reference says the bloom
+  changes, and at least 1,000 of them.
+- Measured, not required: the row pass without its `s_barrier` (a race the reference cannot predict). It changed 0
+  certain pixels on the test machine.
+
+```
+Lanterns stage 5: PASS, fp16 scene 97664 of 97664 certain pixels exact, bloom composite 82563 of 82563 certain pixels exact and 15741 bounded pixels within bounds, skipping the blur changed 15113 pixels as predicted
 ```
 
 ## Stage 6: compressed textures with mip chains

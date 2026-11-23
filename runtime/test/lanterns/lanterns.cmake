@@ -8,6 +8,7 @@
 # inside a DXBC/XDAT/XBCH container (<build>/generated/lanterns/<name>.dxbc, what the guest hands to
 # CreateGraphicsPipelineState) and runs tools/fssm_unpack.py, shader_disasm.py and rdna2spirv.py on that folder, which
 # write spirv/index.json keyed by each program's FSSM SHA-256 (what LEONIDA_SHADERS points the runtime at).
+# --wave64-emulate makes the wave64 compute shaders exact on 32-lane GPUs; a native variant is translated without it.
 # The guest links nothing from src/ or shims/: its device comes from the D3D12XboxCreateDevice it imports from
 # d3d12_xs.dll, which only gta6rt's shim registry can answer. The import library is tiny_frame's failing stub
 # (d3d12_xs_stub, test/fixtures/d3d12_xs_stub.cpp), built into a folder the loader does not search.
@@ -22,7 +23,7 @@ elseif(LEONIDA_TEST_LANTERNS)
   set(_lanterns_src ${CMAKE_CURRENT_SOURCE_DIR}/test/lanterns)
   add_executable(lanterns ${_lanterns_src}/lanterns.cpp ${_lanterns_src}/lanterns_gpu.cpp
                           ${_lanterns_src}/lanterns_edges_gpu.cpp ${_lanterns_src}/lanterns_textures_gpu.cpp
-                          ${_lanterns_src}/lanterns_shadow_gpu.cpp)
+                          ${_lanterns_src}/lanterns_shadow_gpu.cpp ${_lanterns_src}/lanterns_post_gpu.cpp)
   target_link_libraries(lanterns PRIVATE d3d12_xs_stub Vulkan::Headers)
   target_compile_definitions(lanterns PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
   target_compile_options(lanterns PRIVATE /W4 /permissive- /utf-8)
@@ -50,7 +51,10 @@ elseif(LEONIDA_TEST_LANTERNS)
                       ${_lanterns_src}/shaders/ps_lanterns_edges.asm ${_lanterns_src}/shaders/cs_lanterns_rise.asm
                       ${_lanterns_src}/shaders/ps_lanterns_tex_floor.asm
                       ${_lanterns_src}/shaders/ps_lanterns_tex_solid.asm
-                      ${_lanterns_src}/shaders/ps_lanterns_shadow.asm)
+                      ${_lanterns_src}/shaders/ps_lanterns_shadow.asm ${_lanterns_src}/shaders/cs_lanterns_bloom_h.asm
+                      ${_lanterns_src}/shaders/cs_lanterns_bloom_h_nobarrier.asm
+                      ${_lanterns_src}/shaders/cs_lanterns_bloom_v.asm ${_lanterns_src}/shaders/vs_lanterns_full.asm
+                      ${_lanterns_src}/shaders/ps_lanterns_composite.asm)
     get_filename_component(_lanterns_spirv_tools ${LEONIDA_SPIRV_AS} DIRECTORY)
     file(TO_NATIVE_PATH "${_lanterns_spirv_tools}" _lanterns_spirv_tools)
     add_custom_command(
@@ -58,7 +62,7 @@ elseif(LEONIDA_TEST_LANTERNS)
       COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_LANTERNS_SHADERS}
       COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${_lanterns_spirv_tools}"
               $<TARGET_FILE:Python3::Interpreter> -I ${_lanterns_src}/fssm_pack.py
-              ${LEONIDA_LANTERNS_SHADERS} ${_lanterns_asm} --translate
+              ${LEONIDA_LANTERNS_SHADERS} ${_lanterns_asm} --translate --wave64-emulate
       DEPENDS ${_lanterns_asm} ${_lanterns_src}/fssm_pack.py ${_lanterns_tool_py}
       COMMENT "Packing and translating the Lanterns shaders"
       VERBATIM)

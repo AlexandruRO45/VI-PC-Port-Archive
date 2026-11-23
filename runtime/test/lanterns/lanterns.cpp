@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3|6|8 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|5|6|8 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -24,6 +24,16 @@
 // submitted before its compute work; it is reported (old state, new state or a mix), not required, since a layer may
 // order the queues on its own.
 //
+// Stage 5: the stage-3 frame after two rounds of rise steps (the points drawn directly, their instances written by
+// the compute shader) into an R16G16B16A16_FLOAT target, then a
+// post-process on the same direct queue (lanterns_post.h): two wave64 compute passes, each 128 lanes in two waves
+// sharing LDS across an s_barrier, blur what is brighter than a threshold along rows (reading the scene through a T#
+// with image_load) and then columns; a fullscreen pixel shader reads SV_Position, the scene texel and the blur, and
+// writes the sum into an R32G32B32A32_FLOAT target. The fp16 scene and the final frame are compared with the CPU
+// (exact where certain, within bounds where the scene's edges leave it uncertain). Control: the composite with the
+// blur skipped must change exactly the certain pixels the reference says the bloom changes. The row pass without its
+// s_barrier is run too and its difference reported (a race: not predicted).
+//
 // Stage 6: the stage-1 scene textured. A BC1 mosaic (256x256, 9 mips) on the floor, sampled with image_sample
 // (trilinear, LOD from derivatives); a BC7 pattern (64x64, 7 mips) on the solids, sampled with image_sample_l at a
 // per-draw mip level from a root constant. The textures are made, mipmapped and compressed here (lanterns_bc.h) and
@@ -40,6 +50,8 @@
 #include "lanterns_edges_gpu.h"
 #include "lanterns_gpu.h"
 #include "lanterns_particles.h"
+#include "lanterns_post.h"
+#include "lanterns_post_gpu.h"
 #include "lanterns_reference.h"
 #include "lanterns_sampling.h"
 #include "lanterns_scene.h"
@@ -280,6 +292,74 @@ int stage3(const std::filesystem::path& shader_dir, const std::filesystem::path&
     return 0;
 }
 
+// The post reference as a Reference for dump(): the exact colour (or the lower bound) and "uncertain" where bounded.
+lanterns::Reference as_reference(const lanterns::PostReference& post) {
+    lanterns::Reference ref;
+    ref.color = post.lo;
+    ref.candidates.resize(post.lo.size());
+    for (std::size_t i = 0; i < post.lo.size(); ++i)
+        if (!post.certain[i]) ref.candidates[i] = {post.lo[i], post.hi[i]};
+    return ref;
+}
+
+// Stage 5: the stage-3 frame into an fp16 target, then the bloom post-process (see the top of this file).
+int stage5(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
+    using lanterns::kStepsPerFrame;
+    std::vector<lanterns::Particle> cpu = lanterns::initial_particles();
+    for (unsigned k = 0; k < 2 * kStepsPerFrame; ++k) lanterns::step_particles(cpu);
+    const lanterns::Scene scene = lanterns::stage3(cpu);
+    lanterns::Shaders shaders;
+    lanterns::PostShaders post_shaders;
+    if (!lanterns::load_shaders(shader_dir, 5, shaders) || !lanterns::load_post_shaders(shader_dir, post_shaders)) return 1;
+    std::vector<Color> scene_pixels, final_pixels, skipped, no_barrier;
+    lanterns::Readback read;
+    {
+        lanterns::Gpu gpu;
+        if (!gpu.create(scene, shaders, DXGI_FORMAT_R16G16B16A16_FLOAT)) return 1;
+        lanterns::Post post;   // after gpu: released first
+        if (!post.create(gpu, post_shaders)) return 1;
+        std::uint64_t first = 0, second = 0;
+        if (!gpu.submit_compute(kStepsPerFrame, first) || !gpu.submit_compute(kStepsPerFrame, second) ||
+            !gpu.submit_frame(scene, true, second) || !gpu.finish_frame(scene_pixels, &read))
+            return 1;
+        if (!post.run(lanterns::PostMode::full, final_pixels) || !post.run(lanterns::PostMode::skip_blur, skipped) ||
+            !post.run(lanterns::PostMode::no_barrier, no_barrier) || !gpu.idle())
+            return 1;
+    }
+    const bool particles_ok = same_particles("the points after two rounds of rise steps", read.state, read.instances, cpu);
+    const lanterns::Reference ref = lanterns::reference_frame(scene, true);
+    const lanterns::Reference half = lanterns::half_reference(ref);
+    const lanterns::Comparison scene_check = lanterns::compare(scene_pixels, half);
+    report("the fp16 scene target", scene_check);
+    const lanterns::PostReference post = lanterns::post_reference(ref);
+    const lanterns::Comparison final_check = lanterns::compare_post(final_pixels, post);
+    std::printf("lanterns: the final frame: %u of %u certain pixels exact, %u of %u bounded pixels within their bounds "
+                "(the reference's float and double sums differ at %u values)\n", final_check.certain_exact,
+                final_check.certain, final_check.uncertain_plausible, final_check.uncertain, post.inexact);
+    if (!final_check.pass())
+        report("the final frame", final_check);
+    const unsigned control = lanterns::certain_differences(skipped, post);
+    const unsigned race = lanterns::certain_differences(no_barrier, post);
+    std::printf("lanterns: control, the blur skipped: %u certain pixels differ (the reference predicts %u)\n", control,
+                post.bloom_pixels);
+    std::printf("lanterns: measured, the row pass without s_barrier: %u certain pixels differ\n", race);
+    if (!dump(out_dir, "stage5-scene", scene_pixels, half) ||
+        !dump(out_dir, "stage5-final", final_pixels, as_reference(post)) ||
+        !dump(out_dir, "stage5-skipped", skipped, as_reference(post)) ||
+        !dump(out_dir, "stage5-nobarrier", no_barrier, as_reference(post)))
+        return 1;
+    if (!particles_ok || !scene_check.pass() || !final_check.pass() || post.inexact ||
+        post.bloom_pixels < 1000 || control != post.bloom_pixels) {
+        std::fprintf(stderr, "lanterns: stage 5 FAILED\n");
+        return 1;
+    }
+    std::printf("Lanterns stage 5: PASS, fp16 scene %u of %u certain pixels exact, bloom composite %u of %u certain "
+                "pixels exact and %u bounded pixels within bounds, skipping the blur changed %u pixels as predicted\n",
+                scene_check.certain_exact, scene_check.certain, final_check.certain_exact, final_check.certain,
+                final_check.uncertain, control);
+    return 0;
+}
+
 // Stage 6: the stage-1 scene with compressed, mipmapped textures (see the top of this file).
 int stage6(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
     lanterns::Shaders shaders;
@@ -425,10 +505,11 @@ int main(int argc, char** argv) {
     switch (stage) {
     case 1: return stage1(shader_dir, out_dir);
     case 3: return stage3(shader_dir, out_dir);
+    case 5: return stage5(shader_dir, out_dir);
     case 6: return stage6(shader_dir, out_dir);
     case 8: return stage8(shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3|6|8 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }

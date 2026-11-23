@@ -65,7 +65,7 @@ bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out) {
         out.ps_tex_solid = read_file(dir / "ps_lanterns_tex_solid.dxbc");
         CHECK(out.ps_tex_floor.size() > 64 && out.ps_tex_solid.size() > 64);
     }
-    if (stage == 3) {
+    if (stage == 3 || stage == 5) {
         out.cs_rise = read_file(dir / "cs_lanterns_rise.dxbc");
         CHECK(out.cs_rise.size() > 64);
     }
@@ -85,7 +85,9 @@ bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out) {
     return true;
 }
 
-bool Gpu::create(const Scene& scene, const Shaders& shaders) {
+bool Gpu::create(const Scene& scene, const Shaders& shaders, DXGI_FORMAT target_format) {
+    CHECK(target_format == DXGI_FORMAT_R32G32B32A32_FLOAT || target_format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+    target_format_ = target_format;
     const std::uint32_t device_params[24] = {};
     const IID device_iid = __uuidof(ID3D12Device);
     const HRESULT created = D3D12XboxCreateDevice(nullptr, device_params, &device_iid, reinterpret_cast<void**>(&device_.p));
@@ -156,7 +158,7 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
     desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = 1;
-    desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.RTVFormats[0] = target_format_;
     desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     desc.SampleDesc.Count = 1;
     for (int floor = 0; floor < 2; ++floor)
@@ -250,7 +252,7 @@ bool Gpu::create_resources(const Scene& scene) {
     tex.Height = kHeight;
     tex.DepthOrArraySize = 1;
     tex.MipLevels = 1;
-    tex.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    tex.Format = target_format_;
     tex.SampleDesc.Count = 1;
     tex.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     CHECK(SUCCEEDED(device_->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &tex,
@@ -423,7 +425,7 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_c
     D3D12_TEXTURE_COPY_LOCATION dst{};
     dst.pResource = readback_.p;
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint = {0, {DXGI_FORMAT_R32G32B32A32_FLOAT, kWidth, kHeight, 1, kPitch}};
+    dst.PlacedFootprint = {0, {target_format_, kWidth, kHeight, 1, kPitch}};
     D3D12_TEXTURE_COPY_LOCATION src{};
     src.pResource = target_.p;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -451,8 +453,18 @@ bool Gpu::finish_frame(std::vector<Color>& pixels, Readback* readback) {
     CHECK(SUCCEEDED(readback_->Map(0, nullptr, &mapped)));
     const auto* bytes = static_cast<const std::uint8_t*>(mapped);
     pixels.resize(std::size_t(kWidth) * kHeight);
-    for (unsigned y = 0; y < kHeight; ++y)
-        std::memcpy(pixels.data() + std::size_t(y) * kWidth, bytes + y * kPitch, kWidth * sizeof(Color));
+    if (target_format_ == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        for (unsigned y = 0; y < kHeight; ++y)
+            for (unsigned x = 0; x < kWidth; ++x)
+                for (unsigned c = 0; c < 4; ++c) {
+                    std::uint16_t h;
+                    std::memcpy(&h, bytes + y * kPitch + (x * 4 + c) * 2, 2);
+                    pixels[std::size_t(y) * kWidth + x][c] = half_value(h);
+                }
+    } else {
+        for (unsigned y = 0; y < kHeight; ++y)
+            std::memcpy(pixels.data() + std::size_t(y) * kWidth, bytes + y * kPitch, kWidth * sizeof(Color));
+    }
     if (readback) {
         const auto take = [&](auto& out, std::uint64_t offset, std::size_t count) {
             out.resize(count);
