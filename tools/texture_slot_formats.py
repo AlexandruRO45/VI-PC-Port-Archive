@@ -38,7 +38,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from manifest_stream import iter_items  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from tex_headers import DXGI  # noqa: E402
-from texture_dicts import archives, check_count, inside, key64, pool_manifests, stored_hash  # noqa: E402
+from texture_dicts import (archives, check_count, inside, key64, load_object, objects,  # noqa: E402
+                           pool_manifests, stored_hash)
 
 DXGI_BY_NAME = {name: num for num, name in DXGI.items()}
 ZERO_KEY = "0" * 16
@@ -96,9 +97,8 @@ def resolvers(export, problems, coverage):
     dictionary entry)."""
     pool, pool_file, by_hash = {}, {}, {}
     for label, m in pool_manifests(export):
-        with open(m, encoding="utf-8") as f:
-            doc = json.load(f)
-        rows = doc.get("Textures") or []
+        doc = load_object(m)
+        rows = objects(doc.get("Textures"), f"{label} Textures")
         check_count(label, len(rows), doc.get("Count"), problems, coverage, "textures")
         base = os.path.dirname(m)
         for t in rows:
@@ -112,12 +112,11 @@ def resolvers(export, problems, coverage):
     for arc in archives(export):
         m = os.path.join(export, arc, "textures", "manifest.json")
         if os.path.isfile(m):
-            with open(m, encoding="utf-8") as f:
-                doc = json.load(f)
-            items = doc.get("Items") or []
+            doc = load_object(m)
+            items = objects(doc.get("Items"), f"{arc}/textures Items")
             check_count(f"{arc}/textures", len(items), doc.get("Count"), problems, coverage, "dictionaries")
             for it in items:
-                for t in it.get("Textures") or []:
+                for t in objects(it.get("Textures"), f"{arc}/textures Textures"):
                     hv = usable_hash(t, name_key=None)
                     if hv is not None:
                         by_hash.setdefault(hv, []).append(dxgi(t.get("Format")))
@@ -148,6 +147,8 @@ def census(export, only=None):
             except StopIteration as stop:
                 check_count(f"{arc}/models", rows, stop.value, problems, coverage, "models")
                 break
+            if not isinstance(item, dict):
+                raise ValueError(f"{arc}/models: model entry {rows + 1} is not an object")
             rows += 1
             # embedded textures resolve references from every archive, so they are read even when filtered out
             for t in embedded(item):
@@ -158,8 +159,8 @@ def census(export, only=None):
             if not use:
                 continue
             models += 1
-            for mat in item.get("Materials") or []:
-                for t in mat.get("Textures") or []:
+            for mat in objects(item.get("Materials"), f"{arc}/models Materials"):
+                for t in objects(mat.get("Textures"), f"{arc}/models material Textures"):
                     p = param_hash(t.get("Param"))
                     if p is None:
                         no_param += 1

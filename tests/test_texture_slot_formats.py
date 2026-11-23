@@ -274,5 +274,21 @@ class ReviewCases(unittest.TestCase):
                          (2, 0, 2, 0))
         self.assertEqual((d["formats"], d["exact_pool_without_file"]), ({}, 1))
 
+    def test_non_object_entries_exit_2(self):
+        # Flyander's #4946 pattern: entries that are not objects are input errors, not tracebacks
+        cases = [(("lv", "models", "manifest.json"), {"Items": [1]}),
+                 (("lv", "models", "manifest.json"), {"Items": [{"Materials": [7]}]}),
+                 (("lv", "models", "manifest.json"), {"Items": [{"Materials": [{"Textures": {"Param": "1"}}]}]}),
+                 (("lv", "textures", "manifest.json"), {"Items": [{"Textures": ["x"]}]}),
+                 (("ttpf", "pool1", "manifest.json"), {"Textures": [None]}),
+                 (("ttpf", "pool1", "manifest.json"), [])]
+        for rel, doc in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                exp = build_export(tmp)
+                dump(os.path.join(exp, *rel), doc)
+                code, _, err = Cli.run_main([exp])
+                self.assertEqual(code, 2, (rel, doc, err))
+                self.assertIn("invalid manifest JSON", err)
+
 if __name__ == "__main__":
     unittest.main()
