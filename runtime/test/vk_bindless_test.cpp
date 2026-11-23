@@ -107,9 +107,10 @@ std::uint32_t probe_depth(std::span<const std::uint32_t> table, const Descriptor
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv | ps_imgatomic.spv>\n");
+        std::fprintf(stderr, "usage: vk_bindless_test <vs_ids.spv> <ps_tex.spv | ps_imgatomic.spv | ps_mixed_depth_2d.spv --separate-depth-2d>\n");
         return 2;
     }
+    const bool depth_test = argc == 4 && std::strcmp(argv[3], "--separate-depth-2d") == 0;
     // A bad readback in a single channel must still fail when all three others match.
     const float black[4]{};
     for (int c = 0; c < 4; ++c) {
@@ -344,7 +345,7 @@ int main(int argc, char** argv) {
         vi.image = *image;
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vi.format = format;
-        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vi.subresourceRange = {VkImageAspectFlags(format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
         return vkCreateImageView(dev, &vi, nullptr, view);
     };
 
@@ -367,6 +368,10 @@ int main(int argc, char** argv) {
     CHECK(make_image(VK_FORMAT_R8G8B8A8_UNORM, TW, TW, sampled_usage, &gradient, &gradient_view));
     CHECK(make_image(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, sampled_usage, &decoy, &decoy_view));
     CHECK(make_image(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, sampled_usage | VK_IMAGE_USAGE_STORAGE_BIT, &stored, &stored_view));
+    VkImage depth_image = VK_NULL_HANDLE;
+    VkImageView depth_view = VK_NULL_HANDLE;
+    if (depth_test)
+        CHECK(make_image(VK_FORMAT_D32_SFLOAT, 1, 1, sampled_usage, &depth_image, &depth_view));
     std::vector<std::uint32_t> texels(TW * TW);
     for (std::uint32_t y = 0; y < TW; y++)
         for (std::uint32_t x = 0; x < TW; x++) texels[y * TW + x] = (x * 32u) | ((y * 32u) << 8) | (128u << 16) | (255u << 24);
@@ -376,11 +381,20 @@ int main(int argc, char** argv) {
     CHECK(make_buffer(4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &upload, &upload_map));
     std::memcpy(upload_map, texels.data(), texels.size() * 4);
     std::memcpy(static_cast<char*>(upload_map) + 1024, &orange, 4);
+    const float test_depth = 0.75f;
+    std::memcpy(static_cast<char*>(upload_map) + 1028, &test_depth, sizeof(test_depth));
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VkSampler nearest;
     CHECK(vkCreateSampler(dev, &sci, nullptr, &nearest));
+
+    VkSampler depth_sampler = VK_NULL_HANDLE;
+    if (depth_test) {
+        sci.compareEnable = VK_TRUE;
+        sci.compareOp = VK_COMPARE_OP_LESS;
+        CHECK(vkCreateSampler(dev, &sci, nullptr, &depth_sampler));
+    }
 
     // Render target, pass and framebuffer.
     constexpr VkFormat target_format = VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -487,19 +501,20 @@ int main(int argc, char** argv) {
     const struct { VkImage image; std::uint32_t size; VkDeviceSize offset; VkImageLayout layout; } uploads[] = {
         {gradient, TW, 0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {decoy, 1, 1024, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {stored, 1, 0, VK_IMAGE_LAYOUT_GENERAL}};
+        {stored, 1, 0, VK_IMAGE_LAYOUT_GENERAL}, {depth_image, 1, 1028, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     for (const auto& u : uploads) {
+        if (!u.image) continue;
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         ib.image = u.image;
-        ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        ib.subresourceRange = {VkImageAspectFlags(u.image == depth_image ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
         ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
         VkBufferImageCopy c{};
         c.bufferOffset = u.offset;
-        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.imageSubresource = {ib.subresourceRange.aspectMask, 0, 0, 1};
         c.imageExtent = {u.size, u.size, 1};
         vkCmdCopyBufferToImage(cmd, upload, u.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
         ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -578,12 +593,13 @@ int main(int argc, char** argv) {
     const int configuration_count = (device_flags.update_after_bind || device_flags.partially_bound) ? 2 : 1;
     for (int configuration = 0; configuration < configuration_count; ++configuration) {
         BindlessFeatures flags = configurations[configuration];
+        flags.separate_depth_2d = depth_test;
         flags.ms_samples[0] = VK_SAMPLE_COUNT_4_BIT;
         // A device below the default counts gets a smaller set; this test needs at least those.
         const bool full = bindless::size_bindings(flags, props.properties.limits, props11, props12);
         const char* name = flags.update_after_bind && flags.partially_bound ? "update after bind, partially bound"
                            : flags.update_after_bind ? "update after bind" : flags.partially_bound ? "partially bound" : "no flags";
-        if (!full || !fits(flags)) {
+        if ((!full && !depth_test) || !fits(flags) || (depth_test && flags.counts[0] < 4)) {
             std::printf("%s: skipped, the set does not fit this device's descriptor limits\n", name);
             continue;
         }
@@ -644,7 +660,7 @@ int main(int argc, char** argv) {
         CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipeline));
 
         // One draw and read back. The first also initialises the set's fallback images.
-        const auto draw = [&]() {
+        const auto draw = [&](float reference = 0.0f) {
             vkResetCommandBuffer(cmd, 0);
             VkResult r = vkBeginCommandBuffer(cmd, &begin);
             if (r) return r;
@@ -662,6 +678,10 @@ int main(int argc, char** argv) {
             const VkDescriptorSet bound = set.set();
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, &bound, 0, nullptr);
             std::uint32_t block[36] = {};
+            if (depth_test) {
+                block[0] = table_va;
+                std::memcpy(&block[5], &reference, sizeof(reference));
+            }
             block[2] = table_va;  // s2:s3 = console VA of the descriptor table
             block[32] = std::uint32_t(heap_base);
             block[33] = std::uint32_t(heap_base >> 32);
@@ -695,6 +715,42 @@ int main(int argc, char** argv) {
         EXPECT(stored_index >= 1 && stored_index < set.storage_capacity(ImageDimension::dim_2d));
         EXPECT(decoy_index >= set.storage_capacity(ImageDimension::dim_2d) && gradient_index > decoy_index);
         EXPECT(gradient_index < set.image_capacity(ImageDimension::dim_2d));
+        EXPECT(set.free_samplers() == set.sampler_capacity() - 1);
+        const std::uint32_t decoy_sampler = set.add_sampler(nearest);
+        const std::uint32_t sampler_index = set.add_sampler(nearest);
+        EXPECT(decoy_sampler == 1 && sampler_index == 2 && set.free_samplers() == set.sampler_capacity() - 3);
+
+        if (depth_test) {
+            // Use a non-gray 1x1 color, a separate D32 image, and their actual sampler types. A hash miss and a
+            // color-only 2D index both select the depth-zero fallback in binding 29.
+            const DescriptorKey shadow_key{0x1001, 0, 0, 0, 0, 0, 0, 0};
+            const std::uint32_t color_s[4]{0x92, 0xc00000, 0x14500000, 0};
+            const std::uint32_t compare_s[4]{0x3092, 0xc00000, 0x14500000, 0};
+            std::memcpy(static_cast<char*>(heap_map) + table_va + 32, shadow_key.data(), 32);
+            const auto shadow_index = set.add_image(ImageDimension::dim_2d, depth_view,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, {}, 0, true);
+            const auto compare_index = set.add_sampler(depth_sampler);
+            EXPECT(shadow_index && compare_index);
+            set.insert_key(tsharp, decoy_index);
+            set.insert_key(make_ssharp_key(color_s), sampler_index);
+            set.insert_key(make_ssharp_key(compare_s), compare_index);
+            set.insert_key(shadow_key, shadow_index);
+            EXPECT(flush());
+            const float pass_shadow[4]{1.0f, 128.0f / 255.0f, 0.0f, 1.0f};
+            const float fail_shadow[4]{1.0f, 128.0f / 255.0f, 0.0f, 0.0f};
+            CHECK(draw(0.5f)); compare("LESS passes", pass_shadow);
+            CHECK(draw(0.875f)); compare("LESS fails", fail_shadow);
+            set.update_image(ImageDimension::dim_2d, shadow_index, decoy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            EXPECT(flush());
+            CHECK(draw(0.5f)); compare("updated to color uses depth fallback", fail_shadow);
+            EXPECT(set.erase_key(shadow_key) && flush());
+            CHECK(draw(0.5f)); compare("missing depth key", fail_shadow);
+            ++runs;
+            vkDestroyPipeline(dev, pipeline, nullptr);
+            vkDestroyPipelineLayout(dev, pipeline_layout, nullptr);
+            continue;
+        }
+
         std::vector<std::uint32_t> filled;
         for (std::uint32_t i = 1; i < set.image_capacity(ImageDimension::dim_1d); ++i)
             filled.push_back(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL));
@@ -705,10 +761,6 @@ int main(int argc, char** argv) {
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 7);
         for (const std::uint32_t index : filled) set.remove_image(ImageDimension::dim_1d, index);
         EXPECT(set.free_images(ImageDimension::dim_1d) == set.image_capacity(ImageDimension::dim_1d) - 1);
-        EXPECT(set.free_samplers() == set.sampler_capacity() - 1);
-        const std::uint32_t decoy_sampler = set.add_sampler(nearest);
-        const std::uint32_t sampler_index = set.add_sampler(nearest);
-        EXPECT(decoy_sampler == 1 && sampler_index == 2 && set.free_samplers() == set.sampler_capacity() - 3);
 
         if (atomic_mode) {
             // ps_imgatomic.asm: image_atomic_umax/umin/or on three 8x8 r32ui images and umax on a 4x4x4 one, from
@@ -1051,6 +1103,9 @@ int main(int argc, char** argv) {
     vkDestroyRenderPass(dev, pass, nullptr);
     vkDestroyShaderModule(dev, fs, nullptr);
     vkDestroyShaderModule(dev, vs, nullptr);
+    if (depth_sampler) vkDestroySampler(dev, depth_sampler, nullptr);
+    if (depth_view) vkDestroyImageView(dev, depth_view, nullptr);
+    if (depth_image) vkDestroyImage(dev, depth_image, nullptr);
     vkDestroySampler(dev, nearest, nullptr);
     for (const auto view : {target_view, stored_view, decoy_view, gradient_view})
         vkDestroyImageView(dev, view, nullptr);

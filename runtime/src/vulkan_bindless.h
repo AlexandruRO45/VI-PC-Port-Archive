@@ -11,6 +11,7 @@
 //   dimension: 0 = 2D, 1 = 2D array, 2 = 3D, 3 = 1D (the translator's STORE_DIMS); class: 0 = float, 1 = uint, 2 = sint.
 //   bindings 20/21: sampled multisample 2D images / 2D arrays, 256 each (runtime SRVs).
 //   bindings 22/23 and 24/25 are their UINT and SINT equivalents on devices supporting those classes.
+//   binding 29: optional depth-comparison views at the same 2D indices as binding 0; fallback depth is zero.
 // These are the default counts (BindlessFeatures::counts). size_bindings() sizes the 2D, sampler and storage arrays
 // from the device's limits instead; the shaders declare runtime arrays, so any count works for them.
 //
@@ -67,7 +68,7 @@ struct StorageViews {
 };
 
 namespace bindless {
-inline constexpr std::uint32_t binding_count = 26;
+inline constexpr std::uint32_t binding_count = 30;
 constexpr std::array<std::uint32_t, binding_count> default_counts();
 } // namespace bindless
 
@@ -79,6 +80,7 @@ struct BindlessFeatures {
         VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT};
     // Descriptors in each binding, by binding number: bindless::bindings by default, or what size_bindings() chose.
     std::array<std::uint32_t, bindless::binding_count> counts = bindless::default_counts();
+    bool separate_depth_2d = false;
 };
 
 namespace bindless {
@@ -91,10 +93,13 @@ struct Binding {
 inline constexpr std::uint32_t table_binding = 2;
 inline constexpr std::uint32_t sampler_binding = 1;
 inline constexpr std::uint32_t first_ms_binding = 20;
+inline constexpr std::uint32_t depth_2d_binding = 29;
 inline constexpr std::uint32_t no_binding = 0xffffffffu;
+// Binding 29's fallback: 1x1, sampled and cleared to depth 0, seen only through a depth-aspect view.
+inline constexpr VkFormat depth_2d_fallback_format = VK_FORMAT_D32_SFLOAT;
 
 // Indexed by binding number.
-inline constexpr std::array<Binding, 26> bindings = {{
+inline constexpr std::array<Binding, binding_count> bindings = {{
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
@@ -108,6 +113,8 @@ inline constexpr std::array<Binding, 26> bindings = {{
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
+    {}, {}, {}, // 26..28 reserved for other proposed typed resources.
+    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096},
 }};
 
 static_assert(bindings.size() == binding_count);
@@ -118,8 +125,12 @@ constexpr std::array<std::uint32_t, binding_count> default_counts() {
     return counts;
 }
 
+// False at binding_count and past, so ms_samples is indexed only by the three MS pairs.
 constexpr bool binding_enabled(std::uint32_t binding, const BindlessFeatures& features) {
-    return binding < first_ms_binding || features.ms_samples[(binding - first_ms_binding) / 2] != VK_SAMPLE_COUNT_1_BIT;
+    if (binding < first_ms_binding) return true;
+    if (binding == depth_2d_binding) return features.separate_depth_2d;
+    if (binding >= first_ms_binding + 2 * features.ms_samples.size()) return false;
+    return features.ms_samples[(binding - first_ms_binding) / 2] != VK_SAMPLE_COUNT_1_BIT;
 }
 
 // Every binding is visible to every shader stage. Preserve the single-sample layout on devices whose
@@ -131,6 +142,10 @@ constexpr void limit_ms_bindings(BindlessFeatures& features, std::uint32_t sampl
     for (std::uint32_t b = 0; b < first_ms_binding; ++b) {
         if (bindings[b].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) sampled += counts[b];
         if (bindings[b].type != VK_DESCRIPTOR_TYPE_SAMPLER) total += counts[b];
+    }
+    if (features.separate_depth_2d) {  // binding 29 is visible to every stage too
+        sampled += counts[depth_2d_binding];
+        total += counts[depth_2d_binding];
     }
     for (std::uint32_t c = 0; c < features.ms_samples.size(); ++c) {
         if (features.ms_samples[c] == VK_SAMPLE_COUNT_1_BIT) continue;
@@ -212,7 +227,8 @@ inline constexpr std::uint32_t growth_headroom = 64;
 //   3. Growth towards the maximums above, in the same order, within maxPerSetDescriptors. That limit only says
 //      what is sure to work (vkGetDescriptorSetLayoutSupport may allow more), so it never shrinks step 1.
 // A storage array holds the smaller of the storage count and its dimension's images: add_image never gives a
-// storage view an index past the sampled array. The other bindings keep their default counts.
+// storage view an index past the sampled array. Binding 29, when enabled, always has the 2D images' count and counts
+// against the same limits. The other bindings keep their default counts.
 // layout_supported, when given, answers vkGetDescriptorSetLayoutSupport for set 0 at the counts in its argument:
 // step 3 then also grows past maxPerSetDescriptors where the device says the layout works (Intel's Xe-LP reports
 // 6159 and supports the full sizes, D3D-219). It is asked only once the sum is above maxPerSetDescriptors.
@@ -244,6 +260,7 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     // take descriptors away.
     const auto apply = [&](bool final) {
         counts[sampled_binding(ImageDimension::dim_2d)] = images;
+        if (features.separate_depth_2d) counts[depth_2d_binding] = images;  // binding 0's indices exactly
         counts[sampler_binding] = samplers;
         for (std::uint32_t d = 0; d < 4; ++d) {
             const auto dimension = ImageDimension(d);
@@ -253,8 +270,7 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
             if (r32ui_binding(dimension) != no_binding) counts[r32ui_binding(dimension)] = held;
         }
     };
-    const auto fits = [&](std::uint32_t headroom, std::uint64_t set_limit) {
-        apply(false);
+    const auto layout_fits = [&](std::uint32_t headroom, std::uint64_t set_limit) {
         std::uint64_t sampled = 0, sampler = 0, stored = 0, buffers = 0;
         for (std::uint32_t b = 0; b < binding_count; ++b) {
             if (!binding_enabled(b, features)) continue;
@@ -275,7 +291,8 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
         std::uint32_t low = n;
         while (low < high) {
             n = low + (high - low + 1) / 2;
-            if (fits(headroom, set_limit)) low = n;
+            apply(false);
+            if (layout_fits(headroom, set_limit)) low = n;
             else high = n - 1;
         }
         n = low;
@@ -303,6 +320,28 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     grow(images, std::max(images, max_2d_images), growth_headroom, set_limit);
     grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
     apply(true);
+    if (features.separate_depth_2d) {
+        // The extra sampled array must also fit the device's total set limit. On small sets, shrink every
+        // array together: fixed-size 2D-array/3D/1D bindings alone can exceed maxPerSetDescriptors.
+        // If the fixed dimension tables never fit, grow() could not leave room for even one real 2D image.
+        // Start from the default proportions and reduce them instead of retaining a fallback-only table.
+        if (images == 1) counts = default_counts();
+        bool shrunk = false;
+        while (!layout_fits(0, v11.maxPerSetDescriptors)) {
+            bool changed = false;
+            for (auto& count : counts) {
+                if (count < 2) continue;
+                count = (count + 1) / 2;
+                changed = true;
+            }
+            shrunk = true;
+            if (!changed) {
+                counts[depth_2d_binding] = 0; // Even one descriptor per binding exceeds a device limit.
+                return false;
+            }
+        }
+        return full && !shrunk;
+    }
     return full;
 }
 
@@ -313,7 +352,8 @@ public:
     BindlessSet(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
                 BindlessFeatures features = {})
         : device_(device), memory_(memory), features_(features) {
-        ok_ = vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffers() && fill();
+        ok_ = (!features_.separate_depth_2d || features_.counts[bindless::depth_2d_binding] != 0) &&
+              vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffers() && fill();
     }
 
     ~BindlessSet() {
@@ -333,6 +373,7 @@ public:
     BindlessSet& operator=(const BindlessSet&) = delete;
 
     bool ok() const { return ok_; }
+    bool has_separate_depth_2d() const { return features_.separate_depth_2d; }
     bool supports_ms_class(std::uint32_t component_class) const {
         return component_class < classes && features_.ms_samples[component_class] != VK_SAMPLE_COUNT_1_BIT;
     }
@@ -373,15 +414,21 @@ public:
             barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.image = image.image;
-            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            barrier.subresourceRange = {image.aspect, 0, 1, 0, 1};
             barriers.push_back(barrier);
         }
         vk_.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
                                  nullptr, 0, nullptr, std::uint32_t(barriers.size()), barriers.data());
         const VkClearColorValue zero{};
-        for (const auto& barrier : barriers)
-            vk_.vkCmdClearColorImage(command_buffer, barrier.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1,
-                                     &barrier.subresourceRange);
+        const VkClearDepthStencilValue depth_zero{0.0f, 0};
+        for (const auto& barrier : barriers) {
+            if (barrier.subresourceRange.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT)
+                vk_.vkCmdClearColorImage(command_buffer, barrier.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1,
+                                         &barrier.subresourceRange);
+            else  // binding 29's D32 fallback
+                vk_.vkCmdClearDepthStencilImage(command_buffer, barrier.image, VK_IMAGE_LAYOUT_GENERAL, &depth_zero, 1,
+                                                &barrier.subresourceRange);
+        }
         VkMemoryBarrier done{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         done.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         done.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -392,32 +439,35 @@ public:
     // Gives an image an index in its dimension's bindings: 0 when the dimension is full. `sampled` goes to the
     // sampled array in `sampled_layout` (the layout the image is in when shaders read it); the storage views go to
     // the storage arrays in GENERAL. For MS views, sampled_class selects the float, uint or sint sampled array.
+    // depth: `sampled` is a depth-aspect view (created with VK_IMAGE_ASPECT_DEPTH_BIT alone); with separate_depth_2d
+    // it also goes to binding 29 at the same 2D index, which otherwise keeps the D32 fallback. Ignored for the other
+    // dimensions and without separate_depth_2d.
     // The caller maps the T# to the index with insert_key(). Takes effect at flush().
     std::uint32_t add_image(ImageDimension dimension, VkImageView sampled, VkImageLayout sampled_layout,
-                            const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
+                            const StorageViews& storage = {}, std::uint32_t sampled_class = 0, bool depth = false) {
         const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui;
         if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class))) return 0;
         auto& used = image_used_[std::uint32_t(dimension)];
         const std::uint32_t low_end = std::min(std::uint32_t(used.size()), storage_capacity(dimension));
         std::uint32_t index = stores ? 0 : allocate(used, low_end, std::uint32_t(used.size()));
         if (!index) index = allocate(used, 1, low_end);
-        if (index) write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
+        if (index) write_image(dimension, index, sampled, sampled_layout, storage, sampled_class, depth);
         return index;
     }
 
     // New views or a new layout for an index add_image returned (a texture's state changed, say).
     void update_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
-                      const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
+                      const StorageViews& storage = {}, std::uint32_t sampled_class = 0, bool depth = false) {
         const auto& used = image_used_[std::uint32_t(dimension)];
         if (index && index < used.size() && used[index])
-            write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
+            write_image(dimension, index, sampled, sampled_layout, storage, sampled_class, depth);
     }
 
     // Returns the index to the fallback and frees it. The caller removes the image's keys with erase_key() first.
     void remove_image(ImageDimension dimension, std::uint32_t index) {
         auto& used = image_used_[std::uint32_t(dimension)];
         if (!index || index >= used.size() || !used[index]) return;
-        write_image(dimension, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {}, 0);
+        write_image(dimension, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {}, 0, false);
         used[index] = 0;
     }
 
@@ -517,7 +567,7 @@ private:
     X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory)              \
     X(vkFreeMemory) X(vkMapMemory) X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements)          \
     X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler)     \
-    X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdUpdateBuffer) X(vkCmdClearColorImage)
+    X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdUpdateBuffer) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage)
 #define LEONIDA_BINDLESS_MEMBER(name) PFN_##name name = nullptr;
         LEONIDA_BINDLESS_FUNCTIONS(LEONIDA_BINDLESS_MEMBER)
 #undef LEONIDA_BINDLESS_MEMBER
@@ -537,6 +587,7 @@ private:
     struct FallbackImage {
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;  // what record_fallback_init moves and clears
     };
 
     struct TableBuffer {
@@ -559,6 +610,7 @@ private:
     };
 
     static constexpr std::uint32_t dimensions = 6, classes = 3;
+    static constexpr std::uint32_t depth_fallback = 4 * classes;  // binding 29's image in fallback_images_
 
     // The first free index in [begin, end), marked used; 0 when there is none.
     static std::uint32_t allocate(std::vector<std::uint8_t>& used, std::uint32_t begin, std::uint32_t end) {
@@ -605,7 +657,22 @@ private:
         return true;
     }
 
-    // One 1x1 image for each image type and component class, and the views of them every binding needs.
+    // Creates one fallback image and binds memory to it.
+    bool create_fallback_image(const VkImageCreateInfo& info, VkImageAspectFlags aspect, FallbackImage& image) {
+        image.aspect = aspect;
+        if (vk_.vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vk_.vkGetImageMemoryRequirements(device_, image.image, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = memory_type(requirements.memoryTypeBits, 0);
+        return allocation.memoryTypeIndex != 0xffffffffu &&
+               vk_.vkAllocateMemory(device_, &allocation, nullptr, &image.memory) == VK_SUCCESS &&
+               vk_.vkBindImageMemory(device_, image.image, image.memory, 0) == VK_SUCCESS;
+    }
+
+    // One 1x1 image for each image type and component class, and the views of them every binding needs; with
+    // separate_depth_2d also a D32 image and its depth view for binding 29.
     bool create_fallbacks() {
         // Each MS class shares one sampled-only fallback between its 2D and 2D-array views.
         constexpr VkImageType types[] = {VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D, VK_IMAGE_TYPE_1D, VK_IMAGE_TYPE_2D};
@@ -629,16 +696,7 @@ private:
                 info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
                 if (t != ms_type) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
                 if (t == ms_type || c == 0) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-                FallbackImage& image = fallback_images_[t * classes + c];
-                if (vk_.vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) return false;
-                VkMemoryRequirements requirements{};
-                vk_.vkGetImageMemoryRequirements(device_, image.image, &requirements);
-                VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                allocation.allocationSize = requirements.size;
-                allocation.memoryTypeIndex = memory_type(requirements.memoryTypeBits, 0);
-                if (allocation.memoryTypeIndex == 0xffffffffu ||
-                    vk_.vkAllocateMemory(device_, &allocation, nullptr, &image.memory) != VK_SUCCESS ||
-                    vk_.vkBindImageMemory(device_, image.image, image.memory, 0) != VK_SUCCESS)
+                if (!create_fallback_image(info, VK_IMAGE_ASPECT_COLOR_BIT, fallback_images_[t * classes + c]))
                     return false;
             }
         }
@@ -661,6 +719,27 @@ private:
                 const auto r32ui_at = bindless::r32ui_binding(dimension);
                 if (c == 1 && r32ui_at != bindless::no_binding) fallback_by_binding_[r32ui_at] = view;
             }
+        }
+        if (features_.separate_depth_2d) {
+            VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            info.imageType = VK_IMAGE_TYPE_2D;
+            info.format = bindless::depth_2d_fallback_format;
+            info.extent = {1, 1, 1};
+            info.mipLevels = 1;
+            info.arrayLayers = 1;
+            info.samples = VK_SAMPLE_COUNT_1_BIT;
+            info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            FallbackImage& image = fallback_images_[depth_fallback];
+            if (!create_fallback_image(info, VK_IMAGE_ASPECT_DEPTH_BIT, image)) return false;
+            VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            view_info.image = image.image;
+            view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            view_info.format = info.format;
+            view_info.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            VkImageView view = VK_NULL_HANDLE;
+            if (vk_.vkCreateImageView(device_, &view_info, nullptr, &view) != VK_SUCCESS) return false;
+            fallback_views_.push_back(view);
+            fallback_by_binding_[bindless::depth_2d_binding] = view;
         }
         VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
@@ -894,7 +973,7 @@ private:
 
     // Queues every binding of the dimension at `index`: the given views, or the fallback where one is null.
     void write_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
-                     const StorageViews& storage, std::uint32_t sampled_class) {
+                     const StorageViews& storage, std::uint32_t sampled_class, bool depth) {
         if (bindless::multisampled(dimension)) {
             for (std::uint32_t c = 0; c < classes; ++c) {
                 if (!supports_ms_class(c)) continue;
@@ -908,6 +987,11 @@ private:
         const std::uint32_t sampled_at = bindless::sampled_binding(dimension);
         queue(sampled_at, index,
               sampled ? VkDescriptorImageInfo{VK_NULL_HANDLE, sampled, sampled_layout} : fallback_info(sampled_at));
+        // Binding 29 takes only depth views; any other image leaves the D32 fallback at its index.
+        if (dimension == ImageDimension::dim_2d && features_.separate_depth_2d)
+            queue(bindless::depth_2d_binding, index,
+                  sampled && depth ? VkDescriptorImageInfo{VK_NULL_HANDLE, sampled, sampled_layout}
+                                   : fallback_info(bindless::depth_2d_binding));
         const auto store = [&](std::uint32_t binding, VkImageView view) {
             if (binding == bindless::no_binding || index >= features_.counts[binding]) return;
             queue(binding, index,
@@ -927,7 +1011,7 @@ private:
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkDescriptorSet set_ = VK_NULL_HANDLE;
-    std::array<FallbackImage, 4 * classes> fallback_images_{};  // [2D, 3D, 1D, 2D MS][class]
+    std::array<FallbackImage, 4 * classes + 1> fallback_images_{};  // [2D, 3D, 1D, 2D MS][class], then binding 29's
     std::vector<VkImageView> fallback_views_;
     std::array<VkImageView, bindless::bindings.size()> fallback_by_binding_{};
     VkSampler fallback_sampler_ = VK_NULL_HANDLE;

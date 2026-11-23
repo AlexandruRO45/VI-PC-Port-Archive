@@ -980,7 +980,13 @@ struct DeviceState {
             if (storage_format == VK_FORMAT_R32_UINT) views.r32ui = entry.storage;
         }
         // Every state a shader can read or write the texture in is GENERAL (ResourceBinding::sampled_in_general).
-        entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class);
+        // A depth-aspect view also fills set 0's comparison binding at the same index when it has one
+        // (LEONIDA_SEPARATE_DEPTH_2D); colour and stencil views leave the fallback there.
+        const bool depth_view = bindless->has_separate_depth_2d() && dimension == leonida::ImageDimension::dim_2d &&
+                                view_info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT &&
+                                (optimal_features(view_format) & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT);
+        entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class,
+                                          depth_view);
         if (!entry.index) {
             log_once("a bindless image array is full; dimension", int(dimension));
             vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
@@ -1082,6 +1088,16 @@ struct DeviceState {
         sampler_entries.emplace(key, vk_sampler);
         bindless->insert_key(key, index);
         return true;
+    }
+
+    VkFormatFeatureFlags2 optimal_features(VkFormat format) const {
+        const auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceFormatProperties2"));
+        if (!query) return 0;
+        VkFormatProperties3 p3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+        VkFormatProperties2 p2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &p3};
+        query(info.physical, format, &p2);
+        return p3.optimalTilingFeatures;
     }
 
     // An optimal-tiling image of this format can take VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT.
@@ -2636,6 +2652,10 @@ public:
                                  stage.entry->name.c_str());
                     return E_NOTIMPL;
                 }
+                if (stage.entry->uses_separate_depth_2d && !device_.bindless->has_separate_depth_2d()) {
+                    std::fprintf(stderr, "[rt] d3d12: %s requires LEONIDA_SEPARATE_DEPTH_2D=1\n", stage.entry->name.c_str());
+                    return E_NOTIMPL;
+                }
                 uses_bindless = true;
             }
             if (stage.entry->uses_code_base) {
@@ -3027,6 +3047,10 @@ public:
         if (entry->binding_count && !device_.bindless) {
             std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
                          entry->name.c_str());
+            return E_NOTIMPL;
+        }
+        if (entry->uses_separate_depth_2d && !device_.bindless->has_separate_depth_2d()) {
+            std::fprintf(stderr, "[rt] d3d12: %s requires LEONIDA_SEPARATE_DEPTH_2D=1\n", entry->name.c_str());
             return E_NOTIMPL;
         }
         // SHADER-309: a module over the device's maxComputeSharedMemorySize is invalid usage that spirv-val accepts
@@ -4213,8 +4237,23 @@ public:
         leonida::BindlessFeatures features{};
         features.update_after_bind = true;  // VulkanDeviceInfo::bindless promises it
         features.partially_bound = state_.info.bindless_partially_bound;
+        // LEONIDA_SEPARATE_DEPTH_2D=1: binding 29, the depth views of 2D images for Dref sampling beside colour reads
+        // (vulkan_bindless.h). Its fallback must be sampled and cleared; without that, set 0 is not made at all rather
+        // than made without the binding that shaders translated for it declare.
+        char separate_depth[4]{};
+        std::size_t length = 0;
+        if (getenv_s(&length, separate_depth, "LEONIDA_SEPARATE_DEPTH_2D") == 0 && !std::strcmp(separate_depth, "1")) {
+            const auto required = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT |
+                                  VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+            if ((state_.optimal_features(leonida::bindless::depth_2d_fallback_format) & required) != required) {
+                std::fprintf(stderr, "[rt] d3d12: binding 29 requires D32_SFLOAT depth comparison and transfer clear\n");
+                return false;
+            }
+            features.separate_depth_2d = true;
+        }
         const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
             state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
+        if (!get_properties && features.separate_depth_2d) return false;
         if (get_properties) {
             VkPhysicalDeviceVulkan12Properties indexed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
             VkPhysicalDeviceVulkan11Properties v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &indexed};
@@ -4233,7 +4272,7 @@ public:
             VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
             VkPhysicalDeviceProperties2 driver_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
             get_properties(state_.info.physical, &driver_properties);
-            if (driver.driverID == VK_DRIVER_ID_MOLTENVK)
+            if (driver.driverID == VK_DRIVER_ID_MOLTENVK && !features.separate_depth_2d)
                 layout_supported = [](const leonida::BindlessFeatures&) { return true; };
             else if (layout_support)
                 layout_supported = [&](const leonida::BindlessFeatures& candidate) {
@@ -4256,6 +4295,9 @@ public:
                      features.counts[b::sampled_binding(leonida::ImageDimension::dim_3d)],
                      features.counts[b::sampled_binding(leonida::ImageDimension::dim_1d)],
                      features.counts[b::storage_binding(leonida::ImageDimension::dim_2d, 0)]);
+        if (features.separate_depth_2d)
+            std::fprintf(stderr, "[rt] d3d12: bindless set: %u 2D depth views at binding %u (LEONIDA_SEPARATE_DEPTH_2D)\n",
+                         features.counts[b::depth_2d_binding], b::depth_2d_binding);
         // D3D12 promises a shader holds a full shader-visible sampler heap. Past this many distinct S#s, CreateSampler
         // logs that the array is full and a shader reads the fallback (clamping) sampler.
         if (features.counts[b::sampler_binding] < D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE + 1)

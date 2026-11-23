@@ -100,6 +100,8 @@ def cs_fssm_extra(path):
 
 
 def shader_source(name):
+    if name == "ps_mixed_depth_2d":
+        return "../fixtures/ps_mixed_depth_2d"
     if name == "ps_mullit":
         return "../../../tests/semantic/fixtures/ps_mullit"
     return "vs_clip" if name in CLIP_CASES else name
@@ -160,6 +162,10 @@ def translate_tests(work, names):
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
+    if os.environ.get("LEONIDA_SEPARATE_DEPTH_2D") == "1":
+        cmd.append("--separate-depth-2d")
+    if os.environ.get("LEONIDA_NO_FLOAT_CONTROLS") == "1":
+        cmd.append("--no-float-controls")
     if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
         cmd.append("--wave64-emulate")
     if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
@@ -187,7 +193,7 @@ def main():
     available = sorted({p.stem for p in Path(HERE).glob("*.asm")} | CLIP_CASES.keys())
     names = sys.argv[2:] or available
     # mullit_readback.py uses the CPU semantic fixture as an explicit build target.
-    unknown = sorted(set(names) - set(available) - {"ps_mullit"})
+    unknown = sorted(set(names) - set(available) - {"ps_mullit", "ps_mixed_depth_2d"})
     if unknown:
         sys.exit("Unknown test shaders: " + ", ".join(unknown))
     skipped = [n for n in names if n.startswith("ms_")]

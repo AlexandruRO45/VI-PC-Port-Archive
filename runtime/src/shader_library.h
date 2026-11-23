@@ -622,6 +622,7 @@ struct ShaderEntry {
     std::string fssm_sha256;
     std::string fspx_code_sha256;   // an FSPX program (docs/fspx.md): the SHA-256 of its kind-6 bytes
     std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)
+    bool uses_separate_depth_2d = false;
     std::size_t binding_count = 0;  // set-0 bindings the module declares
     std::uint32_t push_constant_bytes = 0;
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
@@ -777,7 +778,11 @@ private:
             if (by_fspx) e.fspx_code_sha256 = code_hash->string;
             if (const Json* s = meta.find("fspx_state_sha256"); s && s->kind == Json::Kind::string)
                 e.fspx_state_sha256 = s->string;
-            if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
+            if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) {
+                e.binding_count = b->array.size();
+                for (const auto& binding : b->array)
+                    if (binding.kind == Json::Kind::number && binding.number == 29) e.uses_separate_depth_2d = true;
+            }
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
             e.lds_bytes = u32(meta.find("lds_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)

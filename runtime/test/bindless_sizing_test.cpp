@@ -219,6 +219,56 @@ int main() {
                storage(f, D::dim_2d) == 256);
     }
 
+    // separate_depth_2d (LEONIDA_SEPARATE_DEPTH_2D): binding 29 is in the layout only when asked for, holds exactly
+    // the 2D images' indices and counts against the same limits; binding_enabled stays in bounds past the MS pairs.
+    {
+        constexpr auto depth = bindless::depth_2d_binding;
+        static_assert(depth == bindless::binding_count - 1 &&
+                      bindless::bindings[depth].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && defaults[depth] == defaults[0]);
+        BindlessFeatures off = with_ms(true), on = with_ms(true);
+        on.separate_depth_2d = true;
+        EXPECT(!bindless::binding_enabled(depth, off) && bindless::binding_enabled(depth, on));
+        EXPECT(!bindless::binding_enabled(bindless::binding_count, on) &&
+               !bindless::binding_enabled(bindless::no_binding, on));
+        const Device big = uniform(1048576, 1048576);
+        EXPECT(bindless::size_bindings(off, big.limits, big.v11, big.v12));
+        EXPECT(bindless::size_bindings(on, big.limits, big.v11, big.v12));
+        EXPECT(off.counts[depth] == defaults[depth]);
+        EXPECT(on.counts[depth] == count(on, D::dim_2d) && count(on, D::dim_2d) == bindless::max_2d_images);
+        for (std::uint32_t b = 0; b < bindless::binding_count; ++b)
+            if (b != depth) EXPECT(on.counts[b] == off.counts[b]);
+        EXPECT(on.ms_samples == off.ms_samples && storage_consistent(on));
+        EXPECT(bindless::SetLayout(on).info.bindingCount == bindless::SetLayout(off).info.bindingCount + 1);
+        {
+            const bindless::SetLayout layout(on);
+            const auto& last = layout.entries[layout.info.bindingCount - 1];
+            EXPECT(last.binding == depth && last.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
+                   last.descriptorCount == count(on, D::dim_2d));
+        }
+
+        Device small_set = big;
+        small_set.v11.maxPerSetDescriptors = 1212;
+        BindlessFeatures limited = with_ms(true);
+        limited.separate_depth_2d = true;
+        EXPECT(!bindless::size_bindings(limited, small_set.limits, small_set.v11, small_set.v12,
+                                       [](const BindlessFeatures&) { return false; }));
+        EXPECT(totals(limited).all <= 1212 && limited.counts[depth] == count(limited, D::dim_2d) &&
+               limited.counts[depth] > 1 && storage_consistent(limited));
+
+        // At today's sampled-image limit the second array halves the 2D images instead of overrunning the limit,
+        // and leaves no room for MS pairs.
+        Device d = uniform(1048576, 1048576);
+        d.v12.maxPerStageDescriptorUpdateAfterBindSampledImages = 5632;
+        d.v12.maxPerStageDescriptorUpdateAfterBindSamplers = 1024;
+        d.v12.maxPerStageDescriptorUpdateAfterBindStorageImages = 3584;
+        BindlessFeatures f = with_ms(true);
+        f.separate_depth_2d = true;
+        EXPECT(!bindless::size_bindings(f, d.limits, d.v11, d.v12));
+        EXPECT(count(f, D::dim_2d) == 2048 && f.counts[depth] == 2048 && totals(f).sampled <= 5632);
+        EXPECT(f.ms_samples == (std::array{VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT}));
+        EXPECT(storage_consistent(f));
+    }
+
     // The default features are today's counts, which the device-less users (vk_image_fuzz) still get.
     EXPECT(BindlessFeatures{}.counts == defaults);
     std::printf("bindless sizing: synthetic limits gave the expected counts\n");

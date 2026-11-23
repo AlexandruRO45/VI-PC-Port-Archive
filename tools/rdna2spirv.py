@@ -66,6 +66,7 @@ FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
+SEPARATE_DEPTH_2D = False
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
@@ -235,6 +236,7 @@ class Gen:
         self.uses_tex = False
         self.uses_subgroup = False
         self.uses_tex_array = False
+        self.uses_depth_2d = False
         self.uses_storage = False
         self.uses_query = False
         self.uses_tex_1d = False
@@ -10037,6 +10039,10 @@ class Gen:
         if dim not in kinds:
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         itype, iarr, stype, ncoord, iptr = kinds[dim]
+        if SEPARATE_DEPTH_2D and ncoord == 2 and op.removesuffix("_o") in ("image_sample_c_lz", "image_sample_c_l"):
+            # Metal arrays have one texture type. A Dref on the color table turns every RGBA sample into a scalar.
+            self.uses_depth_2d = True
+            itype, iarr, stype, iptr = "depth2d", "%depth_images", "sampled_depth2d", "_ptr_UC_depth2d"
         is3d = ncoord == -3          # 3D: three real coordinates (and 3-component gradients)
         if is3d:
             ncoord = 3
@@ -11909,6 +11915,8 @@ def assemble(gen):
         iface += ["%images", "%samplers", "%desc_map"] + (["%images_arr"] if gen.uses_tex_array else []) + \
                  (["%simages"] if gen.uses_storage else []) + (["%images_1d"] if gen.uses_tex_1d else []) + \
                  (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else [])
+    if gen.uses_depth_2d:
+        iface += ["%depth_images"]
     if sg:
         iface += ["%sg_lane"]
     if gen.writes_depth:
@@ -12133,6 +12141,12 @@ def assemble(gen):
                 "OpDecorate %DescMap Block", "OpMemberDecorate %DescMap 0 Offset 0",
                 "OpDecorate %rt_map ArrayStride 4", "OpDecorate %desc_map NonWritable"]
         types += ["%v3float = OpTypeVector %float 3", "%v3int = OpTypeVector %int 3"]
+        if gen.uses_depth_2d:
+            types += ["%depth2d = OpTypeImage %float 2D 1 0 0 1 Unknown",
+                      "%sampled_depth2d = OpTypeSampledImage %depth2d", "%rt_depth2d = OpTypeRuntimeArray %depth2d",
+                      "%_ptr_UC_depth2d = OpTypePointer UniformConstant %depth2d",
+                      "%_ptr_UC_rt_depth2d = OpTypePointer UniformConstant %rt_depth2d"]
+            dec += ["OpDecorate %depth_images DescriptorSet 0", "OpDecorate %depth_images Binding 29"]
         if gen.uses_tex_array:
             types += ["%img2da = OpTypeImage %float 2D 0 1 0 1 Unknown", "%simg2da = OpTypeSampledImage %img2da",
                       "%rt_imga = OpTypeRuntimeArray %img2da",
@@ -12404,6 +12418,8 @@ def assemble(gen):
         gvars += ["%images = OpVariable %_ptr_UC_rt_img UniformConstant",
                   "%samplers = OpVariable %_ptr_UC_rt_smp UniformConstant",
                   "%desc_map = OpVariable %_ptr_SB_DescMap StorageBuffer"]
+        if gen.uses_depth_2d:
+            gvars += ["%depth_images = OpVariable %_ptr_UC_rt_depth2d UniformConstant"]
         if gen.uses_tex_array:
             gvars += ["%images_arr = OpVariable %_ptr_UC_rt_imga UniformConstant"]
         if gen.uses_storage:
@@ -14933,6 +14949,8 @@ def main():
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
                          "VK_KHR_fragment_shader_barycentric (e.g. NVIDIA Pascal)")
+    ap.add_argument("--separate-depth-2d", action="store_true",
+                    help="use a separate sampled-image binding for 2D depth comparisons (runtime: LEONIDA_SEPARATE_DEPTH_2D=1)")
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="image_sample*_o without VK_KHR_maintenance8 (e.g. NVIDIA Pascal): fold the texel offset into "
                          "the coordinate instead of the Offset operand")
@@ -14976,7 +14994,8 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
-    global PC_TAIL_UBO
+    global PC_TAIL_UBO, SEPARATE_DEPTH_2D
+    SEPARATE_DEPTH_2D = a.separate_depth_2d
     PC_TAIL_UBO = a.pc_tail_ubo
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop

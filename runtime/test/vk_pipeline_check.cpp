@@ -92,6 +92,7 @@ struct VertexInputMeta {
 };
 
 struct ShaderMeta {
+    bool separate_depth_2d = false;
     std::string stage;
     uint32_t subgroup_size = 0;
     uint32_t lds_bytes = 0;
@@ -325,6 +326,10 @@ struct JsonParser {
             else if (k == "push_constant_bytes")
                 m.push_constant_bytes = parse_strict_u32("expected unsigned 32-bit push_constant_bytes");
             else if (k == "pc_tail") m.pc_tail_bytes = parse_pc_tail_bytes();
+            else if (k == "bindings") {
+                const auto bindings = parse_u32_array();
+                m.separate_depth_2d = std::find(bindings.begin(), bindings.end(), 29u) != bindings.end();
+            }
             else if (k == "writes_depth") m.writes_depth = parse_bool();
             else if (k == "needs_maintenance8") m.needs_maintenance8 = parse_bool();
             else if (k == "features") m.features = parse_str_array();
@@ -1068,6 +1073,9 @@ int main(int argc, char** argv) {
     add(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
     add(6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256); add(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
     for (uint32_t i = 8; i <= 19; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
+    // This checker creates pipelines but never indexes the array or draws.
+    if (std::any_of(work.begin(), work.end(), [](const Item& item) { return item.second->separate_depth_2d; }))
+        add(29, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1);
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
     VkDescriptorSetLayout dsl;

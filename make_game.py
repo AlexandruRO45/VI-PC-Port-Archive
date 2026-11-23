@@ -1152,7 +1152,8 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--separate-depth-2d", "separate_depth_2d"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -1855,6 +1856,8 @@ def main() -> int:
                     help="translate raw barycentric reads from an interpolated vec3 input (with a pass-through "
                          "geometry shader the runtime draws), for devices without "
                          "VK_KHR_fragment_shader_barycentric")
+    ap.add_argument("--separate-depth-2d", action="store_true",
+                    help="translate 2D depth comparisons for the dedicated table (run with LEONIDA_SEPARATE_DEPTH_2D=1)")
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="fold the run-time texel offset of image_sample*_o into the coordinate, for devices "
                          "without VK_KHR_maintenance8")
