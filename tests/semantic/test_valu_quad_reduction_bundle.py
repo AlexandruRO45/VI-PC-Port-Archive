@@ -895,3 +895,48 @@ class TestDsBpermuteB32NegativeAndTranslator(unittest.TestCase):
         ]
         _, spv = run_workgroup_lanes("ps_bperm_lowering", lines, lanes=4)
         self.assertIn("OpGroupNonUniformShuffle", spv)
+
+
+# ------------------------------------------------------------------------------
+# ds_permute_b32 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+def ref_ds_permute_b32(lanes_data: List[int], lane_addrs: List[int], offset: int = 0) -> List[int]:
+    out = [0] * len(lanes_data)
+    for i in range(len(lane_addrs)):
+        dst_lane = ((lane_addrs[i] + offset) // 4) % 32
+        if dst_lane < len(out):
+            out[dst_lane] = lanes_data[i]
+    return out
+
+
+class TestDsPermuteB32Oracle(unittest.TestCase):
+    def test_oracle_scatter_hardware(self):
+        # Reverse scatter: lane i sends data to lane 3 - i
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_sub_nc_u32 v1, 3, v0",
+            "v_lshlrev_b32 v1, 2, v1",
+            "v_add_nc_u32 v2, v0, 100",
+            "ds_permute_b32 v4, v1, v2",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_perm_oracle", lines, lanes=4)
+        self.assertEqual(res, [103, 102, 101, 100])
+
+    def test_oracle_offset_scatter_hardware(self):
+        # Lane i scatters to lane i + 1 with offset 4
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_lshlrev_b32 v1, 2, v0",
+            "v_add_nc_u32 v2, v0, 10",
+            "ds_permute_b32 v4, v1, v2 offset:4",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_perm_offset", lines, lanes=4)
+        # Lane 0 sends to 1, lane 1 sends to 2, lane 2 sends to 3
+        self.assertEqual(res[1], 10)
+        self.assertEqual(res[2], 11)
+        self.assertEqual(res[3], 12)
