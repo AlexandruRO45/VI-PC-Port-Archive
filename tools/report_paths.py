@@ -4,13 +4,15 @@ an input or another output.
     from report_paths import same_report_path        # after sys.path.insert(0, <this folder>), as -I needs
 
 `same_report_path(first, second)` is true when the two paths resolve to one name (`realpath`, then `normcase`, and on a
-case-insensitive macOS volume also case-folded and with composed and decomposed accents treated alike) or when both
+case-insensitive macOS volume also case-folded and with composed and decomposed accents treated alike; on Windows a
+name also ends at its last non-dot, non-space character) or when both
 exist and `os.path.samefile` says they are one file (a hard link, another spelling the name rules missed). Neither
 path has to exist: two report paths that don't exist yet still collide when they differ only in case on a volume that
 ignores case. Where the name rules cannot tell, `same_name_on_folding_volume` asks the volume itself with one
 scratch folder: a Linux mount that folds case (vfat, exFAT, CIFS) answers neither `normcase` nor `pathconf`.
 Standard library only; no game data.
 """
+import ntpath
 import os
 import posixpath
 import sys
@@ -18,6 +20,18 @@ import tempfile
 import unicodedata
 
 _PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def windows_folded(path):
+    """The name Windows opens for `path`: every component loses its trailing dots and spaces, which Windows drops
+    before it looks the name up. `realpath` folds them only once the file is there; a guard here runs before the
+    first write, so `index.json.` and `index.json` must already be one report on a file neither has created yet.
+    A `\\\\?\\` path keeps them: that prefix exists to make the name literal."""
+    if path.startswith("\\\\?\\"):
+        return path
+    drive, tail = ntpath.splitdrive(path)
+    parts = [part if part in ("", ".", "..") else (part.rstrip(" .") or part) for part in tail.split("\\")]
+    return drive + "\\".join(parts)
 
 
 def case_insensitive_volume(path):
@@ -43,6 +57,11 @@ def path_key(path):
 
 def _resolved_key(path):
     """`path_key` for a path `os.path.realpath` has already resolved."""
+    # Windows drops a trailing dot or space from every name it opens, but realpath folds them only for a file that
+    # is already there. A guard runs before the first write, so an `index.json.` that does not exist yet must key
+    # the same as the `index.json` it would create.
+    if sys.platform == "win32":
+        path = windows_folded(path)
     # Use the path rules of the platform we are resolving for. On macOS os.path is
     # posixpath and keeps case; on Windows ntpath lowercases. Resolving a simulated
     # macOS path through ntpath would hide the case-sensitive branch under test.
