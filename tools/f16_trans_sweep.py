@@ -32,14 +32,18 @@ import argparse
 import functools
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 OPS = ("v_exp_f16", "v_log_f16", "v_rcp_f16", "v_rsq_f16", "v_sqrt_f16", "v_sin_f16", "v_cos_f16")
 
@@ -407,16 +411,57 @@ def validate_json_path(path):
 
 
 def write_json_report(path, report):
-    """Create missing parent directories and write `report` as LF-terminated JSON, or return an error string."""
+    """Create missing parent directories and stage `report` as LF-terminated JSON via a sibling temp file,
+    so a write or replace failure keeps any previous report intact, or return an error string."""
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         try:
             os.makedirs(parent, exist_ok=True)
         except OSError as e:
             return f"cannot create directory for --json {path}: {e.strerror or e}"
+    destination = os.path.realpath(path)
+    dest_parent = os.path.dirname(destination) or "."
+    if dest_parent != parent:
+        try:
+            os.makedirs(dest_parent, exist_ok=True)
+        except OSError as e:
+            return f"cannot create directory for --json {path}: {e.strerror or e}"
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        try:
+            mode = os.stat(destination).st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None and not stat.S_ISREG(mode):
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+            return None
+        if mode is not None:
+            # Keep the direct writer's permission check without truncating the previous report.
+            os.close(os.open(destination, os.O_WRONLY))
+        fd = None
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=dest_parent, prefix=".f16_trans_sweep-", suffix=".tmp")
+            with open(fd, "w", encoding="utf-8", newline="\n") as f:
+                fd = None
+                json.dump(report, f, indent=1)
+            if os.name != "nt":
+                os.chmod(tmp, published_mode(destination))
+            replace_retry(tmp, destination)
+        except BaseException:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp is not None:
+                try:
+                    if os.path.lexists(tmp):
+                        os.chmod(tmp, 0o600)
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+            raise
     except OSError as e:
         return f"cannot write --json {path}: {e.strerror or e}"
     return None

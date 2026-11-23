@@ -192,6 +192,7 @@ class Cli(unittest.TestCase):
             self.assertEqual(data["device"], "fake-gpu")
             self.assertEqual(data["arch"], "gfx1030")
             self.assertIn("keep16", data["ops"]["v_exp_f16"])
+            self.assertEqual([p.name for p in out_path.parent.glob(".f16_trans_sweep-*")], [])
             fake_oracle.close.assert_called_once()
 
     def test_json_blocked_by_regular_file_parent_exits_1(self):
@@ -241,6 +242,60 @@ class Cli(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("error:", err.getvalue())
             self.assertIn("No space left on device", err.getvalue())
+            self.assertEqual([p.name for p in out_path.parent.glob(".f16_trans_sweep-*")], [])
+
+    def test_json_write_failure_preserves_previous_report_and_cleans_temp(self):
+        previous = '{"previous": true}'
+        ref = [0] * 65536
+        fake_oracle = mock.MagicMock(device="fake-gpu", arch="gfx1030")
+        real_open = open
+
+        def failing_open(*args, **kwargs):
+            handle = real_open(*args, **kwargs)
+            orig_write = handle.write
+
+            def fail_write(data):
+                orig_write(data[:8])
+                raise OSError(28, "No space left on device")
+
+            handle.write = fail_write
+            return handle
+
+        for label, patch in (
+            ("write", mock.patch("builtins.open", side_effect=failing_open)),
+            ("replace", mock.patch.object(sw, "replace_retry", side_effect=PermissionError(13, "Permission denied"))),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as d:
+                out_path = Path(d) / "keep.json"
+                out_path.write_text(previous, encoding="utf-8", newline="\n")
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=fake_oracle), \
+                        mock.patch.object(sw, "check_modes"), \
+                        mock.patch.object(sw, "reference", return_value=ref), \
+                        mock.patch.object(sw, "sweep", return_value=list(ref)), \
+                        patch, redirect_stdout(out), redirect_stderr(err):
+                    rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", str(out_path)])
+                self.assertEqual(rc, 1)
+                self.assertIn("cannot write --json", err.getvalue())
+                self.assertEqual(out_path.read_text(encoding="utf-8"), previous)
+                self.assertEqual([p.name for p in Path(d).glob(".f16_trans_sweep-*")], [])
+
+    def test_readonly_existing_report_is_preserved_without_temp_files(self):
+        if os.name != "nt" and os.geteuid() == 0:
+            self.skipTest("root bypasses read-only file mode")
+        previous = '{"readonly": true}'
+        with tempfile.TemporaryDirectory() as d:
+            out_path = Path(d) / "readonly.json"
+            out_path.write_text(previous, encoding="utf-8", newline="\n")
+            os.chmod(out_path, 0o444)
+            try:
+                err = sw.write_json_report(str(out_path), {"ok": True})
+                self.assertIsNotNone(err)
+                self.assertIn("cannot write --json", err)
+                self.assertEqual(out_path.read_text(encoding="utf-8"), previous)
+                self.assertEqual([p.name for p in Path(d).glob(".f16_trans_sweep-*")], [])
+            finally:
+                os.chmod(out_path, 0o600)
 
 
 class OnHardware(unittest.TestCase):
