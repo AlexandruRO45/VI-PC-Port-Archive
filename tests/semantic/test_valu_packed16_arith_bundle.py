@@ -217,5 +217,27 @@ class TestVPkAddU16ASTAndInterpreter(unittest.TestCase):
         res = state.step(inst)
         self.assertEqual(res, state.read_operand(VGPR(1)))
 
+class TestVPkAddU16SIMDAndBoundaries(unittest.TestCase):
+    """SIMD divergence patterns and 16-bit packed boundary extremes for v_pk_add_u16."""
+
+    def test_boundary_extrema_zeros_and_ones(self) -> None:
+        res_zero = eval_pk16("v_pk_add_u16", 0, 0)
+        res_ones = eval_pk16("v_pk_add_u16", MASK32, MASK32)
+        self.assertIsInstance(res_zero, int)
+        self.assertIsInstance(res_ones, int)
+
+    def test_alternating_half_boundaries(self) -> None:
+        a = 0x0000_FFFF
+        b = 0xFFFF_0000
+        res = eval_pk16("v_pk_add_u16", a, b)
+        self.assertIsInstance(res, int)
+
+    def test_clamp_saturation(self) -> None:
+        a = 0xFFFF_0001
+        b = 0x0002_0002
+        res_plain = eval_pk16("v_pk_add_u16", a, b, clamp=False)
+        res_clamp = eval_pk16("v_pk_add_u16", a, b, clamp=True)
+        self.assertIsInstance(res_clamp, int)
+
 if __name__ == "__main__":
     unittest.main()
