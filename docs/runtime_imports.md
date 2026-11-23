@@ -171,11 +171,26 @@ index and caller once and returns `E_NOTIMPL` without writing its arguments. The
 the top of the file; `xg_xs_test` covers them. Textures whose layout the game asks for are therefore not laid out yet.
 The table above was measured before this shim and still lists these two as unimplemented; they are served now.
 
-Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
-they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
-`xapu.dll`, `AcpHal.dll`) with no shim at all.
+The 1.0.2.1 upload caller passes a common destination base, plane zero, a subresource index, a source pointer,
+a source row pitch and a source slice pitch to texture-computer slot 8. It walks all mip levels of one array
+slice before advancing to the next slice. The subresource index is `arraySlice * mipCount + mip`. Source
+levels are consecutive, including between array slices. For a 3D texture the caller visits each mip once
+and includes its shrinking depth in the source level size.
 
-The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
+For RGBA8 the source row contains four bytes per mip texel. For BC1 it contains eight bytes per 4×4 block,
+rounding the mip width and height up to whole blocks. Each dimension shrinks to a minimum of one texel.
+The slice pitch is the row pitch times the number of texel rows or block rows. For example, a 9×5 BC1 mip
+has a 24-byte source row and a 48-byte source slice. These pitches describe the input to the copy.
+The destination layout and the graphics resource that consumes it remain separate measurements.
+
+At the revision used for the table, `xmem.dll` and `d3d12_xs.dll` had shims and accounted for 8 of the 30
+unimplemented imports. The other 22 were in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`, `xapu.dll`,
+and `AcpHal.dll`) that had no shim at that revision.
+
+Serving the seven `xmem.dll` imports reduced that dry run to 23 (see the `xmem.dll` notes above). A Windows
+CMake build at `dfe4e4ad` mapped five modules from 1.0.2.1 with `gta6rt.exe --dry-run` and bound both XG
+exports. The remaining 20 unimplemented imports were 9 in `AcpHal.dll`, 5 in `xapu.dll`, 5 in `chad.dll`
+and 1 in `XCRDAPI.dll`.
 
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
