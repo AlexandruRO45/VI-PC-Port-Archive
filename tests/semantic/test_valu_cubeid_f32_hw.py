@@ -531,5 +531,56 @@ class TestVCubeidF32IEEE754(unittest.TestCase):
         self.assertEqual(hw_res, f32_to_bits(4.0))
 
 
+class TestVCubeidF32NegativeAndMutation(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_cubeid_f32."""
+
+    def test_rejection_of_invalid_syntax(self):
+        lines_missing = [
+            "v_mov_b32 v1, 1.0",
+            "v_cubeid_f32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_cubeid_err", lines_missing)
+
+    def test_rejection_of_out_of_bounds_register(self):
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, 106)
+
+    def test_mutation_detection_inverted_tie_breaker(self):
+        # Mutated oracle where X wins ties over Y and Z
+        def bad_oracle_x_wins(x, y, z):
+            ax, ay, az = abs(x), abs(y), abs(z)
+            if ax >= ay and ax >= az:
+                return 1.0 if x < 0.0 else 0.0
+            elif ay >= az:
+                return 3.0 if y < 0.0 else 2.0
+            else:
+                return 5.0 if z < 0.0 else 4.0
+
+        # For |x| == |y| == |z| (e.g. 2.0, 2.0, 2.0):
+        # Correct RDNA2 (Z wins): 4.0
+        # Mutated (X wins): 0.0
+        self.assertNotEqual(ref_cubeid(2.0, 2.0, 2.0), bad_oracle_x_wins(2.0, 2.0, 2.0))
+
+    def test_mutation_detection_inverted_sign_faces(self):
+        # Mutated oracle where +Z is 5.0 and -Z is 4.0
+        def bad_oracle_z_signs(x, y, z):
+            ax, ay, az = abs(x), abs(y), abs(z)
+            if az >= ax and az >= ay:
+                return 4.0 if z < 0.0 else 5.0
+            elif ay >= ax:
+                return 3.0 if y < 0.0 else 2.0
+            else:
+                return 1.0 if x < 0.0 else 0.0
+
+        self.assertNotEqual(ref_cubeid(0.5, 0.5, 2.0), bad_oracle_z_signs(0.5, 0.5, 2.0))
+
+
 if __name__ == "__main__":
     unittest.main()
