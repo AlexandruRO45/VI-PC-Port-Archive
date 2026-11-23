@@ -41,6 +41,8 @@ from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(".github", "workflows", "ci.yml")
+RUNTIME_WORKFLOW = os.path.join(".github", "workflows", "runtime.yml")
+VULKAN_HEADERS_REF = "6802bb4733b63ed5efd3adb308a6c885ef180ea1"
 
 # What a file has to be called to claim it is a test. Any of these that no job selects is a bug, which is why
 # the suffix form (tests/thing_test.py) counts even though no job's glob matches it today.
@@ -258,6 +260,48 @@ def semantic_job_text(workflow):
     return match.group(1)
 
 
+def runtime_job_text(workflow, job):
+    """One job of runtime.yml, up to the next job, so a Windows fix cannot satisfy a Linux check."""
+    match = re.search(rf"^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow, re.M | re.S)
+    if not match:
+        raise AssertionError(f"runtime.yml no longer has a `{job}:` job; update tests/test_ci_registration.py")
+    return match.group(1)
+
+
+def vulkan_headers_checkout(job):
+    """The step that checks out KhronosGroup/Vulkan-Headers, or None.
+
+    One step, not the whole job: the header cache key names the same commit, so a job-wide search for
+    the SHA still finds it when only the checkout ``ref:`` drifts back to a branch -- and a cache hit
+    then builds against whichever headers that ref produced last.
+    """
+    for step in re.split(r"\n(?=      - )", job):
+        if re.search(r"repository:\s*KhronosGroup/Vulkan-Headers\b", step):
+            return step
+    return None
+
+
+def linux_gpu_vulkan_header_problem(workflow):
+    """Why linux-gpu-tools cannot build vk_harness.cpp, or None: it must use the pinned headers."""
+    job = runtime_job_text(workflow, "linux-gpu-tools")
+    problems = []
+    step = vulkan_headers_checkout(job)
+    if step is None:
+        problems.append("it does not check out KhronosGroup/Vulkan-Headers")
+    else:
+        ref = re.search(r"^\s+ref:\s*(\S+)", step, re.M)
+        if ref is None or ref.group(1) != VULKAN_HEADERS_REF:
+            problems.append(f"the Vulkan-Headers checkout does not pin ref: {VULKAN_HEADERS_REF}"
+                            f" (it has {ref.group(1) if ref else 'no ref'})")
+        if not re.search(r"^\s+path:\s*\.vulkan-headers\s*$", step, re.M):
+            problems.append("the Vulkan-Headers checkout does not use `path: .vulkan-headers`")
+        if not re.search(rf"key:\s*vulkan-headers-{VULKAN_HEADERS_REF}\b", job):
+            problems.append("the header cache key does not name the pinned commit")
+    if not re.search(r"VULKAN_SDK:\s*\$\{\{\s*github\.workspace\s*\}\}/\.vulkan-headers\b", job):
+        problems.append("Configure does not set VULKAN_SDK to the checked-out headers")
+    return "; ".join(problems) or None
+
+
 def spirv_gated_semantic_files(root, files):
     """tests/semantic files that skip when spirv-as / spirv-val are not installed."""
     gated = []
@@ -340,6 +384,34 @@ class RepositoryRegistrationTest(unittest.TestCase):
             files = tracked_under_tests(ROOT)
             self.assertGreaterEqual(len(files), 300)
             self.assertTrue(any(f.startswith("tests/semantic/") for f in files))
+
+    def test_the_linux_gpu_tools_job_uses_pinned_vulkan_headers(self):
+        # apt libvulkan-dev on ubuntu-24.04 is Vulkan 1.3.275, which has no VK_KHR_pipeline_binary.
+        # vk_harness.cpp needs it, so the job must reuse the pinned Windows header checkout.
+        problem = linux_gpu_vulkan_header_problem(read(ROOT, RUNTIME_WORKFLOW))
+        self.assertIsNone(problem, "runtime.yml's linux-gpu-tools job cannot build vk_harness.cpp: " + str(problem))
+
+    def test_the_vulkan_header_check_flags_apt_only_headers(self):
+        workflow = read(ROOT, RUNTIME_WORKFLOW)
+        job = runtime_job_text(workflow, "linux-gpu-tools")
+        broken_job = job.replace("repository: KhronosGroup/Vulkan-Headers",
+                                 "repository: example/not-vulkan-headers", 1)
+        self.assertNotEqual(broken_job, job)
+        self.assertIn("does not check out KhronosGroup/Vulkan-Headers",
+                      linux_gpu_vulkan_header_problem(workflow.replace(job, broken_job, 1)) or "")
+
+        no_sdk = job.replace("VULKAN_SDK: ${{ github.workspace }}/.vulkan-headers", "", 1)
+        self.assertNotEqual(no_sdk, job)
+        self.assertIn("does not set VULKAN_SDK",
+                      linux_gpu_vulkan_header_problem(workflow.replace(job, no_sdk, 1)) or "")
+
+        # The cache key keeps the SHA, so only the checkout `ref:` is wrong here. The job-wide search
+        # for VULKAN_HEADERS_REF used to accept this, because the key satisfied it.
+        drifted_ref = job.replace(f"ref: {VULKAN_HEADERS_REF}", "ref: main", 1)
+        self.assertNotEqual(drifted_ref, job)
+        self.assertIn(VULKAN_HEADERS_REF, drifted_ref)
+        self.assertIn("does not pin ref",
+                      linux_gpu_vulkan_header_problem(workflow.replace(job, drifted_ref, 1)) or "")
 
     def test_every_test_file_is_selected_by_a_job(self):
         unselected = [f for f in self.files if job_of(ROOT, f, self.rules) is None]
