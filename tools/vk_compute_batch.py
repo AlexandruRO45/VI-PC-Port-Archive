@@ -19,8 +19,8 @@ import time
 from dataclasses import dataclass, field
 
 # The settings a single run reads from its environment and a batch job gives on its line (vk_compute_test.cpp).
-SETTINGS = ("VKC_OUT_WORDS", "VKC_DUMP", "VKC_HEAP_INIT", "VKC_SUBGROUP_SIZE", "VKC_SGPRS", "VKC_BENCH",
-            "LEONIDA_PC_TAIL_UBO")
+SETTINGS = ("VKC_OUT_WORDS", "VKC_DUMP", "VKC_HEAP_INIT", "VKC_HEAP_FILE", "VKC_SUBGROUP_SIZE", "VKC_SGPRS",
+            "VKC_BENCH", "LEONIDA_PC_TAIL_UBO")
 # Programs per process. Measured on an RTX 5080 (valu_fuzz --family mem --emulate, 600 programs, while a fuzzing
 # campaign kept opening the device): the GPU phase took 21.5 s in batches of 16, 3.6 s in batches of 64 and 1.2 s in
 # one batch of 1024. A program costs about 2 ms once the device is open; what varies is each device open (2 s idle, up

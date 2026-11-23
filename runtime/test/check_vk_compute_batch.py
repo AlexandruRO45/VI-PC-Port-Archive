@@ -1,8 +1,8 @@
 """ctest vk_compute_batch: vk_compute_test --batch on one Vulkan device (runtime/test/vk_compute_test.cpp).
 
-Three jobs of SHADER (below, assembled with the SDK's spirv-as) in one process: one that passes mirror64, one whose VKC_SGPRS makes it fail
-mirror64 (exit 1) with its own dump size, and one with no settings, which must pass again (nothing leaks from the
-job before). Each job's exit code, stdout and stderr must equal a single run of the same program with the same
+Five jobs of SHADER (below, assembled with the SDK's spirv-as) in one process: one that passes mirror64, one whose VKC_SGPRS makes it fail
+mirror64 (exit 1) with its own dump size, one with no settings, which must pass again (nothing leaks from the
+job before), one with a bad group count (exit 2) and one that copies a VKC_HEAP_FILE into the heap past the output. Each job's exit code, stdout and stderr must equal a single run of the same program with the same
 settings, and its dump the single run's dump. Then a job that keeps the GPU busy for seconds runs under
 --job-timeout 0.25: it must be reported as timed out (exit 124) and the batch must stop there (exit 3, no record
 for the next job). Exit 0 when all hold, 1 when one fails, 77 without a Vulkan device.
@@ -16,8 +16,8 @@ import subprocess
 import sys
 import time
 
-SETTINGS = ("VKC_OUT_WORDS", "VKC_DUMP", "VKC_HEAP_INIT", "VKC_SUBGROUP_SIZE", "VKC_SGPRS", "VKC_BENCH",
-            "LEONIDA_PC_TAIL_UBO")
+SETTINGS = ("VKC_OUT_WORDS", "VKC_DUMP", "VKC_HEAP_INIT", "VKC_HEAP_FILE", "VKC_SUBGROUP_SIZE", "VKC_SGPRS",
+            "VKC_BENCH", "LEONIDA_PC_TAIL_UBO")
 NO_DEVICE = (b"no Vulkan physical device", b"could not load")
 # One compute group of 64 threads writes the mirror64 pattern plus s4, out[g*64 + t] = g*64 + 63 - t + s4, so
 # VKC_SGPRS=0 (or none) passes "mirror64" and any other s4 fails it. Before the store each thread runs s5 rounds of a
@@ -161,9 +161,14 @@ def main():
         return 1
     base = {k: v for k, v in os.environ.items() if k not in SETTINGS}
     path = lambda name: os.path.join(a.work, name)   # noqa: E731
+    heap_bytes = bytes(range(16))
+    with open(path("heap.bin"), "wb") as f:
+        f.write(heap_bytes)
     jobs = [(["2", "mirror64"], {"VKC_DUMP": "a"}),
             (["1", "mirror64"], {"VKC_SGPRS": "5", "VKC_DUMP": "b", "VKC_OUT_WORDS": "100"}),
-            (["4", "mirror64"], {})]
+            (["4", "mirror64"], {}),
+            (["0", "mirror64"], {}),
+            (["2", "mirror64"], {"VKC_HEAP_FILE": path("heap.bin") + "@0x400", "VKC_DUMP": "c"})]
     singles = []
     for args, settings in jobs:
         env = dict(base, **{k: path(v + ".single.bin") if k == "VKC_DUMP" else v for k, v in settings.items()})
@@ -175,11 +180,11 @@ def main():
     lines = ["\t".join([spv] + args + [f"{k}={path(v + '.batch.bin') if k == 'VKC_DUMP' else v}"
                                        for k, v in settings.items()]) for args, settings in jobs]
     with open(path("jobs.txt"), "w", encoding="utf-8", newline="\n") as f:
-        f.write("# three jobs\n" + "\n".join(lines) + "\n")
+        f.write("# five jobs\n" + "\n".join(lines) + "\n")
     b = subprocess.run(exe + ["--batch", path("jobs.txt")], capture_output=True, env=base, timeout=300)
     found, ended = records(b.stdout)
     problems = []
-    if b.returncode != 0 or not ended or [f[0] for f in found] != [0, 1, 2]:
+    if b.returncode != 0 or not ended or [f[0] for f in found] != [0, 1, 2, 3, 4]:
         problems.append(f"batch: exit {b.returncode}, records {[f[0] for f in found]}, end line {ended}")
     for (index, code, status, out, err), s in zip(found, singles):
         if (code, plain(out), plain(err)) != (s.returncode, plain(s.stdout), plain(s.stderr)):
@@ -187,9 +192,10 @@ def main():
                             f"{s.returncode} {s.stdout!r} {s.stderr!r}")
         if status != "done":
             problems.append(f"job {index}: status {status}")
-    if [f[1] for f in found] != [0, 1, 0]:
-        problems.append(f"exit codes {[f[1] for f in found]}, expected [0, 1, 0] (job 1 fails mirror64)")
-    for name in ("a", "b"):
+    if [f[1] for f in found] != [0, 1, 0, 2, 0]:
+        problems.append(f"exit codes {[f[1] for f in found]}, expected [0, 1, 0, 2, 0] (job 1 fails mirror64, "
+                        "job 3 has no groups)")
+    for name in ("a", "b", "c"):
         single, batch = (open(path(f"{name}.{kind}.bin"), "rb").read() if os.path.exists(path(f"{name}.{kind}.bin"))
                          else None for kind in ("single", "batch"))
         if batch is None or batch != single:
@@ -198,6 +204,24 @@ def main():
         words = struct.unpack("<100I", open(path("b.batch.bin"), "rb").read())
         if words[0] != 63 + 5 or set(words[64:]) != {0xEEEEEEEE}:
             problems.append(f"dump b: out[0] = {words[0]}, expected 68, and the 36 words after the group untouched")
+    if os.path.exists(path("c.batch.bin")):
+        words = open(path("c.batch.bin"), "rb").read()
+        if words[0x400:0x410] != heap_bytes or len(words) != 0x410:
+            problems.append("dump c: the heap file is not at 0x400 in a buffer that ends with it")
+    # LEONIDA_VK_VALIDATION applies to the whole batch (when the layer is installed): a job reads the same as its run.
+    venv = dict(base, LEONIDA_VK_VALIDATION="1")
+    vsingle = subprocess.run(exe + [spv, "2", "mirror64"], capture_output=True, env=venv, timeout=300)
+    if b"is not installed" not in vsingle.stderr:
+        with open(path("validation.txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"{spv}\t2\tmirror64\n")
+        vb = subprocess.run(exe + ["--batch", path("validation.txt")], capture_output=True, env=venv, timeout=300)
+        vfound, vended = records(vb.stdout)
+        if not vended or len(vfound) != 1 or (vfound[0][1], plain(vfound[0][3]), plain(vfound[0][4])) != (
+                vsingle.returncode, plain(vsingle.stdout), plain(vsingle.stderr)):
+            problems.append(f"validation: batch gave {vfound!r}, a single run exit {vsingle.returncode} "
+                            f"{vsingle.stdout!r} {vsingle.stderr!r}")
+        if b"(validation on)" not in vsingle.stderr:
+            problems.append("validation: a single run does not say \"(validation on)\"")
     # The timeout: s5 = 2^32 - 1 rounds per thread (seconds on any GPU), then the plain job, which must not run.
     with open(path("timeout.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write(f"{spv}\t1\tmirror64\tVKC_SGPRS=0,0xffffffff,0x12345\n{spv}\t4\tmirror64\n")
@@ -209,7 +233,7 @@ def main():
     if t.returncode != 3 or ended or [(f[0], f[1], f[2]) for f in found] != [(0, 124, "timeout")]:
         problems.append(f"timeout batch: exit {t.returncode}, records {[(f[0], f[1], f[2]) for f in found]}, "
                         f"end line {ended}: {t.stderr!r}")
-    print(f"batch of 3: exit codes {[f[1] for f in records(b.stdout)[0]]}; timeout batch: exit {t.returncode} "
+    print(f"batch of 5: exit codes {[f[1] for f in records(b.stdout)[0]]}; timeout batch: exit {t.returncode} "
           f"after {took:.1f} s (device open included)")
     for p in problems:
         print("FAIL:", p)

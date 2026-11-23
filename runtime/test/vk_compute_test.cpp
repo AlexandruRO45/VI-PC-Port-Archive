@@ -21,12 +21,18 @@
 // Contract (docs/design.md): push constants = s0..s31 (128 bytes), heap base lo/hi, code base lo/hi (144 bytes).
 // LEONIDA_PC_TAIL_UBO=1 (modules from rdna2spirv.py --pc-tail-ubo): s0..s31 only, the rest at set 1 (vk_pc_tail.h).
 // The output buffer is the "heap": Xbox VA 0 maps to its device address, and s[0:3] hold a V# with base 0.
+// LEONIDA_VK_VALIDATION=1 (env): run under VK_LAYER_KHRONOS_validation; a validation error fails the run (exit 1),
+// so scripts/run_gpu_tests.py reports it. The layer's own variables still apply, for example
+// VK_KHRONOS_VALIDATION_GPUAV_ENABLE=1 for GPU-assisted validation of what the translated shader does. In batch mode
+// the process environment's LEONIDA_VK_VALIDATION applies to the whole batch; a validation error is charged to the
+// job during which the layer reported it (its messages are in that job's stderr, and its exit code is 1 unless the
+// job failed otherwise).
 //
 // Batch mode: vk_compute_test --batch FILE [--job-timeout SECONDS] opens the device once and runs every job of FILE
 // ("-" reads standard input) in order, so a fuzzer pays the device open (seconds on NVIDIA, more when many processes
 // open it at once) once per batch instead of once per program. One job per line, fields separated by tabs:
 //   cs.spv <TAB> groups <TAB> expect [<TAB> --require-wave64] [<TAB> NAME=VALUE]...
-// with NAME one of VKC_OUT_WORDS, VKC_DUMP, VKC_HEAP_INIT, VKC_SUBGROUP_SIZE, VKC_SGPRS, VKC_BENCH and
+// with NAME one of VKC_OUT_WORDS, VKC_DUMP, VKC_HEAP_INIT, VKC_HEAP_FILE, VKC_SUBGROUP_SIZE, VKC_SGPRS, VKC_BENCH and
 // LEONIDA_PC_TAIL_UBO: what the environment gives a single program. In batch mode they come from the job line only
 // (the process environment's values are not used), so one job's settings never reach the next. Empty lines and lines
 // starting with # are not jobs. Each job gets a fresh shader module, pipeline, buffers, command pool and fence, and
@@ -43,6 +49,7 @@
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
+#include "vk_validation.h"
 #include "cs_wave_probe_spv.h"
 
 #include <cctype>
@@ -173,7 +180,8 @@ static bool parse_user_sgprs(const char* s, uint32_t* pc) {
 }
 
 // The settings a single run reads from the environment; a batch job gives them on its line.
-static const char* const kJobSettings[] = {"VKC_OUT_WORDS", "VKC_DUMP", "VKC_HEAP_INIT", "VKC_SUBGROUP_SIZE",
+static const char* const kJobSettings[] = {"VKC_OUT_WORDS", "VKC_DUMP", "VKC_HEAP_INIT", "VKC_HEAP_FILE",
+                                           "VKC_SUBGROUP_SIZE",
                                            "VKC_SGPRS", "VKC_BENCH", "LEONIDA_PC_TAIL_UBO"};
 
 // One program to run: the command line of a single run, or one line of a batch.
@@ -202,6 +210,9 @@ struct Program {
     const char* heap_init_path = nullptr;
     const char* bench = nullptr;
     std::vector<char> heap_init, code;
+    std::string heap_file_path;          // VKC_HEAP_FILE: a file copied into the heap at heap_file_at
+    uint64_t heap_file_at = 0;
+    std::vector<char> heap_file;
     uint32_t local[3] = {};
     uint32_t spirv_version = 0;
     uint32_t req_sg = 0;
@@ -220,7 +231,14 @@ static int prepare(const Job& job, Io& io, Program& p) {
         io.err.print("workgroup_yz expects a 2x3x4 dispatch\n");
         return 2;
     }
-    p.groups = p.workgroup_yz ? 2u : uint32_t(atoi(job.groups.c_str()));
+    p.groups = 2;
+    if (!p.workgroup_yz) {
+        const char* count = job.groups.c_str();
+        if (!parse_u32(count, p.groups) || *count || !p.groups) {
+            io.err.print("groups: expected a positive 32-bit workgroup count, got \"%s\"\n", job.groups.c_str());
+            return 2;
+        }
+    }
     p.groups_y = p.workgroup_yz ? 3u : 1u;
     p.groups_z = p.workgroup_yz ? 4u : 1u;
     p.yz_bins = (p.groups_y + 1) * (p.groups_z + 1);
@@ -235,6 +253,40 @@ static int prepare(const Job& job, Io& io, Program& p) {
             return 2;
         }
         p.heap_init.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    // VKC_HEAP_FILE=<path>[@<offset>]: copy a file into the heap so a shader can read a buffer (a BVH, its
+    // descriptor blocks and the records) without the test hard-coding it. The offset is a decimal or 0x hex byte
+    // offset (no octal, sign or spaces); addresses the shader sees are Xbox VAs, i.e. heap offsets, as for every
+    // other heap buffer here. Two overlaps to keep in mind: "bvh" mode writes its synthetic scene after this copy,
+    // so a file at 0x100..0x264 is overwritten there, and the output V# starts at heap offset 0, so a file at @0
+    // shares bytes with the dispatch's output.
+    if (const char* heap_file_env = job.get("VKC_HEAP_FILE")) {
+        const std::string spec(heap_file_env);
+        const std::size_t at_sign = spec.rfind('@');
+        p.heap_file_path = spec.substr(0, at_sign);
+        if (at_sign != std::string::npos) {
+            const char* digits = spec.c_str() + at_sign + 1;
+            const bool hex = digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X');
+            const char* body = hex ? digits + 2 : digits;
+            const auto first = static_cast<unsigned char>(*body);
+            if (!(hex ? std::isxdigit(first) : std::isdigit(first))) {
+                io.err.print("VKC_HEAP_FILE: expected <path>[@<offset>], got \"%s\"\n", heap_file_env);
+                return 2;
+            }
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(body, &end, hex ? 16 : 10);
+            if (end == body || *end || parsed > (1ull << 32) || p.heap_file_path.empty()) {
+                io.err.print("VKC_HEAP_FILE: expected <path>[@<offset>], got \"%s\"\n", heap_file_env);
+                return 2;
+            }
+            p.heap_file_at = parsed;
+        }
+        std::ifstream hf(p.heap_file_path, std::ios::binary);
+        p.heap_file.assign(std::istreambuf_iterator<char>(hf), {});
+        if (p.heap_file.empty()) {
+            io.err.print("VKC_HEAP_FILE: cannot read %s\n", p.heap_file_path.c_str());
+            return 2;
+        }
     }
     if (out_words_env) {
         char* end;
@@ -268,6 +320,7 @@ static int prepare(const Job& job, Io& io, Program& p) {
 // Not copied: the property and feature structures point at each other.
 struct Device {
     VkInstance inst = VK_NULL_HANDLE;
+    leonida::vk_test::OptInValidation validation;   // LEONIDA_VK_VALIDATION (its create info outlives the instance call)
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties props{};
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{
@@ -300,8 +353,10 @@ static int open_instance(Device& d, Io& io) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    if (!d.validation.prepare(gipa, ici)) return 1;
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
     d.inst = inst;
+    CHECK(d.validation.attach(gipa, inst));
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties);
     LOADI(vkGetPhysicalDeviceProperties2); LOADI(vkGetPhysicalDeviceFeatures2);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetPhysicalDeviceMemoryProperties);
@@ -323,8 +378,8 @@ static int open_instance(Device& d, Io& io) {
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &d.subgroup;
     vkGetPhysicalDeviceProperties2(d.pd, &props2);
-    io.err.print("device: %s (subgroup %u..%u)\n", d.props.deviceName, d.sgProps.minSubgroupSize,
-                 d.sgProps.maxSubgroupSize);
+    io.err.print("device: %s (subgroup %u..%u)%s\n", d.props.deviceName, d.sgProps.minSubgroupSize,
+                 d.sgProps.maxSubgroupSize, d.validation.enabled() ? " (validation on)" : "");
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(d.pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);
@@ -345,6 +400,12 @@ struct Plan {
 };
 
 static int plan_job(const Device& d, const Job& job, const Program& p, Io& io, Plan& pl) {
+    const uint32_t max_groups_x = d.props.limits.maxComputeWorkGroupCount[0];
+    if (p.groups > max_groups_x) {
+        io.err.print("groups: %u exceeds the X dispatch limit of %u on %s\n", p.groups, max_groups_x,
+                     d.props.deviceName);
+        return 2;
+    }
     const uint32_t req_sg = p.req_sg;
     pl.can_request_size = req_sg > 0 && d.f13q.subgroupSizeControl &&
         req_sg >= d.sgProps.minSubgroupSize && req_sg <= d.sgProps.maxSubgroupSize &&
@@ -469,6 +530,11 @@ static int run_job(Device& d, const Job& job, Program& p, const Plan& plan, Io& 
     // Output buffer = heap. Host-visible so the result can be read back directly.
     VkDeviceSize words = workgroup_yz ? yz_bins * (1 + origins) : VkDeviceSize(groups) * 64;
     if (out_words > words) words = out_words;
+    // The heap file may need more than the dispatch's own output words; round its end up to a word.
+    if (!p.heap_file.empty()) {
+        const VkDeviceSize need = VkDeviceSize(p.heap_file_at + p.heap_file.size() + 3) / 4;
+        if (need > words) words = need;
+    }
     // "bvh" writes its nodes at heap offsets 0x100 to 0x264 below, past the 256 bytes one group's 64 words give: the
     // shader then read them through the device address outside the buffer (VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819).
     const bool bvh = !std::strcmp(expect, "bvh");
@@ -501,6 +567,11 @@ static int run_job(Device& d, const Job& job, Program& p, const Plan& plan, Io& 
             return 2;
         }
         if (!heap_init.empty()) std::memcpy(map, heap_init.data(), heap_init.size());
+    }
+    if (!p.heap_file.empty()) {
+        std::memcpy(static_cast<char*>(map) + p.heap_file_at, p.heap_file.data(), p.heap_file.size());
+        io.out.print("heap file: %s at 0x%llx (%zu bytes)\n", p.heap_file_path.c_str(),
+                     static_cast<unsigned long long>(p.heap_file_at), p.heap_file.size());
     }
     if (!std::strcmp(expect, "bvh")) {
         // AMD-format BVH in the heap (runtime/test/shaders/cs_bvh.asm): box32 root at 0x100 whose children are a
@@ -845,7 +916,8 @@ static Job parse_job_line(const std::string& text, std::size_t line) {
             std::any_of(std::begin(kJobSettings), std::end(kJobSettings), [&](const char* s) { return name == s; });
         if (!known) {
             job.error = "unknown field \"" + f + "\" (--require-wave64 or NAME=VALUE with NAME one of VKC_OUT_WORDS, "
-                        "VKC_DUMP, VKC_HEAP_INIT, VKC_SUBGROUP_SIZE, VKC_SGPRS, VKC_BENCH, LEONIDA_PC_TAIL_UBO)";
+                        "VKC_DUMP, VKC_HEAP_INIT, VKC_HEAP_FILE, VKC_SUBGROUP_SIZE, VKC_SGPRS, VKC_BENCH, "
+                        "LEONIDA_PC_TAIL_UBO)";
             return job;
         }
         job.settings.emplace_back(name, f.substr(eq + 1));
@@ -874,6 +946,16 @@ static void write_bytes(const std::string& s) {
     if (!s.empty()) std::fwrite(s.data(), 1, s.size(), stdout);
 }
 
+// Validation errors the layer reported while one job ran fail that job, as exit_status does for a single run;
+// `charged` is how many were counted so far.
+static int charge_validation(int code, unsigned& charged, Io& io) {
+    const unsigned total = leonida::vk_test::OptInValidation::errors();
+    if (total == charged) return code;
+    io.err.print("%u validation errors\n", total - charged);
+    charged = total;
+    return code != 0 && code != 77 ? code : 1;
+}
+
 static int batch_main(const char* path, double timeout_s) {
     std::vector<Job> jobs;
     if (!read_jobs(path, jobs)) {
@@ -893,11 +975,13 @@ static int batch_main(const char* path, double timeout_s) {
     const std::string device_line = device_io.err.text;
     std::printf("@vkc-batch 1 jobs %zu\n", jobs.size());
     std::fflush(stdout);
+    unsigned charged = 0;   // validation errors already charged to a job (those of the device open go to the first)
     for (std::size_t i = 0; i < jobs.size(); i++) {
         std::printf("@vkc-job-begin %zu\n", i);
         std::fflush(stdout);
         const Job& job = jobs[i];
         Io io;
+        leonida::vk_test::OptInValidation::capture(&io.err.text);   // the layer's messages join this job's stderr
         int code;
         if (!job.error.empty()) {
             io.err.print("batch line %zu: %s\n", job.line, job.error.c_str());
@@ -912,6 +996,8 @@ static int batch_main(const char* path, double timeout_s) {
                 if (code < 0) code = run_job(d, job, p, pl, io, timeout_ns);
             }
         }
+        leonida::vk_test::OptInValidation::capture(nullptr);
+        code = charge_validation(code, charged, io);
         const char* status = io.timed_out ? "timeout" : io.lost ? "lost" : "done";
         std::printf("@vkc-job-end %zu %d %s %zu %zu\n", i, code, status, io.out.text.size(), io.err.text.size());
         write_bytes(io.out.text);
@@ -927,6 +1013,7 @@ static int batch_main(const char* path, double timeout_s) {
     std::fflush(stdout);
     d.vkDeviceWaitIdle(d.dev);
     d.vkDestroyDevice(d.dev, nullptr);
+    d.validation.detach(gipa, d.inst);
     if (const auto destroy = reinterpret_cast<PFN_vkDestroyInstance>(gipa(d.inst, "vkDestroyInstance")))
         destroy(d.inst, nullptr);
     return 0;
@@ -980,5 +1067,6 @@ int main(int argc, char** argv) {
     Job job;
     job.spv = argv[1]; job.groups = argv[2]; job.expect = argv[3];
     job.require_wave64 = require_wave64;
-    return single_main(job);
+    // GPU-assisted validation reports what the shader did when the queue finishes, after the words were judged.
+    return leonida::vk_test::OptInValidation::exit_status(single_main(job));
 }
