@@ -64,9 +64,10 @@ def main() -> int:
         print(f"ERROR: missing executable {exe}", file=sys.stderr)
         return 2
     env = os.environ.copy()
-    # An implicit Vulkan layer may be forced by the loader even if the application
-    # enabled VK_LAYER_KHRONOS_validation explicitly via LEONIDA_VK_VALIDATION.
-    env["VK_INSTANCE_LAYERS"] = "VK_LAYER_LUNARG_api_dump"
+    # The Vulkan loader orders layers in VK_INSTANCE_LAYERS ahead of app-enabled layers.
+    # Put VK_LAYER_KHRONOS_validation ahead of VK_LAYER_LUNARG_api_dump so api_dump sits
+    # below validation, avoiding an access violation crash in vkDestroyDevice (issue #5804).
+    env["VK_INSTANCE_LAYERS"] = os.pathsep.join(["VK_LAYER_KHRONOS_validation", "VK_LAYER_LUNARG_api_dump"])
     env["LEONIDA_VK_VALIDATION"] = "1"
     with tempfile.TemporaryDirectory(prefix="leonida_sparse_trace_") as td:
         path = Path(td)
