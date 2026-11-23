@@ -477,7 +477,10 @@ int main() {
             VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &m3};
             d.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(d.physical, &properties);
             const std::uint64_t arena = rt::d3d12::device_arena_size(device.p);
-            EXPECT(arena > 0 && arena <= m4.maxBufferSize && arena <= m3.maxMemoryAllocationSize);
+            // 0 is "not known" (src/arena_size.h): a device without VK_KHR_maintenance4 (MoltenVK 1.2 under CrossOver)
+            // leaves maxBufferSize unwritten, and the runtime then caps nothing by it.
+            EXPECT(arena > 0 && (m4.maxBufferSize == 0 || arena <= m4.maxBufferSize) &&
+                   (m3.maxMemoryAllocationSize == 0 || arena <= m3.maxMemoryAllocationSize));
 
             constexpr std::uint64_t capped_limit = 32ull << 20;
             rt::d3d12::VulkanDeviceInfo capped_info = info;
