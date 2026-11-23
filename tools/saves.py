@@ -577,7 +577,8 @@ def import_saves(args):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] in ('-h', '--help'):
+    # `<command> --help` too: the commands read their arguments by hand, so the flag would become a file or folder name.
+    if len(argv) < 2 or any(a in ('-h', '--help') for a in argv[1:]):
         print(__doc__)
         return 0
     cmd, args = argv[1], argv[2:]

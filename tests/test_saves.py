@@ -793,6 +793,16 @@ class MalformedJsavTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
 
+class CommandHelpTest(unittest.TestCase):
+    def test_help_after_a_command_prints_the_usage_page(self):
+        for argv in (["--help"], ["import", "--help"], ["info", "-h"], ["extract", "--help"]):
+            with self.subTest(argv=argv):
+                r = subprocess.run([sys.executable, "-I", TOOL, *argv], capture_output=True, text=True, timeout=10)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("import <save dir>...", r.stdout)
+                self.assertNotIn("ERROR:", r.stderr)
+
+
 class PackIndexValidationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
