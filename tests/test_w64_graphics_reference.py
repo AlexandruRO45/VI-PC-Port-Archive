@@ -13,6 +13,25 @@ import w64_graphics
 
 
 class TierCReferenceTests(unittest.TestCase):
+    def test_reference_requires_a_complete_readback(self) -> None:
+        name = "ps_w64_c_lane_id"
+        pixels = [(0, 0, 0, 0)] * (w64_graphics.W * w64_graphics.H)
+        expected_bytes = len(pixels) * struct.calcsize("<4I")
+
+        with tempfile.TemporaryDirectory() as work:
+            (Path(work) / f"{name}.spv").touch()
+            reference = Path(work) / f"{name}.ref64.raw"
+            with patch.dict(os.environ, W64G_REF=work, W64G_SAVE_REF=""), patch.object(
+                w64_graphics, "draw", return_value=(pixels, None, None),
+            ):
+                for actual_bytes in (expected_bytes - 1, expected_bytes - 16, expected_bytes + 16):
+                    with self.subTest(actual_bytes=actual_bytes):
+                        reference.write_bytes(bytes(actual_bytes))
+                        self.assertEqual(
+                            w64_graphics.check(work, work, name),
+                            f"64-lane reference: {actual_bytes} bytes, expected {expected_bytes}",
+                        )
+
     def test_partition_invariant_word_must_match_reference(self) -> None:
         name = "ps_w64_c_lane_id"
         # The fixture writes lane ID, lane ID within a half, pixel X and zero.

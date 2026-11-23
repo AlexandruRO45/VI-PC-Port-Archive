@@ -431,6 +431,9 @@ def check(tools, spirv, name):
             compared = True
         if ref and (Path(ref) / (name + ".ref64.raw")).is_file():
             data = (Path(ref) / (name + ".ref64.raw")).read_bytes()
+            expected_bytes = len(runs[None][0]) * struct.calcsize("<4I")
+            if len(data) != expected_bytes:
+                return f"64-lane reference: {len(data)} bytes, expected {expected_bytes}"
             ref_words = list(struct.iter_unpack("<4I", data))
             for size, (words, heap) in runs.items():
                 if size == 64:
