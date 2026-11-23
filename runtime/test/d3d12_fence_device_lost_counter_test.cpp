@@ -75,7 +75,51 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const
 }
 }  // namespace driver
 
-bool native_warp_control() {
+// RemoveDevice is a logical removal, not a physical GPU failure. Both fences and every registered
+// event must complete, including waits registered after removal; a second removal is harmless.
+bool remove_device_notifies(ID3D12Device* device, const char* label) {
+    Ref<ID3D12Device1> device1;
+    Ref<ID3D12Device5> device5;
+    Event before[3], after[3];  // outlive the fences and their pending callbacks on every exit path
+    Ref<ID3D12Fence> a, b;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1.p))) ||
+        FAILED(device->QueryInterface(IID_PPV_ARGS(&device5.p))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&a.p))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&b.p)))) return false;
+    HANDLE pre[] = {before[0].handle, before[1].handle, before[2].handle};
+    HANDLE post[] = {after[0].handle, after[1].handle, after[2].handle};
+    for (HANDLE h : pre) if (!h) return false;
+    for (HANDLE h : post) if (!h) return false;
+    ID3D12Fence* fences[] = {a.p, b.p};
+    const UINT64 values[] = {1, 1};
+    const auto subscribe = [&](HANDLE* events) {
+        return SUCCEEDED(a->SetEventOnCompletion(1, events[0])) &&
+               SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(fences, values, 2,
+                                                                    D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, events[1])) &&
+               SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(fences, values, 2,
+                                                                    D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY, events[2]));
+    };
+    if (device->GetDeviceRemovedReason() != S_OK || a->GetCompletedValue() != 0 || b->GetCompletedValue() != 0 ||
+        !subscribe(pre)) return false;
+    for (HANDLE h : pre) if (WaitForSingleObject(h, 0) != WAIT_TIMEOUT) return false;
+    device5->RemoveDevice();
+    const HRESULT reason = device->GetDeviceRemovedReason();
+    const UINT64 first = a->GetCompletedValue(), second = b->GetCompletedValue();
+    const DWORD pre_status = WaitForMultipleObjects(3, pre, TRUE, 1000);
+    const bool post_registered = subscribe(post);
+    const DWORD post_status = WaitForMultipleObjects(3, post, TRUE, 1000);
+    device5->RemoveDevice();
+    const bool repeated = device->GetDeviceRemovedReason() == DXGI_ERROR_DEVICE_REMOVED &&
+                          a->GetCompletedValue() == UINT64_MAX && b->GetCompletedValue() == UINT64_MAX;
+    const bool ok = reason == DXGI_ERROR_DEVICE_REMOVED && first == UINT64_MAX && second == UINT64_MAX &&
+                    pre_status == WAIT_OBJECT_0 && post_registered && post_status == WAIT_OBJECT_0 && repeated;
+    std::printf("%s RemoveDevice: reason=%08lx fences=%llu/%llu before=%lu after=%lu repeated=%d: %s\n", label,
+                static_cast<unsigned long>(reason), static_cast<unsigned long long>(first),
+                static_cast<unsigned long long>(second), pre_status, post_status, int(repeated), ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+int native_warp_control() {
     Ref<IDXGIFactory4> factory;
     Ref<IDXGIAdapter> adapter;
     Ref<ID3D12Device> device;
@@ -84,34 +128,36 @@ bool native_warp_control() {
         FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p))) ||
         FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device.p))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
-        return false;
+        return 77;
     Event event;
     if (!event.handle || fence->GetCompletedValue() != 0 ||
         FAILED(fence->SetEventOnCompletion(2, event.handle)) || event.ready(0) ||
         FAILED(fence->Signal(2)) || !event.ready(2000) ||
         fence->GetCompletedValue() != 2 || device->GetDeviceRemovedReason() != S_OK)
-        return false;
+        return 1;
     Ref<ID3D12Device1> device1;
     Ref<ID3D12Fence> second;
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1.p))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&second.p))))
-        return false;
+        return 1;
     ID3D12Fence* const fences[] = {fence.p, second.p};
     const UINT64 values[] = {2, 3};
     if (FAILED(second->Signal(3)) ||
         FAILED(device1->SetEventOnMultipleFenceCompletion(fences, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, nullptr)) ||
         FAILED(device1->SetEventOnMultipleFenceCompletion(fences, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY, nullptr)))
-        return false;
+        return 1;
     std::printf("native WARP: normal fence query/signal/event completed value 2 and two-fence ALL/ANY blocking waits\n");
-    return true;
+    return remove_device_notifies(device.p, "native WARP") ? 0 : 1;
 }
 }  // namespace
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    if (!native_warp_control()) {
-        std::fprintf(stderr, "SKIP: native WARP unavailable or failed normal fence control\n");
-        return 77;
+    const int native_result = native_warp_control();
+    if (native_result) {
+        std::fprintf(stderr, "%s: native WARP %s\n", native_result == 77 ? "SKIP" : "FAIL",
+                     native_result == 77 ? "unavailable" : "fence control failed");
+        return native_result;
     }
     vktest::Device vk;
     const auto status = vk.initialize();
@@ -236,6 +282,19 @@ int main() {
             removed != DXGI_ERROR_DEVICE_REMOVED || delta != 2 ||
             driver::fail_next_wait.load() != VK_SUCCESS)
             ++failures;
+    }
+    // Separate logical device: RemoveDevice must mark this device's context lost, as an observed Vulkan loss does.
+    {
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = vk.instance_proc;
+        info.instance = vk.instance;
+        info.physical = vk.physical;
+        info.device = vk.device;
+        info.queue = vk.queue;
+        info.queue_family = vk.family;
+        Ref<ID3D12Device> device;
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p)))) return 1;
+        if (!remove_device_notifies(device.p, "Leonida Vulkan")) ++failures;
     }
     const unsigned errors = vk.validation_errors();
     std::printf("Vulkan validation errors: %u\n", errors);

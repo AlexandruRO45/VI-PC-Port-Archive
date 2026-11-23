@@ -5426,8 +5426,10 @@ public:
                    : D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
     }
 
-    // STUB
-    void STDMETHODCALLTYPE RemoveDevice() override { removed_.store(true, std::memory_order_release); }
+    void STDMETHODCALLTYPE RemoveDevice() override {
+        if (state_.context) state_.context->mark_device_lost();  // completes pending fence waits
+        removed_.store(true, std::memory_order_release);
+    }
 
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
