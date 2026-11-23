@@ -742,6 +742,22 @@ node --test tests\test_viewer_streaming.cjs
 ```
 
 The entity rows and the placed chunks come from your own copy of the game; keep them in the local work folder.
+
+### Viewing it
+
+`viewer/serve.py` serves `viewer/index.html` and a built world on this machine only:
+
+```powershell
+python -I viewer\serve.py --world work\world\lod
+```
+
+It prints the URL it bound (for example `viewer: http://127.0.0.1:8765/  world: work\world\lod`); open it in a
+browser. `--port 0` asks the OS for a free port and prints it. `--world` is the folder `world_build.py --out` wrote
+(`world.json` and the `chunks/` it names), and it is served under `/world/`, so the game-derived files never have to
+sit inside the repository. Without `--world` the page shows the built-in test terrain instead
+(`world: (none: test terrain)`). The page imports three.js r160 from jsdelivr through the import map in
+`viewer/index.html`, so that page needs internet access for those two modules; the world data itself stays local.
+
 ## Trains (`CTrainConfigs`)
 
 Trains are configured by one `CTrainConfigs` XML document in `common.rpf` (see [gamedata.md](gamedata.md)).
