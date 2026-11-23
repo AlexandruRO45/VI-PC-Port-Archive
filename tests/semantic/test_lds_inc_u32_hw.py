@@ -550,6 +550,35 @@ class TestDSIncU32ConditionCodesAndStatusFlags(unittest.TestCase):
 
         self.assertEqual(state.lgkm_cnt, 4)
 
+class TestDSIncU32BoundaryExtremes(unittest.TestCase):
+    """Part 7: Boundary extremes, wrap reset points, and address wrap."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_bytes=4096)
+        self.interp = ScalarDSInterpreter(self.lds)
+        self.state = ScalarThreadState(self.lds)
+
+    def test_boundary_increments_and_resets(self) -> None:
+        # DATA = 0: any non-negative unsigned integer >= 0 is True -> always resets to 0
+        self.assertEqual(ref_ds_inc_u32(0, 0), 0)
+        self.assertEqual(ref_ds_inc_u32(1, 0), 0)
+        self.assertEqual(ref_ds_inc_u32(0xFFFFFFFF, 0), 0)
+
+        # DATA = UINT32_MAX: cur < UINT32_MAX increments
+        self.assertEqual(ref_ds_inc_u32(0, 0xFFFFFFFF), 1)
+        self.assertEqual(ref_ds_inc_u32(0xFFFFFFFE, 0xFFFFFFFF), 0xFFFFFFFF)
+        self.assertEqual(ref_ds_inc_u32(0xFFFFFFFF, 0xFFFFFFFF), 0)
+
+        # 0x80000000 in unsigned is 2147483648
+        self.assertEqual(ref_ds_inc_u32(0x7FFFFFFF, 0x80000000), 0x80000000)
+        self.assertEqual(ref_ds_inc_u32(0x80000000, 0x80000000), 0)
+
+    def test_memory_address_wrapping_boundaries(self) -> None:
+        idx = self.lds.resolve_dword_index(0xFFFFFFFC, offset=4)
+        self.assertEqual(idx, 0)
+        idx2 = self.lds.resolve_dword_index(4096)
+        self.assertEqual(idx2, 0)
+
 
 if __name__ == '__main__':
     unittest.main()
