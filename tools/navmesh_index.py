@@ -335,9 +335,11 @@ def main() -> int:
             with open(a.input, "rb") as f:
                 magic = f.read(8)
         except OSError as e:
-            raise SystemExit(f"{a.input}: {e.strerror or e}")
+            print(f"ERROR: {a.input}: {e.strerror or e}", file=sys.stderr)
+            return 2
         if len(magic) < 8 or magic[1:4] != b"FPR" or magic[0] not in b"789":
-            raise SystemExit(f"{a.input}: not an RPF7/8/9 archive (magic {magic[:4]!r})")
+            print(f"ERROR: {a.input}: not an RPF7/8/9 archive (magic {magic[:4]!r})", file=sys.stderr)
+            return 2
         rows, summary = scan_archive(a.input, a.start, a.limit)
 
     add_distribution(summary, rows)
