@@ -62,6 +62,8 @@ bool same_explicit_matches(IDXGIOutput* shim, IDXGIOutput* host) {
         if (FAILED(host->FindClosestMatchingMode(&legacy, &expected, nullptr)) ||
             FAILED(shim->FindClosestMatchingMode(&legacy, &actual, nullptr)) || !same(actual, expected)) return false;
     }
+    if (checked.empty()) std::fprintf(stderr, "SKIP explicit scaling: no scaled modes on this output\n");
+    else std::fprintf(stderr, "explicit scaling: %zu scaling types compared\n", checked.size());
     return true;
 }
 
