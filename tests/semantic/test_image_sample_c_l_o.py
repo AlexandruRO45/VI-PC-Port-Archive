@@ -91,6 +91,27 @@ class ImageSampleCLOtests(unittest.TestCase):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate_lines("cs_img_sample_c_l_o_bad", [line, "s_endpgm"], fssm=FSSM_BYTES)
 
+    def test_texel_offset_fallback_nearest_mip_selection(self):
+        prev = rdna2spirv.TEXEL_OFFSET_FALLBACK
+        rdna2spirv.TEXEL_OFFSET_FALLBACK = True
+        try:
+            for suffix in ("", " d16"):
+                with self.subTest(suffix=suffix):
+                    spv = translate_and_assemble([
+                        f"image_sample_c_l_o v0, v[0:4], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D{suffix}",
+                    ])
+                    self.assertRegex(
+                        spv,
+                        r"OpImageSampleDrefExplicitLod %float %\w+ %\w+ %\w+ Lod %\w+\n",
+                    )
+                    self.assertNotIn("Lod|Offset", spv)
+                    self.assertIn("OpExtInst %float %glsl Floor ", spv)
+                    self.assertIn("OpFOrdGreaterThanEqual %bool ", spv)
+                    self.assertIn("OpImageQuerySizeLod %v2int ", spv)
+                    self.assertIn("OpFDiv %v2float ", spv)
+        finally:
+            rdna2spirv.TEXEL_OFFSET_FALLBACK = prev
+
 
 if __name__ == "__main__":
     unittest.main()
