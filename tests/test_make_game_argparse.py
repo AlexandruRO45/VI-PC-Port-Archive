@@ -297,14 +297,14 @@ class JobsHandlingTest(unittest.TestCase):
     """Test --jobs default computation, command-line overrides, and forwarding."""
 
     def host_independent_jobs(self):
-        """Keep the clamp from reducing a requested --jobs on a small machine.
+        """Keep the clamp from moving a requested --jobs on this machine.
 
         make_game.main() clamps --jobs to the host's CPU count (leonida_tui.clamp_jobs), so a test that
         asks for 6 jobs only sees 6 on a machine with at least 6 cores; on a 4-core laptop or a 2-core CI
         runner the assertion compared the clamped value. The behaviour under test is the forwarding, not
         the clamp.
         """
-        return patch.object(make_game.leonida_tui, "cpu_jobs_bounds", return_value=(1, 1, 64))
+        return patch.object(make_game.leonida_tui, "cpu_jobs_bounds", return_value=(1, 1, 1 << 30))
 
     def test_jobs_default_calculation_scenarios(self):
         scenarios = [
