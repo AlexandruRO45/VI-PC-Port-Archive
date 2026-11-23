@@ -99,11 +99,30 @@ def run_process(label, command, **kwargs):
         raise SystemExit(f"FAIL: cannot start {label} ({location}): {error}") from error
 
 
+# Left set in a game's environment, these would put every D3D12 queue of the game on one VkQueue.
+QUEUE_TEST_SETTINGS = {"LEONIDA_VK_MAX_QUEUES_PER_FAMILY": "1", "LEONIDA_VK_GRAPHICS_FAMILY_ONLY": "1"}
+
+
+def check_queue_test_settings_ignored(output):
+    """Problems if the game's device applied a queue test setting instead of saying it ignores it."""
+    lines = output.replace("\r\n", "\n").split("\n")
+    problems = []
+    for name in QUEUE_TEST_SETTINGS:
+        if any(line.startswith(f"[rt] d3d12: {name}: ") for line in lines):
+            problems.append(f"the game's device applied the test setting {name}")
+        if not any(line.startswith(f"[rt] d3d12: {name} is a test setting; the game's device ignores it")
+                   for line in lines):
+            problems.append(f"the game's device did not say it ignores {name}")
+    return problems
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("loader")
     parser.add_argument("guest")
     parser.add_argument("--probe", help="a Vulkan device test; its exit code 77 skips this test")
+    parser.add_argument("--queue-test-settings", action="store_true",
+                        help="also set the queue test settings (docs/testing.md), which the game's device must ignore")
     parser.add_argument("--runner", action="append", default=[],
                         help="run Windows executables through this command (repeat for its arguments), e.g. wine")
     options = parser.parse_args()
@@ -117,6 +136,8 @@ def main():
             return SKIP
 
     environment = dict(os.environ, LEONIDA_D3D12="vulkan")
+    if options.queue_test_settings:
+        environment.update(QUEUE_TEST_SETTINGS)
     run = run_process(
         "tiny-frame loader",
         [*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
@@ -125,6 +146,8 @@ def main():
     )
     output = run.stdout + run.stderr
     problems = check_output(run.returncode, output)
+    if options.queue_test_settings:
+        problems += check_queue_test_settings_ignored(output)
     if problems:
         print(output)
         for problem in problems:

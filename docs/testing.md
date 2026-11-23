@@ -401,7 +401,9 @@ whose Metal device is "Apple Paravirtual device" (Metal family Mac2, not Apple7)
 subgroups, so the wave64 and "32 lanes on request" tests skip there (about 75 of 190 in November 2026), and Mesa's
 KosmicKrisp finds no device. `macos-15` can't build the runtime: Xcode 16's libc++ has no floating-point
 `std::from_chars`. A test known to fail on MoltenVK is listed in the step's `EXPECTED_FAILURES` with the pull
-request or coordination-issue finding that tracks it; it still runs, and `scripts/ci_expected_failures.py` fails the step on any other failure.
+request or coordination-issue finding that tracks it; it still runs, and `scripts/ci_expected_failures.py` fails the step
+on any other failure. It takes `FAILED_LIST EXIT_STATUS [EXPECTED ...]`, answers `--help`, and reports a list it cannot
+read or a non-numeric status as one line with exit code 2.
 
 ## GPUs without fragment barycentrics (NVIDIA Volta, Pascal and older)
 
@@ -500,6 +502,16 @@ and a value that matches no device fails the run instead of testing
 another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` picks the D3D12 adapter the same way.
 The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) read it the same way through
 `vk_device_pick.h`, and fail with a message naming the filter when it matches no device.
+
+Two test settings make the layer's standalone device look like a GPU with fewer Vulkan queues, so D3D12 queues share
+them (`docs/d3d12_vulkan.md` section 4.4) on any GPU: `LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N` (1 to 16) creates at most
+N Vulkan queues per queue family, and `LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1` puts COMPUTE and COPY queues in the
+graphics family, as on a GPU without async compute or transfer families. Both together give the shape of the Intel
+UHD 770 on Windows and of lavapipe, one family with one queue; the `d3d12_queue_share_one_queue` and
+`d3d12_queue_wait_one_queue` tests run that way, and any other test can be run so by hand. The device logs what it
+applied; a queue count outside 1 to 16 is ignored, with a message. Only tests apply them: the device that
+`gta6rt --run` creates for a game (`LEONIDA_D3D12=vulkan`) ignores both and prints `... is a test setting; the
+game's device ignores it`, so leaving them set cannot slow a game down (`run_tiny_frame_queue_test_settings`).
 
 ## Known problems
 
