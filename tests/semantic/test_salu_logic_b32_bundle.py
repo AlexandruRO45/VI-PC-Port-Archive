@@ -631,6 +631,23 @@ class TestSXnorB32SIMDAndIEEE(unittest.TestCase):
         res, _ = ref_s_xnor_b32(qnan, snan)
         self.assertIsInstance(res, int)
 
+class TestSXnorB32Translation(unittest.TestCase):
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available")
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_xnor_b32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s2",
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bundle_s_xnor_b32", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xe2c4a688)
+
 
 if __name__ == "__main__":
     unittest.main()
