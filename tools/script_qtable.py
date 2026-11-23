@@ -22,14 +22,17 @@ import json
 import os
 import struct
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing sibling helpers.
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
+from file_mode import published_mode  # noqa: E402
 import gamedata_index as gi  # noqa: E402
 import gamedata_maps as gm  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 HEADER_BYTES = 40
@@ -575,6 +578,30 @@ def _print_summary(report: dict) -> None:
         )
 
 
+def _write_json_staged(path: str, payload: dict) -> None:
+    """Write `payload` to a sibling temp file and atomically replace `path`, keeping any existing report on error."""
+    gm._make_parent(path)
+    parent = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=parent)
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=1)
+        os.chmod(tmp, published_mode(path))  # mkstemp creates 0600
+        replace_retry(tmp, path)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)  # a read-only destination's mode would block unlink on Windows
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="carved script directory, script.rpf archive, or joined .bin file")
@@ -609,9 +636,7 @@ def main(argv=None) -> int:
 
     if a.json:
         try:
-            gm._make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1)
+            _write_json_staged(a.json, out)
         except OSError as e:
             print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2

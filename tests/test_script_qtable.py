@@ -5,6 +5,8 @@
 Every fixture is synthetic: 40-byte header + u64 offset table + 16-byte-aligned
 struct, wrapper and array records linked by 0x71717171-tagged pointers.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -332,6 +335,52 @@ class ScriptQtableTests(unittest.TestCase):
         self.assertLess(elapsed, 1.0)
         self.assertFalse(rep["valid"])
         self.assertEqual(rep["cross_tree_edges"], n - 1)
+
+    def test_json_write_failure_preserves_existing_report_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "qtable.bin")
+            with open(bin_path, "wb") as f:
+                f.write(build_synthetic_qtable())
+            report_path = os.path.join(tmp, "report.json")
+            sentinel = '{"previous": true}\n'
+            with open(report_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(sentinel)
+
+            def fail_mid_write(obj, fp, **kwargs):
+                fp.write('{"partial": ')
+                raise OSError("simulated disk full")
+
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(script_qtable.json, "dump", side_effect=fail_mid_write), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = script_qtable.main([bin_path, "--json", report_path])
+
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR: cannot write ", err.getvalue())
+            with open(report_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), sentinel)
+            self.assertEqual(sorted(os.listdir(tmp)), ["qtable.bin", "report.json"])
+
+    def test_json_replace_failure_preserves_existing_report_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "qtable.bin")
+            with open(bin_path, "wb") as f:
+                f.write(build_synthetic_qtable())
+            report_path = os.path.join(tmp, "report.json")
+            sentinel = '{"previous": true}\n'
+            with open(report_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(sentinel)
+
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(script_qtable, "replace_retry", side_effect=OSError("simulated replace failure")), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = script_qtable.main([bin_path, "--json", report_path])
+
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR: cannot write ", err.getvalue())
+            with open(report_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), sentinel)
+            self.assertEqual(sorted(os.listdir(tmp)), ["qtable.bin", "report.json"])
 
 
 if __name__ == "__main__":
