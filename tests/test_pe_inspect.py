@@ -283,6 +283,20 @@ class PeInspectTest(unittest.TestCase):
             self.assertEqual(report["pdata_functions"], 3)
             self.assertEqual(report["tls_callbacks"], 2)
 
+    def test_exe_inspection_rejects_tls_callbacks_outside_the_image(self):
+        for is64, fmt in ((True, "<Q"), (False, "<I")):
+            image = bytearray(build_image(is64=is64))
+            info = pe_inspect.PeImage(image)
+            slot = info.offset(0x1940 + struct.calcsize(fmt), struct.calcsize(fmt))
+            for target in (info.image_base - 1, info.image_base + info.size_of_image):
+                with self.subTest(is64=is64, target=hex(target)):
+                    struct.pack_into(fmt, image, slot, target)
+                    path = os.path.join(self.dir, "invalid-callback.exe")
+                    with open(path, "wb") as f:
+                        f.write(image)
+                    with self.assertRaisesRegex(pe_inspect.PeFormatError, "TLS callback 2 .* outside the image"):
+                        pe_inspect.inspect(path, self.dir)
+
     def test_pe32_headers_and_thunks(self):
         r = self.report32
         self.assertEqual(r["machine"], "x86")

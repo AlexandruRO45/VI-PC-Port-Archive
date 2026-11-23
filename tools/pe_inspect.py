@@ -301,8 +301,13 @@ def _tls_callbacks(img: PeImage) -> int:
     width = 8 if img.is64 else 4
     for i in range(MAX_ENTRIES):
         entry = img.offset(callbacks + i * width, width)
-        if entry is None or not img.word(entry):
+        if entry is None:
             break
+        target = img.word(entry)
+        if not target:
+            break
+        if not 0 <= target - img.image_base < img.size_of_image:
+            raise PeFormatError(f"TLS callback {i + 1} address {target:#x} is outside the image")
         count += 1
     return count
 
