@@ -987,9 +987,16 @@ def svg_panel_height(units, weighted):
     return int(min(330, max(70, 40 + 8.5 * math.sqrt(units))))
 
 
+# What may come before an SVG's root element: white space, an XML declaration or other processing instructions,
+# comments and a DOCTYPE (with or without an internal subset).
+SVG_PROLOG = re.compile(rb"(?:\s+|<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^>\[]*(?:\[.*?\])?\s*>)*", re.S | re.I)
+SVG_ROOT = re.compile(rb"<(?:[A-Za-z_][\w.-]*:)?svg[\s/>]")
+
+
 def svg_target_problem(path):
     """Why --svg may not write to `path`, or None. It may point inside the repository, so it only takes a .svg name
-    and only replaces a file that is already an SVG: a mistyped path never overwrites a script or a document."""
+    and only replaces a file whose root element is <svg>: a mistyped path never overwrites a script, a document or
+    another XML file that happens to carry a .svg name."""
     if not path.lower().endswith(".svg"):
         return "the file name must end in .svg"
     if os.path.isdir(path):
@@ -997,10 +1004,11 @@ def svg_target_problem(path):
     if os.path.exists(path):
         try:
             with open(path, "rb") as f:
-                head = f.read(256).lstrip()
+                head = f.read(4096)
         except OSError as error:
             return f"cannot read the existing file ({error.strerror})"
-        if not (head.startswith(b"<svg") or head.startswith(b"<?xml")):
+        head = head.removeprefix(b"\xef\xbb\xbf")
+        if not SVG_ROOT.match(head, SVG_PROLOG.match(head).end()):
             return "exists and is not an SVG; refusing to overwrite it"
     return None
 

@@ -317,6 +317,35 @@ class Svg(unittest.TestCase):
             root = ET.fromstring(pd.render_svg(snap))
             self.assertTrue(root.tag.endswith("svg"))
 
+    def test_svg_target_checks_the_root_element(self):
+        # An XML declaration alone is not enough: the first element has to be <svg>, with or without a prefix.
+        cases = {
+            "plain.svg": (b'<svg xmlns="http://www.w3.org/2000/svg"/>', True),
+            "decl.svg": (b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"></svg>', True),
+            "bom.svg": (b'\xef\xbb\xbf<?xml version="1.0"?><svg/>', True),
+            "prolog.svg": (b'<?xml version="1.0"?>\n<!-- drawn by hand -->\n<!DOCTYPE svg PUBLIC '
+                           b'"-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n<svg>\n</svg>',
+                           True),
+            "subset.svg": (b'<!DOCTYPE svg [ <!ENTITY a "b"> ]>\n<svg/>', True),
+            "prefixed.svg": (b'<svg:svg xmlns:svg="http://www.w3.org/2000/svg"/>', True),
+            "xml_other_root.svg": (b'<?xml version="1.0"?>\n<project><svg/></project>', False),
+            "html.svg": (b'<!DOCTYPE html><html><svg/></html>', False),
+            "longer_name.svg": (b'<?xml version="1.0"?><svgfont/>', False),
+            "decl_only.svg": (b'<?xml version="1.0"?>\n', False),
+            "empty.svg": (b'', False),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, (data, ok) in cases.items():
+                with self.subTest(name=name):
+                    path = os.path.join(tmp, name)
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    problem = pd.svg_target_problem(path)
+                    if ok:
+                        self.assertIsNone(problem)
+                    else:
+                        self.assertIn("not an SVG", problem)
+
     def test_svg_target_takes_only_svg_names_and_svg_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             script = os.path.join(tmp, "tool.py")
