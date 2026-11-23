@@ -481,6 +481,23 @@ class VRcpF64SimdIeeeTests(unittest.TestCase):
         res = oracle_rcp_f64(F64_MIN_NORMAL)
         self.assertTrue(u64_to_f64(res) > 1e300)
 
+class VRcpF64TranslatorTests(unittest.TestCase):
+    def test_rcp_f64_translation(self):
+        lines = [
+            f"v_mov_b32 v2, {F64_POS_TWO & MASK32:#010x}",
+            f"v_mov_b32 v3, {(F64_POS_TWO >> 32) & MASK32:#010x}",
+            "v_rcp_f64 v[0:1], v[2:3]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_rcp_f64_test", lines)
+        self.assertIn("OpCapability Float64", spv)
+        self.assertIn("OpFDiv %double", spv)
+
+    def test_rcp_f64_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_rcp_f64", ["v_rcp_f64"])
+
 
 if __name__ == "__main__":
     unittest.main()
