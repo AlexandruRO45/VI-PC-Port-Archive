@@ -85,6 +85,19 @@ class BadGamedataMapsIndexTest(unittest.TestCase):
             self.assertNotIn("Traceback", result.stderr)
             self.assertIn("no MHIU or PAMH payloads", result.stdout)
 
+    def test_an_index_saved_with_a_utf8_bom_is_read(self):
+        # the same class PR #6017 fixed in world_index.py: an editor's BOM made _read_index_rows raise
+        # UnicodeDecodeError before json.load saw any content.
+        with tempfile.TemporaryDirectory() as td:
+            carve = self.make_carve(td, {"files": []})
+            index = carve / "index.json"
+            text = index.read_text(encoding="utf-8")
+            index.write_text(text, encoding="utf-8-sig")
+            result = self.run_tool(carve)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("no MHIU or PAMH payloads", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

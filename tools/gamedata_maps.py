@@ -320,7 +320,7 @@ def _join(row: dict, data: bytes) -> dict:
 
 def _read_index_rows(directory: str) -> list[dict]:
     index_path = os.path.join(directory, "index.json")
-    with open(index_path, encoding="utf-8") as f:
+    with open(index_path, encoding="utf-8-sig") as f:  # an index saved with a UTF-8 BOM is still JSON
         index = json.load(f)
     # A hand-edited or half-written index used to fail as `error: 'files'`, naming neither the folder nor the
     # file. Name the index and the malformed row like gamedata_blobs.check_carve_index does.
