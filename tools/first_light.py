@@ -145,7 +145,7 @@ def ensure_carve(game: str, work: str) -> str:
 
 
 def choose(index_path: str, vs: str, ps: str) -> list[dict]:
-    with open(index_path, encoding="utf-8") as f:
+    with open(index_path, encoding="utf-8-sig") as f:  # -sig: a copy re-saved by a Windows editor has a BOM
         entries = json.load(f)
     by_stage_and_name = {(entry["stage"], entry["name"]): entry for entry in entries}
     requested = (("vs", vs), ("ps", ps))
@@ -192,7 +192,7 @@ def translate(work: str, picked: list[dict]) -> dict:
             spirv,
         ]
     )
-    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+    with open(os.path.join(spirv, "index.json"), encoding="utf-8-sig") as f:
         meta = json.load(f)
     result = {}
     for entry in picked:

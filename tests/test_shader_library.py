@@ -222,6 +222,15 @@ class Main(unittest.TestCase):
             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
                              ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
 
+    def test_carve_index_saved_with_a_bom_is_read(self):
+        # Windows PowerShell 5.1 and Notepad write a UTF-8 BOM; json.load would refuse it as "Unexpected UTF-8 BOM".
+        with tempfile.TemporaryDirectory() as carve:
+            with open(os.path.join(carve, "PS_A.dxbc"), "wb") as f:
+                f.write(dxbc(D_PS))
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump([{"name": "PS_A", "file": "PS_A.dxbc"}], f)
+            self.assertEqual(sl.carve_digests(carve), {D_PS: [("PS_A", os.path.join(carve, "PS_A.dxbc"))]})
+
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = os.path.join(tmp, "carve")

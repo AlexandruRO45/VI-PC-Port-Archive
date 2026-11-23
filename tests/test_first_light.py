@@ -238,6 +238,14 @@ class PpmTests(unittest.TestCase):
 
 class ShaderPreparationTests(unittest.TestCase):
     def test_same_display_name_keeps_both_stage_files(self) -> None:
+        self.check_pair_run("utf-8")
+
+    def test_indexes_saved_with_a_bom_are_read(self) -> None:
+        # Windows PowerShell 5.1 and Notepad write a UTF-8 BOM: the carve's index.json and the translator's are read.
+        self.check_pair_run("utf-8-sig")
+
+    def check_pair_run(self, encoding: str) -> None:
+        """main() on a two-stage carve whose shaders share a display name; both indexes written in `encoding`."""
         modules = {"vs": build_vs_stub([0]), "ps": build_ps_stub([0])}
         entries = [
             {"name": "shared", "file": "shared.dxbc", "stage": "vs"},
@@ -247,7 +255,7 @@ class ShaderPreparationTests(unittest.TestCase):
             work = Path(tmp)
             dxbc = work / "shaders" / "dxbc"
             dxbc.mkdir(parents=True)
-            (dxbc / "index.json").write_text(json.dumps(entries), encoding="utf-8", newline="\n")
+            (dxbc / "index.json").write_text(json.dumps(entries), encoding=encoding, newline="\n")
             for entry in entries:
                 (dxbc / entry["file"]).write_bytes(entry["stage"].encode("ascii"))
 
@@ -266,7 +274,7 @@ class ShaderPreparationTests(unittest.TestCase):
                     stem = Path(entry["file"]).stem
                     (spirv / f"{stem}.spv").write_bytes(modules[stage])
                     index[stem] = {"stage": stage, "fssm_sha256": stage + "-fixture"}
-                (spirv / "index.json").write_text(json.dumps(index), encoding="utf-8", newline="\n")
+                (spirv / "index.json").write_text(json.dumps(index), encoding=encoding, newline="\n")
 
             with patch.object(fl, "run", side_effect=write_translation), redirect_stdout(io.StringIO()):
                 self.assertEqual(fl.main(["--game", tmp, "--work", tmp, "--no-fit",

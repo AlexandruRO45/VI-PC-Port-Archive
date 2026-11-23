@@ -48,8 +48,8 @@ class PickPair(unittest.TestCase):
         if spv:
             open(os.path.join(self.root, "spirv", name + ".spv"), "wb").close()
 
-    def pick(self):
-        with open(os.path.join(self.root, "spirv", "index.json"), "w") as f:
+    def pick(self, bom=False):
+        with open(os.path.join(self.root, "spirv", "index.json"), "w", encoding="utf-8-sig" if bom else "utf-8") as f:
             json.dump(self.index, f)
         return sandbox.pick_pair(self.root)
 
@@ -62,6 +62,15 @@ class PickPair(unittest.TestCase):
         self.add("b_ps", {"stage": "ps", "input_signature": PS_SIG, "user_sgpr_reads": PTR8 + [{"kind": "const32", "sgpr": 9}],
                           "bindings": [0, 1, 2]}, PS_TEXT)
         self.assertEqual(self.names(), ("a_vs", "b_ps"))
+
+    def test_an_index_saved_with_a_bom_is_read(self):
+        # Windows PowerShell 5.1 and Notepad write a UTF-8 BOM; the index must not read as "no pair".
+        self.add("a_vs", {"stage": "vs", "input_signature": VS_SIG, "user_sgpr_reads": PTR8, "bindings": []}, VS_TEXT)
+        self.add("b_ps", {"stage": "ps", "input_signature": PS_SIG, "user_sgpr_reads": PTR8 + [{"kind": "const32", "sgpr": 9}],
+                          "bindings": [0, 1, 2]}, PS_TEXT)
+        pair = self.pick(bom=True)
+        self.assertIsNotNone(pair)
+        self.assertEqual(tuple(os.path.splitext(os.path.basename(p))[0] for p in pair), ("a_vs", "b_ps"))
 
     def test_rejects_wrong_layout_and_signature(self):
         self.add("a_vs", {"stage": "vs", "input_signature": VS_SIG, "user_sgpr_reads": PTR8, "bindings": []},

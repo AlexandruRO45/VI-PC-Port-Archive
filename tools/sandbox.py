@@ -50,7 +50,7 @@ def pick_pair(shaders_dir):
     spirv = os.path.join(shaders_dir, "spirv")
     disasm = os.path.join(shaders_dir, "dxbc", "disasm")
     try:
-        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8-sig") as f:  # -sig: a BOM from a Windows editor
             index = json.load(f)
     except (OSError, ValueError):
         return None
