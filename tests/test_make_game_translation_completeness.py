@@ -79,6 +79,14 @@ class TranslationCompletenessTests(unittest.TestCase):
             code, err = self.run_check(dxbc, spirv)
             self.assertEqual(code, 1)
 
+    def test_an_index_larger_than_the_carve_fails_without_a_negative_count(self):
+        tmp, dxbc, spirv = workdir(2, ["s0", "s1", "s2"])
+        with tmp:
+            code, err = self.run_check(dxbc, spirv)
+            self.assertEqual(code, 1)
+            self.assertIn("3 shaders, more than the 2 carved", err)
+            self.assertNotIn("-1", err)
+
     def test_a_missing_translation_index_is_left_to_the_paths_that_own_it(self):
         # A translation that did not run, or a merge that failed, already fails the stage before this check
         # (rdna2spirv.py exits nonzero; an empty merge is refused at the merge): a missing or unreadable index
@@ -127,6 +135,7 @@ class ShadersStageOrderTests(unittest.TestCase):
         settings = {"translation_sources.sha256": "d", "wave64_emulate.txt": "off", "translator_flags.txt": ""}
         calls = []
         later = {name: mock.Mock(side_effect=lambda *a, _n=name, **k: calls.append(_n)) for name in self.LATER}
+        self.logged = []
         err = io.StringIO()
         with mock.patch.multiple(make_game, **later,
                                  llvm_mc_signature=mock.Mock(return_value="sig"),
@@ -138,7 +147,8 @@ class ShadersStageOrderTests(unittest.TestCase):
                                  translator_flags_setting=mock.Mock(return_value=""),
                                  translated_index_is_empty=mock.Mock(return_value=False),
                                  translate=mock.Mock(side_effect=AssertionError("translate must not run")),
-                                 log=mock.Mock()), contextlib.redirect_stderr(err):
+                                 log=lambda *a, **k: self.logged.append(" ".join(map(str, a)))), \
+                contextlib.redirect_stderr(err):
             try:
                 make_game.shaders(game, work, 1)
                 code = 0
@@ -151,6 +161,8 @@ class ShadersStageOrderTests(unittest.TestCase):
         self.assertEqual(calls, list(self.LATER))
         self.assertEqual(code, 1)
         self.assertIn("3 of the 5", err)
+        # the counts are logged before the later steps too, so a later step that fails doesn't hide them
+        self.assertTrue(any("3 of the 5" in line for line in self.logged), self.logged)
 
     def test_a_complete_index_runs_every_later_step_and_passes(self):
         code, err, calls = self.run_stage(2, ["s0", "s1"])

@@ -1318,8 +1318,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     # on the missing ones, and a run stopped here left fspx/ and bvh/ out without saying so.
     short = translation_shortfall(dxbc, spirv)
     if short:
-        log("shaders: some carved shaders are not in the translation index; the remaining steps run, then the "
-            "stage fails")
+        log(f"{short}. The remaining steps run first, then the stage fails")
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     if short:
@@ -1919,7 +1918,10 @@ def translation_shortfall(dxbc: str, spirv: str) -> str:
              "run the shaders stage again")
     if not index:
         return ""   # an empty index is #3328's to refuse or translate again, not a partial one to compare
-    if len(index) != len(carved):
+    if len(index) > len(carved):
+        return (f"shaders: the translation index holds {len(index)} shaders, more than the {len(carved)} carved: "
+                "it comes from another carve. Run the shaders stage again")
+    if len(index) < len(carved):
         return (f"shaders: the translation index holds {len(index)} of the {len(carved)} carved shaders "
                 f"({len(carved) - len(index)} were refused or failed spirv-val, listed in this stage's output): "
                 "a port built from it would lack them. Fix the translator for that class and translate again")
