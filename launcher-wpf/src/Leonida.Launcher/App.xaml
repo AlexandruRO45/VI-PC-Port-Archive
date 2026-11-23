@@ -463,6 +463,31 @@
       <Style TargetType="RadioButton">
         <Setter Property="Foreground" Value="{DynamicResource Text}"/>
       </Style>
+      <!-- A settings checkbox: a square on the right of its row, filled with the sunset when on -->
+      <Style x:Key="Tick" TargetType="CheckBox">
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="CheckBox">
+              <Grid Background="Transparent" Width="22" Height="22">
+                <Border x:Name="box" BorderBrush="{DynamicResource LineStrong}" BorderThickness="1.5" CornerRadius="3" Background="{DynamicResource InputBg}"/>
+                <Border x:Name="fill" Width="12" Height="12" CornerRadius="2" Background="{StaticResource Sunset}" Visibility="Collapsed"/>
+              </Grid>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="box" Property="BorderBrush" Value="{DynamicResource Heading}"/></Trigger>
+                <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="box" Property="BorderBrush" Value="{DynamicResource Heading}"/></Trigger>
+                <Trigger Property="IsChecked" Value="True">
+                  <Setter TargetName="fill" Property="Visibility" Value="Visible"/>
+                  <Setter TargetName="box" Property="BorderBrush" Value="{DynamicResource Heading}"/>
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.45"/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Style>
       <Style TargetType="ListBox">
         <Setter Property="Foreground" Value="{DynamicResource Text}"/>
       </Style>

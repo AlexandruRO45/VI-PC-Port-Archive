@@ -27,19 +27,42 @@ public partial class SettingsView : UserControl
     {
         InitializeComponent();
         SettingsPath.Text = AppPaths.Settings;
+        var v = typeof(SettingsView).Assembly.GetName().Version?.ToString(3) ?? "?";
+        SideVersion.Text = "v" + v;
+        AboutVersion.Text = Loc.F("Leonida Launcher {0} · .NET {1} · Windows", v, Environment.Version.ToString(2));
     }
+
+    /// <summary>The pages: (key, nav button, panel, title). "launcher" and "leonida" open each group's first page.</summary>
+    (string Key, RadioButton Nav, FrameworkElement Page, string Title)[] AllPages =>
+    [
+        ("general", NavGeneral, PageGeneral, "General"), ("builds", NavBuilds, PageBuilds, "Builds"),
+        ("online", NavOnline, PageOnline, "Online"), ("about", NavAbout, PageAbout, "About and files"),
+        ("setup", NavSetup, PageSetup, "Your setup"), ("play", NavPlay, PagePlay, "Play"),
+        ("folders", NavFolders, PageFolders, "Folders and Python"),
+    ];
+
+    bool switching;
 
     public void ShowSection(string section)
     {
-        (section == "leonida" ? NavLeonida : NavLauncher).IsChecked = true;
-        LauncherSection.Visibility = section == "leonida" ? Visibility.Collapsed : Visibility.Visible;
-        LeonidaSection.Visibility = section == "leonida" ? Visibility.Visible : Visibility.Collapsed;
-        if (section == "leonida") ShowChecks();
+        section = section switch { "launcher" => "general", "leonida" => "setup", _ => section };
+        var pages = AllPages;
+        if (!pages.Any(p => p.Key == section)) section = "general";
+        switching = true;
+        foreach (var p in pages)
+        {
+            bool on = p.Key == section;
+            p.Page.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+            if (on) { p.Nav.IsChecked = true; PageTitle.Text = Loc.T(p.Title); }
+        }
+        switching = false;
+        Pages.ScrollToTop();
+        if (section == "setup") ShowChecks();
     }
 
     void OnSection(object sender, RoutedEventArgs e)
     {
-        if (LauncherSection != null) ShowSection(sender == NavLeonida ? "leonida" : "launcher");
+        if (!switching && PageTitle != null && sender is RadioButton { Tag: string key }) ShowSection(key);
     }
 
     void OnBack(object sender, RoutedEventArgs e) => BackRequested?.Invoke();
@@ -63,7 +86,7 @@ public partial class SettingsView : UserControl
         SoundDone.IsChecked = c.SoundWhenDone;
         FontSlider.Value = c.ConsoleFontSize;
         KeepLogsBox.Text = c.KeepLogsDays.ToString();
-        AvatarPreview.Content = Avatar.Make(c.AvatarSeed, 56);
+        AvatarPreview.Content = Avatar.Make(c.AvatarSeed, 44);
         // Leonida
         OverlayBox.Text = c.Play.Overlay ?? "";
         ModsBox.Text = c.Play.Mods ?? "";
@@ -132,7 +155,7 @@ public partial class SettingsView : UserControl
     {
         state.Settings.Current.AvatarSeed = Random.Shared.Next();
         Save();
-        AvatarPreview.Content = Avatar.Make(state.Settings.Current.AvatarSeed, 56);
+        AvatarPreview.Content = Avatar.Make(state.Settings.Current.AvatarSeed, 44);
         AvatarChanged?.Invoke();
     }
 
