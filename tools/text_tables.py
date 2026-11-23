@@ -37,7 +37,8 @@ Usage:
                              [--dialogue dialogue.csv] [--tables tables.csv] [--strings strings.csv]
 
 A source is an ``rpf9_carve.py`` directory, an ``.rpf`` archive (read through ``gamedata_index.py``; nothing is
-written), or files and directories of whole resources. ``--labels`` adds label names (word lists or a
+written), or files and directories of whole resources. Store repeat exports outside a directory of whole resources
+because the scan treats its existing files as inputs. ``--labels`` adds label names (word lists or a
 ``hashdict.py`` JSON) so non-dialogue strings and table groups can be named. Standard library only. The outputs
 quote game text: they are local work products and must not be committed or attached to an issue. The tests use
 synthetic resources.
@@ -286,14 +287,23 @@ def blobs(source: str, outputs=()):
             src.close()
     else:
         paths = [source]
+        output_stats = []
         if os.path.isdir(source):
             def scan_failed(error: OSError) -> None:
                 raise error
 
+            for output in outputs:
+                try:
+                    output_stats.append(os.stat(output))
+                except FileNotFoundError:
+                    pass  # A new report cannot be a file in the walk.
             paths = [os.path.join(r, f) for r, _d, fs in os.walk(source, onerror=scan_failed)
                      for f in sorted(fs)]
         for path in paths:
-            if os.path.getsize(path) <= MAX_RESOURCE_BYTES:
+            info = os.stat(path)
+            if any(os.path.samestat(info, dest) for dest in output_stats):
+                raise ValueError(f"report would overwrite input file: {path}")
+            if info.st_size <= MAX_RESOURCE_BYTES:
                 with open(path, "rb") as fh:
                     yield path, 0, fh.read()
 

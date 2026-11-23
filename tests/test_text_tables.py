@@ -302,6 +302,38 @@ class TestDialogue(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_report_cannot_replace_a_nested_loose_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp, "loose")
+            nested = source / "nested"
+            nested.mkdir(parents=True)
+            payload = nested / "resource.bin"
+            original = make_resource(EN)
+            payload.write_bytes(original)
+            report = Path(tmp, "tables.csv")
+            report.write_bytes(b"previous report\n")
+            with contextlib.redirect_stderr(io.StringIO()) as error:
+                rc = T.main([str(source), "--tables", str(report), "--strings", str(payload)])
+            self.assertEqual(rc, 2)
+            self.assertIn(str(payload), error.getvalue())
+            self.assertEqual(payload.read_bytes(), original)
+            self.assertEqual(report.read_bytes(), b"previous report\n")
+
+    def test_report_cannot_replace_a_hard_link_to_a_loose_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp, "loose")
+            source.mkdir()
+            payload = source / "resource.bin"
+            payload.write_bytes(make_resource(EN))
+            report = Path(tmp, "dialogue.csv")
+            try:
+                os.link(payload, report)
+            except OSError:
+                self.skipTest("hard links unavailable")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(T.main([str(source), "--dialogue", str(report)]), 2)
+            self.assertTrue(report.samefile(payload))
+
     def test_unreadable_subdirectory_preserves_previous_tables_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
