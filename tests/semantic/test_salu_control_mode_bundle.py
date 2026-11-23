@@ -136,6 +136,18 @@ class TestRoundModeTranslator(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestDenormModeOracle(unittest.TestCase):
+    def test_oracle_denorm_modes(self):
+        self.assertEqual(model_denorm_mode(0), {"fp32": 0, "fp16_64": 0})
+        self.assertEqual(model_denorm_mode(3), {"fp32": 3, "fp16_64": 0})
+        self.assertEqual(model_denorm_mode(12), {"fp32": 0, "fp16_64": 3})
+        self.assertEqual(model_denorm_mode(15), {"fp32": 3, "fp16_64": 3})
+
+    def test_translator_denorm_mode_rejection(self):
+        prog = ["s_denorm_mode 0", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("cs_denorm_oracle", prog, fssm=saveexec_run.fssm())
+
 
 if __name__ == "__main__":
     unittest.main()
