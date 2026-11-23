@@ -171,7 +171,7 @@ class HeadlessGui(unittest.TestCase):
               mock.patch("builtins.print") as printed):
             pc.main()
         cli.assert_called_once()
-        printed.assert_called_once_with("No graphical display available; using text mode.\\n")
+        printed.assert_called_once_with("No graphical display available; using text mode.\n")
 
 
 if __name__ == "__main__":
