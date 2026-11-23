@@ -81,6 +81,24 @@ class ReadError(unittest.TestCase):
             self.assertIn("No such file", err)
             self.assertNotIn("Traceback", err)
 
+    def test_a_common_path_that_is_not_a_directory_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "tiny.rpf")
+            with open(archive, "wb") as f:  # the magic and a u32: enough for the option check, never scanned
+                f.write(b"9FPR" + b"\0" * 8)
+            for name, common in (("missing", os.path.join(tmp, "missing")), ("a file", archive)):
+                with self.subTest(name=name):
+                    err, out = io.StringIO(), io.StringIO()
+                    argv = ["navmesh_cell_fit.py", archive, "--common", common]
+                    with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(err), \
+                            contextlib.redirect_stdout(out):
+                        rc = cf.main()
+                    self.assertEqual(rc, 2)
+                    self.assertIn("error: --common ", err.getvalue())
+                    self.assertIn(common, err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+                    self.assertEqual(out.getvalue(), "")   # no report with zero documents
+
 
 if __name__ == "__main__":
     unittest.main()
