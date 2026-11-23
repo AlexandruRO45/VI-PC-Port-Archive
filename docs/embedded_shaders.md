@@ -346,7 +346,7 @@ a time beside the one long run. That driver keeps compiled shaders on disk and g
 |---|---|---|---|
 | dispatch loop, translator of `3faac557` | 1,658,968 B | 1,532 blocks: one loop around an `OpSwitch` with 581 cases | created after 2,039.5 s (34 minutes): 2,014 s of CPU time, one busy thread, the process at 1.2 GB after 5 minutes and 1.7 GB after 21. Slow, not hung |
 | the same module, pipeline requiring 32-wide subgroups, or no size | | | not within 150 s either way |
-| dispatch loop, current translator (`--dispatch-loop` or `--max-structured-depth 16`, the same bytes) | 1,192,148 B | 2,954 blocks, the same loop and switch | XXnot created within 10 minutes; the run was stopped there |
+| dispatch loop, current translator (`--dispatch-loop` or `--max-structured-depth 16`, the same bytes) | 1,192,148 B | 2,954 blocks, the same loop and switch | not created within 10 minutes; the run was stopped there |
 | structured, the default now | 1,238,360 B | 4,108 blocks, 1,763 selections, no loop, no switch | 2.9 s (3.6 s and 3.2 s for two more copies) |
 | `--wave64-emulate`, translator of `3faac557` | 1,703,748 B | emulated wave64 structured | 12.6 s |
 | `--wave64-emulate`, current translator | 1,358,436 B | emulated wave64 structured | 12.4 s |
