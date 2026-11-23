@@ -8,6 +8,7 @@ import io
 import math
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -107,6 +108,29 @@ class TestLeaves(unittest.TestCase):
         self.assertEqual(floats(out, 0x100, 9), (1, 0, 0, 0, 0, 0, 0, 1, 0))
         self.assertEqual(struct.unpack_from("<I", out, 0x100 + 60)[0], 0x006)
 
+    def test_all_vertex_permutations_preserve_upper_order_bits(self):
+        # Expected output-slot order of the three distinct input vertices, independent of the decoder formula.
+        permutations = {0x1: (0, 2, 1), 0x2: (2, 0, 1), 0x4: (1, 2, 0),
+                        0x6: (1, 0, 2), 0x8: (2, 1, 0), 0x9: (0, 1, 2)}
+        vertices = ((0, 0, 0), (1, 0, 0), (0, 1, 0))
+        for low, indices in permutations.items():
+            expected = tuple(c for i in indices for c in vertices[i])
+            for upper in range(0, 256, 16):
+                order = upper | low
+                with self.subTest(order=hex(order)):
+                    src, _, _ = build([(0, 0x01, 0, None, order)])
+                    out = R.rehydrate(src, [QUADS])
+                    self.assertEqual(floats(out, 0x100, 9), expected)
+
+    def test_invalid_vertex_permutations_are_input_errors(self):
+        for low in (0x0, 0x3, 0x5, 0x7, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF):
+            for upper in range(0, 256, 16):
+                order = upper | low
+                with self.subTest(order=hex(order)):
+                    src, _, _ = build([(0, 0x01, 0, None, order)])
+                    with self.assertRaisesRegex(ValueError, "leaf at 0x100.*vertex order 0x%x" % order):
+                        R.rehydrate(src, [QUADS])
+
     def test_fourth_vertex_choice(self):
         for order, expected in ((0x29, (1, 0, 0)), (0x89, (0, 1, 0))):   # 0x20 picks index 0 of triangle 1, 0x80 index 1
             geo = R.Geometry(QUADS.vertices, indices=struct.pack("<6I", 0, 1, 2, 1, 2, 3))
@@ -199,6 +223,37 @@ class TestLeafFrame(unittest.TestCase):
 
 
 class TestErrorsAndCli(unittest.TestCase):
+    def test_invalid_vertex_order_cli_preserves_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            source = os.path.join(d, "in.bin")
+            vb, ib = os.path.join(d, "vb.bin"), os.path.join(d, "ib.bin")
+            for path, data in ((vb, QUADS.vertices), (ib, QUADS.indices)):
+                with open(path, "wb") as f:
+                    f.write(data)
+            for order in (0x00, 0x03, 0x05, 0x0A, 0x0F, 0xA5):
+                with open(source, "wb") as f:
+                    f.write(build([(0, 0x01, 0, None, order)])[0])
+                for existing in (False, True):
+                    with self.subTest(order=hex(order), existing=existing):
+                        out = os.path.join(d, "out-%02x-%s.bin" % (order, existing))
+                        sentinel = b"existing synthetic output"
+                        if existing:
+                            with open(out, "wb") as f:
+                                f.write(sentinel)
+                        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "bvh_rehydrate.py"),
+                                            source, "--geom", vb + "," + ib, "--out", out],
+                                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                        self.assertEqual(p.stdout, "")
+                        self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+                        self.assertIn("error: leaf at 0x100", p.stderr)
+                        self.assertIn("vertex order 0x%x" % order, p.stderr)
+                        if existing:
+                            with open(out, "rb") as f:
+                                self.assertEqual(f.read(), sentinel)
+                        else:
+                            self.assertFalse(os.path.exists(out))
+
     def test_errors(self):
         src, _, _ = build([(0, 0x01, 0, None, 0x09)])
         with self.assertRaisesRegex(ValueError, "geometry index 0"):

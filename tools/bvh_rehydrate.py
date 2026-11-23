@@ -289,6 +289,8 @@ def write_leaves(src, dst, hdr, geometries, frame):
             j = g.triangle(prim1)
             fourth = frame.apply(g.vertex(j[0] if order & 0x20 else j[1] if order & 0x80 else j[2]))
         a, b = order & 3, (order >> 2) & 3
+        if a >= 3 or b >= 3 or a == b:
+            raise ValueError("leaf at %#x has invalid vertex order %#x" % (out, order))
         slots = [None, None, None, fourth]
         for which, value in zip((a, b, (a ^ 3) - b), tri):
             slots[SLOT_OF_ORDER[which]] = value
