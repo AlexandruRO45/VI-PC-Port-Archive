@@ -209,5 +209,23 @@ class VFrexpExpI16F16AstInterpreterTests(unittest.TestCase):
         res = oracle_frexp_exp_i16_f16(0xBC00)
         self.assertEqual(res, 1)
 
+class VFrexpExpI16F16SimdDivergenceTests(unittest.TestCase):
+    def test_frexp_exp_f16_simd_exec_masking(self):
+        wave = WavefrontSimdState(lane_count=32)
+        wave.exec_mask = 0x55555555  # Even lanes
+        for i in range(32):
+            wave.set_vgpr(i, 0, 0xDEADBEEF)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_vgpr(i, 0, oracle_frexp_exp_i16_f16(0x3C00))
+        for i in range(32):
+            if (0x55555555 >> i) & 1:
+                self.assertEqual(wave.get_vgpr(i, 0), 1)
+            else:
+                self.assertEqual(wave.get_vgpr(i, 0), 0xDEADBEEF)
+
+    def test_frexp_exp_f16_subnormal_normalization(self):
+        # Subnormal 0x0001 (2^-24) -> exp = -23 (0xFFE9)
+        self.assertEqual(oracle_frexp_exp_i16_f16(0x0001), 0xFFE9)
+
 if __name__ == "__main__":
     unittest.main()
