@@ -118,5 +118,16 @@ class OnHardware(unittest.TestCase):
         self.assertEqual([(n, d) for n, ok, d in H.analyze(res) if not ok], [])
 
 
+class JsonGuard(unittest.TestCase):
+    """The --json guard fires before any device work, so it is testable without a GPU or a build."""
+
+    def test_a_json_that_names_a_folder_is_refused_first(self):
+        import io, contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(H.main(["--build", os.path.join(ROOT, "no_such_build"), "--json", ROOT]), 2)
+        self.assertIn("--json is a directory", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
