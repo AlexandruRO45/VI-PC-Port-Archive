@@ -13,7 +13,7 @@ Covers RDNA2 Data Share (DS) sub-dword and d16 operations translated by tools/rd
     negative (0x80, 0xFF, 0x8000, 0xFFFF) values, verifying sign-extension vs zero-extension.
   * ds_read_u16_d16 (writes [15:0], preserves dest [31:16]) and
     ds_read_u16_d16_hi (writes [31:16], preserves dest [15:0]).
-  * In-memory SPIR-V negative controls (OpBitFieldSExtract <-> OpBitFieldUExtract,
+  * In-memory SPIR-V negative controls (signed <-> unsigned extension of the field read,
     d16 insert offset 0 <-> 16, and d16_hi source shift).
 """
 import os
@@ -253,7 +253,7 @@ class LdsSubwordD16Tests(unittest.TestCase):
         ])
 
     def test_negative_controls_spirv_in_memory(self):
-        # 1) Signedness swap on ds_read_i8 (0x80 -> 0xFFFFFF80 must break if OpBitFieldUExtract is used).
+        # 1) Signedness swap on ds_read_i8 (0x80 -> 0xFFFFFF80 must break if the byte is only zero-extended).
         spv_i8 = translate_cs([
             "v_mov_b32_e32 v1, 0",
             "v_mov_b32_e32 v2, 0x00000080",
@@ -263,8 +263,11 @@ class LdsSubwordD16Tests(unittest.TestCase):
             "s_waitcnt lgkmcnt(0)",
         ] + emit_stores(["v10"]), "cs_neg_i8")
         self.assertEqual(run_cs(spv_i8), [0xFFFFFF80])
-        self.assertIn("OpBitFieldSExtract", spv_i8)
-        bad_i8 = spv_i8.replace("OpBitFieldSExtract", "OpBitFieldUExtract")
+        # The signed read is OpBitFieldUExtract followed by (field ^ sign) - sign; without that pair it zero-extends.
+        sext = r"(%\w+) = OpBitwiseXor %uint (%\w+) (%\w+)\n(\s*)(%\w+) = OpISub %uint \1 \3\n"
+        self.assertNotIn("OpBitFieldSExtract", spv_i8)
+        self.assertEqual(len(re.findall(sext, spv_i8)), 1)
+        bad_i8 = re.sub(sext, r"\1 = OpCopyObject %uint \2\n\4\5 = OpCopyObject %uint \2\n", spv_i8)
         self.assertEqual(run_cs(bad_i8), [0x00000080])
         self.assertNotEqual(run_cs(bad_i8), [0xFFFFFF80])
 

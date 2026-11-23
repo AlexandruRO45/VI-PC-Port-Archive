@@ -4664,8 +4664,16 @@ class Gen:
             w = self.lds_load(addr, off)
             if bits == 16:
                 w, sh2 = self.lds_u16_cross_read(addr, off, w, sh2)
-            f = "OpBitFieldSExtract" if op.split("_")[2].startswith("i") else "OpBitFieldUExtract"
-            self.emit(f"{v} = {f} %uint {w} {sh2} {self.cu(bits)}")
+            if op.split("_")[2].startswith("i"):
+                # Sign-extend as (field ^ sign) - sign, not with OpBitFieldSExtract at a run-time offset: AMD's Windows
+                # driver (gfx1036, 32.0.21042.62) loses that extension when the register is then written back with
+                # ds_write_b16 (0x0090 for the byte 0x90; cs_w64_lds_i8_d16_write.asm). The result is the same word.
+                u, x, sign = self.tmp(), self.tmp(), self.cu(1 << (bits - 1))
+                self.emit(f"{u} = OpBitFieldUExtract %uint {w} {sh2} {self.cu(bits)}")
+                self.emit(f"{x} = OpBitwiseXor %uint {u} {sign}")
+                self.emit(f"{v} = OpISub %uint {x} {sign}")
+            else:
+                self.emit(f"{v} = OpBitFieldUExtract %uint {w} {sh2} {self.cu(bits)}")
             d = a[0]
             if "_d16" in op:
                 # u8/i8: v is the 8-bit field extended to 32 bits; the insert keeps only its low 16 bits, so the

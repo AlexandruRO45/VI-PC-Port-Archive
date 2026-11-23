@@ -121,9 +121,11 @@ class LdsSubdwordWide(unittest.TestCase):
             self.assertEqual(len(names), 1, f"uint constant {value}: {names}")
             return names[0]
 
-        def unsigned(t):         # ds_read_i8 / ds_read_i16 zero-extend
-            self.assertIn("OpBitFieldSExtract", t)
-            return t.replace("OpBitFieldSExtract", "OpBitFieldUExtract")
+        def unsigned(t):         # ds_read_i8 / ds_read_i16 zero-extend: without the (field ^ sign) - sign pair
+            pat = r"(%\w+) = OpBitwiseXor %uint (%\w+) (%\w+)\n(\s*)(%\w+) = OpISub %uint \1 \3\n"
+            self.assertNotIn("OpBitFieldSExtract", t)
+            self.assertTrue(re.search(pat, t))
+            return re.sub(pat, r"\1 = OpCopyObject %uint \2\n\4\5 = OpCopyObject %uint \2\n", t)
 
         def no_hi_shift(t):      # the _d16_hi writes store DATA[7:0] / [15:0] instead of the high half
             pat = r"= OpShiftRightLogical %uint (%\w+) " + const(t, 16) + r"\n"

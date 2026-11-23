@@ -162,6 +162,9 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # not bit 0 for every lane; word = set lanes | lowest lane << 8 (derivations in each .asm header)
             ("cs_w32_mask_imm", [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
             ("cs_w64_mask_imm", [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
+            # ds_read_i8_d16 then ds_write_b16 in wave64: the half written is the sign-extended byte; AMD's Windows
+            # driver wrote it zero-extended with the old lowering (cs_w64_lds_i8_d16_write.asm header)
+            ("cs_w64_lds_i8_d16_write", [0x0000FFA5, 0x0000FF90, 0x0000FFCC, 0x0000FF80, 0xBEEFFFA5, 0xBEEFFF90, 0xBEEFFFCC, 0xBEEFFF80]),
             # SHADER-99: -0 and NaN survive translation (SignedZeroInfNanPreserve); words 0, 2, 3 on Apple: see below
             ("cs_signed_zero_nan", SIGNED_ZERO_NAN),
             # s_andn2_saveexec_b32 / s_andn2_wrexec_b32: EXEC = S0 & ~EXEC, D old / new EXEC, SCC (cs_w32_andn2_exec.asm)
