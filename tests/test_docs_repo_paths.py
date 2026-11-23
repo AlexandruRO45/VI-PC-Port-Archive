@@ -21,6 +21,13 @@ PATH = re.compile(r"`((?:tools|runtime|tests|scripts|docs|viewer|game)/[A-Za-z0-
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 # Build output, not tracked.
 BUILD_OUTPUT = ("runtime/build",)
+# Skip remote inline links and autolinks, not other code spans on the same line.
+URI_PREFIX = r"[A-Za-z][A-Za-z0-9+.-]*://"
+REMOTE_MARKUP = re.compile(
+    rf"\[[^\]\n]*\]\([ \t]*(?:<{URI_PREFIX}[^>\n]+>|{URI_PREFIX}[^)\s]+)"
+    r"""(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\)))?[ \t]*\)"""
+    rf"|<{URI_PREFIX}[^>\n]+>"
+)
 
 
 def tracked_files():
@@ -48,8 +55,10 @@ def missing_paths(pages, files):
             if line.lstrip().startswith("```"):
                 in_fence = not in_fence
                 continue
-            if in_fence or "://" in line:          # a link into another repository names its paths
+            if in_fence:
                 continue
+            if "://" in line:
+                line = REMOTE_MARKUP.sub(" ", line)
             for m in PATH.finditer(line):
                 path = m.group(1).rstrip("/.")
                 if "*" in path or path.startswith(BUILD_OUTPUT) or path in known:
@@ -72,6 +81,26 @@ class DocsRepoPaths(unittest.TestCase):
         self.assertEqual(missing_paths(pages, files),
                          [("docs/b.md:1", "docs/gone.md"), ("docs/b.md:1", "viewer/gone.js"),
                           ("docs/b.md:1", "game/gone.json")])
+
+    def test_remote_markup_does_not_hide_local_paths(self):
+        pages = {"docs/a.md": "\n".join((
+            "Run `tools/gone.py`; see [upstream](https://example.invalid/ref).",
+            "See [`tools/foreign.py`](https://example.invalid/src); then run `runtime/gone.cpp`.",
+            "See https://example.invalid/ref and run `viewer/gone.js`.",
+            "See [`docs/gone.md`](./gone.md) and [upstream](https://example.invalid/ref).",
+        ))}
+        self.assertEqual(missing_paths(pages, []), [
+            ("docs/a.md:1", "tools/gone.py"), ("docs/a.md:2", "runtime/gone.cpp"),
+            ("docs/a.md:3", "viewer/gone.js"), ("docs/a.md:4", "docs/gone.md"),
+        ])
+
+    def test_remote_labels_and_autolinks_stay_exempt(self):
+        pages = {"docs/a.md": "\n".join((
+            "See [`tools/foreign.py`](https://example.invalid/src).",
+            'See [the `tools/foreign.py` script](<https://example.invalid/src> "Upstream").',
+            "See <https://example.invalid/`tools/foreign.py`>.",
+        ))}
+        self.assertEqual(missing_paths(pages, []), [])
 
     def test_docs_name_existing_paths(self):
         files = tracked_files()
