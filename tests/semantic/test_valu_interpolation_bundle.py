@@ -440,5 +440,31 @@ class TestInterpMovF32ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[3], f32_to_bits(50.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_mov_f32 SIMD & Flat Attribute Handling
+# ------------------------------------------------------------------------------
+
+class SIMDWaveInterpMovF32:
+    def __init__(self, wave_size: int = 64):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def step(self, insn: VInterpMovF32Instruction, p0: float, p1: float, p2: float):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                self.vgprs[insn.dst.index][lane] = ref_interp_mov_f32(insn.vsel, p0, p1, p2)
+
+
+class TestInterpMovF32SIMDAndFlat(unittest.TestCase):
+    def test_simd_flat_across_lanes(self):
+        wave = SIMDWaveInterpMovF32(wave_size=32)
+        insn = VInterpMovF32Instruction(dst=RegisterOperand(OperandType.VGPR, 5), vsel="p0", attr=AttrOperand(0, "w"))
+        wave.step(insn, p0=123.0, p1=0.0, p2=0.0)
+
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[5][lane], f32_to_bits(123.0))
+
+
 if __name__ == '__main__':
     unittest.main()
