@@ -1812,6 +1812,10 @@ class Gen:
                 self.emit(f"OpStore %vcc {r}")
             elif dst["k"] == "sgpr":
                 self.mask_dst(dst, r)
+            elif dst["k"] == "vgpr":
+                # A VOP3 compare whose destination is a VGPR (the `v_cmp_* vN, ...` form) writes the comparison result
+                # per lane as -1/0, not a lane mask: that is the same all-ones/zero word `r` holds, so store it.
+                self.store_reg("vgpr", dst["r"], r)
             else:
                 raise Unsupported("v_cmp destination")
             return
@@ -1868,8 +1872,18 @@ class Gen:
             self.uses_active = True
         elif dst["k"] == "special" and dst["t"] in ("vcc", "vcc_lo"):
             self.emit(f"OpStore %vcc {r}")
+        elif dst["k"] == "special" and dst["t"] == "vcc_hi":
+            # vcc_hi as the compare destination: the mask word lands in the upper half of VCC. In wave64, where VCC
+            # holds the wave mask, that half is bits 32..63 of it (`put_mask` keeps the low half); in wave32 it is the
+            # scratch SGPR the compiler uses for a second live mask.
+            if self.wave64 and self.vcc_half_keeps_mask():
+                self.put_mask(dst, r, "hi")
+            self.emit(f"OpStore %vcc_hi {r}")
         elif dst["k"] == "sgpr":
             self.mask_dst(dst, r)
+        elif dst["k"] == "vgpr":
+            # VGPR destination: -1/0 per lane, as on hardware (see the f64 path).
+            self.store_reg("vgpr", dst["r"], r)
         else:
             raise Unsupported("v_cmp destination")
 
@@ -6107,6 +6121,16 @@ class Gen:
                 self.store_reg("sgpr", d["r"] + 1, v)
         elif d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
             self.emit(f"OpStore %vcc {v}")
+        elif d["k"] == "special" and d["t"] == "vcc_hi":
+            # Upper half of VCC, as in write_compare_result (see there).
+            if self.wave64 and self.vcc_half_keeps_mask():
+                self.put_mask(d, v, "hi")
+            self.emit(f"OpStore %vcc_hi {v}")
+        elif d["k"] == "vgpr":
+            # A lane-mask destination in a VGPR (or a VGPR pair for a 64-bit mask) holds the -1/0 word per lane.
+            self.store_reg("vgpr", d["r"], v)
+            if d.get("n") == 2:
+                self.store_reg("vgpr", d["r"] + 1, v)
         else:
             raise Unsupported("mask destination")
 
@@ -16583,6 +16607,13 @@ def translate(path):
         # kind-0 entry (docs/fspx.md).
         rsrc2, lx, ly, lz = cs_dispatch_state(path, info["name"])
         if (rsrc2 >> 10) & 1:
+            # TG_SIZE_EN: the workgroup size is not compiled into the program, so the title must pass it at dispatch
+            # time. Mesa (radv_shader_args.c) puts it in the user SGPRs after the enabled workgroup ids, but the
+            # packing is unmeasured: one of the 91 such programs of 1.0.2.1's pipeline library reads s7 as
+            # `s_and_b32 s10, s7, 0xfc0` and feeds it to `v_mbcnt_lo/hi_u32_b32` as the lane base of a dword index,
+            # which the three size words of its 16x16x1 group (0x10, 0x10, 0x1) do not explain. Rejected until a
+            # Windows d3d12_xs run or a Mesa/LLVM reference pins the words; four of them are the programs RT-5's boot
+            # asks for through device slot 67.
             raise Unsupported("CS thread-group-size SGPR")
         if not (1 <= lx * ly * lz <= 1024):
             raise Unsupported("CS group size")

@@ -200,11 +200,18 @@ class CmpF64Tests(unittest.TestCase):
         self.assertNotIn("OpCapability Float64", spv)
         self.assertNotIn("OpTypeFloat 64", spv)
 
+    def test_vgpr_destination(self):
+        # A VGPR destination writes -1/0 per lane, not a lane mask (the runtime's RT-5 boot asks for four pipeline-library
+        # programs that compare into VGPRs); it is no longer refused.
+        mod = translate(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 0",
+                         "v_mov_b32_e32 v3, 0", "v_cmp_lt_f64_e64 v2, v[0:1], v[2:3]"])
+        body = mod if isinstance(mod, str) else "\n".join(mod)
+        self.assertIn("%reg_v2", body)
+
     def test_rejected_forms(self):
         for line in (
             "v_cmp_lt_f64_e32 vcc_lo, v0, v[2:3]",          # single VGPR src0
             "v_cmp_lt_f64_e64 s4, v[0:1], s2",              # single SGPR src1
-            "v_cmp_lt_f64_e64 v2, v[0:1], v[2:3]",          # VGPR destination
             "v_cmp_lt_f64_e64 s4, v[0:1], v[2:3] clamp",    # unsupported modifier
             "v_cmp_t_f64_e64 s4, v[0:1], v[2:3]",           # integer 't' predicate on float
             "s_cmp_eq_f64 s[0:1], s[2:3]",                  # scalar compare has no f64
