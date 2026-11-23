@@ -69,11 +69,19 @@ import math
 import os
 import struct
 import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 
 try:  # optional: the stdlib path below is the fallback and is covered by the tests
     import numpy as _np
 except ImportError:  # pragma: no cover - depends on the interpreter
     _np = None
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -201,7 +209,7 @@ def _finite_matrix(m) -> bool:
 def _load_json(path: str) -> dict:
     # An interrupted export leaves an empty or cut-off model.json: report it like any other bad input (BUILD-1031).
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8-sig") as handle:
             value = json.load(handle)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SkinError(f"{path}: invalid JSON: {exc}") from exc
@@ -238,6 +246,30 @@ def _unpack_packed_joints(data: bytes, slot: int) -> bytes:
                 raise SkinError(f"skin stream slot {slot} joint index {index} does not fit u8")
             out.append(index)
     return bytes(out)
+
+
+def source_input_paths(source: str) -> list[str]:
+    """Files one --skeleton/--component source may read or reference: its model.json,
+    the model.glb beside it and the buffer files named in model.json. A source that cannot
+    be resolved or read yet contributes only the paths known so far; the normal input checks
+    report it."""
+    try:
+        model_dir, json_path = model_json_path(source)
+    except SkinError:
+        return []
+    paths = [json_path]
+    try:
+        model = _load_json(json_path)
+    except (OSError, ValueError, SkinError):
+        return paths
+    glb_name = model.get("glb", "model.glb")
+    if isinstance(glb_name, str) and glb_name:
+        paths.append(os.path.join(model_dir, glb_name))
+    buffer_files = model.get("buffer_files", [])
+    if isinstance(buffer_files, list):
+        paths += [os.path.join(model_dir, name) for name in buffer_files
+                  if isinstance(name, str) and name]
+    return paths
 
 
 def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
@@ -460,7 +492,11 @@ def _alias_tokens(tokens: list[str], side: str | None) -> set[str]:
     return aliases
 
 
-def infer_ped_parent(name: str, ped_by_name: dict[str, dict]) -> int | None:
+def infer_ped_parent(
+    name: str,
+    ped_by_name: dict[str, dict],
+    ped_indices: dict[str, int] | None = None,
+) -> int | None:
     """Pick the ped bone a drawable-local helper covers, by name tokens.
 
     Garment helpers such as ``GM_*_L_UpperArm01_CF`` carry no hierarchy of their
@@ -472,10 +508,11 @@ def infer_ped_parent(name: str, ped_by_name: dict[str, dict]) -> int | None:
     tokens, side = _ped_tokens(name)
     aliases = _alias_tokens(tokens, side)
     best: tuple[int, int, int, int] | None = None
-    for index, bone in enumerate(ped_by_name.values()):
+    for ordinal, bone in enumerate(ped_by_name.values()):
         ped_name = bone["name"]
         if not ped_name.upper().startswith("SKEL_"):
             continue
+        index = ped_indices[ped_name] if ped_indices is not None and ped_name in ped_indices else ordinal
         ped_tokens, ped_side = _ped_tokens(ped_name)
         if side in ("L", "R") and ped_side in ("L", "R") and side != ped_side:
             continue
@@ -494,9 +531,10 @@ def infer_ped_parent(name: str, ped_by_name: dict[str, dict]) -> int | None:
                 best = candidate
     if best is not None:
         return best[3]
-    for index, bone in enumerate(ped_by_name.values()):
-        if bone["name"].upper().startswith("SKEL_"):
-            return index
+    for ordinal, bone in enumerate(ped_by_name.values()):
+        ped_name = bone["name"]
+        if ped_name.upper().startswith("SKEL_"):
+            return ped_indices[ped_name] if ped_indices is not None and ped_name in ped_indices else ordinal
     return None
 
 
@@ -556,6 +594,14 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
     for row in (j0, j1, w0, w1):
         if len(row) != expected:
             raise SkinError("skin stream is shorter than the vertex count")
+
+    oversized = {slot for slot, joint in enumerate(local_to_joint) if joint > 0xFFFF}
+    if oversized:
+        for indices, weights in ((j0, w0), (j1, w1)):
+            if any(weight and index in oversized for index, weight in zip(indices, weights)):
+                raise SkinError("a weighted joint index exceeds the glTF UNSIGNED_SHORT limit (65535)")
+        # NumPy converts the entire palette, including entries no weighted slot uses.
+        local_to_joint = [0 if slot in oversized else joint for slot, joint in enumerate(local_to_joint)]
 
     if _np is not None:
         indices = _np.concatenate(
@@ -805,7 +851,7 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
                         parent_name = resolver.own_skeleton[parent].get("name")
                 parent_index = joints.find(parent_name) if isinstance(parent_name, str) else None
                 if parent_index is None:
-                    inferred = infer_ped_parent(name, joints.ped_by_name)
+                    inferred = infer_ped_parent(name, joints.ped_by_name, joints._by_name)
                     parent_index = inferred if inferred is not None else joints.root
                 bind = None
                 if isinstance(record, dict) and _finite_matrix(record.get("bind_matrix")):
@@ -952,14 +998,23 @@ def write_skinned_glb(path: str, skeleton_path: str, component_paths: list[str],
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    temporary = path + ".tmp"
+    # A fixed `path + ".tmp"` blocks every later export when a stale directory keeps that
+    # name, and two writers to one output race on the same temporary file. Use a unique name
+    # in the output directory so os.replace() still publishes atomically.
+    fd, temporary = tempfile.mkstemp(
+        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
     try:
-        with open(temporary, "wb") as handle:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
+        os.chmod(temporary, published_mode(path))  # mkstemp creates 0600
         os.replace(temporary, path)
     except BaseException:
         try:
-            os.remove(temporary)
+            # The temp was chmodded to the destination's mode before replace. On Windows a
+            # read-only destination leaves a read-only temp that cannot be unlinked; restore
+            # mkstemp's private writable mode first so a failed publish cleans up after itself.
+            os.chmod(temporary, 0o600)
+            os.unlink(temporary)
         except OSError:
             pass
         raise
@@ -975,6 +1030,16 @@ def main(argv=None) -> int:
                         help="decoded component directory or its model.json (repeatable)")
     parser.add_argument("--generator", default="Leonida skinned_glb")
     args = parser.parse_args(argv)
+
+    # The output must never replace a file the export reads (a source's model.json, its model.glb or a
+    # buffer file). same_report_path also catches a case-only spelling on Windows and macOS's default
+    # volume; sources it cannot resolve yet are left to the normal input checks below.
+    for source in [args.skeleton] + args.component:
+        for source_path in source_input_paths(source):
+            if same_report_path(args.output, source_path):
+                print(f"error: {args.output} must not overwrite the source {source_path}",
+                      file=sys.stderr)
+                return 2
 
     try:
         stats = write_skinned_glb(args.output, args.skeleton, args.component,
