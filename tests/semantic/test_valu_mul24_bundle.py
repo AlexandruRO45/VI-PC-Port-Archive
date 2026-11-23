@@ -167,5 +167,14 @@ class VMulI32I24OracleTests(unittest.TestCase):
         res = oracle_mul_i32_i24(0x00800000, 2)
         self.assertEqual(res, u32(-16777216))
 
+class VMulI32I24AstInterpreterTests(unittest.TestCase):
+    def test_mul_i24_ast_construction(self):
+        ast = ValuInstructionAST("v_mul_i32_i24", Operand(RegKind.VGPR, 2), Operand(RegKind.VGPR, 0), Operand(RegKind.VGPR, 1))
+        self.assertEqual(ast.mnemonic, "v_mul_i32_i24")
+
+    def test_mul_i24_scalar_execution(self):
+        res = oracle_mul_i32_i24(-15, 3)
+        self.assertEqual(res, u32(-45))
+
 if __name__ == "__main__":
     unittest.main()
