@@ -90,10 +90,35 @@ class CensusTest(unittest.TestCase):
         self.assertNotIn("containers", rsc.census(NO_SPILL))
 
     def test_malformed_reads_are_skipped(self):
-        index = {"m": {"stage": "cs", "user_sgpr_reads": [{"kind": "ptr32_lo"}, {"sgpr": "0", "kind": "ptr64_lo"}]}}
-        cs = rsc.census(index)["stages"]["cs"]
-        self.assertEqual(cs["shaders"], 1)
+        index = {
+            "m": {
+                "stage": "cs",
+                "user_sgprs": True,
+                "user_sgpr_reads": [
+                    {"kind": "ptr32_lo"},
+                    {"sgpr": "0", "kind": "ptr64_lo"},
+                    {"sgpr": False, "kind": "ptr64_lo"},
+                    {"sgpr": True, "kind": "ptr64_hi"},
+                    {"sgpr": -1, "kind": "ptr32_lo"},
+                    "not-a-dict",
+                    None,
+                ],
+            },
+            "n": {"stage": "cs", "user_sgprs": -4, "user_sgpr_reads": 123},
+            "bad_stage": {"stage": None, "user_sgpr_reads": []},
+            "list_stage": {"stage": ["cs"], "user_sgpr_reads": []},
+        }
+        out = rsc.census(index, carve=[{"name": "x", "parts": 123}, {"name": "y", "parts": {"RTS0": 1}}, "bad"])
+        cs = out["stages"]["cs"]
+        self.assertEqual(cs["shaders"], 2)
         self.assertEqual(cs["spill_pointer_candidates"], {})
+        self.assertEqual(cs["shaders_with_spill_pointer_candidate"], 0)
+        self.assertEqual(cs["highest_sgpr_read"], {})
+        self.assertIsNone(cs["max_highest_sgpr_read"])
+        self.assertNotIn("user_sgprs", cs)
+        self.assertEqual(out["stages"]["?"]["shaders"], 2)
+        self.assertEqual(out["containers"], 2)
+        self.assertEqual(out["containers_with_rts0"], 1)
 
 
 class CliTest(unittest.TestCase):

@@ -54,9 +54,12 @@ def census(index, base=None, carve=None):
     for entry in index.values():
         if not isinstance(entry, dict):
             continue
-        stage = entry.get("stage", "?")
+        raw_stage = entry.get("stage")
+        stage = raw_stage if isinstance(raw_stage, str) and raw_stage else "?"
         shaders[stage] += 1
-        reads = [r for r in entry.get("user_sgpr_reads") or [] if isinstance(r.get("sgpr"), int)]
+        raw_reads = entry.get("user_sgpr_reads")
+        reads = [r for r in (raw_reads if isinstance(raw_reads, list) else [])
+                 if isinstance(r, dict) and type(r.get("sgpr")) is int and r["sgpr"] >= 0]
         b = base.get(stage)
         found = set()
         if b is not None:
@@ -73,7 +76,7 @@ def census(index, base=None, carve=None):
             kinds = {r.get("kind") for r in reads if r["sgpr"] == top}
             highest_kind[stage]["pointer" if kinds & set(POINTER_KINDS) else "/".join(sorted(map(str, kinds)))] += 1
         count = entry.get("user_sgprs")
-        if isinstance(count, int):
+        if type(count) is int and count >= 0:
             user_sgprs[stage][count] += 1
     out = {"stages": {}}
     for stage in sorted(shaders):
@@ -96,10 +99,12 @@ def census(index, base=None, carve=None):
                 s["root_dwords_available"] = USER_SGPRS - base[stage]
         out["stages"][stage] = s
     if carve is not None:
-        entries = carve.values() if isinstance(carve, dict) else carve
+        entries = carve.values() if isinstance(carve, dict) else (carve if isinstance(carve, list) else [])
         containers = [e for e in entries if isinstance(e, dict)]
         out["containers"] = len(containers)
-        out["containers_with_rts0"] = sum(1 for e in containers if "RTS0" in (e.get("parts") or {}))
+        out["containers_with_rts0"] = sum(
+            1 for e in containers if isinstance(e.get("parts"), dict) and "RTS0" in e["parts"]
+        )
     return out
 
 
