@@ -453,10 +453,13 @@ function fixture(count = 1) {
         AbortController,
         fetch: (url, { signal }) => new Promise((resolve, reject) => {
             const request = { url, signal, reject };
-            request.headers = (url = '') => resolve({ ok: true, url, arrayBuffer: () => new Promise((body, fail) => {
-                request.completeBody = () => body(request);
-                signal.addEventListener('abort', () => fail(signal.reason), { once: true });
-            }) });
+            request.headers = (url = '', status = 200) => resolve({
+                ok: status >= 200 && status < 300, status, url,
+                arrayBuffer: () => new Promise((body, fail) => {
+                    request.completeBody = () => body(request);
+                    signal.addEventListener('abort', () => fail(signal.reason), { once: true });
+                }),
+            });
             signal.addEventListener('abort', () => reject(signal.reason), { once: true });
             requests.push(request);
         }),
@@ -535,6 +538,26 @@ test('a transient failure retries only after backoff, then loads the chunk', asy
     assert.deepEqual(f.added, [obj]);
     f.frame(100000);
     assert.equal(f.requests.length, 2);
+});
+
+test('an HTTP error aborts the unread chunk response before retrying', async () => {
+    const f = fixture();
+    f.frame();
+    const request = f.requests[0];
+    request.headers('', 503);
+    await settle();
+
+    assert.equal(f.state.failed, 1);
+    assert.equal(f.state.inflight, 0);
+    assert.equal(request.completeBody, undefined, 'the error body must stay unread');
+    assert.equal(request.signal.aborted, true, 'abort the download when rejecting the response');
+    f.frame(999);
+    assert.equal(f.requests.length, 1);
+    f.frame(1000);
+    assert.equal(f.requests.length, 2);
+    assert.equal(f.requests[1].signal.aborted, false);
+    await f.succeed(1, f.object());
+    assert.equal(f.added.length, 1);
 });
 
 test('stalled chunk headers and bodies release their slots at the download deadline', async () => {
