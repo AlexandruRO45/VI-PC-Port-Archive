@@ -189,11 +189,24 @@ int main() {
     uint8_t found[32];
     std::memset(found, 0xAB, sizeof(found));
     bool zero = true;
-    check(at<FindController>(device, 9)(device, reinterpret_cast<void*>(1), &async) == S_OK && finished(&async) &&
+    void* controller_user = nullptr;
+    check(at<FindUser>(device, 3)(device, device_id, &controller_user) == S_OK && controller_user &&
+              at<FindController>(device, 9)(device, controller_user, &async) == S_OK && finished(&async) &&
               at<FindControllerResult>(device, 10)(device, &async, found) == S_OK,
           "XUserFindControllerForUserWithUi completes without UI");
     for (uint8_t b : found) zero = zero && b == 0;
     check(zero, "with an all-zero device id, as on desktop");
+    // The user handle must be one the user shim handed out and the title has not closed, as for every other
+    // handle-taking XUser call: a closed or foreign handle starts no operation.
+    at<CloseUser>(user_object(query), 4)(user_object(query), controller_user);
+    async = XAsyncBlock{};
+    check(at<FindController>(device, 9)(device, controller_user, &async) == E_INVALIDARG,
+          "XUserFindControllerForUserWithUi refuses a closed user handle");
+    int not_a_user = 0;
+    async = XAsyncBlock{};
+    check(at<FindController>(device, 9)(device, &not_a_user, &async) == E_INVALIDARG,
+          "XUserFindControllerForUserWithUi refuses a pointer that is not an XUserHandle");
+    check(rt::shims::xgameruntime_user_open_handles() == 0, "the controller lookup leaves no user handle open");
 
     // ---- XAccessibility ----
     void* acc = nullptr;

@@ -40,6 +40,7 @@
 #include <XTaskQueue.h>
 
 namespace rt::shims {
+bool xgameruntime_user_is_open_handle(const void* handle);   // xgameruntime_user.cpp
 void* xgameruntime_user_new_handle();   // xgameruntime_user.cpp
 }
 
@@ -494,8 +495,10 @@ HRESULT CALLBACK find_controller_provider(XAsyncOp op, const XAsyncProviderData*
 }
 
 // 9: HRESULT XUserFindControllerForUserWithUiAsync(XUserHandle user, XAsyncBlock* async): no UI, as on desktop.
+// The user must be a handle the user shim handed out and the title has not closed, as every handle-taking XUser call
+// requires (xgameruntime_user.cpp); a closed or foreign one is refused before anything starts.
 HRESULT STDMETHODCALLTYPE device_find_controller_async(void*, XUserHandle user, XAsyncBlock* async) {
-    if (!user) return E_INVALIDARG;
+    if (!rt::shims::xgameruntime_user_is_open_handle(user)) return E_INVALIDARG;
     if (!async) return E_POINTER;
     return XAsyncBegin(async, nullptr, &kFindControllerIdentity, "XUserFindControllerForUserWithUiAsync",
                        find_controller_provider);

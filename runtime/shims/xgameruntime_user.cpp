@@ -541,4 +541,12 @@ long xgameruntime_user_open_handles() {
     return static_cast<long>(g_handles.size());
 }
 
+// Whether `handle` is an XUserHandle the title holds open, for the classes that take one too
+// (XUserFindControllerForUserWithUiAsync, in xgameruntime_offline.cpp). Looked up, never read.
+bool xgameruntime_user_is_open_handle(const void* handle) {
+    if (!handle) return false;
+    std::lock_guard<std::mutex> lock(g_handles_mutex);
+    return g_handles.count(handle) != 0;
+}
+
 }  // namespace rt::shims
