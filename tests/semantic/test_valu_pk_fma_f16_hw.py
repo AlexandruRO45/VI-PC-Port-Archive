@@ -677,3 +677,48 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         # lo: 5.0 * 2.0 = 10.0 -> clamped to 1.0 (0x3C00)
         # hi: -3.0 * 1.0 = -3.0 -> clamped to 0.0 (0x0000)
         self.assertEqual(got, 0x00003C00)
+
+
+# ==============================================================================
+# SECTION 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754EdgeCases(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_signed_zero_multiplication_and_addition(self) -> None:
+        """Verify IEEE signed zeros: (+0) * (+0) + (+0) = +0, (-0) * (+0) + (-0) = -0."""
+        # (+0) * (+0) + (+0) = +0 (0x0000)
+        got_pos = fma_f16(F16_POS_ZERO, F16_POS_ZERO, F16_POS_ZERO)
+        self.assertEqual(got_pos, F16_POS_ZERO)
+
+        # (-0) * (+0) + (-0) = -0 (0x8000)
+        got_neg = fma_f16(F16_NEG_ZERO, F16_POS_ZERO, F16_NEG_ZERO)
+        self.assertEqual(got_neg, F16_NEG_ZERO)
+
+    def test_subnormal_precision(self) -> None:
+        """Verify subnormal preservation and computation without flush."""
+        sub = F16_MIN_SUBNORMAL
+        res = fma_f16(sub, F16_ONE, sub)
+        # min_subnormal * 1.0 + min_subnormal = 2 * min_subnormal (0x0002)
+        self.assertEqual(res, 0x0002)
+
+    def test_infinities_and_cancellation(self) -> None:
+        """Verify (+Inf) * 2.0 + 1.0 = +Inf, and (+Inf) + (-Inf) = NaN."""
+        # Inf * 2.0 + 1.0 = Inf
+        self.assertEqual(fma_f16(F16_POS_INF, F16_TWO, F16_ONE), F16_POS_INF)
+        self.assertEqual(fma_f16(F16_NEG_INF, F16_TWO, F16_ONE), F16_NEG_INF)
+
+        # (+Inf) * 1.0 + (-Inf) = NaN
+        self.assertEqual(fma_f16(F16_POS_INF, F16_ONE, F16_NEG_INF), F16_QNAN)
+
+    def test_nan_propagation(self) -> None:
+        """Verify NaN operand propagates canonical quiet NaN."""
+        self.assertEqual(fma_f16(F16_QNAN, F16_ONE, F16_TWO), F16_QNAN)
+        self.assertEqual(fma_f16(F16_ONE, F16_SNAN, F16_TWO), F16_QNAN)
+        self.assertEqual(fma_f16(F16_ONE, F16_TWO, F16_QNAN), F16_QNAN)
+
+    def test_overflow_to_infinity(self) -> None:
+        """Verify overflow beyond MAX_NORMAL produces infinity."""
+        res = fma_f16(F16_MAX_NORMAL, F16_TWO, F16_POS_ZERO)
+        self.assertEqual(res, F16_POS_INF)
