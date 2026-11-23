@@ -216,6 +216,19 @@ class TestWriteLaneOracle(unittest.TestCase):
         self.assertIn("OpSelect", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestWriteLaneAST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        lanes = [1] * 64
+        out = model_writelane(lanes, 0xCAFE, 31)
+        self.assertEqual(out[31], 0xCAFE)
+        self.assertEqual(out[30], 1)
+
+    def test_translator_writelane_ast(self):
+        prog = ["s_mov_b32 s3, 0xCAFE", "s_mov_b32 s4, 31", "v_writelane_b32 v1, s3, s4", "s_endpgm"]
+        spv = support.translate_lines("cs_wl_ast", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpSelect", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
