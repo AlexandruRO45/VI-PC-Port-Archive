@@ -6349,6 +6349,17 @@ class Gen:
     # ---- instructions ----
     SDWA_SEL = {"BYTE_0": (0, 8), "BYTE_1": (8, 8), "BYTE_2": (16, 8), "BYTE_3": (24, 8),
                 "WORD_0": (0, 16), "WORD_1": (16, 16), "DWORD": (0, 32)}
+    CO_CI_OPS = ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32")
+
+    @classmethod
+    def _src0_index(cls, op, args):
+        """Operand index of src0 in parsed VOP1/VOP2/VOPC arguments."""
+        if op.startswith("v_cmpx"):
+            return 0
+        # Canonical VOP2_SDWA/DPP carry ops place the carry-out mask at args[1] before src0, src1, cin.
+        if op in cls.CO_CI_OPS and len(args) >= 4:
+            return 2
+        return 1
 
     def insn(self, ins):
         """SDWA (sub-dword addressing): each source is narrowed to src<i>_sel (zero-extended, or sign-extended
@@ -6370,7 +6381,7 @@ class Gen:
         op, mods = base_op(ins["op"]), ins["mods"]
         kv = dict(m.split(":", 1) for m in mods if m.split(":", 1)[0] in ("src0_sel", "src1_sel", "dst_sel", "dst_unused"))
         args = [dict(x) for x in ins["args"]]
-        first = 0 if op.startswith("v_cmpx") else 1
+        first = self._src0_index(op, args)
         for i, key in enumerate(("src0_sel", "src1_sel")):
             j = first + i
             if j < len(args) and (kv.get(key, "DWORD") != "DWORD" or args[j].get("sext")):
@@ -6474,13 +6485,16 @@ class Gen:
             raise Unsupported("DPP mask")
 
         args = [dict(a) for a in ins["args"]]
-        if len(args) < 2:
+        src_idx = self._src0_index(base_op(ins["op"]), args)
+        if src_idx == 0:
+            raise Unsupported("DPP operands")
+        if len(args) <= src_idx:
             raise Unsupported("DPP operands")
         if args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
             raise Unsupported("DPP destination")
-        if args[1].get("n", 1) != 1:
+        if args[src_idx].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
-        src = args[1]
+        src = args[src_idx]
         src_val = self.src_u(src)    # neg/abs are lane-uniform, so before or after the shuffle is the same
 
         lane = self.wave_lane()
@@ -6652,7 +6666,7 @@ class Gen:
         else:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
-        args[1] = {"k": "ssa", "v": src0}
+        args[src_idx] = {"k": "ssa", "v": src0}
         previous = self.dpp_guard
         self.dpp_guard = write
         try:
@@ -9147,6 +9161,11 @@ class Gen:
             if not (cd["k"] == "special" and cd["t"] == "null"):
                 cm, m = self.tmp(), self.tmp()
                 self.emit(f"{cm} = OpLogicalAnd %bool {carry_nz} {self.active_b()}")  # inactive lanes write 0
+                if self.dpp_guard is not None:
+                    # DPP-disabled lanes (row_mask/bank_mask/bound_ctrl:0) write 0 to the scalar mask.
+                    cg = self.tmp()
+                    self.emit(f"{cg} = OpLogicalAnd %bool {cm} {self.dpp_guard}")
+                    cm = cg
                 self.emit(f"{m} = OpSelect %uint {cm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
                 self.mask_dst(cd, m)
         elif op == "v_mul_legacy_f32":

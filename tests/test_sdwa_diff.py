@@ -89,6 +89,29 @@ class Reference(unittest.TestCase):
         self.assertEqual(run(cmp.format("i"), "v_cndmask_b32_sdwa v1, v2, v3, vcc_lo dst_sel:DWORD "
                              "dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:BYTE_0", v=seeds)[0], 1)
 
+    def test_co_ci_carry_and_selects(self):
+        # src0=0xFFFF0001 WORD_1=0xFFFF, src1=0x00020100 BYTE_0=0, cin=1 -> 0x10000 (0, carry=1), placed into WORD_1
+        self.assertEqual(
+            run("v_add_co_ci_u32_sdwa v1, vcc_lo, v2, v3, vcc_lo dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE "
+                "src0_sel:WORD_1 src1_sel:BYTE_0",
+                v={1: 0xDEAD1234, 2: 0xFFFF0001, 3: 0x00020100}, vcc=1)[::3],
+            [0x00001234, 0],
+        )
+        # sub borrow with clamp: 0x00000002 (BYTE_0=2) - sext(0xFF= -1 -> 0xFFFFFFFF) - cin(1) -> borrow=1, clamped=0
+        self.assertEqual(
+            run("v_sub_co_ci_u32_sdwa v1, vcc_lo, v2, sext(v3), vcc_lo clamp dst_sel:DWORD dst_unused:UNUSED_PAD "
+                "src0_sel:BYTE_0 src1_sel:BYTE_0",
+                v={2: 2, 3: 0xFF}, vcc=1)[::3],
+            [0, 1],
+        )
+        # subrev borrow: src1(BYTE_0=5) - src0(WORD_1=10) - cin(1) -> 0xFFFFFFFA, borrow=1
+        self.assertEqual(
+            run("v_subrev_co_ci_u32_sdwa v1, vcc_lo, v2, v3, vcc_lo dst_sel:DWORD dst_unused:UNUSED_PAD "
+                "src0_sel:WORD_1 src1_sel:BYTE_0",
+                v={2: 0x000A0000, 3: 5}, vcc=1)[::3],
+            [0xFFFFFFFA, 1],
+        )
+
     def test_constant_shift_amount_is_selected(self):
         # the #2005 case: WORD_1 of 0x40001 is 4
         self.assertEqual(run("v_lshlrev_b32_sdwa v1, s4, v2 dst_sel:DWORD dst_unused:UNUSED_PAD "
@@ -119,13 +142,14 @@ class Generator(unittest.TestCase):
         def known_form(line):
             op, args, mods, _ = d.parse(line)
             family, form, width = d.OPS[op][:3]
-            src0 = d.parse_src(args[1])
+            srcs = args[2:4] if form == "co_ci" else args[1:3] if form != "vop1" else args[1:2]
+            src0 = d.parse_src(srcs[0])
             if op in d.SHIFTS and src0["tok"][0] != "v" and (mods["src0_sel"] != "DWORD" or src0["sext"]):
                 return "shift-const-sel"
             if form != "vopc" and width == 16 and mods["dst_sel"] == "DWORD":
                 return "dword-16bit"
-            srcs = args[1:3] if form != "vop1" else args[1:2]
-            if family == "f16" and any(a in d.FLOAT_CONSTS and mods.get(f"src{i}_sel") != "DWORD"
+            if family == "f16" and any(a in d.FLOAT_CONSTS and not (op == "v_cmp_class_f16" and i == 1)
+                                       and mods.get(f"src{i}_sel") != "DWORD"
                                        for i, a in enumerate(srcs)):
                 return "f16-const-sel"
             return None
@@ -182,7 +206,13 @@ class Translated(unittest.TestCase):
                   "v_fract_f16_sdwa v1, v3 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_1",
                   "v_cmp_lt_i16_sdwa vcc_lo, v3, v2 src0_sel:WORD_1 src1_sel:BYTE_0",
                   "v_lshlrev_b32_sdwa v1, v2, v3 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 "
-                  "src1_sel:WORD_0"]
+                  "src1_sel:WORD_0",
+                  "v_add_co_ci_u32_sdwa v1, vcc_lo, v2, sext(v3), vcc_lo dst_sel:WORD_1 "
+                  "dst_unused:UNUSED_PRESERVE src0_sel:WORD_0 src1_sel:BYTE_1",
+                  "v_sub_co_ci_u32_sdwa v1, vcc_lo, sext(v2), v3, vcc_lo clamp dst_sel:DWORD "
+                  "dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:WORD_0",
+                  "v_subrev_co_ci_u32_sdwa v1, vcc_lo, v2, v3, vcc_lo dst_sel:BYTE_2 "
+                  "dst_unused:UNUSED_SEXT src0_sel:WORD_1 src1_sel:BYTE_0"]
         for case in cases:
             with self.subTest(case=case):
                 self.assertIsNone(d.check(prefix + [case, "v_cmp_lt_u16_sdwa vcc_lo, v1, v2 src0_sel:BYTE_2 "

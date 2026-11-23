@@ -19,16 +19,17 @@ What is modelled, per instruction:
     UNUSED_SEXT fills the bits above the field with its top bit (bits below stay zero), UNUSED_PRESERVE keeps them.
     A 16-bit result (f16 ops, v_cvt_{u16,i16}_f16, v_cvt_f16_{u16,i16}) with dst_sel:DWORD zeroes the high half,
     whatever dst_unused says: unlike the non-SDWA forms (docs/design.md "16-bit results"), which keep it.
-  * clamp: unsigned saturation on v_add/sub/subrev_nc_u32, [0, 1] on f16 results (clamp(-0) = +0) and on
-    v_cvt_f32_f16.
+  * clamp: unsigned saturation on v_add/sub/subrev_nc_u32 and v_add/sub/subrev_co_ci_u32 (while reporting real
+    carry/borrow to VCC), [0, 1] on f16 results (clamp(-0) = +0) and on v_cvt_f32_f16.
   * f16 arithmetic rounds to nearest even with denormals kept (the MODE the translator assumes); min/max order -0
     below +0; v_fract_f16(-0) = +0 and the result stops at 0x3bff.
-  * VOPC writes VCC (one bit, this lane); v_cndmask_b32 reads it.
-Every one of these rules was checked against an RDNA2 GPU (AMD Radeon iGPU, gfx1036, Windows driver 26.10.1) with
---oracle hw, the f16 constant, dst_sel:DWORD and v_fract_f16(-0) rules included.
+  * VOPC writes VCC (one bit, this lane); v_add/sub/subrev_co_ci_u32 read carry-in from VCC and write carry-out
+    to VCC; v_cndmask_b32 reads VCC.
+Every one of these rules except the v_*_co_ci_u32_sdwa carry forms was checked against an RDNA2 GPU (AMD Radeon iGPU,
+gfx1036, Windows driver 26.10.1) with --oracle hw, the f16 constant, dst_sel:DWORD and v_fract_f16(-0) rules included.
 
-The int family is the 32-bit integer VOP2 ops, v_cndmask_b32, the integer VOP1 ops and v_cvt_f32_{u32,i32,ubyteN},
-and the 32- and 16-bit integer compares. The f16 family is v_add/sub/subrev/mul/min/max_f16, the f16 rounding ops
+The int family is the 32-bit integer VOP2 ops, v_add/sub/subrev_co_ci_u32, v_cndmask_b32, the integer VOP1 ops and
+v_cvt_f32_{u32,i32,ubyteN}, and the 32- and 16-bit integer compares. The f16 family is v_add/sub/subrev/mul/min/max_f16, the f16 rounding ops
 and v_fract_f16, the f16 <-> 16-bit integer and f16 -> f32 conversions, the f16 compares and v_cmp_class_f16.
 --list-ops prints them. Not generated: omod, v_cmpx, an SGPR destination for VOPC, DPP, literals (SDWA has none),
 transcendentals, f32 arithmetic.
@@ -233,7 +234,8 @@ def ffbh_i32(a):
 
 # ---- the reference: one entry per opcode -------------------------------------------------------------
 # (family, form, width, fn). family "int" / "f16" decides the modifiers (sext vs neg/abs) and how a float inline
-# constant reads. form: "vop2" d, a, b; "vop1" d, a; "vopc" vcc, a, b; "cndmask" d, a, b, vcc.
+# constant reads. form: "vop2" d, a, b; "vop1" d, a; "vopc" vcc, a, b; "cndmask" d, a, b, vcc;
+# "co_ci" d, vcc, a, b, vcc.
 # width: bits of the result (16 or 32); a 16-bit result has a zero high half under dst_sel:DWORD.
 # fn(a, b) gets the selected 32-bit sources and returns the result (a bit for "vopc").
 
@@ -247,6 +249,9 @@ def _ops():
     add("v_add_nc_u32", "int", "vop2", lambda a, b: a + b, clamp=usat)
     add("v_sub_nc_u32", "int", "vop2", lambda a, b: a - b, clamp=usat)
     add("v_subrev_nc_u32", "int", "vop2", lambda a, b: b - a, clamp=usat)
+    add("v_add_co_ci_u32", "int", "co_ci", lambda a, b, c: a + b + c, clamp=usat)
+    add("v_sub_co_ci_u32", "int", "co_ci", lambda a, b, c: a - b - c, clamp=usat)
+    add("v_subrev_co_ci_u32", "int", "co_ci", lambda a, b, c: b - a - c, clamp=usat)
     add("v_and_b32", "int", "vop2", lambda a, b: a & b)
     add("v_or_b32", "int", "vop2", lambda a, b: a | b)
     add("v_xor_b32", "int", "vop2", lambda a, b: a ^ b)
@@ -413,7 +418,9 @@ def step(st, line):
     if clamp and not clamp_kind:
         raise RefError(f"{op}: clamp not modelled")
     f16 = family == "f16"
-    srcs = args[1:3] if form in ("vop2", "vopc", "cndmask") else args[1:2]
+    srcs = (args[2:4] if form == "co_ci"
+            else args[1:3] if form in ("vop2", "vopc", "cndmask")
+            else args[1:2])
     vals = []
     for i, text in enumerate(srcs):
         s = parse_src(text)
@@ -427,7 +434,10 @@ def step(st, line):
     if form == "vopc":
         st.vcc = int(bool(fn(vals[0], vals[1])))
         return
-    if form == "cndmask":
+    if form == "co_ci":
+        r = fn(vals[0], vals[1], st.vcc & 1)
+        st.vcc = int(r < 0 or r > M32)
+    elif form == "cndmask":
         r = vals[1] if st.vcc else vals[0]
     else:
         r = fn(vals[0], vals[1] if len(vals) > 1 else 0)
@@ -523,8 +533,11 @@ def emit(rng, name):
         unused = rng.choice(UNUSED)
         a = _src(rng, "cndmask" if form == "cndmask" else family)
         b = _src(rng, "cndmask" if form == "cndmask" else family) if form != "vop1" else None
-        if form == "cndmask" and a[0] == b[0] == "s" and a != b:
-            b = f"v{rng.choice(VREGS)}"       # VCC is on the constant bus too: at most one other SGPR (gfx1030)
+        if form in ("cndmask", "co_ci"):
+            sa = a[5:-1] if a.startswith("sext(") else a
+            sb = b[5:-1] if b.startswith("sext(") else b
+            if sa[0] == sb[0] == "s" and sa != sb:
+                b = f"v{rng.choice(VREGS)}"       # VCC is on the constant bus too: at most one other SGPR (gfx1030)
     if not KNOWN:
         inner = a[5:-1] if a.startswith("sext(") else a
         if name in SHIFTS and inner[0] != "v":
@@ -534,6 +547,8 @@ def emit(rng, name):
     tail = f"{clamp} dst_sel:{dsel} dst_unused:{unused} src0_sel:{s0}"
     if form == "vop1":
         return f"{name}_sdwa {d}, {a}{tail}"
+    if form == "co_ci":
+        return f"{name}_sdwa {d}, vcc_lo, {a}, {b}, vcc_lo{tail} src1_sel:{s1}"
     vcc = ", vcc_lo" if form == "cndmask" else ""
     return f"{name}_sdwa {d}, {a}, {b}{vcc}{tail} src1_sel:{s1}"
 
