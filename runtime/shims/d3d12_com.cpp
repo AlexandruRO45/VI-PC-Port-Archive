@@ -1158,7 +1158,12 @@ public:
                 VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
                 info.semaphore = semaphore;
                 info.value = value;
-                context->vk.vkSignalSemaphore(context->device(), &info);
+                if (context->vk.vkSignalSemaphore(context->device(), &info) == VK_SUCCESS) {
+                    // Only now: a queue Wait released earlier could reach the GPU ahead of the queue Signal this one
+                    // waits behind, on the same VkQueue when D3D12 queues share one, and never make progress.
+                    context->holds().signaled(semaphore, value);  // the queues holding a batch for it run it now
+                    context->holds().pump_ready();
+                }
             }
             held->fetch_sub(1);
         });
