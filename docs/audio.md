@@ -245,8 +245,8 @@ is the one the stems fall under:
 | `audio.rpf` streamed cues under 30 s | 1,149 channels / 5.78 h | none |
 | `audio.rpf` all banks | 7,162 banks, all streams | none as a single stream; the stems are bank `0x300695000` (above) |
 | loop/chunked banks | 1,099 banks / 118,180 streams | none |
-| `packs.rpf` inflated | 144,364 files / 9.74 GB | 0 AWC, 0 Bink2 |
-| `data.rpf` inflated | 28,509 files / 1.41 GB | mission text, 0 song strings |
+| `packs.rpf` inflated | 144,364 zlib streams / 9.74 GB | 0 AWC, 0 Bink2 |
+| `data.rpf` inflated | 28,509 zlib streams / 1.41 GB | mission text, 0 song strings |
 | `script.rpf`, `common.rpf`, `story000_script.rpf` | 1,057 / 954 / 2,632 zlib streams | none |
 | `levels.rpf` raw | 94 `ADAT` magics, 2,820 `KB2` patterns | 0 valid AWC/Bink |
 
@@ -254,8 +254,9 @@ is the one the stems fall under:
 AWC exporter, Bink tracks for the movie rows, and zlib streams for the inflated-archive rows. The three
 script/config archives are **1,057 / 954 / 2,632 zlib streams** in a 1.0.2.1 carve (`tools/rpf9_carve.py`); this
 row first recorded 1,058 / 955 / 2,633, one item more per archive than the carve finds, while the `packs.rpf`
-and `data.rpf` rows above match their stream counts exactly. `gamedata.md`'s archive table agrees with the carve
-(954 streams for `common.rpf`), so the carve count is the one to use.
+and `data.rpf` rows above match their stream counts exactly. `gamedata.md`'s archive table gives the same 954
+streams for `common.rpf`, but its `script.rpf` row still says 714 (671 `PSIN`), which both this carve (1,057)
+and the 1,012 `PSIN` in `docs/psin.md` disagree with, so the carve count is the one to use here.
 
 Fingerprint search: about 19,807 files / 19.9 M Chromaprint frames / 653 fingerprint-hours, with a
 0.50-2.00 tempo sweep over the story-music and long-AWC targets. No candidate passes the vote
