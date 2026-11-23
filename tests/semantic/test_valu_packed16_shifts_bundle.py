@@ -474,5 +474,44 @@ class TestVPkLshrrevB16Oracle(unittest.TestCase):
         s1 = pack16(0xFFFF, 0x8000)
         self.assertEqual(ref_v_pk_lshrrev_b16(s0, s1), pack16(1, 1))
 
+GLOBAL_ORACLE_MAP[Opcode.V_PK_LSHRREV_B16] = ref_v_pk_lshrrev_b16
+
+
+class TestVPkLshrrevB16ASTAndInterpreter(unittest.TestCase):
+    def test_ast_disasm(self) -> None:
+        inst = ASTInstruction(
+            Opcode.V_PK_LSHRREV_B16,
+            ASTOperand.vgpr(10),
+            ASTOperand.vgpr(11),
+            ASTOperand.vgpr(12),
+        )
+        self.assertEqual(inst.disasm(), "v_pk_lshrrev_b16 v10, v11, v12")
+
+    def test_scalar_interpreter_step(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(1, pack16(3, 2))
+        state.write_vgpr(2, pack16(0x0080, 0x0040))
+        inst = ASTInstruction(
+            Opcode.V_PK_LSHRREV_B16,
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(2),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, pack16(0x0010, 0x0010))
+        self.assertEqual(state.vgprs[0], pack16(0x0010, 0x0010))
+
+    def test_imm_operands(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(2, pack16(0x0100, 0x0200))
+        inst = ASTInstruction(
+            Opcode.V_PK_LSHRREV_B16,
+            ASTOperand.vgpr(0),
+            ASTOperand.imm(pack16(4, 5)),
+            ASTOperand.vgpr(2),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, pack16(0x0010, 0x0010))
+
 if __name__ == "__main__":
     unittest.main()
