@@ -30,7 +30,7 @@ struct Ref {
     T* operator->() const { return p; }
 };
 
-int check(IDXGIFactory4* factory, const char* who) {
+int check(IDXGIFactory4* factory, IUnknown* swap_device, const char* who) {
     // CreateSoftwareAdapter: a null module or a null output is DXGI_ERROR_INVALID_CALL.
     HMODULE self = GetModuleHandleW(nullptr);
     EXPECT(self);
@@ -40,13 +40,17 @@ int check(IDXGIFactory4* factory, const char* who) {
     EXPECT_HR(factory->CreateSoftwareAdapter(self, nullptr), DXGI_ERROR_INVALID_CALL);
     EXPECT_HR(factory->CreateSoftwareAdapter(nullptr, nullptr), DXGI_ERROR_INVALID_CALL);
 
-    // GetSharedResourceAdapterLuid: a null handle or a null LUID.
+    // GetSharedResourceAdapterLuid: a null handle or a null LUID is DXGI_ERROR_INVALID_CALL, INVALID_HANDLE_VALUE is
+    // E_INVALIDARG and a non-null handle that is not a shared resource is 0x88760873 (not INVALID_CALL).
     Ref<IDXGIFactory2> factory2;
     EXPECT(SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory2.p))));
     LUID luid{};
     EXPECT_HR(factory2->GetSharedResourceAdapterLuid(nullptr, &luid), DXGI_ERROR_INVALID_CALL);
     EXPECT_HR(factory2->GetSharedResourceAdapterLuid(reinterpret_cast<HANDLE>(0x1234), nullptr),
               DXGI_ERROR_INVALID_CALL);
+    EXPECT_HR(factory2->GetSharedResourceAdapterLuid(reinterpret_cast<HANDLE>(0x1234), &luid),
+              static_cast<HRESULT>(0x88760873));
+    EXPECT_HR(factory2->GetSharedResourceAdapterLuid(INVALID_HANDLE_VALUE, &luid), E_INVALIDARG);
 
     // CreateSwapChainForComposition: the page says pDevice, pDesc and ppSwapChain cannot be NULL.
     DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -64,6 +68,28 @@ int check(IDXGIFactory4* factory, const char* who) {
     EXPECT_HR(factory2->CreateSwapChainForComposition(nullptr, nullptr, nullptr, &swapchain.p),
               DXGI_ERROR_INVALID_CALL);
     EXPECT_HR(factory2->CreateSwapChainForComposition(factory, &desc, nullptr, nullptr), DXGI_ERROR_INVALID_CALL);
+    // Non-null arguments with a bad descriptor field: SwapEffect must be a flip model (FLIP_SEQUENTIAL and
+    // FLIP_DISCARD are accepted by the host, DISCARD and SEQUENTIAL are not) and Scaling must not be
+    // ASPECT_RATIO_STRETCH (STRETCH and NONE are accepted). swap_device is a real command queue on the host.
+    const DXGI_SWAP_EFFECT bad_effects[] = {DXGI_SWAP_EFFECT_DISCARD, DXGI_SWAP_EFFECT_SEQUENTIAL};
+    for (const auto effect : bad_effects) {
+        DXGI_SWAP_CHAIN_DESC1 bad = desc;
+        bad.SwapEffect = effect;
+        EXPECT_HR(factory2->CreateSwapChainForComposition(swap_device, &bad, nullptr, &swapchain.p),
+                  DXGI_ERROR_INVALID_CALL);
+        EXPECT(swapchain.p == nullptr);
+    }
+    {
+        DXGI_SWAP_CHAIN_DESC1 bad = desc;
+        bad.Scaling = DXGI_SCALING_ASPECT_RATIO_STRETCH;
+        EXPECT_HR(factory2->CreateSwapChainForComposition(swap_device, &bad, nullptr, &swapchain.p),
+                  DXGI_ERROR_INVALID_CALL);
+        bad = desc;
+        bad.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        bad.Scaling = DXGI_SCALING_NONE;
+        EXPECT_HR(factory2->CreateSwapChainForComposition(swap_device, &bad, nullptr, &swapchain.p),
+                  DXGI_ERROR_INVALID_CALL);
+    }
 
     // RegisterHardwareContentProtectionTeardownStatusEvent: a null event or cookie is DXGI_ERROR_INVALID_CALL,
     // an event gets S_OK and a non-zero cookie, and the cookie unregisters.
@@ -110,10 +136,19 @@ int main() {
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p)))) return 1;
     Ref<IDXGIFactory4> ours;
     if (FAILED(rt::d3d12::create_dxgi_factory(device.p, IID_PPV_ARGS(&ours.p)))) return 1;
-    failures += check(ours.p, "layer");
+    failures += check(ours.p, ours.p, "layer");
     Ref<IDXGIFactory4> host;
-    if (!hostwine::host_is_wine() && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&host.p))))
-        failures += check(host.p, "host");
+    if (!hostwine::host_is_wine() && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&host.p)))) {
+        Ref<ID3D12Device> host_device;
+        Ref<ID3D12CommandQueue> host_queue;
+        D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host_device.p))) ||
+            FAILED(host_device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&host_queue.p)))) {
+            std::fprintf(stderr, "host: no D3D12 device for the descriptor checks\n");
+            return 1;
+        }
+        failures += check(host.p, host_queue.p, "host");
+    }
     if (vk.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", vk.validation_errors());
         return 1;

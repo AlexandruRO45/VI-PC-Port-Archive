@@ -1544,11 +1544,14 @@ public:
         if (FAILED(hr) || !hwnd) return DXGI_ERROR_INVALID_CALL;
         return create_swap_chain(device, hwnd, desc, restrict_to_output, out);
     }
-    // The host answers DXGI_ERROR_INVALID_CALL for a null handle or a null LUID. Nothing here is shared between
-    // adapters, so any other handle stays E_NOTIMPL.
+    // Measured on the host dxgi.dll (RTX 4080 SUPER, Intel UHD 770 and WARP adapters): a null handle or a null LUID is
+    // DXGI_ERROR_INVALID_CALL, INVALID_HANDLE_VALUE is E_INVALIDARG and any other handle that is not a shared
+    // resource (0x1234) is 0x88760873, not DXGI_ERROR_INVALID_CALL. Nothing here resolves a handle to an adapter, so
+    // every other handle gets the same answer as an unknown one.
     HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE resource, LUID* luid) override {
         if (!resource || !luid) return DXGI_ERROR_INVALID_CALL;
-        return E_NOTIMPL;
+        if (resource == INVALID_HANDLE_VALUE) return E_INVALIDARG;
+        return static_cast<HRESULT>(0x88760873);
     }
     // Microsoft documents S_OK with a cookie for UnregisterStereoStatus (E_NOTIMPL is only the answer of the
     // Windows 7 Platform Update). Stereo is never enabled here, so the window or event is never notified.
@@ -1578,11 +1581,16 @@ public:
     void STDMETHODCALLTYPE UnregisterOcclusionStatus(DWORD) override {}
     // The page (https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgifactory2-createswapchainforcomposition)
     // says pDevice, pDesc and ppSwapChain cannot be NULL and the error is DXGI_ERROR_INVALID_CALL, as on the host.
-    // Composition surfaces are not implemented, so a call that passes those checks stays E_NOTIMPL.
+    // The host also answers DXGI_ERROR_INVALID_CALL when SwapEffect is not a flip model (DISCARD and SEQUENTIAL are
+    // refused, FLIP_SEQUENTIAL and FLIP_DISCARD are accepted) or Scaling is ASPECT_RATIO_STRETCH (STRETCH and NONE are
+    // accepted). Composition surfaces are not implemented, so a call that passes those checks stays E_NOTIMPL.
     HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc,
                                                             IDXGIOutput*, IDXGISwapChain1** out) override {
         if (out) *out = nullptr;
         if (!device || !desc || !out) return DXGI_ERROR_INVALID_CALL;
+        if (desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD)
+            return DXGI_ERROR_INVALID_CALL;
+        if (desc->Scaling == DXGI_SCALING_ASPECT_RATIO_STRETCH) return DXGI_ERROR_INVALID_CALL;
         return E_NOTIMPL;
     }
 
