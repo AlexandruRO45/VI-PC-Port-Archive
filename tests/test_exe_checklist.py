@@ -112,5 +112,32 @@ class ExeChecklist(unittest.TestCase):
         self.assertTrue(any(n["file"] == "docs/runtime_imports.md" and n["kind"] == "UNVERIFIED" for n in notes))
 
 
+class ChecklistOutput(unittest.TestCase):
+    """--out: a missing folder is created, and a path that cannot be written is one line instead of a traceback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, "docs"))
+        with open(os.path.join(self.root, "docs", "demo.md"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("# Demo\n\n**VERIFY:** one note.\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_out_creates_a_missing_folder(self):
+        out = os.path.join(self.root, "reports", "deep", "checklist.md")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ec.main(["--root", self.root, "--out", out]), 0)
+        with open(out, "rb") as f:
+            self.assertNotIn(b"\r\n", f.read())
+
+    def test_out_that_is_a_directory_is_one_line(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            self.assertEqual(ec.main(["--root", self.root, "--out", self.root]), 1)
+        self.assertIn("cannot write the checklist to", stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,8 +12,8 @@ several). A shim note then says whether the executable calls a runtime class tha
 the ones a boot can reach, so they come first; "not called" ones can wait. The classes of a file are its
 `constexpr GUID k...Class` ids, as gdk_runtime_calls reads them.
 
-Output: Markdown, to stdout or --out (LF). Exit status 0; 1 when a --gdk-calls file can't be read. Reads files only.
-Standard library only.
+Output: Markdown, to stdout or --out (LF; the folder is created when it is missing). Exit status 0; 1 when a
+--gdk-calls file can't be read or --out can't be written. Reads files only. Standard library only.
 """
 from __future__ import annotations
 
@@ -170,8 +170,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     text = render(collect(a.root), called)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        except OSError as e:                        # a folder where the file goes, no permission, a missing parent
+            print(f"cannot write the checklist to {a.out}: {e.strerror or e}", file=sys.stderr)
+            return 1
         print(f"wrote {a.out}")
     else:
         print(text, end="")
