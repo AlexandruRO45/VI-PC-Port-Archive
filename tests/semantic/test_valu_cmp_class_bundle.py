@@ -317,3 +317,54 @@ class TestCmpClassF16NegativeAndTranslator(unittest.TestCase):
         _, spv = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=False, test_id="lowering")
         self.assertIn("OpBitwiseAnd", spv)
         self.assertIn("OpLogicalOr", spv)
+
+
+# ------------------------------------------------------------------------------
+# v_cmp_class_f32 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+def classify_f32(u: int) -> int:
+    u = u & 0xFFFF_FFFF
+    sign = (u >> 31) & 1
+    exp = (u >> 23) & 0xFF
+    man = u & 0x7FFFFF
+    if exp == 0:
+        if man == 0:
+            return 5 if sign else 6
+        return 4 if sign else 7
+    elif exp == 255:
+        if man == 0:
+            return 2 if sign else 9
+        return 1 if (man & 0x400000) else 0
+    return 3 if sign else 8
+
+
+def ref_cmp_class_f32(u: int, mask: int) -> bool:
+    c = classify_f32(u)
+    return bool(mask & (1 << c))
+
+
+class TestCmpClassF32Oracle(unittest.TestCase):
+    def test_oracle_matches_hardware(self):
+        samples = [
+            (0x7F800001, CLASS_SNAN),
+            (0x7FC00000, CLASS_QNAN),
+            (0xFF800000, CLASS_NEG_INF),
+            (0xBF800000, CLASS_NEG_NORMAL),
+            (0x80000001, CLASS_NEG_DENORM),
+            (0x80000000, CLASS_NEG_ZERO),
+            (0x00000000, CLASS_POS_ZERO),
+            (0x00000001, CLASS_POS_DENORM),
+            (0x3F800000, CLASS_POS_NORMAL),
+            (0x7F800000, CLASS_POS_INF),
+        ]
+        for idx, (val, mask) in enumerate(samples):
+            res_hw, _ = run_cmp_shader("f32", val, mask, is_cmpx=False, test_id=f"oracle_{idx}")
+            self.assertEqual(res_hw, 1 if ref_cmp_class_f32(val, mask) else 0)
+
+    def test_oracle_mask_combinations_hardware(self):
+        res_all, _ = run_cmp_shader("f32", 0x3F800000, CLASS_ALL, is_cmpx=False, test_id="all_mask")
+        self.assertEqual(res_all, 1)
+
+        res_zero, _ = run_cmp_shader("f32", 0x3F800000, 0, is_cmpx=False, test_id="zero_mask")
+        self.assertEqual(res_zero, 0)
