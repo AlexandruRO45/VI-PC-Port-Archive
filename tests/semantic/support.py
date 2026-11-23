@@ -1,6 +1,8 @@
 """Shared helpers for the translator tests (standard library only)."""
+import atexit
 import gc
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -41,24 +43,52 @@ def translate_lines(name, lines, dxbc=STUB_DXBC, fssm=None):
     return translate_listing(name, text.encode("utf-8"), dxbc, fssm)
 
 
+_scratch = {"dir": None, "files": {}}
+
+
+def _scratch_dir():
+    """One temporary directory for the whole test process, removed at exit (a fresh one per translation cost a
+    mkdir, two file writes and an rmtree each time: ~4 ms on Windows with a virus scanner, 3 000 times a file)."""
+    if _scratch["dir"] is None:
+        _scratch["dir"] = tempfile.mkdtemp()
+        atexit.register(_remove_scratch)
+    return _scratch["dir"]
+
+
+def _remove_scratch():
+    path, _scratch["dir"] = _scratch["dir"], None
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        gc.collect()        # a leaked file object still holds the directory (Windows); close it and retry
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _put(path, data):
+    """Make `path` hold `data` (None: absent), writing only when it differs from what this process left there."""
+    if _scratch["files"].get(path) == data:
+        return
+    if data is None:
+        os.remove(path)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+    _scratch["files"][path] = data
+
+
 def translate_listing(name, data, dxbc=STUB_DXBC, fssm=None):
     """SPIR-V assembly text for a listing in the translator's input format (bytes of a .s file)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        os.mkdir(os.path.join(tmp, "disasm"))
-        with open(os.path.join(tmp, "disasm", name + ".s"), "wb") as f:
-            f.write(data)
-        with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
-            f.write(dxbc)
-        if fssm is not None:
-            os.mkdir(os.path.join(tmp, "fssm"))
-            with open(os.path.join(tmp, "fssm", name + ".fssm"), "wb") as f:
-                f.write(fssm)
-        with warnings.catch_warnings():
-            # translate() leaves its .dxbc handle to the garbage collector; harmless, and not ours to change here.
-            warnings.simplefilter("ignore", ResourceWarning)
-            result = rdna2spirv.translate(os.path.join(tmp, "disasm", name + ".s"))
-            gc.collect()        # release the handle before the temporary directory is removed (Windows)
-        return result
+    tmp = _scratch_dir()
+    listing = os.path.join(tmp, "disasm", name + ".s")
+    _put(listing, data)
+    _put(os.path.join(tmp, name + ".dxbc"), dxbc)
+    if fssm is not None or os.path.join(tmp, "fssm", name + ".fssm") in _scratch["files"]:
+        _put(os.path.join(tmp, "fssm", name + ".fssm"), fssm)
+    with warnings.catch_warnings():
+        # translate() leaves its .dxbc handle to the garbage collector; harmless, and not ours to change here.
+        warnings.simplefilter("ignore", ResourceWarning)
+        return rdna2spirv.translate(listing)
 
 
 def mrt0_words(spvasm, **run_options):
