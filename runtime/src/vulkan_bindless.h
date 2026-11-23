@@ -835,8 +835,14 @@ private:
                 destroy(larger);
                 return false;
             }
+            try {
+                retired_.push_back({table_buffers_, pool_, set_, retire_ticket});
+            } catch (...) {
+                destroy(larger);
+                vk_.vkDestroyDescriptorPool(device_, pool, nullptr);
+                throw;
+            }
             table_device_local_ = device_local;
-            retired_.push_back({table_buffers_, pool_, set_, retire_ticket});
             table_buffers_ = larger;
             pool_ = pool;
             set_ = set;
