@@ -233,11 +233,14 @@ pub fn emit(
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
-    // read get the mode their barycentrics say.
+    // read get the mode their barycentrics say. Conservative depth outputs
+    // (`SV_DepthGreaterEqual`/`SV_DepthLessEqual`) require centroid or sample
+    // interpolation on `SV_Position`.
+    let conservative_depth = pixel && outputs.iter().any(|o| matches!(o.kind, 18 | 19));
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated {
         e.interp = match (e.kind, e.comp) {
-            (3, _) => 4,
+            (3, _) => if conservative_depth { 5 } else { 4 },
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
