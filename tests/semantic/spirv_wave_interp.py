@@ -703,11 +703,6 @@ class _Wave:
                         raise UnsupportedConstruct(f"psb access chain into {k[0]}")
                 lane.pointers[res] = ("psb", addr, ty)
                 return None
-            if p[0] == "psb":
-                if m.size(p[2]) != 4:
-                    raise UnsupportedConstruct("psb load wider than one word")
-                v = self.memory.get(p[1], 0)
-                return F(v) if m.types[p[2]][0] == "float" else v & MASK
             if p[0] == "pc":
                 off, ty = p[1], p[2]
                 for x in a[2:]:
@@ -747,6 +742,11 @@ class _Wave:
                     raise UnsupportedConstruct("push-constant load wider than one word")
                 w = p[1] // 4
                 v = self.pcw[w] if w < len(self.pcw) else 0
+                return F(v) if m.types[p[2]][0] == "float" else v & MASK
+            if p[0] == "psb":
+                if m.size(p[2]) != 4:
+                    raise UnsupportedConstruct("psb load wider than one word")
+                v = self.memory.get(p[1], 0)
                 return F(v) if m.types[p[2]][0] == "float" else v & MASK
             v = p[0][p[1]]
             if isinstance(v, list) and m.types[p[2]][0] == "vec":

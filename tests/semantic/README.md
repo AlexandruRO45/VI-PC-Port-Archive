@@ -73,6 +73,11 @@ instruction family per file; the list below describes some of them, not every fi
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);
   `test_spirv_wave_interp.py` pins its convergence rules on hand-written modules.
+- `test_wave64_uniform_load.py` runs hand-written vertex shaders with `buffer_load_dword ... idxen` on that
+  interpreter as one wave of 64 lanes and as two waves of 32 (SHADER-10, `Analysis.uniform_load` of
+  `tools/wave64_halves.py`): a load from an address that is the same in every lane is tier B and gives equal
+  words both ways; a varying index, a load under a narrowed EXEC, an index written in part and a lane count
+  as `soffset` stay tier C and give different words.
 - `test_global_mem_offset.py` runs the address arithmetic `global_load*`/`global_store*` emit (its own small
   evaluator, since the interpreter refuses 64-bit integers and PhysicalStorageBuffer) and asserts the address
   accessed for the signed 12-bit instruction offset (-4, -2048, 2047, 0) in both addressing modes.

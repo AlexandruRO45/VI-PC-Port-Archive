@@ -14,8 +14,10 @@ there is no partner half to exchange values with (compute and mesh shaders have 
        whole-quad masks and per-lane arithmetic: exact as translated, on any subgroup size.
     B  also uses a wave-wide idiom whose result is invariant by construction: a waterfall loop, a wave-aggregated
        atomic (ballot count, one atomic from the first lane, rank), a v_readfirstlane / v_readlane of a value that
-       is the same in every lane. Exact (the aggregated atomic up to the order in which lanes get slots), with the
-       rewrites listed in docs/design.md (a readlane of a uniform value reads the own copy).
+       is the same in every lane (written from scalars and constants, or loaded by a buffer_load with idxen from
+       an address that is the same in every lane: uniform_load). Exact (the aggregated atomic up to the order in
+       which lanes get slots), with the rewrites listed in docs/design.md (a readlane of a uniform value reads the
+       own copy).
     C  not exact on a 32-wide subgroup: a lane count, rank, first-lane index or lane id that reaches an export,
        a store's data or a branch, readlane / writelane of varying data, a 32-bit access to half of a lane mask,
        scalar state defined behind a wave-wide vote and read where the vote did not run, ... Each reason is a
@@ -77,6 +79,12 @@ LOADS = ("buffer_load", "global_load", "flat_load", "scratch_load", "tbuffer_loa
          "image_gather", "image_get", "s_load", "s_buffer_load", "ds_read", "v_interp")
 SINKS = ("exp", "buffer_store", "global_store", "flat_store", "scratch_store", "tbuffer_store", "image_store",
          "ds_write", "ds_store")
+# Instructions that write memory: stores, atomics and the wave-wide LDS counters. The two halves of a wave run one
+# after the other, so a word the shader itself can write is not the same word for both (uniform_load).
+MEM_WRITES = ("buffer_store", "tbuffer_store", "global_store", "flat_store", "scratch_store", "image_store",
+              "buffer_atomic", "global_atomic", "flat_atomic", "image_atomic", "s_store", "s_scratch_store",
+              "ds_write", "ds_store", "ds_add", "ds_sub", "ds_inc", "ds_dec", "ds_min", "ds_max", "ds_and", "ds_or",
+              "ds_xor", "ds_cmpst", "ds_wrxchg", "ds_mskor", "ds_append", "ds_consume", "ds_ordered_count", "ds_gws")
 SCC_LESS = ("s_mov", "s_cmov", "s_cselect", "s_load", "s_buffer_load", "s_getpc", "s_setpc", "s_nop", "s_waitcnt",
             "s_sendmsg", "s_getreg", "s_setreg", "s_movrel", "s_bitset", "s_movk", "s_mul", "s_pack", "s_sext",
             "s_flbit", "s_ff0", "s_ff1", "s_brev", "s_bfm", "s_bitreplicate", "s_get_waveid", "s_cbranch", "s_branch",
@@ -269,6 +277,7 @@ class Analysis:
         self.stale = set()
         self.voted = {}                              # block -> mask register key the terminating branch votes on
         self.branch_class = {}
+        self.mem_writes = any(base_op(ins["op"]).startswith(MEM_WRITES) for b in blocks for ins in b)
         self.pure_spill_vgprs = self._find_pure_spill_vgprs()
 
     def _find_pure_spill_vgprs(self):
@@ -1107,11 +1116,38 @@ class Analysis:
             ctok = scaled_cnt_token()
             if ctok is not None:
                 tag = ("cnt", ctok)
+        uniform = self.uniform_load(st, ins, op, mods, srcs, uses, t_src)
         for d in dests:
-            put(d, t_src, tag)
+            put(d, t_src, tag, uniform=uniform and d.get("k") == "vgpr")
         if "scc" in defs:
             T["scc"] = t_src
             st["g"].pop("scc", None)
+
+    def uniform_load(self, st, ins, op, mods, srcs, uses, t_src):
+        """Whether a memory load writes the same value to every lane, so that its destination enters st["u"] as a
+        VALU result of scalars does. All of:
+          * a MUBUF buffer_load_* with idxen. With idxen the address is base + soffset + a function of the index
+            and the offset; without it a V# with ADD_TID_ENABLE adds the lane number (docs/design.md, "Swizzled
+            buffer addressing"), and the V# is not known here. The d16 forms keep half of the destination;
+          * EXEC is the launch mask, so every lane the program runs does the load;
+          * the index and offset VGPRs are uniform, the descriptor and soffset are scalars that are no lane mask,
+            and no operand carries a taint: one address, one bounds result, one V# format for all lanes;
+          * the shader writes no memory. A wave reads the word in all its lanes at once; its two halves read it one
+            after the other, and a store or atomic of this shader could change it between the two reads."""
+        if not op.startswith("buffer_load") or "_d16" in op or "idxen" not in mods:
+            return False
+        if t_src or uses or not st["f"] or self.mem_writes:
+            return False
+        for x in srcs:
+            k = x.get("k")
+            if k == "imm" or (k == "special" and x.get("t") == "off"):
+                continue
+            if self.is_mask(ins, x):
+                return False
+            if k == "sgpr" or (k == "vgpr" and all(r[1] in st["u"] for r in _regs(x))):
+                continue
+            return False
+        return True
 
     @staticmethod
     def cnt_token(st, reg):

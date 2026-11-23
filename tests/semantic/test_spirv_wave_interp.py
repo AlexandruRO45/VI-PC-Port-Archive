@@ -414,5 +414,41 @@ OpFunctionEnd
             self.assertEqual(res["outputs"][lane]["%out"], (lane ^ 1, lane ^ 2, lane ^ 3, lane & ~3))
 
 
+class MemoryLoad(unittest.TestCase):
+    """OpConvertUToPtr gives a pointer to address A; OpAccessChain into a runtime array of 32-bit words adds 4 * index;
+    OpLoad reads memory[address] (0 for an address the memory does not hold). Lane l reads the word at 4096 + 4 * l,
+    which the test's memory sets to 100 + l."""
+    TYPES = """%ulong = OpTypeInt 64 0
+%rt = OpTypeRuntimeArray %uint
+%pmem_arr = OpTypePointer PhysicalStorageBuffer %rt
+%pmem = OpTypePointer PhysicalStorageBuffer %uint
+%base = OpConstant %ulong 4096
+%main = OpFunction"""
+    BODY = """%p = OpConvertUToPtr %pmem_arr %base
+%e = OpAccessChain %pmem %p %l
+%w = OpLoad %uint %e Aligned 4
+%v = OpCompositeConstruct %v4uint %w %l %c0 %c0
+OpStore %out %v
+"""
+
+    def run_mem(self, body, memory, wave=32):
+        text = HEAD.replace("%main = OpFunction", self.TYPES) + body + TAIL
+        return [o["%out"] for o in run_wave(text, wave=wave, memory=memory)["outputs"]]
+
+    def test_each_lane_reads_its_word(self):
+        for wave in (32, 64):
+            memory = {4096 + 4 * i: 100 + i for i in range(wave)}
+            self.assertEqual(self.run_mem(self.BODY, memory, wave), [(100 + i, i, 0, 0) for i in range(wave)])
+
+    def test_an_address_the_memory_does_not_hold_reads_zero(self):
+        memory = {4096 + 4 * i: 100 + i for i in range(31)}           # lane 31 has no word
+        self.assertEqual(self.run_mem(self.BODY, memory)[30:], [(130, 30, 0, 0), (0, 31, 0, 0)])
+
+    def test_a_pointer_to_another_storage_class_is_rejected(self):
+        body = self.BODY.replace("%p = OpConvertUToPtr %pmem_arr %base", "%p = OpConvertUToPtr %pout %base")
+        with self.assertRaises(UnsupportedConstruct):
+            self.run_mem(body, {})
+
+
 if __name__ == "__main__":
     unittest.main()
