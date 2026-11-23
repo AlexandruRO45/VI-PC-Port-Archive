@@ -847,7 +847,7 @@ class App:
         try:
             v = int(float(self.ram_var.get()))
             return v if v > 0 else None
-        except ValueError:
+        except (ValueError, OverflowError):
             return None
 
     def refresh(self, *_):
