@@ -54,9 +54,9 @@ helper joints named by the palette. Every vertex keeps all eight influences as
 to 255; they are normalised to 1.0. Bind matrices and inverse bind matrices use
 the same RAGE Z-up -> glTF Y-up conversion as positions, ``(x, y, z) -> (x, z, -y)``.
 
-Only skinned primitives are exported, with clay materials. Textures, UV atlas
-data and materials of the source package are not copied. This is a static export
-path: it does not assemble a body or any other unrequested component.
+Only skinned primitives are exported. By default they use a clay material.
+``build_skinned_glb`` can also embed caller-provided albedo and normal PNGs for
+components with an unambiguous material and a first UV set.
 
 numpy is optional: when present it accelerates the weight pass; without it the
 standard-library path produces the same bytes and is covered by the tests.
@@ -749,11 +749,80 @@ def _component_primitives(gltf: dict, wanted: int) -> list[dict]:
     return primitives
 
 
+def _component_alpha(gltf: dict, primitives: list[dict], component: str) -> tuple[str, float | None, float]:
+    """Read the alpha settings shared by the primitives receiving this component's textures."""
+    materials = gltf.get("materials", [])
+    slots = set()
+    for primitive in primitives:
+        if "material" not in primitive:
+            slots.add(None)  # glTF default material
+            continue
+        slot = primitive["material"]
+        if type(slot) is not int or not isinstance(materials, list) or not 0 <= slot < len(materials):
+            raise SkinError(f"{component}: invalid source material slot {slot!r}")
+        slots.add(slot)
+    if len(slots) > 1:
+        raise SkinError(f"{component}: one texture pair cannot address multiple source material slots")
+    slot = slots.pop()
+    material = {} if slot is None else materials[slot]
+    if not isinstance(material, dict):
+        raise SkinError(f"{component}: source material must be an object")
+    mode = material.get("alphaMode", "OPAQUE")
+    if mode not in ("OPAQUE", "MASK", "BLEND"):
+        raise SkinError(f"{component}: unsupported source material alphaMode {mode!r}")
+    cutoff = material.get("alphaCutoff", 0.5)
+    if type(cutoff) not in (int, float) or not 0 <= cutoff <= sys.float_info.max:
+        raise SkinError(f"{component}: alphaCutoff must be a finite nonnegative number")
+    alpha = 1.0
+    if mode != "OPAQUE":
+        pbr = material.get("pbrMetallicRoughness", {})
+        factor = pbr.get("baseColorFactor", [1, 1, 1, 1]) if isinstance(pbr, dict) else None
+        if not isinstance(factor, list) or len(factor) != 4 or type(factor[3]) not in (int, float) or not 0 <= factor[3] <= 1:
+            raise SkinError(f"{component}: expected a baseColorFactor with alpha in [0, 1]")
+        alpha = float(factor[3])
+    return mode, float(cutoff) if mode == "MASK" else None, alpha
+
+
+def _embed_component_textures(gltf: dict, builder: _GlbBuilder, material_indices: dict) -> None:
+    images = []
+    textures = []
+    by_png = {}
+
+    def texture_index(png: bytes) -> int:
+        if png not in by_png:
+            by_png[png] = len(textures)
+            textures.append({"source": len(images)})
+            images.append({"bufferView": builder.view(png), "mimeType": "image/png"})
+        return by_png[png]
+
+    for (albedo, normal, mode, cutoff, alpha), material_index in material_indices.items():
+        pbr = dict(gltf["materials"][0]["pbrMetallicRoughness"])
+        material = {"name": f"skinned_material_{material_index}", "doubleSided": True,
+                    "pbrMetallicRoughness": pbr}
+        if mode != "OPAQUE":
+            material["alphaMode"] = mode
+        if cutoff is not None:
+            material["alphaCutoff"] = cutoff
+        if albedo is not None:
+            pbr["baseColorFactor"] = [1.0, 1.0, 1.0, alpha]
+            pbr["baseColorTexture"] = {"index": texture_index(albedo)}
+        elif alpha != 1:
+            pbr["baseColorFactor"] = [*pbr["baseColorFactor"][:3], alpha]
+        if normal is not None:
+            material["normalTexture"] = {"index": texture_index(normal)}
+        gltf["materials"].append(material)
+    gltf["images"] = images
+    gltf["textures"] = textures
+
+
 def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
-                      generator: str = "Leonida skinned_glb") -> tuple[bytes, dict]:
-    """Build one skinned GLB from a ped skeleton and one or more component models."""
+                      generator: str = "Leonida skinned_glb",
+                      component_textures: list[tuple[bytes | None, bytes | None]] | None = None) -> tuple[bytes, dict]:
+    """Build a skinned GLB. Optional (albedo PNG, normal PNG) pairs follow component_paths in order."""
     if not component_paths:
         raise SkinError("at least one --component is required")
+    if component_textures is not None and len(component_textures) != len(component_paths):
+        raise SkinError("component_textures must contain one texture pair per component")
     _skeleton_dir, skeleton_json = model_json_path(skeleton_path)
     ped_model = _load_json(skeleton_json)
     ped_skeleton = (ped_model.get("drawable") or {}).get("skeleton")
@@ -762,9 +831,10 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
     builder = _GlbBuilder()
     primitives_out = []
     records = []
+    material_indices: dict[tuple[bytes | None, bytes | None, str, float | None, float], int] = {}
     weight_min, weight_max = math.inf, -math.inf
 
-    for component_path in component_paths:
+    for component_index, component_path in enumerate(component_paths):
         model_dir, json_path = model_json_path(component_path)
         model = _load_json(json_path)
         source_meshes = _source_meshes(model)
@@ -777,6 +847,18 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
                  if mesh.get("skinned") and mesh.get("skin_influences")]
         if not pairs:
             raise SkinError(f"{model_dir}: model has no skinned mesh with skin_influences")
+        material_index = 0
+        if component_textures is not None:
+            pair = component_textures[component_index]
+            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                raise SkinError(f"{model_dir}: expected an (albedo PNG, normal PNG) pair")
+            for png in pair:
+                if png is not None and (not isinstance(png, bytes) or not png.startswith(b"\x89PNG\r\n\x1a\n")):
+                    raise SkinError(f"{model_dir}: component textures must be PNG bytes or None")
+            if pair[0] is not None or pair[1] is not None:
+                mode, cutoff, alpha = _component_alpha(gltf, [prim for _, prim in pairs], model_dir)
+                key = (pair[0], pair[1], mode, cutoff, alpha)
+                material_index = material_indices.setdefault(key, len(material_indices) + 1)
         resolver = PaletteResolver(model, joints.ped_by_name)
 
         component_joint_start = joints.count
@@ -812,6 +894,12 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
 
             attributes, index_pair = _component_geometry(gltf, glb_bin, source_primitive)
             position = attributes["POSITION"][1]
+            if material_index:
+                if "TEXCOORD_0" not in attributes:
+                    raise SkinError(f"{model_dir}: textured primitive {mesh.get('name', 'mesh')} lacks TEXCOORD_0")
+                uv = attributes["TEXCOORD_0"][1]
+                if uv["type"] != "VEC2" or uv["count"] != position["count"]:
+                    raise SkinError(f"{model_dir}: textured primitive needs one TEXCOORD_0 VEC2 per vertex")
             if position.get("count") != streams["count"]:
                 raise SkinError(
                     f"{mesh.get('name', 'mesh')}: model.glb position count "
@@ -853,7 +941,7 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
             primitives_out.append({
                 "attributes": gltf_attributes,
                 "indices": index_accessor_index,
-                "material": 0,
+                "material": material_index,
                 "mode": MODE_TRIANGLES,
             })
             records.append({
@@ -915,6 +1003,8 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
             "inverseBindMatrices": ibm_accessor,
         }],
     }
+    if material_indices:
+        _embed_component_textures(gltf, builder, material_indices)
     builder.bin.extend(b"\x00" * ((-len(builder.bin)) % 4))
     gltf["buffers"][0]["byteLength"] = len(builder.bin)
 
