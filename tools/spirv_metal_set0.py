@@ -7,7 +7,8 @@ set 0 (sampled images at binding 0, samplers at 1, more image arrays at 3+) it c
 path only (the Vulkan module and layout stay as they are):
 
 - each set-0 runtime descriptor array becomes a sized array with that binding's capacity from
-  runtime/src/vulkan_bindless.h (`bindings`), and
+  runtime/src/vulkan_bindless.h (`bindings`),
+- generated array lengths use a 32-bit unsigned integer type, which is declared if absent, and
 - each set-0 Binding becomes the first ID of its range: the capacities of all lower bindings added up.
 
 Convert the result with `spirv-cross --msl --msl-argument-buffers --msl-argument-buffer-tier 1
