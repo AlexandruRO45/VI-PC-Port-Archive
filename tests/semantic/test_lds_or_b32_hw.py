@@ -543,5 +543,43 @@ class TestLdsOrB32ConditionCodes(unittest.TestCase):
         self.assertEqual(interp.scc, 1)
 
 
+# ---------------------------------------------------------------------------
+# IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ---------------------------------------------------------------------------
+
+class TestLdsOrB32BoundaryExtremes(unittest.TestCase):
+    """Unit tests for boundary extremes, integer wrapping, and IEEE 754 bit representations."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_dwords=1024)
+
+    def test_32bit_integer_extremes(self) -> None:
+        # INT32_MAX | INT32_MIN = UINT32_MAX
+        self.lds.write_dword(0, 0x7FFFFFFF)
+        updated = self.lds.atomic_or_b32(0, 0x80000000)
+        self.assertEqual(updated, 0xFFFFFFFF)
+
+    def test_float32_bit_pattern_preservation(self) -> None:
+        # Untyped bitwise OR operates on raw bits without float quietening or subnormal flushing
+        qnan_bits = 0x7FC00000
+        subnormal_bits = 0x00000001
+        self.lds.write_dword(0x10, qnan_bits)
+        updated = self.lds.atomic_or_b32(0x10, subnormal_bits)
+        self.assertEqual(updated, qnan_bits | subnormal_bits)
+
+        # +0.0 (0x00000000) | -0.0 (0x80000000) = 0x80000000
+        self.lds.write_dword(0x20, 0x00000000)
+        updated_zero = self.lds.atomic_or_b32(0x20, 0x80000000)
+        self.assertEqual(updated_zero, 0x80000000)
+
+    def test_lds_offset_boundary_max_16bit(self) -> None:
+        # Max unsigned 16-bit offset = 0xFFFF (65535)
+        # 65535 bytes = dword index (65535 >> 2) & 1023 = 16383 & 1023 = 1023
+        self.lds.write_dword(1023 * 4, 0x10)
+        updated = self.lds.atomic_or_b32(0, 0x20, offset16=0xFFFF)
+        self.assertEqual(updated, 0x30)
+        self.assertEqual(self.lds.read_dword(1023 * 4), 0x30)
+
+
 if __name__ == "__main__":
     unittest.main()
