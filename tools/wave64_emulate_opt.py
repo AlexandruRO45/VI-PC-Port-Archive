@@ -387,19 +387,24 @@ def _postdominators(succ):
     return ipdom
 
 
-def _holds_lane_mask(ins, x, lm_map):
+def _holds_lane_mask(ins, x, lm_map, either=()):
     k = x.get("k")
     if k == "special":
         t = x.get("t", "")
         return t.startswith("exec") or (t.startswith("vcc") and "vcc" in lm_map)
     if k == "sgpr":
-        return all(x["r"] + i in lm_map for i in range(x.get("n", 1)))
+        n = x.get("n", 1)
+        regs = range(x["r"], x["r"] + n)
+        if n == 2:
+            # Match Gen.holds_lane_mask: a literal 0/-1 can supply the other half, but two literals are data.
+            return any(r in lm_map for r in regs) and all(r in lm_map or r in either for r in regs)
+        return all(r in lm_map for r in regs)
     return False
 
 
-def _is_mask_op(ins, x, lm_map):
+def _is_mask_op(ins, x, lm_map, either=()):
     """Matches Gen.is_mask_op in tools/rdna2spirv.py (special exec/vcc operands always take the mask path)."""
-    if _holds_lane_mask(ins, x, lm_map):
+    if _holds_lane_mask(ins, x, lm_map, either):
         return True
     return x.get("k") == "special" and x.get("t", "").startswith(("exec", "vcc"))
 
@@ -431,7 +436,7 @@ def _x_memory_order_access(op):
     return kind, reads, writes
 
 
-def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
+def _classify_block_body(insns, lane_masks, scc_live, mask_writes, lane_either=None):
     """Inspect non-terminator instructions of a block for lane-local region safety.
 
     Returns `(clean, mem_stats, may_write_scalars, exec_writes, sgpr_write_ops)` where:
@@ -458,6 +463,7 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
             return False, empty_stats, 0, (), ()
         a = ins["args"]
         lm = lane_masks.get(id(ins), {})
+        either = lane_either.get(id(ins), ()) if lane_either is not None else ()
 
         # 1. Strictly forbidden opcodes inside a lane-local folded region (cross-lane, barrier, unmasked writes).
         if raw_op.endswith(("_dpp", "_dpp8")):
@@ -504,19 +510,19 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
         # 2. Cross-lane mask readers (`wave_mask`, `wave_equal`, live-SCC `scc_from_mask`).
         if op in ("s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
                   "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64"):
-            if len(a) > 1 and _holds_lane_mask(ins, a[1], lm):
+            if len(a) > 1 and _holds_lane_mask(ins, a[1], lm, either):
                 return False, empty_stats, 0, (), ()
         elif op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
-            if len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm):
+            if len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm, either):
                 return False, empty_stats, 0, (), ()
         elif op.startswith(("s_cmp", "s_bitcmp")):
-            if any(_holds_lane_mask(ins, x, lm) for x in a):
+            if any(_holds_lane_mask(ins, x, lm, either) for x in a):
                 return False, empty_stats, 0, (), ()
         elif op in _MASK_SCC_VOTE_OPS and id(ins) in scc_live:
             # Would emit scc_from_mask -> x_round if operating on a lane mask (matches Gen.is_mask_op).
             is_mask_dst = bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith(("exec", "vcc"))
             if "saveexec" in op or "wrexec" in op or op.endswith("_mask") or is_mask_dst \
-                    or any(_is_mask_op(ins, x, lm) for x in a[1:]):
+                    or any(_is_mask_op(ins, x, lm, either) for x in a[1:]):
                 return False, empty_stats, 0, (), ()
 
         # 3. Track scalar writes and EXEC writes.
@@ -738,7 +744,7 @@ def _region_has_cycle(region, succ):
     return False
 
 
-def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_writes=frozenset()):
+def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_writes=frozenset(), *, lane_either=None):
     """Find safe lane-local `s_cbranch_execz`/`nz` regions to fold inline under --wave64-emulate.
 
     Allows read-only regions (including regions with internal scalar-counted loops) AND acyclic
@@ -770,7 +776,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
     blk_info = []
     terms = []
     for b, insns in enumerate(active_blocks):
-        blk_info.append(_classify_block_body(insns, lane_masks, scc_live, mask_writes))
+        blk_info.append(_classify_block_body(insns, lane_masks, scc_live, mask_writes, lane_either))
         last = insns[-1] if insns else None
         op = base_op(last["op"]) if last is not None else None
         if op == "s_endpgm":
@@ -965,7 +971,7 @@ def _is_uniform_scc_safe(active_blocks, lane_masks, scc_live):
     return True
 
 
-def _insn_may_barrier(ins, lane_masks, scc_live):
+def _insn_may_barrier(ins, lane_masks, scc_live, lane_either=None):
     """Conservative (over-approximate) check: True if `ins` may emit x_round or OpControlBarrier in --wave64-emulate."""
     raw_op = ins["op"]
     op = base_op(raw_op)
@@ -982,17 +988,18 @@ def _insn_may_barrier(ins, lane_masks, scc_live):
         return True
     a = ins["args"]
     lm = lane_masks.get(id(ins), {})
+    either = lane_either.get(id(ins), ()) if lane_either is not None else ()
     if op in ("s_bcnt0_i32_b32", "s_bcnt1_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b64",
               "s_ff0_i32_b32", "s_ff1_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b64"):
-        return len(a) > 1 and _holds_lane_mask(ins, a[1], lm)
+        return len(a) > 1 and _holds_lane_mask(ins, a[1], lm, either)
     if op in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
-        return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm)
+        return len(a) > 1 and a[1].get("k") != "imm" and _holds_lane_mask(ins, a[1], lm, either)
     if op.startswith(("s_cmp", "s_bitcmp")):
-        return any(_holds_lane_mask(ins, x, lm) for x in a)
+        return any(_holds_lane_mask(ins, x, lm, either) for x in a)
     if op in _MASK_SCC_VOTE_OPS and id(ins) in scc_live:
         is_mask_dst = bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith(("exec", "vcc"))
         return ("saveexec" in op or "wrexec" in op or op.endswith("_mask") or is_mask_dst
-                or any(_is_mask_op(ins, x, lm) for x in a[1:]))
+                or any(_is_mask_op(ins, x, lm, either) for x in a[1:]))
     return False
 
 
@@ -1001,7 +1008,8 @@ def _dirty_conflicts(dirty, reads, writes):
             or any((k, "r") in dirty or (k, "w") in dirty for k in writes))
 
 
-def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorbed, lane_masks, scc_live, x_lanes):
+def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorbed, lane_masks, scc_live, x_lanes,
+                              *, lane_either=None):
     """Plan structured --wave64-emulate emission eliminating the giant global round-loop OpSwitch.
 
     - Single-wave workgroups (`x_lanes == 64`): every reducible CFG emits 100% inline structured SPIR-V
@@ -1095,7 +1103,7 @@ def plan_structured_emulation(blocks, raw_edges, succ, folds, fold_chain, absorb
                 if op == "s_barrier":
                     has_sb = True
                     may_bar = True
-                elif _insn_may_barrier(ins, lane_masks, scc_live):
+                elif _insn_may_barrier(ins, lane_masks, scc_live, lane_either):
                     may_bar = True
                 acc = _x_memory_order_access(op)
                 if acc is not None:

@@ -1138,6 +1138,55 @@ class LocalExecFoldTests(unittest.TestCase):
 class StructuredEmulationTests(unittest.TestCase):
     """Structured --wave64-emulate (`inline_all` for <=64 threads, `structured_hybrid` for >64 threads)."""
 
+    def test_split_mask_with_constant_half_keeps_wave_exchange_synchronized(self):
+        # Each case gives the mask bit, the opposite 32-bit word, and the expected popcount and first bit.
+        # A None mask bit denotes ordinary data, with a low word of 8 for a zero high word, or 0 for -1.
+        cases = (
+            (3, 0, 1, 3), (37, 0, 1, 37),
+            (3, -1, 33, 3), (37, -1, 33, 0),
+            (None, 0, 1, 3), (None, -1, 32, 32),
+        )
+        for branch, lx in (("execz", 64), ("execz", 128), ("scc", 128)):
+            if branch == "execz":
+                guard = [
+                    ("s_mov_b32 exec_lo, 0", 4),
+                    ("s_mov_b32 exec_hi, 1", 4),
+                    ("s_cbranch_execz 4", 4),
+                ]
+                lanes = range(32, lx, 64)
+            else:
+                guard = [
+                    ("v_readfirstlane_b32 s20, v0", 4),
+                    ("s_cmp_eq_u32 s20, 0", 4),
+                    ("s_cbranch_scc0 4", 4),
+                ]
+                lanes = range(64)
+            for mask_bit, word, population, first in cases:
+                setup = [("v_lshlrev_b32_e32 v6, 2, v0", 4)]
+                if mask_bit is None:
+                    setup += [(f"s_mov_b32 s10, {8 if word == 0 else 0}", 4), (f"s_mov_b32 s11, {word}", 4)]
+                else:
+                    constant = 11 if mask_bit < 32 else 10
+                    setup += [
+                        ("v_and_b32_e32 v1, 63, v0", 4),
+                        (f"v_cmp_eq_u32_e64 s[10:11], {mask_bit}, v1", 8),
+                        (f"s_mov_b32 s{constant}, {word}", 4),
+                    ]
+                for op, expected in (("s_bcnt1_i32_b64", population), ("s_ff1_i32_b64", first)):
+                    with self.subTest(branch=branch, threads=lx, op=op, mask_bit=mask_bit, word=word):
+                        insns = setup + guard + [
+                            (f"{op} s9, s[10:11]", 4),
+                            ("v_mov_b32_e32 v4, s9", 4),
+                            ("buffer_store_dword v4, v6, s[0:3], 0 offen", 8),
+                            ("s_mov_b64 exec, -1", 4),
+                            ("s_endpgm", 4),
+                        ]
+                        spv, _ = _translate_encoded("cs_mask_with_constant_half", insns, (lx, 1, 1), emulate=True)
+                        if branch == "execz" and mask_bit is None:
+                            self.assertNotIn("OpAtomicOr", spv)
+                        mem, _ = run_emulated_workgroup(spv, (lx, 1, 1), push_constants=VSHARP + [0] * 28)
+                        self.assertEqual(mem, {lane * 4: expected for lane in lanes})
+
     def test_single_wave_inline_all_zero_switch_and_loop_carried_war(self):
         # 64-thread and partial 40-thread shaders with live-out scalars, loop-carried store->load->store WAR/RAW,
         # and v_readfirstlane emit 0 OpSwitch cases and 0 x_spills while staying bit-exact.
