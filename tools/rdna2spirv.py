@@ -1556,13 +1556,31 @@ class Gen:
         text = line + " " + str(ins.get("raw", ""))
         bm = _re.search(r'swizzle\(BITMASK_PERM,\s*"([01pi]{5})"\)', text)
         m = _re.search(r"swizzle\((\w+)((?:,\s*\d+)*)\)", text)
-        numeric = _re.search(r"\boffset:(0[xX][0-9a-fA-F]+|[0-9]+)\b", text)
-        offset = int(numeric.group(1), 0) if numeric else 0
-        numeric_mode = offset & 0xe000 if 0 <= offset <= 0xffff else 0
-        if not m and not bm and numeric_mode not in (0xc000, 0xe000):
-            raise Unsupported("ds_swizzle pattern")
-        kind = "BITMASK_PERM" if bm else m.group(1) if m else "ROTATE" if numeric_mode == 0xc000 else "FFT"
         args = [int(x) for x in m.group(2).split(",")[1:]] if m and m.group(2) else []
+        offset = 0
+        if bm:
+            kind = "BITMASK_PERM"
+        elif m:
+            kind = m.group(1)
+            if kind == "ROTATE":
+                if len(args) != 2 or args[0] not in (0, 1) or not 0 <= args[1] <= 31:
+                    raise Unsupported("ds_swizzle ROTATE operands")
+                # LLVM's symbolic ROTATE spelling omits the mask. Keep it when the listing has encoding bytes.
+                enc = ins.get("enc")
+                mask = int(enc[:2], 16) & 31 if enc and len(enc) == 16 else 0
+                offset = 0xc000 | (args[0] << 10) | (args[1] << 5) | mask
+            elif kind == "FFT":
+                if len(args) != 1 or not 0 <= args[0] <= 31:
+                    raise Unsupported("ds_swizzle FFT operands")
+                offset = 0xe000 | args[0]
+        else:
+            numeric = _re.search(r"\boffset:(0[xX][0-9a-fA-F]+|[0-9]+)\b", text)
+            if numeric:
+                literal = numeric.group(1)
+                offset = int(literal, 16 if literal.lower().startswith("0x") else 10)
+            if not 0xc000 <= offset <= 0xffff:
+                raise Unsupported("ds_swizzle pattern")
+            kind = "ROTATE" if offset < 0xe000 else "FFT"
         self.uses_subgroup = True
         lane = self.tmp()
         self.sub_lane(lane)

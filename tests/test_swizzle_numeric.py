@@ -3,6 +3,7 @@
 import pytest
 
 from conftest import requires_tools
+from semantic.support import translate_lines
 
 
 @requires_tools
@@ -21,3 +22,15 @@ def test_swizzle_translation(make_shader, offset, opcode):
     assert opcode in assembly
     assert "OpGroupNonUniformShuffle" in assembly
     shader.validate(assembly)
+
+@pytest.mark.parametrize("symbolic, numeric", [
+    ("swizzle(ROTATE,0,1)", "0xc020"),
+    ("swizzle(ROTATE,1,1)", "0xc420"),
+    ("swizzle(FFT,3)", "0xe003"),
+    ("swizzle(ROTATE,0,3) ; encoding: [0x78,0xc0,0xd4,0xd8,0,0,0,1]", "0xc078"),
+])
+def test_symbolic_swizzle_matches_numeric(symbolic, numeric):
+    def translate(offset):
+        return translate_lines("ps_probe", [f"ds_swizzle_b32 v1, v0 offset:{offset}", "s_endpgm"])
+
+    assert translate(symbolic) == translate(numeric)
