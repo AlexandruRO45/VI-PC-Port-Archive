@@ -941,6 +941,91 @@ class ErrorHandlingTests(unittest.TestCase):
         with self.assertRaises(smh_groom.GroomError):
             smh_groom.scatter(groom, count=-1)
 
+    def test_system_page_rejects_non_finite_bounds_and_lod_match_rejects_nan(self):
+        sysd, gpu = build_synthetic_groom_buffers()
+        for off in (0x30, 0x34, 0x38, 0x40, 0x44, 0x48):
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(offset=hex(off), value=bad):
+                    mut = bytearray(sysd)
+                    struct.pack_into("<f", mut, off, bad)
+                    with self.assertRaises(smh_groom.GroomError):
+                        smh_groom.parse_system_page(mut)
+                    with self.assertRaises(smh_groom.GroomError):
+                        smh_groom.parse(mut, gpu)
+
+        # Direct synthetic rows with NaN bounds must never falsely match another LOD chain.
+        valid_box = ((-0.1, -0.1, 0.6), (0.1, 0.1, 0.85))
+        nan_box = ((float("nan"), -0.1, 0.6), (0.1, 0.1, 0.85))
+        row_a = {"offset": 0x100, "guides": 120, "ppg": 8, "flags": 0x443, "s0": 1000, "s1": 200,
+                 "box": valid_box, "error": None}
+        row_b = {"offset": 0x200, "guides": 60, "ppg": 8, "flags": 0x443, "s0": 1000, "s1": 200,
+                 "box": nan_box, "error": None}
+        self.assertFalse(smh_groom._same_lod_asset(row_a, row_b))
+        self.assertFalse(smh_groom._same_lod_asset(row_b, row_a))
+        self.assertEqual(len(smh_groom.group_lod_chains([row_a, row_b])), 2)
+
+    def test_scatter_density_scale_validation_and_large_f32_saturation(self):
+        sysd, gpu = build_synthetic_groom_buffers(
+            tri_count=[(0, 0, 0, 0), (255, 0, 0, 0)],
+            tri_region=[0, 0],
+        )
+        groom = smh_groom.parse(sysd, gpu)
+
+        # Invalid density_scale values fail closed with GroomError instead of NaN thresholds or OverflowError.
+        for bad in (float("nan"), float("inf"), float("-inf"), -0.1, True, False):
+            with self.subTest(bad_density_scale=bad):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.scatter(groom, count=8, strand_class=0, density_scale=bad)
+
+        # Large finite density_scale (where 255 * ds overflows f32) saturates cleanly to 1.0 for c >= 1 and 0.0 for c == 0.
+        expected = smh_groom.scatter(groom, count=32, strand_class=0, density_scale=1.0)
+        for large_ds in (1.0, 2.5, 1e37, 1e38, 1e300):
+            with self.subTest(large_density_scale=large_ds):
+                got = smh_groom.scatter(groom, count=32, strand_class=0, density_scale=large_ds)
+                self.assertEqual(got, expected)
+
+    def test_to_glb_rejects_invalid_radii_and_budgets(self):
+        sysd, gpu = build_synthetic_groom_buffers()
+        groom = smh_groom.parse(sysd, gpu)
+
+        for bad_rad in (float("nan"), float("inf"), float("-inf"), 0.0, -0.001, True, False):
+            with self.subTest(guide_radius=bad_rad):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.to_glb(groom, max_strands=4, guide_radius=bad_rad)
+            with self.subTest(strand_radius=bad_rad):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.to_glb(groom, max_strands=4, strand_radius=bad_rad)
+
+        for bad_max in (-1, True, False, 1.5):
+            with self.subTest(max_strands=bad_max):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.to_glb(groom, max_strands=bad_max)
+
+        for bad_budget in (0, -100, True, False, 100.5):
+            with self.subTest(vertex_budget=bad_budget):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.to_glb(groom, max_strands=4, vertex_budget=bad_budget)
+
+        # CLI export-glb reports non-finite/negative radii cleanly with exit 1 instead of a traceback or inverted mesh.
+        with tempfile.TemporaryDirectory() as tmp:
+            smh_path = os.path.join(tmp, "sample.smh")
+            with open(smh_path, "wb") as f:
+                f.write(pack_native_resource(sysd, gpu))
+            for idx, (flag, val) in enumerate(
+                (f, v) for f in ("--guide-radius", "--strand-radius") for v in ("nan", "inf", "-0.01")
+            ):
+                glb_path = os.path.join(tmp, f"out_{idx}.glb")
+                with self.subTest(flag=flag, val=val):
+                    proc = subprocess.run(
+                        [sys.executable, "-I", os.path.join(TOOLS, "smh_groom.py"),
+                         "export-glb", smh_path, glb_path, flag, val],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(proc.returncode, 1)
+                    self.assertIn("ERROR:", proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertFalse(os.path.exists(glb_path))
+
 
 class CliTests(unittest.TestCase):
     def test_cli_inspect_census_and_export_glb(self):

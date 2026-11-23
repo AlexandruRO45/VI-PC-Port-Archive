@@ -283,6 +283,8 @@ def parse_system_page(system: bytes | bytearray | memoryview) -> dict:
 
     box_min = struct.unpack_from("<3f", sys_bytes, 0x30)
     box_max = struct.unpack_from("<3f", sys_bytes, 0x40)
+    if not all(math.isfinite(v) for v in (*box_min, *box_max)):
+        raise GroomError("non-finite system page bounding box")
     box = (box_min, box_max)
 
     # Child rigs leave the +0x50..+0x6f secondary bounds floats (within +0x48..+0x70) unset
@@ -793,10 +795,23 @@ def scatter(
 
     if density_scale is None:
         max_c = max(per_tri) if per_tri else 0
-        density_scale = 1.0 / max(float(max_c), 1.0)
-    ds32 = _f32(float(density_scale))
+        ds = 1.0 / max(float(max_c), 1.0)
+    else:
+        if isinstance(density_scale, bool):
+            raise GroomError(f"density_scale must be finite and non-negative, got {density_scale!r}")
+        try:
+            ds = float(density_scale)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise GroomError(f"density_scale must be finite and non-negative, got {density_scale!r}") from exc
+        if not math.isfinite(ds) or ds < 0.0:
+            raise GroomError(f"density_scale must be finite and non-negative, got {density_scale!r}")
     # Precompute IEEE 754 float32 acceptance thresholds for every possible u8 triangle count (0..255).
-    thresh = [min(max(_f32(float(c) * ds32), 0.0), 1.0) for c in range(256)]
+    # For any finite ds >= 1.0, c == 0 gives 0.0 and every c >= 1 saturates to 1.0 without f32 overflow.
+    if ds >= 1.0:
+        thresh = [0.0] + [1.0] * 255
+    else:
+        ds32 = _f32(ds)
+        thresh = [min(max(_f32(float(c) * ds32), 0.0), 1.0) for c in range(256)]
 
     blocked = [False] * 256
     for rid in region_mask or ():
@@ -1284,6 +1299,13 @@ def to_glb(
     up = up_axis.lower()
     if up not in ("z", "y"):
         raise GroomError(f"unsupported up_axis {up_axis!r} (expected 'z' or 'y')")
+    if isinstance(max_strands, bool) or not isinstance(max_strands, int) or max_strands < 0:
+        raise GroomError(f"max_strands must be a non-negative integer, got {max_strands!r}")
+    if isinstance(vertex_budget, bool) or not isinstance(vertex_budget, int) or vertex_budget < 1:
+        raise GroomError(f"vertex_budget must be a positive integer, got {vertex_budget!r}")
+    for label, rad in (("guide_radius", guide_radius), ("strand_radius", strand_radius)):
+        if isinstance(rad, bool) or not isinstance(rad, (int, float)) or not math.isfinite(rad) or rad <= 0.0:
+            raise GroomError(f"{label} must be finite and positive, got {rad!r}")
     cls_tuple = tuple(classes)
     for cls in cls_tuple:
         if cls not in (0, 1):
@@ -1554,7 +1576,7 @@ def _same_lod_asset(a: dict, b: dict) -> bool:
         return False
     for u, v in zip(a["box"], b["box"]):
         for p, q in zip(u, v):
-            if abs(p - q) > 0.03:
+            if not (abs(p - q) <= 0.03):
                 return False
     if abs(a["s0"] - b["s0"]) > max(12, 0.05 * a["s0"]):
         return False
