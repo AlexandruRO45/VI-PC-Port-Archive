@@ -677,5 +677,50 @@ class TestLdsReadI16ConditionCodes(unittest.TestCase):
         self.assertEqual(self.interp.vcc, 0x12345678DEADBEEF)
 
 
+
+class TestLdsReadI16EdgeCases(unittest.TestCase):
+    """Unit tests for boundary extremes, halfword integer limits, and IEEE 754 bit-pattern invariance."""
+
+    def test_16bit_integer_boundaries(self) -> None:
+        # Max positive int16: 0x7FFF = +32767
+        self.assertEqual(oracle_ds_read_i16(0x7FFF), 32767)
+        # Min negative int16: 0x8000 = -32768 -> 0xFFFF8000
+        self.assertEqual(oracle_ds_read_i16(0x8000), 0xFFFF8000)
+        # -1 int16: 0xFFFF -> 0xFFFFFFFF
+        self.assertEqual(oracle_ds_read_i16(0xFFFF), 0xFFFFFFFF)
+
+    def test_max_offset_addressing(self) -> None:
+        lds = LDSModel(capacity_dwords=16384)
+        lds.write_dword(65532, 0x8000)
+        res = lds.read_i16(vaddr=0, offset=65532)
+        self.assertEqual(res, 0xFFFF8000)
+
+    def test_cross_dword_unaligned_read(self) -> None:
+        # Unaligned read across dword boundary at byte offset 3
+        # Dword 0: high byte (byte 3) is 0x34
+        # Dword 1: low byte (byte 0) is 0x12
+        # Result halfword is 0x1234 -> sign-extended = 0x00001234
+        lds = LDSModel(capacity_dwords=1024)
+        lds.write_dword(0, 0x34000000)
+        lds.write_dword(4, 0x00000012)
+        res = lds.read_i16(vaddr=0, offset=3)
+        self.assertEqual(res, 0x1234)
+
+        # Cross-dword read with sign bit set (0x80 in byte 1 -> 0x8034 -> 0xFFFF8034)
+        lds.write_dword(4, 0x00000080)
+        res_neg = lds.read_i16(vaddr=0, offset=3)
+        self.assertEqual(res_neg, 0xFFFF8034)
+
+    def test_fp16_bitpatterns_treated_as_integers(self) -> None:
+        # FP16 +inf: 0x7C00 -> positive int16: 0x00007C00
+        self.assertEqual(oracle_ds_read_i16(0x7C00), 0x7C00)
+        # FP16 -inf: 0xFC00 -> sign-extended: 0xFFFFFC00
+        self.assertEqual(oracle_ds_read_i16(0xFC00), 0xFFFFFC00)
+        # FP16 qNaN: 0x7E00 -> positive int16: 0x00007E00
+        self.assertEqual(oracle_ds_read_i16(0x7E00), 0x7E00)
+        # FP16 -0.0: 0x8000 -> sign-extended: 0xFFFF8000
+        self.assertEqual(oracle_ds_read_i16(0x8000), 0xFFFF8000)
+
+
 if __name__ == "__main__":
     unittest.main()
