@@ -213,8 +213,15 @@ def step(state, ins, wave64=True):
         put(state, a[0], MASK_LO if op.endswith("_b32") else MASK)
     elif op == "s_bfm_b64":
         # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
-        # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.
-        put(state, a[0], MASK if wave64 else None)
+        # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there. In wave64 code
+        # two literal operands into an SGPR pair give a known constant that rdna2spirv moves like s_mov_b64 of that
+        # immediate, so it is classified as that copy is: either kind for 0 or ~0, plain data otherwise.
+        if wave64 and a[0]["k"] == "sgpr" and a[0].get("n") == 2 and len(a) > 2 \
+                and a[1]["k"] == "imm" and a[2]["k"] == "imm":
+            value = (((1 << (a[1]["v"] & 63)) - 1) << (a[2]["v"] & 63)) & 0xFFFFFFFFFFFFFFFF
+            put(state, a[0], EITHER if value in (0, 0xFFFFFFFFFFFFFFFF) else None)
+        else:
+            put(state, a[0], MASK if wave64 else None)
     elif op.startswith(COPIES) and len(a) > 1:
         k = kind(state, a[1])
         dst_t = a[0].get("t") if a[0]["k"] == "special" else None

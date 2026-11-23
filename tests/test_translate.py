@@ -677,9 +677,10 @@ def test_wave64_detected_from_mask_ops_without_exec_markers(make_shader):
 
 
 def test_wave64_bfm64_and_half_cmp_emit_wave_ops(make_shader):
-    """Wave64 s_bfm_b64 must use wave_lane() and reconstruct the 64-bit mask; 32-bit half ops must guard their half."""
-    bfm = make_shader("s_mov_b64 exec, -1\ns_bfm_b64 s[6:7], 16, 8\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n",
-                      name="cs_bfm64_ci")
+    """Wave64 s_bfm_b64 with a register operand must use wave_lane() and reconstruct the 64-bit mask (two literal
+    operands are a constant, moved as s_mov_b64 would be); 32-bit half ops must guard their half."""
+    bfm = make_shader("s_mov_b64 exec, -1\ns_mov_b32 s2, 16\ns_bfm_b64 s[6:7], s2, 8\ns_bcnt1_i32_b64 s8, s[6:7]\n"
+                      "s_endpgm\n", name="cs_bfm64_ci")
     asm_bfm = bfm.translate()
     bfm.validate(asm_bfm)
     assert "OpGroupNonUniformBitwiseOr" in asm_bfm

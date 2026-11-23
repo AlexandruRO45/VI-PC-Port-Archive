@@ -3,7 +3,8 @@
 Standard library only; no GPU, no LLVM, no game files.
 
 RDNA2 ISA SOP2 S_BFM_B64: D = ((1 << (S0 & 63)) - 1) << (S1 & 63), SCC not written. In a 64-lane wave the
-translator reads D as a lane mask (each invocation holds its own lane's bit; test_salu_bfm64_add_i32.py). A 32-lane
+translator reads D as a lane mask (each invocation holds its own lane's bit; test_salu_bfm64_add_i32.py), except
+with two literal operands, where it is a known constant usable as either (test_wave64_bfm64_data.py). A 32-lane
 wave has no 64-bit lane masks, so there it is plain 64-bit data. The pipeline library's wave32 compute programs
 (docs/shader_library.md) use it that way: `s_bfm_b64 s[88:89], 2, 54` and `s_mov_b64 s[90:91], 0x18500000` build
 an S# in place, which image_sample then reads. Their kind-0 dispatch state says wave32, and until this change the
@@ -102,8 +103,15 @@ class Wave32BfmTests(unittest.TestCase):
         st64, st32 = {}, {}
         lane_masks.step(st64, ins)
         lane_masks.step(st32, ins, wave64=False)
-        self.assertEqual((st64.get(8), st64.get(9)), (lane_masks.MASK_LO, lane_masks.MASK_HI))
+        # Two literal operands: a known constant in wave64 too, classified as `s_mov_b64 s[8:9], <value>` is
+        # (test_wave64_bfm64_data.py); a run-time operand in wave64 still makes a lane mask.
+        self.assertEqual((st64.get(8), st64.get(9)), (None, None))
         self.assertEqual((st32.get(8), st32.get(9)), (None, None))
+        run_time = {"op": "s_bfm_b64", "args": [{"k": "sgpr", "r": 8, "n": 2}, {"k": "sgpr", "r": 6, "n": 1},
+                                                 {"k": "imm", "v": 54}], "mods": []}
+        st64 = {}
+        lane_masks.step(st64, run_time)
+        self.assertEqual((st64.get(8), st64.get(9)), (lane_masks.MASK_LO, lane_masks.MASK_HI))
 
 
 if __name__ == "__main__":

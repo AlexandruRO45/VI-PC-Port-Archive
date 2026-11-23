@@ -141,10 +141,13 @@ def test_vmov_mask_copy_is_exec_gated():
 
 
 def test_bfm64_and_half_kinds():
-    # s_bfm_b64 produces a 64-bit lane mask (low half in s6, high half in s7).
+    # s_bfm_b64 with a run-time operand produces a 64-bit lane mask (low half in s6, high half in s7).
     use = ins("s_bcnt1_i32_b64", s(8), s(6, 2))
-    got = L.analyse([[ins("s_bfm_b64", s(6, 2), imm(16), imm(8)), use]], [[]])[0][id(use)]
+    got = L.analyse([[ins("s_bfm_b64", s(6, 2), s(2), imm(8)), use]], [[]])[0][id(use)]
     assert got == {6: L.MASK_LO, 7: L.MASK_HI}
+    # Two literal operands give a known constant, classified as `s_mov_b64 s[6:7], <value>` is: data here.
+    got_lit = L.analyse([[ins("s_bfm_b64", s(6, 2), imm(16), imm(8)), use]], [[]])[0][id(use)]
+    assert got_lit == {}
     # exec_lo / exec_hi preserve half identity on 32-bit copies.
     got2 = L.analyse([[ins("s_mov_b32", s(6), sp("exec_lo")), ins("s_mov_b32", s(7), sp("exec_hi")), use]], [[]])[0][id(use)]
     assert got2 == {6: L.MASK_LO, 7: L.MASK_HI}

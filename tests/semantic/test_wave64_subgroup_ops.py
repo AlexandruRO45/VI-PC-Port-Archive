@@ -9,7 +9,8 @@ with base 0 and num_records 0xFFFFFFFF.
   cs_wavemask the per-lane formula of vk_compute_test's "wavemask" mode). This covers ballots and s_bcnt1 /
   s_ff1 of 64-bit masks, readfirstlane with only upper lanes on, the votes behind wave-uniform branches, and the
   missing lanes of a partial wave (ds_bpermute uses the ballot to avoid shuffling from a missing lane).
-* Two 32-wide subgroups (NVIDIA without emulation): the words differ, and WAVE32_EXPECTED pins them. Measured:
+* Two 32-wide subgroups (NVIDIA without emulation): the words differ (except SAME_ON_TWO_SUBGROUPS), and
+  WAVE32_EXPECTED pins them. Measured:
   NVIDIA GeForce RTX 4070 SUPER (subgroup 32), driver 610.88, `vk_compute_test <name>.spv 1 dump` on
   run_gpu_tests.py's non-emulated build, three runs each: every word equals WAVE32_EXPECTED, and cs_wavemask
   reports 64 mismatches with lane 0 = 0x00081021, as here. These follow from SPIR-V (each subgroup votes over its
@@ -48,9 +49,14 @@ WAVE32_EXPECTED = {
     "cs_w64x_load_ballot_load": [43, 74, 43, 10, 42, 18, 41, 32],
     "cs_w64x_partial": [32, 8, 528, 0, 0, 532, 539, 500],
     "cs_wave64_ballot": [16, 16, 0, 0xFFFFFFFF, 0, 0xFFFFFFFF],
-    "cs_wm_bfm64": [16, 8, 0, 0xFFFFFFFF],
+    "cs_wm_bfm64": [16, 8, 8, 40],
     "cs_wm_half_cmp": [1, 0, 0, 1],
 }
+# Correct on two 32-wide subgroups as well: cs_wm_bfm64's s_bfm_b64 have literal operands, so the translator moves
+# the constant (as s_mov_b64 would) instead of building the mask from each subgroup's lane ids, and s_bcnt1 / s_ff1
+# count 64 bits of data. Measured: AMD Radeon RX 7700 XT, driver 26.11.2 (LLPC), `vk_compute_test cs_wm_bfm64.spv 1
+# dump` with VKC_SUBGROUP_SIZE=32 gives 16 8 8 40 (16 8 0 4294967295 with the per-lane lowering before).
+SAME_ON_TWO_SUBGROUPS = {"cs_wm_bfm64"}
 
 
 class Heap(dict):
@@ -101,7 +107,10 @@ class OnTwoSubgroups32(unittest.TestCase):
                 want = WAVE32_EXPECTED[name]
                 got = words(run(name, 32), len(want))
                 self.assertEqual(got, want)
-                self.assertNotEqual(got, GPU_DUMPS[name][:len(want)])
+                if name in SAME_ON_TWO_SUBGROUPS:
+                    self.assertEqual(got, GPU_DUMPS[name][:len(want)])
+                else:
+                    self.assertNotEqual(got, GPU_DUMPS[name][:len(want)])
 
     def test_wavemask_fails_on_every_lane(self):
         got = words(run("cs_wavemask", 32), 64)

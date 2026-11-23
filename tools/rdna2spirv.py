@@ -7786,6 +7786,15 @@ class Gen:
             if size is None or off is None:
                 raise Unsupported(op + " with a run-time operand in wave32")
             self.mov64(a[0], {"k": "imm", "v": (((1 << (size & 63)) - 1) << (off & 63)) & 0xFFFFFFFFFFFFFFFF})
+        elif op == "s_bfm_b64" and a[0]["k"] == "sgpr" and a[0].get("n") == 2 \
+                and a[1]["k"] == "imm" and a[2]["k"] == "imm":
+            # Wave64 with two literal operands: the result is a known 64-bit constant, so it is moved like
+            # `s_mov_b64 s[N:N+1], <value>`, which serves both readers: a lane-mask use (v_cndmask, EXEC) and a data
+            # use (the S# words `s_bfm_b64 s[N:N+1], 2, 54` builds, a v_mov_b32 of either half). The per-lane form
+            # below gives every lane 0 or ~0 in both halves, so a data reader got the wrong words.
+            # lane_masks.step classifies the destination as for that immediate copy.
+            self.mov64(a[0], {"k": "imm", "v": (((1 << (a[1]["v"] & 63)) - 1) << (a[2]["v"] & 63))
+                                               & 0xFFFFFFFFFFFFFFFF})
         elif op == "s_bfm_b64":
             # D = ((1 << size) - 1) << offset as a lane mask: in the per-lane model this lane's bit is
             # offset <= lane < offset + size (size/offset taken mod 64).

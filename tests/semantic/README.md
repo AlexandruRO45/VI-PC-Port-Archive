@@ -129,7 +129,8 @@ instruction family per file; the list below describes some of them, not every fi
 - `test_wave64_subgroup_ops.py` runs eight more wave64 GPU tests the same way (`cs_w64x_ballot`,
   `_readfirstlane`, `_load_ballot_load`, `_partial`, `cs_wave64_ballot`, `cs_wm_bfm64`, `cs_wm_half_cmp`,
   `cs_wavemask`): on one 64-wide subgroup every word equals the GPU check; on two 32-wide subgroups the
-  words pinned there are the ones an RTX 4070 SUPER (driver 610.88) wrote without `--wave64-emulate`. The
+  words pinned there are the ones an RTX 4070 SUPER (driver 610.88) wrote without `--wave64-emulate`, except
+  `cs_wm_bfm64`, whose literal `s_bfm_b64` operands make it correct there too (RX 7700 XT at subgroup size 32). The
   cs_w64x tests with branches need llvm-mc encodings and are not covered.
 - `test_alu_int_misc.py` translates one-instruction synthetic listings for `v_bfm_b32`, `v_and_or_b32`,
   `v_add_lshl_u32`, `v_lshl_or_b32`, `v_mad_i32_i24` and `v_mul_lo_u32` and checks the mrt0 word against
