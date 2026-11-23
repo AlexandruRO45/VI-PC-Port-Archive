@@ -240,6 +240,23 @@ class TestVSubI16EdgeCases(unittest.TestCase):
     def test_underflow_wrap(self):
         self.assertEqual(ref_v_sub_i16(0x8000, 1), 0x7FFF)  # -32768 - 1 = 32767 (wrap)
 
+class TestVSubI16Translator(unittest.TestCase):
+    def test_translate_v_sub_i16(self):
+        lines = [
+            "v_mov_b32 v1, 500",
+            "v_mov_b32 v2, 200",
+            "v_sub_i16 v0, v1, v2",
+            "v_mov_b32 v3, 0x8000",
+            "v_mov_b32 v4, 10",
+            "v_sub_i16 v1, v3, v4 clamp",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_sub_i16", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = mrt0_words(spv)
+        self.assertEqual(words, [300, 0x8000, 300, 0x8000])
+
 
 if __name__ == "__main__":
     unittest.main()
