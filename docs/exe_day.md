@@ -44,13 +44,15 @@ The kit at `C:\Users\kam\leonida-work\gta6rt-exeday` has three loaders. Prefer t
 
 | Loader | Bytes | SHA-256 | Capture route | Series startup |
 |---|---|---|---|---|
-| `gta6rt-final.exe` | 6,679,552 | `A478A5DF41E3C79052B4118A8B272A3E30EC451C66834411A53A191FFD7E9E7B` | yes | #6351 `XMemTransferMemory` |
+| `gta6rt-final.exe` | 6,679,552 (A478) / 6,681,600 (0D32) | `A478A5DF41E3C79052B4118A8B272A3E30EC451C66834411A53A191FFD7E9E7B` / `0D32DD2CCCD9B2BE59DCCADCFC164F7492C4E6FEC80ADD8300B7B6E438B6E396` | yes | #6351 `XMemTransferMemory` |
 | `gta6rt-final-pre-xmem.exe` | 6,672,896 | `A5F6124D6C8C43D5260B69C0A9AA4A5FDAC8EB8C6FF4520FDD3FB3FBD6D2BAD7` | yes | no #6351 |
 | `gta6rt.exe` | 6,456,320 | `4F2C5156D0BAB04369E547C83D8809634DBAB233B8CDC052C697E68D1EF1ED16` | no | no #6351 |
 
 `gta6rt-final.exe` is the default: SDL3 3.4.20 is static, the PresentX capture route is #6230 at `255efe094` (the
 identity guard), and #6351 serves `XMemTransferMemory`. That last call is a Series startup call used by public
-NetRumble/NativeAOT-Xbox bootstraps; without it the title can stop before the device.
+NetRumble/NativeAOT-Xbox bootstraps; without it the title can stop before the device. The handover build was
+6,679,552 bytes (`A478`); the kit was refreshed while this page was being written to 6,681,600 bytes (`0D32`). Both
+have all five strings and pass `check_tiny_frame`, so the selector accepts either.
 `gta6rt-final-pre-xmem.exe` is the same build minus #6351, for a machine that must avoid it. The older `gta6rt.exe`
 can trace and draw but has no present capture. Do not use the kit's `gta6rt-mesh-only.exe` or `gta6rt-nosdl3.exe`;
 those are history.
@@ -67,16 +69,18 @@ $bin   = Join-Path $work "exeday\bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
 
 $candidates = @(
-    [pscustomobject]@{ Name = "gta6rt-final.exe"; Bytes = 6679552; Sha = "A478A5DF41E3C79052B4118A8B272A3E30EC451C66834411A53A191FFD7E9E7B" },
+    [pscustomobject]@{ Name = "gta6rt-final.exe"; Bytes = 6679552, 6681600; Sha = "A478A5DF41E3C79052B4118A8B272A3E30EC451C66834411A53A191FFD7E9E7B", "0D32DD2CCCD9B2BE59DCCADCFC164F7492C4E6FEC80ADD8300B7B6E438B6E396" },
     [pscustomobject]@{ Name = "gta6rt-final-pre-xmem.exe"; Bytes = 6672896; Sha = "A5F6124D6C8C43D5260B69C0A9AA4A5FDAC8EB8C6FF4520FDD3FB3FBD6D2BAD7" },
     [pscustomobject]@{ Name = "gta6rt.exe"; Bytes = 6456320; Sha = "4F2C5156D0BAB04369E547C83D8809634DBAB233B8CDC052C697E68D1EF1ED16" }
 )
 $selected = $candidates | Where-Object { Test-Path (Join-Path $kit $_.Name) } | Select-Object -First 1
 if (-not $selected) { throw "no exe-day loader in $kit" }
 $source = Join-Path $kit $selected.Name
+$actualBytes = (Get-Item $source).Length
 $actual = (Get-FileHash $source -Algorithm SHA256).Hash
-if ($actual -ne $selected.Sha) { throw "$($selected.Name): hash $actual, expected $($selected.Sha)" }
-"selected $($selected.Name) ($($selected.Bytes) bytes, $actual)"
+if (@($selected.Bytes) -notcontains $actualBytes) { throw "$($selected.Name): $actualBytes bytes, expected $($selected.Bytes)" }
+if (@($selected.Sha) -notcontains $actual) { throw "$($selected.Name): hash $actual, expected $($selected.Sha)" }
+"selected $($selected.Name) ($actualBytes bytes, $actual)"
 
 $files = $selected.Name, "gta6rt_tls_host.dll",
          "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"
@@ -810,8 +814,9 @@ These restate `AGENTS.md` for the pressure of the day.
 
 Run on 2026-11-23 on Windows 11, NVIDIA GeForce RTX 5070 Ti (driver 621.24):
 
-- `gta6rt-final.exe` (6,679,552 bytes, SHA-256 `A478A5DF41E3C79052B4118A8B272A3E30EC451C66834411A53A191FFD7E9E7B`)
-  passed `check_tiny_frame.py` against the synthetic `tiny_frame` guest:
+- Both `gta6rt-final.exe` builds (6,679,552 bytes / `A478A5DF41E3C79052B4118A8B272A3E30EC451C66834411A53A191FFD7E9E7B`
+  and the 6,681,600-byte refresh / `0D32DD2CCCD9B2BE59DCCADCFC164F7492C4E6FEC80ADD8300B7B6E438B6E396`) passed
+  `check_tiny_frame.py` against the synthetic `tiny_frame` guest:
   `tiny_frame under gta6rt --run on the Vulkan D3D12 device: OK`.
 - The exact string scan is true for all five tokens on `gta6rt-final.exe`. `gta6rt-final-pre-xmem.exe` has the three
   capture strings and SDL3 but not `XMemTransferMemory`; the older `gta6rt.exe` has only SDL3.
