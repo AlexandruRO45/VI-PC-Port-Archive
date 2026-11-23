@@ -206,6 +206,19 @@ class TestPermLane16Routing(unittest.TestCase):
         self.assertIn("OpBitwiseAnd", spv)
         self.assertIn("OpBitwiseOr", spv)
 
+class TestPermLane16Aliasing(unittest.TestCase):
+    def test_aliasing_vdst_vsrc(self):
+        code = [
+            "v_mov_b32_e32 v0, 100",
+            "s_mov_b32 s1, 0x76543210",
+            "s_mov_b32 s2, 0xFEDCBA98",
+            "v_permlane16_b32 v0, v0, s1, s2",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_p16_alias", code, fssm=saveexec_run.fssm())
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
