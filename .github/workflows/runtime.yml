@@ -544,8 +544,11 @@ jobs:
         run: |
           set +e
           ctest --test-dir runtime/build --output-on-failure -j "$(sysctl -n hw.ncpu)" 2>&1 | tee "$RUNNER_TEMP/ctest.log"
-          status=${PIPESTATUS[0]}
+          read -r status log_status <<< "${PIPESTATUS[*]}"
           set -e
+          if (( log_status != 0 )); then
+            exit "$log_status"
+          fi
           sed -n '/The following tests FAILED:/,$p' "$RUNNER_TEMP/ctest.log" |
             sed -nE 's/^[[:space:]]+[0-9]+ - ([^ ]+) .*/\1/p' > "$RUNNER_TEMP/failed.txt"
           python3 -I scripts/ci_expected_failures.py "$RUNNER_TEMP/failed.txt" "$status" "$EXPECTED_FAILURES"
@@ -562,8 +565,11 @@ jobs:
           set +e
           python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc "$LLVM_MC" --work "$RUNNER_TEMP/gpu" 2>&1 |
             tee "$RUNNER_TEMP/gpu.log"
-          status=${PIPESTATUS[0]}
+          read -r status log_status <<< "${PIPESTATUS[*]}"
           set -e
+          if (( log_status != 0 )); then
+            exit "$log_status"
+          fi
           sed -n '/=== GPU TEST RESULTS ===/,$p' "$RUNNER_TEMP/gpu.log" | awk '$1 == "FAIL" { print $2 }' > "$RUNNER_TEMP/failed.txt"
           tail -n 1 "$RUNNER_TEMP/gpu.log" >> "$GITHUB_STEP_SUMMARY"
           python3 -I scripts/ci_expected_failures.py "$RUNNER_TEMP/failed.txt" "$status" "$EXPECTED_FAILURES"
