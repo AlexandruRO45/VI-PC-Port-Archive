@@ -2269,9 +2269,10 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   a CPU-side virtual value and pending signals per fence and blocks the queue's submission thread until a signal that
   satisfies a wait has been submitted, so Vulkan never sees a wait without a submitted signal; a satisfied wait stays
   satisfied. It also maps virtual fence values to physical timeline values so a D3D12 `Signal` of a lower value works;
-  the layer does not yet (the value is dropped with a note). Resources are `VK_SHARING_MODE_EXCLUSIVE` and every
-  D3D12 queue is in the graphics family, so no ownership transfer is needed; with dedicated compute/transfer families
-  they would need `CONCURRENT` (vkd3d-proton does that, because D3D12 gives no information for transfers).
+  the layer does not yet (the value is dropped with a note). Buffers, images, the arena and staging use
+  `VK_SHARING_MODE_CONCURRENT` over the queue families in use when there is more than one (dedicated compute/copy
+  families when the GPU has them, section 4), else `VK_SHARING_MODE_EXCLUSIVE`; either way no ownership transfer is
+  needed (vkd3d-proton uses `CONCURRENT` too, because D3D12 gives no information for transfers).
   Measured: `d3d12_queue_handover_test` runs 358 cases on the layer (371 on the RTX 5070 Laptop, which gives three
   queues per type) and 369 on the host runtime: three-stage chains (produce, relay, consume) over all 27 queue type
   assignments and all 6 submission orders (consumer first among them), two producers (texture from one queue, buffer
