@@ -445,5 +445,34 @@ class TestLdsXorB32ConditionCodes(unittest.TestCase):
         self.assertFalse(cc_same.negative)
         self.assertFalse(cc_same.mutated)
 
+class TestLdsXorB32BoundariesAndWrapping(unittest.TestCase):
+    """Unit tests for address boundaries, immediate offset overflow, and capacity wrapping."""
+
+    def setUp(self) -> None:
+        self.lds = LDSStorage(DEFAULT_LDS_DWORDS)
+
+    def test_capacity_wrapping_64k(self) -> None:
+        # In a 16K dword (64 KiB) LDS, address 65536 wraps to 0
+        self.lds.write_dword(0, 0x11111111)
+        old, new = self.lds.atomic_xor(vaddr=65536, vdata=0x22222222)
+        self.assertEqual(old, 0x11111111)
+        self.assertEqual(new, 0x33333333)
+        self.assertEqual(self.lds.read_dword(0), 0x33333333)
+
+    def test_immediate_offset_boundary(self) -> None:
+        # Immediate offset up to 65535
+        self.lds.write_dword(4, 0xAAAAAAAA)
+        # vaddr 0 + offset 16 -> dword 4
+        old, new = self.lds.atomic_xor(vaddr=0, vdata=0x55555555, offset=16)
+        self.assertEqual(old, 0xAAAAAAAA)
+        self.assertEqual(new, 0xFFFFFFFF)
+
+    def test_32bit_address_wrapping(self) -> None:
+        # vaddr 0xFFFFFFFC + offset 4 wraps to 0
+        self.lds.write_dword(0, 0x77777777)
+        old, new = self.lds.atomic_xor(vaddr=0xFFFFFFFC, vdata=0x11111111, offset=4)
+        self.assertEqual(old, 0x77777777)
+        self.assertEqual(new, 0x66666666)
+
 if __name__ == "__main__":
     unittest.main()
