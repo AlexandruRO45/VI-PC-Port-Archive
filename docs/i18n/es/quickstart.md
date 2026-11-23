@@ -26,8 +26,8 @@ El proyecto está en una fase inicial: **el juego todavía no arranca**.
 
 - **Su propia copia** del paquete de Xbox Series, versión `1.0.2.1`: la carpeta que contiene `MicrosoftGame.Config`
   y los archivos `.rpf`, como ficheros legibles en el disco.
-- **Windows 10/11 x64**, con unos **400 GB libres** para los archivos de trabajo. Pueden ir a otra unidad con
-  `--work`.
+- **Windows 10/11 x64**, con unos **400 GB libres** para los archivos de trabajo (una exportación completa de
+  recursos ocupa por sí sola unos 337 GiB antes del paso de audio). Pueden ir a otra unidad con `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (marque «Add python.exe to PATH» durante la instalación).
 - [SDK de .NET 8](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [SDK de Vulkan](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` y `vulkaninfo`).
