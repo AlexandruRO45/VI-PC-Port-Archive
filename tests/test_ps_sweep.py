@@ -314,6 +314,33 @@ class CompareCommand(unittest.TestCase):
             self.assertEqual(report["rows"][-1]["samples_passed"], [None, 0])
             self.assertNotIn("samples_passed", report["rows"][6])
 
+    def write_sample_and_results(self, out, *folders):
+        sample = [{"name": "synthetic", "stratum": [False, "none", "structured"]}]
+        (out / "sample.json").write_text(json.dumps(sample), encoding="utf-8", newline="\n")
+        receipt = {"i": 0, "code": 0, "reason": "", "targets": 1}
+        for folder in folders:
+            run = out / folder
+            run.mkdir()
+            (run / "results_0.jsonl").write_text(json.dumps(receipt) + "\n", encoding="utf-8", newline="\n")
+            write_raw(run / "0.raw", [0.25])
+
+    def test_distinct_tags_cannot_share_a_result_directory(self):
+        for suffix in ("", "_re"):
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp)
+                self.write_sample_and_results(out, f"amd_z{suffix}")
+                aliases = ["./amd"]
+                if (out / f"AMD_z{suffix}").is_dir():
+                    aliases.append("AMD")
+                for alias in aliases:
+                    for flags, report in (([], "classes_z.json"), (["--exact"], "exact_z.json")):
+                        with self.subTest(suffix=suffix, alias=alias, flags=flags):
+                            args = ["compare", "--out", tmp, "--tags", "amd", alias, *flags]
+                            with contextlib.redirect_stdout(io.StringIO()):
+                                with self.assertRaisesRegex(SystemExit, "same result directory"):
+                                    ps_sweep.main(args)
+                            self.assertFalse((out / report).exists())
+
     def test_incomplete_depth_measurements(self):
         with tempfile.TemporaryDirectory() as tmp:
             rec = {"depth": True, "code": 0, "dir": tmp, "samples_passed": 0}

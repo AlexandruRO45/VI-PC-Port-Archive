@@ -340,12 +340,15 @@ def classify_pair(rec_a, rec_b, raw_a, raw_b, tol=TOLERANCE):
     return "fails on one GPU", f"{which}: {kind}"
 
 
-def load_results(a, tag):
+def result_dirs(a, tag):
     d = run_dir(a, tag)
+    # Re-runs override the first pass, so keep them last.
+    return [folder for folder in (d, d + "_re") if os.path.isdir(folder)]
+
+
+def load_results(folders):
     recs = {}
-    for folder in (d, d + "_re"):   # re-runs override the first pass
-        if not os.path.isdir(folder):
-            continue
+    for folder in folders:
         for name in sorted(os.listdir(folder)):
             if name.startswith("results_") and name.endswith(".jsonl"):
                 with open(os.path.join(folder, name), encoding="utf-8") as f:
@@ -485,10 +488,13 @@ def compare_exact(a, sample, ra, rb):
 
 
 def cmd_compare(a):
+    ta, tb = a.tags
+    left_folders, right_folders = result_dirs(a, ta), result_dirs(a, tb)
+    if ta != tb and any(os.path.samefile(left, right) for left in left_folders for right in right_folders):
+        raise SystemExit(f"compare tags {ta!r} and {tb!r} use the same result directory")
     with open(os.path.join(a.out, "sample.json"), encoding="utf-8") as f:
         sample = json.load(f)
-    ta, tb = a.tags
-    ra, rb = load_results(a, ta), load_results(a, tb)
+    ra, rb = load_results(left_folders), load_results(right_folders)
     if a.exact:
         return compare_exact(a, sample, ra, rb)
     counts, sub, rows = {}, {}, []
