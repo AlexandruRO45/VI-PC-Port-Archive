@@ -763,9 +763,11 @@ int main() {
                                                               r16_cast, IID_PPV_ARGS(&d16_tex.p))));
             EXPECT(capture.last_image_format == VK_FORMAT_D16_UNORM);
             EXPECT(capture.last_view_formats.size() == 1 && capture.last_view_formats[0] == VK_FORMAT_D16_UNORM);
+            Ref<ID3D12Resource> d16_refused;
             EXPECT(hooked->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &d16_desc,
                                                     D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 2, d32_cast,
-                                                    IID_PPV_ARGS(&d16_tex.p)) == E_INVALIDARG);
+                                                    IID_PPV_ARGS(&d16_refused.p)) == E_INVALIDARG);
+            EXPECT(!d16_refused.p);
 
             const D3D12_RESOURCE_DESC1 d24_desc =
                 desc1(texture_desc(4, 4, DXGI_FORMAT_D24_UNORM_S8_UINT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
