@@ -206,7 +206,10 @@ class RuntimeBuildPreflightTest(unittest.TestCase):
 
 class RuntimePackagingTest(unittest.TestCase):
     def setUp(self):
-        self.root = self.enterContext(tempfile.TemporaryDirectory())
+        # The POSIX launcher reports physical paths (readlink -f for itself, getcwd() for the game folder), and
+        # tempfile's /var/... resolves to /private/var/... on macOS. Keep the fixture on the resolved spelling so
+        # the subprocess output can be compared with it.
+        self.root = os.path.realpath(self.enterContext(tempfile.TemporaryDirectory()))
         self.build = os.path.join(self.root, "runtime", "build")
         self.game = os.path.join(self.root, "game")
         self.out = os.path.join(self.root, "out")
