@@ -285,5 +285,27 @@ class TestSOrn2B32ConditionCodes(unittest.TestCase):
         self.assertEqual(scc, 1)
 
 
+class TestSOrn2B32IEEE754(unittest.TestCase):
+    """IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_ieee754_bitcast_preservation(self):
+        # Treating float representations as raw 32-bit words
+        pos_zero = 0x00000000
+        neg_zero = 0x80000000
+        # s_orn2_b32(+0.0, -0.0) -> 0x00000000 | ~0x80000000 = 0x7FFFFFFF
+        d, scc = ref_orn2_b32(pos_zero, neg_zero)
+        self.assertEqual(d, 0x7FFFFFFF)
+        self.assertEqual(scc, 1)
+
+    def test_nan_payload_preservation(self):
+        nan_bits = 0x7F800000 | 0x12345
+        # s0 | ~0 = s0 | 0xFFFFFFFF = 0xFFFFFFFF
+        d, _ = ref_orn2_b32(nan_bits, 0)
+        self.assertEqual(d, MASK32)
+        # s0 | ~0xFFFFFFFF = s0 | 0 = s0
+        d, _ = ref_orn2_b32(nan_bits, MASK32)
+        self.assertEqual(d, nan_bits)
+
+
 if __name__ == '__main__':
     unittest.main()
