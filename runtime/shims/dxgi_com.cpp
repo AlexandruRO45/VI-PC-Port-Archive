@@ -325,7 +325,9 @@ public:
 
     // The chain stays a borderless window; the state is only remembered so Get answers what Set was told.
     // Set(TRUE, null) picks the output containing the window, as native DXGI does.
+    // Leaving fullscreen with a target output is invalid, as in native DXGI; the state stays as it was.
     HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fullscreen, IDXGIOutput* target) override {
+        if (!fullscreen && target) return DXGI_ERROR_INVALID_CALL;
         IDXGIOutput* output = nullptr;
         if (fullscreen) {
             output = target;
@@ -365,7 +367,7 @@ public:
         desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc->BufferCount = swapchain_.image_count();
         desc->OutputWindow = hwnd_;
-        desc->Windowed = TRUE;
+        desc->Windowed = is_windowed();
         desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc->Flags = flags_;
         return S_OK;
@@ -492,7 +494,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* desc) override {
         if (!desc) return E_INVALIDARG;
         std::memset(desc, 0, sizeof(*desc));
-        desc->Windowed = TRUE;
+        desc->Windowed = is_windowed();
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetHwnd(HWND* out) override { if (!out) return E_INVALIDARG; *out = hwnd_; return S_OK; }
@@ -643,6 +645,10 @@ private:
     leonida::VulkanSwapchain swapchain_;
     HWND hwnd_ = nullptr;
     IDXGIOutput* restrict_to_output_ = nullptr;
+    BOOL is_windowed() {
+        std::lock_guard lock(fullscreen_mutex_);
+        return fullscreen_ ? FALSE : TRUE;
+    }
     std::mutex fullscreen_mutex_;
     bool fullscreen_ = false;
     IDXGIOutput* fullscreen_output_ = nullptr;

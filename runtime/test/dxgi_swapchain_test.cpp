@@ -611,12 +611,28 @@ int main() {
         if (FAILED(sc->GetFullscreenState(&fs, &out)) || !fs)
             return fail("GetFullscreenState after SetFullscreenState(TRUE) should be TRUE");
         if (!out) return fail("GetFullscreenState after SetFullscreenState(TRUE) should return the output");
+        DXGI_SWAP_CHAIN_DESC sc_desc{};
+        DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc{};
+        if (FAILED(sc->GetDesc(&sc_desc)) || sc_desc.Windowed)
+            return fail("GetDesc after SetFullscreenState(TRUE) should report Windowed=FALSE");
+        if (FAILED(sc->GetFullscreenDesc(&fs_desc)) || fs_desc.Windowed)
+            return fail("GetFullscreenDesc after SetFullscreenState(TRUE) should report Windowed=FALSE");
+        // Leaving fullscreen with a target output is invalid and must not change the state.
+        if (sc->SetFullscreenState(FALSE, out) != DXGI_ERROR_INVALID_CALL)
+            return fail("SetFullscreenState(FALSE, output) should return DXGI_ERROR_INVALID_CALL");
+        BOOL still_fs = FALSE;
+        if (FAILED(sc->GetFullscreenState(&still_fs, nullptr)) || !still_fs)
+            return fail("failed SetFullscreenState(FALSE, output) should leave the chain fullscreen");
         out->Release();
         if (FAILED(sc->SetFullscreenState(FALSE, nullptr))) return fail("SetFullscreenState(FALSE)");
         fs = TRUE;
         out = reinterpret_cast<IDXGIOutput*>(1);
         if (FAILED(sc->GetFullscreenState(&fs, &out)) || fs || out)
             return fail("GetFullscreenState after SetFullscreenState(FALSE) should be windowed with no output");
+        if (FAILED(sc->GetDesc(&sc_desc)) || !sc_desc.Windowed)
+            return fail("GetDesc after SetFullscreenState(FALSE) should report Windowed=TRUE");
+        if (FAILED(sc->GetFullscreenDesc(&fs_desc)) || !fs_desc.Windowed)
+            return fail("GetFullscreenDesc after SetFullscreenState(FALSE) should report Windowed=TRUE");
         if (FAILED(sc->GetFullscreenState(nullptr, nullptr))) return fail("GetFullscreenState with null outs");
     }
 
