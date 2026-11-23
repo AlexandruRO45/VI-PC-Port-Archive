@@ -21,6 +21,8 @@ TOOLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+import report_paths  # noqa: E402
+
 try:
     import amd_swizzle as A  # noqa: E402
     HAVE_NUMPY = True
@@ -195,7 +197,6 @@ class AmdSwizzleCliGuardTests(unittest.TestCase):
         self.assertNotIn("Traceback", err)
 
     def test_uses_shared_same_report_path_and_guards_header_input_and_load_errors(self):
-        import report_paths
         self.assertIs(self.mod.same_report_path, report_paths.same_report_path)
         with tempfile.TemporaryDirectory() as tmp:
             blob = os.path.join(tmp, "blob.bin")
