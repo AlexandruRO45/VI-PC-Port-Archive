@@ -340,5 +340,15 @@ class VMadU32U24OracleTests(unittest.TestCase):
     def test_mad_u24_wrapping(self):
         self.assertEqual(oracle_mad_u32_u24(0xFFFFFF, 0xFFFFFF, 0xFFFFFFFF), 0xFE000000)
 
+class VMadU32U24AstInterpreterTests(unittest.TestCase):
+    def test_mad_u24_ast_construction(self):
+        ast = ValuInstructionAST("v_mad_u32_u24", Operand(RegKind.VGPR, 3), Operand(RegKind.VGPR, 0), Operand(RegKind.VGPR, 1), Operand(RegKind.VGPR, 2))
+        self.assertEqual(ast.mnemonic, "v_mad_u32_u24")
+        self.assertEqual(ast.dst.index, 3)
+
+    def test_mad_u24_scalar_execution(self):
+        res = oracle_mad_u32_u24(7, 8, 9)
+        self.assertEqual(res, 65)
+
 if __name__ == "__main__":
     unittest.main()
