@@ -501,5 +501,106 @@ class TestSaluOrn2B32RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.interp.sgprs[0], 0xCAFEBABE)
         self.assertEqual(scc, 1)
 
+@dataclasses.dataclass(frozen=True)
+class ConditionCodeState:
+    """Architectural SALU condition code flags."""
+    scc: int
+    is_zero: bool
+    is_negative: bool
+    parity_odd: bool
+
+
+def evaluate_salu_flags(result_u32: int) -> ConditionCodeState:
+    """Compute condition code evaluation for 32-bit SALU result."""
+    res = u32(result_u32)
+    scc = 1 if res != 0 else 0
+    is_zero = (res == 0)
+    is_negative = bool(res & 0x80000000)
+    parity_odd = (bin(res).count("1") % 2 == 1)
+    return ConditionCodeState(scc=scc, is_zero=is_zero, is_negative=is_negative, parity_odd=parity_odd)
+
+
+class TestSaluOrn2B32ConditionCodes(unittest.TestCase):
+    """Unit tests for Scalar Condition Code (SCC) semantics and transitions."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarSALUInterpreter()
+
+    def test_scc_zero_result(self) -> None:
+        # The ONLY input pair producing result 0 is s0 = 0 and s1 = 0xFFFFFFFF
+        self.interp.write_sgpr(1, 0x00000000)
+        self.interp.write_sgpr(2, 0xFFFFFFFF)
+        inst = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 0),
+            ssrc0=RegOperand(RegKind.SGPR, 1),
+            ssrc1=RegOperand(RegKind.SGPR, 2),
+        )
+        res, scc = self.interp.execute(inst)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(self.interp.scc, 0)
+        flags = evaluate_salu_flags(res)
+        self.assertTrue(flags.is_zero)
+        self.assertFalse(flags.is_negative)
+        self.assertEqual(flags.scc, 0)
+
+    def test_scc_nonzero_results(self) -> None:
+        test_cases = [
+            (0x00000001, 0xFFFFFFFF, 1),             # lowest bit set
+            (0x80000000, 0xFFFFFFFF, 0x80000000),    # sign bit set
+            (0x00000000, 0xFFFFFFFE, 1),             # inverted bit 0 set
+            (0x12345678, 0x9ABCDEF0, 0x12345678 | (~0x9ABCDEF0 & MASK32)),
+            (0xFFFFFFFF, 0x00000000, 0xFFFFFFFF),
+        ]
+        for s0, s1, expected_res in test_cases:
+            self.interp.write_sgpr(1, s0)
+            self.interp.write_sgpr(2, s1)
+            inst = SALUInstruction(
+                Opcode.S_ORN2_B32,
+                sdst=RegOperand(RegKind.SGPR, 0),
+                ssrc0=RegOperand(RegKind.SGPR, 1),
+                ssrc1=RegOperand(RegKind.SGPR, 2),
+            )
+            res, scc = self.interp.execute(inst)
+            self.assertEqual(res, expected_res)
+            self.assertEqual(scc, 1)
+            self.assertEqual(self.interp.scc, 1)
+
+    def test_scc_state_transitions(self) -> None:
+        # Step 1: SCC becomes 1
+        self.interp.write_sgpr(1, 0x10)
+        self.interp.write_sgpr(2, 0x20)
+        inst_nonzero = SALUInstruction(
+            Opcode.S_ORN2_B32,
+            sdst=RegOperand(RegKind.SGPR, 0),
+            ssrc0=RegOperand(RegKind.SGPR, 1),
+            ssrc1=RegOperand(RegKind.SGPR, 2),
+        )
+        self.interp.execute(inst_nonzero)
+        self.assertEqual(self.interp.scc, 1)
+
+        # Step 2: SCC becomes 0 (0 | ~0xFFFFFFFF = 0)
+        self.interp.write_sgpr(1, 0)
+        self.interp.write_sgpr(2, 0xFFFFFFFF)
+        self.interp.execute(inst_nonzero)
+        self.assertEqual(self.interp.scc, 0)
+
+        # Step 3: SCC becomes 1 again
+        self.interp.write_sgpr(1, 1)
+        self.interp.write_sgpr(2, 0xFFFFFFFF)
+        self.interp.execute(inst_nonzero)
+        self.assertEqual(self.interp.scc, 1)
+
+        # Step 4: s_mov_b32 preserves SCC
+        self.interp.write_sgpr(5, 0)
+        inst_mov = SALUInstruction(
+            Opcode.S_MOV_B32,
+            sdst=RegOperand(RegKind.SGPR, 0),
+            ssrc0=RegOperand(RegKind.SGPR, 5),
+        )
+        self.interp.execute(inst_mov)
+        self.assertEqual(self.interp.scc, 1, "s_mov_b32 must not corrupt existing SCC")
+
 if __name__ == "__main__":
     unittest.main()
