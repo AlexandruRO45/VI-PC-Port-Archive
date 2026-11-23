@@ -43,6 +43,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <map>
@@ -909,6 +910,11 @@ struct ReplayFunctions {
     // resource has; and one postbuild value (COMPACTED_SIZE, CURRENT_SIZE) of the structure at `src` to `dest`.
     std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dst_va, std::uint64_t bytes)> xdxr_copy;
     std::function<void(VkCommandBuffer, std::uint64_t src_va, std::uint64_t dest_va)> xdxr_postbuild;
+    // RehydrateAccelerationStructure (xdxr_rehydrate.h): `plan`/`plan_offset` is the scratch's buffer, resolved while
+    // the list is prepared. `xdxr_rehydrate_plan_bytes` is the scratch it needs for that many geometries.
+    std::function<bool(VkCommandBuffer, const RehydrateAccelerationStructure&, VkBuffer plan, VkDeviceSize plan_offset)>
+        xdxr_rehydrate;
+    std::function<std::uint64_t(std::size_t geometries)> xdxr_rehydrate_plan_bytes;
     std::function<VkAccelerationStructureKHR(std::uint64_t)> resolve_acceleration_structure;
     // Preparation only allocates a slot; capture records the GPU snapshot at the SetPredication command.
     std::function<bool(VkBuffer, VkDeviceSize, PredicateCapture&)> prepare_predicate;
@@ -1024,6 +1030,8 @@ struct Prepared {
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
+    VkBuffer xdxr_plan = VK_NULL_HANDLE;   // RehydrateAccelerationStructure: the scratch's buffer and offset
+    VkDeviceSize xdxr_plan_offset = 0;
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
 
@@ -3058,6 +3066,33 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             std::uint64_t source = ~std::uint64_t(0);
             if (!vk.buffer_at(copy->src_va, source, buffer, offset)) return ReplayResult::unresolved_resource;
             p.xdxr_bytes = std::min(room, source);
+        } else if (const auto* rehydrate = std::get_if<RehydrateAccelerationStructure>(&command)) {
+            // XDXR only. The plan lives in the scratch, whose buffer the indirect dispatches read; the geometry is
+            // float3 vertices (the formats the console builder's rehydration decodes beyond that are not measured).
+            // A rehydration the layer can't do is skipped with a log line, not the whole list: the structure stays
+            // unwritten, as on a console whose rehydration fails.
+            const auto skip = [&](const char* why) {
+                std::fprintf(stderr, "[rt] d3d12: XDXR rehydration skipped: %s\n", why);
+                p.skip = true;
+            };
+            bool formats = true;
+            for (const RtTriangleGeometry& t : rehydrate->triangles)
+                formats = formats && t.vertex_format == VK_FORMAT_R32G32B32_SFLOAT && t.vertex_stride >= 12 &&
+                          t.vertex_stride % 4 == 0;
+            std::uint64_t room = ~std::uint64_t(0), any = ~std::uint64_t(0);
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            if (!vk.xdxr_rehydrate || !vk.xdxr_rehydrate_plan_bytes || !vk.buffer_at) {
+                skip("no XDXR rehydration on this device");
+            } else if (!formats) {
+                skip("a geometry is not R32G32B32_FLOAT with a 4-byte-multiple stride");
+            } else if (!vk.buffer_at(rehydrate->scratch_va, room, p.xdxr_plan, p.xdxr_plan_offset) ||
+                       !vk.buffer_at(rehydrate->src_va, any, buffer, offset) ||
+                       !vk.buffer_at(rehydrate->dst_va, any, buffer, offset)) {
+                return ReplayResult::unresolved_resource;
+            } else if (room < vk.xdxr_rehydrate_plan_bytes(rehydrate->triangles.size())) {
+                skip("the scratch is smaller than the plan it needs");
+            }
         } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command)) {
             // The KHR path never wrote postbuild values; it keeps skipping them rather than failing the list.
             if (!vk.xdxr_postbuild) {
@@ -3953,6 +3988,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.xdxr_record(command_buffer, *xdxr_build);
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
+        } else if (const auto* rehydrate = std::get_if<RehydrateAccelerationStructure>(&command);
+                   rehydrate && !p.skip) {
+            vk.xdxr_rehydrate(command_buffer, *rehydrate, p.xdxr_plan, p.xdxr_plan_offset);
         } else if (const auto* postbuild = std::get_if<AccelerationStructurePostbuild>(&command);
                    postbuild && !p.skip) {
             for (std::size_t s = 0; s < postbuild->sources.size(); ++s)

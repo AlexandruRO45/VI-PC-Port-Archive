@@ -650,12 +650,23 @@ struct AccelerationStructurePostbuild {
     std::vector<std::uint64_t> sources;
 };
 
+// XboxBvhBuilder.dll's rehydration of a dehydrated XDXR BLAS (src/xdxr_rehydrate.h; docs/bvh.md §4a), recorded by
+// the XboxBvhBuilder shim: the dehydrated structure at `src_va` becomes the runtime structure at `dst_va`, of the same
+// size, from the source geometry (one RtTriangleGeometry per geometry index its leaves use). `scratch_va` holds the
+// GPU-written plan, XdxrRehydrator::plan_bytes(triangles.size()) bytes. XDXR only.
+struct RehydrateAccelerationStructure {
+    std::uint64_t dst_va = 0;
+    std::uint64_t src_va = 0;
+    std::uint64_t scratch_va = 0;
+    std::vector<RtTriangleGeometry> triangles;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
                              CopyResource, ResolveSubresource, Predication, ClearUnorderedAccess, DiscardResource,
                              WriteImmediate, AtomicCopyBuffer, BeginQuery, EndQuery, ResolveQueries, DebugMarker,
                              ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
-                             AccelerationStructurePostbuild>;
+                             AccelerationStructurePostbuild, RehydrateAccelerationStructure>;
 
 class CommandList {
 public:
@@ -887,6 +898,13 @@ public:
     bool copy_acceleration_structure(CopyAccelerationStructure copy) {
         if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256 || copy.mode > 4) return false;
         return append(copy);
+    }
+    // The source and destination are distinct structures: the rehydration reads one while it writes the other.
+    bool rehydrate_acceleration_structure(RehydrateAccelerationStructure r) {
+        if (!r.dst_va || r.dst_va % 256 || !r.src_va || r.src_va % 256 || !r.scratch_va || r.scratch_va % 256 ||
+            r.src_va == r.dst_va)
+            return false;
+        return append(std::move(r));
     }
     bool acceleration_structure_postbuild(AccelerationStructurePostbuild info) {
         if (!info.dest_va || info.dest_va % 8 || info.type > 3 || info.sources.empty()) return false;

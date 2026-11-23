@@ -5,6 +5,7 @@
 #include "d3d12_fence_waiter.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
+#include "d3d12_xdxr_rehydrate.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <algorithm>
@@ -910,7 +911,69 @@ public:
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
+    // The private ILeonidaXdxrRehydrate (d3d12_xdxr_rehydrate.h) is a small face of the list; everything else is
+    // Child's QueryInterface.
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (out && riid == IID_ILeonidaXdxrRehydrate) {
+            *out = static_cast<ILeonidaXdxrRehydrate*>(&rehydrate_face_);
+            AddRef();
+            return S_OK;
+        }
+        return Child::QueryInterface(riid, out);
+    }
+
+    // XboxBvhBuilder's rehydration of one dehydrated BLAS (ILeonidaXdxrRehydrate): recorded as a
+    // RehydrateAccelerationStructure. E_INVALIDARG leaves the list as it was, as the DLL's validation does.
+    HRESULT rehydrate(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc) return E_INVALIDARG;
+        const auto& in = desc->Inputs;
+        if (in.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL ||
+            (in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY && in.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS))
+            return E_INVALIDARG;
+        leonida::RehydrateAccelerationStructure cmd{};
+        cmd.dst_va = desc->DestAccelerationStructureData;
+        cmd.src_va = desc->SourceAccelerationStructureData;
+        cmd.scratch_va = desc->ScratchAccelerationStructureData;
+        for (UINT i = 0; i < in.NumDescs; ++i) {
+            const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
+                in.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS
+                    ? (in.ppGeometryDescs ? in.ppGeometryDescs[i] : nullptr)
+                    : (in.pGeometryDescs ? &in.pGeometryDescs[i] : nullptr);
+            if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) return E_INVALIDARG;
+            leonida::RtTriangleGeometry t{};
+            t.vertex_va = gd->Triangles.VertexBuffer.StartAddress;
+            t.vertex_count = gd->Triangles.VertexCount;
+            t.vertex_stride = static_cast<std::uint32_t>(gd->Triangles.VertexBuffer.StrideInBytes);
+            // The model reads float3 vertices; replay skips any other format with a log line.
+            t.vertex_format = gd->Triangles.VertexFormat == DXGI_FORMAT_R32G32B32_FLOAT ? VK_FORMAT_R32G32B32_SFLOAT
+                                                                                         : VK_FORMAT_UNDEFINED;
+            t.index_va = gd->Triangles.IndexBuffer;
+            t.index_count = gd->Triangles.IndexCount;
+            if (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)
+                t.index_type = 1;
+            else if (gd->Triangles.IndexFormat == DXGI_FORMAT_R32_UINT)
+                t.index_type = 2;
+            t.transform_va = gd->Triangles.Transform3x4;
+            t.flags = static_cast<std::uint32_t>(gd->Flags);
+            cmd.triangles.push_back(t);
+        }
+        return list_.rehydrate_acceleration_structure(std::move(cmd)) ? S_OK : E_INVALIDARG;
+    }
+
 private:
+    struct RehydrateFace final : ILeonidaXdxrRehydrate {
+        GraphicsCommandList* owner;
+        explicit RehydrateFace(GraphicsCommandList* list) : owner(list) {}
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override { return owner->QueryInterface(riid, out); }
+        ULONG STDMETHODCALLTYPE AddRef() override { return owner->AddRef(); }
+        ULONG STDMETHODCALLTYPE Release() override { return owner->Release(); }
+        HRESULT STDMETHODCALLTYPE RehydrateRaytracingAccelerationStructure(
+            const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) override {
+            return owner->rehydrate(desc);
+        }
+    };
+    RehydrateFace rehydrate_face_{this};
+
     static bool valid_postbuild_info_type(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE type) {
         switch (type) {
         case D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE:

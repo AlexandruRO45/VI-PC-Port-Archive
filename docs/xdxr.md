@@ -130,7 +130,7 @@ The executable's imports and call sites, measured statically on 1.0.2.1 (all thr
 | `GetRaytracingAccelerationStructurePrebuildInfo(INPUTS*, XDXR_STREAM_DESC*, PREBUILD_INFO*)` | 3 | the layer's sizes |
 | `BuildRaytracingAccelerationStructureBatched2X(GCL6*, UINT, BATCHED_DESC2*)` | 6 | one layer build per element (§1), with its postbuild descriptions |
 | `CopyRaytracingAccelerationStructure(GCL4*, dest, source, mode)` | 2 | the layer's copy |
-| `RehydrateRaytracingAccelerationStructureBatched2X(GCL8*, UINT, BUILD_DESC*, UINT64*)` | 4 | `E_NOTIMPL` for now |
+| `RehydrateRaytracingAccelerationStructureBatched2X(GCL8*, UINT, BUILD_DESC*, UINT64*)` | 4 | the layer's GPU rehydration, per element ([bvh.md](bvh.md) §7b) |
 
 **Where it differs from the DLL:**
 - **Stream records (§3):** they tune the console builder's heuristics, so they are ignored (logged once). The result
@@ -138,8 +138,11 @@ The executable's imports and call sites, measured statically on 1.0.2.1 (all thr
 - **Validation errors:** the DLL throws them as C++ exceptions. A shim must not throw into the title, so an element
   the DLL would refuse is skipped with a log line. The offline-statistics postbuild type (`0x10`, §4) is one of
   those.
-- **Rehydration** is the next step: rebuild each structure on the GPU from the source geometry its description
-  carries ([bvh.md](bvh.md) §4a), in the leaf frame `compressionParams` gives.
+- **Rehydration** runs on the GPU and writes what `tools/bvh_rehydrate.py` writes, byte for byte ([bvh.md](bvh.md)
+  §7b). Each element goes to the list's private `ILeonidaXdxrRehydrate` (`runtime/shims/d3d12_xdxr_rehydrate.h`), so
+  on the Windows D3D12 backend the export answers `E_NOTIMPL`.
+- **The `UINT64*` argument is not measured.** The title's 4 call sites pass at most 16 elements, with the descriptions
+  and one `UINT64` per element both on its stack. The shim logs the first values once and doesn't use them.
 
 `xbox_bvh_builder_test` calls every export through the shim registry, the way the title's imports bind, and
 `xdxr_bvh.py check-build` checks the BLAS, TLAS and compacted BLAS it builds (ctest `xbox_bvh_builder_check`).

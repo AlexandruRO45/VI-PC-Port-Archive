@@ -23,6 +23,7 @@
 #include "queue_families.h"
 #include "resource_tiling.h"
 #include "xdxr_build.h"
+#include "xdxr_rehydrate.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1038,6 +1039,33 @@ public:
                     const std::uint64_t base = replay_.heap_base;
                     xdxr_->record_postbuild(cb, base + src, base + dest);
                 };
+                // XboxBvhBuilder's rehydration (xdxr_rehydrate.h), recorded by the XboxBvhBuilder shim.
+                rehydrate_ = std::make_unique<XdxrRehydrator>(get, device);
+                if (rehydrate_->loaded()) {
+                    replay_.xdxr_rehydrate_plan_bytes = [](std::size_t geometries) {
+                        return XdxrRehydrator::plan_bytes(geometries);
+                    };
+                    replay_.xdxr_rehydrate = [this](VkCommandBuffer cb, const RehydrateAccelerationStructure& r,
+                                                    VkBuffer plan, VkDeviceSize plan_offset) {
+                        const std::uint64_t base = replay_.heap_base;
+                        const auto addr = [&](std::uint64_t va) { return va ? base + va : 0; };
+                        std::vector<XdxrRehydrateGeometry> geometries;
+                        geometries.reserve(r.triangles.size());
+                        for (const RtTriangleGeometry& t : r.triangles) {
+                            XdxrRehydrateGeometry g;
+                            g.vertices = addr(t.vertex_va);
+                            g.vertex_stride = t.vertex_stride;
+                            g.indices = addr(t.index_va);
+                            g.index_type = t.index_va ? t.index_type : 0u;
+                            g.transform = addr(t.transform_va);
+                            geometries.push_back(g);
+                        }
+                        return rehydrate_->record(cb, base + r.src_va, base + r.dst_va, base + r.scratch_va, plan,
+                                                  plan_offset, geometries);
+                    };
+                } else {
+                    rehydrate_.reset();
+                }
             } else {
                 xdxr_.reset();
             }
@@ -1631,6 +1659,7 @@ private:
     bool loaded_ = false;
     bool ray_tracing_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
+    std::unique_ptr<XdxrRehydrator> rehydrate_;   // XboxBvhBuilder's rehydration, with xdxr_
     std::atomic<bool> device_lost_{false};
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;

@@ -7,7 +7,9 @@
 // an element asking for offline statistics is skipped and leaves its destination untouched, a non-empty XDXR stream
 // is accepted, rehydration answers E_NOTIMPL, and builders are released.
 //
-//   xbox_bvh_builder_test <out dir>        the shim
+//   xbox_bvh_builder_test <out dir> [<rehydrate cases dir>]   the shim; with the second directory (written by
+//                                          runtime/test/xdxr_rehydrate_cases.py) also its rehydration export, each
+//                                          case compared with tools/bvh_rehydrate.py's bytes
 //   xbox_bvh_builder_test --console        run with LEONIDA_BVH_BUILDER=console: nothing is registered
 //
 // Exit 77 without a Vulkan device. No game files.
@@ -23,6 +25,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <sstream>
 #include <vector>
 
 namespace rt::shims {
@@ -116,7 +119,7 @@ template <class F> F shim(const char* name) { return reinterpret_cast<F>(rt::shi
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: xbox_bvh_builder_test <out dir> | --console\n");
+        std::fprintf(stderr, "usage: xbox_bvh_builder_test <out dir> [<rehydrate cases dir>] | --console\n");
         return 2;
     }
     if (std::strcmp(argv[1], "--console") == 0) {
@@ -353,11 +356,9 @@ int main(int argc, char** argv) {
     list->CopyBufferRegion(compacted_rb.p, 0, compacted.p, 0, post[0]);
     if (!submit()) return fail("the compaction did not complete");
 
-    // ---- RehydrateRaytracingAccelerationStructureBatched2X: not implemented yet ----
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC rehydrate_desc{};
-    const UINT64 source = blas->GetGPUVirtualAddress();
-    check(rehydrate(builder, list.p, 1, &rehydrate_desc, &source) == E_NOTIMPL,
-          "RehydrateRaytracingAccelerationStructureBatched2X answers E_NOTIMPL (stage 2)");
+    // ---- RehydrateRaytracingAccelerationStructureBatched2X: arguments ----
+    check(rehydrate(builder, list.p, 0, nullptr, nullptr) == S_OK, "an empty rehydration batch is S_OK");
+    check(rehydrate(builder, nullptr, 1, nullptr, nullptr) == E_INVALIDARG, "a batch without a list is E_INVALIDARG");
 
     // ---- dump for xdxr_bvh.py check-build ----
     auto dump = [&](ID3D12Resource* rb, UINT64 size, const std::string& name, const std::string& json) {
@@ -399,6 +400,119 @@ int main(int argc, char** argv) {
                "{\"kind\": \"blas\", \"address\": " + std::to_string(compacted->GetGPUVirtualAddress()) +
                    ", \"triangles\": " + triangles + "}\n"),
           "the BLAS compacted through the shim is written for check-build");
+
+    // ---- RehydrateRaytracingAccelerationStructureBatched2X on the layer: every case of the second directory, in one
+    // batch per case, read back and compared with the model's bytes ----
+    if (argc > 2) {
+        const std::string cases = argv[2];
+        std::vector<std::string> names;
+        for (const auto& entry : std::filesystem::directory_iterator(cases, ec)) {
+            const std::string f = entry.path().filename().string();
+            const std::string suffix = ".src.bin";
+            if (f.size() > suffix.size() && f.compare(f.size() - suffix.size(), suffix.size(), suffix) == 0)
+                names.push_back(f.substr(0, f.size() - suffix.size()));
+        }
+        check(names.size() >= 5, "the rehydration cases are there");
+        auto read = [](const std::string& path, std::vector<char>& out) {
+            std::ifstream f(path, std::ios::binary);
+            if (!f) return false;
+            out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            return true;
+        };
+        for (const std::string& name : names) {
+            std::vector<char> src, expected;
+            if (!read(cases + "/" + name + ".src.bin", src) || !read(cases + "/" + name + ".expected.bin", expected)) {
+                check(false, (name + ": case files").c_str());
+                continue;
+            }
+            // Everything the case reads, in one upload buffer: the dehydrated structure, then per geometry its
+            // vertices, indices and transform, each 256-byte aligned.
+            struct Geom { std::vector<char> vertices, indices; UINT stride = 12, index_type = 0; float m[12]; bool xf = false; };
+            std::vector<Geom> geoms;
+            std::ifstream geom_file(cases + "/" + name + ".geom.txt");
+            std::string line;
+            bool ok = true;
+            while (std::getline(geom_file, line)) {
+                std::istringstream in(line);
+                std::string vertices, indices, transform;
+                Geom g;
+                in >> vertices >> g.stride >> indices >> g.index_type >> transform;
+                ok = ok && read(cases + "/" + vertices, g.vertices);
+                if (indices != "-") ok = ok && read(cases + "/" + indices, g.indices);
+                if (transform != "-") {
+                    g.xf = true;
+                    g.m[0] = std::stof(transform);
+                    for (int k = 1; k < 12; ++k) in >> g.m[k];
+                }
+                geoms.push_back(std::move(g));
+            }
+            UINT64 bytes = (src.size() + 255) / 256 * 256;
+            for (const Geom& g : geoms)
+                bytes += (g.vertices.size() + 255) / 256 * 256 + (g.indices.size() + 255) / 256 * 256 + 256;
+            Ref<ID3D12Resource> input, dest, plan_scratch, dest_rb;
+            const UINT64 plan_size = 3712 + 32ull * geoms.size();   // XdxrRehydrator::plan_bytes
+            if (!ok || FAILED(buffer(device.p, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                     D3D12_RESOURCE_FLAG_NONE, input.put())) ||
+                FAILED(buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, expected.size(), as_state, uav, dest.put())) ||
+                FAILED(buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, (plan_size + 255) / 256 * 256,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, uav, plan_scratch.put())) ||
+                FAILED(buffer(device.p, D3D12_HEAP_TYPE_READBACK, expected.size(), D3D12_RESOURCE_STATE_COPY_DEST,
+                              D3D12_RESOURCE_FLAG_NONE, dest_rb.put()))) {
+                check(false, (name + ": buffers").c_str());
+                continue;
+            }
+            char* in_map = nullptr;
+            if (FAILED(input->Map(0, nullptr, reinterpret_cast<void**>(&in_map)))) return fail("Map rehydration input");
+            UINT64 at = 0;
+            auto put = [&](const void* data, std::size_t n) {
+                const UINT64 va = input->GetGPUVirtualAddress() + at;
+                if (n) std::memcpy(in_map + at, data, n);
+                at += (n + 255) / 256 * 256;
+                return va;
+            };
+            const UINT64 src_va = put(src.data(), src.size());
+            std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> descs(geoms.size());
+            for (std::size_t g = 0; g < geoms.size(); ++g) {
+                D3D12_RAYTRACING_GEOMETRY_DESC& d = descs[g];
+                d.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+                d.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+                d.Triangles.VertexBuffer = {put(geoms[g].vertices.data(), geoms[g].vertices.size()), geoms[g].stride};
+                d.Triangles.VertexCount = UINT(geoms[g].vertices.size() / geoms[g].stride);
+                if (!geoms[g].indices.empty()) {
+                    d.Triangles.IndexBuffer = put(geoms[g].indices.data(), geoms[g].indices.size());
+                    d.Triangles.IndexFormat = geoms[g].index_type == 1 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+                    d.Triangles.IndexCount = UINT(geoms[g].indices.size() / (geoms[g].index_type == 1 ? 2 : 4));
+                }
+                if (geoms[g].xf) d.Triangles.Transform3x4 = put(geoms[g].m, sizeof geoms[g].m);
+            }
+            input->Unmap(0, nullptr);
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc{};
+            desc.DestAccelerationStructureData = dest->GetGPUVirtualAddress();
+            desc.SourceAccelerationStructureData = src_va;
+            desc.ScratchAccelerationStructureData = plan_scratch->GetGPUVirtualAddress();
+            desc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+            desc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+            desc.Inputs.NumDescs = UINT(descs.size());
+            desc.Inputs.pGeometryDescs = descs.data();
+            const UINT64 per_element = 0;
+            if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for rehydration");
+            const HRESULT rh = rehydrate(builder, list.p, 1, &desc, &per_element);
+            list->ResourceBarrier(1, &barrier);
+            list->CopyBufferRegion(dest_rb.p, 0, dest.p, 0, expected.size());
+            const bool done = submit();
+            std::size_t differ = expected.size();
+            void* p = nullptr;
+            if (done && SUCCEEDED(dest_rb->Map(0, nullptr, &p))) {
+                differ = 0;
+                for (std::size_t i = 0; i < expected.size(); ++i) differ += static_cast<const char*>(p)[i] != expected[i];
+                dest_rb->Unmap(0, nullptr);
+            }
+            char what[160];
+            std::snprintf(what, sizeof what, "%s: rehydrated through the shim, %zu of %zu bytes differ from bvh_rehydrate.py",
+                          name.c_str(), differ, expected.size());
+            check(rh == S_OK && done && differ == 0, what);
+        }
+    }
 
     // ---- the destructor releases the builder ----
     destruct(builder);

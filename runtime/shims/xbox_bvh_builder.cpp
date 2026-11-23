@@ -28,8 +28,10 @@
 //   - The DLL throws its validation errors as C++ exceptions (docs/xdxr.md, "Errors are thrown, not returned"). A
 //     shim must not throw into the title, so an element the DLL would reject is logged and skipped instead. The one
 //     rule a correct title meets every time is kept: the offline-statistics postbuild type (0x10) is never written.
-//   - Rehydration is not implemented yet: RehydrateRaytracingAccelerationStructureBatched2X logs once and returns
-//     E_NOTIMPL. (Planned: rebuild each structure from the source geometry its description carries.)
+//   - Rehydration (RehydrateRaytracingAccelerationStructureBatched2X) is the layer's GPU pass, src/xdxr_rehydrate.*,
+//     which writes what tools/bvh_rehydrate.py writes, byte for byte, the model that matches the DLL: each element
+//     goes to the list's private ILeonidaXdxrRehydrate (d3d12_xdxr_rehydrate.h). The call's last argument, one UINT64
+//     per element on the title's side, is not measured yet; its first values are logged once and it is not used.
 //
 // The builder object belongs to the title, which allocates it with a size this file doesn't know, so nothing is
 // written into it: what the shim keeps (the device, the Morton option) lives in a table keyed by its address.
@@ -48,6 +50,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "d3d12_xdxr_rehydrate.h"
 #include "d3d12_xs_device.h"
 #include "shims.h"
 #include "../src/xdxr_descs.h"
@@ -214,12 +217,41 @@ void builder_copy(void*, void* list, UINT64 dest, UINT64 source, D3D12_RAYTRACIN
 }
 
 // ?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBUD3D12_
-// BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z -> HRESULT. Not implemented yet (see the header comment).
-HRESULT builder_rehydrate_batched2x(void*, void*, UINT, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*,
-                                    const UINT64*) {
-    static std::atomic<bool> s_logged{false};
-    log_once(s_logged, "RehydrateRaytracingAccelerationStructureBatched2X is not implemented yet; E_NOTIMPL");
-    return E_NOTIMPL;
+// BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z -> HRESULT. The title's call sites pass at most 16 elements,
+// with the descriptions and the UINT64 array both on its stack.
+HRESULT builder_rehydrate_batched2x(void*, void* list, UINT count,
+                                    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* descs,
+                                    const UINT64* per_element) {
+    if (count == 0) return S_OK;
+    if (!list || !descs) return E_INVALIDARG;
+    {
+        static std::atomic<bool> s_logged{false};
+        if (per_element && !s_logged.exchange(true)) {
+            std::fprintf(stderr, "[rt] XboxBvhBuilder shim: rehydration batch of %u; the per-element UINT64 (not measured):",
+                         count);
+            for (UINT i = 0; i < count && i < 4; ++i)
+                std::fprintf(stderr, " 0x%llx", static_cast<unsigned long long>(per_element[i]));
+            std::fprintf(stderr, "\n");
+        }
+    }
+    ILeonidaXdxrRehydrate* rehydrate = nullptr;
+    if (FAILED(static_cast<IUnknown*>(list)->QueryInterface(IID_ILeonidaXdxrRehydrate,
+                                                             reinterpret_cast<void**>(&rehydrate)))) {
+        static std::atomic<bool> s_logged{false};
+        log_once(s_logged, "RehydrateRaytracingAccelerationStructureBatched2X: the list is not the layer's; E_NOTIMPL");
+        return E_NOTIMPL;
+    }
+    HRESULT result = S_OK;
+    for (UINT i = 0; i < count; ++i) {
+        const HRESULT hr = rehydrate->RehydrateRaytracingAccelerationStructure(&descs[i]);
+        if (FAILED(hr) && SUCCEEDED(result)) result = hr;
+    }
+    rehydrate->Release();
+    if (FAILED(result)) {
+        static std::atomic<bool> s_logged{false};
+        log_once(s_logged, "RehydrateRaytracingAccelerationStructureBatched2X: an element was refused (E_INVALIDARG)");
+    }
+    return result;
 }
 
 constexpr const char kDll[] = "xboxbvhbuilder.dll";

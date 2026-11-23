@@ -1156,6 +1156,36 @@ Measured on the 1.0.2.1 package with the tools above; counts and offsets only.
   (the buffer fits in 32 bits), nodes other than box32, and a `0x1030`-style dword0, which the hardware would read as
   base 0x103000.
 
+## 7b. Rehydration on the GPU
+
+`runtime/src/xdxr_rehydrate.comp` (recorded by `xdxr_rehydrate.h`) is the GPU side of the DLL's rehydrate exports.
+It follows `tools/bvh_rehydrate.py` step for step, with its float32 rounding (§4a):
+- **A plan pass first:** the dehydrated header and level table are in GPU memory, possibly written by earlier GPU
+  work, so one thread reads them and writes the indirect dispatch arguments of every later pass.
+- **Then the clear, the kept header, and the leaves** (one thread each, through the leaf frame).
+- **Then each level's BOX32 and BOX16 groups, bottom-up,** one workgroup per group: boxes recomputed from the
+  rehydrated children, stored overrides, BOX16 rounding, parent entries.
+
+Every node and leaf is written where its packed bytes are, so the result has exactly the dehydrated size, the size
+the title allocates. The source and the destination must be different buffers. The XboxBvhBuilder shim records it
+through the layer's command list ([xdxr.md](xdxr.md) §4a).
+
+**Checked byte for byte against `tools/bvh_rehydrate.py`:**
+- **Synthetic cases** from `runtime/test/xdxr_rehydrate_cases.py`: several levels of both widths, more than 64 nodes
+  a level, two leaf chunks, overrides, paired leaves, u16, u32 and no indices, a stride, a transform, the leaf frame
+  with rotations, and updatable parents. `vk_xdxr_rehydrate_test` runs them on Vulkan; `xbox_bvh_builder_test` runs
+  them through the shim and the layer.
+- **Real streams**, on an own 1.0.2.1 copy, with random geometry (the source meshes are not identified) and counts
+  only:
+
+| Pack | Streams | Identical |
+|---|---:|---:|
+| `shared_minigame000_bvh4.rpf` | 400 | 400 |
+| `core_bvh4.rpf` (1 to 15 levels, 1,524,515 leaves, a leaf frame on every one) | 400 | 400 |
+
+The geometry is the one part of those real streams that isn't the game's own. Every other byte, the trees, overrides,
+frames and level tables, is.
+
 ## 8. No-sharing rule
 
 Nothing from the packs may be committed: no `.rpf`, carved stream, decompressed buffer, XML text, tile list,
