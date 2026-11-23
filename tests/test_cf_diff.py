@@ -124,7 +124,9 @@ def test_self_test_passes():
 
 
 def test_no_arguments_prints_usage():
-    proc = subprocess.run([sys.executable, "-I", TOOL], capture_output=True, text=True, timeout=5)
+    # cf_diff sets sys.dont_write_bytecode, so every run compiles rdna2spirv from source: several seconds on a
+    # fresh checkout. 120 s matches tests/test_tool_startup.py; a hung import still fails.
+    proc = subprocess.run([sys.executable, "-I", TOOL], capture_output=True, text=True, timeout=120)
     assert proc.returncode == 2
     assert "usage:" in proc.stderr
     assert "Traceback" not in proc.stderr

@@ -111,7 +111,9 @@ class CliTests(unittest.TestCase):
     TOOL = os.path.join(ROOT, "tools", "f32_fuzz.py")
 
     def test_no_arguments_prints_usage(self):
-        r = subprocess.run([sys.executable, "-I", self.TOOL], capture_output=True, text=True, timeout=5)
+        # f32_fuzz sets sys.dont_write_bytecode, so every run compiles rdna2spirv from source: several seconds on a
+        # fresh checkout. 120 s matches tests/test_tool_startup.py; a hung import still fails.
+        r = subprocess.run([sys.executable, "-I", self.TOOL], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertIn("usage:", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
