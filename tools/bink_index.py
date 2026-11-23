@@ -192,6 +192,12 @@ def scan_file(path, source):
     return rows, stats
 
 
+def _walk_error(error):
+    # os.walk skips a folder it cannot list unless onerror raises. Both walks (the scan and the --out
+    # overwrite guard) must fail closed; main() turns the OSError into one error line and exit 2.
+    raise error
+
+
 def scan_target(target, skip_report=None):
     """Index a single container or every file below a directory.
 
@@ -204,11 +210,7 @@ def scan_target(target, skip_report=None):
     if os.path.isdir(target):
         base = target
         paths = []
-
-        def scan_failed(error):
-            raise error
-
-        for root, _dirs, files in os.walk(target, onerror=scan_failed):
+        for root, _dirs, files in os.walk(target, onerror=_walk_error):
             for name in files:
                 path = os.path.join(root, name)
                 if skip_report is not None and same_output_path(path, skip_report):
@@ -365,12 +367,19 @@ def main(argv=None):
         if same_output_path(a.out, manifest):
             ap.error(f"--out would overwrite the carve manifest: {a.out}")
         if os.path.isfile(a.out):
-            for root, _dirs, names in os.walk(a.target):
-                for name in names:
-                    if name.lower().endswith((".json", ".csv")):
-                        continue
-                    if same_output_path(os.path.join(root, name), a.out):
-                        ap.error(f"--out would overwrite an input file: {a.out}")
+            # This walk has to fail closed too: a folder it cannot list may hold the very input the
+            # guard exists to protect. An unlistable folder stops the run with one error line, exit 2.
+            try:
+                for root, _dirs, names in os.walk(a.target, onerror=_walk_error):
+                    for name in names:
+                        if name.lower().endswith((".json", ".csv")):
+                            continue
+                        if same_output_path(os.path.join(root, name), a.out):
+                            ap.error(f"--out would overwrite an input file: {a.out}")
+            except OSError as error:
+                path = error.filename or a.target
+                print(f"bink_index: error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
+                return 2
     if not os.path.exists(a.target):
         print(f"bink_index: error: {a.target}: no such file or directory", file=sys.stderr)
         return 2

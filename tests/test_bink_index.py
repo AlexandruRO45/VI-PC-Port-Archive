@@ -373,6 +373,40 @@ class TestCommandLine(unittest.TestCase):
         with open(payload, "rb") as f:
             self.assertEqual(f.read(), make_stream())
 
+    def test_unlistable_folder_cannot_hide_an_input_from_the_out_check(self):
+        # The --out overwrite guard walks the target looking for the report name among the inputs.
+        # Without onerror that walk skips a folder it cannot list, so an input inside it passed the
+        # guard and got truncated. The guard has to stop the run before anything is scanned or written.
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "carve")
+            sub = os.path.join(target, "locked")
+            os.makedirs(sub)
+            payload = os.path.join(sub, "00000001.bin")
+            with open(payload, "wb") as fh:
+                fh.write(make_stream())
+            real_scandir = os.scandir
+            locked = os.path.normcase(os.path.abspath(sub))
+
+            def scandir(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(str(path))) == locked:
+                    raise PermissionError(13, "Access is denied", str(path))
+                return real_scandir(path, *args, **kwargs)
+
+            def no_scan(*args, **kwargs):
+                raise AssertionError("the overwrite guard let the run reach the scan")
+
+            err = io.StringIO()
+            with mock.patch.object(bink.os, "scandir", scandir), \
+                    mock.patch.object(bink, "scan_target", no_scan):
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    rc = bink.main([target, "--out", payload])
+            self.assertEqual(rc, 2)
+            self.assertEqual(err.getvalue().splitlines(),
+                             [f"bink_index: error: cannot read {sub}: Access is denied"])
+            self.assertNotIn("Traceback", err.getvalue())
+            with open(payload, "rb") as fh:
+                self.assertEqual(fh.read(), make_stream())
+
     def test_output_folder_is_rejected(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
