@@ -379,11 +379,15 @@ struct ResolveSubresource {
 struct Dispatch {
     std::uintptr_t pipeline;
     std::array<std::uint32_t, 32> user_data;
-    std::array<std::uint32_t, 28> tail{};
-    std::uint32_t tail_words = 0;
     std::uint32_t x;
     std::uint32_t y;
     std::uint32_t z;
+    // A generated stage's own parameters past the 144-byte block (the geometry fallback's passes,
+    // SHADER-1092): tail dwords at push-constant bytes 144..; a pipeline that takes them declares the larger
+    // range. Appended after the grid, as Draw's are, so a Dispatch built from the plain fields -- a positional
+    // {pipeline, user_data, x, y, z} -- still sets its grid.
+    std::array<std::uint32_t, 28> tail{};
+    std::uint32_t tail_words = 0;
 };
 
 // What one draw through the geometry fallback records (SHADER-1092): the fused pass's and the capture pass's
