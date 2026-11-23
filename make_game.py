@@ -2336,6 +2336,27 @@ def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
     return next((p for p in found if os.path.isfile(p) and (windows or os.access(p, os.X_OK))), None)
 
 
+def checker_named_like_runtime(exe: str, work: str) -> str:
+    """On Windows, a copy of the checker with the runtime executable's file name; elsewhere the checker itself.
+
+    A driver can make the program's file name part of its pipeline cache key. AMD's Windows driver does (RX 9070 XT,
+    32.0.32029.2010): a cache written by vk_pipeline_check.exe never hits in gta6rt.exe, and one written by the same
+    program under the name gta6rt.exe does. The folder is not part of the key, so the copy goes into the work folder.
+    Without the copy the stage still checks every pipeline; only the cache is of no use to the runtime there."""
+    if os.name != "nt":
+        return exe
+    copy = os.path.join(work, "pipeline_check", RUNTIME_FILES[0])
+    try:
+        os.makedirs(os.path.dirname(copy), exist_ok=True)
+        shutil.copyfile(exe, copy)
+    except OSError as e:
+        log(f"pipelines: could not copy the checker to {copy} ({e.strerror or e}); it runs under its own name, and "
+            "a driver that keys its cache on the program's name will not reuse this cache in the runtime")
+        return exe
+    log(f"pipelines: the checker runs as a copy named {RUNTIME_FILES[0]}, so its cache gets the runtime's key")
+    return copy
+
+
 def require_translated_shaders(work: str) -> str:
     spirv = os.path.join(work, "shaders", "spirv")
     index = os.path.join(spirv, "index.json")
@@ -2363,6 +2384,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
              "cmake --build runtime/build/linux --parallel")
     spirv = require_translated_shaders(work)
     log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
+    exe = checker_named_like_runtime(exe, work)
     os.makedirs(out, exist_ok=True)
     cache = os.path.join(out, "pipeline_cache.bin")
     inflight = os.path.join(out, "pipeline_inflight.txt")

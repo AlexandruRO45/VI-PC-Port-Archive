@@ -371,6 +371,12 @@ bounded coverage and cache checkpoints, collective memory-crash recovery, a genu
 failures, interruptions, setup failures, inconclusive probes and compatibility with older checkers. It needs no
 game files or GPU.
 
+On Windows the stage runs the checker as a copy named `gta6rt.exe` in `<work>/pipeline_check`. A driver can make
+the program's file name part of its pipeline cache key: with AMD's Windows driver (RX 9070 XT, 32.0.32029.2010)
+the same checker binary under another name misses the cache it wrote, so a cache written as
+`vk_pipeline_check.exe` does not hit in the runtime. The folder is not part of that key. If the copy cannot be
+made the stage says so and runs the checker under its own name (`tests/test_make_game_pipelines.py`).
+
 ## Crash isolation (`--isolate`)
 
 A driver that dies while compiling one module (for example the RADV `SIGFPE` in

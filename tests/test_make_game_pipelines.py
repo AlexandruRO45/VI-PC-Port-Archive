@@ -73,7 +73,8 @@ class PipelinesJobsTest(unittest.TestCase):
                 mock.patch.object(make_game, "log"), mock.patch.object(make_game, "run") as run:
             self.assertEqual(make_game.main(), 0)
         run.assert_called_once()
-        self.assertEqual(run.call_args.args[0][0], checker)
+        # The supplied checker, run as its copy named like the runtime (PipelinesCheckerNameTest).
+        self.assertEqual(run.call_args.args[0][0], os.path.join(self.work, "pipeline_check", "gta6rt.exe"))
         self.assertEqual(self.jobs_of(run.call_args.args[0]), "3")
 
     def test_the_default_matches_the_checker_default(self):
@@ -94,6 +95,69 @@ class PipelinesJobsTest(unittest.TestCase):
         self.assertEqual(len(announce), 1, logs)
         self.assertIn("graphics", announce[0])
         self.assertIn("compute", announce[0])
+
+
+class PipelinesCheckerNameTest(unittest.TestCase):
+    """On Windows the checker runs as a copy named like the runtime's executable: a driver can make the program's
+    file name part of its pipeline cache key, and the cache is for gta6rt.exe (docs/pipeline_check.md)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = os.path.join(tmp.name, "work")
+        self.out = os.path.join(tmp.name, "out")
+        spirv = os.path.join(self.work, "shaders", "spirv")
+        os.makedirs(spirv)
+        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8") as f:
+            f.write('{"shader_0": {}}')
+        self.checker = os.path.join(tmp.name, "build", "vk_pipeline_check.exe")
+        os.makedirs(os.path.dirname(self.checker))
+        self.write_checker(b"checker, first build")
+        self.copy = os.path.join(self.work, "pipeline_check", "gta6rt.exe")
+
+    def write_checker(self, content):
+        with open(self.checker, "wb") as f:
+            f.write(content)
+
+    def stage(self, os_name, **patches):
+        """Runs the stage; returns the programs it started (the usage probe included) and what it logged."""
+        logs, asked = [], []
+        with mock.patch.object(make_game, "pipeline_check_exe", return_value=self.checker), \
+                mock.patch.object(make_game, "checker_supports",
+                                  side_effect=lambda exe, *options: asked.append(exe) or False), \
+                mock.patch.object(make_game, "run", return_value=0) as run, \
+                mock.patch.object(make_game, "log", logs.append), mock.patch("os.name", os_name):
+            for target, replacement in patches.items():
+                self.enterContext(mock.patch.object(make_game.shutil, target, replacement))
+            make_game.pipelines(self.work, self.out)
+        return asked + [call.args[0][0] for call in run.call_args_list], logs
+
+    def test_windows_runs_a_copy_with_the_runtime_name(self):
+        started, logs = self.stage("nt")
+        self.assertEqual(started, [self.copy, self.copy])
+        self.assertEqual(os.path.basename(self.copy), make_game.RUNTIME_FILES[0])
+        with open(self.copy, "rb") as f:
+            self.assertEqual(f.read(), b"checker, first build")
+        self.assertTrue(any("gta6rt.exe" in line and "copy" in line for line in logs), logs)
+
+    def test_a_rebuilt_checker_replaces_the_copy(self):
+        self.stage("nt")
+        self.write_checker(b"checker, second build")
+        self.stage("nt")
+        with open(self.copy, "rb") as f:
+            self.assertEqual(f.read(), b"checker, second build")
+
+    def test_other_hosts_run_the_checker_itself(self):
+        started, _ = self.stage("posix")
+        self.assertEqual(started, [self.checker, self.checker])
+        self.assertFalse(os.path.exists(os.path.dirname(self.copy)))
+
+    def test_a_copy_that_cannot_be_made_is_said_and_the_stage_still_runs(self):
+        def refuse(source, target):
+            raise PermissionError(13, "Access is denied")
+        started, logs = self.stage("nt", copyfile=refuse)
+        self.assertEqual(started, [self.checker, self.checker])
+        self.assertTrue(any("could not copy the checker" in line and "Access is denied" in line for line in logs), logs)
 
 
 ABORT = 0x80000003   # how Windows reports the driver's LLVM abort (#884)

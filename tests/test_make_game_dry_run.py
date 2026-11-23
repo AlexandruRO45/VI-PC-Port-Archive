@@ -343,7 +343,9 @@ class PipelineStageIsolationTest(unittest.TestCase):
 
         supports.assert_called_once()
         self.assertEqual(len(executed_cmds), 1)
-        self.assertEqual(executed_cmds[0], [dummy_exe, spirv_dir, expected_cache])
+        # On Windows the stage runs the checker as a copy named like the runtime (checker_named_like_runtime).
+        ran = os.path.join(self.work_dir, "pipeline_check", "gta6rt.exe") if os.name == "nt" else dummy_exe
+        self.assertEqual(executed_cmds[0], [ran, spirv_dir, expected_cache])
 
     def test_pipelines_stage_alone_invokes_no_asset_or_shader_compilers(self) -> None:
         game_dir = os.path.join(self.tmp.name, "game")
