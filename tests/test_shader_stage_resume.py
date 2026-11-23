@@ -526,6 +526,25 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.kill_after_merge(emulate=False)
         self.assertEqual(self.run_stage(), [])                  # hours of translation are not redone
 
+    def test_disassembly_markers_survive_stale_fixed_tmp_directories(self):
+        # Exercises both disasm.started and disasm.done call sites in shaders():
+        # fixed <marker>.tmp paths fail with PermissionError/IsADirectoryError when
+        # those paths exist as directories, whereas write_file_atomic stages uniquely.
+        os.makedirs(os.path.join(self.dxbc, "disasm.started.tmp"))
+        os.makedirs(os.path.join(self.dxbc, "disasm.done.tmp"))
+        self.assertEqual(
+            self.run_stage(),
+            ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"],
+        )
+        self.assertFalse(os.path.exists(os.path.join(self.dxbc, "disasm.started")))
+        self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
+        self.assertEqual(self.run_stage(), [])
+        leftovers = [
+            name for name in os.listdir(self.dxbc)
+            if name.endswith(".tmp") and os.path.isfile(os.path.join(self.dxbc, name))
+        ]
+        self.assertEqual(leftovers, [])
+
 
 class TranslationSourcesTest(unittest.TestCase):
     def test_the_list_covers_every_local_module_the_translator_imports(self):
