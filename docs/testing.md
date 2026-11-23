@@ -37,13 +37,17 @@ This page collects the setup steps and the problems testers have run into so far
 
   ```powershell
   $line = 'v_lshlrev_b16_e64 v34, v27, v27 op_sel:[0,1,1]'
-  Set-Content -LiteralPath "$env:TEMP\inst.txt" -Value $line -Encoding ascii
-  & $env:LLVM_MC -triple=amdgcn--amdpal -mcpu=gfx1013 -show-encoding "$env:TEMP\inst.txt"
+  $tmp = [IO.Path]::GetTempFileName()
+  Set-Content -LiteralPath $tmp -Value $line -Encoding ascii
+  & $env:LLVM_MC -triple=amdgcn--amdpal -mcpu=gfx1013 -show-encoding $tmp
+  Remove-Item -LiteralPath $tmp
   ```
 
   Writing the line to an ASCII file avoids the UTF-8 BOM that Windows PowerShell 5.1 puts before piped text
-  when `$OutputEncoding` is UTF-8 with a BOM (for example after a conda init); `llvm-mc` then answers
-  `<stdin>:1:1: error: invalid character in input`. PowerShell 7 (`pwsh`) accepts the pipe as it was written.
+  when `$OutputEncoding` is UTF-8 with a BOM (a profile can set it to `[System.Text.UTF8Encoding]::new($true)`);
+  `llvm-mc` then answers `<stdin>:1:1: error: invalid character in input`. `$OutputEncoding.GetPreamble().Length`
+  is 0 for the default and 3 with a BOM, so a reader with the default can keep the one-line pipe. PowerShell 7
+  (`pwsh`) is expected to accept the pipe as it is written.
 
   If it reports `not a valid operand`, point `LLVM_MC` at a build that accepts this instruction. The Windows
   conda-forge `llvm-tools` 23.1.6 package assembled the same f16 programs.
