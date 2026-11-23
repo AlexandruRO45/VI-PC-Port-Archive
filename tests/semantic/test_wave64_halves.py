@@ -68,6 +68,17 @@ BREAK_LOOP = ["v_and_b32_e32 v4, 3, v0", "v_add_nc_u32_e32 v10, 1, v4", "v_mov_b
               "v_add_nc_u32_e32 v9, 1, v9", "v_cmp_ge_u32_e32 vcc, v9, v10", "s_or_b64 s[16:17], vcc, s[16:17]",
               "s_andn2_b64 exec, exec, s[16:17]", "s_cbranch_execnz -5",
               "s_or_b64 exec, exec, s[16:17]"]
+# a lane-local def behind an EXEC vote that only lane 2 passes; `widen` restores the launch mask before the compare
+def _skip_then_def(first, define, widen):
+    return [first, "v_cmp_eq_u32_e32 vcc, 2, v0", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_cbranch_execz 3" if widen else "s_cbranch_execz 2"] + (["s_mov_b64 exec, s[10:11]"] if widen else []) + \
+        ["v_cmp_gt_u32_e32 vcc, 64, v0", define, "s_mov_b64 exec, s[10:11]", "s_and_b64 exec, exec, s[16:17]",
+         "v_add_nc_u32_e32 v6, 1, v6", "s_mov_b64 exec, s[10:11]"]
+
+
+WIDENED_OR = _skip_then_def("v_cmp_gt_u32_e64 s[16:17], 0, v0", "s_or_b64 s[16:17], vcc, s[16:17]", True)
+WIDENED_ANDN2 = _skip_then_def("s_mov_b64 s[16:17], exec", "s_andn2_b64 s[16:17], s[16:17], vcc", True)
+NARROWED_OR = _skip_then_def("v_cmp_gt_u32_e64 s[16:17], 0, v0", "s_or_b64 s[16:17], vcc, s[16:17]", False)
 
 
 def vs(body, prologue=PRO):
@@ -369,6 +380,13 @@ class Classification(unittest.TestCase):
         lines[lines.index("s_or_b64 s[16:17], vcc, s[16:17]")] = "s_or_b64 s[16:17], s[10:11], s[16:17]"
         self.tier("ps_c_break_or_exec", ps(lines + ["v_mov_b32_e32 v6, v9"]), "C")
 
+    def test_c_lane_local_def_after_exec_widens_again(self):
+        # @shdann on #4656: the run side restores the launch mask before the compare, so lanes of the half that skipped
+        # are on again at the v_cmp and its bits change: not lane-local (both spellings)
+        for name, lines in (("ps_c_widened_or", WIDENED_OR), ("ps_c_widened_andn2", WIDENED_ANDN2)):
+            with self.subTest(name):
+                self.tier(name, ps(lines), "C", contains=["tainted-exec"])
+
     def test_c_exec_skip_defines_scalar_read_later(self):
         self.tier("ps_c_stale_exec", ps([
             "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_mov_b32 s5, 7",
@@ -428,6 +446,18 @@ class Execution(unittest.TestCase):
         self.assertEqual(tier, "A")
         self.assertEqual(whole, halves)
         self.assertEqual(len({w for w in whole if w is not None}), 4)
+
+    def test_lane_local_def_after_exec_widens_differs_and_is_c(self):
+        # @shdann on #4656: the wave and the halves really differ in lanes 32..63, so tier A would be wrong
+        tier, whole, halves = self.run_both("vs_c_widened", vs(WIDENED_OR))
+        self.assertEqual(tier, "C")
+        self.assertNotEqual(whole, halves)
+
+    def test_lane_local_def_while_exec_stays_narrowed_is_a(self):
+        # the control: without the restore the lanes of the skipping half stay off at the compare
+        tier, whole, halves = self.run_both("vs_a_narrowed", vs(NARROWED_OR))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
 
     def test_a_vertex_invariant(self):
         tier, whole, halves = self.run_both("vs_a_skip", vs([

@@ -1372,10 +1372,19 @@ class Analysis:
         `s_or_b64 D, M, D` (either order) or `s_andn2_b64 D, D, M`, where M is VCC or an SGPR pair that a v_cmp
         (not v_cmpx) wrote earlier in the same block with no EXEC write after it. A v_cmp writes 0 for the lanes
         that are off, so OR-ing or AND-NOT-ing M changes only the bits of active lanes (SHADER-821: a compiler's
-        `break` loop accumulates the lanes that left in such a pair)."""
+        `break` loop accumulates the lanes that left in such a pair).
+
+        The lanes that are off at the v_cmp must include those of a half that a vote sent away, so EXEC may only
+        have narrowed since the first vote on every path to the v_cmp (`widened_after_vote`): an EXEC write that can
+        switch lanes back on (`s_mov_b64 exec, <launch mask>`, an OR, a join's restore) makes the def an ordinary
+        one again (counterexample by @shdann on #4656)."""
+        widened = self.widened_after_vote()
         out = {}
         for b, blk in enumerate(self.blocks):
             zero_off = {}                            # register key tuple -> True while it holds a v_cmp result
+            voted, wide = widened.get(b, (False, False))
+            starts = {self.voted[p] for p in range(self.n) if b in self.succ[p] and p in self.voted}
+            first_exec = True
             for i, ins in enumerate(blk):
                 op = base_op(ins["op"])
                 dests, srcs, d2, _ = operands(ins)
@@ -1389,14 +1398,60 @@ class Analysis:
                         out[(b, i)] = dk
                 if "exec" in written:
                     zero_off.clear()
+                    if voted and not self.narrowing_exec_write(ins, starts if first_exec else ()):
+                        wide = True
+                    first_exec = False
                 for k in list(zero_off):
                     if any(r in k for r in written):
                         del zero_off[k]
-                if op.startswith("v_cmp") and not op.startswith("v_cmpx"):
+                if op.startswith("v_cmp") and not op.startswith("v_cmpx") and not wide:
                     key = ("vcc",) if "vcc" in d2 else tuple(_regs(dests[0])) if dests else None
                     if key:
                         zero_off[key] = True
         return out
+
+    @staticmethod
+    def narrowing_exec_write(ins, vote_masks):
+        """True when this EXEC write can only switch lanes off: EXEC AND (or AND-NOT) a mask, the and-saveexec
+        family, a v_cmpx, or the run side's `s_mov_b64 exec, M` of a vote on M (that vote's lanes are a subset of
+        EXEC, as vote() checks)."""
+        op, a = base_op(ins["op"]), ins["args"]
+        if op.startswith("v_cmpx"):
+            return True
+        if op.startswith(("s_and_saveexec_b64", "s_andn2_saveexec_b64", "s_and_wrexec_b64", "s_andn2_wrexec_b64")):
+            return True
+        if op in ("s_and_b64", "s_andn2_b64") and len(a) == 3 and _regs(a[0]) == ["exec"]:
+            return _regs(a[1]) == ["exec"] or (op == "s_and_b64" and _regs(a[2]) == ["exec"])
+        if op == "s_mov_b64" and len(a) == 2 and _regs(a[0]) == ["exec"]:
+            return (_regs(a[1]) or [None])[0] in vote_masks
+        return False
+
+    def widened_after_vote(self):
+        """block -> (a vote ran on some path to its entry, EXEC may have widened after one on some path): a forward
+        dataflow over the CFG (both bits OR at a join)."""
+        state = {0: (False, False)} if self.n else {}
+        work = [0] if self.n else []
+        while work:
+            b = work.pop()
+            voted, wide = state[b]
+            starts = {self.voted[p] for p in range(self.n) if b in self.succ[p] and p in self.voted}
+            first_exec = True
+            for ins in self.blocks[b]:
+                dests, _, d2, _ = operands(ins)
+                if "exec" in [r for d in dests for r in _regs(d)] + list(d2):
+                    if voted and not self.narrowing_exec_write(ins, starts if first_exec else ()):
+                        wide = True
+                    first_exec = False
+            out = (voted or b in self.voted, wide)
+            for s in self.succ[b]:
+                if s >= self.n:
+                    continue
+                old = state.get(s)
+                new = out if old is None else (old[0] or out[0], old[1] or out[1])
+                if new != old:
+                    state[s] = new
+                    work.append(s)
+        return state
 
     def stale_uses(self):
         n = self.n
