@@ -12,7 +12,6 @@ These tests verify:
 """
 import os
 import re
-import shlex
 import shutil
 import struct
 import subprocess
@@ -21,6 +20,7 @@ import unittest
 
 import support
 import rdna2spirv
+from mc_command import mc_command  # noqa: E402
 
 PS_EPILOGUE = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
 CS_EPILOGUE = ["s_endpgm"]
@@ -50,11 +50,19 @@ def vdata_reg(dmask, d16=False):
 
 
 def llvm_mc_cmd():
-    env = os.environ.get("LLVM_MC")
-    if env:
-        return shlex.split(env)
-    exe = shutil.which("llvm-mc")
-    return [exe] if exe else None
+    """llvm-mc's argv if it starts and its target encodes for gfx1030, else None (the form of
+    tests/semantic/test_lds_src2.py's _llvm_mc). The splitting is the repository's own: LLVM_MC may be a Windows
+    path with backslashes, a path without its .exe, or a whole command line such as
+    `wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc`, and `shlex.split` on a Windows path drops its separators —
+    `C:\\Users\\me\\.leonida\\llvm-mc\\llvm-mc.exe` came out as `C:Usersme.leonidallvm-mcllvm-mc.exe` and every
+    call in this file raised FileNotFoundError (WinError 2), which read as a red test on `main` on Windows."""
+    cmd = mc_command()
+    try:
+        r = subprocess.run(cmd + ["-triple=amdgcn", "-mcpu=gfx1030", "-show-encoding"], input="s_endpgm\n",
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return cmd if r.returncode == 0 and "encoding" in r.stdout else None
 
 
 def validate_spirv(spvasm):
