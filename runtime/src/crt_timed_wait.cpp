@@ -21,11 +21,24 @@
 
 extern "C" {
 
-// Exported by every msvcp140.dll, Windows' and Wine's; no longer declared by the 14.4x headers. The deadline is
-// absolute, in TIME_UTC seconds and nanoseconds, and the result uses _Thrd_result's values (0, or 2 on timeout).
-__declspec(dllimport) int __cdecl _Cnd_timedwait(_Cnd_t, _Mtx_t, const _timespec64*) noexcept;
+// Exported by every msvcp140.dll, Windows' and Wine's. The deadline is absolute, in TIME_UTC seconds and
+// nanoseconds, and the result uses _Thrd_result's values (0, or 2 on timeout). Resolve it by name instead of
+// redeclaring it: 14.39's <xthreads.h> already declares it without dllimport (a redeclaration is C2375), and the
+// 14.4x headers that no longer declare it changed its return type from int to _Thrd_result (C2556).
+using CndTimedwaitFn = _Thrd_result(__cdecl*)(_Cnd_t, _Mtx_t, const _timespec64*) noexcept;
+
+CndTimedwaitFn cnd_timedwait_from_msvcp140() noexcept {
+    static const CndTimedwaitFn fn = []() noexcept -> CndTimedwaitFn {
+        const HMODULE msvcp = GetModuleHandleW(L"msvcp140.dll");
+        if (msvcp == nullptr) return nullptr;
+        return reinterpret_cast<CndTimedwaitFn>(GetProcAddress(msvcp, "_Cnd_timedwait"));
+    }();
+    return fn;
+}
 
 _Thrd_result __stdcall _Cnd_timedwait_for_unchecked(_Cnd_t cond, _Mtx_t mtx, unsigned int ms) noexcept {
+    const CndTimedwaitFn timed_wait = cnd_timedwait_from_msvcp140();
+    if (timed_wait == nullptr) return _Thrd_result::_Error;   // /MD links msvcp140.dll, so this is not a normal path
     _timespec64 deadline{};
     if (_timespec64_get(&deadline, TIME_UTC) != TIME_UTC) deadline = {};
     deadline.tv_sec += ms / 1000;
@@ -35,7 +48,7 @@ _Thrd_result __stdcall _Cnd_timedwait_for_unchecked(_Cnd_t cond, _Mtx_t mtx, uns
         deadline.tv_nsec -= 1000000000L;
     }
     // A spurious or early return is allowed ("unchecked"): the STL's callers check the clock themselves.
-    return static_cast<_Thrd_result>(_Cnd_timedwait(cond, mtx, &deadline));
+    return timed_wait(cond, mtx, &deadline);
 }
 
 // Not declared by the 14.4x headers, but defined by the same member: keep a caller of the older name off it too.
