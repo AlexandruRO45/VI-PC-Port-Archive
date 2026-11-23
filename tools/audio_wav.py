@@ -388,17 +388,24 @@ def plan_outputs(items, src, out, ffmpeg):
     return named, renamed, len(repaired) + moved
 
 
+def opus_decode_args(path):
+    # Chained Opus links can reset timestamps. Give the WAV muxer a continuous timeline so -xerror
+    # rejects partial decodes without failing on those resets. WAV stores the samples in order.
+    filters = "asetpts=N/SR/TB"
+    samples = ogg_output_samples(path)
+    if samples:
+        filters = f"atrim=end_sample={samples},{filters}"
+    return ["-xerror", "-i", path, "-af", filters]
+
+
 def audio_digest(ffmpeg, path, *, source):
     """Hash a metadata-free WAV stream, retaining its PCM, channel layout and sample rate."""
     cmd = [ffmpeg, "-v", "error"]
-    if not source:
-        # Preserve an unspecified layout (e.g. four mapping-family-255 channels) when reading a prior WAV.
-        cmd += ["-f", "wav", "-guess_layout_max", "0"]
-    cmd += ["-i", path]
     if source:
-        samples = ogg_output_samples(path)
-        if samples:
-            cmd += ["-af", f"atrim=end_sample={samples}"]
+        cmd += opus_decode_args(path)
+    else:
+        # Preserve an unspecified layout (e.g. four mapping-family-255 channels) when reading a prior WAV.
+        cmd += ["-f", "wav", "-guess_layout_max", "0", "-i", path]
     cmd += ["-map_metadata", "-1", "-fflags", "+bitexact", "-c:a", "pcm_s16le" if source else "copy", "-f", "wav", "-"]
     # No stdin for ffmpeg here or in decode(): it reads stdin for key commands, which stops a run started in the
     # background of a terminal and swallows input piped to the caller (such as a shell loop's file list).
@@ -421,11 +428,7 @@ def decode(ffmpeg: str, src: str, dst: str):
             td_kwargs["ignore_cleanup_errors"] = True
         with tempfile.TemporaryDirectory(**td_kwargs) as tmp_dir:
             tmp = os.path.join(tmp_dir, "decoded.wav")
-            cmd = [ffmpeg, "-v", "error", "-y", "-i", src]
-            samples = ogg_output_samples(src)
-            if samples:
-                cmd += ["-af", f"atrim=end_sample={samples}"]
-            cmd += ["-c:a", "pcm_s16le", tmp]
+            cmd = [ffmpeg, "-v", "error", "-y", *opus_decode_args(src), "-c:a", "pcm_s16le", tmp]
             r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace")
             if r.returncode != 0:
                 return False, (r.stderr.strip() or f"ffmpeg exited with {r.returncode}")

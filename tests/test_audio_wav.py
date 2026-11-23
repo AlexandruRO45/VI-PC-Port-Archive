@@ -84,6 +84,23 @@ class AudioWavTest(unittest.TestCase):
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
 
+    def write_corrupt_opus(self):
+        silence = bytes.fromhex("f8fffe")
+        # The middle packet declares zero frames, with valid packets before and after it.
+        awc_opus.write_ogg_opus(self.src, [silence] * 50 + [b"\xfb\x00", silence], 1, 42)
+
+    def test_decoder_error_discards_partial_wav(self):
+        self.write_corrupt_opus()
+        p = self.run_tool(self.src, "--out", self.out, "--jobs", "1")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("0 WAV written, 0 already present, 1 failed", p.stdout)
+        self.assertIn("FAILED one:", p.stdout)
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_decoder_error_does_not_return_a_partial_audio_digest(self):
+        self.write_corrupt_opus()
+        self.assertIsNone(audio_wav.audio_digest(FFMPEG, self.src, source=True))
+
     def test_writes_exact_16_bit_mono_wav(self):
         p = self.run_tool(self.src, "--out", self.out, "--jobs", "1")
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -127,10 +144,13 @@ class AudioWavTest(unittest.TestCase):
                     self.assertEqual(w.getnframes(), sum(ms for _, ms in tones) * 48)
                     pcm = w.readframes(w.getnframes())
                 p = self.run_tool(src)
-                self.assertEqual(p.returncode, 0, p.stderr)
-                with wave.open(str(src.with_suffix(".wav")), "rb") as w:
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                output = str(src.with_suffix(".wav"))
+                with wave.open(output, "rb") as w:
                     self.assertEqual(w.getnframes() * 2, len(pcm))
                     self.assertTrue(w.readframes(w.getnframes()) == pcm, "decoded PCM differs")
+                self.assertEqual(audio_wav.audio_digest(FFMPEG, src, source=True),
+                                 audio_wav.audio_digest(FFMPEG, output, source=False))
 
     def test_second_run_skips_the_existing_wav(self):
         self.assertEqual(self.run_tool(self.src, "--out", self.out).returncode, 0)
