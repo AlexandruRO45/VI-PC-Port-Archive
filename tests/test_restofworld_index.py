@@ -503,6 +503,33 @@ class FolderModeStoredBytesTest(unittest.TestCase):
             rows, summary = restofworld_index.scan_dir(tmp)
         self.assertEqual((rows[0]["stored"], summary["compressed_bytes"]), (1000, 1000))
 
+    def test_non_number_summary_count_is_a_value_error_not_a_traceback(self):
+        # int() on a null/list/dict count used to raise TypeError, which main does not catch.
+        for field in ("span", "zero_padding", "unread_bytes"):
+            for bad in (None, [1, 2], {"x": 1}):
+                with self.subTest(field=field, bad=bad):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        self.make(tmp, with_index=False)
+                        summary = {"span": 2000, "zero_padding": 500, "unread_bytes": 1200}
+                        summary[field] = bad
+                        index = {"summary": summary, "files": [{"off": 0x1000, "stored": 300}]}
+                        with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                            json.dump(index, f)
+                        with self.assertRaises(ValueError):
+                            restofworld_index.scan_dir(tmp)
+
+    def test_cli_non_number_summary_count_is_one_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, with_index=False)
+            index = {"summary": {"span": None}, "files": [{"off": 0x1000, "stored": 300}]}
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                json.dump(index, f)
+            proc = subprocess.run([sys.executable, "-I", TOOL, tmp, os.path.join(tmp, "report.json"), "--quiet"],
+                                  capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertIn("span", proc.stderr)
+
 
 def _synth_tex_descriptor(gpu_off, w, h, dxgi_fmt, flags_lo=5, mips=1, dtype=0x980, depth=1):
     """Build one synthetic 8-qword RAGE9 texture descriptor (q[k-2]..q[k+5])."""

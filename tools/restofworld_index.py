@@ -381,6 +381,15 @@ def _carve_index(path):
         return {}, {}
 
 
+def _summary_count(value, field):
+    """int() for an index.json summary count. A non-number (null, list, dict) is a ValueError naming the
+    field, which main reports as one line, not the TypeError traceback int() would otherwise raise."""
+    try:
+        return int(value)
+    except TypeError:
+        raise ValueError(f"index.json summary {field} must be a number, not {type(value).__name__}") from None
+
+
 def scan_dir(path, max_inflate=MAX_INFLATE):
     """Index already-carved files. A leading hexadecimal file name supplies the offset.
 
@@ -410,8 +419,9 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
             row["size"] = len(data)
         rows.append(row)
     if carve_stored and "span" in carve_summary:
-        summary = summarise(rows, int(carve_summary["span"]), int(carve_summary.get("zero_padding", 0)),
-                            int(carve_summary.get("unread_bytes", 0)))
+        summary = summarise(rows, _summary_count(carve_summary["span"], "span"),
+                            _summary_count(carve_summary.get("zero_padding", 0), "zero_padding"),
+                            _summary_count(carve_summary.get("unread_bytes", 0), "unread_bytes"))
     else:
         summary = summarise(rows, sum(r["stored"] for r in rows), 0, 0)
     summary.update(mode="directory", directory=path, elapsed_seconds=round(time.time() - t0, 3),
