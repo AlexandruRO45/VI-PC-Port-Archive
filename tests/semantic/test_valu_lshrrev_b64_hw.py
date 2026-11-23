@@ -426,5 +426,48 @@ class TestVLshrrevB64RegisterAliasing(unittest.TestCase):
         self.assertEqual(hw_res, val >> 8)
 
 
+@dataclasses.dataclass(frozen=True)
+class Lshr64StatusFlags:
+    is_zero: bool
+    high_bit: int
+    lost_bits: bool
+    shift_count: int
+
+
+def compute_status_flags(shift_cnt: int, val64: int) -> Lshr64StatusFlags:
+    sh = shift_cnt & 63
+    res = ref_lshrrev_b64(shift_cnt, val64)
+    lost_mask = (1 << sh) - 1 if sh > 0 else 0
+    return Lshr64StatusFlags(
+        is_zero=(res == 0),
+        high_bit=(res >> 63) & 1,
+        lost_bits=((val64 & lost_mask) != 0),
+        shift_count=sh,
+    )
+
+
+class TestVLshrrevB64ConditionCodes(unittest.TestCase):
+    """Condition codes, status flags, and classification."""
+
+    def test_zero_result_flags(self):
+        flags = compute_status_flags(32, 0x00000000FFFFFFFF)
+        self.assertTrue(flags.is_zero)
+        self.assertEqual(flags.high_bit, 0)
+        self.assertTrue(flags.lost_bits)
+
+    def test_high_bit_zero_fill(self):
+        flags = compute_status_flags(1, 0xFFFFFFFFFFFFFFFF)
+        self.assertFalse(flags.is_zero)
+        # Logical right shift always zero-fills high bit when shift > 0
+        self.assertEqual(flags.high_bit, 0)
+        self.assertTrue(flags.lost_bits)
+
+    def test_no_lost_bits(self):
+        flags = compute_status_flags(8, 0x123456789ABCDE00)
+        self.assertFalse(flags.is_zero)
+        self.assertFalse(flags.lost_bits)
+        self.assertEqual(flags.shift_count, 8)
+
+
 if __name__ == "__main__":
     unittest.main()
