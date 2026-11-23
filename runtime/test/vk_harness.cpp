@@ -45,6 +45,8 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -61,7 +63,10 @@ static PFN_vkGetInstanceProcAddr gipa;
 
 static std::vector<uint32_t> read_spv(const char* path) {
     std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error(std::string("cannot read SPIR-V module: ") + path);
     std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
+    if (f.bad() || b.size() < 20)
+        throw std::runtime_error(std::string("cannot read SPIR-V module: ") + path);
     std::vector<uint32_t> w(b.size() / 4);
     std::memcpy(w.data(), b.data(), w.size() * 4);
     return w;
@@ -137,7 +142,7 @@ static bool read_mesh(const char* path, uint32_t stride, std::vector<uint8_t>& v
     return bool(f);
 }
 
-int main(int argc, char** argv) {
+static int run_main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h [clip-test-s0 clip-test-s1]]\n"
                              "       vk_harness ms.spv fs.spv out.raw --mesh-group-readback X Y Z\n");
@@ -1182,4 +1187,13 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "ok %ux%u -> %s\n", W, H, argv[3]);
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return run_main(argc, argv);
+    } catch (const std::runtime_error& e) {
+        std::fprintf(stderr, "ERROR: %s\n", e.what());
+        return 1;
+    }
 }
