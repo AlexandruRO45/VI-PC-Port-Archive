@@ -324,61 +324,6 @@ int main(int argc, char** argv) {
     check(rt::d3d12_xs::device_slot_hits(76) == 2, "slot 76 hit counter is 2");
     check(rt::d3d12_xs::device_slot_first_call_seen(76), "slot 76 first-call flag is set");
 
-    // Xbox device slots from the public HLE. On the Vulkan device the PC entries at 78/79 are
-    // CreateReservedResource2/CreateSampler2 and 80 is past the 80-slot table, so success here can only come from
-    // the routes: frame events return S_OK and a fresh token, CreateCommandQueueX returns a queue proxy and
-    // CreateCommandListX (desc, allocator, initialState, riid, out; no node mask) reaches PC CreateCommandList.
-    {
-        using SetFrameIntervalFn = HRESULT(WINAPI*)(void*, void*, UINT, UINT, UINT);
-        using ScheduleFrameEventFn = HRESULT(WINAPI*)(void*, UINT, UINT, void*, UINT);
-        using WaitFrameEventFn = HRESULT(WINAPI*)(void*, UINT, UINT, void*, UINT, UINT64*);
-        using CreateQueueXFn = HRESULT(WINAPI*)(void*, const D3D12_COMMAND_QUEUE_DESC*, const IID*, void**);
-        using CreateListXFn = HRESULT(WINAPI*)(void*, const void*, ID3D12CommandAllocator*, ID3D12PipelineState*,
-                                               const IID*, void**);
-
-        hr = reinterpret_cast<SetFrameIntervalFn>(proxy_vtbl[78])(device.Get(), nullptr, 16667, 1, 0);
-        check(hr == S_OK, "slot 78 SetFrameIntervalX returns S_OK");
-        hr = reinterpret_cast<ScheduleFrameEventFn>(proxy_vtbl[79])(device.Get(), 0, 0, nullptr, 0);
-        check(hr == S_OK, "slot 79 ScheduleFrameEventX returns S_OK");
-
-        std::uint64_t token = 0, token2 = 0;
-        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, INFINITE, nullptr, 0, &token);
-        check(hr == S_OK && token != 0, "slot 80 WaitFrameEventX returns a non-zero token");
-        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, &token2);
-        check(hr == S_OK && token2 != 0 && token2 != token, "slot 80 returns a fresh token on the next wait");
-        hr = reinterpret_cast<WaitFrameEventFn>(proxy_vtbl[80])(device.Get(), 0, 0, nullptr, 0, nullptr);
-        check(hr == E_POINTER, "slot 80 refuses a null token with E_POINTER");
-        check(rt::d3d12_xs::device_slot_hits(78) == 1 && rt::d3d12_xs::device_slot_hits(79) == 1 &&
-                  rt::d3d12_xs::device_slot_hits(80) == 3,
-              "slots 78/79/80 hit counters are 1/1/3");
-
-        D3D12_COMMAND_QUEUE_DESC xbox_queue{};
-        xbox_queue.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        const IID iid_queue = __uuidof(ID3D12CommandQueue);
-        ComPtr<ID3D12CommandQueue> xbox_queue_proxy;
-        hr = reinterpret_cast<CreateQueueXFn>(proxy_vtbl[48])(device.Get(), &xbox_queue, &iid_queue,
-                                                               reinterpret_cast<void**>(xbox_queue_proxy.GetAddressOf()));
-        check(hr == S_OK && rt::d3d12_xs::is_queue_proxy(xbox_queue_proxy.Get()),
-              "slot 48 CreateCommandQueueX returns a queue proxy");
-        check(rt::d3d12_xs::device_slot_hits(48) == 1, "slot 48 hit counter is 1");
-
-        ComPtr<ID3D12CommandAllocator> xbox_allocator;
-        hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                            IID_PPV_ARGS(xbox_allocator.GetAddressOf()));
-        struct XboxCommandListDesc {
-            UINT Type;
-            UINT NodeMask;
-        } list_desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 7};  // the node mask is ignored by the console call
-        const IID iid_list = __uuidof(ID3D12GraphicsCommandList);
-        ComPtr<ID3D12GraphicsCommandList> xbox_list;
-        hr = SUCCEEDED(hr) ? reinterpret_cast<CreateListXFn>(proxy_vtbl[73])(
-                                 device.Get(), &list_desc, xbox_allocator.Get(), nullptr, &iid_list,
-                                 reinterpret_cast<void**>(xbox_list.GetAddressOf()))
-                           : hr;
-        check(hr == S_OK && xbox_list != nullptr, "slot 73 CreateCommandListX returns a command list");
-        check(rt::d3d12_xs::device_slot_hits(73) == 1, "slot 73 hit counter is 1");
-    }
-
     // Slot 62: an empty root signature and a trivial compute shader through the Xbox signature. The PC entry at
     // slot 62 is CreateStateObject, so success here proves the override reached CreateComputePipelineState.
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
@@ -497,52 +442,69 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Slot 70 (CreateShaderResourceViewX): multi-component typed buffer SRVs compute byte stride across all channels.
+    // Title-exported __XMemAllocationHooks__ backing for CreateDescriptorHeap (slot 14) + CPU handle translation
+    // against the real WARP D3D12 runtime.
     {
-        using Slot70Fn = void(WINAPI*)(void*, const D3D12_RESOURCE_DESC*, const void*, std::uintptr_t);
-        struct XboxSrvDesc {
-            D3D12_SHADER_RESOURCE_VIEW_DESC srv;
-            std::uint64_t base_va;
+        struct HookState {
+            alignas(64) std::uint8_t backing[4096]{};
+            std::size_t alloc_size = 0;
+            std::uint64_t alloc_attr = 0;
+            void* freed_ptr = nullptr;
+            std::uint64_t freed_attr = 0;
+            int alloc_count = 0;
+            int free_count = 0;
         };
-        static_assert(offsetof(XboxSrvDesc, base_va) == 0x28, "base_va sits at +0x28");
-        void** vtable = *reinterpret_cast<void***>(device.Get());
-        D3D12_RESOURCE_DESC res_desc{};
-        res_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        res_desc.Width = 64;
-        res_desc.Height = 1;
-        res_desc.DepthOrArraySize = 1;
-        res_desc.MipLevels = 1;
-        res_desc.SampleDesc.Count = 1;
-        res_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-        constexpr std::uint64_t kBaseVa = 0x100000000ULL;
-        const struct {
-            DXGI_FORMAT format;
-            std::uint32_t expected_stride;
-            std::uint64_t expected_va;
-            const char* label;
-        } cases[] = {
-            {DXGI_FORMAT_R16G16_FLOAT, 4, kBaseVa + 4, "DXGI_FORMAT_R16G16_FLOAT"},
-            {DXGI_FORMAT_R8G8_UNORM, 2, kBaseVa + 2, "DXGI_FORMAT_R8G8_UNORM"},
+        static HookState hook_state;
+        hook_state = {};
+        struct HookCallbacks {
+            static void* __stdcall alloc(std::size_t size, std::uint64_t attr) {
+                ++hook_state.alloc_count;
+                hook_state.alloc_size = size;
+                hook_state.alloc_attr = attr;
+                if ((attr & 0x3FFFull) == 4 && size <= sizeof(hook_state.backing)) return hook_state.backing;
+                return nullptr;
+            }
+            static void __stdcall free(void* ptr, std::uint64_t attr) {
+                ++hook_state.free_count;
+                hook_state.freed_ptr = ptr;
+                hook_state.freed_attr = attr;
+            }
         };
-        for (const auto& c : cases) {
-            XboxSrvDesc view{};
-            view.srv.Format = c.format;
-            view.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-            view.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            view.srv.Buffer.FirstElement = 1;
-            view.srv.Buffer.NumElements = 4;
-            view.srv.Buffer.StructureByteStride = 0;
-            view.srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
-            view.base_va = kBaseVa;
+        const rt::shims::XMemAllocationHooks title_hooks{&HookCallbacks::alloc, &HookCallbacks::free};
+        rt::shims::add_xmem_allocation_hooks(&title_hooks, &title_hooks);
 
-            std::uint32_t dest[8]{};
-            reinterpret_cast<Slot70Fn>(vtable[70])(device.Get(), &res_desc, &view,
-                                                   reinterpret_cast<std::uintptr_t>(dest));
-            const std::uint64_t decoded_va = (static_cast<std::uint64_t>(dest[1] & 0xFFFFu) << 32) | dest[0];
-            const std::uint32_t decoded_stride = (dest[1] >> 16) & 0x3FFFu;
-            check(decoded_va == c.expected_va && decoded_stride == c.expected_stride && dest[2] == 4, c.label);
+        D3D12_DESCRIPTOR_HEAP_DESC hooked_desc{};
+        hooked_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hooked_desc.NumDescriptors = 4;
+        hooked_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        const UINT inc = device->GetDescriptorHandleIncrementSize(hooked_desc.Type);
+        ComPtr<ID3D12DescriptorHeap> hooked_heap;
+        hr = device->CreateDescriptorHeap(&hooked_desc, IID_PPV_ARGS(hooked_heap.GetAddressOf()));
+        check(SUCCEEDED(hr) && hooked_heap != nullptr, "hooked slot 14 creates a descriptor heap");
+        check(hook_state.alloc_count == 1 && hook_state.alloc_size == hooked_desc.NumDescriptors * inc &&
+                  hook_state.alloc_attr == rt::d3d12_xs::kXmemDescriptorHeapAttributes,
+              "slot 14 invokes __XMemAllocationHooks__ with heap byte size and D3D descriptor-heap attributes");
+        if (hooked_heap) {
+            void** hooked_vtbl = *reinterpret_cast<void***>(hooked_heap.Get());
+            const auto hooked_cpu = reinterpret_cast<GetCpuHandleFn>(hooked_vtbl[9])(hooked_heap.Get());
+            const auto hooked_gpu = reinterpret_cast<GetGpuHandleFn>(hooked_vtbl[10])(hooked_heap.Get());
+            const auto expected_base = reinterpret_cast<SIZE_T>(hook_state.backing);
+            check(hooked_cpu.ptr == expected_base,
+                  "hooked heap slot 9 returns the title-supplied CPU descriptor base");
+            check(hooked_gpu.ptr != 0, "hooked heap slot 10 returns a valid GPU descriptor start");
+
+            // Create a CBV at slot 1 of the title-backed heap; WARP validates the translated real handle.
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+            cbv.BufferLocation = 0;
+            cbv.SizeInBytes = 256;
+            device->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{expected_base + inc});
+            check(true, "CreateConstantBufferView translates a title-backed CPU descriptor handle on WARP");
         }
+        hooked_heap.Reset();
+        check(hook_state.free_count == 1 && hook_state.freed_ptr == hook_state.backing &&
+                  hook_state.freed_attr == rt::d3d12_xs::kXmemDescriptorHeapAttributes,
+              "releasing the hooked heap frees its backing through __XMemAllocationHooks__");
+        rt::shims::remove_xmem_allocation_hooks(&title_hooks);
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.

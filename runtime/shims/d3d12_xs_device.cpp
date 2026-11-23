@@ -16,12 +16,6 @@
 // positions (slot 8: desc, riid, out as a1-a3; slot 50: a1-a5; and so on). A tail call then writes back only the
 // values it read from those slots. A helper that moved a word to another stack position would overwrite the title's
 // frame. xs_proxy_mock_test's mock hit this in an optimized build, and its thunks now pass their words by pointer.
-//
-// The public HLE Freminet/ScarlettX reports five more Xbox device slots (a third-party observation, not a Microsoft
-// ABI); the generic thunk routes them before it forwards anything: 48 CreateCommandQueueX, 73 CreateCommandListX,
-// 78 SetFrameIntervalX, 79 ScheduleFrameEventX and 80 WaitFrameEventX. The slots can be moved with LEONIDA_XS_*_SLOT
-// for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
-// behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
@@ -30,23 +24,21 @@
 #include <dxgi1_4.h>
 
 #include <atomic>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <iterator>
-#include <new>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <utility>
 #include <vector>
 
 namespace rt::d3d12_xs {
 namespace {
 
-constexpr unsigned kMaxSlots = 192;
+constexpr unsigned kMaxSlots = 128;
 static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
@@ -64,18 +56,7 @@ struct DeviceProxy {
     DxgiAdapterProvider adapter_provider;
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
-    // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
-    // they start at 1 and only have to be fresh and non-zero for the boot sequence. Waiting returns at once: there is
-    // no vblank source until a presenter exists, and a bounded zero wait cannot stall the first frame.
-    std::atomic<std::uint32_t> frame_interval_us{0};
-    std::atomic<std::uint32_t> frame_latency{1};
-    std::atomic<bool> frame_event_scheduled{false};
-    std::atomic<std::uint64_t> frame_next_token{1};
-    std::atomic<void*> upload_state{nullptr};
 };
-
-void destroy_upload_state(void* upload_state);
-void** get_vtable();
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
 
@@ -85,9 +66,84 @@ struct HeapProxy {
     DeviceProxy* device;    // keeps the Xbox-ABI device alive; GetDevice returns it
     void** real_vtable;
     std::atomic<unsigned long> refs;
-    std::uint64_t xbox_base_va = 0;
-    std::uint64_t xbox_size = 0;
+    // Non-zero when the title's XMem allocation hook supplied the heap's backing address: slot 9 returns
+    // custom_cpu_start and device descriptor calls translate [custom_cpu_start, +custom_byte_size) to real_cpu_start.
+    SIZE_T custom_cpu_start;
+    SIZE_T custom_byte_size;
+    SIZE_T real_cpu_start;
+    DescriptorHeapBackingFree custom_free;
 };
+
+struct DescriptorRange {
+    SIZE_T custom_start;
+    SIZE_T custom_end;  // exclusive
+    SIZE_T real_start;
+    const DeviceProxy* device;
+    const HeapProxy* heap;
+};
+
+// Immortal: late COM Release calls during process teardown may still unregister a heap or check the table.
+std::mutex& descriptor_range_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<DescriptorRange>& descriptor_ranges() {
+    static auto* v = new std::vector<DescriptorRange>;
+    return *v;
+}
+
+std::atomic<std::size_t> g_custom_range_count{0};
+
+std::mutex& heap_alloc_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+DescriptorHeapBackingAlloc g_heap_alloc = nullptr;
+DescriptorHeapBackingFree g_heap_free = nullptr;
+bool g_heap_alloc_explicit = false;
+
+bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap, SIZE_T custom_start,
+                               SIZE_T byte_size, SIZE_T real_start) {
+    if (custom_start == 0 || byte_size == 0 || custom_start > (std::numeric_limits<SIZE_T>::max)() - byte_size)
+        return false;
+    try {
+        std::lock_guard lock(descriptor_range_mutex());
+        descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap});
+        g_custom_range_count.store(descriptor_ranges().size(), std::memory_order_release);
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+}
+
+void unregister_descriptor_range(const HeapProxy* heap) {
+    if (g_custom_range_count.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard lock(descriptor_range_mutex());
+    auto& ranges = descriptor_ranges();
+    for (auto it = ranges.begin(); it != ranges.end();) {
+        if (it->heap == heap) {
+            it = ranges.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    g_custom_range_count.store(ranges.size(), std::memory_order_release);
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_handle(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    if (handle.ptr == 0 || g_custom_range_count.load(std::memory_order_acquire) == 0) return handle;
+    std::lock_guard lock(descriptor_range_mutex());
+    const auto& ranges = descriptor_ranges();
+    for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
+        if (device && it->device != device) continue;
+        if (handle.ptr >= it->custom_start && handle.ptr < it->custom_end) {
+            return D3D12_CPU_DESCRIPTOR_HANDLE{it->real_start + (handle.ptr - it->custom_start)};
+        }
+    }
+    return handle;
+}
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
 std::atomic<bool> g_first[kMaxSlots];
@@ -135,8 +191,15 @@ const char* slot_name(unsigned slot) {
         case 11: return "CreateComputePipelineState (PC slot 11)";
         case 14: return "CreateDescriptorHeap";
         case 16: return "CreateRootSignature";
+        case 17: return "CreateConstantBufferView (CPU handle translated)";
+        case 18: return "CreateShaderResourceView (CPU handle translated)";
+        case 19: return "CreateUnorderedAccessView (CPU handle translated)";
+        case 20: return "CreateRenderTargetView (CPU handle translated)";
+        case 21: return "CreateDepthStencilView (CPU handle translated)";
+        case 22: return "CreateSampler (CPU handle translated)";
+        case 23: return "CopyDescriptors (CPU handles translated)";
+        case 24: return "CopyDescriptorsSimple (CPU handles translated)";
         case 25: return "GetResourceAllocationInfo";
-        case 26: return "GetCustomHeapProperties";
         case 27: return "CreateCommittedResource (PC slot 27)";
         case 31: return "CreateSharedHandle (proxies unwrapped)";
         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
@@ -146,18 +209,11 @@ const char* slot_name(unsigned slot) {
         case 43: return "GetAdapterLuid";
         case 45: return "SetEventOnMultipleFenceCompletion (fence proxies unwrapped)";
         case 46: return "SetResidencyPriority (proxies unwrapped)";
-        case 48: return "Xbox CreateCommandQueueX -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
-        case 70: return "Xbox CreateShaderResourceViewX / PC CreatePlacedResource1";
-        case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
         case 75: return "CreateCommandQueue1 -> queue proxy";
         case 76: return "Xbox resource creation";
-        case 78: return "Xbox SetFrameIntervalX";
-        case 79: return "Xbox ScheduleFrameEventX";
-        case 80: return "Xbox WaitFrameEventX";
-        case 133: return "Xbox CreatePlacedResourceX";
         default: return "forwarded";
     }
 }
@@ -171,78 +227,6 @@ void note_slot(unsigned slot) {
     } else if (slot >= 3 && trace_enabled()) {
         std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) call\n", slot, slot_name(slot));
     }
-}
-
-// Xbox device slots (public HLE Freminet/ScarlettX, an observation, not Microsoft documentation). The defaults are
-// the HLE's; an environment variable that names another slot in 3..127 replaces one (a whole-table move for a trace
-// that disagrees). A value outside that range is logged once and ignored. The table is read once, on the first
-// generic slot call, so a test that wants other slots sets the variables before it creates a device.
-struct XboxDeviceSlotRoutes {
-    unsigned frame_interval = 78;  // SetFrameIntervalX(output, interval_us, latency, flags)
-    unsigned schedule_event = 79;  // ScheduleFrameEventX(event, offset_us, reserved, flags)
-    unsigned wait_event = 80;      // WaitFrameEventX(event, timeout_ms, reserved, flags, &token)
-    unsigned queue_x = 48;         // CreateCommandQueueX(desc, riid, out)
-    unsigned list_x = 73;          // CreateCommandListX(desc, allocator, initial_state, riid, out)
-};
-
-unsigned env_device_slot(const char* name, unsigned fallback) {
-    char value[32] = {};
-    const DWORD length = GetEnvironmentVariableA(name, value, sizeof(value));
-    if (length == 0) return fallback;
-    if (length >= sizeof(value)) {
-        std::fprintf(stderr, "[rt] d3d12_xs: %s is too long for a device slot; the default is kept\n", name);
-        return fallback;
-    }
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long slot = std::strtoul(value, &end, 0);
-    if (errno != 0 || end == value || *end != '\0' || slot < 3 || slot > 127) {
-        std::fprintf(stderr, "[rt] d3d12_xs: %s=%s is not a device slot in 3..127; the default is kept\n", name,
-                     value);
-        return fallback;
-    }
-    return static_cast<unsigned>(slot);
-}
-
-const XboxDeviceSlotRoutes& xbox_device_slot_routes() {
-    static const XboxDeviceSlotRoutes routes = [] {
-        XboxDeviceSlotRoutes r;
-        const unsigned frame_interval = env_device_slot("LEONIDA_XS_FRAME_INTERVAL_SLOT", r.frame_interval);
-        const unsigned schedule_event = env_device_slot("LEONIDA_XS_SCHEDULE_EVENT_SLOT", r.schedule_event);
-        const unsigned wait_event = env_device_slot("LEONIDA_XS_WAIT_EVENT_SLOT", r.wait_event);
-        const unsigned queue_x = env_device_slot("LEONIDA_XS_QUEUE_X_SLOT", r.queue_x);
-        const unsigned list_x = env_device_slot("LEONIDA_XS_LIST_X_SLOT", r.list_x);
-        const bool moved = frame_interval != r.frame_interval || schedule_event != r.schedule_event ||
-                           wait_event != r.wait_event || queue_x != r.queue_x || list_x != r.list_x;
-        r.frame_interval = frame_interval;
-        r.schedule_event = schedule_event;
-        r.wait_event = wait_event;
-        r.queue_x = queue_x;
-        r.list_x = list_x;
-        if (moved)
-            std::fprintf(stderr,
-                         "[rt] d3d12_xs: Xbox device slots: SetFrameIntervalX=%u ScheduleFrameEventX=%u "
-                         "WaitFrameEventX=%u CreateCommandQueueX=%u CreateCommandListX=%u\n",
-                         r.frame_interval, r.schedule_event, r.wait_event, r.queue_x, r.list_x);
-        return r;
-    }();
-    return routes;
-}
-
-// The public HLE call shapes. SetFrameIntervalX's output and flags are unused while there is no output or pacing;
-// ScheduleFrameEventX's reserved event pointer is a3 in the console call and a4 is its flags. The logged words are the
-// caller's, so a trace names the slot even when an override moved it.
-void log_xbox_route_once(unsigned slot, const char* name, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
-                         std::uint64_t a4, std::uint64_t a5) {
-    static std::atomic<bool> logged[kMaxSlots];
-    if (slot >= kMaxSlots) return;
-    bool expected = false;
-    if (!logged[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
-    std::fprintf(stderr,
-                 "[rt] d3d12_xs: device slot %u routed to %s (args 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx)\n", slot,
-                 name, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
-                 static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
-                 static_cast<unsigned long long>(a5));
 }
 
 const char* heap_slot_name(unsigned slot) {
@@ -282,7 +266,6 @@ unsigned long proxy_release(DeviceProxy* self) {
     note_slot(2);
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) {
-        destroy_upload_state(self->upload_state.load(std::memory_order_relaxed));
         ID3D12Device* real = self->real;
         delete self;
         if (real) real->Release();
@@ -495,11 +478,15 @@ unsigned long heap_release(HeapProxy* self) {
     note_heap_slot(2);
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) {
+        if (self->custom_cpu_start != 0) unregister_descriptor_range(self);
+        void* const backing = reinterpret_cast<void*>(self->custom_cpu_start);
+        const DescriptorHeapBackingFree free_fn = self->custom_free;
         ID3D12DescriptorHeap* real = self->real;
         DeviceProxy* device = self->device;
         delete self;
         if (real) real->Release();
         if (device) proxy_release(device);
+        if (backing && free_fn) free_fn(backing, kXmemDescriptorHeapAttributes);
     }
     return refs;
 }
@@ -534,25 +521,23 @@ HRESULT heap_get_device(HeapProxy* self, const IID* riid, void** out) {
 // The PC methods write through the hidden return pointer (RDX) on the measured runtime; the Xbox ABI wants the
 // 8-byte value in RAX. Call with both conventions and keep whichever produced a value, so a runtime that really
 // returns in RAX also works. The extra register is harmless when the callee ignores it.
-D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
-    note_heap_slot(9);
-    if (self->xbox_base_va != 0) {
-        return {static_cast<SIZE_T>(self->xbox_base_va)};
-    }
+D3D12_CPU_DESCRIPTOR_HANDLE raw_heap_get_cpu_handle(ID3D12DescriptorHeap* real, void** real_vtable) {
     constexpr SIZE_T kUnset = ~static_cast<SIZE_T>(0);
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
     handle.ptr = kUnset;
     using Fn = D3D12_CPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE*);
-    const D3D12_CPU_DESCRIPTOR_HANDLE returned =
-        reinterpret_cast<Fn>(self->real_vtable[9])(self->real, &handle);
+    const D3D12_CPU_DESCRIPTOR_HANDLE returned = reinterpret_cast<Fn>(real_vtable[9])(real, &handle);
     return handle.ptr != kUnset ? handle : returned;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
+    note_heap_slot(9);
+    if (self->custom_cpu_start != 0) return D3D12_CPU_DESCRIPTOR_HANDLE{self->custom_cpu_start};
+    return raw_heap_get_cpu_handle(self->real, self->real_vtable);
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self) {
     note_heap_slot(10);
-    if (self->xbox_base_va != 0) {
-        return {self->xbox_base_va};
-    }
     constexpr UINT64 kUnset = ~static_cast<UINT64>(0);
     D3D12_GPU_DESCRIPTOR_HANDLE handle{};
     handle.ptr = kUnset;
@@ -607,7 +592,8 @@ void** get_heap_vtable() {
 }
 
 HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out,
-                          std::uint64_t xbox_base_va = 0, std::uint64_t xbox_size = 0) {
+                          SIZE_T custom_cpu_start = 0, SIZE_T custom_byte_size = 0, SIZE_T real_cpu_start = 0,
+                          DescriptorHeapBackingFree custom_free = nullptr) {
     if (!real || !device) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -619,13 +605,23 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     proxy->device = device;
     proxy->real_vtable = *reinterpret_cast<void***>(real);
     proxy->refs.store(1, std::memory_order_relaxed);
-    proxy->xbox_base_va = xbox_base_va;
-    proxy->xbox_size = xbox_size;
+    proxy->custom_cpu_start = custom_cpu_start;
+    proxy->custom_byte_size = custom_byte_size;
+    proxy->real_cpu_start = real_cpu_start;
+    proxy->custom_free = custom_free;
     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
+
+    if (custom_cpu_start != 0 &&
+        !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size, real_cpu_start)) {
+        delete proxy;
+        proxy_release(device);
+        return E_OUTOFMEMORY;
+    }
 
     const HRESULT hr = heap_query_interface(proxy, &riid, out);
     if (FAILED(hr)) {
         // No reference escaped, and the caller still owns its references to `real` and `device`.
+        if (custom_cpu_start != 0) unregister_descriptor_range(proxy);
         delete proxy;
         proxy_release(device);
         return hr;
@@ -897,14 +893,12 @@ HRESULT child_get_device(ChildProxy* self, const IID* riid, void** out) {
 template <ChildKind K>
 void** get_child_vtable();
 
-IUnknown* list_real_or_null(const void* object);
-
 template <ChildKind K>
 bool is_child_proxy(const void* object) {
     return object && *reinterpret_cast<void* const*>(object) == reinterpret_cast<void*>(get_child_vtable<K>());
 }
 
-// The real object behind a heap, queue, fence, allocator, or console list proxy, or null when `object` is none.
+// The real object behind a heap, queue or fence proxy, or null when `object` is none of them.
 IUnknown* proxy_real_object(const void* object) {
     if (!object) return nullptr;
     void* const vtable = *reinterpret_cast<void* const*>(object);
@@ -913,7 +907,6 @@ IUnknown* proxy_real_object(const void* object) {
         vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::fence>()) ||
         vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::allocator>()))
         return static_cast<const ChildProxy*>(object)->real;
-    if (IUnknown* real = list_real_or_null(object)) return real;
     return nullptr;
 }
 
@@ -1030,12 +1023,6 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
 
-        UnwrappedArray unwrapped;
-        if constexpr (K == ChildKind::queue && Slot == 10) {
-            if (!unwrapped.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
-            if (unwrapped.data()) a2 = unwrapped.data();
-        }
-
         // The PC vtable entry with the real object as `this`; integer/pointer arguments, the hidden struct-return
         // pointer and stack arguments keep their positions, as in the device proxy.
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
@@ -1137,419 +1124,6 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
     return S_OK;
 }
 
-// ---- Console command-list proxy (for CreateCommandListX console IIDs) ----------------------------------------
-
-constexpr unsigned kListSlots = 160;
-constexpr unsigned kListNotForwarded = ~0u;
-constexpr unsigned kConsoleSetDescriptorHeaps = 32;
-constexpr unsigned kConsoleExecuteBundle = 31;
-constexpr unsigned kConsoleBarrier = 146;
-constexpr unsigned kConsoleAllocateUpload = 148;
-
-struct UploadChunk {
-    UploadChunk* next;
-    ID3D12Resource* resource;
-    std::uint8_t* cpu_base;
-    D3D12_GPU_VIRTUAL_ADDRESS gpu_base;
-    std::size_t size;
-    std::size_t used;
-};
-
-struct UploadArena {
-    UploadChunk* chunks = nullptr;
-    std::mutex lock;
-};
-
-constexpr std::size_t kUploadChunkMin = 8 << 20;
-
-UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
-    auto* chunk = new (std::nothrow) UploadChunk{};
-    if (!chunk) return nullptr;
-    chunk->size = size;
-
-    D3D12_HEAP_PROPERTIES heap = {};
-    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = size;
-    desc.Height = 1;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ID3D12Resource* resource = nullptr;
-    const HRESULT hr = device->real->CreateCommittedResource(
-        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-        __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resource));
-    void* cpu = nullptr;
-    if (SUCCEEDED(hr) && resource && SUCCEEDED(resource->Map(0, nullptr, &cpu)) && cpu &&
-        resource->GetGPUVirtualAddress() != 0) {
-        chunk->resource = resource;
-        chunk->cpu_base = static_cast<std::uint8_t*>(cpu);
-        chunk->gpu_base = resource->GetGPUVirtualAddress();
-        return chunk;
-    }
-    if (resource) resource->Release();
-    auto* cpu_fallback = static_cast<std::uint8_t*>(
-        VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!cpu_fallback) {
-        delete chunk;
-        return nullptr;
-    }
-    chunk->cpu_base = cpu_fallback;
-    chunk->gpu_base = reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(cpu_fallback);
-    return chunk;
-}
-
-std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_t alignment) {
-    if (!device || !size) return 0;
-    alignment = alignment < 16 ? 16 : alignment;
-    auto* arena = static_cast<UploadArena*>(device->upload_state.load(std::memory_order_acquire));
-    if (!arena) {
-        auto* fresh = new (std::nothrow) UploadArena;
-        if (!fresh) return 0;
-        void* expected = nullptr;
-        if (device->upload_state.compare_exchange_strong(expected, fresh, std::memory_order_acq_rel))
-            arena = fresh;
-        else {
-            delete fresh;
-            arena = static_cast<UploadArena*>(expected);
-        }
-    }
-    std::lock_guard<std::mutex> lock(arena->lock);
-    const std::size_t need = static_cast<std::size_t>(size);
-    for (UploadChunk* chunk = arena->chunks; chunk; chunk = chunk->next) {
-        const std::size_t aligned = (chunk->used + (alignment - 1)) & ~(static_cast<std::size_t>(alignment) - 1);
-        if (aligned + need <= chunk->size) {
-            chunk->used = aligned + need;
-            return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
-        }
-    }
-    const std::size_t chunk_size = need + alignment > kUploadChunkMin ? need + alignment : kUploadChunkMin;
-    UploadChunk* chunk = upload_chunk_new(device, chunk_size);
-    if (!chunk) {
-        std::fprintf(stderr, "[rt] d3d12_xs: AllocateUploadMemory(%llu, %llu) failed\n",
-                     static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment));
-        return 0;
-    }
-    chunk->next = arena->chunks;
-    arena->chunks = chunk;
-    const std::size_t aligned = (alignment - 1) & ~(static_cast<std::size_t>(alignment) - 1);
-    chunk->used = aligned + need;
-    return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
-}
-
-std::uint64_t upload_translate(DeviceProxy* device, std::uint64_t va) {
-    auto* arena = static_cast<UploadArena*>(
-        device ? device->upload_state.load(std::memory_order_acquire) : nullptr);
-    if (!arena) return va;
-    std::lock_guard<std::mutex> lock(arena->lock);
-    for (UploadChunk* chunk = arena->chunks; chunk; chunk = chunk->next) {
-        const std::uint64_t base = reinterpret_cast<std::uint64_t>(chunk->cpu_base);
-        if (va >= base && va < base + chunk->size) return chunk->gpu_base + (va - base);
-    }
-    return va;
-}
-
-void destroy_upload_state(void* upload_state) {
-    auto* arena = static_cast<UploadArena*>(upload_state);
-    if (!arena) return;
-    for (UploadChunk* chunk = arena->chunks; chunk;) {
-        UploadChunk* next = chunk->next;
-        if (chunk->resource) {
-            chunk->resource->Unmap(0, nullptr);
-            chunk->resource->Release();
-        } else {
-            VirtualFree(chunk->cpu_base, 0, MEM_RELEASE);
-        }
-        delete chunk;
-        chunk = next;
-    }
-    delete arena;
-}
-
-constexpr unsigned console_to_pc_list_slot(unsigned slot) {
-    if (slot <= 26) return slot;
-    if (slot <= 30) return kListNotForwarded;
-    if (slot <= 59) return slot - 4;
-    if (slot == 60) return 58;
-    if (slot == 61) return 59;
-    if (slot == kConsoleBarrier) return 80;
-    return kListNotForwarded;
-}
-
-struct ListProxy {
-    void** vtable;                      // +0x00
-    ID3D12GraphicsCommandList* real;    // +0x08
-    DeviceProxy* device;                // +0x10
-    alignas(8) std::uint8_t console_fields[0x600];
-    std::atomic<unsigned long> refs;
-    unsigned pc_slot_count;
-    std::vector<D3D12_VERTEX_BUFFER_VIEW> vb_scratch;
-    std::vector<D3D12_STREAM_OUTPUT_BUFFER_VIEW> so_scratch;
-
-    void pin_cursor_at_limit() {
-        const std::uint64_t at_limit = static_cast<std::uint64_t>(
-            reinterpret_cast<std::uintptr_t>(this) + 0x18 + 0x500);
-        for (const size_t offset : {0x18, 0x28, 0x30})
-            std::memcpy(reinterpret_cast<std::uint8_t*>(this) + offset, &at_limit, sizeof(at_limit));
-    }
-};
-static_assert(offsetof(ListProxy, console_fields) == 0x18, "the console fields start at +0x18");
-
-std::mutex& console_list_iid_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
-
-std::vector<IID>& console_list_iids() {
-    static auto* v = new std::vector<IID>;
-    return *v;
-}
-
-void register_console_list_iid(const IID& iid) {
-    std::lock_guard<std::mutex> lock(console_list_iid_mutex());
-    for (const IID& known : console_list_iids()) {
-        if (IsEqualIID(known, iid)) return;
-    }
-    console_list_iids().push_back(iid);
-    std::fprintf(stderr,
-                 "[rt] d3d12_xs: console command-list IID {%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}\n",
-                 iid.Data1, iid.Data2, iid.Data3, iid.Data4[0], iid.Data4[1], iid.Data4[2], iid.Data4[3],
-                 iid.Data4[4], iid.Data4[5], iid.Data4[6], iid.Data4[7]);
-}
-
-bool is_console_list_iid(const IID& iid) {
-    std::lock_guard<std::mutex> lock(console_list_iid_mutex());
-    for (const IID& known : console_list_iids()) {
-        if (IsEqualIID(known, iid)) return true;
-    }
-    return false;
-}
-
-bool is_list_iid(const IID& iid) {
-    return IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12Object)) ||
-           IsEqualIID(iid, __uuidof(ID3D12DeviceChild)) || IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList1)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList2)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList3)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList4)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList5)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList6)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList7)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList8));
-}
-
-void note_list_slot(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4) {
-    if (slot >= kListSlots) return;
-    static std::atomic<bool> first[kListSlots];
-    bool expected = false;
-    if (first[slot].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
-        std::fprintf(stderr, "[rt] d3d12_xs: list slot %u first call (args 0x%llx 0x%llx 0x%llx 0x%llx)\n", slot,
-                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
-                     static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
-    }
-}
-
-unsigned long list_add_ref(ListProxy* self) { return self->refs.fetch_add(1, std::memory_order_relaxed) + 1; }
-
-void destroy_list(ListProxy* self) {
-    IUnknown* real = self->real;
-    DeviceProxy* device = self->device;
-    delete self;
-    if (real) real->Release();
-    if (device) proxy_release(device);
-}
-
-unsigned long list_release(ListProxy* self) {
-    const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
-    if (refs == 0) destroy_list(self);
-    return refs;
-}
-
-HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
-    note_list_slot(0, reinterpret_cast<std::uint64_t>(riid), reinterpret_cast<std::uint64_t>(out), 0, 0);
-    if (!out) return E_POINTER;
-    *out = nullptr;
-    if (!riid) return E_POINTER;
-    if (is_console_list_iid(*riid)) {
-        *out = self;
-        list_add_ref(self);
-        return S_OK;
-    }
-    if (!is_list_iid(*riid)) {
-        if (supports_iid(self->real, *riid)) log_refused_iid("list", *riid);
-        return E_NOINTERFACE;
-    }
-    if (!supports_iid(self->real, *riid)) return E_NOINTERFACE;
-    *out = self;
-    list_add_ref(self);
-    return S_OK;
-}
-
-unsigned detect_list_slot_count(IUnknown* real) {
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList8))) return 82;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList7))) return 81;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList6))) return 78;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList5))) return 75;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList4))) return 69;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList3))) return 67;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList2))) return 66;
-    if (supports_iid(real, __uuidof(ID3D12GraphicsCommandList1))) return 65;
-    return 60;
-}
-
-template <unsigned Slot>
-std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
-                               std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
-                               std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
-                               std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
-    if constexpr (Slot == 0) {
-        return hr_to_u64(list_query_interface(self, reinterpret_cast<const IID*>(a1),
-                                              reinterpret_cast<void**>(a2)));
-    } else if constexpr (Slot == 1) {
-        return list_add_ref(self);
-    } else if constexpr (Slot == 2) {
-        return list_release(self);
-    } else if constexpr (Slot == 7) {
-        note_list_slot(7, a1, a2, 0, 0);
-        if (a2) *reinterpret_cast<void**>(a2) = nullptr;
-        if (!a1) return hr_to_u64(E_POINTER);
-        if (!a2) {
-            using Fn = HRESULT(WINAPI*)(IUnknown*, const IID*, void**);
-            return hr_to_u64(reinterpret_cast<Fn>((*reinterpret_cast<void***>(self->real))[7])(
-                self->real, reinterpret_cast<const IID*>(a1), nullptr));
-        }
-        return hr_to_u64(proxy_query_interface(self->device, reinterpret_cast<const IID*>(a1),
-                                               reinterpret_cast<void**>(a2)));
-    } else {
-        note_list_slot(Slot, a1, a2, a3, a4);
-        constexpr unsigned pc = console_to_pc_list_slot(Slot);
-        if constexpr (pc == kListNotForwarded) {
-            if constexpr (Slot == kConsoleAllocateUpload) {
-                return upload_alloc(self->device, a1, a2);
-            } else {
-                return 0;
-            }
-        } else {
-            if (pc >= self->pc_slot_count) {
-                static std::atomic<bool> beyond_warned[kListSlots];
-                bool expected = false;
-                if (beyond_warned[Slot].compare_exchange_strong(expected, true, std::memory_order_relaxed))
-                    std::fprintf(stderr,
-                                 "[rt] d3d12_xs: list slot %u maps to PC slot %u, beyond the real list's %u "
-                                 "slots; returning E_NOTIMPL\n",
-                                 Slot, pc, self->pc_slot_count);
-                return hr_to_u64(E_NOTIMPL);
-            }
-            using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t, std::uint64_t,
-                                                     std::uint64_t, std::uint64_t);
-            auto** const real_vtable = *reinterpret_cast<void***>(self->real);
-            if constexpr (Slot == 10) {
-                a1 = unwrap_object(a1);
-            } else if constexpr (Slot == kConsoleExecuteBundle) {
-                a1 = unwrap_object(a1);
-            } else if constexpr (Slot >= 41 && Slot <= 46) {
-                a2 = upload_translate(self->device, a2);
-            } else if constexpr (Slot == 47) {
-                if (a1) {
-                    auto view = *reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(a1);
-                    view.BufferLocation = upload_translate(self->device, view.BufferLocation);
-                    return reinterpret_cast<ForwardFn>(real_vtable[pc])(
-                        self->real, reinterpret_cast<std::uint64_t>(&view), a2, a3, a4, a5, a6, a7, a8, a9,
-                        a10, a11, a12, a13, a14);
-                }
-            } else if constexpr (Slot == 48) {
-                if (a3 && a2) {
-                    const auto* in = reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(a3);
-                    self->vb_scratch.assign(in, in + a2);
-                    for (auto& view : self->vb_scratch)
-                        view.BufferLocation = upload_translate(self->device, view.BufferLocation);
-                    return reinterpret_cast<ForwardFn>(real_vtable[pc])(
-                        self->real, a1, a2, reinterpret_cast<std::uint64_t>(self->vb_scratch.data()), a4, a5,
-                        a6, a7, a8, a9, a10, a11, a12, a13, a14);
-                }
-            } else if constexpr (Slot == 49) {
-                if (a3 && a2) {
-                    const auto* in = reinterpret_cast<const D3D12_STREAM_OUTPUT_BUFFER_VIEW*>(a3);
-                    self->so_scratch.assign(in, in + a2);
-                    for (auto& view : self->so_scratch) {
-                        view.BufferLocation = upload_translate(self->device, view.BufferLocation);
-                        view.BufferFilledSizeLocation =
-                            upload_translate(self->device, view.BufferFilledSizeLocation);
-                    }
-                    return reinterpret_cast<ForwardFn>(real_vtable[pc])(
-                        self->real, a1, a2, reinterpret_cast<std::uint64_t>(self->so_scratch.data()), a4, a5,
-                        a6, a7, a8, a9, a10, a11, a12, a13, a14);
-                }
-            } else if constexpr (Slot == kConsoleSetDescriptorHeaps) {
-                UnwrappedArray heaps;
-                if (!heaps.fill(a2, a1)) return 0;
-                const std::uint64_t real_heaps = heaps.data() ? heaps.data() : a2;
-                return reinterpret_cast<ForwardFn>(real_vtable[pc])(self->real, a1, real_heaps, a3, a4, a5, a6,
-                                                                  a7, a8, a9, a10, a11, a12, a13, a14);
-            }
-            return reinterpret_cast<ForwardFn>(real_vtable[pc])(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9,
-                                                              a10, a11, a12, a13, a14);
-        }
-    }
-}
-
-template <std::size_t... I>
-void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
-    ((vtable[I] = reinterpret_cast<void*>(&list_slot<static_cast<unsigned>(I)>)), ...);
-}
-
-void** get_list_vtable() {
-    static void** vtable = [] {
-        static void* storage[kListSlots];
-        fill_list_vtable(storage, std::make_index_sequence<kListSlots>{});
-        return storage;
-    }();
-    return vtable;
-}
-
-bool is_list_proxy_impl(const void* list) {
-    return list && *reinterpret_cast<void* const*>(list) == reinterpret_cast<void*>(get_list_vtable());
-}
-
-IUnknown* list_real_or_null(const void* object) {
-    return is_list_proxy_impl(object) ? static_cast<IUnknown*>(static_cast<const ListProxy*>(object)->real)
-                                      : nullptr;
-}
-
-HRESULT wrap_list_console(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
-    if (!created) return E_FAIL;
-    ListProxy* proxy = new (std::nothrow) ListProxy();
-    if (!proxy) {
-        created->Release();
-        return E_OUTOFMEMORY;
-    }
-    proxy->vtable = get_list_vtable();
-    proxy->real = static_cast<ID3D12GraphicsCommandList*>(created);
-    proxy->device = device;
-    proxy->refs.store(1, std::memory_order_relaxed);
-    proxy->pc_slot_count = detect_list_slot_count(created);
-    proxy->pin_cursor_at_limit();
-    proxy_add_ref(device);
-
-    const HRESULT hr = list_query_interface(proxy, riid, out);
-    if (FAILED(hr)) {
-        destroy_list(proxy);
-        return hr;
-    }
-    static std::atomic<bool> logged{false};
-    if (!d3d12_trace::enabled() && (!logged.exchange(true, std::memory_order_relaxed) || trace_enabled()))
-        std::fprintf(stderr, "[rt] d3d12_xs: list proxy %p wraps %p (%u PC vtable slots)\n",
-                     static_cast<void*>(proxy), static_cast<void*>(created), proxy->pc_slot_count);
-    proxy->refs.fetch_sub(1, std::memory_order_relaxed);
-    return S_OK;
-}
-
 // Calls the real device's slot `Slot` with these five words in the positions the thunk received them (see "A thunk
 // declares 14 argument words" at the top: no word may move to another stack position on the way).
 template <unsigned Slot>
@@ -1587,101 +1161,6 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
-}
-
-// Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
-// not used before a presenter exists. The period is a vblank period in microseconds in the public samples (16667 for
-// 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
-HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std::uint64_t interval_us,
-                                   std::uint64_t latency, std::uint64_t flags) {
-    (void)output;
-    (void)flags;
-    self->frame_interval_us.store(static_cast<std::uint32_t>(interval_us), std::memory_order_relaxed);
-    self->frame_latency.store(static_cast<std::uint32_t>(latency ? latency : 1), std::memory_order_relaxed);
-    return S_OK;
-}
-
-// Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
-HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
-                                     std::uint64_t flags) {
-    (void)event;
-    (void)offset_us;
-    (void)flags;
-    self->frame_event_scheduled.store(true, std::memory_order_relaxed);
-    return S_OK;
-}
-
-// Xbox device slot 80 (public HLE): WaitFrameEventX(event, timeout_ms, pEvent, flags, &token). It returns at once with
-// a fresh non-zero token (the first-frame choice): there is no vblank source behind the device before a presenter, and
-// a zero wait cannot stall the title. A null token pointer is E_POINTER, as a _Out_ parameter.
-HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
-                                 std::uint64_t flags, std::uint64_t token_word) {
-    (void)event;
-    (void)timeout_ms;
-    (void)flags;
-    auto* token = reinterpret_cast<std::uint64_t*>(token_word);
-    if (!token) return E_POINTER;
-    std::uint64_t value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
-    if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);  // skip the null token
-    *token = value;
-    return S_OK;
-}
-
-// Xbox device slot 73 (public HLE): CreateCommandListX(desc, allocator, initial_state, riid, out). The console call is
-// not the PC six-argument form: the type is the first word of D3D12XBOX_COMMAND_LIST_DESC and there is no node mask
-// (the HLE passes 0). The second desc word is logged, not interpreted: its public layout is not established.
-HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, std::uint64_t allocator_word,
-                                    std::uint64_t initial_state_word, const IID* riid, void** out) {
-    if (out) *out = nullptr;
-    if (!desc_word || !allocator_word) return E_INVALIDARG;
-    if (!riid) return E_POINTER;
-    if (!out) return E_POINTER;
-
-    std::uint32_t words[2] = {};
-    std::memcpy(words, reinterpret_cast<const void*>(desc_word), sizeof(words));
-    auto type = static_cast<D3D12_COMMAND_LIST_TYPE>(words[0]);
-    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
-        type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY)
-        type = D3D12_COMMAND_LIST_TYPE_DIRECT;  // as the public HLE does
-
-    static std::atomic<bool> logged{false};
-    if (first_call(logged))
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: slot 73 CreateCommandListX desc words 0x%08x 0x%08x -> node mask 0, type %d\n",
-                     words[0], words[1], static_cast<int>(type));
-
-    // Leonida wraps its Vulkan allocators; a PC allocator comes back unwrapped and is passed as it is. Pipeline states
-    // are not wrapped by this proxy, so initial_state is already the real object (a proxy there is passed through too).
-    auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
-    if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
-    auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
-    if (is_list_iid(*riid)) {
-        return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
-    }
-    register_console_list_iid(*riid);
-    void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
-                                                     __uuidof(ID3D12GraphicsCommandList), &created);
-    if (FAILED(hr)) return hr;
-    return wrap_list_console(static_cast<IUnknown*>(created), self, riid, out);
-}
-
-HRESULT proxy_create_command_queue_x(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
-                                     void** out) {
-    if (desc && (static_cast<std::uint32_t>(desc->Flags) &
-                 ~static_cast<std::uint32_t>(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT)) != 0) {
-        D3D12_COMMAND_QUEUE_DESC pc_desc = *desc;
-        pc_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(
-            static_cast<std::uint32_t>(desc->Flags) &
-            static_cast<std::uint32_t>(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT));
-        static std::atomic<bool> logged{false};
-        if (first_call(logged))
-            std::fprintf(stderr, "[rt] d3d12_xs: CreateCommandQueueX type=%d prio=%d flags=0x%x -> 0x%x\n",
-                         static_cast<int>(desc->Type), desc->Priority, static_cast<unsigned>(desc->Flags),
-                         static_cast<unsigned>(pc_desc.Flags));
-        return proxy_create_command_queue(self, &pc_desc, riid, out);
-    }
-    return proxy_create_command_queue(self, desc, riid, out);
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
@@ -1806,30 +1285,6 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
-    std::uint64_t xbox_base_va = 0;
-    std::uint64_t xbox_size = 0;
-    if (desc && !IsBadReadPtr(desc, 32)) {
-        const auto* qwords = reinterpret_cast<const std::uint64_t*>(desc);
-        const std::uint64_t ext0 = qwords[2];
-        const std::uint64_t ext1 = qwords[3];
-        const std::uint64_t count = desc->NumDescriptors;
-        if (ext0 != 0 && (ext0 & 0xFFu) == 0 && (ext1 == count * 32 || ext1 == count * 16)) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQuery(reinterpret_cast<const void*>(ext0), &mbi, sizeof(mbi)) && mbi.State != MEM_FREE) {
-                xbox_base_va = ext0;
-                xbox_size = ext1;
-                static std::atomic<int> heap_logs{0};
-                if (heap_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
-                    std::fprintf(stderr,
-                                 "[rt] d3d12_xs: slot 14 CreateDescriptorHeap type=%u num=%u flags=0x%x "
-                                 "xbox_va=0x%llx size=0x%llx (mbi state=0x%lx prot=0x%lx)\n",
-                                 static_cast<unsigned>(desc->Type), desc->NumDescriptors,
-                                 static_cast<unsigned>(desc->Flags), static_cast<unsigned long long>(xbox_base_va),
-                                 static_cast<unsigned long long>(xbox_size), mbi.State, mbi.Protect);
-                }
-            }
-        }
-    }
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as the PC device does
     if (!riid) return E_POINTER;
     // No output: a capability check, answered by the device (S_FALSE, as on the PC).
@@ -1840,9 +1295,127 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
 
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
-    hr = create_heap_proxy(heap, self, *riid, out, xbox_base_va, xbox_size);
-    if (FAILED(hr)) heap->Release();
+    SIZE_T custom_cpu_start = 0;
+    SIZE_T custom_byte_size = 0;
+    SIZE_T real_cpu_start = 0;
+    DescriptorHeapBackingAlloc alloc_fn = nullptr;
+    DescriptorHeapBackingFree free_fn = nullptr;
+    {
+        std::lock_guard lock(heap_alloc_mutex());
+        alloc_fn = g_heap_alloc;
+        free_fn = g_heap_free;
+    }
+    if (alloc_fn && desc && desc->NumDescriptors > 0) {
+        const UINT inc = self->real->GetDescriptorHandleIncrementSize(desc->Type);
+        if (inc > 0 && desc->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc) {
+            const SIZE_T byte_size = static_cast<SIZE_T>(desc->NumDescriptors) * static_cast<SIZE_T>(inc);
+            void* backing = alloc_fn(byte_size, kXmemDescriptorHeapAttributes);
+            if (backing) {
+                const auto addr = reinterpret_cast<SIZE_T>(backing);
+                if (addr <= (std::numeric_limits<SIZE_T>::max)() - byte_size) {
+                    custom_cpu_start = addr;
+                    custom_byte_size = byte_size;
+                    real_cpu_start = raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr;
+                } else if (free_fn) {
+                    free_fn(backing, kXmemDescriptorHeapAttributes);
+                }
+            }
+        }
+    }
+
+    hr = create_heap_proxy(heap, self, *riid, out, custom_cpu_start, custom_byte_size, real_cpu_start,
+                           custom_cpu_start ? free_fn : nullptr);
+    if (FAILED(hr)) {
+        heap->Release();
+        if (custom_cpu_start && free_fn)
+            free_fn(reinterpret_cast<void*>(custom_cpu_start), kXmemDescriptorHeapAttributes);
+    }
     return hr;
+}
+
+// Device slots 17-24 write or copy descriptors using CPU handles. When a title supplies its own descriptor-heap base
+// via __XMemAllocationHooks__, those handles fall in [custom_start, custom_end) and must be translated back to the
+// underlying PC/Vulkan heap before forwarding.
+void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+                      D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    note_slot(17);
+    self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
+}
+
+void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                      D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    note_slot(18);
+    self->real->CreateShaderResourceView(resource, desc, translate_cpu_handle(self, dest));
+}
+
+void proxy_create_uav(DeviceProxy* self, ID3D12Resource* resource, ID3D12Resource* counter,
+                      const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    note_slot(19);
+    self->real->CreateUnorderedAccessView(resource, counter, desc, translate_cpu_handle(self, dest));
+}
+
+void proxy_create_rtv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
+                      D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    note_slot(20);
+    self->real->CreateRenderTargetView(resource, desc, translate_cpu_handle(self, dest));
+}
+
+void proxy_create_dsv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
+                      D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    note_slot(21);
+    self->real->CreateDepthStencilView(resource, desc, translate_cpu_handle(self, dest));
+}
+
+void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
+    note_slot(22);
+    self->real->CreateSampler(desc, translate_cpu_handle(self, dest));
+}
+
+void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
+                            const UINT* dest_sizes, UINT num_src, const D3D12_CPU_DESCRIPTOR_HANDLE* src_starts,
+                            const UINT* src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    note_slot(23);
+    if (g_custom_range_count.load(std::memory_order_acquire) == 0) {
+        self->real->CopyDescriptors(num_dest, dest_starts, dest_sizes, num_src, src_starts, src_sizes, type);
+        return;
+    }
+    constexpr UINT kInline = 32;
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_inline[kInline];
+    D3D12_CPU_DESCRIPTOR_HANDLE src_inline[kInline];
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> dest_heap;
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> src_heap;
+    const D3D12_CPU_DESCRIPTOR_HANDLE* dest_out = dest_starts;
+    const D3D12_CPU_DESCRIPTOR_HANDLE* src_out = src_starts;
+    try {
+        if (dest_starts && num_dest > 0) {
+            D3D12_CPU_DESCRIPTOR_HANDLE* dst = dest_inline;
+            if (num_dest > kInline) {
+                dest_heap.resize(num_dest);
+                dst = dest_heap.data();
+            }
+            for (UINT i = 0; i < num_dest; ++i) dst[i] = translate_cpu_handle(self, dest_starts[i]);
+            dest_out = dst;
+        }
+        if (src_starts && num_src > 0) {
+            D3D12_CPU_DESCRIPTOR_HANDLE* src = src_inline;
+            if (num_src > kInline) {
+                src_heap.resize(num_src);
+                src = src_heap.data();
+            }
+            for (UINT i = 0; i < num_src; ++i) src[i] = translate_cpu_handle(self, src_starts[i]);
+            src_out = src;
+        }
+    } catch (const std::bad_alloc&) {
+        return;
+    }
+    self->real->CopyDescriptors(num_dest, dest_out, dest_sizes, num_src, src_out, src_sizes, type);
+}
+
+void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE dest_start,
+                                   D3D12_CPU_DESCRIPTOR_HANDLE src_start, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    note_slot(24);
+    self->real->CopyDescriptorsSimple(num_descriptors, translate_cpu_handle(self, dest_start),
+                                      translate_cpu_handle(self, src_start), type);
 }
 
 // The Xbox slot 62 takes two more words between the description and the IID: (desc, w2, w3, riid, out). Measured
@@ -1973,139 +1546,6 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
-// Xbox device slot 133: CreatePlacedResourceX(va, const D3D12_RESOURCE_DESC*, state, clear, riid, out).
-// Stand-in backs the call with a committed DEFAULT-heap resource after masking Xbox flags and mapping state 0xFFFFFFFF
-// to D3D12_RESOURCE_STATE_COMMON.
-HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* xbox_desc,
-                                       D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear_value,
-                                       const IID* riid, void** out) {
-    note_slot(133);
-    if (!out) return E_POINTER;
-    *out = nullptr;
-    if (!xbox_desc || !riid) return E_POINTER;
-
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
-    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
-    const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
-    const auto xbox_state = static_cast<std::uint32_t>(state);
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & 0x3Fu);
-    pc_desc.Alignment = 0;
-    pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-                                                                         : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    const D3D12_RESOURCE_STATES pc_state =
-        xbox_state == 0xFFFFFFFFu ? D3D12_RESOURCE_STATE_COMMON : state;
-    D3D12_HEAP_PROPERTIES default_heap{};
-    default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-    static std::atomic<bool> logged{false};
-    if (first_call(logged)) {
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: slot 133 CreatePlacedResourceX va=0x%llx dim=%d width=%llu flags=0x%x->0x%x "
-                     "layout=0x%x state=0x%x->0x%x\n",
-                     static_cast<unsigned long long>(va), static_cast<int>(pc_desc.Dimension),
-                     static_cast<unsigned long long>(pc_desc.Width), xbox_flags,
-                     static_cast<unsigned>(pc_desc.Flags), xbox_layout, xbox_state,
-                     static_cast<unsigned>(pc_state));
-    }
-    return self->real->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &pc_desc, pc_state, clear_value,
-                                               *riid, out);
-}
-
-bool memory_range_valid(const void* ptr, std::size_t size, bool require_writable) {
-    if (!ptr || reinterpret_cast<std::uintptr_t>(ptr) < 0x10000u) return false;
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(ptr, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
-    if (require_writable) {
-        constexpr DWORD kWriteProt =
-            PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-        if ((mbi.Protect & kWriteProt) == 0) return false;
-    }
-    const auto start = reinterpret_cast<std::uintptr_t>(ptr);
-    const auto region_end = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    return size <= region_end - start;
-}
-
-std::uint32_t typed_buffer_stride(DXGI_FORMAT fmt) {
-    const auto id = static_cast<std::uint32_t>(fmt);
-    if (id >= 1 && id <= 4) return 16;                                // R32G32B32A32_* (4x32)
-    if (id >= 5 && id <= 8) return 12;                                // R32G32B32_* (3x32)
-    if (id >= 9 && id <= 22) return 8;                                // R16G16B16A16_*, R32G32_*, R32G8X24_* (64-bit)
-    if (id >= 23 && id <= 47) return 4;                               // 10/10/10/2, 11/11/10, 4x8, R16G16_*, R32_*, R24G8_*
-    if ((id >= 48 && id <= 52) || (id >= 53 && id <= 59)) return 2;   // R8G8_* (2x8) and R16_* / D16_* (1x16)
-    if (id >= 60 && id <= 65) return 1;                               // R8_* / A8_* (1x8)
-    if ((id >= 67 && id <= 69) || (id >= 87 && id <= 93)) return 4;   // packed 32-bit and B8G8R8{A,X}8_*
-    if ((id >= 85 && id <= 86) || id == 115) return 2;                // B5G6R5, B5G5R5A1, B4G4R4A4
-    return 4;
-}
-
-// Xbox device slot 70: CreateShaderResourceViewX(res_desc, view_desc, dest) where view_desc extends
-// D3D12_SHADER_RESOURCE_VIEW_DESC with base GPU VA at +0x28. Distinguished from PC CreatePlacedResource1 (slot 70)
-// and zero-arg mock probes strictly via register args (a1, a2, a3) without touching unpassed stack slots.
-bool try_create_shader_resource_view_x(DeviceProxy* /*self*/, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3) {
-    if (a1 < 0x10000u || a2 < 0x10000u || a3 < 0x10000u) return false;
-    const auto* res_desc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a1);
-    if (is_heap_proxy(res_desc)) return false;
-
-    auto* dest_ptr = reinterpret_cast<void*>(a3);
-    const auto* view_bytes = reinterpret_cast<const std::uint8_t*>(a2);
-    if (!memory_range_valid(dest_ptr, 32, true)) return false;
-    if (!memory_range_valid(res_desc, sizeof(D3D12_RESOURCE_DESC), false)) return false;
-    if (!memory_range_valid(view_bytes, 0x30, false)) return false;
-    if (res_desc->Dimension < D3D12_RESOURCE_DIMENSION_BUFFER ||
-        res_desc->Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
-        return false;
-    }
-
-    note_slot(70);
-    std::memset(dest_ptr, 0, 32);
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    std::memcpy(&srv, view_bytes, sizeof(srv));
-    std::uint64_t base_va = 0;
-    std::memcpy(&base_va, view_bytes + 0x28, sizeof(base_va));
-
-    if (srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && base_va != 0 && srv.Buffer.NumElements != 0) {
-        std::uint32_t stride = 0;
-        std::uint64_t byte_off = 0;
-        std::uint32_t num_records = 0;
-        constexpr std::uint32_t kGfx10Fmt32Uint = 20u;
-        std::uint32_t oob = 1u;  // structured
-
-        if ((srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0) {
-            stride = 0;
-            byte_off = static_cast<std::uint64_t>(srv.Buffer.FirstElement) * 4ULL;
-            const std::uint64_t byte_size = static_cast<std::uint64_t>(srv.Buffer.NumElements) * 4ULL;
-            num_records = byte_size <= 0xFFFFFFFFULL ? static_cast<std::uint32_t>(byte_size) : 0xFFFFFFFFu;
-            oob = 3u;  // raw
-        } else if (srv.Buffer.StructureByteStride != 0) {
-            stride = srv.Buffer.StructureByteStride;
-            byte_off = static_cast<std::uint64_t>(srv.Buffer.FirstElement) * static_cast<std::uint64_t>(stride);
-            num_records = srv.Buffer.NumElements;
-        } else {
-            stride = typed_buffer_stride(srv.Format);
-            byte_off = static_cast<std::uint64_t>(srv.Buffer.FirstElement) * static_cast<std::uint64_t>(stride);
-            num_records = srv.Buffer.NumElements;
-        }
-
-        const std::uint64_t va = base_va + byte_off;
-        std::uint32_t words[4]{};
-        words[0] = static_cast<std::uint32_t>(va);
-        words[1] = (static_cast<std::uint32_t>(va >> 32) & 0xFFFFu) | ((stride & 0x3FFFu) << 16);
-        words[2] = num_records;
-        words[3] = 0x0FACu | ((kGfx10Fmt32Uint & 0x7Fu) << 12) | ((oob & 0x3u) << 28);
-        std::memcpy(dest_ptr, words, sizeof(words));
-    }
-
-    static std::atomic<bool> logged{false};
-    if (first_call(logged)) {
-        std::fprintf(stderr, "[rt] d3d12_xs: slot 70 CreateShaderResourceViewX dim=%d view_dim=%d dest=0x%llx\n",
-                     static_cast<int>(res_desc->Dimension), static_cast<int>(srv.ViewDimension),
-                     static_cast<unsigned long long>(a3));
-    }
-    return true;
-}
-
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -2139,6 +1579,47 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
             reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 17) {
+        proxy_create_cbv(self, reinterpret_cast<const D3D12_CONSTANT_BUFFER_VIEW_DESC*>(a1),
+                         D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)});
+        return 0;
+    } else if constexpr (Slot == 18) {
+        proxy_create_srv(self, reinterpret_cast<ID3D12Resource*>(a1),
+                         reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(a2),
+                         D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a3)});
+        return 0;
+    } else if constexpr (Slot == 19) {
+        proxy_create_uav(self, reinterpret_cast<ID3D12Resource*>(a1), reinterpret_cast<ID3D12Resource*>(a2),
+                         reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(a3),
+                         D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a4)});
+        return 0;
+    } else if constexpr (Slot == 20) {
+        proxy_create_rtv(self, reinterpret_cast<ID3D12Resource*>(a1),
+                         reinterpret_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(a2),
+                         D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a3)});
+        return 0;
+    } else if constexpr (Slot == 21) {
+        proxy_create_dsv(self, reinterpret_cast<ID3D12Resource*>(a1),
+                         reinterpret_cast<const D3D12_DEPTH_STENCIL_VIEW_DESC*>(a2),
+                         D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a3)});
+        return 0;
+    } else if constexpr (Slot == 22) {
+        proxy_create_sampler(self, reinterpret_cast<const D3D12_SAMPLER_DESC*>(a1),
+                             D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)});
+        return 0;
+    } else if constexpr (Slot == 23) {
+        proxy_copy_descriptors(self, static_cast<UINT>(a1), reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a2),
+                               reinterpret_cast<const UINT*>(a3), static_cast<UINT>(a4),
+                               reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a5),
+                               reinterpret_cast<const UINT*>(a6),
+                               static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(static_cast<UINT>(a7)));
+        return 0;
+    } else if constexpr (Slot == 24) {
+        proxy_copy_descriptors_simple(self, static_cast<UINT>(a1),
+                                      D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)},
+                                      D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a3)},
+                                      static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(static_cast<UINT>(a4)));
+        return 0;
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
@@ -2155,63 +1636,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
-    } else if constexpr (Slot == 26) {
-        // Xbox struct-returning calls pass (return_buffer, this, node_mask, heap_type) instead of (this,
-        // return_buffer, ...). Detect the swapped registers and forward to PC slot 26.
-        const auto* self_ptr = reinterpret_cast<const void*>(self);
-        const auto* a1_ptr = reinterpret_cast<const void*>(a1);
-        if (!(self_ptr && *reinterpret_cast<void* const*>(self_ptr) == reinterpret_cast<void*>(get_vtable())) &&
-            (a1_ptr && *reinterpret_cast<void* const*>(a1_ptr) == reinterpret_cast<void*>(get_vtable()))) {
-            auto* proxy = reinterpret_cast<DeviceProxy*>(a1);
-            const std::uint64_t out_buf = reinterpret_cast<std::uint64_t>(self);
-            note_slot(26);
-            static std::atomic<bool> swapped_logged{false};
-            if (first_call(swapped_logged))
-                std::fprintf(stderr, "[rt] d3d12_xs: slot 26 GetCustomHeapProperties swapped (buf, this) -> PC\n");
-            forward_device<26>(proxy, out_buf, a2, a3, a4, a5);
-            return out_buf;
-        }
-        note_slot(26);
-        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
-        return forward_device<26>(self, a1, a2, a3, a4, a5);
-    } else if constexpr (Slot == 133) {
-        return hr_to_u64(proxy_create_placed_resource_x(
-            self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
-            static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a3)),
-            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4), reinterpret_cast<const IID*>(a5),
-            reinterpret_cast<void**>(a6)));
     } else {
-        if constexpr (Slot == 70) {
-            if (try_create_shader_resource_view_x(self, a1, a2, a3)) return 0;
-        }
         note_slot(Slot);
-        // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
-        // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
-        // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
-        const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
-        if (Slot == routes.frame_interval) {
-            log_xbox_route_once(Slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
-        }
-        if (Slot == routes.schedule_event) {
-            log_xbox_route_once(Slot, "ScheduleFrameEventX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_schedule_frame_event_x(self, a1, a2, a4));
-        }
-        if (Slot == routes.wait_event) {
-            log_xbox_route_once(Slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
-        }
-        if (Slot == routes.queue_x) {
-            log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue_x(
-                self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1), reinterpret_cast<const IID*>(a2),
-                reinterpret_cast<void**>(a3)));
-        }
-        if (Slot == routes.list_x) {
-            log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
-                                                         reinterpret_cast<void**>(a5)));
-        }
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
@@ -2347,6 +1773,25 @@ ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap) {
     return static_cast<const HeapProxy*>(heap)->real;
 }
 
+void set_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free) {
+    std::lock_guard lock(heap_alloc_mutex());
+    g_heap_alloc = alloc;
+    g_heap_free = free;
+    g_heap_alloc_explicit = (alloc != nullptr || free != nullptr);
+}
+
+void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free) {
+    std::lock_guard lock(heap_alloc_mutex());
+    if (g_heap_alloc_explicit) return;
+    g_heap_alloc = alloc;
+    g_heap_free = free;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    const auto* proxy = is_device_proxy(device) ? static_cast<const DeviceProxy*>(device) : nullptr;
+    return translate_cpu_handle(proxy, handle);
+}
+
 unsigned device_proxy_slot_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
     return static_cast<const DeviceProxy*>(device)->slot_count;
@@ -2358,13 +1803,9 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 26 || slot == 31 || slot == 32 || slot == 34 ||
-        slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76 || slot == 133)
-        return true;
-    const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
-    return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
-           slot == routes.queue_x || slot == routes.list_x;
+    return slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 31 ||
+           slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 ||
+           slot == 62 || slot == 67 || slot == 75 || slot == 76;
 }
 
 bool is_queue_proxy(const void* queue) { return is_child_proxy<ChildKind::queue>(queue); }
