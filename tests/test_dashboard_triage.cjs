@@ -113,9 +113,11 @@ function fakeGraphql(nodes, calls) {
     if (query.includes('pullRequests(')) {
       calls.pages++;
       const start = variables.cursor ? Number(variables.cursor) : 0;
-      const page = nodes.slice(start, start + 100);
-      const next = start + 100 < nodes.length;
-      return { ok: true, status: 200, headers, json: async () => ({ data: { repository: { pullRequests: { totalCount: nodes.length, pageInfo: { hasNextPage: next, endCursor: String(start + 100) }, nodes: page } } } }) };
+      const size = variables.first;
+      calls.sizes.push(size);
+      const page = nodes.slice(start, start + size);
+      const next = start + size < nodes.length;
+      return { ok: true, status: 200, headers, json: async () => ({ data: { repository: { pullRequests: { totalCount: nodes.length, pageInfo: { hasNextPage: next, endCursor: String(start + size) }, nodes: page } } } }) };
     }
     calls.bodies++;
     const asked = [...query.matchAll(/pullRequest\(number:(\d+)\)/g)].map(m => Number(m[1]));
@@ -140,7 +142,7 @@ test('the sweep pages through every open PR and reads a body only when its PR ch
   nodes[0] = node(1, { mergeable: 'CONFLICTING', commits: { nodes: [{ commit: { statusCheckRollup: { state: 'FAILURE' } } }] } });
   nodes[1] = node(2, { mergeable: 'UNKNOWN', changedFiles: 140, commits: { nodes: [{ commit: { statusCheckRollup: null } }] } });
   nodes[2] = node(3, { author: null, commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] } });
-  const calls = { pages: 0, bodies: 0, bodyPrs: [] };
+  const calls = { pages: 0, bodies: 0, bodyPrs: [], sizes: [] };
   const ctx = load({ fetch: fakeGraphql(nodes, calls) });
   const { t } = ctx;
   assert.equal(await t.loadGraph(Date.now()), 'done');
@@ -183,7 +185,7 @@ test('the sweep pages through every open PR and reads a body only when its PR ch
 
 test('the PR list is shown even when its descriptions fail to load', async () => {
   const nodes = [node(1), node(2)];
-  const working = fakeGraphql(nodes, { pages: 0, bodies: 0, bodyPrs: [] });
+  const working = fakeGraphql(nodes, { pages: 0, bodies: 0, bodyPrs: [], sizes: [] });
   const ctx = load({ fetch: async (url, init) => (JSON.parse(init.body).query.includes('pullRequests(')
     ? working(url, init) : { ok: false, status: 502, headers: { get: () => null }, json: async () => ({}) }) });
   assert.equal(await ctx.t.loadGraph(Date.now()), 'done');
@@ -200,7 +202,42 @@ test('a failed sweep hands back to the search path and waits before trying again
   assert.equal(await t.loadGraph(Date.now()), 'error');
   assert.equal(t.graphCovers(), false);
   assert.equal(await t.loadGraph(Date.now()), 'error', 'not retried right away');
+  assert.equal(asked, 3, 'one page asked at 100, 50 and 25 PRs, then the sweep gives up');
+  assert.equal(ctx.applied.length, 0);
+});
+
+test('a page GitHub does not answer in time is asked again smaller, from the same place', async () => {
+  const nodes = Array.from({ length: 160 }, (_, i) => node(i + 1));
+  const calls = { pages: 0, bodies: 0, bodyPrs: [], sizes: [] };
+  const working = fakeGraphql(nodes, calls);
+  let failed = 0;
+  const ctx = load({ fetch: async (url, init) => {
+    const { variables } = JSON.parse(init.body);
+    // The second page times out at 100 (no response: the browser's "Failed to fetch") and with a 504 at 50.
+    if (variables && variables.cursor === '100' && variables.first === 100) { failed++; throw new TypeError('Failed to fetch'); }
+    if (variables && variables.cursor === '100' && variables.first === 50) { failed++; return { ok: false, status: 504, headers: { get: () => null }, json: async () => ({}) }; }
+    return working(url, init);
+  } });
+  assert.equal(await ctx.t.loadGraph(Date.now()), 'done');
+  assert.equal(failed, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.sizes)), [100, 25, 100], 'the next page goes back to the full size');
+  assert.equal(ctx.applied[0].length, 160, 'every PR, none twice');
+  assert.equal(new Set(ctx.applied[0].map(p => p.n)).size, 160);
+});
+
+test('an error that a smaller page cannot fix is not retried', async () => {
+  let asked = 0;
+  const ctx = load({ fetch: async () => { asked++; return { ok: false, status: 401, headers: { get: () => null }, json: async () => ({}) }; } });
+  assert.equal(await ctx.t.loadGraph(Date.now()), 'error');
   assert.equal(asked, 1);
+});
+
+test('more open PRs than the sweep covers is an error, not a short list', async () => {
+  const nodes = Array.from({ length: 8100 }, (_, i) => node(i + 1));
+  const calls = { pages: 0, bodies: 0, bodyPrs: [], sizes: [] };
+  const ctx = load({ fetch: fakeGraphql(nodes, calls) });
+  assert.equal(await ctx.t.loadGraph(Date.now()), 'error');
+  assert.equal(calls.pages, 80);
   assert.equal(ctx.applied.length, 0);
 });
 

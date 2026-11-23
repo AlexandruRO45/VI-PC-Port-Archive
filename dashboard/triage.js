@@ -17,8 +17,11 @@
 
 const GRAPH_MS = 2 * 60 * 1000;           // a full sweep this often while the tab is in use
 const GRAPH_RETRY_MS = 5 * 60 * 1000;     // after a failed sweep the search path takes over this long
-const GRAPH_PAGE = 100;
-const GRAPH_MAX_PAGES = 30;               // up to 3,000 open PRs
+// PRs per page, largest first. A page GitHub doesn't answer in time (no response, which a browser reports as
+// "Failed to fetch" because the gateway's error carries no CORS headers, or a 502/503/504) is asked again smaller.
+const GRAPH_PAGE_SIZES = [100, 50, 25];
+const GRAPH_MAX_PRS = 8000;               // past this the sweep reports itself incomplete instead of done
+const GRAPH_TIMEOUT_STATUS = [502, 503, 504];
 const GRAPH_FILES = 100;                  // files per PR; a PR with more can't be placed in a round
 const BODY_BATCH = 50;                    // bodies per GraphQL call
 const BODY_MAX_BATCHES = 25;              // per sweep: the first one fetches every body (about 21 calls)
@@ -169,7 +172,9 @@ async function graphql(query, variables = {}) {
   if (!res.ok) {
     if (res.status === 401) { tokenRefused = true; console.warn('[dashboard] GitHub refused the saved token; continuing without it'); }
     if (res.status === 403 || res.status === 429) noteLimit(res, 'graphql');
-    throw new Error('GitHub answered ' + res.status + ' to GraphQL');
+    const err = new Error('GitHub answered ' + res.status + ' to GraphQL');
+    err.status = res.status;
+    throw err;
   }
   const body = await res.json();
   if (!body.data) throw new Error((body.errors && body.errors[0] && body.errors[0].message) || 'GraphQL answered without data');
@@ -178,8 +183,8 @@ async function graphql(query, variables = {}) {
 }
 
 const [GQL_OWNER, GQL_NAME] = REPO.split('/');
-const PRS_QUERY = `query($owner:String!,$name:String!,$cursor:String){ repository(owner:$owner,name:$name){
-  pullRequests(states:OPEN, first:${GRAPH_PAGE}, after:$cursor, orderBy:{field:CREATED_AT, direction:ASC}){
+const PRS_QUERY = `query($owner:String!,$name:String!,$cursor:String,$first:Int!){ repository(owner:$owner,name:$name){
+  pullRequests(states:OPEN, first:$first, after:$cursor, orderBy:{field:CREATED_AT, direction:ASC}){
     totalCount pageInfo{ hasNextPage endCursor }
     nodes{ number title url isDraft createdAt updatedAt mergeable changedFiles
       author{ login avatarUrl } comments{ totalCount }
@@ -246,6 +251,24 @@ const graphDue = now => !!activeToken() && now - graph.at >= GRAPH_MS && now - g
 /** The search path runs only when there is no token or the sweep has not worked lately. */
 const graphCovers = () => !!activeToken() && graph.ok && Date.now() - graph.failAt >= GRAPH_RETRY_MS;
 
+/** A failure that a smaller page may get past: no response at all, or a gateway timeout. */
+const timedOut = e => !!e && (e.name === 'TypeError' || GRAPH_TIMEOUT_STATUS.includes(e.status));
+
+/** One page of open PRs after `cursor`, asked again with fewer PRs when GitHub doesn't answer in time. */
+async function prPage(cursor) {
+  for (let i = 0; ; i++) {
+    try {
+      const data = await graphql(PRS_QUERY, { owner: GQL_OWNER, name: GQL_NAME, cursor, first: GRAPH_PAGE_SIZES[i] });
+      const prs = data.repository && data.repository.pullRequests;
+      if (!prs) throw new Error('GraphQL returned no pull requests');
+      return prs;
+    } catch (e) {
+      if (!timedOut(e) || i === GRAPH_PAGE_SIZES.length - 1) throw e;
+      console.warn(`[dashboard] GraphQL page of ${GRAPH_PAGE_SIZES[i]} PRs got no answer in time; asking for ${GRAPH_PAGE_SIZES[i + 1]}`, e);
+    }
+  }
+}
+
 /** Sweep every open PR when due. Returns 'off' (no token), 'idle' (not due), 'done' or 'error'. */
 async function loadGraph(now) {
   if (!activeToken()) return 'off';
@@ -253,15 +276,15 @@ async function loadGraph(now) {
   const nodes = [];
   try {
     let cursor = null;
-    for (let page = 0; page < GRAPH_MAX_PAGES; page++) {
-      const data = await graphql(PRS_QUERY, { owner: GQL_OWNER, name: GQL_NAME, cursor });
-      const prs = data.repository && data.repository.pullRequests;
-      if (!prs) throw new Error('GraphQL returned no pull requests');
+    let page = 0;
+    for (;;) {
+      const prs = await prPage(cursor);
       nodes.push(...prs.nodes.filter(Boolean));
-      graph.pages = page + 1;
+      graph.pages = ++page;
       if (!prs.pageInfo.hasNextPage) break;
+      if (nodes.length >= GRAPH_MAX_PRS) throw new Error(`more than ${GRAPH_MAX_PRS} open PRs; the sweep stops there`);
       cursor = prs.pageInfo.endCursor;
-      graphProgress('open PRs', page + 1, Math.ceil(prs.totalCount / GRAPH_PAGE));
+      graphProgress('open PRs', page, page + Math.ceil(Math.max(0, prs.totalCount - nodes.length) / GRAPH_PAGE_SIZES[0]));
     }
   } catch (e) {
     console.error('[dashboard] GraphQL sweep failed; the search path takes over for now', e);
