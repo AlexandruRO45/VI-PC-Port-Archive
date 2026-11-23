@@ -11,6 +11,9 @@
 // room for both push-constant layouts: with the 144-byte VS, and with its --pc-tail-ubo twin (vs_fullscreen.vert
 // compiled with -DPC_TAIL, 128 bytes) on a layer device limited to 128 bytes, the Vulkan minimum. A device below 144
 // bytes cannot build the 144-byte PSO and runs the twin alone (TEST-613). Each is compared with the host.
+// No stage of the twin has a pc_tail (the VS reads neither heap nor code base, the pixel shaders declare no push
+// constants), so this test narrows the push-constant range only; the set-1 block is covered by d3d12_draw_test and
+// d3d12_bundle.
 // A view format the layer does not map yet (its CheckFeatureSupport gives no RENDER_TARGET) is reported and skipped,
 // so the R8 family and the 16-bit integer and normalized formats are covered as soon as their mapping lands.
 // Synthetic data only. LEONIDA_VK_VALIDATION=1 runs it under VK_LAYER_KHRONOS_validation.
@@ -283,11 +286,12 @@ int main() {
     }
     info.shader_dir = library.string();
     // The --pc-tail-ubo twin: the same pixel shaders (they declare no push constants) with the 128-byte VS.
-    const auto tail_library = std::filesystem::temp_directory_path() / "leonida_typeless_families_test_tail";
-    std::filesystem::create_directories(tail_library);
-    std::filesystem::copy_file(LEONIDA_TYPELESS_VS_TAIL_SPV, tail_library / "vs.spv", overwrite);
-    std::filesystem::copy_file(LEONIDA_TYPELESS_PS_FLOAT_SPV, tail_library / "ps_float.spv", overwrite);
-    std::filesystem::copy_file(LEONIDA_TYPELESS_PS_UINT_SPV, tail_library / "ps_uint.spv", overwrite);
+    const testfiles::ScratchDir tail_scratch("leonida_typeless_families_test_tail");
+    const auto& tail_library = tail_scratch.path();
+    if (!testfiles::copy_file(LEONIDA_TYPELESS_VS_TAIL_SPV, tail_library / "vs.spv") ||
+        !testfiles::copy_file(LEONIDA_TYPELESS_PS_FLOAT_SPV, tail_library / "ps_float.spv") ||
+        !testfiles::copy_file(LEONIDA_TYPELESS_PS_UINT_SPV, tail_library / "ps_uint.spv"))
+        return 1;
     {
         std::ofstream index(tail_library / "index.json", std::ios::binary);
         index << "{\"vs\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
@@ -302,8 +306,15 @@ int main() {
     limited.max_push_constants_size = 128;
     limited.push_constants_need_fallback = true;
     Ref<ID3D12Device> ours_tail;
-    if (FAILED(rt::d3d12::create_vulkan_device(limited, IID_PPV_ARGS(&ours_tail.p)))) return 1;
-    if (!rt::d3d12::device_push_constants_need_fallback(ours_tail.p)) return 1;
+    if (const HRESULT hr = rt::d3d12::create_vulkan_device(limited, IID_PPV_ARGS(&ours_tail.p)); FAILED(hr)) {
+        std::fprintf(stderr, "the layer device limited to 128 push-constant bytes could not be created: 0x%08lx\n",
+                     static_cast<unsigned long>(hr));
+        return 1;
+    }
+    if (!rt::d3d12::device_push_constants_need_fallback(ours_tail.p)) {
+        std::fprintf(stderr, "the layer device limited to 128 push-constant bytes does not report the fallback\n");
+        return 1;
+    }
 #endif
     Ref<ID3D12Device> ours, host, warp;
     std::string adapter;
