@@ -888,6 +888,7 @@ public:
                         ? (in.ppGeometryDescs ? in.ppGeometryDescs[i] : nullptr)
                         : (in.pGeometryDescs ? &in.pGeometryDescs[i] : nullptr);
                 if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) return check(false);
+                if (gd->Triangles.VertexBuffer.StrideInBytes > UINT32_MAX) return check(false);
                 leonida::RtTriangleGeometry t{};
                 t.vertex_va = gd->Triangles.VertexBuffer.StartAddress;
                 t.vertex_count = gd->Triangles.VertexCount;
@@ -905,10 +906,22 @@ public:
                 }
                 t.index_va = gd->Triangles.IndexBuffer;
                 t.index_count = gd->Triangles.IndexCount;
-                if (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)
+                switch (gd->Triangles.IndexFormat) {
+                case DXGI_FORMAT_UNKNOWN:
+                    if (t.index_count != 0 || t.index_va != 0) return check(false);
+                    t.index_type = 0;
+                    break;
+                case DXGI_FORMAT_R16_UINT:
+                    if (!t.index_va || (t.index_va % 2) != 0) return check(false);
                     t.index_type = 1;
-                else if (gd->Triangles.IndexFormat == DXGI_FORMAT_R32_UINT)
+                    break;
+                case DXGI_FORMAT_R32_UINT:
+                    if (!t.index_va || (t.index_va % 4) != 0) return check(false);
                     t.index_type = 2;
+                    break;
+                default:
+                    return check(false);
+                }
                 t.transform_va = gd->Triangles.Transform3x4;
                 t.opaque = (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) != 0;
                 t.flags = static_cast<std::uint32_t>(gd->Flags);

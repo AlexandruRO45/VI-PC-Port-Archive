@@ -94,9 +94,11 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
         return 77;
     }
 
-    Ref<ID3D12Resource> vb, inst_buf, scratch, blas_buf, tlas_buf, src_as, post_buf;
+    Ref<ID3D12Resource> vb, ib, inst_buf, scratch, blas_buf, tlas_buf, src_as, post_buf;
     if (!make_buffer(dev.p, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                      D3D12_RESOURCE_STATE_GENERIC_READ, vb) ||
+        !make_buffer(dev.p, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                     D3D12_RESOURCE_STATE_GENERIC_READ, ib) ||
         !make_buffer(dev.p, 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                      D3D12_RESOURCE_STATE_GENERIC_READ, inst_buf) ||
         !make_buffer(dev.p, 262144, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -113,7 +115,7 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
         return 1;
     }
 
-    // Upload a single valid triangle and a single valid TLAS instance.
+    // Upload a single valid triangle, valid 16-bit and 32-bit index buffers, and a single valid TLAS instance.
     {
         float* verts = nullptr;
         D3D12_RANGE no_read{0, 0};
@@ -122,6 +124,15 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
         std::memcpy(verts, tri_verts, sizeof(tri_verts));
         D3D12_RANGE written{0, sizeof(tri_verts)};
         vb->Unmap(0, &written);
+
+        std::uint8_t* idxs = nullptr;
+        if (FAILED(ib->Map(0, &no_read, reinterpret_cast<void**>(&idxs))) || !idxs) return 1;
+        const std::uint16_t idx16[3] = {0, 1, 2};
+        const std::uint32_t idx32[3] = {0, 1, 2};
+        std::memcpy(idxs, idx16, sizeof(idx16));
+        std::memcpy(idxs + 16, idx32, sizeof(idx32));
+        D3D12_RANGE ib_written{0, 16 + sizeof(idx32)};
+        ib->Unmap(0, &ib_written);
 
         D3D12_RAYTRACING_INSTANCE_DESC* inst = nullptr;
         if (FAILED(inst_buf->Map(0, &no_read, reinterpret_cast<void**>(&inst))) || !inst) return 1;
@@ -136,6 +147,7 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
     }
 
     const D3D12_GPU_VIRTUAL_ADDRESS vb_va = vb->GetGPUVirtualAddress();
+    const D3D12_GPU_VIRTUAL_ADDRESS ib_va = ib->GetGPUVirtualAddress();
     const D3D12_GPU_VIRTUAL_ADDRESS inst_va = inst_buf->GetGPUVirtualAddress();
     const D3D12_GPU_VIRTUAL_ADDRESS scr_va = scratch->GetGPUVirtualAddress();
     const D3D12_GPU_VIRTUAL_ADDRESS blas_va = blas_buf->GetGPUVirtualAddress();
@@ -228,6 +240,23 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
         uav.UAV.pResource = blas_buf.p;
         cl->ResourceBarrier(1, &uav);
 
+        // Also execute valid indexed BLAS builds (R16_UINT and R32_UINT) on the GPU.
+        D3D12_RAYTRACING_GEOMETRY_DESC tri_r16 = tri;
+        tri_r16.Triangles.IndexFormat = DXGI_FORMAT_R16_UINT;
+        tri_r16.Triangles.IndexCount = 3;
+        tri_r16.Triangles.IndexBuffer = ib_va;
+        blas_desc.Inputs.pGeometryDescs = &tri_r16;
+        cl->BuildRaytracingAccelerationStructure(&blas_desc, 0, nullptr);
+        cl->ResourceBarrier(1, &uav);
+
+        D3D12_RAYTRACING_GEOMETRY_DESC tri_r32 = tri;
+        tri_r32.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+        tri_r32.Triangles.IndexCount = 3;
+        tri_r32.Triangles.IndexBuffer = ib_va + 16;
+        blas_desc.Inputs.pGeometryDescs = &tri_r32;
+        cl->BuildRaytracingAccelerationStructure(&blas_desc, 0, nullptr);
+        cl->ResourceBarrier(1, &uav);
+
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlas_desc{};
         tlas_desc.DestAccelerationStructureData = tlas_va;
         tlas_desc.ScratchAccelerationStructureData = scr_va;
@@ -302,6 +331,88 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
                 d.SourceAccelerationStructureData = src_va + 128;
                 cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
             })) return 1;
+
+        // Triangle geometry valid recording parity (non-indexed, R16/R32 indexed, StrideInBytes=0/UINT32_MAX,
+        // and unsupported VertexFormat deferred to replay).
+        if (!expect_ok("Build BLAS non-indexed UNKNOWN cnt=0 ib=0", [&](ID3D12GraphicsCommandList4* cl) {
+                auto g = tri;
+                auto d = valid_blas_desc();
+                d.Inputs.pGeometryDescs = &g;
+                cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+            })) return 1;
+
+        if (!expect_ok("Build BLAS indexed R16_UINT aligned+2", [&](ID3D12GraphicsCommandList4* cl) {
+                auto g = tri;
+                g.Triangles.IndexFormat = DXGI_FORMAT_R16_UINT;
+                g.Triangles.IndexCount = 3;
+                g.Triangles.IndexBuffer = ib_va + 2;
+                auto d = valid_blas_desc();
+                d.Inputs.pGeometryDescs = &g;
+                cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+            })) return 1;
+
+        if (!expect_ok("Build BLAS indexed R32_UINT aligned+4", [&](ID3D12GraphicsCommandList4* cl) {
+                auto g = tri;
+                g.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+                g.Triangles.IndexCount = 3;
+                g.Triangles.IndexBuffer = ib_va + 4;
+                auto d = valid_blas_desc();
+                d.Inputs.pGeometryDescs = &g;
+                cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+            })) return 1;
+
+        if (!expect_ok("Build BLAS indexed R16_UINT cnt=0 valid ib", [&](ID3D12GraphicsCommandList4* cl) {
+                auto g = tri;
+                g.Triangles.IndexFormat = DXGI_FORMAT_R16_UINT;
+                g.Triangles.IndexCount = 0;
+                g.Triangles.IndexBuffer = ib_va;
+                auto d = valid_blas_desc();
+                d.Inputs.pGeometryDescs = &g;
+                cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+            })) return 1;
+
+        if (!expect_ok("Build BLAS indexed R32_UINT cnt=0 valid ib", [&](ID3D12GraphicsCommandList4* cl) {
+                auto g = tri;
+                g.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+                g.Triangles.IndexCount = 0;
+                g.Triangles.IndexBuffer = ib_va;
+                auto d = valid_blas_desc();
+                d.Inputs.pGeometryDescs = &g;
+                cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+            })) return 1;
+
+        if (!expect_ok("Build BLAS StrideInBytes=0", [&](ID3D12GraphicsCommandList4* cl) {
+                auto g = tri;
+                g.Triangles.VertexBuffer.StrideInBytes = 0;
+                auto d = valid_blas_desc();
+                d.Inputs.pGeometryDescs = &g;
+                cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+            })) return 1;
+
+        if (!expect_ok("Build BLAS StrideInBytes=UINT32_MAX", [&](ID3D12GraphicsCommandList4* cl) {
+                auto g = tri;
+                g.Triangles.VertexBuffer.StrideInBytes = UINT32_MAX;
+                auto d = valid_blas_desc();
+                d.Inputs.pGeometryDescs = &g;
+                cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+            })) return 1;
+
+        if (!expect_ok("Build BLAS VertexFormat=UNKNOWN (deferred to replay)", [&](ID3D12GraphicsCommandList4* cl) {
+                auto g = tri;
+                g.Triangles.VertexFormat = DXGI_FORMAT_UNKNOWN;
+                auto d = valid_blas_desc();
+                d.Inputs.pGeometryDescs = &g;
+                cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+            })) return 1;
+
+        if (!expect_ok("Build BLAS VertexFormat=R8G8B8A8_UNORM (deferred to replay)",
+                       [&](ID3D12GraphicsCommandList4* cl) {
+                           auto g = tri;
+                           g.Triangles.VertexFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+                           auto d = valid_blas_desc();
+                           d.Inputs.pGeometryDescs = &g;
+                           cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+                       })) return 1;
 
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE info_types[] = {
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
@@ -523,6 +634,165 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
             d.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
                              D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
             d.SourceAccelerationStructureData = src_va + 128;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    // Triangle geometry IndexFormat, index buffer/count pairing, and StrideInBytes rejections
+    if (!expect_fail("Build BLAS invalid IndexFormat=R8_UINT", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_R8_UINT;
+            g.Triangles.IndexCount = 3;
+            g.Triangles.IndexBuffer = ib_va;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS invalid IndexFormat=R32_FLOAT", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_R32_FLOAT;
+            g.Triangles.IndexCount = 3;
+            g.Triangles.IndexBuffer = ib_va;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS invalid IndexFormat=R8_UINT cnt=0 ib=0", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_R8_UINT;
+            g.Triangles.IndexCount = 0;
+            g.Triangles.IndexBuffer = 0;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS IndexFormat=UNKNOWN cnt=3 ib=0", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN;
+            g.Triangles.IndexCount = 3;
+            g.Triangles.IndexBuffer = 0;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS IndexFormat=UNKNOWN cnt=3 ib=valid", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN;
+            g.Triangles.IndexCount = 3;
+            g.Triangles.IndexBuffer = ib_va;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS IndexFormat=UNKNOWN cnt=0 ib=valid", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN;
+            g.Triangles.IndexCount = 0;
+            g.Triangles.IndexBuffer = ib_va;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS IndexFormat=R16_UINT cnt=3 ib=0", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_R16_UINT;
+            g.Triangles.IndexCount = 3;
+            g.Triangles.IndexBuffer = 0;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS IndexFormat=R16_UINT cnt=0 ib=0", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_R16_UINT;
+            g.Triangles.IndexCount = 0;
+            g.Triangles.IndexBuffer = 0;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS IndexFormat=R16_UINT ib+1 misaligned", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_R16_UINT;
+            g.Triangles.IndexCount = 3;
+            g.Triangles.IndexBuffer = ib_va + 1;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS IndexFormat=R32_UINT cnt=3 ib=0", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+            g.Triangles.IndexCount = 3;
+            g.Triangles.IndexBuffer = 0;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS IndexFormat=R32_UINT cnt=0 ib=0", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+            g.Triangles.IndexCount = 0;
+            g.Triangles.IndexBuffer = 0;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS IndexFormat=R32_UINT ib+2 misaligned", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+            g.Triangles.IndexCount = 3;
+            g.Triangles.IndexBuffer = ib_va + 2;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS StrideInBytes=0x100000004ULL > UINT32_MAX", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.VertexBuffer.StrideInBytes = 0x100000004ULL;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS StrideInBytes=0x100000000ULL > UINT32_MAX", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.VertexBuffer.StrideInBytes = 0x100000000ULL;
+            auto d = valid_blas_desc();
+            d.Inputs.pGeometryDescs = &g;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS ARRAY_OF_POINTERS invalid IndexFormat", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.IndexFormat = DXGI_FORMAT_R8_UINT;
+            g.Triangles.IndexCount = 3;
+            g.Triangles.IndexBuffer = ib_va;
+            const D3D12_RAYTRACING_GEOMETRY_DESC* ptr = &g;
+            auto d = valid_blas_desc();
+            d.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
+            d.Inputs.ppGeometryDescs = &ptr;
+            cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
+        })) return 1;
+
+    if (!expect_fail("Build BLAS ARRAY_OF_POINTERS StrideInBytes > UINT32_MAX", [&](ID3D12GraphicsCommandList4* cl) {
+            auto g = tri;
+            g.Triangles.VertexBuffer.StrideInBytes = 0x100000004ULL;
+            const D3D12_RAYTRACING_GEOMETRY_DESC* ptr = &g;
+            auto d = valid_blas_desc();
+            d.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
+            d.Inputs.ppGeometryDescs = &ptr;
             cl->BuildRaytracingAccelerationStructure(&d, 0, nullptr);
         })) return 1;
 
