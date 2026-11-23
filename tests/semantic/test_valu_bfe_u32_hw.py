@@ -233,5 +233,61 @@ class TestVBfeU32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(mach.vgprs[2], 0xB)
 
 
+class SimdWave:
+    def __init__(self, size: int = 32):
+        self.size = size
+        self.exec_mask: int = (1 << size) - 1
+        self.lanes: list[dict[int, int]] = [{i: 0 for i in range(32)} for _ in range(size)]
+
+    def step_bfe(self, dst_idx: int, s0_idx: int, s1_idx: int, s2_idx: int):
+        for lane in range(self.size):
+            if self.exec_mask & (1 << lane):
+                s0 = self.lanes[lane].get(s0_idx, 0)
+                s1 = self.lanes[lane].get(s1_idx, 0)
+                s2 = self.lanes[lane].get(s2_idx, 0)
+                self.lanes[lane][dst_idx] = ref_bfe_u32(s0, s1, s2)
+
+
+class TestVBfeU32SIMDDivergence(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_divergent_offsets(self):
+        wave = SimdWave(32)
+        base_val = 0x89ABCDEF
+        for lane in range(32):
+            wave.lanes[lane][1] = base_val
+            wave.lanes[lane][2] = lane
+            wave.lanes[lane][3] = 4
+            wave.lanes[lane][0] = 0xAA
+
+        wave.exec_mask = 0x55555555
+        wave.step_bfe(0, 1, 2, 3)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                expected = ref_bfe_u32(base_val, lane, 4)
+                self.assertEqual(wave.lanes[lane][0], expected)
+            else:
+                self.assertEqual(wave.lanes[lane][0], 0xAA)
+
+    def test_wave64_divergence_and_exec_boundary(self):
+        wave = SimdWave(64)
+        for lane in range(64):
+            wave.lanes[lane][1] = (lane * 0x11111111) & MASK32
+            wave.lanes[lane][2] = (lane * 3) & 31
+            wave.lanes[lane][3] = ((lane % 8) + 1)
+            wave.lanes[lane][0] = 0xFFFFFFFF
+
+        wave.exec_mask = 0xFFFFFFFF00000000
+        wave.step_bfe(0, 1, 2, 3)
+
+        for lane in range(64):
+            if lane >= 32:
+                expected = ref_bfe_u32(wave.lanes[lane][1], wave.lanes[lane][2], wave.lanes[lane][3])
+                self.assertEqual(wave.lanes[lane][0], expected)
+            else:
+                self.assertEqual(wave.lanes[lane][0], 0xFFFFFFFF)
+
+
 if __name__ == '__main__':
     unittest.main()
