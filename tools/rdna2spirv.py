@@ -12844,7 +12844,7 @@ class Gen:
             if off is not None and TEXEL_OFFSET_FALLBACK:
                 fb_lod = bias_lod if (not implicit and kind in ("_b", "_c_b")) else lod
                 uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, fb_lod, bias,
-                                                       a[3])
+                                                       a[3], grads=grads, minlod=minlod)
                 off = None
 
             def opnd(mask, args):
@@ -13652,11 +13652,13 @@ class Gen:
         self.emit(f"{r} = OpFAdd %float {s} {m2}")
         return r
 
-    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, s_op):
+    def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, s_op,
+                          grads=None, minlod=None):
         """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
 
         The level is 0 for _lz / _c_lz (and for implicit samples outside the PS, which sample LOD 0), the given LOD
-        for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), rounded the way the S#'s
+        for _l, explicit-gradient LOD log2(max(length(dx * size0), length(dy * size0))) (clamped by minlod for _cl)
+        for _d / _c_d, and OpImageQueryLod's for implicit samples (plus the bias for _b), rounded the way the S#'s
         MIP_FILTER (word 2 [27:26]) selects a level and clamped to the image's levels: floored for linear, nearest
         with a tie rounding up (floor(lod + 0.5), as an RTX 5070 samples LOD 0.5 at mip 1 and image_query_probe.py
         records for RDNA2) for point and for the value 3, which the runtime also samples as nearest, and 0 for
@@ -13674,6 +13676,7 @@ class Gen:
         spatial = n_off                                   # 1D: 1, 2D / 2D array: 2, 3D: 3 (array layer excluded)
         vf = {1: "%float", 2: "%v2float", 3: "%v3float"}[spatial]
         vi = {1: "%int", 2: "%v2int", 3: "%v3int"}[spatial]
+        qtype = "%int" if ncoord == 1 else "%v3int" if ncoord == 3 else "%v2int"
         uvs = uv
         if ncoord > spatial:                              # 2D array: the spatial part of (u, v, layer)
             uvs = self.tmp()
@@ -13692,6 +13695,34 @@ class Gen:
                 level_f = qb
         elif kind in ("_b", "_c_b"):
             level_f = lod if lod is not None else bias
+        elif kind in ("_d", "_c_d") and grads is not None:
+            sz0 = self.tmp()
+            self.emit(f"{sz0} = OpImageQuerySizeLod {qtype} {img} {ci(0)}")
+            if qtype == "%v3int" and spatial == 2:
+                sz0s = self.tmp()
+                self.emit(f"{sz0s} = OpVectorShuffle %v2int {sz0} {sz0} 0 1")
+                sz0 = sz0s
+            sz0f, tdx, tdy, px, py, rho, rpos, lam = (
+                self.tmp(), self.tmp(), self.tmp(), self.tmp(),
+                self.tmp(), self.tmp(), self.tmp(), self.tmp(),
+            )
+            self.emit(f"{sz0f} = OpConvertSToF {vf} {sz0}")
+            self.emit(f"{tdx} = OpFMul {vf} {grads[0]} {sz0f}")
+            self.emit(f"{tdy} = OpFMul {vf} {grads[1]} {sz0f}")
+            if spatial == 1:
+                self.emit(f"{px} = OpExtInst %float %glsl FAbs {tdx}")
+                self.emit(f"{py} = OpExtInst %float %glsl FAbs {tdy}")
+            else:
+                self.emit(f"{px} = OpExtInst %float %glsl Length {tdx}")
+                self.emit(f"{py} = OpExtInst %float %glsl Length {tdy}")
+            self.emit(f"{rho} = OpExtInst %float %glsl FMax {px} {py}")
+            self.emit(f"{rpos} = OpExtInst %float %glsl FMax {rho} {self.tof(self.cu(0x00800000))}")
+            self.emit(f"{lam} = OpExtInst %float %glsl Log2 {rpos}")
+            if minlod is not None:
+                lam_c = self.tmp()
+                self.emit(f"{lam_c} = OpExtInst %float %glsl FMax {lam} {minlod}")
+                lam = lam_c
+            level_f = lam
         mip = None
         if level_f is not None:
             lit = self.sgpr_imm.get(s_op["r"] + 2)
@@ -13731,7 +13762,6 @@ class Gen:
             self.emit(f"{lo} = OpExtInst %int %glsl SClamp {li} {ci(0)} {lvm}")
             level = lo
         # Size of that level: 1D int, 2D v2int, 2D array / 3D v3int (array: width, height, layers).
-        qtype = "%int" if ncoord == 1 else "%v3int" if ncoord == 3 else "%v2int"
         sz = self.tmp()
         self.emit(f"{sz} = OpImageQuerySizeLod {qtype} {img} {level}")
         if qtype == "%v3int" and spatial == 2:

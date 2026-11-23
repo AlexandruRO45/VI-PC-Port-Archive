@@ -154,6 +154,37 @@ class ImageSampleCdAndCompareGradTests(unittest.TestCase):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate_and_assemble([ins])
 
+    def test_texel_offset_fallback_gradient_lod(self):
+        cases = [
+            (f"image_sample_c_d_o v4, v[10:17], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D",
+             r"(?m)OpImageSampleDrefExplicitLod %float %\w+ %\w+ %\w+ Grad %\w+ %\w+$", False),
+            (f"image_sample_c_cd_o v4, v[10:17], {DESC} dmask:0x1 dim:SQ_RSRC_IMG_2D",
+             r"(?m)OpImageSampleDrefExplicitLod %float %\w+ %\w+ %\w+ Grad %\w+ %\w+$", False),
+            (f"image_sample_d_o v[4:7], v[10:16], {DESC} dmask:0xf dim:SQ_RSRC_IMG_2D",
+             r"(?m)OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad %\w+ %\w+$", False),
+            (f"image_sample_cd_cl_o v[4:7], v[10:17], {DESC} dmask:0xf dim:SQ_RSRC_IMG_2D",
+             r"(?m)OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad\|MinLod %\w+ %\w+ %\w+$", True),
+        ]
+        prev = rdna2spirv.TEXEL_OFFSET_FALLBACK
+        try:
+            rdna2spirv.TEXEL_OFFSET_FALLBACK = True
+            for ins, sample_pat, has_minlod in cases:
+                with self.subTest(ins=ins):
+                    spv = translate_and_assemble([ins])
+                    self.assertRegex(spv, sample_pat)
+                    sample_lines = [ln for ln in spv.splitlines() if "OpImageSample" in ln]
+                    self.assertTrue(sample_lines and all("Offset" not in ln for ln in sample_lines), sample_lines)
+                    # Mip-0 size query for gradient LOD + clamped mip size query for offset division
+                    size_queries = re.findall(r"%\w+ = OpImageQuerySizeLod %v2int %\w+ %\w+", spv)
+                    self.assertEqual(len(size_queries), 2, spv)
+                    self.assertIn("OpExtInst %float %glsl Length", spv)
+                    self.assertIn("OpExtInst %float %glsl Log2", spv)
+                    self.assertIn("OpFDiv %v2float", spv)
+                    fmax_count = len(re.findall(r"OpExtInst %float %glsl FMax", spv))
+                    self.assertEqual(fmax_count, 3 if has_minlod else 2, spv)
+        finally:
+            rdna2spirv.TEXEL_OFFSET_FALLBACK = prev
+
 
 if __name__ == "__main__":
     unittest.main()
