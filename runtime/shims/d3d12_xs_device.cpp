@@ -2028,11 +2028,14 @@ bool memory_range_valid(const void* ptr, std::size_t size, bool require_writable
 
 std::uint32_t typed_buffer_stride(DXGI_FORMAT fmt) {
     const auto id = static_cast<std::uint32_t>(fmt);
-    if (id >= 1 && id <= 4) return 16;    // R32G32B32A32_*
-    if (id >= 5 && id <= 8) return 12;    // R32G32B32_*
-    if (id >= 9 && id <= 22) return 8;    // R16G16B16A16_* / R32G32_*
-    if ((id >= 33 && id <= 40) || (id >= 53 && id <= 59)) return 2;  // 16-bit formats
-    if ((id >= 48 && id <= 52) || (id >= 60 && id <= 65)) return 1;  // 8-bit formats
+    if (id >= 1 && id <= 4) return 16;                                // R32G32B32A32_* (4x32)
+    if (id >= 5 && id <= 8) return 12;                                // R32G32B32_* (3x32)
+    if (id >= 9 && id <= 22) return 8;                                // R16G16B16A16_*, R32G32_*, R32G8X24_* (64-bit)
+    if (id >= 23 && id <= 47) return 4;                               // 10/10/10/2, 11/11/10, 4x8, R16G16_*, R32_*, R24G8_*
+    if ((id >= 48 && id <= 52) || (id >= 53 && id <= 59)) return 2;   // R8G8_* (2x8) and R16_* / D16_* (1x16)
+    if (id >= 60 && id <= 65) return 1;                               // R8_* / A8_* (1x8)
+    if ((id >= 67 && id <= 69) || (id >= 87 && id <= 93)) return 4;   // packed 32-bit and B8G8R8{A,X}8_*
+    if ((id >= 85 && id <= 86) || id == 115) return 2;                // B5G6R5, B5G5R5A1, B4G4R4A4
     return 4;
 }
 

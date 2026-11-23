@@ -497,6 +497,54 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Slot 70 (CreateShaderResourceViewX): multi-component typed buffer SRVs compute byte stride across all channels.
+    {
+        using Slot70Fn = void(WINAPI*)(void*, const D3D12_RESOURCE_DESC*, const void*, std::uintptr_t);
+        struct XboxSrvDesc {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+            std::uint64_t base_va;
+        };
+        static_assert(offsetof(XboxSrvDesc, base_va) == 0x28, "base_va sits at +0x28");
+        void** vtable = *reinterpret_cast<void***>(device.Get());
+        D3D12_RESOURCE_DESC res_desc{};
+        res_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        res_desc.Width = 64;
+        res_desc.Height = 1;
+        res_desc.DepthOrArraySize = 1;
+        res_desc.MipLevels = 1;
+        res_desc.SampleDesc.Count = 1;
+        res_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        constexpr std::uint64_t kBaseVa = 0x100000000ULL;
+        const struct {
+            DXGI_FORMAT format;
+            std::uint32_t expected_stride;
+            std::uint64_t expected_va;
+            const char* label;
+        } cases[] = {
+            {DXGI_FORMAT_R16G16_FLOAT, 4, kBaseVa + 4, "DXGI_FORMAT_R16G16_FLOAT"},
+            {DXGI_FORMAT_R8G8_UNORM, 2, kBaseVa + 2, "DXGI_FORMAT_R8G8_UNORM"},
+        };
+        for (const auto& c : cases) {
+            XboxSrvDesc view{};
+            view.srv.Format = c.format;
+            view.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            view.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.srv.Buffer.FirstElement = 1;
+            view.srv.Buffer.NumElements = 4;
+            view.srv.Buffer.StructureByteStride = 0;
+            view.srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+            view.base_va = kBaseVa;
+
+            std::uint32_t dest[8]{};
+            reinterpret_cast<Slot70Fn>(vtable[70])(device.Get(), &res_desc, &view,
+                                                   reinterpret_cast<std::uintptr_t>(dest));
+            const std::uint64_t decoded_va = (static_cast<std::uint64_t>(dest[1] & 0xFFFFu) << 32) | dest[0];
+            const std::uint32_t decoded_stride = (dest[1] >> 16) & 0x3FFFu;
+            check(decoded_va == c.expected_va && decoded_stride == c.expected_stride && dest[2] == 4, c.label);
+        }
+    }
+
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
     if (real) real->AddRef();
     // Drop every device child before the proxy so the PC device is not released first.

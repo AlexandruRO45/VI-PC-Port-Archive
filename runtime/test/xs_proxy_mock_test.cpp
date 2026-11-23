@@ -755,6 +755,58 @@ int check_xbox_slots() {
     EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
            xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
 
+    // 70 CreateShaderResourceViewX(res_desc, view_desc, dest): typed buffer SRVs size multi-component formats by
+    // full element width (channel count * component bytes) when advancing FirstElement * stride.
+    {
+        struct XboxSrvDesc {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+            std::uint64_t base_va;
+        };
+        static_assert(offsetof(XboxSrvDesc, base_va) == 0x28, "base_va sits at +0x28");
+        D3D12_RESOURCE_DESC res_desc{};
+        res_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        res_desc.Width = 64;
+        res_desc.Height = 1;
+        res_desc.DepthOrArraySize = 1;
+        res_desc.MipLevels = 1;
+        res_desc.SampleDesc.Count = 1;
+        res_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        struct TypedCase {
+            DXGI_FORMAT format;
+            std::uint32_t expected_stride;
+            std::uint64_t expected_va;
+        };
+        constexpr std::uint64_t kBaseVa = 0x100000000ULL;
+        const TypedCase cases[] = {
+            {DXGI_FORMAT_R16G16_FLOAT, 4, kBaseVa + 4},
+            {DXGI_FORMAT_R8G8_UNORM, 2, kBaseVa + 2},
+            {DXGI_FORMAT_R16_FLOAT, 2, kBaseVa + 2},
+            {DXGI_FORMAT_R8_UNORM, 1, kBaseVa + 1},
+        };
+        const std::uint64_t calls_before = mock->calls[70];
+        for (const TypedCase& c : cases) {
+            XboxSrvDesc view{};
+            view.srv.Format = c.format;
+            view.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            view.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.srv.Buffer.FirstElement = 1;
+            view.srv.Buffer.NumElements = 4;
+            view.srv.Buffer.StructureByteStride = 0;
+            view.srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+            view.base_va = kBaseVa;
+
+            std::uint32_t dest[8]{};
+            EXPECT(raw(device, 70, word(&res_desc), word(&view), word(dest)) == 0);
+            EXPECT(mock->calls[70] == calls_before);
+            const std::uint64_t decoded_va = (static_cast<std::uint64_t>(dest[1] & 0xFFFFu) << 32) | dest[0];
+            const std::uint32_t decoded_stride = (dest[1] >> 16) & 0x3FFFu;
+            EXPECT(decoded_va == c.expected_va);
+            EXPECT(decoded_stride == c.expected_stride);
+            EXPECT(dest[2] == 4);
+        }
+    }
+
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(release(queue) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
