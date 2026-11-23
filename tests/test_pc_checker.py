@@ -21,6 +21,11 @@ class GpuScore(unittest.TestCase):
     def test_vram_suffix_ignored(self):
         self.assertEqual(pc.gpu_score("NVIDIA GeForce RTX 3070 (8 GB VRAM)"), 100)
 
+    def test_fractional_vram_suffix_ignored(self):
+        # an iGPU's sub-1 GB carve-out is shown with one decimal; the name must still be recognised
+        self.assertEqual(pc.gpu_score("AMD Radeon(TM) Graphics (0.5 GB VRAM)"), pc.gpu_score("AMD Radeon(TM) Graphics"))
+        self.assertEqual(pc.gpu_score("Intel(R) UHD Graphics 770 (0.1 GB VRAM)"), 15)
+
     def test_laptop_penalty(self):
         self.assertAlmostEqual(pc.gpu_score("RTX 3070 Ti Laptop GPU"), 108 * 0.8)
 
@@ -104,6 +109,61 @@ class Evaluate(unittest.TestCase):
         _, _, rows = pc.evaluate(XBOX, "AMD Ryzen 5 5600", "NVIDIA GeForce RTX 6070", 32)
         self.assertFalse(rows[0][4])
         self.assertTrue(rows[1][4])
+
+
+class VramGb(unittest.TestCase):
+    def test_whole_gb_from_one_gb_up(self):
+        self.assertEqual(pc._vram_gb(11.94), 12)   # RTX 5070: 12227 MiB
+        self.assertEqual(pc._vram_gb(1.0), 1)
+        self.assertEqual(pc._vram_gb(0.97), 1)
+
+    def test_below_one_gb_is_not_zero(self):
+        self.assertEqual(pc._vram_gb(0.5), 0.5)    # round(0.5) == 0 before
+        self.assertEqual(pc._vram_gb(0.25), 0.2)
+        self.assertEqual(pc._vram_gb(0.03), 0.1)
+
+    def test_no_value(self):
+        for v in (None, 0, 0.0, -1):
+            self.assertIsNone(pc._vram_gb(v))
+
+
+class DetectGpusVram(unittest.TestCase):
+    """detect_gpus with the system queries replaced: a 512 MB iGPU next to a discrete card."""
+
+    def setUp(self):
+        self._saved = (pc.sys.platform, pc.shutil.which, pc._run, pc._win_vram_map)
+
+    def tearDown(self):
+        pc.sys.platform, pc.shutil.which, pc._run, pc._win_vram_map = self._saved
+
+    def detect(self, smi, cim, registry):
+        pc.sys.platform = "win32"
+        pc.shutil.which = lambda name: "nvidia-smi" if smi is not None else None
+        outputs = ([smi] if smi is not None else []) + [cim]
+        pc._run = lambda *a, **k: outputs.pop(0)
+        pc._win_vram_map = lambda: registry
+        return pc.detect_gpus()
+
+    def test_registry_igpu_half_gb(self):
+        gpus = self.detect("NVIDIA GeForce RTX 5070, 12227",
+                           '[{"Name":"NVIDIA GeForce RTX 5070","AdapterRAM":4293918720},'
+                           '{"Name":"AMD Radeon(TM) Graphics","AdapterRAM":536870912}]',
+                           {"nvidia geforce rtx 5070": 11.94, "amd radeon(tm) graphics": 0.5})
+        self.assertEqual(gpus, [("NVIDIA GeForce RTX 5070", 12), ("AMD Radeon(TM) Graphics", 0.5)])
+
+    def test_cim_only_igpu_half_gb(self):
+        gpus = self.detect(None, '{"Name":"AMD Radeon(TM) Graphics","AdapterRAM":536870912}', {})
+        self.assertEqual(gpus, [("AMD Radeon(TM) Graphics", 0.5)])
+
+    def test_igpu_only_pc_reports_its_vram(self):
+        detect = pc.detect_gpus
+        try:
+            pc.detect_gpus = lambda: [("AMD Radeon(TM) Graphics", 0.5)]
+            gpu = pc.detect_all()["gpu"]
+        finally:
+            pc.detect_gpus = detect
+        self.assertEqual(gpu, pc.clean_name("AMD Radeon(TM) Graphics") + " (0.5 GB VRAM)")
+        self.assertEqual(pc.gpu_score(gpu), pc.gpu_score("AMD Radeon(TM) Graphics"))
 
 
 class Api(unittest.TestCase):

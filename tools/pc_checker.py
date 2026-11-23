@@ -107,7 +107,7 @@ GPU_TABLE = [
 
 _GPU_JUNK = re.compile(
     r"\((?:r|tm)\)|[®™]|\b(?:nvidia|geforce|amd|radeon|intel|graphics|corporation|"
-    r"laptop|gpu|mobile|max-q|with|design|series|vram)\b|\d+\s?gb|[()\[\]]"
+    r"laptop|gpu|mobile|max-q|with|design|series|vram)\b|\d+(?:\.\d+)?\s?gb|[()\[\]]"
 )
 
 
@@ -462,6 +462,16 @@ def _win_vram_map() -> dict:
     return found
 
 
+def _vram_gb(gb):
+    """VRAM for display: whole GB from 1 GB up, one decimal below it, so an iGPU's 512 MB carve-out is 0.5 rather than
+    round(0.5) == 0. None when there is no positive value."""
+    if not gb or gb <= 0:
+        return None
+    if gb >= 0.95:
+        return round(gb)
+    return max(0.1, round(gb, 1))
+
+
 def detect_gpus() -> list:
     """All GPUs found, as (name, vram_gb or None)."""
     gpus = []
@@ -473,7 +483,7 @@ def detect_gpus() -> list:
             if not parts or not parts[0]:
                 continue
             try:
-                gpus.append((parts[0], round(float(parts[1]) / 1024)))
+                gpus.append((parts[0], _vram_gb(float(parts[1]) / 1024)))
             except (IndexError, ValueError):
                 gpus.append((parts[0], None))
 
@@ -494,7 +504,7 @@ def detect_gpus() -> list:
             vram = vmap.get(name.lower())
             if vram is None and d.get("AdapterRAM"):
                 vram = d["AdapterRAM"] / 2**30
-            gpus.append((name, round(vram) if vram else None))
+            gpus.append((name, _vram_gb(vram)))
     elif sys.platform == "darwin":
         out = _run(["system_profiler", "SPDisplaysDataType", "-json"], timeout=20)
         try:
