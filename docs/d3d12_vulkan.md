@@ -2860,6 +2860,19 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   image is not done. 2 planes must share one token (see "Plane composition" for what happens to plane 1). More than 2
   planes, null planes, or an empty/outside rectangle give `E_INVALIDARG`. A missing `ALLOW_DISPLAY` heap flag is logged
   once and presented anyway.
+- *Opt-in slot routing and windowless first-frame capture (exe day)*. The console's `PresentX`, `SuspendX` and
+  `ResumeX` slots are unmeasured; the queue proxy refuses every slot past the public 19 with `E_NOTIMPL` and logs its
+  first argument words. `LEONIDA_PRESENTX_SLOT=<n>` (likewise `LEONIDA_PRESENTX_SUSPEND_SLOT` and
+  `LEONIDA_PRESENTX_RESUME_SLOT`) routes just that slot, 19..127, and logs the first call with the slot and the three
+  argument words; every other slot keeps the refusal. With `LEONIDA_CAPTURE=<dir>` a routed `PresentX` creates no
+  window and no swapchain: the plane count (0-2), the plane array, each `ppResources` and each resource's vtable are
+  checked with `VirtualQuery` before they are read; the resource must be a single-sample 2D BGRA8/RGBA8 texture created
+  with `D3D12_HEAP_FLAG_ALLOW_DISPLAY` (assumed to be in `PRESENT`). Each plane with `ResourceCount >= 1` copies
+  `ppResources[0]` through a committed readback buffer on the presenting queue and writes
+  `present-<n>-plane-<m>.ppm` (P6, RGB; `n` counts routed presents including blanks, `m` is the plane). A malformed
+  call returns `E_INVALIDARG` with one log line and never faults; a zero-plane present writes nothing and returns
+  `S_OK`. Without `LEONIDA_CAPTURE` a routed present is accepted and dropped. Both variables are read once, at the
+  first call past the public chain, so the path is inert when they are unset.
 - *Plane composition* (M7). *Fact* (public MIT sample, Xbox-GDK-Samples `Samples/Graphics/HDR10/DeviceResources.cpp` and
   its readme): the two-plane form there is **not** an overlay. Plane 0 is the HDR10 back buffer
   (`RGB_FULL_G2084_NONE_P2020`), plane 1 is a second back-buffer set holding the SDR rendering of the same frame

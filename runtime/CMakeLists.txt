@@ -185,6 +185,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     add_executable(xs_proxy_mock_test
       test/xs_proxy_mock_test.cpp
       shims/d3d12_xs_device.cpp
+      shims/presentx_capture.cpp
     )
     target_compile_definitions(xs_proxy_mock_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(xs_proxy_mock_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
@@ -1350,7 +1351,7 @@ if(TARGET Vulkan::Headers)
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
     add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp shims/xbox_present.cpp
-                shims/dxgi_com.cpp ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
+                shims/presentx_capture.cpp shims/dxgi_com.cpp ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers gta6rt_root_signature)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -1899,6 +1900,19 @@ if(TARGET Vulkan::Headers)
     # Needs a Vulkan GPU and a window; exits 77 (skipped) without a Vulkan device.
     add_test(NAME xbox_present COMMAND xbox_present_test)
     set_tests_properties(xbox_present PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Opt-in PresentX slot routing and windowless capture (docs section 4.5): a synthetic probe calls the configured
+    # queue slot through the proxy's vtable. Three processes: capture (PPM pixels), malformed (E_INVALIDARG, no
+    # file), inert (the old E_NOTIMPL when the variables are unset). Needs a Vulkan GPU; skips (77) without one.
+    add_executable(presentx_capture_probe test/presentx_capture_probe.cpp)
+    target_link_libraries(presentx_capture_probe PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(presentx_capture_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(presentx_capture_probe PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME presentx_capture COMMAND presentx_capture_probe capture)
+    add_test(NAME presentx_capture_malformed COMMAND presentx_capture_probe malformed)
+    add_test(NAME presentx_capture_inert COMMAND presentx_capture_probe inert)
+    set_tests_properties(presentx_capture presentx_capture_malformed presentx_capture_inert
+        PROPERTIES SKIP_RETURN_CODE 77)
 
     # TEST-528: a real boot-movie frame (the package's Bink2Scarlett.dll) uploaded through the Xbox-ABI proxy and
     # presented with PresentX, checked against the decoded BGRA. Package-gated like bink_decode_test: skips (77)

@@ -18,10 +18,14 @@
 //   ID3D12CommandQueue (Xbox):  PresentX (plane count, planes, params)                           slot ?
 //                               SuspendX (flags)                                                 slot ?
 //                               ResumeX ()                                                       slot ?
+// The queue slots can be named at run time by LEONIDA_PRESENTX_SLOT, LEONIDA_PRESENTX_SUSPEND_SLOT and
+// LEONIDA_PRESENTX_RESUME_SLOT (presentx_capture.h) and a routed PresentX can be captured without a window; the real
+// slot numbers, the device slots and the struct layouts are still unmeasured.
 // The queue-side calls do not look at the queue: the Vulkan device has one VkQueue behind every D3D12 queue, and
 // the present is submitted after the work already executed on it.
 
 #include "d3d12_com.h"
+#include "xbox_present_types.h"
 #include "../src/frame_pacer.h"
 #include "../src/vulkan_present.h"
 
@@ -38,55 +42,6 @@ namespace rt::d3d12 {
 inline constexpr std::uint32_t xbox_frame_interval_30hz_us = 33333;
 inline constexpr std::uint32_t xbox_frame_interval_60hz_us = 16667;
 inline constexpr std::uint32_t xbox_frame_interval_120hz_us = 8333;
-
-// Provisional (ours): D3D12XBOX_PRESENT_PLANE_PARAMETERS. The names are those the samples use; the layout, the
-// token width (64 bits here) and the fields the console has beyond these are unmeasured.
-//
-// The fields after pSrcViewRects exist in the console's struct (names and order seen in a public binding, see the struct)
-// but their types, enum values and flag bits are unmeasured: the values of ours below are placeholders that make the
-// composition (section 4.5) testable. Zero everything is the default and means "as before": the whole output,
-// bilinear when scaling, SDR, plane 1 premultiplied and not composed.
-struct XboxViewRect {  // D3D12XBOX_VIEW_RECT: four floats; as fractions 0..1 of the output (hypothesis, section 4.5)
-    float left, top, right, bottom;
-};
-// DXGI_COLOR_SPACE_TYPE values (documented DXGI numbers). Only these two are composed; any other is treated as the first.
-inline constexpr int xbox_color_space_g22_p709 = 0;       // DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709: SDR
-inline constexpr int xbox_color_space_g2084_p2020 = 12;   // DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: HDR10
-// Provisional (ours): ScaleFilter and Flags.
-inline constexpr int xbox_scale_filter_default = 0;  // bilinear (point when not scaled makes no difference)
-inline constexpr int xbox_scale_filter_point = 1;
-inline constexpr int xbox_scale_filter_linear = 2;
-// Plane 1 is composed over plane 0 as an overlay only with this flag (hypothesis: whether the console blends a second plane
-// at all is unmeasured; the public HDR sample's plane 1 is the GameDVR copy of the frame, not shown, so without the flag
-// plane 1 is not composed, as before).
-inline constexpr UINT xbox_plane_flag_overlay = 1;
-inline constexpr UINT xbox_plane_flag_straight_alpha = 2;  // plane 1's colour is not premultiplied by its alpha
-
-struct XboxPresentPlaneParameters {
-    // Field ORDER and names: the public Go binding of the GDK header in hajimehoshi/ebiten (Apache-2.0,
-    // internal/graphicsdriver/directx/d3d12_windows.go, _D3D12XBOX_PRESENT_PLANE_PARAMETERS); the HDR10 sample confirms
-    // the first four and ColorSpace. Types, padding and the console's real sizes are unmeasured (ours: 64-bit token, int
-    // enums), so nothing here is the console's ABI.
-    std::uint64_t Token;                  // from WaitFrameEventX
-    UINT ResourceCount;                   // 1 in the samples
-    ID3D12Resource* const* ppResources;   // ResourceCount committed resources with ALLOW_DISPLAY, in PRESENT
-    const D3D12_RECT* pSrcViewRects;      // null, or one rectangle per resource (the HDR sample sets it)
-    const XboxViewRect* pDestPlacementBase;  // null: the whole output
-    int ColorSpace;                       // a DXGI_COLOR_SPACE_TYPE (see above)
-    int ScaleFilter;                      // xbox_scale_filter_*; anything unknown is the default
-    UINT ExtendedDescCount;               // not used (logged once when non-zero)
-    const void* pExtendedDescs;
-    UINT Flags;                           // xbox_plane_flag_*; unknown bits are ignored
-};
-
-// Provisional (ours): D3D12XBOX_PRESENT_PARAMETERS. The samples show at least this field.
-struct XboxPresentParameters {
-    // 0 (the default): a frame that missed its vblank waits for the next one. Above 0: a frame that missed it is shown
-    // at once, mid-scan, when the scan is not further than this percentage down the screen (100: wherever it is).
-    // Needs VK_KHR/EXT_swapchain_maintenance1 and an IMMEDIATE or FIFO_RELAXED mode the swapchain can switch to;
-    // without them it is ignored (logged once). What late means: see FramePacer::present_timing.
-    float ImmediateThresholdPercent;
-};
 
 class XboxPresentation {
 public:
