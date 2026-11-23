@@ -8,6 +8,7 @@ As a module: parse_file(path) -> {"name", "code_start", "insns": [...], "invalid
 As a tool:  python -I shader_ir.py <disasm dir> [--limit N]   (parses everything and reports coverage)
 """
 import argparse
+import math
 import os
 import re
 import sys
@@ -130,12 +131,15 @@ def operand(tok):
             return out
         return {"k": "imm", "v": -v if neg else v}
     if _FLOAT.fullmatch(core):
+        value = float(core)
+        if not math.isfinite(value):
+            return {"k": "raw", "t": t}
         if absm:
-            out = {"k": "fimm", "v": float(core), "abs": True}
+            out = {"k": "fimm", "v": value, "abs": True}
             if neg:
                 out["neg"] = True
             return out
-        return {"k": "fimm", "v": float(core) * (-1 if neg else 1), "abs": False}
+        return {"k": "fimm", "v": value * (-1 if neg else 1), "abs": False}
     if core.startswith("hwreg(") or core.startswith("sendmsg(") or core.startswith("vmcnt(") or \
             core.startswith("expcnt(") or core.startswith("lgkmcnt(") or core.startswith("vscnt(") or \
             core.startswith("depctr") or core.startswith("instid") or core.startswith("quad_perm") or \

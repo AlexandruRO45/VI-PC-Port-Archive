@@ -216,6 +216,13 @@ class Unsupported(Exception):
     pass
 
 
+def f32_immediate_bits(value):
+    try:
+        return struct.unpack("<I", struct.pack("<f", value))[0]
+    except OverflowError:
+        raise Unsupported("f32 immediate out of range") from None
+
+
 class Gen:
     def __init__(self, stage):
         self.stage = stage
@@ -425,7 +432,7 @@ class Gen:
         elif k == "imm":
             v = self.cu(a["v"])
         elif k == "fimm":
-            v = self.cu(struct.unpack("<I", struct.pack("<f", a["v"]))[0])
+            v = self.cu(f32_immediate_bits(a["v"]))
         elif k == "special" and a["t"] in ("vcc_lo", "vcc"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc")
@@ -5367,7 +5374,7 @@ class Gen:
             if s["k"] == "imm":
                 bits = s["v"] & 0xFFFFFFFF
             elif s["k"] == "fimm":
-                bits = struct.unpack("<I", struct.pack("<f", s["v"]))[0]
+                bits = f32_immediate_bits(s["v"])
             if bits is not None:
                 if sel is None:
                     is_nan = (bits & 0x7F800000) == 0x7F800000 and bits & 0x7FFFFF
@@ -5771,7 +5778,7 @@ class Gen:
             src = a[1]
             const = (src["v"] & 0xFFFFFFFF) if src["k"] == "imm" else None
             if src["k"] == "fimm":
-                const = struct.unpack("<I", struct.pack("<f", src["v"]))[0]
+                const = f32_immediate_bits(src["v"])
             # an SGPR that isn't a mask (a constant, say) gives each lane its own bit, as a constant does (mask_src)
             val = None if const is not None else (self.mask_src(src, wide=False) if src["k"] == "sgpr"
                                                   else self.src_u(src))

@@ -72,6 +72,22 @@ class SourceDiscovery(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_out_of_range_float_does_not_stop_later_shader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "disasm"
+            src.mkdir()
+            out = root / "out"
+            for name, token in (("ps_a", "1E39"), ("ps_b", "-1e999"), ("ps_c", "1e0")):
+                listing = f"\tv_mov_b32 v0, {token}\n\texp mrt0 v0, v0, v0, v0 done vm\n\ts_endpgm\n"
+                (src / (name + ".s")).write_text(listing, encoding="utf-8", newline="\n")
+                (root / (name + ".dxbc")).write_bytes(b"DXBC" + bytes(28))
+            output = self.run_main(src, out)
+            self.assertIn("f32 immediate out of range", output)
+            self.assertIn("1 pass spirv-val", output)
+            self.assertEqual([p.name for p in out.glob("*.spv")], ["ps_c.spv"])
+            self.assertIn("ps_c", json.loads((out / "index.json").read_text(encoding="utf-8")))
+
     def test_directory_ending_in_s_as_src_is_a_directory(self):
         # A .s suffix alone is not a shader: an existing directory is still scanned as a folder.
         with tempfile.TemporaryDirectory() as tmp:
