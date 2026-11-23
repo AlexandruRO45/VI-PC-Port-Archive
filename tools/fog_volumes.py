@@ -16,6 +16,7 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
 import tempfile
@@ -28,6 +29,8 @@ if _TOOLS_DIR not in sys.path:
 import pool_workers  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -389,23 +392,43 @@ def summarize(path: str, jobs: int = 1) -> dict:
 
 
 def _write_json_atomic(path: str, doc: dict) -> None:
-    out_abs = os.path.abspath(path)
-    parent = os.path.dirname(out_abs)
-    os.makedirs(parent, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".fog-volumes-", suffix=".tmp", dir=parent)
+    """Publish a complete regular file via a temp sibling, or write a non-regular destination directly."""
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(doc, f, indent=1, sort_keys=True)
             f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, out_abs)
-    except Exception:
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".fog-volumes-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(doc, staged, indent=1, sort_keys=True)
+            staged.write("\n")
+            staged.flush()
+            os.fsync(staged.fileno())
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
         try:
-            os.unlink(tmp)
-        except OSError:
+            os.unlink(staged.name)
+        except FileNotFoundError:
             pass
-        raise
 
 
 def main(argv=None) -> int:
