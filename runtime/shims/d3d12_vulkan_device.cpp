@@ -6050,6 +6050,9 @@ public:
             if (view.mip_count != UINT_MAX && view.mip_count > 0) {
                 view.mip_count = std::min(view.mip_count, avail_mips);
             }
+            if (view.min_lod > 0.0f) {
+                view.min_lod = std::max(0.0f, view.min_lod - float(drop));
+            }
         }
         write_image_descriptor(*r, view, destination, false);
     }

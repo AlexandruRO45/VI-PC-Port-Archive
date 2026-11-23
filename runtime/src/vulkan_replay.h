@@ -2580,7 +2580,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     const std::uint32_t slice = sub / orig_mips;
                     if (mip < p.binding.mips_dropped) {
                         p.skip = true;
-                        return ReplayResult::success;
+                        continue;
                     }
                     sub = slice * p.binding.mip_levels + (mip - p.binding.mips_dropped);
                 }
@@ -2596,17 +2596,36 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
             if (!bind(texture->resource)) return ReplayResult::unresolved_resource;
             BarrierSubresourceRange range = texture->range;
-            if (p.binding.mips_dropped > 0 && range.mip_count == 0 && range.index_or_first_mip != all_subresources) {
+            if (p.binding.mips_dropped > 0 && range.index_or_first_mip != all_subresources) {
                 const std::uint32_t orig_mips = p.binding.mip_levels + p.binding.mips_dropped;
-                const std::uint32_t total = orig_mips * p.binding.array_layers;
-                if (range.index_or_first_mip >= total) return ReplayResult::invalid_subresource;
-                const std::uint32_t mip = range.index_or_first_mip % orig_mips;
-                const std::uint32_t slice = range.index_or_first_mip / orig_mips;
-                if (mip < p.binding.mips_dropped) {
-                    p.skip = true;
-                    return ReplayResult::success;
+                if (range.mip_count == 0) {
+                    const std::uint32_t total = orig_mips * p.binding.array_layers;
+                    if (range.index_or_first_mip >= total) return ReplayResult::invalid_subresource;
+                    const std::uint32_t mip = range.index_or_first_mip % orig_mips;
+                    const std::uint32_t slice = range.index_or_first_mip / orig_mips;
+                    if (mip < p.binding.mips_dropped) {
+                        p.skip = true;
+                        continue;
+                    }
+                    range.index_or_first_mip = slice * p.binding.mip_levels + (mip - p.binding.mips_dropped);
+                } else {
+                    const std::uint32_t first_mip = range.index_or_first_mip;
+                    const std::uint32_t count = range.mip_count;
+                    if (first_mip >= orig_mips || count > orig_mips - first_mip)
+                        return ReplayResult::invalid_subresource;
+                    if (first_mip + count <= p.binding.mips_dropped) {
+                        p.skip = true;
+                        continue;
+                    }
+                    if (first_mip < p.binding.mips_dropped) {
+                        const std::uint32_t dropped_from_range = p.binding.mips_dropped - first_mip;
+                        range.index_or_first_mip = 0;
+                        range.mip_count = (count > dropped_from_range) ? (count - dropped_from_range) : 1;
+                    } else {
+                        range.index_or_first_mip = first_mip - p.binding.mips_dropped;
+                    }
+                    range.mip_count = std::min(range.mip_count, p.binding.mip_levels - range.index_or_first_mip);
                 }
-                range.index_or_first_mip = slice * p.binding.mip_levels + (mip - p.binding.mips_dropped);
             }
             if (!p.binding.image || !barrier_range(p.binding, range, p.range))
                 return ReplayResult::invalid_subresource;

@@ -100,6 +100,9 @@ int main() {
     D3D12_HEAP_PROPERTIES upload_heap{};
     upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
 
+    D3D12_HEAP_PROPERTIES readback_heap{};
+    readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+
     // 1. 2D Texture (16x16, 4 mips): with drop 1, physical image is 8x8, 3 mips.
     Ref<ID3D12Resource> tex2d;
     const auto desc2d = tex2d_desc(16, 16, 4, DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -115,35 +118,63 @@ int main() {
                                                      D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&tex3d.p))));
     EXPECT(tex3d->GetDesc().DepthOrArraySize == 4);
 
-    // 3. Upload Buffer
+    // 3. Upload & Readback Buffers
     Ref<ID3D12Resource> upload;
     const auto udesc = buffer_desc(4096);
     EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &udesc,
                                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload.p))));
 
-    // 4. Command List: CopyTextureRegion targeting dropped mip 0 and retained mips 1, 2.
-    // Mip 0 copy: should be skipped gracefully (p.skip = true)
+    void* upload_map = nullptr;
+    EXPECT(SUCCEEDED(upload->Map(0, nullptr, &upload_map)));
+    std::memset(static_cast<char*>(upload_map) + 512, 0xAB, 256);
+    upload->Unmap(0, nullptr);
+
+    Ref<ID3D12Resource> readback;
+    const auto rdesc = buffer_desc(4096);
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &rdesc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.p))));
+
+    // 4. Command List:
+    // A. Dropped-mip barrier (b0): subresource 0 is dropped.
+    // Must be skipped (p.skip = true) without prematurely aborting prepare() for subsequent commands!
+    D3D12_RESOURCE_BARRIER b0{};
+    b0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b0.Transition.pResource = tex2d.p;
+    b0.Transition.Subresource = 0; // dropped mip
+    b0.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b0.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &b0);
+
+    // B. CopyTextureRegion targeting dropped mip 0 (skipped)
     D3D12_TEXTURE_COPY_LOCATION dst_loc0{};
     dst_loc0.pResource = tex2d.p;
     dst_loc0.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst_loc0.SubresourceIndex = 0; // dropped mip
+    dst_loc0.SubresourceIndex = 0;
 
-    D3D12_TEXTURE_COPY_LOCATION src_loc{};
-    src_loc.pResource = upload.p;
-    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src_loc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    src_loc.PlacedFootprint.Footprint.Width = 16;
-    src_loc.PlacedFootprint.Footprint.Height = 16;
-    src_loc.PlacedFootprint.Footprint.Depth = 1;
-    src_loc.PlacedFootprint.Footprint.RowPitch = 256;
+    D3D12_TEXTURE_COPY_LOCATION src_loc0{};
+    src_loc0.pResource = upload.p;
+    src_loc0.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src_loc0.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    src_loc0.PlacedFootprint.Footprint.Width = 16;
+    src_loc0.PlacedFootprint.Footprint.Height = 16;
+    src_loc0.PlacedFootprint.Footprint.Depth = 1;
+    src_loc0.PlacedFootprint.Footprint.RowPitch = 256;
+    list->CopyTextureRegion(&dst_loc0, 0, 0, 0, &src_loc0, nullptr);
 
-    list->CopyTextureRegion(&dst_loc0, 0, 0, 0, &src_loc, nullptr);
+    // C. Retained mip 1 barrier (remapped to physical mip 0)
+    D3D12_RESOURCE_BARRIER b1{};
+    b1.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b1.Transition.pResource = tex2d.p;
+    b1.Transition.Subresource = 1; // retained mip
+    b1.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b1.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &b1);
 
-    // Mip 1 copy: retained mip (physical mip 0 of 8x8)
+    // D. Copy to retained mip 1 (physical mip 0)
     D3D12_TEXTURE_COPY_LOCATION dst_loc1{};
     dst_loc1.pResource = tex2d.p;
     dst_loc1.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst_loc1.SubresourceIndex = 1; // retained mip
+    dst_loc1.SubresourceIndex = 1;
 
     D3D12_TEXTURE_COPY_LOCATION src_loc1{};
     src_loc1.pResource = upload.p;
@@ -154,40 +185,45 @@ int main() {
     src_loc1.PlacedFootprint.Footprint.Height = 8;
     src_loc1.PlacedFootprint.Footprint.Depth = 1;
     src_loc1.PlacedFootprint.Footprint.RowPitch = 256;
-
     list->CopyTextureRegion(&dst_loc1, 0, 0, 0, &src_loc1, nullptr);
 
-    // 5. ResourceBarrier transitions:
-    // Subresource 0 barrier (dropped mip -> skipped)
-    D3D12_RESOURCE_BARRIER b0{};
-    b0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b0.Transition.pResource = tex2d.p;
-    b0.Transition.Subresource = 0;
-    b0.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    b0.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    list->ResourceBarrier(1, &b0);
+    // E. Transition retained mip 1 to COPY_SOURCE and readback to verify execution after b0
+    D3D12_RESOURCE_BARRIER b1_src{};
+    b1_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b1_src.Transition.pResource = tex2d.p;
+    b1_src.Transition.Subresource = 1;
+    b1_src.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b1_src.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &b1_src);
 
-    // Subresource 1 barrier (retained mip -> remapped to physical 0)
-    D3D12_RESOURCE_BARRIER b1{};
-    b1.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b1.Transition.pResource = tex2d.p;
-    b1.Transition.Subresource = 1;
-    b1.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    b1.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    list->ResourceBarrier(1, &b1);
+    D3D12_TEXTURE_COPY_LOCATION src_tex{};
+    src_tex.pResource = tex2d.p;
+    src_tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_tex.SubresourceIndex = 1;
 
-    // All subresources barrier
+    D3D12_TEXTURE_COPY_LOCATION dst_rb{};
+    dst_rb.pResource = readback.p;
+    dst_rb.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst_rb.PlacedFootprint.Offset = 0;
+    dst_rb.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst_rb.PlacedFootprint.Footprint.Width = 8;
+    dst_rb.PlacedFootprint.Footprint.Height = 8;
+    dst_rb.PlacedFootprint.Footprint.Depth = 1;
+    dst_rb.PlacedFootprint.Footprint.RowPitch = 256;
+    list->CopyTextureRegion(&dst_rb, 0, 0, 0, &src_tex, nullptr);
+
+    // F. All subresources barrier to PIXEL_SHADER_RESOURCE
     D3D12_RESOURCE_BARRIER ball{};
     ball.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     ball.Transition.pResource = tex2d.p;
     ball.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    ball.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    ball.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     ball.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     list->ResourceBarrier(1, &ball);
 
     EXPECT(SUCCEEDED(list->Close()));
 
-    // 6. ExecuteCommandLists - verify no invalid subresource abort
+    // 5. ExecuteCommandLists - verify commands after dropped-mip barrier b0 execute cleanly
     ID3D12CommandList* lists[] = {list.p};
     queue->ExecuteCommandLists(1, lists);
 
@@ -195,7 +231,7 @@ int main() {
     EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
     EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
 
-    // 7. Descriptor Heap and SRVs (verifying first_mip & mip_count clamping without bleed)
+    // 6. Descriptor Heap and SRVs (verifying first_mip & mip_count clamping, and ResourceMinLODClamp rebasing)
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap_desc.NumDescriptors = 4;
@@ -222,6 +258,14 @@ int main() {
     srv1.Texture2D.MipLevels = 2;
     device->CreateShaderResourceView(tex2d.p, &srv1, handle);
 
+    // SRV 2: ResourceMinLODClamp = 2.0f (rebased into physical coordinates without empty-view zero swizzle)
+    handle.ptr += stride;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv2 = srv0;
+    srv2.Texture2D.MostDetailedMip = 0;
+    srv2.Texture2D.MipLevels = 3;
+    srv2.Texture2D.ResourceMinLODClamp = 2.0f;
+    device->CreateShaderResourceView(tex2d.p, &srv2, handle);
+
     // Wait for fence
     if (fence->GetCompletedValue() < 1) {
         HANDLE event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
@@ -230,6 +274,14 @@ int main() {
         CloseHandle(event);
     }
     EXPECT(fence->GetCompletedValue() >= 1);
+
+    // 7. Verify readback data copied after dropped-mip barrier b0 (proves b0 didn't terminate prepare())
+    void* readback_map = nullptr;
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &readback_map)));
+    EXPECT(readback_map != nullptr);
+    const auto* rb_bytes = static_cast<const unsigned char*>(readback_map);
+    EXPECT(rb_bytes[0] == 0xAB);
+    readback->Unmap(0, nullptr);
 
     std::printf("d3d12_texture_mip_drop_test: PASS\n");
     return 0;
