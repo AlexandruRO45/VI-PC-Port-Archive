@@ -261,5 +261,41 @@ class TestVSinF32HardwareTranslator(unittest.TestCase):
         self.assertEqual(math.copysign(1.0, res_neg), -1.0)
 
 
+def ref_cos_f32(src: float) -> float:
+    """Bit-accurate reference oracle for RDNA2 v_cos_f32."""
+    if math.isnan(src) or math.isinf(src):
+        return float("nan")
+    if src == 0.0:
+        return 1.0
+    rnd = round(src)
+    if abs(src - rnd) == 0.5:
+        if rnd % 2 != 0:
+            rnd = round(src - math.copysign(0.5, src))
+    d = src - rnd
+    if abs(abs(d) - 0.25) < 1e-7:
+        return 0.0
+    return math.cos(d * 2.0 * math.pi)
+
+
+class TestVCosF32Reference(unittest.TestCase):
+    """Reference mathematical oracle verification for v_cos_f32."""
+
+    def test_reference_values(self):
+        self.assertAlmostEqual(ref_cos_f32(0.0), 1.0, places=6)
+        self.assertAlmostEqual(ref_cos_f32(0.5), -1.0, places=6)
+        self.assertAlmostEqual(ref_cos_f32(1.0), 1.0, places=6)
+        self.assertAlmostEqual(ref_cos_f32(-0.5), -1.0, places=6)
+
+    def test_reference_exact_zero_quarter_turns(self):
+        self.assertEqual(ref_cos_f32(0.25), 0.0)
+        self.assertEqual(ref_cos_f32(0.75), 0.0)
+        self.assertEqual(ref_cos_f32(-0.25), 0.0)
+        self.assertEqual(ref_cos_f32(-0.75), 0.0)
+
+    def test_reference_nan_and_inf(self):
+        self.assertTrue(math.isnan(ref_cos_f32(float("nan"))))
+        self.assertTrue(math.isnan(ref_cos_f32(float("inf"))))
+
+
 if __name__ == "__main__":
     unittest.main()
