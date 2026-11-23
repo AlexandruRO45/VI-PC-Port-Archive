@@ -10,6 +10,8 @@
 ;   slot 0 (+0x00): V#, raw buffer, the records (written)
 ;   slot 1 (+0x20): V#, raw buffer, the count (written)
 ; lane k < N: record k = { 1 + (k & 3), 1, 1 } at byte offset 12 * k; lane 0 also writes the count at offset 0.
+; D3D12 build: runtime/CMakeLists.txt builds this with LEONIDA_USER_DATA_SHIFT=4, so in the PSO every SGPR named
+; here is 4 higher (the console compute layout starts the root arguments at s4, D3D-448).
 s_load_dwordx4 s[8:11], s[4:5], 0x0
 s_load_dwordx4 s[12:15], s[4:5], 0x20
 s_waitcnt lgkmcnt(0)

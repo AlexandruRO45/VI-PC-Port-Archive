@@ -2145,6 +2145,7 @@ if(TARGET Vulkan::Headers)
         OUTPUT ${LEONIDA_M5_MESH_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M5_MESH_DIR}
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M5_MESH_DIR} ms_m5 ps_m5_mesh vs_m3 ps_m5_flat cs_m5_args
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
@@ -2155,6 +2156,8 @@ if(TARGET Vulkan::Headers)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_flat.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m5_args.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        # LEONIDA_USER_DATA_SHIFT=4 shifts cs_m5_args only (the cs_ fixtures): a D3D12 compute PSO gets its root
+        # arguments from s4 (D3D-448), as for the M4 shaders.
         COMMENT "Translating ms_m5, ps_m5_mesh, vs_m3 and ps_m5_flat for the M5 mesh test"
         VERBATIM)
       # The same shaders translated with --mesh-compute and --wave64-emulate: the test's --mesh-compute mode runs the
@@ -2173,6 +2176,7 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M5_MESH_COMPUTE_DIR}
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 "LEONIDA_MESH_COMPUTE=1" "LEONIDA_W64_EMULATE=1"
+                LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M5_MESH_COMPUTE_DIR} ms_m5 ps_m5_mesh vs_m3 ps_m5_flat cs_m5_args
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
