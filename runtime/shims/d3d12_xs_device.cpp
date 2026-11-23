@@ -1552,10 +1552,19 @@ HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std:
 HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
                                      std::uint64_t flags) {
     self->frame_event_scheduled.store(true, std::memory_order_relaxed);
-    if (XboxPresentationSink* presentation = device_presentation(self))
-        return presentation->ScheduleFrameEventX(static_cast<std::uint32_t>(event),
-                                                 static_cast<std::uint32_t>(offset_us),
-                                                 static_cast<std::uint32_t>(flags));
+    if (XboxPresentationSink* presentation = device_presentation(self)) {
+        const HRESULT hr = presentation->ScheduleFrameEventX(static_cast<std::uint32_t>(event),
+                                                             static_cast<std::uint32_t>(offset_us),
+                                                             static_cast<std::uint32_t>(flags));
+        if (SUCCEEDED(hr)) return hr;
+        // The title treats a negative answer as fatal (int3 right after the call). A pacer that refuses this early
+        // origin must not end the boot; the first PresentX will establish the origin.
+        static std::atomic<bool> logged{false};
+        if (first_call(logged))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 79 ScheduleFrameEventX returned 0x%08lx; accepted (boot)\n",
+                         static_cast<unsigned long>(hr));
+        return S_OK;
+    }
     (void)event;
     (void)offset_us;
     (void)flags;
@@ -1571,10 +1580,22 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
     if (!token) return E_POINTER;
     // The real pacer hands out the token its PresentX checks; without a presenter the stand-in below keeps a fresh
     // non-zero token so the boot can continue (there is no vblank source to wait on yet).
-    if (XboxPresentationSink* presentation = device_presentation(self))
-        return presentation->WaitFrameEventX(static_cast<std::uint32_t>(event),
-                                             static_cast<std::uint32_t>(timeout_ms),
-                                             static_cast<std::uint32_t>(flags), token);
+    if (XboxPresentationSink* presentation = device_presentation(self)) {
+        const HRESULT hr = presentation->WaitFrameEventX(static_cast<std::uint32_t>(event),
+                                                         static_cast<std::uint32_t>(timeout_ms),
+                                                         static_cast<std::uint32_t>(flags), token);
+        if (SUCCEEDED(hr) && *token) return hr;
+        // The title int3s on a negative WaitFrameEventX. A caught-up or timed-out pacer still has to hand back a
+        // token the matching PresentX can use; take the next one from the shared source.
+        static std::atomic<bool> logged{false};
+        if (first_call(logged))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 80 WaitFrameEventX returned 0x%08lx; handing out a token (boot)\n",
+                         static_cast<unsigned long>(hr));
+        std::uint64_t value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
+        if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
+        *token = value;
+        return S_OK;
+    }
     (void)event;
     (void)timeout_ms;
     (void)flags;
@@ -2496,8 +2517,11 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, cons
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
     const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    const auto state = (buffer || initial_state == 0xFFFFFFFFu) ? D3D12_RESOURCE_STATE_COMMON
-                                                                 : static_cast<D3D12_RESOURCE_STATES>(initial_state);
+    // The fourth word is a console D3D12_BARRIER_LAYOUT (0xFFFFFFFF is UNDEFINED), not a legacy resource state.
+    // Create as COMMON and let the title's barriers move it; a value above 0xFF is a legacy state and is kept.
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    if (!buffer && initial_state != 0xFFFFFFFFu && initial_state > 0xFF)
+        state = static_cast<D3D12_RESOURCE_STATES>(initial_state);
     const bool clearable =
         !buffer && (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
 
@@ -2635,53 +2659,6 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
         lease_title_resource_memory(self, *out, plain);
     }
     return hr;
-}
-
-// Device slot 133 places a resource at a virtual address: (va, desc, initial_state, clear_value, riid, out), the
-// shape of the console's CreatePlacedResourceX. Measured locally at a title's call sites: riid is ID3D12Resource, va is
-// the start of a range the title has just reserved for physical pages, desc is a 56-byte D3D12_RESOURCE_DESC with
-// Xbox bits in Flags above the PC flags, and initial_state is all ones, which is no PC state. The PC has no call that
-// puts a resource at a caller's address, so this creates a committed DEFAULT-heap resource from the cleaned
-// description: the PC flags only, slot 76's layout rule, COMMON for a buffer or an all-ones state, and the clear value
-// only for a render target or depth texture. The resource is not backed by the memory at va: what the title writes
-// there does not reach it. Backing it needs the physical-page mapper; until then this gets the title past the call.
-constexpr std::uint32_t kPcResourceFlags = 0x3FF;  // D3D12_RESOURCE_FLAG_* up to USE_TIGHT_ALIGNMENT (0x200)
-
-HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* xbox_desc,
-                                       std::uint32_t initial_state, const D3D12_CLEAR_VALUE* clear_value,
-                                       const IID* riid, void** out) {
-    note_slot(133);
-    if (out) *out = nullptr;
-    if (!xbox_desc) return E_INVALIDARG;
-    if (!riid || !out) return E_POINTER;
-
-    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
-    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
-    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
-    const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
-    pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    // The fourth word is a console D3D12_BARRIER_LAYOUT (0xFFFFFFFF is UNDEFINED), not a legacy resource state: a
-    // texture arrives with layout 6 (SHADER_RESOURCE), which the PC committed-resource path refuses. Create as
-    // COMMON and let the title's barriers move it. A larger value is a legacy state and is kept.
-    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
-    if (!buffer && initial_state != 0xFFFFFFFFu && initial_state > 0xFF)
-        state = static_cast<D3D12_RESOURCE_STATES>(initial_state);
-    const bool clearable =
-        !buffer && (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
-
-    static std::atomic<unsigned> calls{0};
-    const unsigned call = calls.fetch_add(1, std::memory_order_relaxed);
-    if (call < 8)
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: slot 133 CreatePlacedResourceX #%u va=0x%llx dimension=%d flags=0x%x -> 0x%x "
-                     "width=0x%llx height=%u layout=0x%x state=0x%x\n",
-                     call, static_cast<unsigned long long>(va), static_cast<int>(pc_desc.Dimension), xbox_flags,
-                     static_cast<unsigned>(pc_desc.Flags), static_cast<unsigned long long>(pc_desc.Width),
-                     pc_desc.Height, static_cast<unsigned>(pc_desc.Layout), initial_state);
-    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-                                     D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
-    return self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc, state,
-                                               clearable ? clear_value : nullptr, *riid, out);
 }
 
 // Slot 74: the retail title calls it once with (pointer, u32, pointer) (kapitche, issue 7231). The PC slot 74 is
