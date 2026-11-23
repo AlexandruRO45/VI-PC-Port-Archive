@@ -17,8 +17,10 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -128,10 +130,51 @@ int synthetic() {
     return 0;
 }
 
+// The marker buffer's sharing mode, read from the create call: several queue families write it (direct, compute and
+// copy queues), with no ownership transfer, so it is CONCURRENT among them when there are two or more.
+namespace sharing {
+VkSharingMode mode = VK_SHARING_MODE_MAX_ENUM;
+std::vector<std::uint32_t> families;
+VKAPI_ATTR VkResult VKAPI_CALL create_buffer(VkDevice, const VkBufferCreateInfo* info, const VkAllocationCallbacks*,
+                                             VkBuffer*) {
+    mode = info->sharingMode;
+    families.assign(info->pQueueFamilyIndices, info->pQueueFamilyIndices + info->queueFamilyIndexCount);
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;  // the create info is all this test needs
+}
+VKAPI_ATTR void VKAPI_CALL write_marker(VkCommandBuffer, VkPipelineStageFlagBits, VkBuffer, VkDeviceSize, std::uint32_t) {}
+VKAPI_ATTR VkResult VKAPI_CALL map(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void**) {
+    return VK_ERROR_MEMORY_MAP_FAILED;
+}
+}  // namespace sharing
+
+int marker_buffer_sharing() {
+    BreadcrumbFunctions fn;
+    fn.create_buffer = sharing::create_buffer;
+    fn.write_marker = sharing::write_marker;
+    fn.map = sharing::map;
+    const VkPhysicalDeviceMemoryProperties memory{};
+    const std::uint32_t three[] = {0, 2, 1};
+    const std::uint32_t one[] = {0};
+    for (const auto& [families, want] : {std::pair{std::span<const std::uint32_t>(three), VK_SHARING_MODE_CONCURRENT},
+                                         std::pair{std::span<const std::uint32_t>(one), VK_SHARING_MODE_EXCLUSIVE},
+                                         std::pair{std::span<const std::uint32_t>(), VK_SHARING_MODE_EXCLUSIVE}}) {
+        BreadcrumbRing ring;
+        EXPECT(!ring.initialize(VK_NULL_HANDLE, memory, fn, families));  // the fake create fails, after the call
+        EXPECT(sharing::mode == want);
+        const std::vector<std::uint32_t> expected(want == VK_SHARING_MODE_EXCLUSIVE ? 0 : 3);
+        const bool listed = want == VK_SHARING_MODE_EXCLUSIVE ||
+                            (sharing::families.size() == 3 && sharing::families[0] == 0 &&
+                             sharing::families[1] == 2 && sharing::families[2] == 1);
+        EXPECT(sharing::families.size() == expected.size() && listed);
+    }
+    std::printf("breadcrumbs: marker buffer CONCURRENT among several queue families, EXCLUSIVE for one ok\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
-    if (synthetic()) return 1;
+    if (synthetic() || marker_buffer_sharing()) return 1;
 
     vktest::Device d;
     d.request_buffer_marker = true;

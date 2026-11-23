@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -237,7 +238,11 @@ public:
 
     // GPU breadcrumbs. False (whatever was made is freed with the ring) when the marker command is missing or no
     // host-visible coherent memory fits; the caller may fall back to initialize_cpu_only().
-    bool initialize(VkDevice device, const VkPhysicalDeviceMemoryProperties& memory, const BreadcrumbFunctions& fn) {
+    // `queue_families`: the distinct families whose queues record markers. Every queue of the device writes the
+    // buffer and there are no ownership transfers, so with two or more it is VK_SHARING_MODE_CONCURRENT among them
+    // (as DeviceState::share does for the device's own resources); one family, or none given, keeps it EXCLUSIVE.
+    bool initialize(VkDevice device, const VkPhysicalDeviceMemoryProperties& memory, const BreadcrumbFunctions& fn,
+                    std::span<const std::uint32_t> queue_families = {}) {
         if (!fn.write_marker || !fn.create_buffer || !fn.map) return false;
         device_ = device;
         fn_ = fn;
@@ -245,6 +250,11 @@ public:
         info.size = VkDeviceSize(kSlots) * 2 * sizeof(std::uint32_t);
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;  // the usage buffer markers need
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (queue_families.size() >= 2) {
+            info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+            info.queueFamilyIndexCount = static_cast<std::uint32_t>(queue_families.size());
+            info.pQueueFamilyIndices = queue_families.data();
+        }
         if (fn_.create_buffer(device_, &info, nullptr, &buffer_) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         fn_.requirements(device_, buffer_, &requirements);

@@ -3449,6 +3449,9 @@ reports one (D3D-264). Implemented in `runtime/src/vulkan_breadcrumbs.h`, `runti
 - **Breadcrumbs are per list.** `execute()` writes two markers around each list's commands in the submission's
   command buffer: a unique non-zero tag into the list's begin word at `TOP_OF_PIPE`, the same tag into its end
   word at `BOTTOM_OF_PIPE`. The words live in a host-visible, coherent ring of 1024 slots (two `uint32` each).
+  Every queue of the device records markers into it (direct, compute, copy, and the staging queue), with no
+  ownership transfer. So with two or more queue families the buffer is `VK_SHARING_MODE_CONCURRENT` among the
+  device's distinct families, as its other resources are; with one family it stays `EXCLUSIVE`.
   Replay and `emit()` are not changed.
 - **States, never inferred from the CPU.** *Submitted*: `vkQueueSubmit` succeeded, nothing more; a failed
   submission forgets its lists. *Started*: the GPU wrote the tag into the begin word. *Completed*: it wrote the

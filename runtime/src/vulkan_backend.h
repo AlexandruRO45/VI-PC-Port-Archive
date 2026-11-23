@@ -1272,8 +1272,10 @@ public:
     // extension that is not enabled must not be called, even when the loader returned one. True with GPU
     // breadcrumbs (VK_AMD_buffer_marker); false when the ring keeps only what the CPU knows, because the marker
     // extension is not enabled or no host-visible memory fits.
+    // `queue_families`: the distinct queue families of the queues that will use the context (see
+    // BreadcrumbRing::initialize); empty when there is one.
     bool configure_breadcrumbs(const VkPhysicalDeviceMemoryProperties& memory, bool buffer_marker_enabled,
-                               bool device_fault_enabled) {
+                               bool device_fault_enabled, std::span<const std::uint32_t> queue_families = {}) {
         device_fault_enabled_ = device_fault_enabled;
         BreadcrumbFunctions fn;
         fn.create_buffer = vk.vkCreateBuffer;
@@ -1286,7 +1288,7 @@ public:
         fn.unmap = vk.vkUnmapMemory;
         fn.write_marker = buffer_marker_enabled ? vk.vkCmdWriteBufferMarkerAMD : nullptr;
         auto ring = std::make_unique<BreadcrumbRing>();
-        const bool gpu = fn.write_marker && ring->initialize(device_, memory, fn);
+        const bool gpu = fn.write_marker && ring->initialize(device_, memory, fn, queue_families);
         if (!gpu) {
             ring = std::make_unique<BreadcrumbRing>();  // frees whatever a failed initialize() made
             ring->initialize_cpu_only();
