@@ -146,6 +146,9 @@ jobs:
           while IFS= read -r t; do
             if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               pytest_files+=("$t")
+            elif [[ "$t" == tests/test_shader_disasm.py ]]; then
+              # unittest file; this job has the llvm-22 llvm-mc, so the packed-literal decode test really runs
+              pytest_files+=("$t::PackedLiteralTest")
             elif [[ "$t" == tests/test_tex_headers.py ]]; then
               pytest_files+=("$t::TestTextureDescriptorParsing::test_stdlib_qword_scanner_edge_cases_and_parity")
             fi

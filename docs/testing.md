@@ -13,21 +13,21 @@ This page collects the setup steps and the problems testers have run into so far
 ## What you need
 
 - **Python 3.11+.** `scripts/run_gpu_tests.py` needs at least 3.10.
-- **`llvm-mc` with the AMDGPU target** (LLVM 21+). The official LLVM Windows release has no AMDGPU target. On
+- **`llvm-mc` with the AMDGPU target** (LLVM 22+). The official LLVM Windows release has no AMDGPU target. On
   Windows, use one of:
   - `scripts\build_llvm_mc.ps1`, which builds a native `llvm-mc.exe` (needs git and the Visual Studio C++ tools);
   - conda-forge's `llvm-tools` package, whose Windows build includes the AMDGPU target;
-  - `llvm-21` in WSL, with `LLVM_MC` set to the whole command:
-    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"`.
+  - `llvm-22` in WSL, with `LLVM_MC` set to the whole command:
+    `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-22/bin/llvm-mc"`.
 
-  On Linux and macOS, the distribution's or Homebrew's `llvm-mc` on `PATH` is enough, if it is 21 or newer.
+  On Linux and macOS, the distribution's or Homebrew's `llvm-mc` on `PATH` is enough, if it is 22 or newer. LLVM 21 cannot decode a packed-math instruction with a literal (`v_pk_*` with `0xFBFF3C00` shows up as `exp`), so the tools refuse it.
 
   An older `llvm-mc` is not enough for everything. Ubuntu 24.04's `llvm-18` (18.1.3) runs `run_gpu_tests.py`,
   `valu_fuzz.py --family mem` and `lds_fuzz.py`, but rejects `op_sel` on the 16-bit integer VOP3 forms that
   `valu_fuzz.py --family f16` generates (`v_ashrrev_i16_e64 ... op_sel:[0,0,0]`: "not a valid operand"), so no f16
   program assembles. 23.1.6 assembles them.
 
-  On Windows, ROCm 7.2's bundled `llvm-mc.exe` reports LLVM 21.0.0git. It assembled the TEST-71 memory and
+  On Windows, ROCm 7.2's bundled `llvm-mc.exe` reports LLVM 21.0.0git, too old for the translator tools. It assembled the TEST-71 memory and
   LDS programs but rejected the 16-bit shift used by the f16 generator. To check an assembler directly in
   PowerShell, set `$env:LLVM_MC` to the path of its executable and run:
 
