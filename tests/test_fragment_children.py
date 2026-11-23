@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "fragment_children.py")
@@ -245,6 +246,28 @@ class TestCommandLine(unittest.TestCase):
                     self.assertIn("no-such-folder", result.stderr)
                     self.assertNotIn("a.rpf:", result.stdout)   # the scan did not start
                     self.assertFalse(os.path.exists(os.path.dirname(out)))
+
+    def test_the_guard_asks_the_shared_report_path_helper(self):
+        """The guard must not depend on skin_streams' private same_output_path, which #6137 removes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.rpf")
+            with open(path, "wb") as fh:
+                fh.write(archive(fragment()))
+            totals = os.path.join(tmp, "t.json")
+            seen = []
+
+            def refuse(first, second):
+                seen.append((first, second))
+                return True
+
+            with mock.patch.object(fc, "same_report_path", refuse):
+                self.assertEqual(fc.main([path, "--json", totals]), 2)
+            self.assertEqual(seen, [(totals, path)])
+            self.assertFalse(os.path.exists(totals))
+
+            with mock.patch.object(fc, "same_report_path", lambda *_: False):
+                self.assertEqual(fc.main([path, "--json", totals]), 0)
+            self.assertTrue(os.path.exists(totals))
 
 
 if __name__ == "__main__":
