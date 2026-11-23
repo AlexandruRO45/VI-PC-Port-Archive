@@ -290,7 +290,9 @@ def build_for_index(spirv_dir, *, assembler="spirv-as", validate=True):
 
 def python_assemble(asm, spv):
     """Assemble the .spvasm file `asm` into `spv` with tools/spirv_asm.py; RuntimeError names the file on failure."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    tools = os.path.dirname(os.path.abspath(__file__))
+    if tools not in sys.path:   # once, not one entry per helper built
+        sys.path.insert(0, tools)
     import spirv_asm
     with open(asm, encoding="utf-8") as f:
         text = f.read()

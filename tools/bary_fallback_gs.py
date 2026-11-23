@@ -202,7 +202,9 @@ def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
 
 def python_assemble(shader: str, asm: str, spv: str) -> None:
     """Assemble `shader` (the text of `asm`) into `spv` with tools/spirv_asm.py; RuntimeError names `asm` on failure."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    tools = os.path.dirname(os.path.abspath(__file__))
+    if tools not in sys.path:   # once, not one entry per helper built
+        sys.path.insert(0, tools)
     import spirv_asm
     try:
         data = spirv_asm.assemble(shader, target_env="vulkan1.2")
