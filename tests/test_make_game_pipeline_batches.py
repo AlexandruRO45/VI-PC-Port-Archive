@@ -43,6 +43,8 @@ def record(event):
     with (spirv / "calls.jsonl").open("a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(dict(event=event, pid=os.getpid(), selected=selected, active=active, args=args)) + "\n")
 record("started")
+if config.get("interrupt_while_saving"):
+    Path(f"{cache}.tmp.{os.getpid()}.0").write_text("partial", encoding="utf-8")
 if config.get("setup_error") or config.get("probe_setup_error") and count == 1 and option("--jobs") == "1":
     print("no Vulkan physical devices found", file=sys.stderr)
     sys.exit(config.get("setup_exit", 2))
@@ -279,6 +281,26 @@ class PipelineBatchesTest(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(self.batch_and_merge_commands()[1], [])
         self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")), ["previous"])
+
+    def test_staging_files_a_stopped_checker_left_beside_the_parts_are_removed(self):
+        parts = self.out / "pipeline_cache.parts"
+        parts.mkdir(parents=True)
+        staged = [parts / "000000-000003.bin.tmp.1234.0", self.out / "pipeline_cache.bin.merging.tmp.1234.0"]
+        for p in staged:
+            p.write_text("partial", encoding="utf-8")
+        unrelated = parts / "notes.txt"
+        unrelated.write_text("keep", encoding="utf-8")
+        code, _, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertEqual([p for p in staged if p.exists()], [])
+        self.assertTrue(unrelated.exists())
+        self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")), self.names)
+
+    def test_the_part_staging_file_of_an_interrupted_batch_is_removed(self):
+        code, _, _ = self.invoke({"interrupt": True, "interrupt_while_saving": True})
+        self.assertNotEqual(code, 0)
+        self.assertEqual(len(self.calls("started")), 1)
+        self.assertEqual(list((self.out / "pipeline_cache.parts").iterdir()), [])
 
     def test_a_checker_without_merge_cache_seeds_every_batch_with_the_whole_cache(self):
         code, _, err = self.invoke(merge_support=False)

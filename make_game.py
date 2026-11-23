@@ -2392,6 +2392,17 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     use_parts = len(ranges) > 1 and checker_supports(exe, "--merge-cache")
     used_parts: "list[str]" = []
 
+    def drop_part_staging() -> None:
+        # A checker killed while saving a part or the merged cache leaves that file's `.tmp.*` staging copy behind.
+        for staged in glob.glob(os.path.join(glob.escape(parts_dir), "*.tmp.*")) + \
+                glob.glob(glob.escape(cache + PIPELINE_CACHE_MERGING) + ".tmp.*"):
+            try:
+                os.remove(staged)
+            except OSError:
+                pass   # still open in a running checker
+
+    drop_part_staging()
+
     def cache_for(start: int, count: "int | None") -> str:
         if not use_parts or count is None:
             return cache
@@ -2465,6 +2476,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         for stale in glob.glob(os.path.join(glob.escape(parts_dir), "*.bin")):
             if os.path.normcase(os.path.abspath(stale)) not in current:
                 os.remove(stale)   # a range of an earlier batch layout; nothing seeds from it any more
+    drop_part_staging()
     if code != 0:
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
             if crashed else ""
@@ -2477,12 +2489,13 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
 PIPELINE_CRASH_RETRIES = 5
 PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
 PIPELINE_CACHE_PARTS = "pipeline_cache.parts"   # beside pipeline_cache.bin: one cache per batch range
+PIPELINE_CACHE_MERGING = ".merging"   # suffix of the merge output, renamed over pipeline_cache.bin when complete
 
 
 def merge_cache_parts(exe: str, spirv: str, cache: str, parts: "list[str]", entries: int) -> None:
     """Merge the batch caches into `cache` with one checker run that checks no shader (its range starts past the
     index), then replace `cache` with the result."""
-    merged = cache + ".merging"
+    merged = cache + PIPELINE_CACHE_MERGING
     drop(merged)
     log(f"pipelines: merging {len(parts)} batch cache(s) into {os.path.basename(cache)}")
     args = [exe, spirv, merged, "--jobs", "1", "--start", str(entries), "--count", "1"]

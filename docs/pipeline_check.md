@@ -344,7 +344,11 @@ Windows and POSIX. The ranges partition the same name-sorted index as `--start` 
 short range. Each range keeps its own cache part in `pipeline_cache.parts\<start>-<count>.bin`, which seeds the
 same range on the next run, and one more checker run that checks no shader (its `--start` is past the index) merges
 the parts into `pipeline_cache.bin` with `--merge-cache` (`vkMergePipelineCaches`). Parts of an earlier batch layout
-are removed after the merge; an interrupted run merges nothing and keeps the previous `pipeline_cache.bin`. Seeding
+are removed after the merge; an interrupted run merges nothing and keeps the previous `pipeline_cache.bin`. The
+batches never seed from `pipeline_cache.bin` itself, so the first run with parts starts every range from an empty
+cache, and its merge replaces a `pipeline_cache.bin` that a single shared cache wrote earlier. Each run removes the
+`.tmp.*` staging files that a checker stopped while saving a part or the merged cache left in
+`pipeline_cache.parts\` and beside `pipeline_cache.bin.merging`. Seeding
 every batch with the whole cache instead reads and rewrites it once per batch: on an RTX 4080 (NVIDIA 621.24) a
 one-shader run takes 0.9 s with an empty cache and 36-51 s with the 5.1 GB cache of the full corpus. A checker
 without `--merge-cache` keeps that single shared cache.
