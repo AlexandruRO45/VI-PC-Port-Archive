@@ -107,9 +107,9 @@ def classify(data, offset, stored):
               "version": None, "name": "", "count": None, "detail": ""}
     if data[:4] == b"MoVE":
         record.update(signature="move", version=_u32(data, 4))
-        hint = _u32(data, 0x14)
-        if hint is not None:
-            record["detail"] = f"size_hint={hint}"
+        body_size = _u32(data, 0x18)
+        if body_size is not None:
+            record["detail"] = f"size_hint={body_size}"
     elif data[:4] == b"PSIN":
         record.update(signature="psin", detail="metadata container")
     elif data[:4] == b"RBF0":

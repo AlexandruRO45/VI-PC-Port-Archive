@@ -19,8 +19,11 @@ import zlib
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "anim_index.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 import anim_index  # noqa: E402
+from anim_move import parse_move  # noqa: E402
+from test_anim_move import build_motion_tree, build_move_resource  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -44,11 +47,7 @@ def tracked_mmaps():
 
 
 def move():
-    data = bytearray(72)
-    data[:4] = b"MoVE"
-    struct.pack_into("<I", data, 4, 19)
-    struct.pack_into("<I", data, 0x14, 852)
-    return bytes(data)
+    return build_move_resource(build_motion_tree())
 
 
 def page():
@@ -154,8 +153,10 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(got, EXPECTED)
 
     def test_move_header(self):
-        r = anim_index.classify(move(), 0x100, 90)
-        self.assertEqual((r["version"], r["detail"]), (19, "size_hint=852"))
+        data = move()
+        body_size = parse_move(data)["body_size"]
+        r = anim_index.classify(data, 0x100, 90)
+        self.assertEqual((r["version"], r["detail"]), (19, f"size_hint={body_size}"))
 
     def test_page_header(self):
         r = anim_index.classify(page(), 0x200, 40)

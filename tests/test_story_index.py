@@ -20,8 +20,11 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "story_index.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 import story_index  # noqa: E402
+from anim_move import parse_move  # noqa: E402
+from test_anim_move import build_motion_tree, build_move_resource  # noqa: E402
 
 
 def psin():
@@ -123,6 +126,12 @@ class ClassifyTest(unittest.TestCase):
     def test_signatures(self):
         got = [story_index.classify(p, 0, len(p))["signature"] for p in PAYLOADS]
         self.assertEqual(got, EXPECTED)
+
+    def test_move_header(self):
+        data = build_move_resource(build_motion_tree())
+        body_size = parse_move(data)["body_size"]
+        r = story_index.classify(data, 0x100, 90)
+        self.assertEqual((r["signature"], r["version"], r["detail"]), ("move", 19, f"size_hint={body_size}"))
 
     def test_clip_header(self):
         r = story_index.classify(clip(), 0x600, 70)

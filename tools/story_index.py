@@ -134,7 +134,7 @@ def classify(data, offset, stored):
     elif data[:4] == b"9FPR":
         record.update(signature="rpf9-nested", detail=f"data_off={_u32(data, 4)} toc={_u32(data, 8)}")
     elif data[:4] == b"MoVE":
-        record.update(signature="move", version=_u32(data, 4), detail=f"size_hint={_u32(data, 0x14)}")
+        record.update(signature="move", version=_u32(data, 4), detail=f"size_hint={_u32(data, 0x18)}")
     elif _is_xml(data):
         record.update(signature="xml", detail="XML text")
     elif (len(data) >= 16 and _u32(data, 4) == 8 and _u32(data, 12) == 0
