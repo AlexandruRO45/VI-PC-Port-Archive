@@ -359,7 +359,7 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
 
 
 def _bbox(accessor: dict | None) -> dict | None:
-    """An accessor's declared POSITION min/max, or None when either is missing."""
+    """Return the declared POSITION box if all three axes have ordered numeric bounds."""
     if accessor is None:
         return None
     lower = accessor.get("min")
