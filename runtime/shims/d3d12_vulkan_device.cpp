@@ -7144,7 +7144,7 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3*>(data);
             *opts = {};
-            opts->CopyQueueTimestampQueriesSupported = FALSE;
+            opts->CopyQueueTimestampQueriesSupported = copy_queue_timestamp_queries_supported;
             // Only typeless resources set VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
             opts->CastingFullyTypedFormatSupported = FALSE;
             opts->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;

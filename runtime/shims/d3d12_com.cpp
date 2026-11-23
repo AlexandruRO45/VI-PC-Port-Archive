@@ -1634,9 +1634,10 @@ public:
 
     // Ticks per second of the timestamps EndQuery writes: one tick is timestampPeriod nanoseconds. Every D3D12
     // queue of the device shares one VkQueue, so they share one frequency. E_FAIL when that queue has no
-    // timestamps (timestampValidBits 0), as D3D12 reports for a queue that does not support them.
+    // timestamps (timestampValidBits 0), or when the queue type does not support them.
     HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* frequency) override {
         if (!frequency) return E_INVALIDARG;
+        if (desc_.Type == D3D12_COMMAND_LIST_TYPE_COPY && !copy_queue_timestamp_queries_supported) return E_FAIL;
         const double period = context_.timestamp_period();
         if (!(period > 0)) return E_FAIL;
         *frequency = static_cast<UINT64>(1e9 / period + 0.5);

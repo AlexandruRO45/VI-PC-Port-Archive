@@ -34,6 +34,8 @@ struct PresentPlanes;
 
 namespace rt::d3d12 {
 
+inline constexpr BOOL copy_queue_timestamp_queries_supported = FALSE;
+
 // How a queue answers GetClockCalibration. With `calibrated` (vkGetCalibratedTimestampsKHR or its EXT alias, on a
 // device whose time domains include DEVICE and QUERY_PERFORMANCE_COUNTER) both clocks are read in one call. Without
 // it, the queue writes a timestamp query and reads QueryPerformanceCounter around it; that needs `get_device_proc`

@@ -6706,6 +6706,19 @@ int main() {
             UINT64 frequency = 0;
             EXPECT(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency >= 1'000'000);
             EXPECT(queue->GetTimestampFrequency(nullptr) == E_INVALIDARG);
+            D3D12_FEATURE_DATA_D3D12_OPTIONS3 options3{};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options3, sizeof(options3))));
+            EXPECT(!options3.CopyQueueTimestampQueriesSupported);
+            for (const auto type : {D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_COMPUTE}) {
+                D3D12_COMMAND_QUEUE_DESC desc{};
+                desc.Type = type;
+                Ref<ID3D12CommandQueue> other;
+                EXPECT(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&other.p))));
+                UINT64 other_frequency = 0;
+                const HRESULT result = other->GetTimestampFrequency(&other_frequency);
+                if (type == D3D12_COMMAND_LIST_TYPE_COPY) EXPECT(result == E_FAIL);
+                else EXPECT(result == S_OK && other_frequency > 0);
+            }
             Ref<ID3D12QueryHeap> occlusion, timestamps, statistics, so, refused;
             D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0};
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&occlusion.p))));
