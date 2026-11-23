@@ -280,7 +280,10 @@ class TestBatchGlbOutputCollisions(unittest.TestCase):
     def test_distinct_stems_with_mixed_case_extensions_export_both_models(self) -> None:
         self.write_obj(os.path.join(self.in_dir, "other.OBJ"), 2)
         stats = batch_glb.batch_convert(self.in_dir, self.out_dir, jobs=2)
-        self.assertEqual(stats, {"total": 2, "succeeded": 2, "failed": 0})
+        self.assertEqual(
+            {key: stats[key] for key in ("total", "succeeded", "failed")},
+            {"total": 2, "succeeded": 2, "failed": 0},
+        )
         for name in ("model.glb", "other.glb"):
             with open(os.path.join(self.out_dir, name), "rb") as output:
                 contents = output.read()
