@@ -628,6 +628,8 @@ def main(argv=None) -> int:
         print(f"hardware oracle: {oracle.device} ({oracle.arch})")
         kernels, meta = build_jobs(ops, waves, exhaustive=exhaustive)
         raw_results = oracle.run(kernels)
+        if len(raw_results) != len(kernels):
+            raise RuntimeError(f"the hardware runner returned {len(raw_results)} results for {len(kernels)} kernels")
         summary = evaluate_results(ops, waves, meta, raw_results, exhaustive=exhaustive)
     except RuntimeError as e:
         print(f"harness error: {e}")

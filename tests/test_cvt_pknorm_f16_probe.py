@@ -240,6 +240,22 @@ class BuildJobsTests(unittest.TestCase):
 
 
 class MockedCLITests(unittest.TestCase):
+    def test_wrong_result_count_is_harness_error(self):
+        for delta in (-1, 1):
+            with self.subTest(delta=delta):
+                oracle = FakeOracle()
+                original_run = oracle.run
+
+                def wrong_count(kernels):
+                    results = original_run(kernels)
+                    return results[:-1] if delta < 0 else results + [results[0]]
+
+                oracle.run = wrong_count
+                rc, out, _ = _run_main(oracle, "--no-exhaustive", "--waves", "32", "--ops", pr.OPS[0])
+                self.assertEqual(rc, 2)
+                self.assertIn(f"hardware runner returned {2 + delta} results for 2 kernels", out)
+                self.assertTrue(oracle.closed)
+
     def test_pass_and_json_lf_endings(self):
         oracle = FakeOracle()
         with tempfile.TemporaryDirectory() as tmp:
