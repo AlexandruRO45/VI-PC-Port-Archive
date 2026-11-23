@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +24,15 @@ import merge_check as mc  # noqa: E402
 PARAGRAPH = ("The effect record is a fixed 48-byte header followed by its parameters, one 16-byte slot each.\n"
              "A slot whose type is zero ends the list early, before the count in the header says it should.\n"
              "Readers stop at that slot and ignore the bytes after it, which later versions use for padding.\n")
+
+
+class MergeCheckArgumentsTest(unittest.TestCase):
+    def test_non_decimal_digit_is_an_argument_error(self):
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as raised:
+            mc.main(["#\u00b2=main"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("expected PR=REF", err.getvalue())
 
 
 class MergeCheckTest(unittest.TestCase):

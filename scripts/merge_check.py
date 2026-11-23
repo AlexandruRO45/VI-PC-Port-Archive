@@ -168,7 +168,7 @@ def check(repo, main, number, ref, min_length, merges):
 
 def parse_pair(text):
     number, sep, ref = text.partition("=")
-    if not sep or not number.lstrip("#").isdigit() or not ref:
+    if not sep or not number.lstrip("#").isdecimal() or not ref:
         raise argparse.ArgumentTypeError(f"expected PR=REF, got {text!r}")
     return int(number.lstrip("#")), ref
 
