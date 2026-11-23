@@ -274,3 +274,29 @@ class TestSaluAndn2B64ScalarInterpreter(unittest.TestCase):
         self.assertEqual(state.sgpr[4], expected & MASK32)
         self.assertEqual(state.sgpr[5], (expected >> 32) & MASK32)
         self.assertEqual(state.scc, 1)
+
+
+class TestSaluAndn2B64SimdDivergence(unittest.TestCase):
+    """Test suite for SIMD multi-lane divergence and 64-bit EXEC masking."""
+
+    def test_wave64_lane_mask_isolation(self):
+        lanes = lambda lo, hi: sum(1 << l for l in range(lo, hi))
+        s0 = lanes(0, 48)  # lanes 0..47
+        s1 = lanes(16, 64) # lanes 16..63
+        # s0 & ~s1 = lanes 0..15
+        sdst, scc = ref_andn2_b64(s0, s1)
+        self.assertEqual(sdst, lanes(0, 16))
+        self.assertEqual(scc, 1)
+
+    def test_divergent_mask_checkerboard(self):
+        even_lanes = 0x5555555555555555
+        odd_lanes = 0xAAAAAAAAAAAAAAAA
+        # even & ~odd = even & even = even
+        sdst, scc = ref_andn2_b64(even_lanes, odd_lanes)
+        self.assertEqual(sdst, even_lanes)
+        self.assertEqual(scc, 1)
+
+        # even & ~even = even & odd = 0
+        sdst_zero, scc_zero = ref_andn2_b64(even_lanes, even_lanes)
+        self.assertEqual(sdst_zero, 0)
+        self.assertEqual(scc_zero, 0)
