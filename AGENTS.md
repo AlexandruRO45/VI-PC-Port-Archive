@@ -49,6 +49,15 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 
   Check its tables and the open pull requests first. If someone has claimed the item or has a pull request for it,
   stop and tell the user instead of writing it a second time.
+
+  A title search misses most of them: two pull requests for the same fix rarely share words, but they change the
+  same file. List the open pull requests that touch each file you are about to edit, then read the diffs of the ones
+  that change the same function. Thousands are open, so the list takes a minute or two:
+
+  ```sh
+  gh pr list -R ItsNotRexed/Leonida --state open --limit 10000 --json number,title,files \
+    --jq '.[] | select(any(.files[]; .path == "runtime/src/vulkan_present.h")) | "#\(.number) \(.title)"'
+  ```
 - Put the item ID from that issue in the pull request, and `Depends on: #N` for every pull request yours builds on.
 - Found work you won't do yourself (a bug, a missing method, a stale doc, a follow-up of your own pull request)?
   Post it in the coordination issue as `finding: <one line>`, followed by where it is (file and line), why it matters,
