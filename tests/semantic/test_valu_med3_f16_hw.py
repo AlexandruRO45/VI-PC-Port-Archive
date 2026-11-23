@@ -227,5 +227,89 @@ class TestVMed3F16AST(unittest.TestCase):
                 op_sel=(2, 0, 0, 0)
             )
 
+# Append scalar interpreter
+class ScalarRegisterFile:
+    """Architectural 256-entry 32-bit Vector Register File for a single thread."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.vgprs[reg.index] & MASK32
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.vgprs[reg.index] = val & MASK32
+
+    def get_half(self, src: Union[VGPR, ImmF16], hi: int, neg: bool = False, abs_m: bool = False) -> int:
+        if isinstance(src, ImmF16):
+            bits = src.raw
+        else:
+            w = self.get_vgpr(src)
+            bits = (w >> 16 if hi else w) & MASK16
+        if abs_m:
+            bits &= 0x7FFF
+        if neg:
+            bits ^= 0x8000
+        return bits & MASK16
+
+    def set_half(self, reg: VGPR, val16: int, hi: int) -> None:
+        old = self.get_vgpr(reg)
+        val16 &= MASK16
+        if hi:
+            new_val = (old & 0x0000FFFF) | (val16 << 16)
+        else:
+            new_val = (old & 0xFFFF0000) | val16
+        self.set_vgpr(reg, new_val)
+
+
+class ScalarVALUInterpreter:
+    """Deterministic scalar instruction interpreter for VALU v_med3_f16."""
+
+    def execute(self, rf: ScalarRegisterFile, inst: VMed3F16Instruction) -> int:
+        s0_hi, s1_hi, s2_hi, d_hi = inst.op_sel
+        v0 = rf.get_half(inst.src0, s0_hi, inst.neg0, inst.abs0)
+        v1 = rf.get_half(inst.src1, s1_hi, inst.neg1, inst.abs1)
+        v2 = rf.get_half(inst.src2, s2_hi, inst.neg2, inst.abs2)
+        res = v_med3_f16_oracle(v0, v1, v2, clamp=inst.clamp)
+        rf.set_half(inst.dst, res, d_hi)
+        return rf.get_vgpr(inst.dst)
+
+
+class TestVMed3F16ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter for v_med3_f16."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter()
+
+    def test_scalar_low_half_preserves_high_half(self) -> None:
+        # Pre-set v0 = 0xDEADBEEF
+        self.rf.set_vgpr(VGPR(0), 0xDEADBEEF)
+        self.rf.set_vgpr(VGPR(1), 0x00003C00)  # 1.0
+        self.rf.set_vgpr(VGPR(2), 0x00004000)  # 2.0
+        self.rf.set_vgpr(VGPR(3), 0x00004200)  # 3.0
+
+        inst = VMed3F16Instruction(
+            dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3),
+            op_sel=(0, 0, 0, 0)
+        )
+        res = self.interp.execute(self.rf, inst)
+        # Low half should be 0x4000, high half preserved as 0xDEAD
+        self.assertEqual(res, 0xDEAD4000)
+
+    def test_scalar_high_half_preserves_low_half(self) -> None:
+        self.rf.set_vgpr(VGPR(0), 0x12345678)
+        self.rf.set_vgpr(VGPR(1), 0x3C000000)  # src0 high = 1.0
+        self.rf.set_vgpr(VGPR(2), 0x40000000)  # src1 high = 2.0
+        self.rf.set_vgpr(VGPR(3), 0x42000000)  # src2 high = 3.0
+
+        inst = VMed3F16Instruction(
+            dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3),
+            op_sel=(1, 1, 1, 1)
+        )
+        res = self.interp.execute(self.rf, inst)
+        # High half should be 0x4000, low half preserved as 0x5678
+        self.assertEqual(res, 0x40005678)
+
 if __name__ == "__main__":
     unittest.main()
