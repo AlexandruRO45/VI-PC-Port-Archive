@@ -8,8 +8,9 @@
 //     exit;
 //   - the game's atexit registrations (_crt_atexit, which MSVC's atexit and static destructors reach; msvcrt's
 //     atexit and _onexit) go to a table of the run's own instead of the CRT's process-wide one, which the game
-//     shares with gta6rt. exit() runs it newest first, as the CRT does, before the run ends; _exit(), _Exit(),
-//     quick_exit(), ExitProcess() and abort() do not. _cexit() runs it and returns, _c_exit() returns. A second
+//     shares with gta6rt. exit() runs it newest first and flushes every C stream before the run ends, as the CRT
+//     does; a returning entry point is a normal exit too. _exit(), _Exit(), quick_exit(), ExitProcess() and abort()
+//     run no handlers. _cexit() runs them and returns, _c_exit() returns. A second
 //     thread that calls exit(), _exit(), _Exit() or quick_exit() while the first is leaving waits, as with the
 //     CRT's exit lock. Not covered yet: at_quick_exit() handlers (quick_exit() runs none) and the thread-local
 //     destructor callback (_register_thread_local_exe_atexit_callback); both still reach the host CRT.
@@ -150,6 +151,7 @@ bool take_exit_lock() {
 // exit(): the game's handlers and static destructors, then the end of the run.
 void __cdecl game_exit(int code) {
     if (take_exit_lock()) run_atexit_handlers();
+    std::fflush(nullptr);
     end_run(code);
 }
 // _exit(), _Exit(), quick_exit(): the end of the run without the atexit handlers.
@@ -251,6 +253,7 @@ DWORD WINAPI game_thread(void* p) {
     // An EXE entry point (mainCRTStartup and friends) takes the PEB pointer and returns the process exit code.
     auto entry = reinterpret_cast<DWORD(WINAPI*)(void*)>(call->entry);
     const DWORD code = entry(nullptr);
+    std::fflush(nullptr);
     end_run(static_cast<int>(code));  // returning from the entry point is an exit too
 }
 

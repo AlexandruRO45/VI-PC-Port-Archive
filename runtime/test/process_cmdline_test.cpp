@@ -18,6 +18,61 @@
 namespace {
 int failures = 0;
 
+const wchar_t* g_flush_path = nullptr;
+FILE* g_flush_stream = nullptr;
+
+bool buffer_stream() {
+    if (_wfopen_s(&g_flush_stream, g_flush_path, L"w") != 0 || !g_flush_stream) return false;
+    std::fputs("buffered C stream\n", g_flush_stream);
+    return true;
+}
+
+DWORD WINAPI returning_flush_entry(void*) { return buffer_stream() ? 17 : 90; }
+DWORD WINAPI exit_flush_entry(void*) {
+    if (!buffer_stream()) return 90;
+    using Exit = void(__cdecl*)(int);
+    const auto game_exit = reinterpret_cast<Exit>(rt::shims::find("ucrtbase.dll", "exit"));
+    if (!game_exit) return 91;
+    game_exit(23);
+    return 92;
+}
+
+void check_normal_exit_flush(bool use_exit) {
+    wchar_t temp[MAX_PATH];
+    wchar_t path[MAX_PATH];
+    const DWORD length = GetTempPathW(MAX_PATH, temp);
+    if (!length || length >= MAX_PATH || !GetTempFileNameW(temp, L"rt", 0, path)) {
+        std::fprintf(stderr, "FAIL normal-exit flush: could not create a temporary file\n");
+        ++failures;
+        return;
+    }
+    g_flush_path = path;
+    g_flush_stream = nullptr;
+    const auto entry = use_exit ? &exit_flush_entry : &returning_flush_entry;
+    const int code = rt::process::run_entry(reinterpret_cast<void*>(entry), 0);
+    g_flush_path = nullptr;
+
+    char contents[32] = {};
+    FILE* copy = nullptr;
+    if (_wfopen_s(&copy, path, L"r") == 0 && copy) {
+        std::fread(contents, 1, sizeof(contents) - 1, copy);
+        std::fclose(copy);
+    }
+    if (g_flush_stream) {
+        std::fclose(g_flush_stream);
+        g_flush_stream = nullptr;
+    }
+    DeleteFileW(path);
+
+    const int expected_code = use_exit ? 23 : 17;
+    if (code != expected_code || std::strcmp(contents, "buffered C stream\n") != 0) {
+        std::fprintf(stderr, "FAIL %s: exit code %d (want %d), buffered contents %s\n",
+                     use_exit ? "exit()" : "entry return", code, expected_code,
+                     std::strcmp(contents, "buffered C stream\n") == 0 ? "match" : "were not flushed");
+        ++failures;
+    }
+}
+
 wchar_t** wargv() {
     using Fn = wchar_t*** (__cdecl*)();
     return *reinterpret_cast<Fn>(rt::shims::find("ucrtbase.dll", "__p___wargv"))();
@@ -192,6 +247,10 @@ int main() {
     check_winmain(L"game.exe", {}, L"", "no arguments");
     // A byte above 0x7f in the narrow program name is part of the name, not the end of it.
     check_winmain(L"caf\u00e9.exe", {L"-x"}, L"-x", "a non-ASCII program name");
+
+    // Read while the guest's stream is still open: a later host exit or test cleanup must not be what flushes it.
+    check_normal_exit_flush(false);
+    check_normal_exit_flush(true);
 
     // If the entry thread exits via ExitThread() without going through end_run(), run_entry() must preserve its exit
     // code (and claim g_exited before closing g_done).
