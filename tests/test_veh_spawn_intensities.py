@@ -182,6 +182,30 @@ class CliTest(unittest.TestCase):
             self.assertEqual(status, 2)
             self.assertIn("ERROR:", err)
 
+    def test_json_directory_is_refused_before_census(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.xml")
+            status, out, err = self.run_tool(missing, "--json", tmp)
+            self.assertEqual(status, 2)
+            self.assertEqual(out, "")
+            self.assertIn("is a folder", err)
+
+    def test_failed_json_replace_preserves_previous_report(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = write_doc(tmp)
+            report = os.path.join(tmp, "report.json")
+            with open(report, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"previous": true}\n')
+            with mock.patch.object(vsi.os, "replace", side_effect=PermissionError(13, "busy")):
+                status, _, err = self.run_tool(xml, "--json", report)
+            self.assertEqual(status, 2)
+            self.assertIn("cannot write", err)
+            self.assertNotIn("Traceback", err)
+            with open(report, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"previous": true}\n')
+            self.assertEqual(sorted(os.listdir(tmp)), ["graphics.xml", "report.json"])
+
 
 if __name__ == "__main__":
     unittest.main()

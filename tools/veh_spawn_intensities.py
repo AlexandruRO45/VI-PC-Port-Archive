@@ -23,9 +23,11 @@ import json
 import math
 import os
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 DOC_ROOT = "CGraphicsDefinitionsData"
@@ -135,6 +137,9 @@ def main(argv=None) -> int:
     cli.add_argument("input", help="a rebuilt CGraphicsDefinitionsData XML file or a rpf9_carve directory")
     cli.add_argument("--json", help="write the same aggregate census here")
     args = cli.parse_args(argv)
+    if args.json and os.path.isdir(args.json):
+        print(f"ERROR: --json is a folder, not a file: {args.json}", file=sys.stderr)
+        return 2
     if args.json and same_report_path(args.input, args.json):
         print("ERROR: --json must not overwrite the input", file=sys.stderr)
         return 2
@@ -145,15 +150,29 @@ def main(argv=None) -> int:
         return 2
     print(json.dumps(census_out, sort_keys=True))
     if args.json:
+        staged = None
         try:
             folder = os.path.dirname(os.path.abspath(args.json))
             os.makedirs(folder, exist_ok=True)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
+            with tempfile.NamedTemporaryFile(
+                "w", dir=folder, prefix=".veh-spawn-", suffix=".tmp",
+                encoding="utf-8", newline="\n", delete=False,
+            ) as f:
+                staged = f.name
                 json.dump(census_out, f, indent=1, sort_keys=True)
                 f.write("\n")
+            os.chmod(staged, published_mode(args.json))
+            os.replace(staged, args.json)
+            staged = None
         except OSError as e:
             print(f"ERROR: cannot write {args.json}: {e.strerror or e}", file=sys.stderr)
             return 2
+        finally:
+            if staged is not None:
+                try:
+                    os.remove(staged)
+                except OSError:
+                    pass
     return 0
 
 
