@@ -361,19 +361,23 @@ def _join(items):
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
-def evaluate(profile_name: str, cpu: str, gpu: str, ram):
-    """Compare the hardware with a profile. Returns (headline, subtitle, rows)."""
+def evaluate(profile_name: str, cpu: str, gpu: str, ram, ram_kind: str = ""):
+    """Compare the hardware with a profile. Returns (headline, subtitle, rows).
+
+    ram_kind is the memory generation ("DDR5") when it is known, and only labels
+    the RAM row: the profiles compare capacity, not bandwidth."""
     p = PROFILES[profile_name]
     cs = [cpu_score(n) for n in p["cpu_ref"]]
     gs = [gpu_score(n) for n in p["gpu_ref"]]
     cpu_s, cpu_exact = cpu_lookup(cpu)
     gpu_s, gpu_exact = gpu_lookup(gpu)
+    ram_text = " ".join(t for t in (f"{ram} GB" if ram else "", ram_kind) if t)
     rows = [
         ("CPU", _judge(cpu_s, min(cs), max(cs), CPU_TOL), p["cpu_text"], cpu.strip(),
          cpu_s is not None and not cpu_exact),
         ("GPU", _judge(gpu_s, min(gs), max(gs), GPU_TOL), p["gpu_text"], gpu.strip(),
          gpu_s is not None and not gpu_exact),
-        ("RAM", _judge_ram(ram, p["ram"]), p["ram_text"], f"{ram} GB" if ram else "", False),
+        ("RAM", _judge_ram(ram, p["ram"]), p["ram_text"], ram_text, False),
     ]
     weak = [r[0] for r in rows if r[1] == BELOW]
     unknown = [r[3] or r[0] for r in rows if r[1] == UNKNOWN]
@@ -559,6 +563,36 @@ def detect_ram_gb():
     return max(4, min(128, round(gb)))
 
 
+# SMBIOS memory type codes (Win32_PhysicalMemory SMBIOSMemoryType), the DDR generation
+MEMORY_TYPES = {20: "DDR", 21: "DDR2", 24: "DDR3", 26: "DDR4", 27: "LPDDR",
+                28: "LPDDR2", 29: "LPDDR3", 30: "LPDDR4", 34: "DDR5", 35: "LPDDR5"}
+
+
+def memory_type(codes) -> str:
+    """Type name for the SMBIOS codes of the installed sticks, "" when none is known.
+
+    The sticks of one PC are the same type; the most common code wins when one
+    slot reports something else, and unknown codes (0, 0xFFFF) are ignored."""
+    known = [MEMORY_TYPES[c] for c in codes if c in MEMORY_TYPES]
+    return max(known, key=known.count) if known else ""
+
+
+def detect_memory_type() -> str:
+    """DDR generation from SMBIOS on Windows; "" elsewhere (no unprivileged source)."""
+    if sys.platform != "win32":
+        return ""
+    out = _run(["powershell", "-NoProfile", "-Command",
+                "Get-CimInstance Win32_PhysicalMemory | "
+                "Select-Object -ExpandProperty SMBIOSMemoryType"])
+    codes = []
+    for line in out.splitlines():
+        try:
+            codes.append(int(line.strip()))
+        except ValueError:
+            continue
+    return memory_type(codes)
+
+
 def detect_all() -> dict:
     best = None
     for name, vram in detect_gpus():  # with several GPUs, use the strongest
@@ -571,7 +605,8 @@ def detect_all() -> dict:
         gpu = clean_name(best[1])
         if best[2]:
             gpu += f" ({best[2]} GB VRAM)"
-    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb()}
+    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb(),
+            "ram_kind": detect_memory_type()}
 
 
 # ----------------------------------------------------------------------------
@@ -634,12 +669,15 @@ class SpecChecker:
 
     def check(self, cpu=None, gpu=None, ram=None) -> Report:
         """Anything left as None is detected from this PC."""
+        kind = ""
         if cpu is None or gpu is None or ram is None:
             info = detect_all()
             cpu = info["cpu"] if cpu is None else cpu
             gpu = info["gpu"] if gpu is None else gpu
-            ram = info["ram"] if ram is None else ram
-        headline, summary, rows = evaluate(self.profile, cpu, gpu, ram)
+            if ram is None:
+                ram = info["ram"]
+                kind = info.get("ram_kind", "") if ram else ""
+        headline, summary, rows = evaluate(self.profile, cpu, gpu, ram, kind)
         return Report(self.profile, headline, summary, [Check(*r) for r in rows])
 
     def warn_if_weak(self, report=None) -> bool:
@@ -705,6 +743,7 @@ class App:
         self.cpu_var = tk.StringVar()
         self.gpu_var = tk.StringVar()
         self.ram_var = tk.StringVar(value="16")
+        self.ram_kind = ""       # "DDR5" once detected; the RAM row shows it
 
         self._stripe()
         self._title()
@@ -854,7 +893,7 @@ class App:
     def refresh(self, *_):
         name = self.profile_var.get()
         headline, sub, rows = evaluate(name, self.cpu_var.get(), self.gpu_var.get(),
-                                       self.get_ram())
+                                       self.get_ram(), self.ram_kind)
         self.headline.config(text=headline)
         self.sub.config(text=sub)
         for (res, ref, mine), (_lbl, st, ref_text, mine_text, est) in zip(self.rows, rows):
@@ -892,6 +931,7 @@ class App:
             self.root.after(150, self._poll)
             return
         self.btn.config(state="normal")
+        self.ram_kind = info.get("ram_kind", "")   # before the vars, so refresh sees it
         missing = []
         for key, var, label in (("cpu", self.cpu_var, "CPU"), ("gpu", self.gpu_var, "GPU"),
                                 ("ram", self.ram_var, "RAM")):
@@ -944,8 +984,10 @@ def run_cli(args):
     cpu = args.cpu or info.get("cpu", "")
     gpu = args.gpu or info.get("gpu", "")
     ram = args.ram or info.get("ram")
-    print(f"PC -> CPU: {cpu or '?'} | GPU: {gpu or '?'} | RAM: {ram or '?'} GB\n")
-    print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram)))
+    kind = "" if args.ram else info.get("ram_kind", "")
+    print(f"PC -> CPU: {cpu or '?'} | GPU: {gpu or '?'} | "
+          f"RAM: {f'{ram} GB {kind}'.strip() if ram else '?'}\n")
+    print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram, kind)))
 
 
 def main():
