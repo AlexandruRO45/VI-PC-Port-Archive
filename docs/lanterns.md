@@ -42,6 +42,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 |---|---|---|
 | [1](#stage-1) | Five indexed, instanced draws with a depth buffer | Depth test off changes the predicted pixels |
 | [3](#stage-3-compute-on-a-second-queue) | A compute queue moves the points of light; the frame waits on its fence | Point states and records equal the CPU's; the points move the predicted pixels |
+| [6](#stage-6-compressed-textures-with-mip-chains) | BC1 and BC7 textures with full mip chains, trilinear and explicit-LOD sampling | Two mips down leaves the predicted pixels' bounds |
 
 ## Stage 1
 
@@ -164,6 +165,27 @@ How the check works:
 
 ```
 Lanterns stage 3: PASS, 97675 and 97664 of 98304 pixels exact, 256 points exact after 24 and 48 compute steps, points moved 14839 pixels
+```
+
+## Stage 6: compressed textures with mip chains
+
+The stage-1 scene, textured. `lanterns_bc.h` makes two patterns from integer formulas (a 256x256 mosaic and 64x64
+nested squares), box-filters them down to 1x1 and compresses them with its own encoders: BC1, and BC7 mode 6. The
+textures go up the D3D12 way: `GetCopyableFootprints`, an upload buffer, one `CopyTextureRegion` per mip level. No
+tiled layout is written or assumed. The floor samples the BC1 mosaic with `image_sample` (trilinear, LOD from the 2x2
+quad's derivatives). The solids sample the BC7 squares with `image_sample_l`, at a mip level each draw passes in a root
+constant. The root signature gains an SRV table and a sampler table.
+
+How the check works. Texture filtering precision differs between GPUs, so the reference decodes the same blocks and
+gives every pixel bounds instead of one colour (`lanterns_sampling.h`):
+
+- Solids: the exact bilinear sample, plus or minus 4/255.
+- Floor: the trilinear sample over the whole LOD range Vulkan allows (coarse or fine derivatives, and a scale factor
+  anywhere from the largest component to their sum), plus or minus 4/255.
+- Control: the solids drawn two mip levels down must leave the main bounds wherever the two references cannot overlap.
+
+```
+Lanterns stage 6: PASS, 98144 of 98144 certain pixels within the BC1/BC7 sampling bounds (trilinear floor, image_sample_l solids), control two mips down moved 10221 of 10221 predicted pixels
 ```
 
 ## Build and run

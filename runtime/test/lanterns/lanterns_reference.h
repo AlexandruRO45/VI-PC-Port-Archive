@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <vector>
 
@@ -37,7 +38,7 @@ namespace detail {
 
 struct ScreenVertex {
     double x, y, z, q;     // screen position (pixels, y down), depth z/w, q = 1/w
-    double wx, wz;         // world x and z (the floor's checker reads them)
+    double wx, wy, wz;     // world position (the floor's checker and stage 6's textures read it)
 };
 
 struct Fragment {
@@ -102,7 +103,7 @@ inline ScreenVertex transform(const Scene& scene, const Draw& draw, const Instan
                   vp[r * 4 + 3];
     const double q = 1.0 / clip[3];
     return {(clip[0] * q + 1.0) * 0.5 * kWidth, (1.0 - clip[1] * q) * 0.5 * kHeight, clip[2] * q, q, world[0],
-            world[2]};
+            world[1], world[2]};
 }
 
 // The colour vs_lanterns.asm exports for a face, as the float products it forms: (tint * colour) * shade.
@@ -121,11 +122,23 @@ inline double cross(double ax, double ay, double bx, double by) { return ax * by
 
 }  // namespace detail
 
-// The frame the stage-1 draws make, with the depth test on (LESS, cleared to 1) or off (submission order wins).
-inline Reference reference_frame(const Scene& scene, bool depth_test) {
-    using namespace detail;
+// Where a face covers a pixel centre: what a shading function gets to colour the fragment. world(px, py) is the
+// perspective-correct world position at any screen point of the face's plane (what the PS's v_interp_p1/p2 of the
+// VS's param1 reads), so a function can also take differences across the pixel's 2x2 quad.
+struct PixelSite {
+    const Draw* draw;
+    const Instance* inst;
+    Color lit;            // the face colour vs_lanterns.asm exports (flat)
+    double px, py;        // the pixel centre
+    std::function<void(double, double, double[3])> world;
+};
+
+namespace detail {
+
+// Every fragment of every face, in submission order, coloured by shade(site, fragment) (which sets colors and count).
+template <class Shade>
+std::vector<std::vector<Fragment>> fragments(const Scene& scene, Shade shade, unsigned& degenerate_faces) {
     std::vector<std::vector<Fragment>> frags(std::size_t(kWidth) * kHeight);
-    Reference ref;
     unsigned seq = 0, groups = 0;
     for (const Draw& draw : scene.draws) {
         const Mesh& mesh = scene.meshes[draw.mesh];
@@ -143,7 +156,7 @@ inline Reference reference_frame(const Scene& scene, bool depth_test) {
                 }
                 const double a012 = cross(s[1].x - s[0].x, s[1].y - s[0].y, s[2].x - s[0].x, s[2].y - s[0].y);
                 if (std::fabs(area) < 1e-6 || std::fabs(a012) < 1e-9) {
-                    ++ref.degenerate_faces;
+                    ++degenerate_faces;
                     continue;
                 }
                 const double orient = area > 0 ? 1.0 : -1.0;
@@ -160,13 +173,14 @@ inline Reference reference_frame(const Scene& scene, bool depth_test) {
                     bary(px, py, l);
                     return l[0] * s[0].z + l[1] * s[1].z + l[2] * s[2].z;
                 };
-                // Perspective-correct world x and z, as the PS's v_interp_p1/p2 reads them.
-                const auto world_at = [&](double px, double py, double& wx, double& wz) {
+                // Perspective-correct world position, as the PS's v_interp_p1/p2 reads it.
+                const auto world_at = [&](double px, double py, double w[3]) {
                     double l[3];
                     bary(px, py, l);
                     const double qs = l[0] * s[0].q + l[1] * s[1].q + l[2] * s[2].q;
-                    wx = (l[0] * s[0].wx * s[0].q + l[1] * s[1].wx * s[1].q + l[2] * s[2].wx * s[2].q) / qs;
-                    wz = (l[0] * s[0].wz * s[0].q + l[1] * s[1].wz * s[1].q + l[2] * s[2].wz * s[2].q) / qs;
+                    w[0] = (l[0] * s[0].wx * s[0].q + l[1] * s[1].wx * s[1].q + l[2] * s[2].wx * s[2].q) / qs;
+                    w[1] = (l[0] * s[0].wy * s[0].q + l[1] * s[1].wy * s[1].q + l[2] * s[2].wy * s[2].q) / qs;
+                    w[2] = (l[0] * s[0].wz * s[0].q + l[1] * s[1].wz * s[1].q + l[2] * s[2].wz * s[2].q) / qs;
                 };
                 const double dzdx = depth_at(1, 0) - depth_at(0, 0), dzdy = depth_at(0, 1) - depth_at(0, 0);
                 const double tol = (std::fabs(dzdx) + std::fabs(dzdy)) * kMargin + 1e-6;
@@ -204,27 +218,39 @@ inline Reference reference_frame(const Scene& scene, bool depth_test) {
                             f.edge = {p.x, p.y, q.x, q.y};
                             f.side = cross(q.x - p.x, q.y - p.y, cx - p.x, cy - p.y) > 0 ? 1 : -1;
                         }
-                        if (draw.floor) {
-                            double wx, wz, wx1, wz1, wx2, wz2;
-                            world_at(px, py, wx, wz);
-                            world_at(px + 1, py, wx1, wz1);
-                            world_at(px, py + 1, wx2, wz2);
-                            const double gx = std::fabs(wx1 - wx) + std::fabs(wx2 - wx);
-                            const double gz = std::fabs(wz1 - wz) + std::fabs(wz2 - wz);
-                            const auto near_border = [](double v, double g) {
-                                return std::fabs(v - std::round(v)) <= g * kMargin + 1e-5;
-                            };
-                            const long parity = (long(std::floor(wx)) + long(std::floor(wz))) & 1;
-                            f.colors[0] = times(parity ? kFloorB : kFloorA, lit);
-                            f.colors[1] = times(parity ? kFloorA : kFloorB, lit);
-                            f.count = near_border(wx, gx) || near_border(wz, gz) ? 2 : 1;
-                        }
+                        shade(PixelSite{&draw, &inst, lit, px, py, world_at}, f);
                         frags[std::size_t(y) * kWidth + x].push_back(f);
                     }
             }
         }
     }
 
+    return frags;
+}
+
+// Stage 1's shading: the face colour, and on the floor the checker (both colours near a checker border).
+inline void checker_shade(const PixelSite& site, Fragment& f) {
+    if (!site.draw->floor) return;
+    double w[3], w1[3], w2[3];
+    site.world(site.px, site.py, w);
+    site.world(site.px + 1, site.py, w1);
+    site.world(site.px, site.py + 1, w2);
+    const double gx = std::fabs(w1[0] - w[0]) + std::fabs(w2[0] - w[0]);
+    const double gz = std::fabs(w1[2] - w[2]) + std::fabs(w2[2] - w[2]);
+    const auto near_border = [](double v, double g) { return std::fabs(v - std::round(v)) <= g * kMargin + 1e-5; };
+    const long parity = (long(std::floor(w[0])) + long(std::floor(w[2]))) & 1;
+    f.colors[0] = times(parity ? kFloorB : kFloorA, site.lit);
+    f.colors[1] = times(parity ? kFloorA : kFloorB, site.lit);
+    f.count = near_border(w[0], gx) || near_border(w[2], gz) ? 2 : 1;
+}
+
+}  // namespace detail
+
+// The frame the stage-1 draws make, with the depth test on (LESS, cleared to 1) or off (submission order wins).
+inline Reference reference_frame(const Scene& scene, bool depth_test) {
+    using namespace detail;
+    Reference ref;
+    const auto frags = fragments(scene, checker_shade, ref.degenerate_faces);
     ref.color.assign(frags.size(), Color{kClear[0], kClear[1], kClear[2], kClear[3]});
     ref.candidates.resize(frags.size());
     for (std::size_t i = 0; i < frags.size(); ++i) {

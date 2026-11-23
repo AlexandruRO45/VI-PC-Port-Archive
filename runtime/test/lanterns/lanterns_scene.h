@@ -226,4 +226,13 @@ inline Scene stage1() {
     return s;
 }
 
+// Stage 6: the stage-1 scene with textures. A solid draw's tint.a is the mip level its pixel shader samples with
+// image_sample_l (the vertex shader's alpha output is not used); the floor samples trilinearly.
+inline Scene stage6() {
+    Scene s = stage1();
+    const float lods[4] = {0.0f, 1.0f, 2.0f, 1.0f};   // lanterns, cubes, octahedra, pyramids
+    for (unsigned d = 0; d < 4; ++d) s.draws[d].tint[3] = lods[d];
+    return s;
+}
+
 }  // namespace lanterns

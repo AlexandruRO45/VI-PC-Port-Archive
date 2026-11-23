@@ -20,8 +20,9 @@ using d3d12test::Ref;
 // The containers the guest hands to the pipelines, read from the folder fssm_pack.py wrote.
 struct Shaders {
     std::vector<std::uint8_t> vs, ps_lit, ps_floor, unknown_vs, rebuilt_vs, vs_w64, ps_lit_w64, cs_rise;
+    std::vector<std::uint8_t> ps_tex_floor, ps_tex_solid;   // stage 6: they replace ps_floor and ps_lit
 };
-// stage 1: graphics only; 3: plus cs_lanterns_rise.
+// stage 1: graphics only; 3: plus cs_lanterns_rise; 6: plus the textured pixel shaders.
 bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out);
 
 // What a frame's readback holds besides the pixels (stage 3).
@@ -53,9 +54,11 @@ public:
     // Submits `steps` dispatches of cs_lanterns_rise on the compute queue and signals the fence.
     bool submit_compute(unsigned steps, std::uint64_t& signalled);
     std::uint64_t next_compute_value() const { return compute_value_ + 1; }
+    // Stage 6: the textures' SRVs (the floor's mosaic, the solids' squares) and the sampler, before the first frame.
+    bool bind_textures(ID3D12Resource* floor, ID3D12Resource* solid);
     // Waits until both queues are idle (before the objects are released).
     bool idle();
-    // For the passes that record on the same device and direct queue (lanterns_edges_gpu.cpp).
+    // For the texture uploads (stage 6), which record on the same device and queue before the first frame.
     ID3D12Device* device() const { return device_.p; }
     ID3D12CommandQueue* queue() const { return queue_.p; }
 
@@ -75,13 +78,14 @@ private:
     Ref<ID3D12PipelineState> compute_pso_;
     Ref<ID3D12Resource> vertex_buffer_, index_buffer_, instance_buffer_, upload_, readback_, target_, depth_;
     Ref<ID3D12Resource> particle_state_, particle_instances_;
-    Ref<ID3D12DescriptorHeap> srv_heap_, rtv_heap_, dsv_heap_;
+    Ref<ID3D12DescriptorHeap> srv_heap_, rtv_heap_, dsv_heap_, sampler_heap_;
     Ref<ID3D12CommandQueue> queue_, compute_queue_;
     Ref<ID3D12CommandAllocator> allocator_, compute_allocator_;
     Ref<ID3D12GraphicsCommandList> list_, compute_list_;
     Ref<ID3D12Fence> fence_, compute_fence_;
     Geometry geometry_;
-    bool compute_ = false;
+    bool compute_ = false, textured_ = false, textures_bound_ = false;
+    std::uint64_t srv_texture_slot_ = 0;   // the two texture SRVs (stage 6), after the compute tables
     std::uint64_t upload_vb_ = 0, upload_ib_ = 0, upload_inst_ = 0, upload_cbv_ = 0, upload_particles_ = 0;
     std::uint64_t srv_cpu_ = 0, srv_gpu_ = 0;
     UINT srv_step_ = 0;

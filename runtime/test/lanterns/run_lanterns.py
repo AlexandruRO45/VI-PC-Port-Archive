@@ -30,6 +30,8 @@ folder:
            mask of the depth frame: certain and exact (grey), certain and wrong (red), uncertain (yellow)
   stage 3: frames 1 and 2 side by side (the points rise); sheet: frame 2 | its reference / the control frame without
            the Wait | mask of frame 2
+  stage 6: the textured frame; sheet: frame | the middle of its reference bounds / the control (solids two mips
+           down) | where the control left the frame's bounds (red, as predicted)
 """
 import argparse
 import array
@@ -62,6 +64,9 @@ PASS_LINES = {
         and centres >= 500),
     3: (rf"Lanterns stage 3: PASS, {N} and {N} of 98304 pixels exact, 256 points exact after 24 and 48 compute steps, "
         rf"points moved {N} pixels", lambda a, b, moved: 0 < a <= 98304 and 0 < b <= 98304 and moved >= 50),
+    6: (rf"Lanterns stage 6: PASS, {N} of {N} certain pixels within the BC1/BC7 sampling bounds \(trilinear floor, "
+        rf"image_sample_l solids\), control two mips down moved {N} of {N} predicted pixels",
+        lambda a, b, moved, predicted: a == b and moved == predicted and predicted > 0),
 }
 
 
@@ -274,9 +279,9 @@ def mask_rows(gpu, ref, uncertain):
         row = bytearray()
         for x in range(WIDTH):
             i = y * WIDTH + x
-            if uncertain[i]:
+            if uncertain[i] == 1:
                 row += b"\xe0\xc0\x20"
-            elif gpu[i * 4:i * 4 + 4] == ref[i * 4:i * 4 + 4]:
+            elif uncertain[i] == 3 or (uncertain[i] == 0 and gpu[i * 4:i * 4 + 4] == ref[i * 4:i * 4 + 4]):
                 row += b"\x50\x50\x50"
             else:
                 row += b"\xff\x00\x00"
@@ -291,6 +296,8 @@ PANELS = {
                   ["stage1-edges.gpu", "stage1-edges.ref"]]},
     3: {"main": [["stage3-frame1.gpu", "stage3-frame2.gpu"]],
         "sheet": [["stage3-frame2.gpu", "stage3-frame2.ref"], ["stage3-control.gpu", "stage3-frame2:mask"]]},
+    6: {"main": [["stage6-frame.gpu"]],
+        "sheet": [["stage6-frame.gpu", "stage6-frame.ref"], ["stage6-control.gpu", "stage6-control:mask"]]},
 }
 
 

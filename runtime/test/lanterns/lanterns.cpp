@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|6 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -24,13 +24,21 @@
 // submitted before its compute work; it is reported (old state, new state or a mix), not required, since a layer may
 // order the queues on its own.
 //
+// Stage 6: the stage-1 scene textured. A BC1 mosaic (256x256, 9 mips) on the floor, sampled with image_sample
+// (trilinear, LOD from derivatives); a BC7 pattern (64x64, 7 mips) on the solids, sampled with image_sample_l at a
+// per-draw mip level from a root constant. The textures are made, mipmapped and compressed here (lanterns_bc.h) and
+// uploaded with CopyTextureRegion per level; the reference decodes them and bounds every pixel (lanterns_sampling.h).
+// Control: the solids two mip levels down must leave the main bounds wherever the two references cannot overlap.
+//
 // On success the guest prints one line starting "Lanterns stage N: PASS" and exits 0; run_lanterns.py checks that
 // line, the exit code and the device line.
 #include "lanterns_edges_gpu.h"
 #include "lanterns_gpu.h"
 #include "lanterns_particles.h"
 #include "lanterns_reference.h"
+#include "lanterns_sampling.h"
 #include "lanterns_scene.h"
+#include "lanterns_textures_gpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -54,12 +62,14 @@ bool write_file(const std::filesystem::path& path, const void* data, std::size_t
     return bool(out);
 }
 
-// Writes <out>/<name>.gpu.rgba32f, .ref.rgba32f and .uncertain.u8 (one byte per pixel, 1 = uncertain), which
-// run_lanterns.py turns into PNGs.
+// Writes <out>/<name>.gpu.rgba32f, .ref.rgba32f and .uncertain.u8 (one byte per pixel: 0 = compare the two exactly,
+// 1 = uncertain, 2 = out of bounds, 3 = within bounds), which run_lanterns.py turns into PNGs. states, when given,
+// replaces the bytes the reference's candidates make (0 or 1).
 bool dump(const std::filesystem::path& out, const char* name, const std::vector<Color>& gpu,
-          const lanterns::Reference& ref) {
+          const lanterns::Reference& ref, const std::vector<std::uint8_t>* states = nullptr) {
     std::vector<std::uint8_t> uncertain(gpu.size());
     for (std::size_t i = 0; i < gpu.size(); ++i) uncertain[i] = ref.candidates[i].empty() ? 0 : 1;
+    if (states) uncertain = *states;
     const std::string base = (out / name).string();
     const bool ok = write_file(base + ".gpu.rgba32f", gpu.data(), gpu.size() * sizeof(Color)) &&
                     write_file(base + ".ref.rgba32f", ref.color.data(), ref.color.size() * sizeof(Color)) &&
@@ -264,6 +274,73 @@ int stage3(const std::filesystem::path& shader_dir, const std::filesystem::path&
     return 0;
 }
 
+// Stage 6: the stage-1 scene with compressed, mipmapped textures (see the top of this file).
+int stage6(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
+    lanterns::Shaders shaders;
+    if (!lanterns::load_shaders(shader_dir, 6, shaders)) return 1;
+    const lanterns::BcTexture mosaic = lanterns::make_texture(lanterns::mosaic_pattern(), lanterns::BcFormat::bc1);
+    const lanterns::BcTexture squares = lanterns::make_texture(lanterns::squares_pattern(), lanterns::BcFormat::bc7);
+    const lanterns::Scene scene = lanterns::stage6();
+    lanterns::Scene control = scene;   // every solid two mip levels further down
+    for (unsigned d = 0; d < 4; ++d) control.draws[d].tint[3] += 2.0f;
+    std::vector<Color> frame, control_frame;
+    {
+        lanterns::Gpu gpu;
+        if (!gpu.create(scene, shaders)) return 1;
+        lanterns::Ref<ID3D12Resource> floor_tex, solid_tex;   // after gpu: released first
+        if (!lanterns::upload_texture(gpu.device(), gpu.queue(), mosaic, floor_tex) ||
+            !lanterns::upload_texture(gpu.device(), gpu.queue(), squares, solid_tex) ||
+            !gpu.bind_textures(floor_tex.p, solid_tex.p))
+            return 1;
+        std::printf("lanterns: textures: BC1 %ux%u with %zu mips, BC7 %ux%u with %zu mips, uploaded by "
+                    "CopyTextureRegion per level\n", mosaic.width, mosaic.height, mosaic.blocks.size(), squares.width,
+                    squares.height, squares.blocks.size());
+        if (!gpu.submit_frame(scene, true, 0) || !gpu.finish_frame(frame) ||
+            !gpu.submit_frame(control, true, 0) || !gpu.finish_frame(control_frame) || !gpu.idle())
+            return 1;
+    }
+    const lanterns::TexturedReference ref = lanterns::textured_reference(scene, {&mosaic, &squares, 0.0f});
+    const lanterns::TexturedReference ctl = lanterns::textured_reference(scene, {&mosaic, &squares, 2.0f});
+    const lanterns::Comparison c = lanterns::compare_textured(frame, ref);
+    std::printf("lanterns: textured frame: %u of %u certain pixels within their bounds, %u of %u uncertain pixels "
+                "within their candidates' bounds\n", c.certain_exact, c.certain, c.uncertain_plausible, c.uncertain);
+    if (!c.pass()) report("textured frame", c);
+    // The control: wherever the references for LOD and LOD + 2 cannot overlap, the control frame must leave the
+    // main frame's bounds, and it must stay inside its own.
+    const auto predicted = lanterns::disjoint(ref, ctl);
+    unsigned expected = 0, moved = 0;
+    for (std::size_t i = 0; i < predicted.size(); ++i) {
+        expected += predicted[i];
+        moved += predicted[i] && !lanterns::within(control_frame[i], ref.bounds[i]);
+    }
+    const lanterns::Comparison own = lanterns::compare_textured(control_frame, ctl);
+    std::printf("lanterns: control, the solids two mips down: %u of %u predicted pixels left the bounds; the control "
+                "frame is within its own bounds at %u of %u certain pixels\n", moved, expected, own.certain_exact,
+                own.certain);
+    // The dumps: the reference panel is the middle of each pixel's bounds; the mask is grey within bounds, yellow
+    // where coverage is uncertain, red outside the bounds (for the control: where it left them, as predicted).
+    lanterns::Reference shown;
+    shown.color.resize(ref.bounds.size());
+    shown.candidates.resize(ref.bounds.size());
+    std::vector<std::uint8_t> states(ref.bounds.size()), control_states(ref.bounds.size());
+    for (std::size_t i = 0; i < states.size(); ++i) {
+        for (int k = 0; k < 4; ++k) shown.color[i][k] = (ref.bounds[i].lo[k] + ref.bounds[i].hi[k]) / 2;
+        states[i] = !ref.certain[i] ? 1 : lanterns::within(frame[i], ref.bounds[i]) ? 3 : 2;
+        control_states[i] = !ref.certain[i] ? 1 : lanterns::within(control_frame[i], ref.bounds[i]) ? 3 : 2;
+    }
+    if (!dump(out_dir, "stage6-frame", frame, shown, &states) ||
+        !dump(out_dir, "stage6-control", control_frame, shown, &control_states))
+        return 1;
+    if (!c.pass() || !own.pass() || expected < 1000 || moved != expected) {
+        std::fprintf(stderr, "lanterns: stage 6 FAILED\n");
+        return 1;
+    }
+    std::printf("Lanterns stage 6: PASS, %u of %u certain pixels within the BC1/BC7 sampling bounds (trilinear floor, "
+                "image_sample_l solids), control two mips down moved %u of %u predicted pixels\n", c.certain_exact,
+                c.certain, moved, expected);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -282,8 +359,9 @@ int main(int argc, char** argv) {
     switch (stage) {
     case 1: return stage1(shader_dir, out_dir);
     case 3: return stage3(shader_dir, out_dir);
+    case 6: return stage6(shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|6 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }

@@ -56,6 +56,11 @@ bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out) {
     out.ps_lit_w64 = read_file(dir / "ps_lanterns_lit_w64.dxbc");
     CHECK(out.vs.size() > 64 && out.ps_lit.size() > 64 && out.ps_floor.size() > 64);
     CHECK(out.vs_w64.size() > 64 && out.ps_lit_w64.size() > 64);
+    if (stage == 6) {
+        out.ps_tex_floor = read_file(dir / "ps_lanterns_tex_floor.dxbc");
+        out.ps_tex_solid = read_file(dir / "ps_lanterns_tex_solid.dxbc");
+        CHECK(out.ps_tex_floor.size() > 64 && out.ps_tex_solid.size() > 64);
+    }
     if (stage == 3) {
         out.cs_rise = read_file(dir / "cs_lanterns_rise.dxbc");
         CHECK(out.cs_rise.size() > 64);
@@ -85,6 +90,7 @@ bool Gpu::create(const Scene& scene, const Shaders& shaders) {
         return false;
     }
     compute_ = !shaders.cs_rise.empty();
+    textured_ = !shaders.ps_tex_floor.empty() && !shaders.ps_tex_solid.empty();
     geometry_ = flatten(scene);
     CHECK(create_pipelines(shaders));
     if (compute_) CHECK(create_compute(shaders));
@@ -107,9 +113,12 @@ void Gpu::bind_draw(const Scene& scene, std::size_t d) {
 bool Gpu::create_pipelines(const Shaders& shaders) {
     // [0] table: the mesh V# (t0)   [1] table: the instance V# (t1)   [2] 16 constants (b0)   [3] root CBV (b1)
     // -> s[0:1], s[2:3], s4..s19, s[20:21]: what vs_lanterns.asm reads.
-    D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0},
-                                        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0, 0}};
-    D3D12_ROOT_PARAMETER params[4] = {};
+    // Stage 6 adds [4] a table of the two textures (t2, t3) and [5] a table of one sampler -> s[22:23], s[24:25].
+    D3D12_DESCRIPTOR_RANGE ranges[4] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0},
+                                        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0, 0},
+                                        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 2, 0, 0},
+                                        {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0}};
+    D3D12_ROOT_PARAMETER params[6] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable = {1, &ranges[0]};
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -118,9 +127,12 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
     params[2].Constants = {0, 0, 16};
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[3].Descriptor = {1, 0};
+    params[4].ParameterType = params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[4].DescriptorTable = {1, &ranges[2]};
+    params[5].DescriptorTable = {1, &ranges[3]};
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
     root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-    root_desc.Desc_1_0 = {4, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    root_desc.Desc_1_0 = {textured_ ? 6u : 4u, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     const auto root_blob = serialize_root_signature(root_desc);
     CHECK(!root_blob.empty());
     CHECK(SUCCEEDED(device_->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root_.p))));
@@ -142,7 +154,8 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
     desc.SampleDesc.Count = 1;
     for (int floor = 0; floor < 2; ++floor)
         for (int depth = 0; depth < 2; ++depth) {
-            const auto& ps = floor ? shaders.ps_floor : shaders.ps_lit;
+            const auto& ps = textured_ ? (floor ? shaders.ps_tex_floor : shaders.ps_tex_solid)
+                                       : (floor ? shaders.ps_floor : shaders.ps_lit);
             desc.PS = {ps.data(), ps.size()};
             desc.DepthStencilState.DepthEnable = depth ? TRUE : FALSE;
             CHECK(SUCCEEDED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso_[floor][depth].p))));
@@ -245,7 +258,7 @@ bool Gpu::create_resources(const Scene& scene) {
     const D3D12_DESCRIPTOR_HEAP_DESC srv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 32,
                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&srv_heap_.p))));
-    CHECK(scene.meshes.size() + scene.draws.size() + kComputeSlots <= 32);
+    CHECK(scene.meshes.size() + scene.draws.size() + kComputeSlots + 2 <= 32);
     const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap_.p))));
     const D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -301,6 +314,7 @@ bool Gpu::fill_descriptors(const Scene& scene) {
             put(meshes + d, make_vsharp(inst + geometry_.first_instance[d] * sizeof(Instance), sizeof(Instance), count));
         }
     }
+    srv_texture_slot_ = meshes + draws + kComputeSlots;
     if (compute_) {
         // The compute table: [state, instance records].
         srv_compute_slot_ = meshes + draws;
@@ -361,8 +375,13 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_c
     list_->ClearRenderTargetView(rtv_, kClear.data(), 0, nullptr);
     list_->ClearDepthStencilView(dsv_, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     list_->SetGraphicsRootSignature(root_.p);
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.p};
-    list_->SetDescriptorHeaps(1, heaps);
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.p, sampler_heap_.p};
+    list_->SetDescriptorHeaps(textured_ ? 2 : 1, heaps);
+    if (textured_) {
+        CHECK(textures_bound_);
+        list_->SetGraphicsRootDescriptorTable(4, D3D12_GPU_DESCRIPTOR_HANDLE{srv_gpu_ + srv_texture_slot_ * srv_step_});
+        list_->SetGraphicsRootDescriptorTable(5, D3D12_GPU_DESCRIPTOR_HANDLE{heap_gpu(sampler_heap_.p)});
+    }
     list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     const D3D12_INDEX_BUFFER_VIEW ibv{index_buffer_->GetGPUVirtualAddress(),
                                       UINT(align(geometry_.indices.size() * sizeof(std::uint16_t), 4)),
@@ -470,6 +489,34 @@ bool Gpu::submit_compute(unsigned steps, std::uint64_t& signalled) {
     compute_queue_->ExecuteCommandLists(1, lists);
     CHECK(SUCCEEDED(compute_queue_->Signal(compute_fence_.p, ++compute_value_)));
     signalled = compute_value_;
+    return true;
+}
+
+bool Gpu::bind_textures(ID3D12Resource* floor, ID3D12Resource* solid) {
+    CHECK(textured_ && floor && solid);
+    // The texture slots follow the compute ones (fill_descriptors): the mosaic, then the squares.
+    for (unsigned t = 0; t < 2; ++t) {
+        ID3D12Resource* texture = t ? solid : floor;
+        const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = desc.MipLevels;
+        device_->CreateShaderResourceView(texture, &srv,
+                                          D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srv_cpu_ + (srv_texture_slot_ + t) * srv_step_)});
+    }
+    const D3D12_DESCRIPTOR_HEAP_DESC sampler_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1,
+                                                  D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&sampler_desc, IID_PPV_ARGS(&sampler_heap_.p))));
+    D3D12_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.MaxAnisotropy = 1;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    device_->CreateSampler(&sampler, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(heap_cpu(sampler_heap_.p))});
+    textures_bound_ = true;
     return true;
 }
 
