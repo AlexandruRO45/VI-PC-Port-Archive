@@ -1,8 +1,12 @@
 """tools/navmesh_cell_fit.py: the grid fit, its chance baseline and the per-cell summary, on synthetic vertices.
 No game files."""
+import contextlib
+import io
 import os
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import navmesh_cell_fit as cf  # noqa: E402
@@ -44,6 +48,38 @@ class CellFit(unittest.TestCase):
         self.assertIn(cf.nd.joaat_cs("wagon01"), h)
         self.assertIn(cf.nd.joaat_cs("Wagon01.yft"), h)
         self.assertEqual(len(h), 4)
+
+
+class ReadError(unittest.TestCase):
+    """An archive the tool cannot read is one error line and exit 2, not a traceback."""
+
+    def run_main(self, path):
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["navmesh_cell_fit.py", path]), contextlib.redirect_stderr(err):
+            return cf.main(), err.getvalue()
+
+    def test_a_file_that_is_not_an_rpf_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = os.path.join(tmp, "empty.rpf")
+            open(empty, "wb").close()
+            notrpf = os.path.join(tmp, "notrpf.rpf")
+            with open(notrpf, "wb") as f:
+                f.write(b"\x01" * 32)
+            for path, want in ((empty, "too small for an RPF header"), (notrpf, "not an RPF7/8/9 archive")):
+                with self.subTest(name=os.path.basename(path)):
+                    rc, err = self.run_main(path)
+                    self.assertEqual(rc, 2)
+                    self.assertIn("error: ", err)
+                    self.assertIn(want, err)
+                    self.assertNotIn("Traceback", err)
+
+    def test_a_missing_archive_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, err = self.run_main(os.path.join(tmp, "missing.rpf"))
+            self.assertEqual(rc, 2)
+            self.assertIn("error: ", err)
+            self.assertIn("No such file", err)
+            self.assertNotIn("Traceback", err)
 
 
 if __name__ == "__main__":
