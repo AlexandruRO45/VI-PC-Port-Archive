@@ -341,5 +341,51 @@ class TestSIMDDivergence(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][3], 0xCAFEBABE)
 
 
+class TestRegisterAliasing(unittest.TestCase):
+    def test_alias_dst_equals_src0(self):
+        # v0 = v_bfe_i32 v0, v1, v2 (base aliased with dst)
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v1, 4",
+            "v_mov_b32 v2, 8",
+            "v_bfe_i32 v0, v0, v1, v2",
+            "v_mov_b32 v3, v0",
+        ])
+        self.assertEqual(words[0], 0x67)
+
+    def test_alias_dst_equals_src1(self):
+        # v1 = v_bfe_i32 v0, v1, v2 (offset aliased with dst)
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v1, 4",
+            "v_mov_b32 v2, 8",
+            "v_bfe_i32 v1, v0, v1, v2",
+            "v_mov_b32 v3, v1",
+        ])
+        self.assertEqual(words[0], 0x67)
+
+    def test_alias_dst_equals_src2(self):
+        # v2 = v_bfe_i32 v0, v1, v2 (width aliased with dst)
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v1, 4",
+            "v_mov_b32 v2, 8",
+            "v_bfe_i32 v2, v0, v1, v2",
+            "v_mov_b32 v3, v2",
+        ])
+        self.assertEqual(words[0], 0x67)
+
+    def test_alias_quadruple_collision(self):
+        # v0 = v_bfe_i32 v0, v0, v0
+        # If v0 = 0x00000005, offset=5&31=5, width=5&31=5:
+        # 5 >> 5 is 0 -> result 0
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 5",
+            "v_bfe_i32 v0, v0, v0, v0",
+            "v_mov_b32 v3, v0",
+        ])
+        self.assertEqual(words[0], ref_bfe_i32(5, 5, 5))
+
+
 if __name__ == "__main__":
     unittest.main()
