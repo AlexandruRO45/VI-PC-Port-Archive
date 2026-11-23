@@ -36,11 +36,15 @@ import glob
 import json
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MIDL = re.compile(r'MIDL_INTERFACE\("([0-9a-fA-F-]{36})"\)\s*\n\s*(ID3D12\w+)')
@@ -344,6 +348,41 @@ def scan(path: str, known: dict[str, uuid.UUID]) -> dict:
     }
 
 
+def write_json_report(path: str, report: dict) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=2)
+            f.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".d3d12_guid_sites-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=2)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("images", nargs="+")
@@ -398,9 +437,7 @@ def main(argv: list[str] | None = None) -> int:
         for line in r["imports_of_note"]:
             print(f"   GUID-named imports: {line}")
     if args.json:
-        with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"known": len(known), "images": results}, f, indent=2)
-            f.write("\n")
+        write_json_report(args.json, {"known": len(known), "images": results})
     return 0
 
 
