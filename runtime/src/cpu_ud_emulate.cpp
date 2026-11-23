@@ -28,11 +28,22 @@ bool writable(const void* p, size_t n) {
 // CLZERO, 0F 01 FC: zero the 64-byte cache line that contains the address in RAX (the low 6 bits are ignored). If
 // that line is not writable the real instruction raises a page fault; here the emulator declines, so the access
 // violation the game would see on real hardware is not turned into a silent success.
+// Zeroes the line under SEH: another thread may unmap or reprotect it after writable() looked.
+bool zero_line(uint8_t* line) {
+    __try {
+        std::memset(line, 0, kCacheLine);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 size_t emulate_clzero(CONTEXT& ctx, const uint8_t* code, size_t available) {
     if (available < 3 || code[0] != 0x0F || code[1] != 0x01 || code[2] != 0xFC) return 0;
     auto* line = reinterpret_cast<uint8_t*>(ctx.Rax & ~static_cast<DWORD64>(kCacheLine - 1));
-    if (!writable(line, kCacheLine)) return 0;
-    std::memset(line, 0, kCacheLine);
+    // A line whose end wraps past the top of the address space (RAX near 2^64) cannot be a mapped line.
+    if (reinterpret_cast<uintptr_t>(line) > UINTPTR_MAX - kCacheLine) return 0;
+    if (!writable(line, kCacheLine) || !zero_line(line)) return 0;
     return 3;
 }
 

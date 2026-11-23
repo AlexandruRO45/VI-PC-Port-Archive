@@ -144,6 +144,8 @@ void test_unwritable_target() {
     check(ud::emulate(&na.pointers) == EXCEPTION_CONTINUE_SEARCH, "CLZERO on a no-access page: passed on");
     Fault unmapped(kClzero, 0x10);
     check(ud::emulate(&unmapped.pointers) == EXCEPTION_CONTINUE_SEARCH, "CLZERO at an unmapped address: passed on");
+    Fault top(kClzero, ~static_cast<DWORD64>(0));
+    check(ud::emulate(&top.pointers) == EXCEPTION_CONTINUE_SEARCH, "CLZERO at the top of the address space: passed on");
     VirtualFree(page, 0, MEM_RELEASE);
 }
 
