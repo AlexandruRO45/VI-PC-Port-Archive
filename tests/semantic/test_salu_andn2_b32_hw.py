@@ -394,3 +394,140 @@ class TestSaluAndn2B32BitwiseEdgeCases(unittest.TestCase):
             for cb1 in checkerboards:
                 sdst, scc = ref_andn2_b32(cb0, cb1)
                 self.assertEqual(sdst, cb0 & (~cb1 & MASK32))
+
+
+def parse_s_andn2_b32_asm(asm_line: str) -> ASTInstruction:
+    """Parse a single assembly instruction line for s_andn2_b32."""
+    clean = asm_line.strip()
+    if not clean:
+        raise ValueError("Empty assembly line")
+    parts = clean.split(None, 1)
+    mnemonic = parts[0].lower()
+    if mnemonic != "s_andn2_b32":
+        raise ValueError(f"Expected mnemonic s_andn2_b32, got {mnemonic}")
+    if len(parts) < 2:
+        raise ValueError("Missing operands")
+    operands_str = [op.strip() for op in parts[1].split(",")]
+    if len(operands_str) != 3:
+        raise ValueError(f"Expected 3 operands (dst, src0, src1), got {len(operands_str)}")
+
+    def parse_op(op_str: str) -> ASTOperand:
+        op_lower = op_str.lower()
+        if op_lower in ("exec_lo", "exec"):
+            return ASTOperand.exec_lo()
+        elif op_lower in ("vcc_lo", "vcc"):
+            return ASTOperand.vcc_lo()
+        elif op_lower.startswith("s") and op_lower[1:].isdigit():
+            return ASTOperand.sgpr(int(op_lower[1:]))
+        elif op_str.startswith("0x") or op_str.startswith("-") or op_str.isdigit():
+            val = int(op_str, 0)
+            return ASTOperand.literal32(val)
+        else:
+            raise ValueError(f"Invalid operand: {op_str}")
+
+    dst = parse_op(operands_str[0])
+    src0 = parse_op(operands_str[1])
+    src1 = parse_op(operands_str[2])
+
+    inst = ASTInstruction(Opcode.S_ANDN2_B32, dst, src0, src1)
+    inst.validate()
+    return inst
+
+
+# Mutant functions for mutation testing
+def mutant_and(s0: int, s1: int) -> tuple[int, int]:
+    """Mutant 1: uses regular AND (omits ~ negation)."""
+    res = (s0 & s1) & MASK32
+    return res, 1 if res != 0 else 0
+
+
+def mutant_orn2(s0: int, s1: int) -> tuple[int, int]:
+    """Mutant 2: uses OR instead of AND."""
+    res = (s0 | (~s1 & MASK32)) & MASK32
+    return res, 1 if res != 0 else 0
+
+
+def mutant_swapped_operands(s0: int, s1: int) -> tuple[int, int]:
+    """Mutant 3: swaps operand order (s1 & ~s0)."""
+    res = (s1 & (~s0 & MASK32)) & MASK32
+    return res, 1 if res != 0 else 0
+
+
+def mutant_invert_scc(s0: int, s1: int) -> tuple[int, int]:
+    """Mutant 4: inverts SCC logic."""
+    res = (s0 & (~s1 & MASK32)) & MASK32
+    return res, 1 if res == 0 else 0
+
+
+class TestSaluAndn2B32NegativeControlsAndMutations(unittest.TestCase):
+    """Test suite for syntax rejection, negative controls, mutation detection, and translator execution."""
+
+    def test_syntax_rejection_malformed_syntax(self):
+        with self.assertRaises(ValueError):
+            parse_s_andn2_b32_asm("")
+
+        with self.assertRaises(ValueError):
+            parse_s_andn2_b32_asm("s_orn2_b32 s0, s1, s2")
+
+        with self.assertRaises(ValueError):
+            parse_s_andn2_b32_asm("s_andn2_b32 s0, s1")
+
+        with self.assertRaises(ValueError):
+            parse_s_andn2_b32_asm("s_andn2_b32 s106, s1, s2")
+
+    def test_mutation_detection_and(self):
+        s0, s1 = 0x0F, 0x0F
+        correct = ref_andn2_b32(s0, s1)
+        mutated = mutant_and(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_orn2(self):
+        s0, s1 = 0x00, 0x00
+        correct = ref_andn2_b32(s0, s1)
+        mutated = mutant_orn2(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_swapped_operands(self):
+        s0, s1 = 0x0F, 0x00
+        correct = ref_andn2_b32(s0, s1)
+        mutated = mutant_swapped_operands(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_mutation_detection_invert_scc(self):
+        s0, s1 = 0x00, 0x00
+        correct = ref_andn2_b32(s0, s1)
+        mutated = mutant_invert_scc(s0, s1)
+        self.assertNotEqual(correct, mutated)
+
+    def test_andn2_spirv_emission(self):
+        """Verify that support.translate_lines emits expected SPIR-V logic for s_andn2_b32."""
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x00ff00ff",
+            "s_andn2_b32 s2, s0, s1",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_test_andn2_b32_emit", lines)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpNot", spv)
+
+    def test_andn2_hardware_execution(self):
+        """Verify hardware-accurate execution of s_andn2_b32 through support.mrt0_words."""
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x00ff00ff",
+            "s_andn2_b32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "exp mrt0, v0, v1, v0, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_andn2_b32_hw", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x12005600)
+        self.assertEqual(words[1], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
