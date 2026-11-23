@@ -396,6 +396,77 @@ class Runner(unittest.TestCase):
         self.assertIn("MISMATCH", out)
         self.assertIn("0 skipped", out)
 
+    def test_gpu_timeout_is_a_harness_error_and_next_program_runs(self):
+        import contextlib
+        import io
+        import os
+        import subprocess
+        import tempfile
+        from unittest.mock import patch
+
+        progs = f.programs(1, 2, (32,))
+        attempted = []
+
+        def translate(ps, work, _emulate):
+            (work / "spirv").mkdir(parents=True, exist_ok=True)
+            for p in ps:
+                (work / "spirv" / (p.name + ".spv")).touch()
+            return {p.name: {} for p in ps}
+
+        def fake_run(cmd, *, env, timeout, **_kwargs):
+            self.assertEqual(timeout, 0.25)
+            name = Path(cmd[1]).stem
+            attempted.append(name)
+            if name == progs[0].name:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            self.correct_dump(progs[1], Path(env["VKC_DUMP"]))
+            return subprocess.CompletedProcess(cmd, 0, "compute subgroup size: 32", "")
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            build = tmp / "build"
+            build.mkdir()
+            (build / ("vk_compute_test" + (".exe" if os.name == "nt" else ""))).touch()
+            argv = ["lds_fuzz.py", "--programs", "2", "--wave", "32", "--build", str(build), "--work", str(tmp)]
+            out = io.StringIO()
+            env = {k: v for k, v in os.environ.items() if k != "LEONIDA_PC_TAIL_UBO"}
+            env["LEONIDA_GPU_TEST_TIMEOUT"] = "0.25"
+            with (patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", argv),
+                  patch.object(f, "translate", side_effect=translate),
+                  patch.object(f.subprocess, "run", side_effect=fake_run),
+                  contextlib.redirect_stdout(out)):
+                status = f.main()
+        self.assertEqual(status, 2)
+        self.assertEqual(attempted, [p.name for p in progs])
+        text = out.getvalue()
+        self.assertIn(f"ERROR {progs[0].name}", text)
+        self.assertIn("timed out after 0.25 s", text)
+        self.assertIn("1/1 programs that ran match", text)
+        self.assertIn("1 harness errors", text)
+
+    def test_dll_not_found_exit_code_reports_actionable_hint(self):
+        import os
+        import subprocess
+        import tempfile
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            build = tmp / "build"
+            build.mkdir()
+            (build / ("vk_compute_test" + (".exe" if os.name == "nt" else ""))).touch()
+            prog = f.Program(1, 0, 32)
+            for code in (0xC0000135, -1073741515):
+                with self.subTest(returncode=code):
+                    done = subprocess.CompletedProcess(["vk_compute_test"], code, "", "")
+                    with patch.object(f.subprocess, "run", return_value=done):
+                        rc, msg = f.run_gpu(prog, tmp / "a.spv", str(build), {}, False, tmp / "a.bin")
+                    self.assertEqual(rc, code)
+                    self.assertIn("STATUS_DLL_NOT_FOUND", msg)
+                    self.assertIn("0xc0000135", msg)
+                    self.assertIn("PATH", msg)
+                    self.assertIn("libc++.dll", msg)
+
 
 class UnpinnedSubgroup(unittest.TestCase):
     """compute_fixture.unpinned_subgroup reads vk_compute_test's VKC_SUBGROUP_SIZE line."""

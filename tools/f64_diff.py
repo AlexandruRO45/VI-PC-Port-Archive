@@ -426,6 +426,9 @@ def sdk_tool(name):
 
 
 def prepare_gpu(exe, tmpdir):
+    # Windows CreateProcess does not resolve relative forward-slash paths (e.g. runtime/build/vk_harness.exe),
+    # even when os.path.isfile accepts them; normalize to an absolute path before launching.
+    exe = os.path.abspath(exe) if exe else exe
     if not os.path.isfile(exe): raise GPUUnavailable(f"vk_harness not found: {exe}")
     glslc, spirv_as = sdk_tool("glslc"), sdk_tool("spirv-as")
     if not glslc or not spirv_as: raise GPUUnavailable("Vulkan SDK glslc and spirv-as are required for --oracle gpu")
@@ -778,7 +781,7 @@ def main(argv=None):
         print(f"hardware oracle: {getattr(hw, 'device', 'AMD GPU')}")
     if args.oracle == "gpu":
         ext = ".exe" if os.name == "nt" else ""
-        gpu = args.exe or os.path.join(ROOT, "runtime", "build", "vk_harness" + ext)
+        gpu = os.path.abspath(args.exe) if args.exe else os.path.join(ROOT, "runtime", "build", "vk_harness" + ext)
     try:
         counts, skips, failures = run_batch(ops, args.programs, args.seed, args.max_ops, args.sweep,
                                             not args.no_literals, args.known, args.all_failures,

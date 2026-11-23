@@ -118,6 +118,34 @@ class F64DiffTests(unittest.TestCase):
         self.assertTrue(observed)
         self.assertTrue(all(item is context for item in observed))
 
+    def test_relative_forward_slash_exe_is_normalized_to_absolute(self):
+        seen_batch = []
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "build"))
+            exe = os.path.join(tmp, "build", "vk_harness.exe")
+            open(exe, "wb").close()
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                given = "build/vk_harness.exe"
+                with mock.patch.object(fd, "run_batch",
+                                       side_effect=lambda *a: seen_batch.append(a[9]) or (fd.Counter(), fd.Counter(), [])), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    code = fd.main(["--oracle", "gpu", "--exe", given, "--programs", "0", "--no-sweep"])
+                self.assertEqual(code, 0)
+                self.assertEqual(len(seen_batch), 1)
+                self.assertTrue(os.path.isabs(seen_batch[0]), seen_batch[0])
+                self.assertTrue(os.path.samefile(seen_batch[0], exe), seen_batch[0])
+
+                with mock.patch.object(fd, "sdk_tool", side_effect=lambda name: name), \
+                        mock.patch.object(fd.subprocess, "run",
+                                          return_value=subprocess.CompletedProcess(["glslc"], 0, "", "")):
+                    ctx = fd.prepare_gpu(given, tmp)
+                self.assertTrue(os.path.isabs(ctx["exe"]), ctx["exe"])
+                self.assertTrue(os.path.samefile(ctx["exe"], exe), ctx["exe"])
+            finally:
+                os.chdir(cwd)
+
     def test_known_divergences_only_reinserted_with_known(self):
         normal = self.command("--ops", "v_add_f64", "--programs", "0")
         known = self.command("--ops", "v_add_f64", "--programs", "0", "--no-sweep", "--known", "--all-failures")

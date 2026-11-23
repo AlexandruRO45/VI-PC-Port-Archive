@@ -348,6 +348,42 @@ def test_a_silent_crash_still_says_how_the_harness_ended(monkeypatch, tmp_path, 
     assert "FAIL (vk_image_fuzz exit 0xc0000005 (access violation), no output)" in out
 
 
+def test_dll_not_found_exit_code_gives_actionable_hint(monkeypatch, tmp_path, capsys):
+    assert run_case_with_harness_result(monkeypatch, tmp_path, 0xC0000135, "") is False
+    out = capsys.readouterr().out
+    assert "exit 0xc0000135" in out
+    assert "STATUS_DLL_NOT_FOUND" in out
+    assert "PATH" in out and "libc++.dll" in out
+
+
+def test_gpu_timeout_uses_leonida_gpu_test_timeout_and_fails_cleanly(monkeypatch, tmp_path, capsys):
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
+    monkeypatch.setattr(imf, "assemble", lambda *_args: None)
+    monkeypatch.setattr(imf, "translate", lambda work: str(tmp_path / "spirv"))
+    seen_timeouts = []
+
+    def fake_timeout(cmd, **kw):
+        seen_timeouts.append(kw.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+    monkeypatch.setenv("LEONIDA_GPU_TEST_TIMEOUT", "0.25")
+    monkeypatch.setattr(imf.subprocess, "run", fake_timeout)
+    assert imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(tmp_path), str(build), False, False) is False
+    assert seen_timeouts == [0.25]
+    out = capsys.readouterr().out
+    assert "FAIL (timed out after 0.25 s:" in out
+    assert "LEONIDA_GPU_TEST_TIMEOUT" in out
+
+    monkeypatch.setenv("LEONIDA_GPU_TEST_TIMEOUT", "0")
+    monkeypatch.setattr(imf.subprocess, "run",
+                        lambda cmd, **kw: seen_timeouts.append(kw.get("timeout")) or subprocess.CompletedProcess(
+                            cmd, 77, "unsupported: test\n", ""))
+    assert imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(tmp_path), str(build), False, False) is None
+    assert seen_timeouts == [0.25, None]
+
+
 def test_a_long_stderr_prints_only_its_tail(monkeypatch, tmp_path, capsys):
     stderr = "".join(f"line {i}\n" for i in range(50))
     assert run_case_with_harness_result(monkeypatch, tmp_path, 3, "", stderr) is False
@@ -362,6 +398,7 @@ def test_a_long_stderr_prints_only_its_tail(monkeypatch, tmp_path, capsys):
     (2, "exit 2"),
     (-signal.SIGABRT, "killed by SIGABRT"),
     (-99, "killed by signal 99"),
+    (0xC0000135, "exit 0xc0000135 (STATUS_DLL_NOT_FOUND: missing runtime DLL on PATH, e.g. llvm-mingw libc++.dll / libunwind.dll)"),
     (0xC0000409, "exit 0xc0000409 (stack buffer overrun)"),
     (0xC0001234, "exit 0xc0001234"),
 ])

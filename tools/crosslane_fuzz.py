@@ -1330,7 +1330,11 @@ class HarnessError(RuntimeError):
     """vk_compute_test did not give a result for one program: it hung, crashed or wrote no dump."""
 
 
-class Unpinned(RuntimeError):
+class Skipped(RuntimeError):
+    """vk_compute_test reported that the device cannot run this program (exit 77 or unpinned subgroups): skipped."""
+
+
+class Unpinned(Skipped):
     """vk_compute_test ran a wave32 program but couldn't pin the 32-lane subgroups it needs, so its words came from
     another wave size (Mesa llvmpipe: 8 lanes) and are no evidence either way: the program is skipped. Programs
     translated with --wave64-emulate use no subgroup operations, so they are judged at any size."""
@@ -1348,6 +1352,9 @@ def run_gpu(exe, spv, prog, work, emulate):
         r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=GPU_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise HarnessError(f"vk_compute_test timed out after {GPU_TIMEOUT} s") from None
+    if r.returncode == 77:
+        msg = (r.stdout + r.stderr).strip()
+        raise Skipped(msg.splitlines()[-1] if msg else "unsupported")
     import compute_fixture
     lanes = compute_fixture.unpinned_subgroup(r.stdout + r.stderr) if prog.wave == 32 else None
     if lanes:
@@ -1409,8 +1416,8 @@ def still_fails(prog, ops, mode, ctx):
             return False
         try:
             bad, hyp = compare(prog, run_gpu(exe, spv, prog, work, mode == "emulate"), ops)
-        except (HarnessError, Unpinned):
-            return False                # a reduction that hangs or crashes is not the mismatch being reduced
+        except (HarnessError, Skipped):
+            return False                # a reduction that hangs, crashes or skips is not the mismatch being reduced
         return bool(bad) and not hyp
 
 
@@ -1706,7 +1713,7 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
                     st["harness_errors"] += 1
                     fails.append((p, mode, f"harness error: {e}", None))
                     continue
-                except Unpinned as e:
+                except Skipped as e:
                     st["skipped"] += 1
                     print(f"SKIP {p.name} [{mode}]: {e}")
                     continue

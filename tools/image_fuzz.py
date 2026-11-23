@@ -48,6 +48,7 @@ TRANSLATOR = os.path.join(TOOLS, "rdna2spirv.py")
 sys.path.insert(0, TOOLS)
 sys.path.insert(0, SHADERS)
 import mc_command  # noqa: E402
+from check import gpu_test_timeout, timed_out  # noqa: E402
 from compute_fixture import find_test_program  # noqa: E402
 from hw_oracle import asm as hw_asm, tsharp  # noqa: E402
 
@@ -74,6 +75,7 @@ NTSTATUS = {
     0xC000001D: "illegal instruction",
     0xC0000094: "integer divide by zero",
     0xC00000FD: "stack overflow",
+    0xC0000135: "STATUS_DLL_NOT_FOUND: missing runtime DLL on PATH, e.g. llvm-mingw libc++.dll / libunwind.dll",
     0xC0000374: "heap corruption",
     0xC0000409: "stack buffer overrun",
 }
@@ -314,11 +316,16 @@ def run_case(fmt_name, width, height, rng, work, build, keep, show, dmask=0xf, d
     if not os.path.exists(harness):
         raise SystemExit(f"{harness} not found: build the runtime first "
                          f"(cmake --build <build> --target {HARNESS})")
-    run_kw = {"capture_output": True, "text": True}
+    limit = gpu_test_timeout()
+    run_kw = {"capture_output": True, "text": True, "timeout": limit}
     if pc_tail:
         run_kw["env"] = dict(os.environ, LEONIDA_PC_TAIL_UBO="1")
-    r = subprocess.run([harness, os.path.join(spirv, "vs_ids.spv"), os.path.join(spirv, "ps_image_load.spv"),
-                        out_path, spec_path], **run_kw)
+    try:
+        r = subprocess.run([harness, os.path.join(spirv, "vs_ids.spv"), os.path.join(spirv, "ps_image_load.spv"),
+                            out_path, spec_path], **run_kw)
+    except subprocess.TimeoutExpired:
+        print(f"{fmt_name} {width}x{height} dmask:0x{dmask:x}: FAIL ({timed_out(harness, limit)})")
+        return False
     if r.returncode == 77:   # a device limit or missing feature, named on the harness's "unsupported:" line
         why = next((ln for ln in f"{r.stdout}\n{r.stderr}".splitlines() if ln.startswith("unsupported:")),
                    "the device does not support the set")

@@ -511,6 +511,19 @@ class UnpinnedSubgroup(unittest.TestCase):
         words = self._run_gpu(prog, True, self.UNPINNED)
         self.assertEqual(len(words), prog.group * len(X.OUT_REGS))
 
+    def test_exit_77_raises_skipped_not_harness_error(self):
+        prog = X.make_program(1, 32, 4)
+        for stdout, want in (
+            ("device: X\nunsupported: need feature Y\n", "unsupported: need feature Y"),
+            ("", "unsupported"),
+        ):
+            with self.subTest(stdout=stdout):
+                done = subprocess.CompletedProcess(["x"], 77, stdout=stdout, stderr="")
+                with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", return_value=done):
+                    with self.assertRaises(X.Skipped) as ctx:
+                        X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+                self.assertEqual(str(ctx.exception), want)
+
 
 class HardwareOracle(unittest.TestCase):
     """--oracle hw: the native kernel text (no GPU needed) and the exit-77 contract."""
@@ -665,6 +678,29 @@ class HarnessErrors(unittest.TestCase):
         self.assertIn("wave32 native: programs 2, match 0, mismatch 0, hyp_only 0, rejected 0, harness_errors 0, "
                       "skipped 2", out)
         self.assertIn("wave64 emulate: programs 2, match 2", out)
+
+    def test_exit_77_counts_as_skip_not_harness_error(self):
+        def run_gpu(exe, spv, prog, work, emulate):
+            if prog.wave == 32:
+                raise X.Skipped("unsupported: feature missing")
+            return self._expected_words(prog)
+
+        with tempfile.TemporaryDirectory() as keep:
+            code, out = self._main(run_gpu, ["--programs", "4", "--wave", "both", "--no-maskdata", "--keep", keep])
+            kept = os.listdir(keep)
+        self.assertEqual(code, 0, out)
+        self.assertIn("SKIP ", out)
+        self.assertIn("unsupported: feature missing", out)
+        self.assertIn("wave32 native: programs 2, match 0, mismatch 0, hyp_only 0, rejected 0, harness_errors 0, "
+                      "skipped 2", out)
+        self.assertIn("wave64 emulate: programs 2, match 2", out)
+        self.assertEqual(kept, [])
+
+        code_all, out_all = self._main(lambda *a: (_ for _ in ()).throw(X.Skipped("unsupported")),
+                                       ["--programs", "2", "--wave", "32", "--modes", "native"])
+        self.assertEqual(code_all, 2, out_all)
+        self.assertIn("harness_errors 0, skipped 2", out_all)
+        self.assertIn("no program ran", out_all)
 
     def test_clean_run_still_exits_0(self):
         code, out = self._main(lambda exe, spv, prog, work, emulate: self._expected_words(prog),
