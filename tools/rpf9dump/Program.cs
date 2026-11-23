@@ -64,7 +64,12 @@ long? effectiveScanLength = scanLength is long reqSpan ? Math.Min(reqSpan, lengt
 var json = new JsonSerializerOptions { WriteIndented = true };
 var sw = Stopwatch.StartNew();
 string baseName = Path.GetFileNameWithoutExtension(src);
-string outDir = Path.Combine(outRoot, baseName); Directory.CreateDirectory(outDir);
+// ttpf, audio and xma hand the source to a reader that only takes a container it knows: a file that is none used to
+// surface as an unhandled InvalidDataException ("Not an RDS5 container.", "Full AWC recovery requires an RPF9
+// archive.") after <out>/<name> existed. Each of those branches reads first and creates outDir afterwards, so such a
+// source is one line and exit 2 like a mistyped path. models and textures scan whatever they are given on purpose: a
+// headerless slice of an archive is a supported source there.
+string outDir = Path.Combine(outRoot, baseName);
 int ok = 0, fail = 0, skip = 0, writeFail = 0;
 // Every mode below works on all cores by default. Core's readers open their own read handle per call, entry and
 // file names come from offsets and indexes, and results are put back in source order, so outputs match a
@@ -73,7 +78,14 @@ var par = new ParallelOptions { MaxDegreeOfParallelism = jobs };
 
 if (mode == "ttpf")
 {
-    var info = TtpfReader.Inspect(src);
+    TtpfInfo info;
+    try { info = TtpfReader.Inspect(src); }
+    catch (Exception e) when (e is InvalidDataException or NotSupportedException)
+    {
+        Console.Error.WriteLine($"source is not a texture pool this mode can read: {src}: {e.Message}");
+        return 2;
+    }
+    Directory.CreateDirectory(outDir);
     var rows = new object[info.Textures.Count];
     int done = 0;
     Parallel.For(0, info.Textures.Count, par, i =>
@@ -115,15 +127,25 @@ if (mode == "ttpf")
 }
 else if (mode == "audio")
 {
-    if (!AwcRecovery.HasCompleteCache(src))
+    ArchiveDocument doc;
+    try
     {
-        long last = -1;
-        var prog = new Progress<long>(p => { long s = p / (4L << 30); if (s != last) { last = s; Console.WriteLine($"  awc scan {100.0 * p / length:0.0}%"); } });
-        var found = AwcRecovery.RecoverFull(src, prog);
-        AwcRecovery.WriteCache(src, found);
-        Console.WriteLine($"  {found.Count:N0} AWC banks ({sw.Elapsed.TotalSeconds:0}s)");
+        if (!AwcRecovery.HasCompleteCache(src))
+        {
+            long last = -1;
+            var prog = new Progress<long>(p => { long s = p / (4L << 30); if (s != last) { last = s; Console.WriteLine($"  awc scan {100.0 * p / length:0.0}%"); } });
+            var found = AwcRecovery.RecoverFull(src, prog);
+            AwcRecovery.WriteCache(src, found);
+            Console.WriteLine($"  {found.Count:N0} AWC banks ({sw.Elapsed.TotalSeconds:0}s)");
+        }
+        doc = ArchiveReader.Open(src);
     }
-    var doc = ArchiveReader.Open(src);
+    catch (Exception e) when (e is InvalidDataException or NotSupportedException)
+    {
+        Console.Error.WriteLine($"source is not an archive this mode can read: {src}: {e.Message}");
+        return 2;
+    }
+    Directory.CreateDirectory(outDir);
     var banks = doc.Entries.Where(e => e.Extension == ".awc" && e.CanExtract).ToList();
     string sub = Path.Combine(outDir, "awc");
     var todo = banks.Where(e => !File.Exists(ArchiveReader.SafeDestination(sub, e.Path))).ToList();
@@ -138,7 +160,14 @@ else if (mode == "audio")
 else if (mode == "xma")
 {
     // XMA2 streams (AWC codec 5) as RIFF XMA2 .wav files that ffmpeg decodes (AwcRecovery.WriteXmaWave).
-    var doc = ArchiveReader.Open(src);
+    ArchiveDocument doc;
+    try { doc = ArchiveReader.Open(src); }
+    catch (Exception e) when (e is InvalidDataException or NotSupportedException)
+    {
+        Console.Error.WriteLine($"source is not an archive this mode can read: {src}: {e.Message}");
+        return 2;
+    }
+    Directory.CreateDirectory(outDir);
     var banks = doc.Entries.Where(e => e.Extension == ".awc" && e.CanExtract).ToList();
     string sub = Path.Combine(outDir, "xma"); Directory.CreateDirectory(sub);
     Parallel.ForEach(banks, par, e =>
