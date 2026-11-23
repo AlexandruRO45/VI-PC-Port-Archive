@@ -760,7 +760,7 @@ public:
         D3D12_QUERY_HEAP_DESC desc{};
         if (!query_heap_desc(heap, &desc)) return true;
         if (!leonida::query_fits_heap(desc.Type, u(type))) return false;
-        return first < desc.Count && count <= desc.Count - first;
+        return first <= desc.Count && count <= desc.Count - first;
     }
 
     void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) override {
