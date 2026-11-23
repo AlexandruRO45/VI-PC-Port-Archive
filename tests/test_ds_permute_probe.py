@@ -48,7 +48,7 @@ class DsPermuteProbeTests(unittest.TestCase):
     def test_invalid_waves_rejected_before_open_oracle(self):
         pkg, asm_mod, runner_mod, open_oracle = _fake_hw_oracle()
         with mock.patch.dict(sys.modules, {"hw_oracle": pkg, "hw_oracle.asm": asm_mod, "hw_oracle.runner": runner_mod}):
-            for bad in ("", " , ", "abc", "32,abc", "16", "128"):
+            for bad in ("", " , ", "abc", "32,abc", "16", "128", "3_2", "+32", "\u0663\u0662"):
                 with self.subTest(waves=bad):
                     stderr = io.StringIO()
                     with mock.patch.object(sys, "stderr", stderr):

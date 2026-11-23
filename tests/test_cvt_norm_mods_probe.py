@@ -257,7 +257,7 @@ class ProbeCliTests(unittest.TestCase):
         self.assertIn("harness error", out)
 
     def test_bad_cli_args_exit_2(self):
-        for bad_waves in ("", "16", "32,", "32,,64", "abc"):
+        for bad_waves in ("", "16", "32,", "32,,64", "abc", "3_2", "+32", "\u0663\u0662"):
             with self.subTest(waves=bad_waves):
                 rc, _, err = _run_main(FakeOracle(), "--waves", bad_waves)
                 self.assertEqual(rc, 2)

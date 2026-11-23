@@ -37,7 +37,7 @@ class BufferStoreProbeTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 77, proc.stderr or proc.stdout)
 
     def test_invalid_waves_rejected_before_open_oracle(self):
-        for bad in ("", "   ", "abc", "32,foo", "16", "32,128"):
+        for bad in ("", "   ", "abc", "32,foo", "16", "32,128", "3_2", "+32", "\u0663\u0662"):
             with self.subTest(waves=bad):
                 err = io.StringIO()
                 with unittest.mock.patch.object(hw_runner, "open_oracle",

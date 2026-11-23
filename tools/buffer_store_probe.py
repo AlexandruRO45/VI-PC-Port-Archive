@@ -293,13 +293,9 @@ def parse_waves(raw):
         return None, "--waves must not be empty"
     waves = []
     for tok in tokens:
-        try:
-            w = int(tok)
-        except ValueError:
+        if tok not in ("32", "64"):
             return None, f"invalid wave size {tok!r} (expected 32 or 64)"
-        if w not in (32, 64):
-            return None, f"unsupported wave size {w} (expected 32 or 64)"
-        waves.append(w)
+        waves.append(int(tok))
     return waves, None
 
 

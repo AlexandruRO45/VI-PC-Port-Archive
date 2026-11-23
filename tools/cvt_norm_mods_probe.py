@@ -540,13 +540,9 @@ def _parse_waves(spec: str) -> list[int] | None:
     parts = [p.strip() for p in spec.split(",")]
     if not parts or any(not p for p in parts):
         return None
-    try:
-        waves = [int(p) for p in parts]
-    except ValueError:
+    if any(p not in ("32", "64") for p in parts):
         return None
-    if any(w not in (32, 64) for w in waves):
-        return None
-    return list(dict.fromkeys(waves))
+    return list(dict.fromkeys(int(p) for p in parts))
 
 
 def _parse_ops(spec: str) -> list[str] | None:

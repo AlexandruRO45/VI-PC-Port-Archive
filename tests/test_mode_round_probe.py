@@ -35,7 +35,7 @@ class ModeRoundProbeTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 77, proc.stderr or proc.stdout)
 
     def test_invalid_waves_fail_before_opening_oracle(self):
-        for bad_waves in ("", "   ", "abc", "16", "32,16", "32,foo"):
+        for bad_waves in ("", "   ", "abc", "16", "32,16", "32,foo", "3_2", "+32", "\u0663\u0662"):
             with self.subTest(waves=bad_waves):
                 err = io.StringIO()
                 with mock.patch.object(runner, "open_oracle") as mock_open:
