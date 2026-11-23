@@ -711,3 +711,38 @@ class TestDsSwizzleB32SIMDAndProperties(unittest.TestCase):
         ]
         res, _ = run_workgroup_lanes("ps_swiz_inv", lines, lanes=4)
         self.assertEqual(res, [0, 1, 2, 3])
+
+
+# ------------------------------------------------------------------------------
+# ds_swizzle_b32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestDsSwizzleB32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_swiz_bad", [
+                "ds_swizzle_b32 v0, v1 offset:bad_pattern",
+                "exp mrt0 v0, v0, v0, v0 done vm",
+                "s_endpgm"
+            ])
+
+    def test_boundary_extremes_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_mov_b32 v2, 0xFFFFFFFF",
+            "ds_swizzle_b32 v4, v2 offset:swizzle(QUAD_PERM,1,0,3,2)",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_swiz_max", lines, lanes=4)
+        self.assertEqual(res, [0xFFFFFFFF] * 4)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "ds_swizzle_b32 v4, v0 offset:swizzle(SWAP,1)",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        _, spv = run_workgroup_lanes("ps_swiz_lowering", lines, lanes=4)
+        self.assertIn("OpGroupNonUniformShuffle", spv)
