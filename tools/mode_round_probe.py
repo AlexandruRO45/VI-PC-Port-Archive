@@ -59,6 +59,11 @@ CASES = (
      "v_add_f64 v[3:4], v[0:1], v[6:7]", True, (0x00000000, 0x3FF00000), (0xFFFFFFFF, 0x3FEFFFFF)),
     ("add_f64_ovf", ("v_mov_b32 v0, -1", "v_mov_b32 v1, 0x7fefffff"),
      "v_add_f64 v[3:4], v[0:1], v[0:1]", True, (0x00000000, 0x7FF00000), (0xFFFFFFFF, 0x7FEFFFFF)),
+    # v_ldexp_f64 rounds only out of the normal range: DBL_MAX * 2, and (1 + 3 * 2^-52) * 2^-1023 (1.5 subnormal ulp)
+    ("ldexp_f64_ovf", ("v_mov_b32 v0, -1", "v_mov_b32 v1, 0x7fefffff", "v_mov_b32 v2, 1"),
+     "v_ldexp_f64 v[3:4], v[0:1], v2", True, (0x00000000, 0x7FF00000), (0xFFFFFFFF, 0x7FEFFFFF)),
+    ("ldexp_f64_sub", ("v_mov_b32 v0, 3", "v_mov_b32 v1, 0xbff00000", "v_mov_b32 v2, -1023"),
+     "v_ldexp_f64 v[3:4], v[0:1], v2", True, (0x00000002, 0x80080000), (0x00000001, 0x80080000)),
 )
 
 TRANSCENDENTALS = (

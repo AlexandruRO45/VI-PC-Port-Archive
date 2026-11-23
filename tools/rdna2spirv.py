@@ -10871,6 +10871,9 @@ class Gen:
             # - VOP3 clamp applies in both denorm16_64=3 and 0 (dx10_clamp=1: NaN/-0/<0 -> +0.0, >1.0 -> 1.0).
             # - VOP3 omod (mul:2/mul:4/div:2) is ignored by hardware when denorm16_64=3 and active when 0, so it is
             #   rejected as MODE-dependent rather than guessed.
+            # After a MODE.FP_ROUND[3:2] (f16/f64 rounding) toward-zero write (%mode_r16 = 3) the result rounds like
+            # v_add_f64's: an overflow gives +-DBL_MAX, not +-inf, and a subnormal result is truncated (RDNA2 ISA,
+            # MODE register; not measured on hardware for this op).
             if any(m.startswith(("mul:", "div:")) for m in mods):
                 raise Unsupported(op + " output modifier")
             d = a[0]
@@ -10966,8 +10969,20 @@ class Gen:
             self.emit(f"{sig_m} = OpBitwiseAnd %uint {sig_hi} {self.cu(0x000FFFFF)}")
             self.emit(f"{norm_r_hi0} = OpBitwiseOr %uint {sgn} {sig_m}")
             self.emit(f"{norm_r_hi} = OpBitwiseOr %uint {norm_r_hi0} {e2_sh}")
-            self.emit(f"{inf_hi} = OpBitwiseOr %uint {sgn} {self.cu(0x7FF00000)}")
-            # Subnormal / underflow (e2 <= 0): shift 53-bit significand right by sh = 1 - e2 and round to nearest even.
+            rtz = inf_lo = None
+            if self.round_mode:
+                # Toward zero, an overflow saturates at the largest finite binary64 (0x7FEFFFFF_FFFFFFFF).
+                md, rtz, big_hi = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{md} = OpLoad %uint %mode_r16")
+                self.emit(f"{rtz} = OpIEqual %bool {md} {self.cu(3)}")
+                self.emit(f"{big_hi} = OpSelect %uint {rtz} {self.cu(0x7FEFFFFF)} {self.cu(0x7FF00000)}")
+                self.emit(f"{inf_hi} = OpBitwiseOr %uint {sgn} {big_hi}")
+                inf_lo = self.tmp()
+                self.emit(f"{inf_lo} = OpSelect %uint {rtz} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            else:
+                self.emit(f"{inf_hi} = OpBitwiseOr %uint {sgn} {self.cu(0x7FF00000)}")
+            # Subnormal / underflow (e2 <= 0): shift 53-bit significand right by sh = 1 - e2 and round to nearest even
+            # (toward zero: truncate).
             sh_i, under, sh_ci, sh_c, sh_lt32, sh_eq32 = (self.tmp() for _ in range(6))
             self.emit(f"{sh_i} = OpISub %int {self.as_int(self.cu(1))} {e2_i}")
             self.emit(f"{under} = OpSGreaterThan %bool {sh_i} {self.as_int(self.cu(53))}")
@@ -11030,6 +11045,11 @@ class Gen:
             self.emit(f"{odd} = OpINotEqual %bool {odd_u} {self.cu(0)}")
             self.emit(f"{tie} = OpLogicalAnd %bool {eq} {odd}")
             self.emit(f"{up} = OpLogicalOr %bool {gt} {tie}")
+            if rtz is not None:
+                not_z, upn = self.tmp(), self.tmp()
+                self.emit(f"{not_z} = OpLogicalNot %bool {rtz}")
+                self.emit(f"{upn} = OpLogicalAnd %bool {up} {not_z}")
+                up = upn
             self.emit(f"{inc} = OpSelect %uint {up} {self.cu(1)} {self.cu(0)}")
             self.emit(f"{ql_inc} = OpIAdd %uint {q_lo} {inc}")
             self.emit(f"{carry_b} = OpULessThan %bool {ql_inc} {q_lo}")
@@ -11040,7 +11060,7 @@ class Gen:
             self.emit(f"{den_hi} = OpSelect %uint {under} {sgn} {den_hi0}")
             self.emit(f"{den_lo} = OpSelect %uint {under} {self.cu(0)} {ql_inc}")
             self.emit(f"{nv_hi} = OpSelect %uint {over} {inf_hi} {den_hi}")
-            self.emit(f"{nv_lo} = OpSelect %uint {over} {self.cu(0)} {den_lo}")
+            self.emit(f"{nv_lo} = OpSelect %uint {over} {inf_lo or self.cu(0)} {den_lo}")
             self.emit(f"{sc_hi} = OpSelect %uint {valid} {norm_r_hi} {nv_hi}")
             self.emit(f"{sc_lo} = OpSelect %uint {valid} {sig_lo} {nv_lo}")
             self.emit(f"{r_hi} = OpSelect %uint {fin} {sc_hi} {hi}")
