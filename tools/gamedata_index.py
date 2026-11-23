@@ -285,6 +285,14 @@ class ArchiveSource:
             raise IndexMismatch(f"{mismatch} does not inflate ({e})") from e
         if not d.eof:   # rpf9_carve.py indexes only streams that inflate to their end
             raise IndexMismatch(f"{mismatch} is cut short: its {stored} bytes do not inflate to the stream end")
+        # rpf9_carve.py records "stored" as exactly the bytes the stream used and "size" as what they inflate to, so
+        # either one being off means the row describes some other stream.
+        if d.unused_data:
+            raise IndexMismatch(f"{mismatch}: its zlib stream ends after {stored - len(d.unused_data)} of its "
+                                f"{stored} bytes")
+        size = row.get("size")
+        if isinstance(size, int) and not isinstance(size, bool) and len(out) != size:
+            raise IndexMismatch(f"{mismatch} inflates to {len(out)} bytes, not the {size} its row gives")
         return out
 
     @property

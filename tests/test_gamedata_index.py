@@ -215,6 +215,23 @@ class GamedataIndexTest(unittest.TestCase):
                                                "pre": "", "head": doc[:16].hex()})
         self.assert_mismatch(rpf, "is cut short")
 
+    def test_archive_row_claiming_bytes_past_the_stream_end_is_an_error(self):
+        # rpf9_carve.py records "stored" as the bytes the zlib stream used, so a row that claims more (here one byte
+        # of what follows the stream) does not describe this archive, even though the stream inflates to its end.
+        doc = b'<?xml version="1.0"?>\n<Foo a="1"><Bar/></Foo>\n'
+        stream = zlib.compress(doc)
+        rpf = self.mismatched_archive(stream + b"\x00" * 16, {"off": 0x1000, "stored": len(stream) + 1,
+                                                              "size": len(doc), "pre": "", "head": doc[:16].hex()})
+        self.assert_mismatch(rpf, f"ends after {len(stream)} of its {len(stream) + 1} bytes")
+
+    def test_archive_row_with_the_wrong_inflated_size_is_an_error(self):
+        # "size" is the inflated length rpf9_carve.py measured; a row that says more used to be read as it is.
+        doc = b'<?xml version="1.0"?>\n<Foo a="1"><Bar/></Foo>\n'
+        stream = zlib.compress(doc)
+        rpf = self.mismatched_archive(stream, {"off": 0x1000, "stored": len(stream), "size": len(doc) + 100,
+                                               "pre": "", "head": doc[:16].hex()})
+        self.assert_mismatch(rpf, f"inflates to {len(doc)} bytes, not the {len(doc) + 100}")
+
     def test_archive_reads_a_matching_stream(self):
         doc = b'<?xml version="1.0"?>\n<Foo a="1"><Bar/></Foo>\n'
         stream = zlib.compress(doc)
