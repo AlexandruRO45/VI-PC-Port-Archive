@@ -22,9 +22,12 @@ IMAGE_SCN_MEM_EXECUTE = 0x20000000
 
 
 def joaat(name):
-    """RAGE's joaat: Jenkins one-at-a-time over the lower-cased name (joaat('cs_mandy') == 0xD7C0CDFF)."""
+    """RAGE's joaat: Jenkins one-at-a-time over the lower-cased name (joaat('cs_mandy') == 0xD7C0CDFF).
+
+    The bytes are the name's Latin-1 ones, as in tools/hashdict.py: every dictionary and every other copy
+    in tools/ hashes them that way, and a UTF-8 copy gives each accented name a hash none of them stores."""
     h = 0
-    for c in name.lower().encode("utf-8"):
+    for c in name.lower().encode("latin-1", "replace"):
         h = (h + c) & 0xFFFFFFFF
         h = (h + (h << 10)) & 0xFFFFFFFF
         h ^= h >> 6
