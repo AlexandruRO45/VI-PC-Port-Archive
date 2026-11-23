@@ -780,7 +780,7 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 p[0][p[1]] = new & MASK
             values[res] = old
         elif op == "OpSelect":
-            cond, yes, no = val(a[1]), val(a[2]), val(a[3])
+            cond, yes, no = vector(val(a[1])), vector(val(a[2])), vector(val(a[3]))
             if isinstance(cond, tuple):
                 if not all(isinstance(v, bool) for v in cond) or not (isinstance(yes, tuple) and
                                                                        isinstance(no, tuple)):

@@ -52,6 +52,7 @@ OpEntryPoint Fragment %main "main" %out
 %const_b = OpConstantComposite %v2uint %c3 %c9
 %const_lo = OpConstantComposite %v2uint %c1 %c2
 %const_hi = OpConstantComposite %v2uint %c7 %c3
+%cond_const = OpConstantComposite %v2bool %t %f
 %_ptr_Function_uint = OpTypePointer Function %uint
 %arr = OpTypeArray %uint %c4
 %_ptr_Function_arr = OpTypePointer Function %arr
@@ -181,6 +182,22 @@ class InterpreterTests(unittest.TestCase):
                 "%r = OpSelect %v2uint %cond %a %b\n")
         self.assertEqual(tuple(run_word(f"{body}%res = OpCompositeExtract %uint %r {i}\n") for i in (0, 1)),
                          (1, 0xFFFFFFFF))
+
+    def test_select_accepts_constant_vector_condition(self):
+        # A constant-composite bool vector (a list) selects per component; operands differ in every component.
+        constructed = ("%a = OpCompositeConstruct %v2uint %c1 %c2\n"
+                       "%b = OpCompositeConstruct %v2uint %cF0 %cFF\n")
+        got = si.run_fragment(HEADER + constructed + "%r = OpSelect %v2uint %cond_const %a %b\n"
+                              "OpStore %vout %r\n" + FOOTER)
+        self.assertEqual(got["%vout"], (1, 0xFFFFFFFF))
+
+    def test_select_accepts_constant_vector_operands(self):
+        # Constant-composite operands (lists) with either a constant or a constructed bool vector condition.
+        for cond_id, prelude in (("%cond_const", ""),
+                                 ("%cond", "%cond = OpCompositeConstruct %v2bool %t %f\n")):
+            got = si.run_fragment(HEADER + prelude + f"%r = OpSelect %v2uint {cond_id} %const_a %const_b\n"
+                                  "OpStore %vout %r\n" + FOOTER)
+            self.assertEqual(got["%vout"], (5, 9))
 
     def test_integer_ops_wrap(self):
         self.assertEqual(run_word("%res = OpIAdd %uint %cFF %c2\n"), 1)
