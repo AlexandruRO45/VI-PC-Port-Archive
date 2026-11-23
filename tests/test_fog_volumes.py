@@ -230,6 +230,11 @@ class FogVolumesTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 fv.main([os.path.join(td, "missing.rpf")])
             self.assertEqual(cm.exception.code, 2)
+            # Refuses a worker count the run cannot honour
+            for jobs in ("0", "-4"):
+                with self.assertRaises(SystemExit) as cm:
+                    fv.main([fp, "--jobs", jobs])
+                self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":
