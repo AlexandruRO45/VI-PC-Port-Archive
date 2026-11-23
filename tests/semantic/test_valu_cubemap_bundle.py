@@ -406,5 +406,10 @@ class VCubeMaAstTests(unittest.TestCase):
         self.assertEqual(ast.mnemonic, "v_cubema_f32")
         self.assertEqual(ast.dst.index, 6)
 
+class VCubeMaScalarInterpreterTests(unittest.TestCase):
+    def test_cubema_scalar_execution(self):
+        res = oracle_cubema_f32(0.5, 1.0, 2.5)  # Z major -> 2 * 2.5 = 5.0
+        self.assertEqual(res, 5.0)
+
 if __name__ == "__main__":
     unittest.main()
