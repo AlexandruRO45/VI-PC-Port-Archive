@@ -367,7 +367,11 @@ def main(argv=None):
             sys.stderr.write("error: --out must not overwrite the input path\n")
             return 2
 
-    doc = scan(args.input, start=args.start, limit=args.limit)
+    try:
+        doc = scan(args.input, start=args.start, limit=args.limit)
+    except (OSError, ValueError) as exc:
+        print(f"error: cannot scan {args.input}: {exc}", file=sys.stderr)
+        return 2
     if args.out is not None:
         parent = os.path.dirname(os.path.abspath(args.out))
         if parent:
