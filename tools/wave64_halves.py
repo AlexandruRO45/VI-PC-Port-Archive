@@ -583,7 +583,7 @@ class Analysis:
                     # a waterfall scalar / mask names the VGPR it was read from: once that is rewritten the
                     # equality no longer says "every lane owns this value"
                     for k, v in list(st["g"].items()):
-                        if v[0] in ("wfs", "wfmask") and v[1] == r[1]:
+                        if v[0] in ("wfs", "wfs_d", "wfmask") and v[1] == r[1]:
                             del st["g"][k]
                             T[k] = T.get(k, 0) | X
 
@@ -974,7 +974,7 @@ class Analysis:
             for k in [k for k in st["l"] if k[0] >= dst_base]:
                 del st["l"][k]
             for k, v in list(st["g"].items()):
-                if v[0] in ("wfs", "wfmask") and v[1] >= dst_base:
+                if v[0] in ("wfs", "wfs_d", "wfmask") and v[1] >= dst_base:
                     del st["g"][k]
                     T[k] = T.get(k, 0) | X
             if wt:
@@ -1047,7 +1047,7 @@ class Analysis:
                 for x in srcs:
                     for r in _regs(x):
                         g = st["g"].get(r)
-                        if T.get(r, 0) & WFS and not (ok and g and g[0] == "wfs" and g[1] == st["xg"][1]):
+                        if T.get(r, 0) & WFS and not (ok and g and g[0] in ("wfs", "wfs_d") and g[1] == st["xg"][1]):
                             good = False
                 tj = tj & ~WFS if good else tj | X
             # an active-EXEC-only v_readfirstlane scalar is exact only on lanes active within its EXEC mask
@@ -1086,9 +1086,16 @@ class Analysis:
         if t_src & WFS and t_src & ACT_RFL:
             t_src |= X
         elif t_src & WFS:
-            gs = {st["g"].get(r) for x in srcs for r in _regs(x) if T.get(r, 0) & WFS}
-            if len(gs) == 1 and None not in gs:
-                tag = next(iter(gs))
+            gs = [st["g"].get(r) for x in srcs for r in _regs(x) if T.get(r, 0) & WFS]
+            vrs = {g[1] for g in gs if g and g[0] in ("wfs", "wfs_d")}
+            if len(vrs) == 1 and all(g and g[0] in ("wfs", "wfs_d") for g in gs):
+                vr = next(iter(vrs))
+                # Only an unmodified 32-bit copy still equals v_r for cmp_tag(); any other scalar op is a
+                # derived function of v_r ("wfs_d"), safe inside a ("wf", vr) body but not a waterfall guard.
+                if op == "s_mov_b32" and len(srcs) == 1 and len(gs) == 1 and gs[0][0] == "wfs":
+                    tag = ("wfs", vr)
+                else:
+                    tag = ("wfs_d", vr)
             else:
                 t_src |= X
         elif t_src & ACT_RFL:
@@ -1148,14 +1155,27 @@ class Analysis:
         against 0 (the first lane of the mask the rank counts)."""
         T = st["t"]
         tag, tj = None, t_src
-        if "_eq_" in op and len(srcs) == 2:
+        mods = ins.get("mods") or ()
+        bad_mods = op.endswith(("_sdwa", "_dpp")) or any(
+            m.startswith(("op_sel", "src0_sel", "src1_sel", "dst_sel")) for m in mods
+        )
+        if "_eq_" in op and len(srcs) == 2 and not bad_mods:
+            op_base = op[:-4] if op.endswith(("_e32", "_e64")) else op
+            wfs_eq_ok = op_base in ("v_cmp_eq_u32", "v_cmp_eq_i32")
+            rank_eq_ok = op_base in ("v_cmp_eq_u32", "v_cmp_eq_i32", "v_cmp_eq_u16", "v_cmp_eq_i16")
             for sc, vv in ((srcs[0], srcs[1]), (srcs[1], srcs[0])):
+                if any(o.get(k) for o in (sc, vv) for k in ("neg", "abs", "sext")):
+                    continue
                 r = _regs(sc)
-                g = st["g"].get(r[0]) if r else None
-                if g and g[0] == "wfs" and vv.get("k") == "vgpr" and vv["r"] == g[1] and not vv.get("neg"):
+                if len(r) != 1:
+                    continue
+                g = st["g"].get(r[0])
+                if (wfs_eq_ok and g and g[0] == "wfs" and vv.get("k") == "vgpr"
+                        and len(_regs(vv)) == 1 and vv["r"] == g[1]):
                     tag, tj = ("wfmask", g[1]), self.rd(st, ins, vv) | (T.get(r[0], 0) & ~WFS)
                     idiom("waterfall")
-                elif g and g[0] == "rank" and sc.get("k") == "vgpr" and vv.get("k") == "imm" and vv["v"] == 0 and                         (T.get(r[0], 0) & ~TAG_BITS) == 0:
+                elif (rank_eq_ok and g and g[0] == "rank" and sc.get("k") == "vgpr"
+                      and vv.get("k") == "imm" and vv["v"] == 0 and (T.get(r[0], 0) & ~TAG_BITS) == 0):
                     tag, tj = ("elect", g[1]), ELECT
         return tag, tj
 

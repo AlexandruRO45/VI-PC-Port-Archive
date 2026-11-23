@@ -344,6 +344,48 @@ class Classification(unittest.TestCase):
             "s_xor_b64 exec, exec, s[12:13]", "s_cbranch_execnz -6", "s_mov_b64 exec, s[10:11]",
             "v_mov_b32_e32 v7, s22"]), "C", ["stale-scalar"])
 
+    def test_c_waterfall_derived_scalar_is_not_a_guard(self):
+        # s_add_i32 derives from v4's first-lane value, so s21 != v4 and cannot certify a waterfall guard.
+        self.tier("ps_c_wf_derived_guard", ps([
+            "v_and_b32_e32 v4, 7, v0", "v_readfirstlane_b32 s20, v4", "s_add_i32 s21, s20, 1",
+            "v_cmp_eq_u32_e32 vcc, s21, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "v_add_nc_u32_e32 v6, s20, v0", "s_mov_b64 exec, s[10:11]"]), "C")
+        # A plain 32-bit copy keeps the exact waterfall-scalar tag and still certifies Tier B.
+        self.tier("ps_b_wf_mov_copy", ps([
+            "v_and_b32_e32 v4, 7, v0", "v_readfirstlane_b32 s20, v4", "s_mov_b32 s21, s20",
+            "v_cmp_eq_u32_e32 vcc, s21, v4", "s_and_saveexec_b64 s[12:13], vcc",
+            "s_mul_i32 s22, s21, 17", "v_add_nc_u32_e32 v6, s22, v0",
+            "s_xor_b64 exec, exec, s[12:13]", "s_cbranch_execnz -7", "s_mov_b64 exec, s[10:11]"]),
+            "B", [], ["waterfall"])
+
+    def test_c_cmp_tag_rejects_narrow_modified_and_float_compares(self):
+        for name, cmp_line in (
+            ("ps_c_wf_opsel", "v_cmp_eq_u16_e64 vcc, s20, v4 op_sel:[0,1,0]"),
+            ("ps_c_wf_u16", "v_cmp_eq_u16_e32 vcc, s20, v4"),
+            ("ps_c_wf_f32", "v_cmp_eq_f32_e32 vcc, s20, v4"),
+            ("ps_c_wf_abs_sc", "v_cmp_eq_u32_e64 vcc, |s20|, v4"),
+            ("ps_c_wf_abs_vv", "v_cmp_eq_u32_e64 vcc, s20, |v4|"),
+        ):
+            with self.subTest(name=name):
+                self.tier(name, ps([
+                    "v_and_b32_e32 v4, 7, v0", "v_readfirstlane_b32 s20, v4", cmp_line,
+                    "s_and_saveexec_b64 s[12:13], vcc", "v_add_nc_u32_e32 v6, s20, v0",
+                    "s_mov_b64 exec, s[10:11]"]), "C")
+        for name, cmp_line in (
+            ("ps_c_elect_opsel", "v_cmp_eq_u16_e64 vcc, 0, v10 op_sel:[0,1,0]"),
+            ("ps_c_elect_f32", "v_cmp_eq_f32_e32 vcc, 0, v10"),
+        ):
+            with self.subTest(name=name):
+                self.tier(name, ps([
+                    "v_and_b32_e32 v4, 3, v0", "v_cmp_eq_u32_e32 vcc, 1, v4", "s_and_saveexec_b64 s[12:13], vcc",
+                    "s_bcnt1_i32_b64 s6, exec", "v_mbcnt_lo_u32_b32 v10, exec_lo, 0",
+                    "v_mbcnt_hi_u32_b32 v10, exec_hi, v10", cmp_line, "s_and_saveexec_b64 s[14:15], vcc",
+                    "v_mov_b32_e32 v11, s6", "v_mov_b32_e32 v12, 0",
+                    "buffer_atomic_add v11, v12, s[0:3], 0 offen glc", "s_or_b64 exec, exec, s[14:15]",
+                    "v_readfirstlane_b32 s7, v11", "v_add_nc_u32_e32 v13, s7, v10",
+                    "v_lshlrev_b32_e32 v13, 2, v13", "buffer_store_dword v0, v13, s[0:3], 0 offen offset:256",
+                    "s_mov_b64 exec, s[10:11]"]), "C")
+
     def test_c_vote_defines_scalar_read_later(self):
         self.tier("ps_c_stale", ps([
             "v_cmp_eq_u32_e32 vcc, 0, v0", "s_mov_b32 s5, 7", "s_cbranch_vccz 1", "s_add_u32 s5, s5, 1",
