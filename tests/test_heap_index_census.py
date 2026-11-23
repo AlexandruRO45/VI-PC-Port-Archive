@@ -179,6 +179,18 @@ class HeapIndexCensus(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
 
+    def test_cli_reads_a_carve_index_saved_with_a_bom(self):
+        self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
+        index = os.path.join(self.work.root, "index.json")
+        with open(index, encoding="utf-8") as f:
+            text = f.read()
+        with open(index, "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write(text)
+        p = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "heap_index_census.py"),
+                            self.work.disasm], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("ps sfi0=res+smp: 1 shaders", p.stdout)
+
     def test_cli_json_over_the_carve_index_is_refused(self):
         self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
         index = os.path.join(self.work.root, "index.json")
