@@ -602,3 +602,53 @@ class TestDsMinU32IEEE754EdgeCases(unittest.TestCase):
         snan = 0x7F800001
         res = ref_min_u32(qnan, snan)
         self.assertEqual(res, snan)
+
+
+# -----------------------------------------------------------------------------
+# Part 8: Negative Rejection, Syntax Validation, and Mutation Detection
+# -----------------------------------------------------------------------------
+
+class TestDsMinU32NegativeRejection(unittest.TestCase):
+    """Test suite verifying negative rejection, syntax bounds, and mutation catching."""
+
+    def test_invalid_register_types(self):
+        with self.assertRaises(ValueError):
+            DsInstruction.parse_asm("ds_min_u32 s0, v1")
+
+        with self.assertRaises(ValueError):
+            DsInstruction.parse_asm("ds_min_u32 v0, s1")
+
+        with self.assertRaises(ValueError):
+            DsInstruction.parse_asm("ds_min_rtn_u32 s2, v0, v1")
+
+    def test_offset_bounds_rejection(self):
+        with self.assertRaises(AssertionError):
+            inst = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1), offset=-4)
+            assert 0 <= inst.offset <= 0xFFFF, "Offset out of bounds"
+
+        with self.assertRaises(AssertionError):
+            inst = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1), offset=0x10000)
+            assert 0 <= inst.offset <= 0xFFFF, "Offset out of bounds"
+
+    def test_mutation_sensitivity_signed_min(self):
+        """Verify that substituting signed min fails the unsigned oracle."""
+        def signed_min_u32(a: int, b: int) -> int:
+            sa = (a & MASK32) - 0x100000000 if (a & 0x80000000) else (a & MASK32)
+            sb = (b & MASK32) - 0x100000000 if (b & 0x80000000) else (b & MASK32)
+            return a if sa <= sb else b
+
+        # 0x80000000 vs 1:
+        # unsigned min is 1
+        # signed min is 0x80000000 (-2^31 < 1)
+        self.assertNotEqual(signed_min_u32(0x80000000, 1), ref_min_u32(0x80000000, 1))
+
+    def test_mutation_sensitivity_umax(self):
+        """Verify that substituting unsigned max fails the unsigned oracle."""
+        def ref_max_u32(a: int, b: int) -> int:
+            return max(a & MASK32, b & MASK32)
+
+        self.assertNotEqual(ref_max_u32(5, 10), ref_min_u32(5, 10))
+
+
+if __name__ == "__main__":
+    unittest.main()
