@@ -1300,6 +1300,31 @@ void destroy_present_state(void* present_state) {
 }
 
 LRESULT CALLBACK present_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_ERASEBKGND) return 1;
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        RECT area{};
+        GetClientRect(window, &area);
+        HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
+        FillRect(dc, &area, black);
+        DeleteObject(black);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(220, 220, 220));
+        RECT text = area;
+        text.top = (area.bottom - area.top) / 2 - 34;
+        DrawTextW(dc, L"Extracting shaders...", -1, &text, DT_CENTER | DT_SINGLELINE);
+        RECT bar = area;
+        bar.left = (area.right - area.left) / 2 - 180;
+        bar.right = bar.left + 360;
+        bar.top = (area.bottom - area.top) / 2 + 8;
+        bar.bottom = bar.top + 6;
+        HBRUSH light = CreateSolidBrush(RGB(220, 220, 220));
+        FillRect(dc, &bar, light);
+        DeleteObject(light);
+        EndPaint(window, &paint);
+        return 0;
+    }
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
@@ -1314,12 +1339,12 @@ PresentState* present_state_for(DeviceProxy* device) {
     WNDCLASSW window_class{};
     window_class.lpfnWndProc = present_window_proc;
     window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.lpszClassName = L"LeonidaPresentX";
+    window_class.lpszClassName = L"AmericasPresentX";
     if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
         return state;
     }
-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Americas", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                                   CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
                                   window_class.hInstance, nullptr);
     if (!state->window) {
