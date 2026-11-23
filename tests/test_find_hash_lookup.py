@@ -5,6 +5,8 @@
 The images are synthetic PE files: one executable section holding `mov ecx, <hash>` followed by calls, with a
 "lookup" called from many places and a decoy called once.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -103,6 +105,55 @@ class FindHashLookupTest(unittest.TestCase):
             r = subprocess.run([sys.executable, "-I", TOOL, bad], capture_output=True, text=True)
             self.assertEqual(r.returncode, 2)
             self.assertIn("ERROR", r.stderr)
+
+
+class ReportPathTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.exe = os.path.join(self.dir, "fake.exe")
+        data, _, _ = image()
+        with open(self.exe, "wb") as f:
+            f.write(data)
+
+    def run_main(self, *args):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                code = fhl.main(list(args))
+            except SystemExit as e:
+                return e.code, err.getvalue()
+        return code, err.getvalue()
+
+    def test_json_must_not_overwrite_the_input(self):
+        with open(self.exe, "rb") as f:
+            before = f.read()
+        code, err = self.run_main(self.exe, "--json", self.exe)
+        self.assertEqual(code, 2)
+        self.assertIn("would overwrite the input", err)
+        with open(self.exe, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_json_creates_a_missing_folder(self):
+        out = os.path.join(self.dir, "reports", "report.json")
+        code, err = self.run_main(self.exe, "--json", out)
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.isfile(out))
+
+    def test_json_refuses_a_folder(self):
+        code, err = self.run_main(self.exe, "--json", self.dir)
+        self.assertEqual(code, 2)
+        self.assertIn("is a folder, not a file", err)
+
+    def test_a_failed_write_is_one_line(self):
+        blocker = os.path.join(self.dir, "not_a_folder")
+        with open(blocker, "wb") as f:
+            f.write(b"keep me")
+        code, err = self.run_main(self.exe, "--json", os.path.join(blocker, "r.json"))
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR: cannot write", err)
+        self.assertNotIn("Traceback", err)
 
 
 if __name__ == "__main__":
