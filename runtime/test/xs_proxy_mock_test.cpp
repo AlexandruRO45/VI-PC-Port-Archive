@@ -338,6 +338,9 @@ unsigned long release(void* object) {
 
 // ---- 1. Device interface levels ----
 
+// D3D12_RESOURCE_STATES is a 32-bit enum: MSVC stores only the low half of its 8-byte stack slot.
+std::uint32_t state_of(std::uint64_t word) { return static_cast<std::uint32_t>(word); }
+
 int check_levels() {
     struct Level { int level; unsigned slots; } const levels[] = {{0, 44}, {1, 47}, {3, 51}, {9, 76}};
     for (const Level& l : levels) {
@@ -832,15 +835,15 @@ int check_committed_resource_states() {
         EXPECT(mock->args[slot][1] == 0x40 && mock->args[slot][4] == clear);
         EXPECT(mock->tail[slot][0] == first && mock->tail[slot][1] == (slot == 27 ? out : riid));
         EXPECT(slot == 27 || mock->tail[slot][2] == out);
-        EXPECT(mock->calls[slot] == before + 1 && mock->args[slot][3] == kRender);
+        EXPECT(mock->calls[slot] == before + 1 && state_of(mock->args[slot][3]) == kRender);
         EXPECT(mock->args[slot][0] == word(&props) && mock->args[slot][2] == word(&rt));
         EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&ds), kConsole)) == S_OK);
-        EXPECT(mock->args[slot][3] == kDepth);
+        EXPECT(state_of(mock->args[slot][3]) == kDepth);
         // Left alone: a buffer with 0x6, a render target with state 0, a texture without a use flag, any other state.
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&buffer), kConsole)) == S_OK && mock->args[slot][3] == kConsole);
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), 0)) == S_OK && mock->args[slot][3] == 0);
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&plain), kConsole)) == S_OK && mock->args[slot][3] == kConsole);
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), 0x4)) == S_OK && mock->args[slot][3] == 0x4);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&buffer), kConsole)) == S_OK && state_of(mock->args[slot][3]) == kConsole);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), 0)) == S_OK && state_of(mock->args[slot][3]) == 0);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&plain), kConsole)) == S_OK && state_of(mock->args[slot][3]) == kConsole);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), 0x4)) == S_OK && state_of(mock->args[slot][3]) == 0x4);
     }
     EXPECT(rt.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET && ds.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
 
@@ -848,11 +851,11 @@ int check_committed_resource_states() {
     const IID resource_iid = __uuidof(ID3D12Resource);
     void* resource = nullptr;
     EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&rt), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
-    EXPECT(mock->args[27][3] == kRender);
+    EXPECT(state_of(mock->args[27][3]) == kRender);
     EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&ds), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
-    EXPECT(mock->args[27][3] == kDepth);
+    EXPECT(state_of(mock->args[27][3]) == kDepth);
     EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&buffer), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
-    EXPECT(mock->args[27][3] == kConsole);
+    EXPECT(state_of(mock->args[27][3]) == kConsole);
 
     EXPECT(xs::device_slot_overridden(27) && xs::device_slot_overridden(53));
     EXPECT(release(device) == 0 && mock->refs == 0);

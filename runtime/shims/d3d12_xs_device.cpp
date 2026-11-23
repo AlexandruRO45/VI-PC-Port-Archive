@@ -1599,9 +1599,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                          reinterpret_cast<void**>(a5)));
         }
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
-        if constexpr (Slot == 27 || Slot == 53)
+        if constexpr (Slot == 27 || Slot == 53) {
             return proxy_create_committed_resource<Slot>(self, a1, a2, a3, a4, a5, a6, a7, a8);
-
+        } else {
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
         // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
@@ -1610,6 +1610,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
         auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
         return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        }
     }
 }
 
