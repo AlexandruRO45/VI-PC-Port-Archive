@@ -106,6 +106,35 @@ class Evaluate(unittest.TestCase):
         self.assertTrue(rows[1][4])
 
 
+class MemoryType(unittest.TestCase):
+    def test_generation_from_codes(self):
+        self.assertEqual(pc.memory_type([34, 34]), "DDR5")     # #8179: SMBIOS 34
+        self.assertEqual(pc.memory_type([26]), "DDR4")
+        self.assertEqual(pc.memory_type([24, 24, 24]), "DDR3")
+
+    def test_unknown_and_empty(self):
+        self.assertEqual(pc.memory_type([]), "")
+        self.assertEqual(pc.memory_type([0, 0xFFFF]), "")      # "unknown" per SMBIOS
+        self.assertEqual(pc.memory_type([99]), "")
+
+    def test_most_common_code_wins(self):
+        self.assertEqual(pc.memory_type([26, 34, 34]), "DDR5")
+
+    def test_detect_parses_the_windows_query(self):
+        plat, run = pc.sys.platform, pc._run
+        pc.sys.platform = "win32"
+        try:
+            pc._run = lambda cmd, timeout=10: "34\r\n34"
+            self.assertEqual(pc.detect_memory_type(), "DDR5")
+            pc._run = lambda cmd, timeout=10: "N/A\n"          # query failed or odd output
+            self.assertEqual(pc.detect_memory_type(), "")
+            pc.sys.platform = "linux"
+            pc._run = lambda cmd, timeout=10: self.fail("no query off Windows")
+            self.assertEqual(pc.detect_memory_type(), "")
+        finally:
+            pc.sys.platform, pc._run = plat, run
+
+
 class Api(unittest.TestCase):
     GOOD = ("AMD Ryzen 5 5600", "NVIDIA GeForce RTX 3070", 32)
     WEAK = ("Intel Core i3-10100F", "NVIDIA GeForce GTX 1650", 8)
