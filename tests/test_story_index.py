@@ -360,6 +360,17 @@ class ArchiveTest(unittest.TestCase):
             self.assertEqual(story_index.main(), 2)
         self.assertIn(f"{out}: disk full", err.getvalue())
 
+    def test_missing_source_is_one_error_line(self):
+        """A missing input is one ERROR line and exit 2, not the raw [Errno 2] text (BUILD-1046)."""
+        missing = os.path.join(self.root, "no_such.rpf")
+        out = os.path.join(self.root, "out.json")
+        err = io.StringIO()
+        with (mock.patch.object(sys, "argv", [TOOL, missing, out, "--quiet"]),
+              contextlib.redirect_stderr(err)):
+            self.assertEqual(story_index.main(), 2)
+        self.assertEqual(err.getvalue(), f"ERROR: {missing}: does not exist\n")
+        self.assertFalse(os.path.exists(out))
+
     def test_unwritable_or_bad_output_path_fails_before_the_scan(self):
         for out in (os.path.join(self.root, "no_such_folder", "x.json"),
                     os.path.join(self.root, "out.txt"),
