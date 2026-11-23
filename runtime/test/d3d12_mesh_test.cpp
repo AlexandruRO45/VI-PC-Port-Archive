@@ -498,7 +498,7 @@ int main() {
         }
 
         for (auto* r : {&upload, &readback, &target}) r->reset();
-        for (auto* p : {&mesh_pso, &vs_pso, &refused}) p->reset();
+        for (auto* p : {&mesh_pso, &vs_pso, &refused, &cached_pso}) p->reset();
         root.reset();
         rtv_heap.reset();
         list6.reset();
