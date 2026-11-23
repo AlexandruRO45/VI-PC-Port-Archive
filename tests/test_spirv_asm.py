@@ -163,6 +163,41 @@ class SpirvAsmUnitTests(unittest.TestCase):
                 with self.assertRaisesRegex(spirv_asm.SpirvAsmError, f"line 2: .*f{width}.*range"):
                     spirv_asm.assemble(asm)
 
+    def test_bfloat16_constant_words(self):
+        for opcode, literal, expected in (
+            ("OpConstant", "1.0", 0x3F80),
+            ("OpSpecConstant", "0.5", 0x3F00),
+            ("OpConstant", "1.007812499999999999", 0x3F81),  # f32 rounds up before BF16 truncation
+            ("OpConstant", "-1e-45", 0x8000),
+            ("OpConstant", "9.1835e-41", 0x0001),
+            ("OpConstant", "-0.0", 0x8000),
+            ("OpConstant", "3.4028235e38", 0x7F7F),
+            ("OpConstant", "0x1.01ffffffp0", 0x3F80),  # hex truncates directly
+            ("OpConstant", "0x1.ffffffffp-134", 0x0000),
+            ("OpConstant", "0x1.ffffffffp-127", 0x007F),
+            ("OpConstant", "0x1.ffffffp127", 0x7F7F),
+            ("OpConstant", "-0x1p128", 0xFF80),
+            ("OpSpecConstant", "0x1.02p128", 0x7F81),
+        ):
+            with self.subTest(opcode=opcode, literal=literal):
+                asm = f"%type = OpTypeFloat 16 BFloat16KHR\n%value = {opcode} %type {literal}\n"
+                spv = spirv_asm.assemble(asm)
+                self.assertEqual(struct.unpack_from("<I", spv, len(spv) - 4)[0], expected)
+
+    def test_bfloat16_numeric_encoding_and_implicit_ieee_f16(self):
+        for encoding, expected in ((" 0", 0x3F80), (" 0x0", 0x3F80), ("", 0x3C00)):
+            with self.subTest(encoding=encoding):
+                asm = f"%type = OpTypeFloat 16{encoding}\n%value = OpConstant %type 1.0\n"
+                spv = spirv_asm.assemble(asm)
+                self.assertEqual(struct.unpack_from("<I", spv, len(spv) - 4)[0], expected)
+
+    def test_bfloat16_rejects_invalid_decimal_literals(self):
+        for literal in ("3.4028236e38", "-3.4028236e38", "inf", "-inf", "nan", "-nan"):
+            with self.subTest(literal=literal):
+                asm = f"%type = OpTypeFloat 16 BFloat16KHR\n%value = OpConstant %type {literal}\n"
+                with self.assertRaisesRegex(spirv_asm.SpirvAsmError, "line 2: .*BF16"):
+                    spirv_asm.assemble(asm)
+
     def test_hex_float_inf_nan_and_string_escapes_match_spirv_as(self):
         # Regression tests for PR #2251 review (@FreddyxS):
         # 1) Width-aware hex-float Inf and NaN payload spellings (f16, f32, f64).

@@ -154,6 +154,7 @@ _FLOAT_SPEC = {
     32: (8, 23, 127, "<f", "<I"),
     64: (11, 52, 1023, "<d", "<Q"),
 }
+_BFLOAT16_ENCODING = VALUE_ENUMS["FPEncoding"]["BFloat16KHR"][0]
 
 
 def _decimal_f32_bits(value: Decimal) -> int:
@@ -259,6 +260,42 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
         return (sign << (exp_bits + mant_bits)) | (exp_max << mant_bits)
 
 
+def _parse_bfloat16_bits(tok: str, lineno: int) -> int:
+    if _DECIMAL_FLOAT_RE.fullmatch(tok):
+        # spirv-as parses decimal text as binary32, then truncates to BF16.
+        try:
+            bits = _decimal_f32_bits(Decimal(tok)) >> 16
+        except InvalidOperation as exc:
+            raise SpirvAsmError(f"line {lineno}: invalid BF16 literal {tok!r}") from exc
+        if bits & 0x7F80 == 0x7F80:
+            raise SpirvAsmError(f"line {lineno}: decimal BF16 literal {tok!r} out of range")
+        return bits
+
+    match = _HEX_FLOAT_RE.fullmatch(tok)
+    if match is None or "p" not in tok or not any(match.group(2, 3)):
+        raise SpirvAsmError(f"line {lineno}: invalid BF16 literal {tok!r}")
+    sign_text, integer, fraction, exponent_text = match.groups()
+    fraction = fraction or ""
+    significand = int(integer + fraction, 16)
+    sign = 0x8000 if sign_text == "-" else 0
+    if not significand:
+        return sign
+
+    # Hex text writes the BF16 significand directly, preserving NaN payload bits.
+    power = int(exponent_text) - 4 * len(fraction)
+    top = significand.bit_length() - 1
+    exponent = power + top
+    if exponent > 128:
+        return sign | 0x7F80
+    if exponent < -126:
+        shift = power + 133  # The least positive subnormal is 2**-133.
+        fraction_bits = significand << shift if shift >= 0 else significand >> -shift
+        return sign | fraction_bits
+    shift = 7 - top
+    fraction_bits = significand << shift if shift >= 0 else significand >> -shift
+    return sign | ((exponent + 127) << 7) | (fraction_bits & 0x7F)
+
+
 def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
     if type_info is None:
         raise SpirvAsmError(f"line {lineno}: OpConstant references unknown scalar type")
@@ -272,6 +309,8 @@ def _encode_context_number(tok: str, type_info, lineno: int) -> list[int]:
             return [u64 & 0xFFFFFFFF, (u64 >> 32) & 0xFFFFFFFF]
         raise SpirvAsmError(f"line {lineno}: unsupported integer constant width {width}")
     if kind == "float":
+        if width == 16 and type_info[2] == _BFLOAT16_ENCODING:
+            return [_parse_bfloat16_bits(tok, lineno)]
         bits = _parse_float_bits(tok, width, lineno)
         if width <= 32:
             return [bits & 0xFFFFFFFF]
@@ -289,7 +328,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
     sym_to_id: dict[str, int] = {}
     next_id = 1
-    type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width)
+    type_info: dict[int, tuple] = {}       # type_id -> ('int', width, signedness) | ('float', width, encoding)
     id_to_type: dict[int, int] = {}        # result_id -> result_type_id
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
 
@@ -494,11 +533,9 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
         elif res_tok is not None:
             raise SpirvAsmError(f"line {lineno}: {opname} does not produce a result id")
 
-        # Track scalar type widths for OpConstant / OpSwitch, and ExtInstImport sets.
+        # Track integer widths for OpConstant / OpSwitch, and ExtInstImport sets.
         if opname == "OpTypeInt" and res_id is not None and arg_idx + 1 < len(toks):
             type_info[res_id] = ("int", _parse_int(toks[arg_idx], lineno), _parse_int(toks[arg_idx + 1], lineno))
-        elif opname == "OpTypeFloat" and res_id is not None and arg_idx < len(toks):
-            type_info[res_id] = ("float", _parse_int(toks[arg_idx], lineno))
         elif opname == "OpExtInstImport" and res_id is not None and arg_idx < len(toks):
             ext_name = _unquote_string(toks[arg_idx], lineno)
             if ext_name in _EXT_SETS:
@@ -514,6 +551,7 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
             if sel_ti and sel_ti[0] == "int":
                 switch_width = sel_ti[1]
 
+        operand_start = arg_idx
         for kind, quant in op_specs:
             if quant == "*":
                 while arg_idx < len(toks):
@@ -528,6 +566,11 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
         if arg_idx != len(toks):
             raise SpirvAsmError(f"line {lineno}: {opname} unexpected trailing tokens {toks[arg_idx:]!r}")
+
+        if opname == "OpTypeFloat":
+            width = _parse_int(toks[operand_start], lineno)
+            encoding = out[2] if len(out) > 2 else None
+            type_info[res_id] = ("float", width, encoding)
 
         word_count = 1 + len(out)
         if word_count > 0xFFFF:
