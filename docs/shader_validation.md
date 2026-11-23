@@ -484,6 +484,14 @@ First results on an RX 6700 XT (RADV, Mesa 26.3.1), native wave64/wave32 and wit
   (`ds_read_u8_d16[_hi]`, `ds_read_i8_d16[_hi]`) are translated since SHADER-85 (`cs_w32_lds_u8_d16`) and the
   fuzzer generates them.
 
+**RDNA2 iGPU sweep, seeds 3 to 10 (TEST-587).** The AMD Radeon iGPU of a Ryzen 7 9800X3D (gfx1036), Windows 11, AMD
+driver 32.0.21042.62 (seeds 3 to 7) and 32.0.21045.29003 (seeds 8 to 10), `main` 3faac557, translator oracle,
+`--programs 200 --wave both` per seed: **3,200 of 3,200 programs match** (wave32 and native wave64), with 0
+mismatches, 0 skipped, 0 not translated and 0 harness errors. The
+same seeds as emulated wave64 on Mesa lavapipe (llvmpipe, LLVM 20.1.2, WSL Ubuntu 24.04, `--wave 64 --emulate`, which
+also runs the wave64 half of each seed; lavapipe can't pin 32-lane subgroups) match 1,600 of 1,600. The native wave64
+shuffle miscompile of this driver (#4613, seed 7031 program 496) did not come up in these 1,600 native wave64 programs.
+
 #### Hardware oracle for the LDS programs (`--oracle hw`)
 
 `--oracle hw` runs each program natively on an AMD GPU through `tools/hw_oracle/` (setup: "Hardware oracle" under
@@ -891,6 +899,18 @@ vscnt wait plus `s_dcache_inv`; vector accesses only need `s_waitcnt vmcnt(0)`.
 on gfx1150 (they were measured on RDNA2 and, for the vector part, on this GPU before; the `s_buffer_load` bound and the
 `idxen offen` and offset-only soffset forms are new on gfx1150). The one difference is `v_pack_b32_f16` quieting
 signaling NaNs (only signaling NaN halves are not judged; a quiet NaN is compared). The default translator path of `mem` ran on the Radeon 880M (`VK_LOADER_DRIVERS_SELECT=*amd*`, `vk_compute_test` built with g++ as in the lab script): `--family mem --programs 200 --seed 1` gave 400 of 400 programs (native wave64 and wave32) matching the model, 0 not translated, 0 harness errors, so the translator agrees with the model on the OOB_SELECT, straddle, `s_load` and `s_buffer_load` rules there. On the RTX 5070 `vk_compute_test` loses the device (-4) for this and for the unchanged generator of `main`, so use the AMD device.
+
+*RDNA2 iGPU sweep, seeds 3 to 10 (TEST-587).* The translator path of both families on the AMD Radeon iGPU of a Ryzen 7
+9800X3D (gfx1036), Windows 11, AMD driver 32.0.21042.62 (seeds 3 to 7) and 32.0.21045.29003 (seeds 8 to 10), `main`
+3faac557, `--programs 200 --wave both` per seed: **`f16` 3,199 of 3,200 and `mem` 3,200 of 3,200 programs match**
+(wave32 and native wave64), with 0 skipped, 0 not translated and 0 harness errors. `f16` left 226,264 result words
+unjudged (model results that are NaN, infinite or denormal, as above); `mem` none. The one mismatch is a driver
+miscompile on 32.0.21045.29003 (#5533): in `cs_f16fuzz_s10_55_w32`, a `v_pk_ashrrev_i16` that reads the high half of
+`v24` right after `v_med3_f16 ... op_sel:[1,1,1,1]` wrote only that half gets `v24`'s low half in its high result.
+The same SPIR-V matches on an RTX 5080, the Radeon fails it 4 of 4 times, and `--skip-op` of either instruction makes
+it match. Spelling that read as a plain `>> 16` (the #1506 workaround) doesn't avoid it. Emulated wave64 of the same
+seeds on Mesa lavapipe (llvmpipe, LLVM 20.1.2, WSL Ubuntu 24.04, `--wave 64 --emulate`) also matches: `f16` 1,600 of
+1,600 and `mem` 1,600 of 1,600.
 
 ### Packed and 16-bit integer VALU (`tools/pk16_diff.py`)
 
