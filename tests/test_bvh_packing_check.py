@@ -307,6 +307,16 @@ class TestArchive(unittest.TestCase):
             C.scan_archive(path, 62, 1024, progress=False)
         self.assertEqual(RecordingPool.sizes, [61])
 
+    def test_pool_is_not_larger_than_the_window_count(self):
+        # A three-window scan must not start one process per requested worker (shdann, #5854).
+        path = self.write_raw_rpf(bytes(3 << 10))
+        RecordingPool.sizes = []
+        self.addCleanup(setattr, RecordingPool, "sizes", [])
+        with unittest.mock.patch.object(C.pool_workers, "MAX_PROCESS_WORKERS", 61), \
+                unittest.mock.patch.object(C.multiprocessing, "Pool", RecordingPool):
+            C.scan_archive(path, 16, 1024, progress=False)
+        self.assertEqual(RecordingPool.sizes, [3])
+
     def test_cli_json_and_exit_status(self):
         with tempfile.TemporaryDirectory() as d:
             good, bad = os.path.join(d, "good.bin"), os.path.join(d, "bad.bin")
