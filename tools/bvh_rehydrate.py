@@ -472,13 +472,21 @@ def main(argv=None):
     except (OSError, ValueError, struct.error) as e:
         print("error: %s" % e, file=sys.stderr)
         return 2
-    with open(a.out, "wb") as f:
-        f.write(out)
+    try:
+        with open(a.out, "wb") as f:
+            f.write(out)
+    except OSError as e:
+        print("error: cannot write %s: %s" % (a.out, e.strerror or e), file=sys.stderr)
+        return 2
     print("rehydrated %d bytes, %d leaves, %d geometries -> %s" % (len(out), Header(data, a.header_offset).num_elements,
                                                                   len(geometries), a.out))
     if a.compare:
-        with open(a.compare, "rb") as f:
-            ref = f.read()
+        try:
+            with open(a.compare, "rb") as f:
+                ref = f.read()
+        except OSError as e:
+            print("error: cannot read %s: %s" % (a.compare, e.strerror or e), file=sys.stderr)
+            return 2
         diff = sum(x != y for x, y in zip(out, ref)) + abs(len(out) - len(ref))
         print("differs from %s in %d bytes" % (a.compare, diff))
     return 0

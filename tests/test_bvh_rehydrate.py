@@ -237,6 +237,30 @@ class TestErrorsAndCli(unittest.TestCase):
                 self.assertEqual(R.main([paths["in.bin"], "--geom", paths["vb.bin"], "--out", paths["out.bin"],
                                          "--transform", "1,2,3"]), 2)
 
+    def test_write_and_compare_failures_are_one_error_line(self):
+        src, _, _ = build([(0, 0x01, 0, None, 0x09)])
+        with tempfile.TemporaryDirectory() as d:
+            paths = {k: os.path.join(d, k) for k in ("in.bin", "vb.bin", "ib.bin", "out.bin")}
+            for k, data in (("in.bin", src), ("vb.bin", QUADS.vertices), ("ib.bin", QUADS.indices)):
+                with open(paths[k], "wb") as f:
+                    f.write(data)
+            nested = os.path.join(d, "nope", "out.bin")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = R.main([paths["in.bin"], "--geom", paths["vb.bin"] + "," + paths["ib.bin"], "--out", nested])
+            self.assertEqual(rc, 2)
+            self.assertIn("error: cannot write", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            with open(paths["out.bin"], "wb") as f:
+                f.write(R.rehydrate(src, [QUADS]))
+            err2 = io.StringIO()
+            with contextlib.redirect_stderr(err2):
+                rc = R.main([paths["in.bin"], "--geom", paths["vb.bin"] + "," + paths["ib.bin"],
+                             "--out", paths["out.bin"], "--compare", os.path.join(d, "nope", "ref.bin")])
+            self.assertEqual(rc, 2)
+            self.assertIn("error: cannot read", err2.getvalue())
+            self.assertNotIn("Traceback", err2.getvalue())
+
     def test_out_must_not_overwrite_an_input(self):
         src, _, _ = build([(0, 0x01, 0, None, 0x09), (0, 0x81, 0, 1, 0x09)])
         with tempfile.TemporaryDirectory() as d:
