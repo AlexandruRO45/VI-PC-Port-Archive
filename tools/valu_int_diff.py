@@ -533,6 +533,8 @@ def main(argv=None):
     ap.add_argument("--spirv-val", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
+    if args.programs < 1 or args.max_ops < 1:
+        ap.error("--programs and --max-ops must be at least 1")
     if args.self_test:
         self_test()
         print("self-test OK")
