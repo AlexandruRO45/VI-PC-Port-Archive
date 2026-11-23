@@ -244,8 +244,8 @@ def _carve_index(path):
     """Read rpf9_carve.py's index.json in `path`.
 
     Returns (by_name, by_offset, summary, has_manifest):
-      - by_name: {lowercase filename: (offset, stored_bytes, expected_size)} for `<off:012x>.bin` / `.bk2`
-      - by_offset: {offset: (stored_bytes, expected_size)} for hex-prefixed names of another width
+      - by_name: {canonical lowercase filename: (offset, stored_bytes, expected_size)}
+      - by_offset: {offset: (offset, stored_bytes, expected_size)} for other hex-prefixed names
       - summary: the manifest's summary dict (or {})
       - has_manifest: True when index.json is a valid carve manifest
     """
@@ -275,8 +275,9 @@ def _carve_index(path):
         if off is None or stored is None or off in by_offset:
             return {}, {}, {}, False
         ext = ".bk2" if entry.get("type") == "bink2" else ".bin"
-        by_name[f"{off:012x}{ext}"] = (off, stored, size)
-        by_offset[off] = (stored, size)
+        record = (off, stored, size)
+        by_name[f"{off:012x}{ext}"] = record
+        by_offset[off] = record
     raw_summary = index.get("summary")
     summary = raw_summary if isinstance(raw_summary, dict) else {}
     return by_name, by_offset, summary, True
@@ -285,16 +286,15 @@ def _carve_index(path):
 def scan_dir(path, progress=None, output=None):
     """Index carved files, excluding the output report. Use leading hex digits for offsets when possible.
 
-    With rpf9_carve.py's index.json in the folder, each file's stored (compressed) size and (when every carved
-    stream matches the manifest, including its inflated size when recorded) the carve's span, zero padding and
-    unread bytes come from it so compressed_bytes and readable_fraction match archive mode; otherwise the
-    file falls back to its length on disk and the summary uses the partial-folder fallback.
+    Each rpf9_carve.py manifest entry supplies a stored size to at most one file, preferring the canonical
+    filename and checking the inflated size when recorded. Other files use their length on disk. A complete
+    match also supplies the carve's span, zero padding and unread bytes so the summary matches archive mode.
     """
     entries = []
     t0 = time.time()
     by_name, by_offset, carve_summary, has_manifest = _carve_index(path)
-    matched = 0
-    matched_offsets = set()
+    matched_by_name = {}
+    matched_by_offset = {}
     try:
         report = os.stat(output) if output is not None else None
     except FileNotFoundError:
@@ -315,27 +315,25 @@ def scan_dir(path, progress=None, output=None):
         m = re.match(r"([0-9a-fA-F]{6,})", name)
         offset = int(m.group(1), 16) if m else len(entries)
         hit = by_name.get(name.lower())
+        matches = matched_by_name
+        if hit is None and m is not None:
+            hit = by_offset.get(offset)
+            matches = matched_by_offset
         if hit is not None:
             entry_off, entry_stored, entry_size = hit
-        elif m is not None and offset in by_offset:
-            entry_off = offset
-            entry_stored, entry_size = by_offset[offset]
-        else:
-            entry_off = entry_stored = entry_size = None
-        if entry_stored is not None and (entry_size is None or len(data) == entry_size):
-            stored = entry_stored
-            matched += 1
-            matched_offsets.add(entry_off)
-        else:
-            stored = len(data)
-        entries.append((offset, data, stored))
-    rows = [classify(data, offset, stored) for offset, data, stored in entries]
+            if entry_size is None or len(data) == entry_size:
+                matches.setdefault(entry_off, (len(entries), entry_stored))
+        entries.append((offset, data))
+    # Exact names take priority while rows keep their original filename order.
+    matched_by_offset.update(matched_by_name)
+    stored_by_row = dict(matched_by_offset.values())
+    rows = [classify(data, offset, stored_by_row.get(i, len(data))) for i, (offset, data) in enumerate(entries)]
     total_stored = sum(r["stored"] for r in rows)
     span = _nonneg_int(carve_summary.get("span")) if has_manifest else None
     zero = _nonneg_int(carve_summary.get("zero_padding", 0)) if has_manifest else None
     unread = _nonneg_int(carve_summary.get("unread_bytes", 0)) if has_manifest else None
     if (has_manifest
-            and len(entries) == matched == len(matched_offsets) == len(by_offset)
+            and len(entries) == len(matched_by_offset) == len(by_offset)
             and span is not None and zero is not None and unread is not None
             and span >= total_stored):
         summary = summarise(rows, span, zero, unread)

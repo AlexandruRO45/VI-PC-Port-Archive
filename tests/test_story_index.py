@@ -619,6 +619,37 @@ class FolderModeCarveManifestTest(unittest.TestCase):
         self.assertEqual(summary["compressed_bytes"], 250)
         self.assertEqual((summary["span"], summary["zero_padding"], summary["unread_bytes"]), (400, 100, 50))
 
+    def test_manifest_stored_size_applies_to_only_one_file_per_offset(self):
+        canonical = "000000001000.bin"
+        alias_before = "000000001000-copy.bin"
+        alias_after = "001000-copy.bin"
+        payload = psin()
+        index = {
+            "summary": {"span": 2000, "zero_padding": 700, "unread_bytes": 50},
+            "files": [{"off": 0x1000, "stored": 120, "size": len(payload)}],
+        }
+        cases = (
+            ((alias_before, canonical), (len(payload), 120)),
+            ((canonical, alias_after), (120, len(payload))),
+            ((alias_before, alias_after), (120, len(payload))),
+        )
+        for names, expected_stored in cases:
+            with self.subTest(names=names), tempfile.TemporaryDirectory(dir=self.root) as carved:
+                for name in names:
+                    with open(os.path.join(carved, name), "wb") as f:
+                        f.write(payload)
+                with open(os.path.join(carved, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(index, f)
+
+                rows, summary = story_index.scan_dir(carved)
+                self.assertEqual([row["offset"] for row in rows], [0x1000, 0x1000])
+                self.assertEqual(tuple(row["stored"] for row in rows), expected_stored)
+                expected_total = 120 + len(payload)
+                self.assertEqual(
+                    (summary["compressed_bytes"], summary["span"], summary["zero_padding"], summary["unread_bytes"]),
+                    (expected_total, expected_total, 0, 0),
+                )
+
     def test_partial_or_extra_files_do_not_misapply_full_span_or_zero_offset(self):
         with self.subTest("extra_non_hex_file_with_offset_zero"):
             carved = os.path.join(self.root, "extra")
