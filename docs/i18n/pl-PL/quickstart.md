@@ -3,7 +3,7 @@
 > [!NOTE]
 > Dokumentacja w języku angielskim ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) i
 > [`docs/README.md`](../../README.md)) jest **wersją obowiązującą**. Ten przewodnik zawiera tylko stabilne instrukcje
-> konfiguracji i budowania (zsynchronizowany z commitem `f847748c`). Aktualny stan projektu znajdziesz w
+> konfiguracji i budowania (zsynchronizowany z commitem `3faac557`). Aktualny stan projektu znajdziesz w
 > [`README.md`](../../../README.md).
 
 ## Czym jest Leonida
@@ -36,7 +36,11 @@ Projekt jest na wczesnym etapie: **gra jeszcze się nie uruchamia**.
   - Oficjalna wersja LLVM dla Windowsa **nie** zawiera targetu AMDGPU.
   - Aby zbudować natywny `llvm-mc.exe` z AMDGPU, uruchom `.\scripts\build_llvm_mc.ps1` w PowerShellu w głównym
     folderze repozytorium (WSL nie jest potrzebny). Skrypt wymaga `git` i narzędzi C++ z Visual Studio, ustawia
-    zmienną `LLVM_MC` dla Twojego użytkownika i prosi o otwarcie nowego terminala, żeby zmienna była widoczna.
+    zmienną `LLVM_MC` dla Twojego użytkownika i prosi o otwarcie nowego terminala, żeby zmienna była widoczna
+    (trwa to około 20–40 minut). Szybciej, jeśli używasz [condy](https://docs.conda.io/): `conda install -c
+    conda-forge llvm-tools` (jej build dla Windowsa zawiera target AMDGPU; [`docs/testing.md`](../../testing.md) użył
+    wersji 23.1.6), a potem ustaw `LLVM_MC` na pełną ścieżkę zainstalowanego `llvm-mc.exe` (pokaże ją `where llvm-mc`
+    w aktywnym środowisku).
   - Jeśli używasz WSL, zainstaluj `llvm-21` w Ubuntu i ustaw zmienną w tej samej sesji PowerShella, w której
     uruchamiasz `make_game.py`:
 
@@ -54,10 +58,12 @@ Projekt jest na wczesnym etapie: **gra jeszcze się nie uruchamia**.
 
 **Mało miejsca na dysku:** około 350 GB dotyczy pełnego builda. Do *uruchomienia* portu etapy
 `--stages check,shaders,runtime` potrzebują około 30 GB; etap `assets` (~300 GB) służy tylko narzędziom do zasobów,
-a `--wav` dodaje kilkakrotność rozmiaru Ogg Opus. `--work` i `--out` mogą leżeć na innym dysku; paczka na dysku
-tylko do odczytu wymaga `--overlay` (opcja `gta6rt`) na dysku zapisywalnym. Nie usuwaj plików `.s` z
-`work/shaders/dxbc/disasm`: skasowanie ich z pozostawieniem folderu sprawia, że etap wygląda na ukończony z zerem
-shaderów, a `disasm` będący dowiązaniem symbolicznym jest odrzucany.
+a `--wav` dodaje kilkakrotność rozmiaru Ogg Opus (preflight wypisuje ten wybór, gdy to etap `assets` się nie
+mieści). `--work` i `--out` mogą leżeć na innym dysku. Runtime mapuje paczkę tam, gdzie leży, więc paczka na dysku
+tylko do odczytu wymaga `gta6rt --overlay <folder zapisywalny>`; `--overlay` to opcja `gta6rt`, nie `make_game.py`.
+Nie usuwaj plików `.s` z `work/shaders/dxbc/disasm`: ich usunięcie razem z przetłumaczonym
+`work/shaders/spirv/index.json` może sprawić, że etap shaderów wygląda na ukończony z zerem shaderów. Folder `disasm`
+będący dowiązaniem symbolicznym jest odrzucany, gdy etap musi go wyczyścić.
 
 ## Jak zbudować
 
@@ -97,8 +103,9 @@ python -I make_game.py --wave64-emulate off            # auto (domyślnie), on l
 ```
 
 Etapy wykonują się w tej kolejności: `check` → `shaders` → `assets` → `runtime` → `pipelines`. Etap `pipelines`
-tworzy każdy przetłumaczony shader na sterowniku Twojej karty graficznej i zapisuje cache potoków, żeby pierwsze
-uruchomienie nie musiało ich kompilować. Tłumaczenie shaderów trwa najdłużej i domyślnie używa połowy wątków
+tworzy każdy przetłumaczony shader na sterowniku Twojej karty graficznej, sprawdza, czy się kompiluje, zgłasza te,
+które musi pominąć, i zapisuje cache potoków do `pipeline_cache.bin` w `--out`; runtime jeszcze go nie wczytuje, więc
+nie przyspiesza on pierwszego uruchomienia. Tłumaczenie shaderów trwa najdłużej i domyślnie używa połowy wątków
 procesora (można to zmienić przez `--jobs`).
 
 - **`--wave64-emulate`**: decyduje, czy shadery compute i mesh wave64 są tłumaczone tak, by były dokładne przy
@@ -113,13 +120,17 @@ procesora (można to zmienić przez `--jobs`).
   przetłumaczonych shaderów, a jego zmiana tłumaczy je ponownie. `auto` zwykle może użyć ponownie wcześniej
   emulowanych shaderów; obejście dla AMD na Windowsie przebudowuje je w trybie natywnym. Użyj `--wave64-emulate on`,
   aby wymusić emulację, albo `--wave64-emulate off`, aby wymusić natywne wave64.
-- **Cztery flagi awaryjne** są przekazywane do translatora w ten sam sposób, zapisywane obok przetłumaczonych
-  shaderów, a ich zmiana tłumaczy je ponownie: `--no-float-controls` (usuwa `SignedZeroInfNanPreserve` dla urządzeń,
-  których sprawdzanie potoku pomija shader bez `shaderSignedZeroInfNanPreserveFloat32`; wymaga flagi translatora z
-  PR #664), `--bary-fallback` (czyta surowe barycentryki z interpolowanego wejścia, dla urządzeń bez
-  `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (wlicza przesunięcia `image_sample*_o` do
-  współrzędnej, dla urządzeń bez `VK_KHR_maintenance8`) i `--mesh-compute` (shadery mesh jako compute, dla urządzeń
-  bez `VK_EXT_mesh_shader`). Każda jest opisana w [`docs/design.md`](../../design.md).
+- **Flagi awaryjne** są przekazywane do translatora w ten sam sposób, zapisywane obok przetłumaczonych shaderów,
+  a ich zmiana tłumaczy je ponownie: `--no-float-controls` (tłumaczy bez `SignedZeroInfNanPreserve`, dla urządzeń,
+  których `vk_pipeline_check` pomija shader bez `shaderSignedZeroInfNanPreserveFloat32`), `--bary-fallback` (czyta
+  surowe barycentryki z interpolowanego wejścia, dla urządzeń bez `VK_KHR_fragment_shader_barycentric`),
+  `--texel-offset-fallback` (wlicza przesunięcie texeli `image_sample*_o` do współrzędnej, dla urządzeń bez
+  `VK_KHR_maintenance8`), `--mesh-compute` (shadery mesh jako compute zapisujące bufor wyjściowy, dla urządzeń bez
+  `VK_EXT_mesh_shader`), `--f16-interp-fallback` (interpolacja 16-bitowa z połówkowych wartości eksportowanych przez
+  shader wierzchołków albo mesh zamiast wejść `PerVertexKHR`; włącza się sama, gdy karta runtime ich nie obsługuje,
+  np. MoltenVK) i `--pc-tail-ubo` (trzyma `s0..s31` w 128 bajtach push constants, a bazę heap i kodu przenosi do
+  uniform blocku w secie 1; włącza się sama, gdy karta runtime podaje `maxPushConstantsSize` poniżej potrzeb
+  shaderów). Każda jest opisana w [`docs/design.md`](../../design.md).
 - **`--work`**: najlepiej wskazać dysk z co najmniej 350 GB wolnego miejsca; do samego uruchomienia wystarczy około
   30 GB (zobacz „Mało miejsca na dysku” powyżej).
 - **`--wav`**: domyślnie wyłączone, bo 16-bitowy PCM WAV jest kilkakrotnie większy od Ogg Opus. Dekoduje przepakowane
@@ -139,13 +150,18 @@ Build zapisuje polecenie i wersję `llvm-mc`, które utworzyły pliki `.s`, oraz
 shadery. Zmiana któregokolwiek z nich, a także użycie starszego folderu roboczego, uruchamia ponownie deasemblację
 albo tłumaczenie z zachowaniem wyodrębnionych wejść shaderów.
 
+Build zapisuje też, który dekoder (commit `third_party/rpf9-explorer` i źródła `tools/rpf9dump`) wyeksportował modele
+i tekstury każdego archiwum. Gdy się zmieni, etap `assets` usuwa ten eksport i tworzy go od nowa. Starsze foldery
+robocze nie mają tego zapisu, więc po aktualizacji ich modele i tekstury są eksportowane jeszcze raz.
+
 ## Częste problemy
 
 - **Pobrałeś repozytorium przyciskiem „Download ZIP” na GitHubie**: archiwum ZIP nie zawiera submodułu
   `third_party/rpf9-explorer`. Użyj `git clone --recursive`; build pobierze submoduł sam, jeśli masz `git`, a jeśli
   nie — powie, co zrobić. Możesz też uruchomić `git submodule update --init --recursive` w folderze repozytorium.
 - **`llvm-mc` odrzuca `gfx1013` / AMDGPU**: najpewniej masz oficjalny instalator LLVM dla Windowsa. Użyj
-  `scripts\build_llvm_mc.ps1` albo ustaw `LLVM_MC` na `llvm-mc` z WSL (`llvm-21`).
+  `scripts\build_llvm_mc.ps1`, `llvm-mc` z pakietu `llvm-tools` z conda-forge (jego build dla Windowsa ma AMDGPU)
+  albo ustaw `LLVM_MC` na `llvm-mc` z WSL (`llvm-21`).
 - **Błąd `D3D12_ROOT_SIGNATURE_DESC2` przy budowaniu runtime**: zaktualizuj Windows SDK do `10.0.26100` lub nowszego
   przez Visual Studio Installer albo `winget install Microsoft.WindowsSDK.10.0.26100`, usuń folder builda i
   skonfiguruj go ponownie.
