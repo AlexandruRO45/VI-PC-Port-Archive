@@ -105,6 +105,9 @@ jobs:
       wine-artifact: ${{ steps.upload-wine-artifact.outcome }}
     env:
       SCCACHE_GHA_ENABLED: "true"
+      # The pinned SDL3 release: the same SHA-256 as URL_HASH in runtime/CMakeLists.txt. The SDL3 cache is keyed on it,
+      # so a new pin starts from an empty cache.
+      SDL3_TARBALL_SHA256: f3bb06f55bed9557227a700af2ea62e49497ebdf58037732a731a5fb3ef8581f
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -233,6 +236,24 @@ jobs:
           # FindVulkan and the runtime fallback look for the legacy executable name.
           Copy-Item -LiteralPath (Join-Path $bin 'glslang.exe') -Destination (Join-Path $bin 'glslangValidator.exe')
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin -Encoding utf8
+      # Every run that builds the shim compiles SDL3 from the pinned release. Cache the fetched sources and that
+      # build tree so a run with the same tarball and the same compiler reuses them; cl's version is in the key, so
+      # an image update does not restore objects an older toolset built.
+      - name: Read cl's version for the SDL3 cache key
+        id: cl-version
+        shell: pwsh
+        run: |
+          $version = ((& cl 2>&1 | Select-Object -First 1) -replace '\s+', '_')
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Cache the SDL3 fetch and build
+        id: sdl3-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            runtime/build/_deps/sdl3-src
+            runtime/build/_deps/sdl3-subbuild
+            runtime/build/_deps/sdl3-build
+          key: sdl3-3.4.20-${{ env.SDL3_TARBALL_SHA256 }}-${{ steps.cl-version.outputs.version }}
       - name: Configure
         env:
           VULKAN_SDK: ${{ github.workspace }}/.vulkan-headers
