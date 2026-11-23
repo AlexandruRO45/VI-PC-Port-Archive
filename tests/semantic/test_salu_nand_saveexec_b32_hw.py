@@ -6,6 +6,10 @@ import os
 import struct
 import sys
 import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -483,5 +487,88 @@ class TestSaluNandSaveexecB32IEEE754EdgeCases(unittest.TestCase):
                 self.assertEqual(saved_d, exec_lo)
                 self.assertEqual(scc, 1 if exp_new != 0 else 0)
 
+# ==============================================================================
+# Unit Tests: Translator-Backed Execution Tests
+# ==============================================================================
+
+import support  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+
+VSHARP = [0, 0, 0x1000, 0x31016FAC]
+FSSM_64 = bytes(0x138) + struct.pack("<4I", 0x88, 64, 1, 1)
+
+
+class TestSaluNandSaveexecB32Translator(unittest.TestCase):
+    """Integration tests verifying tools/rdna2spirv.py translation of s_nand_saveexec_b32."""
+
+    def test_spirv_emission_reaches_translator(self) -> None:
+        """Verify that support.translate_lines translates s_nand_saveexec_b32 without errors."""
+        lines = [
+            "s_mov_b32 s0, 0x0000FFFF",
+            "s_mov_b32 exec_lo, 0x00FF00FF",
+            "s_nand_saveexec_b32 s2, s0",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_test_s_nand_saveexec_b32", lines, fssm=FSSM_64)
+        self.assertIn("OpCapability", spv)
+        self.assertIn("OpMemoryModel", spv)
+        self.assertTrue(len(spv) > 0)
+
+    def test_wave64_execution_matches_oracle(self) -> None:
+        """Run wave64 compute shader and verify saved D (bcnt), EXEC_LO, EXEC_HI, and SCC match oracle."""
+        cases = [
+            (0x0000_FFFF, 0x00FF_00FF, 0x1234_5678),
+            (0xFFFF_FFFF, 0xFFFF_FFFF, 0x0000_0000),
+            (0x0000_0000, 0x0000_0000, 0x8765_4321),
+            (0xAAAA_AAAA, 0x5555_5555, 0xDEAD_BEEF),
+            (0x1234_5678, 0x9ABC_DEF0, 0xCAFE_BABE),
+            (0x0000_0000, 0xFFFF_FFFF, 0x5555_5555),
+            (0xFFFF_FFFF, 0x0000_0000, 0xAAAA_AAAA),
+        ]
+        for s0_val, init_lo, init_hi in cases:
+            with self.subTest(s0=hex(s0_val), exec_lo=hex(init_lo), exec_hi=hex(init_hi)):
+                prog = [
+                    "s_mov_b64 exec, -1",
+                    f"s_mov_b32 exec_lo, {init_lo:#x}",
+                    f"s_mov_b32 exec_hi, {init_hi:#x}",
+                    f"s_nand_saveexec_b32 s8, {s0_val:#x}",
+                    "s_cselect_b32 s10, 1, 0",
+                    "v_mov_b32_e32 v10, 0",
+                    "s_mov_b64 s[12:13], exec",
+                    "s_mov_b64 exec, -1",
+                    "v_cndmask_b32_e64 v10, 0, 1, s[12:13]",
+                    "v_lshlrev_b32_e32 v11, 2, v0",
+                    "v_add_nc_u32_e32 v12, 64, v11",
+                    "buffer_store_dword v10, v12, s[0:3], 0 offen",
+                    "s_bcnt1_i32_b32 s11, s8",
+                    "v_cmpx_eq_u32_e32 0, v0",
+                    "v_mov_b32_e32 v1, s10",
+                    "v_mov_b32_e32 v2, s11",
+                    "v_mov_b32_e32 v13, 0",
+                    "buffer_store_dword v1, v13, s[0:3], 0 offen",
+                    "v_mov_b32_e32 v14, 4",
+                    "buffer_store_dword v2, v14, s[0:3], 0 offen",
+                    "s_endpgm",
+                ]
+                spv = support.translate_lines("cs_exec_s_nand_saveexec_b32", prog, fssm=FSSM_64)
+                mem = si.run_workgroup(
+                    spv, 64, 64,
+                    inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                    push_constants=VSHARP + [0] * 28,
+                    memory={},
+                )
+                exec_lo_got = sum(((mem.get(64 + 4 * i, 0) & 1) << i) for i in range(32))
+                exec_hi_got = sum(((mem.get(64 + 4 * (32 + i), 0) & 1) << i) for i in range(32))
+                scc_got = mem.get(0, 0)
+                bcnt_got = mem.get(4, 0)
+
+                exp_exec, exp_saved_d, exp_scc = ref_nand_saveexec_b32(s0_val, init_lo)
+                self.assertEqual(exec_lo_got, exp_exec)
+                self.assertEqual(exec_hi_got, init_hi)
+                self.assertEqual(scc_got, exp_scc)
+                self.assertEqual(bcnt_got, bin(exp_saved_d).count("1"))
+
+
 if __name__ == "__main__":
     unittest.main()
+
