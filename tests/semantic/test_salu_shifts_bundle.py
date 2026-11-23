@@ -226,6 +226,19 @@ class TestSAshrI32AST(unittest.TestCase):
         expr_pos = SAshrI32Expr(4, 2)
         self.assertEqual(expr_pos.eval(), (1, 1))
 
+class TestSAshrI32SignAndSCC(unittest.TestCase):
+    def test_sign_bit_propagation(self) -> None:
+        val = 0x80000000
+        for sh in range(32):
+            res, scc = ref_s_ashr_i32(val, sh)
+            # Bit 31 must stay 1
+            self.assertEqual(res & 0x80000000, 0x80000000)
+            self.assertEqual(scc, 1)
+
+    def test_zero_result(self) -> None:
+        res, scc = ref_s_ashr_i32(0, 5)
+        self.assertEqual((res, scc), (0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
