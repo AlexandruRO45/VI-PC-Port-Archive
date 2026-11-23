@@ -59,7 +59,8 @@ def same_name_on_folding_volume(first, second):
     os.path.normcase folds case only on Windows and the `pathconf` probe above answers only on macOS, so a Linux
     mount that ignores case (vfat, exFAT, CIFS) would pass `R.json` and `r.json` as two reports and let the second
     one overwrite the first. Ask the volume itself: create one spelling in a scratch folder beside the reports and
-    look for the other. For a shared parent that does not exist yet, probe its nearest existing ancestor.
+    look for the other. When case variants of the parent do not exist yet, probe the differing components at
+    their nearest shared existing ancestor.
     Names that differ by more than case are never one file, so that costs nothing.
     """
     return _same_resolved_name(os.path.realpath(first), os.path.realpath(second))
@@ -71,18 +72,33 @@ def _same_resolved_name(first, second):
     second_dir, second_name = os.path.split(second)
     if first_name.casefold() != second_name.casefold():
         return False
+    spellings = [(first_name, second_name)] if first_name != second_name else []
     try:
-        if first_dir == second_dir:
-            while not os.path.exists(first_dir):
-                parent = os.path.dirname(first_dir)
-                if parent == first_dir:
-                    return False
-                first_dir = parent
-        elif not os.path.samefile(first_dir, second_dir):
-            return False
-        with tempfile.TemporaryDirectory(prefix=".leonida-report-", dir=first_dir) as probe:
-            with open(os.path.join(probe, first_name), "xb"):
-                return os.path.exists(os.path.join(probe, second_name))
+        while True:
+            if first_dir == second_dir:
+                if os.path.exists(first_dir):
+                    break
+            else:
+                try:
+                    if not os.path.samefile(first_dir, second_dir):
+                        return False
+                    break
+                except FileNotFoundError:
+                    pass
+            first_parent, first_component = os.path.split(first_dir)
+            second_parent, second_component = os.path.split(second_dir)
+            if not first_component or not second_component or first_component.casefold() != second_component.casefold():
+                return False
+            if first_component != second_component:
+                spellings.append((first_component, second_component))
+            first_dir, second_dir = first_parent, second_parent
+
+        for first_name, second_name in spellings:
+            with tempfile.TemporaryDirectory(prefix=".leonida-report-", dir=first_dir) as probe:
+                with open(os.path.join(probe, first_name), "xb"):
+                    if not os.path.exists(os.path.join(probe, second_name)):
+                        return False
+        return True
     except OSError:
         return False
 

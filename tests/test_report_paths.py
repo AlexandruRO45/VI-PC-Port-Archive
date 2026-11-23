@@ -206,6 +206,32 @@ class MissingReportParentTests(unittest.TestCase):
                 temporary.assert_called_once_with(prefix=".leonida-report-", dir=ancestor)
                 opened.assert_called_once_with(os.path.join(scratch, "Report.json"), "xb")
 
+    def test_case_variant_missing_parents_probe_the_differing_components(self):
+        ancestor = os.path.abspath("synthetic-volume")
+        scratch = os.path.join(ancestor, ".probe")
+        for parent, leaf, folds, same in (
+            ("fresh", "Report.json", True, True),
+            ("fresh", "Report.json", False, False),
+            ("elsewhere", "Report.json", True, False),
+            ("fresh", "report.json", True, True),
+        ):
+            with self.subTest(parent=parent, leaf=leaf, folds=folds):
+                first = os.path.join(ancestor, "Fresh", "Report.json")
+                second = os.path.join(ancestor, parent, leaf)
+                existing = {ancestor}
+                if folds:
+                    existing.update(os.path.join(scratch, name) for name in ("fresh", "report.json"))
+                with mock.patch.object(report_paths.os.path, "exists", side_effect=existing.__contains__), \
+                        mock.patch.object(report_paths.os.path, "samefile", side_effect=FileNotFoundError), \
+                        mock.patch.object(report_paths.tempfile, "TemporaryDirectory") as temporary, \
+                        mock.patch.object(report_paths, "open", mock.mock_open(), create=True) as opened:
+                    temporary.return_value.__enter__.return_value = scratch
+                    self.assertEqual(report_paths._same_resolved_name(first, second), same)
+                if parent == "elsewhere":
+                    temporary.assert_not_called()
+                else:
+                    opened.assert_any_call(os.path.join(scratch, "Fresh"), "xb")
+
 
 class NoPrivateCopiesTests(unittest.TestCase):
     def functions(self, tool):
