@@ -176,6 +176,11 @@ all marked `wave64_emulated`. Tier C is a fidelity gap on a 32-wide subgroup, no
 census at `f847748c` predates four analyzer fixes, so its PS split (2,383 / 6 / 8,585) is stale; at `3faac557b`
 it is 3,404 / 27 / 7,543 (tier A up 1,021, tier C down 1,042).
 
+The user-SGPR side also fits the layer's packed `s0..s31` window: `tools/user_sgpr_census.py` over the same index
+finds the lowest pointer at **s4** (CS), **s8** (PS, VS, GS) or **s16** (MS), and no shader reads a pointer above
+**s13**; the reads below a stage's base are root constants at s1/s3/s5/s7, which the root signature provides. All
+26,503 were checked.
+
 What remains before a frame is runtime support, not translation:
 
 * **Mesh.** All 9,282 are wave64, 128x1x1 with 128/128 outputs. On `main` (`3faac557b`) the layer answers
