@@ -848,5 +848,26 @@ OpStore %out %result
         self.assertEqual(si.run_fragment(self.HEADER + body + FOOTER)["%out"], (0, 7))
 
 
+class Float32NanRuleTests(unittest.TestCase):
+    """si.f32 / si.f32_bits give one NaN word on every Python version.
+
+    struct's '<f' quiets a signalling NaN on CI's 3.12 (and 3.13, 3.15) but keeps it signalling on 3.14 (CPython
+    gh-130317), so arithmetic on a bitcast signalling NaN (OpFNegate, OpFAbs) gave a different word on 3.14 than on
+    CI. The pinned rule is CI's: the result is quiet, with its sign and the top 22 payload bits kept."""
+
+    def test_negated_signalling_nan_comes_back_quiet(self):
+        for bits in (0x7F800001, 0xFF800001, 0x7FA00000, 0xFFBFFFFF):
+            with self.subTest(bits=hex(bits)):
+                negated = -si.bits_f32(bits)          # arithmetic returns a plain float, which drops the bits
+                want = (bits ^ 0x80000000) | 0x00400000
+                self.assertEqual(si.f32_bits(si.f32(negated)), want)
+                self.assertEqual(si.f32_bits(negated), want)
+
+    def test_quiet_nan_and_numbers_are_unchanged(self):
+        for bits in (0x7FC00000, 0xFFC12345, 0x3FC00000, 0x00000001, 0xFF7FFFFF):
+            with self.subTest(bits=hex(bits)):
+                self.assertEqual(si.f32_bits(si.f32(float(si.bits_f32(bits)))), bits)
+
+
 if __name__ == "__main__":
     unittest.main()

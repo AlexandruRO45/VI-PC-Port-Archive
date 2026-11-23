@@ -114,8 +114,18 @@ _PURE = frozenset({
 })
 
 
+def _nan_word(x):
+    # The binary32 word of a NaN, quiet, with the sign and the top 22 payload bits kept. struct's '<f' gives this
+    # before 3.14 and on 3.15; 3.14 keeps a signalling NaN signalling (CPython gh-130317). Same pin as
+    # half_to_float below: the rule of CI's 3.12, which every pinned expected word uses.
+    d = struct.unpack("<Q", struct.pack("<d", x))[0]
+    return (d >> 32) & 0x80000000 | 0x7FC00000 | (d >> 29) & 0x3FFFFF
+
+
 def f32(x):
-    """Round a Python float to binary32 (overflow to infinity)."""
+    """Round a Python float to binary32 (overflow to infinity; a NaN comes back quiet on every Python)."""
+    if x != x:
+        return struct.unpack("<f", struct.pack("<I", _nan_word(x)))[0]
     try:
         return struct.unpack("<f", struct.pack("<f", x))[0]
     except OverflowError:
@@ -181,6 +191,8 @@ def fma_f32(x, y, z):
 def f32_bits(x):
     if isinstance(x, _F32):
         return x.bits
+    if x != x:
+        return _nan_word(x)
     try:
         return struct.unpack("<I", struct.pack("<f", x))[0]
     except OverflowError:
