@@ -1714,14 +1714,16 @@ below 4 GiB). A parameter that does not fit goes, with every later one, to the s
     two dwords from s6). The `pack()` layout contradicts 7 of them, which read the second table at s5, the first
     table's high half in that layout.
 - **The argument table behind `s[0:1]`: measured on `XboxBvhBuilder.dll`.** Its 52 compute containers carry an
-  `RTS0` too: 16 shapes of root descriptors and constants, 5 to 30 dwords, no descriptor table. None of the 52
-  programs takes a root argument in a user SGPR, although 48 of the signatures would fit from s4. Each builds a
-  40-bit pointer from `s0` and the low byte of `s1` and loads its arguments through it, and every such load starts at
-  a parameter of a packed layout: root order, 8 bytes per root descriptor, 4 per constant, no padding
-  (`tools/rootsig_census.py <dxbc> --disasm <dxbc>/disasm`: 52 of 52, no load off a parameter). The compiler rounds
-  a load up to 2, 4, 8 or 16 dwords, so 14 programs read past the table's end, by 24 bytes at most. So whether a
-  signature fits from s4 does not say where a program's arguments are. What does is not measured: the upscaler's
-  29 programs, with tables and root CBVs, use the SGPRs.
+  `RTS0` too: 16 shapes of root descriptors and constants, 5 to 30 dwords, no descriptor table. All 52 programs
+  build a 40-bit pointer from `s0` and the low byte of `s1` and load arguments through it, although 48 of the
+  signatures would fit from s4; whether one also reads an argument from s2 and up is not measured (no FSPX
+  `user_sgprs` record, so no read scan). Every such load starts at a parameter of a packed layout: root order, 8 bytes
+  per root descriptor, 4 per constant, no padding (`tools/rootsig_census.py <dxbc> --disasm <dxbc>/disasm`: 52 of
+  52, no load off a parameter). 1 of the 16 shapes places a descriptor at an offset that is not a multiple of 8, and
+  its 4 programs load it there, off a parameter under 8-byte alignment. The compiler rounds a load up to 2, 4, 8 or
+  16 dwords, so 14 programs read past the table's end, by 24 bytes at most. So whether a signature fits from s4 does
+  not say where a program's arguments are. What does is not measured: the upscaler's 29 programs, with tables and
+  root CBVs, use the SGPRs.
 - **Vertex/pixel/geometry s8 and mesh s16: a hypothesis.** It rests on the census above only; no signature
   confirms these bases, and visibility is not modelled (every parameter takes its place in every stage).
 

@@ -20,8 +20,8 @@ signatures each model fits. `--disasm DIR` adds the program's own reads, from a 
 folder: which user SGPRs it reads, which one it zero-extends into an `s_load` base, and which 64-bit pairs it copies
 whole. That is where the tables and the root descriptors surface.
 
-`--disasm` also checks the argument table. A program that takes no root argument in a user SGPR builds a 40-bit
-pointer from `s0` and the low byte of `s1` and loads its arguments through it. The 52 compute programs of
+`--disasm` also checks the argument table. A program can build a 40-bit pointer from `s0` and the low byte of `s1`
+and load its root arguments through it. The 52 compute programs of
 `XboxBvhBuilder.dll` all do (their containers carry `RTS0` too; `tools/pe_shader_containers.py --extract`, then
 `tools/fssm_unpack.py` and `tools/shader_disasm.py`). Each such load is compared with the packed layout of the
 program's own signature: root order, 8 bytes per root descriptor, 4 per constant, no padding.
@@ -41,6 +41,9 @@ import re
 import struct
 import sys
 from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from feature_scan import sgpr_writes  # noqa: E402
 
 KNOWN_VERSIONS = {1: "1.0", 2: "1.1", 3: "1.2"}
 TYPE_NAMES = {0: "table", 1: "constants", 2: "cbv", 3: "srv", 4: "uav"}
@@ -238,29 +241,52 @@ def _single(text):
     return regs[0][0] if len(regs) == 1 and regs[0][0] == regs[0][1] else None
 
 
+_OFFSET = re.compile(r"(-?)(?:0x([0-9a-fA-F]+)|(\d+))")
+
+
+def _offset(text):
+    """The byte offset of an SMEM offset token (hex with `0x`, else decimal; signed), else None."""
+    m = _OFFSET.fullmatch(text)
+    if m is None:
+        return None
+    value = int(m.group(2), 16) if m.group(2) is not None else int(m.group(3), 10)
+    return -value if m.group(1) else value
+
+
+def _sgpr_writes(op, ops):
+    """The SGPRs an instruction writes, by the rule of tools/feature_scan.py `sgpr_writes`."""
+    args = []
+    for o in ops:
+        token = o.split()[0] if o.split() else ""
+        regs = _registers(token) if _REGISTER.fullmatch(token) else []
+        args.append({"k": "sgpr", "r": regs[0][0], "n": regs[0][1] - regs[0][0] + 1} if regs else {"k": "other"})
+    return sgpr_writes({"op": op, "args": args})
+
+
 def table_scan(asm):
     """The loads a program makes through the 40-bit pointer it builds from `s0` and the low byte of `s1`.
 
-    The pointer is `s[n:n+1]` after `s_and_b32 s<n+1>, s1, 0xff` and, unless n is 0, `s_mov_b32 s<n>, s0`. Loads are
-    taken in listing order until either half is written again. `reads` holds [offset, bytes] for each load with a
-    constant offset, and `indexed` counts the others.
+    The pointer is `s[n:n+1]` after `s_and_b32 s<n+1>, s1, 0xff` and, unless n is 0, `s_mov_b32 s<n>, s0`, with
+    neither source nor a copied half written in between. Loads are taken in listing order, not by control flow, until
+    either half is written again. `reads` holds [offset, bytes] for each load with a constant offset (the `glc`/`dlc`
+    after it ignored), and `indexed` counts the others.
     """
     low = high = None
     reads, indexed = [], 0
     live = False
     for op, ops in instructions(asm):
+        written = _sgpr_writes(op, ops)
         if live:
             m = re.fullmatch(r"s_load_dword(?:x(\d+))?", op)
             if m and len(ops) >= 3 and _registers(ops[1]) == [(low, high)]:
                 size = 4 * int(m.group(1) or 1)
-                if ops[2] == "null":
-                    reads.append([0, size])
-                elif re.fullmatch(r"0x[0-9a-fA-F]+|\d+", ops[2]):
-                    reads.append([int(ops[2], 0), size])
-                else:
+                token = ops[2].split()[0] if ops[2].split() else ""
+                at = 0 if token == "null" else _offset(token)
+                if at is None:
                     indexed += 1
-            written = _registers(ops[0]) if ops and not op.startswith(NO_DEST) else []
-            if any(lo <= r <= hi for lo, hi in written for r in (low, high)):
+                else:
+                    reads.append([at, size])
+            if low in written or high in written:
                 break
             continue
         if op == "s_and_b32" and len(ops) == 3 and ops[1] == "s1" and ops[2] == "0xff" and high is None:
@@ -269,6 +295,9 @@ def table_scan(asm):
                 low = 0
         elif op == "s_mov_b32" and len(ops) == 2 and ops[1] == "s0" and low is None:
             low = _single(ops[0])
+        elif (0 in written and low is None) or (1 in written and high is None) \
+                or low in written or high in written:
+            break
         if low is not None and high is not None:
             if high != low + 1:
                 break

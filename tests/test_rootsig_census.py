@@ -206,6 +206,56 @@ class TestArgumentTable(unittest.TestCase):
         got = R.table_scan(asm("s_and_b32 s3, s1, 0xff", "s_mov_b32 s2, s0", "s_load_dword s5, s[2:3], s8"))
         self.assertEqual(got, {"pointer": True, "reads": [], "indexed": 1})
 
+    PROLOGUE = ("s_and_b32 s3, s1, 0xff", "s_mov_b32 s2, s0")
+
+    def test_an_offset_is_hex_with_0x_and_decimal_otherwise(self):
+        # int("08", 0) raises; the 21-bit SMEM offset is signed, and tools/rdna2_decode.py prints it below 100 in
+        # decimal. Text that is neither a number nor `null` is counted, not raised on.
+        got = R.table_scan(asm(*self.PROLOGUE, "s_load_dword s5, s[2:3], 08", "s_load_dword s6, s[2:3], 0x10",
+                               "s_load_dword s7, s[2:3], -8", "s_load_dword s8, s[2:3], 0x1g"))
+        self.assertEqual(got, {"pointer": True, "reads": [[8, 4], [16, 4], [-8, 4]], "indexed": 1})
+
+    def test_cache_modifiers_follow_the_offset(self):
+        # tools/rdna2_decode.py prints an SMEM load as `<offset> [glc] [dlc]`, and a register offset with
+        # `offset:0x..` after it.
+        got = R.table_scan(asm(*self.PROLOGUE, "s_load_dword s5, s[2:3], 0x4 glc", "s_load_dword s6, s[2:3], null dlc",
+                               "s_load_dwordx2 s[8:9], s[2:3], 0x8 glc dlc",
+                               "s_load_dword s10, s[2:3], s8 offset:0x10"))
+        self.assertEqual(got, {"pointer": True, "reads": [[4, 4], [0, 4], [8, 8]], "indexed": 1})
+
+    def test_instructions_without_an_sgpr_destination_do_not_end_the_scan(self):
+        # s_bitcmp writes SCC only; a store's first operand is the data it reads (tools/feature_scan.py NO_SDST).
+        for line in ("s_bitcmp1_b32 s2, 0", "s_bitcmp0_b64 s[2:3], 1", "s_store_dword s2, s[4:5], 0x0",
+                     "s_buffer_store_dwordx2 s[2:3], s[8:11], 0x0", "s_cmpk_lg_i32 s3, 0x1"):
+            with self.subTest(line=line):
+                got = R.table_scan(asm(*self.PROLOGUE, line, "s_load_dword s5, s[2:3], 0x8"))
+                self.assertEqual(got["reads"], [[8, 4]])
+
+    def test_vector_instructions_that_write_an_sgpr_end_the_scan(self):
+        # The carry of a VOP3b add and the destination of v_readfirstlane are SGPRs.
+        for line in ("v_add_co_u32 v0, s2, v1, v2", "v_readfirstlane_b32 s3, v0", "v_cmp_eq_u32_e64 s[2:3], v0, v1"):
+            with self.subTest(line=line):
+                got = R.table_scan(asm(*self.PROLOGUE, "s_load_dword s5, s[2:3], null", line,
+                                       "s_load_dword s6, s[2:3], 0x8"))
+                self.assertEqual(got["reads"], [[0, 4]])
+
+    def test_no_pointer_once_its_source_is_written_first(self):
+        # s0 overwritten before it is copied: s2 does not hold the table's address.
+        for text in (asm("s_mov_b32 s0, 5", "s_and_b32 s3, s1, 0xff", "s_mov_b32 s2, s0",
+                         "s_load_dword s5, s[2:3], 0x8"),
+                     asm("s_mov_b32 s1, 0", "s_and_b32 s3, s1, 0xff", "s_mov_b32 s2, s0",
+                         "s_load_dword s5, s[2:3], 0x8"),
+                     asm("s_add_u32 s0, s0, 16", "s_and_b32 s1, s1, 0xff", "s_load_dword s5, s[0:1], null"),
+                     # a copied half overwritten before the other half is built
+                     asm("s_mov_b32 s2, s0", "s_mov_b32 s2, 7", "s_and_b32 s3, s1, 0xff",
+                         "s_load_dword s5, s[2:3], 0x8")):
+            with self.subTest(text=text):
+                self.assertEqual(R.table_scan(text), {"pointer": False, "reads": [], "indexed": 0})
+        # Writing s0 or s1 after it has been copied leaves the pointer intact.
+        got = R.table_scan(asm("s_mov_b32 s2, s0", "s_mov_b32 s0, 5", "s_and_b32 s3, s1, 0xff", "s_mov_b32 s1, 0",
+                               "s_load_dword s5, s[2:3], 0x8"))
+        self.assertEqual(got, {"pointer": True, "reads": [[8, 4]], "indexed": 0})
+
     def test_no_pointer_without_the_masked_high_half(self):
         self.assertFalse(R.table_scan(asm("s_mov_b32 s2, s0", "s_mov_b32 s3, 0",
                                           "s_load_dword s5, s[2:3], null"))["pointer"])
