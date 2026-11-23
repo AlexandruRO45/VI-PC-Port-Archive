@@ -46,6 +46,8 @@ using CopyFileExWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID
 using CopyFile2Fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS*);
 using SetFileAttributesWFn = BOOL(WINAPI*)(LPCWSTR, DWORD);
 using SetFileAttributesAFn = BOOL(WINAPI*)(LPCSTR, DWORD);
+using GetFullPathNameWFn = DWORD(WINAPI*)(LPCWSTR, DWORD, LPWSTR, LPWSTR*);
+using GetFullPathNameAFn = DWORD(WINAPI*)(LPCSTR, DWORD, LPSTR, LPSTR*);
 
 int g_checks = 0;
 int g_failures = 0;
@@ -696,6 +698,45 @@ int main() {
         check(attributes_w(L"T:\\x") == INVALID_FILE_ATTRIBUTES && GetLastError() != ERROR_INVALID_NAME,
               "without configured folders G: and T: stay host drives");
         rt::fs::configure(package, overlay);
+    }
+
+    // A caller that makes its path absolute before opening it (Rust's std::fs, std::filesystem::absolute) goes through
+    // GetFullPathName. The host reads "GAME:\x" as a relative name and answers "<current folder>\GAME:\x", so the
+    // open that follows never reached the game folder: "GAME:\a\b\c.bin" failed with ERROR_PATH_NOT_FOUND
+    // while the same name through CreateFileW opened.
+    {
+        write_path(package / "nested" / "deeper" / "c.bin", "deep");
+        const auto full_w = resolve<GetFullPathNameWFn>("kernel32.dll", "GetFullPathNameW");
+        const auto full_a = resolve<GetFullPathNameAFn>("kernel32.dll", "GetFullPathNameA");
+        check(full_w && full_a, "kernel32.dll serves GetFullPathNameW and GetFullPathNameA");
+        if (full_w && full_a) {
+        wchar_t full[MAX_PATH] = {};
+        wchar_t* file_part = nullptr;
+        const DWORD n = full_w(L"GAME:/nested/./deeper/../deeper/c.bin", MAX_PATH, full, &file_part);
+        check(n == 25 && std::wstring(full) == L"GAME:\\nested\\deeper\\c.bin", "GetFullPathNameW keeps a GAME: path on GAME:, normalized");
+        check(file_part && std::wstring(file_part) == L"c.bin", "and points the file part at the last name");
+        HANDLE h = create_w(full, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "deep", "so the path it answers still opens the package file");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(full_w(L"GAME:\\nested\\deeper\\c.bin", 5, full, nullptr) == 26, "a buffer that is too small gets the size with the NUL");
+        check(full_w(L"game:", MAX_PATH, full, &file_part) == 6 && std::wstring(full) == L"GAME:\\" && file_part == nullptr,
+              "GAME: alone is the root with no file part");
+        char narrow[MAX_PATH] = {};
+        char* narrow_part = nullptr;
+        check(full_a("GAME:\\nested\\deeper\\c.bin", MAX_PATH, narrow, &narrow_part) == 25 &&
+                  std::string(narrow) == "GAME:\\nested\\deeper\\c.bin" && narrow_part && std::string(narrow_part) == "c.bin",
+              "GetFullPathNameA answers the same");
+
+        // Every other path is still the host's answer.
+        wchar_t host_ours[MAX_PATH] = {};
+        wchar_t host_real[MAX_PATH] = {};
+        const DWORD ours = full_w(L"relative\\x.txt", MAX_PATH, host_ours, nullptr);
+        const DWORD real = ::GetFullPathNameW(L"relative\\x.txt", MAX_PATH, host_real, nullptr);
+        check(ours == real && std::wstring(host_ours) == std::wstring(host_real), "a host path is answered by the host");
+        // A GAME: path that climbs out of the drive is not made absolute here; the open refuses it.
+        const DWORD escaped = full_w(L"GAME:\\..\\x", MAX_PATH, full, nullptr);
+        check(escaped != 0 && std::wstring(full).rfind(L"GAME:", 0) != 0, "GAME:\\.. is left to the host, which does not call it a GAME: path");
+        }
     }
 
     std::filesystem::remove_all(root);
