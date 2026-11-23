@@ -62,6 +62,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 
 if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an older Python can't run
     sys.exit("ERROR: Python 3.12 or newer is needed: https://www.python.org/downloads/")
@@ -72,6 +73,7 @@ sys.path.insert(0, TOOLS)
 from mc_command import mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 
 VERSIONS = os.path.join(ROOT, "game")
@@ -1242,11 +1244,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             drop(disassembly_started, disassembled)
         prepare_shader_disassembly(work, disasm, resume)
         if not os.path.isfile(disassembly_started) or os.path.isfile(disassembled):
-            marker = disassembly_started + ".tmp"
-            with open(marker, "w", encoding="utf-8", newline="\n") as f:
-                start = json.dumps({"llvm": signature, "listings": sorted(expected)}) if expected else signature
-                f.write(start + "\n")
-            os.replace(marker, disassembly_started)
+            start = json.dumps({"llvm": signature, "listings": sorted(expected)}) if expected else signature
+            write_file_atomic(disassembly_started, start + "\n")
         drop(disassembled)
         resume_args = ("--skip-existing",) if resume else ()
         py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--unpack-index", unpacked,
@@ -1254,11 +1253,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         listings = disassembly_listings(dxbc)
         if not listings or not expected <= listings:
             fail("Shader disassembly did not restore all expected listings")
-        marker = disassembled + ".tmp"
-        with open(marker, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"llvm": signature, "listings": sorted(listings)}, f)
-            f.write("\n")
-        os.replace(marker, disassembled)
+        write_file_atomic(disassembled, json.dumps({"llvm": signature, "listings": sorted(listings)}) + "\n")
         drop(disassembly_started)
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
     # it (from before the file existed), with an unreadable one or with another one is translated again; carving, unpacking and
@@ -1710,6 +1705,36 @@ def drop(*paths: str) -> None:
     for p in paths:
         if os.path.isfile(p):
             os.remove(p)
+
+
+def write_file_atomic(path: str, data: bytes | str) -> None:
+    """Stage data into a unique sibling file, set its published mode, and replace path with Windows retry."""
+    abs_path = os.path.abspath(path)
+    directory = os.path.dirname(abs_path)
+    prefix = f".{os.path.basename(abs_path)}-"
+    tmp = None
+    try:
+        if isinstance(data, bytes):
+            with tempfile.NamedTemporaryFile(mode="wb", prefix=prefix, suffix=".tmp",
+                                             dir=directory, delete=False) as f:
+                tmp = f.name
+                f.write(data)
+        else:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                             prefix=prefix, suffix=".tmp",
+                                             dir=directory, delete=False) as f:
+                tmp = f.name
+                f.write(data)
+        os.chmod(tmp, published_mode(abs_path))
+        replace_retry(tmp, abs_path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            with suppress(OSError):
+                # The staging file may have inherited a read-only target's mode; make it
+                # deletable first, or Windows strands it beside the destination on failure.
+                os.chmod(tmp, 0o600)
+                os.unlink(tmp)
 
 
 SHARD_PLAN = "shards.json"   # beside the index parts: the --jobs, mode and translator source that made them
@@ -2285,14 +2310,7 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
         # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
         encoded = shader_dir.encode("utf-8") if os.name == "nt" else os.fsencode(shader_dir)
-        pending = tempfile.NamedTemporaryFile(dir=out, delete=False)
-        try:
-            with pending:
-                pending.write(encoded)
-            os.replace(pending.name, os.path.join(out, "shader_path.txt"))
-        finally:
-            if os.path.exists(pending.name):
-                os.unlink(pending.name)
+        write_file_atomic(os.path.join(out, "shader_path.txt"), encoded)
     start = os.path.join(out, "gta6rt.exe")
     if os.name != "nt":
         start = os.path.join(out, "gta6rt.sh")

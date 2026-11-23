@@ -664,5 +664,93 @@ class RedirectedConsoleEncodingTest(unittest.TestCase):
                         f"the synthetic dump was not listed: {r.stdout!r}")
 
 
+
+
+class AtomicStagingTest(unittest.TestCase):
+    """write_file_atomic stages uniquely, applies published_mode, retries replace, and cleans read-only staging."""
+
+    def test_stale_dot_tmp_directory_does_not_block_marker_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, ".disassembled")
+            blocker = dest + ".tmp"
+            os.mkdir(blocker)
+            make_game.write_file_atomic(dest, '{"llvm":"ok"}\n')
+            with open(dest, "rb") as f:
+                self.assertEqual(f.read(), b'{"llvm":"ok"}\n')
+            self.assertTrue(os.path.isdir(blocker))
+            self.assertEqual(sorted(os.listdir(d)), [".disassembled", ".disassembled.tmp"])
+
+    def test_applies_published_mode_without_flipping_umask_and_uses_replace_retry(self):
+        import file_mode
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "shader_path.txt")
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def record_chmod(path, mode):
+                chmod_calls.append((os.path.abspath(path), mode))
+                return real_chmod(path, mode)
+
+            with mock.patch.object(make_game, "published_mode", wraps=make_game.published_mode) as pub, \
+                    mock.patch.object(make_game, "replace_retry", wraps=make_game.replace_retry) as rep, \
+                    mock.patch.object(make_game.os, "chmod", side_effect=record_chmod), \
+                    mock.patch("os.umask", side_effect=AssertionError("os.umask must not be called")):
+                make_game.write_file_atomic(dest, b"/work/shaders/spirv")
+
+            self.assertEqual(pub.call_count, 1)
+            self.assertEqual(rep.call_count, 1)
+            self.assertEqual(len(chmod_calls), 1)
+            staged_path, staged_mode = chmod_calls[0]
+            self.assertNotEqual(staged_path, os.path.abspath(dest))
+            self.assertEqual(staged_mode, file_mode.published_mode(dest))
+            with open(dest, "rb") as f:
+                self.assertEqual(f.read(), b"/work/shaders/spirv")
+            self.assertEqual(os.listdir(d), ["shader_path.txt"])
+
+    def test_failed_replace_cleans_read_only_staging_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "shader_path.txt")
+            with open(dest, "wb") as f:
+                f.write(b"previous")
+            os.chmod(dest, 0o444)
+            self.addCleanup(lambda: os.path.exists(dest) and os.chmod(dest, 0o600))
+            with mock.patch.object(make_game, "replace_retry", side_effect=PermissionError("locked")):
+                with self.assertRaises(PermissionError):
+                    make_game.write_file_atomic(dest, b"replacement")
+            with open(dest, "rb") as f:
+                self.assertEqual(f.read(), b"previous")
+            self.assertEqual(os.listdir(d), ["shader_path.txt"])
+
+    def test_runtime_shader_path_publishes_via_write_file_atomic(self):
+        with tempfile.TemporaryDirectory() as root:
+            game = os.path.join(root, "game")
+            build = os.path.join(root, "build")
+            out = os.path.join(root, "out")
+            work = os.path.join(root, "work")
+            os.makedirs(game)
+            os.makedirs(build)
+            for name in make_game.RUNTIME_FILES:
+                with open(os.path.join(build, name), "wb") as f:
+                    f.write(name.encode())
+            with mock.patch.object(make_game, "log"), \
+                    mock.patch.object(make_game, "published_mode", wraps=make_game.published_mode) as pub, \
+                    mock.patch.object(make_game, "replace_retry", wraps=make_game.replace_retry) as rep:
+                make_game.runtime(game, out, {"expected_exe": "game.exe"}, runtime_build=build, work=work)
+            self.assertEqual(pub.call_count, 1)
+            self.assertEqual(rep.call_count, 1)
+            self.assertTrue(os.path.isfile(os.path.join(out, "shader_path.txt")))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_new_and_replaced_files_preserve_posix_bits(self):
+        import file_mode
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "shader_path.txt")
+            make_game.write_file_atomic(dest, b"first")
+            self.assertEqual(os.stat(dest).st_mode & 0o777, file_mode.new_file_mode(d))
+            os.chmod(dest, 0o640)
+            make_game.write_file_atomic(dest, b"second")
+            self.assertEqual(os.stat(dest).st_mode & 0o777, 0o640)
+
+
 if __name__ == "__main__":
     unittest.main()
