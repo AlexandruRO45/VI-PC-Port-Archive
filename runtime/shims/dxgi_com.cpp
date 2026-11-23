@@ -208,11 +208,13 @@ class SwapChain final : public IDXGISwapChain3 {
 public:
     SwapChain(IDXGIFactory4* parent, IUnknown* device, leonida::VulkanContext& context,
               PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
-              PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family)
+              PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family,
+              bool swapchain_mutable_format)
         : parent_(parent),
           device_(device),
           context_(context),
-          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex()) {
+          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex(),
+                     swapchain_mutable_format) {
         if (parent_) parent_->AddRef();
         if (device_) device_->AddRef();
     }
@@ -1336,9 +1338,10 @@ private:
 class Factory final : public IDXGIFactory7 {
 public:
     Factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
-            VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family)
+            VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family,
+            bool swapchain_mutable_format)
         : context_(context), gipa_(gipa), instance_(instance), physical_(physical), gdpa_(gdpa),
-          queue_(queue), queue_family_(queue_family) {}
+          queue_(queue), queue_family_(queue_family), swapchain_mutable_format_(swapchain_mutable_format) {}
 
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override {
@@ -1496,7 +1499,8 @@ public:
         if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
         const VkFormat vk_fmt = dxgi_to_vk_format(desc->Format);
         if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
-        auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
+        auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_,
+                                 swapchain_mutable_format_);
         if (restrict_to_output) sc->set_restrict_to_output(restrict_to_output);
         if (!sc->init(hwnd, *desc, vk_fmt)) {
             sc->Release();
@@ -1672,6 +1676,7 @@ private:
     PFN_vkGetDeviceProcAddr gdpa_;
     VkQueue queue_;
     std::uint32_t queue_family_;
+    bool swapchain_mutable_format_ = false;
     HWND assoc_hwnd_ = nullptr;
     mutable std::once_flag tearing_once_;
     bool tearing_supported_ = false;
@@ -1686,10 +1691,10 @@ private:
 
 HRESULT create_factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
                        VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue,
-                       std::uint32_t queue_family, REFIID riid, void** out) {
+                       std::uint32_t queue_family, REFIID riid, void** out, bool swapchain_mutable_format) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* factory = new Factory(context, gipa, instance, physical, gdpa, queue, queue_family);
+    auto* factory = new Factory(context, gipa, instance, physical, gdpa, queue, queue_family, swapchain_mutable_format);
     const HRESULT hr = factory->QueryInterface(riid, out);
     factory->Release();
     return hr;

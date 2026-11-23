@@ -140,6 +140,9 @@ struct VulkanDeviceInfo {
     // instance (only meaningful with `presentation`): a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per
     // present, which PresentX's ImmediateThresholdPercent uses.
     bool swapchain_maintenance1 = false;
+    // VK_KHR_swapchain_mutable_format is enabled on the device (with `presentation`): swapchain images are created
+    // mutable with a UNORM/SRGB format list so sRGB RTVs on UNORM backbuffers are valid.
+    bool swapchain_mutable_format = false;
     // VK_EXT_swapchain_colorspace is enabled on the instance (with `presentation`): the surface can list its HDR10
     // (ST.2084) formats, which a PresentX plane in HDR10 uses. Without it HDR10 planes are tone mapped to SDR.
     bool swapchain_colorspace = false;

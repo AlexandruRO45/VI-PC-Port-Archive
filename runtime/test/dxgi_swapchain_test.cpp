@@ -443,12 +443,29 @@ int main() {
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
 
-    const char* dev_ext = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    std::vector<const char*> dev_exts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    bool has_swapchain_mutable_format = false;
+    if (const auto enum_dev_ext = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+            gipa(instance, "vkEnumerateDeviceExtensionProperties"))) {
+        std::uint32_t ext_count = 0;
+        if (enum_dev_ext(physical, nullptr, &ext_count, nullptr) == VK_SUCCESS && ext_count > 0) {
+            std::vector<VkExtensionProperties> exts(ext_count);
+            if (enum_dev_ext(physical, nullptr, &ext_count, exts.data()) == VK_SUCCESS) {
+                for (const auto& e : exts) {
+                    if (std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME) == 0) {
+                        has_swapchain_mutable_format = true;
+                        dev_exts.push_back(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f12};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
-    dci.ppEnabledExtensionNames = &dev_ext;
+    dci.enabledExtensionCount = static_cast<std::uint32_t>(dev_exts.size());
+    dci.ppEnabledExtensionNames = dev_exts.data();
 
     VkDevice vk_dev = VK_NULL_HANDLE;
     if (create_dev(physical, &dci, nullptr, &vk_dev) != VK_SUCCESS) return fail("vkCreateDevice");
@@ -465,6 +482,8 @@ int main() {
     info.queue = vk_queue;
     info.queue_family = family;
     info.separate_depth_stencil_layouts = true;
+    info.presentation = true;
+    info.swapchain_mutable_format = has_swapchain_mutable_format;
 
     ID3D12Device* dev = nullptr;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&dev))) || !dev) return fail("create_vulkan_device");
@@ -738,6 +757,92 @@ int main() {
         if (FAILED(sc->Present(0, 0))) return fail("Present");
         return 0;
     };
+
+    // sRGB RTV on a UNORM swapchain backbuffer: requires VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR (or a mutable
+    // offscreen ring image) so Vulkan validation sees 0 VUIDs and the clear writes sRGB-encoded bytes.
+    if (has_swapchain_mutable_format) {
+        const UINT idx = sc->GetCurrentBackBufferIndex();
+        ID3D12Resource* bb = nullptr;
+        if (FAILED(sc->GetBuffer(idx, IID_PPV_ARGS(&bb))) || !bb) return fail("GetBuffer (sRGB RTV)");
+        const D3D12_RESOURCE_DESC bb_desc = bb->GetDesc();
+        const DXGI_FORMAT srgb_fmt = (bb_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)
+                                         ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                                         : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        D3D12_RENDER_TARGET_VIEW_DESC srgb_rtv{};
+        srgb_rtv.Format = srgb_fmt;
+        srgb_rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        dev->CreateRenderTargetView(bb, &srgb_rtv, h_rtv);
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT64 total_bytes = 0;
+        dev->GetCopyableFootprints(&bb_desc, 0, 1, 0, &fp, nullptr, nullptr, &total_bytes);
+        D3D12_HEAP_PROPERTIES rb_hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC rb_desc{};
+        rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rb_desc.Width = total_bytes;
+        rb_desc.Height = 1;
+        rb_desc.DepthOrArraySize = 1;
+        rb_desc.MipLevels = 1;
+        rb_desc.SampleDesc.Count = 1;
+        rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* rb = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&rb_hp, D3D12_HEAP_FLAG_NONE, &rb_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                nullptr, IID_PPV_ARGS(&rb)))) {
+            bb->Release();
+            return fail("CreateCommittedResource (sRGB RTV readback)");
+        }
+
+        const float linear_rgba[4] = {0.75f, 0.50f, 0.25f, 1.0f};
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        auto b_rt = make_transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cl->ResourceBarrier(1, &b_rt);
+        cl->ClearRenderTargetView(h_rtv, linear_rgba, 0, nullptr);
+        auto b_src = make_transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cl->ResourceBarrier(1, &b_src);
+        D3D12_TEXTURE_COPY_LOCATION src_loc{bb, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+        dst_loc.pResource = rb;
+        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst_loc.PlacedFootprint = fp;
+        cl->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+        auto b_pres = make_transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+        cl->ResourceBarrier(1, &b_pres);
+        cl->Close();
+
+        ID3D12CommandList* lists[1] = {cl};
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, ++fence_val);
+        if (!wait_fence(fence, fence_val)) {
+            rb->Release();
+            bb->Release();
+            return fail("wait_fence (sRGB RTV)");
+        }
+
+        void* mapped = nullptr;
+        if (FAILED(rb->Map(0, nullptr, &mapped)) || !mapped) {
+            rb->Release();
+            bb->Release();
+            return fail("readback Map (sRGB RTV)");
+        }
+        const auto* px = static_cast<const std::uint8_t*>(mapped);
+        const bool is_bgra = (bb_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
+        const std::uint8_t exp[4] = {is_bgra ? std::uint8_t(0x89) : std::uint8_t(0xe1), std::uint8_t(0xbc),
+                                     is_bgra ? std::uint8_t(0xe1) : std::uint8_t(0x89), std::uint8_t(0xff)};
+        const bool ok = std::abs(int(px[0]) - int(exp[0])) <= 1 && std::abs(int(px[1]) - int(exp[1])) <= 1 &&
+                        std::abs(int(px[2]) - int(exp[2])) <= 1 && px[3] == exp[3];
+        const std::uint8_t got[4] = {px[0], px[1], px[2], px[3]};
+        rb->Unmap(0, nullptr);
+        rb->Release();
+        bb->Release();
+        if (!ok) {
+            std::fprintf(stderr, "FAIL: sRGB swapchain RTV pixel (%02x %02x %02x %02x) != expected (%02x %02x %02x %02x)\n",
+                         got[0], got[1], got[2], got[3], exp[0], exp[1], exp[2], exp[3]);
+            return 1;
+        }
+        if (FAILED(sc->Present(0, 0))) return fail("Present (sRGB RTV)");
+        std::printf("swapchain sRGB RTV clear: %02x %02x %02x %02x (OK)\n", got[0], got[1], got[2], got[3]);
+    }
 
     {
         DXGI_SWAP_CHAIN_DESC1 before{}, after{};

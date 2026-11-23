@@ -109,6 +109,7 @@ public:
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
+    bool swapchain_mutable_format = false;  // create(true) only: VK_KHR_swapchain_mutable_format enabled
     bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
@@ -548,7 +549,15 @@ public:
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";
-        if (presentation) device_extensions.push_back(swapchain);
+        if (presentation) {
+            device_extensions.push_back(swapchain);
+            if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                    return std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME) == 0;
+                })) {
+                device_extensions.push_back(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME);
+                swapchain_mutable_format = true;
+            }
+        }
 #if defined(VK_KHR_swapchain_maintenance1)
         VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_m1{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};

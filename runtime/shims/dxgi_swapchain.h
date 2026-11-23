@@ -108,9 +108,9 @@ class VulkanSwapchain {
 public:
     VulkanSwapchain(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                     PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkQueue queue, std::uint32_t queue_family,
-                    std::mutex& submit_mutex)
+                    std::mutex& submit_mutex, bool swapchain_mutable_format = false)
         : instance_(instance), physical_(physical), device_(device), queue_(queue), queue_family_(queue_family),
-          submit_mutex_(submit_mutex) {
+          submit_mutex_(submit_mutex), swapchain_mutable_format_(swapchain_mutable_format) {
         loaded_ = fn_.load(gipa, instance, gdpa, device);
         if (loaded_) {
             VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -242,10 +242,27 @@ public:
         b.mip_levels = 1;
         b.array_layers = 1;
         b.presentable = !offscreen;
+        b.mutable_format = offscreen ? offscreen_mutable_ : native_mutable_;
         return b;
     }
 
 private:
+    static bool srgb_pair_formats(VkFormat fmt, VkFormat out[2]) {
+        switch (fmt) {
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+            out[0] = VK_FORMAT_R8G8B8A8_UNORM;
+            out[1] = VK_FORMAT_R8G8B8A8_SRGB;
+            return true;
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+            out[0] = VK_FORMAT_B8G8R8A8_UNORM;
+            out[1] = VK_FORMAT_B8G8R8A8_SRGB;
+            return true;
+        default:
+            return false;
+        }
+    }
     bool transition_image_layout(VkImage img, VkImageLayout old_layout, VkImageLayout new_layout) {
         if (!blit_cmd_ || !blit_fence_ || !img) return false;
         std::lock_guard lock(submit_mutex_);
@@ -282,6 +299,7 @@ private:
             if (mem) fn_.free_mem(device_, mem, nullptr);
         offscreen_images_.clear();
         offscreen_memory_.clear();
+        offscreen_mutable_ = false;
     }
 
     void destroy_swapchain() {
@@ -296,6 +314,7 @@ private:
         }
         images_.clear();
         exposed_count_ = 0;
+        native_mutable_ = false;
     }
 
     bool create_offscreen_backbuffers(std::uint32_t count) {
@@ -303,8 +322,11 @@ private:
         fn_.mem_props(physical_, &mp);
         offscreen_images_.reserve(count);
         offscreen_memory_.reserve(count);
+        VkFormat pair[2]{};
+        const bool mutable_img = srgb_pair_formats(format_, pair);
         for (std::uint32_t i = 0; i < count; ++i) {
             VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            if (mutable_img) ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             ici.imageType = VK_IMAGE_TYPE_2D;
             ici.format = format_;
             ici.extent = {extent_.width, extent_.height, 1};
@@ -395,6 +417,7 @@ private:
                 return false;
             }
         }
+        offscreen_mutable_ = mutable_img;
         return true;
     }
 
@@ -539,11 +562,23 @@ private:
         ci.clipped = VK_TRUE;
         ci.oldSwapchain = swapchain_;
 
+        VkFormat pair[2]{};
+        VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+        bool native_mutable = false;
+        if (swapchain_mutable_format_ && srgb_pair_formats(chosen.format, pair)) {
+            ci.flags |= VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
+            format_list.viewFormatCount = 2;
+            format_list.pViewFormats = pair;
+            ci.pNext = &format_list;
+            native_mutable = true;
+        }
+
         VkSwapchainKHR next = VK_NULL_HANDLE;
         if (fn_.create_swapchain(device_, &ci, nullptr, &next) != VK_SUCCESS) return false;
         if (swapchain_) fn_.destroy_swapchain(device_, swapchain_, nullptr);
         destroy_offscreen();
         swapchain_ = next;
+        native_mutable_ = native_mutable;
         present_mode_ = chosen_present_mode;
         format_ = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : chosen.format;
         surface_extent_ = ext;
@@ -591,6 +626,9 @@ private:
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
     bool allow_tearing_ = false;
+    bool swapchain_mutable_format_ = false;
+    bool native_mutable_ = false;
+    bool offscreen_mutable_ = false;
     VkExtent2D surface_extent_{0, 0};
     VkExtent2D extent_{0, 0};
     std::vector<VkImage> images_;

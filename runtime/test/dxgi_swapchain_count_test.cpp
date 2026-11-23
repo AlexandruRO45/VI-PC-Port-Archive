@@ -36,6 +36,9 @@ struct Fake {
     VkImage blit_dst = VK_NULL_HANDLE;
     unsigned presents = 0;
     unsigned created_offscreen = 0;
+    VkImageCreateFlags last_offscreen_flags = 0;
+    VkSwapchainCreateFlagsKHR last_swapchain_flags = 0;
+    std::vector<VkFormat> last_swapchain_view_formats;
 };
 Fake g;
 
@@ -100,6 +103,14 @@ VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice, const VkSwapchainCreat
                                                 const VkAllocationCallbacks*, VkSwapchainKHR* out) {
     if (!info || !out) return VK_ERROR_INITIALIZATION_FAILED;
     g.create_min_image_count = info->minImageCount;
+    g.last_swapchain_flags = info->flags;
+    g.last_swapchain_view_formats.clear();
+    for (const auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next; next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+            const auto* list = reinterpret_cast<const VkImageFormatListCreateInfo*>(next);
+            g.last_swapchain_view_formats.assign(list->pViewFormats, list->pViewFormats + list->viewFormatCount);
+        }
+    }
     *out = reinterpret_cast<VkSwapchainKHR>(kSwapchain);
     return VK_SUCCESS;
 }
@@ -137,9 +148,10 @@ VKAPI_ATTR VkResult VKAPI_CALL wait_for_fences(VkDevice, std::uint32_t, const Vk
 }
 VKAPI_ATTR VkResult VKAPI_CALL reset_fences(VkDevice, std::uint32_t, const VkFence*) { return VK_SUCCESS; }
 VKAPI_ATTR VkResult VKAPI_CALL device_wait_idle(VkDevice) { return VK_SUCCESS; }
-VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice, const VkImageCreateInfo*, const VkAllocationCallbacks*,
+VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice, const VkImageCreateInfo* info, const VkAllocationCallbacks*,
                                             VkImage* out) {
-    if (!out) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!info || !out) return VK_ERROR_INITIALIZATION_FAILED;
+    g.last_offscreen_flags = info->flags;
     *out = reinterpret_cast<VkImage>(static_cast<std::uintptr_t>(kOffscreenBase + g.created_offscreen++));
     return VK_SUCCESS;
 }
@@ -242,14 +254,15 @@ int fail(const char* what) {
 
 // Requests `requested` buffers while faking `native` images and a surface minimum of `minimum`.
 int run_case(const char* label, std::uint32_t requested, std::uint32_t native, std::uint32_t minimum,
-             bool expect_offscreen) {
+             bool expect_offscreen, bool mutable_ext) {
     g = Fake{};
     g.min_image_count = minimum;
     g.returned_images = native;
     std::mutex mutex;
     leonida::VulkanSwapchain swapchain(get_instance_proc, reinterpret_cast<VkInstance>(1),
                                       reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
-                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex);
+                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex,
+                                      mutable_ext);
     if (!swapchain.create(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)), 64, 64,
                           VK_FORMAT_B8G8R8A8_UNORM, requested))
         return fail("VulkanSwapchain::create");
@@ -271,10 +284,13 @@ int run_case(const char* label, std::uint32_t requested, std::uint32_t native, s
 
     if (expect_offscreen) {
         if (g.created_offscreen != requested) return fail("offscreen ring size != requested BufferCount");
+        if (!(g.last_offscreen_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
+            return fail("offscreen UNORM backbuffer missing VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT");
         std::vector<VkImage> exposed;
         for (std::uint32_t i = 0; i < requested; ++i) {
             const leonida::ResourceBinding binding = swapchain.resource_binding(i);
             if (!binding.image || binding.presentable) return fail("offscreen backbuffer binding is not offscreen");
+            if (!binding.mutable_format) return fail("offscreen UNORM backbuffer binding missing mutable_format");
             if (binding.image != swapchain.image(i)) return fail("binding/image disagree");
             for (VkImage other : exposed)
                 if (other == binding.image) return fail("two exposed backbuffers share one image");
@@ -307,6 +323,17 @@ int run_case(const char* label, std::uint32_t requested, std::uint32_t native, s
     }
 
     // Direct path: exposed index and native image index are the same, and nothing is blitted.
+    if (mutable_ext) {
+        if (!(g.last_swapchain_flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR))
+            return fail("direct mutable swapchain missing VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR");
+        if (g.last_swapchain_view_formats.size() != 2 ||
+            g.last_swapchain_view_formats[0] != VK_FORMAT_B8G8R8A8_UNORM ||
+            g.last_swapchain_view_formats[1] != VK_FORMAT_B8G8R8A8_SRGB)
+            return fail("direct mutable swapchain missing UNORM/SRGB format list");
+    } else {
+        if (g.last_swapchain_flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)
+            return fail("direct non-mutable swapchain unexpectedly set MUTABLE_FORMAT_BIT");
+    }
     if (swapchain.current_back_buffer_index() != 0) return fail("direct initial index");
     std::uint32_t index = 0;
     if (!swapchain.acquire_next_image(index)) return fail("direct first acquire");
@@ -314,8 +341,11 @@ int run_case(const char* label, std::uint32_t requested, std::uint32_t native, s
         const std::uint32_t current = swapchain.current_back_buffer_index();
         if (current >= requested) return fail("direct GetCurrentBackBufferIndex >= BufferCount");
         if (current != g.last_acquired) return fail("direct current index is not the acquired image");
-        if (swapchain.resource_binding(current).image != native_image(current))
+        const leonida::ResourceBinding binding = swapchain.resource_binding(current);
+        if (binding.image != native_image(current))
             return fail("direct binding is not the native image");
+        if (binding.mutable_format != mutable_ext)
+            return fail("direct binding mutable_format disagrees with extension support");
         g.blit_src = g.blit_dst = VK_NULL_HANDLE;
         g.presented_image = UINT32_MAX;
         if (!swapchain.present(current)) return fail("direct present");
@@ -332,6 +362,7 @@ struct Case {
     std::uint32_t native;
     std::uint32_t minimum;
     bool offscreen;
+    bool mutable_ext;
 };
 
 }  // namespace
@@ -339,16 +370,19 @@ struct Case {
 int main() {
     const Case cases[] = {
         // Vulkan returns more images than minImageCount: the app asked for 2 and must see 2.
-        {"driver returns 4 for BufferCount 2", 2, 4, 2, true},
+        {"driver returns 4 for BufferCount 2", 2, 4, 2, true, false},
         // The surface minimum exceeds the request (2): still expose the app's 2.
-        {"minImageCount 3 for BufferCount 2", 2, 3, 3, true},
+        {"minImageCount 3 for BufferCount 2", 2, 3, 3, true, false},
         // Control: the app asks for more than minImageCount; native and exposed counts agree, no blit.
-        {"BufferCount 3 above minImageCount 2", 3, 3, 2, false},
+        {"BufferCount 3 above minImageCount 2 (non-mutable)", 3, 3, 2, false, false},
+        // Same direct path with VK_KHR_swapchain_mutable_format enabled.
+        {"BufferCount 3 above minImageCount 2 (mutable)", 3, 3, 2, false, true},
     };
     for (const Case& c : cases) {
-        if (const int result = run_case(c.label, c.requested, c.native, c.minimum, c.offscreen)) return result;
+        if (const int result = run_case(c.label, c.requested, c.native, c.minimum, c.offscreen, c.mutable_ext))
+            return result;
     }
-    std::printf("dxgi_swapchain_count_test: PASS (3 cases: extra native images, min above request, "
-                "request above min)\n");
+    std::printf("dxgi_swapchain_count_test: PASS (4 cases: extra native images, min above request, "
+                "request above min non-mutable/mutable)\n");
     return 0;
 }

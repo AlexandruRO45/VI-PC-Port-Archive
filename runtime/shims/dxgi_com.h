@@ -15,6 +15,6 @@ namespace rt::dxgi {
 // and registers its back-buffer images with `context` (keyed by the returned ID3D12Resource* pointer).
 HRESULT create_factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
                        VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue,
-                       std::uint32_t queue_family, REFIID riid, void** out);
+                       std::uint32_t queue_family, REFIID riid, void** out, bool swapchain_mutable_format = false);
 
 }  // namespace rt::dxgi

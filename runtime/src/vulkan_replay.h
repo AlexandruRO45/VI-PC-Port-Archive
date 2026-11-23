@@ -83,6 +83,7 @@ struct ResourceBinding {
     bool typeless = false;  // A TYPELESS color resource: views name a format of its family (D3D-275).
     bool castable_view_formats = false;  // A creation-time castable list made the image mutable (D3D-85/D3D-90),
                                          // so views may reinterpret it as typeless resources do.
+    bool mutable_format = false;  // Image or swapchain created with MUTABLE_FORMAT_BIT (UNORM <-> SRGB RTV casts).
     // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (the GPU has no D24): footprint copies of the depth plane convert
     // (depth24.h) and clears quantise to 24 bits.
     bool depth24_as_float = false;
@@ -1202,7 +1203,8 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     const int family = typeless_view_family(format);
     if (!family) return VK_FORMAT_UNDEFINED;
     if (!resource.typeless && !resource.castable_view_formats)
-        return (format == resource.format || is_unorm_srgb_pair(resource.format, format))
+        return (format == resource.format ||
+                (resource.mutable_format && is_unorm_srgb_pair(resource.format, format)))
                    ? format
                    : VK_FORMAT_UNDEFINED;
     const bool other_order = resource.castable_view_formats && rgba8_any_order(format) &&

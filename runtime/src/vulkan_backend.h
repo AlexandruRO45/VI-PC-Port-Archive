@@ -1276,6 +1276,12 @@ public:
         return resources_.find(id) != resources_.end();
     }
 
+    bool resource_mutable_format(ResourceId id) {
+        std::shared_lock lock(resource_mutex_);
+        const auto it = resources_.find(id);
+        return it != resources_.end() && it->second.mutable_format;
+    }
+
     bool ray_tracing_supported() const { return ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR != nullptr; }
     bool xdxr_acceleration_structures() const { return xdxr_ != nullptr; }
 

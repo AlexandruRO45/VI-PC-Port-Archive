@@ -1911,6 +1911,7 @@ public:
         binding_.aspects = aspects_;
         binding_.width = sparse->image_extent.width;
         binding_.height = sparse->image_extent.height;
+        binding_.mutable_format = (create.info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) != 0;
         // An unbound tile reads as zero. Keep the layout stable once the image can share memory with an alias.
         binding_.not_zeroed = true;
         binding_.simultaneous_access = true;
@@ -2000,6 +2001,7 @@ public:
         binding.image = image_;
         binding.typeless = format.typeless && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT;  // views name their format
         binding.castable_view_formats = !view_formats_.empty();  // a castable list made the image mutable
+        binding.mutable_format = (info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) != 0;
         binding.rgb96 = format.rgb96;
         binding.depth24_as_float = format.d24_as_float;
         binding.depth24 = format.d24;
@@ -5666,7 +5668,8 @@ public:
                                  rgba8_any_order(requested) && r->lists_castable_format(requested);
         const bool listed = requested == rd.Format ||
                             (r && r->has_view_format_list() && r->allows_view_format(named.format));
-        const bool srgb_pair_cast = !(r && r->has_view_format_list()) && is_unorm_srgb_rtv_pair(rd.Format, requested);
+        const bool srgb_pair_cast = !(r && r->has_view_format_list()) && is_unorm_srgb_rtv_pair(rd.Format, requested) &&
+                                    state_.context->resource_mutable_format(rid);
         if (typeless_color || cast_listed || srgb_pair_cast ||
             (requested != rd.Format && listed && rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
             const int family = leonida::detail::typeless_view_family(named.format);
@@ -8365,7 +8368,7 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
     const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(i.get_instance_proc(i.instance, "vkGetDeviceProcAddr"));
     if (!gdpa) return E_FAIL;
     return rt::dxgi::create_factory(d->context(), i.get_instance_proc, i.instance, i.physical, gdpa, i.queue,
-                                    i.queue_family, riid, out);
+                                    i.queue_family, riid, out, i.swapchain_mutable_format);
 }
 
 // Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and
@@ -8973,6 +8976,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    const bool has_swapchain_mutable_format =
+        has_swapchain && instance_has_surface &&
+        std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME) == 0;
+        });
+    if (has_swapchain_mutable_format)
+        device_extensions.push_back(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
@@ -8980,6 +8990,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
     info.presentation = has_swapchain && instance_has_surface;
+    info.swapchain_mutable_format = has_swapchain_mutable_format;
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());

@@ -259,14 +259,39 @@ int main() {
     }
     auto wrong = binding; wrong.typeless = false;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
+    {
+        // A typed UNORM/SRGB image created with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT allows its UNORM <-> SRGB pair,
+        // while still rejecting non-pair formats (e.g. UINT) and non-mutable typed images.
+        auto mutable_rgba = wrong; mutable_rgba.mutable_format = true;
+        auto mutable_bgra = mutable_rgba; mutable_bgra.format = VK_FORMAT_B8G8R8A8_UNORM;
+        const auto bgra8_srgb = static_cast<ColorViewFormat>(VK_FORMAT_B8G8R8A8_SRGB);
+        CommandList srgb_clear;
+        EXPECT(srgb_clear.clear_render_target({1, 0, 0, 1, ColorViewFormat::rgba8_srgb}, color) && srgb_clear.close());
+        EXPECT(run(srgb_clear, mutable_rgba, vk) == ReplayResult::success);
+        EXPECT(image_clears == 0 && attachment_clears == 1 && requested_format == VK_FORMAT_R8G8B8A8_SRGB);
+        CommandList bgra_srgb_clear;
+        EXPECT(bgra_srgb_clear.clear_render_target({1, 0, 0, 1, bgra8_srgb}, color) && bgra_srgb_clear.close());
+        EXPECT(run(bgra_srgb_clear, mutable_bgra, vk) == ReplayResult::success);
+        EXPECT(image_clears == 0 && attachment_clears == 1 && requested_format == VK_FORMAT_B8G8R8A8_SRGB);
+        EXPECT(rejects(mutable_rgba, {1, 0, 0, 1, ColorViewFormat::rgba8_uint}));
+        auto immutable_bgra = mutable_bgra; immutable_bgra.mutable_format = false;
+        EXPECT(rejects(immutable_bgra, {1, 0, 0, 1, bgra8_srgb}));
+        checks += 4;
+    }
     wrong = binding; wrong.format = VK_FORMAT_R32_SFLOAT;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_uint}));
     wrong = binding; wrong.mip_levels = 2;
     EXPECT(rejects(wrong, {1, 2, 0, 1, ColorViewFormat::rgba8_uint}, ReplayResult::invalid_subresource));
     wrong = binding; wrong.array_layers = 2;
     EXPECT(rejects(wrong, {1, 0, 1, 2, ColorViewFormat::rgba8_srgb}, ReplayResult::invalid_subresource));
-    wrong = binding; wrong.volume = true;
-    EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
+    {
+        // Typeless 3D volumes support typed RTV views of their family.
+        auto volume = binding; volume.volume = true; volume.depth = 2;
+        CommandList vol_list;
+        EXPECT(vol_list.clear_render_target({1, 0, 0, 1, ColorViewFormat::rgba8_srgb}, color) && vol_list.close());
+        EXPECT(run(vol_list, volume, vk) == ReplayResult::success);
+        EXPECT(image_clears == 0 && attachment_clears == 1 && requested_format == VK_FORMAT_R8G8B8A8_SRGB);
+    }
     // A castable RGBA8 or BGRA8 image clears through a view in the other channel order (the device checked that the
     // list names it); without a castable list, or for a UINT image, the other order stays refused.
     {
