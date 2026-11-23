@@ -278,10 +278,12 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(tcode, 1)
         self.assertIn("merged tree matches main", text)
         self.assertIn("merged before at", text)
-        # Earlier issue number in the squash subject must not match as a prior merge.
+        # Earlier issue number in the squash subject must not match as a prior merge. sq2's content is on main all
+        # the same, so asked about as #999 it reads already-on-main, with no merge of #999 behind it.
         code_issue, [r_issue] = self.run_check("999=sq2")
-        self.assertEqual(code_issue, 0)
         self.assertEqual(r_issue["merges"], [])
+        self.assertEqual(r_issue["verdict"], "already-on-main")
+        self.assertEqual(code_issue, 1)
 
     def test_a_follow_up_commit_after_a_multi_commit_squash_merge_is_clean(self):
         base = self.git("rev-parse", "main")
@@ -314,6 +316,59 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(r["verdict"], "clean")
         self.assertEqual(r["merges"], [])
+
+    def stack(self):
+        """A PR `lower` and a PR `upper` stacked on it; squash-merging `upper` (#41) takes `lower`'s change along."""
+        base = self.git("rev-parse", "main")
+        self.pr_branch("lower", base, "\n" + PARAGRAPH)
+        self.git("checkout", "-q", "-b", "upper", "lower")
+        self.write("docs/upper.md", "The upper pull request adds a document of its own that the lower one never had.\n")
+        self.commit("upper: add its own document")
+        self.git("checkout", "-q", "main")
+        self.squash_merge(41, "upper", "upper: its own document, on top of the lower PR's section")
+
+    def test_a_stacked_pr_squash_merged_inside_the_one_above_it_is_already_on_main(self):
+        self.stack()
+        code, [r] = self.run_check("40=lower")
+        self.assertEqual(code, 1)
+        self.assertEqual(r["verdict"], "already-on-main")
+        self.assertEqual(r["merges"], [])
+        self.assertEqual(r["commits"], {"total": 1, "on_main": 0})
+        self.assertIsNone(r["on_main_outside_conflicts"])
+        _, text = self.run_text("40=lower")
+        self.assertIn("though no merge of it is found", text)
+
+    def test_a_stacked_pr_whose_lines_main_edited_since_conflicts_and_adds_nothing_outside_the_conflict(self):
+        self.stack()
+        lines = PARAGRAPH.splitlines(keepends=True)
+        reworded = lines[0] + lines[1].replace("ends the list early", "ends the parameter list early") + lines[2]
+        with open(os.path.join(self.repo, "docs", "notes.md"), encoding="utf-8") as f:
+            notes = f.read()
+        self.write("docs/notes.md", notes.replace(PARAGRAPH, reworded))
+        self.commit("notes: reword the slot sentence")
+        code, [r] = self.run_check("40=lower")
+        self.assertEqual(code, 1)
+        self.assertEqual(r["verdict"], "conflict")
+        self.assertIs(r["on_main_outside_conflicts"], True)
+        _, text = self.run_text("40=lower")
+        self.assertIn("outside them merging changes nothing", text)
+
+    def test_a_conflicting_pr_that_adds_more_is_not_said_to_be_on_main(self):
+        base = self.git("rev-parse", "main")
+        intro = "\n\nAn introduction long enough to be counted as a line of its own here.\n"
+        self.git("checkout", "-q", "-b", "live", base)
+        self.write("docs/notes.md", "# Notes, as the live PR names them" + intro)
+        self.write("docs/new.md", "A new document that nothing on main has, so merging the PR adds it.\n")
+        self.commit("live: rename the notes and add a document")
+        self.git("checkout", "-q", "main")
+        self.write("docs/notes.md", "# Notes, as main names them" + intro)
+        self.commit("main: rename the notes")
+        code, [r] = self.run_check("50=live")
+        self.assertEqual(code, 1)
+        self.assertEqual(r["verdict"], "conflict")
+        self.assertIs(r["on_main_outside_conflicts"], False)
+        _, text = self.run_text("50=live")
+        self.assertNotIn("outside them", text)
 
     def test_merged_pr_number_subject_parsing(self):
         self.assertEqual(mc._merged_pr_number("Merge pull request #7 from someone/first"), 7)

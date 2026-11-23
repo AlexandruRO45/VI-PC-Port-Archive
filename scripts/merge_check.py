@@ -15,9 +15,15 @@ against `--main` (default `origin/main`), using one history scan for the whole b
   repeated line is not reported, since code and tables repeat lines legitimately. Only text files (.md, .txt,
   .rst) make the verdict `duplicates`; a block in code is listed, since equal lines in two functions are ordinary.
 - `conflict`: whether `git merge-tree` reports a conflict (the duplicate check is then on the conflicted tree).
+- `on_main_outside_conflicts`: with a conflict, whether the merge with every conflicting hunk resolved to main's side
+  (`merge-tree -X ours`) leaves main as it is, so that the PR adds nothing outside its conflicts: what a PR that
+  landed inside another merge looks like once main has edited its lines since. It stays a `conflict`, since a PR
+  whose every change conflicts looks the same. `null` without a conflict, and where git cannot make that merge.
 
 Verdict per PR: `already-merged` (a prior merge exists and either every commit is on main or the conflict-free merged
-tree matches main, as after a multi-commit squash merge), `duplicates`, `conflict` or `clean`.
+tree matches main, as after a multi-commit squash merge), `already-on-main` (no merge of this PR is found, but the
+conflict-free merged tree matches main: everything it adds landed another way, such as a stacked PR squash-merged
+inside the PR above it, so merging it changes nothing), `duplicates`, `conflict` or `clean`.
 Exit 0 when every PR is clean, 1 when any is not, 2 on a usage or git error. Read-only: `merge-tree --write-tree`
 writes only objects, no refs. Standard library only; needs git 2.38 or newer for `merge-tree --write-tree`.
 """
@@ -89,6 +95,16 @@ def merged_tree(repo, main, ref):
     return r.stdout.split()[0], r.returncode == 1
 
 
+def merged_tree_keeping_main(repo, main, ref):
+    """The merged tree with every conflicting hunk resolved to main's side, or None where git cannot make it.
+
+    `-X ours` settles content conflicts only; a conflict it leaves (a file deleted on one side, for one) exits 1, and
+    a git whose `merge-tree` takes no `-X` exits with a usage error. Either way there is no such tree to compare.
+    """
+    r = git(repo, "merge-tree", "--write-tree", "-X", "ours", main, ref, check=False)
+    return r.stdout.split()[0] if r.returncode == 0 and r.stdout.strip() else None
+
+
 def patch_destination(header):
     """Decode Git's +++ header. An unquoted path containing spaces can have a trailing tab."""
     name = header[4:].removesuffix("\t")
@@ -149,11 +165,19 @@ def duplicates(repo, main, tree, min_length, block=3):
 def check(repo, main, number, ref, min_length, merges):
     total, on_main = cherry(repo, main, ref)
     tree, conflict = merged_tree(repo, main, ref)
-    unchanged = not conflict and tree == rev_tree(repo, main)
+    main_tree = rev_tree(repo, main)
+    unchanged = not conflict and tree == main_tree
+    outside = None
+    if conflict:
+        kept = merged_tree_keeping_main(repo, main, ref)
+        outside = None if kept is None else kept == main_tree
     dups = {} if unchanged else duplicates(repo, main, tree, min_length)
     text_dups = {p: v for p, v in dups.items() if p.lower().endswith(TEXT_SUFFIXES)}
     if merges and (total == on_main or unchanged):
         verdict = "already-merged"
+    elif unchanged:
+        # No merge of its own, yet merging changes nothing: a stacked PR that went in with the one above it.
+        verdict = "already-on-main"
     elif text_dups:
         verdict = "duplicates"
     elif conflict:
@@ -162,6 +186,7 @@ def check(repo, main, number, ref, min_length, merges):
         verdict = "clean"
     return {"pr": number, "ref": ref, "verdict": verdict, "merges": merges,
             "commits": {"total": total, "on_main": on_main}, "conflict": conflict,
+            "on_main_outside_conflicts": outside,
             "duplicates": {p: len(v) for p, v in dups.items()},
             "duplicate_samples": {p: v[:3] for p, v in dups.items()}}
 
@@ -196,8 +221,12 @@ def main(argv=None):
             print(f"#{r['pr']} {r['verdict']}: {c['on_main']}/{c['total']} commit(s) already on main"
                   + (", merged tree matches main"
                      if r["verdict"] == "already-merged" and c["on_main"] != c["total"] else "")
+                  + (", merged tree matches main, though no merge of it is found"
+                     if r["verdict"] == "already-on-main" else "")
                   + (f", merged before at {', '.join(r['merges'])}" if r["merges"] else "")
-                  + (", conflicts" if r["conflict"] else ""))
+                  + (", conflicts" if r["conflict"] else "")
+                  + (", and outside them merging changes nothing (already on main another way?)"
+                     if r["on_main_outside_conflicts"] else ""))
             for path, n in sorted(r["duplicates"].items()):
                 note = "" if path.lower().endswith(TEXT_SUFFIXES) else " (code: listed, not counted)"
                 print(f"  {path}: {n} added line(s) already there in the same order{note}, "
