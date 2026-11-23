@@ -6266,11 +6266,37 @@ class Gen:
         self.emit(f"{sel} = OpSelect %float {nan_second} {first} {res}")
         return sel
 
-    def nminmax_f32(self, glsl_op, x, y, y_src=None, nan_y=None):
-        """GLSL.std.450 ``NMin``/``NMax`` returning ``x`` with its bits intact whenever ``y`` is NaN."""
+    def f32_bits_with_mods(self, src):
+        """The source's 32 bits with ``abs``/``neg`` applied bitwise.
+
+        An all-NaN min/max/med3 must return src0's exact bits, and a signaling NaN has to stay signaling: the
+        hardware only flips the sign bit. ``OpFNegate`` is a float operation and quiets an sNaN before the
+        select can use it (SPIR-V: float ops quiet), so the modifier is applied on the bits instead of the
+        value. Same rule the f16 path follows with ``h_mod`` in f16_in_bits."""
+        bits = self.src_u({**src, "neg": False, "abs": False})   # src_u applies the modifier itself
+        if src.get("abs"):
+            b = self.tmp()
+            self.emit(f"{b} = OpBitwiseAnd %uint {bits} {self.cu(0x7FFFFFFF)}")
+            bits = b
+        if src.get("neg"):
+            b = self.tmp()
+            self.emit(f"{b} = OpBitwiseXor %uint {bits} {self.cu(0x80000000)}")
+            bits = b
+        return bits
+
+    def f32_from_bits(self, bits):
+        f = self.tmp()
+        self.emit(f"{f} = OpBitcast %float {bits}")
+        return f
+
+    def nminmax_f32(self, glsl_op, x, y, y_src=None, nan_y=None, nan_first=None):
+        """GLSL.std.450 ``NMin``/``NMax`` returning ``x`` with its bits intact whenever ``y`` is NaN.
+
+        ``nan_first`` is the value the all-NaN select returns when it must keep src0's payload through a
+        source modifier; it defaults to ``x`` (the comparison value)."""
         r = self.tmp()
         self.emit(f"{r} = OpExtInst %float %glsl {glsl_op} {x} {y}")
-        return self._select_nan_first(r, x, nan_y, y, y_src)
+        return self._select_nan_first(r, x if nan_first is None else nan_first, nan_y, y, y_src)
 
     def _read_f16_minmax_srcs(self, srcs, sels, mods):
         """Read f16 min/max/med3 sources and track raw modified ``src0`` half when ``clamp`` is absent."""
@@ -6337,7 +6363,9 @@ class Gen:
             self.emit(f"{o} = OpLogicalOr %bool {nan} {c}")
             nan = o
         if sel is None:
-            mn1 = self._select_nan_first(lo, x, preds[1])
+            # src0's bits carry the modifier so an all-NaN median keeps an sNaN signaling (f32_bits_with_mods).
+            nan_x = self.f32_from_bits(self.f32_bits_with_mods(srcs[0]))
+            mn1 = self._select_nan_first(lo, nan_x, preds[1])
             mn = self.nminmax_f32("NMin", mn1, z, nan_y=preds[2])
         else:
             mn = self.tmp()
@@ -6765,8 +6793,11 @@ class Gen:
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
             x, y, z = (self.src_f(t) for t in a[1:4])
+            # src0's bits carry the source modifier so an all-NaN result keeps an sNaN signaling (see
+            # f32_bits_with_mods); the comparison still uses the value.
+            x_nan = self.f32_from_bits(self.f32_bits_with_mods(a[1]))
             f = "NMax" if "max" in op else "NMin"      # RDNA2: f(f(s0, s1), s2) keeping S0 on all-NaN
-            m = self.nminmax_f32(f, x, y, y_src=a[2])
+            m = self.nminmax_f32(f, x, y, y_src=a[2], nan_first=x_nan)
             r = self.nminmax_f32(f, m, z, y_src=a[3])
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_and_or_b32":

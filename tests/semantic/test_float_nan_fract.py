@@ -460,6 +460,12 @@ class AllNaNSrc0PayloadTests(unittest.TestCase):
                 self.assertEqual(run_op(f"{op} v0, v1, v2, v3", (snan_a, NAN_A, NAN_B)), snan_a)
                 self.assertEqual(run_op(f"{op} v0, v1, v2, v3", (NAN_A, NAN_B, snan_b)), NAN_A)
                 self.assertEqual(run_op(f"{op} v0, -v1, v2, v3", (snan_a, NAN_A, NAN_B)), snan_a ^ SIGN_BIT32)
+                # |s0| of a NEGATIVE sNaN must stay signaling with the sign cleared (not quieted), and a finite
+                # src0 with both modifiers must keep its value: the comparison runs on the float, the all-NaN
+                # select on the bits (f32_bits_with_mods).
+                self.assertEqual(run_op(f"{op} v0, |v1|, v2, v3", (snan_b, NAN_A, NAN_B)), snan_b & ~SIGN_BIT32)
+                self.assertEqual(run_op(f"{op} v0, -|v1|, v2, v3", (snan_b, NAN_A, NAN_B)),
+                                 (snan_b & ~SIGN_BIT32) | SIGN_BIT32)
                 for args in ((snan_a, NAN_B, M25), (snan_a, M25, NAN_B), (M25, snan_a, NAN_B)):
                     self.assertEqual(run_op(f"{op} v0, v1, v2, v3", args), M25)
 
