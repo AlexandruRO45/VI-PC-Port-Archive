@@ -2,9 +2,10 @@ r"""Differential fuzzer for v_div_fixup_f16, v_div_fixup_f32 and v_div_fixup_f64
 
 No other fuzzer generates these three ops: they are on no `--list-ops` list and in no generator.
 
-    v_div_fixup_f16  VOP3  d, s0, s1, s2  [op_sel:[a,b,c,d]] [clamp]       s0 quotient, s1 denominator, s2 numerator
+    v_div_fixup_f16  VOP3  d, s0, s1, s2  [op_sel:[a,b,c,d]] [clamp] [mul:2 | mul:4 | div:2]
     v_div_fixup_f32  VOP3  d, s0, s1, s2  [clamp] [mul:2 | mul:4 | div:2]
-    v_div_fixup_f64  VOP3  d[2], s0[2], s1[2], s2[2]
+    v_div_fixup_f64  VOP3  d[2], s0[2], s1[2], s2[2]  [mul:2 | mul:4 | div:2]
+                                                                      s0 quotient, s1 denominator, s2 numerator
 
 Seeded straight-line programs run through two independent oracles, and the four exported mrt0 words are compared:
 
@@ -28,6 +29,9 @@ Seeded straight-line programs run through two independent oracles, and the four 
         exp(S1) >= 1076 and a finite S2, so it never meets rule 5.
       - f32 output modifiers: mul:2, mul:4 or div:2, then clamp to [0, 1], where a NaN gives +0 (DX10_CLAMP = 1).
         f16 clamp: to [0, 1].
+      - f16 and f64 output multipliers (mul:2, mul:4, div:2) change nothing: the hardware ignores them on a 16-bit or
+        binary64 result while denorm_mode_16_64 = 3, the game's MODE (docs/design.md, measured on gfx1036 with
+        tools/f64_omod_probe.py, #6314). An f16 clamp still applies.
       - an f16 result goes to the half op_sel's last bit names, and the other half is kept.
     tests/test_div_fixup_diff.py pins it to the gfx1036 words that tests/semantic records, and
   * tools/rdna2spirv.py, executing the SPIR-V with tests/semantic/spirv_mini_interp.py.
@@ -55,17 +59,17 @@ as the low half of its word (docs/design.md, "f16 inline constants"). An f64 ope
 sign-extended. Every program is encodable on GFX10: at most one literal and at most two constant-bus reads.
 
 Modifiers: neg/abs on the register sources, op_sel on f16 register sources and the destination bit, clamp on f16
-and f32, and mul:2 / mul:4 / div:2 on f32. Not generated, on purpose: a literal on f64 (the translator puts it in
-bits 31:0; #3791 moves it to bits 63:32), output multipliers on f16 (SHADER-297 is open) and any output modifier on
-f64 (the translation needs Float64, which spirv_mini_interp does not run), op_sel on a constant, and the forms the
-translator refuses (--self-test pins those as expected rejections).
+and f32, and mul:2 / mul:4 / div:2 on all three. Not generated, on purpose: a literal on f64 (the translator puts it
+in bits 31:0; #3791 moves it to bits 63:32), clamp on f64 (the translation needs Float64, which spirv_mini_interp
+does not run), op_sel on a constant, and the forms the translator refuses (--self-test pins those as expected
+rejections).
 
 Stages:
   1. a sweep: every encodable source-kind combination of every op, twice, with random modifiers;
   2. an edge grid: zeros, denormals, the normal bounds, 1, the largest finite value, inf and quiet and signalling
      NaNs as S1 and S2 under five S0 values; the rule 6 boundaries (one exponent above, at and below the cutoff, also
-     against a NaN or inf S0, and on f64 with a denormal S2); abs/neg on every kind of source; the f32 output
-     modifiers on every rule's result; f16 op_sel and clamp;
+     against a NaN or inf S0, and on f64 with a denormal S2); abs/neg on every kind of source; the output
+     modifiers on every rule's result (f32), f16 op_sel, clamp and output multipliers, f64 output multipliers;
   3. random seeded programs.
 
 Exit code 0 when every judged program matches, 1 on a mismatch (the first one is printed with its listing) or a
@@ -114,9 +118,9 @@ SGPR_PAIRS = (4, 6)
 
 OPS = ("v_div_fixup_f16", "v_div_fixup_f32", "v_div_fixup_f64")
 OP_FORMS = {
-    "v_div_fixup_f16": "d, [-][|]s0[|], [-][|]s1[|], [-][|]s2[|] [op_sel:[a,b,c,d]] [clamp]",
+    "v_div_fixup_f16": "d, [-][|]s0[|], [-][|]s1[|], [-][|]s2[|] [op_sel:[a,b,c,d]] [clamp] [mul:2|mul:4|div:2]",
     "v_div_fixup_f32": "d, [-][|]s0[|], [-][|]s1[|], [-][|]s2[|] [clamp] [mul:2|mul:4|div:2]",
-    "v_div_fixup_f64": "d[2], [-][|]s0[2][|], [-][|]s1[2][|], [-][|]s2[2][|] (no literal)",
+    "v_div_fixup_f64": "d[2], [-][|]s0[2][|], [-][|]s1[2][|], [-][|]s2[2][|] [mul:2|mul:4|div:2] (no literal)",
 }
 RULES = ("NaN(S2)", "NaN(S1)", "0/0 or inf/inf", "zero", "inf", "exponent cutoff", "NaN(S0)", "copysign(S0)")
 
@@ -124,6 +128,9 @@ KINDS = ("vgpr", "sgpr", "lit", "int", "float")
 KINDS64 = ("vgpr", "sgpr", "int", "float")
 MODS = ("", "-", "|", "-|")         # source modifiers on a register: none, neg, abs, neg(abs)
 OMODS = ("", "", "", "mul:2", "mul:4", "div:2")
+# the grid's output modifiers on f16 and f64, where the hardware ignores the multipliers in the game's MODE (#6314)
+F16_F64_OMODS = {16: ("mul:2", "mul:4", "div:2", "clamp mul:2", "clamp mul:4", "clamp div:2"),
+                 64: ("mul:2", "mul:4", "div:2")}
 FLOAT_INLINE = {  # token -> (f32 word, f16 half)
     "0.5": (0x3F000000, 0x3800), "-0.5": (0xBF000000, 0xB800), "1.0": (0x3F800000, 0x3C00),
     "-1.0": (0xBF800000, 0xBC00), "2.0": (0x40000000, 0x4000), "-2.0": (0xC0000000, 0xC000),
@@ -422,8 +429,8 @@ def step(line, mc, events=None):
     sel = _opsel(mods)
     if fmt.width != 16 and any(sel):
         raise HarnessError(f"op_sel on {op}")
-    if fmt.width != 32 and any(m in ("mul:2", "mul:4", "div:2") for m in mods):
-        raise HarnessError(f"output multiplier on {op}")
+    if sum(m in ("mul:2", "mul:4", "div:2") for m in mods) > 1:
+        raise HarnessError(f"two output multipliers on {op}")
     if fmt.width == 64 and "clamp" in mods:
         raise HarnessError("clamp on v_div_fixup_f64")
     d = mc.dst(args[0], fmt.width)
@@ -431,6 +438,7 @@ def step(line, mc, events=None):
     bits = [b for b, _ in srcs]
     rule, r = fixup(fmt, *bits)
     _count(events, op, fmt, rule, bits)
+    # an output multiplier on an f16 or f64 result is ignored under denorm_mode_16_64 = 3 (#6314): nothing to do
     if fmt.width == 16:
         if "clamp" in mods:
             r = clamp_f16(r)
@@ -582,14 +590,13 @@ def _reg_mod(rng, tok, kind):
 
 
 def _out_mods(rng, width):
-    """The output modifiers of a random line: clamp on f16 and f32, an output multiplier on f32."""
+    """The output modifiers of a random line: clamp on f16 and f32, an output multiplier on all three."""
     extra = ""
     if width in (16, 32) and rng.random() < 0.25:
         extra += " clamp"
-    if width == 32:
-        k = rng.choice(OMODS)
-        if k:
-            extra += " " + k
+    k = rng.choice(OMODS)
+    if k:
+        extra += " " + k
     return extra
 
 
@@ -607,7 +614,7 @@ def op_line(rng, op, kinds=None, mods=True):
     srcs = [_reg_mod(rng, t, k) if mods else t for t, k in zip(toks, ks)]
     if width == 64:
         n = rng.choice(DSTS64)
-        return f"{op} v[{n}:{n + 1}], {', '.join(srcs)}", ks
+        return f"{op} v[{n}:{n + 1}], {', '.join(srcs)}{_out_mods(rng, width) if mods else ''}", ks
     extra = ""
     if width == 16:
         sel = [rng.getrandbits(1) if k in ("vgpr", "sgpr") else 0 for k in ks] + [rng.getrandbits(1)]
@@ -706,12 +713,17 @@ def grid_cases(ops=None):
             words = (rng.choice(S0_EDGES[w] + EDGES[w]), rng.choice(EDGES[w]), rng.choice(EDGES[w]))
             cases.append((op, words, tuple(rng.choice(MODS) for _ in range(3)), (0, 0, 0, 0), ""))
         # 4. the output modifiers on each rule's result (f32), clamp and op_sel (f16)
-        one, neg_one = {16: (0x3C00, 0xBC00), 32: (0x3F800000, 0xBF800000), 64: (0, 0)}[w]
-        if w == 64:
-            continue
+        one, neg_one = {16: (0x3C00, 0xBC00), 32: (0x3F800000, 0xBF800000), 64: (F64_EDGES[5], F64_EDGES[6])}[w]
         nan = EDGES[w][10]
         zero = 0
         outcomes = ((one, one), (zero, zero), (one, zero), (zero, one), (one, nan), (neg_one, one), (nan, one))
+        if w == 64:
+            # the multipliers change nothing on a binary64 result (#6314); clamp is not generated on f64
+            for s0 in S0_EDGES[w] + (F64_EDGES[7], F64_EDGES[4]):
+                for s1, s2 in outcomes:
+                    for om in F16_F64_OMODS[w]:
+                        cases.append((op, (s0, s1, s2), plain, (0, 0, 0, 0), om))
+            continue
         if w == 32:
             s0s = (0x3F000000, 0x3FC00000, 0xBF000000, 0x7F7FFFFF, 0x00800000, 0x00000001, 0x7FC00001, 0x3E800000)
             omods = ("clamp", "mul:2", "mul:4", "div:2", "clamp mul:2", "clamp mul:4", "clamp div:2")
@@ -727,6 +739,10 @@ def grid_cases(ops=None):
                         for _ in range(2):
                             sel = tuple(rng.getrandbits(1) for _ in range(4))
                             cases.append((op, (s0, s1, s2), plain, sel, clamp))
+            # the multipliers change nothing on an f16 result (#6314), with or without clamp, in either half
+            for i, (s0, (s1, s2)) in enumerate((s0, o) for s0 in s0s for o in outcomes):
+                for om in F16_F64_OMODS[w]:
+                    cases.append((op, (s0, s1, s2), plain, (0, 0, 0, i & 1), om))
     return cases
 
 
@@ -748,7 +764,7 @@ def grid_program(chunk, rng):
                 lines.append(f"v_mov_b32 v{base + 2 * j}, 0x{x & M32:08x}")
                 lines.append(f"v_mov_b32 v{base + 2 * j + 1}, 0x{x >> 32:08x}")
             srcs = [_mod(f"v[{base + 2 * j}:{base + 2 * j + 1}]", m) for j, m in enumerate(mods)]
-            body.append(f"{op} v[{8 + 2 * i}:{9 + 2 * i}], {', '.join(srcs)}")
+            body.append(f"{op} v[{8 + 2 * i}:{9 + 2 * i}], {', '.join(srcs)}{' ' + om if om else ''}")
             continue
         for j, x in enumerate(words):
             if w == 16:
@@ -919,6 +935,13 @@ def self_test():
         report(fixup(fmt, *words)[1] == want, what)
     report(out_f32(0x3FC00000, ["clamp", "mul:2"]) == (0x3F800000, None), "f32: mul:2 then clamp of 1.5 is 1.0")
     report(out_f32(0xFFC00000, ["clamp"]) == (0, None), "f32: clamp of a NaN is +0")
+    zeros = [f"v_mov_b32 v{r}, 0x0" for r in EXPORT_REGS]
+    words = reference(zeros + ["v_mov_b32 v12, 0x3e00", "v_mov_b32 v13, 0x3c00", "v_mov_b32 v14, 0x3c00",
+                               "v_div_fixup_f16 v8, v12, v13, v14 clamp div:2"])[0]
+    report(words[0] & 0xFFFF == 0x3C00, "f16: div:2 is ignored and clamp still applies (1.5 gives 1.0, not 0.75)")
+    words = reference(zeros + ["v_mov_b32 v12, 0x0", "v_mov_b32 v13, 0x3ff80000", "v_mov_b32 v14, 0x0",
+                               "v_mov_b32 v15, 0x3ff00000", "v_div_fixup_f64 v[8:9], v[12:13], v[14:15], v[14:15] mul:4"])[0]
+    report(words[:2] == [0, 0x3FF80000], "f64: mul:4 is ignored (1.5 stays 1.5)")
     for what, line in REJECTED:
         try:
             with tempfile.TemporaryDirectory(prefix="dfx-diff-st-") as tmp:

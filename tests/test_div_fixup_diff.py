@@ -173,13 +173,46 @@ class Reference(unittest.TestCase):
                       d.compare([0, 0, 0, 0], [NONE] * 4, [0, 0x80000000, 0, 0]))
 
     def test_harness_errors(self):
-        for line in ("v_div_fixup_f32 v8, v9, v10, v11 op_sel:[1,0,0,0]", "v_div_fixup_f16 v8, v9, v10, v11 mul:2",
+        for line in ("v_div_fixup_f32 v8, v9, v10, v11 op_sel:[1,0,0,0]", "v_div_fixup_f16 v8, v9, v10, v11 mul:2 div:2",
                      "v_div_fixup_f64 v[8:9], v[10:11], v[10:11], v[10:11] clamp",
                      "v_div_fixup_f64 v[8:9], 0x3ff00000, v[10:11], v[10:11]", "v_div_fixup_f64 v8, 1.0, 1.0, 1.0",
                      "v_div_fixup_f16 v8, 1.0, v9, v9 op_sel:[1,0,0,0]", "v_div_fixup_f32 v8, 65, v9, v9",
                      "v_div_scale_f32 v8, vcc_lo, v9, v9, v9"):
             with self.assertRaises(d.HarnessError, msg=line):
                 run(line, v9=0x3F800000, v10=0x3F800000, v11=0x3FF00000)
+
+
+class OutputMultipliers(unittest.TestCase):
+    """#6314 measured on gfx1036: under denorm_mode_16_64 = 3 an f16 or binary64 result ignores mul:2/mul:4/div:2,
+    and an f16 clamp still applies."""
+
+    def test_f16_result_is_not_scaled(self):
+        for s0, s1, s2 in ((0x3E00, 0x3C00, 0x3C00), (0x7BFF, 0x3C00, 0x3C00), (0x0001, 0x3C00, 0x3C00),
+                           (0x3C00, 0x0000, 0x3C00), (0x3C00, 0x7C01, 0x3C00), (0x3800, 0xBC00, 0x3C00)):
+            regs = {"v12": s0 | 0xABCD0000, "v13": s1, "v14": s2}
+            for sel in ("", " op_sel:[0,0,0,1]"):
+                plain = run(f"v_div_fixup_f16 v8, v12, v13, v14{sel}", **regs)[1]
+                clamped = run(f"v_div_fixup_f16 v8, v12, v13, v14{sel} clamp", **regs)[1] if s1 != 0x7C01 else None
+                for om in ("mul:2", "mul:4", "div:2"):
+                    with self.subTest(s0=hex(s0), s1=hex(s1), sel=sel, om=om):
+                        self.assertEqual(run(f"v_div_fixup_f16 v8, v12, v13, v14{sel} {om}", **regs)[1], plain)
+                        if clamped is not None:
+                            self.assertEqual(run(f"v_div_fixup_f16 v8, v12, v13, v14{sel} clamp {om}", **regs)[1],
+                                             clamped)
+        # 1.5 under clamp div:2: 1.0 (clamped, not halved to 0.75)
+        self.assertEqual(run("v_div_fixup_f16 v8, v12, v13, v14 clamp div:2", v12=0x3E00, v13=0x3C00, v14=0x3C00)[1]
+                         & 0xFFFF, 0x3C00)
+
+    def test_f64_result_is_not_scaled(self):
+        for s0 in (0x3FF8000000000000, 0x7FEFFFFFFFFFFFFF, 0x0010000000000000, 3, 1 << 63):
+            regs = {"v12": s0 & d.M32, "v13": s0 >> 32, "v14": 0, "v15": 0x3FF00000}
+            mc, _ = run("v_div_fixup_f64 v[8:9], v[12:13], v[14:15], v[14:15]", **regs)
+            plain = (mc.v[8], mc.v[9])
+            self.assertEqual(plain, (s0 & d.M32, (s0 >> 32) & 0x7FFFFFFF))    # |S0| with sign(S1) ^ sign(S2) = +
+            for om in ("mul:2", "mul:4", "div:2"):
+                with self.subTest(s0=hex(s0), om=om):
+                    mc, _ = run(f"v_div_fixup_f64 v[8:9], v[12:13], v[14:15], v[14:15] {om}", **regs)
+                    self.assertEqual((mc.v[8], mc.v[9]), plain)
 
 
 class Generator(unittest.TestCase):
@@ -219,21 +252,25 @@ class Generator(unittest.TestCase):
                     if sel[i]:
                         self.assertRegex(a, r"^[sv]\d+$", line)
                 if op == "v_div_fixup_f64":
-                    self.assertFalse(lits or mods, line)
+                    self.assertFalse(lits, line)
+                    self.assertLessEqual(set(mods), {"mul:2", "mul:4", "div:2"}, line)
+                    seen[op + " " + " ".join(mods)] += 1
                     self.assertRegex(args[0], r"^v\[(8:9|9:10|10:11)\]$", line)
                     seen["f64 odd pair"] += any(re.match(r"v\[(9|11|13):", a) for a in srcs)
                     seen["f64 sgpr pair"] += any(a.startswith("s[") for a in srcs)
                 else:
                     self.assertIn(args[0], ("v8", "v9", "v10", "v11"), line)
                     seen[op + " " + " ".join(mods)] += 1
-        for want in ("f64 odd pair", "f64 sgpr pair", "v_div_fixup_f32 clamp mul:4", "v_div_fixup_f32 div:2"):
+        for want in ("f64 odd pair", "f64 sgpr pair", "v_div_fixup_f32 clamp mul:4", "v_div_fixup_f32 div:2",
+                     "v_div_fixup_f64 mul:2", "v_div_fixup_f64 mul:4", "v_div_fixup_f64 div:2"):
             self.assertGreater(seen[want], 0, want)
+        self.assertTrue(any(k.startswith("v_div_fixup_f16 ") and k.endswith(" clamp mul:4") for k in seen))
         self.assertTrue(any(k.startswith("v_div_fixup_f16 op_sel:") and k.endswith("clamp") for k in seen))
 
     def test_edge_grid_reaches_every_rule(self):
         cases = d.grid_cases()
         self.assertEqual(Counter(c[0] for c in cases),
-                         {"v_div_fixup_f16": 1156, "v_div_fixup_f32": 1397, "v_div_fixup_f64": 1032})
+                         {"v_div_fixup_f16": 1450, "v_div_fixup_f32": 1397, "v_div_fixup_f64": 1179})
         for op in d.OPS:
             f, rules, unjudged = d.FMT[op], Counter(), 0
             for _, words, mods, _, _ in (c for c in cases if c[0] == op):
@@ -246,9 +283,13 @@ class Generator(unittest.TestCase):
             want = set(range(8)) - ({5} if op == "v_div_fixup_f16" else set())
             self.assertEqual(set(rules), want, op)
             self.assertEqual(unjudged, 8 if op == "v_div_fixup_f64" else 0, op)
-        omods = {c[4] for c in cases if c[0] == "v_div_fixup_f32"}
-        self.assertEqual(omods, {"", "clamp", "mul:2", "mul:4", "div:2", "clamp mul:2", "clamp mul:4", "clamp div:2"})
+        every = {"", "clamp", "mul:2", "mul:4", "div:2", "clamp mul:2", "clamp mul:4", "clamp div:2"}
+        omods = {op: {c[4] for c in cases if c[0] == op} for op in d.OPS}
+        self.assertEqual(omods, {"v_div_fixup_f16": every, "v_div_fixup_f32": every,
+                                 "v_div_fixup_f64": {"", "mul:2", "mul:4", "div:2"}})
         self.assertTrue(any(c[3][3] for c in cases if c[0] == "v_div_fixup_f16"))
+        # the f16 multipliers reach both destination halves
+        self.assertEqual({c[3][3] for c in cases if c[0] == "v_div_fixup_f16" and "mul:4" in c[4]}, {0, 1})
 
 
 class Translated(unittest.TestCase):
@@ -299,6 +340,25 @@ class Translated(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(d.reference(lines)[0][0], want)
                 self.assertIsNone(d.check(lines))
+
+    def test_output_multipliers_through_the_translator(self):
+        lines = [f"v_mov_b32 v{r}, 0x5a5a5a5a" for r in d.VGPRS] + [f"s_mov_b32 s{r}, 0" for r in d.SGPRS]
+        lines += ["v_mov_b32 v12, 0x3e00", "v_mov_b32 v13, 0x3c00", "v_mov_b32 v14, 0x3c00", "v_mov_b32 v15, 0x3ff80000",
+                  "v_div_fixup_f16 v8, v12, v13, v14 mul:2",
+                  "v_div_fixup_f16 v9, v12, v13, v14 op_sel:[0,0,0,1] clamp div:2",
+                  "v_div_fixup_f64 v[10:11], v[14:15], v[12:13], v[12:13] mul:4"]
+        want = d.reference(lines)[0]
+        self.assertEqual(want, [0x5A5A3E00, 0x3C005A5A, 0x3C00, 0x3FF80000])
+        self.assertIsNone(d.check(lines))
+        real = d.translate_listing
+        try:   # a translator that applied mul:2 to the f16 result: 3.0, not 1.5
+            d.translate_listing = lambda l, n, t: [0x5A5A4200] + real(l, n, t)[1:]
+            self.assertIn("expected 0x5a5a3e00, actual 0x5a5a4200", d.check(lines))
+            # ... or mul:4 to the f64 one: 6.0, not 1.5
+            d.translate_listing = lambda l, n, t: real(l, n, t)[:3] + [0x40180000]
+            self.assertIn("expected 0x3ff80000, actual 0x40180000", d.check(lines))
+        finally:
+            d.translate_listing = real
 
     def test_a_wrong_translation_is_caught(self):
         lines = [f"v_mov_b32 v{r}, 0x5a5a5a5a" for r in d.VGPRS] + [f"s_mov_b32 s{r}, 0" for r in d.SGPRS]
