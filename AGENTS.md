@@ -49,6 +49,11 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 
   Check its tables and the open pull requests first. If someone has claimed the item or has a pull request for it,
   stop and tell the user instead of writing it a second time.
+- Check again right before you act, not only when you start: claims, pull request heads and the coordination issue
+  itself change within the hour. Before you test someone's pull request, look that it is still open, that its head is
+  the commit you built, and that its comments don't already hold a result for your GPU and driver. Before you post a
+  result, look that the head hasn't moved since you built it. Before you open a pull request, look that nobody opened
+  one for the same item meanwhile. If something changed, tell the user instead of carrying on.
 - Put the item ID from that issue in the pull request, and `Depends on: #N` for every pull request yours builds on.
 - Found work you won't do yourself (a bug, a missing method, a stale doc, a follow-up of your own pull request)?
   Post it in the coordination issue as `finding: <one line>`, followed by where it is (file and line), why it matters,
