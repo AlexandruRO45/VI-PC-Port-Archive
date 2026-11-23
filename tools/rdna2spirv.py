@@ -286,6 +286,7 @@ class Gen:
         self.round_mode = False     # the program writes MODE.FP_ROUND[3:2] (f16/f64 rounding): kept in %mode_r16
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
+        self.fma_mode = "khr" if FMA_KHR else "exact" if FMA_EXACT else "glsl"
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_clock = set()
         self.uses_bvh = False
@@ -1074,10 +1075,10 @@ class Gen:
         GLSL.std.450 Fma is specified in the Vulkan environment as "inherited from OpFMul followed by OpFAdd", so a
         driver may round twice. With --fma khr it is OpFmaKHR instead: "correctly rounded" (SPV_KHR_fma), which needs
         VK_KHR_shader_fma + shaderFmaFloat32 and is recorded in the index as capability FMAKHR."""
-        if FMA_KHR:
+        if self.fma_mode == "khr":
             self.uses_fma_khr = True
             self.emit(f"{r} = OpFmaKHR %float {x} {y} {z}")
-        elif FMA_EXACT:
+        elif self.fma_mode == "exact":
             self.fma_exact(r, x, y, z)
         else:
             self.emit(f"{r} = OpExtInst %float %glsl Fma {x} {y} {z}")
@@ -16822,7 +16823,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,
          # but --fma exact has no capability to distinguish it from the default GLSL Fma (TEST-1147).
-         "fma": "exact" if FMA_EXACT else "khr" if FMA_KHR else "glsl",
+         "fma": g.fma_mode,
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))} |
                             {{"subgroup": "shaderSubgroupClock", "device": "shaderDeviceClock"}[k]

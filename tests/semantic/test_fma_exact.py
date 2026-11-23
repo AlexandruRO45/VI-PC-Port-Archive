@@ -120,6 +120,16 @@ class FmaExactTests(unittest.TestCase):
                 with self.subTest(x=f"{x:08x}", y=f"{y:08x}", z=f"{z:08x}"):
                     self.assertEqual(f"{got:08x}", f"{want:08x}")
 
+    def test_index_keeps_the_mode_used_for_each_translation(self):
+        ops = ["v_mov_b32 v8, 0x3f800800", "v_fma_f32 v0, v8, v8, v8"]
+        shaders = []
+        for mode in ("exact", "khr", "glsl"):
+            asm = translate(ops, mode)
+            shaders.append((mode, rdna2spirv.translate.last_gen, asm))
+        for mode, gen, asm in shaders:
+            with self.subTest(mode=mode):
+                self.assertEqual(rdna2spirv.shader_meta(gen, asm)["fma"], mode)
+
     def test_cs_fma_fused_words(self):
         # The cases of runtime/test/shaders/cs_fma_fused.asm that a splitting driver gets wrong (words 0 and 2).
         a, p = 0x3F800800, bits_of(si.f32(f32_of(0x3F800800) ** 2))
