@@ -1732,6 +1732,38 @@ is cached).
 - **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
 - **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
 - **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
+#### Pixel-shader system VGPRs (`tools/ps_sysvals_probe.py`)
+
+What the SPI puts in the VGPRs after the barycentric pair, which the "PS system inputs" row maps from Vulkan's
+`FragCoord` and `FrontFacing`. The probe enables all eight inputs through the PAL metadata (`spi_ps_input_ena` and
+`spi_ps_input_addr`), draws a triangle into an 8 x 8 target and exports v2..v9 with raw ISA. The vertex shader scales
+the clip position by a per-vertex w, so the NDC position stays the same while w is 1/2/4 or a constant 2; the template
+pixel shader writes Vulkan's `FrontFacing`, so which winding is front-facing comes from the driver, not from an
+assumption.
+
+```sh
+LEONIDA_VK_DEVICE=radeon python -I tools/ps_sysvals_probe.py --build <runtime build> [--json out.json]
+```
+
+On the Ryzen 9 9950X3D iGPU (`AMD Radeon(TM) Graphics`, gfx1036, wave64 pixel stage, Windows driver 26.10.1): 8 of 8
+checks hold.
+
+| register | measured |
+|---|---|
+| v2, v3 (POS_X/Y_FLOAT) | the pixel centre, `x + 0.5`, `y + 0.5` at every pixel |
+| v4 (POS_Z_FLOAT) | the NDC z (0.25) |
+| v5 (POS_W_FLOAT) | the clip-space w: 2.0 for a vertex w of 2 (Vulkan's `FragCoord.w` is 0.5); with vertex w 1, 2, 4 it is 1 / (interpolated 1/w) to 5.8e-8 relative, where the interpolated w is 35% off |
+| v6 (FRONT_FACE), FRONT_FACE_ALL_BITS = 1 | `0xffffffff` front, `0` back |
+| v6, FRONT_FACE_ALL_BITS = 0 | `0x3f800000` (+1.0) front, `0xbf800000` (-1.0) back |
+| v7 (ANCILLARY) | `0x2` at every pixel of a plain draw (not decoded) |
+| v8 (SAMPLE_COVERAGE) | 1 (one sample, covered) |
+| v9 (POS_FIXED_PT) | `y << 16 \| x`, the integer pixel position |
+
+The w row is the one the translator had backwards: it wrote `FragCoord.w` into v5. Fixed with
+`runtime/test/shaders/ps_pos_w.asm` and `tests/semantic/test_ps_position_w.py`. The NVIDIA driver returns two pipeline
+binaries, so on an RTX 5080 the probe exits 77 (see `tools/ps_oracle.py`). Not measured: wave32 pixel stages,
+`pos_float_location` other than 0 (centre), and more than one sample.
+
 #### Helper lanes at a triangle edge (`tools/ps_helper_probe.py`, SHADER-681)
 
 What a pixel wave does with the helper lanes of a partly covered 2x2 quad, which the translator's EXEC model and

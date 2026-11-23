@@ -13378,8 +13378,15 @@ def assemble(gen):
                        "%ffv = OpSelect %float %ff %f1 %ffm1", "%ffu = OpBitcast %uint %ffv",
                        f"%ffp = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", "OpStore %ffp %ffu"]
                 continue
-            fn += [f"%fc{c} = OpCompositeExtract %float %fc {c}", f"%fcu{c} = OpBitcast %uint %fc{c}",
-                   f"%fcp{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", f"OpStore %fcp{c} %fcu{c}"]
+            fn += [f"%fc{c} = OpCompositeExtract %float %fc {c}"]
+            if c == 3:
+                # POS_W_FLOAT holds the clip-space w (measured on gfx1036: w = 2 reads 2.0, and 1 / the interpolated
+                # 1/w across a triangle), the reciprocal of Vulkan's FragCoord.w.
+                fn += [f"%fcw = OpFDiv %float %f1 %fc{c}"]
+                fn += [f"%fcu{c} = OpBitcast %uint %fcw"]
+            else:
+                fn += [f"%fcu{c} = OpBitcast %uint %fc{c}"]
+            fn += [f"%fcp{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", f"OpStore %fcp{c} %fcu{c}"]
     for reg, ctype in gen.vertex_inputs:
         vt = {1: "%v4uint_in", 2: "%v4int_in"}.get(ctype, "%v4float")
         st = {1: "%uint", 2: "%int"}.get(ctype, "%float")
@@ -14590,9 +14597,10 @@ def translate(path):
         sig = input_signature_full(path, info["name"])
         pos = [rw for sv, m, rw in sig if sv == 1]
         used = pos[0] if pos else 0
-        # Position w: AMD's POS_W_FLOAT input holds 1/w. Mesa (src/amd/common/nir/ac_nir_lower_intrinsics_to_args.c)
-        # lowers nir_intrinsic_load_frag_coord_w_rcp straight to frag_pos[3]. That's the same value as Vulkan's
-        # FragCoord.w, so all four components map directly.
+        # Position w: AMD's POS_W_FLOAT input holds the clip-space w, not 1/w: on gfx1036 a vertex w of 2 reads 2.0,
+        # and across a triangle the register is 1 / (the interpolated 1/w) to 6e-8 (tools/ps_sysvals_probe.py). Vulkan's
+        # FragCoord.w is that interpolated 1/w, so x, y and z map directly and w is its reciprocal (Mesa lowers
+        # load_frag_coord_w_rcp, the reciprocal of FragCoord.w, straight to frag_pos[3]).
         # Hardware order (Mesa src/amd/vulkan/radv_shader_args.c): barycentric pairs, ..., POS_X/Y/Z/W, FRONT_FACE,
         # ANCILLARY, SAMPLE_COVERAGE, POS_FIXED_PT. Only enabled inputs are packed. Front face is a float whose
         # sign gives facing (Mesa: load_front_face = front_face > 0; load_front_face_fsign = the raw value).

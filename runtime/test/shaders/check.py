@@ -386,7 +386,9 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_vcmp_f32_nan": (0x0000376c, 0x0000fd5b, 0x0000d36c, 0x00000fe7),
               "ps_vcmp_64": (0x0000b3c4, 0x000091e6, 0x00006787, 0x00007c93),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
-              "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
+              "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be),
+              # SV_Position.xyzw with clip w = 2 (vs_pos_w); the .asm header derives the words
+              "ps_pos_w": (0x3f000000, 0x3e800000, 0x40000000, 0x3f800000)}
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
 # a required subgroup size onto the fragment stage ("fragment subgroup size: N", the whole line; a device that could
 # not take the size gets "fragment subgroup size: N not available" or no line). A device that cannot
@@ -431,7 +433,8 @@ PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_
                       "ps_mandelbrot"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
 PIXEL_VERTEX = {"ps_interp_f16_high": "vs_f16_pack",
-                "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts"}
+                "ps_interp_f32_mods": "vs_interp_consts", "ps_interp_mov_mods": "vs_interp_consts",
+                "ps_pos_w": "vs_pos_w"}
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 SIGNED_MIP_TEST = "ps_sample_implicit_sint"

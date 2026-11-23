@@ -582,6 +582,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
+              "ps_pos_w": "vs_pos_w.asm",
               SIGNED_MIP_TEST: "vs_ids.asm",
               "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
@@ -740,6 +741,8 @@ def run_suite(a, work: str) -> int:
                 (b"ISG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
                 (b"OSG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
             ])
+        elif name == "ps_pos_w":    # SV_Position (system value 1), register 0, all four components read
+            dxbc = make_dxbc([(b"ISG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF)]))])
         elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_f16_pack"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
         elif name == "ms_v5_workgroup":
@@ -1283,6 +1286,7 @@ def run_suite(a, work: str) -> int:
                 "ps_vcmp_f32_nan": (0x0000376C, 0x0000FD5B, 0x0000D36C, 0x00000FE7),   # from the .asm headers
                 "ps_vcmp_64": (0x0000B3C4, 0x000091E6, 0x00006787, 0x00007C93),
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
+                "ps_pos_w": (0x3F000000, 0x3E800000, 0x40000000, 0x3F800000),   # SV_Position.w is 1 / v5; drawn with vs_pos_w
             }
             if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge
                 results.append((name, None, str(skip)))

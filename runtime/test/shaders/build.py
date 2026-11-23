@@ -124,6 +124,13 @@ def gs_container():
             + b"ISG1" + chunk + b"OSG1" + chunk)
 
 
+def ps_pos_container():
+    # ISG1 of ps_pos_w: SV_Position (system value 1) in register 0, float4, all four components read.
+    sig = struct.pack("<II", 1, 8) + struct.pack("<6I2B6x", 0, 0, 0, 1, 3, 0, 0xF, 0xF)
+    chunk = struct.pack("<I", len(sig)) + sig
+    return (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 40 + len(chunk), 1, 36) + b"ISG1" + chunk)
+
+
 def translate_tests(work, names):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     disasm.mkdir()
@@ -158,6 +165,8 @@ def translate_tests(work, names):
             (work / (n + ".dxbc")).write_bytes(clip_container())
         elif n.startswith("gs_"):
             (work / (n + ".dxbc")).write_bytes(gs_container())
+        elif n == "ps_pos_w":
+            (work / (n + ".dxbc")).write_bytes(ps_pos_container())
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]

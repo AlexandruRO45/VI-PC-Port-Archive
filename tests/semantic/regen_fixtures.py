@@ -37,6 +37,7 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_sm
            "cs_w64x_saveexec_b64",   # s_and/s_or/s_andn2_saveexec_b64, s_andn2_wrexec_b64 (test_saveexec_b64.py)
            "ps_valu16_mad", "ps_valu16_subrev",   # v_mad_u32_u16 / v_mad_i32_i16, v_subrev_f16
            "cs_cvt_pk_u8",   # v_cvt_pk_u8_f32 rounding and NaN (test_cvt_pk_u8.py)
+           "ps_pos_w",   # SV_Position.w register is the clip w, 1 / FragCoord.w (measured on gfx1036)
            "ps_vcmp_f32_nan", "ps_vcmp_64", "cs_w32_andn2_exec")   # VOPC f32 NaN / 64-bit int compares; s_andn2_saveexec/wrexec_b32
 
 
