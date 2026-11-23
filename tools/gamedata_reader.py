@@ -42,12 +42,22 @@ if HERE not in sys.path:
 
 BOM = b"\xef\xbb\xbf"
 VECTOR_KEYS = ("x", "y", "z", "w")
+VECTOR_ATTRIBUTES = frozenset(VECTOR_KEYS)
 BASE_CONVENTION_KEYS = frozenset(("type", "content", "value", "ref", "key"))
 CONVENTION_KEYS = BASE_CONVENTION_KEYS | frozenset(VECTOR_KEYS)
 GROUPS = {"vector2_array": 2, "vec3v_array": 3, "matrix33": 3, "matrix34": 3}
 INT = re.compile(r"[-+]?\d+")
 HEX = re.compile(r"0x[0-9A-Fa-f]+")
 FLOAT = re.compile(r"[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?f?|[-+]?(inf|nan)", re.I)
+
+# INT, HEX and FLOAT as one pattern, tried in that order (HEX cannot match what the others do, so only INT before
+# FLOAT matters); ``lastgroup`` names the one that matched. The ignore-case flag stays on the float part, as in FLOAT.
+SCALAR = re.compile(r"(?P<int>[-+]?\d+)|(?P<hex>0x[0-9A-Fa-f]+)"
+                    r"|(?i:(?P<float>[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?f?|[-+]?(?:inf|nan)))")
+
+# Characters of an array body whose tokens are decimal numbers (no exponent, ``f`` suffix, ``0x``, ``_`` or non-ASCII
+# digit) separated by ASCII whitespace; parse_content converts such a body with ``float`` or ``int`` in one pass.
+NUMERIC_BODY_CHARS = frozenset("0123456789.+- \t\r\n")
 
 ROOT_HANDLERS = {}
 TYPE_HANDLERS = {}
@@ -84,15 +94,22 @@ def register_type(name):
 
 def parse_scalar(text):
     """A ``value`` attribute or array token: bool, int (decimal or 0x hex), float, else the text unchanged."""
+    if text.isdecimal():  # ``isdecimal`` is exactly the set ``\d`` matches: INT without the regex call
+        return int(text)
     if text in ("true", "false"):
         return text == "true"
-    if HEX.fullmatch(text):
-        return int(text, 16)
-    if INT.fullmatch(text):
+    m = SCALAR.fullmatch(text)
+    if m is None:
+        return text
+    kind = m.lastgroup
+    if kind == "int":
         return int(text)
-    if FLOAT.fullmatch(text):
-        return _float(text)
-    return text
+    if kind == "hex":
+        return int(text, 16)
+    try:  # _float, inlined: this is the hottest line of an array of numbers
+        return float(text)
+    except ValueError:
+        return float(text[:-1])
 
 
 def _float(text):
@@ -105,13 +122,29 @@ def _float(text):
 
 def parse_content(kind, text):
     """The numbers of a ``content=`` body, grouped into tuples for vector arrays and matrices."""
-    nums = [parse_scalar(t) for t in (text or "").split()]
+    text = text or ""
+    tokens = text.split()
+    nums = None
+    if tokens and NUMERIC_BODY_CHARS.issuperset(text):
+        # Every token has a ``.`` (so it is a float to parse_scalar) or none has (an int). ``float``/``int`` raise on
+        # anything that is not a plain number, and the body then takes the token-by-token path below.
+        dots = text.count(".")
+        try:
+            if dots == len(tokens):
+                nums = [float(t) for t in tokens]
+            elif not dots:
+                nums = [int(t) for t in tokens]
+        except ValueError:
+            pass
+    if nums is None:
+        nums = [parse_scalar(t) for t in tokens]
+    del tokens  # the number list and the tokens are not both alive while the groups are built
     width = GROUPS.get(kind)
     if not width:
         return nums
     if len(nums) % width:
         raise ValueError(f"{kind}: {len(nums)} numbers is not a multiple of {width}")
-    return [tuple(nums[i:i + width]) for i in range(0, len(nums), width)]
+    return [group for group in zip(*[iter(nums)] * width)]  # (not list(zip(..)): that over-allocates the list)
 
 
 class Reader:
@@ -127,9 +160,29 @@ class Reader:
     def convert(self, el, use_type_handler=True):
         """The generic value of element ``el`` (a registered ``type`` handler first, unless told not to). Attributes
         no convention uses (``name``, ``userFlags``, ...) are kept as ``"@name"`` entries."""
-        in_handler = id(el) in self._active_type_elements
+        attrib = el.attrib
+        if len(attrib) == 1 and "value" in attrib:
+            # ``<x value=".."/>``, by far the commonest element: no type, content or extra attribute to look at
+            self.stats["scalar"] += 1
+            return parse_scalar(attrib["value"])
+        if "x" in attrib and attrib.keys() <= VECTOR_ATTRIBUTES:
+            # ``<v x=".." y=".." z=".."/>`` with nothing else on it: a vector when every component is a float
+            nums = []
+            for k in VECTOR_KEYS:
+                v = attrib.get(k)
+                if v is not None:
+                    if not FLOAT.fullmatch(v):
+                        break
+                    nums.append(_float(v))
+            else:
+                self.stats["vector"] += 1
+                return tuple(nums)
+        active = self._active_type_elements
+        in_handler = bool(active) and id(el) in active
         value = self._convert(el, use_type_handler)
-        return self.with_attributes(el.attrib, value, count_stats=not in_handler)
+        if attrib.keys() <= BASE_CONVENTION_KEYS:
+            return value  # every attribute is one a convention consumes: nothing extra to keep
+        return self.with_attributes(attrib, value, count_stats=not in_handler)
 
     def with_attributes(self, attrib, value, count_stats=True):
         consumed = CONVENTION_KEYS if _uses_vector_keys(attrib) else BASE_CONVENTION_KEYS
@@ -203,8 +256,15 @@ class Reader:
     def assemble(self, parts):
         """``(tag, key or None, value)`` of each child, in order -> list, dict by key or dict by tag (a tag that occurs
         more than once becomes the list of its values)."""
-        if all(tag == "Item" for tag, _, _ in parts):
-            if all(key is not None for _, key, _ in parts):
+        all_items = all_keyed = True
+        for tag, key, _ in parts:
+            if tag != "Item":
+                all_items = False
+                break
+            if key is None:
+                all_keyed = False
+        if all_items:
+            if all_keyed:
                 self.stats["map"] += 1
                 return {key: value for _, key, value in parts}
             self.stats["list"] += 1
