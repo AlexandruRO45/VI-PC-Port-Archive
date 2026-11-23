@@ -466,5 +466,41 @@ class TestVAlignbyteB32ConditionCodes(unittest.TestCase):
                 self.assertTrue(flags.mixed_bytes)
 
 
+class TestVAlignbyteB32IEEE754(unittest.TestCase):
+    """IEEE 754 raw bit pattern preservation and subnormal/NaN behavior."""
+
+    def test_ieee754_boundary_patterns(self):
+        patterns = [
+            0x00000000,
+            0x80000000,
+            0x00000001,
+            0x007FFFFF,
+            0x80000001,
+            0x807FFFFF,
+            0x7F800000,
+            0xFF800000,
+            0x7FC00000,
+            0x7F800001,
+            0xFFC00001,
+        ]
+        for p0 in patterns:
+            for p1 in patterns:
+                for sel in range(4):
+                    with self.subTest(p0=hex(p0), p1=hex(p1), sel=sel):
+                        res = ref_alignbyte(p0, p1, sel)
+                        expected_bytes = struct.pack("<I", p1) + struct.pack("<I", p0)
+                        expected_word = struct.unpack("<I", expected_bytes[sel:sel + 4])[0]
+                        self.assertEqual(res, expected_word)
+
+    def test_ieee754_hw_translator_nan_preservation(self):
+        qnan = 0x7FC00000
+        snan = 0x7F800001
+        for sel in range(4):
+            with self.subTest(sel=sel):
+                hw_res = run_hw_alignbyte(qnan, snan, sel)
+                ref_res = ref_alignbyte(qnan, snan, sel)
+                self.assertEqual(hw_res, ref_res)
+
+
 if __name__ == "__main__":
     unittest.main()
