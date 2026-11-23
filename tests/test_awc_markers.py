@@ -68,6 +68,44 @@ def speech_bank(sid, samples, marker_chunk, payload=b"\0" * 64):
     return build_bank([(sid, [(0x55, payload), (0x76, bytes(fmt)), (0xBD, marker_chunk)])])
 
 
+class MusicCueSheetTest(unittest.TestCase):
+    def test_exported_frame_coordinates_and_ambiguous_inputs(self):
+        import awc_opus
+        from rsc8_audio import MARKER_VALUE_START as start, MARKER_VALUE_END as end, parse_adat_header_bytes
+
+        cues = (event(1, start, 10) + event(2, start, 20) + event(1, end, 30)
+                + event(2, end, 40) + event(3, start, 60) + event(3, end, 500))
+        bank = music_bank(7, 200, 0xFC, cues)  # 100 frames of stereo
+        header = parse_adat_header_bytes(bank, 0, len(bank))
+        entries = [(sid, [(kind, bank[off:off + size]) for kind, off, size in tags])
+                   for sid, tags in header["entries"]]
+        desc, data = [blob for _, blob in entries[0][1]]
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "music.awc")
+            out = os.path.join(tmp, "out")
+            sheet = os.path.join(out, "music", "cue_regions.json")
+
+            def export(payload, flag=True):
+                with open(src, "wb") as f:
+                    f.write(payload)
+                args = [src, out, "--jobs", "1"] + (["--cue-sheet"] if flag else [])
+                self.assertEqual(awc_opus.main(args), 0)
+                if flag:
+                    with open(sheet, encoding="utf-8") as f:
+                        return json.load(f)
+
+            export(bank, False)
+            self.assertFalse(os.path.exists(sheet))
+            self.assertEqual(export(bank), {"sample_rate": 48000, "regions": [
+                {"file": "00000007.ogg", "name_hash": "00000001", "start_sample": 10, "end_sample": 30},
+                {"file": "00000007.ogg", "name_hash": "00000002", "start_sample": 20, "end_sample": 40}]})
+            self.assertTrue(os.path.isfile(os.path.join(out, "music", "00000007.ogg")))
+            for ambiguous in (entries + [entries[0]], entries + [entries[1]],
+                              [(0, [(0x48, desc), (0x55, bytes(len(data)))]), entries[1]],
+                              [entries[0], (9, entries[1][1])]):
+                self.assertEqual(export(build_bank(ambiguous))["regions"], [])
+
+
 class EventLayoutTest(unittest.TestCase):
     def test_sixteen_byte_events_and_a_dropped_tail(self):
         chunk = event(TRACK, 1234.0, 0) + event(TICK, 8.0, 48000, 5) + b"\x01\x02\x03"
