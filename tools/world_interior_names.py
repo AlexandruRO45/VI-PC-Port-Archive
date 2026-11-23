@@ -82,11 +82,11 @@ def _instances(b, structs, blocks, h):
             yield off + k * ssize, members
 
 
-def _array(b, blocks, base, member):
+def _array(b, blocks, base, member, stride):
     """(block hash, first byte, count) of an array member: a u64 (low 12 bits: 1-based block index, bits 20+:
     byte offset in that block) and a u16 count at +8, as docs/world.md describes for instance lists."""
     p = base + member[0]
-    if p + 10 > len(b):
+    if stride <= 0 or p + 10 > len(b):
         return None
     ref, count = struct.unpack_from("<Q", b, p)[0], struct.unpack_from("<H", b, p + 8)[0]
     index = ref & 0xFFF
@@ -94,7 +94,8 @@ def _array(b, blocks, base, member):
         return None
     h, size, off = blocks[index - 1]
     start = ref >> 20
-    if off is None or start >= size:
+    end = start + count * stride
+    if off is None or end > size or off + end > len(b):
         return None
     return h, off + start, count
 
@@ -107,12 +108,12 @@ def _rooms(b, structs, blocks, base, members):
     for mm in members.values():
         if mm[1] != ARRAY:
             continue
-        found = _array(b, blocks, base, mm)
-        if found and found[0] == ROOM and rsize:
+        found = _array(b, blocks, base, mm, rsize)
+        if found and found[0] == ROOM:
             h, first, count = found
             return [[WI._value(b, o, rm.get(NAME)), _vec3(b, o, rm.get(BBMIN)), _vec3(b, o, rm.get(BBMAX)),
                      WI._value(b, o, rm.get(ROOM_KEY))]
-                    for o in range(first, first + rsize * count, rsize) if o + rsize <= len(b)]
+                    for o in range(first, first + rsize * count, rsize)]
     return []
 
 
