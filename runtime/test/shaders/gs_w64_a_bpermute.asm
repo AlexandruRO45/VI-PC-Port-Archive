@@ -2,23 +2,32 @@
 ; counterpart of ps_w64_a_bpermute, and of the vertex fixture vs_w64_a_bpermute in the separate pull request #7311,
 ; which this file does not depend on). Drawn with vs_ids (param1 = 0x101 + vertex index): triangle
 ; p = (TEXCOORD0.x of input vertex 0 - 0x101) / 3, as in gs_w64_a_ring. Triangle p sends values to the lane that reads
-; them. Measured with gs_w64_c_lane_id on one GPU only (RADV Mesa 26.3.1, gfx1036; other GPUs may pack differently), the
-; 320 triangles of the draw go to waves of 42 invocations at wave64 (first triangles 0, 42, 84, 126, ...) and, at wave32,
-; to waves of 32 and 10 (0, 32, 42, 74, 84, 116, ...): every wave32 wave is one half of a wave64 wave, and the triangle
-; of lane L is the wave's first triangle + L. A wave starts at triangle 42 * w, so a group of four lanes is not a group
-; of four triangles (the odd waves start 2 mod 4): only lane ^ 1 is guaranteed to hold triangle p ^ 1, at either size.
-; The address comes from the lane id (v_mbcnt_lo then v_mbcnt_hi of -1) and uses address bits 2..6 only. The words are a
-; function of p alone:
-;  r0 = ds_bpermute of p from lane ^ 1: p ^ 1.
-;  r1 = ds_bpermute of 3 * p + 7 from lane ^ 1: 3 * (p ^ 1) + 7.
+; them from lane ^ 1. Which triangle that is depends on how the driver packed the draw into waves: the triangle of
+; lane L is the wave's first triangle + L, and the waves differ by GPU and driver. Measured with gs_w64_c_lane_id over
+; the 320 triangles of the draw (reported on the pull request where not RADV gfx1036):
+;  RADV gfx1036 (Mesa 26.3.1): waves of 42 invocations at wave64 (first triangles 0, 42, 84, ...), of 32 and 10 at wave32
+;    (0, 32, 42, 74, ...). Every wave starts at an even triangle.
+;  RADV gfx1010 (RX 5700 XT, Mesa 26.3.1): waves of 41 (0, 41, 82, 123, ...), of 32 and 9 at wave32. Half the waves
+;    start at an odd triangle, and the last lane of a 41-lane wave has no partner.
+;  AMD Windows driver 26.11.2 (RX 9060 XT): waves of 64, 21, 64, 21, 64, 21, 1, 64 (0, 64, 85, 149, 170, 234, 255, 256).
+;  NVIDIA Windows driver 621.24 (RTX 4060 Ti, default size): 32 spans of 10 triangles, every one from an even triangle.
+; In every layout seen so far each wave32 wave is one half of a wave64 wave.
+; So the words are not a function of p alone. w64_graphics.py derives them from the lanes the probe measured at the same
+; size (layout_words): the partner q of p is the triangle that holds lane ^ 1 in the same wave, and a triangle without
+; one (the last lane of a wave of odd size) reads 0, because a source lane that is not running gives 0.
+; The address comes from the lane id (v_mbcnt_lo then v_mbcnt_hi of -1) and uses address bits 2..6 only. With q the
+; partner of p (all four words 0 without one):
+;  r0 = ds_bpermute of p from lane ^ 1: q.
+;  r1 = ds_bpermute of 3 * p + 7 from lane ^ 1: 3 * q + 7.
 ;  r2 = ds_bpermute from lane ^ 1 of r0, back to the own triangle: p.
-;  r3 = ds_bpermute of p >> 1 from lane ^ 1: p >> 1 (a pair shares it).
+;  r3 = ds_bpermute of p >> 1 from lane ^ 1: q >> 1.
 ; Each invocation stores them to its record at heap 0x1000 + 16 * p through the V# in s[4:7] (the translator sets s3
 ; for the prologue), then emits one vertex through the lane-based ring address, which makes no primitive.
 ; Needs a DXBC with ISG1/OSG1 = {SV_Position reg 0, TEXCOORD0 reg 1} (build.py makes it for gs_*).
 ; Run: VKH_GS=gs_w64_a_bpermute.spv VKH_VERTICES=960 VKH_SGPRS=0,0,0,0,0,0,65536,0x30000000 VKH_HEAP=0=0
 ; VKH_HEAP_DUMP=heap.raw vk_harness vs_ids.spv <any fragment shader> out.raw, with and without RADV_PERFTEST=gewave32:
-; equal records, and equal to the expected words.
+; equal records where the wave32 draw is the wave64 draw cut into halves, and each draw equal to the words its own
+; layout gives.
 ; mattr: +wavefrontsize64,-wavefrontsize32
 s_bfe_i32 s0, s3, 0x80008
 s_bfm_b64 exec, s0, 0

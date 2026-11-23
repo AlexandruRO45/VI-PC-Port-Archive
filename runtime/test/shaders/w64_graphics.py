@@ -174,7 +174,9 @@ def _gs_a_ring(i):                                             # gs_w64_* fixtur
 
 
 def _gs_a_bpermute(i):
-    return (i ^ 1, 3 * (i ^ 1) + 7, i, i >> 1)                 # ds_bpermute from lane ^ 1: the pair's other triangle
+    # ds_bpermute from lane ^ 1: the pair's other triangle, when every wave starts at an even triangle (RADV gfx1036).
+    # check() judges the draw by layout_words, from the measured wave layout; this form serves the tests.
+    return (i ^ 1, 3 * (i ^ 1) + 7, i, i >> 1)
 
 
 VS_ENV = {"VKH_SGPRS": "0,0,65536,0x30000000", "VKH_HEAP": "0=0"}
@@ -343,9 +345,11 @@ def draw(tools, spirv, name, size, tmp):
     return words, words_heap, applied
 
 
-def expected_problem(name, words, heap):
-    """'' when the words (and heap) are what the fixture's header derives, else the first discrepancy."""
-    tier, expect, _ = FIXTURES[name]
+def expected_problem(name, words, heap, expect=None):
+    """'' when the words (and heap) are what the fixture's header derives, else the first discrepancy. `expect`
+    replaces the fixture's expected-words function (the layout-derived fixtures, see layout_words)."""
+    tier, fixture_expect, _ = FIXTURES[name]
+    expect = expect or fixture_expect
     wrong = []
     for i, w in enumerate(words):
         want = expect(i)
@@ -380,6 +384,51 @@ def partition_dependent(name, a, b):
     """Whether the words the fixture's header names as partition dependent differ between two draws."""
     return any(any(g is None and x != y for g, x, y in zip(FIXTURES[name][1](i), p, q))
                for i, (p, q) in enumerate(zip(a, b)))
+
+
+def layout_derived(name):
+    """The vertex and geometry permute fixtures: a ds_bpermute from lane ^ 1 returns the vertex (triangle) the driver
+    put at that lane, so their words follow how the driver packed the draw into waves, not only the index
+    (RADV gfx1036 starts every wave at an even index; gfx1010 does not: waves of 64 and 59 vertices, 42 and 41
+    invocations; the AMD Windows driver of an RX 9060 XT packs 64 and 21 GS invocations)."""
+    return name.endswith("_a_bpermute") and name.startswith(("vs_", "gs_"))
+
+
+def layout_words(lanes):
+    """The words of every record of a layout-derived fixture, from `lanes`, the lane each vertex (triangle) got,
+    measured with the stage's lane-id probe on the same draw at the same size. A wave is a run of consecutive
+    lanes that begins at lane 0. Lane L of a wave reads lane L ^ 1, held by the partner q of the same wave, and a
+    lane past the wave's last one is not running and reads 0 (docs/testing.md: a source lane that is not running).
+    The record of v is (q, 3 * q + 7, v, q >> 1), and all zeros for the last lane of a wave of odd size. A Skip
+    when the lanes are not runs that begin at 0."""
+    words, start = [None] * len(lanes), 0
+    for i in range(1, len(lanes) + 1):
+        if i < len(lanes) and lanes[i] == lanes[i - 1] + 1:
+            continue
+        if lanes[start] != 0:
+            return Skip(f"SKIP (the wave of record {start} begins at lane {lanes[start]}, not 0: the wave layout "
+                        "cannot be derived)")
+        size = i - start
+        for k in range(size):
+            q = start + (k ^ 1)
+            words[start + k] = (q, 3 * q + 7, start + k, q >> 1) if (k ^ 1) < size else (0, 0, 0, 0)
+        start = i
+    return words
+
+
+def layout_is_halves(lanes64, lanes32):
+    """Whether the wave32 draw is the wave64 draw cut into halves (every record has the same lane modulo 32): only
+    then must the two images be equal. A driver that repacks for wave32 pairs other vertices, and each size is still
+    judged against its own layout."""
+    return len(lanes64) == len(lanes32) and all(a % 32 == b for a, b in zip(lanes64, lanes32))
+
+
+def _probe_lanes(tools, spirv, stage, size, tmp):
+    """(the lane of every record, '') from the stage's lane-id probe drawn at `size`, else (None, why)."""
+    records, heap = _draw_heap(tools, spirv, PROBES[stage], size, tmp)
+    if records is None:
+        return None, heap
+    return [r[0] for r in records], ""
 
 
 def check(tools, spirv, name):
@@ -420,13 +469,27 @@ def check(tools, spirv, name):
             Path(save).mkdir(parents=True, exist_ok=True)
             (Path(save) / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))
         if tier in ("A", "B"):
+            lanes = {}
             for size, (words, heap) in runs.items():
                 if size is None and len(runs) > 1:
                     continue                      # the default draw repeats one of the forced sizes
-                p = expected_problem(name, words, heap)
+                expect = None
+                if layout_derived(name):          # judged against the layout this size gave the draw
+                    lanes[size], problem = _probe_lanes(tools, spirv, name[:2], size, tmp)
+                    if lanes[size] is None:
+                        return Skip("SKIP (" + problem + ")") if problem.startswith("unsupported") \
+                            else f"{size or 'default'} wave layout probe: {problem}"
+                    layout = layout_words(lanes[size])
+                    if isinstance(layout, Skip):
+                        return layout
+                    expect = layout.__getitem__
+                p = expected_problem(name, words, heap, expect)
                 if p:
                     return f"{size or 'default size'}: {p}"
-            if 64 in runs and 32 in runs and comparable(name, *runs[64]) != comparable(name, *runs[32]):
+            # The two images must be equal when the wave32 draw is the wave64 draw cut into halves. For a
+            # layout-derived fixture on a driver that repacks for wave32, each size was judged against its own layout.
+            if 64 in runs and 32 in runs and (not layout_derived(name) or layout_is_halves(lanes[64], lanes[32])) \
+                    and comparable(name, *runs[64]) != comparable(name, *runs[32]):
                 return "the images at required subgroup size 64 and 32 differ"
         elif 64 in runs and 32 in runs:
             if comparable(name, *runs[64]) != comparable(name, *runs[32]):
@@ -448,7 +511,8 @@ def check(tools, spirv, name):
                     if not partition_dependent(name, ref_words, words):
                         return "tier C but the run equals the 64-lane reference: the detector is wrong"
                     compared = True
-                elif not name.endswith("_b_ballot_atomic") and comparable(name, ref_words, None) != comparable(name, words, None):
+                elif not name.endswith("_b_ballot_atomic") and not layout_derived(name) \
+                        and comparable(name, ref_words, None) != comparable(name, words, None):
                     return "the run differs from the 64-lane reference"
         if tier == "C" and not compared:
             return Skip("SKIP (tier C needs a device that can require both 64 and 32, or W64G_REF)")
