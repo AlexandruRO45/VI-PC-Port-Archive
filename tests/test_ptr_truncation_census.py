@@ -165,6 +165,26 @@ class SummaryTests(unittest.TestCase):
             with open(idx, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {"0": {"stage": "ps", "user_sgpr_reads": [{"sgpr": 2, "kind": "ptr32_lo"}]}})
 
+    def test_json_and_index_out_naming_one_file_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            write_listing(tmp, "ps_table32", LISTINGS["ps_table32"])
+            report = os.path.join(tmp, "report.json")
+            with open(report, "w", encoding="utf-8", newline="\n") as f:
+                f.write("kept\n")
+            stderr, sys.stderr = sys.stderr, io.StringIO()
+            stdout, sys.stdout = sys.stdout, io.StringIO()
+            try:
+                rc = P.main([disasm, "--json", report, "--index-out", report])
+                message = sys.stderr.getvalue()
+            finally:
+                sys.stderr, sys.stdout = stderr, stdout
+            self.assertEqual(rc, 2)
+            self.assertIn("--json and --index-out", message)
+            with open(report, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "kept\n")
+
     def test_missing_folder(self):
         stderr = sys.stderr
         sys.stderr = io.StringIO()
