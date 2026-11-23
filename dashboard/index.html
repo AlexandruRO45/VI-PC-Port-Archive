@@ -205,6 +205,17 @@ details.more div { font-size: 12.5px; color: var(--muted); margin-top: 6px; over
 .obj.done { border-color: rgba(46,230,200,.5); color: var(--done); }
 .obj.pr { border-color: rgba(255,182,72,.5); color: var(--wip); }
 .obj.none { color: var(--dim); }
+.proof-stack { margin-top: 22px; }
+.proof-legend { gap: 8px 16px; }
+.proof-legend b { color: var(--text); font-weight: 600; }
+.proof-list { margin: 0; padding-left: 18px; font: 500 12.5px var(--mono); color: var(--muted); columns: 2 220px; column-gap: 24px; }
+.proof-list li { break-inside: avoid; padding: 2px 0; overflow-wrap: anywhere; }
+.proof-list .more { list-style: none; color: var(--dim); }
+.proof-num { display: flex; align-items: baseline; gap: 14px; margin: 10px 0 4px; }
+.proof-num b { font: 900 clamp(34px, 5vw, 48px)/1 var(--display); letter-spacing: -.02em; }
+.proof-num b.good { color: var(--done); }
+.proof-num b.bad { color: var(--wip); }
+.proof-num span { color: var(--muted); }
 .milestones { display: grid; grid-template-columns: repeat(8, minmax(0,1fr)); gap: 6px; margin-top: 16px; }
 @media (max-width: 700px) { .milestones { grid-template-columns: repeat(4, minmax(0,1fr)); } }
 .ms { border-radius: 12px; padding: 10px; background: rgba(0,0,0,.2); border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
@@ -633,6 +644,19 @@ body.card-mode .card-url { display: block; }
         </div>
       </div>
       <div id="graphicsBody"><div class="pending" data-part="status"><div class="skeleton"></div><div class="pending-box"><b class="pending-title">Loading from GitHub…</b><p class="pending-msg"></p><button class="linkbtn pb-token" type="button" hidden>Load faster with a free token</button></div></div></div>
+    </div>
+  </section>
+
+  <section id="proof">
+    <div class="wrap">
+      <div class="sec-head">
+        <div>
+          <div class="eyebrow">Proof, not promises</div>
+          <h2>How sure are we?</h2>
+          <p class="lede">Every rule the shader translator follows says in the project's design notes how it was checked: on a real graphics card, against the AMD compilers in LLVM and Mesa, over every shader, or only in a CPU test. Next to it: how much of the console's system software still has no PC stand-in.</p>
+        </div>
+      </div>
+      <div id="proofBody"><div class="pending"><div class="skeleton"></div><div class="pending-box"><b class="pending-title">Loading the project's documents…</b><p class="pending-msg"></p></div></div></div>
     </div>
   </section>
 
@@ -1802,5 +1826,6 @@ document.addEventListener('DOMContentLoaded', init);
 <script src="activity.js"></script>
 <script src="pipeline.js"></script>
 <script src="triage.js"></script>
+<script src="proof.js"></script>
 </body>
 </html>

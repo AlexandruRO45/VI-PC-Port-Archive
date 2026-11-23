@@ -21,6 +21,10 @@ browser. An example running from a fork's GitHub Pages: https://clhelper.github.
 - **Activity**: merged and opened PRs per hour over the last 24 hours, and who merged most.
 - **Road to playable**: a weighted milestone score from the README's status table and the D3D12 tracker, the
   blockers, the graphics layer's method coverage and the work board.
+- **How sure are we?**: the translator's contract rows in `docs/design.md` by how they were confirmed (a GPU, an
+  LLVM/Mesa reference, a corpus count, a CPU test, or not stated), the rows still waiting for a GPU test, and from
+  `docs/runtime_imports.md` the imports with no stand-in. It counts with the rules of `tools/progress_dashboard.py`
+  (`proof.js`; `tests/test_dashboard_proof.cjs` covers the parsers).
 
 ## Viewing and hosting
 
@@ -37,7 +41,8 @@ browser. An example running from a fork's GitHub Pages: https://clhelper.github.
 
 From the browser, GET requests only, except the GraphQL sweep with a token:
 
-- `raw.githubusercontent.com`: the README (no rate limit).
+- `raw.githubusercontent.com`: the README, and every 30 minutes `docs/design.md` and `docs/runtime_imports.md`
+  (no rate limit).
 - `api.github.com`: the coordination issue and its comments, the D3D12 tracker, GitHub search (open and merged PRs,
   CI results), the latest commits on `main` and the repository's star and contributor counts.
 - `api.github.com/graphql`, only with a token: every open PR with its changed files, CI result and merge state, about
@@ -60,7 +65,7 @@ and sent only to `api.github.com`.
 ## What it keeps in the browser
 
 Local storage under `ldash:v2:<repo>:`: the last GitHub answers, the last pipeline load, the merged PRs of the last
-24 hours and the feed, so a reload shows them at once. Clearing the site's data resets it.
+24 hours, the feed and the counts of the two documents (not the documents), so a reload shows them at once. Clearing the site's data resets it.
 
 ## No game data
 
