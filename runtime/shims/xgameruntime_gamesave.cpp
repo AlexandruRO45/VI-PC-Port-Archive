@@ -9,8 +9,10 @@
 //
 // Offline the saves are files, in the layout tools/saves.py imports into (docs/saves.md):
 //   <root>\local-user\<container>\<blob>      root = LEONIDA_SAVE_DIR, else %LOCALAPPDATA%\Leonida\saves
-// Container and blob names are %-encoded: [A-Za-z0-9_-] and '.' (except as the first character) stay, every other
-// UTF-8 byte becomes %XX. A container's display name is kept in "<container>\.display", which no encoded blob name
+// Container and blob names are %-encoded: [A-Za-z0-9_-] and '.' (except as the first or last character) stay, every
+// other UTF-8 byte becomes %XX, and so does the first character of a name whose part before the first '.' is a
+// Windows device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9, any case), since Windows would drop a trailing '.' and
+// open a device instead. A container's display name is kept in "<container>\.display", which no encoded blob name
 // can collide with (an encoded name never starts with '.'). Names ending in '~' are temporary files of an update in
 // progress; an encoded name never ends in '~' either.
 //
@@ -94,14 +96,25 @@ constexpr size_t kMaxBlobName = 256;                         // ASSUMPTION, see 
 
 // ---- Names ----
 
+bool device_name(std::string_view name) {
+    std::string base(name.substr(0, name.find('.')));
+    for (char& c : base)
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+    if (base == "CON" || base == "PRN" || base == "AUX" || base == "NUL") return true;
+    return base.size() == 4 && (base.compare(0, 3, "COM") == 0 || base.compare(0, 3, "LPT") == 0) && base[3] >= '1' &&
+           base[3] <= '9';
+}
+
 std::string encode_name(std::string_view name) {
     static const char hex[] = "0123456789ABCDEF";
+    const bool device = device_name(name);
     std::string out;
-    for (const char ch : name) {
+    for (size_t i = 0; i < name.size(); ++i) {
+        const char ch = name[i];
         const auto c = static_cast<unsigned char>(ch);
         const bool keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
-                          c == '-' || (c == '.' && !out.empty());
-        if (keep) {
+                          c == '-' || (c == '.' && i != 0 && i + 1 != name.size());
+        if (keep && !(device && i == 0)) {
             out += ch;
         } else {
             out += '%';

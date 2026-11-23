@@ -231,6 +231,10 @@ int main() {
     count = 1;
     check(at<Read>(save, 20)(save, container, absent, &count, buffer.size() * 8, out) == E_GS_BLOB_NOT_FOUND,
           "a blob that is not there is E_GS_BLOB_NOT_FOUND");
+    const char* device_blob[] = {"nul"};
+    count = 1;
+    check(at<Read>(save, 20)(save, container, device_blob, &count, buffer.size() * 8, out) == E_GS_BLOB_NOT_FOUND,
+          "so is one named like a device");
     count = 0;
     check(at<Read>(save, 20)(save, container, nullptr, &count, buffer.size() * 8, out) == S_OK && count == 2,
           "blobNames = nullptr reads every blob");
@@ -277,6 +281,34 @@ int main() {
               at<AsyncOnly>(save, 12)(save, &async) == S_OK && !std::filesystem::exists(dir),
           "DeleteContainerAsync removes the container");
     at<Close>(save, 17)(save, container);
+
+    // ---- names Windows would fold: a trailing '.', device names ----
+    for (const char* device : {"CON", "AUX.sav"}) {
+        Handle dc = nullptr, du = nullptr;
+        check(at<Create>(save, 16)(save, provider, device, &dc) == S_OK &&
+                  at<Create>(save, 23)(save, dc, nullptr, &du) == S_OK &&
+                  at<Write>(save, 25)(save, du, "data", reinterpret_cast<const uint8_t*>("plain"), 5) == S_OK &&
+                  at<Write>(save, 25)(save, du, "data.", reinterpret_cast<const uint8_t*>("dotted"), 6) == S_OK &&
+                  at<Write>(save, 25)(save, du, "NUL.sav", reinterpret_cast<const uint8_t*>("device"), 6) == S_OK &&
+                  at<Submit>(save, 27)(save, du) == S_OK,
+              "a container named like a device saves blobs \"data\", \"data.\" and \"NUL.sav\"");
+        const char* dnames[] = {"data", "data.", "NUL.sav"};
+        std::vector<uint64_t> dbuf(64);
+        auto* dout = reinterpret_cast<Blob*>(dbuf.data());
+        uint32_t dcount = 3;
+        check(at<Read>(save, 20)(save, dc, dnames, &dcount, dbuf.size() * 8, dout) == S_OK && dcount == 3 &&
+                  dout[0].info.size == 5 && std::memcmp(dout[0].data, "plain", 5) == 0 && dout[1].info.size == 6 &&
+                  std::memcmp(dout[1].data, "dotted", 6) == 0 && dout[2].info.size == 6 &&
+                  std::memcmp(dout[2].data, "device", 6) == 0,
+              "and read back as three blobs, byte for byte");
+        Seen dseen;
+        check(at<EnumBlobs>(save, 18)(save, dc, &dseen, on_blob) == S_OK && dseen.names.size() == 3 &&
+                  dseen.names[0] == "NUL.sav" && dseen.names[1] == "data" && dseen.names[2] == "data.",
+              "EnumerateBlobInfo lists all three by their own names");
+        at<Close>(save, 24)(save, du);
+        at<Close>(save, 17)(save, dc);
+        check(at<ByName>(save, 10)(save, provider, device) == S_OK, "DeleteContainer removes it");
+    }
 
     // ---- async provider, XGameSaveFiles ----
     async = XAsyncBlock{};

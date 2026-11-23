@@ -577,6 +577,18 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(saves.xgs_encode(".hidden"), "%2Ehidden")
         self.assertEqual(saves.xgs_encode("~tmp"), "%7Etmp")
         self.assertEqual(saves.xgs_encode("é"), "%C3%A9")
+        self.assertEqual(saves.xgs_encode("data."), "data%2E")
+        self.assertEqual(saves.xgs_encode(".."), "%2E%2E")
+        self.assertEqual(saves.xgs_encode("a.b.c"), "a.b.c")
+        self.assertEqual(saves.xgs_encode("NUL.sav"), "%4EUL.sav")
+        self.assertEqual(saves.xgs_encode("CON"), "%43ON")
+        self.assertEqual(saves.xgs_encode("aux.sav"), "%61ux.sav")
+        self.assertEqual(saves.xgs_encode("Com1"), "%43om1")
+        self.assertEqual(saves.xgs_encode("LPT9.a.b"), "%4CPT9.a.b")
+        self.assertEqual(saves.xgs_encode("CON."), "%43ON%2E")
+        for kept in ("COM0", "LPT10", "CONSOLE", "NULL.sav", "xCON", "slots/CON"):
+            self.assertNotEqual(saves.xgs_encode(kept)[:1], "%", kept)
+        self.assertEqual(saves.xgs_encode("COM¹"), "COM%C2%B9")
 
     def _folders(self, tmp):
         jsav, _, _ = make_jsav()

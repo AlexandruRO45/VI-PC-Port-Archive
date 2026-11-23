@@ -501,13 +501,21 @@ def diff(pa, pb):
 
 
 # ---------------------------------------------------------------------------------------------- import
+WINDOWS_DEVICE_NAMES = {b'CON', b'PRN', b'AUX', b'NUL'} | {b'%s%d' % (p, d) for p in (b'COM', b'LPT')
+                                                           for d in range(1, 10)}
+
+
 def xgs_encode(name):
     """Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp: keep
-    [A-Za-z0-9_-] and '.' except as the first character; everything else becomes %XX (uppercase hex) per UTF-8 byte."""
+    [A-Za-z0-9_-] and '.' except as the first or last character; everything else becomes %XX (uppercase hex) per UTF-8
+    byte, and so does the first character when the part before the first '.' is a Windows device name (any case)."""
+    raw = name.encode('utf-8')
+    device = raw.split(b'.', 1)[0].upper() in WINDOWS_DEVICE_NAMES
     out = []
-    for c in name.encode('utf-8'):
+    for i, c in enumerate(raw):
         ch = chr(c)
-        if (ch.isascii() and ch.isalnum()) or ch in '_-' or (ch == '.' and out):
+        keep = (ch.isascii() and ch.isalnum()) or ch in '_-' or (ch == '.' and 0 < i < len(raw) - 1)
+        if keep and not (device and i == 0):
             out.append(ch)
         else:
             out.append('%%%02X' % c)
