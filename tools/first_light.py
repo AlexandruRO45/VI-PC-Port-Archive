@@ -45,6 +45,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
@@ -157,10 +158,29 @@ def choose(index_path: str, vs: str, ps: str) -> list[dict]:
     return [by_stage_and_name[key] for key in requested]
 
 
-def translate(work: str, picked: list[dict]) -> dict:
-    """Translate just the two chosen containers, in the layout rdna2spirv.py reads."""
+def translate(work: str, picked: list[dict]) -> tuple[dict, str]:
+    """Translate just the two chosen containers, in the layout rdna2spirv.py reads.
+
+    Every call stages into its own ``prepare-`` folder under ``work/first_light`` and returns
+    it, so two prepares sharing ``--work`` with different ``--out`` cannot replace each other's
+    staged inputs or translator results while both are in flight. The shared ``dxbc``/``spirv``
+    folders that an earlier layout left behind are never read or written here. A failure inside
+    this function leaves the folder for diagnosis; the caller removes it after publishing.
+    """
     base = os.path.join(work, "first_light")
-    dxbc = reset_run_folders(work)
+    real_base = os.path.join(os.path.realpath(work), "first_light")
+    if os.path.lexists(base) and (
+        not os.path.isdir(base)
+        or os.path.normcase(os.path.realpath(base)) != os.path.normcase(real_base)
+    ):
+        raise SystemExit(
+            f"{base} is a symlink, a junction or a file: each run stages a folder under it and does "
+            "not follow a link to do it; remove it and run again"
+        )
+    os.makedirs(base, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix="prepare-", dir=base)
+    dxbc = os.path.join(staging, "dxbc")
+    os.makedirs(dxbc, exist_ok=True)
     index = []
     for entry in picked:
         shutil.copy(
@@ -183,7 +203,7 @@ def translate(work: str, picked: list[dict]) -> dict:
             "gfx1013",
         ]
     )
-    spirv = os.path.join(base, "spirv")
+    spirv = os.path.join(staging, "spirv")
     run(
         [
             os.path.join(TOOLS, "rdna2spirv.py"),
@@ -201,7 +221,7 @@ def translate(work: str, picked: list[dict]) -> dict:
         if item is None or item.get("stage") != entry["stage"]:
             raise SystemExit(f"translator has no {entry['stage']} result for {stem}")
         result[entry["stage"]] = item
-    return result
+    return result, staging
 
 
 def _obj_lines(handle):
@@ -1003,15 +1023,18 @@ def main(argv=None) -> int:
     index = ensure_carve(game, work)
     ps_name = a.ps if a.ps is not None else (DEFAULT_TEXTURED_PS if a.dds else DEFAULT_PS)
     picked = choose(index, a.vs, ps_name)
-    meta = translate(work, picked)
-    os.makedirs(out_dir, exist_ok=True)
-    for entry in picked:
-        stem = os.path.splitext(entry["file"])[0]
-        stage = entry["stage"]
-        shutil.copy(
-            os.path.join(work, "first_light", "spirv", f"{stem}.spv"),
-            os.path.join(out_dir, f"{stage}.spv"),
-        )
+    meta, staging = translate(work, picked)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        for entry in picked:
+            stem = os.path.splitext(entry["file"])[0]
+            stage = entry["stage"]
+            shutil.copy(
+                os.path.join(staging, "spirv", f"{stem}.spv"),
+                os.path.join(out_dir, f"{stage}.spv"),
+            )
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     # For d3d12_first_light_test: the game's containers (the PSO finds each stage by the FSSM hash inside) and
     # the translator's index entries, keyed vs/ps so the runtime's shader library reads vs.spv and ps.spv here.
     for entry in picked:

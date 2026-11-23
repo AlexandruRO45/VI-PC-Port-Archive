@@ -254,7 +254,7 @@ class ShaderPreparationTests(unittest.TestCase):
             def write_translation(argv: list[str]) -> None:
                 if Path(argv[0]).name != "rdna2spirv.py":
                     return
-                staged = work / "first_light" / "dxbc"
+                staged = Path(argv[1]).parent  # the prepare's dxbc folder (argv[1] is its disasm)
                 picked = json.loads((staged / "index.json").read_text(encoding="utf-8"))
                 self.assertEqual(picked, entries)
                 spirv = Path(argv[argv.index("--out") + 1])
@@ -357,10 +357,13 @@ class RunFolderTests(unittest.TestCase):
         return sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file())
 
     def test_a_second_run_holds_only_its_own_pair(self) -> None:
+        """Each prepare stages into a fresh folder; leftovers from the old shared layout are ignored."""
         other_out = self.work / "first_light" / "out_first"
         self.prepare("first", "--out", str(other_out))
         self.assertEqual(self.handed, [["first", "vertex"]])
+        self.staged.mkdir(parents=True)
         (self.staged / "leftover.dxbc").write_bytes(b"leftover")  # a container no run selected
+        self.spirv.mkdir(parents=True)
         (self.spirv / "leftover.spvasm").write_bytes(b"leftover")
         carved_before = {name: (self.work / "shaders" / "dxbc" / name).read_bytes()
                          for name in self.files(self.work / "shaders" / "dxbc")}
@@ -369,17 +372,17 @@ class RunFolderTests(unittest.TestCase):
         self.prepare("second")
 
         self.assertEqual(self.handed[1], ["second", "vertex"])
-        self.assertEqual(self.files(self.staged),
-                         ["disasm/second.s", "disasm/vertex.s", "fssm/second.fssm", "fssm/vertex.fssm",
-                          "index.json", "second.dxbc", "vertex.dxbc"])
-        self.assertEqual(self.files(self.spirv), ["index.json", "second.spv", "vertex.spv"])
-        translated = json.loads((self.spirv / "index.json").read_text(encoding="utf-8"))
-        self.assertEqual({stem: meta["stage"] for stem, meta in translated.items()},
-                         {"second": "ps", "vertex": "vs"})
         out = self.work / "first_light" / "out"
         self.assertEqual((out / "ps.dxbc").read_bytes(), b"second")
         self.assertEqual((out / "ps.spv").read_bytes(), b"spv second")
-        # Only the two run folders are emptied: the carve and the other run's --out are as they were.
+        published = json.loads((out / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual({stage: meta["fssm_sha256"] for stage, meta in published.items()},
+                         {"vs": "vertex", "ps": "second"})
+        # The old shared folders are untouched, the per-run folder is removed after publishing,
+        # and the carve and the other run's --out are as they were.
+        self.assertEqual(self.files(self.staged), ["leftover.dxbc"])
+        self.assertEqual(self.files(self.spirv), ["leftover.spvasm"])
+        self.assertEqual(list((self.work / "first_light").glob("prepare-*")), [])
         self.assertEqual({name: (self.work / "shaders" / "dxbc" / name).read_bytes()
                           for name in self.files(self.work / "shaders" / "dxbc")}, carved_before)
         self.assertEqual({name: (other_out / name).read_bytes() for name in self.files(other_out)},
@@ -447,16 +450,106 @@ class RunFolderTests(unittest.TestCase):
                 self.assertNotIn("\n", str(refused.exception))
                 self.assertEqual(os.listdir(outside), [])
 
-    def test_a_file_that_cannot_be_removed_stops_the_run(self) -> None:
-        self.prepare("first")
-        held = self.staged / "first.dxbc"
-        denied = PermissionError(13, "Permission denied", str(held))
-        with patch.object(fl.shutil, "rmtree", side_effect=denied), self.assertRaises(SystemExit) as stopped:
-            self.prepare("second")
-        self.assertIn(str(held), str(stopped.exception))
-        self.assertIn("Permission denied", str(stopped.exception))
-        self.assertNotIn("\n", str(stopped.exception))
-        self.assertEqual(self.handed, [["first", "vertex"]])  # nothing was translated from the stale folder
+    def test_a_linked_first_light_folder_is_refused_by_a_prepare(self) -> None:
+        """A prepare must not stage through a symlink/junction outside --work."""
+        for kind in LINK_KINDS:
+            with self.subTest(kind=kind):
+                work, outside = self.linked(kind, "")
+                carved = work / "shaders" / "dxbc"
+                carved.mkdir(parents=True)
+                for f in (self.work / "shaders" / "dxbc").iterdir():
+                    (carved / f.name).write_bytes(f.read_bytes())
+                with patch.object(fl, "run", side_effect=self.tools), redirect_stdout(io.StringIO()), \
+                     self.assertRaises(SystemExit) as refused:
+                    fl.main(["--game", str(self.tmp), "--work", str(work), "--no-fit",
+                             "--vs", "vertex", "--ps", "first"])
+                self.assertIn(str(work / "first_light"), str(refused.exception))
+                self.assertNotIn("\n", str(refused.exception))
+                self.assertEqual(self.files(outside), ["dxbc/keep.dxbc", "keep.dxbc"])
+                self.assertEqual(self.handed, [])
+
+
+class OverlappingPrepareTests(unittest.TestCase):
+    """Two prepares sharing --work with separate --out must not steal each other's inputs.
+
+    The tool calls are stand-ins; the staging, orchestration and shader selection in
+    first_light.main are real. A starts, and at its first tool call (after its pair is
+    staged, before the unpack reads it) a full second prepare runs to completion on the
+    same work folder; then A resumes. Both must publish their own pair.
+    """
+
+    entries = [
+        {"name": "first", "file": "first.dxbc", "stage": "vs"},
+        {"name": "first", "file": "first~1.dxbc", "stage": "ps"},
+        {"name": "second", "file": "second.dxbc", "stage": "vs"},
+        {"name": "second", "file": "second~1.dxbc", "stage": "ps"},
+    ]
+
+    def stage_translator(self, modules: dict):
+        def translate_argv(argv: list[str]) -> None:
+            name = Path(argv[0]).name
+            if name == "fssm_unpack.py":
+                staged = Path(argv[1])
+                fssm = staged / "fssm"
+                fssm.mkdir(exist_ok=True)
+                for entry in json.loads((staged / "index.json").read_text(encoding="utf-8")):
+                    (fssm / f"{Path(entry['file']).stem}.fssm").write_bytes(entry["stage"].encode("ascii"))
+            elif name == "shader_disasm.py":
+                fssm = Path(argv[1])
+                out = Path(argv[argv.index("--out") + 1])
+                out.mkdir(exist_ok=True)
+                for f in fssm.glob("*.fssm"):
+                    (out / f"{f.stem}.isa").write_bytes(f.read_bytes())
+            elif name == "rdna2spirv.py":
+                disasm = Path(argv[1])
+                out = Path(argv[argv.index("--out") + 1])
+                out.mkdir(exist_ok=True)
+                index = {}
+                for f in disasm.glob("*.isa"):
+                    stage = f.read_bytes().decode("ascii")
+                    (out / f"{f.stem}.spv").write_bytes(modules[stage])
+                    index[f.stem] = {"stage": stage, "fssm_sha256": stage + "-fixture"}
+                (out / "index.json").write_text(json.dumps(index), encoding="utf-8", newline="\n")
+
+        return translate_argv
+
+    def test_overlapping_prepares_with_one_work_folder_publish_independently(self) -> None:
+        modules = {"vs": build_vs_stub([0]), "ps": build_ps_stub([0])}
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            dxbc = work / "shaders" / "dxbc"
+            dxbc.mkdir(parents=True)
+            (dxbc / "index.json").write_text(json.dumps(self.entries), encoding="utf-8", newline="\n")
+            for entry in self.entries:
+                (dxbc / entry["file"]).write_bytes(entry["stage"].encode("ascii"))
+            out_a, out_b = work / "out_a", work / "out_b"
+            translator = self.stage_translator(modules)
+            state = {"a_unpacked": False}
+
+            def run_a(argv: list[str]) -> None:
+                if Path(argv[0]).name == "fssm_unpack.py" and not state["a_unpacked"]:
+                    state["a_unpacked"] = True
+                    with patch.object(fl, "run", side_effect=translator), redirect_stdout(io.StringIO()):
+                        self.assertEqual(
+                            fl.main(["--game", tmp, "--work", tmp, "--no-fit",
+                                     "--out", str(out_b), "--vs", "second", "--ps", "second"]), 0
+                        )
+                translator(argv)
+
+            with patch.object(fl, "run", side_effect=run_a), redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    fl.main(["--game", tmp, "--work", tmp, "--no-fit",
+                             "--out", str(out_a), "--vs", "first", "--ps", "first"]), 0
+                )
+
+            for out, name in ((out_a, "first"), (out_b, "second")):
+                manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual(manifest["vs"]["name"], name)
+                self.assertEqual(manifest["ps"]["name"], name)
+                self.assertTrue((out / "vs.spv").is_file())
+                self.assertTrue((out / "ps.spv").is_file())
+            # a successful prepare removes its staging folder
+            self.assertEqual(list((work / "first_light").glob("prepare-*")), [])
 
 
 class OracleTests(unittest.TestCase):
