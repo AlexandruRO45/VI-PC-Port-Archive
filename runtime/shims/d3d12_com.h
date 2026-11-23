@@ -194,6 +194,8 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer);
 VkImage vulkan_image(ID3D12Resource* resource);
 // The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
+// The Vulkan buffer and byte range backing a resource created by such a device, or a null buffer. For tests.
+VkDescriptorBufferInfo vulkan_buffer_binding(ID3D12Resource* resource);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.

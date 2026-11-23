@@ -6,11 +6,9 @@
 //   - the user-data contract: a descriptor-table root argument (s0:s1, the table's console VA) and four root constants
 //     (s2..s5) reach the VS and the PS through the 144-byte push-constant block;
 //   - vertex fetch: the VS has no input layout; it s_loads a V# the application wrote into a shader-visible descriptor
-//     slot and fetches position and colour with buffer_load_dwordx4 ... idxen. The V# points at a DEFAULT-heap vertex
-//     buffer (a range of the GPU address arena, copied from an upload buffer). A V# cannot point at the upload
-//     buffer itself: its base is 48 bits, and the upload buffer's console VA (device address minus heap base) is
-//     negative, so heap base + the truncated base is a wild address (measured on both test GPUs: the draw faults the
-//     queue). Root views and table pointers are 64 bits and do not have the problem; see docs/d3d12_vulkan.md 3.3;
+//     slot and fetches position and colour with buffer_load_dwordx4 ... idxen. Two views reference the staged
+//     DEFAULT-heap vertex buffer and the committed UPLOAD vertex buffer. The test checks that the upload allocation
+//     fits the unsigned 48-bit V# address range before submitting the draw (docs/d3d12_vulkan.md section 3.3);
 //   - the code base: the PS starts with s_getpc_b64 and s_loads four floats that sit in its own FSSM program at offset
 //     0x100, so heap base + code base + 0x100 must be where the layer put that program;
 //   - interpolation of param0 and the mrt0 export into a R32G32B32A32_FLOAT render target, read back through
@@ -211,8 +209,11 @@ int main() {
         EXPECT(cpu && gpu >= 0x10000 && gpu < (1ull << 32) && step >= 16);
         const std::uint64_t buffer_va = vertex_buffer->GetGPUVirtualAddress();
         EXPECT(buffer_va >= 0x10000);
-        const std::array<std::uint32_t, 4> vsharps[2] = {make_vsharp(buffer_va, 9),                       // 9 vertices
-                                                         make_vsharp(buffer_va + 6 * sizeof(Vertex), 3)};  // 6..8
+        constexpr std::uint64_t vsharp_limit = std::uint64_t{1} << 48;
+        const std::uint64_t upload_va = upload->GetGPUVirtualAddress();
+        EXPECT(upload_va < vsharp_limit && upload_desc.Width <= vsharp_limit - upload_va);
+        const std::array<std::uint32_t, 4> vsharps[2] = {make_vsharp(buffer_va, 6),                       // 0..5, DEFAULT
+                                                         make_vsharp(upload_va + 6 * sizeof(Vertex), 3)};  // 6..8, UPLOAD
         for (unsigned i = 0; i < 2; ++i)
             std::memcpy(reinterpret_cast<void*>(cpu + std::uint64_t(i) * step), vsharps[i].data(), 16);
 
@@ -340,7 +341,7 @@ int main() {
     }
     std::printf("M1.5: translated VS+PS found by FSSM hash drew three draws; %u of %u pixels exact, %u edge "
                 "pixels on the triangle's diagonal (%u its colour, %u the clear colour). User data from a descriptor "
-                "table and root constants, V# vertex fetch from the arena, PS constants "
+                "table and root constants, V# vertex fetch from DEFAULT and UPLOAD buffers, PS constants "
                 "through the code base\n",
                 target_extent * target_extent - edge, target_extent * target_extent, edge, edge_triangle, edge_clear);
     return 0;

@@ -1596,6 +1596,11 @@ public:
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
     VkBuffer buffer() const { return buffer_; }
+    VkDescriptorBufferInfo buffer_binding() const {
+        if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return {};
+        if (in_arena_ || placed_) return {device_.arena.buffer, va_, desc_.Width};
+        return buffer_ ? VkDescriptorBufferInfo{buffer_, 0, desc_.Width} : VkDescriptorBufferInfo{};
+    }
     const D3D12_RESOURCE_DESC& desc() const { return desc_; }
     VkFormat format() const { return format_; }                  // of the image
     bool has_view_format_list() const { return !view_formats_.empty(); }
@@ -1618,48 +1623,14 @@ public:
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
     const DeviceState& device_state() const { return device_; }
 
-    // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
-    // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
-    // VA is their device address minus heap_base, so a shader's heap_base + VA still lands on them (section 3.3).
+    // Default-heap buffers are ranges of the GPU address arena. CPU-visible buffers use dedicated allocations when
+    // every byte can be encoded by an unsigned 48-bit V# relative to heap_base (section 3.3).
     HRESULT create_buffer(D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON) {
         auto& vk = device_.context->vk;
         // A buffer has at least one byte, and its size must survive alignment to 64 KiB without wrapping.
         if (!desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) return E_INVALIDARG;
         const bool host = cpu_visible();
-        leonida::ResourceBinding binding{};  // a buffer: no image
-        binding.size = desc_.Width;
-        if (!host && device_.arena.mapped) {
-            if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
-                                        DeviceState::arena_buffer)) {
-                log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:",
-                         int(desc_.Width / 1024));
-                return E_OUTOFMEMORY;
-            }
-            in_arena_ = true;
-            std::memset(device_.arena.mapped + arena_offset_, 0, std::size_t(desc_.Width));
-            va_ = arena_offset_;
-            binding.va = va_;
-            binding.buffer = device_.arena.buffer;
-            binding.buffer_offset = arena_offset_;
-            // A default-heap AS resource is one of these ranges: a GENERIC acceleration structure covers it where
-            // it sits. It is named by its real device address (heap base + offset), as instance descriptors and
-            // BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
-            if (device_.info.ray_tracing &&
-                initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
-                vk.vkCreateAccelerationStructureKHR) {
-                VkAccelerationStructureCreateInfoKHR asci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
-                asci.buffer = device_.arena.buffer;
-                asci.offset = arena_offset_;
-                asci.size = desc_.Width;
-                asci.type = VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR;
-                if (vk.vkCreateAccelerationStructureKHR(device_.info.device, &asci, nullptr, &accel_) == VK_SUCCESS) {
-                    gpu_va_ = device_.arena.address + va_;
-                    device_.context->register_acceleration_structure(gpu_va_, accel_);
-                }
-            }
-            device_.context->add_resource(id(), binding);
-            return S_OK;
-        }
+        if (!host && device_.arena.mapped) return create_committed_arena_buffer(initial_state);
         const bool addressable = device_.arena.buffer != VK_NULL_HANDLE;
         const bool need_bda = device_.info.buffer_device_address || device_.info.ray_tracing;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -1691,10 +1662,23 @@ public:
                                           addressable || need_bda);
         if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;
-        if (addressable) {
+        VkDeviceAddress bda = 0;
+        if (addressable || (need_bda && vk.vkGetBufferDeviceAddress)) {
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             address.buffer = buffer_;
-            va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
+            bda = vk.vkGetBufferDeviceAddress(device_.info.device, &address);
+        }
+        if (addressable) {
+            va_ = bda - device_.arena.address;
+            constexpr VkDeviceSize vsharp_span = VkDeviceSize{1} << 48;
+            if (host && (!bda || bda < device_.arena.address || va_ >= vsharp_span || desc_.Width > vsharp_span - va_)) {
+                // No mapping, resource binding or GPU use exists yet for this abandoned allocation.
+                vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+                vk.vkFreeMemory(device_.info.device, memory_, nullptr);
+                buffer_ = VK_NULL_HANDLE;
+                memory_ = VK_NULL_HANDLE;
+                return create_committed_arena_buffer(initial_state);
+            }
             device_.log_va(heap_.Type == D3D12_HEAP_TYPE_READBACK ? "readback buffer" : "upload buffer", va_,
                            desc_.Width);
         }
@@ -1704,9 +1688,7 @@ public:
             std::memset(mapped_, 0, std::size_t(desc_.Width));  // committed resources start zeroed
         }
         if (need_bda && vk.vkGetBufferDeviceAddress) {
-            VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-            bda.buffer = buffer_;
-            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            buffer_va_ = bda;
             gpu_va_ = buffer_va_;
         }
         if (device_.info.ray_tracing && initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
@@ -1727,11 +1709,10 @@ public:
                     device_.context->register_acceleration_structure(buffer_va_, accel_);
             }
         }
+        leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
         binding.size = desc_.Width;
-        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
-                                 (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
-                                  heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
+        binding.host_readable = host_readable();
         binding.va = va_;
         device_.context->add_resource(id(), binding);
         // Committed resources start zeroed unless the heap says otherwise; the host cannot reach device-local memory,
@@ -1739,6 +1720,33 @@ public:
         if (!host && !(heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED))
             device_.context->zero_on_next_submit(id(), buffer_);
         return S_OK;
+    }
+
+    HRESULT create_committed_arena_buffer(D3D12_RESOURCE_STATES initial_state) {
+        if (!device_.arena.mapped ||
+            !device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
+                                    DeviceState::arena_buffer)) {
+            log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:", int(desc_.Width / 1024));
+            return E_OUTOFMEMORY;
+        }
+        in_arena_ = true;
+        va_ = arena_offset_;
+
+        // The driver uses the real device address for AS build inputs and instance descriptors.
+        auto& vk = device_.context->vk;
+        if (device_.info.ray_tracing && initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
+            vk.vkCreateAccelerationStructureKHR) {
+            VkAccelerationStructureCreateInfoKHR asci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+            asci.buffer = device_.arena.buffer;
+            asci.offset = arena_offset_;
+            asci.size = desc_.Width;
+            asci.type = VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR;
+            if (vk.vkCreateAccelerationStructureKHR(device_.info.device, &asci, nullptr, &accel_) == VK_SUCCESS) {
+                gpu_va_ = device_.arena.address + va_;
+                device_.context->register_acceleration_structure(gpu_va_, accel_);
+            }
+        }
+        return bind_arena_buffer();
     }
 
     HRESULT create_sparse_buffer() {
@@ -1768,20 +1776,18 @@ public:
         return S_OK;
     }
 
-    // A placed buffer is a range of the heap's arena memory: it has no VkBuffer of its own and its console VA is
-    // where it sits in the arena. The arena is host-visible, so an upload or readback place maps that same range.
-    HRESULT create_placed_buffer() {
+    // Replay binds the shared arena buffer at the resource's offset. CPU-visible buffers map that same range.
+    HRESULT bind_arena_buffer() {
         if (!device_.arena.mapped) return E_OUTOFMEMORY;
+        memory_flags_ = device_.memory.memoryTypes[device_.arena.memory_type].propertyFlags;
         if (cpu_visible()) mapped_ = device_.arena.mapped + va_;
-        std::memset(device_.arena.mapped + va_, 0, std::size_t(desc_.Width));  // a fresh place reads as zeroed
+        std::memset(device_.arena.mapped + va_, 0, std::size_t(desc_.Width));
         leonida::ResourceBinding binding{};
         binding.size = desc_.Width;
         binding.buffer = device_.arena.buffer;
         binding.buffer_offset = va_;
         binding.va = va_;
-        binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
-                                 (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
-                                  heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
+        binding.host_readable = host_readable();
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -2186,6 +2192,11 @@ private:
         if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD || heap_.Type == D3D12_HEAP_TYPE_READBACK) return true;
         return heap_.Type == D3D12_HEAP_TYPE_CUSTOM && heap_.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
                heap_.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    }
+
+    bool host_readable() const {
+        return heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+               (heap_.Type == D3D12_HEAP_TYPE_CUSTOM && heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK);
     }
 
     DeviceState& device_;
@@ -6191,7 +6202,7 @@ public:
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            hr = resource->create_placed_buffer();
+            hr = resource->bind_arena_buffer();
         } else {
             hr = S_OK;
             const Format format = state_.texture_format(*desc);
@@ -7602,6 +7613,11 @@ VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource) {
 VkBuffer vulkan_buffer(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->buffer() : VK_NULL_HANDLE;
+}
+
+VkDescriptorBufferInfo vulkan_buffer_binding(ID3D12Resource* resource) {
+    const Resource* r = Resource::from<Resource>(resource);
+    return r ? r->buffer_binding() : VkDescriptorBufferInfo{};
 }
 
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {

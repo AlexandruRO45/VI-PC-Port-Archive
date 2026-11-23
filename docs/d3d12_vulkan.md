@@ -1232,23 +1232,20 @@ The layer therefore owns the console VAs. It returns them from `ID3D12Resource::
 | Heaps and placed resources | `CreateHeap` reserves the requested size in the arena, so a buffer placed at a 64 KiB-aligned offset is that offset into the arena and its console VA is the heap's place plus the offset. A placed texture (1D, 2D or 3D) gets its own `VkDeviceMemory` and a null VA, as in D3D12. Tiled (`64KB_UNDEFINED_SWIZZLE` and Xbox `0x101`) 2D/3D placed textures (D3D-191) and multisampled 2D placed textures (D3D-222) share that backing, answer `GetResourceAllocationInfo` and `GetResourceTiling`, and check heap/offset alignments. Reserved buffers can use heap tile mappings (section 4.2). |
 | Descriptor heaps | Shader-visible CBV/SRV/UAV and sampler heaps are allocated in the low 4 GB of the arena. RTV/DSV heaps are host-side only. |
 | Shader code | Each FSSM blob is uploaded to the arena; its console VA is the code base. |
-| Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` resources are separate host-visible buffers outside the arena. Their console VAs are only used by copy APIs; if the game binds one as a vertex/index buffer or reads it in a shader, the layer biases the view/descriptor by `-heap_base` so the shader's addition lands on the host BDA (**Assumption**; **measured to fail for a V#**, see below). |
+| CPU-visible committed buffers | Upload, readback and CPU-visible custom buffers keep dedicated Vulkan allocations when their entire byte range fits the unsigned 48-bit V# address field relative to `heap_base`. Otherwise they use the mapped arena. |
 
-Non-arena buffers (upload/readback) can still be addressed by the shader without putting them in the arena: pass
-`console_va = host_bda - heap_base` (mod 2^64) in root descriptors and vertex/index/indirect views, so the shader's
-`heap_base + console_va` equals the host BDA. For descriptors, patch the V# base field the same way when the layer
-copies or scans them. This relies on the game not using the raw VA for anything except shader addressing
-(**Assumption**); if it does, the resource must move into the arena instead.
+For a dedicated buffer, `console_va = host_bda - heap_base` lets root arguments and buffer views reconstruct the
+host address as `heap_base + console_va`. A V# stores the offset in dword0 and dword1[15:0]. The layer checks the
+whole buffer when allocating it so a view can start anywhere within the resource. A dedicated address below
+`heap_base`, or a range that extends past the V# limit, falls back to an arena range before the resource is
+registered. `Map` and copies use that range, and creation fails with `E_OUTOFMEMORY` if the range cannot fit.
+Reserved sparse buffers follow their own allocation path.
 
-**Measured (D3D-53, `d3d12_translated_draw_test`):** the bias works for 64-bit root arguments (`d3d12_compute_test`: a root
-CBV and a table slot that point at an upload buffer) but **not for a V#**. A V#'s base field is 48 bits
-(dword0 and dword1[15:0]), and an upload buffer's console VA, its device address minus `heap_base`, is negative on both test
-GPUs (`0xffffffffffce0000` on the AMD Radeon 880M, `0xffffffffffedc000` on the RTX 5070 Laptop; the buffer's device
-address lay below the arena's, an allocation-order fact of these runs, so it is not guaranteed either way). The shader
-adds `heap_base` to the truncated 48-bit value, which is a wild address: the draw faults and the whole queue submission is lost
-(the clear that came before it is lost as well). Any resource a game can put in a V# (a vertex, constant or structured buffer
-behind a descriptor) must therefore be an arena range, whatever the allocator happens to do, upload and readback heaps included. Until the layer does that, the
-translated-draw test fetches from a DEFAULT-heap buffer and does not draw from the upload buffer.
+**Original D3D-53 measurement (`d3d12_translated_draw_test`):** dedicated upload buffers landed below the arena
+on the AMD Radeon 880M (`0xffffffffffce0000` relative to `heap_base`) and the RTX 5070 Laptop
+(`0xffffffffffedc000`). The 64-bit root arguments could represent those offsets. The V# truncated them to 48 bits,
+so the shader reconstructed the wrong address and the draw faulted. The translated-draw test now checks the full
+committed upload range and fetches vertices through V# views of both DEFAULT and UPLOAD buffers.
 
 **Measured (static, `XboxBvhBuilder.dll`): the BVH builder only takes destination addresses below 2^40.** Its
 validation function at `0xc8f0` loads `DestAccelerationStructureData` (the first field of the build description it
@@ -1306,7 +1303,8 @@ The runtime allocates image keys from `0x100000000` (4 GiB) in 256-byte steps, a
   256 MiB. Without Resizable BAR that type lives in a window of 256 MiB or less (214 MiB on an RTX 3090) that every
   upload buffer would share, so they stay in system memory. If VRAM is full, the allocation falls back to system
   memory. The device logs which one it uses (`[rt] d3d12: upload heaps in ...`), and `LEONIDA_UPLOAD_SYSMEM=1`
-  keeps them in system memory to compare the two. Readback buffers keep preferring `HOST_CACHED`.
+  requests system memory for dedicated uploads. Dedicated readbacks prefer `HOST_CACHED`. When an address requires
+  the section 3.3 fallback, the buffer uses the arena's memory type.
 - Textures and default-heap buffers outside the arena prefer `DEVICE_LOCAL` and need no host access. When VRAM is
   full they still get memory, from the next type `memory_type_order` lists, which is system memory. The first one
   that does is logged once (`[rt] d3d12: a N-byte allocation did not fit in device-local memory ...`, D3D-299,

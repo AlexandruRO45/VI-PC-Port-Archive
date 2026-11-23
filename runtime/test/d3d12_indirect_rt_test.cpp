@@ -412,6 +412,23 @@ int main() {
                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb))))
                 return fail("CreateCommittedResource(rb)");
 
+            const auto argument_binding = rt::d3d12::vulkan_buffer_binding(arg_buf);
+            const auto count_binding = rt::d3d12::vulkan_buffer_binding(count_buf);
+            const auto readback_binding = rt::d3d12::vulkan_buffer_binding(rb);
+            if (!argument_binding.buffer || argument_binding.range < buffer_size ||
+                !count_binding.buffer || count_binding.range < buffer_size ||
+                !readback_binding.buffer || readback_binding.range < rb_desc.Width)
+                return fail("vulkan_buffer_binding(indirect buffers)");
+
+            // The replay sees slices after each prefix, possibly within a shared VkBuffer.
+            leonida::ResourceBinding arg_b{}, cnt_b{};
+            arg_b.buffer = argument_binding.buffer;
+            arg_b.buffer_offset = argument_binding.offset + argument_base;
+            arg_b.size = argument_binding.range - argument_base;
+            cnt_b.buffer = count_binding.buffer;
+            cnt_b.buffer_offset = count_binding.offset + count_base;
+            cnt_b.size = count_binding.range - count_base;
+
             VkShaderModule vs_mod = VK_NULL_HANDLE, fs_mod = VK_NULL_HANDLE;
             VkShaderModuleCreateInfo vci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, vs_words.size() * 4,
                                          vs_words.data()};
@@ -543,14 +560,6 @@ int main() {
                 vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
 
                 const auto resolver = [&](leonida::ResourceId id) -> const leonida::ResourceBinding* {
-                    // Treat the two upload buffers as backing stores for slices that start after a prefix.
-                    static leonida::ResourceBinding arg_b{}, cnt_b{};
-                    arg_b.buffer = rt::d3d12::vulkan_buffer(arg_buf);
-                    arg_b.buffer_offset = argument_base;
-                    arg_b.size = buffer_size - argument_base;
-                    cnt_b.buffer = rt::d3d12::vulkan_buffer(count_buf);
-                    cnt_b.buffer_offset = count_base;
-                    cnt_b.size = buffer_size - count_base;
                     if (id == rt::d3d12::resource_id(arg_buf)) return &arg_b;
                     if (id == rt::d3d12::resource_id(count_buf)) return &cnt_b;
                     return nullptr;
@@ -571,10 +580,11 @@ int main() {
                                      0, 0, nullptr, 0, nullptr, 1, &b_to_src);
 
                 VkBufferImageCopy bic{};
+                bic.bufferOffset = readback_binding.offset;
                 bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 bic.imageExtent = {kW, kH, 1};
                 vkCmdCopyImageToBuffer(cb, rt::d3d12::vulkan_image(rt), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                       rt::d3d12::vulkan_buffer(rb), 1, &bic);
+                                       readback_binding.buffer, 1, &bic);
 
                 VkMemoryBarrier host_b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
                 host_b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -780,7 +790,8 @@ int main() {
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
         as_write.accelerationStructureCount = 1;
         as_write.pAccelerationStructures = &tlas_vk;
-        VkDescriptorBufferInfo out_bi{rt::d3d12::vulkan_buffer(out_buf), 0, 64};
+        const auto out_bi = rt::d3d12::vulkan_buffer_binding(out_buf);
+        if (!out_bi.buffer || out_bi.range < out_desc.Width) return fail("vulkan_buffer_binding(rayquery out)");
 
         VkWriteDescriptorSet writes[2]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
