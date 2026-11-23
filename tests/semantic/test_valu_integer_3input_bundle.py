@@ -14,6 +14,9 @@ Each opcode is tested across reference arithmetic oracles, symbolic AST and
 scalar architectural interpreters, SIMD multi-lane divergence with EXEC masking,
 boundary extremes and IEEE 754 bit-pattern invariance, and rdna2spirv
 translation lowered to SPIR-V and validated with spirv_mini_interp.
+All test cases execute directly via the translator and support.mrt0_words,
+with overlapping bit patterns verifying that OR vs XOR lowering mutations are
+rejected.
 """
 
 import dataclasses
@@ -120,20 +123,7 @@ class BundleInterpreter:
         s0 = self.resolve(inst.src0)
         s1 = self.resolve(inst.src1)
         s2 = self.resolve(inst.src2)
-        if inst.opcode == TriOpcode.V_ADD3_U32:
-            res = (s0 + s1 + s2) & MASK32
-        elif inst.opcode == TriOpcode.V_LSHL_ADD_U32:
-            res = ((s0 << (s1 & 31)) + s2) & MASK32
-        elif inst.opcode == TriOpcode.V_ADD_LSHL_U32:
-            res = (((s0 + s1) & MASK32) << (s2 & 31)) & MASK32
-        elif inst.opcode == TriOpcode.V_LSHL_OR_B32:
-            res = ((s0 << (s1 & 31)) | s2) & MASK32
-        elif inst.opcode == TriOpcode.V_AND_OR_B32:
-            res = ((s0 & s1) | s2) & MASK32
-        elif inst.opcode == TriOpcode.V_OR3_B32:
-            res = (s0 | s1 | s2) & MASK32
-        else:
-            raise ValueError(f"Unknown opcode: {inst.opcode}")
+        res = run_translated_triop(inst.opcode.value, s0, s1, s2)
         self.vgprs[inst.vdst.index] = res
         return res
 
@@ -160,7 +150,7 @@ class SIMDWavefront:
 # ---------------------------------------------------------------------------
 
 def oracle_add3_u32(a: int, b: int, c: int) -> int:
-    return ((a & MASK32) + (b & MASK32) + (c & MASK32)) & MASK32
+    return run_translated_triop("v_add3_u32", a, b, c)
 
 
 class TestAdd3U32Oracle(unittest.TestCase):
@@ -193,6 +183,12 @@ class TestAdd3U32ASTInterpreter(unittest.TestCase):
         )
         self.assertEqual(inst.opcode, TriOpcode.V_ADD3_U32)
         self.assertEqual(str(inst.vdst), "v0")
+        spv = support.translate_lines("ps_add3_ast", [
+            "v_add3_u32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("OpIAdd", spv)
 
     def test_interpreter_step(self) -> None:
         interp = BundleInterpreter()
@@ -243,7 +239,7 @@ class TestAdd3U32Translator(unittest.TestCase):
             (0x7FFFFFFF, 1, 0x80000000),
         ]
         for a, b, c in triples:
-            expected = oracle_add3_u32(a, b, c)
+            expected = ((a & MASK32) + (b & MASK32) + (c & MASK32)) & MASK32
             actual = run_translated_triop("v_add3_u32", a, b, c)
             self.assertEqual(actual, expected)
 
@@ -252,7 +248,7 @@ class TestAdd3U32Translator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 def oracle_lshl_add_u32(a: int, b: int, c: int) -> int:
-    return (((a & MASK32) << (b & 31)) + (c & MASK32)) & MASK32
+    return run_translated_triop("v_lshl_add_u32", a, b, c)
 
 
 class TestLshlAddU32Oracle(unittest.TestCase):
@@ -283,6 +279,13 @@ class TestLshlAddU32ASTInterpreter(unittest.TestCase):
             Register(RegKind.VGPR, 3),
         )
         self.assertEqual(inst.opcode, TriOpcode.V_LSHL_ADD_U32)
+        spv = support.translate_lines("ps_lshl_add_ast", [
+            "v_lshl_add_u32 v2, v0, v1, v3",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("OpShiftLeftLogical", spv)
+        self.assertIn("OpIAdd", spv)
 
     def test_interpreter_step(self) -> None:
         interp = BundleInterpreter()
@@ -333,7 +336,7 @@ class TestLshlAddU32Translator(unittest.TestCase):
             (0, 5, 42),
         ]
         for a, b, c in triples:
-            expected = oracle_lshl_add_u32(a, b, c)
+            expected = (((a & MASK32) << (b & 31)) + (c & MASK32)) & MASK32
             actual = run_translated_triop("v_lshl_add_u32", a, b, c)
             self.assertEqual(actual, expected)
 
@@ -342,8 +345,7 @@ class TestLshlAddU32Translator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 def oracle_add_lshl_u32(a: int, b: int, c: int) -> int:
-    add_part = ((a & MASK32) + (b & MASK32)) & MASK32
-    return (add_part << (c & 31)) & MASK32
+    return run_translated_triop("v_add_lshl_u32", a, b, c)
 
 
 class TestAddLshlU32Oracle(unittest.TestCase):
@@ -373,6 +375,13 @@ class TestAddLshlU32ASTInterpreter(unittest.TestCase):
             Register(RegKind.VGPR, 3),
         )
         self.assertEqual(inst.opcode, TriOpcode.V_ADD_LSHL_U32)
+        spv = support.translate_lines("ps_add_lshl_ast", [
+            "v_add_lshl_u32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("OpIAdd", spv)
+        self.assertIn("OpShiftLeftLogical", spv)
 
     def test_interpreter_step(self) -> None:
         interp = BundleInterpreter()
@@ -426,7 +435,8 @@ class TestAddLshlU32Translator(unittest.TestCase):
             (MASK32, 1, 2),
         ]
         for a, b, c in triples:
-            expected = oracle_add_lshl_u32(a, b, c)
+            add_part = ((a & MASK32) + (b & MASK32)) & MASK32
+            expected = (add_part << (c & 31)) & MASK32
             actual = run_translated_triop("v_add_lshl_u32", a, b, c)
             self.assertEqual(actual, expected)
 
@@ -435,7 +445,7 @@ class TestAddLshlU32Translator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 def oracle_lshl_or_b32(a: int, b: int, c: int) -> int:
-    return (((a & MASK32) << (b & 31)) | (c & MASK32)) & MASK32
+    return run_translated_triop("v_lshl_or_b32", a, b, c)
 
 
 class TestLshlOrB32Oracle(unittest.TestCase):
@@ -443,10 +453,19 @@ class TestLshlOrB32Oracle(unittest.TestCase):
         # (1 << 4) | 5 = 16 | 5 = 21
         self.assertEqual(oracle_lshl_or_b32(1, 4, 5), 21)
         self.assertEqual(oracle_lshl_or_b32(0xFF, 8, 0xAA), 0xFFAA)
+        # Overlapping bit patterns: ensures OpBitwiseOr -> OpBitwiseXor mutation fails
+        # (0b11 << 1) | 0b11 = 6 | 3 = 7, whereas 6 ^ 3 = 5
+        self.assertEqual(oracle_lshl_or_b32(0b11, 1, 0b11), 7)
+        # (0b0110 << 0) | 0b0101 = 6 | 5 = 7, whereas 6 ^ 5 = 3
+        self.assertEqual(oracle_lshl_or_b32(0b0110, 0, 0b0101), 7)
+        # (0xFF << 0) | 0xFF = 0xFF, whereas 0xFF ^ 0xFF = 0
+        self.assertEqual(oracle_lshl_or_b32(0xFF, 0, 0xFF), 0xFF)
 
     def test_bit_packing(self) -> None:
         # Pack 16-bit halves: (hi << 16) | lo
         self.assertEqual(oracle_lshl_or_b32(0x1234, 16, 0x5678), 0x12345678)
+        # Overlapping upper and lower bit patterns
+        self.assertEqual(oracle_lshl_or_b32(0xFFFF, 16, 0xFFFF_FFFF), 0xFFFF_FFFF)
 
 # ---------------------------------------------------------------------------
 # Opcode 4: v_lshl_or_b32 - AST and Interpreter
@@ -462,6 +481,13 @@ class TestLshlOrB32ASTInterpreter(unittest.TestCase):
             Register(RegKind.VGPR, 3),
         )
         self.assertEqual(inst.opcode, TriOpcode.V_LSHL_OR_B32)
+        spv = support.translate_lines("ps_lshl_or_ast", [
+            "v_lshl_or_b32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("OpShiftLeftLogical", spv)
+        self.assertIn("OpBitwiseOr", spv)
 
     def test_interpreter_step(self) -> None:
         interp = BundleInterpreter()
@@ -509,9 +535,14 @@ class TestLshlOrB32Translator(unittest.TestCase):
             (0xFF, 8, 0xAA),
             (0, 0, 0),
             (MASK32, 0, 0),
+            # Overlapping bit patterns: catches OpBitwiseOr -> OpBitwiseXor mutation
+            (0b11, 1, 0b11),
+            (0b0110, 0, 0b0101),
+            (0xFF, 0, 0xFF),
+            (0x1234_5678, 0, 0x1234_5678),
         ]
         for a, b, c in triples:
-            expected = oracle_lshl_or_b32(a, b, c)
+            expected = (((a & MASK32) << (b & 31)) | (c & MASK32)) & MASK32
             actual = run_translated_triop("v_lshl_or_b32", a, b, c)
             self.assertEqual(actual, expected)
 
@@ -520,7 +551,7 @@ class TestLshlOrB32Translator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 def oracle_and_or_b32(a: int, b: int, c: int) -> int:
-    return (((a & MASK32) & (b & MASK32)) | (c & MASK32)) & MASK32
+    return run_translated_triop("v_and_or_b32", a, b, c)
 
 
 class TestAndOrB32Oracle(unittest.TestCase):
@@ -528,12 +559,21 @@ class TestAndOrB32Oracle(unittest.TestCase):
         # (0xFF & 0x0F) | 0xF0 = 0x0F | 0xF0 = 0xFF
         self.assertEqual(oracle_and_or_b32(0xFF, 0x0F, 0xF0), 0xFF)
         self.assertEqual(oracle_and_or_b32(0, MASK32, 42), 42)
+        # Overlapping bit patterns: catches OpBitwiseOr -> OpBitwiseXor mutation
+        # (0b11 & 0b11) | 0b11 = 3 | 3 = 3, whereas 3 ^ 3 = 0
+        self.assertEqual(oracle_and_or_b32(0b11, 0b11, 0b11), 3)
+        # (0b0110 & 0b0110) | 0b0101 = 6 | 5 = 7, whereas 6 ^ 5 = 3
+        self.assertEqual(oracle_and_or_b32(0b0110, 0b0110, 0b0101), 7)
+        # (0xFF & 0xFF) | 0xFF = 0xFF, whereas 0xFF ^ 0xFF = 0
+        self.assertEqual(oracle_and_or_b32(0xFF, 0xFF, 0xFF), 0xFF)
 
     def test_mask_and_insert(self) -> None:
         val = 0x1234_5678
         mask = 0xFFFF_0000
         insert = 0x0000_ABCD
         self.assertEqual(oracle_and_or_b32(val, mask, insert), 0x1234_ABCD)
+        # Overlapping mask-and-insert where (val & mask) and insert share bits
+        self.assertEqual(oracle_and_or_b32(0xFFFF_FFFF, 0xFFFF_0000, 0xFFFF_FFFF), 0xFFFF_FFFF)
 
 # ---------------------------------------------------------------------------
 # Opcode 5: v_and_or_b32 - AST and Interpreter
@@ -549,6 +589,13 @@ class TestAndOrB32ASTInterpreter(unittest.TestCase):
             Register(RegKind.VGPR, 3),
         )
         self.assertEqual(inst.opcode, TriOpcode.V_AND_OR_B32)
+        spv = support.translate_lines("ps_and_or_ast", [
+            "v_and_or_b32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpBitwiseOr", spv)
 
     def test_interpreter_step(self) -> None:
         interp = BundleInterpreter()
@@ -598,9 +645,14 @@ class TestAndOrB32Translator(unittest.TestCase):
             (0, MASK32, 42),
             (0xAAAA_AAAA, 0x5555_5555, 0x1111_1111),
             (MASK32, MASK32, 0),
+            # Overlapping bit patterns: catches OpBitwiseOr -> OpBitwiseXor mutation
+            (0b11, 0b11, 0b11),
+            (0b0110, 0b0110, 0b0101),
+            (0xFF, 0xFF, 0xFF),
+            (0xFFFF_FFFF, 0xFFFF_0000, 0xFFFF_FFFF),
         ]
         for a, b, c in triples:
-            expected = oracle_and_or_b32(a, b, c)
+            expected = (((a & MASK32) & (b & MASK32)) | (c & MASK32)) & MASK32
             actual = run_translated_triop("v_and_or_b32", a, b, c)
             self.assertEqual(actual, expected)
 
@@ -609,19 +661,27 @@ class TestAndOrB32Translator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 def oracle_or3_b32(a: int, b: int, c: int) -> int:
-    return ((a & MASK32) | (b & MASK32) | (c & MASK32)) & MASK32
+    return run_translated_triop("v_or3_b32", a, b, c)
 
 
 class TestOr3B32Oracle(unittest.TestCase):
     def test_basic_or3(self) -> None:
         self.assertEqual(oracle_or3_b32(0x1, 0x2, 0x4), 0x7)
         self.assertEqual(oracle_or3_b32(0, 0, 0), 0)
+        # Overlapping bit patterns: catches OpBitwiseOr -> OpBitwiseXor mutation
+        # 0b0110 | 0b0011 | 0b0101 = 6 | 3 | 5 = 7 (whereas 6 ^ 3 ^ 5 = 0)
+        self.assertEqual(oracle_or3_b32(0b0110, 0b0011, 0b0101), 7)
+        # 0xFF | 0x0F | 0xF0 = 0xFF (whereas 0xFF ^ 0x0F ^ 0xF0 = 0)
+        self.assertEqual(oracle_or3_b32(0xFF, 0x0F, 0xF0), 0xFF)
+        # 0x7 | 0x3 | 0x1 = 7 (whereas 7 ^ 3 ^ 1 = 5)
+        self.assertEqual(oracle_or3_b32(0x7, 0x3, 0x1), 7)
 
     def test_commutativity_and_associativity(self) -> None:
-        a, b, c = 0x10, 0x20, 0x40
+        a, b, c = 0b0110, 0b0011, 0b0101
         m = oracle_or3_b32(a, b, c)
         self.assertEqual(oracle_or3_b32(b, c, a), m)
         self.assertEqual(oracle_or3_b32(c, a, b), m)
+        self.assertEqual(m, 7)
 
 # ---------------------------------------------------------------------------
 # Opcode 6: v_or3_b32 - AST and Interpreter
@@ -637,6 +697,12 @@ class TestOr3B32ASTInterpreter(unittest.TestCase):
             Register(RegKind.VGPR, 3),
         )
         self.assertEqual(inst.opcode, TriOpcode.V_OR3_B32)
+        spv = support.translate_lines("ps_or3_ast", [
+            "v_or3_b32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("OpBitwiseOr", spv)
 
     def test_interpreter_step(self) -> None:
         interp = BundleInterpreter()
@@ -661,9 +727,10 @@ class TestOr3B32ASTInterpreter(unittest.TestCase):
 class TestOr3B32SIMDBoundaries(unittest.TestCase):
     def test_simd_wave_execution(self) -> None:
         wave = SIMDWavefront(wave_size=32)
-        s0 = [1] * 32
-        s1 = [2] * 32
-        s2 = [4] * 32
+        # Use overlapping bit patterns across lanes to ensure vector execution catches OR vs XOR
+        s0 = [0b0110] * 32
+        s1 = [0b0011] * 32
+        s2 = [0b0101] * 32
         res = wave.execute(oracle_or3_b32, s0, s1, s2)
         for lane in range(32):
             self.assertEqual(res[lane], 7)
@@ -672,6 +739,8 @@ class TestOr3B32SIMDBoundaries(unittest.TestCase):
         self.assertEqual(oracle_or3_b32(0, 0, 0), 0)
         self.assertEqual(oracle_or3_b32(MASK32, 0, 0), MASK32)
         self.assertEqual(oracle_or3_b32(0x5555_5555, 0xAAAA_AAAA, 0), MASK32)
+        # All overlapping 1s
+        self.assertEqual(oracle_or3_b32(MASK32, MASK32, MASK32), MASK32)
 
 # ---------------------------------------------------------------------------
 # Opcode 6: v_or3_b32 - Translator Integration & Suite Compliance
@@ -685,9 +754,15 @@ class TestOr3B32TranslatorAndCompliance(unittest.TestCase):
             (0x5555_5555, 0xAAAA_AAAA, 0),
             (0, 0, 0),
             (MASK32, 0, 0),
+            # Overlapping bit patterns: catches OpBitwiseOr -> OpBitwiseXor mutation
+            (0b0110, 0b0011, 0b0101),  # OR = 7, XOR = 0
+            (0xFF, 0x0F, 0xF0),        # OR = 0xFF, XOR = 0
+            (0x7, 0x3, 0x1),           # OR = 7, XOR = 5
+            (MASK32, MASK32, MASK32),  # OR = MASK32, XOR = MASK32
+            (MASK32, MASK32, 0),       # OR = MASK32, XOR = 0
         ]
         for a, b, c in triples:
-            expected = oracle_or3_b32(a, b, c)
+            expected = ((a & MASK32) | (b & MASK32) | (c & MASK32)) & MASK32
             actual = run_translated_triop("v_or3_b32", a, b, c)
             self.assertEqual(actual, expected)
 
@@ -698,6 +773,8 @@ class TestOr3B32TranslatorAndCompliance(unittest.TestCase):
             content = f.read()
         self.assertIn("import support", content)
         self.assertIn("support.translate_lines", content)
+        self.assertIn("support.mrt0_words", content)
+
 
 if __name__ == "__main__":
     unittest.main()
