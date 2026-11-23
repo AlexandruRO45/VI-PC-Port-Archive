@@ -60,6 +60,7 @@ method, scope and caveats. No game data is included.
 |---|---|
 | [d3d12_vulkan.md](d3d12_vulkan.md) | Xbox D3D12 to Vulkan plan and status; device proxy, queues, command lists, barriers, copies. |
 | [boot.md](boot.md) | The first real boot: the `gta6rt --trace`/`--trace-d3d12` runbook, the startup + D3D12 trace summary (`tools/boot_trace.py`), the triage order and the Q1–Q22 checklist. |
+| [exe_day.md](exe_day.md) | The five-hour exe-day runbook: pre-flight build and corpus checks, the 0:00-5:00 trace, boot, device, draw and present triage, evidence and the three fallbacks. |
 | [descriptor_lookup_apple.md](descriptor_lookup_apple.md) | M3 Max GPU timings for texture and sampler descriptor lookups at 1k, 10k and 100k live entries. |
 | [descriptor_lookup_ada.md](descriptor_lookup_ada.md) | RTX 4070 SUPER (Ada, Windows) timings for the same lookups in VRAM, host-visible and ReBAR memory. |
 | [descriptor_lookup_intel.md](descriptor_lookup_intel.md) | Intel UHD Graphics 770 (Xe-LP, Windows, driver 101.6129) timings for the same lookups at 1k–100k live entries; both memory placements within 0.6% of each other. |
