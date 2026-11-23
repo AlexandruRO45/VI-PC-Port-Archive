@@ -1367,8 +1367,6 @@ class Analysis:
         return ev
 
     # ---- control dependence on wave-wide votes ----
-    LANE_LOCAL_OPS = ("s_or_b64", "s_andn2_b64", "s_andn2_b64_e32")
-
     def lane_local_defs(self):
         """(block, index) -> the SGPR-pair register keys of a def that leaves every inactive lane's bit unchanged:
         `s_or_b64 D, M, D` (either order) or `s_andn2_b64 D, D, M`, where M is VCC or an SGPR pair that a v_cmp
