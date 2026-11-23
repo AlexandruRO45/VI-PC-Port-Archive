@@ -474,7 +474,7 @@ def _carve_successors(folder):
     `folder` (each file is <offset>.bin; the next stream starts at the 16-byte boundary after `stored`). Empty
     when there is no readable index, so files are then parsed one by one."""
     try:
-        with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
+        with open(os.path.join(folder, "index.json"), encoding="utf-8-sig") as f:
             entries = json.load(f).get("files", [])
         by_off = {int(e["off"]): int(e["stored"]) for e in entries}
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
