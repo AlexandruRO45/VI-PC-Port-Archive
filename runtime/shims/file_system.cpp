@@ -449,6 +449,19 @@ Target open_target(const std::wstring& path, DWORD access, DWORD disposition) {
     return write_target(path, keeps_contents);
 }
 
+// Wine's server opens the file's unix descriptor read-write only when the request names a write right, so a
+// MAXIMUM_ALLOWED handle reports FILE_ALL_ACCESS but its writes fail (ERROR_INVALID_HANDLE). Naming read and write
+// next to it changes nothing on Windows, where MAXIMUM_ALLOWED grants both whenever the file allows them. A file that
+// refuses writing (read-only, or by its ACL) then fails with ERROR_ACCESS_DENIED, and the open as the title asked
+// still gets the rights the file does allow, as on Windows.
+template <class Open>
+HANDLE open_maximum_allowed(DWORD access, Open open) {
+    if ((access & MAXIMUM_ALLOWED) == 0) return open(access);
+    const HANDLE h = open(access | GENERIC_READ | GENERIC_WRITE);
+    if (h != INVALID_HANDLE_VALUE || ::GetLastError() != ERROR_ACCESS_DENIED) return h;
+    return open(access);
+}
+
 // ---- FindFirstFile: the overlay and the package merged into one listing
 //
 // The host enumerates each folder; the results are merged here, overlay first, so a name that exists in both appears
@@ -640,7 +653,9 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    return ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    return open_maximum_allowed(access, [&](DWORD a) {
+        return ::CreateFileW(t.path.c_str(), a, share, attributes, disposition, flags, template_file);
+    });
 }
 
 HANDLE WINAPI create_file_a(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
@@ -664,7 +679,8 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    return ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+    return open_maximum_allowed(
+        access, [&](DWORD a) { return ::CreateFile2(t.path.c_str(), a, share, disposition, params); });
 }
 
 DWORD WINAPI get_file_attributes_w(LPCWSTR name) {

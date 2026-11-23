@@ -788,6 +788,23 @@ int main() {
                       !std::filesystem::exists(overlay / "data" / "max_read.txt"),
                   "a GENERIC_READ open is still a read: no overlay copy is made");
             if (h_plain != INVALID_HANDLE_VALUE) ::CloseHandle(h_plain);
+
+            // A file that refuses writing still opens with MAXIMUM_ALLOWED, with the rights it does allow: the shim
+            // asks for read and write first (Wine needs a write right named to hand out a writable handle) and falls
+            // back to the access as given when that is denied.
+            write_path(package / "data" / "max_ro.txt", "pkg-max");
+            check(setattr_w(L"GAME:\\data\\max_ro.txt", FILE_ATTRIBUTE_READONLY) != FALSE,
+                  "the overlay copy of max_ro.txt is made read-only");
+            const HANDLE h_ro = create_w(L"GAME:\\data\\max_ro.txt", MAXIMUM_ALLOWED, 0, nullptr, OPEN_EXISTING, 0,
+                                         nullptr);
+            check(h_ro != INVALID_HANDLE_VALUE && read_handle(h_ro) == "pkg-max",
+                  "CreateFileW(MAXIMUM_ALLOWED) opens a read-only overlay copy for reading");
+            if (h_ro != INVALID_HANDLE_VALUE) ::CloseHandle(h_ro);
+            const HANDLE h_ro2 = create2(L"GAME:\\data\\max_ro.txt", MAXIMUM_ALLOWED, 0, OPEN_EXISTING, &ext);
+            check(h_ro2 != INVALID_HANDLE_VALUE && read_handle(h_ro2) == "pkg-max",
+                  "CreateFile2(MAXIMUM_ALLOWED) opens a read-only overlay copy for reading");
+            if (h_ro2 != INVALID_HANDLE_VALUE) ::CloseHandle(h_ro2);
+            setattr_w(L"GAME:\\data\\max_ro.txt", FILE_ATTRIBUTE_NORMAL);
         }
 
         // FindFirstFileExW merges package + overlay and honours FindExInfoBasic & FindExSearchLimitToDirectories.
