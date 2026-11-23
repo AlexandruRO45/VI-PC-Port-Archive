@@ -238,9 +238,10 @@ bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
         return value;
     };
     // On a native device at an unaligned offset, first ask the row-major copy (an aligned path) which host this is.
-    // Every texel as written: compare as usual below. Every texel from the rounded-down offset: AMD's reading,
-    // reported, and this native run is not compared with the layer (its tile-order readbacks round the same way).
-    // Anything else fails.
+    // Every texel from the rounded-down offset: AMD's reading, reported, and this native run is not compared with the
+    // layer (its tile-order readbacks round the same way). Every texel as written: then the tile-order readbacks
+    // either match as well (compared as usual below), or every one of them was written from the rounded-down offset,
+    // Intel's way, also reported and left out of the comparison. Anything else fails.
     if (!layer && tile_copy_offset % 4) {
         UINT checked = 0, exact = 0, rounded = 0;
         for (UINT tile = 0; tile < tiles; ++tile) {
@@ -271,6 +272,45 @@ bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
                          "offset\n",
                          static_cast<unsigned long long>(tile_copy_offset), exact, checked, rounded);
             return false;
+        }
+        // The upload took the offset as given. Intel's D3D12 writes the tile-order readbacks (CopyTiles into the
+        // linear buffer) from the offset rounded down to a multiple of 4 (measured on an Arc B580, Intel 101.9150,
+        // Windows: all 60,960 alias texels of the 256 x 240 case at offset 1), so a texel read back at the offset is
+        // the expected one's top bytes followed by the next texel's low bytes. Only texels whose next texel the
+        // snapshot defines are judged.
+        const unsigned shift = unsigned(tile_copy_offset % 4);
+        const auto written_early = [shift](std::uint32_t texel, std::uint32_t next) {
+            return (texel >> (8 * shift)) | (next << (32 - 8 * shift));
+        };
+        UINT judged = 0, as_written = 0, early = 0;
+        const auto judge = [&](std::uint32_t value, std::uint32_t texel, std::uint32_t next) {
+            ++judged;
+            as_written += value == texel;
+            early += value == written_early(texel, next);
+        };
+        for (UINT tile = 0; tile < tiles; ++tile) {
+            const UINT first_y = (tile / 2) * tile_height, first_x = (tile % 2) * tile_width;
+            const UINT rows = std::min(tile_height, height - first_y), columns = std::min(tile_width, width - first_x);
+            const UINT source_x = ((tile ^ 1) % 2) * tile_width;
+            const bool kept = tile < 2;   // the remap keeps the top row, as below
+            for (UINT y = 0; y < rows; ++y)
+                for (UINT x = 0; x + 1 < columns; ++x) {
+                    const auto tiled = tile_copy_offset + tile * tile_bytes + y * row_pitch + x * sizeof(std::uint32_t);
+                    judge(read_pixel(tiled), 0, 0);   // initially unbound
+                    if (source_x + x + 1 < width)
+                        judge(read_pixel(image_bytes + tiled), pixel(tile ^ 1, x, y), pixel(tile ^ 1, x + 1, y));
+                    judge(read_pixel(2 * image_bytes + tiled), kept ? pixel(0, x, y) : 0, kept ? pixel(0, x + 1, y) : 0);
+                }
+        }
+        if (early == judged && as_written != judged) {
+            std::printf("Native D3D12 wrote CopyTiles' tile-order readbacks at linear offset %llu from %llu: all %u "
+                        "judged texels %u byte(s) early, the %u row-major texels as written (a host difference, "
+                        "reported; the layer is checked against the texels)\n",
+                        static_cast<unsigned long long>(tile_copy_offset),
+                        static_cast<unsigned long long>(tile_copy_offset & ~UINT64(3)), judged, shift, checked);
+            readback->Unmap(0, &empty);
+            if (native_host_difference) *native_host_difference = true;
+            return true;
         }
     }
     // AMD's D3D12 COPY queue can read parts of the tiled texture as if the DIRECT queue's mappings had not happened,
