@@ -11510,25 +11510,52 @@ class Gen:
             # Measured on RDNA2 hardware (docs/design.md, "Signed-byte dot products"): op_sel[k] picks the 16-bit half
             # of source k (0=lo, 1=hi) for byte pairs 0..1, and op_sel_hi[k] picks the 16-bit half for byte pairs 2..3
             # (defaults op_sel=[0,0,0], op_sel_hi=[1,1,1]). S2 (addend) is 32-bit; non-default S2 half-select is refused.
-            # neg_lo/neg_hi are not ignored either: measured on v_dot4_i32_i8, they flip bit 15 and bit 31 of a
-            # source dword (and take the addend's absolute value, then negate it), as if the operands were floats.
-            # A set bit is refused; an all-zero field is the plain instruction.
+            # neg_lo/neg_hi on v_dot4_i32_i8 act as float sign-bit modifiers on the integer dwords: for S0 and S1,
+            # neg_lo[k] flips bit 15 and neg_hi[k] flips bit 31; for S2 (addend), neg_hi[2] clears bit 31 and neg_lo[2]
+            # then flips bit 31.
             def bits(name, default):
                 m = next((m for m in mods if m.startswith(name + ":")), None)
                 return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
             is_vop3p = op == "v_dot4_i32_i8"
             has_opsel = any(m.startswith("op_sel") for m in mods)
+            has_neg = any(m.startswith(("neg_lo", "neg_hi")) for m in mods)
             has_clamp = "clamp" in mods
-            if not is_vop3p and (has_opsel or has_clamp):
-                raise Unsupported(op + (" clamp" if has_clamp else " op_sel"))
-            if any(m.startswith(("neg_lo", "neg_hi")) and "1" in m.split(":", 1)[-1] for m in mods):
-                raise Unsupported(op + " neg")
+            if not is_vop3p and (has_opsel or has_neg or has_clamp):
+                raise Unsupported(op + (" clamp" if has_clamp else " neg" if has_neg else " op_sel"))
             sel = bits("op_sel", [0, 0, 0])
             selhi = bits("op_sel_hi", [1, 1, 1])
-            if len(sel) != 3 or len(selhi) != 3 or sel[2] != 0 or selhi[2] != 1:
+            nlo = bits("neg_lo", [0, 0, 0])
+            nhi = bits("neg_hi", [0, 0, 0])
+            if (len(sel) != 3 or len(selhi) != 3 or sel[2] != 0 or selhi[2] != 1
+                    or any(b not in (0, 1) for b in sel + selhi)):
                 raise Unsupported(op + " op_sel")
+            if len(nlo) != 3 or len(nhi) != 3 or any(b not in (0, 1) for b in nlo + nhi):
+                raise Unsupported(op + " neg")
             x, y = self.src_u(a[1]), self.src_u(a[2])
             acc = self.src_u(a[3]) if is_vop3p else self.src_u(a[0])
+            if is_vop3p:
+                x_mask = (0x8000 if nlo[0] else 0) | (0x80000000 if nhi[0] else 0)
+                if x_mask:
+                    xt = self.tmp()
+                    self.emit(f"{xt} = OpBitwiseXor %uint {x} {self.cu(x_mask)}")
+                    x = xt
+                y_mask = (0x8000 if nlo[1] else 0) | (0x80000000 if nhi[1] else 0)
+                if y_mask:
+                    yt = self.tmp()
+                    self.emit(f"{yt} = OpBitwiseXor %uint {y} {self.cu(y_mask)}")
+                    y = yt
+                if nhi[2] and nlo[2]:
+                    at = self.tmp()
+                    self.emit(f"{at} = OpBitwiseOr %uint {acc} {self.cu(0x80000000)}")
+                    acc = at
+                elif nhi[2]:
+                    at = self.tmp()
+                    self.emit(f"{at} = OpBitwiseAnd %uint {acc} {self.cu(0x7FFFFFFF)}")
+                    acc = at
+                elif nlo[2]:
+                    at = self.tmp()
+                    self.emit(f"{at} = OpBitwiseXor %uint {acc} {self.cu(0x80000000)}")
+                    acc = at
             x_offs = (16 * sel[0], 16 * sel[0] + 8, 16 * selhi[0], 16 * selhi[0] + 8)
             y_offs = (16 * sel[1], 16 * sel[1] + 8, 16 * selhi[1], 16 * selhi[1] + 8)
             dot = None
