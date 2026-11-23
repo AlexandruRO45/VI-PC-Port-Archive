@@ -1305,6 +1305,29 @@ def _exclusive_output(out_dir: str):
                     msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
+def _refuse_out_inside_assets(assets_dir: str, out_dir: str) -> None:
+    """Raise ValueError when ``out_dir`` is ``assets_dir`` or lies inside it.
+
+    --out must not be the assets directory or sit inside it. The manifest walk then visits the
+    output's own chunks/ and staging directories, _remove_stale_staging deletes
+    <out>/.chunks-staging-* directories before the build starts, and a build that completes has
+    _prune_stale_chunks delete c_*.glb/.tmp files under <out>/chunks that the user placed there.
+    (--out merely containing assets_dir is allowed: the cleanup only ever touches <out>/chunks
+    and <out>/.chunks-staging-*.)
+    """
+    assets_real = os.path.normcase(os.path.realpath(assets_dir))
+    out_real = os.path.normcase(os.path.realpath(out_dir))
+    try:
+        inside = os.path.commonpath([assets_real, out_real]) == assets_real
+    except ValueError:  # different drives on Windows
+        inside = False
+    if inside:
+        raise ValueError(
+            f"--out {out_dir!r} must not be the assets directory or inside it ({assets_dir!r}); "
+            "the build writes world.json, chunks/ and staging directories there"
+        )
+
+
 def _with_output_lock(fn):
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
@@ -1313,6 +1336,13 @@ def _with_output_lock(fn):
             out_dir = args[1]
         if out_dir is None:
             raise TypeError("build_world requires an out_dir")
+        assets_dir = kwargs.get("assets_dir")
+        if assets_dir is None and args:
+            assets_dir = args[0]
+        # The lock and the stale-staging recovery act on <out> before build_world's own checks, so
+        # an existing assets tree with --out inside it is refused first.
+        if assets_dir is not None and os.path.exists(assets_dir):
+            _refuse_out_inside_assets(assets_dir, out_dir)
         abs_out = os.path.abspath(out_dir)
         with _exclusive_output(abs_out):
             _remove_stale_staging(abs_out)
@@ -1521,24 +1551,6 @@ def build_world(
 
     if not os.path.exists(assets_dir):
         raise FileNotFoundError(f"assets path does not exist: {assets_dir}")
-
-    # --out must not be the assets directory or sit inside it. Then the manifest walk scans the
-    # output's own world.json/chunks/staging directories as inputs, and when the --out folder also
-    # holds a models/manifest.json the build runs far enough for _remove_stale_staging and
-    # _prune_stale_chunks to delete .chunks-staging-* directories and c_*.glb/.tmp files under
-    # <out>/chunks that the user placed there. (--out merely containing assets_dir is allowed:
-    # the cleanup only ever touches <out>/chunks and <out>/.chunks-staging-*.)
-    assets_real = os.path.normcase(os.path.realpath(assets_dir))
-    out_real = os.path.normcase(os.path.realpath(out_dir))
-    try:
-        inside = os.path.commonpath([assets_real, out_real]) == assets_real
-    except ValueError:  # different drives on Windows
-        inside = False
-    if inside:
-        raise ValueError(
-            f"--out {out_dir!r} must not be the assets directory or inside it ({assets_dir!r}); "
-            "the build writes world.json, chunks/ and staging directories there"
-        )
 
     glb_mod = _get_glb_writer()
     dds_mod = _get_dds_png() if textures else None

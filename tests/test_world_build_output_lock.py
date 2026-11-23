@@ -152,6 +152,22 @@ class WorldBuildOutputLockTests(unittest.TestCase):
                 wb.build_world(assets, out, textures=False)
             self.assertEqual(calls, [os.path.abspath(out)] * 2)
 
+    def test_output_inside_assets_is_refused_before_the_lock_and_staging_cleanup(self):
+        # The output lock and the stale-staging recovery act on <out> before build_world's own
+        # checks. With <out> in the assets tree they would already have deleted .chunks-staging-*
+        # directories there by the time the build refuses the layout.
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = os.path.join(tmp, "assets")
+            twb._write_synthetic_assets(assets, origin_overlap=False)
+            lock, cleanup = mock.MagicMock(), mock.MagicMock()
+            with mock.patch.multiple(wb, _exclusive_output=lock, _remove_stale_staging=cleanup):
+                for out in (assets, os.path.join(assets, "world")):
+                    with self.subTest(out=out):
+                        with self.assertRaisesRegex(ValueError, "must not be the assets directory or inside it"):
+                            wb.build_world(assets, out, textures=False)
+            lock.assert_not_called()
+            cleanup.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
