@@ -440,5 +440,41 @@ class SaluAndB64AliasingTests(unittest.TestCase):
         self.assertEqual(state.read_sgpr64(1), expected)
         self.assertEqual(state.sgprs[3], 0xDDDDDDDD)
 
+class SaluAndB64ConditionCodesTests(unittest.TestCase):
+    """Thorough validation of Scalar Condition Code (SCC) generation."""
+
+    def test_scc_four_quadrants(self) -> None:
+        """Verify (lo32, hi32) quadrants: zero/zero, non-zero/zero, zero/non-zero, non-zero/non-zero."""
+        quadrants = [
+            (0x00000000, 0x00000000, 0),
+            (0x12345678, 0x00000000, 1),
+            (0x00000000, 0x87654321, 1),
+            (0x12345678, 0x87654321, 1),
+        ]
+        state = ScalarState()
+        for lo, hi, expected_scc in quadrants:
+            with self.subTest(lo=hex(lo), hi=hex(hi)):
+                val = (hi << 32) | lo
+                state.write_sgpr64(0, val)
+                state.step_s_and_b64("s[2:3]", "s[0:1]", MASK64)
+                self.assertEqual(state.read_sgpr64(2), val)
+                self.assertEqual(state.scc, expected_scc)
+
+    def test_scc_extreme_bits(self) -> None:
+        """Verify bit 0 and bit 63 alone trigger SCC = 1."""
+        state = ScalarState()
+
+        # Bit 0 only
+        state.step_s_and_b64("s[0:1]", 1, 1)
+        self.assertEqual(state.scc, 1)
+
+        # Bit 63 only (MSB)
+        state.step_s_and_b64("s[0:1]", 1 << 63, 1 << 63)
+        self.assertEqual(state.scc, 1)
+
+        # Disjoint bits -> SCC = 0
+        state.step_s_and_b64("s[0:1]", 1, 1 << 63)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
