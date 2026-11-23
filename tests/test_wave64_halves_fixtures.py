@@ -176,6 +176,64 @@ def test_expected_words_of_the_gpu_fixtures():
     assert w64_graphics._vs_c_lane_id(700) == (None, None, 700, 0)
 
 
+def _waves(sizes, total):
+    """The lane of each of `total` records for waves of the given sizes in turn (the last wave may be cut short)."""
+    lanes = []
+    while len(lanes) < total:
+        for n in sizes:
+            lanes += range(n)
+    return lanes[:total]
+
+
+def test_layout_derived_fixtures_are_named_by_stage_and_suffix():
+    for name in ("vs_w64_a_bpermute", "gs_w64_a_bpermute"):
+        assert w64_graphics.layout_derived(name)
+    for name in ("ps_w64_a_bpermute", "vs_w64_a_skip", "gs_w64_a_ring", "vs_w64_c_lane_id"):
+        assert not w64_graphics.layout_derived(name)
+
+
+def test_layout_words_on_radv_gfx1036_are_the_even_start_words():
+    # RADV gfx1036: vertex waves of 64 and 62 (starts 0, 64, 126, ...), geometry waves of 42: every wave starts at an
+    # even record and holds an even number of them, so the partner of v is v ^ 1.
+    def even(i):
+        return (i ^ 1, 3 * (i ^ 1) + 7, i, i >> 1)
+
+    assert w64_graphics.layout_words(_waves([64, 62], 960)) == [even(i) for i in range(960)]
+    assert w64_graphics.layout_words(_waves([42], 320)) == [even(i) for i in range(320)]
+
+
+def test_layout_words_on_radv_gfx1010_vertices_follow_the_odd_starts():
+    # RX 5700 XT (RADV, measured): vertex waves of 64 and 59, starts 0, 64, 123, 187, ...
+    words = w64_graphics.layout_words(_waves([64, 59], 960))
+    assert words[122] == (0, 0, 0, 0)                           # lane 58 of the 59-lane wave: lane 59 is not running
+    assert words[123] == (124, 3 * 124 + 7, 123, 62)            # the next wave starts at the odd vertex 123
+    assert words[124] == (123, 3 * 123 + 7, 124, 61)            # what the even-start words would give vertex 122
+    assert sum(1 for w in words if w == (0, 0, 0, 0)) == 8      # one unpaired last lane per 59-lane wave
+
+
+def test_layout_words_on_the_amd_windows_driver_geometry_layout():
+    # RX 9060 XT (AMD Windows driver 26.11.2, measured): 320 triangles in waves of 64, 21, 64, 21, 64, 21, 1, 64
+    # (starts 0, 64, 85, 149, 170, 234, 255, 256). The tester found records 84, 169, 254 and 255 all zero.
+    lanes = [lane for n in (64, 21, 64, 21, 64, 21, 1, 64) for lane in range(n)]
+    assert len(lanes) == 320
+    words = w64_graphics.layout_words(lanes)
+    assert {i for i, w in enumerate(words) if w == (0, 0, 0, 0)} == {84, 169, 254, 255}
+    assert words[85] == (86, 3 * 86 + 7, 85, 43)
+
+
+def test_layout_words_skip_a_layout_that_is_not_runs_from_lane_zero():
+    assert isinstance(w64_graphics.layout_words([0, 1, 2, 5, 6, 7]), w64_graphics.Skip)   # a wave begins at lane 5
+    assert isinstance(w64_graphics.layout_words([1, 2, 3]), w64_graphics.Skip)
+    assert w64_graphics.layout_words([]) == []
+
+
+def test_layout_is_halves_only_for_a_wave32_draw_cut_from_the_wave64_one():
+    l64 = _waves([64, 59], 960)
+    assert w64_graphics.layout_is_halves(l64, [lane % 32 for lane in l64])               # RDNA1: 59 = 32 + 27
+    assert not w64_graphics.layout_is_halves(l64, _waves([32, 32, 32, 30], 960))         # repacked for wave32
+    assert not w64_graphics.layout_is_halves(l64, l64[:-1])
+
+
 def test_vs_probe_and_radv_perftest(monkeypatch):
     monkeypatch.setenv("RADV_PERFTEST", "gewave32,nggc")
     assert w64_graphics._radv_perftest(64) == "nggc"                # the user's other flags stay, gewave32 goes
