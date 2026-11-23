@@ -70,6 +70,29 @@ class PrintedEncodingTest(unittest.TestCase):
         python = printed.replace(b"0 invalid words", b"1 invalid words")
         self.assertEqual(self.translate(python, native), self.translate(llvm, native))
 
+    def test_undecodable_word_at_entry_is_refused(self):
+        native = blob([("", "ff ff ff ff")] + PROGRAM)
+        printed = listing(PROGRAM, end=len(native)).replace(b"0 invalid words", b"1 invalid words")
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "undecodable word at shader entry"):
+            self.translate(printed, native)
+
+    def test_branch_cannot_reanchor_endpgm_past_the_declared_code_range(self):
+        branch = ("s_branch 1", "01 00 82 bf")
+        unknown = ("", "ff ff ff ff")
+        native = blob([branch, unknown, PROGRAM[-1]])
+        printed = listing([branch, PROGRAM[-1]], end=len(native) - 4)
+        printed = printed.replace(b"0 invalid words", b"1 invalid words")
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "cannot re-anchor|branch into data"):
+            self.translate(printed, native)
+
+    def test_invalid_listing_requires_printed_instruction_bytes(self):
+        native = blob(PROGRAM)
+        printed = listing(PROGRAM).replace(b"0 invalid words", b"1 invalid words")
+        lines = printed.splitlines(keepends=True)
+        lines[1] = lines[1].split(b"; encoding:", 1)[0] + b"\n"
+        with self.assertRaisesRegex(rdna2spirv.Unsupported, "cannot re-anchor.*missing encoding"):
+            self.translate(b"".join(lines), native)
+
     def test_dropped_vopc_op_sel_is_refused(self):
         # The blob holds v_cmp_lt_f16_e64 with op_sel:[1,0] (word 0 bit 11); LLVM printed it without.
         stored = with_byte(PROGRAM, 0, 1, 0x08)

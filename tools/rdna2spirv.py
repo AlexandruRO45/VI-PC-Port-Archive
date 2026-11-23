@@ -16445,31 +16445,36 @@ def translate(path):
         # translate only code reachable from entry; a branch into data is rejected below.
         blob = native_blob(path, info["name"])
         pos = info["code_start"]
+        code_end = info["code_end"]
+        if code_end is None or code_end <= pos:
+            code_end = len(blob)
+        code_limit = min(code_end, len(blob))
         for ins in insns:
+            if not ins["enc"]:
+                raise Unsupported(f"undecodable words (cannot re-anchor {ins['op']}: missing encoding)")
             enc = bytes.fromhex(ins["enc"])
             op, operand_count = ins["op"], len(ins["args"])
-            skipped, at = 0, pos
-            while not same_encoding(blob[at:at + len(enc)], enc, op, operand_count):
-                literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
+            for at in range(pos, min(pos + 4096, code_limit - len(enc)) + 1, 4):
+                native = blob[at:at + len(enc)]
+                if same_encoding(native, enc, op, operand_count):
+                    break
+                literal = mix_literal(native, enc, base_op(op))
                 if literal is not None:
-                    restore_mix_literal(ins, blob[at:at + len(enc)], literal)
+                    restore_mix_literal(ins, native, literal)
                     break
-                at += 4
-                skipped += 4
-                if skipped > 4096 or at >= len(blob):
-                    at = None
-                    break
-            if at is None:
+            else:
                 # LLVM prints the encoding of the instruction it decoded, not the bytes it read: data words that
                 # decode with ignored fields set (e.g. 0xbe8d2242 -> s_rfe_b64, printed 0xbe802242) never match.
                 # The decoder consumed the same number of bytes, so the instruction sits at the current position.
                 # Such words are data in every case seen; reachable_code drops them unless a branch lands there.
-                if pos + len(enc) > len(blob):
+                if pos + len(enc) > code_limit:
                     raise Unsupported("undecodable words (cannot re-anchor)")
                 at = pos
                 ins["normalized"] = True
             ins["pc"] = at
             pos = at + len(enc)
+        if insns[0]["pc"] != info["code_start"]:
+            raise Unsupported("undecodable word at shader entry")
         insns = fold_far_branches(insns)
         insns = reachable_code(insns, info.get("code_end"))
         if any(i.get("normalized") for i in insns):
