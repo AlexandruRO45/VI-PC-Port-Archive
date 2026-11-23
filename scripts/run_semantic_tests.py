@@ -3,21 +3,26 @@ r"""Run the translator regression suite (tests/semantic) one process per test fi
     python -I scripts/run_semantic_tests.py tests/semantic          # one file per core
     python -I scripts/run_semantic_tests.py tests/semantic -j 4     # four at a time
     python -I scripts/run_semantic_tests.py tests/semantic -v       # also print the output of the files that pass
+    python -I scripts/run_semantic_tests.py tests/semantic --timeout 180  # seconds per test file
 
 It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py`, and packages below it), each as
 `python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
-run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
-or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
-line, and exits 1 if a file fails or none is found. Standard library only.
+run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1
+or on a single core, and no --timeout, it runs that discover command itself. Prints failing files and one summary
+line, and exits 1 if a file fails or none is found. With --timeout, every file gets its own process even with -j 1;
+a timeout prints the captured output, fails that file and lets the remaining files run. The limit applies to the
+test interpreter, not descendant processes it starts. Without --timeout there is no time limit. Standard library only.
 """
 import argparse
 import concurrent.futures
 import fnmatch
+import locale
 import os
 import re
 import subprocess
 import sys
 import time
+from threading import TIMEOUT_MAX
 
 
 def test_modules(directory):
@@ -32,11 +37,18 @@ def test_modules(directory):
     return names
 
 
-def run_module(directory, module, verbose):
+def run_module(directory, module, verbose, timeout=None):
     """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
     cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
-    p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                       errors="replace")
+    try:
+        # shortcut: only the test interpreter is killed; add process-tree cleanup if tests leave children running.
+        p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode(locale.getpreferredencoding(False), errors="replace")
+        return 1, 0, output + f"\nTIMEOUT after {timeout:g} seconds\n"
     ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
     return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
 
@@ -46,9 +58,13 @@ def main(argv=None):
     ap.add_argument("directory", help="the suite's folder, tests/semantic")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="files at a time (default: cores)")
     ap.add_argument("-v", "--verbose", action="store_true", help="unittest -v, and print passing files' output")
+    ap.add_argument("--timeout", type=float, metavar="SECONDS",
+                    help=f"seconds per test interpreter, 0 < limit <= {TIMEOUT_MAX:g} (default: unlimited)")
     a = ap.parse_args(argv)
+    if a.timeout is not None and not 0 < a.timeout <= TIMEOUT_MAX:
+        ap.error(f"--timeout must be positive and at most {TIMEOUT_MAX:g} seconds")
     directory = os.path.abspath(a.directory)
-    if a.jobs <= 1:
+    if a.jobs <= 1 and a.timeout is None:
         return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", directory,
                                 *(["-v"] if a.verbose else [])])
     modules = test_modules(directory)
@@ -58,8 +74,9 @@ def main(argv=None):
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     modules.sort(key=lambda m: -os.path.getsize(os.path.join(directory, *m.split(".")) + ".py"))
     start, total, failed = time.monotonic(), 0, []
-    with concurrent.futures.ThreadPoolExecutor(a.jobs) as pool:
-        jobs = {pool.submit(run_module, directory, m, a.verbose): m for m in modules}
+    workers = max(1, a.jobs)
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        jobs = {pool.submit(run_module, directory, m, a.verbose, a.timeout): m for m in modules}
         for job in concurrent.futures.as_completed(jobs):
             code, ran, out = job.result()
             total += ran
@@ -69,7 +86,7 @@ def main(argv=None):
             elif a.verbose:
                 print(f"==== {jobs[job]}\n{out}", flush=True)
     took = time.monotonic() - start
-    summary = f"{len(modules)} files, {total} tests, {len(failed)} files failed in {took:.0f} s with {a.jobs} jobs"
+    summary = f"{len(modules)} files, {total} tests, {len(failed)} files failed in {took:.0f} s with {workers} jobs"
     print(summary + (": " + ", ".join(sorted(failed)) if failed else ""))
     return 1 if failed else 0
 

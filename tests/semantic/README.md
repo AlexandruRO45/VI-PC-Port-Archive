@@ -3,12 +3,19 @@
 Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 
     python -I scripts/run_semantic_tests.py tests/semantic        # one file per core: 26 s instead of 253 s on 16 cores
+    python -I scripts/run_semantic_tests.py tests/semantic --timeout 180  # optional seconds per test file
     python -m unittest discover -s tests/semantic -v             # the same tests, one file after another
 
 The runner starts `python -m unittest <file>` for each file, several at a time, prints the output of the files that
-fail and one summary line; `-j N` sets how many run at once (`-j 1` is the discover command above) and `-v` prints
+fail and one summary line; `-j N` sets how many run at once (`-j 1` without a timeout is the discover command above) and `-v` prints
 every file's output. Files run side by side, so a test writes only into its own temporary folder (`tempfile`), never
 to a fixed path, and does not rely on another file having run first.
+
+`--timeout SECONDS` sets a positive limit within the platform's timeout range for each test interpreter. By default
+there is no limit. With this option, `-j 1` also runs each file in a separate process. A timed-out file prints its captured
+output and a `TIMEOUT` message, counts as a failed file, and does not stop the remaining files from running.
+Its unfinished test count is omitted from the total. The limit does not terminate descendant processes started
+by a test.
 
 Every file here must call `tools/rdna2spirv.py` (directly, through `support.py`, or by running the tool) and assert
 on what it emitted. A test that reimplements the instruction in Python passes whatever the translator does, so it is
