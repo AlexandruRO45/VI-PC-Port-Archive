@@ -416,5 +416,77 @@ class TestValuSubCoU32RegisterAliasing(unittest.TestCase):
         self.assertEqual(words[0] & MASK32, 65)
         self.assertEqual(words[1] & 1, 0)
 
+# ---------------------------------------------------------------------------
+# Stage 6: Condition codes, status flags, and carry/borrow generation
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class SubStatusFlags:
+    zero: bool
+    negative: bool
+    borrow: bool
+    overflow: bool
+
+
+def compute_sub_status_flags(src0: int, src1: int) -> SubStatusFlags:
+    """Compute ALU status flags for 32-bit subtraction src0 - src1."""
+    u0 = src0 & MASK32
+    u1 = src1 & MASK32
+    diff = (u0 - u1) & MASK32
+    zero = (diff == 0)
+    negative = bool((diff >> 31) & 1)
+    borrow = (u0 < u1)
+    # Signed overflow: operands have different signs and result sign differs from src0
+    overflow = bool(((u0 ^ u1) & (u0 ^ diff) & 0x8000_0000) != 0)
+    return SubStatusFlags(zero=zero, negative=negative, borrow=borrow, overflow=overflow)
+
+
+class TestValuSubCoU32ConditionCodes(unittest.TestCase):
+    """Stage 6: Condition codes, status flags, and carry/borrow for v_sub_co_u32."""
+
+    def test_zero_flag(self) -> None:
+        flags = compute_sub_status_flags(0x1234, 0x1234)
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.borrow)
+        self.assertFalse(flags.overflow)
+
+    def test_negative_and_borrow(self) -> None:
+        flags = compute_sub_status_flags(5, 10)
+        self.assertFalse(flags.zero)
+        self.assertTrue(flags.negative)
+        self.assertTrue(flags.borrow)
+        self.assertFalse(flags.overflow)
+
+    def test_signed_overflow_without_unsigned_borrow(self) -> None:
+        # 0x8000_0000 (-2147483648) - 1 => 0x7FFF_FFFF (+2147483647)
+        # Unsigned: 0x8000_0000 >= 1 => no borrow
+        # Signed: -2147483648 - 1 => overflow
+        flags = compute_sub_status_flags(0x8000_0000, 1)
+        self.assertFalse(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.borrow)
+        self.assertTrue(flags.overflow)
+
+    def test_multi_precision_64bit_borrow_chain(self) -> None:
+        # Compute 64-bit subtraction using two 32-bit steps:
+        # A = 0x0000_0002_0000_0001, B = 0x0000_0001_0000_0005
+        # Lower: 1 - 5 = 0xFFFF_FFFC with borrow = 1
+        # Upper: 2 - 1 - borrow = 0 with borrow = 0
+        a_lo, a_hi = 1, 2
+        b_lo, b_hi = 5, 1
+
+        diff_lo, borrow_lo = oracle_sub_co_u32(a_lo, b_lo)
+        self.assertEqual(diff_lo, 0xFFFF_FFFC)
+        self.assertEqual(borrow_lo, 1)
+
+        diff_hi, borrow_hi = oracle_sub_co_u32(a_hi - borrow_lo, b_hi)
+        self.assertEqual(diff_hi, 0)
+        self.assertEqual(borrow_hi, 0)
+
+        res64 = (diff_hi << 32) | diff_lo
+        expected64 = (((a_hi << 32) | a_lo) - ((b_hi << 32) | b_lo)) & MASK64
+        self.assertEqual(res64, expected64)
+
 if __name__ == "__main__":
     unittest.main()
