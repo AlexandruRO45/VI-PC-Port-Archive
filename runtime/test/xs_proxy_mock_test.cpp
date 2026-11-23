@@ -85,6 +85,7 @@ struct Mock {
     int device_level;        // device: highest ID3D12DeviceN it answers (0 = ID3D12Device only)
     bool fence1;             // fence: answers ID3D12Fence1; device: the fences it makes do
     bool allocator_tag;      // allocator: answers kLeonidaCommandAllocatorTag; device: the allocators it makes do
+    bool refuse_dispatch_mesh;  // device: slot 41 refuses DISPATCH_MESH with E_NOTIMPL (no VK_EXT_mesh_shader)
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
@@ -199,11 +200,14 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             case 41:                                                        // CreateCommandSignature(desc, ...)
                 if (const auto* desc = reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1)) {
                     m->array[41][0] = desc->ByteStride | std::uint64_t{desc->NumArgumentDescs} << 32;
+                    bool has_dispatch_mesh = false;
                     for (UINT i = 0; desc->pArgumentDescs && i < desc->NumArgumentDescs && i < 3; ++i) {
                         std::uint32_t type = 0;  // read as its 32 bits: a console type is outside the enum's range
                         std::memcpy(&type, &desc->pArgumentDescs[i].Type, sizeof(type));
                         m->array[41][i + 1] = type;
+                        if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) has_dispatch_mesh = true;
                     }
+                    if (m->refuse_dispatch_mesh && has_dispatch_mesh) return static_cast<std::uint32_t>(E_NOTIMPL);
                 }
                 break;
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
@@ -789,6 +793,16 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 41, word(&pc_sig), 0, word(&sig_iid), word(&sig))) == S_OK);
     EXPECT(mock->calls[41] == 2 && mock->args[41][0] == word(&pc_sig));
     EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
+
+    // When the PC device refuses DISPATCH_MESH with E_NOTIMPL (no VK_EXT_mesh_shader), slot 41 retries once with a
+    // copy replacing DISPATCH_MESH by DISPATCH and leaves the caller's description untouched.
+    mock->refuse_dispatch_mesh = true;
+    EXPECT(hr_of(raw(device, 41, word(&pc_sig), 0, word(&sig_iid), word(&sig))) == S_OK);
+    EXPECT(mock->calls[41] == 4 && xs::device_slot_hits(41) == 3);
+    EXPECT(mock->args[41][0] != word(&pc_sig));
+    EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
+    EXPECT(pc_arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
+    mock->refuse_dispatch_mesh = false;
 
     EXPECT(xs::device_slot_overridden(41) && xs::device_slot_overridden(48) && xs::device_slot_overridden(73) &&
            xs::device_slot_overridden(78) && xs::device_slot_overridden(79) && xs::device_slot_overridden(80));

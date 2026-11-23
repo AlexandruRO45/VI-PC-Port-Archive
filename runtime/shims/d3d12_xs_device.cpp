@@ -1372,14 +1372,19 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
 }
 
 // The Xbox slot 41 is CreateCommandSignature at its PC position, (desc, root signature, riid, out), but a console
-// description can hold an argument type the PC does not have. The retail title creates five one-argument signatures
+// description can hold an argument type the PC does not have, or DISPATCH_MESH on a PC device without
+// VK_EXT_mesh_shader. The retail title creates five one-argument signatures
 // with no root signature at startup; one has type 105 (0x69) and a 12-byte stride, next to a DISPATCH and a
 // DISPATCH_MESH of 12 bytes. Read statically from its call sites (counts and shapes only): its two ExecuteIndirect
 // sites pass MaxCommandCount 1 and an argument offset into the same upload buffer as the DISPATCH ones, and set the
 // compute state (pipeline, compute root signature, tables, constants, SRV/UAV) right before, as the DISPATCH path
 // does; they record on a second command list of the title's context. So type 105 is taken as a dispatch whose
 // arguments are a D3D12_DISPATCH_ARGUMENTS. HYPOTHESIS: what the console does differently for it (which command
-// stream it feeds) is not known; the PC layer has one compute path. Other descriptions are forwarded unchanged.
+// stream it feeds) is not known; the PC layer has one compute path. When the underlying PC device refuses a
+// DISPATCH_MESH signature with E_NOTIMPL (a GPU without VK_EXT_mesh_shader, such as RDNA1 under --mesh-compute),
+// slot 41 retries once with DISPATCH_MESH replaced by DISPATCH (the same 12-byte {ThreadGroupCountX, Y, Z} shape)
+// so renderer startup does not abort before allocating its per-frame query ring buffer. Other descriptions are
+// forwarded unchanged.
 // 105 is outside D3D12_INDIRECT_ARGUMENT_TYPE's range, so the field is read as its 32 bits (a constant expression that
 // casts 105 to the enum does not compile with clang-cl).
 constexpr std::uint32_t kXboxIndirectArgumentDispatch105 = 105;
@@ -1397,10 +1402,18 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
                                            const IID*, void**);
     const auto forward = reinterpret_cast<Fn>(self->real_vtable[41]);
     bool console = false;
-    if (desc && desc->pArgumentDescs)
-        for (UINT i = 0; i < desc->NumArgumentDescs && !console; ++i)
-            console = argument_type(desc->pArgumentDescs[i]) == kXboxIndirectArgumentDispatch105;
-    if (!console) return forward(self->real, desc, root_signature, riid, out);
+    bool dispatch_mesh = false;
+    if (desc && desc->pArgumentDescs) {
+        for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
+            const std::uint32_t type = argument_type(desc->pArgumentDescs[i]);
+            if (type == kXboxIndirectArgumentDispatch105) console = true;
+            if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) dispatch_mesh = true;
+        }
+    }
+    if (!console) {
+        const HRESULT hr = forward(self->real, desc, root_signature, riid, out);
+        if (hr != E_NOTIMPL || !dispatch_mesh) return hr;
+    }
 
     std::unique_ptr<D3D12_INDIRECT_ARGUMENT_DESC[]> args(new (std::nothrow)
                                                              D3D12_INDIRECT_ARGUMENT_DESC[desc->NumArgumentDescs]);
@@ -1408,17 +1421,33 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
         if (out) *out = nullptr;
         return E_OUTOFMEMORY;
     }
-    for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
-        args[i] = desc->pArgumentDescs[i];
-        if (argument_type(args[i]) == kXboxIndirectArgumentDispatch105)
-            args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
-    }
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[rt] d3d12_xs: slot 41 argument type 105 (stride %u) created as DISPATCH\n",
-                     desc->ByteStride);
+    const auto substitute = [&](bool replace_mesh) {
+        for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
+            args[i] = desc->pArgumentDescs[i];
+            const std::uint32_t type = argument_type(args[i]);
+            if (type == kXboxIndirectArgumentDispatch105 ||
+                (replace_mesh && type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH))
+                args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        }
+    };
     D3D12_COMMAND_SIGNATURE_DESC pc = *desc;
     pc.pArgumentDescs = args.get();
+    if (console) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 41 argument type 105 (stride %u) created as DISPATCH\n",
+                         desc->ByteStride);
+        substitute(false);
+        const HRESULT hr = forward(self->real, &pc, root_signature, riid, out);
+        if (hr != E_NOTIMPL || !dispatch_mesh) return hr;
+    }
+    static std::atomic<bool> mesh_logged{false};
+    if (!mesh_logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 41 DISPATCH_MESH (stride %u) created as DISPATCH (device has no mesh "
+                     "shaders)\n",
+                     desc->ByteStride);
+    substitute(true);
     return forward(self->real, &pc, root_signature, riid, out);
 }
 
