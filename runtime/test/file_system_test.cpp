@@ -765,6 +765,65 @@ void run_checks(const std::filesystem::path& root) {
               "and the old name is deleted");
     }
 
+    // The host copy calls refuse read-only, hidden and system targets. MoveFileEx only refuses read-only.
+    // The same rules apply when the destination exists only in the package.
+    for (const DWORD attribute : {DWORD{FILE_ATTRIBUTE_READONLY}, DWORD{FILE_ATTRIBUTE_HIDDEN},
+                                  DWORD{FILE_ATTRIBUTE_SYSTEM}}) {
+        const std::wstring suffix = std::to_wstring(attribute) + L".txt";
+        const std::wstring copy_leaf = L"copy-protected-" + suffix, move_leaf = L"move-protected-" + suffix;
+        const auto package_copy = package / "misc" / copy_leaf, package_move = package / "misc" / move_leaf;
+        const auto overlay_copy = overlay / "misc" / copy_leaf, overlay_move = overlay / "misc" / move_leaf;
+        const std::wstring copy_to = L"GAME:\\misc\\" + copy_leaf, move_to = L"GAME:\\misc\\" + move_leaf;
+        constexpr auto copy_from = L"GAME:\\misc\\keep.txt";
+        const std::wstring source_leaf = L"move-source-" + suffix;
+        const std::wstring move_from = L"GAME:\\misc\\" + source_leaf;
+        const auto overlay_source = overlay / "misc" / source_leaf;
+        write_path(package_copy, "copy destination");
+        write_path(package_move, "move destination");
+        write_path(overlay_source, "move source");
+        check(::SetFileAttributesW(package_copy.c_str(), attribute) && ::SetFileAttributesW(package_move.c_str(), attribute),
+              "set attributes on the package-only destinations");
+        const DWORD copy_attributes = ::GetFileAttributesW(package_copy.c_str());
+        const DWORD move_attributes = ::GetFileAttributesW(package_move.c_str());
+        // Some Wine filesystems cannot persist HIDDEN or SYSTEM. Only compare attributes the host exposes.
+        if (copy_attributes != INVALID_FILE_ATTRIBUTES && move_attributes != INVALID_FILE_ATTRIBUTES &&
+            (copy_attributes & move_attributes & attribute) != 0) {
+            check(!copy_w(copy_from, copy_to.c_str(), TRUE) && GetLastError() == ERROR_FILE_EXISTS,
+                  "CopyFileW keeps fail-if-exists precedence on a protected destination");
+            check(!copy_w(copy_from, copy_to.c_str(), FALSE) && GetLastError() == ERROR_ACCESS_DENIED,
+                  "CopyFileW refuses to overwrite a protected package-only destination");
+            check(!copy_ex_w(copy_from, copy_to.c_str(), nullptr, nullptr, nullptr, 0) &&
+                      GetLastError() == ERROR_ACCESS_DENIED,
+                  "CopyFileExW refuses to overwrite a protected package-only destination");
+            for (const bool fallback : {false, true}) {
+                rt::fs::force_copy_file2_fallback(fallback);
+                check(copy2(copy_from, copy_to.c_str(), nullptr) == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED),
+                      "CopyFile2 refuses to overwrite a protected package-only destination");
+            }
+            rt::fs::force_copy_file2_fallback(false);
+            check(!std::filesystem::exists(overlay_copy), "a refused copy leaves no overlay destination");
+
+            const bool moved = move_ex_w(move_from.c_str(), move_to.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
+            const DWORD move_error = moved ? ERROR_SUCCESS : GetLastError();
+            const bool expect_move = attribute != FILE_ATTRIBUTE_READONLY;
+            check(moved == expect_move && (moved || move_error == ERROR_ACCESS_DENIED),
+                  "MoveFileEx refuses a read-only replacement and permits hidden and system replacements");
+            check(expect_move ? read_path(overlay_move) == "move source" && !std::filesystem::exists(overlay_source)
+                              : !std::filesystem::exists(overlay_move) && read_path(overlay_source) == "move source",
+                  "the overlay move changes only the accepted destinations");
+
+            write_path(overlay_copy, "writable overlay");
+            check(copy_w(copy_from, copy_to.c_str(), FALSE) && read_path(overlay_copy) == "keep",
+                  "protected package attributes do not block overwriting a writable overlay copy");
+        }
+        check(read_path(package_copy) == "copy destination" && read_path(package_move) == "move destination" &&
+                  ::GetFileAttributesW(package_copy.c_str()) == copy_attributes &&
+                  ::GetFileAttributesW(package_move.c_str()) == move_attributes,
+              "copies and moves leave package bytes and attributes intact");
+        ::SetFileAttributesW(package_copy.c_str(), FILE_ATTRIBUTE_NORMAL);
+        ::SetFileAttributesW(package_move.c_str(), FILE_ATTRIBUTE_NORMAL);
+    }
+
     // CopyFile: reads where a read would, writes the overlay; an existing name counts even if only the package has it.
     {
         check(copy_w(L"GAME:\\misc\\keep.txt", L"GAME:\\cache\\keep_copy.txt", TRUE) != FALSE &&

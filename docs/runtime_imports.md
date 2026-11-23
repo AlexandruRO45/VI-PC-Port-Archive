@@ -221,13 +221,15 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   folder on its own (left by a file deleted below it) does not hide anything.
 - `MoveFile*` writes the destination in the overlay. A package file is copied there and its old name deleted by a
   marker; an overlay file or an overlay-only folder is renamed. An existing destination needs
-  `MOVEFILE_REPLACE_EXISTING` even when only the package has it. Moving a package folder fails with
-  `ERROR_ACCESS_DENIED` (as deleting one does), a move between `GAME:` and a host path with `ERROR_NOT_SAME_DEVICE`, and
-  `MOVEFILE_DELAY_UNTIL_REBOOT` with `ERROR_INVALID_PARAMETER`.
+  `MOVEFILE_REPLACE_EXISTING` even when only the package has it. Replacing a read-only destination or moving a
+  package folder fails with `ERROR_ACCESS_DENIED`. A move between `GAME:` and a host path fails with
+  `ERROR_NOT_SAME_DEVICE`, and `MOVEFILE_DELAY_UNTIL_REBOOT` fails with `ERROR_INVALID_PARAMETER`.
 - `CopyFile`, `CopyFileEx` and `CopyFile2` read the source the way a read does and write a `GAME:` destination in the
-  overlay; fail-if-exists counts a name only the package has. Either side can be a host path. `CopyFile2` checks its
-  parameter block before preparing the destination: one shorter than `COPYFILE2_EXTENDED_PARAMETERS` is
-  `E_INVALIDARG` and writes nothing, as Windows answers. Where the host has no `CopyFile2` (Wine 9, whose loader binds
+  overlay; fail-if-exists counts a name only the package has. Overwriting an existing read-only, hidden or system
+  destination fails with `ERROR_ACCESS_DENIED`, including when only the package has it. Either side can be a host path.
+  `CopyFile2` checks its parameter block before preparing the destination. A block shorter than
+  `COPYFILE2_EXTENDED_PARAMETERS` returns `E_INVALIDARG` and writes nothing, as on Windows.
+  Where the host has no `CopyFile2` (Wine 9, whose loader binds
   the import to a stub that aborts the process), the shim copies with `CopyFileExW` instead: the flags both calls
   define and the cancel flag are passed on (a flag already set cancels before anything is written), CopyFile2-only
   requests that leave the contents as `CopyFileExW` writes them (no offload, compressed traffic, sparse copy, ...)

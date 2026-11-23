@@ -294,6 +294,14 @@ View view(const Roots& r, const std::vector<std::wstring>& parts) {
 
 bool is_folder(const Roots& r, const std::vector<std::wstring>& parts) { return view(r, parts).kind == Kind::Directory; }
 
+// When only the package holds a file, the host operation targets a new overlay path and cannot see its attributes.
+bool package_destination_has_attributes(const Roots& r, const std::vector<std::wstring>& parts, const View& destination,
+                                        DWORD mask) {
+    if (destination.kind != Kind::File || destination.in_overlay || !destination.in_package) return false;
+    const DWORD attributes = ::GetFileAttributesW(join(r.game, parts).c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & mask) != 0;
+}
+
 // Whether two console paths name the same entry: names compare without case, as the lookups do.
 bool same_entry(const std::vector<std::wstring>& a, const std::vector<std::wstring>& b) {
     if (a.size() != b.size()) return false;
@@ -1085,6 +1093,8 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     const View to_view = view(r, dst);
     if (to_view.kind == Kind::Directory) return fail_bool(ERROR_ACCESS_DENIED);
     if (to_view.kind == Kind::File && (flags & MOVEFILE_REPLACE_EXISTING) == 0) return fail_bool(ERROR_ALREADY_EXISTS);
+    if (package_destination_has_attributes(r, dst, to_view, FILE_ATTRIBUTE_READONLY))
+        return fail_bool(ERROR_ACCESS_DENIED);
     if (!is_folder(r, parent_of(dst))) return fail_bool(ERROR_PATH_NOT_FOUND);
 
     std::error_code ec;
@@ -1153,6 +1163,8 @@ bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& ou
     const View v = view(r, parts);
     error = ERROR_ACCESS_DENIED;
     if (v.kind == Kind::Directory) return false;
+    constexpr DWORD protected_attributes = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+    if (!fail_if_exists && package_destination_has_attributes(r, parts, v, protected_attributes)) return false;
     error = ERROR_FILE_EXISTS;
     if (v.kind == Kind::File && fail_if_exists) return false;
     error = ERROR_PATH_NOT_FOUND;
