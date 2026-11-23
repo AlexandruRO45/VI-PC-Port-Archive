@@ -754,12 +754,6 @@ public:
             if (error) *error = why;
             return false;
         };
-        // Nothing here may throw into the D3D12 shim (only allocation can, and that is caught too).
-        try {
-            if (!load_index(dir, "", fail)) return false;
-        } catch (...) {
-            return fail("index.json could not be read");
-        }
         const auto ignore = [](const std::string&) { return false; };
         for (const char* folder : {"fspx", "bvh", "library"}) {
             try {
@@ -778,6 +772,9 @@ public:
     // of carved RPF DXBC containers never reaches these, so callers comparing reached entries with size() leave them
     // out.
     std::size_t fspx_size() const { return fspx_count_; }
+    // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
+    // their containers itself.
+    std::size_t bvh_size() const { return bvh_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -880,6 +877,7 @@ private:
             fspx_entries_.clear();
             count_ = 0;
             fspx_count_ = 0;
+            bvh_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
