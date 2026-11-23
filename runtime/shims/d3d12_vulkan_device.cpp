@@ -8180,6 +8180,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable12.bufferDeviceAddress = info.buffer_device_address ? VK_TRUE : VK_FALSE;
     info.storage_buffer_8bit = chosen12.storageBuffer8BitAccess == VK_TRUE;
     enable12.storageBuffer8BitAccess = info.storage_buffer_8bit;
+    // Shaders translated with `rdna2spirv.py --int64-atomics` swap a 64-bit element with one 64-bit atomic on
+    // device-address memory (index capability Int64Atomics, feature shaderBufferInt64Atomics; SHADER-868). Enabled
+    // where the GPU has it; without it such modules are not created, so translate without the option there.
+    enable12.shaderBufferInt64Atomics = chosen12.shaderBufferInt64Atomics;
     // Where the GPU has them: what the bindless set 0 needs (VulkanDeviceInfo::bindless), and the sampler features
     // D3D12 samplers can ask for.
     info.bindless = chosen12.runtimeDescriptorArray && chosen_features.shaderSampledImageArrayDynamicIndexing &&

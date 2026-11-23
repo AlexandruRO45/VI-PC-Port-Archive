@@ -749,6 +749,16 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             p = pointers[a[1]]
             if p[0] == "pc":
                 raise UnsupportedConstruct(f"{op} on a PushConstant")
+            if types.bits(a[0]) == 64 and op == "OpAtomicExchange" and p[0] == "psb":
+                # A 64-bit exchange (rdna2spirv --int64-atomics): two words, low first, 8-byte aligned.
+                if p[1] % 8:
+                    raise UnsupportedConstruct(f"64-bit {op} at {p[1]:#x}, not 8-byte aligned")
+                lo, hi = psb_word(p[1]), psb_word(p[1] + 4)
+                old = memory.get(lo, 0) | (memory.get(hi, 0) << 32)
+                new = val(a[4]) & ((1 << 64) - 1)
+                memory[lo], memory[hi] = new & MASK, new >> 32
+                values[res] = old
+                continue
             if types.bits(a[0]) != 32:
                 raise UnsupportedConstruct(f"{op} on a non-32-bit integer")
             if p[0] == "psb":

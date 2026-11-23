@@ -110,5 +110,41 @@ class BufferAtomicsX2(unittest.TestCase):
                     translate(["v_mov_b32_e32 v1, 0", line])
 
 
+class BufferSwapX2Int64Atomics(unittest.TestCase):
+    """--int64-atomics (SHADER-868): buffer_atomic_swap_x2 is one 64-bit OpAtomicExchange; bounds, alignment and the
+    values one lane sees are as with the two-dword form."""
+
+    def setUp(self):
+        self.saved = rdna2spirv.INT64_ATOMICS
+        rdna2spirv.INT64_ATOMICS = True
+
+    def tearDown(self):
+        rdna2spirv.INT64_ATOMICS = self.saved
+
+    def test_one_64_bit_exchange(self):
+        asm = translate(["v_mov_b32_e32 v1, 0", "buffer_atomic_swap_x2 v[2:3], v1, s[8:11], 0 offen glc"])
+        self.assertIn("OpCapability Int64Atomics", asm)
+        self.assertEqual(asm.count("OpAtomicExchange %ulong"), 1)
+        self.assertNotIn("OpAtomicExchange %uint", asm)
+
+    def test_values_bounds_and_alignment(self):
+        for m in VALUES:
+            for d in VALUES:
+                with self.subTest(m=hex(m), d=hex(d)):
+                    self.assertEqual(atomic_x2("swap", m, d), (split(m), split(d)))
+        m, d = 0x11111111_22222222, 0x33333333_44444444
+        self.assertEqual(atomic_x2("swap", m, d, glc=False), (split(d), split(d)))
+        self.assertEqual(atomic_x2("swap", m, d, offset=RECORDS - 8), (split(m), split(d)))
+        for offset in (RECORDS - 4, RECORDS, ELEM + 4):   # partly or wholly out of range, or not 8-byte aligned
+            with self.subTest(offset=hex(offset)):
+                self.assertEqual(atomic_x2("swap", m, d, offset=offset), ((0, 0), split(m)))
+
+    def test_off_by_default(self):
+        rdna2spirv.INT64_ATOMICS = False
+        asm = translate(["v_mov_b32_e32 v1, 0", "buffer_atomic_swap_x2 v[2:3], v1, s[8:11], 0 offen glc"])
+        self.assertNotIn("Int64Atomics", asm)
+        self.assertEqual(asm.count("OpAtomicExchange %uint"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

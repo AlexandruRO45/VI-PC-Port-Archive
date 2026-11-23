@@ -783,6 +783,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--pc-tail-ubo")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
             cmd += ["--fma", os.environ["LEONIDA_FMA"]]
+        if os.environ.get("LEONIDA_INT64_ATOMICS") == "1":   # swap_x2 as one 64-bit atomic (SHADER-868)
+            cmd.append("--int64-atomics")
         rc, out = run_cmd(cmd, gpu=False)
     print("=== rdna2spirv.py ===")
     print(out)

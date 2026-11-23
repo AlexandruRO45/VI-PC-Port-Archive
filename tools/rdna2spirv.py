@@ -68,6 +68,10 @@ FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from si
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
+# --int64-atomics: global_atomic_swap_x2 / buffer_atomic_swap_x2 become one 64-bit OpAtomicExchange (capability
+# Int64Atomics, feature shaderBufferInt64Atomics) instead of one 32-bit exchange per dword, which can tear when lanes
+# swap into one element at once (SHADER-868). Off by default: the two-dword form needs no Int64 atomics.
+INT64_ATOMICS = False
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
@@ -259,6 +263,7 @@ class Gen:
         self.uses_fhalf = False        # %fhalf_g (0.5) constant
         self.uses_f64 = False
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
+        self.uses_int64_atomics = False  # a 64-bit OpAtomicExchange (--int64-atomics): capability Int64Atomics
         self.uses_clock = set()
         self.uses_bvh = False
         self.lconsts = {}              # 64-bit constants: value -> id
@@ -2207,7 +2212,8 @@ class Gen:
             self.dst(vdst, old)
 
     def global_atomic_x2(self, op, kind, a, mods):
-        """global_atomic_{and,or,xor,swap}_x2 (see global_atomic): one 32-bit atomic per dword of the element."""
+        """global_atomic_{and,or,xor,swap}_x2 (see global_atomic): one 32-bit atomic per dword of the element, except
+        swap under --int64-atomics, which is one 64-bit exchange (see buffer_atomic_x2 for why)."""
         if any(m in mods for m in ("slc", "dlc", "lds")):
             raise Unsupported(op + " form")
         rtn = "glc" in mods
@@ -2228,14 +2234,17 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
-        res = []
-        for w in range(2):
-            p, r = self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
-            self.emit(f"{r} = {spv} %uint {p} {self.cu(1)} {self.cu(0)} {vals[w]}")
-            res.append(r)
+        if kind == "swap" and INT64_ATOMICS:
+            res = self.atomic_swap_int64(full, vals)
+        else:
+            ptr = self.tmp()
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+            res = []
+            for w in range(2):
+                p, r = self.tmp(), self.tmp()
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
+                self.emit(f"{r} = {spv} %uint {p} {self.cu(1)} {self.cu(0)} {vals[w]}")
+                res.append(r)
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         olds = []
@@ -2321,7 +2330,8 @@ class Gen:
         no Int64 atomics are needed. That leaves the same memory for a bitwise op, whose bits are independent, but an
         exchange can tear: two lanes swapping into one element at once can leave one's low dword with the other's high
         dword (A.lo, B.lo, B.hi, A.hi). The returned pair is two reads, so another lane's 64-bit op on the same element
-        between them could be seen half done. Measured natively on RDNA2 (gfx1036, wave32 & wave64): the bounds check
+        between them could be seen half done. --int64-atomics makes swap one 64-bit OpAtomicExchange instead, which
+        cannot tear (SHADER-868; needs shaderBufferInt64Atomics). Measured natively on RDNA2 (gfx1036, wave32 & wave64): the bounds check
         covers the whole 8-byte element all or nothing (fixed_fmt=62) and addresses with (addr & 7) != 0 are dropped
         (memory untouched, active glc returns (0, 0), inactive preserves vdata)."""
         vd = a[0]
@@ -2338,14 +2348,17 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
-        res = []
-        for w in range(2):
-            p, r = self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
-            self.emit(f"{r} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {vals[w]}")
-            res.append(r)
+        if kind == "swap" and INT64_ATOMICS:
+            res = self.atomic_swap_int64(addr, vals)
+        else:
+            ptr = self.tmp()
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+            res = []
+            for w in range(2):
+                p, r = self.tmp(), self.tmp()
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
+                self.emit(f"{r} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {vals[w]}")
+                res.append(r)
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         olds = []
@@ -2357,6 +2370,23 @@ class Gen:
         if "glc" in mods:
             for w in range(2):
                 self.dst({"k": "vgpr", "r": vd["r"] + w, "n": 1}, olds[w])
+
+    def atomic_swap_int64(self, xbox_va, vals):
+        """--int64-atomics (SHADER-868): the 64-bit element swapped by one OpAtomicExchange on a 64-bit pointer, so no
+        other lane's exchange can land between the two dwords. The caller has checked 8-byte alignment and bounds.
+        vals are the (low, high) dwords; returns the old (low, high) dwords."""
+        self.uses_int64_atomics = True
+        lo, hi, sh, v64, p, r, rlo, rsh, rhi = (self.tmp() for _ in range(9))
+        self.emit(f"{lo} = OpUConvert %ulong {vals[0]}")
+        self.emit(f"{hi} = OpUConvert %ulong {vals[1]}")
+        self.emit(f"{sh} = OpShiftLeftLogical %ulong {hi} %c64_32")
+        self.emit(f"{v64} = OpBitwiseOr %ulong {sh} {lo}")
+        self.emit(f"{p} = OpConvertUToPtr %_ptr_PSB_ulong {self.host_addr(xbox_va)}")
+        self.emit(f"{r} = OpAtomicExchange %ulong {p} {self.cu(1)} {self.cu(0)} {v64}")
+        self.emit(f"{rlo} = OpUConvert %uint {r}")
+        self.emit(f"{rsh} = OpShiftRightLogical %ulong {r} %c64_32")
+        self.emit(f"{rhi} = OpUConvert %uint {rsh}")
+        return [rlo, rhi]
 
     def current_label_placeholder(self):
         """Label of the block currently being emitted (needed for OpPhi). Blocks are opened by OpLabel lines;
@@ -12809,6 +12839,8 @@ def assemble(gen):
         caps.append("Float64")
     if gen.uses_fma_khr:
         caps.append("FMAKHR")
+    if gen.uses_int64_atomics:
+        caps.append("Int64Atomics")     # shaderBufferInt64Atomics (a 64-bit atomic on device-address memory)
     if gen.uses_clock:
         caps.append("ShaderClockKHR")
     if gen.uses_store_views:
@@ -12959,6 +12991,8 @@ def assemble(gen):
                   "%rt_uint = OpTypeRuntimeArray %uint", "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                   "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint"]
         dec.append("OpDecorate %rt_uint ArrayStride 4")
+        if gen.uses_int64_atomics:
+            types.append("%_ptr_PSB_ulong = OpTypePointer PhysicalStorageBuffer %ulong")
         types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(gen.lconsts.items())]
     if tex:
         # Bindless set 0: images (binding 0), samplers (binding 1), descriptor hash table (binding 2).
@@ -15504,7 +15538,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     feats = {"FragmentBarycentricKHR": "fragmentShaderBarycentric",
              "FragmentShaderPixelInterlockEXT": "fragmentShaderPixelInterlock",
              "MeshShadingEXT": "meshShader", "Geometry": "geometryShader", "Float64": "shaderFloat64",
-             "Int64": "shaderInt64", "StorageImageWriteWithoutFormat": "shaderStorageImageWriteWithoutFormat",
+             "Int64": "shaderInt64", "Int64Atomics": "shaderBufferInt64Atomics",
+             "StorageImageWriteWithoutFormat": "shaderStorageImageWriteWithoutFormat",
              "StorageImageReadWithoutFormat": "shaderStorageImageReadWithoutFormat",
              "PhysicalStorageBufferAddresses": "bufferDeviceAddress",
              "RuntimeDescriptorArray": "runtimeDescriptorArray", "ImageGatherExtended": "shaderImageGatherExtended",
@@ -15879,6 +15914,9 @@ def main():
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="image_sample*_o without VK_KHR_maintenance8 (e.g. NVIDIA Pascal): fold the texel offset into "
                          "the coordinate instead of the Offset operand")
+    ap.add_argument("--int64-atomics", action="store_true",
+                    help="global/buffer_atomic_swap_x2 as one 64-bit OpAtomicExchange, which cannot tear "
+                         "(needs shaderBufferInt64Atomics; default: one 32-bit exchange per dword)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
@@ -15924,7 +15962,8 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES, OPT_SPIRV
-    global PC_TAIL_UBO
+    global PC_TAIL_UBO, INT64_ATOMICS
+    INT64_ATOMICS = a.int64_atomics
     PC_TAIL_UBO = a.pc_tail_ubo
     global FMA_EXACT
     FMA_KHR = a.fma == "khr"

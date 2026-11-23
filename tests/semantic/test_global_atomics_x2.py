@@ -69,5 +69,44 @@ class GlobalAtomicsX2(unittest.TestCase):
             translate(["v_mov_b32_e32 v1, 0", "global_atomic_or_x2 v6, v1, v[2:3], s[0:1] glc"])
 
 
+class GlobalSwapX2Int64Atomics(unittest.TestCase):
+    """--int64-atomics (SHADER-868): global_atomic_swap_x2 is one 64-bit OpAtomicExchange, so two lanes swapping into
+    one element cannot tear it. The values one lane sees are the same as with the two-dword form."""
+
+    def setUp(self):
+        self.saved = rdna2spirv.INT64_ATOMICS
+        rdna2spirv.INT64_ATOMICS = True
+
+    def tearDown(self):
+        rdna2spirv.INT64_ATOMICS = self.saved
+
+    def test_one_64_bit_exchange(self):
+        asm = translate(["v_mov_b32_e32 v1, 0", "global_atomic_swap_x2 v[6:7], v1, v[2:3], s[0:1] glc"])
+        self.assertIn("OpCapability Int64Atomics", asm)
+        self.assertEqual(asm.count("OpAtomicExchange %ulong"), 1)
+        self.assertNotIn("OpAtomicExchange %uint", asm)
+
+    def test_values(self):
+        for m in VALUES:
+            for d in VALUES:
+                with self.subTest(m=hex(m), d=hex(d)):
+                    self.assertEqual(atomic_x2("swap", m, d), (split(m), split(d)))
+        self.assertEqual(atomic_x2("swap", 0x11111111_22222222, 0x33333333_44444444, glc=False),
+                         ((0xDEAD, 0xBEEF), split(0x33333333_44444444)))
+        self.assertEqual(atomic_x2("swap", 0x11111111_22222222, 0x33333333_44444444, offset=-8),
+                         (split(0x11111111_22222222), split(0x33333333_44444444)))
+
+    def test_bitwise_forms_keep_32_bit_atomics(self):
+        asm = translate(["v_mov_b32_e32 v1, 0", "global_atomic_xor_x2 v[6:7], v1, v[2:3], s[0:1] glc"])
+        self.assertNotIn("Int64Atomics", asm)
+        self.assertEqual(asm.count("OpAtomicXor %uint"), 2)
+
+    def test_off_by_default(self):
+        rdna2spirv.INT64_ATOMICS = False
+        asm = translate(["v_mov_b32_e32 v1, 0", "global_atomic_swap_x2 v[6:7], v1, v[2:3], s[0:1] glc"])
+        self.assertNotIn("Int64Atomics", asm)
+        self.assertEqual(asm.count("OpAtomicExchange %uint"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

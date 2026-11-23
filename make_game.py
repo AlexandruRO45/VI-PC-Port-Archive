@@ -1155,10 +1155,12 @@ def fspx_key_clash(spirv: str):
 
 WAVE64_MODES = ("auto", "on", "off")
 
-# The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
+# The translator's fallback flags make_game.py can forward (and --int64-atomics, which asks for a feature instead
+# of avoiding one), and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--int64-atomics", "int64_atomics"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -2002,6 +2004,9 @@ def main() -> int:
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
+    ap.add_argument("--int64-atomics", action="store_true",
+                    help="translate global/buffer_atomic_swap_x2 as one 64-bit atomic, which cannot tear, for "
+                         "devices with shaderBufferInt64Atomics (SHADER-868; default: one 32-bit atomic per dword)")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:

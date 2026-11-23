@@ -426,6 +426,8 @@ int main(int argc, char** argv) {
             return 77;
         }
         f12.bufferDeviceAddress = VK_TRUE;
+        // rdna2spirv.py --int64-atomics (64-bit swaps on device-address memory), where the device has it.
+        f12.shaderBufferInt64Atomics = f12q.shaderBufferInt64Atomics;
         if (tex_rgba_path) {
             if (!f12q.runtimeDescriptorArray || !f12q.descriptorIndexing) {
                 std::fprintf(stderr, "unsupported: VKH_TEX_RGBA needs runtimeDescriptorArray and descriptorIndexing\n");

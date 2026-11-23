@@ -358,6 +358,14 @@ without it they're skipped, which is expected, not a failure. To test the fallba
 **for both `build.py` and `check.py`** (or for `run_gpu_tests.py`): the offset is then folded into the coordinate
 (`docs/design.md`, "Texel offsets"), and the +16/-32 sample is judged on every device.
 
+## 64-bit swaps: one 64-bit atomic
+
+`global_atomic_swap_x2` and `buffer_atomic_swap_x2` are translated as one 32-bit exchange per dword by default, which
+can tear when lanes swap into one element at once. `LEONIDA_INT64_ATOMICS=1` for `build.py` (or `run_gpu_tests.py`)
+translates them with `rdna2spirv.py --int64-atomics` as one 64-bit `OpAtomicExchange` (SHADER-868). Such a module
+needs `shaderBufferInt64Atomics`: `vk_compute_test` enables it, and skips with 77 on a device without it.
+`make_game.py --int64-atomics` translates the game's shaders the same way.
+
 ## Fused multiply-add: GLSL Fma or OpFmaKHR
 
 `cs_fma_fused` checks that `v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32` (and one `v_fma_f16`) round once, on

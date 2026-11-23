@@ -194,7 +194,8 @@ int main(int argc, char** argv) {
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
-    VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12q};
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2q.pNext = &f13q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
@@ -210,6 +211,13 @@ int main(int argc, char** argv) {
     const bool needs_float64 = leonida::vk_test::spirv_declares_capability(code.data(), code.size(), 10);  // Float64
     if (needs_float64 && !f2q.features.shaderFloat64) {
         std::fprintf(stderr, "unsupported: %s uses Float64 and the device has no shaderFloat64\n", argv[1]);
+        return 77;
+    }
+    // rdna2spirv.py --int64-atomics: a 64-bit atomic on device-address memory (capability Int64Atomics).
+    const bool needs_int64_atomics = leonida::vk_test::spirv_declares_capability(code.data(), code.size(), 12);
+    if (needs_int64_atomics && !f12q.shaderBufferInt64Atomics) {
+        std::fprintf(stderr, "unsupported: %s uses Int64Atomics and the device has no shaderBufferInt64Atomics\n",
+                     argv[1]);
         return 77;
     }
     // A size the device can't require but runs anyway: one min..max range (fixed), or its default subgroupSize in a
@@ -229,6 +237,7 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE;
+    f12.shaderBufferInt64Atomics = needs_int64_atomics ? VK_TRUE : VK_FALSE;
     if (f13q.subgroupSizeControl || require_wave64) {
         f13.subgroupSizeControl = f13q.subgroupSizeControl;
         f13.computeFullSubgroups = require_wave64 || observed_full ? VK_TRUE : VK_FALSE;
