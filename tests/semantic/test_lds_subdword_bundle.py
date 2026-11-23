@@ -147,5 +147,41 @@ class TestDsReadU8ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[2], 0x7E)
 
 
+# ------------------------------------------------------------------------------
+# ds_read_u8 SIMD Divergence & Addressing
+# ------------------------------------------------------------------------------
+
+class SIMDWaveDS:
+    def __init__(self, wave_size: int = 64):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.lds: LDSMemory = LDSMemory()
+
+    def step_read_u8(self, insn: DSReadU8Instruction):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                addr = self.vgprs[insn.addr.index][lane]
+                self.vgprs[insn.dst.index][lane] = self.lds.read_u8(addr, insn.offset)
+
+
+class TestDsReadU8SIMD(unittest.TestCase):
+    def test_simd_divergent_byte_addresses(self):
+        wave = SIMDWaveDS(wave_size=32)
+        for i in range(32):
+            wave.lds.write_u8(i * 4, (i * 7) & 0xFF)
+            wave.vgprs[1][i] = i * 4
+            wave.vgprs[2][i] = 0
+
+        insn = DSReadU8Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 2),
+            addr=RegisterOperand(OperandType.VGPR, 1),
+        )
+        wave.step_read_u8(insn)
+
+        for i in range(32):
+            self.assertEqual(wave.vgprs[2][i], (i * 7) & 0xFF)
+
+
 if __name__ == '__main__':
     unittest.main()
