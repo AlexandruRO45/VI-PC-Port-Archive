@@ -168,5 +168,52 @@ None of the programs has been run on a GPU.
 * **A second compiled form of 6,522 shaders.** The pipeline builds differ from the FSSM code. Which form the game
   runs for a pipeline is not measured here (that needs the executable). Either way, a translated pipeline build can
   be compared with the translated FSSM shader of the same pipeline.
-* **Not decoded.** The graphics state blob, the 40 bytes in each graphics record, the compute kind-1 blob, the
-  records inside the stage blobs, and slot 6.
+* **Not decoded.** Most of the graphics state blob (§7 has its colour and depth registers), the 40 bytes in each
+  graphics record, the compute kind-1 blob, the records inside the stage blobs, and slot 6.
+
+## 7. The graphics state blob
+
+The executable hands this blob to device slot 57 as the first (pointer, size) pair of a graphics pipeline description
+(#8273), next to the input-layout blob and the PS and VS programs with their stage blobs. It is a block of GPU
+context register **values**, without register numbers, in two fixed layouts:
+
+| word 1 | pipelines | size | colour and depth registers |
+|---:|---|---|---|
+| 4 | every VS (+ PS) pipeline | 380 to 420 bytes | at the offsets below |
+| 6 | every MS (+ PS) pipeline | 464 to 520 bytes | 0x54 bytes later |
+
+The registers were identified from the values alone, by their RDNA2 field layouts (as Mesa's `ac` headers name
+them), and checked over all 5,680 distinct state blobs of 1.0.2.1:
+
+| offset (VS layout) | register | what it gives |
+|---|---|---|
+| `0x070` | `SPI_SHADER_COL_FORMAT` | export format per render target; the leading non-zero nibbles count the targets |
+| `0x078` | `CB_SHADER_MASK` | channels the shader exports per target |
+| `0x0B8` | `DB_DEPTH_CONTROL` | depth test, depth write, compare function, stencil enable and functions |
+| `0x0BC` | `DB_STENCIL_CONTROL` | stencil fail / pass / depth-fail operations, front and back |
+| `0x0C0`, `0x0C4` | `DB_STENCILREFMASK`, `_BF` | stencil reference, read and write masks |
+| `0x0CC` | `CB_TARGET_MASK` | write mask per target (`RenderTargetWriteMask`) |
+| `0x0D0`–`0x0EC` | `CB_BLEND0..7_CONTROL` | blend factors and operations per target |
+| `0x0F4` | `SX_PS_DOWNCONVERT` | format class per target (8_8_8_8, 10_11_11, 2_10_10_10, 16_16, ...) |
+| `0x0F8`, `0x0FC` | `SX_BLEND_OPT_EPSILON`, `_CONTROL` | blend optimisation |
+| `0x100`–`0x11C` | `SX_MRT0..7_BLEND_OPT` | blend optimisation per target |
+
+The checks behind them:
+
+* **Blend.** Blending is enabled on render target n (`CB_BLENDn_CONTROL` bit 30) exactly when `SX_MRTn_BLEND_OPT` is
+  not the "blend disabled" word `0x06000600`, in all 45,440 (blob, target) pairs. Every enabled word decodes to an
+  ordinary D3D12 blend: `SRC_ALPHA`/`INV_SRC_ALPHA`, premultiplied `ONE`/`INV_SRC_ALPHA`, dual-source `SRC1_*`,
+  `MAX`, multiplicative `DEST_COLOR`.
+* **Masks.** The four per-target masks have their non-zero nibbles from target 0 upwards in 97 to 100% of the
+  blobs; 230 blobs have no colour target (depth-only).
+* **Depth.** No blob writes depth with the depth test off. Mesh pipelines mostly test `GREATER_EQUAL` (reversed Z);
+  the `LESS` pipelines that write depth look like shadow maps.
+
+Inside a set of records built from the same shaders, these are the words that differ (the blend block in about 4,770
+of 8,786 pairs of VS pipelines, then depth and stencil), so a title's pipeline description can be matched to one
+record through them. The rasterizer state, the topology and the remaining words are not decoded. Nothing here is
+measured on a console: it is a reading of the data.
+
+`tools/pso_state_decode.py <library or shaders.rpf> --out <file.json> [--summary]` writes, per graphics record, the
+D3D12-level reading of its state blob. Its output is game data. `tests/test_pso_state_decode.py` decodes hand-built
+blobs of both layouts.
