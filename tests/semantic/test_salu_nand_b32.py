@@ -235,5 +235,123 @@ class SaluNandB32AstTests(unittest.TestCase):
             parse_sop2("s_nand_b32 s106, s1, s2")
 
 
+class ScalarInterpreter:
+    """Single-lane scalar execution state modeling RDNA2 SGPRs and SCC."""
+
+    def __init__(self) -> None:
+        self.sgprs: list[int] = [0] * 106
+        self.scc: int = 0
+        self.vcc_lo: int = 0
+        self.vcc_hi: int = 0
+        self.exec_lo: int = 0xFFFFFFFF
+        self.exec_hi: int = 0xFFFFFFFF
+
+    def read_operand(self, op: Operand) -> int:
+        if op.kind == OperandKind.SGPR:
+            assert op.reg_num is not None
+            return self.sgprs[op.reg_num]
+        if op.kind == OperandKind.IMM:
+            assert op.imm_val is not None
+            return op.imm_val
+        if op.kind == OperandKind.SPECIAL:
+            if op.raw == "vcc_lo":
+                return self.vcc_lo
+            if op.raw == "vcc_hi":
+                return self.vcc_hi
+            if op.raw == "exec_lo":
+                return self.exec_lo
+            if op.raw == "exec_hi":
+                return self.exec_hi
+            if op.raw == "scc":
+                return self.scc
+        if op.kind == OperandKind.NULL:
+            return 0
+        raise ValueError(f"cannot read operand {op}")
+
+    def write_operand(self, op: Operand, val: int) -> None:
+        v = val & MASK32
+        if op.kind == OperandKind.SGPR:
+            assert op.reg_num is not None
+            self.sgprs[op.reg_num] = v
+        elif op.kind == OperandKind.SPECIAL:
+            if op.raw == "vcc_lo":
+                self.vcc_lo = v
+            elif op.raw == "vcc_hi":
+                self.vcc_hi = v
+            elif op.raw == "exec_lo":
+                self.exec_lo = v
+            elif op.raw == "exec_hi":
+                self.exec_hi = v
+            elif op.raw == "scc":
+                self.scc = 1 if v != 0 else 0
+        elif op.kind == OperandKind.NULL:
+            pass
+        else:
+            raise ValueError(f"cannot write operand {op}")
+
+    def step(self, inst: SOP2Instruction) -> int:
+        validate_sop2(inst)
+        s0 = self.read_operand(inst.src0)
+        s1 = self.read_operand(inst.src1)
+        res = ref_nand_b32(s0, s1)
+        self.write_operand(inst.dst, res)
+        self.scc = ref_scc(res)
+        return res
+
+    def exec_line(self, line: str) -> None:
+        clean = line.split(";")[0].strip()
+        if not clean:
+            return
+        parts = clean.split(None, 1)
+        op = parts[0]
+        args = [arg.strip() for arg in parts[1].split(",") if arg.strip()]
+        if op == "s_mov_b32":
+            dst = parse_operand(args[0])
+            src = parse_operand(args[1])
+            val = self.read_operand(src)
+            self.write_operand(dst, val)
+        elif op == "s_nand_b32":
+            inst = parse_sop2(line)
+            self.step(inst)
+        elif op == "s_cselect_b32":
+            dst = parse_operand(args[0])
+            s0 = self.read_operand(parse_operand(args[1]))
+            s1 = self.read_operand(parse_operand(args[2]))
+            self.write_operand(dst, s0 if self.scc != 0 else s1)
+        else:
+            raise ValueError(f"unsupported interpreter op: {op}")
+
+
+class SaluNandB32InterpreterTests(unittest.TestCase):
+    """Deterministic scalar interpreter tests for s_nand_b32."""
+
+    def test_interp_basic_reg_reg(self):
+        interp = ScalarInterpreter()
+        interp.exec_line("s_mov_b32 s0, 0x0F0F0F0F")
+        interp.exec_line("s_mov_b32 s1, 0x33333333")
+        interp.exec_line("s_nand_b32 s2, s0, s1")
+        self.assertEqual(interp.sgprs[2], 0xFCFCFCFC)
+        self.assertEqual(interp.scc, 1)
+
+    def test_interp_immediate_operand(self):
+        interp = ScalarInterpreter()
+        interp.exec_line("s_mov_b32 s0, 0xFFFFFFFF")
+        interp.exec_line("s_nand_b32 s1, s0, 0x12345678")
+        self.assertEqual(interp.sgprs[1], (~0x12345678) & MASK32)
+        self.assertEqual(interp.scc, 1)
+
+    def test_interp_null_destination(self):
+        interp = ScalarInterpreter()
+        interp.exec_line("s_mov_b32 s0, 0xFFFFFFFF")
+        interp.exec_line("s_mov_b32 s1, 0xFFFFFFFF")
+        interp.exec_line("s_nand_b32 null, s0, s1")
+        self.assertEqual(interp.scc, 0)
+
+    def test_interp_negative_invalid_instruction(self):
+        interp = ScalarInterpreter()
+        with self.assertRaises(ValueError):
+            interp.exec_line("s_invalid_op s0, s1, s2")
+
+
 if __name__ == "__main__":
     unittest.main()
