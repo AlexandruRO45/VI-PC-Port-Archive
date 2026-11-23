@@ -26,10 +26,13 @@ inside the vertex shader as straight-line selects (there is no index pass):
   flags in emission order with selects, and the vertices past the last end flag form the invocation's trailing
   strip, as a geometry shader's implicit OpEndPrimitive does. A triangle past the primitive's emitted count (or
   a primitive past the count) gets a position outside the clip volume; the corner's record feeds the outputs at
-  the GS's own output slots, so the pixel shader is unchanged. Push-constant tail members 1..5: record buffer
-  address, meta buffer address, primitive count.
+  the GS's own output slots, so the pixel shader is unchanged. Push-constant tail members 1..5: the record
+  and meta buffers' console VAs, heap-relative like every other stage's (the heap base is the block's own
+  members 1..2; the harness passes absolute addresses against a zero base, which reads the same), and the
+  primitive count.
 
-    python3 -I tools/gs_compute_stages.py <spirv dir> [name ...]    # per index entry with "gs_compute"
+    python3 -I tools/gs_compute_stages.py <spirv dir> [name ...]         # per index entry with "gs_compute"
+    python3 -I tools/gs_compute_stages.py <spirv dir> --vs-input name   # a vertex shader's fused pass
 
 Standard library only; assembles and validates with spirv-as / spirv-val from PATH.
 """
@@ -76,15 +79,18 @@ class _E:
 
     # -- push constants and addresses
     def load_pc(self, k):
-        """Parameter k (1-based). "s" mode: the uint at s0 + k - 1, the draw's own user data, as the D3D12
-        layer's flavors read them. "tail" mode: push-constant dword 36 + k - 1, past the user SGPRs (0..31,
-        member 0) and the heap and code base (dwords 32..35, struct members 1..4)."""
+        """Parameter k (1-based): the uint at push-constant dword 36 + k - 1, past the user SGPRs (0..31,
+        member 0) and the heap and code base (dwords 32..35, struct members 1..4). Both the harness and the
+        D3D12 layer push the record-driven draw's facts there."""
         p, v = self.tmp("p"), self.tmp("w")
-        if getattr(self, "pc_mode", "tail") == "s":
-            self.body += [f"{p} = OpAccessChain %_ptr_PC_uint %pc {self.c(0)} {self.c(k - 1)}",
-                          f"{v} = OpLoad %uint {p}"]
-        else:
-            self.body += [f"{p} = OpAccessChain %_ptr_PC_uint %pc {self.c(4 + k)}", f"{v} = OpLoad %uint {p}"]
+        self.body += [f"{p} = OpAccessChain %_ptr_PC_uint %pc {self.c(4 + k)}", f"{v} = OpLoad %uint {p}"]
+        return v
+
+    def pc_member(self, m):
+        """The block's own member m (0-based), a raw read: the heap and code bases are members 1..4 of every
+        translated module's push-constant block."""
+        p, v = self.tmp("pm"), self.tmp("wm")
+        self.body += [f"{p} = OpAccessChain %_ptr_PC_uint %pc {self.c(m)}", f"{v} = OpLoad %uint {p}"]
         return v
 
     def bda(self, lo, hi):
@@ -239,36 +245,6 @@ def _types_and_globals(x, mode, pc_tail, extra_globals=()):
     return types + gvars + list(extra_globals)
 
 
-def _layer_prologue(entry, io_vars, extra_decos=()):
-    """The layer flavor's head: the standard translated-module push-constant block (s0..s31, heap, code),
-    144 bytes; the draw's own user data carries the stage's parameters in s0..s4."""
-    decos = ["OpDecorate %PC Block", "OpMemberDecorate %PC 0 Offset 0", "OpDecorate %arr_ud ArrayStride 4",
-             "OpMemberDecorate %PC 1 Offset 128", "OpMemberDecorate %PC 2 Offset 132",
-             "OpMemberDecorate %PC 3 Offset 136", "OpMemberDecorate %PC 4 Offset 140"]
-    head = ["OpCapability Shader", "OpCapability Int64", "OpCapability PhysicalStorageBufferAddresses",
-            'OpExtension "SPV_KHR_physical_storage_buffer"', "OpMemoryModel PhysicalStorageBuffer64 GLSL450",
-            f'OpEntryPoint {entry} %main "main" {" ".join(io_vars)} %pc']
-    return head + list(extra_decos) + decos
-
-
-def _layer_types(x, extra_globals=()):
-    """The layer flavor's types and globals: the standard block plus this generator's own."""
-    types = ["%void = OpTypeVoid", "%fn = OpTypeFunction %void", "%bool = OpTypeBool",
-             "%uint = OpTypeInt 32 0", "%int = OpTypeInt 32 1", "%ulong = OpTypeInt 64 0",
-             "%float = OpTypeFloat 32", "%v4float = OpTypeVector %float 4",
-             "%_ptr_In_int = OpTypePointer Input %int", "%_ptr_Out_v4 = OpTypePointer Output %v4float",
-             f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
-             "%PC = OpTypeStruct %arr_ud %uint %uint %uint %uint",
-             "%_ptr_PC = OpTypePointer PushConstant %PC", "%_ptr_PC_uint = OpTypePointer PushConstant %uint",
-             "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint",
-             "%f1 = OpConstant %float 1", "%f2 = OpConstant %float 2",
-             "%outside = OpConstantComposite %v4float %f2 %f2 %f2 %f1", "%false = OpConstantFalse %bool"]
-    types += [f"{n} = OpConstant %uint {v}" for v, n in sorted(x.consts.items())]
-    types += [f"{n} = OpConstant %ulong {v}" for v, n in sorted(x.ulongs.items())]
-    gvars = ["%vertex_index = OpVariable %_ptr_In_int Input", "%pc = OpVariable %_ptr_PC PushConstant"]
-    return types + gvars + list(extra_globals)
-
-
 def scatter_module(lay):
     """The regroup pass: linear VS outputs + indices -> the capture pass's primitive-major input buffer."""
     nin, vin = int(lay["num_inputs"]), int(lay["verts_in"])
@@ -322,7 +298,7 @@ def scatter_module(lay):
     return "\n".join(head + tail + ["%main = OpFunction %void None %fn", "%entry = OpLabel"] + x.body) + "\n"
 
 
-def draw_vs_module(lay, pc_mode="tail"):
+def draw_vs_module(lay):
     """The vertex shader of the record-driven draw, the strip-to-triangle decode inside as straight-line selects."""
     nout, mv, topo = len(lay["outputs"]), int(lay["max_verts"]), lay["topology"]
     if topo != "triangle_strip":
@@ -331,14 +307,14 @@ def draw_vs_module(lay, pc_mode="tail"):
         raise Unsupported("gs_compute_stages: the lowering orders the position output first")
     out_locs = [int(o.split()[1]) for o in lay["outputs"] if o != "position"]
     x = _E()
-    x.pc_mode = pc_mode
     per = 3 * (mv - 2 if mv >= 3 else 1)
     x.body += ["%vid = OpLoad %int %vertex_index", "%vidu = OpBitcast %uint %vid",
                f"%p = OpUDiv %uint %vidu {x.c(per)}", f"%rem = OpUMod %uint %vidu {x.c(per)}",
                f"%t = OpUDiv %uint %rem {x.c(3)}", f"%corner = OpUMod %uint %rem {x.c(3)}"]
     prims = x.load_pc(5)
-    rec = x.bda(x.load_pc(1), x.load_pc(2))
-    meta = x.bda(x.load_pc(3), x.load_pc(4))
+    heap = x.bda(x.pc_member(1), x.pc_member(2))
+    rec = x.add64(heap, x.bda(x.load_pc(1), x.load_pc(2)))
+    meta = x.add64(heap, x.bda(x.load_pc(3), x.load_pc(4)))
     p_in = x.lt("%p", prims)
     p_safe = x.sel_u(p_in, "%p", x.c(0))  # a primitive past the count reads primitive 0, clipped out below
     base = x.mul(p_safe, x.c(mv + 1))
@@ -400,12 +376,8 @@ def draw_vs_module(lay, pc_mode="tail"):
             [f"OpDecorate %out{l} Location {l}" for l in out_locs]
     gvars = ["%out_pos = OpVariable %_ptr_Out_v4 Output"] + \
             [f"%out{l} = OpVariable %_ptr_Out_v4 Output" for l in out_locs]
-    if pc_mode == "s":
-        head, tail = _layer_prologue("Vertex", tuple(io), tuple(decos)), \
-            _layer_types(x, extra_globals=gvars)
-    else:
-        head, tail = _prologue("Vertex", 5, tuple(io), tuple(decos)), \
-            _types_and_globals(x, "%vertex_index", 5, extra_globals=gvars)
+    head = _prologue("Vertex", 5, tuple(io), tuple(decos))
+    tail = _types_and_globals(x, "%vertex_index", 5, extra_globals=gvars)
     return "\n".join(head + tail + ["%main = OpFunction %void None %fn", "%entry = OpLabel"] + x.body) + "\n"
 
 
@@ -695,7 +667,8 @@ def vs_input_module(text):
                     'OpExtension "SPV_KHR_physical_storage_buffer"')
     mem_decos = [f"OpMemberDecorate {pc_struct} {n_members + i} Offset {144 + 4 * i}" for i in range(VS_INPUT_SLOTS)]
     mem_decos += [f"OpMemberDecorate {pc_struct} {n_members + VS_INPUT_SLOTS} Offset {144 + 4 * VS_INPUT_SLOTS}",
-                  "OpDecorate %gsc_arr18 ArrayStride 4"]
+                  "OpDecorate %gsc_arr18 ArrayStride 4",
+                  "OpDecorate %gsc_gid BuiltIn GlobalInvocationId"]
     where = max(last_memb, 0)
     out_head[where + 1:where + 1] = mem_decos
     extra_types = []
@@ -717,10 +690,10 @@ def vs_input_module(text):
     return "\n".join(out_head + out_body) + "\n"
 
 
-def build_for_index(spirv_dir, names=None, layer=False):
-    """Write the generated stages for every index entry with a "gs_compute" layout: the harness flavor
-    (<name>.gs_scatter.spv, <name>.gs_vs.spv) for the vk_harness path, or with layer=True the draw vertex
-    shader's layer flavor (<name>.gs_vs_bda.spv), whose parameters ride the draw's own s0..s4."""
+def build_for_index(spirv_dir, names=None):
+    """Write the generated stages for every index entry with a "gs_compute" layout: the scatter pass
+    (<name>.gs_scatter.spv) and the record-driven draw vertex shader (<name>.gs_vs.spv), which the vk_harness
+    path dispatches and the D3D12 layer's fallback draws with."""
     with open(os.path.join(spirv_dir, "index.json"), encoding="utf-8") as f:
         index = json.load(f)
     written = []
@@ -728,9 +701,7 @@ def build_for_index(spirv_dir, names=None, layer=False):
         lay = entry.get("gs_compute")
         if not lay or (names and name not in names):
             continue
-        stages = (("gs_scatter", scatter_module), ("gs_vs", draw_vs_module)) if not layer else \
-            (("gs_vs_bda", lambda l: draw_vs_module(l, pc_mode="s")),)
-        for suffix, module in stages:
+        for suffix, module in (("gs_scatter", scatter_module), ("gs_vs", draw_vs_module)):
             try:
                 text = module(lay)
             except Unsupported as e:
@@ -786,12 +757,9 @@ def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
         return 0 if argv else 2
-    layer, vs_input = "--layer" in argv, "--vs-input" in argv
-    argv = [a for a in argv if a not in ("--layer", "--vs-input")]
+    vs_input = "--vs-input" in argv
+    argv = [a for a in argv if a != "--vs-input"]
     spirv_dir = argv[0]
-    if not os.path.isfile(os.path.join(spirv_dir, "index.json")):
-        print(f"ERROR: {spirv_dir}/index.json not found", file=sys.stderr)
-        return 2
     if vs_input:
         if len(argv) < 2:
             print("--vs-input needs the vertex shader's index name", file=sys.stderr)
@@ -799,7 +767,10 @@ def main(argv):
         for name in argv[1:]:
             vs_input_for(spirv_dir, name)
         return 0
-    build_for_index(spirv_dir, set(argv[1:]) or None, layer=layer)
+    if not os.path.isfile(os.path.join(spirv_dir, "index.json")):
+        print(f"ERROR: {spirv_dir}/index.json not found", file=sys.stderr)
+        return 2
+    build_for_index(spirv_dir, set(argv[1:]) or None)
     return 0
 
 
