@@ -1544,14 +1544,30 @@ public:
         if (FAILED(hr) || !hwnd) return DXGI_ERROR_INVALID_CALL;
         return create_swap_chain(device, hwnd, desc, restrict_to_output, out);
     }
-    // Measured on the host dxgi.dll (RTX 4080 SUPER, Intel UHD 770 and WARP adapters): a null handle or a null LUID is
-    // DXGI_ERROR_INVALID_CALL, INVALID_HANDLE_VALUE is E_INVALIDARG and any other handle that is not a shared
-    // resource (0x1234) is 0x88760873, not DXGI_ERROR_INVALID_CALL. Nothing here resolves a handle to an adapter, so
-    // every other handle gets the same answer as an unknown one.
     HRESULT STDMETHODCALLTYPE GetSharedResourceAdapterLuid(HANDLE resource, LUID* luid) override {
         if (!resource || !luid) return DXGI_ERROR_INVALID_CALL;
         if (resource == INVALID_HANDLE_VALUE) return E_INVALIDARG;
-        return static_cast<HRESULT>(0x88760873);
+        constexpr auto unknown_share = static_cast<HRESULT>(0x88760873);  // native DXGI for an unknown share
+        const auto gdi = GetModuleHandleW(L"gdi32.dll");
+        const auto query = gdi ? reinterpret_cast<decltype(&D3DKMTGetSharedResourceAdapterLuid)>(
+            GetProcAddress(gdi, "D3DKMTGetSharedResourceAdapterLuid")) : nullptr;
+        if (!query) return unknown_share;
+
+        D3DKMT_GETSHAREDRESOURCEADAPTERLUID info{};
+        info.hNtHandle = resource;
+        auto status = query(&info);
+        if (status == STATUS_INVALID_HANDLE) {
+            // IDXGIResource::GetSharedHandle returns a 32-bit global share instead of an NT handle.
+            const auto value = reinterpret_cast<ULONG_PTR>(resource);
+            if (value > UINT32_MAX) return unknown_share;
+            info = {};
+            info.hGlobalShare = static_cast<D3DKMT_HANDLE>(value);
+            status = query(&info);
+            if (status != 0) return unknown_share;
+        }
+        if (status != 0) return E_FAIL;  // e.g. a valid NT event handle, which is not a shared resource
+        *luid = info.AdapterLuid;
+        return S_OK;
     }
     // Microsoft documents S_OK with a cookie for UnregisterStereoStatus (E_NOTIMPL is only the answer of the
     // Windows 7 Platform Update). Stereo is never enabled here, so the window or event is never notified.

@@ -9,6 +9,7 @@
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_6.h>
+#include <d3d11.h>
 
 #define EXPECT_HR(expr, want) do { \
     const HRESULT got_ = (expr); \
@@ -29,6 +30,64 @@ struct Ref {
     ~Ref() { if (p) p->Release(); }
     T* operator->() const { return p; }
 };
+
+struct SharedHandle {
+    HANDLE value = nullptr;
+    ~SharedHandle() { if (value) CloseHandle(value); }
+};
+
+int check_shared_owner(IDXGIFactory4* shim, IDXGIFactory4* host) {
+    const char* who = "shared resource owner";
+    for (UINT i = 0; ; ++i) {
+        Ref<IDXGIAdapter1> adapter;
+        const HRESULT hr = host->EnumAdapters1(i, &adapter.p);
+        if (hr == DXGI_ERROR_NOT_FOUND) break;
+        EXPECT_HR(hr, S_OK);
+        DXGI_ADAPTER_DESC1 desc{};
+        EXPECT_HR(adapter->GetDesc1(&desc), S_OK);
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        Ref<ID3D11Device> device;
+        EXPECT_HR(D3D11CreateDevice(adapter.p, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+                                    D3D11_SDK_VERSION, &device.p, nullptr, nullptr), S_OK);
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = td.Height = 16;
+        td.MipLevels = td.ArraySize = td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+        Ref<ID3D11Texture2D> texture;
+        EXPECT_HR(device->CreateTexture2D(&td, nullptr, &texture.p), S_OK);
+        Ref<IDXGIResource1> resource;
+        EXPECT_HR(texture->QueryInterface(IID_PPV_ARGS(&resource.p)), S_OK);
+        SharedHandle handle;
+        EXPECT_HR(resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &handle.value), S_OK);
+        LUID expected{}, actual{};
+        EXPECT_HR(host->GetSharedResourceAdapterLuid(handle.value, &expected), S_OK);
+        EXPECT(expected.HighPart == desc.AdapterLuid.HighPart && expected.LowPart == desc.AdapterLuid.LowPart);
+        EXPECT_HR(shim->GetSharedResourceAdapterLuid(handle.value, &actual), S_OK);
+        EXPECT(actual.HighPart == expected.HighPart && actual.LowPart == expected.LowPart);
+        // GetSharedHandle returns a legacy global share, owned by the texture (no CloseHandle).
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        Ref<ID3D11Texture2D> legacy;
+        EXPECT_HR(device->CreateTexture2D(&td, nullptr, &legacy.p), S_OK);
+        Ref<IDXGIResource> legacy_resource;
+        EXPECT_HR(legacy->QueryInterface(IID_PPV_ARGS(&legacy_resource.p)), S_OK);
+        HANDLE global = nullptr;
+        EXPECT_HR(legacy_resource->GetSharedHandle(&global), S_OK);
+        actual = {};
+        EXPECT_HR(host->GetSharedResourceAdapterLuid(global, &expected), S_OK);
+        EXPECT_HR(shim->GetSharedResourceAdapterLuid(global, &actual), S_OK);
+        EXPECT(actual.HighPart == expected.HighPart && actual.LowPart == expected.LowPart);
+        std::printf("shared resource owner matches native DXGI on %ls\n", desc.Description);
+    }
+    SharedHandle event{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+    EXPECT(event.value);
+    LUID ignored{};
+    const HRESULT event_hr = host->GetSharedResourceAdapterLuid(event.value, &ignored);
+    EXPECT(FAILED(event_hr));
+    EXPECT_HR(shim->GetSharedResourceAdapterLuid(event.value, &ignored), event_hr);
+    return 0;
+}
 
 int check(IDXGIFactory4* factory, IUnknown* swap_device, const char* who) {
     // CreateSoftwareAdapter: a null module or a null output is DXGI_ERROR_INVALID_CALL.
@@ -148,6 +207,7 @@ int main() {
             return 1;
         }
         failures += check(host.p, host_queue.p, "host");
+        failures += check_shared_owner(ours.p, host.p);
     }
     if (vk.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", vk.validation_errors());
