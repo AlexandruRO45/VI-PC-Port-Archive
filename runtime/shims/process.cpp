@@ -326,6 +326,7 @@ wchar_t** current_wide_environment() {
 
 // msvcrt.dll: int __getmainargs(int* argc, char*** argv, char*** env, int expand, void* startinfo)
 int __cdecl game_getmainargs(int* argc, char*** argv, char*** env, int, void*) {
+    if (!argc || !argv) return EINVAL;
     if (const int error = game_configure_narrow_argv(1)) return error;
     *argc = g_argc;
     *argv = g_argv_ptr;
@@ -333,6 +334,7 @@ int __cdecl game_getmainargs(int* argc, char*** argv, char*** env, int, void*) {
     return 0;
 }
 int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int, void*) {
+    if (!argc || !argv) return EINVAL;
     if (const int error = game_configure_wide_argv(1)) return error;
     *argc = g_argc;
     *argv = g_wargv_ptr;
