@@ -287,6 +287,7 @@ class ImageStoreD16Tests(unittest.TestCase):
             ("2D", "v[2:3]", "dmask:0x3", "glc d16"),
             ("2D_ARRAY", "v[2:3]", "dmask:0xf", "a16 d16"),
             ("3D", "v[2:4]", "dmask:0x7", "glc d16"),
+            ("CUBE", "v[2:4]", "dmask:0xf", "d16"),
             ("2D", "v2", "dmask:0x0", "a16 d16"),
         ]
         for dim, addr, dmask, extra in cases:
@@ -336,7 +337,7 @@ class ImageStoreD16Tests(unittest.TestCase):
 
     def test_unsupported_dims_and_modifiers_still_refused(self):
         for bad in (
-            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm d16",
+            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm d16",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 tfe",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 lwe",
         ):
