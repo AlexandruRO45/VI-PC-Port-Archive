@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -73,9 +74,11 @@ struct ResourceBinding {
     VkBuffer buffer = VK_NULL_HANDLE;  // a buffer resource, for copies
     VkDeviceSize buffer_offset = 0;    // where it starts in `buffer` (the GPU address arena holds many)
     VkDeviceSize size = 0;             // its size in bytes
+    const std::uint8_t* host = nullptr;  // mapped CPU-written bytes (UPLOAD/write-back), for small CPU-side reads
     std::uint64_t va = 0;              // a buffer's console VA (GetGPUVirtualAddress), for vertex/index views
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
+    bool line = false;                 // a 1D image (TEXTURE1D): its attachment views are 1D arrays
     std::uint32_t samples = 1;         // more than one: a multisampled 2D texture
     bool typeless = false;  // A TYPELESS color resource: views name a format of its family (D3D-275).
     bool castable_view_formats = false;  // A creation-time castable list made the image mutable (D3D-85/D3D-90),
@@ -411,8 +414,8 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) return {1, 1};
     switch (format) {
     case VK_FORMAT_R32G32B32A32_SFLOAT:
-    case VK_FORMAT_R32G32B32A32_UINT:
-    case VK_FORMAT_R32G32B32A32_SINT: return {16, 1};
+    case VK_FORMAT_R32G32B32A32_SINT:
+    case VK_FORMAT_R32G32B32A32_UINT: return {16, 1};
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R16G16B16A16_UNORM:
     case VK_FORMAT_R16G16B16A16_SNORM:
@@ -771,7 +774,27 @@ struct ShaderUserData {
 };
 static_assert(sizeof(ShaderUserData) == 144);
 
+// A host read of a small CPU-written input either succeeds, names no VA, or names GPU-written memory. The last is a
+// capability limit, not bad contents: DEFAULT and READBACK bytes may still be stale while replay prepares a command.
+enum class HostReadStatus { ok, absent, not_cpu_written };
+
+enum class ReplayResult {
+    success,
+    list_open,
+    unresolved_resource,
+    invalid_subresource,
+    invalid_clear,
+    invalid_copy,
+    invalid_predication,
+    invalid_query,
+    invalid_indirect_arguments,
+    unsupported
+};
+
 struct ReplayFunctions {
+    // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
+    // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
+    VkDescriptorSet bindless_set = VK_NULL_HANDLE;
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
     PFN_vkCmdClearDepthStencilImage clear_depth_stencil_image = nullptr;
@@ -826,6 +849,9 @@ struct ReplayFunctions {
     // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
     // of it.
     std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer&, VkDeviceSize&)> buffer_at;
+    // Host bytes for a whole console VA range; `not_cpu_written` when it names GPU-writable memory. For small
+    // CPU-written inputs, such as the pointer list of an ARRAY_OF_POINTERS TLAS build.
+    std::function<HostReadStatus(std::uint64_t va, std::uint64_t bytes, const std::uint8_t*&)> host_at;
     // Zeroed memory that unbound vertex-buffer slots and an unbound index buffer read (D3D12 reads zeros there).
     VkBuffer zero_buffer = VK_NULL_HANDLE;
     VkDeviceSize zero_offset = 0;
@@ -859,6 +885,10 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer, const CountedDispatch&)> emit_counted_dispatch;
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
+    // A KHR TLAS built from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS needs a pointer array whose entries are Vulkan
+    // device addresses, not console VAs. This stages one that stays alive until the submission completes and returns
+    // its device address. A GPU-written list is refused as unsupported; a bad entry is invalid_copy.
+    std::function<ReplayResult(const BuildAccelerationStructure&, VkDeviceAddress&)> prepare_khr_instances;
     // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
     // cannot read while the list is prepared, `xdxr_record` records the build.
     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
@@ -876,6 +906,14 @@ struct ReplayFunctions {
     std::function<void(VkCommandBuffer, const std::vector<PredicatedCopyDispatch>&)> emit_predicated_copy;
     // Returns a 2D-array view of the range (caller-owned, alive until execution completes); rectangle clears.
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
+    // Optional. The framebuffer, and through the last argument the render pass, that resolve the depth of the
+    // source's one-layer view into the destination's (both from image_view, each image in the layout after its
+    // view); alive until execution completes. Null: not available. For the resolves prepare names (D3D-417).
+    std::function<VkFramebuffer(const ResourceBinding&, VkImageView, VkImageLayout, const ResourceBinding&, VkImageView,
+                                VkImageLayout, VkResolveModeFlagBits, VkExtent2D, VkRenderPass&)>
+        depth_resolve_framebuffer;
+    PFN_vkCmdBeginRenderPass begin_render_pass = nullptr;
+    PFN_vkCmdEndRenderPass end_render_pass = nullptr;
     // Optional format check for color-attachment reinterpretation on mutable UAV clears; unset assumes every format
     // except E5B9G9R9_UFLOAT_PACK32 supports COLOR_ATTACHMENT.
     std::function<bool(VkFormat)> color_attachment_format;
@@ -889,19 +927,6 @@ struct ReplayFunctions {
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
-};
-
-enum class ReplayResult {
-    success,
-    list_open,
-    unresolved_resource,
-    invalid_subresource,
-    invalid_clear,
-    invalid_copy,
-    invalid_predication,
-    invalid_query,
-    invalid_indirect_arguments,
-    unsupported
 };
 
 namespace detail {
@@ -955,6 +980,9 @@ struct Prepared {
     // Depth or stencil resolves: the mode, and the destination view (`view` is the source's).
     VkResolveModeFlagBits resolve_mode = VK_RESOLVE_MODE_NONE;
     VkImageView resolve_view = VK_NULL_HANDLE;
+    // Set: the resolve runs in this render pass and framebuffer instead of a dynamic-rendering scope.
+    VkRenderPass resolve_pass = VK_NULL_HANDLE;
+    VkFramebuffer resolve_framebuffer = VK_NULL_HANDLE;
     bool has_depth24 = false;  // a depth plane copy of a depth24_as_float texture: convert through depth24
                                // (or a copy of an rgb96 texture: repacked by the same pass)
     std::uint32_t rgb96_row_words = 0;    // an rgb96 footprint: words between its rows and between its slices
@@ -977,6 +1005,7 @@ struct Prepared {
     ComputePipeline pipeline;  // dispatches
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
+    VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
     VkAccelerationStructureKHR accel_src = VK_NULL_HANDLE;
 };
@@ -1024,9 +1053,37 @@ struct PreparedDraw {
     }
 };
 
+// D3D converts a float clear value to a normalised format by rounding to nearest even, so an exact tie goes to the
+// even neighbour (0.5 on 8 bits is 128). Vulkan leaves the rounding of ties to the GPU, and NVIDIA writes 127, one
+// step below WARP and AMD. The value is rounded here and handed over as the exact fraction, which no GPU rounds
+// differently. NaN is 0 and values outside 0..1 clamp, as in D3D.
+//
+// Ties go to even whatever the thread's floating-point rounding mode: std::nearbyint follows it, so a game that
+// changes the mode would round differently. floor() does not depend on it, and x + 0.5 is exact here (x is at most
+// a float times 65535, well inside a double's 53 bits).
+inline double round_half_even(double x) {
+    const double r = std::floor(x + 0.5);
+    return r - x == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
+}
+
+inline float quantize_unorm(float value, double maximum) {
+    if (!(value > 0.0f)) return 0.0f;
+    if (value >= 1.0f) return 1.0f;
+    return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
+}
+
+// The same for a signed normalised format: -1..1 on a scale of 127 (8 bits) or 32767 (16 bits), where D3D writes -1.0
+// as -127 and ties go to the even neighbour.
+inline float quantize_snorm(float value, double maximum) {
+    if (!(value > -1.0f)) return value != value ? 0.0f : -1.0f;
+    if (value >= 1.0f) return 1.0f;
+    return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
+}
+
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
 // component range and truncates fractions. Vulkan instead interprets the matching union member as an integer
-// already; copying float bits changes the value without a validation error.
+// already; copying float bits changes the value without a validation error. The normalised formats are rounded like
+// D3D (quantize_unorm, quantize_snorm).
 inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearColor& input) {
     // Integer formats convert the float numerically: NaN maps to zero, values below the range clamp to the low
     // end, positive overflow (and +infinity) to the high end, and fractions truncate toward zero. Unsigned uses
@@ -1034,6 +1091,8 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     constexpr double u32_max = 4294967295.0, s32_min = -2147483648.0, s32_max = 2147483647.0;
     double low = 0, high = 0, alpha_high = 0;
     bool is_integer = true, is_signed = false;
+    std::array<double, 4> unorm{};  // the largest value of each normalised channel; 0 leaves the channel to the GPU
+    double snorm = 0;               // the largest value of a signed normalised format
     switch (format) {
     case VK_FORMAT_R8_UINT:
     case VK_FORMAT_R8G8_UINT:
@@ -1054,13 +1113,33 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     case VK_FORMAT_R32_SINT:
     case VK_FORMAT_R32G32_SINT:
     case VK_FORMAT_R32G32B32A32_SINT: low = s32_min; high = s32_max; is_signed = true; break;
+    case VK_FORMAT_R8_SNORM:
+    case VK_FORMAT_R8G8_SNORM:
+    case VK_FORMAT_R8G8B8A8_SNORM: is_integer = false; snorm = 127; break;
+    case VK_FORMAT_R16_SNORM:
+    case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16B16A16_SNORM: is_integer = false; snorm = 32767; break;
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_UNORM: is_integer = false; unorm = {255, 255, 255, 255}; break;
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB:  // the colour channels go through the sRGB curve on the GPU
+        is_integer = false;
+        unorm = {0, 0, 0, 255};
+        break;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: is_integer = false; unorm = {1023, 1023, 1023, 3}; break;
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16B16A16_UNORM: is_integer = false; unorm = {65535, 65535, 65535, 65535}; break;
     default: is_integer = false; break;
     }
     if (format != VK_FORMAT_A2B10G10R10_UINT_PACK32) alpha_high = high;
     VkClearColorValue value{};
     for (std::size_t i = 0; i < input.size(); ++i) {
         if (!is_integer) {
-            value.float32[i] = input[i];
+            if (snorm != 0) value.float32[i] = quantize_snorm(input[i], snorm);
+            else value.float32[i] = unorm[i] != 0.0 ? quantize_unorm(input[i], unorm[i]) : input[i];
             continue;
         }
         const double maximum = i == 3 ? alpha_high : high;
@@ -1096,10 +1175,18 @@ inline int typeless_view_family(VkFormat format) {
     }
 }
 
+// The RGBA8 and BGRA8 UNORM and SRGB formats: a castable-format list may cross between the two channel orders.
+inline bool rgba8_any_order(VkFormat format) {
+    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB ||
+           format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
 // The format a color view clears or renders in. A view of the resource's own format keeps it (a typeless resource
 // has none, so it needs an explicit one). A typeless resource, or one created with a castable-format list (its image
 // is mutable and lists the view formats), may be viewed in another format of its family: the image is mutable, so
-// the view reinterprets its bits (D3D-275; before it only the RGBA8 family was). A volume keeps its own format.
+// the view reinterprets its bits (D3D-275; before it only the RGBA8 family was). A castable RGBA8 or BGRA8 image may
+// also be viewed in the other channel order, which the device let through only when the list names it. A volume
+// keeps its own format.
 inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
     if (target.format == ColorViewFormat::resource)
         return resource.typeless ? VK_FORMAT_UNDEFINED : resource.format;
@@ -1108,7 +1195,9 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     if (!family) return VK_FORMAT_UNDEFINED;
     if (!resource.typeless && !resource.castable_view_formats)
         return format == resource.format ? format : VK_FORMAT_UNDEFINED;
-    if (family != typeless_view_family(resource.format) || resource.volume || resource.depth != 1)
+    const bool other_order = resource.castable_view_formats && rgba8_any_order(format) &&
+                             rgba8_any_order(resource.format);
+    if ((family != typeless_view_family(resource.format) && !other_order) || resource.volume || resource.depth != 1)
         return VK_FORMAT_UNDEFINED;
     return format;
 }
@@ -1763,16 +1852,17 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p, c
     const auto in_slice = std::uint64_t(placed_y / format.block) * placed.row_pitch + x_bytes;
     if (!within(slice_start, in_slice, buffer.size)) return ReplayResult::invalid_copy;
     const auto offset = slice_start + in_slice;
+    const bool stageable = copy.unrestricted_footprint || copy.tile_footprint;
     const bool depth_stencil = (range.aspectMask & depth_stencil_aspects) != 0;
     const std::uint32_t alignment = depth_stencil || image.rgb96 ? 4u : format.bytes;
-    if (!copy.unrestricted_footprint && offset % alignment) return ReplayResult::unsupported;
+    if (!stageable && offset % alignment) return ReplayResult::unsupported;
     if (depth - 1 > (buffer.size - offset) / slice_pitch ||
         !within(offset + (depth - 1) * slice_pitch, (rows - 1) * placed.row_pitch + row_bytes, buffer.size))
         return ReplayResult::invalid_copy;
     if (buffer.size > UINT64_MAX - buffer.buffer_offset) return ReplayResult::invalid_copy;
     const VkDeviceSize backing_offset = buffer.buffer_offset + offset;
     const bool converts = image.rgb96 || (image.depth24_as_float && range.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT);
-    if ((!copy.unrestricted_footprint || converts) && backing_offset % alignment) return ReplayResult::unsupported;
+    if ((!stageable || converts) && backing_offset % alignment) return ReplayResult::unsupported;
     const bool oversized_pitch = placed.row_pitch > INT32_MAX ||
                                  (depth > 1 && slice_rows > UINT32_MAX / format.block);
     if (!copy.unrestricted_footprint && !converts && oversized_pitch) return ReplayResult::invalid_copy;
@@ -1792,14 +1882,14 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p, c
         p.rgb96_slice_words = std::uint32_t(slice_pitch / 4);
         region.bufferRowLength = 0;
         region.bufferImageHeight = 0;
-    } else if (!converts && copy.unrestricted_footprint) {
+    } else if (!converts && stageable) {
         // Vulkan normally aligns the buffer offset to one texel block, with four bytes for depth/stencil and
         // transfer-only families without maintenance11. Copy lists use the conservative transfer alignment even
         // if they are running on a general queue.
         const auto required_alignment = vk && vk->queue_stages == queue_stages_copy ? std::max(4u, alignment) : alignment;
         if (backing_offset % required_alignment || oversized_pitch) {
             if (const auto result = stage_texture_footprint(vk, p, region, upload, rows, row_bytes,
-                                                            placed.row_pitch, slice_pitch, required_alignment);
+                                                           placed.row_pitch, slice_pitch, required_alignment);
                 result != ReplayResult::success)
                 return result;
         }
@@ -2513,10 +2603,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (depth_clear->flags & clear_depth) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
             if (depth_clear->flags & clear_stencil) aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
             const VkImageAspectFlags available = p.binding.aspects & depth_stencil_aspects;
-            if (!p.binding.image || !available || (aspects & ~available) || (p.binding.aspects & ~depth_stencil_aspects))
+            if (!p.binding.image || !available || (p.binding.aspects & ~depth_stencil_aspects))
                 return ReplayResult::invalid_clear;
+            // A flag for a plane the view's format doesn't have is ignored, as the PC D3D12 runtime (WARP) and native
+            // drivers do: STENCIL on a D32_FLOAT view clears nothing, DEPTH | STENCIL clears the depth plane. Until
+            // 2026-11-23 it returned invalid_clear here and the whole list was dropped (D3D-437).
+            aspects &= available;
             if (!detail::view_range(p.binding, depth_clear->target, aspects, p.range))
                 return ReplayResult::invalid_subresource;
+            if (!aspects) p.skip = true;
             if (const auto r = rect_view(clear_rects(depth_clear->rects), depth_clear->target, p.binding.aspects);
                 r != ReplayResult::success)
                 return r;
@@ -2727,6 +2822,23 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!p.view || !p.resolve_view) return ReplayResult::unsupported;
                 if (const auto result = detail::keep_around_resolve(vk, p); result != ReplayResult::success)
                     return result;
+                // D3D-417, a driver workaround: AMD's Windows driver (32.0.21042.62, Radeon RDNA2 iGPU) resolves a
+                // dynamic-rendering depth attachment from layer 0 of the image when the multisampled view starts at
+                // another layer (the resolve view's first layer it honours). The same two views in a framebuffer
+                // of a render pass resolve the right layer there, and on NVIDIA both ways do
+                // (docs/d3d12_vulkan.md). So a depth-only source above layer 0 goes through a render pass, on
+                // every GPU. A depth-stencil source does not: its planes can be in different layouts here.
+                if (p.source_range.baseArrayLayer && p.source.aspects == VK_IMAGE_ASPECT_DEPTH_BIT &&
+                    vk.depth_resolve_framebuffer && vk.begin_render_pass && vk.end_render_pass) {
+                    const VkExtent2D from = detail::mip_extent(p.source, p.source_range.baseMipLevel);
+                    const VkExtent2D to = detail::mip_extent(p.binding, p.range.baseMipLevel);
+                    p.resolve_framebuffer = vk.depth_resolve_framebuffer(
+                        p.source, p.view, image_layout(p.source, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+                        p.binding, p.resolve_view,
+                        image_layout(p.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL), p.resolve_mode,
+                        {std::min(from.width, to.width), std::min(from.height, to.height)}, p.resolve_pass);
+                    if (!p.resolve_framebuffer) return ReplayResult::unsupported;
+                }
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
@@ -2875,6 +2987,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.pipeline = *pipeline;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
+            p.khr_instances = 0;
             if (vk.xdxr_check) {
                 if (!vk.xdxr_check(*build)) return ReplayResult::unsupported;
             } else {
@@ -2885,6 +2998,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (build->update && build->src_va) {
                     p.accel_src = vk.resolve_acceleration_structure(build->src_va);
                     if (!p.accel_src) return ReplayResult::unresolved_resource;
+                }
+                if (build->is_tlas && build->instance_pointers && build->instance_count) {
+                    if (!vk.prepare_khr_instances || !vk.host_at || !vk.buffer_at) return ReplayResult::unsupported;
+                    return vk.prepare_khr_instances(*build, p.khr_instances);
                 }
             }
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
@@ -3292,9 +3409,15 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             const BarrierScope src = vulkan_barrier_scope(texture->sync_before, texture->access_before, predicates);
             const BarrierScope dst = vulkan_barrier_scope(texture->sync_after, texture->access_after, predicates);
-            std::vector<VkImageMemoryBarrier2> barriers;
+            // One barrier for each piece: nearly always one or two (LayoutPieces), which stay on the stack.
+            std::array<VkImageMemoryBarrier2, 2> few;
+            std::vector<VkImageMemoryBarrier2> many;
+            if (pieces.size() > few.size()) many.resize(pieces.size());
+            VkImageMemoryBarrier2* const barriers = many.empty() ? few.data() : many.data();
+            std::uint32_t barrier_count = 0;
             for (const auto& piece : pieces) {
-                VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+                VkImageMemoryBarrier2& b = barriers[barrier_count++];
+                b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
                 b.srcStageMask = src.stages;
                 b.dstStageMask = dst.stages;
                 b.srcAccessMask = src.access;
@@ -3307,11 +3430,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 b.subresourceRange = detail::layout_range(p.binding, piece.range);
                 if (b.srcStageMask) detail::restrict_to_queue(vk, b.srcStageMask, b.srcAccessMask);
                 if (b.dstStageMask) detail::restrict_to_queue(vk, b.dstStageMask, b.dstAccessMask);
-                barriers.push_back(b);
             }
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-            dependency.imageMemoryBarrierCount = std::uint32_t(barriers.size());
-            dependency.pImageMemoryBarriers = barriers.data();
+            dependency.imageMemoryBarrierCount = barrier_count;
+            dependency.pImageMemoryBarriers = barriers;
             vk.pipeline_barrier2(command_buffer, &dependency);
             if (tracker) tracker->set(id, range, new_layout);
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
@@ -3355,7 +3477,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
             const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
-                                                           : depth_clear->depth;
+                                : p.binding.format == VK_FORMAT_D16_UNORM
+                                    ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
+                                    : depth_clear->depth;
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
@@ -3607,6 +3731,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    attachment_access, attachment_stages, [&] {
                     detail::round_trip(vk, command_buffer, p.binding, dest_pieces, dest_attachment, dest_state,
                                        attachment_access, attachment_stages, [&] {
+                        if (p.resolve_framebuffer) {  // D3D-417 (prepare): the same resolve as a render pass
+                            VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+                            begin.renderPass = p.resolve_pass;
+                            begin.framebuffer = p.resolve_framebuffer;
+                            begin.renderArea = {{p.resolve.srcOffset.x, p.resolve.srcOffset.y},
+                                                {p.resolve.extent.width, p.resolve.extent.height}};
+                            vk.begin_render_pass(command_buffer, &begin, VK_SUBPASS_CONTENTS_INLINE);
+                            vk.end_render_pass(command_buffer);
+                            return;
+                        }
                         VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
                         info.imageView = p.view;
                         info.imageLayout = source_attachment;
@@ -3725,9 +3859,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         data.heap_base = vk.heap_base;
                         data.code_base = p.pipeline.code_base;
                         vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
-                        if (p.pipeline.bindless_set)
+                        if (p.pipeline.bindless_set) {
+                            const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
                             vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
-                                                    1, &p.pipeline.bindless_set, 0, nullptr);
+                                                    1, &set0, 0, nullptr);
+                        }
                         vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
                                           &data);
                     }
@@ -3759,8 +3895,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
                 g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
                 g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-                g.geometry.instances.arrayOfPointers = VK_FALSE;
-                g.geometry.instances.data.deviceAddress = addr(build->instances_va);
+                g.geometry.instances.arrayOfPointers = p.khr_instances ? VK_TRUE : VK_FALSE;
+                g.geometry.instances.data.deviceAddress =
+                    p.khr_instances ? p.khr_instances : addr(build->instances_va);
                 geoms.push_back(g);
                 ranges.push_back({build->instance_count, 0, 0, 0});
             } else {
@@ -3807,9 +3944,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
-            if (p.pipeline.bindless_set)
+            if (p.pipeline.bindless_set) {
+                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0, 1,
-                                        &p.pipeline.bindless_set, 0, nullptr);
+                                        &set0, 0, nullptr);
+            }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
@@ -3858,9 +3997,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
-            if (graphics.bindless_set)
+            if (graphics.bindless_set) {
+                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
-                                        &graphics.bindless_set, 0, nullptr);
+                                        &set0, 0, nullptr);
+            }
             vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
