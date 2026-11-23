@@ -11,7 +11,7 @@
 //     LSCH  struct headers (32 bytes) then all members (16 bytes); the header count is not stored, it is the one
 //           count whose headers and members fill the payload exactly
 //     LENM  enum headers (24 bytes) then all values (16 bytes); same rule
-//     LSNS  u32 block count, {u32 kind, u32 byte count} per block, then the blocks: opaque 16-byte records
+//     LSNS  u32 block count, {u32 kind, u32 byte count} per block, then the blocks: 16-byte records
 //     LRSC  "0DRP", u32 version, ...; the u32 at +0x10 is the root block number
 //     CHKS  big-endian file size and a 32-bit value (not verified here)
 //     LGID  empty
@@ -128,7 +128,7 @@ struct LsnsDesc {
 };
 
 struct LsnsRecord {
-    u8 bytes[16] [[comment("opaque")]];
+    u8 bytes[16] [[comment("record")]];
 };
 
 struct LsnsBlock {

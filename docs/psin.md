@@ -47,7 +47,7 @@ empty. The measured tag counts over the 670 complete `script.rpf` records are:
 |---|---:|---|
 | `LSCH` | 670 | 464-544 bytes; the type schema (structs and members), decoded below |
 | `LENM` | 670 | the schema's enums and their values, decoded below |
-| `LSNS` | 670 | block table and 16-byte records; layout decoded below, record contents opaque |
+| `LSNS` | 670 | block table and 16-byte records; block layout and the record order are decoded below |
 | `LGID` | 670 | empty (8-byte section) |
 | `LRSC` | 670 | starts with `0DRP` + version 122; resource page directory link |
 | `CHKS` | 670 | file size and a 32-bit checksum |
@@ -204,7 +204,7 @@ signatures are not joaat of a name. No name or hash from the game is committed h
   `LENM` for 59,945 of 60,354 and in another file for 395 more.
 - The region between the 8-byte header and `LSCH` is the instance data these structs describe: a block table
   and its data blocks, read from the root block that `LRSC` names. See *Instance data*.
-- `LSNS` values occur nowhere else in the container (see *`LSNS`*).
+- `LSNS` values occur nowhere else in the container: 0 of 112,764 64-bit record halves do (see *`LSNS`*).
 
 ## `LSNS`
 
@@ -237,29 +237,64 @@ Blocks by kind across these sections: `0x101` 4,200, `0x11c` 2,118, `0x207` 1,23
 
 ### The records
 
-The record contents are opaque. A wider pass over 16,169 containers that have an `LSNS` block (the archives
-above plus `levels.rpf`, `story000.rpf`, `packs.rpf` and `anim.rpf`; 22,101 blocks, 1,957,739 records) measured:
+Each block is an **ordered list of 16-byte records**. Measured with
+`python -I tools/psin_index.py <carve> --lsns` over the **1,009 complete `script.rpf` containers** (the whole
+corpus, not a sample):
 
-- **Uniform bytes.** 8.0 bits/byte over the pooled records, and no record byte position favours any value.
-  (The per-section 5.2-8.0 bits/byte in [restofworld.md](restofworld.md) is the small-sample limit of short
-  sections.) Records are not version-4 GUIDs: no fixed version or variant nibble.
-- **No references.** No 32-bit or 64-bit record word occurs anywhere else in its container, `LSCH` included (a
-  300-container sample, 107,594 words). Instance data stores its own hashes directly (member types `0x4a`-`0x4f`).
-- **No name hash.** Against up to 3.3 million harvested identifiers and model names, each as is, lower-cased and
-  upper-cased, the records match none of these functions. Each search was checked against a planted known value.
-  - 32-bit words: joaat, FNV-1, FNV-1a, CRC-32, MurmurHash3-32 and xxHash32 all stay at the level of a salted
-    control (about 1,350 chance hits each; this test used a third of the dictionary, 1.0 million words,
-    against 5.8 million distinct 32-bit words).
-  - 64-bit words: MurmurHash3 x64 (either half; the function behind the 64-bit map keys in
-    [world_names.md](world_names.md)), xxHash64, XXH3-64, FNV-1 and FNV-1a 64 have 0 matches.
-  - Whole records: MD5, XXH3-128, BLAKE2b-128, truncated SHA-1 and SHA-256, and full MurmurHash3 x64 128 have
-    0 matches.
-- **Repeats.** 18,692 of the 22,101 blocks are distinct. Beyond repeated whole blocks, 99,071 records still repeat
-  across different blocks.
+| Measure | Value |
+|---|---|
+| `LSNS` sections / blocks / records | 1,009 / 1,009 / 56,382 |
+| kinds | `0x101` on all 1,009 blocks (4-byte words) |
+| distinct blocks | 866; the other 143 are copies (one block occurs 120 times, one 18, one 8) |
+| records per block | 2-1,212, median 35 (distinct blocks) |
+| blocks with a duplicate record inside them | 0 of 866 |
+| distinct records | 50,317 |
+| records in more than one distinct block | 1,264 (the most in 319) |
+| bytes of the distinct-block records | 879,392; entropy 7.9988 bits/byte, all 256 byte values |
 
-Uniform bytes in exact 16-byte units that repeat record by record fit a deterministic 128-bit block cipher. They
-also fit 128-bit hashes of inputs outside the tested dictionary and functions. Which one it is has not been
-established. Per the project rules, no decryption is attempted.
+**The list is ordered.** The order is not the record's own value: no 4- or 8-byte record column is ascending
+on more than 1 of the 866 distinct blocks (a two-record block), so the order comes from outside the 16 bytes.
+It is consistent across the corpus instead:
+
+- The blocks form a **shared-prefix tree**. 205 different records occur first. The largest group sharing a
+  prefix is 319 blocks at length 1, then 150, 136, 124, 124, 110, 65, 35, 34, 30 and 13 for lengths 2-11.
+  No block's list is a proper prefix of another block's list.
+- In every block a record's corpus-wide frequency never rises along the list: 0 violations over 54,096
+  adjacent pairs.
+- Records with the same frequency keep the same relative order wherever they co-occur: 0 contradictions
+  over 65,829 observations of 31,945 pairs.
+
+**What the records are not.** Measured on the same 1,009 containers:
+
+- **Not a table of the section's own blocks.** A container has 4-5 instance-data blocks (`tools/psin_data.py`)
+  and one `LSNS` block of 2-1,212 records; the record count equals the instance block count on 0 of 1,009.
+- **Not a reference into the container.** 0 of 112,764 64-bit record halves occur anywhere else in their own
+  container (`tools/psin_index.py` `lsns_word_check()`). 1 of 225,528 32-bit quarters does, which is chance
+  level for a 32-bit word.
+- **Not a content hash of the container.** No record equals MD5, SHA-1 truncated to 128 bits, SHA-256
+  truncated to 128 bits, BLAKE2b-128 or MurmurHash3 x64 128 of any of the 1,057 carved streams, of any of
+  their sections, or of any instance-data block.
+
+**Reading.** The records are an ordered list of opaque 128-bit IDs, not a block table or an index: a
+container's list is one path through a tree of IDs shared by the corpus, and containers that share the
+common load prefix agree on every record pair they both contain. That is the shape of a reference or
+dependency list emitted in a global order, not of independent random IDs: independent 128-bit values would
+not share prefixes or keep a pair's order across containers.
+
+A **wider pass** over 16,169 containers (the archives above plus `levels`, `story000`, `packs` and `anim`;
+22,101 blocks, 1,957,739 records) measured the same uniform bytes: 8.0 bits/byte, no record byte position
+favours a value, and no fixed version or variant nibble (so not a version-4 GUID). 18,692 of its 22,101
+blocks are distinct, and 99,071 records still repeat across different blocks. Against up to 3.3 million
+harvested identifiers and model names, as is, lower-cased and upper-cased, the records match no tested name
+hash: the 32-bit searches stay at the level of a salted control (about 1,350 chance hits each), and the
+64-bit and whole-record searches (MurmurHash3 x64, xxHash64, XXH3-64/128, FNV-1/1a, MD5, BLAKE2b-128 and
+truncated SHA-1/SHA-256) have 0 matches. So the *values* stay unread; what the layout below measures is
+that they are ordered.
+
+**Hypothesis, not measured:** the 128-bit values are name or asset hashes whose input strings are outside
+the archives measured here (or a deterministic 128-bit block cipher over an ID space). Both fit uniform
+bytes and exact copies; the 128-bit functions tested above find neither. Per
+[CONTRIBUTING.md](../CONTRIBUTING.md) no decryption is attempted.
 
 ## Instance data
 
@@ -428,8 +463,8 @@ run takes about 50 s. `tests/test_psin_names.py` builds containers from invented
 
 ## What it does not give
 
-- No plaintext script code, function names or string table. `LSNS` has a decoded block layout, but its
-  16-byte records are uniformly random and match no tested name hash (see *`LSNS`*).
+- No plaintext script code, function names or string table. `LSNS` gives an ordered list of opaque 128-bit
+  IDs in the measured layout below; the ID values are not decoded (see *`LSNS`*).
 - No station/track names or file paths. Model names occur only as hashes; a name list from elsewhere resolves
   them (see *Name hashes in the data*). The archive TOC is still the only source for original paths.
 - No names. `LSCH` and `LENM` give the schema as 32-bit name hashes only; resolving them needs a name
@@ -438,7 +473,7 @@ run takes about 50 s. `tests/test_psin_names.py` builds containers from invented
 ## Tool
 
 ```text
-python -I tools/psin_index.py <PSIN file or carve directory> [--json] [--schema] [--limit N]
+python -I tools/psin_index.py <PSIN file or carve directory> [--json] [--schema] [--lsns] [--limit N]
 ```
 
 `--limit N` stops after N PSIN containers and must be at least 1 (0 or a negative value is refused with exit
@@ -458,14 +493,19 @@ code 2). Leave it out to index every container.
   not ("" when both were); text mode prints the reason as a `schema:` line.
 - `collect(src)` scans a single file or every `.bin` in a carve directory; non-PSIN files are
   skipped.
+- `lsns_record_profile(block_lists)` counts the 16-byte records and their order, and `lsns_word_check(blob,
+  spans, blocks)` counts record words that also occur elsewhere in their container. `--lsns` prints those
+  counts only: records, distinct and repeated blocks, duplicates, shared prefixes, order trades and the word
+  check. It prints no record value; with `--json` it writes `{"lsns": {...}}`.
 - Text output prints one line per container and a tag summary; `--json` writes `{files, summary}`.
 - The parser validates the first-section offset, each tag's printable range, each section size and
   the exact EOF; a 64 KiB split is reported as incomplete rather than guessed.
 
 `tests/test_psin_index.py` covers complete records, an empty section, a bad first offset, a zero-size
 section, truncated data, trailing bytes and the JSON CLI, and the `LSCH`/`LENM` layouts, empty sections,
-a count that fits nothing and both schema checks. It uses synthetic headers and joaat hashes of invented names
-only.
+a count that fits nothing and both schema checks. It also covers the `LSNS` record profile on synthetic
+blocks (shared prefixes, an equal-frequency order contradiction, the word check excluding the section's own
+bytes) and the `--lsns` CLI. It uses synthetic headers and joaat hashes of invented names only.
 
 ### Viewing a container in ImHex
 
@@ -475,7 +515,7 @@ editor that lays out one container as this page describes it:
 - the section chain;
 - the `LSCH` struct headers and members, and the `LENM` enums and values, with the header count found by the same
   fill-exact rule as `psin_index.py`;
-- the `LSNS` block table and its opaque 16-byte records;
+- the `LSNS` block table and its 16-byte records;
 - the `LRSC` `0DRP` version and root block, and the `CHKS` file size.
 
 A section that runs past the end of a truncated stream is shown as raw bytes. `tests/test_imhex_patterns.py` builds a
@@ -486,7 +526,8 @@ the pattern's output with both.
 
 - The 64 KiB split is not joined automatically. A caller that has the archive order can join adjacent
   blocks first; the tool then parses the complete container.
-- `LSNS` record contents and the `CHKS` payload are opaque to this tool; only the `LSNS` block layout is read. `LSCH` and `LENM` are decoded as above, and the instance
-  data by `tools/psin_data.py`. Struct, member and enum names stay 32-bit hashes, and most of them have no known
-  name.
+- `LSNS` record values and the `CHKS` payload are not interpreted by this tool; `--lsns` counts the records
+  and measures their order, it does not name a record. `LSCH` and `LENM` are decoded as above, and the
+  instance data by `tools/psin_data.py`. Struct, member and enum names stay 32-bit hashes, and most of them
+  have no known name.
 - No game data, names, hashes or payloads are committed. The carve directories are local.

@@ -25,9 +25,11 @@ checksum.
     +4   n x (u32 kind, u32 byte count)
          then the n blocks back to back, each a whole number of 16-byte records
 
-The byte counts fill the payload exactly. The kind's high byte is 1 or 2 (records read as 4- or 8-byte words);
-its low byte varies. The records themselves are uniformly random bytes that match no tested name hash; this tool
-reads the layout, not the contents.
+The byte counts fill the payload exactly. The kind's high byte is 1 or 2 (records read as 4- or 8-byte
+words); its low byte varies. Over the 1,009 complete `script.rpf` containers the records are an ordered list
+of unique 128-bit IDs, not a table of the section's own blocks: blocks share prefixes and the order of a
+pair of records never reverses across containers (docs/psin.md, `--lsns` below). What the 128-bit IDs name
+is not measured; they are not a content hash or a word of the container they sit in.
 
 `LSCH` is a type schema and `LENM` its enum table (measured over all 18,640 PSIN streams in the archives of package
 1.0.2.1; see docs/psin.md). Both store all headers first and then all elements, and neither stores the
@@ -54,16 +56,21 @@ the carved block). A complete record in `data.rpf` is validated by the project's
 meaning to the CHKS payload or to the bytes between the header and the first section.
 
 Usage:
-    python -I psin_index.py <file-or-dir> [--json] [--schema] [--limit N]
+    python -I psin_index.py <file-or-dir> [--json] [--schema] [--lsns] [--limit N]
 
 Text output prints one line per PSIN file and a summary; `--json` writes `{files, summary}`. `--schema` adds the
 decoded LSCH structs and LENM enums (hashes as hex) to each JSON record, or prints them in text mode.
+
+`--lsns` prints only counts of the `LSNS` 16-byte records: how many there are, how unique and repeated they
+are, how many blocks share a prefix, and whether a record word also occurs elsewhere in its container. It
+prints no record value. With `--json` it writes `{"lsns": {...}}`. It supersedes the per-file text.
 """
 import argparse
 import json
 import os
 import struct
 import sys
+from collections import Counter
 
 MAGIC = b"PSIN"
 HEADER = 16
@@ -157,6 +164,149 @@ def decode_lsns(payload):
     if table_end + sum(size for _kind, size in blocks) != len(payload):
         raise ValueError("LSNS blocks do not fill the section")
     return blocks
+
+
+def lsns_block_payloads(blob, record):
+    """[(kind, block bytes)] for every LSNS section of a parsed container; a bad section is skipped.
+
+    `record` is what parse() returned, so the section offsets are already validated.
+    """
+    out = []
+    for section in record["sections"]:
+        if section["tag"] != "LSNS":
+            continue
+        try:
+            blocks = decode_lsns(blob[section["offset"] + SECTION_HEADER:section["offset"] + section["size"]])
+        except ValueError:
+            continue
+        at = section["offset"] + SECTION_HEADER + 4 + 8 * len(blocks)
+        for kind, size in blocks:
+            out.append((kind, blob[at:at + size]))
+            at += size
+    return out
+
+
+def lsns_records(blocks):
+    """The LSNS 16-byte records of [(kind, block bytes)], in block then record order."""
+    return [data[i:i + LSNS_RECORD] for _kind, data in blocks for i in range(0, len(data), LSNS_RECORD)]
+
+
+def lsns_record_profile(block_lists):
+    """Counts of the LSNS 16-byte records and of their order, over any number of containers.
+
+    `block_lists` is one [(kind, block bytes)] list per container. Only counts come back; no record value is
+    kept. The order measures use the **distinct** blocks: a block that occurs in several containers is a
+    copy of it and must not weight the figures.
+
+    - "prefix" is, per prefix length, the largest number of distinct blocks that start with the same records
+      and how many different prefixes of that length occur.
+    - "adjacent_pairs" and "frequency_rises" check that a record's corpus-wide frequency never rises along a
+      block's list.
+    - "tie_pairs" are the co-occurrences of records with equal frequency (>= 2); "tie_contradictions" counts
+      those that appear in both orders in different blocks. Zero on the measured corpus.
+    """
+    block_lists = list(block_lists)
+    kinds = {}
+    uses = {}
+    records = 0
+    for blocks in block_lists:
+        for kind, data in blocks:
+            kinds[kind] = kinds.get(kind, 0) + 1
+            uses[data] = uses.get(data, 0) + 1
+            records += len(data) // LSNS_RECORD
+    seqs = [[data[i:i + LSNS_RECORD] for i in range(0, len(data), LSNS_RECORD)] for data in uses]
+    lengths = sorted(len(s) for s in seqs)
+    freq = {}
+    for seq in seqs:
+        for record in seq:
+            freq[record] = freq.get(record, 0) + 1
+
+    prefix = {}
+    for depth in range(1, 12):
+        counts = {}
+        for seq in seqs:
+            if len(seq) >= depth:
+                key = tuple(seq[:depth])
+                counts[key] = counts.get(key, 0) + 1
+        if counts:
+            prefix[str(depth)] = {"blocks": max(counts.values()), "distinct": len(counts)}
+
+    adjacent = rises = tie_pairs = contradictions = 0
+    directions = {}
+    for seq in seqs:
+        for i in range(len(seq) - 1):
+            adjacent += 1
+            if freq[seq[i]] < freq[seq[i + 1]]:
+                rises += 1
+        for i in range(len(seq)):
+            fi = freq[seq[i]]
+            if fi < 2:
+                continue
+            for j in range(i + 1, len(seq)):
+                if freq[seq[j]] != fi:
+                    continue
+                tie_pairs += 1
+                a, b = seq[i], seq[j]
+                key = (a, b) if a < b else (b, a)
+                direction = a < b
+                previous = directions.get(key)
+                if previous is None:
+                    directions[key] = direction
+                elif previous != direction:
+                    contradictions += 1
+
+    return {
+        "containers": len(block_lists),
+        "blocks": sum(kinds.values()),
+        "records": records,
+        "kinds": {f"0x{kind:x}": count for kind, count in sorted(kinds.items())},
+        "distinct_blocks": len(uses),
+        "repeated_blocks": sum(kinds.values()) - len(uses),
+        "block_multiplicities": dict(sorted(Counter(uses.values()).items())),
+        "records_min": lengths[0] if lengths else 0,
+        "records_median": lengths[len(lengths) // 2] if lengths else 0,
+        "records_max": lengths[-1] if lengths else 0,
+        "duplicate_record_blocks": sum(1 for seq in seqs if len(set(seq)) != len(seq)),
+        "distinct_records": len(freq),
+        "shared_records": sum(1 for count in freq.values() if count > 1),
+        "max_copies": max(freq.values()) if freq else 0,
+        "first_records": len({seq[0] for seq in seqs if seq}),
+        "prefix": prefix,
+        "adjacent_pairs": adjacent,
+        "frequency_rises": rises,
+        "tie_pairs": tie_pairs,
+        "tie_pairs_distinct": len(directions),
+        "tie_contradictions": contradictions,
+    }
+
+
+def lsns_word_check(blob, spans, blocks):
+    """(64-bit checked, found, 32-bit checked, found) for record words outside the LSNS sections.
+
+    `spans` are the (start, end) offsets of the container's LSNS sections, so a record is not compared with
+    its own bytes. A word in the rest of the container is a reference candidate; a chance-level hit is
+    possible for a 32-bit word, so only the 64-bit figure reads as a test.
+    """
+    rest = bytearray()
+    last = 0
+    for start, end in sorted(spans):
+        rest += blob[last:start]
+        last = end
+    rest += blob[last:]
+    rest = bytes(rest)
+    words8 = {rest[i:i + 8] for i in range(len(rest) - 7)}
+    words4 = {rest[i:i + 4] for i in range(len(rest) - 3)}
+    checked64 = found64 = checked32 = found32 = 0
+    for record in lsns_records(blocks):
+        for at in (0, 8):
+            checked64 += 1
+            if record[at:at + 8] in words8:
+                found64 += 1
+        for at in range(0, LSNS_RECORD, 4):
+            checked32 += 1
+            if record[at:at + 4] in words4:
+                found32 += 1
+    return checked64, found64, checked32, found32
 
 
 def check_schema(structs):
@@ -336,6 +486,51 @@ def collect(src, limit=None, schema=False):
     return records
 
 
+def lsns_entries(src, limit=None):
+    """(blob, LSNS spans, blocks) for every container that has an LSNS section.
+
+    Containers without the section and non-PSIN files are skipped, so `limit` counts containers with LSNS.
+    """
+    seen = 0
+    for _name, blob in files_in(src):
+        record = parse(blob)
+        if record is None:
+            continue
+        spans = [(s["offset"], s["offset"] + s["size"]) for s in record["sections"] if s["tag"] == "LSNS"]
+        if not spans:
+            continue
+        yield blob, spans, lsns_block_payloads(blob, record)
+        seen += 1
+        if limit and seen >= limit:
+            break
+
+
+def print_lsns_profile(profile):
+    """The `--lsns` text form: counts only, never a record byte."""
+    print(f"LSNS records: {profile['containers']} containers, {profile['blocks']} blocks, "
+          f"{profile['records']} records")
+    kinds = ", ".join(f"{kind} x{count} ({((int(kind, 16) >> 8) * 4)}-byte words)"
+                      for kind, count in profile["kinds"].items())
+    print(f"kinds: {kinds or '-'}")
+    copies = " ".join(f"{times}x{count}" for times, count in profile["block_multiplicities"].items())
+    print(f"blocks: {profile['distinct_blocks']} distinct, {profile['repeated_blocks']} repeated "
+          f"(copies per block: {copies})")
+    print(f"records per block: {profile['records_min']}-{profile['records_max']}, "
+          f"median {profile['records_median']}")
+    print(f"duplicate records within a block: {profile['duplicate_record_blocks']} blocks")
+    print(f"distinct records: {profile['distinct_records']}, in more than one block: "
+          f"{profile['shared_records']}, most copies: {profile['max_copies']}")
+    print(f"first records: {profile['first_records']} distinct")
+    prefixes = " ".join(f"{depth}:{entry['blocks']}" for depth, entry in profile["prefix"].items())
+    print(f"shared prefixes (length: largest block count): {prefixes or '-'}")
+    print(f"order: {profile['adjacent_pairs']} adjacent pairs, {profile['frequency_rises']} frequency rises; "
+          f"{profile['tie_pairs']} equal-frequency pairs ({profile['tie_pairs_distinct']} distinct), "
+          f"{profile['tie_contradictions']} contradictions")
+    print(f"record words elsewhere in their own container: {profile['words64_elsewhere']} of "
+          f"{profile['words64_checked']} 64-bit halves, {profile['words32_elsewhere']} of "
+          f"{profile['words32_checked']} 32-bit quarters")
+
+
 def summarize(records):
     tags = {}
     versions = {}
@@ -392,12 +587,33 @@ def main():
     ap.add_argument("src", help="PSIN file or directory of carved .bin streams")
     ap.add_argument("--json", action="store_true", help="write records and summary as JSON")
     ap.add_argument("--schema", action="store_true", help="include the decoded LSCH structs and LENM enums")
-    ap.add_argument("--limit", type=count, help="stop after this many PSIN files")
+    ap.add_argument("--lsns", action="store_true",
+                    help="print counts of the LSNS 16-byte records and their order only")
+    ap.add_argument("--limit", type=count,
+                    help="stop after this many PSIN files (containers with an LSNS section with --lsns)")
     a = ap.parse_args()
 
     if not os.path.exists(a.src):   # files_in took any non-file for a folder: a typo ended in a traceback
         print(f"ERROR: {a.src}: no such file or folder", file=sys.stderr)
         return 2
+    if a.lsns:
+        try:
+            entries = list(lsns_entries(a.src, a.limit))
+        except OSError as e:
+            print(f"ERROR: {a.src}: {e}", file=sys.stderr)
+            return 2
+        profile = lsns_record_profile([blocks for _blob, _spans, blocks in entries])
+        checks = [lsns_word_check(blob, spans, blocks) for blob, spans, blocks in entries]
+        profile["words64_checked"] = sum(check[0] for check in checks)
+        profile["words64_elsewhere"] = sum(check[1] for check in checks)
+        profile["words32_checked"] = sum(check[2] for check in checks)
+        profile["words32_elsewhere"] = sum(check[3] for check in checks)
+        if a.json:
+            json.dump({"lsns": profile}, sys.stdout, indent=1)
+            sys.stdout.write("\n")
+        else:
+            print_lsns_profile(profile)
+        return 0
     try:
         records = collect(a.src, a.limit, a.schema)
     except OSError as e:

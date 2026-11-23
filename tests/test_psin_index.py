@@ -196,6 +196,97 @@ class TestLsns(unittest.TestCase):
         self.assertEqual((summary["lsns_decoded"], summary["lsns_records"], summary["lsns_errors"]), (2, 4, 0))
 
 
+def rec(n):
+    """A deterministic synthetic 16-byte record. The fixtures invent every value, so no game hash is used."""
+    return struct.pack("<QQ", 0x1000000000000000 + n, 0x2000000000000000 + n * 7)
+
+
+def records(*ns):
+    return b"".join(rec(n) for n in ns)
+
+
+class TestLsnsRecords(unittest.TestCase):
+    def test_ordered_shared_prefix_profile(self):
+        # A,B,C,D / A,B,E / A,F / a copy of the first block. A occurs in 3 distinct blocks, B in 2.
+        blocks = [records(1, 2, 3, 4), records(1, 2, 5), records(1, 6), records(1, 2, 3, 4)]
+        got = P.lsns_record_profile([[(0x101, b)] for b in blocks])
+        self.assertEqual(got["containers"], 4)
+        self.assertEqual(got["blocks"], 4)
+        self.assertEqual(got["records"], 13)
+        self.assertEqual(got["kinds"], {"0x101": 4})
+        self.assertEqual((got["distinct_blocks"], got["repeated_blocks"]), (3, 1))
+        self.assertEqual(got["block_multiplicities"], {1: 2, 2: 1})
+        self.assertEqual((got["records_min"], got["records_max"]), (2, 4))
+        self.assertEqual(got["duplicate_record_blocks"], 0)
+        self.assertEqual((got["distinct_records"], got["shared_records"], got["max_copies"]), (6, 2, 3))
+        self.assertEqual(got["first_records"], 1)
+        self.assertEqual(got["prefix"]["1"], {"blocks": 3, "distinct": 1})
+        self.assertEqual(got["prefix"]["2"], {"blocks": 2, "distinct": 2})
+        self.assertEqual(got["adjacent_pairs"], 6)
+        self.assertEqual(got["frequency_rises"], 0)
+        self.assertEqual(got["tie_contradictions"], 0)
+
+    def test_equal_frequency_order_contradiction_is_counted(self):
+        got = P.lsns_record_profile([[(0x101, records(7, 8))], [(0x101, records(8, 7))]])
+        self.assertEqual((got["distinct_records"], got["max_copies"]), (2, 2))
+        self.assertEqual(got["frequency_rises"], 0)
+        self.assertEqual(got["tie_pairs"], 2)
+        self.assertEqual(got["tie_pairs_distinct"], 1)
+        self.assertEqual(got["tie_contradictions"], 1)
+
+    def test_word_elsewhere_ignores_the_record_itself(self):
+        marker = struct.pack("<I", 0x11223344)
+        block = marker + b"\x55" * 12
+        blob = b"\0" * 16 + b"pre" + marker + b"post" + b"\0" * 8
+        got = P.lsns_word_check(blob, [(len(blob) - 8, len(blob))], [("0x101", block)])
+        # Two 64-bit halves and four 32-bit quarters checked; only the copied 32-bit word is found.
+        self.assertEqual(got, (2, 0, 4, 1))
+
+    def test_record_words_elsewhere_counts_lsns_only_once(self):
+        block = records(1, 2)
+        blob = b"\0" * 16 + records(1, 2) + b"\0" * 8
+        # The block bytes are the LSNS section itself, so its own words must not count as "elsewhere".
+        got = P.lsns_word_check(blob, [(16, 48)], [("0x101", block)])
+        self.assertEqual(got, (4, 0, 8, 0))
+
+    def test_cli_lsns_prints_counts_only(self):
+        block = records(1, 2, 3)
+        payload = make_lsns([(0x101, block), (0x11C, records(1, 4))])
+        blob = make_psin([("LSCH", b""), ("LSNS", payload), ("LGID", b"")])
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "00000001.bin"), "wb") as f:
+                f.write(blob)
+            p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--lsns"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("2 blocks", p.stdout)
+            self.assertIn("5 records", p.stdout)
+            self.assertIn("0 of 10 64-bit halves", p.stdout)
+            for value in (rec(1), rec(2), rec(3), rec(4)):
+                self.assertNotIn(value.hex(), p.stdout)
+            j = subprocess.run([sys.executable, "-I", TOOL, tmp, "--lsns", "--json"],
+                               capture_output=True, text=True)
+            self.assertEqual(j.returncode, 0, j.stderr)
+            doc = json.loads(j.stdout)["lsns"]
+            self.assertEqual((doc["blocks"], doc["records"], doc["distinct_blocks"]), (2, 5, 2))
+
+    def test_lsns_entries_skips_containers_without_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = make_psin([("LSNS", make_lsns([(0x101, records(1))])), ("LGID", b"")])
+            none = make_psin([("LSCH", b"")])
+            with open(os.path.join(tmp, "00000001.bin"), "wb") as f:
+                f.write(good)
+            with open(os.path.join(tmp, "00000002.bin"), "wb") as f:
+                f.write(none)
+            with open(os.path.join(tmp, "00000003.bin"), "wb") as f:
+                f.write(b"not a psin")
+            got = list(P.lsns_entries(tmp))
+            self.assertEqual(len(got), 1)
+            _blob, spans, blocks = got[0]
+            self.assertEqual(len(spans), 1)
+            self.assertEqual(blocks, [(0x101, records(1))])
+
+
 class TestSchema(unittest.TestCase):
     def test_lsch_layout(self):
         got = P.decode_lsch(make_lsch(SCHEMA))
