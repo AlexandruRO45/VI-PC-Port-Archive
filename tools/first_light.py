@@ -589,24 +589,32 @@ def find_harness(explicit: str | None) -> str:
     executable = "vk_harness.exe" if os.name == "nt" else "vk_harness"
     build = os.path.join(ROOT, "runtime", "build")
     build_dirs = (os.path.join(build, "linux"), os.path.join(build, "windows"), build)
-    # The default Linux harness may be older than the source tree after a checkout.
-    # Explicit paths remain under the caller's control.
-    if os.name != "nt" and not explicit and not os.environ.get("LEONIDA_VK_HARNESS"):
+    # Refresh the default Linux harness only when its build directory has a generated build file.
+    # An existing harness in runtime/build or runtime/build/windows remains usable without Linux CMake.
+    linux_build = build_dirs[0]
+    configured = (
+        os.path.isfile(os.path.join(linux_build, "CMakeCache.txt"))
+        and any(os.path.isfile(os.path.join(linux_build, name)) for name in ("Makefile", "build.ninja"))
+    )
+    if os.name != "nt" and not explicit and not os.environ.get("LEONIDA_VK_HARNESS") and configured:
         cmake = shutil.which("cmake")
         if not cmake:
-            raise SystemExit("cmake is required to refresh the default Linux vk_harness")
-        try:
-            result = subprocess.run(
-                [cmake, "--build", os.path.join(build, "linux"), "--target", "vk_harness"],
-                capture_output=True, text=True,
-            )
-        except OSError as exc:
-            raise SystemExit(f"could not rebuild the default Linux vk_harness: {exc}") from exc
-        if result.returncode:
-            detail = (result.stdout or "") + (result.stderr or "")
-            raise SystemExit(
-                f"could not rebuild the default Linux vk_harness (exit {result.returncode}):\n{detail.strip()}"
-            )
+            print("warning: cmake not found; trying an existing vk_harness", file=sys.stderr, flush=True)
+        else:
+            try:
+                result = subprocess.run(
+                    [cmake, "--build", linux_build, "--parallel", "--target", "vk_harness"],
+                )
+            except OSError as exc:
+                print(f"warning: could not refresh the default Linux vk_harness: {exc}", file=sys.stderr, flush=True)
+            else:
+                if result.returncode:
+                    print(
+                        f"warning: could not refresh the default Linux vk_harness (exit {result.returncode}); "
+                        "trying an existing harness",
+                        file=sys.stderr,
+                        flush=True,
+                    )
     for candidate in (
         explicit,
         os.environ.get("LEONIDA_VK_HARNESS"),
