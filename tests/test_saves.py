@@ -678,6 +678,43 @@ class ImportTest(unittest.TestCase):
                 quiet(saves.import_saves, [story, prof, "--out", out, "--force",
                                            "--map", "SLOT3=Same/blob", "--map", "Player=same/BLOB"])
 
+    def test_map_splits_at_last_slash_for_hierarchical_containers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, _ = self._folders(tmp)
+            _, default_blob, _, _ = saves.save_slot(story)
+
+            # Container with '/' and explicit blob name: valid_container_name accepts 'story/slot0' with no warning.
+            out1 = os.path.join(tmp, "out1")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                quiet(saves.import_saves, [story, "--out", out1, "--map", "SLOT3=story/slot0/Save Game Data"])
+            self.assertEqual(err.getvalue(), "")
+            self.assertTrue(os.path.isfile(os.path.join(out1, "local-user", "story%2Fslot0", "Save%20Game%20Data")))
+            with open(os.path.join(out1, "import-manifest.json"), encoding="utf-8") as f:
+                e1 = json.load(f)["entries"][0]
+            self.assertEqual((e1["container"], e1["blob"]), ("story/slot0", "Save Game Data"))
+
+            # Trailing '/' renames a hierarchical container while keeping the default payload blob name.
+            out2 = os.path.join(tmp, "out2")
+            quiet(saves.import_saves, [story, "--out", out2, "--map", "SLOT3=story/slot0/"])
+            with open(os.path.join(out2, "import-manifest.json"), encoding="utf-8") as f:
+                e2 = json.load(f)["entries"][0]
+            self.assertEqual((e2["container"], e2["blob"]), ("story/slot0", default_blob))
+
+            # Slashless value keeps renaming container only without breaking under rpartition.
+            out3 = os.path.join(tmp, "out3")
+            quiet(saves.import_saves, [story, "--out", out3, "--map", "SLOT3=renamed_container"])
+            with open(os.path.join(out3, "import-manifest.json"), encoding="utf-8") as f:
+                e3 = json.load(f)["entries"][0]
+            self.assertEqual((e3["container"], e3["blob"]), ("renamed_container", default_blob))
+
+            # Leading '/' keeps default container SLOT3 and overrides only the blob name.
+            out4 = os.path.join(tmp, "out4")
+            quiet(saves.import_saves, [story, "--out", out4, "--map", "SLOT3=/renamed_blob"])
+            with open(os.path.join(out4, "import-manifest.json"), encoding="utf-8") as f:
+                e4 = json.load(f)["entries"][0]
+            self.assertEqual((e4["container"], e4["blob"]), ("SLOT3", "renamed_blob"))
+
     def test_container_names_follow_the_runtime_rule(self):
         # The same rule as valid_container_name() in runtime/shims/xgameruntime_gamesave.cpp.
         for good in ("SLOT3", "slots/SAVE_00.sav-1", "a/b/c"):
