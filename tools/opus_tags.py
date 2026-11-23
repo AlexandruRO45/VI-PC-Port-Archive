@@ -23,7 +23,8 @@ sequence numbers do not change. Streams without a name are left untouched, and s
 twice (counted as ``ambiguous name``): the archive stores only the low 29 bits of a name hash, so two names can claim
 one id, and writing either would put another stream's name and, through --dialogue, its subtitle in the file. Running
 the tool again replaces the tags it wrote. A tags packet larger than one Ogg page (65,024 bytes) is skipped and counted.
-Files with a bad page checksum or truncated page are also skipped and left untouched; all pages are checked before any replacement is written.
+Files with a bad page checksum, truncated page or missing final end-of-stream flag are also skipped and left
+untouched; all pages are checked before any replacement is written.
 
 Usage:
     python -I opus_tags.py <Opus folder> --names names.csv [--dialogue dialogue.csv] [--source LABEL] [--dry-run]
@@ -101,8 +102,12 @@ def retag(data: bytes, packet: bytes) -> bytes:
         raise ValueError("the OpusTags packet continues past page 1")
     if any(segment != 255 for segment in segments[:-1]):
         raise ValueError("the OpusTags page contains another packet")
-    for _ in it:  # also check the audio tail before publishing any replacement
+    last_at = tags_at
+    for last_at, _ in it:  # also check the audio tail before publishing any replacement
         pass
+    # A cut at a page boundary leaves every remaining checksum valid (RFC 3533 section 6, header_type_flag).
+    if not data[last_at + 5] & 0x04:
+        raise ValueError("Ogg stream is missing its final end-of-stream page")
     serial, seq = struct.unpack_from("<II", data, tags_at + 14)
     if seq != 1:
         raise ValueError("the OpusTags page is not page 1")
