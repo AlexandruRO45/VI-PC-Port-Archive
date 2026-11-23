@@ -419,6 +419,23 @@ another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` p
 The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) read it the same way through
 `vk_device_pick.h`, and fail with a message naming the filter when it matches no device.
 
+## `vk_harness` environment variables
+
+`vk_harness` (and the other standalone Vulkan test programs) read several `VKH_*` variables directly from the
+environment. `scripts/run_gpu_tests.py` sets some of them from the matching `LEONIDA_*` variables; when you run
+`vk_harness` by hand you set them yourself.
+
+| Variable | Meaning |
+|---|---|
+| `VKH_GS_HELPER` | Set to `1` when the geometry shader (`VKH_GS`) only feeds the pixel shader under test (a `--bary-fallback` pass-through), so `VKH_SUBGROUP_SIZE` still applies to the fragment stage. Without it, the subgroup-size request goes to the geometry stage instead (`runtime/test/vk_harness.cpp`). |
+| `VKH_HEAP` | `addr=word,...` pairs. Allocates a zeroed 64 KiB heap (Xbox VA 0 is its device address), writes each word at its address, and passes the heap base in push constants dwords 32..33, so a V# in `VKH_SGPRS` can point into it. Needs `bufferDeviceAddress`. |
+| `VKH_HEAP_DUMP` | `<file>`. After the draw, writes the 64 KiB heap to this file (needs `VKH_HEAP`, which may be empty-valued as `0=0`), so a test can read what the pixel shader stored or atomically added. |
+| `VKH_MESH_COMPUTE` | `<vs.spv>`. The first shader is a mesh shader translated with `rdna2spirv.py --mesh-compute`; it is dispatched as compute over the mesh grid, writing its slots to an output buffer (`VKH_MESH_SLOT` bytes per workgroup, address in push constants dwords 36..37). Then `vs.spv` (`tools/mesh_compute_vs.py`) draws `groups * VKH_MESH_PRIMS * 3` vertices with the fragment shader. No `VK_EXT_mesh_shader` is needed. |
+| `VKH_MESH_PRIMS` | Primitive count per workgroup, used together with `VKH_MESH_COMPUTE` and `VKH_MESH_SLOT`. |
+| `VKH_MESH_SLOT` | Output-buffer bytes per workgroup, used together with `VKH_MESH_COMPUTE` and `VKH_MESH_PRIMS`. |
+
+Related variables read by the same programs: `VKH_SGPRS` (up to 32 comma-separated words for push constants s0..s31), `VKH_SUBGROUP_SIZE` (32 or 64, requires that subgroup size of the stage under test), `VKH_DRAW_MESH` + `VKH_VERTEX_LAYOUT` (draw an indexed mesh instead of the triangle), `VKH_BINARY_OUT` / `VKH_BINARY_IN` (`VK_KHR_pipeline_binary` capture or replay), `VKH_TEX_RGBA` + `VKH_TSHARP_VA` + `VKH_SSHARP` (bind a 2D RGBA8 texture at bindless image index 1), `VKH_MESH` (=1, draw a mesh shader with `VK_EXT_mesh_shader`), `VKH_GS` (insert a geometry stage), `VKH_VERTICES` (draw n vertices instead of one triangle), and `VKH_DRAW` (`<firstVertex>,<firstInstance>`).
+
 ## Known problems
 
 | What you see | Cause | What to do |
