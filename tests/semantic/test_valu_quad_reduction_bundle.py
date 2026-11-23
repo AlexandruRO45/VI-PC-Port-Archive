@@ -940,3 +940,44 @@ class TestDsPermuteB32Oracle(unittest.TestCase):
         self.assertEqual(res[1], 10)
         self.assertEqual(res[2], 11)
         self.assertEqual(res[3], 12)
+
+
+# ------------------------------------------------------------------------------
+# ds_permute_b32 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class DsPermuteB32Instruction:
+    dst: RegisterOperand
+    addr: RegisterOperand
+    data: RegisterOperand
+    offset: int = 0
+
+
+class TestDsPermuteB32ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_lshlrev_b32 v1, 2, v0",
+            "v_add_nc_u32 v2, v0, 99",
+            "ds_permute_b32 v4, v1, v2",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_perm_ast_scalar", lines, lanes=4)
+        self.assertEqual(res, [99, 100, 101, 102])
+
+    def test_scalar_shift_scatter_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_add_nc_u32 v1, v0, 1",
+            "v_and_b32 v1, v1, 3",
+            "v_lshlrev_b32 v1, 2, v1",
+            "v_add_nc_u32 v2, v0, 30",
+            "ds_permute_b32 v4, v1, v2",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_perm_shift", lines, lanes=4)
+        # Lane 3 sends to 0 (33), 0 sends to 1 (30), 1 sends to 2 (31), 2 sends to 3 (32)
+        self.assertEqual(res, [33, 30, 31, 32])
