@@ -729,7 +729,10 @@ public:
     //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
     // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
     // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
-    bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
+    // When requested, warnings names optional indexes that could not be read; missing indexes are normal.
+    bool load(const std::filesystem::path& dir, std::string* error = nullptr,
+              std::vector<std::string>* warnings = nullptr) {
+        if (warnings) warnings->clear();
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
             return false;
@@ -740,13 +743,27 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
+        const auto warn = [warnings](const char* folder, std::string_view reason) noexcept {
+            if (warnings) {
+                try {
+                    warnings->emplace_back(std::string(folder) + "/index.json: " + std::string(reason));
+                } catch (...) {
+                }
+            }
+            return false;
+        };
         for (const char* folder : {"fspx", "bvh"}) {
             try {
-                const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = dir / folder;
-                if (std::ifstream(sub / "index.json", std::ios::binary))
-                    load_index(sub, std::string(folder) + "/", ignore);
+                std::error_code ec;
+                if (std::filesystem::exists(sub / "index.json", ec)) {
+                    load_index(sub, std::string(folder) + "/",
+                               [&](const std::string& why) { return warn(folder, why); });
+                } else if (ec) {
+                    warn(folder, ec.message());
+                }
             } catch (...) {
+                warn(folder, "could not be read");
             }
         }
         return true;

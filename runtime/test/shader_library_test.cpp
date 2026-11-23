@@ -520,15 +520,20 @@ int main() {
         write(dir / "index.json", "{" + game + "}");
         // A broken bvh/index.json leaves the main index and the FSPX one loaded; a missing one is not an error
         // either, and neither is a broken fspx/index.json for the builder's programs.
+        std::vector<std::string> warnings;
         write(dir / "bvh" / "index.json", "{broken");
-        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 0 && bvh.fspx_size() == 1 &&
-              bvh.program_candidates("cs", program).empty() && bvh.find("cs", hash));
+        CHECK(bvh.load(dir.string(), &error, &warnings) && bvh.size() == 2 && bvh.bvh_size() == 0 &&
+              bvh.fspx_size() == 1 && bvh.program_candidates("cs", program).empty() && bvh.find("cs", hash));
+        CHECK(warnings.size() == 1 && warnings[0].starts_with("bvh/index.json: ") &&
+              warnings[0].find("not a JSON object") != std::string::npos);
         std::filesystem::remove(dir / "bvh" / "index.json");
-        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 0 && bvh.find("cs", hash));
+        CHECK(bvh.load(dir.string(), &error, &warnings) && bvh.size() == 2 && bvh.bvh_size() == 0 &&
+              bvh.find("cs", hash) && warnings.empty());
         write(dir / "bvh" / "index.json", "{\"BuilderProgram\": " + program_entry + "}");
         write(dir / "fspx" / "index.json", "{broken");
-        CHECK(bvh.load(dir.string(), &error) && bvh.size() == 2 && bvh.bvh_size() == 1 && bvh.fspx_size() == 0 &&
-              bvh.program_candidates("cs", program).size() == 1);
+        CHECK(bvh.load(dir.string(), &error, &warnings) && bvh.size() == 2 && bvh.bvh_size() == 1 &&
+              bvh.fspx_size() == 0 && bvh.program_candidates("cs", program).size() == 1);
+        CHECK(warnings.size() == 1 && warnings[0].starts_with("fspx/index.json: "));
         std::filesystem::remove_all(dir);
     }
 

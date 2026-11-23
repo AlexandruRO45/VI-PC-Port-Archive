@@ -782,11 +782,14 @@ struct DeviceState {
                 return nullptr;
             }
             std::string error;
+            std::vector<std::string> warnings;
             if (dir.empty())
                 std::fprintf(stderr, "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv\n");
-            else if (!shader_library.load(dir, &error))
+            else if (!shader_library.load(dir, &error, &warnings))
                 std::fprintf(stderr, "[rt] d3d12: %s\n", error.c_str());
             else {
+                for (const auto& warning : warnings)
+                    std::fprintf(stderr, "[rt] d3d12: ignoring optional shader index %s\n", warning.c_str());
                 const auto path = dir.u8string();
                 std::fprintf(stderr, "[rt] d3d12: %zu translated shaders from %s\n",
                              shader_library.size(), reinterpret_cast<const char*>(path.c_str()));
