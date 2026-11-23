@@ -226,21 +226,32 @@ int main() {
                                                IID_PPV_ARGS(&list.p))));
     EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
-    // Two dispatches, the second with another output and step; then the same again after the allocator's Reset,
-    // with other constants, so the table memory is taken a second time.
+    // For each layout, record two dispatches with different outputs and steps, then repeat after allocator
+    // Reset with a different base. The wide layout's constants extend past the user SGPR limit.
     std::vector<std::uint32_t> first(elements), second(elements);
     UINT64 fence_value = 0;
-    for (const std::uint32_t base : {100u, 9000u}) {
-        const std::uint32_t constants[3] = {base, 3, 50};
-        list->SetPipelineState(table_pso.p);
-        list->SetComputeRootSignature(small_root.p);
+    struct Recording {
+        bool wide;
+        std::uint32_t base;
+    };
+    for (const Recording recording : {Recording{false, 100}, {false, 9000}, {true, 101}, {true, 9001}}) {
+        const auto [wide, base] = recording;
+        const UINT constant_param = wide ? 8 : 1;
+        const UINT constant_count = wide ? 14 : 3;
+        // Two groups select the wide table in the fixture. Only group zero writes to the output.
+        const UINT group_count = wide ? 2 : 1;
+        const std::uint32_t constants[] = {base, 3, 50, 61, 72, 83, 94, 105, 116, 127, 138, 149, 160, 171};
+        std::uint32_t bias = extra_word;
+        for (UINT i = 2; i < constant_count; ++i) bias += (i - 1) * constants[i];
+        list->SetPipelineState(wide ? large_table_pso.p : table_pso.p);
+        list->SetComputeRootSignature(wide ? large_root.p : small_root.p);
         list->SetComputeRootUnorderedAccessView(0, va_a);
-        list->SetComputeRoot32BitConstants(1, 3, constants, 0);
-        list->SetComputeRootUnorderedAccessView(2, va_extra);
-        list->Dispatch(1, 1, 1);
+        list->SetComputeRoot32BitConstants(constant_param, constant_count, constants, 0);
+        list->SetComputeRootUnorderedAccessView(wide ? 7 : 2, va_extra);
+        list->Dispatch(group_count, 1, 1);
         list->SetComputeRootUnorderedAccessView(0, va_b);
-        list->SetComputeRoot32BitConstant(1, 5, 1);
-        list->Dispatch(1, 1, 1);
+        list->SetComputeRoot32BitConstant(constant_param, 5, 1);
+        list->Dispatch(group_count, 1, 1);
         D3D12_RESOURCE_BARRIER to_copy[2] = {
             transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(out_b.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)};
@@ -263,15 +274,14 @@ int main() {
         std::memcpy(second.data(), static_cast<const std::uint8_t*>(results) + bytes, bytes);
         readback->Unmap(0, nullptr);
         for (UINT i = 0; i < elements; ++i) {
-            EXPECT(first[i] == base + 3 * i + 50 + extra_word);
-            EXPECT(second[i] == base + 5 * i + 50 + extra_word);
+            EXPECT(first[i] == base + 3 * i + bias);
+            EXPECT(second[i] == base + 5 * i + bias);
         }
         EXPECT(allocator->Reset() == S_OK);
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
     }
 
-    // The large signature: a program that reads the table can be dispatched with it, one that reads the user SGPRs
-    // cannot, and the small one serves both.
+    // The small signature also serves an SGPR program. The wide one must still reject it.
     const auto closes = [&](ID3D12PipelineState* pso, ID3D12RootSignature* root) {
         list->SetPipelineState(pso);
         list->SetComputeRootSignature(root);
@@ -280,12 +290,11 @@ int main() {
         list->Reset(allocator.p, nullptr);
         return hr;
     };
-    EXPECT(closes(large_table_pso.p, large_root.p) == S_OK);
     EXPECT(closes(large_sgpr_pso.p, large_root.p) == E_INVALIDARG);
     EXPECT(closes(sgpr_pso.p, small_root.p) == S_OK);
     EXPECT(closes(table_pso.p, small_root.p) == S_OK);
 
-    std::printf("d3d12_argument_table_test: two dispatches and a second recording read their arguments from the "
-                "table behind s[0:1]; a 30-dword signature is usable by a program that reads the table\n");
+    std::printf("d3d12_argument_table_test: GPU readback matched two dispatches before and after allocator Reset "
+                "with both 7- and 30-dword tables behind s[0:1]\n");
     return 0;
 }
