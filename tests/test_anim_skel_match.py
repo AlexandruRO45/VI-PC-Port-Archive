@@ -8,6 +8,7 @@ import unittest
 import zlib
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -94,6 +95,37 @@ class CommandLine(unittest.TestCase):
     def test_offsets_parse_as_hex_or_decimal(self):
         self.assertEqual(sm.parse_offset("0x101a32160"), 0x101A32160)
         self.assertEqual(sm.parse_offset("4096"), 4096)
+
+    def test_json_paths_it_cannot_write_are_one_error_line_before_the_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            anim = Path(tmp) / "anim.rpf"
+            packs = Path(tmp) / "packs.rpf"
+            anim.write_bytes(zlib.compress(b"SKEL_Synthetic\x00"))
+            packs.write_bytes(b"\x00")
+            args = [str(anim), str(packs), "--stream", "0", "--json"]
+            missing = os.path.join(tmp, "nope", "report.json")
+            cases = ((tmp, "anim_skel_match: --json %s is a folder, not a JSON file" % tmp),
+                     (missing, "anim_skel_match: --json folder does not exist: %s" % os.path.dirname(missing)))
+            for target, expect in cases:
+                with self.subTest(target=target), redirect_stderr(io.StringIO()) as err, \
+                        redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(sm.main([*args, target]), 2)
+                    self.assertEqual([line for line in err.getvalue().splitlines() if line], [expect])
+                    self.assertEqual(out.getvalue(), "")     # the walk never ran, so no report line was printed
+            self.assertFalse(os.path.exists(os.path.dirname(missing)))
+
+    def test_a_report_it_cannot_write_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            anim = Path(tmp) / "anim.rpf"
+            packs = Path(tmp) / "packs.rpf"
+            anim.write_bytes(zlib.compress(b"SKEL_Synthetic\x00"))
+            packs.write_bytes(b"\x00")
+            report = os.path.join(tmp, "report.json")
+            with mock.patch.object(sm.json, "dump", side_effect=OSError(28, "No space left on device")), \
+                    redirect_stderr(io.StringIO()) as err, redirect_stdout(io.StringIO()):
+                self.assertEqual(sm.main([str(anim), str(packs), "--stream", "0", "--json", report]), 2)
+            self.assertEqual([line for line in err.getvalue().splitlines() if line],
+                             ["anim_skel_match: cannot write %s: No space left on device" % report])
 
 
 if __name__ == "__main__":
