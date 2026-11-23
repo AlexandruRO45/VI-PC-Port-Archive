@@ -100,6 +100,7 @@ class PsocacheCodeTest(unittest.TestCase):
         p = run(self.path)
         self.assertEqual(p.returncode, 1)
         self.assertIn("invalid words: 1", p.stdout)
+        self.assertIn("entries shorter than that: 0", p.stdout)
         self.assertNotIn("bf81", p.stdout.lower())
 
     def test_not_a_cache(self):

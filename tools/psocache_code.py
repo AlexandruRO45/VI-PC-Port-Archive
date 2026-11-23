@@ -16,7 +16,7 @@ instructions, invalid words, entries that decode with no invalid word, and a his
 (opcode prefixes ``s``, ``v``, ``image`` ...). It never prints an instruction, an operand or a byte of the blob.
 
 Usage:
-    python -I psocache_code.py <cache> [--limit N] [--header BYTES] [--json] [--mcpu gfx1013|gfx1030]
+    python -I tools/psocache_code.py <cache> [--limit N] [--header BYTES] [--json] [--mcpu gfx1013|gfx1030]
 
 Exit code: 0 when every decoded entry has no invalid word, 1 when some entry has one, 2 when the file cannot be
 read or does not start with the cache magic.
@@ -140,6 +140,7 @@ def analyse(path, limit=None, mcpu="gfx1013", header=ENTRY_HEADER):
 def print_report(r, out=sys.stdout):
     w = out.write
     w("shader-index entries: %d (decoded %d)\n" % (r["shader_index_entries"], r["entries"]))
+    w("  entry header skipped: %d bytes; entries shorter than that: %d\n" % (r["entry_header"], r["entries_shorter_than_header"]))
     w("  out of bounds: %d, no s_endpgm: %d\n" % (r["entries_out_of_bounds"], r["entries_without_endpgm"]))
     w("  decode with no invalid word: %d, with invalid words: %d\n" % (r["entries_clean"], r["entries_with_invalid"]))
     w("program bytes: %d, instructions: %d, invalid words: %d\n" % (r["program_bytes"], r["instructions"], r["invalid_words"]))
