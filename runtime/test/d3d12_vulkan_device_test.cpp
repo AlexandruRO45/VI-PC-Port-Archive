@@ -2444,8 +2444,8 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
     if (o11.AtomicInt64OnDescriptorHeapResourceSupported) fail("OPTIONS11 unexpected support");
     if (o13.UnrestrictedBufferTextureCopyPitchSupported || o13.UnrestrictedVertexElementAlignmentSupported ||
         o13.InvertedViewportHeightFlipsYSupported || o13.InvertedViewportDepthFlipsZSupported ||
-        o13.TextureCopyBetweenDimensionsSupported || o13.AlphaBlendFactorSupported)
-        fail("OPTIONS13 unexpected support");
+        o13.TextureCopyBetweenDimensionsSupported || !o13.AlphaBlendFactorSupported)
+        fail("OPTIONS13 mismatch");
     if (o14.AdvancedTextureOpsSupported || o14.WriteableMSAATexturesSupported ||
         o14.IndependentFrontAndBackStencilRefMaskSupported)
         fail("OPTIONS14 unexpected support");

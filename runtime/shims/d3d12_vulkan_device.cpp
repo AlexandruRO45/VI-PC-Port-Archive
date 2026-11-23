@@ -2486,39 +2486,66 @@ bool vertex_format(DXGI_FORMAT format, VkFormat& out, UINT& bytes) {
     return false;
 }
 
-VkBlendFactor blend_factor(D3D12_BLEND blend) {
+// Maps a D3D12 blend factor to Vulkan; *_COLOR factors are rejected on alpha channels (D3D12 E_INVALIDARG).
+bool map_blend_factor(D3D12_BLEND blend, bool alpha_channel, VkBlendFactor& out) {
     switch (blend) {
-    case D3D12_BLEND_ZERO: return VK_BLEND_FACTOR_ZERO;
-    case D3D12_BLEND_ONE: return VK_BLEND_FACTOR_ONE;
-    case D3D12_BLEND_SRC_COLOR: return VK_BLEND_FACTOR_SRC_COLOR;
-    case D3D12_BLEND_INV_SRC_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
-    case D3D12_BLEND_SRC_ALPHA: return VK_BLEND_FACTOR_SRC_ALPHA;
-    case D3D12_BLEND_INV_SRC_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    case D3D12_BLEND_DEST_ALPHA: return VK_BLEND_FACTOR_DST_ALPHA;
-    case D3D12_BLEND_INV_DEST_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
-    case D3D12_BLEND_DEST_COLOR: return VK_BLEND_FACTOR_DST_COLOR;
-    case D3D12_BLEND_INV_DEST_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
-    case D3D12_BLEND_SRC_ALPHA_SAT: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
-    case D3D12_BLEND_BLEND_FACTOR: return VK_BLEND_FACTOR_CONSTANT_COLOR;
-    case D3D12_BLEND_INV_BLEND_FACTOR: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
-    case D3D12_BLEND_SRC1_COLOR: return VK_BLEND_FACTOR_SRC1_COLOR;
-    case D3D12_BLEND_INV_SRC1_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
-    case D3D12_BLEND_SRC1_ALPHA: return VK_BLEND_FACTOR_SRC1_ALPHA;
-    case D3D12_BLEND_INV_SRC1_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
-    case D3D12_BLEND_ALPHA_FACTOR: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
-    case D3D12_BLEND_INV_ALPHA_FACTOR: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
-    default: return VK_BLEND_FACTOR_ONE;
+    case D3D12_BLEND_ZERO: out = VK_BLEND_FACTOR_ZERO; return true;
+    case D3D12_BLEND_ONE: out = VK_BLEND_FACTOR_ONE; return true;
+    case D3D12_BLEND_SRC_COLOR: out = VK_BLEND_FACTOR_SRC_COLOR; return !alpha_channel;
+    case D3D12_BLEND_INV_SRC_COLOR: out = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR; return !alpha_channel;
+    case D3D12_BLEND_SRC_ALPHA: out = VK_BLEND_FACTOR_SRC_ALPHA; return true;
+    case D3D12_BLEND_INV_SRC_ALPHA: out = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; return true;
+    case D3D12_BLEND_DEST_ALPHA: out = VK_BLEND_FACTOR_DST_ALPHA; return true;
+    case D3D12_BLEND_INV_DEST_ALPHA: out = VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA; return true;
+    case D3D12_BLEND_DEST_COLOR: out = VK_BLEND_FACTOR_DST_COLOR; return !alpha_channel;
+    case D3D12_BLEND_INV_DEST_COLOR: out = VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR; return !alpha_channel;
+    case D3D12_BLEND_SRC_ALPHA_SAT: out = VK_BLEND_FACTOR_SRC_ALPHA_SATURATE; return true;
+    case D3D12_BLEND_BLEND_FACTOR: out = VK_BLEND_FACTOR_CONSTANT_COLOR; return true;
+    case D3D12_BLEND_INV_BLEND_FACTOR: out = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR; return true;
+    case D3D12_BLEND_SRC1_COLOR: out = VK_BLEND_FACTOR_SRC1_COLOR; return !alpha_channel;
+    case D3D12_BLEND_INV_SRC1_COLOR: out = VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR; return !alpha_channel;
+    case D3D12_BLEND_SRC1_ALPHA: out = VK_BLEND_FACTOR_SRC1_ALPHA; return true;
+    case D3D12_BLEND_INV_SRC1_ALPHA: out = VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA; return true;
+    case D3D12_BLEND_ALPHA_FACTOR: out = VK_BLEND_FACTOR_CONSTANT_ALPHA; return true;
+    case D3D12_BLEND_INV_ALPHA_FACTOR: out = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA; return true;
+    default: return false;
     }
 }
 
-VkBlendOp blend_op(D3D12_BLEND_OP op) {
+bool map_blend_op(D3D12_BLEND_OP op, VkBlendOp& out) {
     switch (op) {
-    case D3D12_BLEND_OP_SUBTRACT: return VK_BLEND_OP_SUBTRACT;
-    case D3D12_BLEND_OP_REV_SUBTRACT: return VK_BLEND_OP_REVERSE_SUBTRACT;
-    case D3D12_BLEND_OP_MIN: return VK_BLEND_OP_MIN;
-    case D3D12_BLEND_OP_MAX: return VK_BLEND_OP_MAX;
-    default: return VK_BLEND_OP_ADD;
+    case D3D12_BLEND_OP_ADD: out = VK_BLEND_OP_ADD; return true;
+    case D3D12_BLEND_OP_SUBTRACT: out = VK_BLEND_OP_SUBTRACT; return true;
+    case D3D12_BLEND_OP_REV_SUBTRACT: out = VK_BLEND_OP_REVERSE_SUBTRACT; return true;
+    case D3D12_BLEND_OP_MIN: out = VK_BLEND_OP_MIN; return true;
+    case D3D12_BLEND_OP_MAX: out = VK_BLEND_OP_MAX; return true;
+    default: return false;
     }
+}
+
+bool convert_blend_attachment(const D3D12_RENDER_TARGET_BLEND_DESC& b, BOOL independent,
+                              VkPipelineColorBlendAttachmentState& out) {
+    out = {};
+    if (b.LogicOpEnable) {
+        if (b.BlendEnable || independent || unsigned(b.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED) return false;
+    }
+    if (b.BlendEnable) {
+        if (!map_blend_factor(b.SrcBlend, false, out.srcColorBlendFactor) ||
+            !map_blend_factor(b.DestBlend, false, out.dstColorBlendFactor) ||
+            !map_blend_op(b.BlendOp, out.colorBlendOp) ||
+            !map_blend_factor(b.SrcBlendAlpha, true, out.srcAlphaBlendFactor) ||
+            !map_blend_factor(b.DestBlendAlpha, true, out.dstAlphaBlendFactor) ||
+            !map_blend_op(b.BlendOpAlpha, out.alphaBlendOp))
+            return false;
+        out.blendEnable = VK_TRUE;
+    } else {
+        // D3D12 ignores blend factors/ops while BlendEnable is FALSE; keep valid Vulkan defaults.
+        out.srcColorBlendFactor = out.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        out.dstColorBlendFactor = out.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        out.colorBlendOp = out.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
+    out.colorWriteMask = b.RenderTargetWriteMask & 0xf;  // R, G, B, A in both APIs
+    return true;
 }
 
 // D3D12 and Vulkan list the logic ops in different orders, so each is named.
@@ -3521,18 +3548,17 @@ public:
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
         depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
 
+        const UINT active_blends =
+            desc.BlendState.IndependentBlendEnable ? D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT : 1u;
+        VkPipelineColorBlendAttachmentState validated_blends[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+        for (UINT i = 0; i < active_blends; ++i) {
+            if (!convert_blend_attachment(desc.BlendState.RenderTarget[i], desc.BlendState.IndependentBlendEnable,
+                                          validated_blends[i]))
+                return E_INVALIDARG;
+        }
         std::vector<VkPipelineColorBlendAttachmentState> blends(desc.NumRenderTargets);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
-            const D3D12_RENDER_TARGET_BLEND_DESC& b =
-                desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
-            blends[i].blendEnable = b.BlendEnable;
-            blends[i].srcColorBlendFactor = blend_factor(b.SrcBlend);
-            blends[i].dstColorBlendFactor = blend_factor(b.DestBlend);
-            blends[i].colorBlendOp = blend_op(b.BlendOp);
-            blends[i].srcAlphaBlendFactor = blend_factor(b.SrcBlendAlpha);
-            blends[i].dstAlphaBlendFactor = blend_factor(b.DestBlendAlpha);
-            blends[i].alphaBlendOp = blend_op(b.BlendOpAlpha);
-            blends[i].colorWriteMask = b.RenderTargetWriteMask & 0xf;  // R, G, B, A in both APIs
+            blends[i] = validated_blends[desc.BlendState.IndependentBlendEnable ? i : 0];
             // B8G8R8X8 has no alpha, so blending reads destination alpha as 1 there (WARP and AMD's D3D12 driver),
             // where its BGRA8 Vulkan image would read the X byte. For colour SRC_ALPHA_SAT is min(As, 1 - Ad), so 0;
             // for alpha it is 1 in both APIs already.
@@ -3555,7 +3581,6 @@ public:
         // RenderTarget[0]. Vulkan applies it to integer and normalized formats and skips float ones.
         const D3D12_RENDER_TARGET_BLEND_DESC& first = desc.BlendState.RenderTarget[0];
         if (desc.NumRenderTargets && first.LogicOpEnable) {
-            if (unsigned(first.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED) return E_INVALIDARG;
             blend.logicOpEnable = VK_TRUE;
             blend.logicOp = logic_op(first.LogicOp);
         }
@@ -7211,7 +7236,8 @@ public:
             opts->InvertedViewportHeightFlipsYSupported = FALSE;
             opts->InvertedViewportDepthFlipsZSupported = FALSE;
             opts->TextureCopyBetweenDimensionsSupported = FALSE;
-            opts->AlphaBlendFactorSupported = FALSE;
+            // VK_BLEND_FACTOR_CONSTANT_ALPHA / ONE_MINUS_CONSTANT_ALPHA are Vulkan 1.0 core factors.
+            opts->AlphaBlendFactorSupported = TRUE;
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS14: {

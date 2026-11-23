@@ -264,21 +264,25 @@ bool compile_hlsl(pD3DCompile compile, const char* source, std::vector<std::uint
     return true;
 }
 
-const char* kBlendNames[] = {"", "ZERO", "ONE", "SRC_COLOR", "INV_SRC_COLOR", "SRC_ALPHA", "INV_SRC_ALPHA", "DEST_ALPHA",
-                             "INV_DEST_ALPHA", "DEST_COLOR", "INV_DEST_COLOR", "SRC_ALPHA_SAT", "", "", "BLEND_FACTOR",
-                             "INV_BLEND_FACTOR"};
+const char* kBlendNames[] = {
+    "",          "ZERO",         "ONE",          "SRC_COLOR",    "INV_SRC_COLOR",    "SRC_ALPHA",
+    "INV_SRC_ALPHA", "DEST_ALPHA", "INV_DEST_ALPHA", "DEST_COLOR", "INV_DEST_COLOR",  "SRC_ALPHA_SAT",
+    "",          "",             "BLEND_FACTOR", "INV_BLEND_FACTOR", "SRC1_COLOR",    "INV_SRC1_COLOR",
+    "SRC1_ALPHA", "INV_SRC1_ALPHA", "ALPHA_FACTOR", "INV_ALPHA_FACTOR"};
 const char* kFuncNames[] = {"", "NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_EQUAL", "ALWAYS"};
 const char* kOpNames[] = {"", "KEEP", "ZERO", "REPLACE", "INCR_SAT", "DECR_SAT", "INVERT", "INCR", "DECR"};
 
-// Blend factors usable for the colour channels without dual-source output (11 = SRC_ALPHA_SAT, 14/15 the blend factor).
+// Blend factors usable for the colour channels without dual-source output (11 = SRC_ALPHA_SAT, 14/15/20/21 blend factor).
 const D3D12_BLEND kColourFactors[] = {
-    D3D12_BLEND_ZERO, D3D12_BLEND_ONE, D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR, D3D12_BLEND_SRC_ALPHA,
-    D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_DEST_COLOR,
-    D3D12_BLEND_INV_DEST_COLOR, D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR};
+    D3D12_BLEND_ZERO,          D3D12_BLEND_ONE,              D3D12_BLEND_SRC_COLOR,    D3D12_BLEND_INV_SRC_COLOR,
+    D3D12_BLEND_SRC_ALPHA,     D3D12_BLEND_INV_SRC_ALPHA,    D3D12_BLEND_DEST_ALPHA,   D3D12_BLEND_INV_DEST_ALPHA,
+    D3D12_BLEND_DEST_COLOR,    D3D12_BLEND_INV_DEST_COLOR,   D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_BLEND_FACTOR,
+    D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_ALPHA_FACTOR,  D3D12_BLEND_INV_ALPHA_FACTOR};
 // The factors an alpha channel takes: no *_COLOR ones.
 const D3D12_BLEND kAlphaFactors[] = {
-    D3D12_BLEND_ZERO, D3D12_BLEND_ONE, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_DEST_ALPHA,
-    D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR};
+    D3D12_BLEND_ZERO,           D3D12_BLEND_ONE,              D3D12_BLEND_SRC_ALPHA,       D3D12_BLEND_INV_SRC_ALPHA,
+    D3D12_BLEND_DEST_ALPHA,     D3D12_BLEND_INV_DEST_ALPHA,   D3D12_BLEND_SRC_ALPHA_SAT,   D3D12_BLEND_BLEND_FACTOR,
+    D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_ALPHA_FACTOR,   D3D12_BLEND_INV_ALPHA_FACTOR};
 
 std::vector<Case> build_cases() {
     std::vector<Case> cases;
@@ -332,11 +336,59 @@ std::vector<Case> build_cases() {
               D3D12_BLEND_OP_ADD, 0xf);
         blend(tag + "DEST_COLOR / SRC_COLOR", f, D3D12_BLEND_DEST_COLOR, D3D12_BLEND_SRC_COLOR, D3D12_BLEND_OP_ADD,
               D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_OP_ADD, 0xf);
+        blend(tag + "ALPHA_FACTOR / INV_ALPHA_FACTOR", f, D3D12_BLEND_ALPHA_FACTOR, D3D12_BLEND_INV_ALPHA_FACTOR,
+              D3D12_BLEND_OP_ADD, D3D12_BLEND_ALPHA_FACTOR, D3D12_BLEND_INV_ALPHA_FACTOR, D3D12_BLEND_OP_ADD, 0xf);
         Case c;
         c.name = tag + "no blend";
         c.format = f;
         cases.push_back(std::move(c));
     }
+    // Blend validation vs host: ignored factors pass when BlendEnable is FALSE; invalid enum/alpha-channel/logic-op
+    // mixes must return E_INVALIDARG just like the host runtime.
+    {
+        Case c;
+        c.name = "blend disabled ignores invalid SrcBlend";
+        c.state = [](D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd) {
+            pd.BlendState.RenderTarget[0].BlendEnable = FALSE;
+            pd.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND(0);
+        };
+        cases.push_back(std::move(c));
+    }
+    const auto invalid_blend = [&](const std::string& name, auto&& mutate) {
+        Case c;
+        c.name = "invalid blend: " + name;
+        c.state = [=](D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd) {
+            pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
+            mutate(pd);
+        };
+        cases.push_back(std::move(c));
+    };
+    invalid_blend("SrcBlend 0", [](auto& pd) { pd.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND(0); });
+    invalid_blend("SrcBlend gap 12", [](auto& pd) { pd.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND(12); });
+    invalid_blend("DestBlend gap 13", [](auto& pd) { pd.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND(13); });
+    invalid_blend("SrcBlend out of range 22", [](auto& pd) { pd.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND(22); });
+    invalid_blend("SrcBlendAlpha SRC_COLOR",
+                  [](auto& pd) { pd.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_SRC_COLOR; });
+    invalid_blend("DestBlendAlpha DEST_COLOR",
+                  [](auto& pd) { pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_DEST_COLOR; });
+    invalid_blend("SrcBlendAlpha SRC1_COLOR",
+                  [](auto& pd) { pd.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_SRC1_COLOR; });
+    invalid_blend("DestBlendAlpha 22",
+                  [](auto& pd) { pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND(22); });
+    invalid_blend("BlendOp 0", [](auto& pd) { pd.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP(0); });
+    invalid_blend("BlendOpAlpha 6", [](auto& pd) { pd.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP(6); });
+    invalid_blend("BlendEnable with LogicOpEnable",
+                  [](auto& pd) { pd.BlendState.RenderTarget[0].LogicOpEnable = TRUE; });
+    invalid_blend("IndependentBlendEnable with LogicOpEnable", [](auto& pd) {
+        pd.BlendState.IndependentBlendEnable = TRUE;
+        pd.BlendState.RenderTarget[0].BlendEnable = FALSE;
+        pd.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
+    });
+    invalid_blend("IndependentBlendEnable bad RT[1].SrcBlend", [](auto& pd) {
+        pd.BlendState.IndependentBlendEnable = TRUE;
+        pd.BlendState.RenderTarget[1].BlendEnable = TRUE;
+        pd.BlendState.RenderTarget[1].SrcBlend = D3D12_BLEND(0);
+    });
     // Depth: the draw's depth is 0; the clear is 0 (EQUAL-ish) or 0.5.
     for (int func = 1; func <= 8; ++func)
         for (float clear : {0.0f, 0.5f})
@@ -503,12 +555,12 @@ int main() {
             return 1;
         }
         if (FAILED(reference.pso)) {
-            // The host refuses this pipeline: the layer must too.
+            // The host refuses this pipeline: the layer must match its refusal code.
             ++compared;
-            if (SUCCEEDED(mine.pso)) {
+            if (mine.pso != reference.pso) {
                 ++differ;
-                std::printf("%s: the host refuses the pipeline (0x%08x), the layer accepts it  MISMATCH\n", c.name.c_str(),
-                            static_cast<unsigned>(reference.pso));
+                std::printf("%s: host refused (0x%08x), layer returned 0x%08x  MISMATCH\n", c.name.c_str(),
+                            static_cast<unsigned>(reference.pso), static_cast<unsigned>(mine.pso));
             }
             continue;
         }

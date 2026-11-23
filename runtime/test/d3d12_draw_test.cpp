@@ -854,6 +854,119 @@ int main() {
             }
             std::printf("B8G8R8X8: %u blends that read destination alpha read 1, B8G8R8A8 its stored alpha\n",
                         unsigned(std::size(x8_cases)));
+
+            // OPTIONS13::AlphaBlendFactorSupported, blend-factor/op validation, and ALPHA_FACTOR / INV_ALPHA_FACTOR
+            // draws with a distinct constant alpha (0.4) vs RGB (0.1, 0.2, 0.3) and OMSetBlendFactor(nullptr) -> 1.0.
+            D3D12_FEATURE_DATA_D3D12_OPTIONS13 options13{};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS13, &options13, sizeof(options13))));
+            EXPECT(options13.AlphaBlendFactorSupported == TRUE);
+            const auto blend_refused = [&](auto&& mutate) {
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC bd = fullscreen_desc;
+                bd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+                bd.BlendState.RenderTarget[0].BlendEnable = TRUE;
+                mutate(bd);
+                Ref<ID3D12PipelineState> bad_pso;
+                return device->CreateGraphicsPipelineState(&bd, IID_PPV_ARGS(&bad_pso.p)) == E_INVALIDARG && !bad_pso.p;
+            };
+            EXPECT(blend_refused([](auto& d) { d.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND(0); }));
+            EXPECT(blend_refused([](auto& d) { d.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND(12); }));
+            EXPECT(blend_refused([](auto& d) { d.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND(13); }));
+            EXPECT(blend_refused([](auto& d) { d.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND(22); }));
+            for (D3D12_BLEND cf : {D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR, D3D12_BLEND_DEST_COLOR,
+                                   D3D12_BLEND_INV_DEST_COLOR, D3D12_BLEND_SRC1_COLOR, D3D12_BLEND_INV_SRC1_COLOR}) {
+                EXPECT(blend_refused([=](auto& d) { d.BlendState.RenderTarget[0].SrcBlendAlpha = cf; }));
+                EXPECT(blend_refused([=](auto& d) { d.BlendState.RenderTarget[0].DestBlendAlpha = cf; }));
+            }
+            EXPECT(blend_refused([](auto& d) { d.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP(0); }));
+            EXPECT(blend_refused([](auto& d) { d.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP(6); }));
+            EXPECT(blend_refused([](auto& d) { d.BlendState.RenderTarget[0].LogicOpEnable = TRUE; }));
+            EXPECT(blend_refused([](auto& d) {
+                d.BlendState.IndependentBlendEnable = TRUE;
+                d.BlendState.RenderTarget[0].BlendEnable = FALSE;
+                d.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
+            }));
+            EXPECT(blend_refused([](auto& d) {
+                d.BlendState.IndependentBlendEnable = TRUE;
+                d.BlendState.RenderTarget[1].BlendEnable = TRUE;
+                d.BlendState.RenderTarget[1].SrcBlend = D3D12_BLEND(0);
+            }));
+            {
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC ok_disabled = fullscreen_desc;
+                ok_disabled.BlendState.RenderTarget[0].BlendEnable = FALSE;
+                ok_disabled.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND(0);
+                Ref<ID3D12PipelineState> ok_pso;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ok_disabled, IID_PPV_ARGS(&ok_pso.p))));
+            }
+            const FLOAT alpha_blend_factor[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+            UINT64 af_fence = 52;
+            for (const DXGI_FORMAT format : {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM}) {
+                D3D12_RESOURCE_DESC af_desc = rt_desc;
+                af_desc.Width = af_desc.Height = 4;
+                af_desc.Format = format;
+                Ref<ID3D12Resource> af_target;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &af_desc,
+                                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                                 IID_PPV_ARGS(&af_target.p))));
+                device->CreateRenderTargetView(af_target.p, nullptr, x8_rtv);
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC af_pso_desc = fullscreen_desc;
+                af_pso_desc.RTVFormats[0] = format;
+                af_pso_desc.BlendState.RenderTarget[0] = {
+                    TRUE, FALSE, D3D12_BLEND_ALPHA_FACTOR, D3D12_BLEND_INV_ALPHA_FACTOR, D3D12_BLEND_OP_ADD,
+                    D3D12_BLEND_INV_ALPHA_FACTOR, D3D12_BLEND_ALPHA_FACTOR, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP,
+                    D3D12_COLOR_WRITE_ENABLE_ALL};
+                Ref<ID3D12PipelineState> af_pso;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&af_pso_desc, IID_PPV_ARGS(&af_pso.p))));
+                for (bool use_null_factor : {false, true}) {
+                    const float a = use_null_factor ? 1.0f : alpha_blend_factor[3];
+                    EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, af_pso.p)));
+                    list->ClearRenderTargetView(x8_rtv, x8_clear, 0, nullptr);
+                    list->SetGraphicsRootSignature(root.p);
+                    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    list->RSSetViewports(1, &x8_viewport);
+                    list->RSSetScissorRects(1, &x8_scissor);
+                    list->OMSetRenderTargets(1, &x8_rtv, FALSE, nullptr);
+                    list->OMSetBlendFactor(use_null_factor ? nullptr : alpha_blend_factor);
+                    list->SetGraphicsRootConstantBufferView(1, upload_va + 2048);
+                    list->DrawInstanced(3, 1, 0, 0);
+                    const auto af_to_copy = transition(af_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list->ResourceBarrier(1, &af_to_copy);
+                    D3D12_TEXTURE_COPY_LOCATION af_dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                    af_dst.PlacedFootprint = {0, {format, 4, 4, 1, 256}};
+                    D3D12_TEXTURE_COPY_LOCATION af_src{af_target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                    list->CopyTextureRegion(&af_dst, 0, 0, 0, &af_src, nullptr);
+                    const auto af_to_target = transition(af_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                         D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    list->ResourceBarrier(1, &af_to_target);
+                    EXPECT(list->Close() == S_OK);
+                    queue->ExecuteCommandLists(1, lists);
+                    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                    ++af_fence;
+                    EXPECT(af_fence < 60);
+                    EXPECT(SUCCEEDED(queue->Signal(fence.p, af_fence)) &&
+                           SUCCEEDED(fence->SetEventOnCompletion(af_fence, nullptr)));
+                    const float source[4] = {0.8f, 0.6f, 0.0f, 1.0f};
+                    const float dest[4] = {51 / 255.0f, 102 / 255.0f, 153 / 255.0f, 64 / 255.0f};
+                    const auto* got = static_cast<const std::uint8_t*>(mapped);
+                    for (UINT ch = 0; ch < 3; ++ch) {
+                        const int want = int((source[ch] * a + dest[ch] * (1.0f - a)) * 255 + 0.5f);
+                        if (std::abs(int(got[2 - ch]) - want) <= 1) continue;
+                        std::fprintf(stderr, "%s ALPHA_FACTOR (null=%d): got B,G,R %u,%u,%u, channel %u wants %d\n",
+                                     format == DXGI_FORMAT_B8G8R8X8_UNORM ? "B8G8R8X8" : "B8G8R8A8",
+                                     int(use_null_factor), got[0], got[1], got[2], ch, want);
+                        return 1;
+                    }
+                    if (format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+                        const int want_a = int((source[3] * (1.0f - a) + dest[3] * a) * 255 + 0.5f);
+                        if (std::abs(int(got[3]) - want_a) > 1) {
+                            std::fprintf(stderr, "B8G8R8A8 ALPHA_FACTOR alpha (null=%d): got %u, want %d\n",
+                                         int(use_null_factor), got[3], want_a);
+                            return 1;
+                        }
+                    }
+                }
+            }
+            std::printf("ALPHA_FACTOR: OPTIONS13, validation and B8G8R8A8/B8G8R8X8 colour/alpha factor blends matched\n");
         }
 
         // Instance step rate > 1 (VK_KHR/EXT_vertex_attribute_divisor): two per-instance colours in slot 1:
