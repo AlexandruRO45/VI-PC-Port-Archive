@@ -333,6 +333,22 @@ class CliTest(unittest.TestCase):
         with open(path, "rb") as f:
             self.assertEqual(f.read(), b"\x00" * 3000)
 
+    def test_out_inside_the_scanned_folder_is_refused_and_leaves_it_alone(self):
+        # A folder scan reads every file under it: --out naming one of them replaced that carved input with the
+        # report and exited 0.
+        defs, m = scene()
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        for name, data in (("a.bin", defs), ("b.bin", m)):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(data)
+        with open(os.path.join(folder, "a.bin"), "rb") as f:
+            before = f.read()
+        self.assertIn("inside the scanned folder",
+                      self.cli_error([folder, "--out", os.path.join(folder, "a.bin")]))
+        with open(os.path.join(folder, "a.bin"), "rb") as f:
+            self.assertEqual(f.read(), before)
+
     def test_out_under_a_regular_file_or_naming_a_folder_is_one_error(self):
         path = os.path.join(self.tmp.name, "carved.bin")
         with open(path, "wb") as f:

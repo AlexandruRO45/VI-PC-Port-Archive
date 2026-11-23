@@ -32,7 +32,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 import world_census as WC  # noqa: E402
-from report_paths import same_report_path  # noqa: E402
+from report_paths import path_key, same_report_path  # noqa: E402
 import world_index as WI  # noqa: E402
 
 
@@ -278,6 +278,14 @@ def run(path, start=None, limit=None, extents=False):
     return doc
 
 
+def _inside(path, folder):
+    """True when `path` resolves inside `folder`, whose every file a folder scan reads, so a report there
+    replaces an input the next run would read. The same check guards world_interior_names.py."""
+    folder = path_key(folder)
+    parent = path_key(os.path.dirname(os.path.abspath(path)))
+    return parent == folder or parent.startswith(folder.rstrip(os.sep) + os.sep)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, one carved 0x7a file, or a folder of carved files")
@@ -299,6 +307,8 @@ def main(argv=None):
         ap.error("--out would overwrite the input %s" % a.path)
     if os.path.isdir(a.out):
         ap.error("--out %s is a folder, not a file" % a.out)
+    if os.path.isdir(a.path) and _inside(a.out, a.path):
+        ap.error("--out %s is inside the scanned folder %s" % (a.out, a.path))
     out_dir = os.path.dirname(os.path.abspath(a.out))
     try:
         os.makedirs(out_dir, exist_ok=True)
