@@ -64,9 +64,12 @@ def split_command(raw: str) -> list[str]:
         return []
     if os.path.isfile(raw):
         return [raw]                    # a plain path, spaces and all
-    if ("/" in raw or "\\" in raw) and shutil.which(raw):
+    if ("/" in raw or "\\" in raw) and (resolved := shutil.which(raw)):
         # A path whose extension is left out (C:\Program Files\LLVM\bin\llvm-mc): Windows finds llvm-mc.exe
         # for it, but it is no file under that exact name, so it used to be split at its spaces.
+        # Windows can start the .exe without its suffix, but a batch wrapper needs its full name.
+        if os.name == "nt" and resolved.lower().endswith((".bat", ".cmd")):
+            return [resolved]
         return [raw]
     try:
         return split_windows_command(raw) if os.name == "nt" else shlex.split(raw)
