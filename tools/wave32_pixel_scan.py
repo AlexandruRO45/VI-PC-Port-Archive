@@ -180,7 +180,7 @@ def family_of(ins, masks, either):
 def scan_shader(insns):
     """Per-family occurrence counts for one wave32 program (a Counter, empty when nothing matches)."""
     blocks, succ = blocks_of(insns)
-    masks_at, _, either_at = lane_masks.analyse(blocks, succ, include_either=True)
+    masks_at, _, either_at = lane_masks.analyse(blocks, succ, include_either=True, wave64=False)
     hits = Counter()
     for blk in blocks:
         scc_from_mask = False                       # the last SCC writer in this block was a lane-mask SOP

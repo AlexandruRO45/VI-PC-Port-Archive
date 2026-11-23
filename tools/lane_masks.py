@@ -139,7 +139,8 @@ def lane_slot(vgpr, lane):
 def step(state, ins, wave64=True):
     """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR.
 
-    `wave64` False: the program runs in 32-lane waves, where a 64-bit s_bfm_b64 result can't be a lane mask."""
+    `wave64` False: the program runs in 32-lane waves, where `s_bfm_b64` is 64-bit data and 32-bit bitwise writes to
+    `vcc_lo` always produce a lane mask (matching `rdna2spirv.Gen._mask_b32_dst_half`)."""
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
         return
@@ -220,7 +221,8 @@ def step(state, ins, wave64=True):
         dst_t = a[0].get("t") if a[0]["k"] == "special" else None
         if k in (None, EITHER) and op.endswith("b64") and dst_t in ("vcc", "vcc_lo") and a[1]["k"] == "imm":
             k = MASK
-        elif op == "s_not_b32" and dst_t in ("vcc", "vcc_lo") and _maskable_b32(a[1]):
+        elif op == "s_not_b32" and dst_t in ("vcc", "vcc_lo") and _maskable_b32(a[1]) and (
+                not wave64 or state.get("vcc") in MASK_KINDS or k in MASK_KINDS):
             k = MASK
         elif op == "s_not_b32" and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and _maskable_b32(a[1]):
             return
@@ -237,7 +239,8 @@ def step(state, ins, wave64=True):
         elif op.endswith("b64") and (ms or dst_t in ("vcc", "vcc_lo")) and \
                 all(k is not None or x["k"] == "imm" for k, x in zip(kinds, a[1:])):
             put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else MASK)
-        elif op.endswith("b32") and dst_t in ("vcc", "vcc_lo") and all(_maskable_b32(x) for x in a[1:]):
+        elif op.endswith("b32") and dst_t in ("vcc", "vcc_lo") and all(_maskable_b32(x) for x in a[1:]) and (
+                not wave64 or state.get("vcc") in MASK_KINDS or ms):
             put(state, a[0], MASK)
         elif op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and \
                 all(_maskable_b32(x) for x in a[1:]):
