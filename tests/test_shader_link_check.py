@@ -537,6 +537,32 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertTrue(json.loads(self.manifest.read_text())["pipelines"])
 
+    def test_report_writer_publishes_to_the_resolved_destination(self):
+        destination = self.directory / "destination.json"
+        self.report.write_text("original entry", encoding="utf-8")
+        with patch.object(link, "ensure_report_is_separate", return_value=destination), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = link.main(["check", "--vs", str(self.vs), "--ps", str(self.ps), "--report", str(self.report)])
+        self.assertEqual(code, 0)
+        self.assertTrue(destination.is_file())
+        report = json.loads(destination.read_text(encoding="utf-8"))
+        self.assertEqual(report["pipelines"][0]["status"], "compatible")
+        self.assertEqual(self.report.read_text(encoding="utf-8"), "original entry")
+
+    def test_report_preserves_a_relative_output_symlink(self):
+        destination = self.directory / "reports" / "actual.json"
+        destination.parent.mkdir()
+        destination.write_text("{}", encoding="utf-8")
+        try:
+            self.report.symlink_to(destination.relative_to(self.directory))
+        except OSError as exc:
+            self.skipTest(f"symbolic links unavailable: {exc}")
+        result = self.command("check", "--vs", self.vs, "--ps", self.ps, "--report", self.report)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.report.is_symlink())
+        report = json.loads(destination.read_text(encoding="utf-8"))
+        self.assertEqual(report["pipelines"][0]["status"], "compatible")
+
     def test_existing_report_cannot_be_a_hard_link_to_an_input(self):
         original = self.vs.read_bytes()
         try:

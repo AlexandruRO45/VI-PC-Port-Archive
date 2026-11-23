@@ -182,8 +182,8 @@ def main(argv=None):
             inputs = [path for path in (args.index, args.manifest, args.device_info) if path]
             inputs.extend(args.index.parent / (name + ".spv") for name in index
                           if is_shader_stem(name))
-            ensure_report_is_separate(args.report, inputs)
-            write_report(args.report, report)
+            report_path = ensure_report_is_separate(args.report, inputs)
+            write_report(report_path, report)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"wave64_pipeline_audit: {exc}", file=sys.stderr)
         return 2

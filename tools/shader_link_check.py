@@ -232,6 +232,7 @@ def write_report(path: Path, doc):
 
 
 def ensure_report_is_separate(output, inputs):
+    """Return the resolved report destination after checking it against the inputs."""
     if output is None:
         return
     out = output.resolve()
@@ -250,10 +251,11 @@ def ensure_report_is_separate(output, inputs):
                 aliases = out == source.resolve()
         if aliases:
             raise ValueError(f"report would overwrite an input file: {source}")
+    return out
 
 
 def inspect(args):
-    ensure_report_is_separate(args.report, [args.module])
+    report_path = ensure_report_is_separate(args.report, [args.module])
     interface = reflect_module(args.module.read_bytes(), args.stage, args.entry)
     doc = {
         "stage": interface.stage,
@@ -261,8 +263,8 @@ def inspect(args):
         "inputs": [declaration_row(item) for item in interface.inputs],
         "outputs": [declaration_row(item) for item in interface.outputs],
     }
-    if args.report:
-        write_report(args.report, doc)
+    if report_path:
+        write_report(report_path, doc)
     else:
         print(json.dumps(doc, indent=2))
     return 0
@@ -294,14 +296,15 @@ def run_checks(args):
             elif entry is not None:
                 raise ValueError(f"--{stage}-entry requires --{stage}")
         pipelines = [Pipeline("pipeline", tuple(refs[stage] for stage in stage_chain(refs)))]
-    ensure_report_is_separate(args.report, [*extra_inputs,
-                                            *(module.path for pipeline in pipelines for module in pipeline.modules)])
+    report_path = ensure_report_is_separate(
+        args.report, [*extra_inputs, *(module.path for pipeline in pipelines for module in pipeline.modules)]
+    )
     cache = InterfaceCache()
     results = [check_pipeline(pipeline, cache, args.maintenance4) for pipeline in pipelines]
     summary = {state: sum(result.status == state for result in results)
                for state in ("compatible", "incompatible", "invalid")}
-    if args.report:
-        write_report(args.report, {"version": 1, "maintenance4": args.maintenance4, "summary": summary,
+    if report_path:
+        write_report(report_path, {"version": 1, "maintenance4": args.maintenance4, "summary": summary,
                                    "pipelines": [asdict(result) for result in results]})
     for result in results:
         if args.quiet and not result.problems:
