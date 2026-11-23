@@ -265,7 +265,9 @@ def cpu_lookup(name: str):
         tier, num, suf = int(m[1]), m[2], m[3]
         gen = int(num[:2]) if (len(num) == 5 or num[0] == "1") else int(num[0])
         is_k = suf in ("k", "kf", "ks")
-        key = f"i{tier}-{num}{'k' if is_k else ''}"
+        # F and KF share the CPU score of their desktop counterparts.
+        suffix_key = {"f": "", "kf": "k"}.get(suf, suf)
+        key = f"i{tier}-{num}{suffix_key}"
         if key in CPU_EXPLICIT:
             return CPU_EXPLICIT[key], True
         base = _pick(INTEL_BASE, gen)[tier]

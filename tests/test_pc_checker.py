@@ -57,6 +57,20 @@ class CpuScore(unittest.TestCase):
     def test_estimated(self):
         self.assertAlmostEqual(pc.cpu_score("Intel Core i7-11700K"), 103 * 1.06)
 
+    def test_intel_variants_use_suffix_estimates(self):
+        for name, expected in (("Intel Core i7-12700H", 135 * 0.85),
+                               ("Intel Core i5-12400T", 108 * 0.8)):
+            with self.subTest(name=name):
+                score, exact = pc.cpu_lookup(name)
+                self.assertFalse(exact)
+                self.assertAlmostEqual(score, expected)
+
+    def test_intel_desktop_aliases_keep_exact_scores(self):
+        for name, score in (("Intel Core i5-12400", 102), ("Intel Core i5-12400F", 102),
+                            ("Intel Core i5-12600K", 125), ("Intel Core i5-12600KF", 125)):
+            with self.subTest(name=name):
+                self.assertEqual(pc.cpu_lookup(name), (score, True))
+
     def test_ultra(self):
         self.assertEqual(pc.cpu_score("Intel Core Ultra 7 265K"), 178)
 
