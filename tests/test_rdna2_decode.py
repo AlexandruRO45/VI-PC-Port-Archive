@@ -91,6 +91,25 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 self.assertEqual(invalid, 0)
                 self.assertIn(op + " v1, v2, v3, v4", asm)
 
+    def test_image_atomic_tfe_counts_the_status_dword(self):
+        # TFE adds a status dword after an atomic's data, as for an image load: each row is what llvm-mc 23
+        # (gfx1013) prints for these bytes, assembled and disassembled alike. Without tfe the range is unchanged.
+        for hexcode, asm in (
+            ("083145f002000000", "image_atomic_add v[0:1], v[2:3], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc tfe"),
+            ("081145f002000000", "image_atomic_add v[0:1], v[2:3], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm tfe"),
+            ("083341f004000000", "image_atomic_cmpswap v[0:2], v[4:5], s[0:7] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm glc tfe"),
+            ("083f41f006000000", "image_atomic_cmpswap v[0:4], v[6:7], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D unorm glc tfe"),
+            ("08335df004000000", "image_atomic_umax v[0:2], v[4:5], s[0:7] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm glc tfe"),
+            ("10313df002000000", "image_atomic_swap v[0:1], v[2:4], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_3D unorm glc tfe"),
+            ("08316df002000000", "image_atomic_inc v[0:1], v[2:3], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc tfe"),
+            ("083144f002000000", "image_atomic_add v0, v[2:3], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc"),
+        ):
+            with self.subTest(asm=asm):
+                ins, = rdna2_decode.decode_bytes(bytes.fromhex(hexcode))["insns"]
+                expected = shader_ir.parse_line(asm)
+                for field in ("op", "args", "mods"):
+                    self.assertEqual(ins[field], expected[field])
+
     def test_sopp_endpgm_branch_and_waitcnt(self):
         # s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070; s_cbranch_scc1 -4 = 0xBF85FFFC;
         # s_branch -20 = 0xBF82FFEC; s_endpgm = 0xBF810000
