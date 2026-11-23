@@ -9,7 +9,7 @@ from pathlib import Path
 TEST_DIR = Path(__file__).resolve().parent
 sys.path[:0] = [str(TEST_DIR.parent / "tools"), str(TEST_DIR)]
 
-from listing import translate_listing
+from listing import check_written, translate_listing
 
 FIXTURE = TEST_DIR / "fixtures" / "f64_conversion.asm"
 
@@ -49,9 +49,7 @@ class F64ConversionTest(unittest.TestCase):
             value = result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
         word = result(rf"OpBitcast %uint {value}")
         dest = result(r"OpAccessChain %_ptr_Function_uint %vgpr %c3")
-        old_word = result(rf"OpLoad %uint {dest}")
-        masked_word = result(rf"OpSelect %uint %\w+ {word} {old_word}")
-        self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked_word}$")
+        check_written(self, spv, dest, word)
 
 
 if __name__ == "__main__":

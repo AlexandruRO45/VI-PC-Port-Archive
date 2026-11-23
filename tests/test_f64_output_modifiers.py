@@ -15,7 +15,7 @@ from pathlib import Path
 TEST_DIR = Path(__file__).resolve().parent
 sys.path[:0] = [str(TEST_DIR.parent / "tools"), str(TEST_DIR)]
 
-from listing import translate_listing
+from listing import check_written, translate_listing
 
 # a = 0.75 in v[0:1], b = 0.5 in v[6:7] (low word first); the sum goes to v[4:5].
 BODY = """v_mov_b32 v0, 0
@@ -72,9 +72,7 @@ class F64OutputModifiersTest(unittest.TestCase):
         for index, register in ((0, "%c4"), (1, "%c5")):
             word = result(rf"OpCompositeExtract %uint {pair} {index}")
             dest = result(rf"OpAccessChain %_ptr_Function_uint %vgpr {register}")
-            old_word = result(rf"OpLoad %uint {dest}")
-            masked_word = result(rf"OpSelect %uint %\w+ {word} {old_word}")
-            self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked_word}$")
+            check_written(self, spv, dest, word)
         # Every f64 add and scale keeps its own rounding (no_contraction decorates all float arithmetic).
         for op in re.findall(r"(?m)^ *(%\w+) = Op(?:FAdd|FMul) %double ", spv):
             self.assertRegex(spv, rf"(?m)^ *OpDecorate {op} NoContraction$")
