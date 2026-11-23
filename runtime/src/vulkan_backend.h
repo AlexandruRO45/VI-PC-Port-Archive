@@ -930,16 +930,18 @@ public:
             return it == query_pools_.end() ? nullptr : &it->second;
         };
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
-        if (loaded_) {
+        if (vk.vkCreateSemaphore && vk.vkDestroySemaphore) {
             VkSemaphoreTypeCreateInfo storage_sem_type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
             storage_sem_type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
             VkSemaphoreCreateInfo storage_sem_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &storage_sem_type};
             if (vk.vkCreateSemaphore(device_, &storage_sem_info, nullptr, &storage_init_timeline_) != VK_SUCCESS) {
                 storage_init_timeline_ = VK_NULL_HANDLE;
+                storage_init_sync_failed_ = true;
                 loaded_ = false;
-            } else {
-                fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
             }
+        }
+        if (loaded_) {
+            fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
         }
     }
 
@@ -947,13 +949,15 @@ public:
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
         for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
-        if (storage_init_timeline_) vk.vkDestroySemaphore(device_, storage_init_timeline_, nullptr);
+        if (storage_init_timeline_ && vk.vkDestroySemaphore)
+            vk.vkDestroySemaphore(device_, storage_init_timeline_, nullptr);
     }
 
     VulkanContext(const VulkanContext&) = delete;
     VulkanContext& operator=(const VulkanContext&) = delete;
 
     bool loaded() const { return loaded_; }
+    bool storage_init_sync_failed() const { return storage_init_sync_failed_; }
     void configure_predication(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties& memory,
                                VkDeviceSize max_range, std::uint32_t family) {
         std::unique_lock lock(resource_mutex_);
@@ -1346,6 +1350,7 @@ private:
 
     VkDevice device_;
     bool loaded_ = false;
+    bool storage_init_sync_failed_ = false;
     bool ray_tracing_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
@@ -1477,7 +1482,7 @@ public:
 
     VulkanQueue(VulkanContext& context, VkQueue queue, std::uint32_t family, QueueKind kind = QueueKind::direct)
         : context_(context), queue_(queue), kind_(kind), family_(family) {
-        if (!context.loaded()) return;
+        if (context.storage_init_sync_failed()) return;
         auto& vk = context.vk;
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1667,7 +1672,8 @@ private:
     };
 
     ReplayResult execute_now(std::span<const CommandList* const> lists) {
-        if (!ok_ || !context_.loaded() || context_.is_device_lost()) return ReplayResult::unsupported;
+        if (!ok_ || context_.storage_init_sync_failed() || context_.is_device_lost())
+            return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
                 for (const auto& command : list->commands())
@@ -2386,7 +2392,7 @@ private:
 
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
                 std::span<const TimelineOp> extra_waits = {}, std::span<const TimelineOp> extra_signals = {}) {
-        if (!ok_ || context_.is_device_lost()) return false;
+        if (!ok_ || context_.storage_init_sync_failed() || context_.is_device_lost()) return false;
         const std::uint64_t ticket = submitted_ + 1;
         if (last_sparse_) collect_bindings(completed());
         std::span<const VkSemaphore> semaphores = waits_;
