@@ -248,11 +248,16 @@ int main() {
     Ref<IDXGIAdapter> adapter;
     std::string host_name = "the default adapter";
     const LUID luid = device->GetAdapterLuid();
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
-        !hostadapter::reference(factory.p, &luid, hostadapter::wanted() == "warp", &adapter.p, host_name))
-        adapter.reset();
+    // No factory, or no adapter for the pass (LEONIDA_HOST_ADAPTER=warp without WARP): don't compare, rather than
+    // fall back to the default adapter and compare with a GPU the layer doesn't run on.
+    const bool have_adapter =
+        SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&
+        hostadapter::reference(factory.p, &luid, hostadapter::wanted() == "warp", &adapter.p, host_name);
     Ref<ID3D12Device> host;
-    if (!create_host || FAILED(create_host(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+    if (!have_adapter) {
+        std::printf("heap properties: no host adapter to compare with; %zu values recorded, not compared\n",
+                    ours.values.size());
+    } else if (!create_host || FAILED(create_host(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
         std::printf("heap properties: no host D3D12 device to compare with; %zu values recorded, not compared\n",
                     ours.values.size());
     } else {
