@@ -173,6 +173,48 @@ class Parse(unittest.TestCase):
         with self.assertRaises(sl.LibraryError):
             sl.find_library(b"9FPR" + bytes(4096))
 
+    def test_find_skips_streams_larger_than_a_block(self):
+        # A stream that inflates past 64 KiB is not a library block: skipped, and inflated only to BLOCK + 1 bytes.
+        lib = sample()
+        self.assertEqual(sl.find_library(zlib.compress(bytes(4 * sl.BLOCK), 9) + archive(lib)), lib)
+        head = bytearray(sl.HEADER)                  # a library header at the start of a too-long stream
+        head[:4] = sl.MAGIC
+        self.assertEqual(sl.find_library(zlib.compress(bytes(head) + bytes(2 * sl.BLOCK), 9) + archive(lib)), lib)
+
+    def test_find_rejects_a_size_the_archive_cannot_hold(self):
+        head = bytearray(sl.HEADER)
+        head[:4] = sl.MAGIC
+        struct.pack_into("<I", head, 0x64, 0xFFFFFF00)   # a 4 GiB code section, from a stream of about 100 bytes
+        with self.assertRaises(sl.LibraryError) as cm:
+            sl.find_library(b"9FPR" + zlib.compress(bytes(head), 9))
+        self.assertIn("can inflate to", str(cm.exception))
+
+    def test_compute_record_fields_may_be_none(self):
+        # ref() allows NONE in every field: a record without a layout links no digest, one without a state gets
+        # no dispatch fields, one without a program names no stage. None of them may raise.
+        blobs = [kind0(), b"\x01" * 20, layout_blob(3, D_CS, 1)]
+        programs = [prog(1), prog(2), prog(3)]
+        compute = [(0, 1, 0, NONE), (NONE, 1, 1, 2), (0, 1, NONE, 2)]
+        b = build([], compute, blobs, programs)
+        lib = sl.parse(b)
+        self.assertEqual(lib["stage"], {0: {"cs"}, 1: {"cs"}})
+        self.assertEqual(lib["digest"], {1: {D_CS}})
+        self.assertIsNone(lib["compute"][2]["program"])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(b)
+            out = os.path.join(tmp, "out")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sl.main([src, "--out", out]), 0)
+            with open(os.path.join(out, "fspx", "lib_cs_00000.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["rsrc2"], 0xB8A)
+            with open(os.path.join(out, "fspx", "lib_cs_00001.json"), encoding="utf-8") as f:
+                self.assertNotIn("rsrc2", json.load(f))
+            with open(os.path.join(out, "library.json"), encoding="utf-8") as f:
+                self.assertEqual([c["program"] for c in json.load(f)["compute"]],
+                                 ["lib_cs_00000", "lib_cs_00001", None])
+
 
 class Main(unittest.TestCase):
     def run_main(self, *args):

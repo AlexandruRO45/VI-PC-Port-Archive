@@ -48,6 +48,7 @@ NONE = 0xFFFFFFFF
 SLOTS = {0: "ps", 1: "vs", 2: "ms", 6: "slot6"}
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 BLOCK = 1 << 16
+MAX_RATIO = 1032   # deflate's largest inflate ratio
 
 
 class LibraryError(ValueError):
@@ -91,17 +92,23 @@ def find_library(m) -> bytes:
         d = zlib.decompressobj()
         inp = m[s:s + 2 * BLOCK]   # a 64 KiB block never deflates to more than this
         try:
-            data = d.decompress(inp) + d.flush()
+            # A library block inflates to at most 64 KiB. Stop one byte later: a false header whose stream inflates
+            # further is not a block (not at eof), and it no longer grows `data` by up to 1032 x the input.
+            data = d.decompress(inp, BLOCK + 1)
         except zlib.error:
             pos = s + 1
             continue
-        if not d.eof:
+        if not d.eof or len(data) > BLOCK:
             pos = s + 1
             continue
         used = len(inp) - len(d.unused_data)
         if out is None:
             if data[:4] == MAGIC and len(data) >= HEADER:
                 need, out, start = layout(header(data))["end"], bytearray(data), s
+                if need > MAX_RATIO * (len(m) - s):
+                    # Deflate inflates at most 1032:1, so the rest of the archive can't hold that much.
+                    raise LibraryError(f"library at 0x{s:x}: the header gives {need} bytes, more than the "
+                                       f"{len(m) - s} bytes after it can inflate to")
         else:
             out += data
         pos = s + used
@@ -155,10 +162,14 @@ def parse(b: bytes) -> dict:
         graphics.append(rec)
     for i in range(h["compute"]):
         hsh, state, blob1, p, blob2 = struct.unpack_from("<QIIII", b, lay["compute"] + i * CS_SIZE)
-        compute.append({"hash": f"{hsh:016x}", "state": ref(state, "blob"), "blob": ref(blob1, "blob"),
-                        "program": ref(p, "program"), "layout": ref(blob2, "blob")})
-        stage.setdefault(p, set()).add("cs")
-        links.append((p, blob2))
+        rec = {"hash": f"{hsh:016x}", "state": ref(state, "blob"), "blob": ref(blob1, "blob"),
+               "program": ref(p, "program"), "layout": ref(blob2, "blob")}
+        compute.append(rec)
+        # NONE is allowed in every field (ref); a record without a program names no stage and links nothing.
+        if rec["program"] is not None:
+            stage.setdefault(p, set()).add("cs")
+            if rec["layout"] is not None:
+                links.append((p, blob2))
     digest = {}
     for p, i in links:
         o, size = blobs[i]
@@ -290,7 +301,7 @@ def main(argv=None) -> int:
         os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
     names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
     sources = carve_digests(a.carve) if a.carve else None
-    cs_state = {c["program"]: c["state"] for c in lib["compute"]}
+    cs_state = {c["program"]: c["state"] for c in lib["compute"] if None not in (c["program"], c["state"])}
     index, written, work = [], 0, []
     for i in range(lib["header"]["programs"]):
         stages = lib["stage"].get(i, set())
@@ -351,7 +362,7 @@ def main(argv=None) -> int:
         "layout": lib["layout"],
         "graphics": [{"hash": g["hash"], "state": g["state"], "input_layout": g["input_layout"],
                       "stages": named(g["stages"])} for g in lib["graphics"]],
-        "compute": [{"hash": c["hash"], "state": c["state"], "program": names[c["program"]]} for c in lib["compute"]],
+        "compute": [{"hash": c["hash"], "state": c["state"], "program": names.get(c["program"])} for c in lib["compute"]],
     }
     with open(os.path.join(a.out, "library.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(summary, f, indent=1)

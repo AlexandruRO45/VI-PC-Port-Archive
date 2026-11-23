@@ -76,8 +76,8 @@ have the sizes and shapes of the four [FSPX](fspx.md) kinds:
 | program | | kind 6 |
 | layout blob | 56 to 10,552 bytes | kind 7 |
 
-1,529 of the 2,684 compute programs set the wave32 flag. 90 set RSRC2 `TG_SIZE_EN` (bit 10), which none of the
-2,689 carved compute shaders do.
+1,529 of the 2,684 compute programs set the wave32 flag. 91 set RSRC2 `TG_SIZE_EN` (bit 10), which none of the
+2,689 carved compute shaders do. No program is named by two records that differ in that bit.
 
 **Programs.** 52 to 239,464 bytes (median 3,968; 238,829,764 in total), padded to 256 bytes with `s_code_end`.
 21,463 of them start with the 36-byte prologue FSPX programs have, three 12-byte VOP3 opcode-0x180 words with
@@ -115,11 +115,14 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
   `lib_<stage>_<index>`.
 * `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
+  Use llvm-mc 23 (`scripts/build_llvm_mc.ps1 -Version 23.1.5`, or the `llvm-23` package): older versions can't
+  decode the `vcc` tuples these programs use (§5).
 * `--carve` names each program's source shaders. It copies the first source container to `<name>.dxbc`, because
   the translator reads the stage's signatures and `PSV0` from there. Pipeline compilation keeps the D3D12 stage
   interface.
 * `--save` writes the reassembled library. A saved file is also accepted as input.
-* `--stages` limits the output to some stages.
+* `--stages` limits the output to some stages. The default, `cs,ps,vs,ms`, leaves out the slot-6 program, so a
+  default run writes 21,521 of the 21,522 programs; `--stages all` writes it too.
 
 The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
@@ -127,36 +130,44 @@ walk. It also checks the `--carve` copy and the translator's reads of the comput
 
 ## 5. Translation
 
-With `--carve` and `rdna2spirv.py` at `main` `aa2988cc` (llvm-mc 23, `gfx1013`), **17,955 of the 21,522 programs
-translate and pass `spirv-val`**:
+**The llvm-mc version matters here.** The first count of this section (17,955 at `aa2988cc`) said llvm-mc 23, but it
+was made with llvm-mc 21.1.8, which rejects the scalar register tuples that run into `vcc` (SGPRs 106 and 107):
+`s_load_dwordx8`/`x4`/`x16` writing `s[100:107]`, `s[104:107]` or `s[92:107]`, and image and buffer instructions
+whose resource or sampler includes them. LLVM 22.1.8 rejects them too. LLVM 23 added register classes for these
+tuples (`VCCTuple` in `SIRegisterInfo.td`) and prints them as lists, `[s100,s101,s102,s103,s104,s105,vcc_lo,vcc_hi]`,
+which the translator reads (design.md, *Scalar/buffer memory*). The FSSM shaders don't use these tuples; the
+pipeline builds use them often: with llvm-mc 21 they blocked 2,533 programs. LLVM 23 also prints some `v_fma_mix*`
+literals as `lit(V)` where LLVM 21 printed the inline constant of their low half and dropped the literal.
 
-| stage | programs | pass `spirv-val` |
-|---|---:|---:|
-| VS | 1,343 | 1,333 (99.3%) |
-| MS | 7,498 | 7,059 (94.1%) |
-| PS | 9,996 | 7,719 (77.2%) |
-| CS | 2,684 | 1,844 (68.7%) |
-| slot 6 | 1 | 0 (stage not identified) |
+With `--stages all --disasm --carve` and `rdna2spirv.py` at `main` `561b65a8` (`gfx1013`), the programs that
+translate and pass `spirv-val`:
 
-What stops the rest, by the translator's message:
+| stage | programs | llvm-mc 21.1.8 | llvm-mc 23.1.5 | 23.1.5 with #6446, #6808, #6809 |
+|---|---:|---:|---:|---:|
+| VS | 1,343 | 1,296 | 1,335 | 1,340 |
+| MS | 7,498 | 6,744 | 7,427 | 7,473 |
+| PS | 9,996 | 6,119 | 6,442 | 7,871 |
+| CS | 2,684 | 1,392 | 1,495 | 1,860 |
+| total | 21,521 | 15,551 | 16,699 | 18,544 |
 
-* **2,533 programs: "reachable instruction with normalized encoding".** llvm-mc rejects scalar register tuples that
-  run into `vcc` (SGPRs 106 and 107): `s_load_dwordx8`/`x4`/`x16` writing `s[100:107]`, `s[104:107]` or
-  `s[92:107]`, and image instructions whose resource is `s[100:107]`. In the compute programs alone that is 37,952
-  SMEM, 22,248 MIMG and 2,298 MUBUF words. The same words with the register field one tuple lower decode; with
-  `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. A decoder
-  fallback for these encodings would cover most of the remaining programs. The translator already reads
-  `[s100,...,vcc_lo,vcc_hi]` lists (design.md *Scalar/buffer memory*).
-* **443: an instruction llvm-mc prints with another encoding than the blob's** (`v_fma_mix*`, `v_interp_p2_f16`):
-  the existing `check_printed_encodings` refusal.
-* **90 CS: "CS thread-group-size SGPR"**: RSRC2 `TG_SIZE_EN`, which no FSSM compute shader sets.
-* **68 translate but fail `spirv-val`**, mostly "requires a previous definition".
-* Fewer than 30 each: `ds_append`, `s_bitreplicate_b64_b32` and `s_flbit_i32_b64` on a lane mask, `v_cmp` and mask
-  destinations, 25 branches into data, 10 undecodable words that can't be re-anchored, and a few `vcc`/`ttmp`
-  operands.
-* Programs with no source container: a PS or MS one has no signatures and is `Unsupported` (the reads now raise
-  that instead of `FileNotFoundError`, which stopped the whole run). A VS that fetches no inputs translates without
-  one.
+The slot-6 program isn't counted (its stage is not identified). The three pull requests: #6446 writes the compute
+thread-group SGPR (RSRC2 `TG_SIZE_EN`, set by 91 compute programs and by no FSSM shader), #6808 reads `lit(V)`, #6809
+translates `s_bfm_b64` in wave32 code as data (958 wave32 compute programs build an S# with it, and the FSPX wave32
+check counted it as wave64 code).
+
+What stops the other 2,977 with all three, by the translator's message:
+
+* **1,731: "fall-through into undecodable words".** Words no llvm-mc version decodes for `gfx1013`, on a reachable
+  path. Most are VOPC compares with a DPP16 source (`src0` 0xFA, e.g. `quad_perm`), which LLVM decodes only for
+  gfx11 and later, followed by their DPP word; the rest are VOP3 opcode 0x180 words with a literal, the instruction
+  the 36-byte prologue is made of, inside the code.
+* **767: "v_cmp destination"**, almost all `v_cmp_*_e64 vcc_hi, ...` in wave32 code (6,324 compares in 910 programs):
+  the compiler keeps a 32-bit lane mask in `vcc_hi`, which the translator models only as half of wave64 `vcc`.
+* **204: `v_interp_p2_f16` printed without its `op_sel`** (`check_printed_encodings`).
+* **149: "mask destination"**, and fewer than 60 each: `s_load*` with `vcc` as the base pointer (54), `ds_append`,
+  `s_bitreplicate_b64_b32` and `s_flbit_i32_b64` on a lane mask, `s_getpc_b64` destinations.
+* Programs with no source container: a PS or MS one has no signatures and is `Unsupported`. A VS that fetches no
+  inputs translates without one.
 
 None of the programs has been run on a GPU.
 
