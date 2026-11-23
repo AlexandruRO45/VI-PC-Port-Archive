@@ -258,6 +258,36 @@ class GamedataXmlTest(unittest.TestCase):
         self.assertEqual(report["rows"][0]["comments"], 2)
         self.assertEqual(report["summary"]["comments"], 2)
 
+    def test_utf16_files_keep_the_declaration_and_count_comments_after_a_parse_error(self):
+        declaration = '<?xml version="1.0" encoding="UTF-16"?>'
+        for encoding, bom in (("utf-16-le", b"\xff\xfe"), ("utf-16-be", b"\xfe\xff")):
+            with self.subTest(encoding=encoding):
+                valid = bom + (declaration + "<Root><!-- real --></Root>").encode(encoding)
+                broken = bom + (declaration + "<Root><!-- before --><Child></Root>"
+                                "<![CDATA[<!-- ignored -->]]><!-- after -->").encode(encoding)
+                cut = bom + "<Root><!-- before --><Child/>".encode(encoding)
+                good_path = self.write("valid.xml", valid)
+                bad_path = self.write("broken.xml", broken)
+                cut_path = self.write("cut.xml", cut)
+                out = os.path.join(self.root, "utf16.json")
+                p = self.run_tool(good_path, bad_path, cut_path, "--check", "--json", out)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                with open(out, encoding="utf-8") as f:
+                    report = json.load(f)
+                good, bad, truncated = report["rows"]
+                self.assertTrue(good["well_formed"])
+                self.assertTrue(good["header"])
+                self.assertEqual(good["bytes"], len(valid))
+                self.assertTrue(bad["malformed"])
+                self.assertTrue(bad["header"])
+                self.assertEqual(bad["root"], "Root")
+                self.assertEqual(bad["comments"], 2)
+                self.assertEqual(bad["bytes"], len(broken))
+                self.assertTrue(truncated["malformed"])
+                self.assertFalse(truncated["tail_only"])
+                self.assertEqual(truncated["comments"], 1)
+                self.assertEqual(report["summary"]["comments_header"], 3)
+
     def test_carve_directory_joins_chunks_and_marks_fragment(self):
         carve = os.path.join(self.root, "carve")
         os.makedirs(carve)

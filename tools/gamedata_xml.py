@@ -20,6 +20,7 @@ nested XML in directory mode, or a carve ``index.json`` or stream. The test fixt
 no game data.
 """
 import argparse
+import codecs
 import csv
 import io
 import json
@@ -127,6 +128,13 @@ def scan_refs(text: str, report: dict) -> None:
             report["platform_total"] += 1
 
 
+def xml_markup(data: bytes) -> bytes:
+    """Expose UTF-16 markup to the byte scanners while leaving the parser's input unchanged."""
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)) and not data.startswith(codecs.BOM_UTF32_LE):
+        return data.decode("utf-16", errors="replace").encode("utf-8")
+    return data
+
+
 def scan_xml(data: bytes) -> dict:
     """Parse one document and return aggregate facts. Never keeps element text or values."""
     report = {
@@ -199,7 +207,7 @@ def scan_xml(data: bytes) -> dict:
                                     and exc.code == errors.codes[errors.XML_ERROR_TAG_MISMATCH])
         # The parser stops at the error, so the comments after it would go uncounted (a truncated or tail-only
         # document): count them in the bytes instead, still skipping comment-like text inside CDATA.
-        report["comments"] = raw_comment_count(data)
+        report["comments"] = raw_comment_count(xml_markup(data))
     if ended is not None:
         scan_refs(ended.tail, report)
     report["attributes"] = sorted(report["attrs"])
@@ -229,9 +237,10 @@ def looks_truncated(data: bytes, root: str) -> bool:
 def file_row(doc: dict, scan: dict) -> dict:
     # A truncated tail can begin with an inner element, so the index's closing-root hint wins.
     root = doc.get("root_hint") or scan["root"]
+    data = doc.get("markup", doc["data"])
     header = doc.get("header")
     if header is None:
-        header = gi.has_xml_decl(doc["data"])
+        header = gi.has_xml_decl(data)
     well_formed = scan["well_formed"]
     if well_formed:
         tail_only = fragment = False
@@ -243,7 +252,6 @@ def file_row(doc: dict, scan: dict) -> dict:
         # retained tags. Accept that explanation only if restoring the opener
         # produces a complete document; a terminator alone is not evidence.
         repaired_root = ""
-        data = doc["data"]
         closing_root = gi.tail_root(data)
         if not header and closing_root:
             body = data[3:] if data.startswith(BOM) else data
@@ -259,7 +267,7 @@ def file_row(doc: dict, scan: dict) -> dict:
         root = repaired_root or gi.xml_root(data) or scan["root"]
         tail_only, fragment = bool(repaired_root), False
     else:
-        tail_only = looks_truncated(doc["data"], root)
+        tail_only = looks_truncated(data, root)
         fragment = not root
     malformed = not well_formed and not tail_only and not fragment
     row = {
@@ -519,10 +527,12 @@ def load_documents(targets: list):
 def file_document(path: str) -> dict:
     with open(path, "rb") as f:
         data = f.read()
-    head, tail = gi.xml_root(data), gi.tail_root(data)
-    root = head if (head and (gi.has_xml_decl(data) or not gi.xml_complete(head, data))) else (tail or head)
+    markup = xml_markup(data)
+    head, tail = gi.xml_root(markup), gi.tail_root(markup)
+    root = head if (head and (gi.has_xml_decl(markup) or not gi.xml_complete(head, markup))) else (tail or head)
     return {
         "data": data,
+        "markup": markup,
         "from_carve": False,
         "name": os.path.basename(path),
         "root_hint": root,
