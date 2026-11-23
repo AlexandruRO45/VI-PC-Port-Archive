@@ -236,6 +236,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(file_system_test PRIVATE /OPT:NOREF)
   target_link_libraries(file_system_test PRIVATE advapi32)  # the ACL calls of the unlistable-marker-folder check
 
+  # Shader-cache file publication and injected stream failures, without a Vulkan device.
+  add_executable(shader_cache_file_test test/shader_cache_file_test.cpp)
+  target_compile_definitions(shader_cache_file_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(shader_cache_file_test PRIVATE /W4 /permissive- /utf-8)
+
   # LEONIDA_SKIP_INT3 (shims/startup_trace.h): its own executable, the variable is read once per process.
   add_executable(int3_skip_test
     test/int3_skip_test.cpp
@@ -1003,6 +1008,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)
+  endif()
+  if(WIN32 AND TARGET shader_cache_file_test)
+    add_test(NAME shader_cache_file COMMAND shader_cache_file_test)
   endif()
   if(WIN32 AND TARGET int3_skip_test)
     add_test(NAME int3_skip COMMAND int3_skip_test)

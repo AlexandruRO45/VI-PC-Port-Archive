@@ -25,6 +25,7 @@
 #include "../src/cached_pso.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
+#include "../src/shader_cache_file.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
@@ -4162,6 +4163,7 @@ struct ShaderCacheStore {
         if (disk_path.empty()) return true;
         std::error_code ec;
         std::filesystem::create_directories(disk_path.parent_path(), ec);
+        if (ec) return false;
         static std::atomic<std::uint64_t> write_seq{0};
         const std::uint64_t seq = write_seq.fetch_add(1, std::memory_order_relaxed);
         wchar_t suffix[64]{};
@@ -4170,9 +4172,7 @@ struct ShaderCacheStore {
                       static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(seq));
         std::filesystem::path tmp = disk_path;
         tmp += suffix;
-        {
-            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-            if (!out) return false;
+        return publish_shader_cache_file(tmp, disk_path, [&](std::ofstream& out) {
             const DiskHeader header{kDiskMagic, kDiskFormatVersion, static_cast<std::uint32_t>(entries.size()), 0,
                                     version};
             out.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -4183,13 +4183,7 @@ struct ShaderCacheStore {
                 out.write(k.data(), static_cast<std::streamsize>(k.size()));
                 out.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size()));
             }
-            if (!out.good()) return false;
-        }
-        if (!MoveFileExW(tmp.c_str(), disk_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-            std::filesystem::remove(tmp, ec);
-            return false;
-        }
-        return true;
+        });
     }
 
     void clear() {
