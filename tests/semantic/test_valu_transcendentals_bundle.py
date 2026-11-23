@@ -561,5 +561,31 @@ class TestVLogF32SIMDAndIEEE(unittest.TestCase):
                 self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.0)
 
 
+def run_hw_log_f32(src_val: float) -> float:
+    bits = f32_to_bits(src_val)
+    lines = [
+        f"v_mov_b32 v0, {bits:#x}",
+        "v_log_f32 v0, v0",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_log_f32_hw", lines)
+    out_bits = support.mrt0_words(spv)[0]
+    return bits_to_f32(out_bits)
+
+
+class TestVLogF32HardwareTranslator(unittest.TestCase):
+    """Translator integration and hardware execution tests for v_log_f32."""
+
+    def test_translator_log_values(self):
+        self.assertEqual(run_hw_log_f32(1.0), 0.0)
+        self.assertEqual(run_hw_log_f32(2.0), 1.0)
+        self.assertEqual(run_hw_log_f32(4.0), 2.0)
+        self.assertEqual(run_hw_log_f32(8.0), 3.0)
+        self.assertEqual(run_hw_log_f32(0.5), -1.0)
+        self.assertEqual(run_hw_log_f32(0.25), -2.0)
+        self.assertEqual(run_hw_log_f32(float("inf")), float("inf"))
+
+
 if __name__ == "__main__":
     unittest.main()
