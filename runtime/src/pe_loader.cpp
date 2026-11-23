@@ -546,10 +546,15 @@ QueryThreadFn query_thread_fn() {
 // in the system and Thread32Next has to walk them all; on Windows 11 a dry run of the retail executable measured
 // 6-10 ms for the snapshot and 23-32 ms for the walk per mapped TLS module (three modules at startup). NtGetNextThread
 // is not in the documented API set, so a missing export or a refused call falls back to the Toolhelp walk.
+// LEONIDA_LOADER_TOOLHELP=1 forces the fallback for a test or a Wine diagnosis.
 using NextThreadFn = LONG(NTAPI*)(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
 NextThreadFn next_thread_fn() {
-    static const auto fn = reinterpret_cast<NextThreadFn>(
-        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtGetNextThread")));
+    static const NextThreadFn fn = []() -> NextThreadFn {
+        wchar_t value[2]{};
+        if (GetEnvironmentVariableW(L"LEONIDA_LOADER_TOOLHELP", value, 2) == 1 && value[0] == L'1') return nullptr;
+        return reinterpret_cast<NextThreadFn>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtGetNextThread")));
+    }();
     return fn;
 }
 constexpr LONG kStatusNoMoreEntries = static_cast<LONG>(0x8000001Au);

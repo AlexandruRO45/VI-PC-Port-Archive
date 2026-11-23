@@ -743,6 +743,11 @@ if(BUILD_TESTING)
     add_test(NAME loader_tls
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
+    # The same suite through the Toolhelp fallback, so both enumeration paths run on CI rather than only under Wine.
+    add_test(NAME loader_tls_toolhelp
+      COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
+    )
+    set_tests_properties(loader_tls_toolhelp PROPERTIES ENVIRONMENT "LEONIDA_LOADER_TOOLHELP=1")
 
     # DisableThreadLibraryCalls from a mapped DllMain (shims/library_loader.cpp). The fixture is built without the CRT, so
     # DllMain's only work is that one call. No game files.

@@ -134,7 +134,10 @@ it, writes that index into the image's `AddressOfIndex`, and copies the image's 
 slot. This reserves one index; every additional simultaneous TLS module gets its own by mapping a fresh
 clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16 modules can be live at
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
-directory (or with an all-zero one) load normally.
+directory (or with an all-zero one) load normally. Threads that were already running get their copy from
+`NtGetNextThread`, which walks only this process; when the export is missing or
+`LEONIDA_LOADER_TOOLHELP=1` is set, the loader falls back to a `TH32CS_SNAPTHREAD` walk of every thread in
+the system.
 
 Current limits, by design:
 
