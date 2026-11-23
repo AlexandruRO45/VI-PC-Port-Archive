@@ -227,6 +227,11 @@ int main() {
     info.shader_dir = fixture.string();
     Ref<ID3D12Device> layer;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&layer.p)))) return 1;
+    if (rt::d3d12::device_push_constants_need_fallback(layer.p)) {
+        std::printf("d3d12_indirect_dispatch_count_test: skipped, the PSOs need 144 push-constant bytes and this "
+                    "GPU has %u\n", rt::d3d12::device_max_push_constants_size(layer.p));
+        return 77;
+    }
 
     // The layer is checked against expected(), the D3D12 rule that the count is read when the GPU executes the
     // command. WARP must match it too, with one measured exception: in-box WARP 10.0.22621.5415 (Windows 11 23H2)
