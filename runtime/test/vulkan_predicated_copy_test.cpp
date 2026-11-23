@@ -230,9 +230,10 @@ int test_window_limits_and_pool_failures() {
     {
         MockVk mock;
         g_mock = &mock;
-        // sp = 16 >= maximum (16) -> cannot fit even 1 byte in window
+        // sp = 16 >= maximum (16) and dp = 16 >= maximum (16) -> cannot fit even 1 byte in window
         PredicatedBufferCopier small_range(mock_get_proc, make_handle<VkDevice>(0x1), make_limits(32, 16, 64));
         EXPECT(!small_range.batch()->prepare(src, dst, 16, 0, 4, out));
+        EXPECT(!small_range.batch()->prepare(src, dst, 0, 16, 4, out));
         EXPECT(mock.create_pool == 0);
 
         PredicatedBufferCopier zero_wg(mock_get_proc, make_handle<VkDevice>(0x1), make_limits(16, 256, 0));
@@ -269,10 +270,18 @@ int test_alignment_splitting_emit_and_teardown() {
         EXPECT(jobs[1].source == 0 && jobs[1].destination == 15 && jobs[1].bytes == 30);
 
         EXPECT(mock.desc_writes.size() == 4);
-        EXPECT(mock.desc_writes[0].info.offset == 16 && mock.desc_writes[0].info.range == 64);
-        EXPECT(mock.desc_writes[1].info.offset == 32 && mock.desc_writes[1].info.range == 63);
-        EXPECT(mock.desc_writes[2].info.offset == 80 && mock.desc_writes[2].info.range == 30);
-        EXPECT(mock.desc_writes[3].info.offset == 80 && mock.desc_writes[3].info.range == 45);
+        EXPECT(mock.desc_writes[0].set == jobs[0].set && mock.desc_writes[0].binding == 0 &&
+               mock.desc_writes[0].info.buffer == src && mock.desc_writes[0].info.offset == 16 &&
+               mock.desc_writes[0].info.range == 64);
+        EXPECT(mock.desc_writes[1].set == jobs[0].set && mock.desc_writes[1].binding == 1 &&
+               mock.desc_writes[1].info.buffer == dst && mock.desc_writes[1].info.offset == 32 &&
+               mock.desc_writes[1].info.range == 63);
+        EXPECT(mock.desc_writes[2].set == jobs[1].set && mock.desc_writes[2].binding == 0 &&
+               mock.desc_writes[2].info.buffer == src && mock.desc_writes[2].info.offset == 80 &&
+               mock.desc_writes[2].info.range == 30);
+        EXPECT(mock.desc_writes[3].set == jobs[1].set && mock.desc_writes[3].binding == 1 &&
+               mock.desc_writes[3].info.buffer == dst && mock.desc_writes[3].info.offset == 80 &&
+               mock.desc_writes[3].info.range == 45);
 
         // Non-overlapping same-buffer copy succeeds and reuses cached pipeline.
         std::vector<PredicatedCopyDispatch> non_overlap;
@@ -295,12 +304,45 @@ int test_alignment_splitting_emit_and_teardown() {
     return 0;
 }
 
+int test_destination_and_dispatch_limits() {
+    const VkBuffer src = make_handle<VkBuffer>(0x301);
+    const VkBuffer dst = make_handle<VkBuffer>(0x302);
+    {
+        // Destination alignment prefix dp=12 > sp=2 caps window 0 at maximum - dp = 52.
+        MockVk mock;
+        g_mock = &mock;
+        PredicatedBufferCopier copier(mock_get_proc, make_handle<VkDevice>(0x1), make_limits(16, 64, 16));
+        auto b = copier.batch();
+        std::vector<PredicatedCopyDispatch> jobs;
+        EXPECT(b->prepare(src, dst, 18, 28, 60, jobs));
+        EXPECT(jobs.size() == 2);
+        EXPECT(jobs[0].source == 2 && jobs[0].destination == 12 && jobs[0].bytes == 52);
+        EXPECT(jobs[1].source == 6 && jobs[1].destination == 0 && jobs[1].bytes == 8);
+    }
+    {
+        // maxComputeWorkGroupCount[0] * 64 = 128 < maxStorageBufferRange = 256 splits at 128;
+        // remaining 65 bytes pins multi-workgroup ceil-div (65 - 1) / 64 + 1 = 2.
+        MockVk mock;
+        g_mock = &mock;
+        PredicatedBufferCopier copier(mock_get_proc, make_handle<VkDevice>(0x1), make_limits(16, 256, 2));
+        auto b = copier.batch();
+        std::vector<PredicatedCopyDispatch> jobs;
+        EXPECT(b->prepare(src, dst, 0, 0, 193, jobs));
+        EXPECT(jobs.size() == 2);
+        EXPECT(jobs[0].bytes == 128 && jobs[1].bytes == 65);
+        copier.emit(make_handle<VkCommandBuffer>(0x401), jobs);
+        EXPECT((mock.dispatches == std::vector<std::uint32_t>{2, 2}));
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
     if (test_validation_and_pipeline_rollback()) return 1;
     if (test_window_limits_and_pool_failures()) return 1;
     if (test_alignment_splitting_emit_and_teardown()) return 1;
+    if (test_destination_and_dispatch_limits()) return 1;
     std::puts("vulkan_predicated_copy_test: ok");
     return 0;
 }
