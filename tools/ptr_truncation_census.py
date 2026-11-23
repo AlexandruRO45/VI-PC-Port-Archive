@@ -37,7 +37,8 @@ Usage:
 
 <disasm dir> is `<work>/shaders/disasm` (the carve's index.json one level up gives each stage). --json writes the
 summary; --index-out writes {number: {"stage", "user_sgpr_reads"}} with shaders numbered in listing order, not
-named, which `tools/user_sgpr_census.py` reads. Neither prints or writes a shader name, listing or byte.
+named, which `tools/user_sgpr_census.py` reads. Neither prints or writes a shader name, listing or byte. The two
+reports must name different files: one path for both is refused, not written twice.
 """
 import argparse
 import json
@@ -49,6 +50,7 @@ from concurrent.futures import ProcessPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pool_workers  # noqa: E402
 import rdna2spirv  # noqa: E402
+import report_paths  # noqa: E402
 import shader_meta  # noqa: E402
 
 STAGES = ("vs", "ps", "cs", "gs", "hs", "ds", "ms", "as")
@@ -300,6 +302,10 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not os.path.isdir(a.src):
         print(f"ERROR: {a.src} is not a folder", file=sys.stderr)
+        return 2
+    if a.json and a.index_out and report_paths.same_report_path(a.json, a.index_out):
+        print("ERROR: --json and --index-out name the same file; the index would replace the summary",
+              file=sys.stderr)
         return 2
     files = listings(a.src)[: a.limit] if a.limit is not None else listings(a.src)
     jobs = pool_workers.process_workers(max(1, a.jobs))
