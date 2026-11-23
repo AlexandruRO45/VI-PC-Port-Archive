@@ -341,6 +341,26 @@ class TestSAddcU32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 301)
 
+def ref_s_subb_u32(src0: int, src1: int, bin_borrow: int) -> tuple[int, int]:
+    """Reference mathematical oracle for s_subb_u32 -> (res, bout)."""
+    s0 = src0 & MASK32
+    s1 = src1 & MASK32
+    b = bin_borrow & 1
+    diff = s0 - s1 - b
+    res = diff & MASK32
+    bout = 1 if s0 < (s1 + b) else 0
+    return res, bout
+
+
+class TestSSubbU32Oracle(unittest.TestCase):
+    def test_with_borrow_in_zero(self) -> None:
+        self.assertEqual(ref_s_subb_u32(50, 20, 0), (30, 0))
+        self.assertEqual(ref_s_subb_u32(10, 20, 0), (0xFFFFFFFF - 9, 1))
+
+    def test_with_borrow_in_one(self) -> None:
+        self.assertEqual(ref_s_subb_u32(50, 20, 1), (29, 0))
+        self.assertEqual(ref_s_subb_u32(0, 0, 1), (0xFFFFFFFF, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
