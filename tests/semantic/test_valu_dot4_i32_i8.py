@@ -338,5 +338,64 @@ class TestValuDot4I32I8SIMDDivergence(unittest.TestCase):
         for lane in range(64):
             self.assertEqual(state.lanes_vgpr[lane][0], 0xCAFE0000 | lane)
 
+class TestValuDot4I32I8Aliasing(unittest.TestCase):
+    """Stage 5: Register aliasing and in-place operand preservation."""
+
+    def test_aliasing_dst_src0(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, pack_i8(1, 2, 3, 4))
+        state.write_vgpr(1, pack_i8(5, 6, 7, 8))
+        state.write_vgpr(2, 10)
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        ScalarInterpreter().step(instr, state)
+        self.assertEqual(state.vgprs[0], 70 + 10)
+
+    def test_aliasing_dst_src1(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, pack_i8(5, 6, 7, 8))
+        state.write_vgpr(1, pack_i8(1, 2, 3, 4))
+        state.write_vgpr(2, 20)
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(2),
+        )
+        ScalarInterpreter().step(instr, state)
+        self.assertEqual(state.vgprs[0], 70 + 20)
+
+    def test_aliasing_dst_src2_accumulator(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, 100)
+        state.write_vgpr(1, pack_i8(1, 2, 3, 4))
+        state.write_vgpr(2, pack_i8(5, 6, 7, 8))
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+            src1=Operand.vgpr(2),
+            src2=Operand.vgpr(0),
+        )
+        ScalarInterpreter().step(instr, state)
+        self.assertEqual(state.vgprs[0], 70 + 100)
+
+    def test_aliasing_all_operands_same_vgpr(self) -> None:
+        state = ScalarMachineState()
+        val = pack_i8(2, 2, 2, 2)
+        state.write_vgpr(0, val)
+        instr = VDot4I32I8Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(0),
+            src2=Operand.vgpr(0),
+        )
+        # dot = 4 * (2 * 2) = 16. acc = 0x02020202. total = val + 16
+        ScalarInterpreter().step(instr, state)
+        self.assertEqual(state.vgprs[0], val + 16)
+
 if __name__ == "__main__":
     unittest.main()
