@@ -365,7 +365,7 @@ Target read_target(const std::wstring& path) {
     return t;
 }
 
-Target write_target(const std::wstring& path, bool copy_up) {
+Target write_target(const std::wstring& path, bool copy_up, bool mirror_directory = false) {
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(path, parts);
     if (parsed == Parsed::Host) {
@@ -433,7 +433,7 @@ Target write_target(const std::wstring& path, bool copy_up) {
             if (!std::filesystem::exists(t.path, ec)) t.error = error;
         }
     }
-    if (copy_up && !deleted(r.overlay, parts) && !std::filesystem::exists(t.path, ec) &&
+    if (copy_up && mirror_directory && !deleted(r.overlay, parts) && !std::filesystem::exists(t.path, ec) &&
         std::filesystem::is_directory(package_path, ec)) {
         std::filesystem::create_directory(t.path, ec);
         if (ec) t.error = static_cast<DWORD>(ec.value());
@@ -451,13 +451,13 @@ bool writes(DWORD access, DWORD disposition) {
            disposition == TRUNCATE_EXISTING;
 }
 
-Target open_target(const std::wstring& path, DWORD access, DWORD disposition) {
+Target open_target(const std::wstring& path, DWORD access, DWORD disposition, DWORD flags) {
     if (!writes(access, disposition)) return read_target(path);
     // OPEN_ALWAYS and TRUNCATE_EXISTING read what is already there, and a write-open must not lose a package file's
     // bytes; CREATE_ALWAYS and CREATE_NEW replace it.
     const bool keeps_contents =
         disposition == OPEN_EXISTING || disposition == OPEN_ALWAYS || disposition == TRUNCATE_EXISTING;
-    return write_target(path, keeps_contents);
+    return write_target(path, keeps_contents, (flags & FILE_FLAG_BACKUP_SEMANTICS) != 0);
 }
 
 // ---- FindFirstFile: the overlay and the package merged into one listing
@@ -665,7 +665,7 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    const Target t = open_target(name, access, disposition);
+    const Target t = open_target(name, access, disposition, flags);
     if (t.error) {
         note_open_failure("CreateFileW", name, t.error, _ReturnAddress());
         SetLastError(t.error);
@@ -696,7 +696,7 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    const Target t = open_target(name, access, disposition);
+    const Target t = open_target(name, access, disposition, params ? params->dwFileFlags : 0);
     if (t.error) {
         note_open_failure("CreateFile2", name, t.error, _ReturnAddress());
         SetLastError(t.error);

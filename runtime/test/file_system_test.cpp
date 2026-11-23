@@ -238,6 +238,19 @@ void run_checks(const std::filesystem::path& root) {
               attributes_ex_w && delete_w && delete_a,
           "the file API resolves through the registry under kernel32/kernelbase and the api sets");
 
+    // A failed open without backup semantics must not hide the package folder's attributes.
+    {
+        const auto folder = package / "hidden_folder";
+        std::filesystem::create_directory(folder);
+        check(::SetFileAttributesW(folder.c_str(), FILE_ATTRIBUTE_HIDDEN) != 0, "mark package folder hidden");
+        HANDLE h = create_w(L"GAME:\\hidden_folder", GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE, "a directory write-open without backup semantics fails");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(!std::filesystem::exists(overlay / "hidden_folder"), "failed open does not mirror the folder");
+        const DWORD attrs = attributes_w(L"GAME:\\hidden_folder");
+        check(attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_HIDDEN), "package folder remains hidden");
+    }
+
     // A writable folder handle needs an overlay mirror, even when only the package has the folder.
     {
         constexpr DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
