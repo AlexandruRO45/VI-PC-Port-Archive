@@ -193,7 +193,7 @@ class ScanTest(unittest.TestCase):
         with mock.patch.object(os, "scandir", scan_directory), contextlib.redirect_stdout(io.StringIO()) as out, \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(awc_markers.main([self.tmp.name, "--out", report]), 1)
-        self.assertIn(blocked, err.getvalue())
+        self.assertTrue(blocked in err.getvalue() or blocked.replace("\\", "\\\\") in err.getvalue())
         self.assertEqual(out.getvalue(), "")
         with open(report, "rb") as f:
             self.assertEqual(f.read(), b"previous report\n")
