@@ -130,5 +130,150 @@ class TestMed3I32Oracle(unittest.TestCase):
         self.assertEqual(result, ref_med3_i32(5, 0x80000000, 7))
 
 
+# ==============================================================================
+# Symbolic AST Opcode Definitions and Typed Expressions (Commit 2)
+# ==============================================================================
+
+class RegType(Enum):
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Reg:
+    index: int
+    reg_type: RegType = RegType.VGPR
+
+    def __post_init__(self) -> None:
+        limit = 256 if self.reg_type == RegType.VGPR else 106
+        if not (0 <= self.index < limit):
+            raise ValueError(f"Invalid register index {self.reg_type.value}{self.index}")
+
+    @property
+    def name(self) -> str:
+        return f"{self.reg_type.value}{self.index}"
+
+
+class OperandKind(Enum):
+    REG = auto()
+    INLINE_INT = auto()
+    LITERAL_INT = auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class OperandAST:
+    kind: OperandKind
+    reg: Optional[Reg] = None
+    imm: Optional[int] = None
+
+    @classmethod
+    def from_vgpr(cls, idx: int) -> OperandAST:
+        return cls(kind=OperandKind.REG, reg=Reg(idx, RegType.VGPR))
+
+    @classmethod
+    def from_sgpr(cls, idx: int) -> OperandAST:
+        return cls(kind=OperandKind.REG, reg=Reg(idx, RegType.SGPR))
+
+    @classmethod
+    def from_imm(cls, val: int) -> OperandAST:
+        if -16 <= s32(val) <= 64:
+            return cls(kind=OperandKind.INLINE_INT, imm=s32(val))
+        return cls(kind=OperandKind.LITERAL_INT, imm=u32(val))
+
+    def format_asm(self) -> str:
+        if self.kind == OperandKind.REG:
+            assert self.reg is not None
+            return self.reg.name
+        elif self.kind == OperandKind.INLINE_INT:
+            assert self.imm is not None
+            return str(self.imm)
+        else:
+            assert self.imm is not None
+            return f"{self.imm:#x}"
+
+
+@dataclasses.dataclass(frozen=True)
+class Med3I32InstructionAST:
+    dst: Reg
+    src0: OperandAST
+    src1: OperandAST
+    src2: OperandAST
+
+    def emit_asm(self) -> str:
+        return f"v_med3_i32 {self.dst.name}, {self.src0.format_asm()}, {self.src1.format_asm()}, {self.src2.format_asm()}"
+
+
+def parse_med3_i32_asm(line: str) -> Med3I32InstructionAST:
+    """Parse a single v_med3_i32 instruction into an AST."""
+    line = line.strip()
+    if not line.startswith("v_med3_i32"):
+        raise ValueError(f"Expected v_med3_i32 instruction, got: {line}")
+    args_str = line[len("v_med3_i32"):].strip()
+    parts = [p.strip() for p in args_str.split(",")]
+    if len(parts) != 4:
+        raise ValueError(f"v_med3_i32 requires exactly 4 operands (dst, src0, src1, src2), got: {len(parts)}")
+
+    dst_part = parts[0]
+    if not dst_part.startswith("v"):
+        raise ValueError(f"Destination must be a VGPR, got {dst_part}")
+    dst_reg = Reg(int(dst_part[1:]), RegType.VGPR)
+
+    def parse_src(p: str) -> OperandAST:
+        if p.startswith("v"):
+            return OperandAST.from_vgpr(int(p[1:]))
+        elif p.startswith("s"):
+            return OperandAST.from_sgpr(int(p[1:]))
+        else:
+            val = int(p, 0)
+            return OperandAST.from_imm(val)
+
+    src0 = parse_src(parts[1])
+    src1 = parse_src(parts[2])
+    src2 = parse_src(parts[3])
+    return Med3I32InstructionAST(dst=dst_reg, src0=src0, src1=src1, src2=src2)
+
+
+class TestMed3I32AST(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_formatting(self):
+        inst = Med3I32InstructionAST(
+            dst=Reg(0, RegType.VGPR),
+            src0=OperandAST.from_vgpr(1),
+            src1=OperandAST.from_imm(-16),
+            src2=OperandAST.from_imm(0x12345678),
+        )
+        self.assertEqual(inst.emit_asm(), "v_med3_i32 v0, v1, -16, 0x12345678")
+
+    def test_ast_parse_valid(self):
+        line = "v_med3_i32 v5, v1, v2, v3"
+        ast_obj = parse_med3_i32_asm(line)
+        self.assertEqual(ast_obj.dst, Reg(5, RegType.VGPR))
+        self.assertEqual(ast_obj.src0, OperandAST.from_vgpr(1))
+        self.assertEqual(ast_obj.src1, OperandAST.from_vgpr(2))
+        self.assertEqual(ast_obj.src2, OperandAST.from_vgpr(3))
+        self.assertEqual(ast_obj.emit_asm(), line)
+
+    def test_translator_with_ast_emitted_code(self):
+        inst = Med3I32InstructionAST(
+            dst=Reg(0, RegType.VGPR),
+            src0=OperandAST.from_vgpr(1),
+            src1=OperandAST.from_vgpr(2),
+            src2=OperandAST.from_vgpr(3),
+        )
+        lines = [
+            "v_mov_b32_e32 v1, 100",
+            "v_mov_b32_e32 v2, -200",
+            "v_mov_b32_e32 v3, 0",
+            inst.emit_asm(),
+            "exp mrt0, v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_med3_ast", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[0], ref_med3_i32(100, -200, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
