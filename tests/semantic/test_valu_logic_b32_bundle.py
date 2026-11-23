@@ -641,3 +641,47 @@ class TestNotB32Oracle(unittest.TestCase):
             "v_not_b32 v0, v1",
         ])
         self.assertEqual(val_all1, 0)
+
+
+# ------------------------------------------------------------------------------
+# v_not_b32 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VNotB32Instruction:
+    dst: RegisterOperand
+    src0: Union[RegisterOperand, LiteralOperand]
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR:
+            raise TypeError("Destination must be a VGPR")
+
+
+def step_not(machine: ScalarMachineLogic, insn: VNotB32Instruction):
+    s0 = machine.read_operand(insn.src0)
+    machine.vgprs[insn.dst.index] = ref_not_b32(s0)
+
+
+class TestNotB32ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        machine = ScalarMachineLogic()
+        machine.vgprs[1] = 0x0F0F_0F0F
+        insn = VNotB32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+        )
+        step_not(machine, insn)
+
+        val_hw, _ = run_shader("ps_not_ast_scalar", [
+            "v_mov_b32 v1, 0x0F0F0F0F",
+            "v_not_b32 v0, v1",
+        ])
+        self.assertEqual(machine.vgprs[0], val_hw)
+        self.assertEqual(val_hw, 0xF0F0_F0F0)
+
+    def test_scalar_in_place_hardware(self):
+        val_inplace, _ = run_shader("ps_not_inplace", [
+            "v_mov_b32 v0, 0x12340000",
+            "v_not_b32 v0, v0",
+        ])
+        self.assertEqual(val_inplace, 0xEDCBFFFF)
