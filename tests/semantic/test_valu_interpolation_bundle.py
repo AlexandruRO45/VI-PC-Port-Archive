@@ -200,5 +200,37 @@ class TestInterpP1F32SIMDAndBarycentrics(unittest.TestCase):
         self.assertEqual(ref_interp_p1_f32(-0.5, 10.0, 20.0), f32_to_bits(5.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p1_f32 Rejection & Hardware Translator
+# ------------------------------------------------------------------------------
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import support
+import rdna2spirv
+
+
+class TestInterpP1F32HardwareTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(TypeError):
+            VInterpP1F32Instruction(
+                dst=RegisterOperand(OperandType.SGPR, 0),
+                src0=RegisterOperand(OperandType.VGPR, 0),
+                attr=AttrOperand(0, "x"),
+            )
+
+    def test_hardware_translator_execution(self):
+        prog = [
+            "v_interp_p1_f32 v2, v0, attr0.x",
+            "v_interp_p2_f32 v2, v1, attr0.x",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_interp_p1_hw", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
+
 if __name__ == '__main__':
     unittest.main()
