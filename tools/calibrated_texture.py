@@ -424,14 +424,23 @@ def local_bc3(symbols, profile):
     return np.column_stack((low, high)).astype("<u8").tobytes()
 
 
+def _reject_constant(constant):
+    raise ValueError(f"invalid JSON constant {constant}")
+
+
 def export_file(pool, index, target, mips, force, profile):
     target = Path(target)
-    with open(profile, encoding="utf-8") as source:
-        decoder = LocalDecoder(pool, json.load(source))
+    try:
+        with open(profile, encoding="utf-8") as source:
+            calibration = json.load(source, parse_constant=_reject_constant)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise ValueError(f"invalid calibration profile {profile}: {exc}") from exc
+    decoder = LocalDecoder(pool, calibration)
     try:
         data = decoder.dds(index, mips)
     finally:
         decoder.read_chunk.cache_clear()
+    target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as f:
         tmp = Path(f.name)
         try:

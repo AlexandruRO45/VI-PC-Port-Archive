@@ -51,6 +51,49 @@ class CalibratedExport(unittest.TestCase):
                 self.assertEqual(dds[148:], expected_full)
                 self.assertEqual(decoder.dds(0, mips=1)[148:], b"".join(expected_top))
 
+    def test_export_file_creates_parent_dir_and_preserves_existing_file_guard(self) -> None:
+        import calibrated_texture as ct
+
+        tile = 65536
+        source = b"\x00" * (tile * 4)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "array.ttpf"
+            desc = fixtures.pack_etpf_record(256, 256, 2, 0, 83, 2, 1, 1, 4096)
+            fixtures.write_rds5_pool(path, [desc], [source])
+            profile = root / "profile.json"
+            profile.write_text(json.dumps({"version": 1}), encoding="utf-8", newline="\n")
+            target = root / "nested" / "sub" / "out.dds"
+            with closing(ct.ttpf.Pool(path)) as pool:
+                self.assertEqual(ct.export_file(pool, 0, target, None, False, profile), 0)
+                self.assertTrue(target.is_file())
+                with self.assertRaises(FileExistsError):
+                    ct.export_file(pool, 0, target, None, False, profile)
+
+    def test_export_file_rejects_invalid_profile_json(self) -> None:
+        import calibrated_texture as ct
+
+        tile = 65536
+        source = b"\x00" * (tile * 4)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "array.ttpf"
+            desc = fixtures.pack_etpf_record(256, 256, 2, 0, 83, 2, 1, 1, 4096)
+            fixtures.write_rds5_pool(path, [desc], [source])
+            target = root / "out.dds"
+            with closing(ct.ttpf.Pool(path)) as pool:
+                for label, raw in (
+                    ("malformed", b"{bad"),
+                    ("non-utf8", b"\xff\xfe"),
+                    ("nan", b'{"version": 1, "x": NaN}'),
+                    ("non-dict", b"[1, 2]"),
+                    ("deep", b"[" * 2000 + b"]" * 2000),
+                ):
+                    profile = root / f"{label}.json"
+                    profile.write_bytes(raw)
+                    with self.subTest(label=label), self.assertRaises(ValueError):
+                        ct.export_file(pool, 0, target, None, False, profile)
+
     def test_bc1_export_and_existing_output(self):
         import calibrated_texture
         try:
