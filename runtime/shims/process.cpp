@@ -269,11 +269,26 @@ int configure_argv(int mode, const std::vector<std::basic_string<C>>& input,
     }
     try {
         auto next_strings = mode == 2 ? expand_arguments(input) : input;
+        auto& retired = retired_argv<C>();
+        if (published && strings == next_strings) {
+            configured_mode = mode;
+            g_argc = static_cast<int>(strings.size());
+            return 0;
+        }
+        for (auto& table : retired) {
+            if (table.strings == next_strings) {
+                strings.swap(table.strings);
+                pointers.swap(table.pointers);
+                configured_mode = mode;
+                published = pointers.data();
+                g_argc = static_cast<int>(strings.size());
+                return 0;
+            }
+        }
         std::vector<C*> next_pointers;
         next_pointers.reserve(next_strings.size() + 1);
         for (auto& argument : next_strings) next_pointers.push_back(argument.data());
         next_pointers.push_back(nullptr);
-        auto& retired = retired_argv<C>();
         retired.reserve(retired.size() + 1);
         // Publish only after every allocation succeeds. The other width keeps its own strings and pointer table.
         strings.swap(next_strings);

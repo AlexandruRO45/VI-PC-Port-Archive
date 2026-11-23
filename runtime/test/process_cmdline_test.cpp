@@ -76,6 +76,15 @@ void check_argv_lifetime() {
         std::fprintf(stderr, "FAIL reconfiguration must retain the first argv\n");
         ++failures;
     }
+    char* const first_argument = first[1];
+    for (int i = 0; i < 512; ++i) {
+        if (get(&count, &second, nullptr, 0, nullptr) || second != first || count != 2 ||
+            configure(false, 2) || argv() != first || first[1] != first_argument) {
+            std::fprintf(stderr, "FAIL alternating argv modes must reuse unchanged pointers\n");
+            ++failures;
+            break;
+        }
+    }
 }
 
 void check_mixed_width_counts() {
