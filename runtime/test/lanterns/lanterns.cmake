@@ -38,8 +38,12 @@ elseif(LEONIDA_TEST_LANTERNS)
   if(LEONIDA_LLVM_MC AND LEONIDA_SPIRV_AS AND TARGET Python3::Interpreter)
     set(LEONIDA_LANTERNS_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/generated/lanterns)
     set(_lanterns_tools ${CMAKE_CURRENT_SOURCE_DIR}/../tools)
+    # Every tools/*.py, as make_game.py's translator_digest() hashes them: the translator imports many of them
+    # (fssm_header, shader_ir, shader_meta, mc_command, rdna2_decode, ...), and a stale index.json must not survive.
+    file(GLOB _lanterns_tool_py CONFIGURE_DEPENDS ${_lanterns_tools}/*.py)
     set(_lanterns_asm ${_lanterns_src}/shaders/vs_lanterns.asm ${_lanterns_src}/shaders/ps_lanterns_lit.asm
-                      ${_lanterns_src}/shaders/ps_lanterns_floor.asm)
+                      ${_lanterns_src}/shaders/ps_lanterns_floor.asm ${_lanterns_src}/shaders/vs_lanterns_w64.asm
+                      ${_lanterns_src}/shaders/ps_lanterns_lit_w64.asm)
     get_filename_component(_lanterns_spirv_tools ${LEONIDA_SPIRV_AS} DIRECTORY)
     file(TO_NATIVE_PATH "${_lanterns_spirv_tools}" _lanterns_spirv_tools)
     add_custom_command(
@@ -48,8 +52,7 @@ elseif(LEONIDA_TEST_LANTERNS)
       COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${_lanterns_spirv_tools}"
               $<TARGET_FILE:Python3::Interpreter> -I ${_lanterns_src}/fssm_pack.py
               ${LEONIDA_LANTERNS_SHADERS} ${_lanterns_asm} --translate
-      DEPENDS ${_lanterns_asm} ${_lanterns_src}/fssm_pack.py ${_lanterns_tools}/fssm_unpack.py
-              ${_lanterns_tools}/shader_disasm.py ${_lanterns_tools}/rdna2spirv.py
+      DEPENDS ${_lanterns_asm} ${_lanterns_src}/fssm_pack.py ${_lanterns_tool_py}
       COMMENT "Packing and translating the Lanterns shaders"
       VERBATIM)
     add_custom_target(lanterns_shaders DEPENDS ${LEONIDA_LANTERNS_SHADERS}/spirv/index.json)
