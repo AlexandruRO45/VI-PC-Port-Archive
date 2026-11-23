@@ -238,6 +238,20 @@ void run_checks(const std::filesystem::path& root) {
               attributes_ex_w && delete_w && delete_a,
           "the file API resolves through the registry under kernel32/kernelbase and the api sets");
 
+    // A writable folder handle needs an overlay mirror, even when only the package has the folder.
+    {
+        constexpr DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        HANDLE h = create_w(L"GAME:\\data", GENERIC_READ | GENERIC_WRITE, share, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "a write-open of a package-only folder succeeds");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        h = create_w(L"GAME:\\absent_folder", GENERIC_READ | GENERIC_WRITE, share, nullptr, OPEN_EXISTING,
+                     FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "a write-open of a missing folder fails with ERROR_FILE_NOT_FOUND");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+
     // A read of a package file, through the mixed-case prefix and through forward slashes.
     {
         HANDLE h = create_w(L"GAME:\\data\\hello.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);

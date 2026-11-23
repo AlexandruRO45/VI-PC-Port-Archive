@@ -433,6 +433,11 @@ Target write_target(const std::wstring& path, bool copy_up) {
             if (!std::filesystem::exists(t.path, ec)) t.error = error;
         }
     }
+    if (copy_up && !deleted(r.overlay, parts) && !std::filesystem::exists(t.path, ec) &&
+        std::filesystem::is_directory(package_path, ec)) {
+        std::filesystem::create_directory(t.path, ec);
+        if (ec) t.error = static_cast<DWORD>(ec.value());
+    }
     return t;
 }
 
