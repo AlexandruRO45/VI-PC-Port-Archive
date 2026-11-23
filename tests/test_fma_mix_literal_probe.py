@@ -97,6 +97,68 @@ class Sides(unittest.TestCase):
         self.assertEqual(code, 77)
         self.assertIn("hardware oracle unavailable", out)
 
+    def test_invalid_or_empty_oracle_flag_exits_2(self):
+        for bad in ("", "   ", "translator,", ",hw", "gpu"):
+            with self.subTest(oracle=bad), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    probe.main(["--oracle", bad])
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_verdict_and_hw_side_readings(self):
+        from hw_oracle import runner
+
+        for reading, want_code, want_msg in (
+            (probe.HALVES, 0, "all sides follow the halves reading"),
+            (probe.LOW, 1, "sides disagree"),
+        ):
+            with self.subTest(reading=reading):
+                ora = mock.MagicMock(device="fake", arch="gfx1030")
+                ora.run.return_value = [[c.expected(reading)] for c in probe.CASES]
+                with mock.patch.object(runner, "open_oracle", return_value=ora):
+                    code, out = self.run_main("--oracle", "hw")
+                self.assertEqual(code, want_code, out)
+                self.assertIn(want_msg, out)
+                ora.close.assert_called_once()
+
+        # Wrong control or rejected kernel -> neither reading (exit 1).
+        for override_idx, override_val in ((3, [probe.f2u(99.0)]), (0, "kernel rejected")):
+            with self.subTest(override=(override_idx, override_val)):
+                res = [[c.expected(probe.HALVES)] for c in probe.CASES]
+                res[override_idx] = override_val
+                ora = mock.MagicMock(device="fake", arch="gfx1030")
+                ora.run.return_value = res
+                with mock.patch.object(runner, "open_oracle", return_value=ora):
+                    code, out = self.run_main("--oracle", "hw")
+                self.assertEqual(code, 1, out)
+                self.assertIn("a side follows neither reading", out)
+                ora.close.assert_called_once()
+
+    def test_truncated_or_empty_hw_oracle_results_exit_2(self):
+        from hw_oracle import runner
+
+        # Truncating after A, B, E used to drop trailing controls C and D via zip() and exit 0.
+        trunc = [[c.expected(probe.HALVES)] for c in probe.CASES[:3]]
+        none_entry = [[c.expected(probe.HALVES)] for c in probe.CASES]
+        none_entry[4] = None
+        empty_entry = [[c.expected(probe.HALVES)] for c in probe.CASES]
+        empty_entry[4] = []
+
+        for responses, match in (
+            (trunc, "the oracle returned 3 results for 5 kernels"),
+            ([], "the oracle returned 0 results for 5 kernels"),
+            (none_entry, "case D: the oracle returned no result word (None)"),
+            (empty_entry, "case D: the oracle returned no result word ([])"),
+        ):
+            with self.subTest(match=match):
+                ora = mock.MagicMock(device="fake", arch="gfx1030")
+                ora.run.return_value = responses
+                with mock.patch.object(runner, "open_oracle", return_value=ora):
+                    code, out = self.run_main("--oracle", "hw")
+                self.assertEqual(code, 2, out)
+                self.assertIn("harness error:", out)
+                self.assertIn(match, out)
+                ora.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
