@@ -268,6 +268,16 @@ class TestCommandLine(unittest.TestCase):
             self.assertEqual(bink.main([empty]), 2)
         self.assertEqual(err.getvalue().splitlines(), [f"bink_index: error: {empty}: empty file"])
 
+    def test_a_named_rpf_without_a_stream_still_scans(self):
+        # An archive that holds no movie is a real answer, not a wrong path.
+        archive = os.path.join(self.tmp.name, "empty-movies.rpf")
+        with open(archive, "wb") as fh:
+            fh.write(b"9FPR" + struct.pack("<III", 0x40, 0, 0) + bytes(0x34))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bink.main([archive]), 0)
+        self.assertIn("0 Bink 2 streams", err.getvalue())
+
     def test_unreadable_directory_entry_reports_the_file_without_writing_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = os.path.join(tmp, "inputs")
