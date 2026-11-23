@@ -150,6 +150,41 @@ def test_a_bad_census_is_one_line_not_a_traceback(tmp_path, capsys):
         assert out.out == "", f"{path.name} printed a census: {out.out!r}"
 
 
+def test_a_bad_census_entry_field_is_one_line_not_a_traceback(tmp_path, capsys):
+    """#1651 guarded the document shape but not the per-entry fields: a non-string wave64_graphics tier
+    is unhashable (TypeError on the Counter key), a non-list reasons/idioms is not iterable, a list of
+    non-strings is unhashable, and mixed-type tiers blow up sorted(). Each used to exit 1 with a
+    traceback; now one ERROR line, exit 2, and no shader name leaks."""
+    base = {"stage": "ps", "wave64": True}
+    cases = (
+        ({"wave64_graphics": ["A"]}, "wave64_graphics is list"),
+        ({"wave64_graphics": {"tier": "A"}}, "wave64_graphics is dict"),
+        ({"wave64_graphics": 1}, "wave64_graphics is int"),
+        ({"wave64_graphics": "C", "wave64_graphics_reasons": 3}, "wave64_graphics_reasons is int"),
+        ({"wave64_graphics": "C", "wave64_graphics_reasons": [["x"]]}, "must contain only strings"),
+        ({"wave64_graphics": "B", "wave64_graphics_idioms": "waterfall"}, "wave64_graphics_idioms is str"),
+    )
+    for extra, diagnostic in cases:
+        path = tmp_path / "index.json"
+        path.write_text(json.dumps({"secret_shader_name": {**base, **extra}}), encoding="utf-8")
+        capsys.readouterr()
+        code = wave64_halves.main(["--census", str(path)])
+        out = capsys.readouterr()
+        assert code == 2, f"{extra}: exit {code}, {out.err!r}"
+        assert "Traceback" not in out.err, out.err
+        assert len(out.err.strip().splitlines()) == 1 and out.err.startswith("ERROR: "), out.err
+        assert diagnostic in out.err, out.err
+        assert "secret_shader_name" not in out.err and out.out == "", out.err
+    # mixed-type tiers across two entries: the int tier is refused before sorted() can compare them
+    path = tmp_path / "mixed.json"
+    path.write_text(json.dumps({"s0": {**base, "wave64_graphics": "A"},
+                                "s1": {**base, "wave64_graphics": 1}}), encoding="utf-8")
+    capsys.readouterr()
+    assert wave64_halves.main(["--census", str(path)]) == 2
+    out = capsys.readouterr()
+    assert "wave64_graphics is int" in out.err and "Traceback" not in out.err
+
+
 def test_an_empty_index_still_reports_no_tier(tmp_path, capsys):
     path = tmp_path / "index.json"
     path.write_text("{}", encoding="utf-8")

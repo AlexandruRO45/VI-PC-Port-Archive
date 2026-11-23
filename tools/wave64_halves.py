@@ -1524,6 +1524,17 @@ def census(index):
         if t is None:
             unmarked += 1
             continue
+        # #1651 guarded the document shape but not these fields: a non-string tier is unhashable
+        # (TypeError on the Counter key), a non-list reasons/idioms is not iterable, and mixed-type
+        # tiers blow up sorted(). Refuse them as a usage error, naming the field not the shader.
+        if not isinstance(t, str):
+            raise ValueError(f"wave64_graphics is {type(t).__name__}, expected a string tier (A/B/C)")
+        for field in ("wave64_graphics_reasons", "wave64_graphics_idioms"):
+            v = m.get(field, [])
+            if not isinstance(v, list):
+                raise ValueError(f"{field} is {type(v).__name__}, expected a list of strings")
+            if not all(isinstance(x, str) for x in v):
+                raise ValueError(f"{field} must contain only strings")
         tiers.setdefault(m["stage"], Counter())[t] += 1
         reasons.update(m.get("wave64_graphics_reasons", []))
         idioms.update(m.get("wave64_graphics_idioms", []))
@@ -1552,7 +1563,11 @@ def main(argv=None):
         print(f"ERROR: {args.census} is not an index object (a mapping of shader name to entry), got "
               f"{type(index).__name__}. Give the <spirv>/index.json rdna2spirv.py writes.", file=sys.stderr)
         return 2
-    c = census(index)
+    try:
+        c = census(index)
+    except ValueError as exc:
+        print(f"ERROR: {args.census}: {exc}", file=sys.stderr)
+        return 2
     total = Counter()
     for stage, counts in c["tiers"].items():
         print(f"{stage}: " + ", ".join(f"{t}={n}" for t, n in counts.items()))
