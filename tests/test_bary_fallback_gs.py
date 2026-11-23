@@ -786,5 +786,34 @@ class TestMainAndCLI(unittest.TestCase):
             self.assertNotIn("Traceback", p.stderr)
 
 
+class F16PvGeometryShaderTest(unittest.TestCase):
+    def test_assembly_copies_each_vertex_into_the_flat_array(self):
+        text = bary_fallback_gs.f16_pv_gs_spvasm([1], {"0": 2})
+        self.assertIn("OpDecorate %in_pv0 Location 0", text)
+        self.assertIn("OpDecorate %out_pv0 Location 2", text)
+        self.assertIn("OpDecorate %in1 Location 1", text)
+        self.assertEqual(text.count("OpEmitVertex"), 3)
+        # Element k is loaded from input vertex k, at every emitted vertex.
+        self.assertIn("%ppv0_0_0 = OpAccessChain %ptr_in_v4 %in_pv0 %int_0", text)
+        self.assertIn("%dpv2_0_2 = OpAccessChain %ptr_out_v4 %out_pv0 %int_2", text)
+        self.assertNotIn("PerVertexKHR", text)
+
+    def test_overlapping_slots_are_rejected(self):
+        with self.assertRaises(ValueError):
+            bary_fallback_gs.f16_pv_gs_spvasm([], {"0": 0, "1": 1})
+
+    def test_index_scan_writes_an_f16pv_helper_and_leaves_other_entries_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({
+                    "ps_ij": {"stage": "ps", "inputs": [2, 1], "f16_pv": {"0": 2}},
+                    "ps_plain": {"stage": "ps", "inputs": [0]},
+                }, f)
+            written = bary_fallback_gs.write_for_index(tmp)
+            self.assertEqual(written, [os.path.join(tmp, "ps_ij.f16pv_gs.spvasm")])
+            text = Path(written[0]).read_text(encoding="utf-8")
+            self.assertIn("OpDecorate %out_pv0 Location 2", text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,8 @@ BaryCoordKHR has, so the pixel shader's .y/.z are AMD's i/j.
     python -I tools/bary_fallback_gs.py <spirv dir> --pair VS PS
 
 The paired helper forwards a VS ClipDistance or CullDistance array. The suffix identifies the kind and length.
+An index entry with ``f16_pv`` (SHADER-1274, computed I/J under --f16-interp-fallback) gets ``<name>.f16pv_gs.spv``:
+vertex k's raw words copied into element k of the pixel shader's Flat vec4[3].
 Mixed clip/cull layouts are rejected. Standard library only; build_for_index assembles and validates with spirv-as / spirv-val from PATH.
 Usage: `python -I tools/bary_fallback_gs.py --help` lists the options.
 """
@@ -111,6 +113,102 @@ def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0
     return "\n".join(lines) + "\n"
 
 
+def f16_pv_gs_spvasm(inputs, f16_pv):
+    """SPIR-V for the geometry shader SHADER-1274 needs under --f16-interp-fallback.
+
+    A computed I/J attribute is a Flat vec4[3] in the pixel shader (index key ``f16_pv``: attribute -> first
+    location). This stage reads the producer's raw words at the attribute's own location and, at every vertex
+    it emits, writes vertex k's value into element k, so the flat array is the whole triangle whatever the
+    provoking vertex. ``inputs`` are the pixel shader's other locations, copied through unchanged.
+    """
+    try:
+        pv = {int(n): int(b) for n, b in dict(f16_pv).items()}
+    except (TypeError, ValueError):
+        raise ValueError("f16_pv must map attribute numbers to locations") from None
+    if not pv:
+        raise ValueError("f16_pv is empty")
+    occupied = set()
+    for n, base in pv.items():
+        if n < 0 or base < 0:
+            raise ValueError(f"f16_pv attribute {n} at {base} is negative")
+        slots = {base, base + 1, base + 2}
+        if slots & occupied:
+            raise ValueError(f"f16_pv attribute {n} overlaps another computed attribute")
+        occupied |= slots
+    ordinary = []
+    seen = set()
+    for loc in inputs:
+        try:
+            loc = int(loc)
+        except (TypeError, ValueError):
+            raise ValueError(f"input location {loc!r} is not an integer") from None
+        if loc in occupied or loc in seen:
+            continue
+        seen.add(loc)
+        ordinary.append(loc)
+    sources = set(pv)
+    if sources & set(ordinary):
+        raise ValueError("a computed attribute's VS location is also a pass-through location")
+    ins_ord = [f"%in{n}" for n in ordinary]
+    outs_ord = [f"%out{n}" for n in ordinary]
+    ins_pv = [f"%in_pv{n}" for n in sorted(pv)]
+    outs_pv = [f"%out_pv{n}" for n in sorted(pv)]
+    iface = " ".join(["%in_pos", "%out_pos", *ins_ord, *outs_ord, *ins_pv, *outs_pv])
+    lines = [
+        "OpCapability Geometry",
+        "OpMemoryModel Logical GLSL450",
+        f'OpEntryPoint Geometry %main "main" {iface}',
+        "OpExecutionMode %main Triangles",
+        "OpExecutionMode %main Invocations 1",
+        "OpExecutionMode %main OutputTriangleStrip",
+        "OpExecutionMode %main OutputVertices 3",
+        "OpDecorate %in_pos BuiltIn Position",
+        "OpDecorate %out_pos BuiltIn Position",
+        *[f"OpDecorate %in{n} Location {n}" for n in ordinary],
+        *[f"OpDecorate %out{n} Location {n}" for n in ordinary],
+        *[f"OpDecorate %in_pv{n} Location {n}" for n in sorted(pv)],
+        *[f"OpDecorate %out_pv{n} Location {pv[n]}" for n in sorted(pv)],
+        "%void = OpTypeVoid",
+        "%fn = OpTypeFunction %void",
+        "%uint = OpTypeInt 32 0",
+        "%int = OpTypeInt 32 1",
+        "%float = OpTypeFloat 32",
+        "%v4float = OpTypeVector %float 4",
+        "%uint_3 = OpConstant %uint 3",
+        "%arr = OpTypeArray %v4float %uint_3",
+        "%ptr_in_arr = OpTypePointer Input %arr",
+        "%ptr_in_v4 = OpTypePointer Input %v4float",
+        "%ptr_out_v4 = OpTypePointer Output %v4float",
+        "%ptr_out_arr = OpTypePointer Output %arr",
+        *[f"%int_{v} = OpConstant %int {v}" for v in range(3)],
+        "%in_pos = OpVariable %ptr_in_arr Input",
+        "%out_pos = OpVariable %ptr_out_v4 Output",
+        *[f"%in{n} = OpVariable %ptr_in_arr Input" for n in ordinary],
+        *[f"%out{n} = OpVariable %ptr_out_v4 Output" for n in ordinary],
+        *[f"%in_pv{n} = OpVariable %ptr_in_arr Input" for n in sorted(pv)],
+        *[f"%out_pv{n} = OpVariable %ptr_out_arr Output" for n in sorted(pv)],
+        "%main = OpFunction %void None %fn",
+        "%entry = OpLabel",
+    ]
+    for v in range(3):
+        lines += [f"%ppos{v} = OpAccessChain %ptr_in_v4 %in_pos %int_{v}",
+                  f"%xpos{v} = OpLoad %v4float %ppos{v}",
+                  f"OpStore %out_pos %xpos{v}"]
+        for n in ordinary:
+            lines += [f"%p{v}_{n} = OpAccessChain %ptr_in_v4 %in{n} %int_{v}",
+                      f"%x{v}_{n} = OpLoad %v4float %p{v}_{n}",
+                      f"OpStore %out{n} %x{v}_{n}"]
+        for n in sorted(pv):
+            for k in range(3):
+                lines += [f"%ppv{v}_{n}_{k} = OpAccessChain %ptr_in_v4 %in_pv{n} %int_{k}",
+                          f"%xpv{v}_{n}_{k} = OpLoad %v4float %ppv{v}_{n}_{k}",
+                          f"%dpv{v}_{n}_{k} = OpAccessChain %ptr_out_v4 %out_pv{n} %int_{k}",
+                          f"OpStore %dpv{v}_{n}_{k} %xpv{v}_{n}_{k}"]
+        lines.append("OpEmitVertex")
+    lines += ["OpEndPrimitive", "OpReturn", "OpFunctionEnd"]
+    return "\n".join(lines) + "\n"
+
+
 def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | None) -> Iterator[tuple[str, str]]:
     index_path = os.path.join(spirv_dir, "index.json")
     if pair is None and not os.path.isfile(index_path):
@@ -151,10 +249,16 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
     for name in names:
         meta = index[name]
         fb = meta.get("bary_fallback_input") if isinstance(meta, dict) else None
-        if not fb:
+        if fb:
+            path = os.path.join(spirv_dir, name + SUFFIX + suffix + ".spvasm")
+            shader = gs_spvasm(meta.get("inputs", []), fb["location"], clip_count, cull_count)
+            yield path, shader
             continue
-        path = os.path.join(spirv_dir, name + SUFFIX + suffix + ".spvasm")
-        shader = gs_spvasm(meta.get("inputs", []), fb["location"], clip_count, cull_count)
+        pv = meta.get("f16_pv") if isinstance(meta, dict) and pair is None else None
+        if not pv:
+            continue
+        path = os.path.join(spirv_dir, name + ".f16pv_gs.spvasm")
+        shader = f16_pv_gs_spvasm(meta.get("inputs", []), pv)
         yield path, shader
 
 

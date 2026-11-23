@@ -22,8 +22,9 @@ VK_KHR_shader_fma; the test programs enable it when the device has it, else they
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
 each gets a pass-through geometry shader, <name>.bary_gs.spv, that check.py draws it with (tools/bary_fallback_gs.py).
 With the variable unset, build.py/check.py follow the Mesa ANV probe automatically.
-Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built: its computed I/J pair needs PerVertexKHR
-inputs, and check.py reports it as SKIP.
+Under that or LEONIDA_F16_INTERP_FALLBACK=1, ps_ij_computed isn't built. The translator does accept it
+with the f16 flag (a Flat vec4[3]; SHADER-1274), but drawing it needs the geometry shader from
+tools/bary_fallback_gs.py, and MoltenVK has no geometry stage. check.py reports it as SKIP.
 With LEONIDA_PC_TAIL_UBO=1, every shader is translated with --pc-tail-ubo (s0..s31 in 128 push-constant bytes, the
 heap base and code base in a uniform block at set 1), for devices whose maxPushConstantsSize is 128; set it for
 check.py too, whose test programs then bind that block (runtime/test/vk_pc_tail.h).

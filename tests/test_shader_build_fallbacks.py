@@ -56,7 +56,7 @@ class BuildUnderFallbackTest(unittest.TestCase):
         index = {}
         for n in names:
             if n == "ps_ij_computed" and fallback:
-                continue   # "computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs"
+                continue   # build.py still omits ps_ij_computed; the draw needs a geometry shader
             (spirv / (n + ".spv")).write_bytes(b"\x03\x02\x23\x07")
             (spirv / (n + ".spvasm")).write_text("; SPIR-V\n", encoding="utf-8")
             index[n] = {"stage": n[:2]}

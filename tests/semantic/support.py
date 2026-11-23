@@ -77,7 +77,9 @@ def varyings(spvasm, attrs, bary):
     out = {"%bary": tuple(bary)}
     for n, verts in attrs.items():
         name, fv = f"%in_attr{n}", [tuple(f(w) for w in v) for v in verts]
-        if f"OpDecorate {name} PerVertexKHR" in spvasm:
+        if (f"OpDecorate {name} PerVertexKHR" in spvasm
+                or f"{name} = OpVariable %_ptr_Input_pv4 Input" in spvasm):
+            # PerVertexKHR, or SHADER-1274's Flat vec4[3]: the three vertices, not the provoking one.
             out[name] = tuple(fv)
         elif f"OpDecorate {name} Flat" in spvasm:
             out[name] = fv[0]

@@ -19,7 +19,9 @@ written, or a pristine copy in the wrong role, is the #1224 guard's refusal (int
 emission); here: a computed pair whose p1 partial is rewritten or read between the ops (its hardware value P10*I is then
 observable), one whose ops are not in a single basic block (the captured I would not dominate the p2), a
 dangling op without its partner, and any computed pair under --bary-fallback, which has no PerVertexKHR
-inputs. A pristine pair (v0/v1 nothing writes) keeps the interpolated-input read: no PerVertexKHR.
+inputs. Under --f16-interp-fallback the same pair is a Flat vec4[3] (SHADER-1274): the three raw words,
+weighted in the PS, with no PerVertexKHR. A pristine pair (v0/v1 nothing writes) keeps the interpolated-input
+read: no PerVertexKHR.
 
 Pipodi's straight-line scan over the corpus found the affected 213 PS (upper bound; issue #1218,
 comment 7076614458); the classification and counts are in docs/design.md's SHADER-177 row.
@@ -297,18 +299,80 @@ class ComputedIJRefusals(unittest.TestCase):
         finally:
             rdna2spirv.BARY_FALLBACK = old
 
-    def test_computed_pair_under_f16_interp_fallback(self):
-        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs to
-        # weight with a computed pair (same regime as --bary-fallback)
+    def _with_f16_fallback(self, lines, attrs=None):
         old = rdna2spirv.F16_HALVES
         rdna2spirv.F16_HALVES = True
         try:
-            self.refuse(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
-                         "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
-                         "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
-                        "computed I/J pair under --f16-interp-fallback")
+            return run(lines, attrs)
         finally:
             rdna2spirv.F16_HALVES = old
+
+    def test_computed_pair_under_f16_interp_fallback(self):
+        """SHADER-1274: the flag used to refuse this. Zeroed weights still read P0, with no PerVertexKHR."""
+        spv, w = self._with_f16_fallback(
+            ["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+             "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+             "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+             "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"])
+        self.assertNotIn("PerVertexKHR", spv)
+        self.assertIn("OpDecorate %in_attr0 Flat", spv)
+        self.assertIn("%in_attr0 = OpVariable %_ptr_Input_pv4 Input", spv)
+        self.assertEqual(rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)["f16_pv"], {"0": 0})
+        self.assertEqual(floats(w[:2]), (0.0, 0.0))
+
+    def test_snapped_pair_under_f16_interp_fallback(self):
+        _, w = self._with_f16_fallback(
+            ["v_mov_b32_e32 v0, 0.25", "v_mov_b32_e32 v1, 0.25",
+             "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+             "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+             "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"])
+        # P = 0.5*P0 + 0.25*P1 + 0.25*P2
+        self.assertEqual(floats(w[:2]), (0.5, 0.5))
+
+    def test_f16_reads_under_f16_interp_fallback_use_the_raw_words(self):
+        """A smooth decoded half would drop the computed weights. Decode the Flat array instead."""
+        attr0 = [(struct.unpack("<I", struct.pack("<ee", lo, hi))[0], 0, 0, 0)
+                 for lo, hi in zip((0.5, 1.5, 2.5), (-4.0, 8.0, 16.0))]
+        spv, w = self._with_f16_fallback(
+            ["v_mov_b32_e32 v0, 0.5", "v_mov_b32_e32 v1, 0",
+             "v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
+             "v_interp_p1ll_f16 v3, v0, attr0.x high", "v_interp_p2_f16 v3, v1, attr0.x, v3 high",
+             "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"], attrs={0: attr0})
+        self.assertNotIn("%in_f16h", spv)
+        self.assertNotIn("PerVertexKHR", spv)
+        self.assertIn("UnpackHalf2x16", spv)
+        self.assertEqual(f"{w[0] & 0xFFFF:#06x}", "0x3c00")   # low 1.0
+        self.assertEqual(f"{w[1] & 0xFFFF:#06x}", "0x4000")   # high 2.0
+
+    def test_flat_array_moves_off_a_smooth_neighbour(self):
+        """attr1 stays a smooth input at location 1, so attr0's three slots start at 2."""
+        spv, _ = self._with_f16_fallback(
+            ["v_mov_b32_e32 v8, 0", "v_mov_b32_e32 v9, 0",
+             "v_interp_p1_f32_e32 v2, v8, attr0.x", "v_interp_p2_f32_e32 v2, v9, attr0.x",
+             "v_interp_p1_f32_e32 v4, v0, attr1.x", "v_interp_p2_f32_e32 v4, v1, attr1.x",
+             "exp mrt0 v2, v4, v2, v4 done vm", "s_endpgm"],
+            attrs={0: ATTR0, 1: ATTR0})
+        meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv)
+        self.assertEqual(meta["f16_pv"], {"0": 2})
+        self.assertIn("OpDecorate %in_attr1 Location 1", spv)
+        self.assertNotIn("PerVertexKHR", spv)
+
+    def test_mov_of_a_computed_location_under_f16_interp_fallback(self):
+        _, w = self._with_f16_fallback(
+            ["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+             "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+             "v_interp_mov_f32_e32 v3, p0, attr0.z",
+             "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"])
+        self.assertEqual(floats(w[:2]), (0.0, 1.0))
+
+    def test_pristine_pair_is_unchanged_under_f16_interp_fallback(self):
+        spv, w = self._with_f16_fallback(
+            ["v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+             "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"])
+        self.assertNotIn("PerVertexKHR", spv)
+        self.assertNotIn("%_ptr_Input_pv4", spv)
+        self.assertNotIn("f16_pv", rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv))
+        self.assertEqual(floats(w[:2]), (2 * I, 2 * I))
 
 
 if __name__ == "__main__":

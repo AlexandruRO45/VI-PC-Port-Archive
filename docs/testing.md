@@ -469,7 +469,10 @@ MoltenVK can't convert to Metal ("PerVertexKHR decoration is not supported in MS
 `--f16-interp-fallback` by itself: the vertex or mesh shader then also exports the decoded f16 halves
 (`docs/design.md`, "16-bit interpolation without `PerVertexKHR`"). `LEONIDA_F16_INTERP_FALLBACK=1` or `0` forces it
 on or off; `build.py` (for `check.py`) translates with the flag only when that variable is `1`. `ms_f16_pack` also runs
-on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`.
+on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`. A pixel shader with a computed I/J pair
+(SHADER-1274, `ps_ij_computed`) translates under the flag: the attribute is a `Flat` `vec4[3]` and
+`tools/bary_fallback_gs.py` can write `<name>.f16pv_gs.spv` to fill it. MoltenVK has no geometry stage, so
+`build.py` still leaves that fixture out and `check.py` reports it as SKIP.
 
 ## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
 

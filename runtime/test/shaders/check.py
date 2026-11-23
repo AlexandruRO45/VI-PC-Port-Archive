@@ -373,8 +373,9 @@ PK_MUL_LO_WORDS = [0x00009E88, 0x03675433, 0x00230000, 0x00077F6C] * 2
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 # LEONIDA_BARY_FALLBACK=1/0 overrides the device probe for raw barycentrics. Unset, Mesa ANV selects the fallback.
 BARY_FALLBACK = barycentric_fallback()
-# LEONIDA_F16_INTERP_FALLBACK=1 (as build.py reads it): *_f16 interps were translated from decoded-half inputs, with no
-# PerVertexKHR inputs at all, so the translator refuses a computed I/J pair (ps_ij_computed) there.
+# LEONIDA_F16_INTERP_FALLBACK=1 (as build.py reads it): *_f16 interps come from decoded-half inputs. A computed
+# I/J pair translates (Flat vec4[3], SHADER-1274) but this harness does not attach its geometry shader, so
+# ps_ij_computed stays a SKIP. MoltenVK could not draw that shader anyway: it has no geometry stage.
 F16_HALVES = os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1"
 W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
