@@ -2588,15 +2588,20 @@ def pipeline_names(spirv: str) -> "list[str]":
 
 
 def pipeline_cache_stamp(cache: str) -> str:
-    """The cache file as stat reports it (device, file id, size and time), so a replaced, truncated or rewritten
-    cache no longer matches pipelines.done. "" when the cache is missing or empty."""
+    """The cache file as stat reports it (device, file id, size and time) and its 32-byte Vulkan cache header, so a
+    replaced, truncated or rewritten cache no longer matches pipelines.done. "" when the cache is missing or shorter
+    than the header."""
     try:
         info = os.stat(cache)
+        if not stat.S_ISREG(info.st_mode):
+            return ""
+        with open(cache, "rb") as f:
+            header = f.read(32)
     except OSError:
         return ""
-    if not stat.S_ISREG(info.st_mode) or not info.st_size:
+    if len(header) < 32:
         return ""
-    return f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}"
+    return f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{header.hex()}"
 
 
 def pipelines_fingerprint(exe: str, spirv: str, out: str, entries: int) -> str:

@@ -359,9 +359,10 @@ without `--merge-cache` keeps that single shared cache.
 After a run in which every pipeline passed, the stage writes `pipelines.done`: a fingerprint of `index.json`, the
 size and modification time of each module and each graphics partner stub in `stubs\`, the checker build, and the
 device's pipeline-cache identity (vendor, device and the driver's cache UUID, read from a run that checks no shader,
-about a second), followed by the finished `pipeline_cache.bin`'s file id, size and modification time. The next run
-skips the stage while both are unchanged. A new translation or stub, a rebuilt checker, a driver update, or a
-missing, empty or rewritten `pipeline_cache.bin` runs it again, and deleting `pipelines.done` forces it.
+about a second), followed by the finished `pipeline_cache.bin`'s file id, size, modification time and 32-byte Vulkan
+cache header. The next run skips the stage while both are unchanged. A new translation or stub, a rebuilt checker, a
+driver update, or a missing, empty or rewritten `pipeline_cache.bin` runs it again, and deleting `pipelines.done`
+forces it. A change confined to the cache's payload that keeps its size, time and header is not detected.
 
 Index entries whose SPIR-V bytes and pipeline fields (everything but `src_sha256` and `fssm_sha256`) equal an earlier
 entry's are listed in `pipeline_duplicates.txt` and skipped through `--duplicates-file`, counted per stage as

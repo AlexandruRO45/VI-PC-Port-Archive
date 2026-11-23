@@ -435,6 +435,17 @@ class PipelineBatchesTest(unittest.TestCase):
             os.utime(cache, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
         self.rerun_after(rewrite)
 
+    def test_a_cache_header_rewritten_with_its_old_size_and_time_runs_the_stage_again(self):
+        def rewrite_header(cache):
+            info = cache.stat()
+            data = cache.read_bytes()
+            cache.write_bytes(b"x" * 32 + data[32:])
+            os.utime(cache, ns=(info.st_atime_ns, info.st_mtime_ns))
+            after = cache.stat()
+            self.assertEqual((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns),
+                             (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
+        self.rerun_after(rewrite_header)
+
     def test_the_fingerprint_follows_the_graphics_stubs(self):
         def probe(args, **kwargs):
             Path(args[2]).write_bytes(bytes(range(32)))   # the cache header the checker saves
