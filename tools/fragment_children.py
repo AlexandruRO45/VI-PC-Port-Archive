@@ -34,8 +34,9 @@ Usage:
                                          [--records out.jsonl] [--json out.json]
 
 `--start`/`--end` bound the byte range scanned (resume a long run, or split it); `--jobs` splits the range
-over worker processes. `--records` writes one JSON line per fragment with its stream offset and the measured
-numbers, for a re-count without a re-scan; it is a local working file, not something to publish.
+over worker processes, at most 61 of them on Windows (`tools/pool_workers.py`). `--records` writes one JSON
+line per fragment with its stream offset and the measured numbers, for a re-count without a re-scan; it is a
+local working file, not something to publish.
 """
 import argparse
 import array as array_module
@@ -49,6 +50,7 @@ import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I keeps the script directory off sys.path
+import pool_workers  # noqa: E402
 import skin_streams as ss  # noqa: E402
 
 SYSTEM = 0x50000000
@@ -308,6 +310,7 @@ def split_ranges(start, end, jobs):
 def scan_archive(path, start=0, end=None, jobs=1, records=None, log=None):
     size = os.path.getsize(path)
     end = size if end is None else min(end, size)
+    jobs = pool_workers.process_workers(max(1, jobs))   # a pool that large never returns on Windows
     total = empty_stats()
     if jobs <= 1 or end - start < 2 * PAGE:
         handle = open(records, "w", encoding="utf-8", newline="\n") if records else None
