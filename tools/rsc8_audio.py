@@ -40,6 +40,8 @@ import struct
 import sys
 import tempfile
 import time
+from collections import Counter
+from operator import itemgetter, le, lt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -798,33 +800,28 @@ def parse_adat_header_bytes(hb, bank_offset, file_size):
     elif pos + count * 4 > hdr_sz:
         return None
 
-    streams = []
-    total_tags = 0
-    for _ in range(count):
-        w = _u32(hb, pos)
-        pos += 4
-        tc = w >> 29
-        sid = w & 0x1FFFFFFF
-        total_tags += tc
-        streams.append((tc, sid))
+    words = struct.unpack_from(f"<{count}I", hb, pos)
+    pos += 4 * count
+    streams = [(w >> 29, w & 0x1FFFFFFF) for w in words]
+    total_tags = sum(w >> 29 for w in words)
     if pos + total_tags * 8 > hdr_sz:
         return None
 
     max_end = hdr_sz
+    limit = file_size - bank_offset
     entries = []
     for tc, sid in streams:
         tags = []
-        for _ in range(tc):
-            q = _u64(hb, pos)
-            pos += 8
-            tt = (q >> 56) & 0xFF
-            tsz = (q >> 28) & 0x0FFFFFFF
-            toff = q & 0x0FFFFFFF
-            if bank_offset + toff + tsz > file_size:
-                return None
-            if toff + tsz > max_end:
-                max_end = toff + tsz
-            tags.append((tt, toff, tsz))
+        if tc:
+            for q in struct.unpack_from(f"<{tc}Q", hb, pos):
+                tsz = (q >> 28) & 0x0FFFFFFF
+                toff = q & 0x0FFFFFFF
+                if toff + tsz > limit:
+                    return None
+                if toff + tsz > max_end:
+                    max_end = toff + tsz
+                tags.append(((q >> 56) & 0xFF, toff, tsz))
+            pos += 8 * tc
         entries.append((sid, tags))
 
     return {
@@ -865,6 +862,8 @@ def parse_adat_at_file(fh, bank_offset, file_size):
 
 GRID20_MAGIC = 12345678
 MAX_GRID20_BYTES = 64 * 1024 * 1024
+GRID20_CHUNK_ENTRIES = 256
+MARKER_CHUNK_RECORDS = 256
 MAX_INDEXRUN_GROUPS = 1 << 20
 
 
@@ -909,17 +908,21 @@ def decode_grid20_table(blob):
     prev = None
     p_ok = True
     increasing = True
-    for i in range(n):
-        at = 4 + 20 * i
-        position, = struct.unpack_from("<I", raw, at)
-        p, = struct.unpack_from("<H", raw, at + 8)
-        if p % 32:
-            p_ok = False
+    # Entry i is five u32 words from byte 4 + 20 * i: word 0 is the position and the low half of word 2 is `p`
+    # (little-endian), so `p % 32` is `word2 & 31`. Read a bounded slice of entries at a time.
+    for first in range(0, n, GRID20_CHUNK_ENTRIES):
+        count = min(GRID20_CHUNK_ENTRIES, n - first)
+        words = struct.unpack_from(f"<{5 * count}I", raw, 4 + 20 * first)
+        positions = words[0::5]
         if prev is None:
-            out["position_first"] = position
-        elif position <= prev:
+            out["position_first"] = positions[0]
+        elif positions[0] <= prev:
             increasing = False
-        prev = position
+        if increasing and not all(map(lt, positions, positions[1:])):
+            increasing = False
+        prev = positions[-1]
+        if p_ok and any(map((31).__and__, words[2::5])):
+            p_ok = False
     out["position_last"] = prev
     out["position_increasing"] = increasing
     out["p_multiple_of_32"] = p_ok
@@ -970,7 +973,7 @@ def decode_index_runs(blob, grid_entries=None):
             return out
         hashes.add(h)
         run = vals[at + 3 : at + 3 + length]
-        if any(run[i] >= run[i + 1] for i in range(len(run) - 1)):
+        if ascending and not all(map(lt, run, run[1:])):
             ascending = False
         if run:
             run_max = max(run)
@@ -1007,6 +1010,15 @@ def decode_marker_records(blob, sample_count=None):
     ``name`` and ``value`` are returned as stored. With ``sample_count`` (the stream's ``0x76`` count),
     ``offsets_within_samples`` says whether every offset is at most that count.
     """
+    return _decode_marker_records(blob, sample_count)[0]
+
+
+def _decode_marker_records(blob, sample_count=None):
+    """decode_marker_records() plus whether any record's ``value`` is a region word (`_REGION_VALUES`).
+
+    The records are read a bounded number of 16-byte rows at a time, so a 16 MiB tag never needs its words held
+    in one tuple.
+    """
     out = {
         "size_ok": False,
         "records": None,
@@ -1019,31 +1031,39 @@ def decode_marker_records(blob, sample_count=None):
     }
     raw = bytes(blob)
     if not raw or len(raw) % MARKER_RECORD_BYTES or len(raw) > MAX_MARKER_BYTES:
-        return out
+        return out, False
     out["size_ok"] = True
     n = len(raw) // MARKER_RECORD_BYTES
-    names = {}
+    names = Counter()
     ascending = True
     prev = None
     offset_max = 0
     extra_max = 0
-    for i in range(n):
-        name, _value, offset, extra = struct.unpack_from("<IIII", raw, MARKER_RECORD_BYTES * i)
-        names[name] = names.get(name, 0) + 1
-        if prev is not None and offset < prev:
+    has_region = False
+    for first in range(0, n, MARKER_CHUNK_RECORDS):
+        count = min(MARKER_CHUNK_RECORDS, n - first)
+        words = struct.unpack_from(f"<{4 * count}I", raw, MARKER_RECORD_BYTES * first)
+        names.update(words[0::4])
+        offsets = words[2::4]
+        if ascending and (
+            (prev is not None and offsets[0] < prev) or not all(map(le, offsets, offsets[1:]))
+        ):
             ascending = False
-        prev = offset
-        offset_max = max(offset_max, offset)
-        extra_max = max(extra_max, extra)
+        prev = offsets[-1]
+        offset_max = max(offset_max, max(offsets))
+        extra_max = max(extra_max, max(words[3::4]))
+        if not has_region:
+            values = words[1::4]
+            has_region = MARKER_VALUE_START in values or MARKER_VALUE_END in values
     out["records"] = n
-    out["names"] = names
+    out["names"] = dict(names)
     out["first_name"] = _u32(raw, 0)
     out["offsets_ascending"] = ascending
     out["offset_max"] = offset_max
     out["extra_max"] = extra_max
     if sample_count is not None:
         out["offsets_within_samples"] = offset_max <= sample_count
-    return out
+    return out, has_region
 
 
 def marker_records(blob):
@@ -1080,7 +1100,8 @@ def pair_marker_regions(records):
     the record is the name's first or last of the tag) and the two offsets are theirs.
     """
     out = {"regions": [], "exceptions": [], "names": {}}
-    if not any(value in _REGION_VALUES for _name, value, _offset, _extra in records):
+    values = set(map(itemgetter(1), records))
+    if MARKER_VALUE_START not in values and MARKER_VALUE_END not in values:
         return out
     by_name = {}
     for index, (name, value, offset, extra) in enumerate(records):
@@ -1461,9 +1482,10 @@ def _tally_undocumented_tables(read_slice, bank_base, tmap, tally, stream_id=Non
     if TAG_MARKER in tmap:
         mo, ms = tmap[TAG_MARKER][0]
         marks = blob = None
+        has_region = False
         if 0 < ms <= MAX_MARKER_BYTES:
             blob = read_slice(bank_base + mo, ms)
-            marks = decode_marker_records(blob)
+            marks, has_region = _decode_marker_records(blob)
         tally["marker_streams"] += 1
         if marks is None or not (marks["size_ok"] and marks["offsets_ascending"]):
             tally["marker_invalid"] += 1
@@ -1472,8 +1494,8 @@ def _tally_undocumented_tables(read_slice, bank_base, tmap, tally, stream_id=Non
             key = f"0x{marks['first_name']:08x}"
             firsts = tally["marker_first_names"]
             firsts[key] = firsts.get(key, 0) + 1
-            records = marker_records(blob)
-            if any(value in _REGION_VALUES for _name, value, _offset, _extra in records):
+            if has_region:
+                records = marker_records(blob)
                 samples = None
                 if TAG_FORMAT in tmap:
                     fo, fs = tmap[TAG_FORMAT][0]
