@@ -38,7 +38,17 @@ def build(work, name, emulate, llvm_mc):
     r = subprocess.run([sys.executable, "-I", BUILD_PY, out, name], env=env, capture_output=True, text=True)
     if r.returncode:
         sys.exit(r.stdout + r.stderr)
-    return os.path.join(out, "spirv", name + ".spv")
+    spv = os.path.join(out, "spirv", name + ".spv")
+    required = [spv]
+    if emulate:
+        required.append(spv[:-4] + ".spvasm")
+    missing = [os.path.basename(path) for path in required if not os.path.isfile(path)]
+    if missing:
+        mode = "emulated" if emulate else "native"
+        message = f"error: build did not produce benchmark artifacts for shader {name!r} ({mode}): {', '.join(missing)}"
+        details = [stream.strip() for stream in (r.stdout, r.stderr) if stream.strip()]
+        sys.exit("\n".join([message, *details]))
+    return spv
 
 
 def segments(spv: str) -> tuple[int, int] | None:
