@@ -1578,7 +1578,8 @@ def load_parts_from_path(
         return parts, None
 
     if ext == ".json":
-        with open(path, encoding="utf-8") as f:
+        # utf-8-sig: a parts or manifest JSON saved by a Windows editor starts with a BOM, which json.load refuses.
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
         if isinstance(data, dict) and "parts" in data:
             skel = _skeleton_from_dict(data.get("skeleton"), default_space=data.get("coord_space", source_space))
