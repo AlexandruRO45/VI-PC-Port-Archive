@@ -337,5 +337,96 @@ class TestSignedZeroAndBoundaries(unittest.TestCase):
         self.assertEqual(self._eval_words(SUBNORM_MIN_BITS, POS_ZERO_BITS, NEG_ZERO_BITS), SUBNORM_MIN_BITS)
         self.assertEqual(self._eval_words(SUBNORM_MAX_BITS, SUBNORM_MIN_BITS, POS_ZERO_BITS), SUBNORM_MAX_BITS)
 
+class TestNanAndModifiers(unittest.TestCase):
+    """IEEE 754-2008 NaN suppression, input modifiers (abs/neg), and output clamp."""
+
+    def test_nan_suppression_single_nan(self):
+        prog = [
+            f"v_mov_b32 v1, {QNAN_BITS:#x}",
+            "v_mov_b32 v2, 0x3f800000",   # 1.0f
+            "v_mov_b32 v3, 0x40000000",   # 2.0f
+            "v_max3_f32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_nan1", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x40000000)
+
+    def test_nan_suppression_two_nans(self):
+        prog = [
+            f"v_mov_b32 v1, {QNAN_BITS:#x}",
+            "v_mov_b32 v2, 0x42280000",   # 42.0f
+            f"v_mov_b32 v3, {SNAN_BITS:#x}",
+            "v_max3_f32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_nan2", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x42280000)
+
+    def test_all_nans_yields_nan(self):
+        prog = [
+            f"v_mov_b32 v1, {QNAN_BITS:#x}",
+            f"v_mov_b32 v2, {QNAN_BITS:#x}",
+            f"v_mov_b32 v3, {SNAN_BITS:#x}",
+            "v_max3_f32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_nan_all", prog)
+        words = support.mrt0_words(spv)
+        self.assertTrue(math.isnan(u32_to_f32(words[0])))
+
+    def test_input_modifiers_abs(self):
+        prog = [
+            "v_mov_b32 v1, 0xc1200000",   # -10.0f
+            "v_mov_b32 v2, 0x40000000",   # 2.0f
+            "v_mov_b32 v3, 0x40400000",   # 3.0f
+            "v_max3_f32 v0, |v1|, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_abs_s0", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x41200000)   # +10.0f
+
+    def test_input_modifiers_neg(self):
+        prog = [
+            "v_mov_b32 v1, 0xc0f00000",   # -7.5f
+            "v_mov_b32 v2, 0x3f800000",   # 1.0f
+            "v_mov_b32 v3, 0x40000000",   # 2.0f
+            "v_max3_f32 v0, -v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_neg_s0", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x40f00000)   # +7.5f
+
+    def test_output_clamp_modifier(self):
+        prog1 = [
+            "v_mov_b32 v1, 0x40a00000",   # 5.0f
+            "v_mov_b32 v2, 0x3f800000",   # 1.0f
+            "v_mov_b32 v3, 0x40000000",   # 2.0f
+            "v_max3_f32 clamp v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv1 = support.translate_lines("ps_max3_clamp_hi", prog1)
+        self.assertEqual(support.mrt0_words(spv1)[0], 0x3f800000)   # 1.0f
+
+        prog2 = [
+            "v_mov_b32 v1, 0xc0000000",   # -2.0f
+            "v_mov_b32 v2, 0xc0400000",   # -3.0f
+            "v_mov_b32 v3, 0xc0800000",   # -4.0f
+            "v_max3_f32 clamp v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv2 = support.translate_lines("ps_max3_clamp_lo", prog2)
+        self.assertEqual(support.mrt0_words(spv2)[0], 0x00000000)   # 0.0f
+
 if __name__ == "__main__":
     unittest.main()
