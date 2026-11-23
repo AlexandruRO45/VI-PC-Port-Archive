@@ -13282,10 +13282,15 @@ class Gen:
         val = self.load_reg("vgpr", vdata["r"])
         cmpv = self.load_reg("vgpr", vdata["r"] + 1) if op == "image_atomic_fcmpswap" else None
         act = self.active_b()
-        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
-        self.emit(f"OpSelectionMerge {lbl_end} None")
-        self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
-        self.emit(f"{lbl_do} = OpLabel")
+        guarded = act != "%true"        # a shader that never writes EXEC has no inactive lane to skip
+        if guarded:
+            lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+            pre_label = lbl_do
+            self.emit(f"OpSelectionMerge {lbl_end} None")
+            self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
+            self.emit(f"{lbl_do} = OpLabel")
+        else:
+            pre_label = self.current_label_placeholder()      # the phi's incoming block is this one
         ip, tp = self.tmp(), self.tmp()
         self.dynamic_storage_access(ip, ptr_ty, arr_var, idx)
         self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
@@ -13308,7 +13313,7 @@ class Gen:
             self.emit(f"{lbl_hdr} = OpLabel")
             cur, got, abs_cur, nan_cur, any_nan, not_nan, same_bits, or_abs, both_zero, eq_val, eq_f = (
                 self.tmp() for _ in range(11))
-            self.emit(f"{cur} = OpPhi %uint {init} {lbl_do} {got} {lbl_cont}")
+            self.emit(f"{cur} = OpPhi %uint {init} {pre_label} {got} {lbl_cont}")
             self.emit(f"{abs_cur} = OpBitwiseAnd %uint {cur} {self.cu(0x7FFFFFFF)}")
             self.emit(f"{nan_cur} = OpUGreaterThan %bool {abs_cur} {self.cu(0x7F800000)}")
             self.emit(f"{any_nan} = OpLogicalOr %bool {nan_cur} {nan_cmp}")
@@ -13344,7 +13349,7 @@ class Gen:
             self.emit(f"OpBranch {lbl_hdr}")
             self.emit(f"{lbl_hdr} = OpLabel")
             cur, got = self.tmp(), self.tmp()
-            self.emit(f"{cur} = OpPhi %uint {init} {lbl_do} {got} {lbl_cont}")
+            self.emit(f"{cur} = OpPhi %uint {init} {pre_label} {got} {lbl_cont}")
             if op == "image_atomic_inc":
                 wrap, step, new_u = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{wrap} = OpUGreaterThanEqual %bool {cur} {val}")
@@ -13373,8 +13378,9 @@ class Gen:
             self.emit(f"{lbl_exit} = OpLabel")
             if "glc" in mods:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, cur)
-        self.emit(f"OpBranch {lbl_end}")
-        self.emit(f"{lbl_end} = OpLabel")
+        if guarded:
+            self.emit(f"OpBranch {lbl_end}")
+            self.emit(f"{lbl_end} = OpLabel")
 
     def image_misc(self, op, a, mods):
         """Query sampled image dimensions, load mip texels and handle storage image operations."""
@@ -13461,10 +13467,12 @@ class Gen:
             val = self.load_reg("vgpr", vdata["r"])
             cmpv = self.load_reg("vgpr", vdata["r"] + 1) if op == "image_atomic_cmpswap" else None
             act = self.active_b()
-            do, end = self.tmp() + "_do", self.tmp() + "_end"
-            self.emit(f"OpSelectionMerge {end} None")
-            self.emit(f"OpBranchConditional {act} {do} {end}")
-            self.emit(f"{do} = OpLabel")               # inactive lanes don't touch memory
+            guarded = act != "%true"        # a shader that never writes EXEC has no inactive lane to skip
+            if guarded:
+                do, end = self.tmp() + "_do", self.tmp() + "_end"
+                self.emit(f"OpSelectionMerge {end} None")
+                self.emit(f"OpBranchConditional {act} {do} {end}")
+                self.emit(f"{do} = OpLabel")           # inactive lanes don't touch memory
             ip, tp, old = self.tmp(), self.tmp(), self.tmp()
             self.dynamic_storage_access(ip, ptr_ty, arr_var, idx)
             self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
@@ -13475,8 +13483,9 @@ class Gen:
                 self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {val}")
             if "glc" in mods:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
-            self.emit(f"OpBranch {end}")
-            self.emit(f"{end} = OpLabel")
+            if guarded:
+                self.emit(f"OpBranch {end}")
+                self.emit(f"{end} = OpLabel")
             return
         ip, img = self.tmp(), self.tmp()
         if array_query:

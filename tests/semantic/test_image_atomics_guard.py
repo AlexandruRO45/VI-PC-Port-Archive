@@ -2,7 +2,9 @@
 
 Every 2D and 3D storage-image atomic must guard OpAccessChain / OpImageTexelPointer / OpAtomic* inside
 `if (active)` (matching image_atomic_cmpswap, buffer_atomic, global_atomic, and lds_op) so inactive lanes
-never execute spurious RMWs or dereference uninitialized descriptors/coordinates.
+never execute spurious RMWs or dereference uninitialized descriptors/coordinates. A shader that never writes
+EXEC has no inactive lane at all: `active_b()` is the constant `%true` there (the same fast path #4473 uses
+for `dst()`), so no guard is emitted and none may be.
 
 Also checks glc write-back inside the guarded block, the extra 32-bit ops lowered via
 `emit_image_atomic_extra` (`image_atomic_swap`, `image_atomic_inc`, `image_atomic_dec`) with `a16`/`glc`,
@@ -73,9 +75,12 @@ def parse_blocks(spv):
     return blocks
 
 
-def find_guarded_texel_block(spv):
+def find_guarded_texel_block(spv, guarded=True):
     """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
-    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
+    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions.
+
+    `guarded=False` is the shader that never writes EXEC: `active_b()` is `%true`, so the atomic sits in
+    the block that computes it, no conditional enters that block and no `%active` load may appear."""
     blocks = parse_blocks(spv)
     active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
     guarded_targets = set()
@@ -89,11 +94,24 @@ def find_guarded_texel_block(spv):
     found = []
     for lbl, insns in blocks.items():
         if any("= OpImageTexelPointer " in ln for ln in insns):
-            if lbl not in guarded_targets:
+            if guarded and lbl not in guarded_targets:
                 raise AssertionError(f"OpImageTexelPointer in unguarded block {lbl}")
             found.append((lbl, insns))
     if not found:
         raise AssertionError("No OpImageTexelPointer emitted")
+    if not guarded:
+        # No conditional may enter the block the atomic sits in: `%true` and `if (active)` are both a guard.
+        targets = set()
+        for insns in blocks.values():
+            for ln in insns:
+                m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", ln)
+                if m:
+                    targets.update(m.groups()[1:])
+        for lbl, _ in found:
+            if lbl in targets:
+                raise AssertionError(f"OpImageTexelPointer in block {lbl}, entered through a conditional branch")
+        if active_loads:
+            raise AssertionError(f"a shader that never writes EXEC loaded %active: {sorted(active_loads)}")
     return found
 
 
@@ -136,18 +154,20 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                         ]
                         spv = translate(lines)
                         validate_spirv(spv)
-                        guarded = find_guarded_texel_block(spv)
-                        self.assertEqual(len(guarded), 1)
-                        insns = guarded[0][1]
+                        blocks = find_guarded_texel_block(spv, guarded=False)
+                        self.assertEqual(len(blocks), 1)
+                        insns = blocks[0][1]
                         self.assertTrue(any(f"OpAccessChain " in ln and arr_var in ln for ln in insns),
-                                        "OpAccessChain must sit inside the active-guarded block")
+                                        "OpAccessChain must sit in the same block as the atomic")
                         self.assertTrue(any(f"= {spv_op} %uint " in ln for ln in insns))
                         v0_ptrs = vgpr_ptrs(spv, 0)
+                        atomic_at = next(i for i, ln in enumerate(insns) if "OpAtomic" in ln)
                         has_glc_store = any(
-                            ln.startswith("OpStore ") and ln.split()[1] in v0_ptrs for ln in insns
+                            ln.startswith("OpStore ") and ln.split()[1] in v0_ptrs
+                            for ln in insns[atomic_at:]
                         )
                         self.assertEqual(has_glc_store, bool(glc),
-                                         f"glc={bool(glc)} mismatch for v0 write-back in guarded block")
+                                         f"glc={bool(glc)} mismatch for v0 write-back in the atomic block")
 
     def test_image_atomic_inc_and_dec_cas_2d_3d_and_a16(self):
         cases = [
@@ -169,7 +189,7 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                 ]
                 spv = translate(lines)
                 validate_spirv(spv)
-                find_guarded_texel_block(spv)
+                find_guarded_texel_block(spv, guarded=False)
                 self.assertIn(marker, spv)
                 if op in ("image_atomic_inc", "image_atomic_dec"):
                     self.assertIn("OpAtomicLoad %uint ", spv)
@@ -177,7 +197,7 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                     self.assertIn("OpLoopMerge ", spv)
 
     def test_cmpswap_and_bad_data_width_rejected(self):
-        # Valid 2-VGPR cmpswap (2D and 3D) stays guarded and valid.
+        # Valid 2-VGPR cmpswap (2D and 3D) stays accepted and valid.
         for dim, addr in (("dim:SQ_RSRC_IMG_2D", "v[1:2]"), ("dim:SQ_RSRC_IMG_3D", "v[1:3]")):
             spv = translate([
                 "v_mov_b32_e32 v4, 1", "v_mov_b32_e32 v5, 2",
@@ -185,17 +205,17 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                 f"image_atomic_cmpswap v[4:5], {addr}, s[4:11] dmask:0x3 {dim} unorm glc",
             ])
             validate_spirv(spv)
-            find_guarded_texel_block(spv)
+            find_guarded_texel_block(spv, guarded=False)
 
         # Two-VGPR dmask:0x3 standard ops (64-bit corpus forms, e.g. image_atomic_umax) stay accepted
-        # and active-guarded so corpus translation coverage does not regress before Int64ImageEXT lands.
+        # so corpus translation coverage does not regress before Int64ImageEXT lands.
         spv64 = translate([
             "v_mov_b32_e32 v4, 1", "v_mov_b32_e32 v5, 0",
             "v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 0",
             "image_atomic_umax v[4:5], v[1:2], s[4:11] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm",
         ])
         validate_spirv(spv64)
-        find_guarded_texel_block(spv64)
+        find_guarded_texel_block(spv64, guarded=False)
 
         # Wrong-width data operands on extra 32-bit ops and cmpswap must still raise Unsupported.
         for bad in (
@@ -206,6 +226,31 @@ class ImageAtomicsGuardTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 0", bad])
+
+
+    def test_shader_that_writes_exec_guards_every_path(self):
+        # `s_and_saveexec_b64` writes EXEC, so `active_b()` is a runtime flag again: every atomic form
+        # (standard, CAS loop, cmpswap) sits behind `if (active)`.
+        cases = [
+            ("image_atomic_add", "v0", "v[1:2]", "0x1", "dim:SQ_RSRC_IMG_2D", ""),
+            ("image_atomic_add", "v0", "v[1:3]", "0x1", "dim:SQ_RSRC_IMG_3D", " glc"),
+            ("image_atomic_inc", "v0", "v[1:2]", "0x1", "dim:SQ_RSRC_IMG_2D", " glc"),
+            ("image_atomic_swap", "v0", "v[1:2]", "0x1", "dim:SQ_RSRC_IMG_3D", " a16"),
+            ("image_atomic_cmpswap", "v[4:5]", "v[1:2]", "0x3", "dim:SQ_RSRC_IMG_2D", ""),
+        ]
+        for op, data, addr, dmask, dim, extra in cases:
+            with self.subTest(op=op, dim=dim, extra=extra):
+                spv = translate([
+                    "s_and_saveexec_b64 s[0:1], -1",
+                    "v_mov_b32_e32 v4, 1", "v_mov_b32_e32 v5, 2",
+                    "v_mov_b32_e32 v0, 7",
+                    "v_mov_b32_e32 v1, 0x00020001",
+                    "v_mov_b32_e32 v2, 3",
+                    "v_mov_b32_e32 v3, 4",
+                    f"{op} {data}, {addr}, s[4:11] dmask:{dmask} {dim} unorm{extra}",
+                ])
+                validate_spirv(spv)
+                find_guarded_texel_block(spv, guarded=True)
 
 
 if __name__ == "__main__":
