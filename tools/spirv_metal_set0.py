@@ -17,6 +17,7 @@ buffer then holds binding b's element i at ID `metal_id(b) + i` (`--print-layout
 Usage: spirv_metal_set0.py in.spv out.spv     |     spirv_metal_set0.py --print-layout
 Needs spirv-dis and spirv-as (SPIRV-Tools) on PATH, or SPIRV_DIS / SPIRV_AS.
 """
+from collections import deque
 import os
 import re
 import subprocess
@@ -57,6 +58,145 @@ def _fresh_id(base, used):
         i += 1
     used.add(cand)
     return cand
+
+
+_ID_RE = re.compile(r'"(?:\\.|[^"\\])*"|(%[^\s"]+)')
+
+
+def _replace_ids(line, id_map):
+    """Replace %id tokens outside quoted string literals using `id_map`."""
+    return _ID_RE.sub(lambda m: m.group(0) if m.group(1) is None else id_map.get(m.group(1), m.group(1)), line)
+
+
+def _specialize_helper_calls(out, retype, used_ids):
+    """Clone helper functions for each distinct retyped set-0 argument signature and rewrite OpFunctionCall sites."""
+    fnty_by_sig = {}
+    for ln in out:
+        m = re.match(r"\s*(%\S+) = OpTypeFunction (%\S+)(.*)$", ln)
+        if m:
+            fnty_by_sig[(m.group(2), tuple(m.group(3).split()))] = m.group(1)
+
+    orig_funcs = {}
+    i = 0
+    while i < len(out):
+        m_fn = re.match(r"(\s*)(%\S+) = OpFunction (%\S+) (\S+) (%\S+)$", out[i])
+        if not m_fn:
+            i += 1
+            continue
+        start = i
+        params = []
+        i += 1
+        while i < len(out):
+            m_p = re.match(r"\s*(%\S+) = OpFunctionParameter (%\S+)$", out[i])
+            if m_p:
+                params.append((m_p.group(1), m_p.group(2)))
+            if out[i].strip() == "OpFunctionEnd":
+                break
+            i += 1
+        end = i + 1
+        orig_funcs[m_fn.group(2)] = {
+            "indent": m_fn.group(1),
+            "ret": m_fn.group(3),
+            "ctrl": m_fn.group(4),
+            "ft": m_fn.group(5),
+            "params": params,
+            "lines": out[start:end],
+            "start": start,
+            "end": end,
+        }
+        i = end
+
+    if not orig_funcs:
+        return out
+
+    extra_fntys = []
+    clones = {}
+    cloned_blocks = []
+    updated_orig = {}
+    worklist = deque()
+    for fn_id, fn in orig_funcs.items():
+        fn_lines = list(fn["lines"])
+        updated_orig[fn_id] = fn_lines
+        worklist.append((fn_lines, dict(retype)))
+
+    while worklist:
+        fn_lines, fn_retype = worklist.popleft()
+        changed = True
+        while changed:
+            changed = False
+            for idx, ln in enumerate(fn_lines):
+                m_cp = re.match(r"(\s*(%\S+) = OpCopyObject )%\S+ (%\S+)$", ln)
+                if m_cp and m_cp.group(3) in fn_retype:
+                    ptr = fn_retype[m_cp.group(3)]
+                    if fn_retype.get(m_cp.group(2)) != ptr:
+                        fn_retype[m_cp.group(2)] = ptr
+                        fn_lines[idx] = f"{m_cp.group(1)}{ptr} {m_cp.group(3)}"
+                        changed = True
+
+        for idx, ln in enumerate(fn_lines):
+            m_call = re.match(r"(\s*%\S+ = OpFunctionCall %\S+ )(%\S+)((?:\s+%\S+)*)$", ln)
+            if not m_call:
+                continue
+            callee = m_call.group(2)
+            args = m_call.group(3).split()
+            fn = orig_funcs.get(callee)
+            if not fn or len(args) != len(fn["params"]):
+                continue
+            orig_param_tys = tuple(p_ty for _, p_ty in fn["params"])
+            call_sig = tuple(fn_retype.get(arg, orig_param_tys[k]) for k, arg in enumerate(args))
+            if call_sig == orig_param_tys:
+                continue
+            key = (callee, call_sig)
+            if key not in clones:
+                clone_fn = _fresh_id(f"{callee}_msl", used_ids)
+                clones[key] = clone_fn
+                ft_key = (fn["ret"], call_sig)
+                ft_new = fnty_by_sig.get(ft_key)
+                if ft_new is None:
+                    ft_new = _fresh_id(f"{fn['ft']}_msl", used_ids)
+                    fnty_by_sig[ft_key] = ft_new
+                    extra_fntys.append(f"{ft_new} = OpTypeFunction {fn['ret']} {' '.join(call_sig)}")
+                id_map = {callee: clone_fn}
+                for cln in fn["lines"][1:]:
+                    m_def = re.match(r"\s*(%\S+) = ", cln)
+                    if m_def:
+                        id_map[m_def.group(1)] = _fresh_id(f"{m_def.group(1)}_msl", used_ids)
+                clone_lines = [f"{fn['indent']}{clone_fn} = OpFunction {fn['ret']} {fn['ctrl']} {ft_new}"]
+                p_idx = 0
+                for cln in fn["lines"][1:]:
+                    m_p = re.match(r"(\s*)(%\S+) = OpFunctionParameter %\S+$", cln)
+                    if m_p:
+                        clone_lines.append(f"{m_p.group(1)}{id_map[m_p.group(2)]} = OpFunctionParameter {call_sig[p_idx]}")
+                        p_idx += 1
+                    else:
+                        clone_lines.append(_replace_ids(cln, id_map))
+                clone_retype = dict(retype)
+                for p_id, orig_pty in fn["params"]:
+                    idx_p = fn["params"].index((p_id, orig_pty))
+                    if call_sig[idx_p] != orig_pty:
+                        clone_retype[id_map[p_id]] = call_sig[idx_p]
+                cloned_blocks.append(clone_lines)
+                worklist.append((clone_lines, clone_retype))
+            fn_lines[idx] = f"{m_call.group(1)}{clones[key]}{m_call.group(3)}"
+
+    result = []
+    fn_by_start = {fn["start"]: (fn_id, fn["end"]) for fn_id, fn in orig_funcs.items()}
+    idx = 0
+    inserted_fntys = False
+    while idx < len(out):
+        if idx in fn_by_start:
+            if not inserted_fntys and extra_fntys:
+                result.extend(extra_fntys)
+                inserted_fntys = True
+            fn_id, end = fn_by_start[idx]
+            result.extend(updated_orig[fn_id])
+            idx = end
+        else:
+            result.append(out[idx])
+            idx += 1
+    for blk in cloned_blocks:
+        result.extend(blk)
+    return result
 
 
 def rewrite(text, counts):
@@ -151,6 +291,8 @@ def rewrite(text, counts):
             for after, decl in new_types:
                 if after == m.group(1):
                     out.extend(decl)
+    if retype:
+        out = _specialize_helper_calls(out, retype, used_ids)
     return "\n".join(out) + "\n"
 
 
