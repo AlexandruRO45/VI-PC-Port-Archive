@@ -1331,8 +1331,10 @@ inline void memory_barrier(const ReplayFunctions& vk, VkCommandBuffer command_bu
 template<typename Pipeline>
 inline void bind_user_data(const ReplayFunctions& vk, VkCommandBuffer command_buffer, VkPipelineBindPoint point,
                            const Pipeline& pipeline, VkShaderStageFlags stages, const ShaderUserData& data) {
-    if (pipeline.bindless_set)
-        vk.bind_descriptor_sets(command_buffer, point, pipeline.layout, 0, 1, &pipeline.bindless_set, 0, nullptr);
+    if (pipeline.bindless_set) {
+                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : pipeline.bindless_set;
+                vk.bind_descriptor_sets(command_buffer, point, pipeline.layout, 0, 1, &set0, 0, nullptr);
+    }
     if (pipeline.tail_set)
         vk.bind_descriptor_sets(command_buffer, point, pipeline.layout, 1, 1, &pipeline.tail_set, 1,
                                 &pipeline.tail_offset);
