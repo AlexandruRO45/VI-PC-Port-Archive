@@ -141,6 +141,19 @@ class TestInterpP2F32Clamp(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(len(words), 4)
 
+class TestInterpP2F32Translator(unittest.TestCase):
+    def test_p2_f32_translator_pipeline(self):
+        code = [
+            "v_interp_p1_f32 v3, v0, attr5.z",
+            "v_interp_p2_f32 v3, v1, attr5.z",
+            "exp mrt0, v3, v3, v3, v3 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p2_f32_trans", code)
+        self.assertIn("OpEntryPoint Fragment", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
