@@ -499,6 +499,28 @@ class PeInspectTest(unittest.TestCase):
         with open(colliding_file, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), "original preserved text")
 
+    def test_cli_refuses_linked_json_and_markdown_reports(self):
+        out = os.path.join(self.dir, "linked_reports")
+        os.mkdir(out)
+        json_path = os.path.join(out, "sample.dll.json")
+        md_path = os.path.join(out, "sample.dll.md")
+        original = b"previous report"
+        with open(json_path, "wb") as f:
+            f.write(original)
+        try:
+            os.link(json_path, md_path)
+        except OSError as error:
+            self.skipTest(f"hard links unavailable: {error}")
+
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = pe_inspect.main([self.image, "--out", out])
+        self.assertEqual(rc, 1)
+        self.assertIn("name the same file", err.getvalue())
+        for path in (json_path, md_path):
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), original)
+
     def test_cli_refuses_existing_file_as_out_dir(self):
         file_out = os.path.join(self.dir, "some_file.txt")
         with open(file_out, "w", encoding="utf-8") as f:

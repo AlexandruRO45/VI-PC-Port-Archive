@@ -26,6 +26,12 @@ import struct
 import sys
 from collections import Counter
 
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+from report_paths import same_report_path  # noqa: E402
+
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
 
 MACHINES = {0x8664: "x86-64", 0x14C: "x86", 0xAA64: "ARM64"}
@@ -533,6 +539,10 @@ def main(argv: list[str] | None = None) -> int:
         stem = os.path.join(a.out, name)
         json_path = stem + ".json"
         md_path = stem + ".md"
+        if same_report_path(json_path, md_path):
+            print(f"{img}: reports {json_path} and {md_path} name the same file", file=sys.stderr)
+            rc = 1
+            continue
         collision = None
         for other in a.image:
             if same_output_path(other, json_path):
