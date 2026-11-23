@@ -258,6 +258,14 @@ def describe(candidate, names):
     return "%sstream 0x%-10x model %d geometry %s%s" % (label, item["Offset"], candidate["model"], used, note)
 
 
+def non_negative(text):
+    """A count or an offset below 0: the run would silently read from the end of the file or match nothing."""
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
 def at_least_one(text):
     """--top: how many candidates to print; 0 or less used to print one anyway through max(1, a.top)."""
     value = int(text)
@@ -272,13 +280,14 @@ def main(argv=None):
     ap.add_argument("manifest")
     ap.add_argument("--models", help="directory of the OBJs (default: the manifest's directory)")
     ap.add_argument("--descriptor", help="208-byte instance descriptor; its 3x4 at +0x50 is the geometry transform")
-    ap.add_argument("--descriptor-offset", type=int, default=0)
+    ap.add_argument("--descriptor-offset", type=non_negative, default=0)
     ap.add_argument("--transform", help="the same 3x4 as 12 comma-separated floats, instead of --descriptor")
-    ap.add_argument("--header-offset", type=int, default=0, help="the 64-byte header's offset in the file")
+    ap.add_argument("--header-offset", type=non_negative, default=0,
+                    help="the 64-byte header's offset in the file")
     ap.add_argument("--skip-shaders", default=os.environ.get(SKIP_SHADERS_ENV, ""),
                     help="shader name hashes of the geometries the BVH leaves out (game data; local use only)")
     ap.add_argument("--unordered", action="store_true", help="also try the geometries in any order")
-    ap.add_argument("--embeddings", type=int, default=64, help="at most this many index choices per model")
+    ap.add_argument("--embeddings", type=non_negative, default=64, help="at most this many index choices per model")
     ap.add_argument("--top", type=at_least_one, default=8, help="how many scored candidates to print")
     ap.add_argument("--names", action="store_true", help="print drawable names (game data: local use only)")
     ap.add_argument("--write", metavar="DIR", help="write the matched geometries here as float3/uint32 buffers "
