@@ -177,5 +177,15 @@ class VMadI16AstTests(unittest.TestCase):
         node = Mul16AstNode("v_mad_i16", "v3", "v0", "v1", "v2")
         self.assertEqual(node.emit_asm(), "v_mad_i16 v3, v0, v1, v2")
 
+class VMadI16InterpreterTests(unittest.TestCase):
+    """Interpreter simulation for v_mad_i16."""
+
+    def test_scalar_simulation(self):
+        regs = {"v0": u16(-3), "v1": 10, "v2": 2}
+        res = ref_mad_i16(regs["v0"], regs["v1"], regs["v2"])
+        regs["v3"] = res
+        # -3 * 10 + 2 = -28 = 0xFFE4
+        self.assertEqual(regs["v3"], 0xFFE4)
+
 if __name__ == "__main__":
     unittest.main()
