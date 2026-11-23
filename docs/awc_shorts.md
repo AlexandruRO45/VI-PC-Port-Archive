@@ -9,10 +9,13 @@ python -I tools\awc_shorts.py <bank.awc | directory> <out> `
     --min-seconds 5 --max-seconds 60 --jobs 8
 ```
 
-The output is `<out>\<bank>\<stream id>.ogg` plus `<out>\shorts.csv` with bank, stream id, duration,
-packet channel count, packet count and relative path. For a directory scan, `<bank>` keeps the
-path relative to the source directory, without the `.awc` extension. For example, a nested
-`left/shared.awc` has a `bank` value of `left/shared`. Existing files are overwritten, and malformed
+The output is `<out>\<bank>\<stream id>.ogg`, the stream id as eight hex digits, plus `<out>\shorts.csv`
+with bank, stream id, duration, packet channel count, packet count and relative path. A bank can hold
+two streams of the same 29-bit id; the later one is then written as `<stream id>~2.ogg` (and `~3` for a
+third), the way `tools/awc_opus.py`'s `export_stems` names them, so the second does not overwrite the
+first and the file name is not always just the id. For a directory scan, `<bank>` keeps the path
+relative to the source directory, without the `.awc` extension. For example, a nested `left/shared.awc`
+has a `bank` value of `left/shared`. A re-run overwrites an output file of the same name, and malformed
 banks are reported and skipped.
 
 ## Duration and channels
