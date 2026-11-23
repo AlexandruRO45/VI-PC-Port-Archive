@@ -547,3 +547,42 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
 
         self.assertEqual(res, 50)
         self.assertEqual(state.get_sgpr(0), 0xCAFE_BABE)
+
+
+# ==============================================================================
+# SECTION 7: IEEE 754 Boundary Extremes and Two's Complement Limits
+# ==============================================================================
+
+class TestIEEE754EdgeCases(unittest.TestCase):
+    """Commit 7: IEEE 754 edge cases and integer two's complement boundary extremes."""
+
+    def test_two_complement_extrema(self) -> None:
+        """Verify minimum against INT32_MIN (-2^31) and INT32_MAX (2^31 - 1)."""
+        s_min = from_signed_i32(INT32_MIN)
+        s_max = from_signed_i32(INT32_MAX)
+        self.assertEqual(oracle_min3_i32(s_min, s_max, 0), s_min)
+        self.assertEqual(oracle_min3_i32(s_max, s_min, -1), s_min)
+        self.assertEqual(oracle_min3_i32(0, s_max, -1), from_signed_i32(-1))
+
+    def test_zero_and_negative_one(self) -> None:
+        """Verify -1 < 0 and 0 < 1."""
+        neg1 = from_signed_i32(-1)
+        self.assertEqual(oracle_min3_i32(neg1, 0, 1), neg1)
+        self.assertEqual(oracle_min3_i32(0, 1, 2), 0)
+
+    def test_near_overflow_boundaries(self) -> None:
+        """Verify values adjacent to INT32_MIN and INT32_MAX."""
+        min_plus_1 = from_signed_i32(INT32_MIN + 1)
+        max_minus_1 = from_signed_i32(INT32_MAX - 1)
+        s_min = from_signed_i32(INT32_MIN)
+        self.assertEqual(oracle_min3_i32(s_min, min_plus_1, max_minus_1), s_min)
+        self.assertEqual(oracle_min3_i32(min_plus_1, max_minus_1, 0), min_plus_1)
+
+    def test_all_permutations_of_key_extrema(self) -> None:
+        """Verify associative and commutative symmetry across permutations of extrema."""
+        import itertools
+        values = [from_signed_i32(INT32_MIN), from_signed_i32(-1), 0, 1, from_signed_i32(INT32_MAX)]
+        for triple in itertools.combinations_with_replacement(values, 3):
+            expected = min(to_signed_i32(x) for x in triple) & MASK32
+            for perm in itertools.permutations(triple):
+                self.assertEqual(oracle_min3_i32(*perm), expected)
