@@ -328,6 +328,7 @@ calls through `xgameruntime.lib`'s thunks, so the executable's list is known bef
 ```powershell
 python -I tools/gdk_runtime_calls.py "$game\XCurl.dll" "$game\libHttpClient.GDK.dll"   # text; --json for JSON
 python -I tools/gdk_runtime_calls.py <exe> --out <dir>    # writes <exe>.gdk_calls.txt and .json, prints a summary
+python -I tools/gdk_runtime_calls.py <exe> --runtime-source <shim.cpp or folder>   # which class ids count as served
 ```
 
 It finds the helper the thunks share (the call a known id's `lea` feeds, after which a vtable slot past IUnknown is
@@ -336,8 +337,9 @@ table doesn't know is listed as unknown) and records each slot called up to `Rel
 `.pdata` function or a byte window without one. The slots are named from `tools/gdk_runtime_classes.json`: the ids,
 inheritance and method order of xodus-gaming/xgameruntime-docs (GPL-3.0; facts only), made with
 `python -I tools/gen_gdk_runtime_classes.py <docs clone>`. An interface's slot table is its chain's methods, base
-first, from slot 3. For each class the report says whether `runtime/shims/xgameruntime.cpp` has its class id (a
-`constexpr GUID k...Class`), and for each thunk whether anything in the image reaches it: a call, tail jump, address
+first, from slot 3. For each class the report says whether the runtime shims have its class id (a `constexpr GUID
+k...Class` in any `xgameruntime*.cpp` of `runtime/shims`, the default `--runtime-source`), and for each thunk whether
+anything in the image reaches it: a call, tail jump, address
 load or pointer in data, directly or through an incremental-link `jmp` stub, a call from another thunk counting only
 when that thunk is reached. The argument count it prints is an estimate from the registers and stack slots written
 before the call.
@@ -364,7 +366,8 @@ Limits:
   follow to a slot are listed.
 - Static: a referenced thunk may never run, and a reference through a computed address or from another module is
   not seen.
-- "Served" means the shim has the class id. It doesn't say that each slot does more than log, nor that
+- "Served" means a `runtime/shims/xgameruntime*.cpp` (or whatever `--runtime-source` names) declares the class id. It
+  doesn't say that each slot does more than log, nor that
   `QueryApiImpl` accepts the interface id the thunk passes; the report marks each request whose interface id is not
   the class id.
 - Names are as complete as xgameruntime-docs: an *unknown* entry keeps its slot unnamed, and a slot past an interface
