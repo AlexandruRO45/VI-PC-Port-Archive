@@ -554,7 +554,7 @@ let texSearchQuery = '';
 
 let scene, camera, renderer, controls;
 let currentMesh = null;
-let modelLoadId = 0;
+let modelRequest = null;
 let shadingMode = 'original'; // 'original' | 'clay' | 'normals'
 let wireframeActive = false;
 let autoRotateActive = false;
@@ -566,6 +566,7 @@ const clayMaterial = new THREE.MeshStandardMaterial({
   flatShading: false
 });
 const normalMaterial = new THREE.MeshNormalMaterial();
+const originalMaterials = new WeakMap();
 
 function formatBytes(bytes) {
   if (!bytes) return '0 B';
@@ -685,45 +686,73 @@ function resetCamera() {
 function applyMeshShading() {
   if (!currentMesh) return;
   currentMesh.traverse(child => {
-    if (child.isMesh) {
-      if (shadingMode === 'clay') {
-        child.material = clayMaterial;
-      } else if (shadingMode === 'normals') {
-        child.material = normalMaterial;
-      } else {
-        child.material = child.userData.origMaterial || child.material;
-      }
-      if (child.material) {
-        child.material.wireframe = wireframeActive;
-        child.material.needsUpdate = true;
-      }
+    if (!child.isMesh) return;
+    if (shadingMode === 'clay') {
+      child.material = clayMaterial;
+    } else if (shadingMode === 'normals') {
+      child.material = normalMaterial;
+    } else {
+      child.material = originalMaterials.get(child);
+    }
+    for (const material of [].concat(child.material || [])) {
+      material.wireframe = wireframeActive;
+      material.needsUpdate = true;
     }
   });
 }
 
 function disposeModel(root) {
+  const geometries = new Set(), materials = new Set(), textures = new Set();
+  const skeletons = new Set(), bitmaps = new Set();
   root.traverse(child => {
-    if (child.geometry) child.geometry.dispose();
-    // In clay/normals mode child.material is a shared material; the model's own is origMaterial.
-    const material = child.userData.origMaterial || child.material;
-    if (!material) return;
-    Object.values(material).forEach(value => {
-      if (value && value.isTexture) value.dispose();
-    });
-    material.dispose();
+    if (child.geometry) geometries.add(child.geometry);
+    if (child.isInstancedMesh && typeof child.dispose === 'function') child.dispose();
+    if (child.isSkinnedMesh && child.skeleton) skeletons.add(child.skeleton);
+    const owned = originalMaterials.get(child) || child.material;
+    for (const material of [].concat(owned || [])) {
+      if (material && material !== clayMaterial && material !== normalMaterial) materials.add(material);
+    }
+    originalMaterials.delete(child);
   });
+  for (const geometry of geometries) geometry.dispose();
+  for (const skeleton of skeletons) skeleton.dispose();
+  for (const material of materials) {
+    for (const value of Object.values(material)) {
+      if (value?.isTexture) textures.add(value);
+    }
+    material.dispose();
+  }
+  for (const texture of textures) {
+    if (typeof ImageBitmap !== 'undefined' && texture.image instanceof ImageBitmap) bitmaps.add(texture.image);
+    texture.dispose();
+  }
+  for (const bitmap of bitmaps) bitmap.close();
 }
 
-function loadModel(url, name, category, size) {
-  const loadId = ++modelLoadId;
+async function loadModel(url, name, category, size) {
+  modelRequest?.abort();
+  const request = new AbortController();
+  modelRequest = request;
   const bar = document.getElementById('loading-bar');
   bar.style.transform = 'scaleX(0.4)';
 
-  const loader = new THREE.GLTFLoader();
-  loader.load(url, (gltf) => {
-    if (loadId !== modelLoadId) return;
+  try {
+    const response = await fetch(url, { signal: request.signal });
+    if (!response.ok) throw new Error(`Model request failed: ${response.status}`);
+    const bytes = await response.arrayBuffer();
+    if (request !== modelRequest) return;
+    const resourcePath = THREE.LoaderUtils.extractUrlBase((response.url || url).split(/[?#]/, 1)[0]);
+    const loader = new THREE.GLTFLoader();
+    const gltf = await new Promise((resolve, reject) => loader.parse(bytes, resourcePath, resolve, reject));
+    // An already-running GLTF parse can finish after a newer selection.
+    if (request !== modelRequest) {
+      disposeModel(gltf.scene);
+      return;
+    }
     bar.style.transform = 'scaleX(1)';
-    setTimeout(() => { bar.style.transform = 'scaleX(0)'; }, 250);
+    setTimeout(() => {
+      if (request === modelRequest) bar.style.transform = 'scaleX(0)';
+    }, 250);
 
     if (currentMesh) {
       scene.remove(currentMesh);
@@ -737,7 +766,7 @@ function loadModel(url, name, category, size) {
 
     currentMesh.traverse((child) => {
       if (child.isMesh) {
-        child.userData.origMaterial = child.material;
+        originalMaterials.set(child, child.material);
         if (child.geometry) {
           verts += child.geometry.attributes.position ? child.geometry.attributes.position.count : 0;
           tris += child.geometry.index ? child.geometry.index.count / 3 : (child.geometry.attributes.position ? child.geometry.attributes.position.count / 3 : 0);
@@ -763,12 +792,12 @@ function loadModel(url, name, category, size) {
     camera.position.set(maxDim * 1.5, maxDim * 1.2, maxDim * 1.8);
     controls.target.set(0, 0, 0);
     controls.update();
-  }, undefined, (err) => {
-    if (loadId !== modelLoadId) return;
+  } catch (err) {
+    if (request !== modelRequest) return;
     bar.style.transform = 'scaleX(0)';
     console.error('Error loading model:', err);
     alert('Не удалось загрузить 3D модель: ' + name);
-  });
+  }
 }
 
 async function loadModels() {
