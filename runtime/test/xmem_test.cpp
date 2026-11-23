@@ -33,6 +33,12 @@ using XMemResetWriteWatchFn = UINT(WINAPI*)(void*, SIZE_T);
 // BOOL XMemTransferMemory(XMEM_TRANSFER_TYPE, SIZE_T): the shape Microsoft's public NetRumble and NativeAOT-Xbox
 // samples call (see runtime/shims/xmem.cpp).
 using XMemTransferMemoryFn = BOOL(WINAPI*)(uint32_t, SIZE_T);
+// The physical-page exports' shapes are from docs/retail_boot_chain.md §2 (the retail executable's call sites).
+using XMemAllocatePhysicalPagesFn = BOOL(WINAPI*)(ULONGLONG, ULONG_PTR*, ULONG_PTR*);
+using XMemFreePhysicalPagesFn = BOOL(WINAPI*)(ULONG_PTR, ULONG_PTR*);
+using XMemMapPhysicalPagesFn = void*(WINAPI*)(void*, ULONG_PTR, ULONG_PTR*);
+using XMemMapPhysicalPagesScatterFn = void*(WINAPI*)(void**, ULONG_PTR, ULONG_PTR*);
+constexpr SIZE_T kPhysicalPageSize = 0x10000;
 constexpr uint32_t kMeasuredKind = 0x20000001;
 
 int g_checks = 0;
@@ -384,6 +390,63 @@ using HostVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, DWORD);
 
 // RT-217: a title's kernel32!VirtualAlloc carries the console's MEM_GRAPHICS / MEM_TITLE type bits, which the host
 // rejects. The registered shim has to drop them and still allocate.
+// A reservation for physical pages is MEM_PHYSICAL on the console and an ordinary reservation here, so the test
+// reserves with VirtualAlloc, maps pages into it, writes through the mapping, unmaps and frees.
+void test_physical_pages(XMemAllocatePhysicalPagesFn allocate, XMemFreePhysicalPagesFn free_pages,
+                         XMemMapPhysicalPagesFn map, XMemMapPhysicalPagesScatterFn scatter) {
+    void* range = VirtualAlloc(nullptr, 4 * kPhysicalPageSize, MEM_RESERVE, PAGE_NOACCESS);
+    check(range != nullptr, "physical pages: a 4-page reservation is made");
+
+    ULONG_PTR count = 2;
+    ULONG_PTR pages[2] = {0, 0};
+    check(allocate(0x280, &count, pages) != FALSE, "XMemAllocatePhysicalPages(0x280, 2) returns TRUE");
+    check(count == 2, "XMemAllocatePhysicalPages writes the count back");
+    check(pages[0] != 0 && pages[1] != 0 && pages[0] != pages[1], "XMemAllocatePhysicalPages hands out two page numbers");
+
+    if (range && pages[0] && pages[1]) {
+        void* mapped = map(range, 2, pages);
+        check(mapped == range, "XMemMapPhysicalPages commits the pages at the reserved range");
+        if (mapped == range) {
+            auto* bytes = static_cast<unsigned char*>(mapped);
+            bytes[0] = 0x5A;
+            bytes[kPhysicalPageSize] = 0x3C;
+            check(bytes[0] == 0x5A && bytes[kPhysicalPageSize] == 0x3C,
+                  "physical pages: the mapping is readable and writable");
+            check(map(range, 2, nullptr) == range, "XMemMapPhysicalPages with a null array unmaps");
+            MEMORY_BASIC_INFORMATION info{};
+            check(VirtualQuery(range, &info, sizeof info) == sizeof info && info.State == MEM_RESERVE,
+                  "physical pages: the unmap leaves the range reserved");
+        }
+        check(free_pages(2, pages) != FALSE, "XMemFreePhysicalPages releases both pages");
+        ULONG_PTR unknown[1] = {0xFFFFFFFFu};
+        check(free_pages(1, unknown) == FALSE, "XMemFreePhysicalPages refuses an unknown page number");
+    }
+
+    if (range) {
+        ULONG_PTR none = 0;
+        check(allocate(0x380, &none, nullptr) != FALSE, "XMemAllocatePhysicalPages(0 pages) returns TRUE");
+        check(map(range, 0, pages) == range, "XMemMapPhysicalPages(0 pages) succeeds");
+        VirtualFree(range, 0, MEM_RELEASE);
+    }
+
+    // The scatter form maps one address per page.
+    void* two = VirtualAlloc(nullptr, 2 * kPhysicalPageSize, MEM_RESERVE, PAGE_NOACCESS);
+    ULONG_PTR scatter_count = 2;
+    ULONG_PTR scatter_pages[2] = {0, 0};
+    if (two && allocate(0x280, &scatter_count, scatter_pages) != FALSE) {
+        void* addresses[2] = {two, static_cast<unsigned char*>(two) + kPhysicalPageSize};
+        check(scatter(addresses, 2, scatter_pages) == addresses,
+              "XMemMapPhysicalPagesScatter maps one page per address");
+        auto* bytes = static_cast<unsigned char*>(two);
+        bytes[0] = 0x11;
+        bytes[kPhysicalPageSize] = 0x22;
+        check(bytes[0] == 0x11 && bytes[kPhysicalPageSize] == 0x22, "physical pages: both scatter pages are writable");
+        check(scatter(addresses, 2, nullptr) == addresses, "XMemMapPhysicalPagesScatter unmaps");
+        check(free_pages(2, scatter_pages) != FALSE, "XMemFreePhysicalPages releases the scatter pages");
+    }
+    if (two) VirtualFree(two, 0, MEM_RELEASE);
+}
+
 void test_title_virtual_alloc() {
     constexpr DWORD kMemGraphics = 0x10000000;
     constexpr DWORD kMemTitle = 0x40000000;
@@ -443,6 +506,14 @@ int main() {
         reinterpret_cast<XMemResetWriteWatchFn>(rt::shims::find("xmem.dll", "XMemResetWriteWatch"));
     const auto transfer =
         reinterpret_cast<XMemTransferMemoryFn>(rt::shims::find("xmem.dll", "XMemTransferMemory"));
+    const auto allocate_pages =
+        reinterpret_cast<XMemAllocatePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto free_pages =
+        reinterpret_cast<XMemFreePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    const auto map_pages =
+        reinterpret_cast<XMemMapPhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    const auto map_pages_scatter =
+        reinterpret_cast<XMemMapPhysicalPagesScatterFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPagesScatter"));
 
     check(alloc != nullptr, "registry exposes xmem.dll!XMemAlloc");
     check(free_mem != nullptr, "registry exposes xmem.dll!XMemFree");
@@ -452,6 +523,10 @@ int main() {
     check(get_write_watch != nullptr, "registry exposes xmem.dll!XMemGetWriteWatch");
     check(reset_write_watch != nullptr, "registry exposes xmem.dll!XMemResetWriteWatch");
     check(transfer != nullptr, "registry exposes xmem.dll!XMemTransferMemory");
+    check(allocate_pages != nullptr, "registry exposes xmem.dll!XMemAllocatePhysicalPages");
+    check(free_pages != nullptr, "registry exposes xmem.dll!XMemFreePhysicalPages");
+    check(map_pages != nullptr, "registry exposes xmem.dll!XMemMapPhysicalPages");
+    check(map_pages_scatter != nullptr, "registry exposes xmem.dll!XMemMapPhysicalPagesScatter");
 
     if (!alloc || !free_mem || !query || !get_stats) {
         print_result();
@@ -471,6 +546,8 @@ int main() {
     }
 
     test_title_virtual_alloc();
+    if (allocate_pages && free_pages && map_pages && map_pages_scatter)
+        test_physical_pages(allocate_pages, free_pages, map_pages, map_pages_scatter);
 
     print_result();
     return g_failures ? 1 : 0;

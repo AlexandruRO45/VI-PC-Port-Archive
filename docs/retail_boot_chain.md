@@ -49,6 +49,13 @@ The shapes, from the call sites and the checks that follow them:
 | `XMemMapPhysicalPagesScatter` | `(va_array, page_count, page_array)`, the same with one VA per page |
 | `XMemFreePhysicalPages` | `(page_count, page_array)` |
 
+The runtime serves these four exports (`runtime/shims/xmem.cpp`): a page is a committed 64 KiB block and the page
+number indexes a process-wide table, `XMemMapPhysicalPages` commits the reserved range at the VA it is given, and a
+null page array decommits it while leaving the reservation. `MEM_PHYSICAL` is dropped from `XMemVirtualAlloc`'s type
+word, so that reservation is an ordinary one. Two mappings of the same page do not share content, and nothing binds
+the pages to the GPU yet. `xmem_test` covers the calls, the unmap and an unknown page number; no title run has used
+them.
+
 The local stand-in that gets past stop 6 is CPU-only: one pagefile section per 64 KiB page
 (`CreateFileMappingW(INVALID_HANDLE_VALUE, …, SEC_COMMIT)`), page numbers handed out as indexes into that table,
 the physical reserve made with `VirtualAlloc2(MEM_RESERVE | MEM_RESERVE_PLACEHOLDER)`, each map a

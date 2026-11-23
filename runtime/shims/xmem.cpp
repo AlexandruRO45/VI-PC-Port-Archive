@@ -19,10 +19,12 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "shims.h"
 #include "startup_trace.h"
@@ -134,6 +136,9 @@ constexpr DWORD kXmemPageModeMask = kXmem64kPages;
 constexpr SIZE_T kXmemPageSize64k = 0x10000;
 constexpr DWORD kXmemHostAllocationTypeMask =
     MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
+// MEM_PHYSICAL marks a reservation that physical pages are mapped into. The PC has no page pool, so the flag is
+// dropped and the range stays an ordinary reservation; XMemMapPhysicalPages commits into it.
+constexpr DWORD kXmemPhysical = 0x00400000;
 
 bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     const SIZE_T max = (std::numeric_limits<SIZE_T>::max)();
@@ -176,7 +181,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
-    const DWORD unsupported = allocation_type & ~(kXmemHostAllocationTypeMask | kXmemPageModeMask);
+    const DWORD unsupported = allocation_type & ~(kXmemHostAllocationTypeMask | kXmemPageModeMask | kXmemPhysical);
     if (unsupported != 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -278,6 +283,147 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
     return TRUE;
 }
 
+// Physical pages. docs/retail_boot_chain.md §2 has the call shapes, from the retail executable's call sites; the
+// console hands out 64 KiB page numbers from a page pool that a title reserves with MEM_PHYSICAL and then maps into
+// its own address space. A PC has no page pool, so this stand-in gives every page its own committed 64 KiB block and
+// a page number that indexes a process-wide table, and a map commits the range at the VA the title reserved. The
+// content is not shared between mappings: nothing reads a page through two mappings yet, and the D3D12 layer has no
+// sparse mapper to bind them to (#5378). Page numbers start at 1, so a zeroed array reads as "no page".
+constexpr SIZE_T kPhysicalPageSize = kXmemPageSize64k;
+
+struct PhysicalPages {
+    std::mutex mutex;
+    std::vector<void*> pages;                 // pages[n - 1] is page number n; null when it was freed
+    std::map<void*, SIZE_T> mappings;         // VA -> bytes committed by a map, for the unmap form
+};
+PhysicalPages& physical_pages() {
+    static auto* p = new PhysicalPages;
+    return *p;
+}
+
+// Non-null when every entry names a live page. The caller holds the lock.
+bool physical_pages_live(const ULONG_PTR* page_array, ULONG_PTR count) {
+    for (ULONG_PTR i = 0; i < count; ++i) {
+        const ULONG_PTR n = page_array[i];
+        if (n == 0 || n > physical_pages().pages.size() || !physical_pages().pages[n - 1]) return false;
+    }
+    return true;
+}
+
+// BOOL XMemAllocatePhysicalPages(ULONGLONG attributes, ULONG_PTR* page_count, ULONG_PTR* page_array): *page_count is
+// the request on entry and the number written back on return; the title checks both the TRUE and the count.
+BOOL WINAPI XMemAllocatePhysicalPages(ULONGLONG attributes, ULONG_PTR* page_count, ULONG_PTR* page_array) {
+    note_attributes("XMemAllocatePhysicalPages", attributes, 0, _ReturnAddress());
+    if (!page_count || (*page_count && !page_array)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    std::lock_guard lock(physical_pages().mutex);
+    const ULONG_PTR want = *page_count;
+    ULONG_PTR got = 0;
+    for (; got < want; ++got) {
+        void* block = VirtualAlloc(nullptr, kPhysicalPageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!block) break;
+        physical_pages().pages.push_back(block);
+        page_array[got] = static_cast<ULONG_PTR>(physical_pages().pages.size());
+    }
+    if (got != want) {
+        for (ULONG_PTR i = 0; i < got; ++i) {
+            const ULONG_PTR n = page_array[i];
+            VirtualFree(physical_pages().pages[n - 1], 0, MEM_RELEASE);
+            physical_pages().pages[n - 1] = nullptr;
+        }
+        *page_count = 0;
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// BOOL XMemFreePhysicalPages(ULONG_PTR page_count, ULONG_PTR* page_array): the return type is unmeasured; TRUE for a
+// known page reads the same as any non-zero console result.
+BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR page_count, ULONG_PTR* page_array) {
+    if (page_count && !page_array) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    std::lock_guard lock(physical_pages().mutex);
+    bool ok = true;
+    for (ULONG_PTR i = 0; i < page_count; ++i) {
+        const ULONG_PTR n = page_array[i];
+        if (n == 0 || n > physical_pages().pages.size() || !physical_pages().pages[n - 1]) {
+            ok = false;
+            continue;
+        }
+        VirtualFree(physical_pages().pages[n - 1], 0, MEM_RELEASE);
+        physical_pages().pages[n - 1] = nullptr;
+    }
+    return ok ? TRUE : FALSE;
+}
+
+// Commits bytes at an address the title reserved. Returns the address on success, null on failure. The caller holds
+// the lock for the live check; refusing an unknown page is the only failure besides the host's own.
+void* map_physical_span(void* address, ULONG_PTR page_count, const ULONG_PTR* page_array) {
+    if (!address || (page_count && !page_array)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (page_count == 0) return address;
+    const SIZE_T bytes = static_cast<SIZE_T>(page_count) * kPhysicalPageSize;
+    if (bytes / kPhysicalPageSize != page_count) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    {
+        std::lock_guard lock(physical_pages().mutex);
+        if (!physical_pages_live(page_array, page_count)) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+    }
+    void* mapped = VirtualAlloc(address, bytes, MEM_COMMIT, PAGE_READWRITE);
+    if (!mapped) return nullptr;
+    std::lock_guard lock(physical_pages().mutex);
+    physical_pages().mappings[mapped] = bytes;
+    return mapped;
+}
+
+// void* XMemMapPhysicalPages(void* address, ULONG_PTR page_count, ULONG_PTR* page_array): a null page_array unmaps;
+// the map returns non-null on success. The reservation stays: only the commit is dropped, so the title can map
+// another page set there.
+void* WINAPI XMemMapPhysicalPages(void* address, ULONG_PTR page_count, ULONG_PTR* page_array) {
+    if (address && !page_array && page_count) {
+        std::lock_guard lock(physical_pages().mutex);
+        const auto it = physical_pages().mappings.find(address);
+        if (it == physical_pages().mappings.end()) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        VirtualFree(address, it->second, MEM_DECOMMIT);
+        physical_pages().mappings.erase(it);
+        return address;
+    }
+    return map_physical_span(address, page_count, page_array);
+}
+
+// void* XMemMapPhysicalPagesScatter(void** address_array, ULONG_PTR page_count, ULONG_PTR* page_array): the same, one
+// address per page. A null page_array unmaps every address in the array.
+void* WINAPI XMemMapPhysicalPagesScatter(void** address_array, ULONG_PTR page_count, ULONG_PTR* page_array) {
+    if (!address_array) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (!page_array) {
+        for (ULONG_PTR i = 0; i < page_count; ++i)
+            if (address_array[i]) XMemMapPhysicalPages(address_array[i], 1, nullptr);
+        return address_array;
+    }
+    for (ULONG_PTR i = 0; i < page_count; ++i) {
+        if (!map_physical_span(address_array[i], 1, page_array + i)) return nullptr;
+    }
+    return address_array;
+}
+
 // kernel32!VirtualAlloc as a title calls it. The console's allocation type has two bits of its own, MEM_GRAPHICS
 // (0x10000000, memory the GPU reads) and MEM_TITLE (0x40000000, the title's own heap). On a PC the host rejects both
 // with ERROR_INVALID_PARAMETER (measured on Windows 11 26200: VirtualAlloc(NULL, 64 KiB, MEM_COMMIT | MEM_RESERVE |
@@ -318,4 +464,8 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
     {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
     {"xmem.dll", "XMemTransferMemory", reinterpret_cast<void*>(&XMemTransferMemory)},
+    {"xmem.dll", "XMemAllocatePhysicalPages", reinterpret_cast<void*>(&XMemAllocatePhysicalPages)},
+    {"xmem.dll", "XMemFreePhysicalPages", reinterpret_cast<void*>(&XMemFreePhysicalPages)},
+    {"xmem.dll", "XMemMapPhysicalPages", reinterpret_cast<void*>(&XMemMapPhysicalPages)},
+    {"xmem.dll", "XMemMapPhysicalPagesScatter", reinterpret_cast<void*>(&XMemMapPhysicalPagesScatter)},
 );

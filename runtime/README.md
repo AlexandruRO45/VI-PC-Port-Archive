@@ -159,7 +159,10 @@ Current limits, by design:
 
 - `xmem.dll` — `XMemAlloc`, `XMemFree`, the measured two-argument `XMemGetWorkingSetStatistics(kind, out)`, and the
   measured three-argument
-  `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
+  `XMemVirtualQuery(process, address, out)`, plus the physical-page calls `XMemAllocatePhysicalPages`,
+  `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter` and `XMemFreePhysicalPages` (shapes in
+  [docs/retail_boot_chain.md](../docs/retail_boot_chain.md#2-physical-pages-xmemdll); a PC has no page pool, so a
+  page is a committed 64 KiB block and the page number indexes a table). Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
   address.
 - The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
