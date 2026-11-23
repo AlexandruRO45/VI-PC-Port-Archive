@@ -670,6 +670,29 @@ class TestSaveExecOracle_xnor(unittest.TestCase):
                 self.assertEqual(d_val, old_exec)
                 self.assertEqual(scc, int(new_exec != 0))
 
+class TestSaveExecASTInterpreter_xnor(unittest.TestCase):
+    def test_ast_construction_and_step(self):
+        sim = SimState()
+        sim.exec_mask = 0x1234_5678_9ABC_DEF0
+        sim.write64(Reg64(10, 11), 0x0000_FFFF_FFFF_0000)
+        ast = SaveExecAST(SaveExecOp.XNOR, Reg64(6, 7), Reg64(10, 11))
+        sim.step(ast)
+        self.assertEqual(sim.read64(Reg64(6, 7)), 0x1234_5678_9ABC_DEF0)
+        expected_exec, _, expected_scc = model_saveexec("xnor", 0x0000_FFFF_FFFF_0000, 0x1234_5678_9ABC_DEF0)
+        self.assertEqual(sim.exec_mask, expected_exec)
+        self.assertEqual(sim.scc, expected_scc)
+
+    def test_ast_register_aliasing(self):
+        sim = SimState()
+        sim.exec_mask = 0xAAAA_5555_AAAA_5555
+        sim.write64(Reg64(6, 7), 0x1111_2222_3333_4444)
+        ast = SaveExecAST(SaveExecOp.XNOR, Reg64(6, 7), Reg64(6, 7))
+        sim.step(ast)
+        self.assertEqual(sim.read64(Reg64(6, 7)), 0xAAAA_5555_AAAA_5555)
+        expected_exec, _, expected_scc = model_saveexec("xnor", 0x1111_2222_3333_4444, 0xAAAA_5555_AAAA_5555)
+        self.assertEqual(sim.exec_mask, expected_exec)
+        self.assertEqual(sim.scc, expected_scc)
+
 
 if __name__ == "__main__":
     unittest.main()
