@@ -555,6 +555,16 @@ are authoring/build-time inputs to that partition:
   |---|---:|---:|---:|---:|---:|
   | Outgoing | 449,013,586 | 9,676,624 | 42 | 94 | 38,523 |
   | Incoming | 702 | 102,408 | 2 | 3 | 458,625,754 |
+
+  Pass `--relative-winding` to subdivide uniquely matched outgoing slots by the winding of the two
+  polygon rings. The first two words of each vertex at `+0x70` are its tile-space X and Y coordinates
+  (see [the lane-graph height check](#polygon-flags-under-the-lane-graph)). Translation and positive
+  per-axis scaling by the tile extents at `+0x60` preserve the sign of the shoelace area, so the test uses
+  exact integer arithmetic. Dynamic meshes use their local XY plane. Endpoint matching still uses XYZ.
+  Either ring makes the pair ambiguous if it has fewer than three projected vertices, zero signed area,
+  a repeated point, or a boundary that crosses, touches itself or doubles back. Nonpositive or nonfinite
+  horizontal extents also make the pair ambiguous.
+
 - `tools/navmesh_nodes.py` (stdlib-only) counts the polygon flag bits under the lane-graph nodes
   ([above](#polygon-flags-under-the-lane-graph)). It reads `navmeshes.rpf` and `levels.rpf` and writes counts only.
 

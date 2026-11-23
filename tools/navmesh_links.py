@@ -12,6 +12,7 @@ totals only (no game data).
 import argparse
 from collections import Counter
 import json
+import math
 import mmap
 import os
 import struct
@@ -75,6 +76,38 @@ ENDPOINT_CLASSES = (
 )
 
 
+def _turn(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _xy_winding(points):
+    """Sign of twice the area of a simple projected ring, or zero if ambiguous."""
+    n = len(points)
+    if n < 3:
+        return 0
+    if n == 3:
+        area = _turn(*points)
+        return (area > 0) - (area < 0)
+    if len(set(points)) != n:
+        return 0
+    area = 0
+    for i, a in enumerate(points):
+        b = points[(i + 1) % n]
+        area += a[0] * b[1] - b[0] * a[1]
+        prev = points[i - 1]
+        if (_turn(prev, a, b) == 0 and
+                (prev[0] - a[0]) * (b[0] - a[0]) + (prev[1] - a[1]) * (b[1] - a[1]) > 0):
+            return 0  # Adjacent segments double back over one another.
+        for j in range(i + 2, n if i else n - 1):
+            c, d = points[j], points[(j + 1) % n]
+            if (max(a[0], b[0]) < min(c[0], d[0]) or max(c[0], d[0]) < min(a[0], b[0]) or
+                    max(a[1], b[1]) < min(c[1], d[1]) or max(c[1], d[1]) < min(a[1], b[1])):
+                continue
+            if _turn(a, b, c) * _turn(a, b, d) <= 0 and _turn(c, d, a) * _turn(c, d, b) <= 0:
+                return 0
+    return (area > 0) - (area < 0)
+
+
 def _endpoint_counts(b, tables, sector, polygon_count, totals):
     """Compare each slot under both cyclic boundary conventions within this tile."""
     vertices, indices, edges, polygons = tables
@@ -85,6 +118,11 @@ def _endpoint_counts(b, tables, sector, polygon_count, totals):
     targets = (target for offset, count in edges for target in
                struct.iter_unpack("<IH6x", b[offset:offset + count * 12]))
     hypotheses = {"outgoing": Counter(), "incoming": Counter()}
+    winding = totals.get("relative_winding")
+    if winding is not None:
+        xy = [struct.unpack_from("<HH", vertex) for vertex in coords]
+        valid_xy = all(math.isfinite(v) and v > 0 for v in nd._f32s(b, 0x60, 2))
+        signs = []
     position = source = self_refs = unlinked = invalid = 0
     for offset, count in polygons:
         for i in range(count):
@@ -93,6 +131,9 @@ def _endpoint_counts(b, tables, sector, polygon_count, totals):
                 return
             end = position + (span & 15)
             ring = [coords[index] for index in ring_indices[position:end]]
+            if winding is not None:
+                signs.append(_xy_winding([xy[index] for index in ring_indices[position:end]])
+                             if valid_xy else 0)
             for j, vertex in enumerate(ring):
                 target_sector, target = next(targets)
                 if (target_sector, target) == (0xffffffff, 0xffff):
@@ -127,6 +168,10 @@ def _endpoint_counts(b, tables, sector, polygon_count, totals):
             else:
                 category = "same_direction"
             totals[convention][category] += n
+            if winding is not None and convention == "outgoing" and category in winding:
+                product = signs[source] * signs[target]
+                relation = "ambiguous" if product == 0 else "same" if product > 0 else "opposite"
+                winding[category][relation] += n
 
 
 def verify_tile(b, stats):
@@ -400,12 +445,17 @@ def _iter_resources(path, start=0, limit=None):
                 yield bytes(buf)
 
 
-def scan(path, start=0, limit=None, *, reciprocity=False, endpoint_agreement=False):
+def scan(path, start=0, limit=None, *, reciprocity=False, endpoint_agreement=False, relative_winding=False):
     stats = new_stats()
-    if endpoint_agreement:
+    if endpoint_agreement or relative_winding:
         stats["endpoint_agreement"] = {
             "tiles_counted": 0, "self_references": 0, "unlinked": 0, "invalid_targets": 0,
             **{name: dict.fromkeys(ENDPOINT_CLASSES, 0) for name in ("incoming", "outgoing")},
+        }
+    if relative_winding:
+        stats["endpoint_agreement"]["relative_winding"] = {
+            category: dict.fromkeys(("same", "opposite", "ambiguous"), 0)
+            for category in ("reversed", "same_direction")
         }
     if reciprocity:
         stats["reciprocity"] = dict.fromkeys(
@@ -416,7 +466,7 @@ def scan(path, start=0, limit=None, *, reciprocity=False, endpoint_agreement=Fal
         for name, ok in chk.items():
             stats["checks"][name]["pass" if ok else "fail"] += 1
     return {
-        **({"endpoint_agreement": stats["endpoint_agreement"]} if endpoint_agreement else {}),
+        **({"endpoint_agreement": stats["endpoint_agreement"]} if endpoint_agreement or relative_winding else {}),
         **({"reciprocity": stats["reciprocity"]} if reciprocity else {}),
         "tiles": stats["tiles"],
         "checks": stats["checks"],
@@ -456,6 +506,8 @@ def main(argv=None):
                     help="Count same-tile directed edges in excess of their reverse multiplicity")
     ap.add_argument("--endpoint-agreement", action="store_true",
                     help="Compare incoming and outgoing boundary endpoints for same-tile edges")
+    ap.add_argument("--relative-winding", action="store_true",
+                    help="Include endpoint agreement and compare polygon XY winding for unique outgoing matches")
     args = ap.parse_args(argv)
 
     if args.start < 0:
@@ -484,7 +536,7 @@ def main(argv=None):
                     return 2
 
     doc = scan(args.input, start=args.start, limit=args.limit, reciprocity=args.reciprocity,
-               endpoint_agreement=args.endpoint_agreement)
+               endpoint_agreement=args.endpoint_agreement, relative_winding=args.relative_winding)
     if args.out is not None:
         parent = os.path.dirname(os.path.abspath(args.out))
         if parent:

@@ -290,6 +290,49 @@ class NavmeshLinksTest(unittest.TestCase):
         self.assertEqual(result["incoming"]["no_exact_return"], 9)
         self.assertEqual(result["unlinked"], 20)
 
+    def test_relative_winding_cli(self):
+        a, b, above, below = (1, 2), (5, 2), (3, 4), (3, 0)
+        left = [a, b, above]
+        opened = (0xffffffff, 0xffff, 0, 0)
+
+        def pair(right, extent=128):
+            edges = [(42, 1, 0, 0), opened, opened, (42, 0, 0, 0)] + [opened] * (len(right) - 1)
+            points = left + right
+            blob = bytearray(build_tile(flags=1, sector=42, n_verts=len(points),
+                                        poly_sizes=(3, len(right)), edges=edges)[0])
+            struct.pack_into("<2f", blob, 0x60, extent, 128)
+            base = nd.split_array(blob, 0x70, 6, len(points))[0][0]
+            for j, (x, y) in enumerate(points):
+                struct.pack_into("<3H", blob, base + 6 * j, x, y, 10)
+            return blob
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "tiles.rpf")
+            make_rpf(path, [pair([a, b, below]), pair([a, b, above]),
+                            pair([b, a, below]), pair([b, a, above]),
+                            pair([a, b, (3, 2)]), pair([b, a, above], extent=0)])
+            baseline = nl.scan(path, endpoint_agreement=True)
+            proc = subprocess.run([sys.executable, "-I", TOOL, path, "--relative-winding"],
+                                  capture_output=True, check=True)
+        report = json.loads(proc.stdout)
+        winding = report["endpoint_agreement"].pop("relative_winding")
+        self.assertEqual(report, baseline)
+        self.assertEqual(winding, {c: {"opposite": 2, "same": 2, "ambiguous": 2}
+                                   for c in ("same_direction", "reversed")})
+
+    def test_projected_ring_geometry(self):
+        concave = [(0, 0), (4, 0), (2, 1), (4, 3), (0, 3)]
+        self.assertEqual(nl._xy_winding(concave), 1)
+        self.assertEqual(nl._xy_winding(concave[::-1]), -1)
+        self.assertEqual(nl._xy_winding([(0, 0), (2, 0), (4, 0), (0, 3)]), 1)
+        for ring in ([], [(0, 0), (1, 0)], [(0, 0), (1, 0), (2, 0)],
+                     [(0, 0), (4, 0), (2, 0), (0, 3)],          # collinear backtrack
+                     [(0, 0), (4, 3), (0, 2), (2, 0)],          # crossed with nonzero area
+                     [(0, 0), (4, 0), (4, 4), (2, 0), (0, 4)],  # touch
+                     [(0, 0), (3, 0), (2, 1), (3, 0), (0, 4)]):
+            with self.subTest(ring=ring):
+                self.assertEqual(nl._xy_winding(ring), 0)
+
     def test_valid_rpf_and_carved_dir(self):
         s1 = build_tile(flags=3)
         s2 = build_tile(flags=1, sector=(260 << 9) | 251, two_streams=True)
