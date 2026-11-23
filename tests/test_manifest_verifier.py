@@ -22,9 +22,10 @@ from unittest.mock import Mock, patch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "manifest_verifier.py")
 
-# Add root directory to sys.path so manifest_verifier can be imported directly
+# Resolve both imports explicitly so this test also runs against an unpatched checkout.
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import tools.manifest_verifier as mv
 import manifest
