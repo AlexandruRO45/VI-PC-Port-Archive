@@ -1099,11 +1099,20 @@ namespace {
 
 // Where a copy writes: a host path as given; a GAME: path is checked against the title's view (an existing name
 // counts even when only the package has it) and then means its overlay copy.
-bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& out, DWORD& error) {
+bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& out, DWORD& error,
+                       bool preflight_only = false) {
     std::vector<std::wstring> parts;
     const Parsed parsed = parse_console(to, parts);
     if (parsed == Parsed::Host) {
         out = std::filesystem::path(to);
+        // A writable console source must not be copied up when a host destination already refuses the copy.
+        if (preflight_only && fail_if_exists) {
+            const DWORD attributes = ::GetFileAttributesW(to);
+            if (attributes != INVALID_FILE_ATTRIBUTES) {
+                error = (attributes & FILE_ATTRIBUTE_DIRECTORY) ? ERROR_ACCESS_DENIED : ERROR_FILE_EXISTS;
+                return false;
+            }
+        }
         return true;
     }
     error = ERROR_INVALID_NAME;
@@ -1119,6 +1128,10 @@ bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& ou
     error = ERROR_PATH_NOT_FOUND;
     if (!is_folder(r, parent_of(parts))) return false;
     out = join(r.overlay, parts);
+    if (preflight_only) {
+        error = 0;
+        return true;
+    }
     std::error_code ec;
     std::filesystem::create_directories(out.parent_path(), ec);
     if (ec) {
@@ -1136,12 +1149,32 @@ bool copy_paths(LPCWSTR from, LPCWSTR to, DWORD flags, std::filesystem::path& so
         error = ERROR_INVALID_PARAMETER;
         return false;
     }
-    // A writable source handle can be passed to the progress callback. Copy up before opening it so callback
-    // writes, like other write opens, cannot reach the package file.
-    const Target t = (flags & COPY_FILE_OPEN_SOURCE_FOR_WRITE) ? write_target(from, true) : read_target(from);
+    Target t = read_target(from);
     if (t.error) {
         error = t.error;
         return false;
+    }
+    std::vector<std::wstring> parts;
+    if ((flags & COPY_FILE_OPEN_SOURCE_FOR_WRITE) && parse_console(from, parts) == Parsed::Console) {
+        // Native copies check source readability before rejecting an existing destination. Use read access only:
+        // missing paths, directories and sharing failures must win without ever opening the package for writing.
+        const HANDLE probe = ::CreateFileW(t.path.c_str(), GENERIC_READ,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (probe == INVALID_HANDLE_VALUE) {
+            error = GetLastError();
+            return false;
+        }
+        ::CloseHandle(probe);
+        // This pass does not create even an empty overlay parent. Only after both paths pass may the source be
+        // copied up for the callback's writable handle. The final destination pass and host call still validate
+        // the paths again; a later failure does not roll back a source copy that has already been published.
+        if (!copy_destination(to, (flags & COPY_FILE_FAIL_IF_EXISTS) != 0, destination, error, true)) return false;
+        t = write_target(from, true);
+        if (t.error) {
+            error = t.error;
+            return false;
+        }
     }
     source = t.path;
     return copy_destination(to, (flags & COPY_FILE_FAIL_IF_EXISTS) != 0, destination, error);

@@ -136,7 +136,11 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
 - `CopyFile`, `CopyFileEx` and `CopyFile2` read the source the way a read does and write a `GAME:` destination in the
   overlay; fail-if-exists counts a name only the package has. `COPY_FILE_OPEN_SOURCE_FOR_WRITE` instead copies a
   package source up to the overlay before opening it, so writes through the progress callback's source handle leave
-  the package unchanged. Either side can be a host path, and a host source keeps its native write behavior. `CopyFile2` checks its
+  the package unchanged. Before copying up, the shim checks the visible source with a read-only open, then validates
+  the destination without creating overlay folders. Missing, directory and unreadable sources keep their native
+  error precedence; a destination rejected by these checks leaves no source copy, including an existing host
+  destination with fail-if-exists. A later host-copy failure does not roll back a source already copied up.
+  Either side can be a host path, and a host source keeps its native write behavior. `CopyFile2` checks its
   parameter block before preparing the destination: one shorter than `COPYFILE2_EXTENDED_PARAMETERS` is
   `E_INVALIDARG` and writes nothing, as Windows answers. Where the host has no `CopyFile2` (Wine 9, whose loader binds
   the import to a stub that aborts the process), the shim copies with `CopyFileExW` instead: the flags both calls

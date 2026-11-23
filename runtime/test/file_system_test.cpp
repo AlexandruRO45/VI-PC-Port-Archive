@@ -880,6 +880,12 @@ void run_checks(const std::filesystem::path& root) {
         check(copy_ex_a != nullptr, "CopyFileExA resolves through kernelbase");
         const bool host_copy2 = ::GetProcAddress(::GetModuleHandleW(L"kernelbase.dll"), "CopyFile2") ||
                                 ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"), "CopyFile2");
+        const auto native_copy2 = [] {
+            for (const wchar_t* dll : {L"kernelbase.dll", L"kernel32.dll"})
+                if (const auto address = ::GetProcAddress(::GetModuleHandleW(dll), "CopyFile2"))
+                    return reinterpret_cast<CopyFile2Fn>(address);
+            return CopyFile2Fn{};
+        }();
         const std::string original(kCopySourceBytes, 'O'), changed(kCopySourceBytes, 'M'), existing(kCopySourceBytes, 'E');
         auto invoke = [&](int api, const std::wstring& from, const std::wstring& to, DWORD flags, CopySourceWrite& result) {
             if (api == 0) return copy_ex_w(from.c_str(), to.c_str(), copy_source_progress, &result, nullptr, flags) != FALSE;
@@ -938,6 +944,142 @@ void run_checks(const std::filesystem::path& root) {
                       read_path(package / "copy-source" / deleted_name) == original &&
                       !std::filesystem::exists(overlay / "copy-source" / deleted_name),
                   "writable-copy source does not resurrect a deleted package file");
+
+            // A destination rejected before copying must not publish a source overlay. Compare the real host
+            // calls first: a missing, directory, or unreadable source takes precedence over an existing target.
+            enum class Source { File, Missing, Directory, Locked, SharedWriter, ReadOnly, Overlay, Deleted, MissingParent };
+            enum class Destination { Package, Overlay, Host, MissingParent, Directory };
+            struct RejectedCopy { const char* name; Source source; Destination destination; };
+            const RejectedCopy cases[] = {
+                {"package destination", Source::File, Destination::Package},
+                {"overlay destination", Source::File, Destination::Overlay},
+                {"host destination", Source::File, Destination::Host},
+                {"missing source", Source::Missing, Destination::Package},
+                {"source directory", Source::Directory, Destination::Package},
+                {"exclusive source handle", Source::Locked, Destination::Package},
+                {"readable source writer", Source::SharedWriter, Destination::Package},
+                {"read-only source", Source::ReadOnly, Destination::Package},
+                {"existing source overlay", Source::Overlay, Destination::Package},
+                {"deleted source", Source::Deleted, Destination::Package},
+                {"missing source parent", Source::MissingParent, Destination::Package},
+                {"missing destination parent", Source::File, Destination::MissingParent},
+                {"destination directory", Source::File, Destination::Directory},
+            };
+            constexpr DWORD rejected_flags = COPY_FILE_OPEN_SOURCE_FOR_WRITE | COPY_FILE_FAIL_IF_EXISTS;
+            for (size_t i = 0; i < std::size(cases); ++i) {
+                const auto& test = cases[i];
+                // The ANSI shim receives ASCII console names; host paths may contain non-ASCII user names.
+                if (api == 1 && test.destination == Destination::Host) continue;
+                const std::wstring prefix = L"copy-preflight-" + std::to_wstring(api) + L"-" + std::to_wstring(i);
+                const auto native_dir = root / "native-copy-preflight" / prefix;
+                const auto package_dir = package / prefix, overlay_dir = overlay / prefix;
+                std::filesystem::create_directories(package_dir);
+                std::filesystem::create_directories(native_dir);
+                const std::filesystem::path source_name = test.source == Source::MissingParent
+                                                             ? L"missing\\source.txt" : L"source.txt";
+                const std::filesystem::path destination_name = test.destination == Destination::MissingParent
+                                                                  ? L"missing\\destination.txt" : L"destination.txt";
+                const auto package_source = package_dir / source_name, overlay_source = overlay_dir / source_name;
+                const auto native_source = native_dir / source_name, native_destination = native_dir / destination_name;
+                const auto package_destination = package_dir / destination_name;
+                const auto overlay_destination = overlay_dir / destination_name;
+                const std::wstring from = L"GAME:\\" + prefix + L"\\" + source_name.wstring();
+                const std::wstring to = test.destination == Destination::Host ? native_destination.wstring()
+                    : L"GAME:\\" + prefix + L"\\" + destination_name.wstring();
+                if (test.source == Source::Directory) {
+                    std::filesystem::create_directories(package_source);
+                    std::filesystem::create_directories(native_source);
+                } else if (test.source != Source::Missing && test.source != Source::MissingParent) {
+                    write_path(package_source, original);
+                    write_path(native_source, test.source == Source::Overlay ? existing : original);
+                    if (test.source == Source::Overlay) write_path(overlay_source, existing);
+                }
+                if (test.destination == Destination::Directory) {
+                    std::filesystem::create_directories(package_destination);
+                    std::filesystem::create_directories(native_destination);
+                } else if (test.destination != Destination::MissingParent) {
+                    write_path(native_destination, "destination");
+                    if (test.destination != Destination::Host) write_path(package_destination, "destination");
+                    if (test.destination == Destination::Overlay) write_path(overlay_destination, "destination");
+                }
+                if (test.source == Source::Deleted) {
+                    check(delete_w(from.c_str()) && ::DeleteFileW(native_source.c_str()),
+                          "prepare deleted source in both logical views");
+                }
+                if (test.source == Source::ReadOnly) {
+                    check(::SetFileAttributesW(package_source.c_str(), FILE_ATTRIBUTE_READONLY) &&
+                              ::SetFileAttributesW(native_source.c_str(), FILE_ATTRIBUTE_READONLY),
+                          "prepare read-only source in both views");
+                }
+                HANDLE package_hold = INVALID_HANDLE_VALUE, native_hold = INVALID_HANDLE_VALUE;
+                if (test.source == Source::Locked || test.source == Source::SharedWriter) {
+                    const DWORD access = test.source == Source::Locked ? GENERIC_READ : GENERIC_WRITE;
+                    const DWORD share = test.source == Source::Locked ? 0 : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+                    package_hold = ::CreateFileW(package_source.c_str(), access, share, nullptr, OPEN_EXISTING, 0, nullptr);
+                    native_hold = ::CreateFileW(native_source.c_str(), access, share, nullptr, OPEN_EXISTING, 0, nullptr);
+                    check(package_hold != INVALID_HANDLE_VALUE && native_hold != INVALID_HANDLE_VALUE,
+                          "hold the source while comparing copy failures");
+                }
+                DWORD native_error = 0, actual_error = 0;
+                if (api == 2 && native_copy2) {
+                    COPYFILE2_EXTENDED_PARAMETERS parameters{sizeof(parameters), rejected_flags, nullptr, nullptr, nullptr};
+                    const HRESULT hr = native_copy2(native_source.c_str(), native_destination.c_str(), &parameters);
+                    native_error = SUCCEEDED(hr) ? ERROR_SUCCESS : HRESULT_CODE(hr);
+                } else {
+                    // The native wide API supplies the error oracle for ANSI console names as well.
+                    native_error = ::CopyFileExW(native_source.c_str(), native_destination.c_str(), nullptr, nullptr,
+                                                  nullptr, rejected_flags) ? ERROR_SUCCESS : GetLastError();
+                }
+                CopySourceWrite rejected;
+                if (api == 2) {
+                    COPYFILE2_EXTENDED_PARAMETERS parameters{sizeof(parameters), rejected_flags, nullptr,
+                                                             copy_source_progress2, &rejected};
+                    const HRESULT hr = copy2(from.c_str(), to.c_str(), &parameters);
+                    actual_error = SUCCEEDED(hr) ? ERROR_SUCCESS : HRESULT_CODE(hr);
+                } else {
+                    actual_error = invoke(api, from, to, rejected_flags, rejected) ? ERROR_SUCCESS : GetLastError();
+                }
+                if (package_hold != INVALID_HANDLE_VALUE) ::CloseHandle(package_hold);
+                if (native_hold != INVALID_HANDLE_VALUE) ::CloseHandle(native_hold);
+                std::printf("rejected copy: API %d, %s, native error %lu, shim error %lu\n",
+                            api, test.name, native_error, actual_error);
+                check(native_error != ERROR_SUCCESS && actual_error == native_error,
+                      "failed writable copy preserves native source/destination error precedence");
+                check(!rejected.attempted && (test.source == Source::Overlay ? read_path(overlay_source) == existing
+                                                                           : !std::filesystem::exists(overlay_source)),
+                      "failed writable copy leaves its source overlay unchanged and starts no source write");
+                const bool package_intact = test.source == Source::Missing || test.source == Source::MissingParent
+                    ? !std::filesystem::exists(package_source)
+                    : test.source == Source::Directory ? std::filesystem::is_directory(package_source)
+                    : read_path(package_source) == original;
+                check(package_intact, "failed writable copy preserves the installed source");
+                const bool destination_intact = test.destination == Destination::Host
+                    ? read_path(native_destination) == "destination"
+                    : test.destination == Destination::MissingParent
+                        ? !std::filesystem::exists(overlay_destination.parent_path())
+                    : test.destination == Destination::Directory
+                        ? std::filesystem::is_directory(package_destination) && !std::filesystem::exists(overlay_destination)
+                        : read_path(package_destination) == "destination" &&
+                            (test.destination == Destination::Overlay ? read_path(overlay_destination) == "destination"
+                                                                     : !std::filesystem::exists(overlay_destination));
+                check(destination_intact, "failed writable copy leaves the destination view unchanged");
+                if (test.source == Source::ReadOnly) {
+                    ::SetFileAttributesW(package_source.c_str(), FILE_ATTRIBUTE_NORMAL);
+                    ::SetFileAttributesW(native_source.c_str(), FILE_ATTRIBUTE_NORMAL);
+                }
+                if (i == 0) {
+                    // After removing the conflict the same request must still perform the real callback write.
+                    check(delete_w(to.c_str()), "remove the destination conflict before retrying the writable copy");
+                    CopySourceWrite retry;
+                    check(invoke(api, from, to, rejected_flags, retry) &&
+                              retry.attempted == has_callback && retry.wrote == has_callback,
+                          "writable copy succeeds after its destination conflict is removed");
+                    check(read_path(package_source) == original &&
+                              read_path(overlay_source) == (has_callback ? changed : original) &&
+                              read_path(overlay_destination) == original,
+                          "successful retry writes its source overlay and preserves the package and copy contents");
+                }
+            }
         }
     }
 
