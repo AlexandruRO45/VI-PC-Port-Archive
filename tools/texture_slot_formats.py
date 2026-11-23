@@ -199,9 +199,9 @@ def census(export, only=None):
             for h in matched:
                 for ident, (fmt, rows) in by_hash[h].items():
                     textures.setdefault(ident, [fmt, 0])[1] += rows
-            if len(matched) > 1:          # two different stored hashes match: ambiguous, as in texture_dicts
-                part["ambiguous"] += 1
-            elif len(textures) == 1:
+            # as in texture_dicts: one metadata group (even reached through two hashes) is a candidate, uncertain when
+            # it holds several keyless rows; more than one group is ambiguous
+            if len(textures) == 1:
                 part["candidate"] += 1
                 (ident, (fmt, rows)), = textures.items()
                 part["uncertain"] += ident[0] != "key" and rows > 1

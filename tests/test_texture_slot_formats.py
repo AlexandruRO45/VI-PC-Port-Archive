@@ -319,14 +319,18 @@ class ReviewCases(unittest.TestCase):
                 d = tsf.census(exp)["parameters"][BUMP]
                 self.assertEqual((d["candidate"], d["candidate_uncertain"], d["ambiguous"]), (1, uncertain, 0), rows)
 
-    def test_two_matching_hashes_for_one_texture_are_ambiguous(self):
-        # whattheflop on #5067: two bindings of one Id64 and parameter with different stored hashes, each matching a
-        # keyless row of the same format and size, were merged into one candidate; texture_dicts calls it ambiguous
-        rows = [{"Hash": h, "Format": "BC1_UNORM", "Width": 4, "Height": 4, "Key": None} for h in ("11111111", "22222222")]
+    def test_two_matching_hashes_of_one_keyless_group_are_an_uncertain_candidate(self):
+        # whattheflop on #5067: two bindings of one Id64 and parameter, two stored hashes each matching a keyless
+        # row of the same format and size: one metadata group, so an uncertain candidate, as texture_dicts reports it
+        row = {"Format": "BC1_UNORM", "Width": 4, "Height": 4, "Key": None}
+        rows = [dict(row, Hash=h) for h in ("11111111", "22222222")]
+        refs = [(BUMP, "00000000000000B2", "11111111"), (BUMP, "00000000000000B2", "22222222")]
         with tempfile.TemporaryDirectory() as tmp:
-            exp = minimal(tmp, [model([(BUMP, "00000000000000B2", "11111111"), (BUMP, "00000000000000B2", "22222222")])],
-                          emb_hash_rows=rows)
-            d = tsf.census(exp)["parameters"][BUMP]
+            d = tsf.census(minimal(tmp, [model(refs)], emb_hash_rows=rows))["parameters"][BUMP]
+        self.assertEqual((d["candidate"], d["candidate_uncertain"], d["ambiguous"]), (1, 1, 0))
+        rows[1]["Width"] = 8                                 # two metadata groups: ambiguous
+        with tempfile.TemporaryDirectory() as tmp:
+            d = tsf.census(minimal(tmp, [model(refs)], emb_hash_rows=rows))["parameters"][BUMP]
         self.assertEqual((d["candidate"], d["ambiguous"], d["candidate_formats"]), (0, 1, {}))
 
 if __name__ == "__main__":
