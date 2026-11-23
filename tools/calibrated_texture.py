@@ -15,18 +15,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import bcpack
+import bcpack_native
 import bcpack_tables
 import ttpf_mips as ttpf
 
 
 @lru_cache(maxsize=1)
 def native():
-    name = {
-        "win32": "bcpack_calibration.dll",
-        "darwin": "libbcpack_calibration.dylib",
-    }.get(sys.platform, "libbcpack_calibration.so")
-    path = Path(__file__).with_name("bcpack_calibration") / "target/release" / name
-    lib = ctypes.CDLL(str(path))
+    lib = bcpack_native.library()
     lib.unpack.argtypes = [
         ctypes.c_char_p,
         ctypes.c_size_t,
@@ -76,6 +72,9 @@ def accumulate(distances, residuals):
 
 def bc1_blocks(s, params):
     seeds, selectors = params
+    native_blocks = bcpack_native.rebuild_calibrated_bc1(s, seeds, selectors)
+    if native_blocks is not None:
+        return native_blocks
     ep = unzig(s[:, 2:8].astype("int32"))
     roots = accumulate(unzig(s[:, 0].astype("int32")) % 256, ep)
     external = roots != -512

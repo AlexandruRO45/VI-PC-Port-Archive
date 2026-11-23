@@ -16,6 +16,7 @@ provisional entries and inspect which ones were used.
 
 See `docs/textures.md` for the bitstream specification and provenance.
 """
+from functools import lru_cache
 import os
 import struct
 import sys
@@ -23,6 +24,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bcpack_tables as _tables  # noqa: E402
 import bcpack_tables_bptc as _bptc  # noqa: E402
+import bcpack_native as _native  # noqa: E402
 
 # rANS and lane-array constants
 RANS_L = 1 << 24
@@ -318,6 +320,10 @@ def decode_lanes(raw, codec, out_size):
             f"decoded size {out_size} is not a whole number of {CODEC_NAMES[codec]} blocks"
         )
     nsym = out_size // ELEMENT_BYTES
+    native = _native.unpack_lanes(raw, LANE_WIDTHS[codec], nsym) if isinstance(raw, bytes) else None
+    if native is not None:
+        lanes, used = native
+        return [list(lane) for lane in lanes], used
     data = memoryview(raw)
     lanes, used = _decode_lanes_raw(data, LANE_WIDTHS[codec], nsym)
     if any(data[used:]):
@@ -1323,6 +1329,15 @@ _REBUILDERS = {
 }
 
 
+@lru_cache(maxsize=1)
+def _mode6_signature():
+    table = _bptc.load_bc7()
+    rank = table["config"].index((6, 0, 0, 0))
+    if rank not in table["inferred"] and rank in table["rank_of"]:
+        return divmod(table["rank_of"].index(rank), 16)
+    return None
+
+
 def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=None):
     """Decode one BCPack chunk, returning `(decoded_bytes, provisional_labels)`.
 
@@ -1336,6 +1351,14 @@ def decode_with_info(raw, codec, out_size, *, allow_provisional=False, history=N
     if rebuilder is None:
         name = CODEC_NAMES.get(codec, str(codec))
         raise BcpackUnsupportedCodec(f"BCPack block rebuilder for codec {codec} ({name}) is not implemented yet")
+    if history is None and not allow_provisional and isinstance(raw, bytes):
+        data = None
+        if codec == 1:
+            data = _native.decode_strict_bc1(raw, out_size)
+        elif codec == 7 and (signature := _mode6_signature()) is not None:
+            data = _native.decode_strict_mode6(raw, out_size, signature)
+        if data is not None:
+            return data, set()
     lanes, _ = decode_lanes(raw, codec, out_size)
     nblocks = out_size // BLOCK_BYTES[codec]
     prov = set() if allow_provisional else None

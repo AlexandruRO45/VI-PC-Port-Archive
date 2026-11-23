@@ -2,6 +2,10 @@
 // of bits established by an archive observation or an earlier decoded block.
 use std::slice;
 
+mod bc1;
+mod bc7;
+mod entropy;
+
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 struct Cell {
