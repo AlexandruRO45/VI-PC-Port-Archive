@@ -6740,15 +6740,15 @@ int main() {
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
             list->CopyBufferRegion(readback.p, 0, fresh.p, 0, bytes);
             list->CopyBufferRegion(not_zeroed.p, 0, upload.p, 0, bytes);  // written before it is read
-            auto readable = transition(not_zeroed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            list->ResourceBarrier(1, &readable);
+            auto readable_buffer = transition(not_zeroed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &readable_buffer);
             list->CopyBufferRegion(readback.p, bytes, not_zeroed.p, 0, bytes);
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
             EXPECT(submit_and_wait());
-            const std::uint8_t zero[4] = {}, written[4] = {0xab, 0xab, 0xab, 0xab};
-            for (UINT64 i = 0; i < bytes; i += 4) report("zero-filled buffer byte", UINT(i), down + i, zero, 4);
+            const std::uint8_t zero_bytes[4] = {}, written[4] = {0xab, 0xab, 0xab, 0xab};
+            for (UINT64 i = 0; i < bytes; i += 4) report("zero-filled buffer byte", UINT(i), down + i, zero_bytes, 4);
             for (UINT64 i = 0; i < bytes; i += 4)
                 report("NOT_ZEROED buffer byte after a copy", UINT(i), down + bytes + i, written, 4);
         }
