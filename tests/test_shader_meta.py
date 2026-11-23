@@ -167,6 +167,22 @@ class DxbcMetaTests(unittest.TestCase):
                 self.assertNotIn("input_signature", meta)
                 self.assertTrue(meta["sfi0_resource_heap_directly_indexed"])
 
+    def test_dxbc_metadata_stays_inside_the_declared_container(self):
+        flag = M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING
+        dxbc = make_dxbc([sfi0_chunk(flag), isg1_chunk([("POSITION", 0, 0, 7, 7, 0, 3)])])
+        first, second = struct.unpack_from("<II", dxbc, 32)
+        expected = {
+            "sfi0_resource_heap_directly_indexed": True,
+            "sfi0_sampler_heap_directly_indexed": False,
+        }
+        for size, want in ((first - 1, {}), (second - 1, {}), (second, expected),
+                           (len(dxbc) - 1, expected), (len(dxbc) + 1, {})):
+            with self.subTest(size=size):
+                buffer = bytearray(dxbc)
+                struct.pack_into("<I", buffer, 24, size)
+                self.assertEqual(M.read_dxbc_meta(bytes(buffer)), want)
+        self.assertEqual(M.read_dxbc_meta(dxbc + bytes(16)), M.read_dxbc_meta(dxbc))
+
     def test_sfi0_both_heaps_and_empty_dxbc(self):
         dxbc = make_dxbc([sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING | M.SFI0_SAMPLER_DESCRIPTOR_HEAP_INDEXING)])
         got = M.read_dxbc_meta(dxbc)
