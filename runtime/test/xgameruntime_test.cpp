@@ -539,10 +539,75 @@ void check_run_time_load() {
         XTaskQueueCloseHandle(manual);
         uint16_t port = 7;
         using QueryPort = HRESULT(STDMETHODCALLTYPE*)(void*, uint16_t*);
-        using NotImpl = HRESULT(STDMETHODCALLTYPE*)(void*);
-        check(reinterpret_cast<QueryPort>(slot(n, 3))(n, &port) == no_network && port == 0 &&
-                  reinterpret_cast<NotImpl>(slot(n, 20))(n) == E_NOTIMPL,
-              "slot 3 (preferred UDP port) has no answer offline; slot 20 (IXNetworkingImpl2) is E_NOTIMPL");
+        check(reinterpret_cast<QueryPort>(slot(n, 3))(n, &port) == no_network && port == 0,
+              "slot 3 (preferred UDP port) has no answer offline");
+
+        // Slots 18-20 (IXNetworkingImpl2): configuration settings (0..2) and TCP receive-buffer statistics (0..2).
+        using QueryConfig = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint64_t*);
+        using SetConfig = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint64_t);
+        using QueryStats = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, void*);
+        const auto query_config = reinterpret_cast<QueryConfig>(slot(n, 18));
+        const auto set_config = reinterpret_cast<SetConfig>(slot(n, 19));
+        const auto query_stats = reinterpret_cast<QueryStats>(slot(n, 20));
+
+        uint64_t title_max = 1, system_max = 1, tools_max = 1;
+        check(query_config(n, 0, &title_max) == S_OK && title_max == 32ull * 1024 * 1024 &&
+                  query_config(n, 1, &system_max) == S_OK && system_max == 4ull * 1024 * 1024 &&
+                  query_config(n, 2, &tools_max) == S_OK && tools_max == 0,
+              "slot 18 (XNetworkingQueryConfigurationSetting): Xbox defaults for title, system and tools");
+
+        uint64_t q0 = 0, q1 = 0, q2 = 0, q0_zero = 99;
+        check(set_config(n, 0, 16ull * 1024 * 1024) == S_OK &&
+                  set_config(n, 1, 8ull * 1024 * 1024) == S_OK &&
+                  set_config(n, 2, 1ull * 1024 * 1024) == S_OK &&
+                  query_config(n, 0, &q0) == S_OK && q0 == 16ull * 1024 * 1024 &&
+                  query_config(n, 1, &q1) == S_OK && q1 == 8ull * 1024 * 1024 &&
+                  query_config(n, 2, &q2) == S_OK && q2 == 1ull * 1024 * 1024 &&
+                  set_config(n, 0, 0) == S_OK && query_config(n, 0, &q0_zero) == S_OK && q0_zero == 0,
+              "slots 18/19 round-trip all three configuration settings independently, including zero");
+        set_config(n, 0, title_max);
+        set_config(n, 1, system_max);
+        set_config(n, 2, tools_max);
+
+        uint64_t sentinel_val = 0xDEADBEEFCAFEBABEull;
+        check(query_config(n, 0, nullptr) == E_POINTER &&
+                  query_config(n, 3, nullptr) == E_POINTER &&
+                  query_config(n, 3, &sentinel_val) == E_INVALIDARG &&
+                  query_config(n, 0xFFFFFFFFu, &sentinel_val) == E_INVALIDARG &&
+                  sentinel_val == 0xDEADBEEFCAFEBABEull &&
+                  set_config(n, 3, 4096) == E_INVALIDARG &&
+                  set_config(n, 0xFFFFFFFFu, 4096) == E_INVALIDARG,
+              "slots 18/19 reject null output pointers with E_POINTER and unknown settings with E_INVALIDARG");
+
+        struct GuardedStats {
+            uint8_t before[8];
+            uint64_t counters[5];  // XNetworkingTcpQueuedReceivedBufferUsageStatistics (40 bytes)
+            uint8_t after[8];
+        };
+        static_assert(sizeof(GuardedStats::counters) == 40, "XNetworkingStatisticsBuffer is 40 bytes");
+        bool stats_ok = true;
+        for (uint32_t stats_type : {0u, 1u, 2u}) {
+            GuardedStats gs{};
+            std::memset(&gs, 0xA5, sizeof(gs));
+            const HRESULT hr = query_stats(n, stats_type, gs.counters);
+            stats_ok = stats_ok && hr == S_OK;
+            for (uint64_t c : gs.counters) stats_ok = stats_ok && c == 0;
+            for (uint8_t b : gs.before) stats_ok = stats_ok && b == 0xA5;
+            for (uint8_t b : gs.after) stats_ok = stats_ok && b == 0xA5;
+        }
+        check(stats_ok,
+              "slot 20 (XNetworkingQueryStatistics): zeroes all five counters for types 0..2 without overrunning 40 bytes");
+
+        GuardedStats invalid_gs{};
+        std::memset(&invalid_gs, 0xA5, sizeof(invalid_gs));
+        const HRESULT bad_null = query_stats(n, 0, nullptr);
+        const HRESULT bad_type_3 = query_stats(n, 3, invalid_gs.counters);
+        const HRESULT bad_type_max = query_stats(n, 0xFFFFFFFFu, invalid_gs.counters);
+        bool invalid_untouched = true;
+        for (size_t i = 0; i < sizeof(invalid_gs); ++i)
+            invalid_untouched = invalid_untouched && reinterpret_cast<const uint8_t*>(&invalid_gs)[i] == 0xA5;
+        check(bad_null == E_POINTER && bad_type_3 == E_INVALIDARG && bad_type_max == E_INVALIDARG && invalid_untouched,
+              "slot 20 rejects null buffer (E_POINTER) and unknown statistics types (E_INVALIDARG) without touching buffer");
         release(n);
     }
 

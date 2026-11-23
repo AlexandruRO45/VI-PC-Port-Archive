@@ -272,7 +272,8 @@ const void* const kErrorVtable[] = {
 // Offline there is no network: the hint says so (initialized, no connectivity), every query that would need the
 // network fails with kNoNetwork (asynchronously, through XAsync, for the *Async calls), a change registration sends
 // the initial notification Microsoft documents (on the queue's completion port) and none after, since nothing
-// changes, and the IXNetworkingImpl2 additions are E_NOTIMPL.
+// changes, and the IXNetworkingImpl2 additions store the three TCP receive-buffer limits atomically (Xbox defaults:
+// 32 MiB title, 4 MiB system, 0 tools) and report zeroed TCP receive-buffer statistics offline.
 
 constexpr GUID kNetworkingClass = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
 constexpr GUID kNetworking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
@@ -420,7 +421,48 @@ bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken token, 
     if (wait) g_net_cv.wait(lock, [&] { return !g_net_registrations.contains(token.token); });
     return wait;
 }
-HRESULT STDMETHODCALLTYPE net_not_implemented(void*) { return E_NOTIMPL; }
+// IXNetworkingImpl2 (slots 18-20): XNetworkingConfigurationSetting (0 = MaxTitleTcpQueuedReceiveBufferSize,
+// 1 = MaxSystemTcpQueuedReceiveBufferSize, 2 = MaxToolsTcpQueuedReceiveBufferSize) and XNetworkingStatisticsType
+// (0 = TitleTcpQueuedReceivedBufferUsage, 1 = SystemTcpQueuedReceivedBufferUsage,
+// 2 = ToolsTcpQueuedReceivedBufferUsage). Defaults follow Microsoft's public XNetworking documentation for Xbox
+// consoles (32 MiB title, 4 MiB system, 0 tools); offline no TCP payload is queued so every statistic is zero.
+constexpr uint32_t kNetConfigSettingCount = 3;
+constexpr uint32_t kNetStatisticsTypeCount = 3;
+std::atomic<uint64_t> g_net_config_settings[kNetConfigSettingCount] = {
+    {32ull * 1024 * 1024},  // MaxTitleTcpQueuedReceiveBufferSize (32 MiB Xbox default)
+    {4ull * 1024 * 1024},   // MaxSystemTcpQueuedReceiveBufferSize (4 MiB Xbox default)
+    {0},                    // MaxToolsTcpQueuedReceiveBufferSize
+};
+
+// XNetworkingTcpQueuedReceivedBufferUsageStatistics / XNetworkingStatisticsBuffer: five UINT64 counters.
+struct TcpQueuedReceivedBufferUsageStatistics {
+    uint64_t num_bytes_currently_queued;
+    uint64_t peak_num_bytes_ever_queued;
+    uint64_t total_num_bytes_queued;
+    uint64_t num_bytes_dropped_for_exceeding_configured_max;
+    uint64_t num_bytes_dropped_due_to_any_failure;
+};
+static_assert(sizeof(TcpQueuedReceivedBufferUsageStatistics) == 40,
+              "XNetworkingTcpQueuedReceivedBufferUsageStatistics is five UINT64");
+
+HRESULT STDMETHODCALLTYPE net_query_configuration_setting(void*, uint32_t setting, uint64_t* value) {
+    if (!value) return E_POINTER;
+    if (setting >= kNetConfigSettingCount) return E_INVALIDARG;
+    *value = g_net_config_settings[setting].load(std::memory_order_relaxed);
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE net_set_configuration_setting(void*, uint32_t setting, uint64_t value) {
+    if (setting >= kNetConfigSettingCount) return E_INVALIDARG;
+    g_net_config_settings[setting].store(value, std::memory_order_relaxed);
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE net_query_statistics(void*, uint32_t statistics_type,
+                                               TcpQueuedReceivedBufferUsageStatistics* statistics_buffer) {
+    if (!statistics_buffer) return E_POINTER;
+    if (statistics_type >= kNetStatisticsTypeCount) return E_INVALIDARG;
+    *statistics_buffer = {};
+    return S_OK;
+}
 
 #define NM(fn) reinterpret_cast<const void*>(&fn)
 const void* const kNetworkingVtable[] = {
@@ -440,9 +482,9 @@ const void* const kNetworkingVtable[] = {
     NM(net_connectivity_hint),     // 15 XNetworkingGetConnectivityHint (XCurl)
     NM(net_register<HintChangedCallback>),  // 16 XNetworkingRegisterConnectivityHintChanged (XCurl)
     NM(net_unregister),            // 17 XNetworkingUnregisterConnectivityHintChanged (XCurl)
-    NM(net_not_implemented),       // 18 XNetworkingQueryConfigurationSetting (IXNetworkingImpl2)
-    NM(net_not_implemented),       // 19 XNetworkingSetConfigurationSetting
-    NM(net_not_implemented),       // 20 XNetworkingQueryStatistics
+    NM(net_query_configuration_setting),  // 18 XNetworkingQueryConfigurationSetting (IXNetworkingImpl2)
+    NM(net_set_configuration_setting),    // 19 XNetworkingSetConfigurationSetting
+    NM(net_query_statistics),             // 20 XNetworkingQueryStatistics
 };
 #undef NM
 static_assert(std::size(kNetworkingVtable) == 21, "IUnknown + IXNetworkingImpl's 15 + IXNetworkingImpl2's 3");
