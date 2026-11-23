@@ -78,6 +78,10 @@ int main(int argc, char** argv) {
         list8.p->SetProtectedResourceSession(nullptr);
         list8.p->SetProtectedResourceSession(nullptr);
         EXPECT(list8.p->Close() == S_OK);
+        // Post-close OMSetFrontAndBackStencilRef is a no-op and does not mutate state.
+        list8.p->OMSetFrontAndBackStencilRef(5, 6);
+        EXPECT(front_back_stencil_ref(list8.p, front, back));
+        EXPECT(front == 3 && back == 4);
         EXPECT(list8.p->Close() == E_FAIL);
         EXPECT(SUCCEEDED(list7.p->Reset(allocator.p, nullptr)));
         EXPECT(front_back_stencil_ref(list8.p, front, back));

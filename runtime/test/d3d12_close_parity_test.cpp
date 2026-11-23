@@ -48,9 +48,10 @@ struct Env {
     Ref<ID3D12QueryHeap> occlusion;
     Ref<ID3D12CommandAllocator> closed_bundle_allocator;
     Ref<ID3D12GraphicsCommandList> closed_bundle;
-    // The list being recorded, and the same list as ID3D12GraphicsCommandList2 (null when not given).
+    // The list being recorded, and the same list as GCL2/GCL8 (null when not given).
     ID3D12GraphicsCommandList* list = nullptr;
     ID3D12GraphicsCommandList2* list2 = nullptr;
+    ID3D12GraphicsCommandList8* list8 = nullptr;
 
     bool init(ID3D12Device* d) {
         device = d;
@@ -337,6 +338,12 @@ std::vector<Case> cases() {
         {"OMSetBlendFactor", true, match,
          CALLS(const FLOAT factor[4] = {0.25f, 0.5f, 0.75f, 1.0f}; e.list->OMSetBlendFactor(factor))},
         {"OMSetStencilRef(7)", true, match, CALLS(e.list->OMSetStencilRef(7))},
+        {"OMSetFrontAndBackStencilRef(1, 2)", true, match,
+         [](Env& e) {
+             if (!e.list8) return false;
+             e.list8->OMSetFrontAndBackStencilRef(1, 2);
+             return true;
+         }},
         {"ExecuteBundle after post-close state calls on bundle", true, match,
          CALLS(const FLOAT factor[4] = {0.25f, 0.5f, 0.75f, 1.0f};
                e.closed_bundle->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -432,17 +439,60 @@ bool run_case(Env& env, const Case& c, HRESULT& close) {
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
     Ref<ID3D12GraphicsCommandList2> list2;
+    Ref<ID3D12GraphicsCommandList8> list8;
     CHECK(SUCCEEDED(env.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
     CHECK(SUCCEEDED(env.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                   IID_PPV_ARGS(&list.p))));
     if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list2.p)))) list2.p = nullptr;
+    if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list8.p)))) list8.p = nullptr;
     env.list = list.p;
     env.list2 = list2.p;
+    env.list8 = list8.p;
     const bool recorded = c.record(env);
     close = recorded ? list->Close() : not_run;
     if (!recorded) list->Close();
     env.list = nullptr;
     env.list2 = nullptr;
+    env.list8 = nullptr;
+    return true;
+}
+
+// Calling OMSetFrontAndBackStencilRef on an already-closed direct list is a no-op: ExecuteCommandLists still
+// succeeds, a second Close returns E_FAIL, and Reset + Close succeeds.
+bool check_post_close_front_back_stencil_ref(ID3D12Device* device, bool is_layer) {
+    D3D12_COMMAND_QUEUE_DESC qdesc{};
+    qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12GraphicsCommandList8> list8;
+    Ref<ID3D12Fence> fence;
+    CHECK(SUCCEEDED(device->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&queue.p))));
+    CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                              IID_PPV_ARGS(&list.p))));
+    if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list8.p)))) {
+        CHECK(!is_layer);
+        list->Close();
+        return true;
+    }
+    CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    CHECK(list8->Close() == S_OK);
+    list8->OMSetFrontAndBackStencilRef(1, 2);
+    CHECK(list8->Close() == E_FAIL);
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    if (is_layer) CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
+    const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    CHECK(event != nullptr);
+    const HRESULT wait_hr = fence->SetEventOnCompletion(1, event);
+    const DWORD wait_rc = SUCCEEDED(wait_hr) ? WaitForSingleObject(event, 5000) : WAIT_FAILED;
+    CloseHandle(event);
+    CHECK(SUCCEEDED(wait_hr) && wait_rc == WAIT_OBJECT_0 && fence->GetCompletedValue() == 1);
+    CHECK(SUCCEEDED(allocator->Reset()));
+    CHECK(SUCCEEDED(list8->Reset(allocator.p, nullptr)));
+    CHECK(list8->Close() == S_OK);
     return true;
 }
 
@@ -482,6 +532,7 @@ int main() {
         Env env;
         REQUIRE(env.init(ours.p));
         for (std::size_t i = 0; i < table.size(); ++i) REQUIRE(run_case(env, table[i], layer[i]));
+        REQUIRE(check_post_close_front_back_stencil_ref(ours.p, true));
     }
 
     bool warp_ran = false;
@@ -495,6 +546,7 @@ int main() {
             Env env;
             REQUIRE(env.init(host.p));
             for (std::size_t i = 0; i < table.size(); ++i) REQUIRE(run_case(env, table[i], warp[i]));
+            REQUIRE(check_post_close_front_back_stencil_ref(host.p, false));
             // Nothing is executed, so nothing should remove the device; if something did, its answers are suspect.
             REQUIRE(host->GetDeviceRemovedReason() == S_OK);
             warp_ran = true;

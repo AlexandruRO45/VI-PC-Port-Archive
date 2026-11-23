@@ -352,6 +352,7 @@ int main(int argc, char** argv) {
         EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 5 && back == 5);
         const FLOAT post_close_factor[4] = {0.1f, 0.2f, 0.3f, 0.4f};
         list->OMSetStencilRef(99);
+        list8->OMSetFrontAndBackStencilRef(11, 22);
         list->OMSetBlendFactor(post_close_factor);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->IASetIndexBuffer(nullptr);
@@ -360,6 +361,16 @@ int main(int argc, char** argv) {
         list->ExecuteBundle(bundle.p);
         EXPECT(rt::d3d12::front_back_stencil_ref(list8.p, front, back) && front == 5 && back == 5);
         EXPECT(list->Close() == E_FAIL);
+        // Post-close calls (including GCL8 OMSetFrontAndBackStencilRef) must not poison the list for execution.
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == ReplayResult::success);
+        EXPECT(SUCCEEDED(queue->Signal(done.p, 2)));
+        const HANDLE post_close_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(post_close_event);
+        EXPECT(SUCCEEDED(done->SetEventOnCompletion(2, post_close_event)));
+        EXPECT(WaitForSingleObject(post_close_event, 5000) == WAIT_OBJECT_0);
+        CloseHandle(post_close_event);
+        EXPECT(done->GetCompletedValue() == 2);
 
         // Post-close state calls on a closed bundle do not append calls or invalidate the bundle.
         bundle->OMSetStencilRef(99);

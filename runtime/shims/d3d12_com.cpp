@@ -790,7 +790,7 @@ public:
     // GCL8. Each draw applies the two faces with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT / BACK_BIT).
     void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT front, UINT back) override {
         d3d12_trace::record("ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef");
-        if (list_.closed()) return check(false);
+        if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) {
                 l.front_stencil_ref_ = front;
                 l.back_stencil_ref_ = back;
