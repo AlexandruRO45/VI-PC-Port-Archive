@@ -47,6 +47,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -1387,20 +1388,29 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
         }
     }
     if (!zero_buf && vk.copy_scratch && vk.fill_buffer) {
-        // Round up to a multiple of fmt.bytes (8 or 16, always a multiple of 4 for vkCmdFillBuffer).
-        const VkDeviceSize fill_bytes = ((needed + fmt.bytes - 1) / fmt.bytes) * fmt.bytes;
+        // vkCmdFillBuffer requires dstOffset and size to be multiples of 4 (VUID-vkCmdFillBuffer-dstOffset-00024,
+        // VUID-vkCmdFillBuffer-size-00026); vkCmdCopyBufferToImage requires bufferOffset to be a multiple of
+        // fmt.bytes. Align to lcm(fmt.bytes, 4) so 1- and 2-byte copy-queue formats stay 4-byte aligned too.
+        const VkDeviceSize align = std::lcm<VkDeviceSize>(fmt.bytes, 4);
+        const VkDeviceSize rounded = ((needed + align - 1) / align) * align;
         VkBuffer scratch = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
-        if (vk.copy_scratch(fill_bytes, scratch, offset)) {
-            const VkDeviceSize align = fmt.bytes;
+        VkDeviceSize alloc_bytes = rounded + (align - 1);
+        bool got = vk.copy_scratch(alloc_bytes, scratch, offset);
+        if (!got && align > 1) {
+            alloc_bytes = rounded;
+            got = vk.copy_scratch(alloc_bytes, scratch, offset);
+        }
+        if (got) {
             const VkDeviceSize pad = (align - (offset % align)) % align;
-            if (fill_bytes >= pad + fmt.bytes) {
-                vk.fill_buffer(command_buffer, scratch, offset + pad, fill_bytes - pad, 0);
+            const VkDeviceSize usable = alloc_bytes > pad ? ((alloc_bytes - pad) / align) * align : 0;
+            if (usable >= fmt.bytes) {
+                vk.fill_buffer(command_buffer, scratch, offset + pad, usable, 0);
                 memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
                 zero_buf = scratch;
                 zero_off = offset + pad;
-                zero_cap = fill_bytes - pad;
+                zero_cap = usable;
             }
         }
     }
@@ -2496,11 +2506,15 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
             return false;
         pieces.clear();
         if (!tracker.pieces(id, range, pieces)) return false;
-        for (const auto& piece : pieces)
-            if (piece.layout == VK_IMAGE_LAYOUT_UNDEFINED &&
-                ((piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) ? !vk.clear_color_image
-                                                                      : !vk.clear_depth_stencil_image))
-                return true;
+        for (const auto& piece : pieces) {
+            if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
+            const bool color = (piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+            // Mirror detail::initialize: when the queue cannot clear this aspect, color images zero through
+            // zero_compressed_image() and depth/stencil images only transition, so neither calls vkCmdClear*Image.
+            const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
+            if (!can_clear) continue;
+            if (color ? !vk.clear_color_image : !vk.clear_depth_stencil_image) return true;
+        }
         return false;
     };
     const auto commands = prepared.list->commands();
@@ -2508,6 +2522,19 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
         if (p.skip) continue;
+        if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
+            if ((texture->flags & texture_barrier_discard) || texture->layout_before == d3d12_layout::undefined)
+                continue;
+            if (missing(texture->resource, p.binding, p.range)) return true;
+            continue;
+        }
+        if (std::holds_alternative<Draw>(command)) {
+            const detail::PreparedDraw& d = prepared.draws[p.draw];
+            for (const auto& a : d.colors)
+                if (missing(a.id, a.binding, a.range)) return true;
+            if (missing(d.depth.id, d.depth.binding, d.depth.range)) return true;
+            continue;
+        }
         if (const auto [dst, src] = copy_ids(command); dst || src) {
             if (missing(dst, p.binding, p.range) || missing(src, p.source, p.source_range)) return true;
             continue;

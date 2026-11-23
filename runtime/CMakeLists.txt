@@ -2971,6 +2971,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_clear_gate_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_clear_gate COMMAND replay_clear_gate_test)
+    # Draw attachment clear-gate checks, copy-queue/discard TextureBarrier routing, and vkCmdFillBuffer 4-byte alignment (no GPU).
+    add_executable(replay_zero_init_test test/replay_zero_init_test.cpp)
+    target_link_libraries(replay_zero_init_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_zero_init_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_zero_init COMMAND replay_zero_init_test)
     # WriteBufferImmediate suspends conditional rendering around vkCmdUpdateBuffer so Intel drivers do not drop it.
     add_executable(replay_write_immediate_predication_test test/replay_write_immediate_predication_test.cpp)
     target_link_libraries(replay_write_immediate_predication_test PRIVATE Vulkan::Headers)
