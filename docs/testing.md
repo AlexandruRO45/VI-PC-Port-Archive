@@ -370,6 +370,8 @@ LEONIDA_BARY_FALLBACK=1 python -I scripts/run_gpu_tests.py --build runtime/build
     --llvm-mc /usr/lib/llvm-19/bin/llvm-mc
 ```
 
+`LEONIDA_LOOP_BUDGET=N` makes `run_gpu_tests.py` translate every fixture with `--loop-budget N` (see "Loop budget" in `design.md`), to check that a budget leaves the results of correct shaders alone; the fixture `cs_loop_budget`, a loop with no exit, is always translated with a budget of 65,536 and is the only one that needs it.
+
 With Mesa 25.2 (llvmpipe, LLVM 20) the first run passes 52 of 88 and skips 36, the second passes 37 of 39 and
 skips 2. The skips are expected: llvmpipe has 8-wide subgroups (so every wave64 test skips without emulation, and
 the 32-lane tests `ps_bitmask_perm`, `cs_wqm_w32` and `cs_w32_lane_wrap` skip in both runs), no

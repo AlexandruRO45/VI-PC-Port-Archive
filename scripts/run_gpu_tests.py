@@ -742,6 +742,52 @@ def _w64_graphics_only() -> frozenset:
 W64_GRAPHICS_ONLY = _w64_graphics_only()
 
 
+# Fixtures translated with --loop-budget N: each runs a loop that never exits, and must still finish (docs/design.md,
+# "Control flow"). Without the flag the driver would hang or reset the GPU, so they are never translated without it.
+LOOP_BUDGET_FIXTURES = {"cs_loop_budget": 65536}
+
+
+def translate_group(work: str, disasm_files: list[str], extra: list[str], out_dir: str) -> tuple[int, str]:
+    """Run rdna2spirv.py on these .s files with the flags this run asks for, plus `extra`. The translator looks for
+    metadata one level above the input directory, so the input folder is made under `work`."""
+    with tempfile.TemporaryDirectory(prefix="disasm-", dir=work) as selected_disasm:
+        for path in disasm_files:
+            shutil.copyfile(path, os.path.join(selected_disasm, os.path.basename(path)))
+        cmd = [sys.executable, "-I", TRANSLATOR, selected_disasm, "--out", out_dir]
+        if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
+            cmd.append("--wave64-emulate")
+        if bary_fallback():   # raw barycentrics from an interpolated input, fed by a pass-through GS
+            cmd.append("--bary-fallback")
+        if f16_interp_fallback():   # *_f16 interps from decoded-half inputs, no PerVertexKHR (MoltenVK)
+            cmd.append("--f16-interp-fallback")
+        if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
+            cmd.append("--texel-offset-fallback")
+        if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
+            cmd.append("--mesh-compute")
+        if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
+            cmd.append("--pc-tail-ubo")
+        if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
+            cmd += ["--fma", os.environ["LEONIDA_FMA"]]
+        budget = (os.environ.get("LEONIDA_LOOP_BUDGET") or "").strip()
+        if budget and "--loop-budget" not in extra:   # every shader with a budget: results must not change
+            cmd += ["--loop-budget", budget]
+        return run_cmd(cmd + extra, gpu=False)
+
+
+def merge_translation(own_dir: str, spirv_dir: str, name: str) -> None:
+    """Copy `name`.spv from a separate translator pass into spirv_dir and add its index.json entry there."""
+    shutil.copyfile(os.path.join(own_dir, f"{name}.spv"), os.path.join(spirv_dir, f"{name}.spv"))
+    entries = {}
+    for folder in (spirv_dir, own_dir):
+        path = os.path.join(folder, "index.json")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as source:
+                data = json.load(source)
+            entries.update(data if folder == spirv_dir else {name: data[name]})
+    with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as target:
+        json.dump(entries, target, indent=1)
+
+
 def run_suite(a, work: str) -> int:
     asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
     # The wave64 pixel fixtures of runtime/test/shaders/w64_graphics.py (tiers A-C, #1541) are checked by that
@@ -800,26 +846,19 @@ def run_suite(a, work: str) -> int:
         # A failed translation must not run an old binary left in a reused --work directory.
         Path(spirv_dir, f"{name}.spv").unlink(missing_ok=True)
 
-    # 2. Translate this run's inputs only. The translator looks for metadata one level above the input directory.
-    with tempfile.TemporaryDirectory(prefix="disasm-", dir=work) as selected_disasm:
-        for path in disasm_files:
-            shutil.copyfile(path, os.path.join(selected_disasm, os.path.basename(path)))
-        cmd = [sys.executable, "-I", TRANSLATOR, selected_disasm, "--out", spirv_dir]
-        if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
-            cmd.append("--wave64-emulate")
-        if bary_fallback():   # raw barycentrics from an interpolated input, fed by a pass-through GS
-            cmd.append("--bary-fallback")
-        if f16_interp_fallback():   # *_f16 interps from decoded-half inputs, no PerVertexKHR (MoltenVK)
-            cmd.append("--f16-interp-fallback")
-        if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
-            cmd.append("--texel-offset-fallback")
-        if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
-            cmd.append("--mesh-compute")
-        if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
-            cmd.append("--pc-tail-ubo")
-        if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
-            cmd += ["--fma", os.environ["LEONIDA_FMA"]]
-        rc, out = run_cmd(cmd, gpu=False)
+    # 2. Translate this run's inputs only. A fixture that needs a translator flag of its own (LOOP_BUDGET_FIXTURES)
+    # is translated apart, in a second pass, and its result is merged into spirv_dir.
+    budgeted = [p for p in disasm_files if os.path.basename(p)[:-2] in LOOP_BUDGET_FIXTURES]
+    rc, out = 0, ""
+    if len(budgeted) < len(disasm_files):
+        rc, out = translate_group(work, [p for p in disasm_files if p not in budgeted], [], spirv_dir)
+    for path in budgeted if rc == 0 else []:
+        name = os.path.basename(path)[:-2]
+        own_dir = os.path.join(work, "spirv_" + name)
+        rc, text = translate_group(work, [path], ["--loop-budget", str(LOOP_BUDGET_FIXTURES[name])], own_dir)
+        out += text
+        if rc == 0:
+            merge_translation(own_dir, spirv_dir, name)
     print("=== rdna2spirv.py ===")
     print(out)
     if rc != 0:
@@ -1030,8 +1069,10 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
-                      "cs_mask_vgpr_exec"):
+                      "cs_mask_vgpr_exec", "cs_loop_budget"):
             cs_dump_wants = {
+                # --loop-budget 65536 (LOOP_BUDGET_FIXTURES): lane 0's loop stores 2 per trip and leaves after 65,536
+                "cs_loop_budget": [131072, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE],
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
                 "cs_smem_soffset_imm": [0x5EED0024, 0x5EED0028, 0x5EED002C, 0x5EED0030,
@@ -1139,7 +1180,8 @@ def run_suite(a, work: str) -> int:
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_permlane_fi", "cs_w32_sincos",
                                   "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_w32_andn2_exec") and not emulated and not partial
+                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_w32_andn2_exec",
+                                  "cs_loop_budget") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)

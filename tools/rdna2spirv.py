@@ -47,6 +47,11 @@ STRUCTURED = True     # False (--dispatch-loop): every shader with branches as o
 # differs. docs/design.md "Control flow" has the numbers.
 MAX_STRUCTURED_DEPTH = 64
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
+# --loop-budget N (0 = off, the default): every loop of the structured and dispatch-loop forms takes one unit of a
+# per-invocation budget of N when it goes round again; with the budget spent the loop leaves instead of repeating, so a
+# loop that never exits (bad data, a translation bug) ends the shader with a wrong result instead of hanging the GPU
+# until the driver resets it (docs/design.md "Control flow"). Off, the output is byte-for-byte what it was.
+LOOP_BUDGET = 0
 # --max-shared-memory: a cap on a compute shader's Workgroup variables, LDS plus %x_buf (SHADER-309, #1721). The
 # default is the hard cap: 64 KiB, RDNA2's LDS per workgroup and the largest maxComputeSharedMemorySize drivers
 # report (RADV, NVIDIA). It is not the device limit: the AMD Windows (RDNA4) and Intel drivers report 32768, the
@@ -14579,6 +14584,7 @@ def assemble(gen):
         helpers.extend(function)
     for function in gen.x_round_fns.values():
         helpers.extend(function)
+    nvars = 2           # %pc and %done, declared with the other Function variables; --loop-budget adds %loop_budget
     tree, nesting = (capped_tree(gen.succ) if gen.blocks and not gen.emulate and not gen.bar_rounds
                      else (None, None))
     if nesting is not None:
@@ -14588,6 +14594,31 @@ def assemble(gen):
         gen.control_flow = "emulated wave64 structured" if gen.emulate_plan is not None else "emulated wave64 rounds"
     elif gen.bar_rounds:
         gen.control_flow = "barrier rounds"
+
+    def has_loop(items):
+        stack = list(items)
+        while stack:
+            it = stack.pop()
+            if it[0] == "loop":
+                return True
+            if it[0] == "guard":
+                stack.extend(it[2])
+        return False
+
+    def budget_step(body, again, label):
+        """Lines for the --loop-budget check at the end of a loop's body: a loop going round again spends one unit
+        of %loop_budget, and goes round only while a unit is left. Returns the id of the flag the branch tests."""
+        left, more, any_left, take, one, now, go = (label("b_left"), label("b_more"), label("b_any"), label("b_take"),
+                                                    label("b_one"), label("b_now"), label("b_go"))
+        body.extend([f"{left} = OpLoad %uint %loop_budget",
+                     f"{more} = OpUGreaterThan %bool {left} {gen.cu(1)}",
+                     f"{go} = OpLogicalAnd %bool {again} {more}",
+                     f"{any_left} = OpUGreaterThan %bool {left} {gen.cu(0)}",
+                     f"{take} = OpLogicalAnd %bool {again} {any_left}",
+                     f"{one} = OpSelect %uint {take} {gen.cu(1)} {gen.cu(0)}",
+                     f"{now} = OpISub %uint {left} {one}",
+                     f"OpStore %loop_budget {now}"])
+        return go
 
     def place_structured(items, body, count):
         def label(prefix):
@@ -14624,14 +14655,20 @@ def assemble(gen):
             else:
                 _, blk_id, head, cont, end, v, again = step
                 body.extend([f"OpBranch {cont}", f"{cont} = OpLabel", f"{v} = OpLoad %uint %pc",
-                             f"{again} = OpIEqual %bool {v} {gen.consts[blk_id]}",
-                             f"OpBranchConditional {again} {head} {end}", f"{end} = OpLabel"])
+                             f"{again} = OpIEqual %bool {v} {gen.consts[blk_id]}"])
+                if LOOP_BUDGET:
+                    again = budget_step(body, again, label)
+                body.extend([f"OpBranchConditional {again} {head} {end}", f"{end} = OpLabel"])
 
     if tree is not None:
         # Real loops and conditionals (cfg_structure): the blocks nested by dominance, each behind a test of %pc,
         # and every natural loop as a loop that repeats while %pc names its header.
         lines = ["%pc = OpVariable %_ptr_Function_uint Function %c0",
                  "%done = OpVariable %_ptr_Function_bool Function %false"]
+        if LOOP_BUDGET and has_loop(tree):
+            lines.append(f"%loop_budget = OpVariable %_ptr_Function_uint Function {gen.cu(LOOP_BUDGET)}")
+            nvars = 3
+            gen.loop_budget = LOOP_BUDGET
         body, count = [], [0]
         place_structured(tree, body, count)
     elif gen.emulate and gen.emulate_plan is not None:
@@ -14699,8 +14736,12 @@ def assemble(gen):
         # graphs cfg_structure refuses (a loop with two entries), and with --dispatch-loop.
         n = len(gen.blocks)
         lines = ["%pc = OpVariable %_ptr_Function_uint Function %c0",
-                 "%done = OpVariable %_ptr_Function_bool Function %false",
-                 "OpBranch %loop_head", "%loop_head = OpLabel", "OpLoopMerge %loop_exit %loop_cont None",
+                 "%done = OpVariable %_ptr_Function_bool Function %false"]
+        if LOOP_BUDGET:
+            lines.append(f"%loop_budget = OpVariable %_ptr_Function_uint Function {gen.cu(LOOP_BUDGET)}")
+            nvars = 3
+            gen.loop_budget = LOOP_BUDGET
+        lines += ["OpBranch %loop_head", "%loop_head = OpLabel", "OpLoopMerge %loop_exit %loop_cont None",
                  "OpBranch %dispatch", "%dispatch = OpLabel", "%pcv = OpLoad %uint %pc",
                  "OpSelectionMerge %sw_merge None",
                  "OpSwitch %pcv %sw_default " + " ".join(f"{i} %blk{i}" for i in range(n))]
@@ -14711,13 +14752,22 @@ def assemble(gen):
             body.append("OpBranch %sw_merge")
         body += ["%sw_default = OpLabel", "OpStore %done %true", "OpBranch %sw_merge",
                  "%sw_merge = OpLabel", "OpBranch %loop_cont", "%loop_cont = OpLabel",
-                 "%dn = OpLoad %bool %done", "OpBranchConditional %dn %loop_exit %loop_head",
-                 "%loop_exit = OpLabel"]
+                 "%dn = OpLoad %bool %done"]
+        stop = "%dn"
+        if LOOP_BUDGET:
+            # A backward jump (the new %pc is not past the block that just ran) takes a unit. With none left the
+            # jump is not taken: the loop exits, as it does once the shader is done.
+            body += ["%dn_pc = OpLoad %uint %pc", "%dn_back = OpULessThanEqual %bool %dn_pc %pcv"]
+            go = budget_step(body, "%dn_back", lambda p: "%dn_" + p)
+            body += [f"%dn_ng = OpLogicalNot %bool {go}", "%dn_out = OpLogicalAnd %bool %dn_back %dn_ng",
+                     "%dn_exit = OpLogicalOr %bool %dn %dn_out"]
+            stop = "%dn_exit"
+        body += [f"OpBranchConditional {stop} %loop_exit %loop_head", "%loop_exit = OpLabel"]
     if gen.blocks:
         # %pc/%done must be declared with the other Function variables, at the top of the entry block,
         # before the vertex-shader prologue.
-        fn_vars = lines[:2]
-        flow = lines[2:]
+        fn_vars = lines[:nvars]
+        flow = lines[nvars:]
         last_var = max(i for i, l in enumerate(fn) if " = OpVariable " in l)
         fn = fn[:last_var + 1] + fn_vars + fn[last_var + 1:]
         gen.body =["         " + l if not (l.startswith("%") and " = OpLabel" in l) else l for l in flow + body]
@@ -16847,6 +16897,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["subgroup_size"] = None
     if "Offset " in asm and re.search(r"OpImageSample\w+ [^\n]*Offset", asm):
         m["needs_maintenance8"] = True
+    if getattr(g, "loop_budget", 0):
+        m["loop_budget"] = g.loop_budget      # --loop-budget: loops of this module leave once N back-edges are spent
     if "SignedZeroInfNanPreserve" in caps:
         # Properties, not features: VkPhysicalDeviceFloatControlsProperties members the device must report true,
         # one per width the module declares SignedZeroInfNanPreserve for (32 always, 64 with Float64; SHADER-597).
@@ -17155,6 +17207,16 @@ def _shard_arg(text):
     return si, sn
 
 
+def _budget_arg(text):
+    try:
+        n = int(text)
+    except ValueError:
+        n = -1
+    if not 0 <= n <= 0x7FFFFFFF:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a loop budget (0 for off, or a count up to 2147483647)")
+    return n
+
+
 def _depth_arg(text):
     """--max-structured-depth N: 0 (never fall back to the dispatch loop) or a positive nesting depth."""
     try:
@@ -17245,6 +17307,12 @@ def main():
                     help="a shader whose structured control flow nests deeper than N is emitted in the dispatch-loop "
                          "form instead (default %(default)s; 0 = never): that form validates faster at great depth "
                          "but compiles 1.7-2x slower on NVIDIA (SHADER-427, docs/design.md \"Control flow\")")
+    ap.add_argument("--loop-budget", type=_budget_arg, default=0, metavar="N",
+                    help="a loop that goes round again spends one unit of a per-invocation budget of N (65536 is a "
+                         "round figure); with none left the loop exits and the shader finishes with a wrong result "
+                         "instead of hanging the GPU until the driver resets it. 0 = off (default). Covers the "
+                         "structured and dispatch-loop forms; not the --wave64-emulate or barrier-round schedulers, "
+                         "nor the atomic retry loops (metadata: loop_budget)")
     ap.add_argument("--opt", action="store_true",
                     help="run basic-block SPIR-V peephole optimization (tools/spirv_opt.py: register store-to-load "
                          "forwarding, OpAccessChain CSE, dead-store elimination, OpSelect/CopyObject folding, DCE)")
@@ -17266,6 +17334,8 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
+    global LOOP_BUDGET
+    LOOP_BUDGET = a.loop_budget
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
