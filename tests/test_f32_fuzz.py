@@ -241,5 +241,52 @@ class HardwareOracle(unittest.TestCase):
                 self.assertGreater(bad, 0, name)
 
 
+class VulkanOracle(unittest.TestCase):
+    """--oracle hw,vk: the program the GPU runs and how a translated result is judged (no GPU needed here)."""
+
+    VALS = [0x39f53dad, 0xc988633f, 0x44c6801c, 0x3f800001, 0x4732d54e, 0x3a51431d, 0x4b800000, 0, 0x37e10db0]
+
+    def case(self, op="v_add_f32", vals=None, srcs=((5, {}), (1, {})), e64=False, mods=()):
+        return ff.Case(op, list(vals or self.VALS), [tuple(x) for x in srcs], e64, list(mods))
+
+    def test_program_is_the_hardware_kernel_in_a_compute_shell(self):
+        text = ff.vk_program(self.case())
+        lines = text.splitlines()
+        self.assertIn("; group: 32,1,1", lines)
+        self.assertEqual(lines.count("v_mov_b32 v20, v0"), 1)          # the lane id is saved before the seeds clobber v0
+        self.assertLess(lines.index("v_mov_b32 v20, v0"), lines.index("v_mov_b32 v0, 0x39f53dad"))
+        self.assertIn("v_add_f32_e32 v8, v5, v1", lines)
+        self.assertIn("buffer_store_dword v8, v21, s[0:3], 0 offen", lines)
+        self.assertIn("buffer_store_dword v9, v21, s[0:3], 0 offen offset:4", lines)
+        self.assertEqual(lines[-1], "s_endpgm")
+
+    def test_verdict_classes(self):
+        c = self.case()
+        self.assertEqual(ff.vk_verdict(c, [0x3f800000, 0], [0x3f800000, 0])[0], "match")
+        self.assertEqual(ff.vk_verdict(c, [0x7fc00000, 0], [0xffc00000, 0])[0], "match")            # any NaN
+        self.assertEqual(ff.vk_verdict(c, [0x3f800000, 0], [0x3f800001, 0])[0], "mismatch")
+        self.assertEqual(ff.vk_verdict(c, [0x3f800000, 0], [0x3f800000, 1])[0], "mismatch")         # VCC counts
+
+    def test_denormal_gap_is_not_a_mismatch(self):
+        vals = list(self.VALS)
+        vals[5] = 0x2                                                  # a denormal operand: RDNA2 flushes it
+        self.assertEqual(ff.vk_verdict(self.case(vals=vals), [0, 0], [0x400002, 0]), ("denormal", "denormal operand"))
+        # normal operands, a denormal result from the driver where the hardware flushed it to zero
+        self.assertEqual(ff.vk_verdict(self.case(), [0, 0], [0x1, 0]), ("denormal", "denormal result"))
+        # a denormal-free difference is still a mismatch
+        self.assertEqual(ff.vk_verdict(self.case(), [0x3f800000, 0], [0x3f800002, 0])[0], "mismatch")
+
+    def test_omod_on_negative_zero(self):
+        c = self.case("v_floor_f32", srcs=((5, {}),), e64=True, mods=("mul:2",))
+        self.assertEqual(ff.vk_verdict(c, [0, 0], [0x80000000, 0])[0], "omod_neg_zero")
+        plain = self.case("v_floor_f32", srcs=((5, {}),), e64=True)
+        self.assertEqual(ff.vk_verdict(plain, [0, 0], [0x80000000, 0])[0], "mismatch")
+
+    def test_vk_needs_the_hardware(self):
+        with self.assertRaises(SystemExit) as cm:
+            ff.main(["--oracle", "vk"])
+        self.assertEqual(cm.exception.code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,9 +26,18 @@ hardware equals an analysed alternative (omod turns -0 into +0), and information
 v_min/max/min3/max3/med3_f32 are hardware-only ops. Exit 77 when the hardware tools are missing. See
 docs/shader_validation.md ("32-bit float VALU on the GPU").
 
+With --oracle hw,vk the cases also run through the translator on a real Vulkan GPU: llvm-mc assembles each one for
+gfx1013 as a 32-lane compute program, rdna2spirv.py translates them, runtime/build/vk_compute_test (LEONIDA_VK_DEVICE
+picks the device) executes them and lane 0's v8 and VCC are judged against the hardware's words. The interpreter above
+runs Python floats; a driver runs its own denormal, NaN and rounding rules, and an input that is undefined in SPIR-V
+gets whatever the GPU does with it. A difference that comes from the f32 denormal mode (a denormal operand or result;
+docs/design.md leaves f32 denormals to the driver) is counted apart from the other mismatches, as is omod turning a
+-0 result into +0. Only the rest fails the run.
+
 Usage:
     python -I tools/f32_fuzz.py [--programs N] [--seed S] [--ops v_add_f32,...] [--show N]
     python -I tools/f32_fuzz.py --oracle hw [--probes N] [--negative-control | --perturb NAME] [--no-info]
+    python -I tools/f32_fuzz.py --oracle hw,vk [--build DIR] [--work DIR] [--probes N]   # translated, on a Vulkan GPU
     python -I tools/f32_fuzz.py --list-ops
     python -I tools/f32_fuzz.py --self-test
 
@@ -37,10 +46,13 @@ files.
 """
 import argparse
 import gc
+import json
 import math
 import os
 import random
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import warnings
@@ -931,6 +943,163 @@ def hw_same(want, got, op=None):
     return True
 
 
+# ---- the translator on a Vulkan GPU (--oracle hw,vk) --------------------------------------------------------------
+
+VK_LANES = 32
+
+
+def vk_program(case):
+    """The case as a 32-lane compute program for vk_compute_test: the same seeds and instruction as the hardware
+    kernel, v8 and the VCC bit (v9) stored for every lane at lane * 8 through the V# in s[0:3]."""
+    op, vals, srcs, e64, out_mods = case.args()
+    out = [f"; f32_fuzz {case.group} {case.index} {op}", f"; group: {VK_LANES},1,1", "; rsrc2: 0x8088",
+           "s_mov_b32 exec_lo, -1", "v_mov_b32 v20, v0"]            # v0 is the lane id until the seeds overwrite it
+    out += [f"v_mov_b32 v{r}, 0x{vals[r]:x}" for r in SEED_REGS]
+    out.append("s_mov_b32 vcc_lo, 0")
+    out.append(line(op, vals, srcs, e64, sorted(out_mods, key=lambda m: m != "clamp")))
+    out += ["v_cndmask_b32_e64 v9, 0, 1, vcc_lo", "v_lshlrev_b32 v21, 3, v20",
+            "buffer_store_dword v8, v21, s[0:3], 0 offen", "buffer_store_dword v9, v21, s[0:3], 0 offen offset:4",
+            "s_endpgm"]
+    return "\n".join(out) + "\n"
+
+
+def vk_run(cases, build, work_parent=None, retries=2):
+    """[v8, vcc] of lane 0 for each case after the translator and vk_compute_test, or a str: why it did not run.
+    The 32 lanes run the same program, so a lane that differs from lane 0 is reported instead of a result."""
+    shaders = os.path.join(os.path.dirname(TOOLS_DIR), "runtime", "test", "shaders")
+    if shaders not in sys.path:
+        sys.path.insert(0, shaders)
+    import mc_command
+    from compute_fixture import compute_header, find_test_program, unpinned_subgroup
+    folder = find_test_program(build, "vk_compute_test")      # the folder holding it (a Visual Studio config subfolder)
+    if not folder:
+        raise FileNotFoundError(f"vk_compute_test not found in {build}; build it first "
+                                "(cmake --build <build dir> --target vk_compute_test)")
+    exe = os.path.join(folder, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
+    work = tempfile.mkdtemp(prefix="f32_vk_", dir=work_parent)
+    disasm, fssm, spirv = (os.path.join(work, d) for d in ("disasm", "fssm", "spirv"))
+    for d in (disasm, fssm):
+        os.mkdir(d)
+    names, results = [], []
+    mc = mc_command.mc_command() + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
+    for i, c in enumerate(cases):
+        name = f"cs_f32vk_{i}"
+        text = vk_program(c)
+        path = os.path.join(work, name + ".asm")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        r = mc_command.run(mc, input=text, capture_output=True, text=True)
+        if r.returncode or "error:" in r.stderr:
+            names.append(None)
+            results.append("llvm-mc: " + (r.stderr.strip().splitlines() or ["failed"])[0][:100])
+            continue
+        code = "".join(ln for ln in r.stdout.splitlines(keepends=True) if not ln.lstrip().startswith("."))
+        with open(os.path.join(disasm, name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"; {name}\n{code}")
+        with open(os.path.join(fssm, name + ".fssm"), "wb") as f:
+            f.write(compute_header(path))
+        names.append(name)
+        results.append(None)
+    subprocess.run([sys.executable, "-I", os.path.join(TOOLS_DIR, "rdna2spirv.py"), disasm, "--out", spirv],
+                   capture_output=True, text=True)
+    index_path = os.path.join(spirv, "index.json")
+    index = {}
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+    for i, name in enumerate(names):
+        if name is None:
+            continue
+        spv = os.path.join(spirv, name + ".spv")
+        if name not in index or not os.path.isfile(spv):
+            results[i] = "translator: not translated"
+            continue
+        dump = os.path.join(work, name + ".bin")
+        env = dict(os.environ, VKC_OUT_WORDS=str(2 * VK_LANES), VKC_DUMP=dump, VKC_SUBGROUP_SIZE=str(VK_LANES))
+        for _ in range(retries + 1):
+            if os.path.isfile(dump):
+                os.remove(dump)
+            r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env)
+            if r.returncode in (0, 77):
+                break
+        msg = (r.stdout + r.stderr).strip()
+        if r.returncode == 77:
+            results[i] = "vk_compute_test: " + (msg.splitlines()[-1] if msg else "unsupported")
+        elif unpinned_subgroup(msg):
+            results[i] = f"the device can't run 32-lane subgroups ({unpinned_subgroup(msg)} lanes)"
+        elif r.returncode or not os.path.isfile(dump) or os.path.getsize(dump) != 8 * VK_LANES:
+            results[i] = f"vk_compute_test exit {r.returncode}"
+        else:
+            with open(dump, "rb") as f:
+                words = struct.unpack(f"<{2 * VK_LANES}I", f.read())
+            lanes = [list(words[k:k + 2]) for k in range(0, 2 * VK_LANES, 2)]
+            odd = [k for k, w in enumerate(lanes) if not hw_same(lanes[0], w, cases[i].op)]
+            results[i] = lanes[0] if not odd else f"lanes {odd[:3]} differ from lane 0 on identical inputs"
+    if not os.environ.get("F32_FUZZ_KEEP"):
+        shutil.rmtree(work, ignore_errors=True)
+    return results
+
+
+# Ops whose translation differs from the hardware where an operand is NaN or infinite (the cube ops pick a face by
+# compares that a NaN fails, the legacy multiply's zero override): listed as "nonfinite", not as new mismatches.
+VK_NONFINITE_OPS = ("v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32", "v_mul_legacy_f32",
+                    "v_mac_legacy_f32", "v_mad_legacy_f32")
+
+
+def vk_verdict(case, hw, got):
+    """(class, why) for a translated result on a Vulkan GPU against the hardware's words (v8, VCC):
+    match; denormal (the case has a denormal operand, or the translated result is one: RDNA2 in the game's MODE
+    flushes f32 denormals and the translator leaves them to the driver); omod_neg_zero (omod made the hardware's -0 a
+    +0, which the translated -0 does not, outside the legacy multiply); nonfinite (VK_NONFINITE_OPS with a NaN or
+    infinite operand); mismatch."""
+    if hw_same(hw, got, case.op):
+        return "match", ""
+    if has_denorm_in(case) or is_denorm(got[0]):
+        return "denormal", "denormal operand" if has_denorm_in(case) else "denormal result"
+    alt = dev_omod_neg_zero(case, got)
+    if alt is not None and hw_same(hw, alt, case.op):
+        return "omod_neg_zero", ""
+    if case.op in VK_NONFINITE_OPS and any(is_nan(v) or is_inf(v) for _, v in float_inputs(case)):
+        return "nonfinite", case.op
+    return "mismatch", ""
+
+
+def vk_suite(oracle, cases, build, work_parent=None, show=2):
+    """Run cases on the hardware and through the translator on the Vulkan device; print the tallies and return
+    ({op: {class: n}}, the number of unexplained mismatches)."""
+    hw = hw_run(oracle, cases)
+    got = vk_run(cases, build, work_parent)
+    tally, shown, skips = {}, {}, {}
+    mismatches = 0
+    for c, h, g in zip(cases, hw, got):
+        row = tally.setdefault(c.op, {})
+        if isinstance(h, str) or isinstance(g, str):
+            why = ("hardware: " + h) if isinstance(h, str) else g
+            skips[why] = skips.get(why, 0) + 1
+            row["skip"] = row.get("skip", 0) + 1
+            continue
+        klass, _ = vk_verdict(c, h, g)
+        row[klass] = row.get(klass, 0) + 1
+        if klass == "mismatch":
+            mismatches += 1
+            if shown.get(c.op, 0) < show:
+                shown[c.op] = shown.get(c.op, 0) + 1
+                print(f"MISMATCH {c.group} {c.index}: {line(*c.args())} (seeds "
+                      + " ".join(f"v{r}=0x{c.vals[r]:x}" for r in SEED_REGS) + f"): hardware v8=0x{h[0]:08x} "
+                      f"vcc={h[1]}, translated on the GPU v8=0x{g[0]:08x} vcc={g[1]}")
+    print("\ntranslated on the Vulkan GPU against the hardware words:")
+    totals = {}
+    for op in sorted(tally):
+        row = tally[op]
+        for k, n in row.items():
+            totals[k] = totals.get(k, 0) + n
+        print(f"  {op:22s} " + ", ".join(f"{k} {n}" for k, n in sorted(row.items())))
+    print("total: " + ", ".join(f"{k} {n}" for k, n in sorted(totals.items())))
+    for why, n in sorted(skips.items()):
+        print(f"  skip x{n}: {why}")
+    return tally, mismatches
+
+
 # ---- known deviations: hardware behaviour measured on gfx1150 that the ISA-text model does not have ----
 # Each maps (case, want) to the words the hardware gives instead, or None when it does not apply. A hardware result
 # that equals the deviation's words is filed under "known deviation", not "match"; anything else stays a mismatch.
@@ -1646,8 +1815,12 @@ def main(argv=None):
     ap.add_argument("--list-ops", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--oracle", default="translator",
-                    help="comma-separated: translator (default; needs llvm-mc for gfx1013) or hw (natively on the AMD "
-                         "GPU, wave32; tools/hw_oracle/), or translator,hw. Exit 77 when the hardware tools are missing")
+                    help="comma-separated: translator (default; needs llvm-mc for gfx1013), hw (natively on the AMD "
+                         "GPU, wave32; tools/hw_oracle/) and vk (with hw: the translated cases on a Vulkan GPU, "
+                         "vk_compute_test). Exit 77 when the hardware tools are missing")
+    ap.add_argument("--build", default=os.path.join(os.path.dirname(HERE), "runtime", "build"),
+                    help="with vk: the folder with vk_compute_test")
+    ap.add_argument("--work", default=None, help="with vk: a folder for the temporary files (F32_FUZZ_KEEP=1 keeps them)")
     ap.add_argument("--hw-arch", default=None, help="GPU architecture to assemble for (default: detected)")
     ap.add_argument("--probes", type=int, default=12,
                     help="with hw: structured probes per op and kind (denormal operand, denormal result, NaN payloads, "
@@ -1677,8 +1850,10 @@ def main(argv=None):
     if a.self_test:
         return 0 if self_test() else 1
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
-    if not backends or any(t not in ("translator", "hw") for t in backends):
-        ap.error("--oracle takes translator, hw or translator,hw")
+    if not backends or any(t not in ("translator", "hw", "vk") for t in backends):
+        ap.error("--oracle takes translator, hw, vk (with hw) or a comma-separated mix")
+    if "vk" in backends and "hw" not in backends:
+        ap.error("--oracle vk judges the translated cases against the hardware's words: use --oracle hw,vk")
     if (a.perturb or a.negative_control or a.keep) and "hw" not in backends:
         ap.error("--perturb, --negative-control and --keep need --oracle hw")
     ops = tuple(ALL_OPS if "hw" in backends else OPS)
@@ -1723,6 +1898,15 @@ def main(argv=None):
                   f"{len(cases)} programs, mode {HW_PRIMARY} (MODE 0x{words[HW_PRIMARY]:x}), seed {a.seed}:")
             tr = translator_verdict if "translator" in backends else None
             n_mis = hw_print(rep, show=a.show, translator_check=tr)
+            if "vk" in backends and not (a.perturb or a.negative_control):
+                if a.work:
+                    os.makedirs(a.work, exist_ok=True)
+                try:
+                    _, vk_bad = vk_suite(oracle, cases, a.build, a.work, show=a.show)
+                except FileNotFoundError as e:
+                    print(e)
+                    return 2
+                rc |= bool(vk_bad)
             if any(r["asm"] for r in rep.per_op.values()):
                 harness = True
             if tr and rep.deviations:

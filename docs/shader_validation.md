@@ -1065,6 +1065,26 @@ python -I tools/f32_fuzz.py --oracle hw --negative-control                   # w
 python -I tools/f32_fuzz.py --oracle hw --perturb mul_rtz --programs 500     # one wrong model, mismatches must appear
 ```
 
+`--oracle hw,vk` adds the translated programs on a real Vulkan GPU. Every case is a 32-lane compute program (llvm-mc for
+gfx1013, `rdna2spirv.py`, `runtime/build/vk_compute_test`; `--build DIR` names the folder, `LEONIDA_VK_DEVICE` the device),
+and lane 0's `v8` and VCC are judged against the hardware's words from the same run: the hardware is the truth, not
+`F32Model`. This covers what the interpreter (`spirv_mini_interp`, Python floats) cannot: the driver's own denormal,
+NaN and rounding rules, and inputs that are undefined in SPIR-V. Differences are sorted: `denormal` (a denormal
+operand, or a denormal result where the hardware flushed it: docs/design.md leaves f32 denormals to the driver),
+`omod_neg_zero` (the hardware's omod turned a -0 result into +0, the translated -0 stayed), `nonfinite` (the cube ops
+and the legacy multiplies with a NaN or infinite operand, not modelled), and the rest, `mismatch`, which fails the run.
+
+```
+python -I tools/f32_fuzz.py --oracle hw,vk --programs 500 --probes 5 --seed 21 --no-info
+```
+
+Seed 21 (500 random programs and 5 probes per op and kind, 1,175 cases, 163 skipped because gfx1036 has no
+`v_mad_*`/`v_mac_*`/`v_madak`/`v_madmk`/`v_mad_legacy`): AMD Radeon iGPU (gfx1036, driver 26.10.1) 984 match, 5 denormal,
+21 nonfinite, 1 omod_neg_zero, 1 mismatch (`v_mul_legacy_f32` of -0 and 3.0 came out -0, fixed by the change that
+adds `cs_legacy_mul_zero`); NVIDIA GeForce RTX 5080 (driver 616.92) 955 match, 56 denormal, 1 omod_neg_zero, 0 mismatch.
+The 56 are the f32 denormal gap (NVIDIA keeps denormal operands and results, RDNA2 in the game's MODE flushes them).
+A deliberately wrong translator (`v_floor_f32` emitting `Ceil`) makes 36 of 66 `v_floor_f32` cases mismatch.
+
 - **Float MODE.** An assembled kernel's descriptor starts with IEEE 1, DX10_CLAMP 1, f32 denormals flushed
   (`.amdhsa_float_denorm_mode_32 0`), f16/f64 denormals kept (3), round to nearest (MODE `0x3c0`, read back with
   `s_getreg_b32`). The primary mode, `flush`, is the state inferred for the game's shaders (IEEE off, f32 denormals
