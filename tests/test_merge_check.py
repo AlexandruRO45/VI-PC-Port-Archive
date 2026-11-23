@@ -78,10 +78,11 @@ class MergeCheckTest(unittest.TestCase):
         title = subject or f"{branch}: add the effect record section"
         self.git("commit", "-q", "-m", f"{title} (#{number})")
 
-    def run_check(self, *pairs):
+    def run_check(self, *pairs, main="main"):
         out = io.StringIO()
         with redirect_stdout(out):
-            code = mc.main(["--repo", self.repo, "--main", "main", "--json", *pairs])
+            code = mc.main(["--repo", self.repo, "--main", main, "--json", *pairs])
+        self.assertNotEqual(code, 2, "merge_check exited before writing its JSON report")
         return code, json.loads(out.getvalue())
 
     def run_text(self, *pairs):
@@ -146,6 +147,16 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(r["verdict"], "duplicates")
         self.assertEqual(r["merges"], [])  # another number: only the text check can see it
         self.assertEqual(r["duplicates"], {"docs/notes.md": 3})
+
+        # A checkout path must not change how Git interprets the base revision.
+        main_commit = self.git("rev-parse", "main")
+        for revision in ("main", main_commit):
+            with self.subTest(revision=revision):
+                self.write(revision, "Unrelated checkout file\n")
+                self.assertEqual(self.run_check("9=moved", main=revision), (code, [r]))
+        if os.name != "nt":
+            self.write("main:docs/notes.md", "Unrelated checkout file\n")
+            self.assertEqual(self.run_check("9=moved"), (code, [r]))
 
     def test_patch_paths_and_added_header_like_lines_still_count_duplicates(self):
         paths = ("docs/quoted \u65e5\u672c\u8a9e.md", "docs/notes with spaces.md", "docs/header-like.md")

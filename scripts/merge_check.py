@@ -62,7 +62,8 @@ def _merged_pr_number(subject):
 
 
 def prior_merges(repo, main, numbers, depth):
-    out = git(repo, "log", main, "--first-parent", f"-n{depth}", "--format=%H%x09%s").stdout
+    # A checkout path can have the same name as the revision.
+    out = git(repo, "log", "--first-parent", f"-n{depth}", "--format=%H%x09%s", main, "--").stdout
     hits = {number: [] for number in numbers}
     for line in out.splitlines():
         sha, _, subject = line.partition("\t")
@@ -107,7 +108,7 @@ def duplicates(repo, main, tree, min_length, block=3):
     hunks, path, added = {}, None, None
     patch = git(repo, "-c", "core.quotePath=true", "diff", "--unified=0", "--no-color", "--no-renames",
                 "--src-prefix=a/", "--dst-prefix=b/", "--no-relative", "--no-ext-diff", "--no-textconv",
-                main, tree).stdout
+                main, tree, "--").stdout
     for line in patch.split("\n"):
         if line.startswith("diff --git "):
             path, added = None, None
@@ -121,7 +122,7 @@ def duplicates(repo, main, tree, min_length, block=3):
             if text:
                 added.append(text)
     def windows(rev, path):
-        r = git(repo, "show", f"{rev}:{path}", check=False)
+        r = git(repo, "show", f"{rev}:{path}", "--", check=False)
         lines = [l.strip() for l in r.stdout.split("\n") if l.strip()] if r.returncode == 0 else []
         return r.returncode == 0, Counter(tuple(lines[i:i + block]) for i in range(len(lines) - block + 1))
 
