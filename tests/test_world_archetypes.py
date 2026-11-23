@@ -279,6 +279,40 @@ class CliTest(unittest.TestCase):
             finally:
                 sys.stderr = saved
 
+    def run_rejected(self, path, *args):
+        out = os.path.join(self.tmp.name, "rejected.json")
+        err = io.StringIO()
+        saved, sys.stderr = sys.stderr, err
+        try:
+            with redirect_stdout(io.StringIO()):
+                try:
+                    code = WA.main([path, "--out", out, *args])
+                except SystemExit as e:
+                    code = e.code
+        finally:
+            sys.stderr = saved
+        return code, err.getvalue(), os.path.exists(out)
+
+    def test_start_outside_the_data_area_is_an_error_line_not_a_traceback(self):
+        defs, m = scene()
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([defs, m]))
+        code, err, written = self.run_rejected(path, "--start", str(1 << 40))
+        self.assertEqual(code, 2)
+        self.assertIn("outside the data area", err)
+        self.assertFalse(written)
+
+    def test_empty_or_negative_window_is_refused_not_reported_as_an_empty_archive(self):
+        defs, m = scene()
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([defs, m]))
+        for args in (("--limit", "0"), ("--limit", "-5"), ("--start", "-1")):
+            code, _err, written = self.run_rejected(path, *args)
+            self.assertEqual(code, 2, args)
+            self.assertFalse(written, args)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -274,15 +274,19 @@ def run(path, start=None, limit=None, extents=False):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, one carved 0x7a file, or a folder of carved files")
-    ap.add_argument("--start", type=int, help="first byte of an RPF9 data-area window")
-    ap.add_argument("--limit", type=int, help="window size in bytes (default: to the end of the archive)")
+    ap.add_argument("--start", type=WI._count(0), help="first byte of an RPF9 data-area window")
+    ap.add_argument("--limit", type=WI._count(1), help="window size in bytes (default: to the end of the archive)")
     ap.add_argument("--out", default=os.path.join("reports", "world_archetypes.json"))
     ap.add_argument("--check-extents", action="store_true",
                     help="also compare each map's entitiesExtents with its transformed archetype boxes")
     a = ap.parse_args(argv)
     if not os.path.exists(a.path):
         ap.error("no such file or folder: %s" % a.path)
-    doc = run(a.path, a.start, a.limit, a.check_extents)
+    try:
+        doc = run(a.path, a.start, a.limit, a.check_extents)
+    except (OSError, ValueError) as e:      # a --start outside the data area, an unreadable file
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w", encoding="utf-8", newline="\n") as f:
