@@ -276,6 +276,24 @@ class TestStreamedManifest(unittest.TestCase):
             self.assertEqual(M.model_geometries(slim), M.model_geometries(full))
         self.assertEqual(got[0]["Materials"], [{"Shader": "DEADBEEF"}, {"Shader": "00000012"}])
 
+    def test_a_number_split_at_any_chunk_boundary(self):
+        # Review of #4310: a chunk that ended at the exponent marker decoded 1e2 as 1 and then failed on "e".
+        # Try every alignment of the numbers against the chunk boundary, including signs and long mantissas.
+        rows = [item(0x40, "b.obj", [1])]
+        tail = ',"Items":%s}' % json.dumps(rows)
+        for number in ("1e2", "-0.5E+3", "2.5e-07", "12345678901234567890", "0", "-7"):
+            for pad in range(12):
+                text = '{"Scale":' + " " * pad + number + tail
+                with self.subTest(number=number, pad=pad):
+                    for chunk in (5, 7, 11, 13):
+                        old = M.CHUNK
+                        M.CHUNK = chunk
+                        try:
+                            got = M.read_items(self.write(text))
+                        finally:
+                            M.CHUNK = old
+                        self.assertEqual([r["Offset"] for r in got], [0x40])
+
     def test_empty_and_missing_items(self):
         self.small_chunks()
         self.assertEqual(M.read_items(self.write('{"Count": 0, "Items": []}')), [])

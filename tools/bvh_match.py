@@ -102,6 +102,7 @@ def embeddings(signature, counts, cap, ordered=True):
 # while the manifest is streamed, so a 5.1 GB levels.rpf manifest needs a few hundred MB, not 20 GB (BUILD-1222).
 ITEM_FIELDS = ("Offset", "File", "Name", "MeshTris", "MeshModels", "MeshGeoms", "MeshShaders")
 CHUNK = 1 << 20
+SCALAR_TAIL = 32   # a top-level scalar must end at least this far before the buffer's end, unless at end of file
 
 
 def _slim(item):
@@ -159,8 +160,10 @@ def read_items(path):
                     if eof or not more():
                         raise ValueError("%s: %s" % (path, e)) from None
                     continue
-                # A number at the very end of the buffer may continue in the next chunk.
-                if complete_scalar and end == len(buf) and not eof and more():
+                # A top-level number near the end of the buffer may continue in the next chunk: raw_decode stops
+                # before a lone "e" or "e+" as happily as at the buffer's end (1e|2 decodes as 1). Read on until
+                # the value ends well inside the buffer, or the file ends.
+                if complete_scalar and not eof and end + SCALAR_TAIL >= len(buf) and more():
                     continue
                 pos = end
                 return obj
