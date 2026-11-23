@@ -247,6 +247,7 @@ int main() {
                     std::fprintf(stderr, "FAIL TerminateProcess(child, 7) returned %d and left exit code %lu\n", ok,
                                  child_code);
                     ++failures;
+                    TerminateProcess(child.hProcess, 1);
                 }
                 CloseHandle(child.hThread);
                 CloseHandle(child.hProcess);
