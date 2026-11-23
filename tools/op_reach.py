@@ -28,10 +28,12 @@ import json
 import os
 import re
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fssm_header  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 INSTRUCTION = re.compile(r"^\t([a-z][a-z0-9_]*)", re.M)
 ENCODING = re.compile(r"_(e32|e64|sdwa|dpp)$")
@@ -56,11 +58,19 @@ def listing_ops(text):
 
 def stages_of(index_path):
     """Listing stem -> stage from the carve index."""
-    with open(index_path, encoding="utf-8") as f:
+    with open(index_path, encoding="utf-8-sig") as f:
         index = json.load(f)
     if not isinstance(index, list) or not all(isinstance(e, dict) for e in index):
         raise ValueError("index.json is not a list of shader entries")
-    return {os.path.splitext(e["file"])[0]: e.get("stage") for e in index if isinstance(e.get("file"), str)}
+    stages = {}
+    for e in index:
+        if not isinstance(e.get("file"), str):
+            continue
+        stage = e.get("stage")
+        if stage is not None and not isinstance(stage, str):
+            raise ValueError("index.json entry has a non-string stage")
+        stages[os.path.splitext(e["file"])[0]] = stage
+    return stages
 
 
 def waves_of(fssm_dir, stems):
@@ -83,7 +93,10 @@ def group_keys(stage, wave, has_waves):
 
 def census(disasm_dir, stages=None, fssm_dir=None):
     """Every .s file's printed-name counts, with its stage (index) and wave size (FSSM header) when given."""
-    names = sorted(n for n in os.listdir(disasm_dir) if n.endswith(".s"))
+    names = sorted(
+        n for n in os.listdir(disasm_dir)
+        if n.endswith(".s") and os.path.isfile(os.path.join(disasm_dir, n))
+    )
     stems = [n[:-2] for n in names]
     waves = waves_of(fssm_dir, stems) if fssm_dir is not None else None
     listings = []
@@ -154,6 +167,42 @@ def report(result, ops=None):
     return rows
 
 
+def _validate_json_out(json_path, disasm_dir, index_path=None, fssm_dir=None):
+    """Refuse an invalid or input-colliding --json path before scanning the corpus."""
+    if not json_path:
+        raise ValueError("--json path must not be empty")
+    if json_path.endswith(("/", "\\")) or os.path.isdir(json_path):
+        raise ValueError(f"--json {json_path} is a folder")
+    if index_path and same_report_path(json_path, index_path):
+        raise ValueError(f"--json {json_path} collides with --index {index_path}")
+    real_json = os.path.realpath(json_path)
+    real_dir, real_name = os.path.split(real_json)
+    if same_report_path(real_dir, disasm_dir) and real_name.casefold().endswith(".s"):
+        raise ValueError(f"--json {json_path} collides with a listing in {disasm_dir}")
+    if fssm_dir is not None and same_report_path(real_dir, fssm_dir) and real_name.casefold().endswith(".fssm"):
+        raise ValueError(f"--json {json_path} collides with a sidecar in {fssm_dir}")
+    parent = os.path.dirname(os.path.abspath(json_path))
+    if not os.path.isdir(parent):
+        raise ValueError(f"--json parent is not a folder: {parent}")
+
+
+def _write_json_atomic(path, payload):
+    """Write JSON to a temp file beside `path` with LF endings, then atomically replace `path`."""
+    parent = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(prefix=".op_reach_", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("disasm", help="folder of .s listings (<work>/shaders/dxbc/disasm)")
@@ -165,6 +214,12 @@ def main(argv=None):
     for path in (a.disasm, a.fssm):
         if path is not None and not os.path.isdir(path):
             print(f"ERROR: {path} is not a folder", file=sys.stderr)
+            return 2
+    if a.json is not None:
+        try:
+            _validate_json_out(a.json, a.disasm, a.index, a.fssm)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
             return 2
     try:
         stages = stages_of(a.index) if a.index else None
@@ -183,11 +238,10 @@ def main(argv=None):
         split = row.get("by_stage_wave") or row.get("by_stage") or row.get("by_wave")
         detail = f"  {split}" if (stages is not None or a.fssm) and split else ""
         print(f"{row['op']:32s} {row['shaders']:7d} shaders {row['instructions']:9d} instructions{detail}")
-    if a.json:
+    if a.json is not None:
         try:
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"listings": result["listings"], **groups,
-                           "after_last_endpgm": result["after_last_endpgm"], "rows": rows}, f, indent=1)
+            _write_json_atomic(a.json, {"listings": result["listings"], **groups,
+                                        "after_last_endpgm": result["after_last_endpgm"], "rows": rows})
         except OSError as e:
             print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2

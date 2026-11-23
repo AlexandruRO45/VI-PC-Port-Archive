@@ -5,6 +5,8 @@
 Every input is built here (five tiny .s listings, an index.json and FSSM headers with only the magic and the
 wave flag). No game data.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "op_reach.py")
@@ -132,6 +135,91 @@ class OpReachTests(unittest.TestCase):
         p = run(empty)
         self.assertEqual(p.returncode, 1)
         self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
+
+    def test_index_with_utf8_bom_loads(self):
+        bom_index = os.path.join(self._tmp.name, "bom_index.json")
+        raw = json.dumps([{"file": s + ".dxbc", "stage": s.split("_")[1]} for s in LISTINGS]).encode("utf-8")
+        with open(bom_index, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + raw)
+        stages = op_reach.stages_of(bom_index)
+        self.assertEqual(stages["a_ps"], "ps")
+        p = run(self.disasm, "v_cndmask_b32", "--index", bom_index)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("'ps': 1", p.stdout)
+
+    def test_index_with_non_string_stage_is_one_error_line(self):
+        for bad_stage in (["ps"], 42, True, {"stage": "ps"}):
+            with self.subTest(bad_stage=bad_stage):
+                bad_index = os.path.join(self._tmp.name, "bad_stage.json")
+                with open(bad_index, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump([{"file": "a_ps.dxbc", "stage": bad_stage}], f)
+                with self.assertRaises(ValueError):
+                    op_reach.stages_of(bad_index)
+                p = run(self.disasm, "--index", bad_index)
+                self.assertEqual(p.returncode, 2)
+                self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
+    def test_subdirectory_ending_in_dot_s_is_ignored(self):
+        os.makedirs(os.path.join(self.disasm, "nested.s"))
+        r = op_reach.census(self.disasm)
+        self.assertEqual(r["listings"], len(LISTINGS))
+
+    def test_json_collision_and_bad_target_refused_before_scan(self):
+        fssm = build_fssm(self._tmp.name)
+        listing_path = os.path.join(self.disasm, "a_ps.s")
+        fssm_path = os.path.join(fssm, "a_ps.fssm")
+        with open(self.index, "rb") as f:
+            index_before = f.read()
+        with open(listing_path, "rb") as f:
+            listing_before = f.read()
+        with open(fssm_path, "rb") as f:
+            fssm_before = f.read()
+        cases = [
+            ("--index exact", [self.disasm, "--index", self.index, "--json", self.index]),
+            ("--index relative", [self.disasm, "--index", self.index, "--json",
+                                  os.path.join(self.disasm, "..", "index.json")]),
+            ("folder target", [self.disasm, "--json", self.disasm]),
+            ("trailing slash target", [self.disasm, "--json", os.path.join(self._tmp.name, "out.json") + os.sep]),
+            ("listing target", [self.disasm, "--json", listing_path]),
+            ("fssm target", [self.disasm, "--fssm", fssm, "--json", fssm_path]),
+            ("empty target", [self.disasm, "--json", ""]),
+            ("missing parent", [self.disasm, "--json", os.path.join(self._tmp.name, "no-such-dir", "out.json")]),
+        ]
+        for label, args in cases:
+            with self.subTest(label=label):
+                p = run(*args)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+        with open(self.index, "rb") as f:
+            self.assertEqual(f.read(), index_before)
+        with open(listing_path, "rb") as f:
+            self.assertEqual(f.read(), listing_before)
+        with open(fssm_path, "rb") as f:
+            self.assertEqual(f.read(), fssm_before)
+
+    def test_json_output_uses_lf_and_cleans_up_on_replace_error(self):
+        out = os.path.join(self._tmp.name, "clean.json")
+        p = run(self.disasm, "v_cndmask_b32", "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, "rb") as f:
+            raw = f.read()
+        self.assertNotIn(b"\r", raw)
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertFalse(any(n.startswith(".op_reach_") for n in os.listdir(self._tmp.name)))
+
+        with open(out, "wb") as f:
+            f.write(b"previous\n")
+        with mock.patch.object(op_reach.os, "replace", side_effect=PermissionError(13, "denied", out)), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = op_reach.main([self.disasm, "v_cndmask_b32", "--json", out])
+        self.assertEqual(rc, 2)
+        self.assertTrue(err.getvalue().startswith("ERROR: cannot write "), err.getvalue())
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"previous\n")
+        self.assertFalse(any(n.startswith(".op_reach_") for n in os.listdir(self._tmp.name)))
 
     def test_patterns_match_printed_names(self):
         r = op_reach.census(self.disasm)
