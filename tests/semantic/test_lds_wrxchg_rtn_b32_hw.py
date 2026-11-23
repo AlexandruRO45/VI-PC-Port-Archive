@@ -219,5 +219,86 @@ class TestDSWrxchgRtnB32AST(unittest.TestCase):
         self.assertEqual(inst.to_asm(), "ds_wrxchg_rtn_b32 v5, v1, v2")
 
 
+class RegisterFile:
+    """Architectural VGPR and SGPR register storage."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.vgprs[reg.index]
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.vgprs[reg.index] = val & MASK32
+
+
+class ScalarThreadState:
+    """Thread state for scalar LDS execution."""
+
+    def __init__(self, lds: LDSMemory) -> None:
+        self.rf: RegisterFile = RegisterFile()
+        self.lds: LDSMemory = lds
+
+
+class ScalarDSInterpreter:
+    """Deterministic scalar interpreter for DS WRXCHG instructions."""
+
+    def execute(self, state: ScalarThreadState, inst: DSWrxchgInstruction) -> Tuple[int, int]:
+        addr = state.rf.get_vgpr(inst.vaddr)
+        data = state.rf.get_vgpr(inst.vdata)
+        eff_addr = (addr + inst.offset.value) & MASK32
+
+        # Capture old memory value before writing to vdst (handling vdst == vdata or vdst == vaddr)
+        old_val = state.lds.atomic_xchg(eff_addr, data)
+        new_val = state.lds.read_dword(eff_addr)
+        state.rf.set_vgpr(inst.vdst, old_val)
+        return old_val, new_val
+
+
+class TestDSWrxchgRtnB32ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_scalar_execution_swap(self) -> None:
+        self.lds.write_dword(0x80, 0x12345678)
+        self.state.rf.set_vgpr(VGPR(1), 0x80)
+        self.state.rf.set_vgpr(VGPR(2), 0x9ABCDEF0)
+        self.state.rf.set_vgpr(VGPR(5), 0xDEADBEEF)
+
+        inst = DSWrxchgInstruction(
+            opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 0x12345678)
+        self.assertEqual(new, 0x9ABCDEF0)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(5)), 0x12345678)
+        self.assertEqual(self.lds.read_dword(0x80), 0x9ABCDEF0)
+
+    def test_scalar_execution_with_offset(self) -> None:
+        self.lds.write_dword(0x54, 0xCAFEBABE)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+        self.state.rf.set_vgpr(VGPR(2), 0xBAADF00D)
+
+        inst = DSWrxchgInstruction(
+            opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            offset=OffsetImmediate(0x14),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 0xCAFEBABE)
+        self.assertEqual(new, 0xBAADF00D)
+        self.assertEqual(self.lds.read_dword(0x54), 0xBAADF00D)
+
+
 if __name__ == "__main__":
     unittest.main()
