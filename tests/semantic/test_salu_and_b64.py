@@ -330,5 +330,61 @@ class SaluAndB64InterpreterTests(unittest.TestCase):
         state.step_s_and_b64("null", 0x55555555_55555555, 0xAAAAAAAA_AAAAAAAA)
         self.assertEqual(state.scc, 0)
 
+class SaluAndB64DivergenceTests(unittest.TestCase):
+    """Wave64 control-flow divergence and execution mask (EXEC) tests."""
+
+    def test_exec_branch_pruning(self) -> None:
+        """Emulate branching: EXEC = EXEC & VCC (pruning lanes where condition is false)."""
+        state = ScalarState()
+        state.exec = MASK64
+        state.vcc = 0xAAAAAAAAAAAAAAAA
+
+        state.step_s_and_b64("exec", "exec", "vcc")
+        self.assertEqual(state.exec, 0xAAAAAAAAAAAAAAAA)
+        self.assertEqual(state.scc, 1)
+
+    def test_exec_all_lanes_disabled(self) -> None:
+        """When EXEC becomes zero, SCC must be 0, signaling whole wave is inactive."""
+        state = ScalarState()
+        state.exec = 0x55555555_55555555
+        state.vcc = 0xAAAAAAAA_AAAAAAAA
+
+        state.step_s_and_b64("exec", "exec", "vcc")
+        self.assertEqual(state.exec, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_exec_single_lane_active_sweep(self) -> None:
+        """Test each of 64 lanes active in isolation."""
+        state = ScalarState()
+        for lane in range(64):
+            with self.subTest(lane=lane):
+                state.exec = MASK64
+                state.vcc = 1 << lane
+                state.step_s_and_b64("exec", "exec", "vcc")
+                self.assertEqual(state.exec, 1 << lane)
+                self.assertEqual(state.scc, 1)
+
+    def test_nested_divergence_monotonicity(self) -> None:
+        """Nested conditionals monotonically reduce or preserve active lanes."""
+        state = ScalarState()
+        state.exec = 0xFFFFFFFF_FFFFFFFF
+        levels = [
+            0x7FFFFFFF_FFFFFFFF,
+            0x0000FFFF_FFFFFFFF,
+            0x000000FF_FFFFFFFF,
+            0x00000000_000000FF,
+            0x00000000_00000001,
+            0x00000000_00000000,
+        ]
+        prev_active_count = 64
+        for mask in levels:
+            state.vcc = mask
+            state.step_s_and_b64("exec", "exec", "vcc")
+            active_count = bin(state.exec).count("1")
+            self.assertLessEqual(active_count, prev_active_count)
+            prev_active_count = active_count
+        self.assertEqual(state.exec, 0)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
