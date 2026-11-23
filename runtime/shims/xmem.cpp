@@ -10,6 +10,7 @@
 // site shows the alignment/type fields, every block is 64-byte aligned (covers cache lines and SIMD) and a size of
 // zero is rounded up to one byte so the result is a stable, non-null pointer that XMemFree can release.
 #include <windows.h>
+#include <intrin.h>
 #include <malloc.h>
 #include <psapi.h>
 
@@ -18,16 +19,47 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <set>
+#include <string>
+#include <utility>
 
 #include "shims.h"
+#include "startup_trace.h"
 
 namespace {
 
 constexpr size_t kAlign = 64;
 
-void* __stdcall XMemAlloc(size_t size, uint64_t /*attributes*/) { return _aligned_malloc(size ? size : 1, kAlign); }
+// gta6rt --trace FILE: the first XMemAlloc and the first XMemFree for each distinct raw attribute word go to the
+// startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
+// bits of the attribute word are not known yet; this records them from a real run without logging every allocation,
+// which would fill the file. Off: one relaxed load per call.
+void note_attributes(bool is_alloc, uint64_t attributes, size_t size, const void* caller) {
+    if (!rt::startup_trace::enabled()) return;
+    static std::mutex mutex;
+    static std::set<std::pair<bool, uint64_t>> seen;
+    {
+        const std::lock_guard lock(mutex);
+        if (!seen.insert({is_alloc, attributes}).second) return;
+    }
+    std::string fields = std::string("\"api\":\"") + (is_alloc ? "XMemAlloc" : "XMemFree") +
+                         "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
+    if (is_alloc) fields += ",\"size\":" + std::to_string(size);
+    fields += ",\"caller\":" +
+              rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
+    rt::startup_trace::event("xmem_attributes", fields);
+}
 
-void __stdcall XMemFree(void* p, uint64_t /*attributes*/) { _aligned_free(p); }
+void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
+    note_attributes(true, attributes, size, _ReturnAddress());
+    return _aligned_malloc(size ? size : 1, kAlign);
+}
+
+void __stdcall XMemFree(void* p, uint64_t attributes) {
+    note_attributes(false, attributes, 0, _ReturnAddress());
+    _aligned_free(p);
+}
 
 // Measured call sites pass a zeroed 64-byte structure. Only the MEMORY_BASIC_INFORMATION-compatible prefix is
 // known: callers read at least the base and size fields. Fill that prefix from VirtualQueryEx and zero the rest.
@@ -64,8 +96,10 @@ SIZE_T __stdcall XMemVirtualQuery(HANDLE process, const void* address, void* out
 // 0x75b1): ECX is the constant 0x20000001 (its meaning is not known) and RDX points at a stack buffer (0x80 bytes
 // where the frame shows it). The caller reads a 64-bit size at +8 and treats a zero return as "no data". Taking the
 // pointer from the first argument wrote to address 0x20000001.
-// Only the first 16 bytes are touched: zero at +0 (unknown) and the process working set at +8. Do not claim more of
-// the struct than is measured.
+// The measured FSR sites establish argument shape, kind and the 64-bit working-set read at +8; +0's title-total memory
+// limit interpretation is inferred from other Series implementations (xcl, xbox-emulator) and title engine telemetry
+// sizing memory pools (RT-220). Note that if GlobalMemoryStatusEx reports 0 physical memory, XMem falls back to the
+// 12 GiB title limit, whereas XSystemGetAppMemoryUsageLimit remains 0.
 BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     if (!stats) {
         static std::atomic<bool> warned{false};
@@ -78,8 +112,15 @@ BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     PROCESS_MEMORY_COUNTERS pmc{};
     if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return FALSE;
 
+    MEMORYSTATUSEX ms{sizeof(ms)};
+    uint64_t total_memory = 12ULL * 1024 * 1024 * 1024;
+    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys != 0) {
+        total_memory = ms.ullTotalPhys;
+    }
+
     uint8_t* bytes = static_cast<uint8_t*>(stats);
     std::memset(bytes, 0, 16);
+    std::memcpy(bytes + 0, &total_memory, sizeof(total_memory));
     uint64_t working_set = pmc.WorkingSetSize;
     std::memcpy(bytes + 8, &working_set, sizeof(working_set));
     return TRUE;
@@ -179,6 +220,52 @@ UINT WINAPI XMemResetWriteWatch(void* base_address, SIZE_T region_size) {
     return ResetWriteWatch(base_address, region_size);
 }
 
+// BOOL XMemTransferMemory(XMEM_TRANSFER_TYPE type, SIZE_T size). Its reference page and the XMEM_TRANSFER_TYPE enum
+// page (gaming/gdk/docs/reference/system/xmem/{functions/xmemtransfermemory,enums/xmem_transfer_type}) are NDA
+// topics on Microsoft Learn, so the shape comes from public code built against the GDK's xmem.h: Microsoft's
+// XBOX-MonoGame-NetRumble sample (console/NetRumble.Bootstrap/Main.cpp) and FNA-XNA/NativeAOT-Xbox (Bootstrap/Main.cpp)
+// both call `if (!XMemTransferMemory(XMemTransferTitleToSystem, additionalKernelPoolMemory))` with a `const size_t`,
+// commented "Transfer additional memory to kernel pool" and "Must be multiples of 2MB sizes". So: two arguments, the
+// enum (32 bits) in ECX and the size in RDX, and a zero return is failure. The public XLaunchNewGame page adds that
+// "Memory transferred to the system using XMemTransferMemory (NDA topic) is persisted", and the game-save debugging
+// page suggests it for E_OUTOFMEMORY "to transfer some memory to the system partition".
+//
+// On the console it moves budget between the title's partition and the system's. A PC has one pool and no budget
+// split, so there is nothing to move: every direction and size returns TRUE and nothing is allocated or reserved. Not
+// known (the pages are NDA): the numeric XMEM_TRANSFER_TYPE values, and whether the console refuses or rounds a size
+// that is not a multiple of 2 MiB. Refusing would stop a title at startup (both samples return -1), while succeeding
+// changes nothing here. TRUE is 1 in EAX, so it also reads as true if the real return type is a one-byte bool.
+//
+// gta6rt --trace FILE: the first call for each distinct (type, size) pair goes to the startup trace as an
+// "xmem_transfer" event with the caller as module+RVA, so a run with the executable records the values it passes.
+BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] xmem: XMemTransferMemory(type %u, %zu bytes): a PC has no title/system memory partition; "
+                     "returning TRUE without moving anything (logged once)\n",
+                     type, static_cast<size_t>(size));
+    }
+    if (rt::startup_trace::enabled()) {
+        static std::mutex mutex;
+        static std::set<std::pair<uint32_t, uint64_t>> seen;
+        bool first = false;
+        {
+            const std::lock_guard lock(mutex);
+            first = seen.insert({type, static_cast<uint64_t>(size)}).second;
+        }
+        if (first) {
+            rt::startup_trace::event(
+                "xmem_transfer",
+                "\"api\":\"XMemTransferMemory\",\"type\":" + std::to_string(type) +
+                    ",\"size\":" + std::to_string(static_cast<uint64_t>(size)) + ",\"caller\":" +
+                    rt::startup_trace::quote(
+                        rt::startup_trace::where(reinterpret_cast<uint64_t>(_ReturnAddress()))));
+        }
+    }
+    return TRUE;
+}
+
 // kernel32!VirtualAlloc as a title calls it. The console's allocation type has two bits of its own, MEM_GRAPHICS
 // (0x10000000, memory the GPU reads) and MEM_TITLE (0x40000000, the title's own heap). On a PC the host rejects both
 // with ERROR_INVALID_PARAMETER (measured on Windows 11 26200: VirtualAlloc(NULL, 64 KiB, MEM_COMMIT | MEM_RESERVE |
@@ -218,4 +305,5 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},
     {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
     {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
+    {"xmem.dll", "XMemTransferMemory", reinterpret_cast<void*>(&XMemTransferMemory)},
 );
