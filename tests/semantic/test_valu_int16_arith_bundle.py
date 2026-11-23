@@ -138,6 +138,30 @@ class TestVAddU16Reference(unittest.TestCase):
     def test_ref_add_u16_clamp(self):
         self.assertEqual(ref_v_add_u16(60000, 10000, clamp=True), 0xFFFF)
 
+@ValuInterpreterState.register("v_add_u16")
+def _step_add_u16(state: ValuInterpreterState, inst: ValuInstruction) -> int:
+    s0_val = inst.s0 if not isinstance(inst.s0, str) else state.vgpr[int(inst.s0.lstrip("v"))]
+    s1_val = inst.s1 if not isinstance(inst.s1, str) else state.vgpr[int(inst.s1.lstrip("v"))]
+    res = ref_v_add_u16(s0_val, s1_val, clamp=inst.clamp)
+    state.vgpr[inst.dst] = res
+    return res
+
+
+class TestVAddU16Interpreter(unittest.TestCase):
+    def test_interpreter_step_add_u16(self):
+        state = ValuInterpreterState()
+        inst = ValuInstruction("v_add_u16", dst=0, s0=500, s1=250)
+        res = state.step(inst)
+        self.assertEqual(res, 750)
+        self.assertEqual(state.vgpr[0], 750)
+
+    def test_interpreter_step_add_u16_clamped(self):
+        state = ValuInterpreterState()
+        inst = ValuInstruction("v_add_u16", dst=1, s0=60000, s1=10000, clamp=True)
+        res = state.step(inst)
+        self.assertEqual(res, 0xFFFF)
+        self.assertEqual(state.vgpr[1], 0xFFFF)
+
 
 if __name__ == "__main__":
     unittest.main()
