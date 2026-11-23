@@ -160,5 +160,57 @@ class TestLshlrevASTAndTypes(unittest.TestCase):
         self.assertEqual(words[1], 0)
 
 
+class Vector64Interpreter:
+    """Deterministic vector instruction interpreter for 64-bit shift blocks."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 64
+
+    def exec_line(self, line: str) -> None:
+        tokens = line.strip().replace(",", " ").split()
+        if not tokens:
+            return
+        op = tokens[0]
+        if op == "v_mov_b32":
+            dst = int(tokens[1].lstrip("v"))
+            val = int(tokens[2], 0)
+            self.vgprs[dst] = val & MASK32
+        elif op == "v_lshlrev_b64":
+            dst_pair = tokens[1].strip("v[]").split(":")
+            d = int(dst_pair[0])
+            shift = int(tokens[2], 0)
+            src_pair = tokens[3].strip("v[]").split(":")
+            s = int(src_pair[0])
+            val64 = self.vgprs[s] | (self.vgprs[s + 1] << 32)
+            rlo, rhi = v_lshlrev_b64_oracle(shift, val64)
+            self.vgprs[d] = rlo
+            self.vgprs[d + 1] = rhi
+
+
+class TestLshlrevScalarInterpreter(unittest.TestCase):
+    """Commit 3: deterministic scalar instruction interpreter for v_lshlrev_b64."""
+
+    def test_sequential_chained_shifts(self):
+        interp = Vector64Interpreter()
+        lines = [
+            "v_mov_b32 v2, 1",
+            "v_mov_b32 v3, 0",
+            "v_lshlrev_b64 v[0:1], 16, v[2:3]",   # 1 << 16 = 0x10000
+            "v_lshlrev_b64 v[0:1], 16, v[0:1]",   # 0x10000 << 16 = 0x1_00000000
+        ]
+        for ln in lines:
+            interp.exec_line(ln)
+        self.assertEqual(interp.vgprs[0], 0)
+        self.assertEqual(interp.vgprs[1], 1)
+
+        prog = lines + [
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_lshlrev_ps(prog, "ps_lshlrev_chained")
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 1)
+
+
 if __name__ == '__main__':
     unittest.main()
