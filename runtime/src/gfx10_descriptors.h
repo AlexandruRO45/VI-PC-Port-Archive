@@ -539,17 +539,24 @@ inline Sampler decode(const SamplerWords& words) {
     sampler.filter_mode = FilterMode(get(words[0], 29, 2));
     sampler.min_lod = float(get(words[1], 0, 12)) / 256.0f;
     sampler.max_lod = float(get(words[1], 12, 12)) / 256.0f;
-    const std::uint32_t bias = get(words[2], 0, 14);
-    sampler.lod_bias = float(std::int32_t(bias ^ 0x2000u) - 0x2000) / 256.0f;  // sign-extend 14 bits
     sampler.mag_filter = Filter(get(words[2], 20, 2));
     sampler.min_filter = Filter(get(words[2], 22, 2));
     sampler.mip_filter = MipFilter(get(words[2], 26, 2));
-    sampler.border_color_index = get(words[3], 0, 12);
-    sampler.border_color = BorderColor(get(words[3], 30, 2));
-    if (!deriv_adjust && sampler.border_color != BorderColor::table &&
-        sampler.border_color_index == kIntegerBorderPtr) {
-        sampler.integer_border = true;
-        sampler.border_color_index = 0;
+    if (deriv_adjust) {
+        // When DERIV_ADJUST_EN (WORD2[31]) is set, WORD3 holds derivative-adjustment fields and WORD2[13:0]
+        // carries BORDER_COLOR_PTR [11:0] and BORDER_COLOR_TYPE [13:12] instead of LOD_BIAS.
+        sampler.lod_bias = 0.0f;
+        sampler.border_color_index = get(words[2], 0, 12);
+        sampler.border_color = BorderColor(get(words[2], 12, 2));
+    } else {
+        const std::uint32_t bias = get(words[2], 0, 14);
+        sampler.lod_bias = float(std::int32_t(bias ^ 0x2000u) - 0x2000) / 256.0f;  // sign-extend 14 bits
+        sampler.border_color_index = get(words[3], 0, 12);
+        sampler.border_color = BorderColor(get(words[3], 30, 2));
+        if (sampler.border_color != BorderColor::table && sampler.border_color_index == kIntegerBorderPtr) {
+            sampler.integer_border = true;
+            sampler.border_color_index = 0;
+        }
     }
     return sampler;
 }

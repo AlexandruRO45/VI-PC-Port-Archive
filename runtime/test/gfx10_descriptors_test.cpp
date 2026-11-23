@@ -388,14 +388,26 @@ int main() {
     CHECK(vulkan_reduction_mode(FilterMode::minimum) == VK_SAMPLER_REDUCTION_MODE_MIN);
     CHECK(vulkan_reduction_mode(FilterMode::maximum) == VK_SAMPLER_REDUCTION_MODE_MAX);
 
-    // DERIV_ADJUST_EN (WORD2 bit 31) repurposes WORD3, so kIntegerBorderPtr there is not a layer integer marker.
+    // DERIV_ADJUST_EN (WORD2 bit 31) repurposes WORD3 and puts BORDER_COLOR_PTR [11:0] / BORDER_COLOR_TYPE [13:12]
+    // in WORD2 instead of LOD_BIAS.
+    const Sampler deriv_repro = decode(SamplerWords{0, 0, 0x80002800u, 0});
+    CHECK(deriv_repro.border_color == BorderColor::opaque_white &&
+          deriv_repro.border_color_index == kIntegerBorderPtr && !deriv_repro.integer_border &&
+          !deriv_repro.compare_never && deriv_repro.lod_bias == 0.0f);
+    info = vulkan_sampler(deriv_repro);
+    CHECK(info.borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE && info.mipLodBias == 0.0f);
     for (const auto [type, want] : {std::pair{BorderColor::transparent_black, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK},
                                     std::pair{BorderColor::opaque_black, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK},
                                     std::pair{BorderColor::opaque_white, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE}}) {
-        const Sampler deriv = decode(SamplerWords{0, 0, 1u << 31, (std::uint32_t(type) << 30) | kIntegerBorderPtr});
-        CHECK(!deriv.integer_border && deriv.border_color_index == kIntegerBorderPtr);
+        const Sampler deriv = decode(SamplerWords{0, 0, (1u << 31) | (std::uint32_t(type) << 12) | kIntegerBorderPtr,
+                                                  (3u << 30) | kCompareNever | kIntegerBorderPtr});
+        CHECK(deriv.border_color == type && deriv.border_color_index == kIntegerBorderPtr && !deriv.integer_border &&
+              !deriv.compare_never && deriv.lod_bias == 0.0f);
         CHECK(vulkan_sampler(deriv).borderColor == want);
     }
+    const Sampler deriv_table = decode(SamplerWords{0, 0, (1u << 31) | (3u << 12) | 0x2ABu, 0xFFFFFFFFu});
+    CHECK(deriv_table.border_color == BorderColor::table && deriv_table.border_color_index == 0x2ABu &&
+          !deriv_table.integer_border && !deriv_table.compare_never && deriv_table.lod_bias == 0.0f);
 
     // Vulkan requires maxLod >= minLod (VUID-VkSamplerCreateInfo-maxLod-01973); when min_lod > max_lod, D3D12/RDNA2
     // give MinLOD precedence.
