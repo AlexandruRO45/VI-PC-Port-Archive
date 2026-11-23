@@ -230,6 +230,20 @@ class TestValuAddF32ScalarExecution(unittest.TestCase):
         words = support.mrt0_words(support.translate_lines(next_test_id("ps_add_alias"), lines))
         self.assertAlmostEqual(bits_to_f32(words[0]), 1.0, places=6)
 
+class TestValuAddF32SIMDDivergence(unittest.TestCase):
+    """Stage 4: SIMD multi-lane divergence tests for v_add_f32 clamp and omod."""
+
+    def test_add_lane_symmetric(self):
+        # A + B == B + A under clamp
+        res_ab = run_binary_f32("v_add_f32", 0.3, 0.4, clamp=True)
+        res_ba = run_binary_f32("v_add_f32", 0.4, 0.3, clamp=True)
+        self.assertAlmostEqual(res_ab, res_ba, places=6)
+
+    def test_add_div2_divergent_lanes(self):
+        # (0.8 + 0.6) * 0.5 = 0.7
+        hw = run_binary_f32("v_add_f32", 0.8, 0.6, omod="div:2")
+        self.assertAlmostEqual(hw, 0.7, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
