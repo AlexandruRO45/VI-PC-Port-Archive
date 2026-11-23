@@ -28,6 +28,36 @@ BOUNDS = (0, 0, 0, 1, 1, 0)
 
 
 class TestChecks(unittest.TestCase):
+    def test_command_line_rejects_an_extra_geometry_path(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        with tempfile.TemporaryDirectory() as d:
+            src_path, vb_path, ib_path, report = (
+                os.path.join(d, name) for name in ("in.bin", "vb.bin", "ib.bin", "report.json")
+            )
+            for path, data in ((src_path, src), (vb_path, VB), (ib_path, IB)):
+                with open(path, "wb") as f:
+                    f.write(data)
+
+            spec = f"{vb_path},{ib_path},missing.bin"
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = C.main([src_path, "--geom", spec, "--json", report])
+            self.assertEqual(rc, 2)
+            self.assertIn("--geom expects VB[,IB]", err.getvalue())
+            self.assertEqual(out.getvalue(), "")
+            self.assertFalse(os.path.exists(report))
+
+    def test_command_line_accepts_nonindexed_geometry(self):
+        src, _, _ = build([(0, 0x01, 0, None, 0x09)], bounds=BOUNDS)
+        with tempfile.TemporaryDirectory() as d:
+            src_path, vb_path = (os.path.join(d, name) for name in ("in.bin", "vb.bin"))
+            for path, data in ((src_path, src), (vb_path, VB[:36])):
+                with open(path, "wb") as f:
+                    f.write(data)
+
+            for spec in (vb_path, f"{vb_path},"):
+                with self.subTest(spec=spec), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(C.main([src_path, "--geom", spec]), 0)
+
     def test_true_geometry_is_consistent(self):
         src, _, _ = build(LEAVES, bounds=BOUNDS)
         r = C.check(src, [TRUE])

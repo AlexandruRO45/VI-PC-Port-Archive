@@ -162,6 +162,9 @@ def main(argv=None):
     geom_paths = []
     for spec in a.geom:
         parts = spec.split(",")
+        if len(parts) > 2 or not parts[0]:
+            print("error: --geom expects VB[,IB]", file=sys.stderr)
+            return 2
         geom_paths.append((parts[0], parts[1] if len(parts) > 1 else ""))
     if a.json:
         if same_report_path(a.json, a.dehydrated):
