@@ -139,5 +139,36 @@ class TestOpcodeTranslation(unittest.TestCase):
         self.assertIn("FAbs", spv)
         self.assertIn("OpFNegate", spv)
 
+class TestScalarExecution(unittest.TestCase):
+    """Deterministic scalar execution via support.translate_lines and mrt0_words."""
+
+    def _run_cubetc(self, s0: int, s1: int, s2: int, *, clamp: bool = False) -> int:
+        clamp_str = "clamp " if clamp else ""
+        prog = [
+            f"v_mov_b32 v1, {s0:#x}",
+            f"v_mov_b32 v2, {s1:#x}",
+            f"v_mov_b32 v3, {s2:#x}",
+            f"v_cubetc_f32 {clamp_str}v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_exec", prog)
+        words = support.mrt0_words(spv)
+        return words[0]
+
+    def test_six_cube_faces_execution(self):
+        cases = [
+            ((4.0, -1.5, 0.75), 1.5),     # +X: tc = -y = 1.5
+            ((-4.0, 1.5, -0.75), -1.5),   # -X: tc = -y = -1.5
+            ((1.25, 3.0, -0.5), -0.5),    # +Y: tc = z = -0.5
+            ((-1.25, -3.0, 0.5), -0.5),   # -Y: tc = -z = -0.5
+            ((-0.5, 1.25, 2.5), -1.25),   # +Z: tc = -y = -1.25
+            ((0.5, -1.25, -2.5), 1.25),   # -Z: tc = -y = 1.25
+        ]
+        for (a, b, c), expected in cases:
+            s0, s1, s2 = f32_to_u32(a), f32_to_u32(b), f32_to_u32(c)
+            got = self._run_cubetc(s0, s1, s2)
+            self.assertEqual(got, f32_to_u32(expected), f"Mismatch for inputs ({a}, {b}, {c})")
+
 if __name__ == "__main__":
     unittest.main()
