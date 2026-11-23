@@ -63,16 +63,34 @@ class TestEndOfStream(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "end-of-stream"):
             opus_tags.retag(first + second[:final_start], opus_tags.tags_packet([]))
 
+    def test_later_eos_does_not_hide_an_incomplete_logical_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            complete = [stream(Path(tmp), 200, serial=n) for n in (1, 2, 3)]
+        for damaged_index in range(3):
+            spans = list(opus_tags.pages(complete[damaged_index]))
+            for cut, _ in (spans[2], spans[-1]):
+                with self.subTest(link=damaged_index, cut=cut):
+                    parts = complete.copy()
+                    parts[damaged_index] = parts[damaged_index][:cut]
+                    damaged = b"".join(parts)
+                    # Every surviving page is CRC-valid, including the later EOS.
+                    self.assertEqual(list(opus_tags.checked_pages(damaged)),
+                                     list(opus_tags.pages(damaged)))
+                    with self.assertRaisesRegex(ValueError, "end-of-stream"):
+                        opus_tags.retag(damaged, opus_tags.tags_packet([]))
+
     def test_cli_skips_incomplete_stream_and_continues(self):
         for dry_run in (False, True):
-            for keep_tags_only in (False, True):
-                with self.subTest(dry_run=dry_run, tags_only=keep_tags_only):
+            for truncation in ("audio_tail", "tags_only", "earlier_chain"):
+                with self.subTest(dry_run=dry_run, truncation=truncation):
                     with tempfile.TemporaryDirectory() as tmp:
                         root = Path(tmp)
                         complete = stream(root)
                         spans = list(opus_tags.pages(complete))
-                        cut = spans[2 if keep_tags_only else -1][0]
+                        cut = spans[2 if truncation == "tags_only" else -1][0]
                         truncated = complete[:cut]
+                        if truncation == "earlier_chain":
+                            truncated += stream(root, 1, serial=2)
                         bank = root / "opus" / "bank"
                         bank.mkdir(parents=True)
                         damaged = bank / "00000001.ogg"

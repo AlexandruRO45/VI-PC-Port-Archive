@@ -380,9 +380,10 @@ positions stay byte for byte as `awc_opus.py` wrote them, and a second run repla
 streams are not touched. A tags packet that would not fit in one Ogg page (65,024 bytes) is skipped and counted;
 dialogue tags are a few kilobytes. `--dry-run` counts without writing.
 
-The tagger checks every page's checksum and refuses a file whose final page lacks the end-of-stream flag
-([Ogg page format, RFC 3533 section 6](https://www.rfc-editor.org/rfc/rfc3533.html#section-6)). Losing a whole final
-page leaves the remaining checksums valid but the stream incomplete. Such a file is counted as skipped and left
+The tagger checks every page's checksum and refuses a file if any logical stream's final page lacks the end-of-stream
+flag ([Ogg page format, RFC 3533 section 6](https://www.rfc-editor.org/rfc/rfc3533.html#section-6)). Losing a whole final
+page leaves the remaining checksums valid but the stream incomplete, even when followed by a complete chained
+stream. Completion is checked separately for each stream serial. Such a file is counted as skipped and left
 unchanged, including in `--dry-run`; other named files are still processed.
 
 Checked on the 1.0.2.1 package (2026-11-22) with all 638 `shared_minigame000.rpf` banks and the first 3,000

@@ -23,8 +23,8 @@ sequence numbers do not change. Streams without a name are left untouched, and s
 twice (counted as ``ambiguous name``): the archive stores only the low 29 bits of a name hash, so two names can claim
 one id, and writing either would put another stream's name and, through --dialogue, its subtitle in the file. Running
 the tool again replaces the tags it wrote. A tags packet larger than one Ogg page (65,024 bytes) is skipped and counted.
-Files with a bad page checksum, truncated page or missing final end-of-stream flag are also skipped and left
-untouched; all pages are checked before any replacement is written.
+Files with a bad page checksum, truncated page or a logical stream missing its final end-of-stream flag are also
+skipped and left untouched; all pages are checked before any replacement is written.
 
 Usage:
     python -I opus_tags.py <Opus folder> --names names.csv [--dialogue dialogue.csv] [--source LABEL] [--dry-run]
@@ -34,6 +34,7 @@ Standard library only. The CSVs and the tagged files hold game names and text: k
 import argparse
 import collections
 import csv
+import itertools
 import os
 import re
 import struct
@@ -91,9 +92,10 @@ def retag(data: bytes, packet: bytes) -> bytes:
         raise ValueError("tags do not fit in one page")
     it = checked_pages(data)
     try:
-        _, (tags_at, tags_end) = next(it), next(it)
+        head_page, tags_page = next(it), next(it)
     except StopIteration:
         raise ValueError("fewer than two Ogg pages") from None
+    tags_at, tags_end = tags_page
     body = tags_at + 27 + data[tags_at + 26]
     if data[body:body + 8] != b"OpusTags":
         raise ValueError("page 1 does not start an OpusTags packet")
@@ -102,11 +104,12 @@ def retag(data: bytes, packet: bytes) -> bytes:
         raise ValueError("the OpusTags packet continues past page 1")
     if any(segment != 255 for segment in segments[:-1]):
         raise ValueError("the OpusTags page contains another packet")
-    last_at = tags_at
-    for last_at, _ in it:  # also check the audio tail before publishing any replacement
-        pass
-    # A cut at a page boundary leaves every remaining checksum valid (RFC 3533 section 6, header_type_flag).
-    if not data[last_at + 5] & 0x04:
+    ended = {}
+    for start, _ in itertools.chain((head_page, tags_page), it):
+        serial, = struct.unpack_from("<I", data, start + 14)
+        ended[serial] = bool(data[start + 5] & 0x04)
+    # A whole-page cut leaves valid CRCs; a later chained stream's EOS must not hide it (RFC 3533 sections 4, 6).
+    if not all(ended.values()):
         raise ValueError("Ogg stream is missing its final end-of-stream page")
     serial, seq = struct.unpack_from("<II", data, tags_at + 14)
     if seq != 1:
