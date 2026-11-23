@@ -154,5 +154,26 @@ class SMinI32SimdDivergenceTests(unittest.TestCase):
         self.assertEqual(res, 0x80000000)
         self.assertEqual(scc, 1)
 
+class SMinI32TranslatorTests(unittest.TestCase):
+    def test_min_i32_translation_and_execution(self):
+        lines = [
+            "s_mov_b32 s0, -5",
+            "s_mov_b32 s1, 10",
+            "s_min_i32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32 v0, s2",
+            "v_mov_b32 v1, s3",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_min_i32_exec", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 0xFFFFFFFB)  # -5 in uint32
+        self.assertEqual(words[1], 1)           # SCC = 1
+
+    def test_min_i32_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_min_i32", ["s_min_i32 s0, s1"])
+
 if __name__ == "__main__":
     unittest.main()
