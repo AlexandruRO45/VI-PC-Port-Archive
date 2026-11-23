@@ -234,5 +234,37 @@ class TestSOrn2B32SIMDDivergence(unittest.TestCase):
         self.assertEqual(scc, 1)
 
 
+class TestSOrn2B32RegisterAliasing(unittest.TestCase):
+    """Register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src0(self):
+        mach = ScalarMachine()
+        mach.sgprs[0] = 0x12345678
+        mach.sgprs[1] = 0x00FF00FF
+        # s0 = s0 | ~s1
+        mach.step(SOrn2B32Inst(Operand(RegType.SGPR, 0), Operand(RegType.SGPR, 0), Operand(RegType.SGPR, 1)))
+        exp_d, exp_scc = ref_orn2_b32(0x12345678, 0x00FF00FF)
+        self.assertEqual(mach.sgprs[0], exp_d)
+        self.assertEqual(mach.sgprs[1], 0x00FF00FF)
+
+    def test_dst_aliases_src1(self):
+        mach = ScalarMachine()
+        mach.sgprs[0] = 0x12345678
+        mach.sgprs[1] = 0x00FF00FF
+        # s1 = s0 | ~s1
+        mach.step(SOrn2B32Inst(Operand(RegType.SGPR, 1), Operand(RegType.SGPR, 0), Operand(RegType.SGPR, 1)))
+        exp_d, exp_scc = ref_orn2_b32(0x12345678, 0x00FF00FF)
+        self.assertEqual(mach.sgprs[1], exp_d)
+        self.assertEqual(mach.sgprs[0], 0x12345678)
+
+    def test_all_operands_aliased(self):
+        mach = ScalarMachine()
+        mach.sgprs[0] = 0xAAAAAAAA
+        # s0 = s0 | ~s0 = 0xFFFFFFFF
+        mach.step(SOrn2B32Inst(Operand(RegType.SGPR, 0), Operand(RegType.SGPR, 0), Operand(RegType.SGPR, 0)))
+        self.assertEqual(mach.sgprs[0], MASK32)
+        self.assertEqual(mach.scc, 1)
+
+
 if __name__ == '__main__':
     unittest.main()
