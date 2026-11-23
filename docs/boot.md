@@ -2,7 +2,7 @@
 
 **Status: `--dry-run` and `--init` have been run on the retail executable; `--run` has not.** The package in the
 repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the dry-run on an executable supplied
-separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
+separately maps it and leaves 29 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
 `DllMain`s without an exception
 ([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
 trace tool for the first boot. The executable's `ws2_32.dll` imports bind to the host's, so run `--run` with the

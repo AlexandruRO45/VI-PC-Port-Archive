@@ -104,36 +104,39 @@ runtime\build\gta6rt.exe --dry-run "D:\path\to\game_scarlett_master.exe" --game-
 ```
 
 `--overlay` points the write overlay away from `<game-dir>\overlay`, so a dry run writes nothing into the package.
-Measured at `1cc6e3c1`, Windows 11, MSVC 14.44:
+Measured at `e0816d6`, Linux, clang-cl 23.1.5 against the Windows SDK 10.0.26100 headers and wine 11.22. The
+earlier `1cc6e3c1` Windows/MSVC 14.44 run is in this table's history: it reported 53 shim and 30 unimplemented for
+the executable, and #6792 has since served one of them.
 
 | Image | Base | Size of image | Entry RVA | Shim | Host | Module | Unimplemented |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `game_scarlett_master.exe` | `0x140000000` | 184,995,840 | `0x56a1ec8` | 53 | 432 | 72 | **30** |
+| `game_scarlett_master.exe` | `0x140000000` | 184,995,840 | `0x56a1ec8` | 54 | 432 | 72 | **29** |
 | `XboxBvhBuilder.dll` | `0x180000000` | 909,312 | `0x227cc` | 5 | 52 | 0 | 0 |
 | `amd_fidelityfx_loader_xbox.dll` | relocated | 32,768 | `0x18d0` | 6 | 16 | 0 | 0 |
 | `libHttpClient.GDK.dll` | relocated | 999,424 | `0x11f0` | 28 | 170 | 0 | 0 |
 | `Bink2Scarlett.dll` | relocated | 278,528 | `0x2ac1c` | 5 | 55 | 0 | 0 |
 
-The 72 module imports are served by those four DLLs. The 30 unimplemented imports all fall under the dry-run's
-policy "other" (none is counted as returning an `HRESULT`), and they come from seven Xbox-only DLLs:
+The 72 module imports are served by those four DLLs. The 29 unimplemented imports all fall under the dry-run's
+policy "other" (none is counted as returning an `HRESULT`), and they come from six Xbox-only DLLs:
 
 | DLL | Unimplemented imports | What the names suggest (not measured) |
 |---|---:|---|
 | `xmem.dll` | 7: `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemIsToolsMemAvailable`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter` | the console's physical page and default allocation routines; `XMemAlloc`, `XMemFree`, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics` and `XMemTransferMemory` already bind |
-| `d3d12_xs.dll` | 1: `D3D12ConfigureVirtualMemoryX` | GPU virtual memory setup |
 | `xg_xs.dll` | 2: `XGCreateTextureComputer`, `XGSuggestSwizzleMode` | texture layout computation |
 | `XCRDAPI.dll` | 1: `DStorageGetFactory` | DirectStorage |
 | `chad.dll` | 5: `XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand` | the audio DSP |
 | `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
 | `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
 
-Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
-they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
-`xapu.dll`, `AcpHal.dll`) with no shim at all.
+Only one of these DLLs has a shim in the repository (`xmem.dll`), and it is not complete: it holds 7 of the 29
+unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`, `xapu.dll`,
+`AcpHal.dll`) with no shim at all. `d3d12_xs.dll` has a shim and no longer appears here: its single import,
+`D3D12ConfigureVirtualMemoryX`, is served by `runtime/shims/d3d12_xs.cpp` since #6792, which returns `S_OK` and logs
+the caller's 32-byte block once.
 
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
-again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
+again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 29
 unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
 
 What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
