@@ -793,14 +793,51 @@ the archetypes reference; the per-bone mapping onto each model's skeleton still 
    A direct hash comparison against the 52,752 bone-bearing dictionaries in `anim.rpf` found zero matches.
    Applying the same root and clip-map checks to the other 21 RPF archives (85,152,072,416 bytes)
    yielded no additional matches. The two references unresolved by that scan appeared in 43 and 64 archetype records,
-   covering two and 16 distinct asset names respectively. This search covers readable dictionary roots
-   at aligned zlib stream starts. Other storage layouts remain possible.
+   covering two and 16 distinct asset names respectively. They are named, and searched for by name,
+   [below](#the-two-unresolved-references-asset-180).
 3. Deduplicate the resulting `(assetName, clipDictionary)` pairs. Of the 159 confirmed dictionaries,
    55 are referenced by one distinct asset name each. The remaining 104 are shared. Across their local
    animation packs, 63 dictionaries have nonzero rotation or translation bone hashes and 96 have none.
    All 63 fall below the 90% reference-skeleton threshold used above.
-measured. Still open in ASSET-20: the `0DRP` "2/3 packed clip streams" ([above](#packed-clip-streams)) and which
-model or skeleton each non-humanoid clip dictionary drives.
+
+#### The two unresolved references (ASSET-180)
+
+Both name the clip dictionary of an ambient prop pack whose models and archetypes are in the package. No
+dictionary with either name was found. The figures in this section come from separate scans of Xbox 1.0.2.1,
+not from a committed tool.
+
+- **Names.** Of the 159 confirmed dictionaries, 104 have a name readable from the first 0x400 inflated bytes
+  of the root stream. All 104 end in `_clip`; the shared ones are named after a prop pack, for example
+  `am_bar_clip` and `am_aircon_clip`. A word-list search (the 395,464 words of Fedora's `/usr/share/dict`
+  lists with 12 prefixes such as `am_` and 5 suffixes such as `_clip`: 23,727,840 candidates) gives
+  `joaat32("am_gym_clip") = 0x147869a0` and `joaat32("am_escalator_clip") = 0x7e2abe07`. At that candidate
+  count, a chance match to either hash is expected about 0.01 times.
+- **Assets.** All 18 referencing asset names are the `joaat32` hashes of `.#ft` and `.#dr` resource names
+  found in `levels.rpf`. `am_gym_clip` is referenced by one treadmill fragment (`assetType` 1) and its
+  `_batchlod` drawable (`assetType` 2). `am_escalator_clip` is referenced by eight escalator fragments of
+  different sizes and their eight `_batchlod` drawables. The archetype boxes fit those objects. The escalator
+  fragments span 10.8–31.6 m in x, 1.50–1.90 m in y and 5.3–17.3 m in z, with z at 0.49–0.61 of x. The
+  treadmill fragment's box is 0.87 × 2.11 × 1.44 m (x × y × z).
+- **No dictionary of that name.** A search of every 16-byte-aligned zlib stream in all 22 archives (2,240,234
+  streams, 364,954,750,250 inflated bytes) for the ASCII names finds neither dictionary name. Each control,
+  `am_bar_clip` and `am_aircon_clip`, is found twice in `levels.rpf`: as its root name at `+0x38` and in its
+  pack name (`am_bar_clip-0`, `am_aircon_clip-0`). The other `am_gym` and `am_escalator` strings are model
+  and LOD resource names in `levels.rpf`, file lists in `common.rpf` and `core_bvh4.rpf`, and animation names
+  for other gym props in `story000.rpf` and `anim.rpf`. None names a treadmill or escalator animation.
+  Like the hash search above, this covers names stored as plain ASCII in aligned zlib streams. Other storage
+  layouts remain possible.
+- **Registration.** The `CDataFileMgr__ContentChangeSetDef` in `common.rpf` lists both packs exactly as it
+  lists the packs whose dictionaries were found: an `.ityp` (`PERMANENT_ITYP_FILE`), an `.rpf` and a
+  `_metadata.rpf`. No entry in that list names a clip dictionary. This suggests, without opening the packs,
+  that a pack's dictionary is stored inside its `.rpf`.
+
+Outside the archetype records, the same streams hold `0x147869a0` as an aligned little-endian u32 once and
+`0x7e2abe07` twice. The single occurrence of `0x147869a0` sits among the sorted keys of an unidentified table
+in `levels.rpf`. For uniformly random data, about 21 aligned occurrences per hash would be expected across
+these bytes, so it is not counted as a reference.
+
+In Xbox 1.0.2.1, both packs therefore ship models and archetypes that name a clip dictionary not found in
+the package. Whether the game animates these props another way at run time has not been checked.
 
 ## `MoVE` state-machine containers
 
