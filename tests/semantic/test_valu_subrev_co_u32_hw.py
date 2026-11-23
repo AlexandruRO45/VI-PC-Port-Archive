@@ -99,3 +99,90 @@ class TestSubrevCoU32Oracle(unittest.TestCase):
         d1, b1 = ref_subrev_co_u32(100, 40)
         self.assertEqual(d1, (40 - 100) & M32)
         self.assertEqual(b1, 1)
+
+# -----------------------------------------------------------------------------
+# Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
+# -----------------------------------------------------------------------------
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    VCC = auto()
+    SPECIAL = auto()
+    IMM = auto()
+
+
+@dataclass(frozen=True)
+class TypedOperand:
+    kind: OperandKind
+    index: int = 0
+    name: str = ""
+    value: int = 0
+
+    @classmethod
+    def vgpr(cls, idx: int) -> TypedOperand:
+        return cls(kind=OperandKind.VGPR, index=idx, name=f"v{idx}")
+
+    @classmethod
+    def sgpr(cls, idx: int) -> TypedOperand:
+        return cls(kind=OperandKind.SGPR, index=idx, name=f"s{idx}")
+
+    @classmethod
+    def vcc_lo(cls) -> TypedOperand:
+        return cls(kind=OperandKind.VCC, name="vcc_lo")
+
+    @classmethod
+    def null(cls) -> TypedOperand:
+        return cls(kind=OperandKind.SPECIAL, name="null")
+
+    @classmethod
+    def imm(cls, val: int) -> TypedOperand:
+        return cls(kind=OperandKind.IMM, value=val, name=str(val))
+
+
+@dataclass(frozen=True)
+class VSubrevCoU32AST:
+    vdst: TypedOperand
+    sdst: TypedOperand
+    src0: TypedOperand
+    src1: TypedOperand
+    clamp: bool = False
+
+    def __post_init__(self) -> None:
+        if self.vdst.kind != OperandKind.VGPR:
+            raise TypeError(f"vdst must be VGPR, got {self.vdst.kind}")
+        if self.sdst.kind not in (OperandKind.SGPR, OperandKind.VCC, OperandKind.SPECIAL):
+            raise TypeError(f"sdst must be SGPR, VCC, or null, got {self.sdst.kind}")
+
+    def to_assembly(self) -> str:
+        mod = " clamp" if self.clamp else ""
+        return f"v_subrev_co_u32 {self.vdst.name}, {self.sdst.name}, {self.src0.name}, {self.src1.name}{mod}"
+
+
+class TestSubrevCoU32AST(unittest.TestCase):
+    def test_ast_construction_valid(self) -> None:
+        ast = VSubrevCoU32AST(
+            vdst=TypedOperand.vgpr(0),
+            sdst=TypedOperand.vcc_lo(),
+            src0=TypedOperand.vgpr(1),
+            src1=TypedOperand.vgpr(2),
+        )
+        self.assertEqual(ast.to_assembly(), "v_subrev_co_u32 v0, vcc_lo, v1, v2")
+
+    def test_ast_with_clamp(self) -> None:
+        ast = VSubrevCoU32AST(
+            vdst=TypedOperand.vgpr(5),
+            sdst=TypedOperand.sgpr(2),
+            src0=TypedOperand.vgpr(3),
+            src1=TypedOperand.imm(100),
+            clamp=True,
+        )
+        self.assertEqual(ast.to_assembly(), "v_subrev_co_u32 v5, s2, v3, 100 clamp")
+
+    def test_ast_type_validation(self) -> None:
+        with self.assertRaises(TypeError):
+            VSubrevCoU32AST(
+                vdst=TypedOperand.sgpr(0),  # Invalid: vdst must be VGPR
+                sdst=TypedOperand.vcc_lo(),
+                src0=TypedOperand.vgpr(1),
+                src1=TypedOperand.vgpr(2),
+            )
