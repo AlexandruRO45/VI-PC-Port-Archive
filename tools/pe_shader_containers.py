@@ -22,6 +22,7 @@ data that must stay in the user's work folder, never in the repository. Nothing 
 
 Standard library only; reads files, never runs them.
 Extract paths that alias an input image, the report, or a planned container are refused (exit 2).
+Usage: `python -I tools/pe_shader_containers.py --help` lists the options.
 """
 
 from __future__ import annotations
