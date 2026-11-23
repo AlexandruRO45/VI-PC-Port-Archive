@@ -14,6 +14,8 @@ import semantic_mutants as sm  # noqa: E402
 TOOL = os.path.join(ROOT, "tools", "semantic_mutants.py")
 
 SOURCE = textwrap.dedent('''\
+    F1 = {"v_a": "InverseSqrt", "v_b": "Sqrt",   # a comment "v_z": "Nope"
+          "v_c": "Exp2"}
     class Gen:
         def op(self, op, a):
             if op == "v_other":
@@ -77,6 +79,23 @@ class Generation(unittest.TestCase):
         line = SOURCE.index(next(s for s in SOURCE if "a comment with OpISub" in s)) + 1
         self.assertEqual(sum(1 for m in self.mutants if m.line == line and m.label == "OpIAdd -> OpISub"), 1)
         self.assertFalse(any(m.line == line and m.label == "OpISub -> OpIAdd" for m in self.mutants))
+
+
+class Tables(unittest.TestCase):
+    def test_entry_takes_the_other_values_of_its_table(self):
+        labels = [m.label for m in sm.table_mutants(SOURCE, "v_a")]
+        self.assertEqual(labels, ['table entry "v_a": "InverseSqrt" -> "Sqrt"',
+                                  'table entry "v_a": "InverseSqrt" -> "Exp2"'])    # never the commented "Nope"
+        m = sm.table_mutants(SOURCE, "v_c")[0]
+        self.assertIn('"v_c": "InverseSqrt"', m.new)
+        self.assertEqual(sm.table_mutants(SOURCE, "v_missing"), [])
+
+    def test_table_only_op_on_the_real_translator(self):
+        # v_rsq_f32 is translated through the F1 table, with no `if op` branch of its own.
+        p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(ROOT, "tests", "semantic", "test_ps_semantics.py"),
+                            "--op", "v_rsq_f32", "--list"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('table entry "v_rsq_f32": "InverseSqrt" -> "Sqrt"', p.stdout)
 
 
 SAD_TEST = textwrap.dedent('''\

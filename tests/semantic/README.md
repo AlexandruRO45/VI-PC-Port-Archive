@@ -138,7 +138,9 @@ instruction family per file; the list below describes some of them, not every fi
 - To check a new test file the same way before sending it, run `python -I tools/semantic_mutants.py
   tests/semantic/test_x.py --op <op>` (or `--function NAME`, `--lines A-B`). It makes one-line mutants of the
   translator code for that op (swapped opcode and GLSL pairs, comparisons, small constants ±1, swapped `OpSelect`
-  arms, a repeated operand) in a private copy of `tools/`, and lists the ones the file still passes. A survivor
+  arms, a repeated operand) in a private copy of `tools/`, and lists the ones the file still passes. An op that is
+  translated through a lookup table (`F1`, `LDS_ATOMICS`, ...) also gets its table entry swapped for the table's other
+  values. A survivor
   usually means a case asserts on the file's own reference model rather than on translated output, or that its
   inputs can't tell the variants apart (all bytes of S0 >= S1, no bits overlapping, only lanes 0–3 checked). Some
   survivors are equivalent mutants, and in a branch shared by several ops the other ops' lines are listed too, so

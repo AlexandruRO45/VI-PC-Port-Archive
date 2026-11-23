@@ -87,6 +87,35 @@ def find_branch(lines: list[str], op: str) -> tuple[int, int]:
     raise LookupError(f"no `if op ...` branch names {quoted}; try --function or --lines")
 
 
+def table_mutants(lines: list[str], op: str, limit: int = 6) -> list[Mutant]:
+    """Mutants for an op translated through a lookup table: `"op": "Value"` inside a dict literal (F1, LDS_ATOMICS,
+    ...) gets each other value of the same table in turn (at most `limit`), e.g. "InverseSqrt" -> "Sqrt"."""
+    out: list[Mutant] = []
+    entry = re.compile(rf'"{re.escape(op)}"\s*:\s*"([^"]+)"')
+    for i, line in enumerate(lines):
+        m = entry.search(line.split("#", 1)[0])
+        if not m:
+            continue
+        start = i                                     # the dict literal holding the entry: from its `{` ...
+        while start > 0 and "{" not in lines[start]:
+            start -= 1
+        depth, end = 0, start                         # ... to the line that closes it
+        for k in range(start, len(lines)):
+            depth += lines[k].count("{") - lines[k].count("}")
+            end = k
+            if depth <= 0 and k >= i:
+                break
+        values: list[str] = []
+        for k in range(start, end + 1):
+            for v in re.findall(r'"[^"]+"\s*:\s*"([^"]+)"', lines[k].split("#", 1)[0]):
+                if v != m.group(1) and v not in values:
+                    values.append(v)
+        for v in values[:limit]:
+            new = line[:m.start(1)] + v + line[m.end(1):]
+            out.append(Mutant(i + 1, f'table entry "{op}": "{m.group(1)}" -> "{v}"', line, new))
+    return out
+
+
 def branch_ops(lines: list[str], first: int) -> list[str]:
     """The op names a branch's condition lists (its string literals), in order."""
     cond, j = lines[first], first
@@ -182,9 +211,16 @@ def main(argv: list[str] | None = None) -> int:
         raw = f.read()
     sep = "\r\n" if "\r\n" in raw else "\n"
     lines = raw.replace("\r\n", "\n").split("\n")
+    table: list[Mutant] = table_mutants(lines, args.op) if args.op else []
     try:
         if args.op:
-            first, last = find_branch(lines, args.op)
+            try:
+                first, last = find_branch(lines, args.op)
+            except LookupError:
+                if not table:
+                    raise LookupError(f'no `if op ...` branch or lookup-table entry names "{args.op}"; '
+                                      "try --function or --lines") from None
+                first = last = -1                     # table-driven only
         elif args.function:
             first, last = find_function(lines, args.function)
         else:
@@ -195,9 +231,11 @@ def main(argv: list[str] | None = None) -> int:
     except (LookupError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    mutants = mutants_for(lines, first, last)
-    print(f"{TRANSLATOR} lines {first + 1}-{last + 1}: {len(mutants)} mutants")
-    if args.op:
+    mutants = (mutants_for(lines, first, last) if first >= 0 else []) + table
+    where = f"lines {first + 1}-{last + 1}" if first >= 0 else "no branch"
+    print(f"{TRANSLATOR} {where}" + (f" + {len(table)} table-entry mutants" if table else "") +
+          f": {len(mutants)} mutants")
+    if args.op and first >= 0:
         named = branch_ops(lines, first)
         if len(named) > 1:
             # A shared branch also holds the other ops' code; a test of one op can't be expected to catch those.
