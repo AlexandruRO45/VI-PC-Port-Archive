@@ -19,12 +19,15 @@ from support import translate_lines
     (0xc078, "OpIAdd"),
     (0xe000, "OpBitReverse"),
     (0xe010, "OpBitReverse"),
-    (0xe01f, "OpBitReverse"),
+    (0xe01f, None),
 ])
 def test_swizzle_translation(make_shader, offset, opcode):
     shader = make_shader(f"ds_swizzle_b32 v1, v0 offset:{offset}\ns_endpgm\n", "cs_swizzle")
     assembly = shader.translate()
-    assert opcode in assembly
+    if opcode is None:
+        assert "OpBitReverse" not in assembly
+    else:
+        assert opcode in assembly
     assert "OpGroupNonUniformShuffle" in assembly
     shader.validate(assembly)
 

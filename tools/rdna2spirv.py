@@ -1634,6 +1634,8 @@ class Gen:
                 added = self.tmp()
                 self.emit(f"{added} = OpIAdd %uint {low} {self.cu(amount)}")
                 self.emit(f"{shuffled} = OpBitwiseAnd %uint {added} {self.cu(31 ^ mask)}")
+            elif mask == 31:
+                shuffled = self.cu(0)  # All lane bits are preserved. A 32-bit shift by 32 is undefined.
             else:
                 reversed_bits = self.tmp()
                 self.emit(f"{reversed_bits} = OpBitReverse %uint {low}")
