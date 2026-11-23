@@ -564,7 +564,7 @@ bool refusals(ID3D12Device* device) {
 struct Answer {
     std::string what;
     UINT64 value = 0;
-    bool driver_defined = false;  // compared with WARP only (see the standard-swizzle control below)
+    bool driver_defined = false;  // compared with WARP only (see the R32G32B32A32 control below)
 };
 constexpr UINT64 kNotAsked = ~UINT64(1);  // no heap (no GPU address arena) or no ID3D12Device10 on that device
 
@@ -672,10 +672,13 @@ std::vector<Answer> tiled_answers(ID3D12Device* device, const DXGI_FORMAT (&form
             add(wide, shape + " GetResourceAllocationInfo size", info.SizeInBytes);
             add(wide, shape + " GetResourceAllocationInfo alignment", info.Alignment);
             // A GPU without 64KB_STANDARD_SWIZZLE (OPTIONS.StandardSwizzle64KBSupported FALSE) sizes it as its driver
-            // likes: in tiles on an RTX 3060 (NVIDIA 32.0.16.1714), 0 on an RX 7600 (AMD 26.11.2). The layer follows
-            // WARP, so these two answers are compared with WARP only.
+            // likes: in tiles on an RTX 3060 (NVIDIA 32.0.16.1714), 0 on an RX 7600 (AMD 26.11.2). The size of a
+            // 64KB_UNDEFINED_SWIZZLE texture is the driver's too: a UHD 770 (Intel) adds one 64 KiB tile. The layer
+            // follows WARP, so these answers are compared with WARP only.
             if (layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE)
                 out[out.size() - 1].driver_defined = out[out.size() - 2].driver_defined = true;
+            else
+                out[out.size() - 2].driver_defined = true;
         }
     return out;
 }
@@ -691,7 +694,13 @@ bool same_tiled_answers(const std::vector<Answer>& ours, const std::vector<Answe
     unsigned compared = 0, differ = 0;
     for (std::size_t i = 0; i < ours.size(); ++i) {
         if (ours[i].value == kNotAsked || host[i].value == kNotAsked) continue;
-        if (skip_driver_defined && ours[i].driver_defined) continue;
+        if (skip_driver_defined && ours[i].driver_defined) {
+            if (ours[i].value != host[i].value)
+                std::printf("tiled 96-bit %s: ours 0x%llx, %s answers 0x%llx, driver-defined layout, not compared\n",
+                            ours[i].what.c_str(), static_cast<unsigned long long>(ours[i].value), host_name,
+                            static_cast<unsigned long long>(host[i].value));
+            continue;
+        }
         ++compared;
         if (ours[i].value == host[i].value) continue;
         if (differ++ < 16)
