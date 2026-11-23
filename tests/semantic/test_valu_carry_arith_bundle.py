@@ -151,5 +151,31 @@ class VAddCoU32SimdBoundaryTests(unittest.TestCase):
         self.assertEqual(s, 0)
         self.assertEqual(c, 0)
 
+class VAddCoU32TranslatorIntegrationTests(unittest.TestCase):
+    """Translator execution and negative mutation controls for v_add_co_u32."""
+
+    def test_spirv_translation_execution(self):
+        lines = [
+            "v_mov_b32 v0, 0xFFFFFFFF",
+            "v_mov_b32 v1, 2",
+            "v_add_co_u32 v2, vcc, v0, v1",
+            "v_mov_b32 v0, v2",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_add_co_int", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 1)
+        self.assertEqual(out[1], 1)
+
+    def test_negative_mutation_contrast(self):
+        a, b = 10, 20
+        add_res, _ = ref_add_co_u32(a, b)
+        sub_res, _ = ref_sub_co_u32(a, b)
+        self.assertNotEqual(add_res, sub_res)
+
 if __name__ == "__main__":
     unittest.main()
