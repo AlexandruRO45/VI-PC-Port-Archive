@@ -98,6 +98,19 @@ class TestSwapOracle(unittest.TestCase):
         self.assertIn("OpCopyObject", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestSwapAST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        x, y = 55, 99
+        x, y = model_swap(x, y)
+        self.assertEqual(x, 99)
+        self.assertEqual(y, 55)
+
+    def test_translator_swap_ast(self):
+        prog = ["v_mov_b32_e32 v2, 55", "v_mov_b32_e32 v3, 99", "v_swap_b32 v2, v3", "s_endpgm"]
+        spv = support.translate_lines("cs_swap_ast", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCopyObject", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
