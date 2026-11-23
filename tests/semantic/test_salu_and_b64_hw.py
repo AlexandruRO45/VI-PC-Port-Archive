@@ -559,5 +559,56 @@ class SaluAndB64AliasingTests(unittest.TestCase):
         self.assertEqual(out[0], expected_scc)
 
 
+class SaluAndB64ConditionCodeTests(unittest.TestCase):
+    """Condition codes, status flags, and carry/borrow generation for s_and_b64."""
+
+    def test_scc_four_corners_exhaustive(self):
+        """Verify SCC distinguishes all 4 combinations of zero/nonzero (lo, hi) halves."""
+        corners = [
+            (0x00000000_00000000, 0),  # lo=0, hi=0 -> SCC=0
+            (0x00000000_12345678, 1),  # lo!=0, hi=0 -> SCC=1
+            (0x12345678_00000000, 1),  # lo=0, hi!=0 -> SCC=1
+            (0x12345678_9ABCDEF0, 1),  # lo!=0, hi!=0 -> SCC=1
+        ]
+        for val, want_scc in corners:
+            with self.subTest(val=hex(val), want_scc=want_scc):
+                self.assertEqual(ref_scc_b64(val), want_scc)
+
+    def test_scc_all_64_single_bit_hot(self):
+        """Every individual bit position must set SCC=1 when isolated."""
+        for bit in range(64):
+            val = 1 << bit
+            with self.subTest(bit=bit):
+                self.assertEqual(ref_scc_b64(val), 1)
+
+    def test_spirv_hardware_scc_four_corners(self):
+        """Verify translator emits correct SCC flag across all 4 (lo, hi) zero/nonzero pairs."""
+        cases = [
+            (0x00000000_00000000, 0xFFFFFFFF_FFFFFFFF, 0),
+            (0x00000000_00000001, 0xFFFFFFFF_FFFFFFFF, 1),
+            (0x80000000_00000000, 0xFFFFFFFF_FFFFFFFF, 1),
+            (0x12345678_9ABCDEF0, 0xFFFFFFFF_FFFFFFFF, 1),
+        ]
+        for idx, (v0, v1, want_scc) in enumerate(cases):
+            with self.subTest(idx=idx, v0=hex(v0), want_scc=want_scc):
+                lines = [
+                    f"s_mov_b32 s0, {lo32(v0):#x}",
+                    f"s_mov_b32 s1, {hi32(v0):#x}",
+                    f"s_mov_b32 s2, {lo32(v1):#x}",
+                    f"s_mov_b32 s3, {hi32(v1):#x}",
+                    "s_and_b64 s[4:5], s[0:1], s[2:3]",
+                    "s_cselect_b32 s6, 1, 0",
+                    "v_mov_b32 v0, s4",
+                    "v_mov_b32 v1, s5",
+                    "v_mov_b32 v2, s6",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = translate_lines(f"ps_salu_and_b64_scc_{idx}", lines)
+                out = mrt0_words(spv)
+                self.assertEqual(out[2], want_scc)
+
+
 if __name__ == "__main__":
     unittest.main()
