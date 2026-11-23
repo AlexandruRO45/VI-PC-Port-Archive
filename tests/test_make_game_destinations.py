@@ -65,15 +65,28 @@ class DestinationTests(unittest.TestCase):
 
     def test_missing_destination_is_accepted(self):
         # A destination that does not exist yet is fine as long as its nearest existing parent is a folder.
-        with tempfile.TemporaryDirectory() as tmp, \
-             patch.object(sys, "argv", ["make_game.py", "--game", os.path.join(tmp, "game"), "--check",
-                                        "--out", os.path.join(tmp, "new", "out"),
-                                        "--work", os.path.join(tmp, "new", "work")]), \
-             patch.object(make_game, "below_normal"), patch.object(make_game, "log"), \
-             patch.object(make_game, "check", return_value={"title": "test", "version": "1.0"}), \
-             contextlib.redirect_stderr(io.StringIO()):
-            os.makedirs(os.path.join(tmp, "game"))
-            self.assertEqual(make_game.main(), 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "new", "out")
+            make_game.require_folder("--out", out)
+            self.assertFalse(os.path.exists(out))
+
+    def test_check_ignores_build_destinations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = os.path.join(tmp, "game")
+            os.makedirs(game)
+            blocker = os.path.join(tmp, "file.txt")
+            open(blocker, "w").close()
+            out = os.path.join(tmp, "out")
+            for destinations in ([], ["--out", blocker], ["--out", out, "--work", blocker]):
+                argv = ["make_game.py", "--game", game, "--check", "--full-check", *destinations]
+                with self.subTest(destinations=destinations), \
+                     patch.object(sys, "argv", argv), \
+                     patch.object(make_game, "below_normal"), \
+                     patch.object(make_game, "default_out", return_value=blocker) as default_out, \
+                     patch.object(make_game, "check") as check:
+                    self.assertEqual(make_game.main(), 0)
+                    check.assert_called_once_with(game, True)
+                    default_out.assert_not_called()
 
 
 class DriveRootGameTests(unittest.TestCase):
