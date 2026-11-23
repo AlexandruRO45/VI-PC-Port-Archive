@@ -242,5 +242,45 @@ class VCvtF32I32SimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.lanes[lane_id].vgprs[0], 0xCAFEBABE)
 
+class VCvtF32I32RegisterAliasingTests(unittest.TestCase):
+    def test_in_place_conversion(self):
+        # Dst aliases Src0: v0 = cvt(v0)
+        state = ScalarLaneState()
+        state.set_vgpr(0, 50)
+        ast = InstructionAST(
+            "v_cvt_f32_i32",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 0),
+        )
+        execute_scalar_cvt_f32_i32(state, ast)
+        self.assertEqual(state.vgprs[0], 0x42480000)  # 50.0f
+
+    def test_unrelated_registers_preserved(self):
+        state = ScalarLaneState()
+        state.set_vgpr(0, 10)
+        state.set_vgpr(1, 20)
+        state.set_vgpr(2, 30)
+        ast = InstructionAST(
+            "v_cvt_f32_i32",
+            Operand(RegKind.VGPR, 1),
+            Operand(RegKind.VGPR, 0),
+        )
+        execute_scalar_cvt_f32_i32(state, ast)
+        self.assertEqual(state.vgprs[0], 10)  # Unaltered
+        self.assertEqual(state.vgprs[1], 0x41200000)  # 10.0f
+        self.assertEqual(state.vgprs[2], 30)  # Unaltered
+
+    def test_sgpr_source_unaltered(self):
+        state = ScalarLaneState()
+        state.sgprs[4] = -25
+        ast = InstructionAST(
+            "v_cvt_f32_i32",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.SGPR, 4),
+        )
+        execute_scalar_cvt_f32_i32(state, ast)
+        self.assertEqual(state.sgprs[4], -25)
+        self.assertEqual(state.vgprs[0], 0xC1C80000)  # -25.0f
+
 if __name__ == "__main__":
     unittest.main()
