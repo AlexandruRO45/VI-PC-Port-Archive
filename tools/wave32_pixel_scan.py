@@ -58,7 +58,7 @@ import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
 import rdna2spirv  # noqa: E402  (stage_of, native_paths, base_op, BRANCHES)
 from shader_ir import parse_file  # noqa: E402
-from wave64_graphics_scan import scanned_paths, wave64_rule  # noqa: E402
+from wave64_graphics_scan import metadata_paths, scanned_paths, wave64_rule  # noqa: E402
 
 FAMILIES = ("lane_id", "mask_word", "lane_select", "permute", "dpp_row", "vote", "quad")
 CROSSING = FAMILIES[:-1]
@@ -247,8 +247,23 @@ def main(argv=None) -> int:
             ap.error(f"{args.out} is a directory, not a JSON file")
         if not os.path.isdir(os.path.dirname(os.path.abspath(args.out))):
             ap.error(f"output directory does not exist: {os.path.dirname(os.path.abspath(args.out))}")
-        if os.path.exists(args.out) and any(os.path.samefile(args.out, p) for p in scanned_paths(args.src)):
-            ap.error("output must not overwrite a listing it scans")
+        # --out must not replace the source directory or any input the scan reads: each listing, its FSSM wave-size
+        # header and the carve index (metadata_paths). samefile also catches a hardlink or symlink alias the name
+        # check alone would miss, so only when the report already exists does it compare --out against each input.
+        if os.path.exists(args.out):
+            out_abs = os.path.abspath(args.out)
+            try:
+                if os.path.samefile(os.path.abspath(args.src), out_abs):
+                    ap.error("output must not overwrite the source directory")
+            except OSError:
+                pass
+            listings = scanned_paths(args.src)
+            for path in [*listings, *metadata_paths(listings)]:
+                try:
+                    if os.path.isfile(path) and os.path.samefile(out_abs, path):
+                        ap.error(f"output must not overwrite an input it scans: {path}")
+                except OSError:
+                    pass
     r = scan_directory(args.src)
     print("ps: %d shaders, %d wave32; %d with a lane-crossing or width-dependent instruction, %d with quad ops only"
           % (r["ps"], r["ps_wave32"], r["crossing"], r["quad_only"]))

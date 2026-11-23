@@ -152,6 +152,24 @@ class ScanTests(unittest.TestCase):
             r = scan.scan_directory(str(root / "disasm"))
             self.assertEqual((r["ps"], r["ps_wave32"], r["crossing"]), (2, 1, 1))
 
+    def test_out_overwriting_a_wave_size_header_is_rejected(self):
+        # scan_directory reads <disasm>/../fssm/<name>.fssm for the wave size, so --out must not name one either
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "disasm").mkdir()
+            (root / "fssm").mkdir()
+            listing = fixture("ps_hdr.s", ["v_readfirstlane_b32 s0, v1", "s_endpgm"])[1]
+            (root / "disasm" / "ps_hdr.s").write_text(listing, encoding="utf-8", newline="\n")
+            header = bytearray(fssm_header.WAVE_FLAGS_OFFSET + 4)
+            header[:4] = fssm_header.MAGIC
+            struct.pack_into("<I", header, fssm_header.WAVE_FLAGS_OFFSET, 0)
+            (root / "fssm" / "ps_hdr.fssm").write_bytes(header)
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as cm:
+                    scan.main([str(root / "disasm"), "--out", str(root / "fssm" / "ps_hdr.fssm")])
+            self.assertNotEqual(cm.exception.code, 0)
+            self.assertIn("must not overwrite an input", err.getvalue())
+
     def test_report_has_no_names(self):
         with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as outdir:
             for name, text in (PS_LANE_ID, PS_VOTE):
