@@ -149,14 +149,17 @@ def scan_window(job):
     return out
 
 
-def start_error(path, start):
-    """Why --start cannot be used on ``path``, or None. Checked before scanning, so --jobs > 1 also gives one line
-    instead of a traceback from a worker; a carved file or folder has no data area and ignores --start."""
-    if start is None or not os.path.isfile(path):
+def archive_window_error(path, start, limit):
+    """Check archive-only options before starting the scan or its workers."""
+    if start is None and limit is None:
         return None
+    if not os.path.isfile(path):
+        return f"--start and --limit require an RPF9 archive: {path}"
     with open(path, "rb") as f:
         magic = f.read(8)
     if magic[:4] != b"9FPR" or len(magic) < 8:
+        return f"--start and --limit require an RPF9 archive: {path}"
+    if start is None:
         return None
     data_start, size = WI._u32(magic, 4), os.path.getsize(path)
     if not data_start <= start < size:
@@ -376,7 +379,7 @@ def main(argv=None):
     ap.add_argument("path", help="levels.rpf, one carved 0x7a file, or a folder of carved files")
     ap.add_argument("--names", required=True, help="GameShape__Data__LocationNameLoopkup JSON (gamedata_reader.py)")
     ap.add_argument("--start", type=int, help="first byte of an RPF9 data-area window")
-    ap.add_argument("--limit", type=int, help="window size in bytes (default: to the end of the archive)")
+    ap.add_argument("--limit", type=int, help="RPF9 window size in bytes (default: to the end of the archive)")
     ap.add_argument("--jobs", type=int, default=1, help="parallel windows over an RPF9 archive (default 1)")
     ap.add_argument("--out", default=os.path.join("reports", "world_interior_names.json"))
     a = ap.parse_args(argv)
@@ -397,14 +400,17 @@ def main(argv=None):
         print("world_interior_names.py: --out is a directory: %s" % a.out, file=sys.stderr)
         return 2
     try:
+        why = archive_window_error(a.path, a.start, a.limit)
+    except OSError as exc:
+        why = f"cannot read {a.path}: {exc.strerror or exc}"
+    if why:
+        print("world_interior_names.py: %s" % why, file=sys.stderr)
+        return 2
+    try:
         names, duplicate_keys, malformed = load_names(a.names)
     except (OSError, ValueError) as exc:  # json.JSONDecodeError is a ValueError
         why = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc
         print("world_interior_names.py: --names %s: %s" % (a.names, why), file=sys.stderr)
-        return 2
-    why = start_error(a.path, a.start)
-    if why:
-        print("world_interior_names.py: %s" % why, file=sys.stderr)
         return 2
     summary, rows = resolve(names, scan(a.path, a.start, a.limit, a.jobs), duplicate_keys, malformed)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)

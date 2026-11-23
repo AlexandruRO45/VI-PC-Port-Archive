@@ -336,6 +336,24 @@ class CliTest(unittest.TestCase):
         s = self.run_cli(folder)
         self.assertEqual((s["interior_names"], s["placed_interior_names"]), (2, 2))
 
+    def test_carved_inputs_refuse_archive_window_options(self):
+        folder = os.path.join(self.tmp.name, "carved")
+        os.makedirs(folder)
+        carved = os.path.join(folder, "a.bin")
+        with open(carved, "wb") as f:
+            f.write(interiors())
+        for path in (folder, carved):
+            for option, value in (("--start", "64"), ("--limit", "1")):
+                with self.subTest(path=path, option=option):
+                    self.fails_with_one_line([path, "--names", self.names, option, value])
+
+    def test_rpf9_archive_window_limits_the_scan(self):
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([interiors(), placements()]))
+        summary = self.run_cli(path, "--start", "64", "--limit", "1")
+        self.assertEqual((summary["interior_definitions"], summary["placements"]), (2, 0))
+
     def test_out_never_overwrites_an_input(self):
         path = os.path.join(self.tmp.name, "levels.rpf")
         archive = rpf([interiors(), placements()])
