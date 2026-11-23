@@ -455,6 +455,19 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertIn("rejected candidates: 1", res.stderr)
         self.assertEqual(os.listdir(self.out), [])
 
+    def test_carve_rejects_a_stored_span_past_archive_end(self):
+        dxbc = make_dxbc([(b"DXIL", make_dxil_payload(0x66, 5))])
+        compressed = compress_raw_deflate(dxbc)
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("valid", 1, dxbc))
+            f.write(make_rpf_entry("truncated", 1, dxbc, compressed_override=compressed,
+                                   stored_override=len(compressed) + 4))
+
+        result = self.run_carve(self.archive, self.out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1 shaders carved, 1 candidates rejected", result.stdout)
+        self.assertEqual(sorted(os.listdir(self.out)), ["index.json", "valid.dxbc"])
+
     def test_empty_carve_preserves_an_existing_index(self):
         dxbc = make_dxbc([(b"PRIV", bytes(range(32)))])
         with open(self.archive, "wb") as f:

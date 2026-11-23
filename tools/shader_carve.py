@@ -107,6 +107,9 @@ def main(argv=None) -> int:
             if not (16 < stored < 64 << 20 and 32 < size < 256 << 20):
                 continue
             start = mt.end()
+            if start + stored > len(m):
+                bad += 1
+                continue
             decompressor = zlib.decompressobj(-15)
             try:
                 data = decompressor.decompress(m[start:start + stored], size + 1)
