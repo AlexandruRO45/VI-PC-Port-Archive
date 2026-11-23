@@ -18,6 +18,7 @@ import check
 GOOD_FMT = struct.pack("<64I", *check.FMT_1010102_WORDS, *[0xEEEEEEEE] * 48)
 GOOD_XY_XYZ = struct.pack("<192I", *check.FMT_XY_XYZ_WORDS, *[0xEEEEEEEE] * 108)
 GOOD_TBUFFER_STORE = struct.pack("<192I", *check.TBUFFER_STORE_WORDS, *[0xEEEEEEEE] * 140)
+GOOD_PKNORM_F16 = struct.pack("<128I", *check.CS_CVT_PKNORM_F16_WORDS, *[0xEEEEEEEE] * (128 - len(check.CS_CVT_PKNORM_F16_WORDS)))
 FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
              (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"))
 
@@ -35,8 +36,9 @@ TOTAL = (len(check.COMPUTE) + 7 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 15)  # three mesh fixtures, ps_tex, ps_imgatomic, six compute fixtures,
-         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case) and cs_fmt_all
+         + len(check.TEXTURE_CONSTANTS) + 17)  # three mesh fixtures, ps_tex, ps_imgatomic, ps_table_fetch, six compute fixtures,
+         # ps_ssharp, vs_base_ids, main's standalone cs_fmt_d16_xyz / cs_heap_init dumps (net one more case), cs_fmt_all
+         # and cs_cvt_pknorm_f16
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -88,6 +90,10 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), str(len(check.FMT_ALL_WORDS))))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack(f"<{len(check.FMT_ALL_WORDS)}I", *check.FMT_ALL_WORDS))
                 return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
+            if name == "cs_cvt_pknorm_f16":
+                self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "128"))
+                Path(env["VKC_DUMP"]).write_bytes(GOOD_PKNORM_F16)
+                return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"   # stdout is not the oracle
             if name == "cs_heap_init":
                 # The seeded words come back only if check.py wrote the init file and sized the buffer for it.
                 path = (env or {}).get("VKC_HEAP_INIT")
@@ -183,6 +189,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "base_ids_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
+                  patch.object(check, "table_fetch_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
