@@ -894,3 +894,45 @@ class TestVMovrelsd2B32AST(unittest.TestCase):
         spv = support.translate_lines("ps_vmovrelsd2_exec", lines)
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0x11223344)
+
+
+class TestVMovrelsd2B32Bitfields(unittest.TestCase):
+    def test_ignored_bits_invariance(self):
+        # Bits 15:10 and 31:26 are ignored (0xFC00FC00)
+        junk = 0xFC00FC00
+        clean_m0 = (3 << 16) | 2
+        noisy_m0 = clean_m0 | junk
+        lines = [
+            "v_mov_b32 v3, 0xFEED5555",
+            f"s_mov_b32 m0, {noisy_m0}",
+            "v_movrelsd_2_b32 v4, v1",
+            "v_mov_b32 v0, v7",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovrelsd2_junk", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0xFEED5555)
+
+    def test_destination_selective_overwrite(self):
+        # Check that neighbouring registers to the target remain untouched
+        m0 = (2 << 16) | 1
+        lines = [
+            "v_mov_b32 v2, 0x11111111",
+            "v_mov_b32 v5, 0xAAAA5555",
+            "v_mov_b32 v6, 0x33333333",
+            f"s_mov_b32 m0, {m0}",
+            "v_movrelsd_2_b32 v4, v1",
+            "v_mov_b32 v0, v5",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovrelsd2_neighbour", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0xAAAA5555)
