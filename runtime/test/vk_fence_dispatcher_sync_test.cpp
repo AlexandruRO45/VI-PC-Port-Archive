@@ -128,20 +128,25 @@ void check_logical_fence_rewind(VkDevice device) {
     const auto a = progress_timeline(context, queue_a), b = progress_timeline(context, queue_b);
     const auto fence = std::make_shared<LogicalFence>(context, 0);
     const auto old_wait = fence->wait(8);
-    const auto submitted = [] { return VK_SUCCESS; };
+    const auto expect_predecessor = [](const QueueProgress* queue, std::uint64_t ticket) {
+        return [queue, ticket](const FencePoint& point) {
+            EXPECT(point.queue.get() == queue && point.ticket == ticket);
+            return VK_SUCCESS;
+        };
+    };
+    const auto submitted = expect_predecessor(nullptr, 0);
     EXPECT(fence->submit_signal({a, 1}, 10, submitted) == VK_SUCCESS);
-    EXPECT(fence->submit_signal({b, 1}, 6, submitted) == VK_SUCCESS);
-    EXPECT(fence->submit_signal({a, 2}, 4, submitted) == VK_SUCCESS);
+    EXPECT(fence->submit_signal({b, 1}, 6, expect_predecessor(a.get(), 1)) == VK_SUCCESS);
+    EXPECT(fence->submit_signal({a, 2}, 4, expect_predecessor(b.get(), 1)) == VK_SUCCESS);
 
-    // A is at 0 when sampled and reaches ticket 2 while the same scan samples B. The scan must not see A2
-    // without A1. The next scan sees both in order and leaves a wait from before the rewind satisfied.
-    EXPECT(driver::signal(device, b->semaphore, 1) == VK_SUCCESS);
-    driver::advance_on_sample = {b->semaphore, a->semaphore, 2};
+    // A is sampled at 0. The GPU reaches A1 then B1 by the time the same scan samples B. The
+    // predecessor wait proves A1 has run, so its existing wait must be satisfied before publishing B1.
+    driver::advance_on_sample = {b->semaphore, a->semaphore, 1, 1};
     EXPECT(fence->completed() == 6);
     EXPECT(driver::advance_on_sample.sampled == VK_NULL_HANDLE);
-    EXPECT(old_wait->status.load() == Status::pending);
-    EXPECT(fence->completed() == 4);
     EXPECT(old_wait->status.load() == Status::ready && old_wait->point.queue == a && old_wait->point.ticket == 1);
+    EXPECT(driver::signal(device, a->semaphore, 2) == VK_SUCCESS);
+    EXPECT(fence->completed() == 4);
     EXPECT(fence->wait(8)->status.load() == Status::pending);
 
     // The queue reaches 12, but no dispatcher callback runs between that completion and CPU Signal(3).

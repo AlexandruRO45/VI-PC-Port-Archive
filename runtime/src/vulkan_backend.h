@@ -1600,9 +1600,16 @@ public:
     template<class Submit>
     VkResult submit_signal(FencePoint point, std::uint64_t value, Submit&& submit) {
         std::lock_guard lock(mutex_);
-        if (closed_) return submit();
-        pending_.push_back({std::move(point), value});
-        const VkResult result = submit();
+        if (closed_) return submit(FencePoint{});
+        FencePoint predecessor;
+        if (!pending_.empty() &&
+            pending_.back().point.queue->physical_queue != point.queue->physical_queue) {
+            // Serialize accepted GPU signals on this fence across Vulkan queues. Signals still held
+            // on the CPU are outside this chain, so every wait points to an earlier submission.
+            predecessor = pending_.back().point;
+        }
+        pending_.push_back({std::move(point), value, predecessor.queue});
+        const VkResult result = submit(predecessor);
         if (result != VK_SUCCESS) pending_.pop_back();
         return result;
     }
@@ -1673,9 +1680,11 @@ private:
     void collect_locked(Notifications& ready) {
         if (pending_.empty() || context_.is_device_lost()) return;
         counters_.clear();
-        completed_prefixes_.clear();
-        for (std::size_t i = 0; i < pending_.size(); ++i) {
-            const auto& signal = pending_[i];
+        auto completed_end = pending_.end();
+        // A completed ticket proves the earlier signals on this fence completed as well.
+        // Find the newest such ticket, sampling each progress semaphore at most once.
+        for (; completed_end != pending_.begin(); --completed_end) {
+            const auto& signal = *(completed_end - 1);
             const auto* progress = signal.point.queue.get();
             auto it = std::find_if(counters_.begin(), counters_.end(),
                                    [progress](const auto& entry) { return entry.first == progress; });
@@ -1683,36 +1692,19 @@ private:
                 std::uint64_t counter = 0;
                 const VkResult result = context_.vk.vkGetSemaphoreCounterValue(
                     context_.device(), progress->semaphore, &counter);
+                if (result == VK_ERROR_DEVICE_LOST) {
+                    context_.mark_device_lost();
+                    return;
+                }
                 if (result != VK_SUCCESS) counter = 0;
-                if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
                 counters_.emplace_back(progress, counter);
                 it = counters_.end() - 1;
             }
-            if (signal.point.ticket > it->second) continue;
-            const auto physical = progress->physical_queue;
-            const auto prefix = std::find_if(completed_prefixes_.begin(), completed_prefixes_.end(),
-                                             [physical](const auto& entry) { return entry.first == physical; });
-            if (prefix == completed_prefixes_.end()) completed_prefixes_.emplace_back(physical, i);
-            else prefix->second = i;
+            if (signal.point.ticket <= it->second) break;
         }
-
-        // Vulkan orders signal operations submitted to the same VkQueue. D3D12 queues can share that VkQueue
-        // but have different progress semaphores. A later completed signal proves the earlier ones have also
-        // completed, even when we sampled their counters before the GPU reached them.
-        std::size_t remaining = 0;
-        for (std::size_t i = 0; i < pending_.size(); ++i) {
-            auto& signal = pending_[i];
-            const auto physical = signal.point.queue->physical_queue;
-            const auto prefix = std::find_if(completed_prefixes_.begin(), completed_prefixes_.end(),
-                                             [physical](const auto& entry) { return entry.first == physical; });
-            if (prefix != completed_prefixes_.end() && i <= prefix->second) {
-                publish_locked(signal.value, signal.point, ready);
-            } else {
-                if (remaining != i) pending_[remaining] = std::move(signal);
-                ++remaining;
-            }
-        }
-        pending_.resize(remaining);
+        for (auto it = pending_.begin(); it != completed_end; ++it)
+            publish_locked(it->value, it->point, ready);
+        pending_.erase(pending_.begin(), completed_end);
     }
 
     void publish_locked(std::uint64_t value, const FencePoint& point, Notifications& ready) {
@@ -1743,6 +1735,7 @@ private:
     struct PendingSignal {
         FencePoint point;
         std::uint64_t value;
+        std::shared_ptr<const QueueProgress> predecessor;  // semaphore borrowed by this submission until completion
     };
     struct EventWait {
         std::uint64_t value;
@@ -1756,7 +1749,6 @@ private:
     FencePoint point_;
     std::vector<PendingSignal> pending_;
     std::vector<std::pair<const QueueProgress*, std::uint64_t>> counters_;
-    std::vector<std::pair<VkQueue, std::size_t>> completed_prefixes_;
     std::vector<EventWait> events_;
     std::vector<std::weak_ptr<LogicalFenceWait>> waits_;
     bool closed_ = false;
@@ -2820,7 +2812,8 @@ private:
         std::span<const std::uint64_t> values = wait_values_;
         std::vector<VkSemaphore> combined_waits;
         std::vector<std::uint64_t> combined_values;
-        if (last_sparse_ || !logical_waits_.empty()) {
+        const bool has_combined_waits = last_sparse_ || !logical_waits_.empty();
+        if (has_combined_waits) {
             combined_waits = waits_;
             combined_values = wait_values_;
             add_logical_waits(combined_waits, combined_values);
@@ -2828,7 +2821,7 @@ private:
             semaphores = combined_waits;
             values = combined_values;
         }
-        const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkResult res = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
@@ -2840,22 +2833,34 @@ private:
                 signal_values[signal_count] = value;
                 ++signal_count;
             }
-            VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-            timeline.waitSemaphoreValueCount = std::uint32_t(values.size());
-            timeline.pWaitSemaphoreValues = values.data();
-            timeline.signalSemaphoreValueCount = signal_count;
-            timeline.pSignalSemaphoreValues = signal_values;
-            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
-            submit.waitSemaphoreCount = std::uint32_t(semaphores.size());
-            submit.pWaitSemaphores = semaphores.data();
-            submit.pWaitDstStageMask = stages.data();
-            submit.commandBufferCount = command_buffer ? 1 : 0;
-            submit.pCommandBuffers = &command_buffer;
-            submit.signalSemaphoreCount = signal_count;
-            submit.pSignalSemaphores = signals;
-            const auto submit_now = [&] { return context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE); };
+            const auto submit_now = [&](const FencePoint& predecessor) {
+                if (predecessor.queue) {
+                    if (!has_combined_waits) {
+                        combined_waits = waits_;
+                        combined_values = wait_values_;
+                    }
+                    add_wait(combined_waits, combined_values, predecessor.queue->semaphore, predecessor.ticket);
+                    semaphores = combined_waits;
+                    values = combined_values;
+                    stages.resize(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                }
+                VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+                timeline.waitSemaphoreValueCount = std::uint32_t(values.size());
+                timeline.pWaitSemaphoreValues = values.data();
+                timeline.signalSemaphoreValueCount = signal_count;
+                timeline.pSignalSemaphoreValues = signal_values;
+                VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
+                submit.waitSemaphoreCount = std::uint32_t(semaphores.size());
+                submit.pWaitSemaphores = semaphores.data();
+                submit.pWaitDstStageMask = stages.data();
+                submit.commandBufferCount = command_buffer ? 1 : 0;
+                submit.pCommandBuffers = &command_buffer;
+                submit.signalSemaphoreCount = signal_count;
+                submit.pSignalSemaphores = signals;
+                return context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
+            };
             res = logical_fence ? logical_fence->submit_signal({progress_owner_, ticket}, value, submit_now)
-                                : submit_now();
+                                : submit_now({});
             if (res == VK_SUCCESS) context_.record_submit_locked(progress_, ticket);
         }
         if (res == VK_ERROR_DEVICE_LOST) {

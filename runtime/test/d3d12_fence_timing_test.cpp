@@ -267,6 +267,31 @@ int check_queue_rewind(ID3D12Device* device, ID3D12CommandQueue* copy, ID3D12Com
     return 0;
 }
 
+// A signal held behind a queue wait leaves another queue free to signal the same fence.
+int check_held_producer_rewind(ID3D12Device* device, ID3D12CommandQueue* copy, ID3D12CommandQueue* direct,
+                               const char* who) {
+    Event copy_done, direct_done;
+    EXPECT(copy_done.h && direct_done.h);
+    Ref<ID3D12Fence> gate, fence, copy_complete, direct_complete;
+    for (Ref<ID3D12Fence>* f : {&gate, &fence, &copy_complete, &direct_complete})
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f->p))));
+    EXPECT(SUCCEEDED(copy_complete->SetEventOnCompletion(1, copy_done.h)));
+    EXPECT(SUCCEEDED(direct_complete->SetEventOnCompletion(1, direct_done.h)));
+    require_progress(SUCCEEDED(copy->Wait(gate.p, 1)) && SUCCEEDED(copy->Signal(fence.p, 10)) &&
+                         SUCCEEDED(copy->Signal(copy_complete.p, 1)), who, "could not hold COPY");
+    require_progress(SUCCEEDED(direct->Signal(fence.p, 4)) && SUCCEEDED(direct->Signal(direct_complete.p, 1)),
+                     who, "could not signal on DIRECT");
+    const bool direct_ran = direct_done.set_within(5000);
+    const UINT64 before = fence->GetCompletedValue();
+    require_progress(SUCCEEDED(gate->Signal(1)) && copy_done.set_within(5000) &&
+                         (direct_ran || direct_done.set_within(5000)), who, "queues did not finish after release");
+    const UINT64 after = fence->GetCompletedValue();
+    std::printf("%s: DIRECT signal while COPY is held %llu, after COPY release %llu\n", who,
+                static_cast<unsigned long long>(before), static_cast<unsigned long long>(after));
+    EXPECT(direct_ran && before == 4 && after == 10);
+    return 0;
+}
+
 int check_standalone_rewinds(ID3D12Device* device, ID3D12CommandQueue* direct, const char* who) {
     Ref<ID3D12CommandQueue> copy;
     const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_COPY};
@@ -275,6 +300,7 @@ int check_standalone_rewinds(ID3D12Device* device, ID3D12CommandQueue* direct, c
     failures += check_pending_gpu_rewind(device, has_copy ? copy.p : direct, who);
     if (has_copy) {
         failures += check_queue_rewind(device, copy.p, direct, who);
+        failures += check_held_producer_rewind(device, copy.p, direct, who);
     } else {
         std::printf("%s: COPY queue unavailable for the cross-queue rewind case\n", who);
     }

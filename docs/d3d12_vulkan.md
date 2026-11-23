@@ -2149,6 +2149,9 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 - **Fence values.** The logical D3D12 fence value can go down. CPU `Signal` sets it immediately. Queue
   `Signal` records a value against a ticket on that queue's Vulkan progress semaphore, whose tickets always
   increase. `GetCompletedValue` also collects completed GPU signals before returning the current logical value.
+  Signals submitted to different Vulkan queues for the same fence wait for the preceding submitted signal's
+  ticket. This gives their completion a defined order. A signal still held by its command queue enters that
+  order when the queue submits it.
   A CPU signal on the same fence carries forward the memory dependency from its last completed GPU signal.
   A wait that has reached its target stays satisfied. Each later wait compares its target with the current
   value. The D3D12 rules are described in [multi-engine synchronization][fence-sync].

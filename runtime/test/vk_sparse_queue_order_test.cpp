@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <utility>
 
 namespace {
 
@@ -23,6 +24,9 @@ struct Trace {
     unsigned wait_count = 0;
     VkSemaphore wait_semaphore = VK_NULL_HANDLE;
     std::uint64_t wait_value = 0;
+    VkSemaphore signal_semaphore = VK_NULL_HANDLE;
+    std::uint64_t signal_value = 0;
+    VkResult next_submit_result = VK_SUCCESS;
     VkSemaphore producer = VK_NULL_HANDLE;
     std::uint64_t producer_completed = 0;
     unsigned host_waits = 0;
@@ -66,12 +70,15 @@ VulkanDeviceFunctions fake_driver() {
         trace.wait_count = info->waitSemaphoreCount;
         const auto* timeline = static_cast<const VkTimelineSemaphoreSubmitInfo*>(info->pNext);
         if (!timeline || timeline->sType != VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO ||
-            timeline->waitSemaphoreValueCount != trace.wait_count) return VK_ERROR_UNKNOWN;
+            timeline->waitSemaphoreValueCount != trace.wait_count || !info->signalSemaphoreCount)
+            return VK_ERROR_UNKNOWN;
+        trace.signal_semaphore = info->pSignalSemaphores[0];
+        trace.signal_value = timeline->pSignalSemaphoreValues[0];
         if (trace.wait_count == 1) {
             trace.wait_semaphore = info->pWaitSemaphores[0];
             trace.wait_value = timeline->pWaitSemaphoreValues[0];
         }
-        return VK_SUCCESS;
+        return std::exchange(trace.next_submit_result, VK_SUCCESS);
     };
     return vk;
 }
@@ -130,8 +137,9 @@ bool run(const Case& test) {
         auto progress = std::make_shared<QueueProgress>(context.device(), handle<VkQueue>(2),
                                                         context.vk.vkDestroySemaphore);
         trace.producer = progress->semaphore = handle<VkSemaphore>(99);
-        if (!expect(logical->submit_signal({progress, producer_ticket}, first_wait, [] { return VK_SUCCESS; }) ==
-                        VK_SUCCESS, "accepted producer signal"))
+        if (!expect(logical->submit_signal({progress, producer_ticket}, first_wait,
+                                           [](const FencePoint&) { return VK_SUCCESS; }) == VK_SUCCESS,
+                    "accepted producer signal"))
             return false;
         queue->wait_fence(logical, first_wait);
     } else {
@@ -172,6 +180,32 @@ bool run(const Case& test) {
                   "the following submission still carries the producer ticket exactly once");
 }
 
+bool signals_on_distinct_queues() {
+    trace = {};
+    VulkanContext context(device_proc, handle<VkDevice>(1), true);
+    VulkanQueue first(context, handle<VkQueue>(1), 0), second(context, handle<VkQueue>(2), 0);
+    const auto fence = std::make_shared<LogicalFence>(context, 0);
+    const auto waiting_for_ten = fence->wait(10);
+    if (!first.ok() || !second.ok() || !first.signal_fence(fence, 10) || trace.wait_count != 0) return false;
+    const auto predecessor = trace.signal_semaphore;
+    const auto predecessor_value = trace.signal_value;
+
+    // The first producer is still incomplete. A rejected second submit must not become the predecessor
+    // of its retry. The accepted retry waits for the first producer's progress on the other VkQueue.
+    trace.next_submit_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (second.signal_fence(fence, 4) || !second.signal_fence(fence, 4) ||
+        trace.wait_count != 1 || trace.wait_semaphore != predecessor || trace.wait_value != predecessor_value) {
+        std::fputs("GPU signals on distinct Vulkan queues lost the first accepted predecessor\n", stderr);
+        return false;
+    }
+    if (fence->completed() != 0) return false;
+    trace.producer = trace.signal_semaphore;
+    trace.producer_completed = trace.signal_value;
+    return fence->completed() == 4 &&
+           waiting_for_ten->status.load() == LogicalFenceWait::Status::ready &&
+           waiting_for_ten->point.queue->semaphore == predecessor;
+}
+
 } // namespace
 
 int main() {
@@ -185,6 +219,7 @@ int main() {
     };
     bool ok = true;
     for (const auto& test : cases) ok = run(test) && ok;
-    if (ok) std::puts("Sparse queue order: deferred no-op and rejected mappings preserve GPU waits");
+    ok = signals_on_distinct_queues() && ok;
+    if (ok) std::puts("Sparse queue order: deferred mappings preserve waits; GPU fence signals are ordered");
     return ok ? 0 : 1;
 }
