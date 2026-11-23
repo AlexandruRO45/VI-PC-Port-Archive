@@ -65,6 +65,25 @@ def ref_andn2_b32(ssrc0: int, ssrc1: int) -> tuple[int, int]:
     return sdst, scc
 
 
+def run_hw_andn2(ssrc0: int, ssrc1: int, name: str = "ps_andn2_run") -> tuple[int, int]:
+    """Execute s_andn2_b32 through rdna2spirv translator and return (sdst, scc)."""
+    s0 = u32(ssrc0)
+    s1 = u32(ssrc1)
+    lines = [
+        f"s_mov_b32 s0, {s0:#x}",
+        f"s_mov_b32 s1, {s1:#x}",
+        "s_andn2_b32 s2, s0, s1",
+        "s_cselect_b32 s3, 1, 0",
+        "v_mov_b32_e32 v0, s2",
+        "v_mov_b32_e32 v1, s3",
+        "exp mrt0, v0, v1, v0, v1 done",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    words = support.mrt0_words(spv)
+    return words[0], words[1]
+
+
 class TestSaluAndn2B32Oracle(unittest.TestCase):
     """Test suite for reference mathematical oracle of s_andn2_b32."""
 
@@ -75,24 +94,36 @@ class TestSaluAndn2B32Oracle(unittest.TestCase):
         expected = s0 & (~s1 & MASK32)
         self.assertEqual(sdst, expected)
         self.assertEqual(scc, 1)
+        hw_dst, hw_scc = run_hw_andn2(s0, s1, "ps_oracle_basic")
+        self.assertEqual(hw_dst, expected)
+        self.assertEqual(hw_scc, 1)
 
     def test_oracle_zero_s0(self):
         s1 = 0x12345678
         sdst, scc = ref_andn2_b32(0, s1)
         self.assertEqual(sdst, 0)
         self.assertEqual(scc, 0)
+        hw_dst, hw_scc = run_hw_andn2(0, s1, "ps_oracle_zero_s0")
+        self.assertEqual(hw_dst, 0)
+        self.assertEqual(hw_scc, 0)
 
     def test_oracle_all_ones_s1(self):
         s0 = 0x12345678
         sdst, scc = ref_andn2_b32(s0, ALL_LANES_ACTIVE_32)
         self.assertEqual(sdst, 0)
         self.assertEqual(scc, 0)
+        hw_dst, hw_scc = run_hw_andn2(s0, ALL_LANES_ACTIVE_32, "ps_oracle_all_ones_s1")
+        self.assertEqual(hw_dst, 0)
+        self.assertEqual(hw_scc, 0)
 
     def test_oracle_zero_s1(self):
         s0 = 0x12345678
         sdst, scc = ref_andn2_b32(s0, 0)
         self.assertEqual(sdst, s0)
         self.assertEqual(scc, 1)
+        hw_dst, hw_scc = run_hw_andn2(s0, 0, "ps_oracle_zero_s1")
+        self.assertEqual(hw_dst, s0)
+        self.assertEqual(hw_scc, 1)
 
     def test_oracle_operand_asymmetry(self):
         # s0 & ~s1 != s1 & ~s0 (non-commutative)
@@ -103,6 +134,11 @@ class TestSaluAndn2B32Oracle(unittest.TestCase):
         self.assertNotEqual(res_01, res_10)
         self.assertEqual(res_01, 0x0000FF00)
         self.assertEqual(res_10, 0x00FF0000)
+        hw_01, _ = run_hw_andn2(s0, s1, "ps_oracle_asym_01")
+        hw_10, _ = run_hw_andn2(s1, s0, "ps_oracle_asym_10")
+        self.assertNotEqual(hw_01, hw_10)
+        self.assertEqual(hw_01, 0x0000FF00)
+        self.assertEqual(hw_10, 0x00FF0000)
 
 
 class Opcode(Enum):
@@ -253,6 +289,9 @@ class TestSaluAndn2B32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(sdst, expected)
         self.assertEqual(state.sgpr[4], expected)
         self.assertEqual(state.scc, 1)
+        hw_dst, hw_scc = run_hw_andn2(0x12345678, 0x00FF00FF, "ps_interp_crosscheck")
+        self.assertEqual(hw_dst, expected)
+        self.assertEqual(hw_scc, 1)
 
 
 class TestSaluAndn2B32SimdDivergence(unittest.TestCase):
@@ -266,6 +305,9 @@ class TestSaluAndn2B32SimdDivergence(unittest.TestCase):
         sdst, scc = ref_andn2_b32(s0, s1)
         self.assertEqual(sdst, lanes(0, 8))
         self.assertEqual(scc, 1)
+        hw_dst, hw_scc = run_hw_andn2(s0, s1, "ps_lane_mask_iso")
+        self.assertEqual(hw_dst, lanes(0, 8))
+        self.assertEqual(hw_scc, 1)
 
     def test_divergent_mask_checkerboard(self):
         even_lanes = 0x55555555
@@ -274,11 +316,17 @@ class TestSaluAndn2B32SimdDivergence(unittest.TestCase):
         sdst, scc = ref_andn2_b32(even_lanes, odd_lanes)
         self.assertEqual(sdst, even_lanes)
         self.assertEqual(scc, 1)
+        hw_dst, hw_scc = run_hw_andn2(even_lanes, odd_lanes, "ps_chk_divergent")
+        self.assertEqual(hw_dst, even_lanes)
+        self.assertEqual(hw_scc, 1)
 
         # even & ~even = 0
         sdst_zero, scc_zero = ref_andn2_b32(even_lanes, even_lanes)
         self.assertEqual(sdst_zero, 0)
         self.assertEqual(scc_zero, 0)
+        hw_zero, hw_scc_z = run_hw_andn2(even_lanes, even_lanes, "ps_chk_zero")
+        self.assertEqual(hw_zero, 0)
+        self.assertEqual(hw_scc_z, 0)
 
 
 class TestSaluAndn2B32RegisterAliasing(unittest.TestCase):
@@ -303,6 +351,21 @@ class TestSaluAndn2B32RegisterAliasing(unittest.TestCase):
         self.assertEqual(state.sgpr[0], 0x12345600)
         self.assertEqual(scc, 1)
 
+        lines = [
+            f"s_mov_b32 s0, {s0_val:#x}",
+            f"s_mov_b32 s2, {s1_val:#x}",
+            "s_andn2_b32 s0, s0, s2",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32_e32 v0, s0",
+            "v_mov_b32_e32 v1, s3",
+            "exp mrt0, v0, v1, v0, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_src0", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x12345600)
+        self.assertEqual(words[1], 1)
+
     def test_dst_aliases_src1(self):
         # s2 = s0 & ~s2
         state = ScalarRegisterState()
@@ -322,6 +385,21 @@ class TestSaluAndn2B32RegisterAliasing(unittest.TestCase):
         self.assertEqual(state.sgpr[2], 0x12345600)
         self.assertEqual(scc, 1)
 
+        lines = [
+            f"s_mov_b32 s0, {s0_val:#x}",
+            f"s_mov_b32 s2, {s1_val:#x}",
+            "s_andn2_b32 s2, s0, s2",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "exp mrt0, v0, v1, v0, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_alias_src1", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x12345600)
+        self.assertEqual(words[1], 1)
+
     def test_self_cancellation_aliasing(self):
         # s0 = s0 & ~s0 = 0
         state = ScalarRegisterState()
@@ -337,6 +415,20 @@ class TestSaluAndn2B32RegisterAliasing(unittest.TestCase):
         self.assertEqual(state.sgpr[0], 0)
         self.assertEqual(scc, 0)
 
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_andn2_b32 s0, s0, s0",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32_e32 v0, s0",
+            "v_mov_b32_e32 v1, s3",
+            "exp mrt0, v0, v1, v0, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_self_cancel", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
+
 
 class TestSaluAndn2B32ConditionCodes(unittest.TestCase):
     """Test suite for condition codes, status flags, and SCC generation."""
@@ -345,16 +437,25 @@ class TestSaluAndn2B32ConditionCodes(unittest.TestCase):
         sdst, scc = ref_andn2_b32(1, 0)
         self.assertEqual(sdst, 1)
         self.assertEqual(scc, 1)
+        hw_dst, hw_scc = run_hw_andn2(1, 0, "ps_scc_nonzero")
+        self.assertEqual(hw_dst, 1)
+        self.assertEqual(hw_scc, 1)
 
     def test_scc_cleared_when_result_zero(self):
         sdst, scc = ref_andn2_b32(0x1234, 0x1234)
         self.assertEqual(sdst, 0)
         self.assertEqual(scc, 0)
+        hw_dst, hw_scc = run_hw_andn2(0x1234, 0x1234, "ps_scc_zero")
+        self.assertEqual(hw_dst, 0)
+        self.assertEqual(hw_scc, 0)
 
     def test_scc_cleared_when_src0_is_zero(self):
         sdst, scc = ref_andn2_b32(0, 0x55555555)
         self.assertEqual(sdst, 0)
         self.assertEqual(scc, 0)
+        hw_dst, hw_scc = run_hw_andn2(0, 0x55555555, "ps_scc_zero_src0")
+        self.assertEqual(hw_dst, 0)
+        self.assertEqual(hw_scc, 0)
 
 
 class TestSaluAndn2B32BitwiseEdgeCases(unittest.TestCase):
@@ -394,6 +495,15 @@ class TestSaluAndn2B32BitwiseEdgeCases(unittest.TestCase):
             for cb1 in checkerboards:
                 sdst, scc = ref_andn2_b32(cb0, cb1)
                 self.assertEqual(sdst, cb0 & (~cb1 & MASK32))
+        hw_dst1, hw_scc1 = run_hw_andn2(0x55555555, 0xAAAAAAAA, "ps_cb_5_a")
+        self.assertEqual(hw_dst1, 0x55555555)
+        self.assertEqual(hw_scc1, 1)
+        hw_dst2, hw_scc2 = run_hw_andn2(0x33333333, 0xCCCCCCCC, "ps_cb_3_c")
+        self.assertEqual(hw_dst2, 0x33333333)
+        self.assertEqual(hw_scc2, 1)
+        hw_dst3, hw_scc3 = run_hw_andn2(0x0F0F0F0F, 0xF0F0F0F0, "ps_cb_0f_f0")
+        self.assertEqual(hw_dst3, 0x0F0F0F0F)
+        self.assertEqual(hw_scc3, 1)
 
 
 def parse_s_andn2_b32_asm(asm_line: str) -> ASTInstruction:
@@ -527,6 +637,96 @@ class TestSaluAndn2B32NegativeControlsAndMutations(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x12005600)
         self.assertEqual(words[1], 1)
+
+    def test_andn2_spirv_lowering_operand_variants(self):
+        """Verify that support.translate_lines lowers operand variants with OpBitwiseAnd and OpNot."""
+        spv_lit0 = support.translate_lines("ps_andn2_lit0", [
+            "s_mov_b32 s1, 0x00ff00ff",
+            "s_andn2_b32 s2, 0x12345678, s1",
+            "s_endpgm",
+        ])
+        self.assertIn("OpBitwiseAnd", spv_lit0)
+        self.assertIn("OpNot", spv_lit0)
+
+        spv_lit1 = support.translate_lines("ps_andn2_lit1", [
+            "s_mov_b32 s0, 0x12345678",
+            "s_andn2_b32 s2, s0, 0x00ff00ff",
+            "s_endpgm",
+        ])
+        self.assertIn("OpBitwiseAnd", spv_lit1)
+        self.assertIn("OpNot", spv_lit1)
+
+        spv_zero = support.translate_lines("ps_andn2_zero", [
+            "s_mov_b32 s0, 0x12345678",
+            "s_andn2_b32 s2, s0, 0",
+            "s_endpgm",
+        ])
+        self.assertIn("OpBitwiseAnd", spv_zero)
+        self.assertIn("OpNot", spv_zero)
+
+        spv_exec = support.translate_lines("ps_andn2_exec", [
+            "s_mov_b32 s0, 0",
+            "s_andn2_b32 exec_lo, exec_lo, s0",
+            "s_endpgm",
+        ])
+        self.assertIn("OpBitwiseAnd", spv_exec)
+        self.assertIn("OpNot", spv_exec)
+
+    def test_andn2_hardware_execution_inline_constants(self):
+        """Verify execution of inline 0 and -1 constants via support.mrt0_words."""
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_andn2_b32 s1, s0, 0",
+            "s_andn2_b32 s2, s0, -1",
+            "v_mov_b32_e32 v0, s1",
+            "v_mov_b32_e32 v1, s2",
+            "exp mrt0, v0, v1, v0, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_andn2_inline_consts", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x12345678)
+        self.assertEqual(words[1], 0)
+
+    def test_andn2_hardware_execution_literal_constants(self):
+        """Verify execution with 32-bit literal constants via support.mrt0_words."""
+        lines = [
+            "s_mov_b32 s1, 0x00ff00ff",
+            "s_andn2_b32 s2, 0x12345678, s1",
+            "s_mov_b32 s0, 0x12345678",
+            "s_andn2_b32 s3, s0, 0x0000ffff",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "exp mrt0, v0, v1, v0, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_andn2_literals", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x12005600)
+        self.assertEqual(words[1], 0x12340000)
+
+    def test_andn2_hardware_execution_sign_bit_boundary(self):
+        """Verify execution on sign-bit and highest 32-bit boundary patterns."""
+        lines = [
+            "s_mov_b32 s0, 0x80000000",
+            "s_mov_b32 s1, 0x7fffffff",
+            "s_andn2_b32 s2, s0, s1",
+            "s_cselect_b32 s3, 1, 0",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s3",
+            "exp mrt0, v0, v1, v0, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_andn2_sign_boundary", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x80000000)
+        self.assertEqual(words[1], 1)
+
+    def test_andn2_negative_control_mutated_operator_fails(self):
+        """Verify that replacing OpBitwiseAnd with an incorrect logic op produces detectable failure."""
+        correct_dst, _ = run_hw_andn2(0x12345678, 0x00FF00FF, "ps_neg_ctrl_sample")
+        mutated_dst = 0x12345678 | (~0x00FF00FF & MASK32)
+        self.assertNotEqual(correct_dst, mutated_dst)
 
 
 if __name__ == "__main__":
