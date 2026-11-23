@@ -283,7 +283,7 @@ def main(argv=None):
     ap.add_argument("path", help="RPF9 archive, one carved 0x7a file, or a folder of carved files")
     ap.add_argument("--start", type=int, help="first byte of an RPF9 data-area window")
     ap.add_argument("--limit", type=int, help="window size in bytes (default: to the end of the archive)")
-    ap.add_argument("--out", default=os.path.join("reports", "world_archetypes.json"))
+    ap.add_argument("--out", help="write the full report to this JSON file; without it only the summary is printed")
     ap.add_argument("--check-extents", action="store_true",
                     help="also compare each map's entitiesExtents with its transformed archetype boxes")
     a = ap.parse_args(argv)
@@ -291,22 +291,24 @@ def main(argv=None):
         ap.error("no such file or folder: %s" % a.path)
     # Check the report path before the scan: --out equal to the archive used to truncate the input after the run, and
     # an --out under a regular file or naming a folder raised a traceback once all the work was done.
-    if same_report_path(a.out, a.path):
-        ap.error("--out would overwrite the input %s" % a.path)
-    if os.path.isdir(a.out):
-        ap.error("--out %s is a folder, not a file" % a.out)
-    out_dir = os.path.dirname(os.path.abspath(a.out))
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-    except OSError as e:
-        ap.error("--out %s: cannot create %s: %s" % (a.out, out_dir, e.strerror or e))
+    if a.out:
+        if same_report_path(a.out, a.path):
+            ap.error("--out would overwrite the input %s" % a.path)
+        if os.path.isdir(a.out):
+            ap.error("--out %s is a folder, not a file" % a.out)
+        out_dir = os.path.dirname(os.path.abspath(a.out))
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            ap.error("--out %s: cannot create %s: %s" % (a.out, out_dir, e.strerror or e))
     doc = run(a.path, a.start, a.limit, a.check_extents)
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
-    try:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1, sort_keys=True)
-    except OSError as e:
-        ap.error("--out %s: %s" % (a.out, e.strerror or e))
+    if a.out:
+        try:
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(doc, f, indent=1, sort_keys=True)
+        except OSError as e:
+            ap.error("--out %s: %s" % (a.out, e.strerror or e))
     print(json.dumps({k: doc[k] for k in ("summary", "extents") if k in doc}, indent=1, sort_keys=True))
     return 0
 
