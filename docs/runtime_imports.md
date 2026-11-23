@@ -286,7 +286,9 @@ mostly correspond one to one to the `xgameruntime.lib` functions. The executable
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`) with a
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`,
+`acphal.dll`, `xapu.dll`, and the DirectStorage
+modules `dstorage_xs.dll`, `xcrdapi.dll` and `dstorage.dll`, [directstorage.md](directstorage.md)) with a
 pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
@@ -644,3 +646,5 @@ asynchronous paths with `.invalid` names; it opens no connection.
   `msvcp`/`concrt`/`vccorlib`/`vcomp` families. The table above maps the packaged images only to test the
   parser; a real run binds the host copies.
 - No game data is stored in this repository. The counts are output of a local run against the user's package.
+
+Local integration status and explicit audio limitations: [local_imports15.md](local_imports15.md).
