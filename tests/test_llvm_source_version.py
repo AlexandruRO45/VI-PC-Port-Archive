@@ -31,11 +31,16 @@ class SourceVersionTest(unittest.TestCase):
         text = SCRIPT.read_text(encoding="utf-8-sig")
         start = text.index('$src = Join-Path $Temp "src"')
         block = text[start:text.index("# DIA SDK off:", start)]
+        # The selection fixture must stop before any cleanup or clone.
+        cleanup_start = block.index("function Remove-DirectoryRobust")
+        cleanup_end = block.index("\n}\n", cleanup_start) + len("\n}")
+        block = (block[:cleanup_start]
+                 + 'function Remove-DirectoryRobust { throw "Unexpected source cleanup" }'
+                 + block[cleanup_end:])
         self.driver = self.root / "select.ps1"
         self.driver.write_text(
             'param([string]$Temp, [string]$Version)\n'
             '$ErrorActionPreference = "Stop"\n'
-            'function Remove-Item { throw "Unexpected deletion" }\n'
             + block + '\nWrite-Output "SOURCE_ACCEPTED"\n',
             encoding="utf-8", newline="\n")
 
@@ -61,6 +66,11 @@ class SourceVersionTest(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_same_release_reused(self):
+        self.select("21.1.8", True)
+
+    def test_same_release_reused_under_a_path_with_brackets(self):
+        self.work = self.work.rename(self.root / "retained [work]")
+        self.src = self.work / "src"
         self.select("21.1.8", True)
 
     def test_different_release_missing_tag_rejected(self):

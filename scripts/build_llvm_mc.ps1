@@ -70,7 +70,7 @@ function Remove-DirectoryRobust([string]$path) {
     cmd.exe /c "rmdir /s /q `"$path`"" 2>$null
 }
 
-if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
+if (-not (Test-Path -LiteralPath (Join-Path $src "llvm\CMakeLists.txt"))) {
     if (Test-Path -LiteralPath $src) { Remove-DirectoryRobust $src }
     New-Item -ItemType Directory -Force $Temp | Out-Null
     # core.longpaths: some llvm/docs paths are about 150 characters, so with a -Temp of about 100 characters the
@@ -82,7 +82,7 @@ if (-not (Test-Path (Join-Path $src "llvm\CMakeLists.txt"))) {
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout failed." }
 }
 # A source kept by a failed LLVM 23 build of an older version of this script has no libc yet.
-if ((Test-Path (Join-Path $src ".git\info\sparse-checkout")) -and -not (Test-Path (Join-Path $src "libc"))) {
+if ((Test-Path -LiteralPath (Join-Path $src ".git\info\sparse-checkout")) -and -not (Test-Path -LiteralPath (Join-Path $src "libc"))) {
     & git -C $src sparse-checkout add libc
     if ($LASTEXITCODE -ne 0) { throw "git sparse-checkout add libc failed." }
 }
