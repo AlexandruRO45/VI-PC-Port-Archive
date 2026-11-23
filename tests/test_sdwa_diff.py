@@ -213,7 +213,7 @@ class Translated(unittest.TestCase):
                     with self.subTest(nan=hex(nan), nan_left=nan_left, op=op):
                         self.assertIsNone(d.check(lines))
 
-    def test_nan_compare_uses_selected_half_and_preserves_signaling(self):
+    def test_nan_compare_is_unordered_for_both_nan_encodings_and_selected_halves(self):
         prefix = ([f"v_mov_b32 v{r}, 0" for r in d.VREGS]
                   + [f"s_mov_b32 s{r}, 0" for r in d.SREGS] + ["s_mov_b32 vcc_lo, 0"])
         for nan in (0x7E00, 0x7C01, 0xFE00, 0xFC01):
@@ -227,6 +227,19 @@ class Translated(unittest.TestCase):
                              + d.observe([1, 2, 3]))
                     with self.subTest(nan=hex(nan), sel=sel, nan_left=nan_left):
                         self.assertIsNone(d.check(lines))
+
+    def test_nan_classification_uses_selected_half_without_quieting(self):
+        prefix = ([f"v_mov_b32 v{r}, 0" for r in d.VREGS]
+                  + [f"s_mov_b32 s{r}, 0" for r in d.SREGS] + ["s_mov_b32 vcc_lo, 0"])
+        for nan, mask in ((0x7C01, 1), (0x7E00, 2), (0xFC01, 1), (0xFE00, 2)):
+            for sel, shift in (("WORD_0", 0), ("WORD_1", 16)):
+                source = (nan << shift) | (0x3C00 << (16 - shift))
+                lines = (prefix + [f"v_mov_b32 v2, {source:#x}",
+                                   f"v_cmp_class_f16_sdwa vcc_lo, v2, {mask} "
+                                   f"src0_sel:{sel} src1_sel:DWORD"]
+                         + d.observe([1, 2, 3]))
+                with self.subTest(nan=hex(nan), mask=mask, sel=sel):
+                    self.assertIsNone(d.check(lines))
 
     def test_a_wrong_translation_is_caught(self):
         lines = (["v_mov_b32 v2, 0x8000", "s_mov_b32 vcc_lo, 0",
