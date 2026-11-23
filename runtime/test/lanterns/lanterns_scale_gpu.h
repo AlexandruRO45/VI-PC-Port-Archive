@@ -10,8 +10,11 @@
 //                  direct queue, the 4x MSAA aux pass and its resolve, the RGBA8 top pass, copies to readback[p], then
 //                  zeros over stream[p] and A[p]]; Signal(direct, f)
 // The direct queue's part is submitted first, so its Waits come before the Signals they wait for; the copy and compute
-// parts follow, and they also wait for a fence the CPU signals only when it starts frame f + 1 (or waits for frame f).
-// So the producers of frame f run late: a direct queue that skipped its Waits reaches its reads first, every frame. The CPU waits for the direct queue's frame f - 2 before it records frame f (allocators, descriptor
+// parts follow, and they also wait for CPU gates: one opens when the CPU starts frame f + 1, the other later, when it
+// waits for frame f; copy takes the later one on even frames, compute on odd ones. So the producers of frame f run
+// late, and the later one after the other. The CPU opens the late gate only after the direct queue signals that its main
+// pass is done, or after kHoldMs. A direct queue that skipped both Waits reads zeros in every frame, and one that skipped
+// only its Wait on the copy (or the compute) queue does in every other frame. The CPU waits for the direct queue's frame f - 2 before it records frame f (allocators, descriptor
 // ring, readback[p]); the copy and compute queues' frame f - 2 is done by then, since that frame waited for them.
 // Because the direct queue zeroes stream[p] and A[p] after use, a frame that does not wait for the copy or compute
 // queue draws zeros (nothing) there and differs from frame 1.
@@ -115,10 +118,17 @@ private:
     Ref<ID3D12DescriptorHeap> srv_heap_, staging_heap_, rtv_heap_, dsv_heap_;
     Ref<ID3D12CommandQueue> direct_, compute_, copy_;
     Ref<ID3D12Fence> direct_fence_, compute_fence_, copy_fence_;
-    // The CPU's gate: frame f's copy and compute parts wait for gate_ >= f, which the CPU signals when it starts frame
-    // f + 1 (or waits for frame f), so they always run after the direct queue's part of frame f was submitted.
-    Ref<ID3D12Fence> gate_;
-    bool open_gate(std::uint64_t value);
+    // The CPU's gates. Frame f's copy and compute parts each wait for one of them to reach f: the early gate opens
+    // when the CPU starts frame f + 1, the late one when it then waits for frame f (or goes idle). On even frames the
+    // copy part takes the late gate and compute the early one, on odd frames the other way round, so both always run
+    // after the direct queue's part of frame f was submitted, and one of them after the other.
+    Ref<ID3D12Fence> gate_early_, gate_late_;
+    // The direct queue signals consumed_ = f after frame f's main pass. Before opening the late gate for frame f the
+    // CPU waits for it, at most kHoldMs: with every Wait in place it cannot come (the main pass waits for the late
+    // producer), so every frame pays kHoldMs; without the Wait on the late producer it comes first.
+    Ref<ID3D12Fence> consumed_;
+    static constexpr unsigned kHoldMs = 100;
+    bool open_gate(ID3D12Fence* gate, std::uint64_t value);
     Ref<ID3D12CommandAllocator> copy_alloc_[2], compute_alloc_[2], main_alloc_[2][3];   // pre, bind, post
     Ref<ID3D12GraphicsCommandList> copy_list_[2], compute_list_[2], main_list_[2][3];
     std::vector<Ref<ID3D12CommandAllocator>> chunk_alloc_[2];

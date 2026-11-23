@@ -447,11 +447,14 @@ several queues and worker threads, every frame. `lanterns_scale.cpp` (with `lant
   queue waits for both queues' frame f, and the CPU waits for the direct queue's frame f - 2 before it records into
   frame f's allocators, descriptor ring and readback buffer. Every Wait and Signal must succeed.
 - the direct queue's part of a frame is submitted first, its Waits before the Signals they wait for (D3D12 allows
-  it, and a title's queues do it); the copy and compute parts follow. They also wait for a fence the CPU signals only
-  when it starts the next frame (or waits for this one), so they always run late. After use, the direct queue zeroes
-  the records and particles it took from them. A direct queue that skipped its Waits would reach its reads before the
-  copy and compute queues had written, draw nothing there, and differ from frame 1: without its two Waits, every frame
-  from frame 2 on differs.
+  it, and a title's queues do it); the copy and compute parts follow. They also wait for gate fences the CPU signals:
+  an early one when it starts the next frame, a late one when it then waits for this frame. The copy part takes the
+  late gate on even frames and the compute part on odd frames. The CPU opens the late gate only once the direct queue
+  has signalled the end of its main pass, or after 100 ms; with every Wait in place the main pass waits for the late
+  producer, so that is the 100 ms, every frame (the price of the check). After use, the direct queue zeroes the records and
+  particles it took from them. A direct queue that skipped a Wait reaches its reads before that producer has written,
+  draws nothing there and differs from frame 1: without both Waits every frame differs, and without only the copy
+  Wait (or only the compute Wait) every other frame does.
 
 How the check works. Every frame draws the same thing, so every readback (the three targets and both particle sets)
 must be byte for byte the first frame's. Frame 1 is checked against the CPU reference at every pixel (certain pixels
@@ -468,6 +471,10 @@ check every 1,000 (give `--timeout` to match). The guest also takes `--frames`, 
 ```
 Lanterns stage 25: PASS, 60 frames at 3840x2160 identical to the first (hash 99f8df1bea376593), 6880 draws and 88 dispatches per frame on 3 queues, frame 1 exact against the CPU reference at every certain pixel, 3 lattice checks exact
 ```
+
+The hash is the frame on the GPU that ran it (an RTX 5080 here), not a constant: blended and resolved pixels may
+differ between vendors within what the reference allows, so another GPU prints another hash (an RX 6700 XT gave
+`a8371b071d4b392c`). What must hold is that every frame matches that run's frame 1, and frame 1 the reference.
 
 ## Build and run
 

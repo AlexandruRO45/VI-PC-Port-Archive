@@ -341,7 +341,9 @@ bool ScaleGpu::create_resources() {
     CHECK(SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&direct_fence_.p))));
     CHECK(SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&compute_fence_.p))));
     CHECK(SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copy_fence_.p))));
-    CHECK(SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate_.p))));
+    CHECK(SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate_early_.p))));
+    CHECK(SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate_late_.p))));
+    CHECK(SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&consumed_.p))));
     const auto make_list = [&](D3D12_COMMAND_LIST_TYPE type, Ref<ID3D12CommandAllocator>& alloc,
                                Ref<ID3D12GraphicsCommandList>& list) {
         return SUCCEEDED(device_->CreateCommandAllocator(type, IID_PPV_ARGS(&alloc.p))) &&
@@ -797,10 +799,11 @@ std::string ScaleGpu::frame_log(std::uint64_t f) const {
 
 std::string ScaleGpu::fence_status() const {
     char text[256];
-    std::snprintf(text, sizeof(text), "fences completed: direct %llu, compute %llu, copy %llu, CPU gate %llu (last frame "
+    std::snprintf(text, sizeof(text), "fences completed: direct %llu, compute %llu, copy %llu, CPU gates %llu and %llu (last frame "
                   "submitted %llu)", (unsigned long long)direct_fence_->GetCompletedValue(),
                   (unsigned long long)compute_fence_->GetCompletedValue(),
-                  (unsigned long long)copy_fence_->GetCompletedValue(), (unsigned long long)gate_->GetCompletedValue(),
+                  (unsigned long long)copy_fence_->GetCompletedValue(), (unsigned long long)gate_early_->GetCompletedValue(),
+                  (unsigned long long)gate_late_->GetCompletedValue(),
                   (unsigned long long)job_frame_);
     return text;
 }
@@ -818,10 +821,10 @@ ScaleGpu::Outcome ScaleGpu::wait_fence(ID3D12Fence* fence, std::uint64_t value, 
     return Outcome::ok;
 }
 
-bool ScaleGpu::open_gate(std::uint64_t value) {
-    if (gate_->GetCompletedValue() >= value) return true;
+bool ScaleGpu::open_gate(ID3D12Fence* gate, std::uint64_t value) {
+    if (gate->GetCompletedValue() >= value) return true;
     HRESULT hr = S_OK;
-    TIMED(kSignal, hr = gate_->Signal(value));
+    TIMED(kSignal, hr = gate->Signal(value));
     if (SUCCEEDED(hr)) return true;
     std::fprintf(stderr, "lanterns: the CPU's Signal(gate, %llu) returned 0x%08lx\n", (unsigned long long)value, (unsigned long)hr);
     return false;
@@ -829,7 +832,7 @@ bool ScaleGpu::open_gate(std::uint64_t value) {
 
 ScaleGpu::Outcome ScaleGpu::submit(std::uint64_t f, unsigned timeout_ms) {
     const unsigned p = unsigned(f & 1);
-    if (f > 1 && !open_gate(f - 1)) return Outcome::error;   // frame f - 1's copy and compute parts may run now
+    if (f > 1 && !open_gate(gate_early_.p, f - 1)) return Outcome::error;   // frame f - 1's early producer may run now
     if (f > 2) {
         const Outcome o = wait_fence(direct_fence_.p, f - 2, timeout_ms);
         if (o != Outcome::ok) return o;
@@ -876,18 +879,26 @@ ScaleGpu::Outcome ScaleGpu::submit(std::uint64_t f, unsigned timeout_ms) {
     if (!check("direct queue Wait(copy, f)")) return Outcome::error;
     TIMED(kQueueWait, hr = direct_->Wait(compute_fence_.p, f));
     if (!check("direct queue Wait(compute, f)")) return Outcome::error;
+    // bind and the main pass, then Signal(consumed, f), then post: the main pass has read both producers' data by
+    // then. The CPU holds the late gate until that Signal (or kHoldMs), so a producer whose Wait is missing runs only
+    // after the main pass read its zeros.
     std::vector<ID3D12CommandList*> lists = {main_list_[p][1].p};
     for (unsigned t = 0; t < threads_; ++t) lists.push_back(chunk_list_[p][t].p);
-    lists.push_back(main_list_[p][2].p);
     TIMED(kExecuteCommandLists, direct_->ExecuteCommandLists(UINT(lists.size()), lists.data()));
     main_stats_.executes += 1;
+    TIMED(kSignal, hr = direct_->Signal(consumed_.p, f));
+    if (!check("direct queue Signal(consumed, f)")) return Outcome::error;
+    run(direct_.p, {main_list_[p][2].p});
     TIMED(kSignal, hr = direct_->Signal(direct_fence_.p, f));
     if (!check("direct queue Signal(direct, f)")) return Outcome::error;
-    log_event(f, "direct queue: Execute(pre), Wait(copy f), Wait(compute f), Execute(bind, chunks, post), Signal(direct)", f);
+    log_event(f, "direct queue: Execute(pre), Wait(copy f), Wait(compute f), Execute(bind, chunks), Signal(consumed), Execute(post), Signal(direct)", f);
     jitter();
     if (f > 2) TIMED(kQueueWait, hr = copy_->Wait(direct_fence_.p, f - 2));
     if (!check("copy queue Wait(direct, f - 2)")) return Outcome::error;
-    TIMED(kQueueWait, hr = copy_->Wait(gate_.p, f));
+    // One producer per frame is held to the late gate, the other to the early one, alternating: copy on even frames,
+    // compute on odd ones. A direct queue missing only its Wait on the late one reads that producer's zeros.
+    const bool copy_late = f % 2 == 0;
+    TIMED(kQueueWait, hr = copy_->Wait(copy_late ? gate_late_.p : gate_early_.p, f));
     if (!check("copy queue Wait(gate, f)")) return Outcome::error;
     run(copy_.p, {copy_list_[p].p});
     TIMED(kSignal, hr = copy_->Signal(copy_fence_.p, f));
@@ -896,7 +907,7 @@ ScaleGpu::Outcome ScaleGpu::submit(std::uint64_t f, unsigned timeout_ms) {
     jitter();
     if (f > 2) TIMED(kQueueWait, hr = compute_->Wait(direct_fence_.p, f - 2));
     if (!check("compute queue Wait(direct, f - 2)")) return Outcome::error;
-    TIMED(kQueueWait, hr = compute_->Wait(gate_.p, f));
+    TIMED(kQueueWait, hr = compute_->Wait(copy_late ? gate_early_.p : gate_late_.p, f));
     if (!check("compute queue Wait(gate, f)")) return Outcome::error;
     run(compute_.p, {compute_list_[p].p});
     TIMED(kSignal, hr = compute_->Signal(compute_fence_.p, f));
@@ -912,7 +923,11 @@ ScaleGpu::Outcome ScaleGpu::submit(std::uint64_t f, unsigned timeout_ms) {
 }
 
 ScaleGpu::Outcome ScaleGpu::wait(std::uint64_t f, unsigned timeout_ms) {
-    if (!open_gate(f)) return Outcome::error;
+    if (!open_gate(gate_early_.p, f)) return Outcome::error;
+    // The hold: with every Wait in place the main pass cannot finish before the late producer has run, so this
+    // times out (kHoldMs) and the late gate opens; a direct queue missing that Wait gets there first.
+    if (wait_fence(consumed_.p, f, kHoldMs) == Outcome::error) return Outcome::error;
+    if (!open_gate(gate_late_.p, f)) return Outcome::error;
     const Outcome o = wait_fence(direct_fence_.p, f, timeout_ms);
     log_event(f, o == Outcome::ok ? "direct fence reached" : "direct fence NOT reached", f);
     return o;
@@ -933,7 +948,7 @@ void ScaleGpu::unmap_readback(std::uint64_t f) {
 
 bool ScaleGpu::idle(unsigned timeout_ms) {
     if (!job_frame_) return true;
-    if (!open_gate(job_frame_)) return false;
+    if (!open_gate(gate_early_.p, job_frame_) || !open_gate(gate_late_.p, job_frame_)) return false;
     return wait_fence(direct_fence_.p, job_frame_, timeout_ms) == Outcome::ok &&
            wait_fence(compute_fence_.p, job_frame_, timeout_ms) == Outcome::ok &&
            wait_fence(copy_fence_.p, job_frame_, timeout_ms) == Outcome::ok;
