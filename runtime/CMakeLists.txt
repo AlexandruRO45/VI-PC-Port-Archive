@@ -423,9 +423,12 @@ elseif(NOT WIN32)
   message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux")
 endif()
 
-# RT-518: Windows converts a program's narrow argv to the ANSI code page, so a test given a file path in a build folder
-# that page cannot spell (%TEMP%\leo\<CJK>\L on code page 1252) got '?' in its place and could not open the file. The
-# manifest makes UTF-8 the test's ANSI code page, which std::ifstream and std::filesystem::path(char*) then use too.
+# RT-518: narrow file paths go through the ANSI code page, which cannot spell a build folder such as
+# %TEMP%\leo\<CJK>\L on code page 1252. Two cases hit it: a path given in argv, which Windows converts to that page
+# ('?' in place of the CJK characters), and a path compiled in as a UTF-8 string literal (/utf-8, e.g. the
+# LEONIDA_TEST_*_SPV defines) that fopen, std::ifstream or std::filesystem::path(char*) decode in that page. Either
+# way the file could not be opened. The manifest makes UTF-8 the program's ANSI code page, which fixes both. It is
+# added to tests and to the vk_pipeline_check tool, not to the runtime itself.
 # Only for MSVC builds on a Windows host: the clang-cl cross build for Wine links as before.
 function(leonida_utf8_code_page target)
   if(MSVC AND CMAKE_HOST_WIN32)
@@ -1747,6 +1750,7 @@ if(TARGET Vulkan::Headers)
       target_sources(d3d12_r9g9b9e5_uav_test PRIVATE ${LEONIDA_TEST_CS_R9G9B9E5_UAV})
       target_compile_definitions(d3d12_r9g9b9e5_uav_test PRIVATE
         LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV="${LEONIDA_TEST_CS_R9G9B9E5_UAV}")
+      leonida_utf8_code_page(d3d12_r9g9b9e5_uav_test)
     endif()
 
     # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
@@ -1872,6 +1876,7 @@ if(TARGET Vulkan::Headers)
       descriptor_test_shader(cs_sample.comp LEONIDA_TEST_MS_SINT_SPV -DTEST_MS_SINT=1)
       descriptor_test_shader(msaa_seed.vert LEONIDA_TEST_MSAA_VERT_SPV)
       descriptor_test_shader(msaa_seed.frag LEONIDA_TEST_MSAA_FRAG_SPV)
+      leonida_utf8_code_page(d3d12_descriptor_test)
     else()
       message(STATUS "glslangValidator not found: d3d12_descriptor_test skips its shader")
     endif()
@@ -1896,6 +1901,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_indirect_dispatch_count_test PRIVATE gta6rt_d3d12_com d3d12 dxgi version)
       target_compile_definitions(d3d12_indirect_dispatch_count_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
         LEONIDA_TEST_INDIRECT_COUNT_SPV="${_indirect_count_spv}")
+      leonida_utf8_code_page(d3d12_indirect_dispatch_count_test)
       target_compile_options(d3d12_indirect_dispatch_count_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_indirect_dispatch_count COMMAND d3d12_indirect_dispatch_count_test)
       set_tests_properties(d3d12_indirect_dispatch_count PROPERTIES SKIP_RETURN_CODE 77)
@@ -1976,6 +1982,7 @@ if(TARGET Vulkan::Headers)
         target_sources(d3d12_typeless_families_test PRIVATE ${binary})
         target_compile_definitions(d3d12_typeless_families_test PRIVATE ${definition}="${binary}")
       endforeach()
+      leonida_utf8_code_page(d3d12_typeless_families_test)
     else()
       message(STATUS "glslangValidator not found: d3d12_typeless_families_test runs its clears only")
     endif()
@@ -2001,6 +2008,7 @@ if(TARGET Vulkan::Headers)
         target_sources(d3d12_state_sweep_test PRIVATE ${binary})
         target_compile_definitions(d3d12_state_sweep_test PRIVATE ${definition}="${binary}")
       endforeach()
+      leonida_utf8_code_page(d3d12_state_sweep_test)
       add_test(NAME d3d12_state_sweep COMMAND d3d12_state_sweep_test)
       set_tests_properties(d3d12_state_sweep PROPERTIES SKIP_RETURN_CODE 77)
     endif()
@@ -2032,6 +2040,7 @@ if(TARGET Vulkan::Headers)
         COMMENT "Compiling the depth resolve test shader vs_depth_edge.vert" VERBATIM)
       target_sources(d3d12_depth_resolve_test PRIVATE ${binary})
       target_compile_definitions(d3d12_depth_resolve_test PRIVATE LEONIDA_DEPTH_EDGE_VS_SPV="${binary}")
+      leonida_utf8_code_page(d3d12_depth_resolve_test)
     endif()
 
     # ID3D12Resource::GetDesc against the host runtime and WARP; run explicitly on a Vulkan GPU.
@@ -2172,6 +2181,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_translated_draw_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_translated_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M15_DIR="${LEONIDA_M15_DIR}")
+      leonida_utf8_code_page(d3d12_translated_draw_test)
       target_compile_options(d3d12_translated_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_translated_draw COMMAND d3d12_translated_draw_test)
       set_tests_properties(d3d12_translated_draw PROPERTIES SKIP_RETURN_CODE 77)
@@ -2229,6 +2239,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_m2_textured_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_m2_textured_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M2_DIR="${LEONIDA_M2_DIR}")
+      leonida_utf8_code_page(d3d12_m2_textured_test)
       target_compile_options(d3d12_m2_textured_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m2_textured COMMAND d3d12_m2_textured_test)
       set_tests_properties(d3d12_m2_textured PROPERTIES SKIP_RETURN_CODE 77)
@@ -2257,6 +2268,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_m2_formats_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_m2_formats_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M2F_DIR="${LEONIDA_M2F_DIR}")
+      leonida_utf8_code_page(d3d12_m2_formats_test)
       target_compile_options(d3d12_m2_formats_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m2_formats COMMAND d3d12_m2_formats_test)
       set_tests_properties(d3d12_m2_formats PROPERTIES SKIP_RETURN_CODE 77)
@@ -2288,6 +2300,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_m3_frame_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_m3_frame_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M3_DIR="${LEONIDA_M3_DIR}")
+      leonida_utf8_code_page(d3d12_m3_frame_test)
       target_compile_options(d3d12_m3_frame_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m3_frame COMMAND d3d12_m3_frame_test)
       add_test(NAME d3d12_m3_first_pass COMMAND d3d12_m3_frame_test --first-pass-only)
@@ -2321,6 +2334,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_m4_compute_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_m4_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_M4_DIR="${LEONIDA_M4_DIR}")
+      leonida_utf8_code_page(d3d12_m4_compute_test)
       target_compile_options(d3d12_m4_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_m4_compute COMMAND d3d12_m4_compute_test)
       set_tests_properties(d3d12_m4_compute PROPERTIES SKIP_RETURN_CODE 77)
@@ -2351,6 +2365,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_buffer_uav_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_buffer_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_BUFFER_UAV_DIR="${LEONIDA_BUFFER_UAV_DIR}")
+      leonida_utf8_code_page(d3d12_buffer_uav_test)
       target_compile_options(d3d12_buffer_uav_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_buffer_uav COMMAND d3d12_buffer_uav_test)
       set_tests_properties(d3d12_buffer_uav PROPERTIES SKIP_RETURN_CODE 77)
@@ -2451,6 +2466,7 @@ if(TARGET Vulkan::Headers)
         LEONIDA_TEST_VS_TRI_SPV="${LEONIDA_TEST_VS_TRI}"
         LEONIDA_TEST_FS_SOLID_SPV="${LEONIDA_TEST_FS_SOLID}"
         LEONIDA_TEST_CS_RAYQUERY_SPV="${LEONIDA_TEST_CS_RAYQUERY}")
+      leonida_utf8_code_page(d3d12_indirect_rt_test)
     endif()
     add_test(NAME d3d12_indirect_rt COMMAND d3d12_indirect_rt_test)
     set_tests_properties(d3d12_indirect_rt PROPERTIES SKIP_RETURN_CODE 77)
@@ -2473,6 +2489,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_compute_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
+      leonida_utf8_code_page(d3d12_compute_test)
       target_compile_options(d3d12_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compute COMMAND d3d12_compute_test)
       set_tests_properties(d3d12_compute PROPERTIES SKIP_RETURN_CODE 77)
@@ -2481,6 +2498,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_fspx_compute_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_fspx_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
+      leonida_utf8_code_page(d3d12_fspx_compute_test)
       target_compile_options(d3d12_fspx_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_fspx_compute COMMAND d3d12_fspx_compute_test)
       set_tests_properties(d3d12_fspx_compute PROPERTIES SKIP_RETURN_CODE 77)
@@ -2512,6 +2530,7 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_PS_UINT_SPV="${LEONIDA_TEST_PS_UINT}"
                                  LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}"
                                  LEONIDA_TEST_VS_INT_SPV="${LEONIDA_TEST_VS_INT}")
+      leonida_utf8_code_page(d3d12_draw_test)
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_draw COMMAND d3d12_draw_test)
       set_tests_properties(d3d12_draw PROPERTIES SKIP_RETURN_CODE 77)
@@ -2531,6 +2550,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_conservative_raster_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
       target_compile_definitions(d3d12_conservative_raster_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
         LEONIDA_CONSERVATIVE_VS="${LEONIDA_CONSERVATIVE_VS}" LEONIDA_CONSERVATIVE_PS="${LEONIDA_CONSERVATIVE_PS}")
+      leonida_utf8_code_page(d3d12_conservative_raster_test)
       target_compile_options(d3d12_conservative_raster_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_conservative_raster COMMAND d3d12_conservative_raster_test)
       set_tests_properties(d3d12_conservative_raster PROPERTIES SKIP_RETURN_CODE 77
@@ -2550,6 +2570,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_conservative_tier2_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
       target_compile_definitions(d3d12_conservative_tier2_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
         LEONIDA_CONSERVATIVE_TIER2_VS="${LEONIDA_CONSERVATIVE_TIER2_VS}" LEONIDA_CONSERVATIVE_TIER2_PS="${LEONIDA_CONSERVATIVE_TIER2_PS}")
+      leonida_utf8_code_page(d3d12_conservative_tier2_test)
       target_compile_options(d3d12_conservative_tier2_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_conservative_tier2 COMMAND d3d12_conservative_tier2_test)
       set_tests_properties(d3d12_conservative_tier2 PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_HOST_ADAPTER=warp")
@@ -2564,6 +2585,7 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_conservative_tier3_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
         LEONIDA_CONSERVATIVE_VS="${LEONIDA_CONSERVATIVE_VS}"
         LEONIDA_CONSERVATIVE_TIER3_PS="${LEONIDA_CONSERVATIVE_TIER3_PS}")
+      leonida_utf8_code_page(d3d12_conservative_tier3_test)
       target_compile_options(d3d12_conservative_tier3_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME inner_coverage_oracle COMMAND d3d12_conservative_tier3_test --oracle-only)
       add_test(NAME d3d12_inner_coverage_guards COMMAND d3d12_conservative_tier3_test --guards-only)
@@ -2576,6 +2598,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_msaa_draw_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_msaa_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      leonida_utf8_code_page(d3d12_msaa_draw_test)
       target_compile_options(d3d12_msaa_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_msaa_draw COMMAND d3d12_msaa_draw_test)
       set_tests_properties(d3d12_msaa_draw PROPERTIES SKIP_RETURN_CODE 77)
@@ -2586,6 +2609,7 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_geometry_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_GS_SPV="${LEONIDA_TEST_GS_DOUBLE}"
                                  LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      leonida_utf8_code_page(d3d12_geometry_test)
       target_compile_options(d3d12_geometry_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_geometry COMMAND d3d12_geometry_test)
       set_tests_properties(d3d12_geometry PROPERTIES SKIP_RETURN_CODE 77)
@@ -2616,6 +2640,7 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_PS_DEPTH_EMPTY_SPV="${LEONIDA_TEST_PS_DEPTH_EMPTY}"
                                  LEONIDA_TEST_PS_DEPTH_WRITE_SPV="${LEONIDA_TEST_PS_DEPTH_WRITE}"
                                  LEONIDA_TEST_GS_DEPTH_SPV="${LEONIDA_TEST_GS_DEPTH}")
+      leonida_utf8_code_page(d3d12_depth24_draw_test)
       target_compile_options(d3d12_depth24_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_depth24_draw COMMAND d3d12_depth24_draw_test)
       set_tests_properties(d3d12_depth24_draw PROPERTIES SKIP_RETURN_CODE 77)
@@ -2634,6 +2659,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_set0_compute_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_set0_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_CS_SET0_SAMPLE_SPV="${LEONIDA_TEST_CS_SET0_SAMPLE}")
+      leonida_utf8_code_page(d3d12_set0_compute_test)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
@@ -2644,6 +2670,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_bindless_churn_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_bindless_churn_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_CS_SET0_SAMPLE_SPV="${LEONIDA_TEST_CS_SET0_SAMPLE}")
+      leonida_utf8_code_page(d3d12_bindless_churn_test)
       target_compile_options(d3d12_bindless_churn_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bindless_churn COMMAND d3d12_bindless_churn_test)
       set_tests_properties(d3d12_bindless_churn PROPERTIES SKIP_RETURN_CODE 77)
@@ -2656,6 +2683,7 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}"
                                  LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}"
                                  LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      leonida_utf8_code_page(d3d12_pipeline_library_test)
       target_compile_options(d3d12_pipeline_library_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_pipeline_library COMMAND d3d12_pipeline_library_test)
       set_tests_properties(d3d12_pipeline_library PROPERTIES SKIP_RETURN_CODE 77)
@@ -2664,6 +2692,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_bundle_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
       target_compile_definitions(d3d12_bundle_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS
                                  LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      leonida_utf8_code_page(d3d12_bundle_test)
       target_compile_options(d3d12_bundle_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_bundle COMMAND d3d12_bundle_test)
       set_tests_properties(d3d12_bundle PROPERTIES SKIP_RETURN_CODE 77)
@@ -2691,6 +2720,7 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}"
                                  LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
                                  LEONIDA_TEST_PS_ATOMIC_SPV="${LEONIDA_TEST_PS_ATOMIC}")
+      leonida_utf8_code_page(d3d12_stores_atomics_test)
       target_compile_options(d3d12_stores_atomics_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_stores_atomics COMMAND d3d12_stores_atomics_test)
       set_tests_properties(d3d12_stores_atomics PROPERTIES SKIP_RETURN_CODE 77)
@@ -2711,6 +2741,7 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_mesh_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_MS_SPV="${LEONIDA_TEST_MS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
                                  LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
+      leonida_utf8_code_page(d3d12_mesh_test)
       target_compile_options(d3d12_mesh_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_mesh COMMAND d3d12_mesh_test)
       set_tests_properties(d3d12_mesh PROPERTIES SKIP_RETURN_CODE 77)
@@ -2777,6 +2808,7 @@ if(TARGET Vulkan::Headers)
       target_link_libraries(d3d12_subgroup_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_subgroup_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_SUBGROUP_SHADERS="${LEONIDA_SG_DIR}")
+      leonida_utf8_code_page(d3d12_subgroup_test)
       target_compile_options(d3d12_subgroup_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_subgroup COMMAND d3d12_subgroup_test)
       set_tests_properties(d3d12_subgroup PROPERTIES SKIP_RETURN_CODE 77)
