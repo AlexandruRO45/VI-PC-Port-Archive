@@ -348,12 +348,12 @@ def heap_init_env():
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
-# cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
+# cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s10 so no driver can fold
 # them; FMA_FUSED are the exact single-rounded words and FMA_SPLIT are the exact split-rounded words (derivations in
 # the .asm header; out[7] is f16 round-to-odd, never GLSL Fma, so it is always 0x7351). Under --fma khr
 # (LEONIDA_FMA=khr, shaderFmaFloat32 in index.json) every word must match FMA_FUSED; under default --fma glsl a
 # spec-compliant driver (e.g. Mesa RADV 26.2.6) may legally split GLSL.std.450 Fma.
-FMA_FUSED_ENV = {"VKC_SGPRS": "0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002"}
+FMA_FUSED_ENV = {"VKC_SGPRS": "0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002,0x6ce1,0x4200,0x8004"}
 FMA_FUSED = [0x33800000, 0xa8800000, 0x3a000400, 0x33800000, 0x33800000, 0x33800000, 0x28800000, 0x00007351]
 FMA_SPLIT = [0x00000000, 0x00000000, 0x3a000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00007351]
 # cs_cvt_f32_sat.asm (#300): s4 is a binary32 input, out[0] = v_cvt_u32_f32, out[1] = v_cvt_i32_f32 (truncate,

@@ -19,12 +19,14 @@
 ;          rounding the exact result to f32 and then to f16 is one step off): 0x00007351; f32-then-f16 gives 0x7352.
 ;          The f16 form does not use Fma at all (round-to-odd, Gen.fma_f16_odd), so it must be the same with
 ;          --fma glsl and --fma khr.
-; The operands come in through s4..s7 (VKC_SGPRS=0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002: a, 1+2^-23, 1-2^-23,
-; -(1+2^-22)), so a driver cannot fold the multiply-adds at compile time; only the fmaak/fmamk constants are literals.
-; Run: VKC_SGPRS=0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002 vk_compute_test cs_fma_fused.spv 1 dump
+; The operands come in through s4..s10 (VKC_SGPRS: a, 1+2^-23, 1-2^-23, -(1+2^-22), then the f16 triple), so a driver
+; cannot fold the multiply-adds at compile time; only the fmaak/fmamk constants are literals. With the f16 triple as
+; literals, Metal folded out[7] to 0 on an Apple M1 Max (MoltenVK 1.4.2), whereas the same f16 code run on
+; operands from s8..s10 gives 0x7351.
+; Run: VKC_SGPRS=0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002,0x6ce1,0x4200,0x8004 vk_compute_test cs_fma_fused.spv 1 dump
 ; out[0..7] = 33800000 a8800000 3a000400 33800000 33800000 33800000 28800000 00007351 (hex)
 ; group: 1,1,1
-; rsrc2: 0x8090
+; rsrc2: 0x8096
 v_mov_b32_e32 v0, s4
 v_mul_f32_e32 v3, v0, v0
 v_mov_b32_e32 v20, 0
@@ -47,9 +49,9 @@ buffer_store_dword v12, v20, s[0:3], 0 offen offset:20
 v_mov_b32_e32 v13, s7
 v_fma_f32 v14, v5, v5, v13
 buffer_store_dword v14, v20, s[0:3], 0 offen offset:24
-v_mov_b32_e32 v15, 0x6ce1
-v_mov_b32_e32 v16, 0x4200
-v_mov_b32_e32 v17, 0x8004
+v_mov_b32_e32 v15, s8
+v_mov_b32_e32 v16, s9
+v_mov_b32_e32 v17, s10
 v_fma_f16 v18, v15, v16, v17
 v_and_b32_e32 v18, 0xffff, v18
 buffer_store_dword v18, v20, s[0:3], 0 offen offset:28
