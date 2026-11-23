@@ -412,6 +412,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
         dyn_indexed: set[str] = set()
         id_type: dict[str, str] = dict(const_type)
 
+        pending_ac: list[tuple[str, str, list[str]]] = []
         for res, op, args, _ in insts:
             if op is None:
                 continue
@@ -439,6 +440,34 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                             dyn_indexed.add(root)
                 elif base in readonly_global_vars:
                     ptr_root[res] = base
+                else:
+                    pending_ac.append((res, base, idxs))
+
+        # Resolve nested OpAccessChain definitions whose base appeared later in module text order.
+        while pending_ac:
+            next_pending: list[tuple[str, str, list[str]]] = []
+            progressed = False
+            for res, base, idxs in pending_ac:
+                if base in ptr_root:
+                    root = ptr_root[base]
+                    ptr_root[res] = root
+                    base_slot = ptr_slot.get(base)
+                    if base_slot is not None and all(i in const_int_val for i in idxs):
+                        cidxs = tuple(const_int_val[i][1] for i in idxs)
+                        ptr_slot[res] = base_slot + cidxs
+                    else:
+                        ptr_slot[res] = None
+                        if root in func_vars:
+                            dyn_indexed.add(root)
+                    progressed = True
+                elif base in readonly_global_vars:
+                    ptr_root[res] = base
+                    progressed = True
+                else:
+                    next_pending.append((res, base, idxs))
+            if not progressed:
+                break
+            pending_ac = next_pending
 
         slot_depths: dict[str, set[int]] = {}
         for res, op, args, _ in insts:
@@ -467,6 +496,8 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                     if tok in ptr_root and ptr_root[tok] in func_vars:
                         escaped.add(ptr_root[tok])
             elif op == "OpAccessChain":
+                if len(args) >= 2 and args[1] in ptr_root and ptr_root[args[1]] in func_vars and res not in ptr_root:
+                    escaped.add(ptr_root[args[1]])
                 for tok in args[2:]:
                     if tok in ptr_root and ptr_root[tok] in func_vars:
                         escaped.add(ptr_root[tok])
