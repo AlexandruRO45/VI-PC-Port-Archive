@@ -346,6 +346,23 @@ class Cli(unittest.TestCase):
             with open(src, "rb") as f:
                 self.assertEqual(f.read(), container)
 
+    def test_refuses_overwriting_input_fspx_sidecar_and_index(self):
+        payload = make_fspx([(0, kind0()), (6, program())])
+        with tempfile.TemporaryDirectory() as t:
+            fspx_dir = os.path.join(t, "fspx")
+            os.makedirs(fspx_dir)
+            for rel in (os.path.join("fspx", "sample.code"), "index.json"):
+                src = os.path.join(t, rel)
+                with self.subTest(rel=rel):
+                    with open(src, "wb") as f:
+                        f.write(payload)
+                    code, out, err = self.run_tool(src, "--out", t)
+                    self.assertEqual(code, 2)
+                    self.assertEqual(out, "")
+                    self.assertIn("ERROR:", err)
+                    with open(src, "rb") as f:
+                        self.assertEqual(f.read(), payload)
+
 
 class TranslatorSidecars(unittest.TestCase):
     """rdna2spirv reads an FSPX program's code and dispatch state from fspx/ when there is no FSSM blob."""

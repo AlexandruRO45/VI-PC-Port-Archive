@@ -179,9 +179,13 @@ def main(argv=None) -> int:
     if os.path.exists(a.out) and not os.path.isdir(a.out):
         print(f"ERROR: --out {a.out} is not a directory", file=sys.stderr)
         return 2
+    index_path = os.path.join(a.out, "index.json")
     for path in a.files:
         if same_report_path(path, a.out):
             print(f"ERROR: --out {a.out} collides with input {path}", file=sys.stderr)
+            return 2
+        if same_report_path(path, index_path):
+            print(f"ERROR: {index_path} would overwrite input file", file=sys.stderr)
             return 2
         if not os.path.exists(path):
             print(f"ERROR: {path} does not exist", file=sys.stderr)
@@ -240,30 +244,35 @@ def main(argv=None) -> int:
                 entry["threads"] = meta["threads"]
             if "wave32" in meta:
                 entry["wave32"] = meta["wave32"]
-            if container:
-                out_dxbc = os.path.join(a.out, name + ".dxbc")
-                if any(same_report_path(out_dxbc, p) for p in a.files):
-                    print(f"ERROR: {out_dxbc} would overwrite input file", file=sys.stderr)
+            out_dxbc = os.path.join(a.out, name + ".dxbc") if container else None
+            out_code = os.path.join(a.out, "fspx", name + ".code")
+            out_state = os.path.join(a.out, "fspx", name + ".state")
+            out_json = os.path.join(a.out, "fspx", name + ".json")
+            out_asm = os.path.join(a.out, "disasm", name + ".s") if disasm and meta["code"]["end"] else None
+            for out_path in (out_dxbc, out_code, out_state, out_json, out_asm):
+                if out_path and any(same_report_path(out_path, p) for p in a.files):
+                    print(f"ERROR: {out_path} would overwrite input file", file=sys.stderr)
                     return 2
+            if out_dxbc:
                 with open(out_dxbc, "wb") as f:
                     f.write(container)
-            with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
+            with open(out_code, "wb") as f:
                 f.write(blob[6])
-            with open(os.path.join(a.out, "fspx", name + ".state"), "wb") as f:
+            with open(out_state, "wb") as f:
                 f.write(blob[0])
-            with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+            with open(out_json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(meta, f, indent=1)
-            if disasm and meta["code"]["end"]:
+            if out_asm:
                 start, end = meta["code"]["start"], meta["code"]["end"]
                 asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
                 entry["invalid_words"] = invalid
-                with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+                with open(out_asm, "w", encoding="utf-8", newline="\n") as f:
                     f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
                     f.write(asm)
                     if err.strip():
                         f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
             index.append(entry)
-    with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+    with open(index_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(index, f, indent=1)
     print(f"{len(index)} FSPX program(s) unpacked to {a.out}" + (f", {bad} input(s) failed" if bad else ""))
     return 1 if bad else 0
