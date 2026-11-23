@@ -385,5 +385,41 @@ class TestVPkLshlrevB16ASTAndInterpreter(unittest.TestCase):
         res = ScalarInterpreter().step(inst, state)
         self.assertEqual(res, pack16(16, 16))
 
+class TestVPkLshlrevB16SIMDAndEdgeCases(unittest.TestCase):
+    def test_simd_divergence_exec_mask(self) -> None:
+        simd = SIMDWavefront(wave_size=32, exec_mask=0x00FF00FF)
+        s0_lanes = [pack16(1, 2) for _ in range(32)]
+        s1_lanes = [pack16(i, i * 2) for i in range(32)]
+        orig_dst = [0xCAFEBABE] * 32
+        res = simd.execute(ref_v_pk_lshlrev_b16, s0_lanes, s1_lanes, orig_dst=orig_dst)
+        for i in range(32):
+            if (0x00FF00FF >> i) & 1:
+                self.assertEqual(res[i], pack16(i << 1, (i * 2) << 2))
+            else:
+                self.assertEqual(res[i], 0xCAFEBABE)
+
+    def test_bit_pattern_invariance(self) -> None:
+        # Shifting 0xFFFF by 0..15 preserves exact bit patterns
+        for shift in range(16):
+            res = ref_v_pk_lshlrev_b16(pack16(shift, shift), pack16(0xFFFF, 0xFFFF))
+            exp = (0xFFFF << shift) & MASK16
+            self.assertEqual(res, pack16(exp, exp))
+
+    def test_condition_code_neutrality(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0x12345678
+        state.write_vgpr(1, pack16(1, 1))
+        state.write_vgpr(2, pack16(2, 2))
+        inst = ASTInstruction(
+            Opcode.V_PK_LSHLREV_B16,
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(2),
+        )
+        ScalarInterpreter().step(inst, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0x12345678)
+
 if __name__ == "__main__":
     unittest.main()
