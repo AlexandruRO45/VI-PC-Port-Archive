@@ -3,6 +3,7 @@
 
 import argparse
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 CATEGORIES = {
     "characters": re.compile(r"^(cs_|ig_|hc_|player_|a_c_|crm_)", re.IGNORECASE),
     "hair": re.compile(r"(hair|beard)", re.IGNORECASE),
-    "minigames": re.compile(r"(minigame|bfyb|sea_tr|crashed_heli)", re.IGNORECASE),
+    "minigames": re.compile(r"(minigame|prop|veh|weap)", re.IGNORECASE),
     "map": re.compile(r"^s\d+_w\d+", re.IGNORECASE),
 }
 
@@ -51,27 +52,37 @@ def scan_assets(work_dir: Path, category: str, min_kb: float, top_n: int) -> int
     else:
         assets_dir = work_dir
 
-    min_bytes = int(min_kb * 1024)
+    min_bytes = min_kb * 1024.0
     pattern = CATEGORIES.get(category)
-    matches = []
+    matches: list[tuple[int, Path]] = []
+    walk_errors: list[OSError] = []
 
-    for obj_path in assets_dir.rglob("*"):
-        if not obj_path.is_file() or obj_path.suffix.lower() != ".obj":
-            continue
-        try:
-            size = obj_path.stat().st_size
-        except OSError:
-            continue
+    for root, _, files in os.walk(assets_dir, onerror=walk_errors.append):
+        root_path = Path(root)
+        for name in files:
+            obj_path = root_path / name
+            if obj_path.suffix.lower() != ".obj" or not obj_path.is_file():
+                continue
+            try:
+                size = obj_path.stat().st_size
+            except OSError as exc:
+                walk_errors.append(exc)
+                continue
 
-        if size < min_bytes:
-            continue
+            if size < min_bytes:
+                continue
 
-        if pattern and not pattern.search(obj_path.name):
-            continue
+            if pattern and not pattern.search(obj_path.name):
+                continue
 
-        matches.append((size, obj_path))
+            matches.append((size, obj_path))
 
-    matches.sort(key=lambda item: item[0], reverse=True)
+    if walk_errors:
+        for err in walk_errors:
+            print(f"[!] Error reading path: {err}", file=sys.stderr)
+        return 1
+
+    matches.sort(key=lambda item: (-item[0], str(item[1])))
 
     shown = min(top_n, len(matches))
     print(f"Found {len(matches)} matching .obj models (showing top {shown}):\n")
