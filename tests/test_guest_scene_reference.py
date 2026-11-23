@@ -17,6 +17,15 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 
+_REDIRECT_ENTRY = (
+    "import runpy, sys; "
+    "encoding, script = sys.argv[1:3]; del sys.argv[1:3]; "
+    "sys.stdout.reconfigure(encoding=encoding, errors='strict'); "
+    "sys.stderr.reconfigure(encoding=encoding, errors='strict'); "
+    "runpy.run_path(script, run_name='__main__')"
+)
+
+
 class GuestSceneReferenceTest(unittest.TestCase):
     def test_trace_and_pixel_digest_at_scene_boundaries(self):
         # These records were read back independently on the RTX 5090 and Apple M3 Max.
@@ -46,13 +55,6 @@ class GuestSceneReferenceTest(unittest.TestCase):
     def test_redirected_cli_preserves_unicode_paths_and_guest_diagnostic(self):
         # Force strict redirected text streams even on UTF-8 hosts. Invoke the real CLI with a
         # small stand-in loader that produces a diagnostic and exits before rendering.
-        entry = (
-            "import runpy, sys; "
-            "encoding, script = sys.argv[1:3]; del sys.argv[1:3]; "
-            "sys.stdout.reconfigure(encoding=encoding, errors='strict'); "
-            "sys.stderr.reconfigure(encoding=encoding, errors='strict'); "
-            "runpy.run_path(script, run_name='__main__')"
-        )
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "spirv").mkdir()
@@ -64,7 +66,7 @@ class GuestSceneReferenceTest(unittest.TestCase):
                 with self.subTest(encoding=encoding):
                     out = root / f"測試 café {encoding}"
                     result = subprocess.run(
-                        [sys.executable, "-I", "-c", entry, encoding, str(path), "--wine", sys.executable,
+                        [sys.executable, "-I", "-c", _REDIRECT_ENTRY, encoding, str(path), "--wine", sys.executable,
                          "--loader", str(loader), "--guest", str(loader), "--shaders", str(root), "--out", str(out)],
                         capture_output=True,
                     )
@@ -78,19 +80,23 @@ class GuestSceneReferenceTest(unittest.TestCase):
                     self.assertIn(diagnostic.encode(encoding, "backslashreplace"), result.stderr)
                     self.assertNotIn(b"UnicodeEncodeError", result.stderr)
 
-    def test_launch_failure_preserves_run_record_and_logs(self):
+    def _assert_launch_failure(self, loader_name="invalid.exe", stream_encoding=None):
+        """Run a synthetic unlaunchable guest and verify launch diagnostics survive non-UTF-8 pipes."""
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "spirv").mkdir()
-            bad_loader = root / "invalid.exe"
+            bad_loader = root / loader_name
             bad_loader.write_bytes(b"synthetic input that is not an executable")
             bad_loader.chmod(0o700)
             out = root / "output"
-            cmd = [sys.executable, "-I", str(path), "--loader", str(bad_loader), "--guest", str(bad_loader),
+            prefix = ([sys.executable, "-I", "-c", _REDIRECT_ENTRY, stream_encoding, str(path)]
+                      if stream_encoding else [sys.executable, "-I", str(path)])
+            cmd = [*prefix, "--loader", str(bad_loader), "--guest", str(bad_loader),
                    "--shaders", str(root), "--out", str(out)]
             if sys.platform != "win32":
                 cmd += ["--wine", str(bad_loader)]
-            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
+            # Under python -I, run_guest_scene writes OS OSError text in the console code page (e.g. cp1251/cp1252).
+            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=20)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             report = json.loads((out / "report.json").read_text(encoding="utf-8"))
             self.assertIn("could not launch", report["error"])
@@ -103,6 +109,13 @@ class GuestSceneReferenceTest(unittest.TestCase):
             for stream in ("stdout", "stderr"):
                 contents = (out / "logs" / f"full.{stream}.log").read_bytes()
                 self.assertEqual(record[f"{stream}_sha256"], runner.sha256(contents))
+
+    def test_launch_failure_preserves_run_record_and_logs(self):
+        self._assert_launch_failure()
+
+    def test_launch_failure_handles_non_utf8_stream_bytes(self):
+        # Force cp1252 with a non-ASCII loader path ('\xe9') so even English/UTF-8 hosts exercise invalid UTF-8 bytes.
+        self._assert_launch_failure("invalid café.exe", stream_encoding="cp1252")
 
     def test_timeout_has_its_own_run_outcome(self):
         with tempfile.TemporaryDirectory() as temp:
