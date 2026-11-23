@@ -537,5 +537,23 @@ class TestDsWriteB8HardwareTranslator(unittest.TestCase):
         self.assertEqual(L.out(mem, 0, 0), 0x5A)
 
 
+# ------------------------------------------------------------------------------
+# ds_write_b16 Reference Oracle
+# ------------------------------------------------------------------------------
+
+class TestDsWriteB16Oracle(unittest.TestCase):
+    def setUp(self):
+        self.lds = LDSMemory()
+
+    def test_halfword_write_preserves_other_half(self):
+        self.lds.write_u16(0, 0x1234)
+        self.lds.write_u16(2, 0x5678)
+
+        # Overwrite only low halfword
+        self.lds.write_u16(0, 0x9ABC)
+        self.assertEqual(self.lds.read_u16(0), 0x9ABC)
+        self.assertEqual(self.lds.read_u16(2), 0x5678)
+
+
 if __name__ == '__main__':
     unittest.main()
