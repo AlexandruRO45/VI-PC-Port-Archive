@@ -419,5 +419,21 @@ class TestMax3I32StatusFlags(unittest.TestCase):
         self.assertEqual(wave.exec_mask, orig_mask)
 
 
+# ==============================================================================
+# IEEE 754 Bit-Pattern Boundary Extremes as Signed Integers
+# ==============================================================================
+
+class TestMax3I32BitPatternBoundaries(unittest.TestCase):
+    def test_float_patterns_as_signed_integers(self):
+        # Raw IEEE 754 float bit patterns interpreted as signed two's complement integers:
+        # Float -0.0f: 0x80000000 -> -2147483648 (INT32_MIN)
+        # Float +0.0f: 0x00000000 -> 0
+        # Float 1.0f:  0x3F800000 -> 1065353216
+        # max(-0.0f, +0.0f, 1.0f) = 1.0f (0x3F800000)
+        self.assertEqual(ref_max3_i32(0x8000_0000, 0x0000_0000, 0x3F80_0000), 0x3F80_0000)
+        # max(-0.0f, -1, -100) = max(-2147483648, -1, -100) = -1 (0xFFFFFFFF)
+        self.assertEqual(ref_max3_i32(0x8000_0000, -1, -100), 0xFFFF_FFFF)
+
+
 if __name__ == '__main__':
     unittest.main()
