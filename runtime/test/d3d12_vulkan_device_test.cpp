@@ -3151,6 +3151,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         InvalidCase call;
         bool (*comparable)(ID3D12Device*) = nullptr;
         bool windows10_refuses = false;
+        bool must_refuse = false;
     };
     const auto device10 = [](ID3D12Device* d) {
         Ref<ID3D12Device10> newer;
@@ -3339,7 +3340,10 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: upload buffer in COMMON", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_COMMON);
-         }, +device10},
+         }, +device10, false, true},
+        {"committed: upload buffer in GENERIC_READ", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_GENERIC_READ);
+         }},
         {"committed: upload buffer in COPY_DEST", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, buffer_desc(256), D3D12_RESOURCE_STATE_COPY_DEST);
          }},
@@ -3537,7 +3541,10 @@ int compare_invalid_arguments(ID3D12Device* ours) {
          }},
         {"committed: readback buffer in COMMON", [](ID3D12Device* d) {
              return committed(d, {D3D12_HEAP_TYPE_READBACK}, buffer_desc(256), D3D12_RESOURCE_STATE_COMMON);
-         }, +device10},
+         }, +device10, false, true},
+        {"committed: readback buffer in COPY_DEST", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_READBACK}, buffer_desc(256), D3D12_RESOURCE_STATE_COPY_DEST);
+         }},
         {"committed: readback buffer with UAV", [](ID3D12Device* d) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -3778,6 +3785,12 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAGS(D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
+         }, +device10, false, true},
+        {"committed: resource flag RAYTRACING_ACCELERATION_STRUCTURE on a UAV buffer", [](ID3D12Device* d) {
+             auto desc = buffer_desc(256);
+             desc.Flags = D3D12_RESOURCE_FLAGS(D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE |
+                                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
          }, +device10},
         {"committed: resource flag 0x200 on a buffer", [](ID3D12Device* d) {
              auto desc = buffer_desc(256);
@@ -3806,7 +3819,7 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"committed: resource flag RAYTRACING_ACCELERATION_STRUCTURE on a texture", [](ID3D12Device* d) {
              auto desc = rgba8(D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE);
              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc);
-         }, +device10},
+         }, +device10, false, true},
         {"committed: resource flag 0x400 on a buffer", [](ID3D12Device* d) {
              auto desc = buffer_desc(256);
              desc.Flags = D3D12_RESOURCE_FLAGS(0x400);
@@ -4297,6 +4310,16 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         }
         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
         if (verbose) std::printf(" ours 0x%08lx host 0x%08lx\n", a, b);
+        if (c.must_refuse) {
+            if (a != E_INVALIDARG) {
+                ++mismatches;
+                std::fprintf(stderr, "invalid arguments %s: D3D12 requires E_INVALIDARG, ours 0x%08lx\n", c.name, a);
+            } else if (b != E_INVALIDARG) {
+                std::printf("invalid arguments %s: host runtime differs from the D3D12 rule (host 0x%08lx)\n",
+                            c.name, b);
+            }
+            continue;
+        }
         if (a == b) continue;
         if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
         if (c.comparable && !c.comparable(host.p)) {

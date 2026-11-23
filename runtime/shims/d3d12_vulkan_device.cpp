@@ -1551,14 +1551,17 @@ const char* committed_resource_refusal(const D3D12_HEAP_PROPERTIES& heap, D3D12_
     const bool rt = flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     const bool ds = flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     const bool uav = flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    // ALLOW_SHADER_ATOMICS is for a resource shaders can write: RTX 4070 Laptop (621.24) and WARP refuse it without
-    // ALLOW_UNORDERED_ACCESS, on buffers and textures alike. It changes nothing on one adapter; GetHeapProperties keeps it.
+    const bool acceleration_structure = flags & D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
+    if (acceleration_structure && !buffer) return "acceleration structure flag on a non-buffer";
+    if (acceleration_structure && !uav) return "acceleration structure flag without ALLOW_UNORDERED_ACCESS";
+    // ALLOW_SHADER_ATOMICS is for a resource shaders can write: the host and WARP refuse it without
+    // ALLOW_UNORDERED_ACCESS, on buffers and textures alike. GetHeapProperties still reports the flag.
     if ((UINT(heap_flags) & D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS) && !uav)
         return "ALLOW_SHADER_ATOMICS without ALLOW_UNORDERED_ACCESS";
-    // Upload heaps start in (a part of) GENERIC_READ, readback heaps in COPY_DEST; COMMON on both; no UAVs.
+    // Upload heaps allow GENERIC_READ and COMMON; readback heaps allow COPY_DEST and COMMON. Neither allows UAVs.
     if (heap.Type == D3D12_HEAP_TYPE_UPLOAD && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_GENERIC_READ))))
         return "upload heap state or UAV";
-    if (heap.Type == D3D12_HEAP_TYPE_READBACK && (uav || (UINT(state) & ~UINT(D3D12_RESOURCE_STATE_COPY_DEST))))
+    if (heap.Type == D3D12_HEAP_TYPE_READBACK && (uav || state != D3D12_RESOURCE_STATE_COPY_DEST))
         return "readback heap state or UAV";
 
     if (const char* why = initial_state_refusal(buffer, flags, state, acceleration_structures)) return why;
