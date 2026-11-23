@@ -3846,13 +3846,15 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
+        // Fetched before the stall opens: the first call creates the cache and loads its seed (and a second thread
+        // waits for that), which is not the compile.
+        const VkPipelineCache cache = device_.pipeline_cache();
         VkResult created = VK_ERROR_UNKNOWN;
         {
             // The console makes this pipeline from native code at once; the driver's compile of the translated module
-            // is host-only time on the title's thread, which a guest Sleep sits out (src/host_stall.h).
+            // is host-only time on the title's thread, which a long guest Sleep sits out (src/host_stall.h).
             const rt::host_stall::Scope compiling;
-            created = vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
-                                                  &pipeline_.pipeline);
+            created = vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &pipeline_.pipeline);
         }
         if (created != VK_SUCCESS) return E_FAIL;
 
