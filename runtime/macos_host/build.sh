@@ -13,7 +13,10 @@ mkdir -p "$OUT"
   "$OUT/guest.obj" "$OUT/kernel32.lib" /out:"$OUT/guest.exe"
 "$LLD/lld-link" /nologo /entry:mainCRTStartup /subsystem:console /nodefaultlib /fixed \
   "$OUT/guest.obj" "$OUT/kernel32.lib" /out:"$OUT/guest_fixed.exe"
-/usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall -Wextra host.cpp kernel32.cpp crt.cpp eh.cpp -o "$OUT/macos_host"
+VKH=${VKH:-/opt/homebrew/opt/vulkan-headers/include}
+MVK=${MVK:-$HOME/.local/share/moltenvk/MoltenVK/MoltenVK/dynamic/dylib/macOS}  # universal MoltenVK release
+/usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall -Wextra -I"$VKH" host.cpp kernel32.cpp crt.cpp eh.cpp vulkan.cpp \
+  window.mm -framework Cocoa -framework QuartzCore -Wl,-rpath,"$MVK" -o "$OUT/macos_host"
 
 # Leonida's own stand-in game (runtime/test/fixtures/tiny_game.cpp), built as runtime/CMakeLists.txt builds it,
 # when an xwin splat is there (docs/testing.md).
@@ -29,3 +32,7 @@ $CL /c $FIX/tiny_game.cpp /Fo"$OUT/tiny_game.obj"
 "$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/tiny_game.obj" "$OUT/xgameruntime.lib" /out:"$OUT/tiny_game.exe"
 $CL /c guest/eh_probe.cpp /Fo"$OUT/eh_probe.obj"
 "$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/eh_probe.obj" /out:"$OUT/eh_probe.exe"
+printf 'LIBRARY vulkan-1.dll\nEXPORTS\n  vkGetInstanceProcAddr\n' > "$OUT/vulkan-1.def"
+"$LLVM/llvm-dlltool" -m i386:x86-64 -d "$OUT/vulkan-1.def" -l "$OUT/vulkan-1.lib"
+$CL -I"$VKH" /c guest/vk_clear.c /Fo"$OUT/vk_clear.obj"
+"$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/vk_clear.obj" "$OUT/vulkan-1.lib" user32.lib /out:"$OUT/vk_clear.exe"

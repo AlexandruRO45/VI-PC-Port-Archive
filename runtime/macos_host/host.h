@@ -88,6 +88,8 @@ using Exports = std::vector<std::pair<std::string, void*>>;  // "dll!name" -> ms
 Exports kernel32_exports();
 Exports crt_exports();
 Exports eh_exports();
+Exports vulkan_exports();
+Exports user32_exports();
 
 }  // namespace host
 
