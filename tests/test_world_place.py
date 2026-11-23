@@ -12,9 +12,11 @@ import io
 import json
 import math
 import os
+import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -314,6 +316,82 @@ class PlacedBuildTest(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     world_build.main([assets, "--out", os.path.join(tmp, "w"), "--region", "5,5,1,1"])
+
+    def test_png_cache_evicted_after_completed_and_failed_builds(self):
+        saved_cache = dict(world_build._PNG_CACHE)
+        self.addCleanup(lambda: (world_build._PNG_CACHE.clear(), world_build._PNG_CACHE.update(saved_cache)))
+        world_build._PNG_CACHE.clear()
+
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        models = os.path.join(tmp, "assets", "levels", "models")
+        ttpf = os.path.join(tmp, "assets", "ttpf", "pool_a")
+        os.makedirs(models)
+        os.makedirs(ttpf)
+
+        hdr = bytearray(128)
+        struct.pack_into("<III", hdr, 0, 0x20534444, 124, 0x100F)
+        struct.pack_into("<III", hdr, 12, 2, 2, 8)
+        struct.pack_into("<IIIII", hdr, 76, 32, 0x41, 0, 32, 0x00FF0000)
+        struct.pack_into("<IIII", hdr, 96, 0x0000FF00, 0x000000FF, 0xFF000000, 0x1000)
+        with open(os.path.join(ttpf, "valid.dds"), "wb") as f:
+            f.write(bytes(hdr) + bytes([20, 40, 220, 255] * 4))
+        with open(os.path.join(ttpf, "corrupt.dds"), "wb") as f:
+            f.write(b"BAD_DDS")
+        with open(os.path.join(ttpf, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"Textures": [
+                {"Name": "valid", "AssetKey": "AABBCCDDEEFF0011", "File": "valid.dds"},
+                {"Name": "corrupt", "AssetKey": "AABBCCDDEEFF0022", "File": "corrupt.dds"},
+            ]}, f)
+
+        obj_lines = UNIT_BOX_OBJ.splitlines()
+        split = next(i for i, l in enumerate(obj_lines) if l.startswith("f "))
+        # Assign half the faces to valid mat0 and half to corrupt mat1, with explicit UVs so textures are bound.
+        uvs = ["vt 0 0", "vt 1 0", "vt 1 1", "vt 0 1"]
+        faces_a = [f"f {' '.join(p + '/1' for p in l.split()[1:])}" for l in obj_lines[split:split + 6]]
+        faces_b = [f"f {' '.join(p + '/1' for p in l.split()[1:])}" for l in obj_lines[split + 6:]]
+        with open(os.path.join(models, "box.obj"), "w", encoding="utf-8") as f:
+            f.write("\n".join(obj_lines[:split] + uvs + ["g mesh_0"] + faces_a + ["g mesh_1"] + faces_b) + "\n")
+        with open(os.path.join(models, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"Items": [{
+                "File": "box.obj",
+                "Name": "test_box.#dr",
+                "Min": [0, 0, 0],
+                "Max": [1, 1, 1],
+                "MeshShaders": [0, 1],
+                "Embedded": [],
+                "Materials": [
+                    {"ShaderIndex": 0, "Textures": [{"Param": "2B5170FD", "TextureIndex": -1, "Id64": "AABBCCDDEEFF0011"}]},
+                    {"ShaderIndex": 1, "Textures": [{"Param": "2B5170FD", "TextureIndex": -1, "Id64": "AABBCCDDEEFF0022"}]},
+                ],
+            }]}, f)
+
+        assets = os.path.join(tmp, "assets")
+        ents = os.path.join(tmp, "entities.jsonl")
+        write_entities(ents, [entity("test_box", (10, 10, 0)), entity("test_box", (400, 10, 0))])
+
+        # Within a build spanning two chunks, each DDS is decoded once; after the build, staging cache is evicted.
+        real_decode = world_build._get_dds_png().dds_file_to_png_bytes
+        decode_calls = []
+
+        def tracked_decode(path, max_size=0):
+            decode_calls.append(os.path.basename(path))
+            return real_decode(path, max_size=max_size)
+
+        with mock.patch.object(world_build._get_dds_png(), "dds_file_to_png_bytes", side_effect=tracked_decode):
+            for run in range(3):
+                out_dir = os.path.join(tmp, f"world_{run}")
+                doc = world_build.build_world(assets, out_dir, textures=True, placements=ents, jobs=1)
+                self.assertEqual(doc["stats"]["textures_embedded"], 2)
+                self.assertEqual(doc["stats"]["textures_skipped"], 2)
+                self.assertEqual(world_build._PNG_CACHE, {})
+        self.assertEqual(decode_calls.count("valid.dds"), 3)
+        self.assertEqual(decode_calls.count("corrupt.dds"), 3)
+
+        with mock.patch.object(world_build, "_publish_world", side_effect=OSError("simulated failure")):
+            with self.assertRaises(OSError):
+                world_build.build_world(assets, os.path.join(tmp, "world_fail"), textures=True, placements=ents, jobs=1)
+        self.assertEqual(world_build._PNG_CACHE, {})
 
 
 if __name__ == "__main__":

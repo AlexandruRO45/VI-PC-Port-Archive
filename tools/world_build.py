@@ -480,6 +480,12 @@ def _png_for(staging_dir: str, dds_path: str, max_tex_size: int) -> bytes | None
     return png
 
 
+def _evict_png_cache(staging_dir: str) -> None:
+    """Drop every PNG cache entry (including None failure markers) for a finished staging dir."""
+    for key in [k for k in _PNG_CACHE if k[0] == staging_dir]:
+        del _PNG_CACHE[key]
+
+
 def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
     """Write one chunk: every distinct (model, mirrored) once, drawn by its instances. Returns
     (chunk record, textures embedded, textures skipped, bytes), after checking the written file."""
@@ -714,6 +720,8 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
             except OSError:
                 pass
         raise
+    finally:
+        _evict_png_cache(staging_dir)
     _discard_publication_staging(staging_dir)
     _prune_stale_chunks(chunks_dir, {f"{c['id']}.glb" for c in world_doc["chunks"]})
     return world_doc
@@ -1336,6 +1344,7 @@ def _holds_recovery_data(staging_dir: str) -> bool:
 
 def _discard_publication_staging(staging_dir: str) -> None:
     # Keep the journal until the backups are gone, including if the process dies during cleanup.
+    _evict_png_cache(staging_dir)
     shutil.rmtree(os.path.join(staging_dir, _STAGING_BACKUP), ignore_errors=True)
     if not _holds_unrestored_chunks(staging_dir):
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -1658,6 +1667,8 @@ def build_world(
             except OSError:
                 pass
         raise
+    finally:
+        _evict_png_cache(staging_dir)
     _discard_publication_staging(staging_dir)
     _prune_stale_chunks(chunks_dir, {f"{c['id']}.glb" for c in world_doc["chunks"]})
     return world_doc
