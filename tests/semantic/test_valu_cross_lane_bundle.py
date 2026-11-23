@@ -139,6 +139,13 @@ class TestReadFirstLaneAliasing(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestReadFirstLaneTranslator(unittest.TestCase):
+    def test_translator_spirv_instructions(self):
+        prog = ["v_mov_b32_e32 v3, 0xABCD", "v_readfirstlane_b32 s10, v3", "s_endpgm"]
+        spv = support.translate_lines("cs_rfl_trans", prog, fssm=saveexec_run.fssm())
+        self.assertTrue("OpGroupNonUniformShuffle" in spv or "OpGroupNonUniformBallot" in spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
