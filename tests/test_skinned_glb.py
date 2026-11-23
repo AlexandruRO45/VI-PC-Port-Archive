@@ -424,6 +424,22 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertEqual(streams["j0"], j0)
         self.assertEqual(streams["j1"], j1)
 
+    def test_mismatched_geometry_attribute_counts_are_rejected(self):
+        from anim_glb import pack_glb
+
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        path = os.path.join(component, "model.glb")
+        source, binary = skinned_glb.read_glb(path)
+        attributes = source["meshes"][0]["primitives"][0]["attributes"]
+        for name in ("NORMAL", "TEXCOORD_0"):
+            with self.subTest(attribute=name):
+                accessor = source["accessors"][attributes[name]]
+                with mock.patch.dict(accessor, count=2), open(path, "wb") as handle:
+                    handle.write(pack_glb(source, binary))
+                with self.assertRaisesRegex(skinned_glb.SkinError, f"{name.lower()} count 2 != skin stream count 3"):
+                    skinned_glb.build_skinned_glb(skeleton, [component])
+
     def test_empty_component_list_is_rejected(self):
         skeleton = _skeleton_dir(self.root)
         with self.assertRaisesRegex(skinned_glb.SkinError, "at least one --component"):

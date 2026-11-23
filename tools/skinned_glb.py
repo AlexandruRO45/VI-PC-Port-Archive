@@ -825,12 +825,12 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
                 local_to_joint.append(joints.add(name, bind, parent_index))
 
             attributes, index_pair = _component_geometry(gltf, glb_bin, source_primitive)
-            position = attributes["POSITION"][1]
-            if position.get("count") != streams["count"]:
-                raise SkinError(
-                    f"{mesh.get('name', 'mesh')}: model.glb position count "
-                    f"{position.get('count')} != skin stream count {streams['count']}"
-                )
+            for name, (_, accessor) in attributes.items():
+                if accessor["count"] != streams["count"]:
+                    raise SkinError(
+                        f"{mesh.get('name', 'mesh')}: model.glb {name.lower()} count "
+                        f"{accessor['count']} != skin stream count {streams['count']}"
+                    )
 
             normalised = normalise_weights(
                 streams["j0"], streams["j1"], streams["w0"], streams["w1"],
