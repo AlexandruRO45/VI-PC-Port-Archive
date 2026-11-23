@@ -267,6 +267,18 @@ class CompareCommand(unittest.TestCase):
             self.assertEqual(report["rows"][-1]["samples_passed"], [None, 0])
             self.assertNotIn("samples_passed", report["rows"][6])
 
+    def test_incomplete_depth_measurements(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = {"depth": True, "code": 0, "dir": tmp, "samples_passed": 0}
+            self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "missing"})
+            with open(os.path.join(tmp, "0.raw.depth"), "wb") as plane:
+                plane.write(b"short")
+            self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
+            with open(os.path.join(tmp, "0.raw.depth"), "wb") as plane:
+                plane.write(bytes(ps_sweep.W * ps_sweep.H * 4))
+            self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
+            self.assertEqual(ps_sweep.depth_measurements(0, {"code": 0}, rec), {"depth_class": "missing"})
+
     @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a precise-query Vulkan worker")
     def test_clear_draws_with_opposite_coverage(self):
         from pathlib import Path
@@ -294,6 +306,41 @@ class CompareCommand(unittest.TestCase):
             self.assertEqual(exact["class"], "clear-only exact")
             self.assertEqual(exact["samples_passed"], [ps_sweep.W * ps_sweep.H, 0])
             self.assertEqual(ordinary["samples_passed"], exact["samples_passed"])
+
+    @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker with D32 readback")
+    def test_equal_color_different_depth(self):
+        from pathlib import Path
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for tag, code in (("clear", "gl_FragDepth = 1.0;"), ("near", "gl_FragDepth = 0.25;"),
+                              ("discarded", "discard;")):
+                folder = out / tag
+                folder.mkdir()
+                src = folder / "control.frag"
+                src.write_text("#version 450\nlayout(location=0) out vec4 color;\nvoid main(){color=vec4(-1);"
+                               + code + "}\n", encoding="utf-8", newline="\n")
+                subprocess.run(["glslangValidator", "-V", str(src), "-o", str(folder / "control.spv")], check=True)
+                (folder / "index.json").write_text('{"control":{"stage":"ps"}}', encoding="utf-8", newline="\n")
+                if tag == "clear":
+                    ps_sweep.main(["sample", "--spirv", str(folder), "--out", tmp])
+                ps_sweep.main(["run", "--spirv", str(folder), "--out", tmp, "--tag", tag, "--depth",
+                               "--exe", os.environ["PS_SWEEP_TEST_EXE"]])
+            pixels = ps_sweep.W * ps_sweep.H
+            for tag, differing, written in (("near", pixels, pixels), ("discarded", 0, 0)):
+                args = ["compare", "--out", tmp, "--tags", "clear", tag]
+                ps_sweep.main(args)
+                ps_sweep.main(args + ["--exact"])
+                ordinary = json.loads((out / "classes_z.json").read_text())[0]
+                exact = json.loads((out / "exact_z.json").read_text())["rows"][0]
+                self.assertEqual(exact["targets"], ["clear-only exact"])
+                for row in (ordinary, exact):
+                    self.assertEqual(row["depth_different_pixels"], differing)
+                    self.assertEqual(row["depth_nonclear_pixels"], [0, differing])
+                    self.assertEqual(row["depth_written_pixels"], [pixels, written])
+                self.assertEqual(ordinary["class"], "depth mismatch" if differing else "OK on both")
+                self.assertEqual(exact["class"], "mismatch" if differing else "clear-only exact")
 
     def test_help_warns_about_nvidia_resets(self):
         buf = io.StringIO()

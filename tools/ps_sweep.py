@@ -17,7 +17,12 @@ The report (exact_<variant>.json) gives one row per sampled draw, with target cl
 compatible pairs. An exact draw is observable if any component differs from the worker's -1 clear value.
 Pass --occlusion to run on a device supporting precise occlusion queries. Both compare modes then include
 samples_passed in tag order for each draw (null for an unavailable measurement).
-A clear-only match cannot distinguish a discarded fragment from an explicit write of the clear value.
+Pass --depth on both runs for an additional D32_SFLOAT attachment cleared to 1.0. This enables precise
+queries and depth writes with an ALWAYS comparison. Both reports compare depth words exactly, count differing
+pixels, and give written and non-clear pixel counts in tag order. With one triangle and one sample per pixel,
+the precise query counts pixels written, including writes equal to the clear. It cannot locate those writes
+within a clear-valued region. Shaders without an explicit depth output write rasterized depth.
+A clear-only color match cannot distinguish a discarded fragment from an explicit write of the clear value.
 
 A `--spirv` folder translated with `--bary-fallback`, with `python -I tools/bary_fallback_gs.py <folder>` run on it
 (it writes `<name>.bary_gs.spv`), draws each shader that reads raw barycentrics through that pass-through geometry
@@ -190,6 +195,8 @@ def cmd_run(a):
                     previous = json.loads(line)
                     if a.occlusion and previous["code"] == 0 and "samples_passed" not in previous:
                         raise SystemExit("--occlusion needs a fresh tag or suffix for previously unmeasured draws")
+                    if previous["code"] != NOT_TRANSLATED and bool(previous.get("depth")) != a.depth:
+                        raise SystemExit("different depth mode needs a fresh tag or suffix")
                     done.add(previous["i"])
     hi = a.hi or len(sample)
     for i, s in enumerate(sample):
@@ -212,6 +219,10 @@ def cmd_run(a):
         env = job_env(os.environ, a.timeout, a.variant, meta, gs)
         cmd = [a.exe, make_vs(a.glslang, meta, cache), os.path.join(a.spirv, s["name"] + ".spv"), raw,
                str(W), str(H), str(targets)]
+        if a.depth:
+            cmd.append("--depth")
+            if os.path.exists(raw + ".depth"):
+                os.unlink(raw + ".depth")
         if a.occlusion:
             cmd.append("--occlusion")
         start = time.time()
@@ -230,7 +241,9 @@ def cmd_run(a):
                     reason = line.split(" (line")[0][:60]
                     break
         rec = {"i": i, "code": code, "reason": reason, "targets": targets, "sec": round(time.time() - start, 2)}
-        if a.occlusion and code == 0:
+        if a.depth:
+            rec["depth"] = True
+        if (a.occlusion or a.depth) and code == 0:
             prefix = "samples_passed "
             counts = [line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)]
             if len(counts) != 1 or not counts[0].isascii() or not counts[0].isdecimal():
@@ -355,15 +368,50 @@ def draw_measurements(left, right):
     return {"samples_passed": counts} if any(count is not None for count in counts) else {}
 
 
+def depth_measurements(i, left, right):
+    """Single-sample, single triangle, ALWAYS depth test and writes; passing samples equal written pixels."""
+    pair = (left, right)
+    if not any(rec and rec.get("depth") for rec in pair):
+        return {}
+    pixels = W * H
+    clear = struct.pack("<f", 1.0)
+    planes, changed, written = [], [], []
+    for rec in pair:
+        if not rec or not rec.get("depth") or rec["code"] != 0:
+            return {"depth_class": "missing"}
+        try:
+            with open(os.path.join(rec["dir"], f"{i}.raw.depth"), "rb") as f:
+                data = f.read(pixels * 4 + 1)
+        except FileNotFoundError:
+            return {"depth_class": "missing"}
+        if len(data) != pixels * 4:
+            return {"depth_class": "incompatible"}
+        count = sum(data[n:n + 4] != clear for n in range(0, len(data), 4))
+        passed = rec.get("samples_passed")
+        if type(passed) is not int or not count <= passed <= pixels:
+            return {"depth_class": "incompatible"}
+        planes.append(data)
+        changed.append(count)
+        written.append(passed)
+    differences = sum(planes[0][n:n + 4] != planes[1][n:n + 4] for n in range(0, pixels * 4, 4))
+    return {"depth_class": "mismatch" if differences else "exact", "depth_different_pixels": differences,
+            "depth_written_pixels": written, "depth_nonclear_pixels": changed}
+
+
 def compare_exact(a, sample, ra, rb):
     draws, attachments = Counter(), Counter()
     rows = []
     for i in range(len(sample)):
         left, right = ra.get(i), rb.get(i)
         outcome, targets = exact_pair(i, left, right)
+        depth = depth_measurements(i, left, right)
+        if depth.get("depth_class") in ("missing", "incompatible", "mismatch"):
+            outcome = depth["depth_class"]
+        elif outcome == "clear-only exact" and any(depth.get("depth_nonclear_pixels", [])):
+            outcome = "non-clear exact"
         draws[outcome] += 1
         attachments.update(targets)
-        rows.append({"i": i, "class": outcome, "targets": targets, **draw_measurements(left, right),
+        rows.append({"i": i, "class": outcome, "targets": targets, **depth, **draw_measurements(left, right),
                      "codes": [r["code"] if r else None for r in (left, right)]})
     with open(os.path.join(a.out, f"exact_{a.variant}.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({"tags": a.tags, "draws": draws, "targets": attachments, "rows": rows}, f)
@@ -385,9 +433,12 @@ def cmd_compare(a):
         if i not in ra or i not in rb:
             raise SystemExit(f"shader {i} has no result on both tags")
         c, sc = classify_pair(ra[i], rb[i], os.path.join(ra[i]["dir"], f"{i}.raw"), os.path.join(rb[i]["dir"], f"{i}.raw"))
+        depth = depth_measurements(i, ra[i], rb[i])
+        if c == "OK on both" and depth.get("depth_class") in ("missing", "incompatible", "mismatch"):
+            c, sc = "depth " + depth["depth_class"], ""
         counts[c] = counts.get(c, 0) + 1
         sub[(c, sc)] = sub.get((c, sc), 0) + 1
-        rows.append({"i": i, "class": c, "sub": sc, "stratum": s["stratum"], **draw_measurements(ra[i], rb[i]),
+        rows.append({"i": i, "class": c, "sub": sc, "stratum": s["stratum"], **depth, **draw_measurements(ra[i], rb[i]),
                      ta: ra[i]["code"], tb: rb[i]["code"],
                      ta + "_reason": ra[i]["reason"], tb + "_reason": rb[i]["reason"]})
     with open(os.path.join(a.out, f"classes_{a.variant}.json"), "w", encoding="utf-8", newline="\n") as f:
@@ -416,6 +467,7 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=20261122)
     ap.add_argument("--tag", help="a label for the GPU this run uses")
     ap.add_argument("--tags", nargs=2, default=["a", "b"])
+    ap.add_argument("--depth", action="store_true", help="capture D32 depth and precise samples passed (run)")
     ap.add_argument("--occlusion", action="store_true", help="measure precise samples passed per draw (run)")
     ap.add_argument("--exact", action="store_true", help="compare target bytes and count clear-only pairs separately")
     ap.add_argument("--variant", choices=["z", "t"], default="z")
@@ -427,6 +479,8 @@ def main(argv=None):
     ap.add_argument("--only", type=lambda s: [int(x) for x in s.split(",")], default=None)
     ap.add_argument("--suffix", default="", help="results folder suffix (a re-run uses _re)")
     a = ap.parse_args(argv)
+    if a.depth and a.cmd != "run":
+        ap.error("--depth needs run")
     if a.occlusion and a.cmd != "run":
         ap.error("--occlusion needs run")
     if a.exact and (a.cmd != "compare" or a.tags[0] == a.tags[1]):

@@ -20,7 +20,8 @@
 //   heap        VKS_HEAP_KB KiB (default 1024), zero unless VKS_HEAP_FILL=<offset>,<bytes>,<seed> fills a range with
 //               floats in [0.25, 1)
 // Output: the targets back to back, each width * height * 16 bytes, cleared to -1 so a pixel that was never
-// written is recognisable.
+// written stays clear. --depth also writes <out.raw>.depth, one D32_SFLOAT word per pixel, cleared to 1.
+// It enables precise occlusion counting, depth test ALWAYS, depth writes, and no stencil or depth bounds test.
 //
 // Exit codes: 0 drawn; 77 the device lacks a feature the module needs (stdout says which); 1 a Vulkan call failed
 // (stderr says which); 3 the fence did not signal in VKS_TIMEOUT_S seconds (default 20); 4 the device was lost.
@@ -116,11 +117,18 @@ static double now_s() {
 
 int main(int argc, char** argv) {
     const double t_start = now_s();
-    const bool occlusion = argc == 8 && std::strcmp(argv[7], "--occlusion") == 0;
-    if (argc != 7 && !occlusion) {
-        std::fprintf(stderr, "usage: vk_ps_sweep vs.spv ps.spv out.raw width height render-targets [--occlusion]\n");
+    bool depth = false, occlusion = false;
+    if (argc < 7) {
+        std::fprintf(stderr, "usage: vk_ps_sweep vs.spv ps.spv out.raw width height render-targets [--occlusion] [--depth]\n");
         return 2;
     }
+    for (int i = 7; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--occlusion") == 0) occlusion = true;
+        else if (std::strcmp(argv[i], "--depth") == 0) depth = true;
+        else return 2;
+    }
+    // Count surviving samples even when their depth equals the attachment clear.
+    occlusion |= depth;
     const uint32_t W = uint32_t(std::atoi(argv[4])), H = uint32_t(std::atoi(argv[5]));
     const uint32_t targets = uint32_t(std::atoi(argv[6]));
     if (!W || !H || targets < 1 || targets > 8) return 2;
@@ -525,13 +533,26 @@ int main(int argc, char** argv) {
 
     // Targets.
     const VkFormat fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
-    std::vector<VkImage> imgs(targets);
-    std::vector<VkImageView> views(targets);
-    for (uint32_t t = 0; t < targets; ++t) {
+    const uint32_t attachments = targets + uint32_t(depth);
+    if (depth) {
+        LOADI(vkGetPhysicalDeviceImageFormatProperties);
+        VkImageFormatProperties image{};
+        const auto result = vkGetPhysicalDeviceImageFormatProperties(pd, VK_FORMAT_D32_SFLOAT, VK_IMAGE_TYPE_2D,
+            VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, &image);
+        if (result == VK_ERROR_FORMAT_NOT_SUPPORTED || (result == VK_SUCCESS &&
+            (image.maxExtent.width < W || image.maxExtent.height < H || !(image.sampleCounts & VK_SAMPLE_COUNT_1_BIT)))) {
+            std::puts("unsupported: D32_SFLOAT depth attachment readback");
+            return 77;
+        }
+        CHECK(result);
+    }
+    std::vector<VkImage> imgs(attachments);
+    std::vector<VkImageView> views(attachments);
+    for (uint32_t t = 0; t < attachments; ++t) {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = fmt; ii.extent = {W, H, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = t == targets ? VK_FORMAT_D32_SFLOAT : fmt; ii.extent = {W, H, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
         ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ii.usage = (t == targets ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         CHECK(vkCreateImage(dev, &ii, nullptr, &imgs[t]));
         VkMemoryRequirements mr;
         vkGetImageMemoryRequirements(dev, imgs[t], &mr);
@@ -542,31 +563,36 @@ int main(int argc, char** argv) {
         CHECK(vkAllocateMemory(dev, &ai, nullptr, &m));
         CHECK(vkBindImageMemory(dev, imgs[t], m, 0));
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vi.image = imgs[t]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = fmt;
-        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vi.image = imgs[t]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ii.format;
+        vi.subresourceRange = {t == targets ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &views[t]));
     }
-    std::vector<VkAttachmentDescription> ads(targets);
-    std::vector<VkAttachmentReference> refs(targets);
-    for (uint32_t t = 0; t < targets; ++t) {
+    std::vector<VkAttachmentDescription> ads(attachments);
+    std::vector<VkAttachmentReference> refs(attachments);
+    for (uint32_t t = 0; t < attachments; ++t) {
         ads[t] = {};
-        ads[t].format = fmt; ads[t].samples = VK_SAMPLE_COUNT_1_BIT;
+        ads[t].format = t == targets ? VK_FORMAT_D32_SFLOAT : fmt; ads[t].samples = VK_SAMPLE_COUNT_1_BIT;
         ads[t].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ads[t].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         ads[t].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; ads[t].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         ads[t].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; ads[t].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        refs[t] = {t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        refs[t] = {t, t == targets ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     }
     VkSubpassDescription sd{};
     sd.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sd.colorAttachmentCount = targets; sd.pColorAttachments = refs.data();
+    if (depth) sd.pDepthStencilAttachment = &refs[targets];
     VkSubpassDependency dep{0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    if (depth) {
+        dep.srcStageMask |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dep.srcAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    }
     VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpi.attachmentCount = targets; rpi.pAttachments = ads.data(); rpi.subpassCount = 1; rpi.pSubpasses = &sd;
+    rpi.attachmentCount = attachments; rpi.pAttachments = ads.data(); rpi.subpassCount = 1; rpi.pSubpasses = &sd;
     rpi.dependencyCount = 1; rpi.pDependencies = &dep;
     VkRenderPass rp;
     CHECK(vkCreateRenderPass(dev, &rpi, nullptr, &rp));
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-    fbi.renderPass = rp; fbi.attachmentCount = targets; fbi.pAttachments = views.data(); fbi.width = W; fbi.height = H; fbi.layers = 1;
+    fbi.renderPass = rp; fbi.attachmentCount = attachments; fbi.pAttachments = views.data(); fbi.width = W; fbi.height = H; fbi.layers = 1;
     VkFramebuffer fb;
     CHECK(vkCreateFramebuffer(dev, &fbi, nullptr, &fb));
 
@@ -627,6 +653,12 @@ int main(int argc, char** argv) {
     VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gpi.stageCount = stage_count; gpi.pStages = stages; gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
     gpi.pViewportState = &vps; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms; gpi.pColorBlendState = &cb;
+    VkPipelineDepthStencilStateCreateInfo ds_state{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    if (depth) {
+        ds_state.depthTestEnable = ds_state.depthWriteEnable = VK_TRUE;
+        ds_state.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        gpi.pDepthStencilState = &ds_state;
+    }
     gpi.layout = pl; gpi.renderPass = rp;
     VkPipeline pipe;
     {
@@ -641,7 +673,8 @@ int main(int argc, char** argv) {
     // Readback buffer.
     const VkDeviceSize target_bytes = VkDeviceSize(W) * H * 16;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bi.size = target_bytes * targets; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const VkDeviceSize color_bytes = target_bytes * targets;
+    bi.size = color_bytes + (depth ? target_bytes / 4 : 0); bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VkBuffer buf;
     CHECK(vkCreateBuffer(dev, &bi, nullptr, &buf));
     VkMemoryRequirements br;
@@ -683,10 +716,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!set->fallbacks_ready()) set->record_fallback_init(cmd);
-    std::vector<VkClearValue> clears(targets);
+    std::vector<VkClearValue> clears(attachments);
     for (auto& c : clears) for (float& f : c.color.float32) f = -1;
+    if (depth) clears[targets].depthStencil = {1.0f, 0};
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rbi.renderPass = rp; rbi.framebuffer = fb; rbi.renderArea = sc; rbi.clearValueCount = targets; rbi.pClearValues = clears.data();
+    rbi.renderPass = rp; rbi.framebuffer = fb; rbi.renderArea = sc; rbi.clearValueCount = attachments; rbi.pClearValues = clears.data();
     LOADD(vkCreateQueryPool); LOADD(vkDestroyQueryPool); LOADD(vkGetQueryPoolResults);
     LOADD(vkCmdResetQueryPool); LOADD(vkCmdBeginQuery); LOADD(vkCmdEndQuery);
     VkQueryPool query = VK_NULL_HANDLE;
@@ -706,10 +740,10 @@ int main(int argc, char** argv) {
     vkCmdDraw(cmd, 3, 1, 0, 0);
     if (occlusion) vkCmdEndQuery(cmd, query, 0);
     vkCmdEndRenderPass(cmd);
-    for (uint32_t t = 0; t < targets; ++t) {
+    for (uint32_t t = 0; t < attachments; ++t) {
         VkBufferImageCopy reg{};
         reg.bufferOffset = target_bytes * t;
-        reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        reg.imageSubresource = {t == targets ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         reg.imageExtent = {W, H, 1};
         vkCmdCopyImageToBuffer(cmd, imgs[t], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
     }
@@ -736,7 +770,13 @@ int main(int argc, char** argv) {
     void* p;
     CHECK(vkMapMemory(dev, bmem, 0, bi.size, 0, &p));
     std::ofstream output(argv[3], std::ios::binary);
-    output.write(static_cast<const char*>(p), std::streamsize(bi.size));
+    output.write(static_cast<const char*>(p), std::streamsize(color_bytes));
+    if (depth) {
+        std::ofstream plane(std::string(argv[3]) + ".depth", std::ios::binary);
+        plane.write(static_cast<const char*>(p) + color_bytes, std::streamsize(bi.size - color_bytes));
+        plane.close();
+        if (!plane) return 1;
+    }
     output.close();
     if (!output) {
         std::fprintf(stderr, "failed to write %s\n", argv[3]);
