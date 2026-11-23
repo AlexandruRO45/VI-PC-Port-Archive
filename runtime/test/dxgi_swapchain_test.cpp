@@ -599,6 +599,27 @@ int main() {
         fullscreen.ScanlineOrdering != DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED)
         return fail("GetFullscreenDesc");
 
+    // SetFullscreenState is remembered: Get answers what Set was told, with the output AddRef'd.
+    {
+        BOOL fs = TRUE;
+        IDXGIOutput* out = reinterpret_cast<IDXGIOutput*>(1);
+        if (FAILED(sc->GetFullscreenState(&fs, &out)) || fs || out)
+            return fail("GetFullscreenState on a new swapchain should be windowed with no output");
+        if (FAILED(sc->SetFullscreenState(TRUE, nullptr))) return fail("SetFullscreenState(TRUE)");
+        fs = FALSE;
+        out = nullptr;
+        if (FAILED(sc->GetFullscreenState(&fs, &out)) || !fs)
+            return fail("GetFullscreenState after SetFullscreenState(TRUE) should be TRUE");
+        if (!out) return fail("GetFullscreenState after SetFullscreenState(TRUE) should return the output");
+        out->Release();
+        if (FAILED(sc->SetFullscreenState(FALSE, nullptr))) return fail("SetFullscreenState(FALSE)");
+        fs = TRUE;
+        out = reinterpret_cast<IDXGIOutput*>(1);
+        if (FAILED(sc->GetFullscreenState(&fs, &out)) || fs || out)
+            return fail("GetFullscreenState after SetFullscreenState(FALSE) should be windowed with no output");
+        if (FAILED(sc->GetFullscreenState(nullptr, nullptr))) return fail("GetFullscreenState with null outs");
+    }
+
     // Factory::GetParent: root DXGI object has no parent; native DXGI returns E_NOINTERFACE
     void* parent_out = reinterpret_cast<void*>(1);
     if (factory->GetParent(IID_IUnknown, nullptr) != E_POINTER)

@@ -220,6 +220,7 @@ public:
     ~SwapChain() {
         unregister_buffers();
         if (restrict_to_output_) restrict_to_output_->Release();
+        if (fullscreen_output_) fullscreen_output_->Release();
         if (waitable_) CloseHandle(waitable_);
         if (device_) device_->Release();
         if (parent_) parent_->Release();
@@ -322,10 +323,35 @@ public:
         return buffers_[buffer]->QueryInterface(riid, surface);
     }
 
-    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return S_OK; }
+    // The chain stays a borderless window; the state is only remembered so Get answers what Set was told.
+    // Set(TRUE, null) picks the output containing the window, as native DXGI does.
+    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fullscreen, IDXGIOutput* target) override {
+        IDXGIOutput* output = nullptr;
+        if (fullscreen) {
+            output = target;
+            if (output) {
+                output->AddRef();
+            } else if (FAILED(GetContainingOutput(&output))) {
+                output = nullptr;
+            }
+        }
+        IDXGIOutput* previous = nullptr;
+        {
+            std::lock_guard lock(fullscreen_mutex_);
+            fullscreen_ = fullscreen != FALSE;
+            previous = fullscreen_output_;
+            fullscreen_output_ = output;
+        }
+        if (previous) previous->Release();
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* fs, IDXGIOutput** out) override {
-        if (fs) *fs = FALSE;
-        if (out) *out = nullptr;
+        std::lock_guard lock(fullscreen_mutex_);
+        if (fs) *fs = fullscreen_ ? TRUE : FALSE;
+        if (out) {
+            *out = fullscreen_output_;
+            if (*out) (*out)->AddRef();
+        }
         return S_OK;
     }
 
@@ -617,6 +643,9 @@ private:
     leonida::VulkanSwapchain swapchain_;
     HWND hwnd_ = nullptr;
     IDXGIOutput* restrict_to_output_ = nullptr;
+    std::mutex fullscreen_mutex_;
+    bool fullscreen_ = false;
+    IDXGIOutput* fullscreen_output_ = nullptr;
     UINT flags_ = 0;
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
