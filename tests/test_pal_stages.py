@@ -158,6 +158,37 @@ class TestContainers(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["payload"], "fssm")
 
+    def test_corrupt_xbch_zlib_records_error_and_continues(self):
+        good_fssm = blob([(1, 5)])
+        corrupt_zlib = bytearray(zlib.compress(good_fssm))
+        corrupt_zlib[-1] ^= 0xFF
+        corrupt_xbch = b"XBCH" + struct.pack("<IIIII", 0, len(corrupt_zlib), 0, len(good_fssm), 0) + bytes(corrupt_zlib)
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "a_corrupt.dxbc"), "wb") as f:
+                f.write(make_dxbc([corrupt_xbch]))
+            with open(os.path.join(folder, "b_valid.fssm"), "wb") as f:
+                f.write(good_fssm)
+            rows = pal_stages.blob_rows(folder)
+            result = subprocess.run([sys.executable, "-I", TOOL, folder, "--json"],
+                                    capture_output=True, text=True)
+        self.assertEqual([row["name"] for row in rows], ["a_corrupt.dxbc", "b_valid.fssm"])
+        self.assertIsNone(rows[0]["payload"])
+        self.assertIn("error", rows[0])
+        self.assertEqual(rows[1]["payload"], "fssm")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual((document["tally"]["blobs"], document["tally"]["errors"]), (1, 1))
+
+    def test_blob_rows_rejects_invalid_limit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            for bad_limit in (0, -1, True, False):
+                with self.subTest(limit=bad_limit):
+                    with self.assertRaises(ValueError):
+                        pal_stages.blob_rows(folder, limit=bad_limit)
+
 
 class TestCli(unittest.TestCase):
     def test_json_output(self):

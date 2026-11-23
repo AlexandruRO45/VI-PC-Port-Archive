@@ -38,6 +38,7 @@ import json
 import os
 import struct
 import sys
+import zlib
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -148,6 +149,8 @@ def files_of(path):
 
 def blob_rows(path, limit=None):
     """One row per FSSM blob in a file or folder: a bare FSSM, or every tag-0x0D payload of a container."""
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ValueError("limit must be at least 1")
     rows = []
     for full in files_of(path)[:limit]:
         name = os.path.basename(full)
@@ -158,7 +161,7 @@ def blob_rows(path, limit=None):
                 rows.append({"name": name, "payload": "fssm", "blob": data})
                 continue
             blobs = fssm_unpack.unpack_all(data)
-        except (OSError, ValueError, struct.error) as e:
+        except (OSError, ValueError, struct.error, zlib.error) as e:
             rows.append({"name": name, "payload": None, "error": str(e)})
             continue
         if not blobs:
