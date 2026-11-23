@@ -32,10 +32,10 @@ import math
 import mmap
 import os
 import re
+import secrets
 import stat
 import struct
 import sys
-import tempfile
 import unicodedata
 import zlib
 from contextlib import contextmanager
@@ -837,8 +837,17 @@ def staged_jsonl(path, *, create_parent=False):
     if mode is not None and not stat.S_ISREG(mode):
         raise OSError(f"placement report destination is not a regular file: {path}")
 
-    # mkdtemp may normalize the returned parent on Windows. Keep the spelling used to create it.
-    directory = os.path.join(parent, os.path.basename(tempfile.mkdtemp(dir=parent, prefix=".world-index-")))
+    # On Windows mkdtemp retries permission errors even when the parent ACL forbids
+    # creating any directory. Only a name collision warrants another attempt here.
+    for _ in range(100):
+        directory = os.path.join(parent, ".world-index-" + secrets.token_hex(8))
+        try:
+            os.mkdir(directory, 0o700)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError(f"no free staging directory name in {parent}")
     staged = os.path.join(directory, "entities.jsonl")
     try:
         with open(staged, "w", encoding="utf-8", newline="\n") as handle:

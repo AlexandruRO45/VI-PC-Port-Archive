@@ -448,6 +448,19 @@ class ScanTest(unittest.TestCase):
         with open(sibling, "rb") as f:
             self.assertEqual(f.read(), b"existing partial")
 
+    def test_denied_staging_directory_preserves_previous_lights(self):
+        lights = os.path.join(self.tmp.name, "lights.jsonl")
+        with open(lights, "wb") as handle:
+            handle.write(b"previous report")
+        with mock.patch.object(os, "mkdir", side_effect=[
+            PermissionError("staging denied"), AssertionError("retried a permission error")
+        ]), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = T.main([self.rpf, "--entities", self.entities, "--lights-out", lights])
+        self.assertEqual(rc, 2)
+        self.assertEqual(err.getvalue().splitlines(), ["ERROR: staging denied"])
+        with open(lights, "rb") as handle:
+            self.assertEqual(handle.read(), b"previous report")
+
     def test_scan_and_summary(self):
         total = T.scan(self.rpf)
         summary = T.summarize(total, self.entities)
