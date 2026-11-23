@@ -227,5 +227,16 @@ class TestVCvtF32U32SIMDDivergence(unittest.TestCase):
                 self.assertEqual(wave.lanes[lane][0], 0xCAFEBABE)
 
 
+class TestVCvtF32U32RegisterAliasing(unittest.TestCase):
+    """Register aliasing and in-place operand preservation."""
+
+    def test_dst_aliases_src(self):
+        mach = ScalarMachine()
+        mach.vgprs[0] = 100
+        # v0 = cvt_f32_u32 v0
+        mach.step(VCvtF32U32Inst(Operand(RegType.VGPR, 0), Operand(RegType.VGPR, 0)))
+        self.assertEqual(mach.vgprs[0], ref_cvt_f32_u32(100))
+
+
 if __name__ == '__main__':
     unittest.main()
