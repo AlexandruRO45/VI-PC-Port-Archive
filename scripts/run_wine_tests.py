@@ -235,9 +235,12 @@ def positive_seconds(text: str) -> float:
 def wine_command(text: str) -> list[str]:
     """--wine: split into a command the way a shell would, refusing blank or malformed values up front. A value that
     names an existing file is one program, spaces and all: Proton's Wine sits under folders such as
-    "steamapps/common/Proton 9.0/files/bin/wine", and $WINE is set to that path unquoted."""
-    if text.strip() and os.path.isfile(text.strip()):
-        return [text.strip()]
+    "steamapps/common/Proton 9.0/files/bin/wine", and $WINE is set to that path unquoted. Such a path comes back
+    absolute: each test runs with the test's own folder as its working directory, where a relative path no longer
+    names the file. A bare name (no folder part) is left to the PATH search, even if a file of that name is here."""
+    value = text.strip()
+    if ("/" in value or os.sep in value) and os.path.isfile(value):
+        return [os.path.abspath(value)]
     try:
         parts = shlex.split(text)
     except ValueError as e:

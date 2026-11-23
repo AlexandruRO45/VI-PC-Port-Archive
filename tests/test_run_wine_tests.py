@@ -556,6 +556,24 @@ class MainTest(unittest.TestCase):
             self.assertEqual(rwt.wine_command("no-such-folder/Proton 8.0/wine"),
                              ["no-such-folder/Proton", "8.0/wine"])
 
+    def test_a_relative_wine_path_comes_back_absolute(self):
+        # Tests run with cwd=<test folder>, where a relative --wine would name nothing (King1565's review).
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "Proton 9.0", "files", "bin"))
+            Path(tmp, "Proton 9.0", "files", "bin", "wine").write_text("", encoding="utf-8")
+            Path(tmp, "wine").write_text("", encoding="utf-8")
+            old = os.getcwd()
+            os.chdir(tmp)
+            try:
+                got = rwt.wine_command("Proton 9.0/files/bin/wine")
+                # A bare name stays a PATH lookup even though a file called "wine" is in this folder.
+                self.assertEqual(rwt.wine_command("wine"), ["wine"])
+            finally:
+                os.chdir(old)
+            self.assertEqual(len(got), 1)
+            self.assertTrue(os.path.isabs(got[0]))
+            self.assertTrue(os.path.samefile(got[0], os.path.join(tmp, "Proton 9.0", "files", "bin", "wine")))
+
 
 if __name__ == "__main__":
     unittest.main()
