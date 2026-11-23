@@ -120,7 +120,9 @@ Their pipeline compile (31.2 s for one of them on an RTX 4080, 59.5 s for all 52
 on the title's thread, longer than its ~30 s startup watchdog, so a cold first boot ends at the builder (boot stop 18).
 `LEONIDA_BVH_BUILDER=console` turns the shim off.
 
-The executable's imports and call sites, measured statically on 1.0.2.1 (all through the IAT):
+The executable's imports and call sites, measured statically on 1.0.2.1. The counts are `call [rip+disp32]`
+through the import table. For `Batched2X`, IDA finds 8 direct calls: 4 in each of two sibling functions with no
+static reference, reached through a table (#7516), so 2 of them are calls of another form.
 
 | Export | Call sites | The shim |
 |---|---:|---|
@@ -128,7 +130,7 @@ The executable's imports and call sites, measured statically on 1.0.2.1 (all thr
 | `~XboxBvhBuilder()` | 1 | releases that entry |
 | `Set64BitMortonCodes(bool)` | 8 | recorded; the layer's builder has no such option |
 | `GetRaytracingAccelerationStructurePrebuildInfo(INPUTS*, XDXR_STREAM_DESC*, PREBUILD_INFO*)` | 3 | the layer's sizes |
-| `BuildRaytracingAccelerationStructureBatched2X(GCL6*, UINT, BATCHED_DESC2*)` | 6 | one layer build per element (§1), with its postbuild descriptions |
+| `BuildRaytracingAccelerationStructureBatched2X(GCL6*, UINT, BATCHED_DESC2*)` | 6 (8) | one layer build per element (§1), with its postbuild descriptions |
 | `CopyRaytracingAccelerationStructure(GCL4*, dest, source, mode)` | 2 | the layer's copy |
 | `RehydrateRaytracingAccelerationStructureBatched2X(GCL8*, UINT, BUILD_DESC*, UINT64*)` | 4 | the layer's GPU rehydration, per element ([bvh.md](bvh.md) §7b) |
 
