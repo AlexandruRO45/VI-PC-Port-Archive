@@ -286,7 +286,8 @@ The executable's first boot confirms them, or names the slots that differ.
 - **Dialogs:** a message dialog's title, text and buttons go to the log (`[rt] game dialog:`), and it completes at
   once with its default button; an error dialog's HRESULT and context are logged and it is dismissed. So an error
   the game would show on screen at boot is readable in the log. Text entry is answered with the title's default
-  text, as if OK were pressed without typing, cut to `maxTextLength` (`[rt] game text entry:`), so a title asking
+  text, as if OK were pressed without typing, cut to the entry's limit in UTF-8 characters, never inside one
+  (`maxTextLength`; 0, past 1024 or a Password scope mean 1024) (`[rt] game text entry:`), so a title asking
   for a name or a save label gets one. Every other UI (profile cards, pickers, web authentication, invites, state
   share) fails before starting (`E_FAIL`); the docs' unnamed slots and the
   PC-hosted UI callbacks of `IXGameUiImpl4` answer `E_NOTIMPL`.

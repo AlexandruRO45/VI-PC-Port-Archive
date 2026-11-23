@@ -216,7 +216,7 @@ HRESULT STDMETHODCALLTYPE ui_error_dialog_result(void*, XAsyncBlock* async) {
 HRESULT STDMETHODCALLTYPE ui_set_notification_hint(void*) { return S_OK; }
 
 // Text entry has no keyboard to show: it is answered with the title's default text, as if OK were pressed without
-// typing, cut to maxTextLength, so a title asking for a name or a save label gets one instead of a failure. The
+// typing, cut to the entry's limit in characters (text_entry_limit), so a title asking for a name or a save label gets one instead of a failure. The
 // answer rides in the async context (a heap copy, freed on Cleanup); the payload is the text and its terminator.
 const char kTextEntryIdentity = 0;
 HRESULT CALLBACK text_entry_provider(XAsyncOp op, const XAsyncProviderData* data) {
@@ -239,13 +239,35 @@ HRESULT CALLBACK text_entry_provider(XAsyncOp op, const XAsyncProviderData* data
     }
 }
 
+// The most characters the answer may have: maxTextLength counts characters, 0 means 1024, the console's maximum is
+// 1024, and a Password input scope (31) always gets 1024 (the GDK reference, XGameUiShowTextEntryAsync and
+// XGameUiTextEntryInputScope).
+std::uint32_t text_entry_limit(std::uint32_t input_scope, std::uint32_t max_length) {
+    constexpr std::uint32_t kConsoleMax = 1024, kPassword = 31;
+    if (input_scope == kPassword || max_length == 0 || max_length > kConsoleMax) return kConsoleMax;
+    return max_length;
+}
+
+// `text` cut to at most `characters` UTF-8 characters, never inside one (a continuation byte is 10xxxxxx).
+void cut_utf8(std::string& text, std::uint32_t characters) {
+    std::uint32_t seen = 0;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if ((static_cast<unsigned char>(text[i]) & 0xC0) == 0x80) continue;   // inside the current character
+        if (seen == characters) {
+            text.resize(i);
+            return;
+        }
+        ++seen;
+    }
+}
+
 // 17: HRESULT XGameUiShowTextEntryAsync(XAsyncBlock* async, const char* titleText, const char* descriptionText,
 //        const char* defaultText, XGameUiTextEntryInputScope inputScope, uint32_t maxTextLength)
 HRESULT STDMETHODCALLTYPE ui_text_entry_async(void*, XAsyncBlock* async, const char* title, const char* description,
-                                              const char* default_text, uint32_t, uint32_t max_length) {
+                                              const char* default_text, uint32_t input_scope, uint32_t max_length) {
     if (!async) return E_POINTER;
     auto* answer = new std::string(default_text ? default_text : "");
-    if (answer->size() > max_length) answer->resize(max_length);
+    cut_utf8(*answer, text_entry_limit(input_scope, max_length));
     std::fprintf(stderr, "[rt] game text entry: \"%s\"%s%s [answered with the default text: \"%s\"]\n", title ? title : "",
                  description ? ": " : "", description ? description : "", answer->c_str());
     // XAsyncBegin fails only before the provider is attached, so no Cleanup runs then: free the answer here.

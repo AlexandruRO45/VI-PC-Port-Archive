@@ -139,6 +139,19 @@ int main() {
               at<TextSize>(ui, 18)(ui, &async, &text_size) == S_OK && text_size == 1 &&
               at<TextResult>(ui, 19)(ui, &async, sizeof(text), text, &text_used) == S_OK && text[0] == 0 && text_used == 1,
           "no default text: an empty answer");
+    async = XAsyncBlock{};
+    check(at<TextAsync>(ui, 17)(ui, &async, "Name", nullptr, "Save 1", 0, 0) == S_OK && finished(&async) &&
+              at<TextResult>(ui, 19)(ui, &async, sizeof(text), text, &text_used) == S_OK && std::strcmp(text, "Save 1") == 0,
+          "maxTextLength 0 is the default maximum (1024), not an empty answer");
+    async = XAsyncBlock{};
+    check(at<TextAsync>(ui, 17)(ui, &async, "Name", nullptr, "Save 1", 31, 2) == S_OK && finished(&async) &&
+              at<TextResult>(ui, 19)(ui, &async, sizeof(text), text, &text_used) == S_OK && std::strcmp(text, "Save 1") == 0,
+          "a Password input scope ignores maxTextLength (always 1024)");
+    async = XAsyncBlock{};   // "h\u00e9\u20ac!" is 1 + 2 + 3 + 1 bytes: three characters keep 6 bytes
+    check(at<TextAsync>(ui, 17)(ui, &async, "Name", nullptr, "h\xC3\xA9\xE2\x82\xAC!", 0, 3) == S_OK && finished(&async) &&
+              at<TextResult>(ui, 19)(ui, &async, sizeof(text), text, &text_used) == S_OK &&
+              std::strcmp(text, "h\xC3\xA9\xE2\x82\xAC") == 0 && text_used == 7,
+          "maxTextLength counts UTF-8 characters, and a cut never splits one");
     async = XAsyncBlock{};   // its own call: xtaskqueue releases a call whose result buffer is too small
     check(at<TextAsync>(ui, 17)(ui, &async, "Name", nullptr, "Save 1", 0, 16) == S_OK && finished(&async) &&
               FAILED(at<TextResult>(ui, 19)(ui, &async, 3, text, &text_used)) && text_used == 0,
