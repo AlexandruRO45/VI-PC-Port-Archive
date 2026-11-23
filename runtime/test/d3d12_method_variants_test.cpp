@@ -10,6 +10,8 @@
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 
+#include <dxgi1_4.h>
+
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -286,6 +288,12 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
         if (layout.Offset == ~0ull && rows == ~0u && row_size == ~0ull && total == ~0ull) return S_FALSE;
         return layout.Offset == 0 && rows != ~0u && total != ~0ull ? S_OK : E_FAIL;
     };
+    const auto alloc2 = [&](const D3D12_RESOURCE_DESC1& desc) {
+        const D3D12_RESOURCE_ALLOCATION_INFO info = device->GetResourceAllocationInfo2(0, 1, &desc, nullptr);
+        if (info.SizeInBytes == UINT64_MAX && info.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+            return S_FALSE;
+        return info.SizeInBytes != UINT64_MAX && info.Alignment != 0 ? S_OK : E_FAIL;
+    };
     const GUID creator{0x1d2c3b4a, 0x5f6e, 0x7a8b, {0x9c, 0x0d, 0x1e, 0x2f, 0x3a, 0x4b, 0x5c, 0x6d}};
     void* queue = nullptr;
     const HRESULT null_queue = device->CreateCommandQueue1(nullptr, creator, __uuidof(ID3D12CommandQueue), &queue);
@@ -481,6 +489,8 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
         {"CreateCommandQueue1, null description", null_queue, E_INVALIDARG},
         {"GetCopyableFootprints1, texture with a mip region", footprint(texture_region), S_FALSE},
         {"GetCopyableFootprints1, buffer with a mip region", footprint(buffer_region), S_OK},
+        {"GetResourceAllocationInfo2, texture with a mip region", alloc2(texture_region), S_FALSE},
+        {"GetResourceAllocationInfo2, buffer with a mip region", alloc2(buffer_region), S_OK},
     };
 }
 
@@ -556,6 +566,109 @@ int main() {
             }
         } else {
             std::printf("no host D3D12 device: edge cases checked against their recorded answers only\n");
+        }
+
+        // GetResourceAllocationInfo2 ignores SamplerFeedbackMipRegion on buffers (single-desc and multi-desc,
+        // with and without pResourceAllocationInfo1) and rejects non-zero regions on textures, matching both
+        // live hardware D3D12 and WARP.
+        {
+            const auto same_alloc = [](const D3D12_RESOURCE_ALLOCATION_INFO& a,
+                                       const D3D12_RESOURCE_ALLOCATION_INFO& b) {
+                return a.SizeInBytes == b.SizeInBytes && a.Alignment == b.Alignment;
+            };
+            const auto same_each = [](const D3D12_RESOURCE_ALLOCATION_INFO1& a,
+                                      const D3D12_RESOURCE_ALLOCATION_INFO1& b) {
+                return a.Offset == b.Offset && a.Alignment == b.Alignment && a.SizeInBytes == b.SizeInBytes;
+            };
+            const D3D12_RESOURCE_DESC1 buf_plain = desc1(buffer_desc(300));
+            D3D12_RESOURCE_DESC1 buf_mip = buf_plain;
+            buf_mip.SamplerFeedbackMipRegion = {4, 4, 1};
+            const D3D12_RESOURCE_DESC1 tex_plain =
+                desc1(texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+            D3D12_RESOURCE_DESC1 tex_mip = tex_plain;
+            tex_mip.SamplerFeedbackMipRegion = {4, 4, 1};
+            const D3D12_RESOURCE_DESC1 buf_pair_plain[2] = {buf_plain, buf_plain};
+            const D3D12_RESOURCE_DESC1 buf_pair_mip[2] = {buf_plain, buf_mip};
+            const D3D12_RESOURCE_DESC1 mixed_plain[2] = {tex_plain, buf_plain};
+            const D3D12_RESOURCE_DESC1 mixed_mip[2] = {tex_plain, buf_mip};
+
+            const auto check_alloc2 = [&](ID3D12Device8* target, ID3D12Device8* ref) {
+                // Single buffer with non-zero SamplerFeedbackMipRegion (nullptr and non-null each).
+                const auto single_plain = target->GetResourceAllocationInfo2(0, 1, &buf_plain, nullptr);
+                const auto single_mip_null = target->GetResourceAllocationInfo2(0, 1, &buf_mip, nullptr);
+                D3D12_RESOURCE_ALLOCATION_INFO1 each1_plain{}, each1_mip{};
+                const auto single_plain_e = target->GetResourceAllocationInfo2(0, 1, &buf_plain, &each1_plain);
+                const auto single_mip_e = target->GetResourceAllocationInfo2(0, 1, &buf_mip, &each1_mip);
+                if (!same_alloc(single_mip_null, single_plain) || !same_alloc(single_mip_e, single_plain_e) ||
+                    !same_each(each1_mip, each1_plain) ||
+                    single_mip_null.SizeInBytes != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT ||
+                    single_mip_null.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+                    return false;
+
+                // Multi-desc buffer array with non-zero SamplerFeedbackMipRegion (nullptr and non-null each).
+                const auto pair_plain = target->GetResourceAllocationInfo2(0, 2, buf_pair_plain, nullptr);
+                const auto pair_mip_null = target->GetResourceAllocationInfo2(0, 2, buf_pair_mip, nullptr);
+                D3D12_RESOURCE_ALLOCATION_INFO1 pair_each_plain[2]{}, pair_each_mip[2]{};
+                const auto pair_plain_e = target->GetResourceAllocationInfo2(0, 2, buf_pair_plain, pair_each_plain);
+                const auto pair_mip_e = target->GetResourceAllocationInfo2(0, 2, buf_pair_mip, pair_each_mip);
+                if (!same_alloc(pair_mip_null, pair_plain) || !same_alloc(pair_mip_e, pair_plain_e) ||
+                    !same_each(pair_each_mip[0], pair_each_plain[0]) ||
+                    !same_each(pair_each_mip[1], pair_each_plain[1]))
+                    return false;
+
+                // Multi-desc [texture, buffer_mip] matches [texture, buffer_plain].
+                const auto mix_plain = target->GetResourceAllocationInfo2(0, 2, mixed_plain, nullptr);
+                const auto mix_mip_null = target->GetResourceAllocationInfo2(0, 2, mixed_mip, nullptr);
+                D3D12_RESOURCE_ALLOCATION_INFO1 mix_each_plain[2]{}, mix_each_mip[2]{};
+                const auto mix_plain_e = target->GetResourceAllocationInfo2(0, 2, mixed_plain, mix_each_plain);
+                const auto mix_mip_e = target->GetResourceAllocationInfo2(0, 2, mixed_mip, mix_each_mip);
+                if (!same_alloc(mix_mip_null, mix_plain) || !same_alloc(mix_mip_e, mix_plain_e) ||
+                    !same_each(mix_each_mip[0], mix_each_plain[0]) || !same_each(mix_each_mip[1], mix_each_plain[1]))
+                    return false;
+
+                // Texture2D with non-zero SamplerFeedbackMipRegion is rejected.
+                const auto tex_rej_null = target->GetResourceAllocationInfo2(0, 1, &tex_mip, nullptr);
+                D3D12_RESOURCE_ALLOCATION_INFO1 tex_each{};
+                const auto tex_rej_e = target->GetResourceAllocationInfo2(0, 1, &tex_mip, &tex_each);
+                if (tex_rej_null.SizeInBytes != UINT64_MAX ||
+                    tex_rej_null.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT ||
+                    !same_alloc(tex_rej_e, tex_rej_null))
+                    return false;
+
+                if (ref) {
+                    const auto ref_single = ref->GetResourceAllocationInfo2(0, 1, &buf_mip, nullptr);
+                    D3D12_RESOURCE_ALLOCATION_INFO1 ref_each1{};
+                    const auto ref_single_e = ref->GetResourceAllocationInfo2(0, 1, &buf_mip, &ref_each1);
+                    const auto ref_pair = ref->GetResourceAllocationInfo2(0, 2, buf_pair_mip, nullptr);
+                    D3D12_RESOURCE_ALLOCATION_INFO1 ref_pair_e[2]{};
+                    const auto ref_pair_info = ref->GetResourceAllocationInfo2(0, 2, buf_pair_mip, ref_pair_e);
+                    const auto ref_tex_rej = ref->GetResourceAllocationInfo2(0, 1, &tex_mip, nullptr);
+                    if (!same_alloc(single_mip_null, ref_single) || !same_alloc(single_mip_e, ref_single_e) ||
+                        !same_each(each1_mip, ref_each1) || !same_alloc(pair_mip_null, ref_pair) ||
+                        !same_alloc(pair_mip_e, ref_pair_info) || !same_each(pair_each_mip[0], ref_pair_e[0]) ||
+                        !same_each(pair_each_mip[1], ref_pair_e[1]) || !same_alloc(tex_rej_null, ref_tex_rej))
+                        return false;
+                }
+                return true;
+            };
+
+            EXPECT(check_alloc2(device.p, have_host ? host.p : nullptr));
+
+            Ref<ID3D12Device8> warp;
+            const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            using PfnCreateDXGIFactory1 = HRESULT(WINAPI*)(REFIID, void**);
+            const auto create_factory = dxgi ? reinterpret_cast<PfnCreateDXGIFactory1>(
+                                                   reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")))
+                                             : nullptr;
+            if (create_host && create_factory && !hostwine::host_is_wine()) {
+                Ref<IDXGIFactory4> factory;
+                Ref<IDXGIAdapter> warp_adapter;
+                if (SUCCEEDED(create_factory(IID_PPV_ARGS(&factory.p))) &&
+                    SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp_adapter.p))) &&
+                    SUCCEEDED(create_host(warp_adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&warp.p)))) {
+                    EXPECT(check_alloc2(device.p, warp.p));
+                }
+            }
         }
 
         // Castable formats: the layer reports relaxed format casting and passes a real list to

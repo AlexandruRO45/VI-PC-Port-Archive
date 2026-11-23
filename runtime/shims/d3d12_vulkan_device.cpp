@@ -7035,13 +7035,11 @@ public:
         if (visible_mask > 1) return kInvalidAllocation;
         return place(count, descs, [&](UINT i) {
             const D3D12_RESOURCE_DESC1& d = descs[i];
-            if (d.SamplerFeedbackMipRegion.Width || d.SamplerFeedbackMipRegion.Height ||
-                d.SamplerFeedbackMipRegion.Depth) {
+            if (texture_mip_region(d)) {
                 log_once("GetResourceAllocationInfo2 sampler feedback not supported, format", d.Format);
                 return D3D12_RESOURCE_DESC{};  // an unknown dimension: invalid
             }
-            return D3D12_RESOURCE_DESC{d.Dimension, d.Alignment, d.Width, d.Height, d.DepthOrArraySize,
-                                       d.MipLevels, d.Format, d.SampleDesc, d.Layout, d.Flags};
+            return resource_desc(d);
         }, each);
     }
 
