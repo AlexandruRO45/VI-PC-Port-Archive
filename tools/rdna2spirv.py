@@ -13272,12 +13272,29 @@ class Gen:
                 vals[i] = kept
         return vals + [lv]
 
+    def image_status_write(self, vdata, data_words):
+        """Write the tfe/lwe status dword into vdata[data_words], the first VGPR after the instruction's data
+        words. Both bits allocate the same extra status VGPR: the RDNA2 ISA names them "Texture Fail Enable (for
+        partially resident textures)" and "LOD Warning Enable (for partially resident textures)" (AMD's
+        machine-readable RDNA2 ISA, the TFE/LWE fields of ENC_MIMG), and AMD's ISA guides place the word at
+        "DST+1 (first GPR after all fetch-dest GPRs)" ("a fetch can return a NACK, which causes a VGPR write into
+        DST+1", the TFE modifier of the image instructions); LLVM's image-intrinsic lowering adds the same dword
+        for every image op, atomics included ("NumVDataDwords += 1" with texfail set, SIISelLowering.cpp).
+        The value written is 0: the status is non-zero only when a fetch of a partially resident texture fails
+        or its LOD was clamped, and everything the runtime binds is a whole image or the index-0 fallback (no
+        sparse binding anywhere), so no fetch fails; image_get_resinfo reads no memory at all. Which bit a failure
+        would set is not in the machine-readable ISA (checked: the XML carries only the field descriptions), so
+        no failure encoding is invented."""
+        self.dst({"k": "vgpr", "r": vdata["r"] + data_words, "n": 1}, self.cu(0))
+
     def emit_image_atomic_extra(self, op, ptr_ty, arr_var, idx, iv, vdata, mods):
         """Lower 32-bit image_atomic_{swap,inc,dec,fmin,fmax,fcmpswap} on an r32ui storage image (2D or 3D).
         Inactive lanes skip the op and preserve vdata. CAS loops use OpAtomicLoad (valid on Image pointers) +
-        OpAtomicCompareExchange, requiring no shader float atomic extension."""
+        OpAtomicCompareExchange, requiring no shader float atomic extension. With tfe/lwe the dword after the
+        data words is the fetch status (image_status_write)."""
         need_n = 2 if op == "image_atomic_fcmpswap" else 1
-        if vdata["k"] != "vgpr" or vdata.get("n", 1) != need_n:
+        status = "tfe" in mods or "lwe" in mods
+        if vdata["k"] != "vgpr" or vdata.get("n", 1) != need_n + (1 if status else 0):
             raise Unsupported(op + " operands")
         val = self.load_reg("vgpr", vdata["r"])
         cmpv = self.load_reg("vgpr", vdata["r"] + 1) if op == "image_atomic_fcmpswap" else None
@@ -13373,6 +13390,8 @@ class Gen:
             self.emit(f"{lbl_exit} = OpLabel")
             if "glc" in mods:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, cur)
+        if status:
+            self.image_status_write(vdata, need_n)
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
@@ -13451,10 +13470,24 @@ class Gen:
                 self.emit_image_atomic_extra(op, ptr_ty, arr_var, idx, iv, vdata, mods)
                 return
             if op == "image_atomic_cmpswap":
-                if vdata["k"] != "vgpr" or vdata.get("n", 1) != 2:
+                status = "tfe" in mods or "lwe" in mods
+                dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x3")
+                if status and int(dm.split(":")[1], 0) != 3:
+                    # The data words before the status dword are the new value and the comparand (dmask 0x3);
+                    # another dmask with tfe names no layout any reference settles.
+                    raise Unsupported(op + " tfe dmask")
+                if vdata["k"] != "vgpr" or vdata.get("n", 1) != (3 if status else 2):
                     raise Unsupported(op + " data")
             elif vdata["k"] != "vgpr":
                 raise Unsupported(op + " data")
+            if "tfe" in mods or "lwe" in mods:
+                # The status dword sits after the data words the dmask sizes: 0x1 one 32-bit value, 0x3 the
+                # two-VGPR form the translator keeps low-dword 32-bit (the status slot is still the second
+                # dword), 0xf four — the GFX10 atomic width rule of rdna2_decode._mimg_data_count, which
+                # llvm-mc's assembler and disassembler agree on.
+                dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+                dmask = int(dm.split(":")[1], 0)
+                data_words = dmask.bit_count() if dmask in (1, 3, 15) else (2 if op == "image_atomic_cmpswap" else 1)
             # Two-VGPR dmask:0x3 forms of the nine standard ops are 64-bit atomics; keep main's low-dword
             # 32-bit behavior here so corpus translation count does not drop while Int64ImageEXT + fallback
             # is handled separately.
@@ -13475,6 +13508,8 @@ class Gen:
                 self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {val}")
             if "glc" in mods:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
+            if "tfe" in mods or "lwe" in mods:
+                self.image_status_write(vdata, data_words)
             self.emit(f"OpBranch {end}")
             self.emit(f"{end} = OpLabel")
             return
@@ -13499,6 +13534,10 @@ class Gen:
                     self.emit(f"{u} = OpBitcast %uint {vals[c]}")
                     self.dst({"k": "vgpr", "r": vdata["r"] + out, "n": 1}, u)
                     out += 1
+            if "tfe" in mods or "lwe" in mods:
+                # The status dword after the dmask's packed result words (LLVM forces a dmask of 0x1 when
+                # texfail is set and no data bit is on, so the status never lands on the first result word).
+                self.image_status_write(vdata, out or 1)
             return
         # image_load_mip: x, y, mip, with the same typed SRV as image_load.
         packed = "a16" in mods
