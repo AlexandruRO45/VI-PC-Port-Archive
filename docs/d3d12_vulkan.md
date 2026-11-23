@@ -2737,11 +2737,16 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   resources are released in between: both kept, nothing destroyed; the CPU `Signal` submits A's batch and destroys
   them (2 Vulkan objects waiting), the readback matches byte for byte, and two submissions on B after A completed
   destroy the objects. Without the keeping, the same case finds both destroyed before the `Signal` and the released
-  batch fails with `result 2`. The never-signaled-fence and released-fence cases also check that a resource only the
-  held batch names is kept and then destroyed with the queue that drops it. Not covered: a default-heap buffer is a
-  range of the GPU address arena, and the range goes back to the arena (to be zero-filled by the CPU for the next
-  buffer placed there) when the resource is destroyed, not when the GPU is done with it; heaps, pipeline states and
-  query heaps are destroyed at once, as D3D12 lets the layer require of the application.
+  batch fails with `result 2`. An operation counts as held until its replay has been submitted, not only until it
+  leaves its queue's list: a resource released on another thread while the last held batch is being replayed (or a
+  `Present` meanwhile) still waits for it (reported on #4557). Measured the same way, with a test hook
+  (`set_held_replay_hook`) stopping the releasing thread just before the replay: released then, both kept
+  (`kept 2`), destroyed once the replay is submitted, readback exact; with the count dropped before the replay,
+  `kept 0` and the replay fails with `result 2`. The never-signaled-fence and released-fence cases also check that a
+  resource only the held batch names is kept and then destroyed with the queue that drops it. Not covered: a
+  default-heap buffer is a range of the GPU address arena, and the range goes back to the arena (to be zero-filled by
+  the CPU for the next buffer placed there) when the resource is destroyed, not when the GPU is done with it; heaps,
+  pipeline states and query heaps are destroyed at once, as D3D12 lets the layer require of the application.
 - **More D3D12 queues than Vulkan queues** (`pick_queue_slot` in `src/queue_families.h`, `CreateCommandQueue`;
   test `d3d12_queue_share_test`). A GPU can expose fewer `VkQueue`s than a title creates D3D12 queues: the Intel
   UHD 770 on Windows and lavapipe have one family with `queueCount` 1, so the second D3D12 queue of any type was

@@ -159,9 +159,17 @@ public:
         return count;
     }
 
-    // Held operations over all queues, for the cheap "is there anything to do" test.
+    // Held operations over all queues, for the cheap "is there anything to do" test. An operation counts until its
+    // replay has been submitted (release_ready), so a resource released meanwhile still waits for it (D3D-203).
     void held_changed(std::int64_t delta) { held_.fetch_add(delta, std::memory_order_acq_rel); }
     bool any_held() const { return held_.load(std::memory_order_acquire) > 0; }
+
+    // Tests only: `hook` (owned by the caller, null to remove) runs on the releasing thread just before each held
+    // operation is replayed, while it still counts as held. Lets a test act in the middle of a replay.
+    void set_replay_hook(const std::function<void()>* hook) { replay_hook_.store(hook, std::memory_order_release); }
+    void before_replay() const {
+        if (const auto* hook = replay_hook_.load(std::memory_order_acquire)) (*hook)();
+    }
 
     // Releases every held operation that has become ready, in dependency order: a release can submit a Signal
     // that makes another queue's front ready, so passes repeat until one finds nothing new. Then the callbacks
@@ -238,6 +246,7 @@ private:
     std::atomic<std::int64_t> barrier_count_{0};
     std::atomic<std::uint64_t> seq_{0};
     std::atomic<bool> dirty_{false};
+    std::atomic<const std::function<void()>*> replay_hook_{nullptr};
 };
 
 }  // namespace leonida

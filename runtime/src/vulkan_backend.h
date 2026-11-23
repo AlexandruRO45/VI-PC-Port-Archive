@@ -2685,7 +2685,9 @@ private:
 
     // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held). The
     // callbacks queued behind an operation (QueueHolds::after_held: the presenter, released resources) run only after
-    // this returns, so what the operation names stays until its submission is recorded.
+    // this returns, so what the operation names stays until its submission is recorded. The operation also counts
+    // as held (any_held) until its replay has been submitted: a resource released on another thread meanwhile, or a
+    // Present, sees it and waits for it instead of taking the unheld path under the replay.
     bool release_ready() override {
         std::vector<std::shared_ptr<void>> retired;
         bool released = false;
@@ -2694,8 +2696,14 @@ private:
             while (!held_.empty() && (context_.is_device_lost() || ready(held_.front()))) {
                 Deferred op = std::move(held_.front());
                 held_.pop_front();
-                context_.holds().held_changed(-1);
-                if (!context_.is_device_lost()) run(op);
+                struct Unheld {  // after the replay, also when it throws
+                    QueueHolds<VkSemaphore>& holds;
+                    ~Unheld() { holds.held_changed(-1); }
+                } unheld{context_.holds()};
+                if (!context_.is_device_lost()) {
+                    context_.holds().before_replay();
+                    run(op);
+                }
                 released = true;
             }
             drain_pins(retired);

@@ -8217,6 +8217,13 @@ DeferredDestruction deferred_destruction(ID3D12Device* device) {
     return {context.holds().pending_after(&d->state()), context.deferred_destructions()};
 }
 
+void set_held_replay_hook(ID3D12Device* device, const std::function<void()>* hook) {
+    if (!device) return;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    const Device* d = Device::from<Device>(real ? real : device);
+    if (d && d->state().context) d->state().context->holds().set_replay_hook(hook);
+}
+
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
     : device_(device), presenter_(std::move(presenter)) {
     device_->AddRef();

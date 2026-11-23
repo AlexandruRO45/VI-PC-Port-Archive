@@ -286,6 +286,10 @@ struct DeferredDestruction {
     std::size_t waiting = 0;
 };
 DeferredDestruction deferred_destruction(ID3D12Device* device);
+// Tests only: `hook` (owned by the caller, null to remove) runs on the thread that releases a held operation of any
+// queue of `device`, just before the operation is replayed (QueueHolds::set_replay_hook). No-op when `device` is not
+// a Vulkan-backed device.
+void set_held_replay_hook(ID3D12Device* device, const std::function<void()>* hook);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be

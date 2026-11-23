@@ -12,7 +12,8 @@
 // submitted), a CPU Signal before the Wait, and three layer-only cases: a fence nobody signals (the other queues keep
 // working, the held batch never runs, the queue is destroyed and the layer reports it, without a hang), a fence
 // released while a batch waits for it, and a resource released while a held batch names it and another queue's later
-// work completes (D3D-203: kept until the batch is submitted, destroyed after it completed).
+// work completes (D3D-203: kept until the batch is submitted, destroyed after it completed), or while that batch is
+// being replayed on another thread.
 //
 // The same cases run on the Vulkan layer and on the host D3D12 runtime (the adapter is named in the output). Results are
 // compared byte for byte with the data written by the CPU: a consumer replayed against the layout from before its
@@ -572,6 +573,70 @@ bool released_while_held(Rig& rig, int seed) {
     return true;
 }
 
+// The race reported on #4557: a resource released on another thread while the last held batch is being replayed.
+// Queue A holds Wait(fence 3, 1) + stage[0] -> readback, the only held operation; a second thread makes the CPU
+// Signal that releases it, and the test hook stops that thread just before the replay, with the batch out of the
+// queue's list. The main thread releases stage[0] then. The batch still counts as held until its replay has been
+// submitted, so the resource must be kept (not destroyed under the replay, which then fails and reads nothing), and
+// destroyed once the replay is done. Layer only.
+bool released_during_replay(Rig& rig, int seed) {
+    arm("resource released while the held batch that names it is replayed");
+    Case c(rig, seed);
+    if (!c.make_resources()) return false;
+    ID3D12Device* device = rig.device;
+    if (!c.submit({copy_q, 0, nullptr, &c.stage[0], 3, {}, 0}) || !c.wait_fence(0, 1)) return false;
+    if (rt::d3d12::deferred_destruction(device).kept) return c.fail("resources kept before the case", __LINE__);
+    ID3D12Fence* gate = c.fence(3);
+    ID3D12Fence* done = c.fence(2);
+    ID3D12GraphicsCommandList* list = c.make_list(direct_q, &c.stage[0], nullptr, 3);
+    if (!gate || !done || !list) return c.fail("setup", __LINE__);
+    ID3D12CommandQueue* queue_a = rig.queues[direct_q][0].Get();
+    ID3D12CommandList* batch[] = {list};
+    if (FAILED(queue_a->Wait(gate, 1))) return c.fail("Wait", __LINE__);
+    queue_a->ExecuteCommandLists(1, batch);  // held, with no Signal behind it
+
+    HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!entered || !go) return c.fail("CreateEvent", __LINE__);
+    std::atomic<bool> fired{false};
+    const std::function<void()> hook = [&] {
+        if (fired.exchange(true)) return;
+        SetEvent(entered);
+        WaitForSingleObject(go, 15000);
+    };
+    rt::d3d12::set_held_replay_hook(device, &hook);
+    rt::d3d12::DeferredDestruction during{};
+    bool signaled = false, in_replay = false;
+    const std::string log = capture_stderr([&] {
+        std::thread signaller([&] { signaled = SUCCEEDED(gate->Signal(1)); });
+        in_replay = WaitForSingleObject(entered, 15000) == WAIT_OBJECT_0;
+        c.stage[0].texture.Reset();
+        c.stage[0].buffer.Reset();
+        during = rt::d3d12::deferred_destruction(device);
+        SetEvent(go);
+        signaller.join();
+    });
+    rt::d3d12::set_held_replay_hook(device, nullptr);
+    CloseHandle(entered);
+    CloseHandle(go);
+    if (!in_replay) return c.fail("the CPU Signal did not replay the held batch", __LINE__);
+    if (!signaled) return c.fail("CPU Signal failed", __LINE__);
+    std::printf("released during the replay of the held batch: kept %zu, waiting %zu\n", during.kept, during.waiting);
+    if (!log.empty()) {
+        std::fprintf(stderr, "stderr was: \"%s\"\n", log.c_str());
+        return c.fail("the layer reported a problem when the held batch was released", __LINE__);
+    }
+    if (during.kept != 2)
+        return c.fail("the resource was destroyed under the replay of the batch that names it", __LINE__);
+    const auto after = rt::d3d12::deferred_destruction(device);
+    std::printf("after the replay: kept %zu, waiting %zu\n", after.kept, after.waiting);
+    if (after.kept || !after.waiting)
+        return c.fail("the resource was not destroyed once the replay was submitted", __LINE__);
+    if (FAILED(queue_a->Signal(done, 1)) || !c.wait_fence(2, 1) || !c.verify()) return false;  // read intact
+    ++cases_run;
+    return true;
+}
+
 // Review item 4: a held Signal names a fence the application has released. The fence lives until the Signal has been
 // submitted (a queue behind it that waits for the fence proves it was signaled), with nothing used after free.
 bool held_signal_survives_release(Rig& rig, int seed) {
@@ -794,6 +859,7 @@ bool run_all(ID3D12Device* device, bool layer) {
         ok &= never_signaled(rig, ++seed);
         ok &= fence_released(rig, ++seed);
         ok &= released_while_held(rig, ++seed);
+        ok &= released_during_replay(rig, ++seed);
         ok &= held_signal_survives_release(rig, ++seed);
         ok &= monotonic_shared_fence(rig, ++seed);
         ok &= teardown_wakes_cpu_waiters(rig, ++seed);
