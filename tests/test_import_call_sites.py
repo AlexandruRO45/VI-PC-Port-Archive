@@ -41,8 +41,8 @@ def rel32(from_end, target):
     return struct.pack("<i", target - from_end)
 
 
-def build_image(callers):
-    """A PE32+ with one import descriptor (xmem.dll: XMemFoo, XMemBar, #7) and the given `.text` callers."""
+def build_image(callers, *, bar_name=b"XMemBar"):
+    """A PE32+ importing XMemFoo, bar_name and #7 from xmem.dll, with the given `.text` callers."""
     buf = bytearray(0x3000)
     buf[0:2] = b"MZ"
     struct.pack_into("<I", buf, 0x3C, 0x40)
@@ -73,7 +73,7 @@ def build_image(callers):
         struct.pack_into("<Q", buf, lookup + i * 8, value)
         struct.pack_into("<Q", buf, IAT_FOO + i * 8, value)
     buf[names + 2:names + 2 + 8] = b"XMemFoo\0"
-    buf[names + 0x10 + 2:names + 0x10 + 2 + 8] = b"XMemBar\0"
+    buf[names + 0x10 + 2:names + 0x10 + 3 + len(bar_name)] = bar_name + b"\0"
     buf[IDATA_RVA + 0xD0:IDATA_RVA + 0xD0 + 9] = b"xmem.dll\0"
 
     # .text: the thunks are `jmp qword [rip+disp32]` to the address-table slots.
@@ -110,15 +110,50 @@ class ImportCallSitesTest(unittest.TestCase):
         self.assertEqual((bar["thunks"], bar["call"], bar["jmp"]), ([THUNK_BAR], [], []))
 
     def test_an_ordinal_import_is_named_by_its_number(self):
-        out = import_call_sites.call_sites(self.data, wanted={"xmem.dll!#7"})["imports"]
+        out = import_call_sites.call_sites(self.data, wanted={"XMEM.DLL!#7"})["imports"]
         self.assertEqual(list(out), ["xmem.dll!#7"])
         self.assertEqual(out["xmem.dll!#7"]["call"], [TEXT_RVA + 0x130])
 
     def test_wanted_names_and_dlls_select_imports(self):
-        out = import_call_sites.call_sites(self.data, wanted={"XMEM.DLL!xmemfoo"})["imports"]
+        out = import_call_sites.call_sites(self.data, wanted={"XMEM.DLL!XMemFoo"})["imports"]
         self.assertEqual(list(out), ["xmem.dll!XMemFoo"])
         self.assertEqual(len(import_call_sites.call_sites(self.data, dlls={"XMem.dll"})["imports"]), 3)
         self.assertEqual(import_call_sites.call_sites(self.data, dlls={"other.dll"})["imports"], {})
+
+    def test_wanted_function_names_are_case_sensitive(self):
+        for name in ("xmemfoo", "XMEMFOO", "XmemFoo"):
+            with self.subTest(name=name):
+                self.assertEqual(import_call_sites.call_sites(
+                    self.data, wanted={f"XMEM.DLL!{name}"})["imports"], {})
+
+    def test_case_distinct_symbols_keep_separate_call_counts(self):
+        data = build_image([*self.callers, (TEXT_RVA + 0x150, 0xE8, THUNK_BAR)], bar_name=b"xmemfoo")
+        for name, thunk, calls, jumps in (
+            ("XMemFoo", THUNK_FOO, [TEXT_RVA + 0x100, TEXT_RVA + 0x110], [TEXT_RVA + 0x120]),
+            ("xmemfoo", THUNK_BAR, [TEXT_RVA + 0x150], []),
+        ):
+            with self.subTest(name=name):
+                key = f"xmem.dll!{name}"
+                out = import_call_sites.call_sites(data, wanted={f"XMEM.DLL!{name}"})["imports"]
+                self.assertEqual(out, {key: {"thunks": [thunk], "call": calls, "jmp": jumps}})
+
+    def test_cli_import_filter_preserves_symbol_case(self):
+        data = build_image([*self.callers, (TEXT_RVA + 0x150, 0xE8, THUNK_BAR)], bar_name=b"xmemfoo")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(data)
+            for name, count in (("XMemFoo", 3), ("xmemfoo", 1)):
+                with self.subTest(name=name):
+                    args = [path, "--import", f"XMEM.DLL!{name}"]
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        self.assertEqual(import_call_sites.main(args), 0)
+                    self.assertIn(f"1 import(s), {count} call site(s)", out.getvalue())
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        self.assertEqual(import_call_sites.main([*args, "--json"]), 0)
+                    self.assertEqual(list(json.loads(out.getvalue())["imports"]), [f"xmem.dll!{name}"])
 
     def test_a_call_is_not_counted_for_a_different_thunk(self):
         data = build_image([(TEXT_RVA + 0x100, 0xE8, THUNK_BAR)])

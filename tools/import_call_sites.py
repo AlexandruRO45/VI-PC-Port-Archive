@@ -10,6 +10,7 @@ disassembled, so this is a byte pattern: a stray `E8` or `E9` inside another ins
 thunk would be counted too, which is rare, and a call that goes through a register (`call rax` after a load of the
 slot) is not seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
 
+DLL names are case-insensitive; function names are case-sensitive.
 With no `--import` and no `--dll`, every import is listed. An import named `#N` is an ordinal import. Output is counts
 and RVAs only, no instruction bytes (docs/runtime_imports.md, "The retail executable (RT-5)").
 """
@@ -51,6 +52,12 @@ def import_slots(img):
     return slots
 
 
+def _import_key(value):
+    """Normalize the DLL name while keeping the imported symbol's exact spelling."""
+    dll, separator, name = value.partition("!")
+    return dll.lower() + separator + name
+
+
 def call_sites(data, wanted=None, dlls=None):
     """Per import: its thunk RVAs and the RVAs of the `call` and `jmp` instructions that target them.
 
@@ -60,14 +67,14 @@ def call_sites(data, wanted=None, dlls=None):
     img = pe_inspect.PeImage(data)
     if not img.is64:
         raise pe_inspect.PeFormatError("only PE32+ (x86-64) images are scanned")
-    lower_wanted = {w.lower() for w in wanted} if wanted else None
+    normalized_wanted = {_import_key(w) for w in wanted} if wanted else None
     lower_dlls = {d.lower() for d in dlls} if dlls else None
 
     def selected(key):
-        dll, _, name = key.partition("!")
-        if lower_wanted is None and lower_dlls is None:
+        dll = key.partition("!")[0]
+        if normalized_wanted is None and lower_dlls is None:
             return True
-        return (lower_wanted is not None and f"{dll.lower()}!{name}".lower() in lower_wanted) or \
+        return (normalized_wanted is not None and _import_key(key) in normalized_wanted) or \
                (lower_dlls is not None and dll.lower() in lower_dlls)
 
     slots = {rva: key for rva, key in import_slots(img).items() if selected(key)}
