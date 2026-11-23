@@ -167,6 +167,31 @@ def animated_gltf():
 
 
 class GlbInspectTests(unittest.TestCase):
+    def test_unrepresentable_animation_duration_is_reported_as_unknown(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "invalid-duration.glb")
+            out = os.path.join(folder, "report.json")
+            for declared_max in (10**400, 1e100):
+                with self.subTest(number_kind=type(declared_max).__name__):
+                    gltf = animated_gltf()
+                    gltf["accessors"][2]["max"] = [declared_max]
+                    data = glb(gltf, triangle_bin())
+                    if isinstance(declared_max, float):
+                        # Equal-length JSON exponent token that overflows Python's float.
+                        self.assertIn(b"1e+100", data)
+                        data = data.replace(b"1e+100", b"1e+999", 1)
+                    with open(path, "wb") as handle:
+                        handle.write(data)
+                    result = self.run_tool(path, "--json", out)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    with open(out, encoding="utf-8") as handle:
+                        animation = json.load(handle)["animations"][0]
+                    self.assertIsNone(animation["duration"])
+                    self.assertIsNone(animation["samplers"][0]["duration"])
+                    self.assertIn("sampler[0] input accessor max does not declare a finite duration",
+                                  animation["issues"])
+
     def run_tool(self, *args):
         return subprocess.run([sys.executable, "-I", TOOL, *args],
                               capture_output=True, text=True, timeout=60, errors="replace")
