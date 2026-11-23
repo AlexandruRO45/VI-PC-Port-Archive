@@ -538,5 +538,69 @@ class SaluOrB32SimdDivergenceTests(unittest.TestCase):
         spv = translate_lines("ps_exec_or_mask", lines)
         self.assertIn("OpBitwiseOr", spv)
 
+
+class SaluOrB32AliasingTests(unittest.TestCase):
+    """Register aliasing and in-place operand preservation for s_or_b32."""
+
+    def test_self_aliasing_all_operands_identical(self):
+        """s_or_b32 s0, s0, s0: in-place idempotent self-OR."""
+        state = ScalarRegisterState()
+        val = 0xFEEDBEEF
+        state.write_reg("s0", val)
+        res = state.execute_s_or_b32("s0", "s0", "s0")
+        self.assertEqual(res, val)
+        self.assertEqual(state.read_reg("s0"), val)
+        self.assertEqual(state.scc, 1)
+
+    def test_in_place_dst_alias_src0(self):
+        """s_or_b32 s0, s0, s1: accumulate into src0 while preserving src1."""
+        state = ScalarRegisterState()
+        state.write_reg("s0", 0x0F0F0F0F)
+        state.write_reg("s1", 0xF0F0F0F0)
+        state.execute_s_or_b32("s0", "s0", "s1")
+        self.assertEqual(state.read_reg("s0"), MASK32)
+        self.assertEqual(state.read_reg("s1"), 0xF0F0F0F0)
+
+    def test_in_place_dst_alias_src1(self):
+        """s_or_b32 s1, s0, s1: accumulate into src1 while preserving src0."""
+        state = ScalarRegisterState()
+        state.write_reg("s0", 0x11111111)
+        state.write_reg("s1", 0x22222222)
+        state.execute_s_or_b32("s1", "s0", "s1")
+        self.assertEqual(state.read_reg("s0"), 0x11111111)
+        self.assertEqual(state.read_reg("s1"), 0x33333333)
+
+    def test_adjacent_register_isolation(self):
+        """Modifying destination register must not touch adjacent SGPRs."""
+        state = ScalarRegisterState()
+        state.write_reg("s0", 0x11111111)
+        state.write_reg("s1", 0x22222222)
+        state.write_reg("s2", 0x33333333)
+        state.write_reg("s3", 0x44444444)
+
+        state.execute_s_or_b32("s1", "s1", "s2")
+        self.assertEqual(state.read_reg("s0"), 0x11111111)
+        self.assertEqual(state.read_reg("s1"), 0x33333333)
+        self.assertEqual(state.read_reg("s2"), 0x33333333)
+        self.assertEqual(state.read_reg("s3"), 0x44444444)
+
+    def test_translated_aliasing_shader(self):
+        """Translate shader with dst aliasing src0 and execute via mrt0_words."""
+        lines = [
+            "s_mov_b32 s0, 0x0F0F0F0F",
+            "s_mov_b32 s1, 0xF0F0F0F0",
+            "s_or_b32 s0, s0, s1",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_salu_or_alias", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], MASK32)
+        self.assertEqual(out[1], 0xF0F0F0F0)
+
 if __name__ == "__main__":
     unittest.main()
