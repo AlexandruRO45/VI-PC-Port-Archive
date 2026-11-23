@@ -1307,6 +1307,101 @@ def _glb_first_base_color_pixel(glb_path):
     return gltf, None
 
 
+SHARED_DDS_RGBA = (10, 200, 30, 128)
+
+
+def _write_bucket_fixture(assets_dir, buckets):
+    """One model, one cube group per shader slot; every slot resolves the same embedded DDS."""
+    models_dir = os.path.join(assets_dir, "models")
+    tex_dir = os.path.join(models_dir, "cubes_tex")
+    os.makedirs(tex_dir)
+    with open(os.path.join(tex_dir, "000_shared.dds"), "wb") as f:
+        f.write(_uniform_bgra_dds(SHARED_DDS_RGBA))
+    with open(os.path.join(models_dir, "cubes.obj"), "w", encoding="utf-8") as f:
+        f.write(_cube_obj(0.0, 0.0, 0.0, groups=len(buckets)))
+    item = {
+        "File": "cubes.obj",
+        "Name": "cubes",
+        "MeshShaders": list(range(len(buckets))),
+        "Embedded": [{"Index": 0, "Name": "shared", "Hash": "00000000", "Key": None}],
+        "Materials": [
+            {"ShaderIndex": i, "Shader": f"{i + 1:08X}", "RenderBucket": b,
+             "Textures": [_param_ref(ALBEDO_PARAM, 0)]}
+            for i, b in enumerate(buckets)
+        ],
+    }
+    with open(os.path.join(models_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"Items": [item]}, f)
+    return models_dir, item
+
+
+class RenderBucketAlphaTest(unittest.TestCase):
+    # bucket 1 -> BLEND, 0x83 (bit 7 flag + bucket 3) -> MASK, the rest stay opaque
+
+    def _assert_materials(self, gltf):
+        self.assertEqual(sorted(m.get("alphaMode", "OPAQUE") for m in gltf["materials"]),
+                         ["BLEND", "MASK", "OPAQUE"])
+        for m in gltf["materials"]:
+            self.assertNotIn("alphaCutoff", m)  # glTF default cutoff, not a native one
+        self.assertEqual(len(gltf["images"]), 1)  # one PNG shared by the three materials
+
+    def test_shader_alpha_modes(self):
+        item = {"Materials": [
+            {"ShaderIndex": 0, "RenderBucket": 1}, {"ShaderIndex": 1, "RenderBucket": 0x83},
+            {"ShaderIndex": 2, "RenderBucket": 2}, {"ShaderIndex": 3},
+            {"ShaderIndex": 4, "RenderBucket": 1}, {"ShaderIndex": 4, "RenderBucket": 3},
+            {"ShaderIndex": 5, "RenderBucket": 1}, {"ShaderIndex": 5, "RenderBucket": 0x81},
+            {"ShaderIndex": 6, "RenderBucket": "1"}, {"ShaderIndex": 7, "RenderBucket": True},
+        ]}
+        self.assertEqual(world_build.shader_alpha_modes(item), {0: "BLEND", 1: "MASK", 5: "BLEND"})
+        self.assertEqual(world_build.shader_alpha_modes({}), {})
+
+    def test_baked_world_keeps_modes_separate_for_one_dds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, out = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            _write_bucket_fixture(assets, [1, 0x83, 0, 2])
+            world_build.build_world(assets, out)
+            with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
+                world = json.load(f)
+            self.assertEqual(world["stats"]["textures_embedded"], 1)  # one deduped image
+            with open(_chunk_disk_path(out, world["chunks"][0]["url"]), "rb") as f:
+                gltf, _ = parse_and_validate_glb(f.read())
+            self._assert_materials(gltf)
+            self.assertEqual(len(gltf["meshes"][0]["primitives"]), 4)
+
+    def test_no_textures_means_no_alpha_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets, out = os.path.join(tmp, "assets"), os.path.join(tmp, "world")
+            _write_bucket_fixture(assets, [1, 3])
+            world_build.build_world(assets, out, textures=False)
+            with open(os.path.join(out, "world.json"), encoding="utf-8") as f:
+                world = json.load(f)
+            with open(_chunk_disk_path(out, world["chunks"][0]["url"]), "rb") as f:
+                gltf, _ = parse_and_validate_glb(f.read())
+            self.assertEqual(gltf.get("images", []), [])
+            self.assertTrue(all("alphaMode" not in m for m in gltf.get("materials", [])))
+
+    def test_instanced_chunks_keep_modes_separate_for_one_dds(self):
+        for mode in ("gpu", "nodes"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                assets = os.path.join(tmp, "assets")
+                models_dir, item = _write_bucket_fixture(assets, [1, 0x83, 0, 2])
+                tex_map = world_build.resolve_model_textures(models_dir, item, {}, ALBEDO_PARAM)
+                pack = os.path.join(tmp, "0.lpk")
+                _, summary = world_build._pack_model_job(
+                    (0, os.path.join(models_dir, "cubes.obj"), item["MeshShaders"], tex_map, True, pack,
+                     world_build.shader_alpha_modes(item)))
+                self.assertEqual(len(summary["mat_to_dds"]), 3)
+                insts = [(0, False, (float(i * 10), 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0))
+                         for i in range(2)]
+                rec, embedded, skipped, _ = world_build._build_chunk_job(
+                    ("c", tmp, mode, insts, {0: pack}, summary["mat_to_dds"], True, 64))
+                self.assertEqual((embedded, skipped), (1, 0))
+                with open(os.path.join(tmp, "c.glb"), "rb") as f:
+                    gltf, _ = parse_and_validate_glb(f.read())
+                self._assert_materials(gltf)
+
+
 class BaseColorParamTest(unittest.TestCase):
     """--base-color-param selects base colour by shader parameter hash; checked by GLB pixel readback."""
 

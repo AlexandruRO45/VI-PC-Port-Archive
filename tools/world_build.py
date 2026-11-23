@@ -433,13 +433,13 @@ def _mirror_packed(prim: dict) -> dict:
 
 def _pack_model_job(job: tuple) -> tuple[int, dict | None]:
     """Parse one model's OBJ once (glTF Y-up model space), pack it to its cache file and return its summary."""
-    model_id, obj_path, mesh_shaders, tex_map, textures, cache_path = job
+    model_id, obj_path, mesh_shaders, tex_map, textures, cache_path, alpha_modes = job
     glb_mod = _get_glb_writer()
     try:
         prims = glb_mod.parse_obj(obj_path, is_path=True, up_axis="z")
     except (OSError, glb_mod.GlbError, ValueError):
         return model_id, None
-    mat_to_dds = _assign_materials(prims, mesh_shaders, tex_map, textures)
+    mat_to_dds = _assign_materials(prims, mesh_shaders, tex_map, textures, alpha_modes)
     try:
         packed = [glb_mod.pack_primitive(p) for p in prims if p.get("positions") and p.get("indices")]
     except glb_mod.GlbError:
@@ -508,8 +508,7 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
             if png is None:
                 skipped += 1
                 continue
-            materials[key] = {"name": os.path.splitext(os.path.basename(dds))[0], "png_bytes": png,
-                              "base_color_factor": [1.0, 1.0, 1.0, 1.0], "double_sided": True}
+            materials[key] = _material_spec(key, dds, png)
     path = os.path.join(staging_dir, f"{chunk_id}.glb")
     info = glb_mod.write_instanced_glb(path, meshes, materials or None, mode=mode)
     _verify_staged_chunk(path, int(info["bytes"]), glb_mod)
@@ -611,7 +610,7 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
             obj_path = os.path.join(models_dir, rel_file) if isinstance(rel_file, str) and rel_file.strip() else ""
             tex_map = resolve_model_textures(models_dir, item, ttpf_index, base_color_param) if textures else {}
             jobs.append((mid, obj_path, _list_field(item, "MeshShaders"), tex_map, textures,
-                         os.path.join(pack_dir, f"{mid}.lpk")))
+                         os.path.join(pack_dir, f"{mid}.lpk"), shader_alpha_modes(item) if textures else {}))
         info: list[dict | None] = [None] * len(model_src)
         for mid, summary in _run_jobs(_pack_model_job, jobs, workers):
             info[mid] = summary
@@ -1025,8 +1024,52 @@ def resolve_model_textures(
     return result
 
 
-def _assign_materials(prims: list[dict], mesh_shaders: list, tex_map: dict, textures: bool) -> dict[str, str]:
-    """Set each primitive's ``material`` key from its shader's resolved DDS; returns key -> DDS path."""
+_BUCKET_ALPHA = {1: "BLEND", 3: "MASK"}
+
+
+def shader_alpha_modes(item: dict) -> dict[int, str]:
+    """shader_index -> glTF alphaMode for a model manifest item, from ``Materials[].RenderBucket``.
+
+    Bit 7 is a separate flag (docs/models.md, Shader render buckets) and is masked off; only bucket 1 (alpha)
+    gives BLEND and 3 (cutout) gives MASK, at the glTF default cutoff. Other, missing, non-integer or
+    conflicting values (one slot listed twice with different buckets) leave the slot out, i.e. opaque."""
+    seen: dict[int, set] = {}
+    for mat in _list_field(item, "Materials"):
+        if not isinstance(mat, dict):
+            continue
+        sidx = mat.get("ShaderIndex")
+        if not isinstance(sidx, int) or isinstance(sidx, bool):
+            continue
+        bucket = mat.get("RenderBucket")
+        ok = isinstance(bucket, int) and not isinstance(bucket, bool) and 0 <= bucket <= 0xFF
+        seen.setdefault(sidx, set()).add(bucket & 0x7F if ok else None)
+    return {sidx: _BUCKET_ALPHA[next(iter(v))] for sidx, v in seen.items()
+            if len(v) == 1 and next(iter(v)) in _BUCKET_ALPHA}
+
+
+def _material_alpha_mode(mat_key: str) -> str | None:
+    """The alpha mode a ``_assign_materials`` key carries (``tex_<dds>#MODE``), or None for opaque."""
+    for mode in _BUCKET_ALPHA.values():
+        if mat_key.endswith("#" + mode):
+            return mode
+    return None
+
+
+def _material_spec(mat_key: str, dds_path: str, png: bytes) -> dict:
+    spec = {"name": os.path.splitext(os.path.basename(dds_path))[0], "png_bytes": png,
+            "base_color_factor": [1.0, 1.0, 1.0, 1.0], "double_sided": True}
+    mode = _material_alpha_mode(mat_key)
+    if mode:
+        spec["alpha_mode"] = mode
+    return spec
+
+
+def _assign_materials(prims: list[dict], mesh_shaders: list, tex_map: dict, textures: bool,
+                      alpha_modes: dict | None = None) -> dict[str, str]:
+    """Set each primitive's ``material`` key from its shader's resolved DDS; returns key -> DDS path.
+
+    A shader slot with an alpha mode in ``alpha_modes`` gets its own key (``#MODE`` suffix), so one DDS used
+    with different modes stays separate materials."""
     mat_to_dds: dict[str, str] = {}
     for p in prims:
         gidx = p.get("group_index", 0)
@@ -1044,6 +1087,8 @@ def _assign_materials(prims: list[dict], mesh_shaders: list, tex_map: dict, text
         ):
             dds_path = os.path.abspath(tex_map[sidx])
             mat_key = f"tex_{os.path.normcase(dds_path)}"
+            if alpha_modes and sidx in alpha_modes:
+                mat_key += "#" + alpha_modes[sidx]
             p["material"] = mat_key
             mat_to_dds[mat_key] = dds_path
         else:
@@ -1536,7 +1581,8 @@ def build_world(
             if textures
             else {}
         )
-        mat_to_dds = _assign_materials(prims, _list_field(item, "MeshShaders"), tex_map, textures)
+        mat_to_dds = _assign_materials(prims, _list_field(item, "MeshShaders"), tex_map, textures,
+                                       shader_alpha_modes(item) if textures else None)
         return {"prims": prims, "bounds": bounds, "mat_to_dds": mat_to_dds}
 
     loaded_models: list[dict] = []
@@ -1696,12 +1742,7 @@ def _build_staged_world(
                     cell_skipped += 1
                     skipped_keys.add(mat_key)
                 else:
-                    materials[mat_key] = {
-                        "name": os.path.splitext(os.path.basename(dds_path))[0],
-                        "png_bytes": png_bytes,
-                        "base_color_factor": [1.0, 1.0, 1.0, 1.0],
-                        "double_sided": True,
-                    }
+                    materials[mat_key] = _material_spec(mat_key, dds_path, png_bytes)
 
         if skipped_keys:
             for p in cell_prims:
