@@ -1453,16 +1453,27 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     return hr;
 }
 
-// The console creates its render-target and depth textures with initial state 0x6; the PC runtime refuses that state
-// for a texture (reported by rafaelpssz from a retail exe integration run). A texture whose flags name the use gets
-// that use's state: ALLOW_RENDER_TARGET -> RENDER_TARGET, ALLOW_DEPTH_STENCIL -> DEPTH_WRITE. Every other state and
-// every buffer goes on unchanged. The description is only read; the title's words are never written.
-constexpr std::uint32_t kConsoleTextureInitialState = 0x6;
+// The console's CreateCommittedResource / CreateCommittedResourceX pass a D3D12_BARRIER_LAYOUT in the initial-state
+// slot (measured by @dracbat on slot 133; @Jadiac5 / D3D-837 on a committed RT+UAV texture). As a legacy
+// D3D12_RESOURCE_STATES value those layouts look like buffer-only bits and the PC runtime refuses them.
+//
+// 0x6 (SHADER_RESOURCE layout): a texture whose flags name a write use still gets that use's state, as #7356 fixed
+// for the retail boot (ALLOW_RENDER_TARGET -> RENDER_TARGET, ALLOW_DEPTH_STENCIL -> DEPTH_WRITE). 0x3
+// (UNORDERED_ACCESS layout): an RT+UAV texture (flags ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS) maps to
+// UNORDERED_ACCESS so create_committed_validated no longer refuses "buffer-only or undefined bits". Every other
+// state and every buffer goes on unchanged. The description is only read; the title's words are never written.
+constexpr std::uint32_t kConsoleShaderResourceLayout = 0x6;
+constexpr std::uint32_t kConsoleUnorderedAccessLayout = 0x3;
 
 std::uint64_t pc_initial_state_word(std::uint64_t desc_word, std::uint64_t state_word) {
-    if (static_cast<std::uint32_t>(state_word) != kConsoleTextureInitialState || !desc_word) return state_word;
+    if (!desc_word) return state_word;
     const auto* desc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(desc_word);
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return state_word;
+    const auto layout = static_cast<std::uint32_t>(state_word);
+    if (layout == kConsoleUnorderedAccessLayout &&
+        (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (layout != kConsoleShaderResourceLayout) return state_word;
     if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) return D3D12_RESOURCE_STATE_RENDER_TARGET;
     if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return D3D12_RESOURCE_STATE_DEPTH_WRITE;
     return state_word;

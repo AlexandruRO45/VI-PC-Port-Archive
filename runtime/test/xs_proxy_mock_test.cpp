@@ -857,10 +857,29 @@ int check_committed_resource_states() {
     EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&buffer), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
     EXPECT(state_of(mock->args[27][3]) == kConsole);
 
+    // D3D-837: console barrier layout 0x3 (UNORDERED_ACCESS) on a committed RT+UAV texture.
+    const D3D12_RESOURCE_DESC rt_uav = resource_desc(
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const std::uint64_t kUavLayout = 0x3;
+    const std::uint64_t kUav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    for (const unsigned slot : {27u, 53u}) {
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt_uav), kUavLayout)) == S_OK);
+        EXPECT(state_of(mock->args[slot][3]) == kUav);
+        // Without ALLOW_UNORDERED_ACCESS, 0x3 is left alone (still looks like buffer-only bits to the PC device).
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), kUavLayout)) == S_OK &&
+               state_of(mock->args[slot][3]) == kUavLayout);
+        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&buffer), kUavLayout)) == S_OK &&
+               state_of(mock->args[slot][3]) == kUavLayout);
+    }
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&rt_uav), kUavLayout, 0, word(&resource_iid),
+                      word(&resource))) == S_OK);
+    EXPECT(state_of(mock->args[27][3]) == kUav);
+
     EXPECT(xs::device_slot_overridden(27) && xs::device_slot_overridden(53));
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: committed textures with state 0x6 reach the PC device as RENDER_TARGET or DEPTH_WRITE; buffers and "
-                "other states are unchanged\n", g_label);
+    std::printf("%s: committed textures with state 0x6 reach the PC device as RENDER_TARGET or DEPTH_WRITE; layout 0x3 "
+                "on RT+UAV reaches it as UNORDERED_ACCESS; buffers and other states are unchanged\n", g_label);
     return 0;
 }
 
