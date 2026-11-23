@@ -70,6 +70,12 @@ inline constexpr Layout layouts[] = {
     {VK_FORMAT_A2B10G10R10_UNORM_PACK32, Kind::unorm, 4, {{{0, 10}, {10, 10}, {20, 10}, {30, 2}}}},
     {VK_FORMAT_A2B10G10R10_UINT_PACK32, Kind::uint, 4, {{{0, 10}, {10, 10}, {20, 10}, {30, 2}}}},
     {VK_FORMAT_B10G11R11_UFLOAT_PACK32, Kind::ufloat, 4, {{{0, 11}, {11, 11}, {22, 10}, {}}}},
+    // B5G6R5, B5G5R5A1 and B4G4R4A4: D3D12 makes typed UAV stores of them optional, and a GPU whose Vulkan driver can
+    // store them (AMD's) is reported as having them, so a clear must encode them (issue on #5425: without a layout
+    // the whole command list was refused).
+    {VK_FORMAT_R5G6B5_UNORM_PACK16, Kind::unorm, 2, {{{11, 5}, {5, 6}, {0, 5}, {}}}},
+    {VK_FORMAT_A1R5G5B5_UNORM_PACK16, Kind::unorm, 2, {{{10, 5}, {5, 5}, {0, 5}, {15, 1}}}},
+    {VK_FORMAT_A4R4G4B4_UNORM_PACK16, Kind::unorm, 2, {{{8, 4}, {4, 4}, {0, 4}, {12, 4}}}},
     {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, Kind::shared_exp, 4, {{{0, 9}, {9, 9}, {18, 9}, {27, 5}}}},
     {VK_FORMAT_R8G8B8A8_UNORM, Kind::unorm, 4, {{{0, 8}, {8, 8}, {16, 8}, {24, 8}}}},
     {VK_FORMAT_R8G8B8A8_SNORM, Kind::snorm, 4, {{{0, 8}, {8, 8}, {16, 8}, {24, 8}}}},
@@ -116,10 +122,26 @@ struct Element {
 namespace detail {
 
 // Rounds to nearest, ties to even, whatever the thread's floating-point rounding mode (std::nearbyint follows it, and
-// a game may change it). x is a float product, exact in a double.
+// a game may change it). x is a float times a channel maximum, computed in double, where it is exact.
 inline double round_half_even(double x) {
     const double r = std::floor(x + 0.5);
     return r - x == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
+}
+
+// D3D multiplies a clear value by the channel's largest value in float (WARP: a D16 depth of 0.681063533 is 44633.5
+// in float, a tie that goes to the even 44634, but 44633.4999... in double, which rounds down). The product is exact
+// in a double; this returns the float nearest to it, ties to even, whatever the thread's rounding mode (a cast to
+// float follows the mode).
+inline double nearest_float(double x) {
+    const float cast = static_cast<float>(x);
+    const float lo = double(cast) <= x ? cast : std::nextafter(cast, -HUGE_VALF);
+    if (double(lo) == x) return lo;
+    const float hi = std::nextafter(lo, HUGE_VALF);
+    const double below = x - double(lo), above = double(hi) - x;
+    if (below != above) return below < above ? lo : hi;
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &lo, sizeof bits);
+    return (bits & 1u) ? hi : lo;
 }
 
 inline constexpr std::uint32_t mask(unsigned bits) { return bits >= 32 ? 0xffffffffu : (1u << bits) - 1; }
@@ -254,11 +276,11 @@ inline bool encode(VkFormat format, bool is_float, const std::array<std::uint32_
         switch (l->kind) {
         case Kind::unorm:
             // A float product rounded to nearest, ties to even, as WARP does (0.5 / 255 clears R8_UNORM to 0, not 1).
-            detail::put(out, c, std::isnan(v) ? 0 : std::uint32_t(detail::round_half_even(std::clamp(v, 0.0f, 1.0f) * float(scale))));
+            detail::put(out, c, std::isnan(v) ? 0 : std::uint32_t(detail::round_half_even(detail::nearest_float(double(std::clamp(v, 0.0f, 1.0f)) * scale))));
             break;
         case Kind::snorm: {
             const float max = float(detail::mask(c.bits - 1));
-            detail::put(out, c, std::isnan(v) ? 0 : std::uint32_t(std::int32_t(detail::round_half_even(std::clamp(v, -1.0f, 1.0f) * max))));
+            detail::put(out, c, std::isnan(v) ? 0 : std::uint32_t(std::int32_t(detail::round_half_even(detail::nearest_float(double(std::clamp(v, -1.0f, 1.0f)) * double(max))))));
             break;
         }
         case Kind::uint: detail::put(out, c, detail::to_integer(v, false, c.bits)); break;

@@ -1070,10 +1070,26 @@ inline double round_half_even(double x) {
     return r - x == 0.5 && std::fmod(r, 2.0) != 0.0 ? r - 1.0 : r;
 }
 
+// D3D multiplies a clear value by the channel's largest value in float (WARP: a D16 depth of 0.681063533 is 44633.5
+// in float, a tie that goes to the even 44634, but 44633.4999... in double, which rounds down). The product is exact
+// in a double; this returns the float nearest to it, ties to even, whatever the thread's rounding mode (a cast to
+// float follows the mode).
+inline double nearest_float(double x) {
+    const float cast = static_cast<float>(x);
+    const float lo = double(cast) <= x ? cast : std::nextafter(cast, -HUGE_VALF);
+    if (double(lo) == x) return lo;
+    const float hi = std::nextafter(lo, HUGE_VALF);
+    const double below = x - double(lo), above = double(hi) - x;
+    if (below != above) return below < above ? lo : hi;
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &lo, sizeof bits);
+    return (bits & 1u) ? hi : lo;
+}
+
 inline float quantize_unorm(float value, double maximum) {
     if (!(value > 0.0f)) return 0.0f;
     if (value >= 1.0f) return 1.0f;
-    return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
+    return static_cast<float>(round_half_even(nearest_float(double(value) * maximum)) / maximum);
 }
 
 // The same for a signed normalised format: -1..1 on a scale of 127 (8 bits) or 32767 (16 bits), where D3D writes -1.0
@@ -1081,20 +1097,9 @@ inline float quantize_unorm(float value, double maximum) {
 inline float quantize_snorm(float value, double maximum) {
     if (!(value > -1.0f)) return value != value ? 0.0f : -1.0f;
     if (value >= 1.0f) return 1.0f;
-    return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
+    return static_cast<float>(round_half_even(nearest_float(double(value) * maximum)) / maximum);
 }
 
-// A linear clear value for an sRGB colour channel as D3D12 writes it: NaN is 0, the value clamps to [0, 1], is encoded
-// with the sRGB curve and rounds to the nearest 8-bit code, ties to even. Returned as that code's linear value, which
-// a GPU's own encoding turns back into the code. NVIDIA (621.14) encodes 0.5 / 255 to 7 where WARP writes 6.
-inline float srgb_clear_value(float value) {
-    if (!(value > 0.0f)) return 0.0f;
-    if (value >= 1.0f) return 1.0f;
-    const double v = value;
-    const double encoded = v <= 0.0031308 ? v * 12.92 : 1.055 * std::pow(v, 1.0 / 2.4) - 0.055;
-    const double code = round_half_even(encoded * 255.0) / 255.0;
-    return static_cast<float>(code <= 0.04045 ? code / 12.92 : std::pow((code + 0.055) / 1.055, 2.4));
-}
 
 // ClearRenderTargetView takes FLOATs even for integer RTVs. Windows D3D12 (WARP and AMD) clamps to the
 // component range and truncates fractions. Vulkan instead interprets the matching union member as an integer
@@ -1162,7 +1167,7 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
             const bool srgb_colour = (format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB) && i < 3;
             if (snorm != 0) value.float32[i] = quantize_snorm(input[i], snorm);
             else if (unorm[i] != 0.0) value.float32[i] = quantize_unorm(input[i], unorm[i]);
-            else if (srgb_colour) value.float32[i] = srgb_clear_value(input[i]);
+            else if (srgb_colour) value.float32[i] = input[i];  // the GPU's sRGB curve
             else  // a float format: D3D12 flushes a denormal to a zero of its sign (WARP); Vulkan keeps it in R32_SFLOAT
                 value.float32[i] = std::fpclassify(input[i]) == FP_SUBNORMAL ? std::copysign(0.0f, input[i]) : input[i];
             continue;
