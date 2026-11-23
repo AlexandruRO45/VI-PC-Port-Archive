@@ -300,5 +300,27 @@ class VCubeScTranslatorTests(unittest.TestCase):
         val = u32_to_f32(mrt0_words(spv)[0])
         self.assertEqual(val, 1.5)
 
+# -----------------------------------------------------------------------------
+# Opcode 3: v_cubetc_f32
+# -----------------------------------------------------------------------------
+def oracle_cubetc_f32(x: float, y: float, z: float) -> float:
+    return select_cube_face(x, y, z)[2]
+
+
+class VCubeTcOracleTests(unittest.TestCase):
+    def test_cubetc_cardinal_coordinates(self):
+        # +X (face 0): tc = -y
+        self.assertEqual(oracle_cubetc_f32(2.0, 0.7, 0.0), -0.7)
+        # -X (face 1): tc = -y
+        self.assertEqual(oracle_cubetc_f32(-2.0, 0.8, 0.0), -0.8)
+        # +Y (face 2): tc = +z
+        self.assertEqual(oracle_cubetc_f32(0.0, 2.0, 0.9), 0.9)
+        # -Y (face 3): tc = -z
+        self.assertEqual(oracle_cubetc_f32(0.0, -2.0, 0.9), -0.9)
+        # +Z (face 4): tc = -y
+        self.assertEqual(oracle_cubetc_f32(0.0, 0.5, 2.0), -0.5)
+        # -Z (face 5): tc = -y
+        self.assertEqual(oracle_cubetc_f32(0.0, 0.5, -2.0), -0.5)
+
 if __name__ == "__main__":
     unittest.main()
